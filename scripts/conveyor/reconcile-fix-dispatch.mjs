@@ -89,7 +89,7 @@ import { createQueueBudget } from '../readiness/heavy-queue-projection.mjs'; // 
 import {
   agentArgsFromEnv, assertNotALaneCheckout, buildAgentArgv, defaultLoadItems, defaultListAgents,
   defaultSpawnAgent, DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, findItem, normalizeHandle, parseBackgroundedId,
-  resolveGhShimSettingsEnv, resumeSucceeded, REPO_ROOT,
+  resolveGhShimSettingsEnv, resumeSucceeded, REPO_ROOT, workerSpawnEnv,
   // #4174 — the SAME "never spawn into `root` itself" fix `dispatch-lane-io.mjs#createDispatchSinks` applies;
   // this file is a SEPARATE fresh-dispatch call site (see `dispatchFix`'s own docblock), so it needs the same
   // two seams wired in here rather than inheriting them for free.
@@ -98,6 +98,7 @@ import {
   isTrustRefusal, grantDispatchTrust,
 } from '../operations/dispatch-lane-io.mjs';
 import { stopSession } from '../operations/dispatch-abort.mjs';
+import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from '../operations/worker-wrapper-launch.mjs';
 import { assertMainNotStale } from '../operations/review-dispatch.mjs';
 import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
 import { BRIEF_REQUIRED_BY_KIND, OPTIONAL_BRIEF_PLACEHOLDERS, REPO_AWARE_VALUE_PATTERNS, fillBrief, sessionSlugFor } from '../operations/dispatch-lane.mjs';
@@ -1034,6 +1035,10 @@ export function dispatchFix(planned, {
   spawnBorrowed = (request) => fixDetachedProvider(request),
   // Stamp the runner pid onto the claim so a dead borrowed fix stops counting against the cap (see `stampBorrowedRunnerPid`).
   stampRunner = stampBorrowedRunnerPid,
+  // 117 S3b (D7 FINAL) — the Claude fix runs to completion through the detached worker wrapper (`claude -p` +
+  // `--json-schema`, a v2 completion record) instead of `claude --bg`. `wrapFix` false keeps the old launch byte for byte.
+  wrapFix = workerWrapperEnabledFor('fix'),
+  launchWrapped = launchWrappedClaudeWorker,
   // The filled brief is handed to the non-Claude launcher as a file (it cannot ride argv); a test stubs the write.
   writeBorrowedPrompt = writePrivateBorrowedPrompt,
   // #x8mpubm — same never-throwing, opt-in-gated resolver `we:scripts/operations/dispatch-lane-io.mjs`'s own
@@ -1184,6 +1189,22 @@ export function dispatchFix(planned, {
       settingsEnv: resolveSettingsEnv(sessionCwd),
       worktreeSettings: isolateSession(sessionCwd).worktreeSettings,
     });
+    if (wrapFix) {
+      // 117 S3b — same argv, run as `claude -p` to completion by the detached wrapper. The handle is the wrapper's pid
+      // (`pid:<n>`), stamped on the claim so the claim's liveness is that process (`isClaimRunnerDead`); the wrapper's
+      // v2 record stands in for the `claude agents` row (`listWrappedWorkerAgents`). Claim kept, as for `--bg`.
+      const launched = launchWrapped({
+        role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
+        model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+      });
+      if (launched.wrapperPid) {
+        try { stampRunner({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, pid: launched.wrapperPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) }); } catch { /* best effort: the plain TTL still applies */ }
+      }
+      return {
+        sessionId, agentId: launched.handle, sessionSlug, pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane, unknownTokens,
+        resumed: false, wrapped: true, ...(resumeAttempt ? { resumeAttempt } : {}),
+      };
+    }
     // #3331 — READ THE REAL ID BACK OFF STDOUT, exactly as the resume branch above already does. `claude --bg`
     // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.

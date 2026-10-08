@@ -135,9 +135,9 @@ describe('job records — liveness by pid, without a transcript', () => {
   });
 
   it('listAgentsWithReviewJobs merges the listing with the job rows, and a job-read failure costs nothing', () => {
-    const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'fix-3' }], listJobs: () => [{ name: 'review-4' }] });
+    const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'fix-3' }], listJobs: () => [{ name: 'review-4' }], listWrapped: () => [] });
     expect(merged.map((a) => a.name)).toEqual(['fix-3', 'review-4']);
-    expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); } })).toEqual([{ name: 'x' }]);
+    expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] })).toEqual([{ name: 'x' }]);
   });
 });
 
@@ -346,7 +346,7 @@ describe('the two readers that decide "is a review running" see job rows (x26lw6
   it('review-status-tag labels a PR with a live job as review-status:reviewing', () => {
     const edits = [];
     const provider = { readLabels: () => [], ensureLabel: () => {}, setLabels: (_r, _p, e) => edits.push(e) };
-    const out = tagReviewStatus({ pr: 10, repo: REPO, listAgents: () => listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [jobRow] }), provider });
+    const out = tagReviewStatus({ pr: 10, repo: REPO, listAgents: () => listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [jobRow], listWrapped: () => [] }), provider });
     expect(out).toMatchObject({ changed: true, label: 'review-status:reviewing' });
   });
 });

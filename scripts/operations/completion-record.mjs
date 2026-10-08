@@ -194,7 +194,9 @@ export const COMPLETION_READ_VERSIONS = Object.freeze([COMPLETION_RECORD_VERSION
 /** v2 `role` (= `kind`). Kept equal to `worker-result.mjs#ROLES` by a test (this file may not import it: cycle). */
 export const ENVELOPE_ROLES = Object.freeze(['review', 'fix', 'ci-heal', 'inspect', 'build', 'prepare', 'investigate']);
 /** v2 `launcher`: which run-to-completion pattern produced the result (D7 FINAL: all of them go through the detached wrapper). */
-export const ENVELOPE_LAUNCHERS = Object.freeze(['claude-bg', 'claude-p', 'codex-exec', 'agy']);
+// `node-job` (117 S3b): a deterministic detached node worker (the review job) — run to completion, its own pid and
+// timeout, a result built by code and checked by the same validator.
+export const ENVELOPE_LAUNCHERS = Object.freeze(['claude-bg', 'claude-p', 'codex-exec', 'agy', 'node-job']);
 /** v2 `source`: where `result` came from. The three legacy sources are the folded stores (D2). */
 export const ENVELOPE_SOURCES = Object.freeze(['worker-result', 'legacy-completion', 'legacy-delivery-report', 'legacy-fix-report', 'none']);
 

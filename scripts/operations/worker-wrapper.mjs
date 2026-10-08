@@ -32,7 +32,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { finishEnvelopeRecord, isValidSessionSlug, newEnvelopeRecord, redactFreeText } from './completion-record.mjs';
-import { resolveCompletionsDir, withCompletionLock, writeCompletion } from './completion-store.mjs';
+import { resolveCompletionsDir, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
 import { WORKER_RESULT_SCHEMA } from './worker-result.mjs';
 import {
   defaultDraftsDir, defaultOperationsDir, envelopeFromLegacy, legacyOutcomeWord, resolvePostmortemMode, routeWorkerResult, settleWorkerResult,
@@ -149,13 +149,17 @@ export function extractAgyResult(stdout) {
  * @returns {Promise<{envelope: object, result: object, action: object, legacyRecord: object|null, stdout: string, stderr: string}>}
  */
 export async function runWorker(spec, io = {}) {
+  for (const k of ['role', 'launcher', 'session', 'command']) if (!spec?.[k]) throw new TypeError(`operations: runWorker needs spec.${k}`);
+  const dir = spec.completionsDir ?? resolveCompletionsDir();
+  // 117 S3b — a wrapped `--bg` brief (fix / ci-heal / review) still tells its agent to `completion-cli report` into
+  // THIS session's completion record. A JSON spec cannot carry a function, so the flag selects that store as the
+  // legacy reader (section 5 order) and as the source of the agent's own outcome words (see `preserveLegacyWords`).
+  const completionLegacyRead = spec.legacyFromCompletion ? () => { try { return tryReadCompletion(spec.session, dir); } catch { return null; } } : null;
   const {
     spawnToCompletionFn = spawnToCompletion, spawnFn = spawn, now = () => new Date().toISOString(), readFile = (f) => readFileSync(f, 'utf8'),
-    head = () => null, legacyRead = null, isOperatorStop = () => false, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
+    head = () => null, legacyRead = completionLegacyRead, isOperatorStop = () => false, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
   } = io;
-  for (const k of ['role', 'launcher', 'session', 'command']) if (!spec?.[k]) throw new TypeError(`operations: runWorker needs spec.${k}`);
   const timeoutMs = Number.isInteger(spec.timeoutMs) && spec.timeoutMs > 0 ? spec.timeoutMs : DEFAULT_TIMEOUT_MS;
-  const dir = spec.completionsDir ?? resolveCompletionsDir();
   const base = { session: spec.session, role: spec.role, launcher: spec.launcher, model: spec.model ?? null, pr: spec.pr ?? null, item: spec.item ?? null, sessionId: spec.sessionId ?? null };
   const headBefore = head();
 
@@ -218,16 +222,36 @@ export async function runWorker(spec, io = {}) {
   // 3. route, write, and make the draft
   const mode = spec.postmortemMode ?? resolvePostmortemMode({ env: process.env, operationsDir: spec.operationsDir ?? defaultOperationsDir() });
   const action = routeWorkerResult(settled.result, { role: spec.role, launcher: spec.launcher, session: spec.session, pr: spec.pr == null ? null : String(spec.pr), item: spec.item == null ? null : String(spec.item), postmortemMode: mode });
-  const finished = finishEnvelopeRecord(started, {
+  let finished = finishEnvelopeRecord(started, {
     result: settled.result, parse: settled.parse, action, outcome: legacyOutcomeWord(settled.result), reroute: settled.reroute,
     headAfter: head(), source: settled.source ?? (gotResult ? 'worker-result' : 'none'),
   }, now);
+  if (spec.preserveLegacyWords && !aborted && legacyRead) finished = preserveLegacyWords(finished, legacyRecord ?? (failure ? null : legacyRead()));
   withCompletionLock(spec.session, () => writeRecord(finished, dir), { dir });
   if (action.type === 'product-fix-draft') {
     // the shared 114 drafts store unless the spec names another; mode `off` writes nothing (the router put the mode on the action)
     try { writeDraft(action, { dir: spec.draftsDir ?? defaultDraftsDir(), now }); } catch { /* the envelope is the record of truth; a draft failure must not lose it */ }
   }
   return { envelope: finished, result: settled.result, action, legacyRecord, stdout, stderr };
+}
+
+/** The v1 words a wrapped agent may have reported itself (its brief still says to), carried over verbatim. */
+export const LEGACY_WORD_FIELDS = Object.freeze(['outcome', 'verdict', 'label', 'runId', 'denied', 'cause']);
+
+/**
+ * 117 S3b — KEEP THE READERS' WORDS. `markSelfReportedDone` and the reaper branch on the agent's OWN outcome word
+ * (`healed`, `needs-human`, `blocked-on-permission` + `denied`, `blocked-on-infra` + `cause`, ...). The worker
+ * result is the new truth (`result` / `action`), but `legacyOutcomeWord` is coarser than those words, so when the
+ * agent DID report `done` itself, its words win on the envelope's legacy fields: existing readers behave exactly as
+ * before the launch moved. PURE. A record that is not a finished report (missing, `started`) changes nothing.
+ * @param {object} envelope a finished v2 record
+ * @param {object|null} legacy the session's record as the agent left it
+ */
+export function preserveLegacyWords(envelope, legacy) {
+  if (!legacy || legacy.status !== 'done' || typeof legacy.outcome !== 'string' || !legacy.outcome) return envelope;
+  const out = { ...envelope };
+  for (const k of LEGACY_WORD_FIELDS) if (legacy[k] !== undefined && legacy[k] !== null) out[k] = legacy[k];
+  return out;
 }
 
 // ── detached launch + CLI ───────────────────────────────────────────────────────────────────────────────────────
