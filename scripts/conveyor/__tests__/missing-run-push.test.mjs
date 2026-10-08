@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pushMissingRunCommit, recoveryPushCredential, RECOVERY_COMMIT_MARKER } from '../missing-run-push.mjs';
-import { countMissingRunComments, buildMissingRunComment, MISSING_RUN_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
+import { countMissingRunComments, buildMissingRunComment, MISSING_RUN_CREDENTIAL_REFUSAL, MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL } from '../main-red-recovery.mjs';
 
 const sha = '1f7481b9bccf75ae1c37ed5705ec2ab57d77a9c7';
 const next = 'a'.repeat(40);
@@ -150,7 +150,7 @@ describe('missing-run PR-event recovery', () => {
   it('never invokes git with an unverified installation credential', () => {
     const { result, calls } = fixture({ env: { GH_TOKEN: 'ghs_actions' } });
     // Structural, not transient: a counted failure so the per-sha cap hands the PR off (no free deferral).
-    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('push requires a PAT') });
+    expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
     expect(result.deferred).toBeUndefined();
     expect(calls).toHaveLength(1);
   });
@@ -171,7 +171,7 @@ describe('missing-run PR-event recovery', () => {
     };
     const bad = run('ghs_unbound');
     expect(bad.calls).toContain('gh auth token --hostname github.com');
-    expect(bad.result).toMatchObject({ ok: false, error: expect.stringContaining('push requires a PAT') });
+    expect(bad.result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
     expect(bad.result.deferred).toBeUndefined();
     const good = run('ghp_from_gh_cli');
     expect(good.calls).toContain('gh auth token --hostname github.com');
@@ -238,10 +238,10 @@ describe('xgq539z - plateau-app (per-owner credential) missing-run recovery', ()
     const { result } = run(() => null, { GH_TOKEN: 'ghs_we-token' });
     expect(result).toMatchObject({ ok: false, error: MISSING_RUN_CREDENTIAL_REFUSAL });
   });
-  it('does not count a pre-push credential refusal toward the per-sha retry cap', () => {
+  it('does not count legacy wrong-owner credential refusals, but still counts a current one (structural refusals stay capped)', () => {
     const mk = (error) => ({ author: { login: 'web-everything' }, body: buildMissingRunComment({ headSha: sha2, ok: false, error }) });
-    const refused = mk(MISSING_RUN_CREDENTIAL_REFUSAL);
-    expect(countMissingRunComments([refused, refused], sha2)).toBe(0);
-    expect(countMissingRunComments([refused, mk('missing-run recovery failed during push')], sha2)).toBe(1);
+    const legacy = mk(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL);
+    expect(countMissingRunComments([legacy, legacy], sha2)).toBe(0);
+    expect(countMissingRunComments([legacy, mk(MISSING_RUN_CREDENTIAL_REFUSAL), mk('missing-run recovery failed during push')], sha2)).toBe(2);
   });
 });
