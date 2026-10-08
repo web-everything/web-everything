@@ -1,7 +1,8 @@
 ---
+bornAs: x1qlf66
 kind: story
 size: 1
-parent: "xliqbhq"
+parent: "5407"
 status: open
 scope: ["we:contracts/backlog.ts", "we:scripts/check-standards-rules.mjs", "we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-10-08"

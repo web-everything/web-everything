@@ -1,7 +1,8 @@
 ---
+bornAs: xyek4mq
 kind: decision
 size: 3
-parent: "xliqbhq"
+parent: "5407"
 status: open
 dateOpened: "2026-10-08"
 tags: []

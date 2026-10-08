@@ -1,7 +1,8 @@
 ---
+bornAs: xykwtdj
 kind: story
 size: 2
-parent: "xliqbhq"
+parent: "5407"
 status: open
 dateOpened: "2026-10-08"
 tags: []
