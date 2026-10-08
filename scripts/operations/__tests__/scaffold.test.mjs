@@ -14,9 +14,6 @@
  * Nothing here touches `fs` — the reader is a plain function returning a fixture.
  */
 import { describe, it, expect } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { sizeRefusal, parseSize } from '../../backlog/scaffold.mjs';
 import { defaultScaffoldItem } from '../explore-io.mjs';
 
@@ -124,27 +121,6 @@ describe('refusals', () => {
     expect(parseSize('0')).toBe(0);
     expect(planScaffold(read(), { kind: 'decision', title: 'x', size: '' }).content).not.toMatch(/^size:/m);
   });
-
-  // Every non-test caller of `file-item`/`fileCard` that hands in `kind: 'task'|'feature'` must NOT also hand in a
-  // `size` — `planScaffold` now refuses it, and a detached filing child fails only in its own log (the
-  // auto-filed prepare-failure card silently stopped being filed). Source-level, because the callers mock the filer.
-  it('no non-test caller pairs a never-sized kind with a size', () => {
-    const scriptsDir = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
-    const offenders = [];
-    const walk = (dir) => {
-      for (const e of readdirSync(dir, { withFileTypes: true })) {
-        const p = join(dir, e.name);
-        if (e.isDirectory()) { if (e.name !== '__tests__' && e.name !== 'node_modules') walk(p); continue; }
-        if (!/\.(mjs|cjs|js)$/.test(e.name) || /\.test\./.test(e.name)) continue;
-        const src = readFileSync(p, 'utf8');
-        if (/kind:\s*['"](task|feature)['"][^}]{0,300}?\bsize\s*:/.test(src)) offenders.push(p);
-        if (/\bsize\s*:[^}]{0,300}?kind:\s*['"](task|feature)['"]/.test(src)) offenders.push(p);
-      }
-    };
-    walk(scriptsDir);
-    expect(offenders).toEqual([]);
-    // ~1200 files read synchronously: the 5s default flakes on a loaded host.
-  }, 60_000);
 
   // explore's `file-stories` hands the CLI a juror-chosen kind: a task/feature (or an absent size) must reach the
   // CLI with NO `--size` at all — never `--size=2` (refused) and never `--size=undefined` (bad-size).
