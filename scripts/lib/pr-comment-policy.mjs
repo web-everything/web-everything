@@ -29,7 +29,12 @@ export const PR_COMMENT_MODES = Object.freeze(['on-change-or-action', 'all']);
 export const DEFAULT_PR_COMMENT_MODE = 'on-change-or-action';
 const DEFAULT_SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'pr-comments-settings.json');
 
-const validMode = (m) => (PR_COMMENT_MODES.includes(m) ? m : null);
+// Trim and lowercase first: `ALL`, ` all` or `all\r` (a CRLF `.env`) is plainly the operator asking for `all`.
+const normalizeMode = (m) => (typeof m === 'string' ? m.trim().toLowerCase() : '');
+const validMode = (m) => {
+  const n = normalizeMode(m);
+  return PR_COMMENT_MODES.includes(n) ? n : null;
+};
 
 /**
  * The live `prComments` setting. Env wins over the file; anything unreadable or unknown is the default.
@@ -40,7 +45,7 @@ export function loadPrCommentSettings({ path = DEFAULT_SETTINGS_PATH, env = glob
   // A SET env value is the operator's explicit choice: if it is not a known mode the answer is the default, never
   // the file (a typo must not silently resurrect the file's `all`). Only an unset or empty value defers to the file.
   const rawEnv = env?.WE_PR_COMMENTS_MODE;
-  if (typeof rawEnv === 'string' && rawEnv !== '') return { mode: validMode(rawEnv) ?? DEFAULT_PR_COMMENT_MODE };
+  if (normalizeMode(rawEnv) !== '') return { mode: validMode(rawEnv) ?? DEFAULT_PR_COMMENT_MODE };
   try {
     const raw = JSON.parse(readFileSync(path, 'utf8'));
     return { mode: validMode(raw?.prComments?.mode) ?? DEFAULT_PR_COMMENT_MODE };

@@ -44,12 +44,22 @@ describe('loadPrCommentSettings', () => {
   it('an invalid env override falls back to the default, whatever the file says', () => {
     const all = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
     const onChange = settingsFile(JSON.stringify({ prComments: { mode: 'on-change-or-action' } }));
-    for (const bad of ['loud', 'ALL', ' all', 'all ', 'on-change', '0']) {
+    for (const bad of ['loud', 'on-change', 'al l', '0', 'all,on-change-or-action']) {
       expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: bad } }).mode, bad).toBe('on-change-or-action');
       expect(loadPrCommentSettings({ path: onChange, env: { WE_PR_COMMENTS_MODE: bad } }).mode, bad).toBe('on-change-or-action');
     }
   });
-  it('an unset or empty env override defers to the file', () => {
+  it('case and surrounding whitespace in env or file are forgiven (ALL, " all", "all\\r")', () => {
+    const onChange = settingsFile(JSON.stringify({ prComments: { mode: 'on-change-or-action' } }));
+    for (const v of ['ALL', ' all', 'all ', 'all\r', 'All\n']) {
+      expect(loadPrCommentSettings({ path: onChange, env: { WE_PR_COMMENTS_MODE: v } }).mode, JSON.stringify(v)).toBe('all');
+    }
+    const upper = settingsFile(JSON.stringify({ prComments: { mode: ' ALL ' } }));
+    expect(loadPrCommentSettings({ path: upper, env: {} }).mode).toBe('all');
+  });
+  it('an unset, empty or whitespace-only env override defers to the file', () => {
+    const allFile = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
+    expect(loadPrCommentSettings({ path: allFile, env: { WE_PR_COMMENTS_MODE: '  ' } }).mode).toBe('all');
     const all = settingsFile(JSON.stringify({ prComments: { mode: 'all' } }));
     expect(loadPrCommentSettings({ path: all, env: {} }).mode).toBe('all');
     expect(loadPrCommentSettings({ path: all, env: { WE_PR_COMMENTS_MODE: '' } }).mode).toBe('all');
