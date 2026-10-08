@@ -20,7 +20,7 @@
  * A code PR is never touched: only an open PR whose head ref is `lane/<n>-prepare-item-...` and whose whole diff is
  * exactly one `backlog/<n>-*.md` card is a prepare PR (see {@link prepareCardOnly}). PURE: IO is injected.
  */
-import { prepareItemFromRef } from '../operations/prepare-pr.mjs';
+import { PREP_REVIEW_HEADLINE, prepareItemFromRef } from './prep-review-record.mjs';
 import { scopeIsDefective, bareScopePath } from './prepare-outcome.mjs';
 import { EDGE_CASE_CLASSES, unansweredEdgeCaseClasses } from '../backlog/edge-case-classes.mjs';
 import { WORKER_RESULT_SCHEMA, validateWorkerResult } from '../operations/worker-result.mjs';
@@ -31,8 +31,7 @@ export const DEFAULT_PREP_REVIEW_MODE = 'advise';
 export const DEFAULT_PREP_REVIEW_MODEL = 'claude-haiku-5-5';
 /** The label a reviewed prepare PR carries instead of the missing `review:*` one. */
 export const PREP_REVIEW_LABEL = 'review:prep';
-/** The durable-record headline `merge-ai-prs.mjs#REVIEW_RECORD_HEADLINES` reads (kind `prep-advised`). */
-export const PREP_REVIEW_HEADLINE = '🔎 review — prep advisory (single reviewer)';
+export { PREP_REVIEW_HEADLINE };
 export const PREP_REVIEW_MARKER = 'prep-review';
 /** Findings reach the preparer for ONE round, then the pass is advice only. */
 export const PREP_REVIEW_MAX_BLOCK_ROUNDS = 1;

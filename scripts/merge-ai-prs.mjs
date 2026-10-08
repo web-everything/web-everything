@@ -187,9 +187,7 @@ import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './li
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
-import { PREP_REVIEW_HEADLINE } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
-import { prepareItemFromRef } from './operations/prepare-pr.mjs';
-import { isTrustedMarkerAuthor as isTrustedPrepReviewAuthor } from './lib/marker-authorship.mjs';
+import { PREP_REVIEW_HEADLINE, prepareItemFromRef } from './conveyor/prep-review-record.mjs'; // card x5f2daz — the light prepare-PR review record
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -2932,7 +2930,7 @@ export function reviewCoverageGaps({ comments = [], reliefWaived = false, relief
   // satisfy this check with a forged heading.
   const prepPr = prepareItemFromRef(headRef) !== null;
   const records = recordedReviewRecords((Array.isArray(comments) ? comments : [])
-    .filter((c) => !(typeof c !== 'string' && reviewRecordKind(c?.body) === 'prep-advised' && !(prepPr && isTrustedPrepReviewAuthor(c)))
+    .filter((c) => !(typeof c !== 'string' && reviewRecordKind(c?.body) === 'prep-advised' && !(prepPr && isTrustedMarkerAuthor(c)))
       && !(typeof c === 'string' && reviewRecordKind(c) === 'prep-advised')));
   const latest = records[records.length - 1] || null;
   if (!latest) codes.push('no-recorded-review');

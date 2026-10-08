@@ -6,9 +6,7 @@
  */
 import { retryTransientGit } from '../lib/git-fetch-retry.mjs';
 import { machinePrTitle } from './machine-pr-title.mjs';
-export function prepareItemFromRef(ref) {
-  return /^lane\/([a-z0-9]+)-prepare-item-/.exec(ref ?? '')?.[1] ?? null;
-}
+export { prepareItemFromRef } from '../conveyor/prep-review-record.mjs'; // one spelling of the rule (card x5f2daz)
 
 export function preparePrTitle(item, card) {
   return machinePrTitle({ item, kind: 'prepare', card });

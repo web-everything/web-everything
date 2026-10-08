@@ -83,6 +83,9 @@ function buildWeTemplate() {
     [
       'ls-files', '-co', '--exclude-standard', '--',
       'scripts', 'skills-src', 'package.json', 'package-lock.json',
+      // card x5f2daz — `scripts/operations/worker-result.mjs` (loaded by the review daemon's prep-review stage) reads
+      // `schemas/worker-result.v1.json` at import, exactly as it does in the real daemon clone.
+      'schemas/worker-result.v1.json',
       // `.gitignore` itself MUST ride along: `lane-pool.mjs` writes a per-lane `.env.local` expecting it to be
       // gitignored (real repo behaviour, confirmed) — without this file in the template, every provisioned
       // lane reads as permanently dirty (`.env.local` shows up as a genuine untracked file) and
