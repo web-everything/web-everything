@@ -77,7 +77,7 @@ import {
   buildMissingRunCandidates, planMissingRunRecoveries, countMissingRunComments, buildMissingRunComment,
   DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS, failingRequiredCheckForAttribution, isAnyRequiredCheckFailed,
   // landing-freeze fix (2026-09-27) — see `main-red-recovery.mjs`'s own "LANDING-FREEZE FIX" section header.
-  mainLatestGreenShaForCheck, isMainGreenFixOwed, isMainLatestCheckGreen, isMainFixedSignatureOwed,
+  mainLatestGreenShaForCheck, isMainGreenFixOwed, classifyMainDefect, classifierNeedsComments, isMainLatestCheckGreen, isMainFixedSignatureOwed,
 } from './main-red-recovery.mjs';
 import {
   defaultReadMainRuns, defaultReadAheadBy, defaultReadMainLatestCheckRuns, defaultReadMainGreenFixFacts,
@@ -255,14 +255,14 @@ export function sweepCiRedRecovery({
       if (greenSha) {
         withFacts = { ...c, ...readMainGreenFixFacts(c.headSha, { repo, greenSha, checkName: c.failingCheckName }) };
         // xo7mr6l: comments are also needed when merge base is green — a main-defect escalation bypasses that veto.
-        if (withFacts.prContainsMainGreenSha === false && (c.needsHuman || !isMainLatestCheckGreen({
-          failingCheckName: c.failingCheckName, mainLatestCheckRuns: withFacts.mergeBaseCheckRuns,
-        }))) {
+        // The gate is the shared classifier's own (never a private label signal: this pass does not fetch labels, so
+        // the old `needsHuman` gate never fired and #4368's recorded main-defect escalation went unseen).
+        if (classifierNeedsComments({ failingCheckName: c.failingCheckName, mainLatestCheckRuns, prContainsMainGreenSha: withFacts.prContainsMainGreenSha })) {
           comments = readComments(c.prNumber, { repo });
           withFacts.comments = comments;
         }
       }
-      if (!isMainGreenFixOwed({ mainLatestCheckRuns, ...withFacts })) {
+      if (!classifyMainDefect({ requiredCheckCompletedAt: c.failureCompletedAt, mainRedWindows, mainLatestCheckRuns, ...withFacts }).mainDefect) {
         withFacts.mainFixedSignature = readMainFixedSignatureFacts({ repo, defaultBranch,
           detailsUrl: c.detailsUrl, failureCompletedAt: c.failureCompletedAt });
         if (!isMainFixedSignatureOwed(withFacts.mainFixedSignature)) return withFacts;
