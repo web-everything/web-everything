@@ -635,7 +635,7 @@ export async function runTickAllRepos({
   // xn025gx (R4 push-wake-cadence): with the three on/off fixDispatch push-on-green settings off this is exactly the pass above; with the fast loop
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
-    : (realTick ? await runTickAwaitVerify({ allowResume: !authGate.paused, legacyPass: runAwaitVerifyPassDefault }) : { rows: [] });
+    : (realTick ? await buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] });
   // card xccgzu5 — SECOND, still before any fresh dispatch: a fixer the watchdog flagged stuck (live 2026-10-08,
   // ci-heal-4453 idle 1h on a verify for a commit it had already pushed) is stopped and its claims released here,
   // so THIS tick's ci-heal/fix halves see the PR unowned and re-dispatch it, and its reserved slot frees up.
@@ -653,7 +653,7 @@ export async function runTickAllRepos({
   // ONE throttle per pass shared by fix + ci-heal: live fix/ci-heal cap and host-load gate (defer-only).
   // xn025gx (R2 fix-slot-count): a session parked on verify gives its slot back; a decided resume keeps one. Setting off →
   // the same live-claim list as before.
-  const dispatchThrottle = queueAdmission ? createDispatchThrottle({ listClaims: () => defaultSlotCountedFixClaims() }) : null;
+  const dispatchThrottle = queueAdmission ? buildFixThrottle() : null;
   // Card 87 — ONE borrow gate per pass (fix only; ci-heal never borrows). OFF unless `fixDispatch.borrowBuildSlots` is on.
   const borrowGate = dispatchThrottle ? createFixBorrowGate({
     listBuildClaims: () => listBuildDispatchClaims(), listFixClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }),
@@ -843,6 +843,41 @@ export function formatNoteCommentLine(c) {
   return `${head} — FAILED to post${c?.error ? ` (${c.error})` : ''}`;
 }
 
+// xn025gx — the three pieces of glue between the tick/main() and the push-on-green core. Each is its own factory so a
+// test drives the real wiring (PR #4510 review: the glue was guarded only by source-text regexes).
+/** The tick's verify-verdict step (R4): the core's `runTickAwaitVerify`, with the unchanged legacy pass as its off-switch fallback. */
+export function buildAwaitVerifyStep({ run = runTickAwaitVerify, legacyPass = runAwaitVerifyPassDefault } = {}) {
+  return ({ allowResume }) => run({ allowResume, legacyPass });
+}
+/** The fix/ci-heal dispatch throttle, counting the cap with R2's active-only claim list. */
+export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, ...rest } = {}) {
+  return createDispatchThrottle({ ...rest, listClaims: () => slotClaims() });
+}
+/**
+ * main()'s two exits (SIGTERM/SIGINT and restart-onto-new-code). Each stops the await-verify loop child FIRST, then
+ * releases the lease, then exits — a child outliving its daemon would keep pushing and waking with no one supervising it.
+ */
+export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => process.exit(code), log = console } = {}) {
+  let stopping = false;
+  return {
+    isStopping: () => stopping,
+    shutdown: (signal) => {
+      if (stopping) return;
+      stopping = true;
+      awaitLoop.stop();
+      log.error(`reconcile-fix-dispatch-daemon: ${signal} — releasing the lease and exiting.`);
+      releaseLease();
+      exit(0);
+    },
+    restartOntoNewCode: () => {
+      stopping = true;
+      awaitLoop.stop();
+      releaseLease();
+      exit(0);
+    },
+  };
+}
+
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
@@ -982,39 +1017,25 @@ async function main() {
     console.error(`reconcile-fix-dispatch-daemon: a live instance already holds the lease (${acquired.heldBy}) — exiting.`);
     return;
   }
-  let stopping = false;
   // xn025gx (R4) — the fast push-on-green loop runs as this daemon's own child (the tick blocks the event loop for
   // minutes, so a timer here would starve). It exits on its own when this process is gone; the supervisor restarts it
   // (at most once a minute) if it dies, and stops it by PID — ours — on shutdown/restart. Setting off → never spawned.
   const awaitLoop = superviseAwaitVerifyLoop();
-  const shutdown = (signal) => {
-    if (stopping) return;
-    stopping = true;
-    awaitLoop.stop();
-    console.error(`reconcile-fix-dispatch-daemon: ${signal} — releasing the lease and exiting.`);
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  const exits = buildDaemonExits({ awaitLoop, releaseLease: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }) });
+  process.on('SIGTERM', () => exits.shutdown('SIGTERM'));
+  process.on('SIGINT', () => exits.shutdown('SIGINT'));
   console.error(`reconcile-fix-dispatch-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms.`);
   // xv6fciw — keep this daemon's dedicated clone on origin/main, and restart onto new code BETWEEN ticks
   // (launchd KeepAlive brings it back), instead of refusing every dispatch until someone re-syncs by hand.
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-  const restartOntoNewCode = () => {
-    stopping = true;
-    awaitLoop.stop();
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
-    process.exit(0);
-  };
   awaitLoop.start();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
   const { stoppedReason } = await runDaemonLoop(
     withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {
-      root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+      root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'fix', repos: FIX_DISPATCH_DAEMON_REPOS }),
   );
-  if (!stopping) {
+  if (!exits.isStopping()) {
     console.error(`reconcile-fix-dispatch-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
     releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
   }

@@ -20,7 +20,7 @@
  * replaces the loop; the rules module moves with it unchanged.
  */
 import { spawn as nodeSpawn } from 'node:child_process';
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -32,6 +32,7 @@ import { listStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.m
 import { listFixDispatchClaims, fixDispatchSessionName, fixDispatchResource, fixDispatchClaimRoot } from './fix-claim-store.mjs';
 import { releaseFixDispatchClaim } from './fix-dispatch-claim.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
+import { ensureFreshGithubAppEnv, FLEET_APP_AUTH_OPTS } from '../lib/github-app-auth-env.mjs';
 import {
   resolveFixerSlotSettings, fixSlotState, slotCountedItems, admitResumes, awaitPassRunner, releaseOnCompletion,
 } from './fixer-slot-rules.mjs';
@@ -125,6 +126,8 @@ export async function runSlotAwareAwaitPass({ io, runPass, allowResume, settings
   return { rows, admitted: admit, deferred: defer };
 }
 
+const latestFinite = (list) => { const ok = list.filter(Number.isFinite); return ok.length ? Math.max(...ok) : null; };
+
 /**
  * R5 sweep: release every fix/ci-heal claim whose session's completion record says done. Owner- and claimedAt-checked
  * against a fresh read, so a claim re-taken meanwhile is never released.
@@ -143,7 +146,8 @@ export function runCompletionReleaseSweep({ claims, records, readCompletion, rel
       claim: { claimedAtMs: ms(m.claimedAt), sessionId: m.sessionId ?? null },
       completion: rec ? { status: rec.status, updatedAtMs: ms(rec.updatedAt), sessionId: rec.sessionId ?? null } : null,
       awaitingVerify: Boolean(waitRecordForClaim(c, records)),
-      lastWokenAtMs: Number.isFinite(ms(woken?.[session])) ? ms(woken[session]) : null,
+      // A session's own stamp, or the journal's floor (a lost journal: wakes before it are unknown), whichever is later.
+      lastWokenAtMs: latestFinite([woken?.[session], woken?.[JOURNAL_FLOOR]].map(ms)),
     });
     if (!d.release) continue;
     const cur = readClaim(m);
@@ -157,24 +161,52 @@ export function runCompletionReleaseSweep({ claims, records, readCompletion, rel
 /**
  * The wake journal R5 reads: session name → the latest time the session was parked or woken. A woken record is cleared
  * from the await store, so without this a `done` written before a red wake would look final.
- * Two stamps, so a crash between the wake and the journal write loses nothing: BEFORE the pass, every parked session
- * is stamped with its wait's `requestedAt` (any wake comes after it, and a done from before parking is then too old);
- * AFTER the pass, every woken session is stamped with the wake time. Entries older than a day drop. Pure.
+ * The stamp is written BEFORE the pass, never after it (PR #4510 review): every session with a recorded wait is stamped
+ * with this cycle's start. Any wake in this cycle happens at or after it, and a parked session cannot write a `done`
+ * meanwhile, so a `done` from before the wake is older than the stamp — and one the woken session writes later is
+ * newer, so it still releases. A crash after the wake therefore loses nothing, and a stamp that cannot be written
+ * turns the cycle's wakes off (the pass counts a refused wake as a failure, so it must never be asked to). A stamp made
+ * AFTER the pass would be later than the real wake and could hold a legitimately finished claim for as long as the pass
+ * kept waking other sessions. {@link withWakeIntent} covers a record that appears mid-cycle. The `__floor` entry (see
+ * {@link JOURNAL_FLOOR}) covers a journal that was lost. Entries older than a day drop. Pure.
  * @param {object} prev  the journal now
- * @param {{rows?:object[]|null, recordsByKey:Map<string,object>, nowMs:number}} o  `rows` absent = the pre-pass stamp
+ * @param {{recordsByKey:Map<string,object>, nowMs:number}} o
  */
-export function nextWokenJournal(prev, { rows = null, recordsByKey, nowMs }) {
+export function nextWokenJournal(prev, { recordsByKey, nowMs }) {
   const out = {};
-  const later = (who, iso) => { if (who && Number.isFinite(ms(iso)) && !(ms(out[who]) >= ms(iso))) out[who] = iso; };
   for (const [who, at] of Object.entries(prev && typeof prev === 'object' ? prev : {})) if (nowMs - ms(at) < 24 * 3_600_000) out[who] = at;
-  if (!rows) {
-    for (const record of recordsByKey?.values() ?? []) later(record?.who, record?.requestedAt);
-    return out;
-  }
-  for (const r of rows) {
-    if (/(^|; )resumed:/.test(String(r.result ?? ''))) later(recordsByKey?.get(r.key)?.who, new Date(nowMs).toISOString());
-  }
+  const at = new Date(nowMs).toISOString();
+  for (const record of recordsByKey?.values() ?? []) if (record?.who && Number.isFinite(ms(record.requestedAt))) out[record.who] = at;
   return out;
+}
+
+/** The journal entry meaning "every session was possibly woken at this time": written when the journal was missing or corrupt. */
+export const JOURNAL_FLOOR = '__floor';
+
+/** Does this wait record speak for that session row? A record naming a session id binds to that id only; otherwise to the name. Pure. */
+export function sessionSpeaksFor(record, session) {
+  if (!record || !session) return false;
+  return record.sessionId ? session.sessionId === record.sessionId : Boolean(record.who) && session.name === record.who;
+}
+
+/**
+ * Wrap the pass's `resume` port so the wake intent is persisted BEFORE the session is woken: `stamp(whos)` records the
+ * wake time for every session name the woken row speaks for, and a stamp that cannot be written skips the wake — the
+ * pass's own rule for every counter that bounds an effect. The cycle stamps every known wait BEFORE the pass (and turns
+ * wakes off if it cannot), so this is the second layer, reached for a record that first appears mid-cycle; the pass counts
+ * a refused wake as a failed resume, which is why the first layer must not rely on it. Pure wrapper.
+ * @param {object} io  the pass's ports (`listRecords`, `resume`)
+ * @param {{stamp:(whos:string[])=>boolean}} o
+ */
+export function withWakeIntent(io, { stamp }) {
+  return {
+    ...io,
+    resume: (args) => {
+      const whos = (io.listRecords() ?? []).map((e) => e?.record ?? e).filter((r) => sessionSpeaksFor(r, args?.session)).map((r) => r.who);
+      if (!stamp(whos)) return { resumed: false, reason: 'wake-intent-not-persisted' };
+      return io.resume(args);
+    },
+  };
 }
 
 /**
@@ -205,10 +237,18 @@ export function superviseAwaitVerifyLoop({ spawnLoop = () => spawnAwaitVerifyLoo
   return { start, stop, current: () => child };
 }
 export const wokenJournalPath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'await-verify-woken.json');
-/** `{}` when the file does not exist yet, null when it exists but cannot be read or parsed. */
-const readJson = (path) => {
-  try { const v = JSON.parse(readFileSync(path, 'utf8')); return v && typeof v === 'object' ? v : null; } catch (e) { return e?.code === 'ENOENT' ? {} : null; }
-};
+/**
+ * The journal file's state: `ok` (parsed), `missing` (no file), `corrupt` (not a JSON object — nothing in it can be
+ * trusted, so it is safe to replace), or `unreadable` (the read itself failed — the file may be fine, so it is left alone).
+ */
+export function readJournal(path, read = readFileSync) {
+  let text;
+  try { text = read(path, 'utf8'); } catch (e) { return e?.code === 'ENOENT' ? { state: 'missing', value: null } : { state: 'unreadable', value: null }; }
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === 'object' && !Array.isArray(v) ? { state: 'ok', value: v } : { state: 'corrupt', value: null };
+  } catch { return { state: 'corrupt', value: null }; }
+}
 const writeJsonAtomic = (path, value) => {
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(`${path}.${process.pid}.tmp`, `${JSON.stringify(value)}\n`);
@@ -257,20 +297,40 @@ export async function runAwaitVerifyCycleDefault({
           try { resumeOk = !gate().paused; } catch { resumeOk = false; }
         }
       }
-      const io = await pass.defaultAwaitVerifyIo();
-      const recordsByKey = new Map(io.listRecords().map(({ key, record }) => [key, record]));
-      // R5 needs the wake times: an unreadable journal, or one this cycle could not update, skips the release sweep
-      // (fail closed — the claim then waits for the tick's own settled-claim sweep, as today).
+      const rawIo = await pass.defaultAwaitVerifyIo();
+      const recordsByKey = new Map(rawIo.listRecords().map(({ key, record }) => [key, record]));
+      // R5 needs the wake times, so the journal is stamped BEFORE the pass (see nextWokenJournal) and a cycle that cannot
+      // stamp it must not wake anyone: pushes still happen, the owed wake-ups wait for a cycle that can. A missing or
+      // corrupt journal is replaced with a fresh one carrying a floor (every session may have been woken at that time);
+      // an unreadable one is left alone and also blocks wakes. No journal also means no release this cycle (fail closed:
+      // the claim then waits for the tick's own settled-claim sweep, as today).
       const journalPath = wokenJournalPath(env);
-      const prevWoken = readJson(journalPath);
-      let journalOk = prevWoken !== null;
-      const stamped = nextWokenJournal(prevWoken ?? {}, { recordsByKey, nowMs });
-      if (journalOk && JSON.stringify(stamped) !== JSON.stringify(prevWoken)) { try { writeJsonAtomic(journalPath, stamped); } catch { journalOk = false; } }
+      const read = readJournal(journalPath);
+      const base = read.state === 'ok' ? read.value : (read.state === 'unreadable' ? null : { [JOURNAL_FLOOR]: new Date(nowMs).toISOString() });
+      // `journal` is what is on disk now (null = nothing usable); `journalOk` = this cycle's stamp is on disk.
+      let journal = read.state === 'ok' ? read.value : null;
+      let journalOk = false;
+      if (base) {
+        const stamped = nextWokenJournal(base, { recordsByKey, nowMs });
+        if (read.state === 'ok' && JSON.stringify(stamped) === JSON.stringify(base)) journalOk = true;
+        else { try { writeJsonAtomic(journalPath, stamped); journal = stamped; journalOk = true; } catch { /* stays as read; wakes and release wait */ } }
+      }
+      // A record that first appears after the stamp above and is woken in the same cycle is stamped right before its wake.
+      const stampWakeIntent = (whos) => {
+        if (journal === null) return false;
+        if (!whos.length) return true;
+        const at = new Date(Date.now()).toISOString();
+        const next = { ...journal };
+        for (const who of whos) next[who] = at;
+        try { writeJsonAtomic(journalPath, next); } catch { return false; }
+        journal = next;
+        return true;
+      };
+      const io = withWakeIntent(rawIo, { stamp: stampWakeIntent });
       const verdicts = await runSlotAwareAwaitPass({
-        io, runPass: pass.runAwaitVerifyPass, allowResume: resumeOk, settings, claims, nowMs, ttlMs, cap: resolveFixDispatchMaxConcurrent({ env }),
+        io, runPass: pass.runAwaitVerifyPass, allowResume: resumeOk && journalOk, settings, claims, nowMs, ttlMs, cap: resolveFixDispatchMaxConcurrent({ env }),
       });
-      const woken = nextWokenJournal(stamped, { rows: verdicts.rows, recordsByKey, nowMs: Date.now() });
-      if (journalOk && JSON.stringify(woken) !== JSON.stringify(stamped)) { try { writeJsonAtomic(journalPath, woken); } catch { journalOk = false; } }
+      const woken = journal ?? {};
       let released = [];
       if (settings.releaseOnCompletion && journalOk) {
         released = runCompletionReleaseSweep({
@@ -326,7 +386,12 @@ export async function runTickAwaitVerify({
   allowResume, env = process.env, nowMs = Date.now(), settings = resolveFixerSlotSettings({ env }),
   legacyPass, cycle = runAwaitVerifyCycleDefault, heartbeat = () => readLoopHeartbeat({ env }), alive = isPidAlive,
 }) {
-  if (!settings.awaitVerifyLoopSeconds && !settings.parkedReleasesSlot && !settings.releaseOnCompletion) return legacyPass({ allowResume });
+  if (!settings.awaitVerifyLoopSeconds && !settings.parkedReleasesSlot && !settings.releaseOnCompletion) {
+    // The unchanged pass wakes sessions without stamping the wake journal. Drop the journal, so when release-on-completion
+    // is switched on later the first cycle starts a fresh one with a floor, instead of trusting stamps that missed these wakes.
+    try { rmSync(wokenJournalPath(env), { force: true }); } catch { /* best effort */ }
+    return legacyPass({ allowResume });
+  }
   const hb = heartbeat();
   const r = awaitPassRunner({ loopSeconds: settings.awaitVerifyLoopSeconds, loopHeartbeatAtMs: hb && alive(hb.pid) ? ms(hb.at) : null, nowMs });
   if (r.runner === 'loop') return { rows: [], released: [], runner: 'loop' };
@@ -341,12 +406,31 @@ export function spawnAwaitVerifyLoop({ env = process.env, spawnFn = nodeSpawn, p
   return spawnFn(process.execPath, [SELF, `--parent-pid=${parentPid}`], { stdio: ['ignore', 'inherit', 'inherit'], env });
 }
 
-/** A cycle that is not healthy: it threw, could not get the lock, or every record it acted on ended in an error. Pure. */
+/**
+ * A cycle that is not healthy: it threw, could not get the lock, or every record it acted on ended in an error or in a
+ * transient push failure (`push-retry`, `push-transient`). The last case matters: a push that cannot even resolve its
+ * head ref (an expired token) is classed transient, not an error, and would otherwise keep the heartbeat fresh while
+ * every push stalls — the tick, which holds its own fresh token, must take the pass over (R4). Pure.
+ */
 export function cycleFailed(result) {
   const rows = result?.rows ?? [];
   if (result?.busy || rows.some((r) => r?.action === 'error' && r.key === undefined)) return true;
   const acted = rows.filter((r) => r?.action !== 'wait' && r?.action !== 'skip');
-  return acted.length > 0 && acted.every((r) => r?.action === 'error' || /^error:/.test(String(r?.result ?? '')));
+  return acted.length > 0 && acted.every((r) => r?.action === 'error' || /^(error:|push-retry\b|push-transient\b)/.test(String(r?.result ?? '')));
+}
+
+/** The loop child's App auth: the same per-owner options every fleet daemon uses (one pinned org's token breaks the others). */
+export const LOOP_APP_AUTH_OPTS = FLEET_APP_AUTH_OPTS;
+
+/**
+ * One loop cycle: refresh the GitHub App auth FIRST, then run the cycle. The child is spawned once with a frozen env,
+ * so without this its pushes and PR reads run on whatever the launching shell held — the operator's personal auth, or
+ * an inherited token that lapses after an hour (PR #4510 review). The daemon does the same per tick
+ * (`withGithubAppAuth`); a failed refresh leaves the previous auth in place and never stops the cycle.
+ */
+export async function runLoopCycle({ settings, ensureAuth = () => ensureFreshGithubAppEnv(LOOP_APP_AUTH_OPTS), cycle = runAwaitVerifyCycleDefault } = {}) {
+  try { await ensureAuth(); } catch { /* the refresh itself never throws; belt and braces */ }
+  return cycle({ settings });
 }
 
 const stamp = (line) => `${new Date().toISOString()} reconcile-fix-dispatch-daemon: ${line}\n`;
@@ -365,7 +449,7 @@ async function main(argv = process.argv.slice(2)) {
     if (!(seconds > 0)) { write('await-verify-loop: setting off — exiting'); return; }
     if (Number.isInteger(parentPid) && parentPid > 0 && !isPidAlive(parentPid)) { write('await-verify-loop: parent gone — exiting'); return; }
     const t0 = Date.now();
-    const result = await runAwaitVerifyCycleDefault({ settings });
+    const result = await runLoopCycle({ settings });
     // The heartbeat says "a cycle completed", not just "the process is up": a cycle that fails, or cannot get the cycle
     // lock, every time lets it go stale, and the tick then runs the pass itself (R4 fallback).
     if (!cycleFailed(result)) {

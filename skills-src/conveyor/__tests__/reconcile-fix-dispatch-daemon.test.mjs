@@ -17,6 +17,7 @@ import {
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh,
+  buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
@@ -1191,14 +1192,56 @@ describe('runTickAllRepos — the await-verify verdict pass wiring (#5137)', () 
 });
 
 // xn025gx — the push-on-green loop and the active-only fix slot are wired into the real tick and main().
-it('the tick runs the verdict pass through runTickAwaitVerify (legacy pass when every setting is off) and counts the fix cap with defaultSlotCountedFixClaims', () => {
-  const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-fix-dispatch-daemon.mjs'), 'utf8');
-  expect(src).toMatch(/runTickAwaitVerify\(\{ allowResume: !authGate\.paused, legacyPass: runAwaitVerifyPassDefault \}\)/);
-  expect(src).toMatch(/createDispatchThrottle\(\{ listClaims: \(\) => defaultSlotCountedFixClaims\(\) \}\)/);
-  // The lifecycle itself is tested behaviourally (superviseAwaitVerifyLoop, await-verify-loop.test.mjs); here only
-  // that main() starts it and that BOTH exits stop it, each at the top of its own function body.
-  expect(src).toMatch(/const awaitLoop = superviseAwaitVerifyLoop\(\);/);
-  expect(src).toMatch(/\n  awaitLoop\.start\(\);\n/);
-  expect(src).toMatch(/const shutdown = \(signal\) => \{\n    if \(stopping\) return;\n    stopping = true;\n    awaitLoop\.stop\(\);/);
-  expect(src).toMatch(/const restartOntoNewCode = \(\) => \{\n    stopping = true;\n    awaitLoop\.stop\(\);/);
+// PR #4510 review (correctness, test-coverage): the glue was guarded only by source-text regexes, which a refactor that
+// keeps the text but changes behaviour would pass. The glue is now three factories, each driven here with real behaviour.
+describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits', () => {
+  it('buildAwaitVerifyStep forwards allowResume exactly as given and hands the core the legacy pass as its fallback', async () => {
+    const run = vi.fn(async () => ({ rows: [] }));
+    const legacyPass = vi.fn();
+    const step = buildAwaitVerifyStep({ run, legacyPass });
+    await step({ allowResume: false });
+    await step({ allowResume: true });
+    expect(run.mock.calls).toEqual([[{ allowResume: false, legacyPass }], [{ allowResume: true, legacyPass }]]);
+  });
+  it('buildAwaitVerifyStep over the real core, every push-on-green setting off: the legacy pass runs with the allowResume it was given', async () => {
+    const { runTickAwaitVerify } = await import('../../../scripts/conveyor/await-verify-loop.mjs');
+    const legacyPass = vi.fn(async () => ({ rows: [{ legacy: true }] }));
+    // every setting off → the core calls the legacy pass with the allowResume it was given
+    const env = { WE_AWAIT_VERIFY_LOOP_SECONDS: '0', WE_FIX_PARKED_RELEASES_SLOT: 'off', WE_FIX_RELEASE_ON_COMPLETION: 'off' };
+    const out = await buildAwaitVerifyStep({ run: (a) => runTickAwaitVerify({ ...a, env }), legacyPass })({ allowResume: false });
+    expect(out).toEqual({ rows: [{ legacy: true }] });
+    expect(legacyPass).toHaveBeenCalledWith({ allowResume: false });
+  });
+  it('buildFixThrottle counts the fix cap with the injected active-only claim list, not the raw one', () => {
+    const fix = { meta: { kind: 'fix', repo: 'we', pr: 1 } };
+    const base = { env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
+    const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
+    expect(full).toMatchObject({ admit: false, kind: 'fix-cap' });
+    const parkedGaveItBack = buildFixThrottle({ ...base, slotClaims: () => [] }).tryAdmit('fix');
+    expect(parkedGaveItBack.admit).toBe(true);
+  });
+  it('buildDaemonExits: both exits stop the loop child BEFORE releasing the lease and exiting; a second signal is a no-op', () => {
+    const calls = [];
+    const make = () => buildDaemonExits({
+      awaitLoop: { stop: () => calls.push('stop') }, releaseLease: () => calls.push('release'), exit: (c) => calls.push(`exit:${c}`), log: { error: (l) => calls.push(`log:${l.split(' — ')[0].split(': ')[1]}`) },
+    });
+    const a = make();
+    expect(a.isStopping()).toBe(false);
+    a.shutdown('SIGTERM');
+    a.shutdown('SIGINT');
+    expect(calls).toEqual(['stop', 'log:SIGTERM', 'release', 'exit:0']);
+    expect(a.isStopping()).toBe(true);
+    calls.length = 0;
+    const b = make();
+    b.restartOntoNewCode();
+    expect(calls).toEqual(['stop', 'release', 'exit:0']);
+    expect(b.isStopping()).toBe(true);
+  });
+  it('the tick and main() call the factories (thin call-site checks; the behaviour is above)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-fix-dispatch-daemon.mjs'), 'utf8');
+    expect(src).toMatch(/buildAwaitVerifyStep\(\)\(\{ allowResume: !authGate\.paused \}\)/);
+    expect(src).toMatch(/queueAdmission \? buildFixThrottle\(\) : null/);
+    expect(src).toMatch(/const exits = buildDaemonExits\(\{ awaitLoop,/);
+    expect(src).toMatch(/\n  awaitLoop\.start\(\);\n/);
+  });
 });

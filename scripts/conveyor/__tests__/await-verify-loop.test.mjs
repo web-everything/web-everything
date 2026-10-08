@@ -3,14 +3,14 @@
  * correctly, the unchanged verdict pass runs in two phases under R3, and R5 releases only what it should.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   waitRecordForClaim, slotCountedFixClaims, runSlotAwareAwaitPass, runCompletionReleaseSweep, runTickAwaitVerify,
   withCycleLock, cycleLockRoot, CYCLE_LOCK_RESOURCE, nextWokenJournal, defaultSlotCountedFixClaims, cycleFailed,
-  superviseAwaitVerifyLoop, runAwaitVerifyCycleDefault,
+  superviseAwaitVerifyLoop, runAwaitVerifyCycleDefault, sessionSpeaksFor, runLoopCycle, LOOP_APP_AUTH_OPTS, readJournal,
 } from '../await-verify-loop.mjs';
 import { reserve, readLockEntry } from '../../readiness/file-locks.mjs';
 import { acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, listFixDispatchClaims } from '../fix-dispatch-claim.mjs';
@@ -121,12 +121,16 @@ describe('runCompletionReleaseSweep (R5)', () => {
 });
 
 describe('runTickAwaitVerify (R4 in the tick)', () => {
-  it('every setting off → the unchanged legacy pass, nothing else', async () => {
+  it('every setting off → the unchanged legacy pass, nothing else (except dropping a wake journal the unstamped wakes would make stale)', async () => {
     const legacyPass = vi.fn(async () => ({ rows: ['legacy'] }));
     const cycle = vi.fn();
-    expect(await runTickAwaitVerify({ allowResume: true, settings: OFF, legacyPass, cycle })).toEqual({ rows: ['legacy'] });
+    const root = mkdtempSync(join(tmpdir(), 'avl-off-'));
+    const env = { ...process.env, WE_COORDINATION_ROOT: root };
+    writeFileSync(join(root, 'await-verify-woken.json'), '{"fix-1":"2026-10-08T00:00:00Z"}');
+    expect(await runTickAwaitVerify({ allowResume: true, settings: OFF, legacyPass, cycle, env })).toEqual({ rows: ['legacy'] });
     expect(legacyPass).toHaveBeenCalledWith({ allowResume: true });
     expect(cycle).not.toHaveBeenCalled();
+    expect(readJournal(join(root, 'await-verify-woken.json')).state).toBe('missing');
   });
   it('loop alive → the tick skips; loop dead → the tick runs the cycle itself', async () => {
     const legacyPass = vi.fn();
@@ -190,20 +194,38 @@ describe('glue against the real lock store and settings file', () => {
     runCompletionReleaseSweep({ claims: [claim(1)], records: [], readCompletion: () => ({ status: 'done', updatedAt: new Date(T0 + 60_000).toISOString() }), release, readClaim: () => claim(1), woken });
     expect(release).not.toHaveBeenCalled();
   });
-  it('nextWokenJournal: before the pass every parked session is stamped with its wait time; after it every woken one with the wake time', () => {
+  it('nextWokenJournal: before the pass every session with a wait is stamped with the cycle start (never its older requestedAt); old entries drop', () => {
     const recs = new Map([['sid-1', rec(1)], ['sid-2', rec(2)]]);
     const prev = { 'fix-9': new Date(NOW - 25 * 3_600_000).toISOString(), 'fix-8': new Date(NOW - 60_000).toISOString() };
     const pre = nextWokenJournal(prev, { recordsByKey: recs, nowMs: NOW });
-    expect(pre).toEqual({ 'fix-8': prev['fix-8'], 'fix-1': rec(1).requestedAt, 'fix-2': rec(2).requestedAt });
-    const post = nextWokenJournal(pre, { rows: [{ key: 'sid-1', result: 'pushed; resumed:green' }, { key: 'sid-2', result: 'pushed; resume-deferred (fix slot full)' }], recordsByKey: recs, nowMs: NOW });
-    expect(post['fix-1']).toBe(new Date(NOW).toISOString());
-    expect(post['fix-2']).toBe(rec(2).requestedAt);
+    expect(pre).toEqual({ 'fix-8': prev['fix-8'], 'fix-1': new Date(NOW).toISOString(), 'fix-2': new Date(NOW).toISOString() });
+    expect(Date.parse(pre['fix-1'])).toBeGreaterThan(Date.parse(rec(1).requestedAt));
+  });
+  it('R5: the journal floor holds back a done written before it, for a session with no stamp of its own', () => {
+    const release = vi.fn(() => ({ released: true }));
+    const done = (iso) => ({ status: 'done', updatedAt: iso });
+    const floor = { __floor: new Date(T0 + 120_000).toISOString() };
+    runCompletionReleaseSweep({ claims: [claim(1)], records: [], readCompletion: () => done(new Date(T0 + 60_000).toISOString()), release, readClaim: () => claim(1), woken: floor });
+    expect(release).not.toHaveBeenCalled();
+    runCompletionReleaseSweep({ claims: [claim(1)], records: [], readCompletion: () => done(new Date(T0 + 180_000).toISOString()), release, readClaim: () => claim(1), woken: floor });
+    expect(release).toHaveBeenCalledTimes(1);
+  });
+  it('readJournal tells a missing, corrupt and unreadable journal apart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'avl-journal-'));
+    expect(readJournal(join(dir, 'none.json'))).toEqual({ state: 'missing', value: null });
+    writeFileSync(join(dir, 'bad.json'), '{not json');
+    expect(readJournal(join(dir, 'bad.json')).state).toBe('corrupt');
+    writeFileSync(join(dir, 'arr.json'), '[1]');
+    expect(readJournal(join(dir, 'arr.json')).state).toBe('corrupt');
+    writeFileSync(join(dir, 'ok.json'), '{"fix-1":"2026-10-08T00:00:00Z"}');
+    expect(readJournal(join(dir, 'ok.json'))).toEqual({ state: 'ok', value: { 'fix-1': '2026-10-08T00:00:00Z' } });
+    expect(readJournal(dir).state).toBe('unreadable'); // a directory: the read itself fails, the file is not ours to replace
   });
   it('R2 reader fails open to the raw claim list when the await store cannot be read', () => {
     const raw = [claim(1), claim(2)];
     expect(defaultSlotCountedFixClaims({ env: { WE_FIX_PARKED_RELEASES_SLOT: 'on' }, listClaims: () => raw, readRecords: () => { throw new Error('EIO'); } })).toBe(raw);
     expect(defaultSlotCountedFixClaims({ env: { WE_FIX_PARKED_RELEASES_SLOT: 'off' }, listClaims: () => raw, readRecords: () => [{ key: 'a', record: rec(1) }] })).toBe(raw);
-    expect(defaultSlotCountedFixClaims({ env: { WE_FIX_PARKED_RELEASES_SLOT: 'on' }, listClaims: () => raw, readRecords: () => [{ key: 'a', record: rec(1, { requestedAt: new Date().toISOString() }) }] }).map((c) => c.meta.pr)).toEqual([2]);
+    expect(defaultSlotCountedFixClaims({ env: { WE_FIX_PARKED_RELEASES_SLOT: 'on' }, listClaims: () => raw, readRecords: () => [{ key: 'a', record: rec(1, { requestedAt: new Date(Date.now() - 60_000).toISOString() }) }] }).map((c) => c.meta.pr)).toEqual([2]);
   });
   it('a cycle that threw or could not get the lock is not a heartbeat; an acting cycle is', () => {
     expect(cycleFailed({ rows: [{ action: 'error', result: 'error: boom' }] })).toBe(true);
@@ -322,5 +344,164 @@ describe('runAwaitVerifyCycleDefault against real stores (R5 fail-closed on the 
       expect(out.released).toEqual([]);
       expect(readFixDispatchClaim({ repo: 'we', pr: 21, kind: 'fix' })).not.toBeNull();
     } finally { restore(); }
+  });
+
+  // PR #4510 review (codex-correctness, CONFIRMED): a fixer parks, writes `done`, is woken to repair a red verdict, and the
+  // process dies before the post-pass journal write. The journal then holds only the wait's `requestedAt`, which is older
+  // than that `done`, so the next cycle used to release the claim of a session that is working again.
+  describe('wake intent is on disk before the wake (crash window)', () => {
+    const parked = async (extra = {}) => {
+      const ctx = await setup(); // setup() wrote the `done` just now; the wait below was requested before it
+      const store = await import('../await-verify.mjs');
+      store.writeStoredAwaitVerify(rec(21, { requestedAt: new Date(Date.now() - 120_000).toISOString(), ...extra }));
+      await new Promise((r) => { setTimeout(r, 15); });
+      const resume = vi.fn(() => ({ resumed: true }));
+      const io = { listRecords: () => store.listStoredAwaitVerify(), readMarker: () => null, listSessions: () => [{ sessionId: 'sid-21', name: 'fix-21' }], resume };
+      return { ...ctx, store, io, resume };
+    };
+    it('a crash after the wake and the wait clear, before the post-pass journal write, keeps the claim held', async () => {
+      const { env, restore, store, io, resume } = await parked();
+      try {
+        const [{ key }] = store.listStoredAwaitVerify();
+        const crashing = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async ({ io: i }) => {
+          i.resume({ session: { sessionId: 'sid-21' }, prompt: 'repair' });
+          store.clearStoredAwaitVerify(key);
+          throw new Error('process died before the journal write');
+        } };
+        const first = await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: { ...ON, parkedReleasesSlot: false }, passModule: crashing });
+        expect(resume).toHaveBeenCalledTimes(1);
+        expect(first.released).toEqual([]);
+        const quiet = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async () => ({ rows: [] }) };
+        const second = await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule: quiet });
+        expect(second.released).toEqual([]);
+        expect(readFixDispatchClaim({ repo: 'we', pr: 21, kind: 'fix' })).not.toBeNull();
+      } finally { restore(); }
+    });
+    it('the two-phase pass (parked-releases-slot on) is covered the same way', async () => {
+      const { env, restore, store, io, resume } = await parked({ pendingResume: { kind: 'red', detail: 'x' } });
+      try {
+        const [{ key }] = store.listStoredAwaitVerify();
+        let calls = 0;
+        const crashing = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async ({ io: i, allowResume }) => {
+          calls += 1;
+          if (!allowResume) return { rows: [{ key, action: 'resume', result: 'resume-paused' }] };
+          i.resume({ session: { sessionId: 'sid-21' }, prompt: 'repair' });
+          store.clearStoredAwaitVerify(key);
+          throw new Error('process died before the journal write');
+        } };
+        await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule: crashing });
+        expect(calls).toBe(2);
+        expect(resume).toHaveBeenCalledTimes(1);
+        const quiet = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async () => ({ rows: [] }) };
+        expect((await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule: quiet })).released).toEqual([]);
+      } finally { restore(); }
+    });
+    it('a journal stamp that cannot be written turns the cycle\'s wakes OFF before the pass (the pass counts a refused wake as a failure), and never wakes', async () => {
+      const { root, env, restore, store, io, resume } = await parked();
+      try {
+        mkdirSync(join(root, `await-verify-woken.json.${process.pid}.tmp`)); // the journal's temp file path is now a directory
+        const allow = [];
+        let seen = null;
+        const pass = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async ({ io: i, allowResume }) => {
+          allow.push(allowResume);
+          seen = i.resume({ session: { sessionId: 'sid-21' }, prompt: 'repair' }); // even a pass that ignores allowResume cannot wake
+          return { rows: [] };
+        } };
+        await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: { ...ON, parkedReleasesSlot: false }, passModule: pass });
+        expect(allow).toEqual([false]);
+        expect(resume).not.toHaveBeenCalled();
+        expect(seen).toMatchObject({ resumed: false });
+        expect(store.listStoredAwaitVerify()).toHaveLength(1); // the wait is still owed
+      } finally { restore(); }
+    });
+    it('a done the woken session writes AFTER the wake, while the pass is still waking others, still releases next cycle (no post-pass stamp)', async () => {
+      const { env, restore, store, io } = await parked();
+      try {
+        const [{ key }] = store.listStoredAwaitVerify();
+        const { writeCompletion } = await import('../../operations/completion-store.mjs');
+        const { newCompletionRecord, applyCompletionUpdate } = await import('../../operations/completion-record.mjs');
+        const pass = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async ({ io: i }) => {
+          i.resume({ session: { sessionId: 'sid-21' }, prompt: 'repair' });
+          store.clearStoredAwaitVerify(key);
+          await new Promise((r) => { setTimeout(r, 15); });
+          writeCompletion(applyCompletionUpdate(newCompletionRecord({ session: 'fix-21', kind: 'fix', pr: 21 }), { status: 'done' })); // the repair finished
+          await new Promise((r) => { setTimeout(r, 15); }); // ...and the pass is still busy with other records
+          return { rows: [{ key, action: 'resume', result: 'resumed:red' }] };
+        } };
+        // the same cycle's sweep runs after the pass: the finished repair's done is newer than the wake stamp, so it releases
+        const out = await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: { ...ON, parkedReleasesSlot: false }, passModule: pass });
+        expect(out.released.map((r) => r.pr)).toEqual([21]);
+        expect(readFixDispatchClaim({ repo: 'we', pr: 21, kind: 'fix' })).toBeNull();
+      } finally { restore(); }
+    });
+    it('a lost journal (missing or corrupt) restarts with a floor: a done from before the loss is held, a later one releases; an unreadable one is left alone and blocks wakes', async () => {
+      const { root, env, restore, store, io, resume } = await parked();
+      try {
+        const quiet = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async () => ({ rows: [] }) };
+        const path = join(root, 'await-verify-woken.json');
+        store.clearStoredAwaitVerify(store.listStoredAwaitVerify()[0].key);
+        for (const lost of [() => rmSync(path, { force: true }), () => writeFileSync(path, '{not json')]) {
+          lost();
+          const out = await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule: quiet });
+          expect(out.released).toEqual([]);
+          expect(readJournal(path).value.__floor).toBeTruthy();
+          expect(readFixDispatchClaim({ repo: 'we', pr: 21, kind: 'fix' })).not.toBeNull();
+        }
+        await new Promise((r) => { setTimeout(r, 15); });
+        const { writeCompletion } = await import('../../operations/completion-store.mjs');
+        const { newCompletionRecord, applyCompletionUpdate } = await import('../../operations/completion-record.mjs');
+        writeCompletion(applyCompletionUpdate(newCompletionRecord({ session: 'fix-21', kind: 'fix', pr: 21 }), { status: 'done' }));
+        expect((await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: ON, passModule: quiet })).released.map((r) => r.pr)).toEqual([21]);
+        // unreadable: a directory where the file should be
+        rmSync(path, { force: true });
+        mkdirSync(path);
+        store.writeStoredAwaitVerify(rec(21, { requestedAt: new Date(Date.now() - 1000).toISOString() }));
+        const allow = [];
+        const pass = { defaultAwaitVerifyIo: async () => io, runAwaitVerifyPass: async ({ allowResume }) => { allow.push(allowResume); return { rows: [] }; } };
+        await runAwaitVerifyCycleDefault({ allowResume: true, env, settings: { ...ON, parkedReleasesSlot: false }, passModule: pass });
+        expect(allow).toEqual([false]);
+        expect(resume).not.toHaveBeenCalled();
+        expect(readJournal(path).state).toBe('unreadable'); // still the directory: never replaced
+      } finally { restore(); }
+    });
+    it('sessionSpeaksFor: a record naming a session id binds to that session only; otherwise to its name', () => {
+      expect(sessionSpeaksFor(rec(1), { sessionId: 'sid-1' })).toBe(true);
+      expect(sessionSpeaksFor(rec(1), { sessionId: 'sid-2', name: 'fix-1' })).toBe(false);
+      expect(sessionSpeaksFor(rec(1, { sessionId: undefined }), { sessionId: 'x', name: 'fix-1' })).toBe(true);
+      expect(sessionSpeaksFor(rec(1, { sessionId: undefined }), { sessionId: 'x', name: 'fix-2' })).toBe(false);
+    });
+  });
+});
+
+// PR #4510 review (security, PLAUSIBLE→broken): the loop child is spawned once with a frozen env and never refreshed
+// the GitHub App token, so its pushes ran on personal auth, or on an inherited token that lapsed after an hour.
+describe('the loop refreshes its GitHub App auth before every cycle', () => {
+  it('runLoopCycle: ensureAuth runs first on every cycle and its token is what the cycle sees; a failing refresh never stops the cycle', async () => {
+    const saved = process.env.GH_TOKEN;
+    try {
+      let n = 0;
+      const ensureAuth = vi.fn(async () => { n += 1; process.env.GH_TOKEN = `fresh-${n}`; });
+      const seen = [];
+      const cycle = vi.fn(async () => { seen.push(process.env.GH_TOKEN); return { rows: [] }; });
+      await runLoopCycle({ settings: ON, ensureAuth, cycle });
+      await runLoopCycle({ settings: ON, ensureAuth, cycle });
+      expect(seen).toEqual(['fresh-1', 'fresh-2']);
+      expect(cycle).toHaveBeenCalledWith({ settings: ON });
+      const out = await runLoopCycle({ settings: ON, ensureAuth: async () => { throw new Error('mint down'); }, cycle });
+      expect(out).toEqual({ rows: [] });
+      expect(cycle).toHaveBeenCalledTimes(3);
+    } finally { if (saved === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = saved; }
+  });
+  it('the default refresh is the fleet one (per-owner tokens), never a single pinned org', async () => {
+    const { FLEET_APP_AUTH_OPTS } = await import('../../lib/github-app-auth-env.mjs');
+    expect(LOOP_APP_AUTH_OPTS).toBe(FLEET_APP_AUTH_OPTS);
+  });
+  it('a cycle whose acted rows are all transient push failures is not a heartbeat (the tick, which holds a fresh token, takes over)', () => {
+    const retry = { key: 'a', action: 'push', result: 'push-retry (could not resolve the head ref of web-everything/web-everything PR #1)' };
+    const gone = { key: 'b', action: 'push', result: 'push-transient; salvaged' };
+    expect(cycleFailed({ rows: [retry] })).toBe(true);
+    expect(cycleFailed({ rows: [retry, gone] })).toBe(true);
+    expect(cycleFailed({ rows: [retry, { key: 'c', action: 'push', result: 'pushed; resumed:green' }] })).toBe(false);
+    expect(cycleFailed({ rows: [retry, { key: 'd', action: 'wait' }] })).toBe(true); // waiting rows are not acting
   });
 });
