@@ -27,25 +27,59 @@ const mins = (ms) => Math.round(ms / 6000) / 10;
 const json = (text) => { try { return JSON.parse(text); } catch { return null; } };
 const plain = (o) => o && typeof o === 'object' && !Array.isArray(o);
 
-/** Replace anything token-like with `[redacted]` before it can reach a report. */
+/**
+ * Replace anything token-like with `[redacted]` before it can reach a report.
+ * Every pattern is linear: no unanchored lookahead over an unbounded run, no nested quantifier. Redaction also never sees
+ * more than RAW_CAP characters (tool output is attacker-influenceable and a tail read is up to 2 MiB).
+ */
 const SECRET_PATTERNS = [
   /\bgh[pousr]_[A-Za-z0-9]{16,}\b/g,
   /\bgithub_pat_[A-Za-z0-9_]{16,}\b/g,
   /\bsk-[A-Za-z0-9_-]{16,}\b/g,
+  /\b(?:[sr]k_(?:live|test)|pk_live|whsec)_[A-Za-z0-9]{16,}\b/g,
   /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/g,
-  /\bAKIA[0-9A-Z]{12,}\b/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{12,}\b/g,
+  /\bAIza[0-9A-Za-z_-]{20,}/g,
+  /\b(?:npm_[A-Za-z0-9]{30,}|glpat-[A-Za-z0-9_-]{16,})/g,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b/g,
-  /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}/gi,
-  /\b((?:api[_-]?key|token|secret|password|passwd|authorization)["']?\s*[:=]\s*["']?)[^\s"',;]{6,}/gi,
+  // PEM / PGP private key: through the END line when it is there (encrypted keys carry `Proc-Type:` headers), else the next 1 KiB.
+  /-----BEGIN [A-Z ]{0,30}PRIVATE KEY(?: BLOCK)?-----(?:[\s\S]{0,4096}?-----END [A-Z ]{0,30}PRIVATE KEY(?: BLOCK)?-----|[\s\S]{0,1024})/g,
+  // URL userinfo (`postgres://user:pass@host`, `redis://:pass@host`, `https://token@host`): everything between `://` and the last `@` of the authority.
+  /(\b[a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/]{1,256}(?=@)/gi,
+  // A token of 8+ chars holding a digit, or any 20+ char run (so prose like "Basic functionality" survives).
+  /\b(Bearer|Basic)\s+(?:(?=[A-Za-z0-9._~+/=-]*\d)[A-Za-z0-9._~+/=-]{8,}|[A-Za-z0-9._~+/=-]{20,})/gi,
+  /\b((?:Set-)?Cookie\s*:\s*)[^\n]{6,512}/gi,
+  // Keyed values. No leading `\b`: `_` is a word character, so `GITHUB_TOKEN` / `DB_PASSWORD` / `MY_API_KEY` must match mid-word.
+  // A quoted value may hold spaces and `;` (`"correct horse battery"`); a bare one stops at whitespace, quote, `,` and `;`.
+  /((?:api[_-]?key|private[_-]?key|token|secret|password|passwd|passphrase|authorization)[A-Za-z0-9_]{0,24}["']?\s*[:=]\s*)(?:"[^"\n]{4,256}"|'[^'\n]{4,256}'|[^\s"',;]{6,})/gi,
   /\b[A-Fa-f0-9]{32,}\b/g,
-  /\b(?=[A-Za-z0-9+/_-]*\d)(?=[A-Za-z0-9+/_-]*[A-Za-z])[A-Za-z0-9+/_-]{40,}={0,2}(?=\s|$|["',.)])/g,
 ];
-export function redact(text) {
-  let out = String(text ?? '');
-  for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, (m, p1) => (typeof p1 === 'string' && p1 && !/^[A-Fa-f0-9]+$/.test(p1) ? `${p1}[redacted]` : '[redacted]'));
-  return out;
+/** A 40+ char key-alphabet run holding both a digit and a letter. One linear regex plus two linear tests (no lookaheads). */
+const BLOB = /[A-Za-z0-9+/_-]{40,}={0,2}/g;
+const RAW_CAP = 8192;
+/** First RAW_CAP chars, cut back to a whitespace boundary so a token is never split into a leftover that no pattern recognises. */
+export function boundedText(text, cap = RAW_CAP) {
+  const s = String(text ?? '');
+  if (s.length <= cap) return s;
+  let end = cap;
+  while (end > 0 && !/\s/.test(s[end])) end--;
+  return end > 0 ? s.slice(0, end) : '[truncated]';
 }
-const excerpt = (text, max = 140) => redact(String(text ?? '').replace(/\s+/g, ' ').trim()).slice(0, max);
+export function redact(text) {
+  let out = boundedText(text);
+  for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, (m, p1) => (typeof p1 === 'string' && p1 && !/^[A-Fa-f0-9]+$/.test(p1) ? `${p1}[redacted]` : '[redacted]'));
+  return out.replace(BLOB, (m) => (/\d/.test(m) && /[A-Za-z]/.test(m) ? '[redacted]' : m));
+}
+const excerpt = (text, max = 140) => redact(boundedText(text).replace(/\s+/g, ' ').trim()).slice(0, max);
+/** Tool output kept per result: head and tail, so a long dump cannot make every later regex scan megabytes. */
+const RESULT_CAP = 32 * 1024;
+const clipResult = (text) => {
+  const s = String(text ?? '');
+  if (s.length <= 2 * RESULT_CAP) return s;
+  // The tail starts on a line boundary: a mid-line fragment must not look like the start of a line (`Blocked:` is line-anchored).
+  const tail = s.slice(-RESULT_CAP), nl = tail.indexOf('\n');
+  return `${s.slice(0, RESULT_CAP)}\n${nl >= 0 ? tail.slice(nl + 1) : ''}`;
+};
 
 /** Bounded tail read via agent-health's reader. Returns parsed JSON rows (objects only). */
 export function readTranscriptRows(file, { maxBytes = 2 * MiB } = {}) {
@@ -54,6 +88,28 @@ export function readTranscriptRows(file, { maxBytes = 2 * MiB } = {}) {
     return { rows: lines.map(json).filter(plain), truncatedHead, bytes: Math.min(size, maxBytes), found: true };
   } catch { return { rows: [], truncatedHead: false, bytes: 0, found: false }; }
 }
+
+/**
+ * Bounded read of the START of a file: the complete JSON lines inside the first `maxBytes` (a partial last line is dropped,
+ * and a first line longer than the cap yields nothing). A tail read of a long rollout loses its `session_meta` and brief;
+ * this gets them back without reading the file.
+ */
+export function readHeadRows(file, { maxBytes = 256 * 1024, io = fs } = {}) {
+  let fd;
+  try {
+    fd = io.openSync(file, 'r');
+    const buf = Buffer.alloc(maxBytes);
+    const n = io.readSync(fd, buf, 0, maxBytes, 0);
+    const text = buf.subarray(0, n).toString('utf8');
+    const whole = n < maxBytes;
+    const lines = text.split('\n');
+    if (!whole) lines.pop();
+    return lines.filter(Boolean).map(json).filter(plain);
+  } catch { return []; } finally { if (fd !== undefined) try { io.closeSync(fd); } catch { /* already closed */ } }
+}
+
+/** `rollout-2026-10-07T12-01-00-<thread id>.jsonl` -> `<thread id>`. */
+export const threadIdFromRolloutName = (name) => /^rollout-\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-(.+)\.jsonl$/.exec(String(name))?.[1] ?? null;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Normalisation: every executor becomes the same event stream.
@@ -69,7 +125,7 @@ export function claudeEvents(rows) {
     for (const block of Array.isArray(content) ? content : []) {
       if (row.type === 'assistant' && block?.type === 'text') events.push({ k: 'say', t, text: String(block.text ?? '') });
       else if (row.type === 'assistant' && block?.type === 'tool_use') events.push({ k: 'call', t, id: block.id, name: String(block.name ?? ''), text: String(block.input?.command ?? block.input?.file_path ?? block.input?.path ?? '') });
-      else if (row.type === 'user' && block?.type === 'tool_result') events.push({ k: 'result', t, id: block.tool_use_id, text: textOf(block.content), err: block.is_error === true });
+      else if (row.type === 'user' && block?.type === 'tool_result') events.push({ k: 'result', t, id: block.tool_use_id, text: clipResult(textOf(block.content)), err: block.is_error === true });
       else if (row.type === 'user' && block?.type === 'text') events.push({ k: 'user', t, text: String(block.text ?? '') });
     }
   }
@@ -91,7 +147,7 @@ export function codexEvents(rows) {
       const cmd = Array.isArray(args.command) ? args.command.join(' ') : String(args.cmd ?? args.command ?? '');
       events.push({ k: 'call', t, id: p.call_id, name: String(p.name ?? ''), text: cmd });
     } else if (row.type === 'response_item' && (p.type === 'custom_tool_call_output' || p.type === 'function_call_output')) {
-      const text = typeof p.output === 'string' ? p.output : textOf(p.output);
+      const text = clipResult(typeof p.output === 'string' ? p.output : textOf(p.output));
       const code = /exit_code\\*"?\s*[:=]\s*(-?\d+)/.exec(text)?.[1];
       events.push({ k: 'result', t, id: p.call_id, text, err: code !== undefined && Number(code) !== 0 });
     } else if (row.type === 'event_msg' && p.type === 'task_complete' && typeof p.last_agent_message === 'string') events.push({ k: 'say', t, text: p.last_agent_message, final: true });
@@ -106,7 +162,7 @@ export function agyEvents(rows) {
     const t = stampMs(row.timestamp);
     if (row.event === 'step_update' && step?.step_type === 'tool' && step.state !== 'ACTIVE') {
       events.push({ k: 'call', t, id: step.id ?? step.step_id, name: String(step.tool_name ?? ''), text: String(step.input ?? step.tool_name ?? '') });
-      events.push({ k: 'result', t, id: step.id ?? step.step_id, text: String(step.output ?? step.error ?? ''), err: step.state === 'ERROR' });
+      events.push({ k: 'result', t, id: step.id ?? step.step_id, text: clipResult(step.output ?? step.error ?? ''), err: step.state === 'ERROR' });
     } else if (row.event === 'result') events.push({ k: 'say', t, text: String(row.result?.output ?? row.result?.status ?? ''), final: true });
   }
   return events;
@@ -118,10 +174,10 @@ const EPERM = /EPERM: operation not permitted|\bOperation not permitted\b/;
 const EPERM_STRONG = /EPERM: operation not permitted, \w+ '/;
 const ADMISSION = /heavy-admission|\.admission\b|admission/i;
 const PERMISSION_DENIED = /\bpermission denied\b|\bEACCES\b|permission_denied/i;
-const GUARD_BLOCK = /(?:^|\n)\s*(?:[✗x]\s*)?Blocked:|\bhook\b[^\n]{0,60}\bblocked\b|PreToolUse[^\n]{0,60}(?:denied|blocked)/i;
+const GUARD_BLOCK = /^[ \t]*(?:[✗x][ \t]*)?Blocked:|\bhook\b[^\n]{0,60}\bblocked\b|PreToolUse[^\n]{0,60}(?:denied|blocked)/im;
 const LANE_LEASED = /\blane-\d+ is (?:leased|held) by\b|lane[- ]already[- ]leased/i;
 const LANE_ACQUIRE_FAIL = /no lane within|Command failed:[^\n]{0,60}lane-pool\.mjs acquire|could not determine an origin URL|lane-pool\.mjs acquire[^\n]{0,80}(?:failed|error)|acquire(?:s)? (?:failed|timed out)/i;
-const READ_ONLY = /^(?:ls|cd|pwd|cat|echo|head|tail|sed -n|rg|grep|git (?:status|diff|log|show)|wc|find)\b/;
+const READ_ONLY = /^(?:ls|cd|pwd|cat|echo|head|tail|sed -n|rg|grep|egrep|fgrep|nl|jq|awk|cut|tr|sort|uniq|column|stat|file|less|more|tree|du|od|xxd|strings|basename|dirname|realpath|which|git (?:status|diff|log|show|grep|blame|ls-files|rev-parse|ls-remote)|gh (?:pr|issue|run|repo|api) (?:view|list|checks|diff|status)|wc|find)\b/;
 const STEP = {
   acquire: /lane-pool\.mjs\s+acquire/,
   verify: /operations\/run\.mjs\s+verify\b|verify-lane\.mjs/,
@@ -130,7 +186,7 @@ const STEP = {
 };
 /** True when any `&&` / `;` segment of a shell line does more than read. */
 const actsOn = (text) => String(text).split(/&&|\|\||;|\n/).map((x) => x.trim()).some((x) => x && !READ_ONLY.test(normalizeCommand(x)));
-const SHELL_TOOLS = /^(?:bash|exec|shell|exec_command|shell_command|local_shell)$/i;
+const SHELL_TOOLS = /^(?:bash|exec|shell|exec_command|shell_command|local_shell|run|run_command|execute_command|terminal)$/i;
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch']);
 const VERDICT = /\bverify\b[^\n]{0,40}\b(GREEN|RED)\b|"status"\s*:\s*"(green|red|timeout)"|\bVERDICT\b[^\n]{0,30}\b(green|red)\b/i;
 const PULL_URL = /github\.com\/[\w.-]+\/[\w.-]+\/pull\/(\d+)/;
@@ -173,9 +229,14 @@ export function extractFrictions(events, meta = {}) {
       prevErr = e.err;
       // Output of a read-only viewer is file content, not an event: source code mentions leases and guard text.
       // A Node-format EPERM line (`EPERM: operation not permitted, mkdir '/path'`) is an error message whichever command printed it.
-      const viewer = Boolean(call && !call.acts && SHELL_TOOLS.test(call.name));
+      // Trust boundary: only the output of a command that acts is an event source. A successful result of ANY other tool
+      // (Read, Grep, Edit's echoed snippet, Task, MCP file fetches ...) or of a call that fell off the truncated tail is
+      // content. An ERROR result of such a tool is still the harness's own message (a real denial), so it stays an event.
+      const contentTool = !call || !SHELL_TOOLS.test(call.name);
+      const fileViewer = contentTool && !e.err;
+      const viewer = fileViewer || Boolean(call && !call.acts && SHELL_TOOLS.test(call.name));
       if (e.err) rec.toolErrors++;
-      const strongEperm = EPERM_STRONG.test(text);
+      const strongEperm = !fileViewer && EPERM_STRONG.test(text);
       const denial = viewer ? null : classifyDenial(text, e.err);
       if (denial) { bump(rec.toolDenials, denial); example(`denial:${denial}`, text); }
       if (!viewer && PERMISSION_DENIED.test(text) && (e.err || /^\W*(?:bash|zsh|sh)?:?[^\n]{0,80}permission denied/i.test(text.trim()))) rec.permissionDenied++;
@@ -188,9 +249,9 @@ export function extractFrictions(events, meta = {}) {
       const leased = !viewer && LANE_LEASED.test(text);
       if (leased) { bump(rec.laneFailures, 'lane-already-leased'); example('lane-already-leased', text.slice(Math.max(0, text.search(LANE_LEASED) - 30))); }
       else if (!viewer && LANE_ACQUIRE_FAIL.test(text)) { bump(rec.laneFailures, 'lane-acquire-failed'); example('lane-acquire-failed', text); }
-      if (call && STEP.openPr.test(call.text)) { const m = PULL_URL.exec(text); if (m) { first('prOpen', e.t); pr = Number(m[1]); } }
-      else if (call && /\bgh\s+pr\s+create\b/.test(call.text)) { const m = PULL_URL.exec(text); if (m) { first('prOpen', e.t); pr = Number(m[1]); } }
-      if (verifyAt !== null && !('verdict' in steps) && VERDICT.test(text)) first('verdict', e.t);
+      if (call && !viewer && STEP.openPr.test(call.text)) { const m = PULL_URL.exec(text); if (m) { first('prOpen', e.t); pr = Number(m[1]); } }
+      else if (call && !viewer && /\bgh\s+pr\s+create\b/.test(call.text)) { const m = PULL_URL.exec(text); if (m) { first('prOpen', e.t); pr = Number(m[1]); } }
+      if (!viewer && verifyAt !== null && !('verdict' in steps) && VERDICT.test(text)) first('verdict', e.t);
     } else if (e.k === 'user') {
       if (verifyAt !== null && !('verdict' in steps) && VERDICT.test(e.text)) first('verdict', e.t);
       const m = PULL_URL.exec(e.text); if (m && pr === null && /opened|created/i.test(e.text)) pr = Number(m[1]);
@@ -337,14 +398,19 @@ export function collectCodexFrictions(window, { env = process.env, home = homedi
       if (sources.count >= maxFiles) break;
       const read = readTranscriptRows(join(base, y.name, m.name, d.name, f.name), { maxBytes });
       if (!read.found) continue;
-      const metaRow = read.rows.find((r) => r.type === 'session_meta')?.payload ?? {};
-      const startedAt = stampMs(metaRow.timestamp ?? read.rows[0]?.timestamp);
+      // A rollout bigger than the tail cap lost its `session_meta` and brief: read them from the head instead, so the thread
+      // join, the build/other classification and the start time (window membership) survive truncation.
+      const head = read.truncatedHead ? readHeadRows(join(base, y.name, m.name, d.name, f.name), { io }) : [];
+      const headRows = head.length ? head : read.rows;
+      const metaFull = [...head, ...read.rows].find((r) => r.type === 'session_meta');
+      const metaRow = metaFull?.payload ?? {};
+      const startedAt = stampMs(metaRow.timestamp ?? metaFull?.timestamp ?? headRows[0]?.timestamp);
       if (!(startedAt >= Date.parse(window.since) && startedAt < Date.parse(window.until))) continue;
-      const id = metaRow.id ?? metaRow.session_id ?? null;
+      const id = metaRow.id ?? metaRow.session_id ?? threadIdFromRolloutName(f.name);
       const joined = id ? threads.get(id) : null;
       if (joined) sources.joined++;
       const events = codexEvents(read.rows);
-      const kind = joined ? kindOfSessionName(joined.slug) : codexKindFromBrief(briefText(read.rows), String(metaRow.cwd ?? ''));
+      const kind = joined ? kindOfSessionName(joined.slug) : codexKindFromBrief(briefText(headRows), String(metaRow.cwd ?? ''));
       const rec = withNamedPr(extractFrictions(events, { session: String(id ?? f.name), executor: 'codex', kind, truncatedHead: read.truncatedHead }), joined?.slug ?? '');
       rec.recordOutcome = joined?.completion?.outcome ?? null;
       rec.at = iso(startedAt);
@@ -364,7 +430,8 @@ export function collectAgyFrictions(window, { env = process.env, home = homedir(
     if (!(mtime >= Date.parse(window.since) && mtime < Date.parse(window.until))) continue;
     const read = readTranscriptRows(join(dir, f.name), { maxBytes });
     if (!read.found) continue;
-    const init = read.rows.find((r) => r.event === 'init')?.init ?? {};
+    // The `init` row is the first line: a truncated tail lost it, so read it from the head (same fix as the Codex meta).
+    const init = [...(read.truncatedHead ? readHeadRows(join(dir, f.name), { io }) : []), ...read.rows].find((r) => r.event === 'init')?.init ?? {};
     const kind = /judge|juror/.test(String(init.cwd ?? '')) ? 'review' : 'task';
     out.push(extractFrictions(agyEvents(read.rows), { session: f.name.replace(/\.jsonl$/, ''), executor: 'agy', kind, truncatedHead: read.truncatedHead }));
     sources.count++;

@@ -376,8 +376,12 @@ export function builderMetrics(ticks, window, cardNames = []) {
       const head = `h|${headOf(f)}`, key = f.attempt ? `f|${f.num}|${f.attempt}` : head, when = stamp(attemptTime(f, t.at));
       let fresh = !prepSeen.has(key) && prepSeen.add(key);
       // The same failure is often listed first without an attempt id and a tick later with one: that is one attempt.
-      if (fresh && f.attempt && headSeenAt.has(head) && Math.abs(when - headSeenAt.get(head)) <= 600000) fresh = false;
-      if (!headSeenAt.has(head) || f.attempt) headSeenAt.set(head, when);
+      // Only an attempt-less row can be that earlier listing, and it is spent by the first attempt that claims it: two
+      // attempt-bearing rows (different ids) minutes apart are two attempts, however close, and never absorb each other.
+      if (f.attempt && headSeenAt.has(head)) {
+        if (fresh && Math.abs(when - headSeenAt.get(head)) <= 600000) fresh = false;
+        headSeenAt.delete(head);
+      } else if (!f.attempt && fresh && !undated(f)) headSeenAt.set(head, when); // a carried-over row is not an earlier listing of a new attempt
       prepSeen.add(head);
       emit(failCause(f), f, key, fresh);
     }
@@ -583,7 +587,7 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
     for (const g of parsed.gates) if (g.waitTimeout) waitTimeoutItems.push({ cause: 'verify-wait-timeout', ref: `session ${session}`, at: g.at, ms: g.ms ?? 0 });
     if (parsed.gates.some((g) => g.waitTimeout)) waitTimeoutSessions++;
     for (const [type, count] of Object.entries(parsed.denials)) add(denials, type, count);
-    loops.push(...parsed.loops.map((loop) => ({ session, ...loop })));
+    loops.push(...parsed.loops.map((loop) => ({ session, ...loop, command: redact(loop.command) })));
     transcriptsTruncated += Number(Boolean(transcript.truncated)); bytesRead += transcript.bytesRead ?? 0;
     records.push({ session, name, kind, pr, outcome, minutes: minutes(ms), outcomeLine: parsed.outcomeLine, truncated: Boolean(transcript.truncated) });
   }
