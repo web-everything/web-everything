@@ -41,7 +41,7 @@ describe('ci-red-recovery-watch — buildCandidates', () => {
     expect(candidates).toEqual([
       {
         prNumber: 2635, headRefName: 'lane/xdzl6mb', headSha: 'ab9985630d90019a07b94e946bc75f8de7a6161f',
-        aheadBy: 33, failureCompletedAt: '2026-09-25T01:57:47Z', failingCheckName: 'test', detailsUrl: null,
+        aheadBy: 33, failureCompletedAt: '2026-09-25T01:57:47Z', failingCheckName: 'test', detailsUrl: null, needsHuman: false,
       },
     ]);
     expect(readAheadBy).toHaveBeenCalledTimes(1);

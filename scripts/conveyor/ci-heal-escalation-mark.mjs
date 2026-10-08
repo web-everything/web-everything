@@ -62,6 +62,12 @@ import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from
  */
 export const CI_HEAL_ESCALATION_MARKER = '🚦 conveyor CI-heal — escalated';
 
+/** xo7mr6l — the structured `cause:` value for "the red is main's own defect, not this PR's diff". */
+export const MAIN_DEFECT_CAUSE = 'main-defect';
+
+/** xo7mr6l — prose shapes ci-heal wrote before `cause:` existed (live: PRs #4368/#4369, 2026-10-08). */
+const LEGACY_MAIN_DEFECT_REASON = /^(?:red is main's own defect\b|main-wide (?:health-gate )?red\b)/i;
+
 /** The three outcomes a ci-heal escalation can carry — see the file header for what distinguishes them. */
 export const CI_HEAL_ESCALATION_OUTCOMES = Object.freeze(['needs-human', 'waiting-on-system-fix', 'not-a-ci-break']);
 
@@ -72,7 +78,7 @@ export const CI_HEAL_ESCALATION_OUTCOMES = Object.freeze(['needs-human', 'waitin
  * @param {{headSha:string, outcome:'needs-human'|'waiting-on-system-fix'|'not-a-ci-break', reason?:string, systemFixRef?:(number|string|null), authDiagnosis?:object}} o
  * @returns {string}
  */
-export function buildCiHealEscalationComment({ headSha, outcome, reason = '', systemFixRef = null, authDiagnosis = null } = {}) {
+export function buildCiHealEscalationComment({ headSha, outcome, reason = '', systemFixRef = null, authDiagnosis = null, cause = null } = {}) {
   if (!headSha || typeof headSha !== 'string') throw new TypeError('ci-heal-escalation-mark: headSha is required');
   if (!CI_HEAL_ESCALATION_OUTCOMES.includes(outcome)) {
     throw new TypeError(`ci-heal-escalation-mark: outcome must be one of ${CI_HEAL_ESCALATION_OUTCOMES.join('|')}, got ${JSON.stringify(outcome)}`);
@@ -87,6 +93,7 @@ export function buildCiHealEscalationComment({ headSha, outcome, reason = '', sy
     if (!systemFixRef) throw new TypeError('ci-heal-escalation-mark: waiting-on-system-fix requires systemFixRef');
     lines.push(`system-fix: #${String(systemFixRef).replace(/^#/, '')}`);
   }
+  if (cause === MAIN_DEFECT_CAUSE) lines.push(`cause: ${MAIN_DEFECT_CAUSE}`);
   if (reason) lines.push(`reason: ${reason}`);
   lines.push('');
   lines.push(
@@ -126,9 +133,10 @@ export function parseCiHealEscalations(comments) {
     const headSha = (/^head:\s*(\S+)/m.exec(body) || [])[1] ?? null;
     const systemFixRef = (/^system-fix:\s*#?(\d+)/m.exec(body) || [])[1] ?? null;
     const reason = (/^reason:\s*(.+)$/m.exec(body) || [])[1] ?? '';
+    const cause = (/^cause:\s*(\S+)/m.exec(body) || [])[1] ?? null;
     if (!outcome || !headSha) continue; // malformed/foreign — never half-parse a marker into a false match
     out.push({
-      headSha: headSha.toLowerCase(), outcome, reason, systemFixRef,
+      headSha: headSha.toLowerCase(), outcome, reason, systemFixRef, cause,
       createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null,
     });
   }
@@ -157,6 +165,17 @@ export function latestCiHealEscalationForHead(comments, headSha) {
   if (!sha) return null;
   const matches = parseCiHealEscalations(comments).filter((e) => e.headSha === sha && !isUnverifiedLaneEscalation(e));
   return matches.length ? matches[matches.length - 1] : null;
+}
+
+/**
+ * xo7mr6l — the head's `needs-human` escalation, when it blames MAIN's own defect (structured `cause: main-defect`,
+ * or the legacy prose shapes). Pure. Evidence only: it never closes anything by itself; the caller still needs
+ * main's required check green AFTER the PR's failure (`main-red-recovery.mjs#isMainGreenFixOwed`).
+ */
+export function mainDefectEscalationForHead(comments, headSha) {
+  const e = latestCiHealEscalationForHead(comments, headSha);
+  if (!e || e.outcome !== 'needs-human') return null;
+  return e.cause === MAIN_DEFECT_CAUSE || LEGACY_MAIN_DEFECT_REASON.test(e.reason) ? e : null;
 }
 
 /** Recorded attribution is evidence only, never permission to ignore a required check.
@@ -202,7 +221,8 @@ export function postOrOweCiHealEscalation({ pr, body, headSha, repo, post = post
 /** Shared CLI composition seam: enrichment failure must never suppress an escalation. */
 export function composeCiHealEscalation(flags, { collect = collectCiAuthDiagnosis } = {}) {
   const original = { headSha: flags.head, outcome: flags.outcome,
-    reason: typeof flags.reason === 'string' ? flags.reason : '', systemFixRef: flags['system-fix'] ?? null };
+    reason: typeof flags.reason === 'string' ? flags.reason : '', systemFixRef: flags['system-fix'] ?? null,
+    cause: flags.cause === MAIN_DEFECT_CAUSE ? MAIN_DEFECT_CAUSE : null };
   const body = buildCiHealEscalationComment(original);
   if (flags.run === undefined && flags.attempt === undefined) return body;
   try {
@@ -238,7 +258,7 @@ async function main() {
   const pr = Number(positionals[0]);
   if (!Number.isInteger(pr) || pr <= 0) {
     fail('usage: ci-heal-escalation-mark.mjs <pr> --head=<sha> --outcome=needs-human|waiting-on-system-fix|not-a-ci-break '
-      + '[--reason="<text>"] [--system-fix=<n>] [--repo=<owner/name>] [--run=<id> --attempt=<n>]');
+      + '[--reason="<text>"] [--system-fix=<n>] [--cause=main-defect] [--repo=<owner/name>] [--run=<id> --attempt=<n>]');
   }
   if (typeof flags.head !== 'string' || !flags.head) fail('--head=<sha> is required');
   let body;
