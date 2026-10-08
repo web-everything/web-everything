@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { REFERRAL_CARRY_REASON, buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { REFERRAL_CARRY_REASON, AUTO_POLICY_ACTOR, buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord } from '../jury-core.mjs';
 import {
   rulingNeeded, ignoredRulings, claimSimilarity, sameFinding, hasSentBack, renderRulingNotAddressed,
   fixerRulingBrief, RULING_NOT_ADDRESSED_MARKER,
@@ -18,7 +21,7 @@ function record({ head, runId, summary = SUMMARY, file, rulings = [], extra }) {
   return { version: 1, repo, pr: 3794, head, runId, reviewer, authorBody: '<!-- authored-by-actor: author -->',
     attempted: true, referrals: [{ key, seat: 'judge', original, finding: normalizeFinding(original) }],
     rulings: rulings.map((r, i) => ({ id: `r${i}`, key, reviewerId: reviewer.id, lens: reviewer.lens,
-      result: r.result, rationale: r.rationale ?? 'no', evidence: ['e'], ...(r.card ? { card: r.card } : {}),
+      result: r.result, rationale: r.rationale ?? 'no', evidence: r.evidence ?? ['e'], ...(r.card ? { card: r.card } : {}),
       ...(r.supersedes ? { supersedes: r.supersedes } : {}) })) };
 }
 const comment = (rec, n, login = 'web-everything') => ({ body: renderReferralRecord(rec), createdAt: t(n), author: { login } });
@@ -278,6 +281,72 @@ describe('ignoredRulings', () => {
     expect(body).toMatch(/policy\/pointer\.md:12/);
     expect(fixerRulingBrief(ig)).toMatch(/Operator ruling, verbatim: block: pointer files must be listed/);
     expect(fixerRulingBrief(ig)).toMatch(/did not satisfy/);
+  });
+});
+
+// Held item 141 — live 2026-10-08 on #4361 (head a5938d89), #4433 (head 4705dcf8) and #4402: the daemons raised
+// "ruling dispute" / "owed a fix, not a review" for blocks recorded on OLDER heads that the CURRENT head's reviewer had
+// ruled not-real (fixed) with line evidence. A block from an older head is satisfied by such a ruling; only a block
+// genuinely re-raised on the current head (unruled, or ruled block again) counts as "came back".
+describe('ignoredRulings — an older-head block the current-head reviewer ruled not-real with evidence (held item 141)', () => {
+  const fixture = (name) => JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'conveyor', '__tests__', 'fixtures', name), 'utf8'));
+  const autoBlock = (rec, n) => ({ author: { login: 'web-everything' }, createdAt: t(n),
+    body: buildOperatorRulingComment({ version: 1, repo, pr: rec.pr, head: rec.head, actor: AUTO_POLICY_ACTOR, channel: 'review daemon',
+      reason: 'auto-blocked by policy review.referralDefault=auto-block', at: t(n), clearerId: '',
+      rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'block' }] }) });
+  const history = [comment(record({ head: H1, runId: 'run-1' }), 1), comment(record({ head: H1, runId: 'run-1', rulings: [block] }), 3)];
+  const fixed = { result: 'not-real', rationale: 'the diff no longer has the defect', evidence: ['policy/pointer.md:12 now lists every pointer file'] };
+
+  describe.each([
+    ['#4361', 'pr-4361-a5938d89-reviewer-cleared-dispute.json', 81, 77],
+    ['#4433', 'pr-4433-4705dcf8-reviewer-cleared-dispute.json', 30, 26],
+  ])('replay %s', (_, file, all, beforeRulings) => {
+    const fx = fixture(file);
+    const pr = (n) => ({ number: fx.pr, headRefOid: fx.headRefOid, body: fx.body, createdAt: fx.createdAt, comments: fx.comments.slice(0, n) });
+    it('raises no dispute once the current-head reviewer ruled the old blocks not-real with evidence', () => {
+      expect(fx.comments).toHaveLength(all);
+      expect(ignoredRulings(pr(all))).toBeNull();
+      expect(ignoredRulings(pr(all), { humanAt: 1 })).toBeNull();
+      expect(rulingNeeded(pr(all), { humanAt: 1 })?.findings?.filter((f) => f.reason === 'dispute') ?? []).toEqual([]);
+    });
+    it('still flags the same findings while the current-head reviewer has not ruled them (control)', () => {
+      expect(ignoredRulings(pr(beforeRulings))?.matches?.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('an auto-policy block from an older head is satisfied by the current-head reviewer\'s not-real with evidence', () => {
+    const r1 = record({ head: H1, runId: 'run-1' });
+    const base = [comment(r1, 1), autoBlock(r1, 3)];
+    expect(ignoredRulings({ headRefOid: H2, comments: [...base, comment(record({ head: H2, runId: 'run-2' }), 10)] })?.matches).toHaveLength(1);
+    expect(ignoredRulings({ headRefOid: H2, comments: [...base, comment(record({ head: H2, runId: 'run-2' }), 10),
+      comment(record({ head: H2, runId: 'run-2', rulings: [fixed] }), 12)] })).toBeNull();
+  });
+  it('a reviewer not-real written BEFORE the block does not satisfy it (only a later clearance does)', () => {
+    const r1 = record({ head: H1, runId: 'run-1', rulings: [fixed] });
+    const key = r1.referrals[0].key;
+    const r2 = record({ head: H2, runId: 'run-2' });
+    const carriedOld = { ...record({ head: H3, runId: 'run-3' }), carried: [{ key, reason: REFERRAL_CARRY_REASON,
+      from: { head: H1, runId: 'run-1', key, rulingId: 'r0' }, result: 'not-real' }] };
+    const ig = ignoredRulings({ headRefOid: H3, comments: [comment(r1, 1), comment(r2, 5), autoBlock(r2, 6), comment(carriedOld, 10)] });
+    expect(ig?.matches).toHaveLength(1);
+    expect(ig.matches[0].source).toBe('structured');
+  });
+  it('a block genuinely re-raised on the current head still came back (ruled block again, or left unruled)', () => {
+    const r1 = record({ head: H1, runId: 'run-1' });
+    const unruled = ignoredRulings({ headRefOid: H2, comments: [comment(r1, 1), autoBlock(r1, 3), comment(record({ head: H2, runId: 'run-2' }), 10)] });
+    expect(unruled?.matches).toHaveLength(1);
+    expect(unruled.matches[0].source).toBe('structured');
+  });
+  it('a record block is satisfied by a later head\'s reviewer not-real carried onto the current head', () => {
+    const r2 = record({ head: H2, runId: 'run-2', rulings: [fixed] });
+    const key = r2.referrals[0].key;
+    const carried = { ...record({ head: H3, runId: 'run-3' }), carried: [{ key, reason: REFERRAL_CARRY_REASON,
+      from: { head: H2, runId: 'run-2', key, rulingId: 'r0' }, result: 'not-real' }] };
+    const comments = [...history, comment(record({ head: H2, runId: 'run-2' }), 10), comment(r2, 12), comment(carried, 20)];
+    expect(ignoredRulings({ headRefOid: H3, comments })).toBeNull();
+    // control: the same head without the carry is the block coming back
+    expect(ignoredRulings({ headRefOid: H3, comments: [...history, comment(record({ head: H2, runId: 'run-2' }), 10), comment(r2, 12),
+      comment(record({ head: H3, runId: 'run-3' }), 20)] })?.matches).toHaveLength(1);
   });
 });
 
