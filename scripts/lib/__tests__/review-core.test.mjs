@@ -2713,3 +2713,54 @@ it('the sandbox parked-review repo table uses the shared owner-qualified slugs',
   expect(Object.fromEntries(Object.entries(repos).map(([key, { slug }]) => [key, slug])))
     .toEqual(Object.fromEntries(Object.entries(CONSTELLATION_REPOS).map(([key, { slug }]) => [key, slug])));
 });
+
+/**
+ * #4418 — RISKS-TO-TEST-PLAN TRACEABILITY rides the existing guarantee rule (no parallel lens, no parser).
+ * A card whose Risks promise bounded reads and isolated degradation but whose Test plan only says "unit-test
+ * the reader" had no test for the bounded read. The instruction is semantic, so the tests pin the CONTENT of
+ * each obligation, not merely that some constant is included.
+ */
+describe('#4418 — GUARANTEE_NEEDS_A_TEST_RULE demands Risks-to-Test-plan traceability', () => {
+  it('requires Risks constraints to map to named Test plan cases', () => {
+    const rule = GUARANTEE_NEEDS_A_TEST_RULE;
+    // enumeration of each explicit constraint, and all four parts of the mapping
+    expect(rule).toMatch(/enumerate each explicit behavioral constraint in its Risks/);
+    expect(rule).toMatch(/matching Test plan entry/);
+    expect(rule).toMatch(/repository-qualified test file/);
+    expect(rule).toMatch(/named test case/);
+    expect(rule).toMatch(/observable assertion/);
+    // a generic reference to testing must NOT satisfy it
+    expect(rule).toMatch(/generic "unit-test the reader" does not satisfy/);
+    // both section spellings
+    expect(rule).toMatch(/heading or a bold label/);
+    // concrete constraint shapes
+    expect(rule).toMatch(/bounded read.*bytes read or the read range, not merely a successful parse/);
+    expect(rule).toMatch(/isolated degradation.*unrelated fields stay available after a failure/);
+    // absence is routed as coverage, not prose
+    expect(rule).toMatch(/absent mapping is a COVERAGE finding/);
+  });
+
+  it('carries risk traceability through every PR review transport', () => {
+    for (const [name, text] of Object.entries({
+      base: buildMandate({}),
+      panel: buildPanelMandate({ lens: 'correctness' }),
+      validator: buildValidatorMandate({ lens: 'correctness' }),
+      adapter: PR_DIFF_ADAPTER.buildMandate({ lens: 'correctness', mandate: 'correctness' }),
+    })) {
+      // assert the semantic content itself, so a constant that omitted it could not pass
+      expect(`${name}: ${/enumerate each explicit behavioral constraint in its Risks/.test(text)}`).toBe(`${name}: true`);
+      expect(`${name}: ${/repository-qualified test file, the named test case, and the observable assertion/.test(text)}`).toBe(`${name}: true`);
+    }
+  });
+
+  it('keeps planned tests and unavailable evidence distinct from verification', () => {
+    const rule = GUARANTEE_NEEDS_A_TEST_RULE;
+    expect(rule).toMatch(/preparation review.*concrete PLANNED test.*not one already implemented/);
+    expect(rule).toMatch(/implementation review.*inspect the actual test/);
+    expect(rule).toMatch(/Risks or Test plan section is absent from the material you were given, report that limitation/);
+    expect(rule).toMatch(/do not invent missing coverage/);
+    // tool-free honesty is preserved (existing clause still present alongside the new one)
+    expect(rule).toMatch(/never claim a mutation result you did not produce/);
+    expect(rule).toMatch(/label (the mapping|your assessment) unverified/);
+  });
+});
