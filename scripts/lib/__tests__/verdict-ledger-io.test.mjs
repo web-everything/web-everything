@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
-  appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
+  appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
 } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -194,5 +194,51 @@ describe('real git', () => {
       expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep }))
         .toThrow(LedgerAppendExhaustedError);
     });
+  });
+});
+
+
+describe('idempotent git writes', () => {
+  it('duplicate-only append makes no commit or push, including legacy unstamped rows', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { [ledgerGitPath(REPO)]: JSON.stringify(row(1)) + '\n' });
+      const calls = [];
+      const run = (args, opts) => { calls.push(args[0]); return git(args, opts); };
+      const result = appendGitRowsSync([row(1), row(1)], { board: ctx.clone, repo: REPO, run });
+      expect(result).toEqual({ ok: true, appended: 0, duplicates: 2 });
+      expect(calls).not.toContain('commit');
+      expect(calls).not.toContain('push');
+      expect(readLedgerFromGit({ board: ctx.clone, repo: REPO }).records).toHaveLength(1);
+    });
+  });
+
+  it('a retry recomputes duplicates against the new tip', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const other = cloneOf(ctx, 'idempotent-rival');
+      let raced = false;
+      let pushes = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push') {
+          pushes++;
+          if (!raced) {
+            raced = true;
+            // A distinct commit message prevents identical rows in the same second producing the same commit.
+            appendLedgerRows({ board: other, repo: REPO, records: [row(1)], message: 'rival append' });
+          }
+        }
+        return git(args, opts);
+      };
+      const result = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], run, sleep: noSleep });
+      expect(result).toEqual({ status: 'appended', attempts: 2, rows: 0, duplicates: 1 });
+      expect(pushes).toBe(1);
+      expect(readLedgerFromGit({ board: other, repo: REPO }).records).toHaveLength(1);
+    });
+  });
+
+  it('sync helper contains throws and async read contains a throwing transport seam', async () => {
+    expect(appendGitRowsSync([{}], { repo: REPO })).toMatchObject({ ok: false, appended: 0 });
+    const store = createGitLedgerStore({ readRows: () => { throw new Error('offline'); } });
+    await expect(store.read({ repo: REPO })).resolves.toMatchObject({ status: 'unreadable', error: 'offline' });
   });
 });

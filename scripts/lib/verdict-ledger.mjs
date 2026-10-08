@@ -96,6 +96,7 @@
  * Reads NEVER throw: a blank, unparseable or schema-invalid line is skipped, mirroring `parseJuryLog`.
  */
 
+import { createHash } from 'node:crypto';
 import { isUnderTest } from './under-test.mjs';
 import { appendFileSync, readFileSync, mkdirSync, readdirSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -107,8 +108,8 @@ import { REVIEW_LABELS, hasReviewLabel, acceptanceCoversHead } from './review-es
 import { canonicalizeSlug, CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { reserve, releaseLockDir } from '../readiness/file-locks.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
-import { createGitLedgerStore } from './verdict-ledger-io.mjs';
-import { registerLedgerStore, getLedgerStore } from './verdict-ledger-store.mjs';
+import { createGitLedgerStore, appendGitRowsSync } from './verdict-ledger-io.mjs';
+import { registerLedgerStore, getLedgerStore, describeLedgerStore } from './verdict-ledger-store.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // SCHEMA
@@ -302,6 +303,7 @@ export const ACTOR_PROVES = 'sanctioned-path';
 
 /**
  * @typedef {Object} VerdictRecord
+ * @property {string} [id] - Idempotency key; legacy rows omit it. New writes stamp {@link ledgerEventId}.
  * @property {number} v - {@link VERDICT_LEDGER_VERSION}.
  * @property {string} kind - {@link VERDICT_LEDGER_KIND}.
  * @property {string} at - ISO-8601 write time (INJECTED — the pure builder never reads a clock).
@@ -435,6 +437,7 @@ export function validateVerdictRecord(raw) {
     return { valid: false, errors: ['not an object'], record: null };
   }
   if (!Number.isInteger(raw.v) || raw.v < 1) errors.push(`bad \`v\`: ${JSON.stringify(raw.v)}`);
+  if ('id' in raw && (typeof raw.id !== 'string' || !/^[A-Za-z0-9:._-]{8,128}$/.test(raw.id))) errors.push('bad `id`: expected 8–128 event-id characters');
   if (raw.kind !== VERDICT_LEDGER_KIND) errors.push(`bad \`kind\`: ${JSON.stringify(raw.kind)}`);
   if (typeof raw.repo !== 'string' || !REPO_RE.test(raw.repo)) errors.push(`bad \`repo\`: ${JSON.stringify(raw.repo)}`);
   if (!Number.isInteger(raw.pr) || raw.pr <= 0) errors.push(`bad \`pr\`: ${JSON.stringify(raw.pr)}`);
@@ -479,6 +482,7 @@ export function validateVerdictRecord(raw) {
   if (Number.isInteger(raw.findingCount) && raw.findingCount >= 0) record.findingCount = raw.findingCount;
   if (raw.unlocked === true) record.unlocked = true;
   if (shadow) Object.assign(record, { mode: 'shadow', wouldClear: raw.wouldClear, applied: false, mutated: false });
+  if ('id' in raw) record.id = raw.id;
   return { valid: true, errors: [], record };
 }
 
@@ -661,6 +665,7 @@ export function validateLedgerEvent(raw) {
   if (!spec) return { valid: false, errors: [`bad \`type\`: ${JSON.stringify(raw.type)}`], record: null };
   const errors = [];
   if (!Number.isInteger(raw.v) || raw.v < LEDGER_EVENT_VERSION) errors.push(`bad \`v\`: ${JSON.stringify(raw.v)}`);
+  if ('id' in raw && (typeof raw.id !== 'string' || !/^[A-Za-z0-9:._-]{8,128}$/.test(raw.id))) errors.push('bad `id`: expected 8–128 event-id characters');
   if (raw.kind !== VERDICT_LEDGER_KIND) errors.push(`bad \`kind\`: ${JSON.stringify(raw.kind)}`);
   if (typeof raw.repo !== 'string' || !REPO_RE.test(raw.repo)) errors.push(`bad \`repo\`: ${JSON.stringify(raw.repo)}`);
   if (!Number.isInteger(raw.pr) || raw.pr <= 0) errors.push(`bad \`pr\`: ${JSON.stringify(raw.pr)}`);
@@ -689,6 +694,7 @@ export function validateLedgerEvent(raw) {
     source: oneLine(raw.source, 64),
     writer: typeof raw.writer === 'string' ? raw.writer : '',
   };
+  if ('id' in raw) record.id = raw.id;
   return { valid: true, errors: [], record };
 }
 
@@ -703,12 +709,29 @@ export function serializeLedgerEvent(raw) {
   return { ok: true, line: JSON.stringify(record), record, errors: [] };
 }
 
+/** Event identity: explicit id, or SHA-256 of the normalized, recursively key-sorted event.
+ * Legacy rows have the same identity as their newly stamped copies. Lock diagnostics are not identity. */
+export function ledgerEventId(row) {
+  const v = validateLedgerEvent(row);
+  if (!v.valid) throw new TypeError(`invalid ledger event: ${v.errors.join('; ')}`);
+  if (v.record.id) return v.record.id;
+  const { id: _id, unlocked: _unlocked, ...record } = v.record;
+  const canonical = (value) => {
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
+    }
+    return value;
+  };
+  return `sha256:${createHash('sha256').update(JSON.stringify(canonical(record))).digest('hex')}`;
+}
+
 /**
  * The store contract's pre-write check, shared by every adapter (card xsij7u6): `rows` is a non-empty array, every
  * row is valid AS GIVEN (a row's own identity is never repaired from `ctx.repo`), and every row belongs to the ONE
  * repo the call names. `ctxRepo` names it; with none, the first row does. A missing, malformed or different repo
  * refuses the whole call, so no store ever files a row under a repo it does not carry.
- * @returns {{ok: true, repo: string, lines: string[], records: object[]} | {ok: false, error: string}}
+ * @returns {{ok: true, repo: string, lines: string[], records: object[], ids: string[]} | {ok: false, error: string}}
  */
 export function checkLedgerAppendRows(rows, ctxRepo) {
   if (!Array.isArray(rows) || !rows.length) return { ok: false, error: '`rows` must be a non-empty array' };
@@ -721,13 +744,14 @@ export function checkLedgerAppendRows(rows, ctxRepo) {
   for (const r of rows) {
     const s = serializeLedgerEvent(r);
     if (!s.ok) return refuse(s.errors.join('; '));
-    lines.push(s.line);
-    records.push(s.record);
+    const record = { ...s.record, id: ledgerEventId(s.record) };
+    lines.push(JSON.stringify(record));
+    records.push(record);
   }
   const repo = ctxRepo ?? records[0].repo;
   const stray = records.find((r) => r.repo !== repo);
   if (stray) return refuse(`row repo ${JSON.stringify(stray.repo)} does not match the call's repo ${JSON.stringify(repo)}`);
-  return { ok: true, repo, lines, records };
+  return { ok: true, repo, lines, records, ids: records.map((r) => r.id) };
 }
 
 /** Parse a ledger's TEXT into normalized events of every type, in append order. Tolerant, never throws.
@@ -1118,7 +1142,7 @@ function eventLabel(row) {
  *
  * STORE (`verdictLedger.store`): `home` writes only the machine-local file; `dual` (default) writes home AND the git
  * transport via `verdict-ledger-io.mjs`; `git` writes git only. A git write miss follows the ratified F4 posture
- * (see `finishGitMiss` / `refuseClearingOnGitMiss`): never silent. Reads are unchanged (home).
+ * (see `finishGitMiss` / `refuseClearingOnGitMiss`): never silent. Report readers pick their store separately (`verdictLedger.readStore`, default `git`).
  *
  * THE BOARD (the checkout whose `origin` owns the `ops/review-requests` transport branch) resolves, in order, from
  * `opts.board`, env `WE_VERDICT_LEDGER_BOARD`, then {@link resolveLedgerBoard}: a checkout (this one, then the
@@ -1127,8 +1151,8 @@ function eventLabel(row) {
  * the board of (a sibling repo) has NO board; the UNCONFIGURED default then stays `home` (one loud notice per
  * process) rather than miss on every call. A store NAMED by the operator (`opts.store` / env
  * `WE_VERDICT_LEDGER_STORE`) is honoured as written: `dual`/`git` with no board is a loud miss, never a silent
- * downgrade. `git` is for the read-slice cut-over only: every reader still reads home, so a git-only row is
- * invisible to the fold until readers move (each `git` write says so on stderr).
+ * downgrade. `git` writes the shared store only: the report readers (`readLedgerEventsFromStore`, default `git`) see it;
+ * the home-only sync readers still used by review-pr (`foldRepo`, `readVerdictLedger`) do not (each `git` write says so).
  *
  * ORDER OF WRITES FOLLOWS WHAT THE ROW CAN DO (F4, `#verdict-ledger-pr-state-store` rule 4). Home is the row every
  * reader folds, so a home row IS authoritative the moment it exists:
@@ -1140,11 +1164,80 @@ function eventLabel(row) {
  *
  * `opts.env` governs store, board and test-mode only; the home directory still reads `process.env`.
  *
+ * Synchronous compatibility entry point: uses sync primitives, never async store methods.
+ * Plugged stores must use {@link appendVerdictAsync}.
+ *
  * @param {VerdictRecord} record - from {@link buildVerdictRecord}.
  * @param {{store?: string, board?: string, boardRoot?: string, originRepo?: Function, env?: object, gitAppend?: Function, homeAppend?: Function, warn?: Function}} [opts] - test seams.
  * @returns {{ok: boolean, path: string|null, record: VerdictRecord|null, locked: boolean, errors: string[]}}
  */
 export function appendVerdict(record, opts = {}) {
+  const plan = verdictWritePlan(record, opts);
+  let step = plan.next();
+  while (!step.done) {
+    const op = step.value;
+    let result;
+    if (op.name === 'home') {
+      try { result = (opts.homeAppend ?? appendVerdictHome)(op.record); }
+      catch (e) { result = homeWriteFailure(e); }
+    } else if (op.name === 'git') {
+      result = op.board ? appendGitRowsSync([op.record], { board: op.board, repo: op.record.repo },
+        opts.gitAppend ? { appendRows: opts.gitAppend } : undefined) : noBoardWriteMiss();
+    } else {
+      result = { ok: false, appended: 0, error: `plugged store ${op.name} is async; use appendVerdictAsync` };
+    }
+    step = plan.next(result);
+  }
+  return step.value;
+}
+
+/** Async entry point with the identical F4 policy, using store contracts for every built-in and plugged store. */
+export async function appendVerdictAsync(record, opts = {}) {
+  const plan = verdictWritePlan(record, opts);
+  let step = plan.next();
+  while (!step.done) {
+    const op = step.value;
+    let result;
+    try {
+      if (op.name === 'home') {
+        if (opts.homeAppend) result = await opts.homeAppend(op.record);
+        else {
+          // Preserve the sync home's receipt (path, lock status, validation errors) across the contract adapter.
+          let receipt;
+          const a = await getLedgerStore('home').append([op.record], {
+            repo: op.record?.repo, onAppend: (r) => { receipt = r; },
+          });
+          result = receipt ?? { ok: a.ok, path: null, record: null, locked: false, errors: a.ok ? [] : [a.error] };
+        }
+      } else if (op.name === 'git' && !op.board) result = noBoardWriteMiss();
+      else {
+        const store = op.name === 'git' && opts.gitAppend
+          ? createGitLedgerStore({ appendRows: opts.gitAppend }) : getLedgerStore(op.name);
+        result = await store.append([op.record], { board: op.board, repo: op.record.repo });
+      }
+    } catch (e) {
+      result = op.name === 'home' ? homeWriteFailure(e) : { ok: false, appended: 0, error: errFirstLine(e) };
+    }
+    step = plan.next(result);
+  }
+  return step.value;
+}
+
+function homeWriteFailure(e) {
+  return { ok: false, path: null, record: null, locked: false, errors: [`home ledger write failed: ${errFirstLine(e)}`] };
+}
+
+function noBoardWriteMiss() {
+  return { ok: false, appended: 0, error: 'no git board configured (set WE_VERDICT_LEDGER_BOARD or pass opts.board)' };
+}
+
+function* writeRemote(name, record, board) {
+  const a = yield { name, record, board };
+  return a.ok ? { status: 'appended' } : { status: 'miss', error: a.error };
+}
+
+/** One source of truth for store selection, operation ordering and F4 write-miss policy. */
+function* verdictWritePlan(record, opts = {}) {
   const env = opts.env ?? process.env;
   const loud = opts.warn ?? ((m) => process.stderr.write(`${m}\n`));
   // One derivation of the store AND whether the operator named it, so the two can never disagree.
@@ -1157,55 +1250,41 @@ export function appendVerdict(record, opts = {}) {
     store = 'home';
     warnDowngradeOnce(loud);
   }
-  // The git store comes from the registry; a test seam (`opts.gitAppend`) swaps only its append.
-  const gitStore = opts.gitAppend ? createGitLedgerStore({ appendRows: opts.gitAppend }) : getLedgerStore('git');
-  // A home write that THROWS (bad ledger dir, full disk) is a failed write with a reason, never an escape: every
-  // caller branches on `ok`, and `review-pr-io` has no catch around this call.
-  const rawHome = opts.homeAppend ?? appendVerdictHome;
-  const homeAppend = (r) => {
-    try { return rawHome(r); } catch (e) {
-      return { ok: false, path: null, record: null, locked: false, errors: [`home ledger write failed: ${errFirstLine(e)}`] };
-    }
-  };
-  const writeGit = (normalized) => {
-    if (!board) return { status: 'miss', error: 'no git board configured (set WE_VERDICT_LEDGER_BOARD or pass opts.board)' };
-    const a = gitStore.append([normalized], { board, repo: normalized.repo });
-    return a.ok ? { status: 'appended' } : { status: 'miss', error: a.error };
-  };
-  if (store === 'home') return { ...homeAppend(record), store };
   // Validate first: an invalid record is refused and nothing is written anywhere.
   const v = serializeLedgerEvent(record);
   if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
+  if (store === 'home') return { ...(yield { name: 'home', record }), store };
+  v.record.id = ledgerEventId(v.record);
   const clears = eventClears(v.record);
   if (!VERDICT_LEDGER_STORES.includes(store)) {
     // A store PLUGGED in through the registry (e.g. a product store): one contract append, F4 posture on a miss.
-    const a = getLedgerStore(store).append([v.record], { board, repo: v.record.repo });
+    const a = (yield { name: store, record: v.record, board });
     if (a.ok) return { ok: true, path: null, record: v.record, locked: false, errors: [], store };
     const g = { status: 'miss', error: a.error };
     if (clears) return refuseClearingOnGitMiss({ g, store, loud, record: v.record });
-    return finishGitMiss({ home: homeAppend(record), g, store, loud, record: v.record });
+    return finishGitMiss({ home: (yield { name: 'home', record }), g, store, loud, record: v.record });
   }
   if (store === 'git') {
-    const g = writeGit(v.record);
+    const g = (yield* writeRemote('git', v.record, board));
     if (g.status === 'appended') {
-      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} ${eventLabel(v.record)} to the git transport ONLY — readers still read home, so the fold does not see this row until the read slice lands (use store=dual)`);
+      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} ${eventLabel(v.record)} to the git transport ONLY — store readers see it; the home-only readers (review-pr's foldRepo) do not (use store=dual)`);
       return { ok: true, path: null, record: v.record, locked: false, errors: [], store, git: g };
     }
     // A clearing verdict that missed git writes NO home row (see the header). A holding one spills to home so the
     // hold is never dropped; a failed spill is reported with its reason alongside the git miss.
     if (clears) return refuseClearingOnGitMiss({ g, store, loud, record: v.record });
-    return finishGitMiss({ home: homeAppend(record), g, store, loud, record: v.record });
+    return finishGitMiss({ home: (yield { name: 'home', record }), g, store, loud, record: v.record });
   }
   if (clears) {
     // CLEARING, dual: git first, home only once git succeeded.
-    const g = writeGit(v.record);
+    const g = (yield* writeRemote('git', v.record, board));
     if (g.status !== 'appended') return refuseClearingOnGitMiss({ g, store, loud, record: v.record });
-    return { ...homeAppend(record), store, git: g };
+    return { ...(yield { name: 'home', record }), store, git: g };
   }
   // HOLDING, dual: home first (fail safe), then git.
-  const home = homeAppend(record);
+  const home = (yield { name: 'home', record });
   if (!home.ok) return { ...home, store };
-  const g = writeGit(home.record);
+  const g = (yield* writeRemote('git', home.record, board));
   if (g.status === 'appended') return { ...home, store, git: g };
   return finishGitMiss({ home, g, store, loud, record: home.record });
 }
@@ -1314,6 +1393,52 @@ export function resolveLedgerStore(explicit, env = process.env) {
   return resolveLedgerStoreChoice(explicit, env).store;
 }
 
+/** `verdictLedger.readStore`, mirrored from config/platformDefaults.ts; independent of the write setting. */
+export const DEFAULT_VERDICT_LEDGER_READ_STORE = 'git';
+
+/** Select any registered name. Unconfigured tests stay local; production reads the shared git store. */
+export function resolveLedgerReadStore(explicit, env = process.env) {
+  const name = String(explicit ?? env.WE_VERDICT_LEDGER_READ_STORE ?? '').trim().toLowerCase();
+  if (getLedgerStore(name)) return name;
+  return isUnderTest(env) ? 'home' : DEFAULT_VERDICT_LEDGER_READ_STORE;
+}
+
+/**
+ * Read one repo through the configured registry store. Never throws or silently falls back to home.
+ * An explicit unknown override is an error; the setting resolver supplies defaults only when no override is given.
+ * Store-specific options (board, run, from, etc.) pass through to read().
+ * @returns {Promise<{status: 'ok', rows: object[], store: object} | {status: 'unreadable', reason: string, error: string, store: object}>}
+ */
+export async function readLedgerEventsFromStore(repo, opts = {}) {
+  let descriptor = { name: 'unknown' };
+  try {
+    const env = opts.env ?? process.env;
+    const name = opts.store == null ? resolveLedgerReadStore(undefined, env) : String(opts.store).trim().toLowerCase();
+    descriptor = { name };
+    const store = getLedgerStore(name);
+    if (!store) return { status: 'unreadable', reason: 'unknown-store', error: `no registered ledger store named ${name}`, store: descriptor };
+    descriptor = describeLedgerStore(store);
+    const range = { ...opts, repo };
+    if (name === 'git') {
+      range.board = resolveLedgerBoard(repo, opts, env);
+      if (!range.board) return { status: 'unreadable', reason: 'no-board', error: `no git board configured for ${repo}`, store: descriptor };
+    }
+    const result = await store.read(range);
+    if (result.status === 'ok' && Array.isArray(result.rows)) return { status: 'ok', rows: result.rows, store: descriptor };
+    return { status: 'unreadable', reason: result.reason ?? 'store-read-failed', error: result.error ?? 'store returned no readable rows', store: descriptor };
+  } catch (e) {
+    return { status: 'unreadable', reason: 'store-read-failed', error: errFirstLine(e), store: descriptor };
+  }
+}
+
+/** Fold only verdict events, restoring the home-only fold's record shape (without the event type). */
+export async function foldRepoFromStore(repo, opts = {}) {
+  const result = await readLedgerEventsFromStore(repo, opts);
+  if (result.status !== 'ok') return result;
+  const verdicts = result.rows.filter((r) => r.type === 'verdict').map(({ type: _type, ...record }) => record);
+  return { ...result, folded: foldVerdictLedger(verdicts) };
+}
+
 /** First line of an error, capped, so a hostile or huge message cannot flood the result or stderr. */
 function errFirstLine(e) {
   return String(e?.message ?? e).split('\n')[0].slice(0, 300);
@@ -1343,11 +1468,18 @@ function appendVerdictHome(record, { appendFile = appendFileSync } = {}) {
 
   try {
     const raw = locked ? record : { ...record, unlocked: true };
-    const { ok, line, record: normalized, errors } = serializeLedgerEvent(raw);
+    const { ok, record: normalized, errors } = serializeLedgerEvent(raw);
     if (!ok) return { ok: false, path: null, record: null, locked, errors };
     const path = verdictLedgerPath(record.repo);
+    normalized.id = ledgerEventId(normalized);
+    let existing;
+    try { existing = readFileSync(path, 'utf8'); }
+    catch (e) { if (e?.code !== 'ENOENT') throw e; existing = ''; }
+    if (parseLedgerEvents(existing).some((row) => ledgerEventId(row) === normalized.id)) {
+      return { ok: true, path, record: normalized, locked, errors: [], duplicate: true };
+    }
     mkdirSync(dirname(path), { recursive: true });
-    appendFile(path, `${line}\n`, 'utf8');
+    appendFile(path, `${JSON.stringify(normalized)}\n`, 'utf8');
     return { ok: true, path, record: normalized, locked, errors: [] };
   } finally {
     if (locked) { try { releaseLockDir(lockRoot, VERDICT_LEDGER_LOCK_PATH); } catch { /* TTL reclaims it */ } }
@@ -1358,47 +1490,60 @@ function appendVerdictHome(record, { appendFile = appendFileSync } = {}) {
  * The home-file store as a contract adapter (card xsij7u6). `append` wraps {@link appendVerdictHome} (locked, one
  * line per row); `read` answers `unreadable` for any failure except a file that is simply absent. The legacy
  * {@link readVerdictLedger} is unchanged, so every existing reader and the v1 fold are byte-identical.
+ * `ctx.onAppend` receives each home receipt so appendVerdictAsync preserves path/lock/error diagnostics.
  * `ctx.appendFile` is a test seam (default `appendFileSync`) so the conformance suite can fail a write mid-batch.
  */
 export const homeLedgerStore = registerLedgerStore({
   name: 'home',
-  capabilities: { durable: true, shared: false, ordering: 'append' },
-  append(rows, ctx = {}) {
-    const check = checkLedgerAppendRows(rows, ctx?.repo);
-    if (!check.ok) return { ok: false, appended: 0, error: check.error };
+  capabilities: { durable: true, shared: false, ordering: 'append', singleWriter: 'file-lock' },
+  async append(rows, ctx = {}) {
     let appended = 0;
-    for (const r of check.records) {
-      let res;
-      try { res = appendVerdictHome(r, ctx?.appendFile ? { appendFile: ctx.appendFile } : undefined); } catch (e) { res = { ok: false, errors: [errFirstLine(e)] }; }
-      if (!res.ok) return { ok: false, appended, error: (res.errors ?? []).join('; ') || 'home append failed' };
-      appended += 1;
+    let duplicates = 0;
+    try {
+      const check = checkLedgerAppendRows(rows, ctx?.repo);
+      if (!check.ok) return { ok: false, appended: 0, error: check.error };
+      for (const r of check.records) {
+        let res;
+        try { res = appendVerdictHome(r, ctx?.appendFile ? { appendFile: ctx.appendFile } : undefined); }
+        catch (e) { res = homeWriteFailure(e); }
+        if (res.ok) {
+          if (res.duplicate) duplicates += 1;
+          else appended += 1;
+        }
+        ctx?.onAppend?.(res);
+        if (!res.ok) return { ok: false, appended, error: (res.errors ?? []).join('; ') || 'home append failed' };
+      }
+      return { ok: true, appended, duplicates };
+    } catch (e) {
+      return { ok: false, appended, error: errFirstLine(e) };
     }
-    return { ok: true, appended };
   },
-  read({ repo, from = 0 } = {}) {
-    let text;
-    try { text = readFileSync(verdictLedgerPath(repo), 'utf8'); } catch (e) {
+  async read(range = {}) {
+    try {
+      const { repo, from = 0 } = range;
+      const text = readFileSync(verdictLedgerPath(repo), 'utf8');
+      // Placement is not identity: repo names can slug to one file.
+      return { status: 'ok', rows: parseLedgerEvents(text).filter((r) => r.repo === repo).slice(from) };
+    } catch (e) {
       if (e?.code === 'ENOENT') return { status: 'ok', rows: [] };
       return { status: 'unreadable', reason: 'home-read-failed', error: errFirstLine(e) };
     }
-    // Placement is not identity: two repo names can slug to one file, so a row answers only for the repo it carries.
-    return { status: 'ok', rows: parseLedgerEvents(text).filter((r) => r.repo === repo).slice(from) };
   },
 });
 
-/** Read + normalize one repo's ledger. A missing file → `[]`. Never throws. */
+/** Read + normalize one repo's HOME FILE ONLY. A missing file → `[]`. Never throws. */
 export function readVerdictLedger(repo) {
   let text;
   try { text = readFileSync(verdictLedgerPath(repo), 'utf8'); } catch { return []; }
   return parseVerdictLog(text);
 }
 
-/** Read one repo's ledger and fold it. The single call a checker or a Phase-2 gate makes. */
+/** Read and fold one repo's HOME FILE ONLY; retained for synchronous legacy callers. */
 export function foldRepo(repo) {
   return foldVerdictLedger(readVerdictLedger(repo));
 }
 
-/** The repos that have a ledger file. `[]` when none. Never throws. */
+/** The repos that have a HOME FILE ONLY. `[]` when none. Never throws. */
 export function listLedgerRepos() {
   const dir = verdictLedgerDir();
   if (!existsSync(dir)) return [];
@@ -1410,7 +1555,7 @@ export function listLedgerRepos() {
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 // CLI — `show` (fold + print) · `path` (where the file is) · `repos`. Gated on direct invocation.
 // The ledger↔label CHECKER is a separate CLI (`we:scripts/review-ledger-check.mjs`) because it needs `gh`;
-// this module stays offline so the unit suite can import it freely.
+// Importing this module performs no reads; show/shadow-agreement use the configured store only when invoked.
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 function parseFlags(argv) {
@@ -1424,7 +1569,7 @@ function parseFlags(argv) {
   return flags;
 }
 
-function main(argv) {
+async function main(argv) {
   const sub = argv[0];
   const flags = parseFlags(argv.slice(1));
   const repo = typeof flags.repo === 'string' ? flags.repo : '';
@@ -1442,7 +1587,12 @@ function main(argv) {
       process.stderr.write('verdict-ledger shadow-agreement: --repo=<owner/name> is required\n');
       process.exit(2);
     }
-    const summary = summarizeShadowAgreement(readVerdictLedger(repo), {
+    const result = await readLedgerEventsFromStore(repo, { store: flags.store });
+    if (result.status !== 'ok') {
+      process.stderr.write(`verdict-ledger: ledger store ${result.store.name} unreadable (${result.reason}): ${result.error}\n`);
+      return 2;
+    }
+    const summary = summarizeShadowAgreement(result.rows.filter((r) => r.type === 'verdict').map(({ type: _type, ...record }) => record), {
       humanActor: typeof flags['human-actor'] === 'string' ? flags['human-actor'] : '',
     });
     writeAllSync(1, `${JSON.stringify(summary, null, flags.json ? 0 : 2)}\n`);
@@ -1456,7 +1606,12 @@ function main(argv) {
     // `e.current` is NULL-GUARDED (#3329): a PR whose only rows are non-bearing has no live verdict, and a
     // bare `e.current.verdict` would throw on exactly the shape this ledger was widened to hold. The observed
     // count prints alongside so a review that HAPPENED stays visible even though it bears nothing.
-    const folded = [...foldRepo(repo).values()].map((e) => ({
+    const result = await foldRepoFromStore(repo, { store: flags.store });
+    if (result.status !== 'ok') {
+      process.stderr.write(`verdict-ledger: ledger store ${result.store.name} unreadable (${result.reason}): ${result.error}\n`);
+      return 2;
+    }
+    const folded = [...result.folded.values()].map((e) => ({
       pr: e.pr,
       verdict: e.current ? e.current.verdict : null,
       clears: e.clears,
@@ -1471,10 +1626,10 @@ function main(argv) {
     writeAllSync(1, `${JSON.stringify(folded, null, flags.json ? 0 : 2)}\n`);
     process.exit(0);
   }
-  process.stderr.write('usage: verdict-ledger <show --repo=<owner/name> [--json] | shadow-agreement --repo=<owner/name> [--human-actor=<name>] [--json] | path [--repo=…] | repos>\n');
+  process.stderr.write('usage: verdict-ledger <show --repo=<owner/name> [--store=<name>] [--json] | shadow-agreement --repo=<owner/name> [--store=<name>] [--human-actor=<name>] [--json] | path [--repo=…] | repos>\n');
   process.exit(2);
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main(process.argv.slice(2));
+  process.exitCode = await main(process.argv.slice(2));
 }
