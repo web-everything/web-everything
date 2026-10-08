@@ -32,7 +32,7 @@ export const REVERT_RED_FIX_KINDS = Object.freeze(['fix', 'ci-heal']);
 /** A test FILE the runner executes. */
 const TEST_FILE_RE = /\.(?:test|spec)\.[cm]?[jt]sx?$/;
 /** Test SUPPORT (helpers, fixtures) — kept as the fix wrote it, never reverted and never run on its own. */
-const TEST_SUPPORT_RE = /(?:^|\/)(?:__tests__|__fixtures__|fixtures)\//;
+const TEST_SUPPORT_RE = /(?:^|\/)(?:__tests__|__fixtures__|__snapshots__|fixtures)\/|\.snap$/;
 /** Planning artifacts that are never behaviour: cards and agent docs. Kept, never reverted. */
 const INERT_RE = /^(?:backlog|docs)\/|\.md$/;
 
@@ -79,7 +79,8 @@ export function planRevert({ changes = [], maxFiles = 40 } = {}) {
  */
 export function newTestTitles(addedLines = []) {
   const titles = [];
-  const re = /\b(?:it|test)(?:\.(?:only|concurrent|skipIf\([^)]*\)|runIf\([^)]*\)))?\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
+  // Not preceded by `.`, a word character or `$`: `re.test('x')` and `fit(` are not test declarations.
+  const re = /(?<![.\w$])(?:it|test)(?:\.(?:only|concurrent|skipIf\([^)]*\)|runIf\([^)]*\)))?\s*\(\s*(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
   for (const line of Array.isArray(addedLines) ? addedLines : []) {
     for (const m of String(line).matchAll(re)) {
       if (m[1] === '`' && m[2].includes('${')) continue;

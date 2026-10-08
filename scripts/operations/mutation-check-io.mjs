@@ -49,7 +49,7 @@ import { admittedArgv } from '../readiness/heavy-admission.mjs';
  */
 const stripAnsi = (s) => s.replace(/\[[0-9;]*[A-Za-z]/g, '');
 
-export function runSuite({ cwd, suite, run, maxFailures = 20 }) {
+export function runSuite({ cwd, suite, run, maxFailures = 20, timeoutMs = 0 }) {
   let out = '';
   let ok = false;
   // #5466 — a suite may be several test files (the revert-red check runs exactly the files a fix added or changed).
@@ -57,7 +57,8 @@ export function runSuite({ cwd, suite, run, maxFailures = 20 }) {
   try {
     // xaipsbs — through the host admission pool; the wrapper's stdout/stderr/exit code are vitest's own.
     const admitted = admittedArgv('npx', ['vitest', 'run', ...files, '--reporter=basic']);
-    out = String(run(admitted.file, admitted.args, { cwd, encoding: 'utf8' }) ?? '');
+    // #5466 — an optional ceiling: a run killed by it produces no summary line, so it reads as `ran: false` (unproven).
+    out = String(run(admitted.file, admitted.args, { cwd, encoding: 'utf8', ...(timeoutMs > 0 ? { timeout: timeoutMs } : {}) }) ?? '');
     ok = true;
   } catch (e) {
     // Non-zero exit is the NORMAL path for a red suite — the output is on the error, and it is the output
@@ -174,6 +175,8 @@ export function createRevertProbe({
   write = (p, s) => writeFileSync(p, s),
   run = execFileSync,
   maxFailures = 200,
+  // A reverted fix for a hang can hang: bounded, so the tree is restored in time rather than by an outer kill.
+  timeoutMs = 10 * 60 * 1000,
 } = {}) {
   return ({ cwd, targets = [], suite = [] }) => {
     const list = Array.isArray(targets) ? targets : [];
@@ -193,7 +196,7 @@ export function createRevertProbe({
         detail: `the working tree no longer holds the fixed content of ${drifted.join(', ')}` };
     }
 
-    const baseline = runSuite({ cwd, suite, run, maxFailures });
+    const baseline = runSuite({ cwd, suite, run, maxFailures, timeoutMs });
     if (!baseline.ran || !baseline.green) {
       return { ...base, applied: false, occurrences: list.length, baselineRan: baseline.ran, baselineGreen: baseline.green,
         restored: true, detail: baseline.detail };
@@ -203,7 +206,7 @@ export function createRevertProbe({
     let mutant = { ran: false, green: false, failures: [], failuresTruncated: false, detail: '' };
     try {
       for (const o of originals) write(o.abs, o.revert);
-      mutant = runSuite({ cwd, suite, run, maxFailures });
+      mutant = runSuite({ cwd, suite, run, maxFailures, timeoutMs });
     } finally {
       restored = true;
       for (const o of originals) {

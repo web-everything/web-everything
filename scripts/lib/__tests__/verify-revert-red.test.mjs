@@ -7,13 +7,14 @@
  * `we:scripts/operations/__tests__/mutation-check-integration.test.mjs` uses).
  */
 import { describe, expect, it } from 'vitest';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import * as realFs from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { withRealRepo } from '../../operations/__tests__/helpers/real-repo.mjs';
 import { createRevertProbe, runSuite } from '../../operations/mutation-check-io.mjs';
-import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ } from '../verify-revert-red.mjs';
+import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ, recoverRevertRed, textOrNull, REVERT_JOURNAL } from '../verify-revert-red.mjs';
 
 const SRC = 'scripts/x/guard.mjs';
 const TEST = 'scripts/x/__tests__/guard.test.mjs';
@@ -84,7 +85,6 @@ describe('revert-red check on a real checkout', () => {
 
   it('a working tree that drifted from the fixed commit is never touched', async () => {
     await withFix(async (ctx) => {
-      const { writeFileSync } = await import('node:fs');
       writeFileSync(join(ctx.root, SRC), 'edited\n');
       const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: createRevertProbe({ run: runner(ctx.root, []) }) });
       expect(v).toMatchObject({ status: 'unproven', reason: 'baseline-unrun' });
@@ -100,6 +100,80 @@ describe('revert-red check on a real checkout', () => {
       ctx.git(['merge', '-q', '--no-edit', 'side']);
       const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'enforce', probe: createRevertProbe({ run: runner(ctx.root, []) }) });
       expect(v).toMatchObject({ status: 'skipped', reason: 'merge-in-range', blocking: false });
+    });
+  });
+
+  it('a restore that fails is reported not-restored and the journal stays; the next run puts the fix back from git', async () => {
+    await withFix(async (ctx) => {
+      let failRestore = true;
+      const write = (p, text) => {
+        if (failRestore && text === FIXED) throw new Error('EIO on restore');
+        realFs.writeFileSync(p, text);
+      };
+      const probe = createRevertProbe({ run: runner(ctx.root, []), write });
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'not-restored' });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(BUGGY);
+      const journal = join(ctx.root, '.git', REVERT_JOURNAL);
+      expect(JSON.parse(readFileSync(journal, 'utf8'))).toMatchObject({ head: ctx.fix, files: [SRC] });
+      failRestore = false;
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true, restored: [SRC] });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED);
+      expect(existsSync(journal)).toBe(false);
+      expect(ctx.porcelain()).toBe('');
+      expect(recoverRevertRed({ checkout: ctx.root })).toEqual({ pending: false, ok: true, restored: [] });
+    });
+  });
+
+  it('a journal naming a path outside the checkout is refused, not followed', async () => {
+    await withFix(async (ctx) => {
+      writeFileSync(join(ctx.root, '.git', REVERT_JOURNAL), JSON.stringify({ head: ctx.fix, files: ['../outside.mjs'] }));
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: false });
+      expect(existsSync(join(ctx.root, '..', 'outside.mjs'))).toBe(false);
+    });
+  });
+
+  it('binary and symlinked sources are never reverted', async () => {
+    await withRealRepo(async (ctx) => {
+      const BIN = 'assets/logo.bin';
+      ctx.commit({ [SRC]: BUGGY, [TEST]: OLD_TEST, [BIN]: 'v1' }, 'base');
+      const base = ctx.head();
+      realFs.mkdirSync(join(ctx.root, 'assets'), { recursive: true });
+      realFs.writeFileSync(join(ctx.root, BIN), Buffer.from([0, 0xff, 0xfe, 1]));
+      ctx.git(['add', BIN]);
+      ctx.commit({ [TEST]: NEW_TEST }, 'fix: binary only');
+      const v = await runRevertRedCheck({ checkout: ctx.root, base, mode: 'enforce', probe: () => { throw new Error('must not run'); } });
+      expect(v).toMatchObject({ status: 'skipped', reason: 'no-source-to-revert', unrevertable: [BIN] });
+      expect(ctx.git(['status', '--porcelain']).trim()).toBe('');
+    });
+    await withRealRepo(async (ctx) => {
+      const LINK = 'scripts/x/link.mjs';
+      ctx.commit({ [SRC]: BUGGY, [TEST]: OLD_TEST }, 'base');
+      realFs.mkdirSync(join(ctx.root, 'scripts/x'), { recursive: true });
+      symlinkSync('guard.mjs', join(ctx.root, LINK));
+      ctx.git(['add', LINK]);
+      ctx.commit({}, 'link');
+      const base = ctx.head();
+      realFs.unlinkSync(join(ctx.root, LINK));
+      symlinkSync('../../README.md', join(ctx.root, LINK));
+      ctx.git(['add', LINK]);
+      ctx.commit({ [TEST]: NEW_TEST }, 'fix: retarget the link');
+      const v = await runRevertRedCheck({ checkout: ctx.root, base, mode: 'enforce', probe: () => { throw new Error('must not run'); } });
+      expect(v).toMatchObject({ status: 'skipped', reason: 'no-source-to-revert', unrevertable: [LINK] });
+    });
+    expect(textOrNull(Buffer.from([0xff, 0x41]))).toBe(null);
+    expect(textOrNull(Buffer.from([0x41, 0x00, 0x42]))).toBe(null); // valid UTF-8, but a NUL byte: binary
+    expect(textOrNull(Buffer.from('plain\n'))).toBe('plain\n');
+  });
+
+  it('a base that is not an ancestor of the head is unproven (blocks in enforce), never skipped', async () => {
+    await withFix(async (ctx) => {
+      ctx.git(['checkout', '-q', '-b', 'other', ctx.base]);
+      ctx.commit({ 'scripts/x/other.mjs': 'y\n' }, 'unrelated');
+      const other = ctx.head();
+      ctx.git(['checkout', '-q', 'main']);
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: other, mode: 'enforce', probe: createRevertProbe({ run: runner(ctx.root, []) }) });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'base-not-ancestor', blocking: true });
     });
   });
 
@@ -126,12 +200,19 @@ describe('the verify-lane entry decides from the fix role\'s own record', () => 
     ['no record (not a fix push)', null, 'not-a-fix-push'],
     ['a delivery record', { kind: 'delivery', sha: 'SELF', ref: 'lane/demo' }, 'not-a-fix-push'],
     ['a fix record for another head', { kind: 'fix', sha: 'a'.repeat(40), ref: 'lane/demo' }, 'fix-record-not-for-this-head'],
-    ['a fix record with an unsafe ref', { kind: 'ci-heal', sha: 'SELF', ref: 'lane/../main' }, 'fix-record-has-no-ref'],
   ])('%s is skipped before any git read', async (_name, record, reason) => {
     await withFix(async (ctx) => {
       const probe = () => { throw new Error('must not run'); };
       const v = await revertRedForVerify({ repo: ctx.root, headSha: ctx.fix, record: record && { ...record, sha: record.sha === 'SELF' ? ctx.fix : record.sha }, settings, probe });
       expect(v).toMatchObject({ status: 'skipped', reason, blocking: false });
+    });
+  });
+
+  it('a fix record with an unsafe ref is unproven (it names no pre-fix base), and nothing runs', async () => {
+    await withFix(async (ctx) => {
+      const v = await revertRedForVerify({ repo: ctx.root, headSha: ctx.fix, record: { kind: 'ci-heal', sha: ctx.fix, ref: 'lane/../main' },
+        settings: { mode: 'enforce' }, probe: () => { throw new Error('must not run'); } });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'fix-record-has-no-ref', blocking: true });
     });
   });
 

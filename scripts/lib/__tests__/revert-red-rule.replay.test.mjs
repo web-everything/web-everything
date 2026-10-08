@@ -58,9 +58,10 @@ describe('revert-red rule — parts', () => {
       { status: 'M', path: 'scripts/a.mjs' }, { status: 'A', path: 'scripts/new.mjs' }, { status: 'D', path: 'scripts/old.mjs' },
       { status: 'M', path: 'scripts/__tests__/a.test.mjs' }, { status: 'A', path: 'scripts/__tests__/b.test.mjs' },
       { status: 'M', path: 'scripts/__tests__/helpers/h.mjs' }, { status: 'M', path: 'backlog/1-x.md' }, { status: 'D', path: 'scripts/__tests__/c.test.mjs' },
+      { status: 'M', path: 'src/__snapshots__/a.test.ts.snap' },
     ] })).toEqual({
       tests: ['scripts/__tests__/a.test.mjs', 'scripts/__tests__/b.test.mjs'], revert: ['scripts/a.mjs'], keptNew: ['scripts/new.mjs'],
-      keptOther: ['backlog/1-x.md', 'scripts/__tests__/c.test.mjs', 'scripts/__tests__/helpers/h.mjs', 'scripts/old.mjs'], tooLarge: false,
+      keptOther: ['backlog/1-x.md', 'scripts/__tests__/c.test.mjs', 'scripts/__tests__/helpers/h.mjs', 'scripts/old.mjs', 'src/__snapshots__/a.test.ts.snap'], tooLarge: false,
     });
   });
 
@@ -73,6 +74,8 @@ describe('revert-red rule — parts', () => {
       '  describe(\'not a test\', () => {',
       '  // it(\'commented\') still counts as text; the runner decides',
       '  expect(fit).toBe(1)',
+      "  if (/x/.test('not a title')) return;",
+      "  fit('focused is not it', () => {})",
     ])).toEqual(['plain title', 'double "quoted"', 'template ok', 'commented']);
   });
 

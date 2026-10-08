@@ -18,8 +18,9 @@
  * IMPURE (git, fs through the injected probe). The decisions are all in `./revert-red-rule.mjs`.
  */
 import { execFileSync } from 'node:child_process';
+import * as nodeFs from 'node:fs';
 import { appendFileSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 import { planRevert, newTestTitles, revertRedVerdict, revertRedGate, formatRevertRed } from './revert-red-rule.mjs';
@@ -27,12 +28,80 @@ import { planRevert, newTestTitles, revertRedVerdict, revertRedGate, formatRever
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
-/** An UNTRIMMED, hardened git runner rooted at `cwd` (file contents must keep their trailing newline). */
+/** An UNTRIMMED, hardened git runner rooted at `cwd` (file contents must keep their trailing newline).
+ *  `{ buffer: true }` returns the raw bytes, so a non-UTF-8 file is detected instead of silently re-encoded. */
 export function hardenedGit(cwd, { exec = execFileSync, env = process.env } = {}) {
   const gitEnv = laneGitHardeningEnv(env);
-  return (args) => String(exec('git', hardenLaneGitArgs(args), {
-    cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv, maxBuffer: GIT_MAX_BUFFER,
-  }));
+  return (args, { buffer = false } = {}) => {
+    const out = exec('git', hardenLaneGitArgs(args), {
+      cwd, ...(buffer ? {} : { encoding: 'utf8' }), stdio: ['ignore', 'pipe', 'pipe'], env: gitEnv, maxBuffer: GIT_MAX_BUFFER,
+    });
+    return buffer ? Buffer.from(out) : String(out);
+  };
+}
+
+/** The bytes as text when they round-trip through UTF-8 exactly and hold no NUL; otherwise `null` (binary: never reverted). */
+export function textOrNull(bytes) {
+  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes ?? ''), 'utf8');
+  if (buf.includes(0)) return null;
+  const text = buf.toString('utf8');
+  return Buffer.from(text, 'utf8').equals(buf) ? text : null;
+}
+
+/**
+ * The revert JOURNAL — written before any file is reverted, removed only after the restore is verified. A run that is
+ * killed between the two (an outer time ceiling, a daemon restart) leaves it behind, and the NEXT verify of the lane
+ * puts the fixed content back from git before it does anything else ({@link recoverRevertRed}).
+ */
+export const REVERT_JOURNAL = '.revert-red-pending.json';
+const journalPath = (run) => join(run(['rev-parse', '--absolute-git-dir']).trim(), REVERT_JOURNAL);
+
+/**
+ * Put back any revert a killed run left behind. Never throws.
+ * @returns {{pending: boolean, ok: boolean, restored: string[], detail?: string}}
+ */
+export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
+  const run = git ?? hardenedGit(checkout);
+  let path;
+  try { path = journalPath(run); } catch { return { pending: false, ok: true, restored: [] }; }
+  let journal;
+  try { journal = JSON.parse(fs.readFileSync(path, 'utf8')); } catch (e) {
+    if (e?.code === 'ENOENT') return { pending: false, ok: true, restored: [] };
+    return { pending: true, ok: false, restored: [], detail: 'unreadable revert journal' };
+  }
+  const head = String(journal?.head ?? '');
+  const files = Array.isArray(journal?.files) ? journal.files.map(String) : [];
+  if (!SHA_RE.test(head)) return { pending: true, ok: false, restored: [], detail: 'revert journal names no head' };
+  const restored = [];
+  try {
+    for (const file of files) {
+      const abs = safeTarget(checkout, file, fs);
+      if (!abs) throw new Error(`unsafe journal path ${JSON.stringify(file)}`);
+      const bytes = run(['show', `${head}:${file}`], { buffer: true });
+      fs.writeFileSync(abs, bytes);
+      if (!Buffer.from(fs.readFileSync(abs)).equals(Buffer.from(bytes))) throw new Error(`re-read of ${file} differs`);
+      restored.push(file);
+    }
+    fs.unlinkSync(path);
+    return { pending: true, ok: true, restored };
+  } catch (e) {
+    return { pending: true, ok: false, restored, detail: String(e?.message ?? e) };
+  }
+}
+
+/**
+ * The absolute path for `target` inside `checkout`, or `null` when it is a symlink or resolves outside the checkout.
+ * The lane is agent-writable: a symlinked file or directory must not turn the revert into a write somewhere else.
+ */
+export function safeTarget(checkout, target, fs = nodeFs) {
+  try {
+    if (typeof target !== 'string' || !target || target.startsWith('/') || target.split('/').includes('..')) return null;
+    const root = fs.realpathSync(checkout);
+    const abs = join(checkout, target);
+    if (fs.lstatSync(abs).isSymbolicLink()) return null;
+    const parent = fs.realpathSync(dirname(abs));
+    return parent === root || parent.startsWith(`${root}${sep}`) ? abs : null;
+  } catch { return null; }
 }
 
 const tryRun = (fn) => { try { return { ok: true, value: fn() }; } catch (error) { return { ok: false, error }; } };
@@ -65,7 +134,7 @@ export function addedLines(diffText) {
  * @param {Function} o.probe    `createRevertProbe(...)`'s returned function.
  * @param {Function} [o.git]    an untrimmed git runner; defaults to {@link hardenedGit}.
  */
-export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, kind = 'fix', recordMatchesHead = true, maxFiles = 40, probe, git } = {}) {
+export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, kind = 'fix', recordMatchesHead = true, maxFiles = 40, probe, git, fs = nodeFs } = {}) {
   const facts = { mode, changeKind: kind, recordMatchesHead };
   // Off / not a fix / wrong head: decided before any git read.
   if (revertRedGate(facts)) {
@@ -73,19 +142,23 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
     return { ...v, base: null, head: null, line: formatRevertRed(v) };
   }
   const run = git ?? hardenedGit(checkout);
+  // A revert a killed run left behind is put back FIRST; if it cannot be, nothing else here runs on that tree.
+  const recovery = recoverRevertRed({ checkout, git: run, fs });
   const fail = (reason) => {
     const v = revertRedVerdict({ ...facts, plan: null, skipReason: '' });
     const out = { ...v, reason, base: null, head: null };
     return { ...out, line: formatRevertRed(out) };
   };
+  if (!recovery.ok) return fail('pending-revert-not-recovered');
   const headSha = tryRun(() => run(['rev-parse', '--verify', `${head}^{commit}`]).trim());
   const baseSha = tryRun(() => run(['rev-parse', '--verify', `${base}^{commit}`]).trim());
   if (!headSha.ok || !SHA_RE.test(headSha.value)) return fail('head-unreadable');
   if (!baseSha.ok || !SHA_RE.test(baseSha.value)) return fail('base-unreadable');
   const finish = (verdict) => ({ ...verdict, base: baseSha.value, head: headSha.value, line: formatRevertRed(verdict) });
   if (baseSha.value === headSha.value) return finish(revertRedVerdict({ ...facts, plan: planRevert({ changes: [] }) }));
+  // Not an ancestor: the record's base does not describe this head. Unproven (blocks in enforce), never skipped.
   if (!tryRun(() => run(['merge-base', '--is-ancestor', baseSha.value, headSha.value])).ok) {
-    return finish(revertRedVerdict({ ...facts, plan: null, skipReason: 'base-not-ancestor' }));
+    return { ...fail('base-not-ancestor'), base: baseSha.value, head: headSha.value };
   }
   // A merge in the range (a fix that merged main to resolve a conflict) brings main's changes into the diff; reverting
   // those would test main, not the fix. Recorded as skipped, never guessed around.
@@ -101,24 +174,41 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
 
   const titles = {};
   const targets = [];
+  const unrevertable = [];
   try {
     for (const file of plan.tests) {
       titles[file] = newTestTitles(addedLines(run(['diff', '-U0', baseSha.value, headSha.value, '--', file])));
     }
     for (const target of plan.revert) {
-      targets.push({ target, fixed: run(['show', `${headSha.value}:${target}`]), revert: run(['show', `${baseSha.value}:${target}`]) });
+      // Text only (binary bytes would not survive a string round trip) and only a real file inside the checkout.
+      const fixed = textOrNull(run(['show', `${headSha.value}:${target}`], { buffer: true }));
+      const revert = textOrNull(run(['show', `${baseSha.value}:${target}`], { buffer: true }));
+      if (fixed === null || revert === null || !safeTarget(checkout, target, fs)) unrevertable.push(target);
+      else targets.push({ target, fixed, revert });
     }
   } catch {
     return fail('content-unreadable');
+  }
+  const runPlan = { ...plan, revert: targets.map((t) => t.target), unrevertable };
+  if (targets.length === 0) return finish({ ...revertRedVerdict({ ...facts, plan: runPlan }), unrevertable });
+
+  let journal;
+  try {
+    journal = journalPath(run);
+    fs.writeFileSync(journal, `${JSON.stringify({ head: headSha.value, files: runPlan.revert, at: new Date().toISOString() })}\n`);
+  } catch {
+    return fail('journal-unwritable');
   }
   let result;
   try {
     result = await probe({ cwd: checkout, targets, suite: plan.tests.map((f) => `./${f}`) });
   } catch (error) {
     // The probe restores in its own `finally`; an error escaping it still never reads as a pass.
-    return finish(revertRedVerdict({ ...facts, plan, titles, probe: { applied: true, restored: false, detail: String(error?.message ?? error) } }));
+    result = { applied: true, restored: false, detail: String(error?.message ?? error) };
   }
-  return { ...finish(revertRedVerdict({ ...facts, plan, titles, probe: result })), probeDetail: String(result?.detail ?? '') };
+  // The journal goes only once the restore is VERIFIED; otherwise the next verify of this lane restores from git.
+  if (result?.restored === true || result?.applied === false) { try { fs.unlinkSync(journal); } catch { /* already gone */ } }
+  return { ...finish(revertRedVerdict({ ...facts, plan: runPlan, titles, probe: result })), unrevertable, probeDetail: String(result?.detail ?? '') };
 }
 
 /**
@@ -141,7 +231,8 @@ export async function revertRedForVerify({ repo, headSha, record, settings = {},
     return { ...v, base: null, head: headSha ?? null, line: formatRevertRed(v) };
   }
   if (!ref) {
-    const v = revertRedVerdict({ ...facts, plan: null, skipReason: 'fix-record-has-no-ref' });
+    // A fix record with no usable ref names no pre-fix base: unproven (blocks in enforce), never skipped.
+    const v = { ...revertRedVerdict({ ...facts, plan: null }), reason: 'fix-record-has-no-ref' };
     return { ...v, base: null, head: headSha, line: formatRevertRed(v) };
   }
   return runRevertRedCheck({
