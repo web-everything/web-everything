@@ -15,10 +15,10 @@ Slice S5 of #5399 (ruled 2026-10-08, Forks 4b and 5b): the review read looks up 
 
 ## Acceptance
 
-- [A1] **Executable** — a `review-pr` mandate test shows a PR whose card has `[A#]` lines carries them, with ids, inside the correctness juror's fenced goal block and in no other lens's; a PR with no resolvable card keeps the title-only goal.
+- [A1] **Executable** — a `review-pr` mandate test shows a PR whose card has `[A#]` lines carries them, with ids, inside the correctness juror's fenced goal block and in no other lens's; a build PR with no resolvable card id, or whose branch or title names a different (easier) card than the one it edits, is marked `unverified against task agreement` in the review output instead of silently keeping the plain title-only goal; the mismatch case is a `review-pr` mandate test with an unresolvable lane branch and a branch that names a sibling card.
 - [A2] **Executable** — a test shows a build PR that edits its own card's `## Acceptance` or `## Non-goals` is flagged, and the juror reads the `main` copy; a prepare PR is exempt.
 - [A3] **Observable** — correctness findings cite the `A#`/`N#` id they judge; a missing Acceptance line or a built Non-goal blocks, while other findings keep the existing three-question disposition.
-- [A4] **Executable** — a `review-pr` mandate test shows an unreadable or missing card gives "no card" with a logged reason and the title-only goal, never an empty list read as agreed; and a PR that names its card by hash (`bornAs`) and one that names it by NNN resolve to the same card and the same lines. A card line holding a fence marker, a heading or an instruction-shaped sentence stays inside the fenced goal block as text.
+- [A4] **Executable** — a `review-pr` mandate test shows an unreadable or missing card gives "no card" with a logged reason, the title-only goal and the `unverified against task agreement` mark, never an empty list read as agreed; and a PR that names its card by hash (`bornAs`) and one that names it by NNN resolve to the same card and the same lines. A card line holding a fence marker, a heading or an instruction-shaped sentence stays inside the fenced goal block as text.
 
 ## Non-goals
 

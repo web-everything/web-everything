@@ -186,7 +186,7 @@ Screen: clear — whether a diff with a regression can land once it meets the li
 
 - Order: nearest-to-build first, by the dispatch/readiness rank (prepared stories first, then the rest by rank).
 - Skip any card that is `active`, held by an open PR or a registered scope (the free-scope check), or that already has a filled, non-draft `## Acceptance` and `## Non-goals`. An existing `## Done when` is renamed to `## Acceptance` and its lines get `[A#]` ids; its meaning is not changed.
-- Every section the refresh writes carries a draft marker that the S1 reader exposes (for example `<!-- task-agreement: draft -->` under the heading). Under `enforce`, S4 treats a draft section as not agreed, and the prepare agent confirms it by removing the marker after checking it against the code.
+- Every section the refresh writes carries a draft marker that the S1 reader exposes. The marker is a visible line, never an HTML comment: the first non-blank line under the heading is `Draft: model-written, not yet confirmed.` `prepareCardStatus` strips `<!--…-->` comments before it reads sections, so a comment marker would be invisible to the S4 gate and would fail open. Under `enforce`, S4 treats a draft section as not agreed, and the prepare agent confirms it by removing the marker line after checking it against the code.
 - Sonnet writes each card's sections. Haiku 5.5 checks only the shape (headings present, `[A#]`/`[N#]` ids, no `TODO`, `n/a: <why>` used correctly) and sends a failing card back once; a second failure leaves the card untouched and logged.
 - About 50 cards per PR, each PR through `open-pr` and the normal review.
 - S2 waits for S7, so a card that switches to `## Acceptance` does not lose the provenance escape or the Must-cite check.
