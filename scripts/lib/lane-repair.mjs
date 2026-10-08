@@ -380,8 +380,8 @@ function provenCleanTree(dir) {
 
 /**
  * Does the clone hold work that exists NOWHERE else? A re-clone checks out the remote branch, so a local commit that no
- * remote-tracking ref contains would drop out of the active checkout. Fails CLOSED: a stash, a local branch (or a
- * detached HEAD) with a commit no `refs/remotes/*` ref reaches, or any git failure while proving it, is "not safe".
+ * remote-tracking ref contains would drop out of the active checkout. Fails CLOSED: a stash, any local ref (branch, tag,
+ * notes, ...) or a detached HEAD with a commit no `refs/remotes/*` ref reaches, or any git failure while proving it, is "not safe".
  * A ref whose commit object is already gone has nothing left to lose and is skipped. When older history is damaged,
  * only a ref that equals (or is cleanly reachable from) a remote-tracking ref can be proven pushed.
  * @returns {{safe:boolean, why?:string}}
@@ -391,12 +391,17 @@ function unpushedWork(dir, headSha) {
   const stash = runGit(['rev-parse', '--verify', '-q', 'refs/stash'], dir);
   if (stash.failed) return { safe: false, why: 'could not probe for a stash' };
   if (stash.code === 0) return { safe: false, why: 'it holds a stash (local work not on any remote)' };
-  const heads = runGit(['for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads'], dir);
-  if (heads.code !== 0) return { safe: false, why: `could not list local branches (${heads.err.trim().split('\n')[0] || `exit ${heads.code}`})` };
+  // EVERY local ref except the remote-tracking baseline (and the stash, probed above): branches, tags (lightweight or
+  // annotated; `^{commit}` below peels them), notes, custom namespaces. Any one of them can be the only thing keeping an
+  // unpushed commit alive once the branch that made it is gone.
+  const heads = runGit(['for-each-ref', '--format=%(objectname) %(refname)'], dir);
+  if (heads.code !== 0) return { safe: false, why: `could not list local refs (${heads.err.trim().split('\n')[0] || `exit ${heads.code}`})` };
   const tips = new Map(); // sha -> label
   for (const line of heads.out.split('\n').map((l) => l.trim()).filter(Boolean)) {
     const i = line.indexOf(' ');
-    tips.set(line.slice(0, i), line.slice(i + 1));
+    const ref = line.slice(i + 1);
+    if (ref.startsWith('refs/remotes/') || ref === 'refs/stash') continue;
+    tips.set(line.slice(0, i), ref);
   }
   if (headSha && !tips.has(headSha)) tips.set(headSha, 'HEAD');
   for (const [sha, label] of tips) {
@@ -414,9 +419,9 @@ function unpushedWork(dir, headSha) {
 
 /** Does THIS process hold the daemon-clone WRITE lock on `dir`? Moving a clone's root out from under a sibling reader
  *  or a child session's cwd is exactly what the #4044 lock exists to prevent, so a re-clone requires this proof. */
-export function holdsCloneWriteLock(dir) {
+export function holdsCloneWriteLock(dir, { lockRoot } = {}) {
   try {
-    const snap = inspectCloneLock(dir);
+    const snap = inspectCloneLock(dir, lockRoot ? { lockRoot } : {});
     return Boolean(snap.writer && snap.writerLive && snap.writer.owner === defaultOwner());
   } catch { return false; }
 }

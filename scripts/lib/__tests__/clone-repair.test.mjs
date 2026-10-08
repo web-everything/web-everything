@@ -58,6 +58,17 @@ describe('repairCloneRefs', () => {
     expect(r.quarantinedTo).toBeUndefined(); // dangling non-remote refs alone never trigger a re-clone
   });
 
+  it('NEVER re-clones over a dangling local branch or tag, even for a caller that is authorized to re-clone', () => {
+    plant('refs/heads/precious'); plant('refs/tags/v0');
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(existsSync(join(tmp, '.quarantine'))).toBe(false);
+    expect(r.reported.some((x) => x.startsWith('refs/heads/precious'))).toBe(true);
+    expect(r.reported.some((x) => x.startsWith('refs/tags/v0'))).toBe(true);
+    expect(existsSync(join(clone, '.git/refs/heads/precious'))).toBe(true);
+    expect(existsSync(join(clone, '.git/refs/tags/v0'))).toBe(true);
+  });
+
   it('heals a stale commit-graph that makes fsck fail even with healthy refs', () => {
     g(clone, 'commit-graph', 'write', '--reachable');
     const gp = join(clone, '.git/objects/info/commit-graph');
@@ -208,6 +219,51 @@ describe('re-clone safety (review round 2)', () => {
     expect(r.quarantinedTo).toBeUndefined();
     expect(r.ok).toBe(false);
     expect(g(clone, 'rev-parse', '--verify', 'side')).toBeTruthy();
+  });
+
+  it('refuses when a local TAG is the only reference to unpushed work (pushed HEAD, damaged older history)', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const parent = g(clone, 'rev-parse', 'HEAD~1');
+    g(clone, 'checkout', '-q', '-b', 'side'); writeFileSync(join(clone, 'c.txt'), 'c'); g(clone, 'add', 'c.txt'); g(clone, 'commit', '-qm', 'three');
+    const three = g(clone, 'rev-parse', 'HEAD');
+    g(clone, 'tag', 'keep-me'); g(clone, 'checkout', '-q', 'main'); g(clone, 'branch', '-D', 'side');
+    loseObject(parent);
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(tmp, '.quarantine'))).toBe(false);
+    expect(g(clone, 'rev-parse', 'keep-me^{commit}')).toBe(three);
+  });
+
+  it('refuses when an ANNOTATED local tag is the only reference to unpushed work', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const parent = g(clone, 'rev-parse', 'HEAD~1');
+    g(clone, 'checkout', '-q', '-b', 'side'); writeFileSync(join(clone, 'c.txt'), 'c'); g(clone, 'add', 'c.txt'); g(clone, 'commit', '-qm', 'three');
+    g(clone, 'tag', '-a', 'keep-annotated', '-m', 'keep'); g(clone, 'checkout', '-q', 'main'); g(clone, 'branch', '-D', 'side');
+    loseObject(parent);
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(r.ok).toBe(false);
+  });
+
+  it('refuses when a ref in a CUSTOM namespace is the only reference to unpushed work', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const parent = g(clone, 'rev-parse', 'HEAD~1');
+    g(clone, 'checkout', '-q', '-b', 'side'); writeFileSync(join(clone, 'c.txt'), 'c'); g(clone, 'add', 'c.txt'); g(clone, 'commit', '-qm', 'three');
+    g(clone, 'update-ref', 'refs/backup/three', 'HEAD'); g(clone, 'checkout', '-q', 'main'); g(clone, 'branch', '-D', 'side');
+    loseObject(parent);
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.quarantinedTo).toBeUndefined();
+    expect(r.ok).toBe(false);
+  });
+
+  it('does not over-refuse for a tag that only names already-pushed work', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    g(clone, 'tag', 'v1');
+    loseObject(g(clone, 'rev-parse', 'HEAD~1'));
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.ok).toBe(true);
+    expect(r.quarantinedTo).toBeTruthy();
   });
 
   it('refuses when the clone holds a stash', () => {
@@ -445,5 +501,33 @@ describe('every daemon fetch site repairs first', () => {
     ['scripts/lib/daemon-self-sync.mjs', /export function selfSyncCheckoutPoc\(/],
   ])('%s %s', (file, re) => {
     expect(repairsBeforeFetch(body(file, re))).toBe(true);
+  });
+});
+
+// Review round 3 (#4402): a re-clone mid-tick replaces the checkout, so every snapshot the tick took of the OLD clone
+// (prevHead, the adoption state) is stale. The tick must end there and re-plan from the fresh clone on the next one.
+describe('prepareRebuild after a mid-tick re-clone', () => {
+  it('ends the tick with clone-recloned instead of planning from the old clone\'s HEAD', async () => {
+    const { rebuildClone, readRebuildState } = await import('../daemon-rebuild.mjs');
+    // one (pushed) -> two (pushed = origin/main) -> the daemon's own local overlay MERGE of a pushed lane ref (= HEAD).
+    // Losing `one` damages history below the remote tip, so the repair re-clones; the fresh clone is plain origin/main.
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    const one = g(clone, 'rev-parse', 'HEAD~1');
+    g(clone, 'checkout', '-q', '-b', 'ov'); writeFileSync(join(clone, 'c.txt'), 'c'); g(clone, 'add', 'c.txt'); g(clone, 'commit', '-qm', 'overlay work');
+    g(clone, 'push', '-q', 'origin', 'ov:refs/heads/lane/ov'); g(clone, 'checkout', '-q', 'main'); g(clone, 'branch', '-D', 'ov');
+    g(clone, '-c', 'user.email=daemon-rebuild@localhost', 'merge', '-q', '--no-ff', '-m', 'daemon-rebuild: merge overlay x', 'refs/remotes/origin/lane/ov');
+    const overlayHead = g(clone, 'rev-parse', 'HEAD');
+    rmSync(join(clone, '.git/objects', one.slice(0, 2), one.slice(2)), { force: true });
+    const stateDir = join(tmp, 'state'); const lockDir = join(tmp, 'locks'); const overlayDir = join(tmp, 'overlays');
+    for (const d of [stateDir, lockDir, overlayDir]) mkdirSync(d, { recursive: true });
+    const env = { ...process.env, WE_DAEMON_STATE_DIR: stateDir, WE_DAEMON_CLONE_LOCK_ROOT: lockDir, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' };
+    delete env.LANE_POOL_ROOT;
+    const runSmoke = async () => { throw new Error('the tick must end before any candidate is smoked'); };
+    const r = await rebuildClone({ root: clone, env, log: { error() {}, log() {} }, runSmoke, prState: async () => null, lockOpts: { waitMs: 0 } });
+    expect(r.reason).toBe('clone-recloned');
+    expect(r.moved).toBe(false);
+    expect(readdirSync(join(tmp, '.quarantine')).some((n) => !n.startsWith('.'))).toBe(true); // the old clone was kept
+    expect(g(clone, 'rev-parse', 'HEAD')).not.toBe(overlayHead); // the fresh clone is plain origin/main
+    expect(readRebuildState(clone, env)?.adopted ?? null).toBeNull(); // nothing was adopted from the stale snapshot
   });
 });
