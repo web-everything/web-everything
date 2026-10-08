@@ -1,8 +1,9 @@
 /**
  * #5466 — replay fixtures for the revert-red rule (protocol card 5468's shape: facts + settings in, exact verdict out).
  *
- * Two fixtures are REAL: the fix commits of PRs 4441 and 4481 (the 2026-10-08 fixer audit's non-discriminating tests),
- * replayed through the real revert transaction and recorded as facts. The rest are synthetic, one per edge class.
+ * The `replay-*` fixtures are derived from two REAL fix commits, PRs 4441 and 4481 (the 2026-10-08 fixer audit's
+ * non-discriminating tests), replayed through the real revert transaction and recorded as facts; 4441 is also replayed
+ * under `off` and `enforce`. The rest are synthetic, one per edge class.
  */
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -79,9 +80,18 @@ describe('revert-red rule — parts', () => {
     ])).toEqual(['plain title', 'double "quoted"', 'template ok', 'commented']);
   });
 
-  it('splits runner failure lines; a bare file is a load error', () => {
+  it('splits runner failure lines; a bare file is a load error; a bracketed title is kept whole', () => {
     expect(parseFailureLine('a.test.mjs > grp > t')).toMatchObject({ file: 'a.test.mjs', path: ['grp', 't'], loadError: false });
     expect(parseFailureLine('a.test.mjs [ a.test.mjs ]')).toMatchObject({ file: 'a.test.mjs', loadError: true });
+    expect(parseFailureLine('a.test.mjs > handles arrays [1]')).toMatchObject({ raw: 'a.test.mjs > handles arrays [1]', path: ['handles arrays [1]'] });
+  });
+
+  it('a fix that added a source file never flags: the green test may test the new code', () => {
+    const T = 's/__tests__/n.test.mjs';
+    const plan = planRevert({ changes: [{ status: 'M', path: 's/a.mjs' }, { status: 'A', path: 's/new.mjs' }, { status: 'A', path: T }] });
+    const probe = { applied: true, occurrences: 1, baselineRan: true, baselineGreen: true, mutantRan: true, mutantGreen: true, killedBy: [], restored: true };
+    expect(revertRedVerdict({ mode: 'enforce', changeKind: 'fix', recordMatchesHead: true, plan, titles: { [T]: ['new helper works'] }, probe }))
+      .toMatchObject({ status: 'unproven', reason: 'new-source-kept', nonDiscriminating: [] });
   });
 
   it('a partial revert never flags: a green test may guard the file that stayed fixed', () => {

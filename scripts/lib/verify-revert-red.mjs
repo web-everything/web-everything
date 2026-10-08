@@ -56,6 +56,8 @@ export function textOrNull(bytes) {
  * puts the fixed content back from git before it does anything else ({@link recoverRevertRed}).
  */
 export const REVERT_JOURNAL = '.revert-red-pending.json';
+/** Two reverted-run ceilings (baseline + reverted run) plus slack: a journal older than this has no live writer. */
+export const REVERT_MAX_AGE_MS = 25 * 60 * 1000;
 const journalPath = (run) => join(run(['rev-parse', '--absolute-git-dir']).trim(), REVERT_JOURNAL);
 
 /**
@@ -81,7 +83,10 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
     return { pending: true, ok: true, restored: [], leftAlone: [], detail: 'dropped a revert journal that names no head' };
   }
   // A revert still IN PROGRESS (another verify of this lane, alive) is not a killed run: never restore under it.
-  if (Number.isSafeInteger(journal?.pid) && journal.pid > 0 && journal.pid !== process.pid && journal.host === hostname() && pidAlive(journal.pid)) {
+  // Bounded by age too: past the longest a revert can legitimately last, a live pid is a REUSED pid, not the writer.
+  const ageMs = Date.now() - Date.parse(String(journal?.at ?? ''));
+  const young = Number.isFinite(ageMs) && ageMs >= 0 && ageMs < REVERT_MAX_AGE_MS;
+  if (young && Number.isSafeInteger(journal?.pid) && journal.pid > 0 && journal.pid !== process.pid && journal.host === hostname() && pidAlive(journal.pid)) {
     return { pending: true, ok: false, restored: [], detail: `another verify (pid ${journal.pid}) is mid-revert in this lane` };
   }
   // Only a tree that is EXACTLY what the killed run left is put back: HEAD still the journaled head, and each file

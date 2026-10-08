@@ -165,8 +165,9 @@ export function createMutationProbe({
  * revert-red check: put the fix's source changes back out, keep its tests, and see which tests go red.
  *
  * Why not N single-file probes: a fix that spans two files is only reverted when both are, and the run must see both
- * at once. Why whole-file replacement and not `find`: the pre-fix content IS the exact mutant, so `occurrences` is
- * "the file still holds the fixed content" (1) or "it changed under us" (0 → nothing is touched, `not-applied`).
+ * at once. Why whole-file replacement and not `find`: the pre-fix content IS the exact mutant. `occurrences` is the
+ * number of files to revert; it is 0 (nothing touched, `not-applied`) when the list is empty or any file no longer
+ * holds the fixed content.
  *
  * Restore is per file, in a `finally`, and VERIFIED by re-reading every one; `restored` is true only when all match.
  */

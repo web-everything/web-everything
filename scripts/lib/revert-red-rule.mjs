@@ -97,7 +97,11 @@ export function newTestTitles(addedLines = []) {
  * @returns {{raw: string, file: string, path: string[], loadError: boolean}}
  */
 export function parseFailureLine(line) {
-  const raw = String(line ?? '').trim().replace(/\s+\[[^\]]*\]$/, '');
+  const trimmed = String(line ?? '').trim();
+  // vitest marks a file that failed to LOAD as `file [ file ]`; only that exact suffix is stripped, so a test title that
+  // itself ends in brackets (`handles arrays [1]`) is kept whole.
+  const head = trimmed.split(' > ')[0].replace(/\s+\[.*$/, '');
+  const raw = trimmed === `${head} [ ${head} ]` ? head : trimmed;
   const parts = raw.split(' > ').map((s) => s.trim());
   return { raw, file: parts[0] ?? '', path: parts.slice(1), loadError: parts.length < 2 };
 }
@@ -184,6 +188,11 @@ export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = 
   // it may guard exactly the file that stayed fixed. Such a test is unproven, never flagged.
   if (Array.isArray(plan.unrevertable) && plan.unrevertable.length) {
     unproven.push(...nonDiscriminating.splice(0).map((t) => ({ ...t, why: 'partial-revert' })));
+  }
+  // Likewise a source file the fix ADDED stays in place (reverting it would only make the test fail to load): a green
+  // test may be testing exactly that new code.
+  if (Array.isArray(plan.keptNew) && plan.keptNew.length) {
+    unproven.push(...nonDiscriminating.splice(0).map((t) => ({ ...t, why: 'new-source-kept' })));
   }
   const lists = { discriminating, nonDiscriminating, unproven };
   if (nonDiscriminating.length) return result('flagged', 'tests-pass-with-fix-reverted', lists);

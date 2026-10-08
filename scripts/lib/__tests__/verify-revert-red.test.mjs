@@ -163,10 +163,13 @@ describe('revert-red check on a real checkout', () => {
       writeFileSync(journal, JSON.stringify({ head: ctx.fix, files: [{ path: 'scripts/x/gone.mjs', reverted: 'x' }] }));
       expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true, leftAlone: ['scripts/x/gone.mjs'] });
       const { hostname } = await import('node:os');
-      writeFileSync(journal, JSON.stringify({ head: ctx.fix, files: [{ path: SRC, reverted: 'x' }], pid: process.ppid, host: hostname() }));
+      writeFileSync(journal, JSON.stringify({ head: ctx.fix, files: [{ path: SRC, reverted: 'x' }], pid: process.ppid, host: hostname(), at: new Date().toISOString() }));
       expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: false });
       expect(existsSync(journal)).toBe(true);
       expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED);
+      // An OLD journal whose pid is alive is a reused pid, not a live writer: recovered (here: left alone, bytes differ).
+      writeFileSync(journal, JSON.stringify({ head: ctx.fix, files: [{ path: SRC, reverted: 'x' }], pid: process.ppid, host: hostname(), at: '2026-01-01T00:00:00Z' }));
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true, leftAlone: [SRC] });
     });
   });
 
@@ -289,6 +292,13 @@ describe('parts', () => {
     expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run, timeoutMs: 1234 })).toMatchObject({ ran: false, green: false });
     expect(seen).toEqual([1234]);
     expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); return 'Test Files  1 passed (1)\n'; } }).ran).toBe(true);
+  });
+
+  it('the revert probe bounds BOTH of its runs with a 10-minute ceiling by default', () => {
+    const seen = [];
+    const probe = createRevertProbe({ read: () => 'fixed', write: () => {}, run: (_f, _a, opts) => { seen.push(opts.timeout); return 'Test Files  1 passed (1)\n'; } });
+    probe({ cwd: '.', targets: [{ target: 'a.mjs', fixed: 'fixed', revert: 'old' }], suite: ['./a.test.mjs'] });
+    expect(seen).toEqual([600000, 600000]);
   });
 
   it('runSuite runs several files in one call and says when the failure list was cut', () => {
