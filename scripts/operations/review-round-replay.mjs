@@ -7,7 +7,7 @@
  *   writes nothing except the fixtures it is asked to emit.
  *
  * Usage:
- *   node scripts/operations/review-round-replay.mjs [--day=2026-10-08] [--repo=web-everything/web-everything]
+ *   node scripts/operations/review-round-replay.mjs [--day=2026-10-08] [--repo=we|<owner/name>]
  *     [--runs-dir=<dir>] [--cwd=<git checkout>] [--prs=4441,4433] [--emit-fixtures=<dir>] [--json]
  *
  * WHAT A ROUND IS. One `review-pr` run that reduced a verdict, per distinct reviewed head (a same-head re-run keeps the
@@ -28,6 +28,7 @@ import { normalizeFinding, MANDATORY_LENSES } from '../lib/jury-core.mjs';
 import { enclosingSymbol, findingHeldVerdict, replayPrRounds } from '../lib/review-round-rules.mjs';
 import { readFixRange } from './review-pr-io.mjs';
 import { sharedRunsDir } from './run-store.mjs';
+import { DEFAULT_REPO_KEY, ghRepoSlug } from '../lib/constellation-repos.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -154,7 +155,7 @@ function parseArgs(argv) {
 
 export function main(argv = process.argv.slice(2), { log = (s) => process.stdout.write(`${s}\n`) } = {}) {
   const args = parseArgs(argv);
-  const repo = args.repo || 'web-everything/web-everything';
+  const repo = args.repo ? ghRepoSlug(String(args.repo)) : ghRepoSlug(DEFAULT_REPO_KEY);
   const day = args.day || etDay(new Date().toISOString());
   const runsDir = resolve(args['runs-dir'] || sharedRunsDir());
   const cwd = resolve(args.cwd || REPO_ROOT);

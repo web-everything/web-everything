@@ -212,6 +212,9 @@ describe('the ledger and notice sinks', () => {
     it('a #3988 replay: 3 runs on one head yield 3 review-run rows with posted:false', async () => {
       const sinks = createReviewPrSinks({ root });
       for (let i = 0; i < 3; i += 1) {
+        // Three real visits never share a millisecond; rows identical down to `at` are one row by event id (#4498),
+        // so a same-millisecond loop made this test flaky (~1 in 4 on a busy host). Space the visits apart.
+        if (i) await new Promise((r) => setTimeout(r, 3));
         await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
       }
       const rows = readEvents().filter((r) => r.type === 'review-run');
