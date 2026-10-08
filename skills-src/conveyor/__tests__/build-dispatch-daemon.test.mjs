@@ -1,7 +1,7 @@
 import { recordPrepareFailure, readFailureState } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, statSync, existsSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -44,6 +44,9 @@ import {
   deriveDispatchedByBuilder,
   // card 80 + hold visibility
   planConfigFrom, holdText,
+  // card xwn53th — tick-overrun speedups
+  CLEAN_VERDICT_MEMO_ENV, BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS, clearPrepareEvidenceCache,
+  EVIDENCE_CACHE_MAX_ENTRIES, prepareEvidenceCacheSizes,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
@@ -2746,5 +2749,113 @@ describe('build-hold visibility', () => {
   it('the live tick line carries buildHolds', () => {
     const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '..', 'build-dispatch-daemon.mjs'), 'utf8');
     expect(src).toMatch(/buildHolds: r\.buildHolds/);
+  });
+});
+
+describe('tick-overrun speedups (card xwn53th) change timing only, never the answer', () => {
+  it('cliPlanTick turns on the clean-lane verdict reuse for its own child only', () => {
+    const before = process.env[CLEAN_VERDICT_MEMO_ENV];
+    let seen;
+    cliPlanTick({}, { exec: (cmd, args, opts) => { seen = opts.env[CLEAN_VERDICT_MEMO_ENV]; return JSON.stringify({ decisions: {}, nextState: {} }); } });
+    expect(seen).toBe(String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS));
+    expect(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS).toBeGreaterThan(0);
+    expect(process.env[CLEAN_VERDICT_MEMO_ENV]).toBe(before);
+  });
+
+  describe('cliPrepareFailureEvidence reuses a settled transcript but matches a fresh read', () => {
+    let projects;
+    const HANDLE = 'abcdef123456';
+    const line = (text) => `${JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] } })}\n`;
+    beforeEach(() => { projects = mkdtempSync(join(tmpdir(), 'evidence-')); mkdirSync(join(projects, 'p1')); clearPrepareEvidenceCache(); });
+    afterEach(() => { rmSync(projects, { recursive: true, force: true }); clearPrepareEvidenceCache(); });
+    const read = () => cliPrepareFailureEvidence({ handle: HANDLE, error: 'boom' }, { projects });
+    const fresh = () => { clearPrepareEvidenceCache(); return read(); };
+
+    it('same evidence on every repeat; a rewritten transcript is re-read', () => {
+      const file = join(projects, 'p1', `${HANDLE}.jsonl`);
+      writeFileSync(file, line('first') + line('the runner owns the stamp; I did not stamp it'));
+      const a = read();
+      expect(a).toEqual(fresh());
+      expect(read()).toEqual(a);
+      expect(a.terminal).toMatch(/runner owns/);
+      expect(a.stoppedBeforeCompletion).toBe(true);
+      appendFileSync(file, line('done, committed'));
+      const b = read();
+      expect(b).toEqual(fresh());
+      expect(b.terminal).toBe('done, committed');
+    });
+
+    it('a miss is reused only while no project directory changes; a new transcript is then found', () => {
+      // Explicit, distinct directory mtimes: never rely on the filesystem's timestamp granularity.
+      const stampDir = (secs) => utimesSync(join(projects, 'p1'), secs, secs);
+      stampDir(1_000_000);
+      expect(read()).toEqual({ error: 'boom' });
+      expect(read()).toEqual({ error: 'boom' });
+      writeFileSync(join(projects, 'p1', `${HANDLE}.jsonl`), line('late'));
+      stampDir(1_000_100); // what a new file in the directory does to its mtime
+      expect(read()).toEqual(fresh());
+      expect(read().terminal).toBe('late');
+    });
+
+    it('retries transcript discovery after a transient project-directory read failure (no mtime change)', () => {
+      const locked = join(projects, 'p2');
+      mkdirSync(locked);
+      writeFileSync(join(locked, `${HANDLE}.jsonl`), line('found after recovery'));
+      utimesSync(locked, 1_000_000, 1_000_000);
+      chmodSync(locked, 0o000);
+      try {
+        // Skip when the process can read it anyway (running as root): the failure cannot be injected.
+        let unreadable = false;
+        try { readdirSync(locked); } catch { unreadable = true; }
+        if (!unreadable) return;
+        expect(read()).toEqual({ error: 'boom' });
+        expect(read()).toEqual({ error: 'boom' });
+      } finally {
+        chmodSync(locked, 0o755);
+        utimesSync(locked, 1_000_000, 1_000_000); // unchanged mtime: only the access recovered
+      }
+      expect(read().terminal).toBe('found after recovery');
+    });
+
+    it('a recently used entry survives eviction pressure (LRU, not FIFO)', () => {
+      const hot = join(projects, 'p1', 'hotsession1.jsonl');
+      writeFileSync(hot, line('AAAA'));
+      utimesSync(hot, 1_000_000, 1_000_000); // a whole-second mtime restores exactly
+      expect(cliPrepareFailureEvidence({ handle: 'hotsession1', error: 'boom' }, { projects }).terminal).toBe('AAAA');
+      for (let i = 0; i < EVIDENCE_CACHE_MAX_ENTRIES + 20; i++) {
+        const handle = `cold${String(i).padStart(8, '0')}`;
+        writeFileSync(join(projects, 'p1', `${handle}.jsonl`), line(`c${i}`));
+        cliPrepareFailureEvidence({ handle, error: 'boom' }, { projects });
+        cliPrepareFailureEvidence({ handle: 'hotsession1', error: 'boom' }, { projects }); // keeps it recent
+      }
+      // Rewrite with the same size and mtime: only a cache HIT can still answer with the old text.
+      writeFileSync(hot, line('BBBB'));
+      utimesSync(hot, 1_000_000, 1_000_000);
+      expect(cliPrepareFailureEvidence({ handle: 'hotsession1', error: 'boom' }, { projects }).terminal).toBe('AAAA');
+    });
+
+    it('both caches stay bounded however many distinct handles are read', () => {
+      const n = EVIDENCE_CACHE_MAX_ENTRIES + 40;
+      for (let i = 0; i < n; i++) {
+        const handle = `h${String(i).padStart(8, '0')}`;
+        if (i % 2 === 0) writeFileSync(join(projects, 'p1', `${handle}.jsonl`), line(`t${i}`));
+        cliPrepareFailureEvidence({ handle, error: 'boom' }, { projects });
+      }
+      const { transcripts, misses } = prepareEvidenceCacheSizes();
+      expect(transcripts).toBeGreaterThan(0);
+      expect(misses).toBeGreaterThan(0);
+      expect(transcripts).toBeLessThanOrEqual(EVIDENCE_CACHE_MAX_ENTRIES);
+      expect(misses).toBeLessThanOrEqual(EVIDENCE_CACHE_MAX_ENTRIES);
+      // An evicted handle is simply re-read, with the identical answer.
+      expect(cliPrepareFailureEvidence({ handle: 'h00000000', error: 'boom' }, { projects }).terminal).toBe('t0');
+    });
+
+    it('a deleted transcript falls back to a fresh scan', () => {
+      const file = join(projects, 'p1', `${HANDLE}.jsonl`);
+      writeFileSync(file, line('x'));
+      expect(read().terminal).toBe('x');
+      rmSync(file);
+      expect(read()).toEqual({ error: 'boom' });
+    });
   });
 });

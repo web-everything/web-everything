@@ -854,7 +854,9 @@ function laneDirtyOrAhead(dir, branch) {
   // The Gap-1 relaxation used to live here, which silently changed reset/skip semantics for every caller
   // (`refreshLane`'s hard-reset decision, `status`, the board) even though it is justified only for acquire's
   // auto-pick. Policy now lives at that one call site — see `aheadIsProvablyPushed`.
-  return { dirty: uncommitted > 0, uncommitted, ahead, dirtyPaths };
+  // A git that failed (spawn error, kill, EMFILE under load) reads above as "nothing uncommitted / nothing ahead".
+  // That is the right fail-open answer for ONE scan, but it must never be REMEMBERED as a clean verdict.
+  return { dirty: uncommitted > 0, uncommitted, ahead, dirtyPaths, probeFailed: porcelain === null || aheadRaw === null };
 }
 
 /**
@@ -2736,7 +2738,14 @@ const VERDICT_MEMO_FILE = (repo) => join(repo.poolDir, '.acquirable-verdict-memo
 const DEFAULT_VERDICT_MEMO_MAX_AGE_MS = 10 * 60_000;
 // v2 (soak-main-red): a DIRTY entry also carries the stat signature of the very paths that made it dirty. A v1
 // file (dirty entries with no signature) is simply ignored — every lane is re-proven once.
-const VERDICT_MEMO_VERSION = 2;
+// v3 (card xwn53th): a CLEAN entry `{fp, tree, at, clean:true}` joins the file. A v2 reader treats ANY entry with
+// `at`+`fp` as "held / not acquirable", so it would read every clean lane as holding work. Bumping the version
+// makes an older lane-pool.mjs discard the file instead. ANY change to the shape or meaning of an entry written by
+// `noteVerdict` MUST bump this constant (pinned by `lane-pool-clean-verdict-memo.test.mjs`).
+const VERDICT_MEMO_VERSION = 3;
+// Upper bound on tracked files + directories a clean-lane tree signature will cover; a bigger tree is simply not
+// memoized (the full probe runs) rather than turning every hit into a long stat walk.
+const TREE_SIG_MAX_ENTRIES = 50_000;
 const DIRT_SIG_MAX_PATHS = 200;
 // A dirty path modified at/after the probe start could have changed between `git status` and our stat — its
 // signature would then describe a tree the probe never saw. Such a verdict is not memoized (git's own "racily
@@ -2770,6 +2779,47 @@ function dirtSignature(dir, paths, probeStartMs = null) {
 }
 const verdictMemoMaxAgeMs = () => numFlagOrEnv('verdict-memo-max-age-ms', 'LANE_POOL_VERDICT_MEMO_MAX_AGE_MS', DEFAULT_VERDICT_MEMO_MAX_AGE_MS);
 
+/**
+ * Card xwn53th (review round 1) — working-tree signature for a CLEAN verdict: a hash of the stat (mtime, ctime, size,
+ * mode, inode; `-` when gone) of every TRACKED file plus every directory that holds one (and the root). The `.git` fingerprint
+ * cannot see an unstaged edit to a tracked file (no index change) or a new untracked file; this does — an edit
+ * changes the file's stat, a created/removed file changes its directory's mtime. One cheap `git ls-files -z`
+ * (index read only: no status, no untracked scan, no network) supplies the file list. `null` = no trustworthy
+ * signature (git failed, too many entries, or — when `probeStartMs` is given — an mtime at/after the probe start
+ * that could have changed between this stat and the probe: git's own "racily clean" rule), so nothing is memoized.
+ */
+function treeSignature(dir, probeStartMs = null) {
+  const lsArgs = ['ls-files', '-z'];
+  let listing;
+  try {
+    // NOT `git()`: its `.trim()` would eat leading whitespace off the first path (that file would then read as gone).
+    listing = readGit(lsArgs, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'], ...defaultGitTimeoutOpt(), ...readOnlyGitEnv(lsArgs), ...scanTimeoutOpt() });
+  } catch { return null; }
+  if (listing.includes('�')) return null; // a non-UTF-8 path decoded lossily could not be stat'd: no trustworthy signature
+  const files = listing.split('\0').filter(Boolean);
+  const dirs = new Set(['.']);
+  for (const f of files) {
+    let d = dirname(f);
+    while (d !== '.' && !dirs.has(d)) { dirs.add(d); d = dirname(d); }
+  }
+  if (files.length + dirs.size > TREE_SIG_MAX_ENTRIES) return null;
+  const h = createHash('sha1');
+  for (const p of [...files, ...dirs].sort()) {
+    let sig = '-';
+    try {
+      const st = lstatSync(join(dir, p));
+      // ctime and mode too: a `chmod`, or `touch -r`/`cp -p` restoring an old mtime on a changed file, moves ctime
+      // (which userspace cannot set) even when mtime+size look untouched — the same reason git's own index stat uses it.
+      const newest = Math.max(st.mtimeMs, st.ctimeMs);
+      const margin = newest % 1000 === 0 ? DIRT_SIG_COARSE_MTIME_MARGIN_MS : 0;
+      if (probeStartMs !== null && newest >= probeStartMs - margin) return null;
+      sig = `${st.mtimeMs}:${st.ctimeMs}:${st.size}:${st.mode}:${st.ino}`;
+    } catch { /* gone — '-' */ }
+    h.update(`${p}\0${sig}\n`);
+  }
+  return h.digest('hex');
+}
+
 /** Stat/read-only fingerprint of the lane state a dirty/ahead verdict depends on. `null` when unreadable. */
 function laneVerdictFingerprint(dir, branch) {
   try {
@@ -2793,22 +2843,53 @@ function readVerdictMemo(repo) {
   return { lanes, updates: new Map() };
 }
 
-/** A lane's memoized "not acquirable" verdict, if its fingerprint still matches and it is young enough. */
-function verdictMemoHit(memo, repo, n, nowMs) {
+/**
+ * A lane's memoized verdict, if its fingerprint still matches and it is young enough:
+ *   'held'  — a NEGATIVE verdict ("work lives here, not acquirable"; always on),
+ *   'clean' — a POSITIVE verdict ("unleased, clean, nothing ahead"; opt-in, see below),
+ *   null    — no usable entry, probe the lane.
+ */
+function verdictMemoState(memo, repo, n, nowMs) {
   const e = memo?.lanes?.[n];
-  if (!e || typeof e.at !== 'number' || !e.fp) return false;
-  const maxAge = verdictMemoMaxAgeMs() * (0.5 + ((n * 37) % 50) / 100); // staggered: 50%–99% of the max age
-  if (nowMs - e.at >= maxAge || e.at > nowMs + 1000) return false;
-  if (e.fp !== laneVerdictFingerprint(laneDir(repo, n), repo.branch)) return false;
+  if (!e || typeof e.at !== 'number' || !e.fp) return null;
+  const clean = e.clean === true;
+  const maxAgeMs = clean ? cleanVerdictMemoMaxAgeMs() : verdictMemoMaxAgeMs();
+  if (maxAgeMs <= 0) return null;
+  const maxAge = maxAgeMs * (0.5 + ((n * 37) % 50) / 100); // staggered: 50%–99% of the max age
+  if (nowMs - e.at >= maxAge || e.at > nowMs + 1000) return null;
+  if (e.fp !== laneVerdictFingerprint(laneDir(repo, n), repo.branch)) return null;
+  if (clean) return typeof e.tree === 'string' && e.tree === treeSignature(laneDir(repo, n)) ? 'clean' : null;
   // soak-main-red — a dirty verdict also needs its dirty paths untouched (see `dirtSignature`).
-  if (e.dirty) return typeof e.dirt === 'string' && Array.isArray(e.paths) && e.dirt === dirtSignature(laneDir(repo, n), e.paths);
-  return true;
+  if (e.dirty) return typeof e.dirt === 'string' && Array.isArray(e.paths) && e.dirt === dirtSignature(laneDir(repo, n), e.paths) ? 'held' : null;
+  return 'held';
 }
 
-function noteVerdict(memo, n, fp, info, remoteShasBox, dir = null, probeStartMs = null) {
+/**
+ * Card xwn53th (build-daemon tick overrun) — OPT-IN reuse of a CLEAN lane's acquirable verdict. Off by default
+ * (env LANE_POOL_CLEAN_VERDICT_MEMO_MAX_AGE_MS / --clean-verdict-memo-max-age-ms unset or 0), so every existing
+ * caller keeps today's behaviour exactly. The build daemon turns it on for its planning read: with ~60 clean
+ * lanes, re-running `git status` + `rev-list` in each of them every 120 s tick was ~50 s of the tick.
+ * SOUNDNESS. The stat-only fingerprint covers HEAD, the branch tip, origin/<branch>, packed-refs, `.git/index` and
+ * the lease marker, so a lease taken, a commit, a stage or a reset all miss. A clean entry ALSO carries a
+ * working-tree signature (`treeSignature`: stat of every tracked file and its directories), so an unstaged edit,
+ * a deleted tracked file or a new untracked file misses too — a reused clean verdict matches a full scan in those
+ * states, not just within a max age. What remains (an untracked file written INSIDE an ignored or untracked-only
+ * directory the signature does not list, with the parent unchanged) is bounded by the max age (staggered per lane),
+ * and a wrong "acquirable" is caught downstream: `acquire` re-verifies the lane before any reset (#2924). Only
+ * fully clean lanes are recorded (no lease, no uncommitted path, nothing ahead, and not an "ahead but provably
+ * pushed" lane whose answer depends on the live remote).
+ */
+const cleanVerdictMemoMaxAgeMs = () => numFlagOrEnv('clean-verdict-memo-max-age-ms', 'LANE_POOL_CLEAN_VERDICT_MEMO_MAX_AGE_MS', 0);
+
+function noteVerdict(memo, n, fp, info, remoteShasBox, dir = null, probeStartMs = null, treeSig = null) {
   if (!memo) return;
   const doa = info?.dirtyOrAhead;
   const holdsWork = !!doa && (doa.dirty || doa.ahead > 0);
+  if (!holdsWork && cleanVerdictMemoMaxAgeMs() > 0) {
+    const fullyClean = !!doa && fp && treeSig && !doa.probeFailed && info.exists && !info.lease && doa.uncommitted === 0 && doa.ahead === 0 && !doa.aheadPushed;
+    memo.updates.set(n, fullyClean ? { fp, tree: treeSig, at: Date.now(), clean: true } : null);
+    return;
+  }
   let provable = holdsWork && fp && !(doa.ahead > 0 && !doa.dirty && remoteShasBox?.failed);
   let dirt = null;
   if (provable && doa.dirty) {
@@ -2968,13 +3049,21 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
     memo = readVerdictMemo(repo);
     for (const n of existingLanes(repo)) {
       let ok = false;
-      if (!verdictMemoHit(memo, repo, n, Date.now())) {
+      const memoState = verdictMemoState(memo, repo, n, Date.now());
+      if (memoState === 'clean') ok = true;
+      else if (memoState === null) {
         const fp = memo ? laneVerdictFingerprint(laneDir(repo, n), repo.branch) : null;
         const probeStartMs = Date.now();
+        // Taken BEFORE the probe (like `fp`): an edit landing after this stat changes the signature, so it can
+        // only ever cost a re-probe, never a stale "clean".
+        // Skipped for a live-leased lane: its probe returns at once and it is never recorded clean, so the walk
+        // would be pure waste on the (many) leased lanes of a real pool.
+        const treeSig = memo && cleanVerdictMemoMaxAgeMs() > 0 && !leaseDisqualifiesAcquire(readLease(laneDir(repo, n)), nowMs, ttlMs)
+          ? treeSignature(laneDir(repo, n), probeStartMs) : null;
         const info = laneAcquirableInfo(repo, n, remoteShasBox, nowMs, ttlMs);
         ok = isLaneAcquirable(info, nowMs, ttlMs);
         if (overrun()) overrunFail(`at lane-${n}`); // before noteVerdict: a past-deadline verdict may rest on a killed git
-        noteVerdict(memo, n, fp, info, remoteShasBox, laneDir(repo, n), probeStartMs);
+        noteVerdict(memo, n, fp, info, remoteShasBox, laneDir(repo, n), probeStartMs, treeSig);
       }
       if (overrun()) overrunFail(`at lane-${n}`);
       if (ok) {
@@ -4026,7 +4115,7 @@ const KNOWN_FLAGS = new Set([
   // #xn432dz — list --acquirable's single-flight cache / early-stop / bounded-scan knobs.
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
-  'no-verdict-memo', 'verdict-memo-max-age-ms',
+  'no-verdict-memo', 'verdict-memo-max-age-ms', 'clean-verdict-memo-max-age-ms',
   // #4025 — provision --acquirable's per-call new-lane cap, and trim's own cap/dry-run knobs.
   'max-new', 'max', 'dry-run',
   // #3383 — acquire's own growth-on-empty knobs: hard ceiling and per-call new-lane cap.

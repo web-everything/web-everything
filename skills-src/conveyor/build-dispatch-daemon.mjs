@@ -40,7 +40,7 @@ import { resolveOperationRoute, routingPolicyEnv } from '../../scripts/lib/dispa
 import { childFailure } from '../../scripts/lib/child-failure.mjs';
 import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
 import { gateHost } from '../../scripts/lib/dispatch-throttle.mjs';
 import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
@@ -979,6 +979,10 @@ const SCRIPTS = join(REPO_ROOT, 'scripts');
  */
 export const BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE = '1000000';
 
+// Card xwn53th — see `scanAcquirable` in lane-pool.mjs: opt-in reuse of a CLEAN lane's acquirable verdict.
+export const CLEAN_VERDICT_MEMO_ENV = 'LANE_POOL_CLEAN_VERDICT_MEMO_MAX_AGE_MS';
+export const BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS = 10 * 60_000;
+
 // EXPORTED (#4464) so a test can assert the env override directly, against an injected `exec` — mirrors this
 // file's own established `{ exec = execFileSync }` seam (`cliRetryInfraBlocked`, below).
 export function cliPlanTick(payload, { exec = execFileSync, config = null } = {}) {
@@ -986,7 +990,10 @@ export function cliPlanTick(payload, { exec = execFileSync, config = null } = {}
   try {
     const text = exec('node', [join(SCRIPTS, 'conveyor', 'tick-core.mjs')], {
       input: JSON.stringify({ bookkeeping: payload || {}, ...(config ? { config } : {}) }), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, [PLANNING_SNAPSHOT_ENV]: snapshotDir },
+      env: { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, [PLANNING_SNAPSHOT_ENV]: snapshotDir,
+        // Speed only (card xwn53th): this planning read re-proved every clean lane every tick (~50 s of the tick).
+        // A clean lane's verdict is reused while its stat fingerprint is unchanged and the entry is young.
+        [CLEAN_VERDICT_MEMO_ENV]: process.env[CLEAN_VERDICT_MEMO_ENV] ?? String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS) },
     });
     return JSON.parse(text);
   } finally { rmSync(snapshotDir, { recursive: true, force: true }); }
@@ -1079,6 +1086,32 @@ export async function cliListSettledBuilds({ launchKind = 'build' } = {}) {
   return rows;
 }
 
+// Speed only (tick-overrun card xwn53th): the evidence read below scans every project dir for the transcript and
+// reads the WHOLE file, for every settled prepare row, on every tick (~14 s p50 in the live daemon). A transcript
+// of a settled attempt does not change, so the parsed answer is reused while the file's size + mtime are the
+// same, and a "no transcript found" answer is reused while no project directory has changed (a new transcript
+// file bumps its directory's mtime). Any change re-reads exactly as before; the returned evidence is identical.
+// Both maps are BOUNDED (insertion-ordered, least-recently-used evicted past the cap; a hit re-inserts): the daemon is a long-lived process and
+// every distinct settled-prepare handle would otherwise add an entry for its whole life. Eviction only costs a
+// re-read, never a wrong answer.
+export const EVIDENCE_CACHE_MAX_ENTRIES = 256;
+const evidenceTranscripts = new Map(); // `${projects}\0${handle}` -> { file, size, mtimeMs, terminal }
+const evidenceMisses = new Map(); // `${projects}\0${handle}` -> digest of the directory signature at the time of the miss
+function setBounded(map, key, value) {
+  map.delete(key); // re-insert at the newest end
+  map.set(key, value);
+  while (map.size > EVIDENCE_CACHE_MAX_ENTRIES) map.delete(map.keys().next().value);
+}
+const projectsSignature = (projects, dirs) => {
+  const stamp = (p) => { try { return statSync(p).mtimeMs; } catch { return -1; } };
+  const raw = `${stamp(projects)}|${dirs.map((d) => `${d}:${stamp(join(projects, d))}`).join(',')}`;
+  return createHash('sha1').update(raw).digest('hex'); // a digest, not the string that grows with the dir count
+};
+/** Test seam: forget every cached transcript answer. */
+export function clearPrepareEvidenceCache() { evidenceTranscripts.clear(); evidenceMisses.clear(); }
+/** Test seam: how many answers the two evidence caches hold right now. */
+export function prepareEvidenceCacheSizes() { return { transcripts: evidenceTranscripts.size, misses: evidenceMisses.size }; }
+
 /** Read terminal observations only. Prompts are instructions, not evidence that a failure occurred. */
 export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.claude', 'projects') } = {}) {
   if (entry.result?.evidence) return entry.result.evidence;
@@ -1086,18 +1119,43 @@ export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.
   const handle = entry.handle;
   // A short handle would prefix-match another session's transcript and misattribute its evidence.
   if (!handle || handle.startsWith('pid:') || handle.length < 6) return evidence;
+  const finish = (file, terminal) => {
+    evidence.terminal = terminal;
+    evidence.transcript = file;
+    evidence.stoppedBeforeCompletion = /runner owns/i.test(terminal) && /no stamp|did not.*(?:stamp|commit|PR)/is.test(terminal);
+    return evidence;
+  };
+  const cacheKey = `${projects}\0${handle}`;
+  const cached = evidenceTranscripts.get(cacheKey);
+  if (cached) {
+    try {
+      const st = statSync(cached.file);
+      if (st.size === cached.size && st.mtimeMs === cached.mtimeMs) {
+        setBounded(evidenceTranscripts, cacheKey, cached); // a hit refreshes recency: LRU, so a hot set under the cap never thrashes
+        return finish(cached.file, cached.terminal);
+      }
+    } catch { /* gone or unreadable: re-scan below */ }
+    evidenceTranscripts.delete(cacheKey);
+  }
   // Runs on every tick for every settled prepare row: an unreadable dir or a transcript rotated mid-scan
   // must degrade to the base evidence, never throw out of the tick.
   try {
     if (!existsSync(projects)) return evidence;
-    for (const project of readdirSync(projects, { withFileTypes: true })) {
-      if (!project.isDirectory()) continue;
+    const projectDirs = readdirSync(projects, { withFileTypes: true }).filter((d) => d.isDirectory());
+    const signature = projectsSignature(projects, projectDirs.map((d) => d.name));
+    if (evidenceMisses.get(cacheKey) === signature) { setBounded(evidenceMisses, cacheKey, signature); return evidence; }
+    let scanComplete = true;
+    for (const project of projectDirs) {
       const dir = join(projects, project.name);
       let file;
-      try { file = readdirSync(dir).find(name => name.startsWith(handle) && name.endsWith('.jsonl')); } catch { continue; }
+      // A directory that cannot be read this tick may hold the transcript: skip it, but never cache the miss.
+      try { file = readdirSync(dir).find(name => name.startsWith(handle) && name.endsWith('.jsonl')); } catch { scanComplete = false; continue; }
       if (!file) continue;
       let terminal = '';
-      for (const line of readFileSync(join(dir, file), 'utf8').split('\n')) {
+      const path = join(dir, file);
+      // Stat BEFORE reading: a write racing the read changes the stat, so the entry just misses next time.
+      const before = statSync(path);
+      for (const line of readFileSync(path, 'utf8').split('\n')) {
         if (!line.trim()) continue;
         let row;
         try { row = JSON.parse(line); } catch { continue; } // a transcript may end in a partial write
@@ -1106,11 +1164,10 @@ export function cliPrepareFailureEvidence(entry, { projects = join(homedir(), '.
         const text = Array.isArray(content) ? content.filter(c => c.type === 'text').map(c => c.text).join('\n') : '';
         if (text) terminal = text;
       }
-      evidence.terminal = terminal;
-      evidence.transcript = join(dir, file);
-      evidence.stoppedBeforeCompletion = /runner owns/i.test(terminal) && /no stamp|did not.*(?:stamp|commit|PR)/is.test(terminal);
-      return evidence;
+      setBounded(evidenceTranscripts, cacheKey, { file: path, size: before.size, mtimeMs: before.mtimeMs, terminal });
+      return finish(path, terminal);
     }
+    if (scanComplete) setBounded(evidenceMisses, cacheKey, signature);
   } catch { /* fall through to the base evidence */ }
   return evidence;
 }
