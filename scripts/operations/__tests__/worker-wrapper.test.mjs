@@ -136,6 +136,13 @@ describe('runWorker: the job record and the result channels', () => {
     expect(out.envelope).toMatchObject({ source: 'legacy-delivery-report', parse: { ok: true, reason: 'legacy-mapped' }, action: { type: 'operator' } });
   });
 
+  it('a draft-write failure never loses the envelope: runWorker resolves and the done record is on disk', async () => {
+    const s = spec({ argv: printing(claudeStdout(BLOCKED('tooling-defect'))) });
+    const out = await runWorker(s, { writeDraft: () => { throw new Error('disk full'); } });
+    expect(out.action.type).toBe('product-fix-draft');
+    expect(read(s)).toMatchObject({ v: 2, status: 'done', action: { type: 'product-fix-draft' } });
+  });
+
   it('records head before and after', async () => {
     const heads = ['aaa', 'bbb'];
     const { envelope } = await runWorker(spec(), { head: () => heads.shift() ?? 'bbb' });

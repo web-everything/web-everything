@@ -234,8 +234,8 @@ export async function runWorker(spec, io = {}) {
 
 /**
  * Launch a spec through THIS file as a detached node process (`unref`ed; survives its parent). The spec is written
- * to `<specDir>/<session>.spec.json` first; the child reads it, runs {@link runWorker}, and exits. The pid is
- * returned and is also in the v2 record's `pid` once the worker itself has one.
+ * to `<specDir>/<session>.spec.json` first; the child reads it, runs {@link runWorker}, and exits. `wrapperPid` is the
+ * wrapper process; the v2 record's `pid` is the WORKER child the wrapper then spawns (a different process).
  * @returns {{wrapperPid: number, specFile: string}}
  */
 export function launchDetached(spec, { specDir, spawnFn = spawn, nodePath = process.execPath, entry = fileURLToPath(import.meta.url) } = {}) {

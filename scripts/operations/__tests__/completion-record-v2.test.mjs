@@ -1,7 +1,8 @@
 /**
  * @file completion-record-v2.test.mjs — item 117 slice S2: the v2 envelope and the three stores read as one (D2).
  */
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -76,6 +77,9 @@ describe('the three stores read as one (D2)', () => {
     const e = readEnvelope('fix-7', { completions: dir, deliveryReports: null, fixReports: null });
     expect(e).toMatchObject({ v: 2, source: 'legacy-completion', role: 'fix', result: { outcome: 'blocked', blocker: { kind: 'permission-wall' } }, action: { type: 'product-fix-draft' } });
     expect(validateCompletionRecord(e).ok).toBe(true);
+    // the agent-written legacy text is redacted too (the fallback must not be a way around the write-point redaction)
+    writeCompletion({ ...newCompletionRecord({ session: 'fix-12', kind: 'fix', pr: 12, now: T0 }), status: 'done', outcome: 'blocked-on-permission', denied: 'curl -H "Authorization: Bearer ghp_abcdefghijklmnop12345"' }, dir);
+    expect(JSON.stringify(readEnvelope('fix-12', { completions: dir, deliveryReports: null, fixReports: null }))).not.toContain('ghp_abcdefghijklmnop12345');
   });
   it('a delivery report (build) and a fix report fold in with their own outcome words', () => {
     const dd = tmp(); const fd = tmp(); const cd = tmp();
@@ -129,5 +133,15 @@ describe('completion-cli show --envelope reads a v1 record as v2', () => {
     } finally {
       if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;
     }
+  });
+});
+
+describe('completion-cli show --envelope through the real argv parser', () => {
+  it('a bare --envelope flag reaches runShow', () => {
+    const dir = tmp();
+    writeCompletion({ ...newCompletionRecord({ session: 'fix-13', kind: 'fix', pr: 13, now: T0 }), status: 'done', outcome: 'healed' }, dir);
+    const run = (...a) => JSON.parse(execFileSync(process.execPath, [join(process.cwd(), 'scripts/operations/completion-cli.mjs'), 'show', '--session=fix-13', ...a], { encoding: 'utf8', env: { ...process.env, OPERATION_COMPLETIONS_DIR: dir } }));
+    expect(run()).toMatchObject({ found: true, v: 1 });
+    expect(run('--envelope')).toMatchObject({ found: true, v: 2, source: 'legacy-completion', action: { type: 'done' } });
   });
 });

@@ -177,7 +177,7 @@ if (IS_CLI) {
     } else if (sub === 'show') {
       writeAllSync(1, `${JSON.stringify(runShow(flags))}\n`);
     } else {
-      writeLineSync(2, 'usage: completion-cli.mjs report|show [--session=<slug>] [--kind=review|fix] [--pr=<n>] ...');
+      writeLineSync(2, 'usage: completion-cli.mjs report|show [--session=<slug>] [--kind=review|fix] [--pr=<n>] [--envelope (show: read through the v2 envelope)] ...');
       process.exitCode = 2;
     }
   } catch (e) {

@@ -299,7 +299,8 @@ export function createFileCompletionStore(dir = resolveCompletionsDir()) {
  * Item 117 S2 (D2) — THE ONE READER. Looks a session up in the completion store first (v1 or v2), then in the two
  * folded stores (delivery-report, fix-report), and returns it AS A v2 ENVELOPE (`{found, ...envelope}` shape is the
  * CLI's job). A v1 record is mapped, never rewritten on disk. `null` when no store has the session.
- * `dirs` overrides each store's directory (tests, and the build wrapper's lane-scoped delivery-reports dir).
+ * `dirs` overrides each store's directory (tests, or a lane-scoped delivery-reports dir); `null` for `deliveryReports` or
+ * `fixReports` switches that store off.
  * @param {string} session
  * @param {{completions?: string, deliveryReports?: string, fixReports?: string}} [dirs]
  * @returns {object|null}

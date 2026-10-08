@@ -88,7 +88,7 @@ describe('routeWorkerResult (section 4 as code)', () => {
     expect(route(done({ outcome: 'no-change' })).type).toBe('no-change');
     expect(route(done({ outcome: 'not-applicable' })).type).toBe('not-applicable');
   });
-  it('tooling-defect, permission-wall and contract-violation make a draft under postmortem.mode; needs-ruling is the ONLY route to the operator', () => {
+  it('tooling-defect, permission-wall and contract-violation make a draft under postmortem.mode; an operator action only ever comes from a needs-ruling (a repeated conflict is promoted to one)', () => {
     expect(DRAFT_KINDS).toEqual(['tooling-defect', 'permission-wall', 'contract-violation']);
     for (const kind of BLOCKER_KINDS) {
       const a = route(blocked(kind === 'needs-ruling' ? { kind, ruling: RULING } : { kind }));
@@ -148,12 +148,13 @@ describe('redaction covers every free-text field, not just the ones the card nam
       ruling: { question: `q ${TOKEN}`, options: [`a ${TOKEN}`, `b ${TOKEN}`], recommendation: `r ${TOKEN}` },
     });
     dirty.summary = `sum ${TOKEN}`;
-    dirty.filesTouched = [`a.mjs ${TOKEN}`];
-    dirty.findingsAddressed = [{ ref: `F1 ${TOKEN}`, disposition: 'fixed', note: `n ${TOKEN}` }];
+    dirty.findingsAddressed = [{ ref: 'F1', disposition: 'fixed', note: `n ${TOKEN}` }];
+    dirty.filesTouched = ['scripts/@scope/a b.mjs'];
     dirty.learning = { kind: 'friction', summary: `l ${TOKEN}`, area: `a ${TOKEN}`, suggestion: `g ${TOKEN}` };
     const clean = redactResultText(dirty);
     expect(leaves(clean).filter((x) => x.includes(TOKEN))).toEqual([]);
     expect(clean.blocker.component).toContain('registry');
+    expect(clean.filesTouched).toEqual(['scripts/@scope/a b.mjs']); // paths are identifiers: never rewritten by the prose redactor
   });
 });
 
@@ -164,9 +165,7 @@ describe('legacyOutcomeWord only speaks the briefs own vocabulary', () => {
     for (const o of ['done', 'no-change', 'not-applicable', 'aborted', 'unparseable']) expect(allowed.has(legacyOutcomeWord({ outcome: o })), o).toBe(true);
   });
   it('a blocked kind maps back to the same kind through mapLegacyOutcome (the word loses nothing the reconciler needs)', () => {
-    for (const kind of BLOCKER_KINDS.filter((k) => k !== 'spec-defect')) {
-      expect(mapLegacyOutcome(legacyOutcomeWord(blocked({ kind })))?.kind, kind).toBe(kind === 'needs-ruling' ? 'needs-ruling' : kind);
-    }
+    for (const kind of BLOCKER_KINDS) expect(mapLegacyOutcome(legacyOutcomeWord(blocked({ kind })))?.kind, kind).toBe(kind);
   });
 });
 

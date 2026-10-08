@@ -29,7 +29,7 @@ import {
 import { withFileLock, writeJsonAtomic } from '../lib/atomic-json-file.mjs';
 
 /**
- * The envelope writer's redaction pass: EVERY free-text field in the schema (S1 stored them as data after the length
+ * The envelope writer's redaction pass: EVERY free-text field in the schema, but not the identifier fields (S1 stored them as data after the length
  * caps; the card makes the envelope writer own redaction at the single write point). One line each, token-like text
  * removed, HTML comment delimiters and backticks gone, @mentions defanged. Returns a copy; nothing routes on it.
  * `deniedCommand` was already redacted by the S1 reader; it goes through the same pass again here.
@@ -38,8 +38,9 @@ export function redactResultText(result) {
   const r = structuredClone(result);
   const clean = redactFreeText;
   r.summary = clean(r.summary, 280);
-  r.findingsAddressed = (r.findingsAddressed ?? []).map((f) => ({ ...f, ref: clean(f.ref, 300), note: clean(f.note, 300) }));
-  r.filesTouched = (r.filesTouched ?? []).map((x) => clean(x, 300));
+  // `ref` (an opaque finding id) and `filesTouched` (repo-relative paths, checked by the S1 reader) are identifiers, not
+  // prose: the redactor would rewrite `@` and whitespace in a real path, so they are left exactly as validated.
+  r.findingsAddressed = (r.findingsAddressed ?? []).map((f) => ({ ...f, note: clean(f.note, 300) }));
   if (r.learning) r.learning = { ...r.learning, summary: clean(r.learning.summary, 600), area: clean(r.learning.area, 200), suggestion: clean(r.learning.suggestion, 600) };
   if (r.blocker) {
     const b = r.blocker;
@@ -173,7 +174,8 @@ export function routeWorkerResult(result, ctx = {}) {
     case 'spec-defect': return { type: 're-prepare', hold: 'spec-defect' };
     case 'dependency': return { type: 'hold-until-ref', ref: b.evidence?.refs?.[0] ?? null };
     case 'conflict':
-      // First conflict goes to the existing resolve-conflict path; the second is a real call (section 4).
+      // First conflict goes to the existing resolve-conflict path; a repeat is PROMOTED to a ruling (section 4), so an
+      // operator action still only ever comes from a needs-ruling.
       return (ctx.priorConflicts ?? 0) >= 1 ? operatorAction(result, ctx) : { type: 'resolve-conflict', via: 'existing' };
     case 'gate-red': return { type: 'redispatch-with-output', via: 'existing-ladder' };
     case 'needs-ruling': return operatorAction(result, ctx);
@@ -181,7 +183,7 @@ export function routeWorkerResult(result, ctx = {}) {
   }
 }
 
-/** The ONLY route to the operator: question + options + recommendation, nothing from prose. */
+/** The ONLY route to the operator (a needs-ruling, or a repeated conflict promoted to one): question + options + recommendation, nothing from prose. */
 function operatorAction(result, ctx) {
   const r = result.blocker.ruling;
   return {
@@ -263,7 +265,7 @@ export function envelopeFromLegacy(record, source, ctx = {}) {
     const result = unparseableOutcome({ role, launcher, reason: 'unreported' });
     return { ...env, result, parse: { ok: false, reason: 'unreported' }, action: routeWorkerResult(result, { ...ctx, role, launcher, session: record.session }) };
   }
-  const result = legacyResult(mapped, record, source);
+  const result = redactResultText(legacyResult(mapped, record, source));
   return { ...env, result, parse: { ok: true, reason: 'legacy-mapped' }, action: routeWorkerResult(result, { ...ctx, role, launcher, session: record.session, pr: env.pr, item: env.item }) };
 }
 
