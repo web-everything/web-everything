@@ -26,7 +26,7 @@
  * Kill switch `WE_FIXER_STUCK_RECLAIM=0` (report only). Every IO seam is injectable. PURE core:
  * {@link planFixerStuckReclaim}. IO shell: {@link runFixerStuckReclaimPass}.
  */
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -64,54 +64,85 @@ export function planFixerStuckReclaim({
   for (const event of events || []) {
     if (event?.type !== ESCALATION_EVENT_TYPE || !event.key || acked.has(event.key) || seen.has(event.key)) continue;
     seen.add(event.key);
+    const row = (decision, reason, extra = {}) => out.push({ key: event.key, event, decision, reason, ...extra });
+    // One event's failing reader (await store, PR head, transcript) must not stop the others: it holds THIS event only.
+    try { planOne(event, row); } catch (e) { row('hold', `planning failed (${String(e?.message ?? e).split('\n')[0]}) — held; other events are unaffected`); }
+  }
+  return out;
+
+  function planOne(event, row) {
     const sid = event.session?.sessionId ?? null;
     const name = event.session?.name ?? null;
-    const row = (decision, reason, extra = {}) => out.push({ key: event.key, event, decision, reason, ...extra });
     const claim = (claims || []).find((c) => c.meta?.repo === event.repo && Number(c.meta?.pr) === Number(event.pr));
-    if (!claim) { row('ack', 'superseded: no live fix claim on the PR any more'); continue; }
+    if (!claim) { row('ack', 'superseded: no live fix claim on the PR any more'); return; }
     const holderSid = claim.meta?.sessionId ?? null;
-    const sameHolder = holderSid ? holderSid === sid : (!!name && claim.meta?.who === name);
-    if (!sameHolder) { row('ack', `superseded: the claim is now held by ${claim.meta?.who ?? claim.owner ?? 'someone else'}`); continue; }
+    if (holderSid) {
+      if (holderSid !== sid) { row('ack', `superseded: the claim is now held by ${claim.meta?.who ?? claim.owner ?? 'someone else'}`); return; }
+    } else {
+      // Name fallback: fixer names are per-PR (`ci-heal-4453`), so a name match alone cannot tell this session from a
+      // newer one re-dispatched under the same name. Only an event NEWER than the claim can be about its holder.
+      if (!name || claim.meta?.who !== name) { row('ack', `superseded: the claim is now held by ${claim.meta?.who ?? claim.owner ?? 'someone else'}`); return; }
+      const claimedAt = Date.parse(claim.meta?.claimedAt ?? '');
+      const eventAt = Date.parse(event.at ?? '');
+      if (!Number.isFinite(claimedAt) || !Number.isFinite(eventAt)) { row('hold', 'unbound claim (no sessionId) and the claim or event time is unknown — cannot tell its holder from a re-dispatched session'); return; }
+      if (eventAt < claimedAt) { row('ack', 'superseded: the event predates the current (unbound) claim, so it is about an earlier session'); return; }
+    }
     const record = awaitFor(sid, name);
     const recordAgeMs = record ? nowMs - Date.parse(record.requestedAt ?? '') : NaN;
     if (record && Number.isFinite(recordAgeMs) && recordAgeMs <= awaitTtlMs) {
       const head = prHeadFor(event.repo, event.pr);
-      if (!head) { row('hold', 'awaiting-verify and the PR head is unknown — the harness owns the wait'); continue; }
+      if (!head) { row('hold', 'awaiting-verify and the PR head is unknown — the harness owns the wait'); return; }
       if (lower(head) !== lower(record.sha)) {
         row('hold', `awaiting-verify on unpushed ${String(record.sha).slice(0, 9)} — the harness owns the wait (TTL ${Math.round(awaitTtlMs / MINUTE)} min)`);
-        continue;
+        return;
       }
     }
     if (event.classification === 'stalled') {
+      // Hold unless POSITIVELY idle: reclaim stops a session and drops its claim, so missing evidence must not authorise it.
       const last = lastActivityMsFor(sid);
-      if (Number.isFinite(last) && nowMs - last < stalledIdleMinutes * MINUTE) {
+      if (!Number.isFinite(last)) { row('hold', 'session activity unknown (transcript not found or unreadable) — not reclaimed on missing evidence'); return; }
+      if (nowMs - last < stalledIdleMinutes * MINUTE) {
         row('hold', `active ${Math.round((nowMs - last) / MINUTE)} min ago — no longer idle`);
-        continue;
+        return;
       }
     } else {
       const ageMs = nowMs - Date.parse(event.at ?? '');
       if (!Number.isFinite(ageMs) || ageMs < waitLoopGraceMinutes * MINUTE) {
         row('hold', `${event.classification} event is ${Number.isFinite(ageMs) ? Math.round(ageMs / MINUTE) : '?'} min old (grace ${waitLoopGraceMinutes} min)`);
-        continue;
+        return;
       }
     }
     const why = record ? `its verify wait is for ${String(record.sha).slice(0, 9)}, already the PR head (CI owns that verdict)` : 'no verify wait in flight';
     row('reclaim', `${event.classification} (${event.reason ?? '?'}); ${why}`, { claim });
   }
-  return out;
 }
 
 // ── IO shell ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-function readJsonl(file, maxLines = 2000) {
+/** Last `maxLines` records of an append-only jsonl, reading at most `tailBytes` from its end (the logs only grow). */
+export function readJsonl(file, maxLines = 2000, { tailBytes = 4 * 1024 * 1024, readRange = readByteRange } = {}) {
   try {
-    return readFileSync(file, 'utf8').split('\n').filter(Boolean).slice(-maxLines)
+    const size = statSync(file).size;
+    const len = Math.min(size, tailBytes);
+    // A tail read starts mid-line when the file is larger than the window: drop that partial first line.
+    return readRange(file, size - len, len).split('\n').slice(size > tailBytes ? 1 : 0).filter(Boolean).slice(-maxLines)
       .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   } catch { return []; }
 }
 
-/** Newest-entry timestamp in a session's own transcript (`~/.claude/projects/<any>/<sessionId>.jsonl`). Null when unknown. */
-export function transcriptLastActivityMs(sessionId, { projectsDir = join(homedir(), '.claude', 'projects'), tailBytes = 256 * 1024 } = {}) {
+/** Read exactly `len` bytes of `file` starting at byte `start` — never the whole file. */
+function readByteRange(file, start, len) {
+  const fd = openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(len);
+    const n = readSync(fd, buf, 0, len, start);
+    return buf.toString('utf8', 0, n);
+  } finally { closeSync(fd); }
+}
+
+/** Newest-entry timestamp in a session's own transcript (`~/.claude/projects/<any>/<sessionId>.jsonl`). Null when unknown.
+ *  Reads at most `tailBytes` from the END of the file (transcripts can be hundreds of MB). */
+export function transcriptLastActivityMs(sessionId, { projectsDir = join(homedir(), '.claude', 'projects'), tailBytes = 256 * 1024, readRange = readByteRange } = {}) {
   if (!sessionId || !/^[0-9a-f-]{8,}$/i.test(sessionId)) return null;
   let file = null;
   try {
@@ -122,16 +153,20 @@ export function transcriptLastActivityMs(sessionId, { projectsDir = join(homedir
   } catch { return null; }
   if (!file) return null;
   try {
-    const size = statSync(file).size;
-    const text = readFileSync(file, 'utf8');
-    const lines = (size > tailBytes ? text.slice(-tailBytes) : text).split('\n');
+    const { size, mtimeMs } = statSync(file);
+    const len = Math.min(size, tailBytes);
+    const text = readRange(file, size - len, len);
+    // A tail read starts mid-line when the file is larger than the window: drop that partial first line.
+    const lines = text.split('\n').slice(size > tailBytes ? 1 : 0);
     let last = null;
     for (const l of lines) {
       const m = /"timestamp":"([^"]+)"/.exec(l);
       const t = m ? Date.parse(m[1]) : NaN;
       if (Number.isFinite(t) && (last === null || t > last)) last = t;
     }
-    return last;
+    // No parseable timestamp in the window (e.g. one entry longer than the window): the file's last write time is still
+    // real evidence of activity, unlike a missing transcript.
+    return last ?? (Number.isFinite(mtimeMs) ? mtimeMs : null);
   } catch { return null; }
 }
 
@@ -197,11 +232,30 @@ export async function runFixerStuckReclaimPass({
       }
       const steps = [];
       const handle = p.event.session?.id ?? p.event.session?.sessionId;
-      try { const s = stop({ handle }); steps.push(s?.alreadyGone ? 'stop:already-gone' : 'stop'); } catch (e) { steps.push(`stop-failed: ${String(e?.message ?? e).split('\n')[0]}`); }
+      // The claim is only released once the holder is KNOWN stopped. A session still running without a claim can push
+      // beside the fixer the same tick re-dispatches, and the push guard no longer protects it. A failed stop leaves the
+      // claim and the event untouched, so the next tick retries.
+      try {
+        const s = stop({ handle });
+        if (s?.stopped === false) throw new Error('stop reported the session is still running');
+        steps.push(s?.alreadyGone ? 'stop:already-gone' : 'stop');
+      } catch (e) {
+        steps.push(`stop-failed: ${String(e?.message ?? e).split('\n')[0]}`);
+        row.result = 'stop-failed';
+        row.steps = steps;
+        continue;
+      }
       const meta = p.claim.meta || {};
       const slug = CONSTELLATION_REPOS[meta.repo]?.slug ?? meta.repo;
       const ended = await endFix({ repo: meta.repo, pr: Number(meta.pr), who: meta.who, sessionId: meta.sessionId ?? null, token: null });
       steps.push(ended?.ok ? 'fix-end' : `fix-end-refused: ${ended?.reason ?? '?'}`);
+      if (!ended?.ok) {
+        // The fix claim is still held (e.g. an unbound claim needs its token, which only the fixer has; it then lapses by
+        // its own TTL): freeing the dispatch claim or the await record now would let a second fixer start beside it.
+        row.result = 'reclaim-incomplete';
+        row.steps = steps;
+        continue;
+      }
       try {
         const r = releaseDispatch({ repo: meta.repo, pr: Number(meta.pr), who: p.event.session?.name ?? meta.who });
         steps.push(`dispatch-claims-released:${r?.released?.length ?? 0}`);

@@ -40,8 +40,15 @@ export default {
     const common = { events: [event], acked: new Set(), claims, awaitFor: () => record, lastActivityMsFor: () => Date.parse('2026-10-08T14:31:02Z'), nowMs: Date.parse('2026-10-08T15:40:00Z') };
     const live = planFixerStuckReclaim({ ...common, prHeadFor: () => PUSHED })[0];
     const unpushed = planFixerStuckReclaim({ ...common, prHeadFor: () => CLAIMED })[0];
-    log?.(JSON.stringify({ live, unpushed }));
+    // Review of #4468: a destructive reclaim must never rest on MISSING evidence (unreadable transcript), and an unbound
+    // claim's name match must not reclaim a re-dispatched same-named session on the strength of an older event.
+    const unknownActivity = planFixerStuckReclaim({ ...common, prHeadFor: () => PUSHED, lastActivityMsFor: () => null })[0];
+    const unboundClaims = [{ owner: 'fixer:ci-heal-4453', meta: { kind: 'fixing', repo: 'we', pr: 4453, who: 'ci-heal-4453', claimedAt: '2026-10-08T15:20:00Z' } }];
+    const staleEvent = planFixerStuckReclaim({ ...common, claims: unboundClaims, prHeadFor: () => PUSHED })[0];
+    log?.(JSON.stringify({ live, unpushed, unknownActivity, staleEvent }));
     const violations = [];
+    if (unknownActivity?.decision !== 'hold') violations.push({ invariant: 'reclaimed-on-unknown-activity', detail: `a stalled session with unreadable activity decided ${unknownActivity?.decision}` });
+    if (staleEvent?.decision !== 'ack') violations.push({ invariant: 'stale-event-hit-redispatched-session', detail: `an event older than the unbound claim decided ${staleEvent?.decision}` });
     if (live?.decision !== 'reclaim') violations.push({ invariant: 'stuck-fixer-not-reclaimed', detail: `#4453 decided ${live?.decision ?? 'nothing'} (${live?.reason ?? ''})` });
     if (unpushed?.decision !== 'hold') violations.push({ invariant: 'unpushed-verify-reclaimed', detail: `a verify wait for an unpushed commit decided ${unpushed?.decision}` });
     return { violations };
