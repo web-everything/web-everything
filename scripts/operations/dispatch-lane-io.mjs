@@ -1788,7 +1788,7 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
   }
   // build-path-codex-isolation — this port implementation always runs Claude; say so on the record.
   request.reportExecutor?.('claude');
-  // advisor trial (we:backlog/x331b7u) — sampled per run id; only kinds the settings list (fix today).
+  // advisor trial (#x331b7u) — sampled per run id; only kinds the settings list (fix today).
   const advisor = (request.advisorFor ?? advisorForLaunch)({ runId: request.sessionId, kind: request.launchKind ?? 'build' });
   const argv = buildAgentArgv({
     advisor,
@@ -2370,7 +2370,7 @@ export function buildAgentArgv({
   // precedence; with no `table`, the launch kind's own tier is used, and a spawn with no resolvable model is
   // refused (operator rule 2026-09-29: every fresh Claude launch passes an explicit --model).
   table = null, modelReason = null,
-  // advisor trial (we:backlog/x331b7u) — a decision from `../lib/advisor-trial.mjs#advisorForLaunch`. When it is
+  // advisor trial (#x331b7u) — a decision from `../lib/advisor-trial.mjs#advisorForLaunch`. When it is
   // on, the fresh launch gets `--advisor <model>` and one brief line; `null`/off keeps the argv byte-identical.
   // Never applied on resume (a resume must stay a bare `--bg --resume`). The worker's `--model` is untouched.
   advisor = null,

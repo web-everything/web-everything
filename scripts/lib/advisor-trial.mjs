@@ -1,6 +1,6 @@
 /**
  * @file scripts/lib/advisor-trial.mjs
- * @description THE ADVISOR TRIAL (operator-approved 2026-10-08, we:backlog/x331b7u-advisor-trial.md). Adds the
+ * @description THE ADVISOR TRIAL (operator-approved 2026-10-08, #x331b7u). Adds the
  * Claude Code advisor (`--advisor <model>`, https://code.claude.com/docs/en/advisor) to a sampled share of
  * background Sonnet worker launches, so the coroner can compare rework with and without it.
  *

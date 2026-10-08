@@ -1071,7 +1071,7 @@ export function dispatchFix(planned, {
   readFixClaim = ({ repo: r, pr }) => readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
   // The ruling-not-addressed send-back's durable notice (once per head). Injectable so a test posts nothing.
   postNotice = postRulingNotice,
-  // advisor trial (we:backlog/x331b7u) — the per-run sampling decision and its ledger row; a test stubs both.
+  // advisor trial (#x331b7u) — the per-run sampling decision and its ledger row; a test stubs both.
   advisorFor = advisorForLaunch,
   recordAdvisor = recordAdvisorRun,
 } = {}) {

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * @file scripts/operations/advisor-trial-report.mjs
- * @description THE ADVISOR TRIAL COMPARISON (we:backlog/x331b7u). Reads the per-run ledger that
+ * @description THE ADVISOR TRIAL COMPARISON (#x331b7u). Reads the per-run ledger that
  * `../lib/advisor-trial.mjs#recordAdvisorRun` appends at every sampled-kind launch, joins each run to
  *   - its own transcript (`~/.claude/projects/*operations-dispatch-<runId>/*.jsonl` — the run id names the
  *     session's scratch cwd): worker tokens/cost (priced per turn by `run-rating.mjs`, the same way the
@@ -29,7 +29,7 @@ import { advisorLedgerPath } from '../lib/advisor-trial.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { usdFromTokens, rateFor } from '../backlog/cost-rates.mjs';
 import { computeTurnsCost, extractTurns, sumTokens } from '../conveyor/run-rating.mjs';
-import { makeGh } from './coroner-extract.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 // ── pure core ─────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -217,8 +217,8 @@ function readJsonl(path) {
   return out;
 }
 
-/** Real facts for the summary: ledger rows, transcripts, review verdicts (one gh call per PR). */
-export function collectAdvisorTrialFacts({ env = process.env, home = homedir(), since = null, gh = makeGh({ home, env }), useGh = true } = {}) {
+/** Real facts for the summary: ledger rows, transcripts, review verdicts (one complete comment read per PR). */
+export function collectAdvisorTrialFacts({ env = process.env, home = homedir(), since = null, readComments = readCompletePrComments, useGh = true } = {}) {
   const ledger = advisorLedgerPath(env, home);
   const rows = existsSync(ledger) ? parseLedger(readFileSync(ledger, 'utf8')).filter((r) => !since || Date.parse(r.at) >= Date.parse(since)) : [];
   const projects = join(home, '.claude', 'projects');
@@ -237,8 +237,7 @@ export function collectAdvisorTrialFacts({ env = process.env, home = homedir(), 
       const [repo, pr] = key.split('#');
       const slug = CONSTELLATION_REPOS[repo]?.slug;
       if (!slug) continue;
-      const data = gh(['pr', 'view', pr, '--repo', slug, '--json', 'comments']);
-      reviews[key] = parseReviewVerdicts(data?.comments ?? []);
+      try { reviews[key] = parseReviewVerdicts(readComments(Number(pr), { repo: slug })); } catch { /* unreadable: no verdicts */ }
     }
   }
   return { rows, transcripts, reviews, ledger };
