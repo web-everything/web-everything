@@ -15,7 +15,7 @@ Slice S3 of #5399 (ruled 2026-10-08, Fork 2 = both, asymmetric): file-item and s
 
 ## Acceptance
 
-- [A1] **Executable** — a file-item test shows `acceptance` and `nonGoals` inputs fill `## Acceptance` and `## Non-goals` with `[A#]`/`[N#]` ids.
+- [A1] **Executable** — a file-item test shows `acceptance` and `nonGoals` inputs fill the skeleton's acceptance section (`## Done when` until S7 switches the scaffold heading, `## Acceptance` after) and `## Non-goals` with `[A#]`/`[N#]` ids, reading the heading from the scaffold rather than hard-coding either.
 - [A2] **Executable** — a file-item test shows a card filed with neither input is still written, and the verdict carries a warning naming the empty section.
 - [A3] **Observable** — `we:skills-src/file-item/SKILL.md` documents both inputs and says filing never refuses on them.
 - [A4] **Executable** — a file-item test shows `acceptance` and `nonGoals` text holding a newline, a backtick, a `$(...)` span, a leading `#` heading and a fence marker is written into the card body as plain list text, never reaches a shell, and cannot open or close a section.

@@ -24,7 +24,7 @@ Each fork was discussed with the operator in chat on 2026-10-08 before the call.
 - **Fork 4 — ruled (b) ("ok").** The correctness juror gets the list and cites `A#`/`N#` in its findings. No new dedicated lens. A new step in the review read looks up the PR's card (PR → card ids → `## Acceptance`/`## Non-goals` on `main`).
 - **Fork 5 — ruled FLOOR, (b) ("ok").** The list is the minimum. Reviewers may still block on a real defect the list does not name. A build PR that weakens its own card's criteria is flagged; the juror judges against the `main` copy.
 
-**Codification.** The card is a `kind: story` and stays open until its slices land, so `codifiedIn` (set when a `kind: decision` resolves) does not apply yet. The reusable rule (every buildable card carries `## Acceptance` and `## Non-goals` with `[A#]`/`[N#]` items; checked at prepare; reviewed as a floor) is written into `we:docs/agent/backlog-workflow.md` by slice S6.
+**Codification.** The card is a `kind: epic` and stays open until its slices land, so `codifiedIn` (set when a `kind: decision` resolves) does not apply yet. The reusable rule (every buildable card carries `## Acceptance` and `## Non-goals` with `[A#]`/`[N#]` items; checked at prepare; reviewed as a floor) is written into `we:docs/agent/backlog-workflow.md` by slice S6.
 
 **Slice numbers.** The slice table below is renumbered for the ruling (new S2 refresh, new S7 reader migration). The fork text keeps the prepared numbers: its S2 is now S3, S3 is S4, S4 is S5, and S5 is S6.
 
@@ -174,13 +174,13 @@ Screen: clear — whether a diff with a regression can land once it meets the li
 
 | slice | size | touch-set | blocked by |
 |---|---|---|---|
-| S1 — reader module + skeleton + setting (in build 2026-10-08) | 3 | `we:scripts/backlog/task-agreement.mjs`, `we:scripts/backlog/scaffold.mjs`, `we:scripts/lib/task-agreement-policy.json`, `we:scripts/backlog/__tests__/` | — |
+| S1 — reader module + `## Non-goals` skeleton section (skeleton stays on `## Done when` until S7) + setting (in build 2026-10-08) | 3 | `we:scripts/backlog/task-agreement.mjs`, `we:scripts/backlog/scaffold.mjs`, `we:scripts/lib/task-agreement-policy.json`, `we:scripts/backlog/__tests__/` | — |
 | S2 — one-off refresh of open stories (Fork 1 ruling) | 5 | a new refresh runner under `we:scripts/backlog/` with its test, then the open `backlog/*.md` stories it rewrites, about 50 cards per PR | S1, S7 |
 | S3 — file-item warns | 2 | `we:scripts/operations/file-item.mjs`, `we:scripts/operations/scaffold.mjs`, `we:skills-src/file-item/SKILL.md`, `we:scripts/operations/__tests__/` | S1 |
 | S4 — prepare + dispatch gate | 5 | `we:scripts/conveyor/prepare-result.mjs`, `we:scripts/readiness/dispatch-plan.mjs`, `we:scripts/backlog.mjs`, `we:skills-src/conveyor/prepare-item-agent-brief.md`, `we:scripts/readiness/__tests__/` | S1 |
 | S5 — correctness juror reads the list | 5 | `we:scripts/lib/review-core.mjs`, `we:scripts/operations/review-pr.mjs`, `we:scripts/operations/review-pr-io.mjs`, `we:scripts/converge-cli.mjs`, `we:scripts/operations/review-prep.mjs`, `we:skills-src/converge/SKILL.md` | S1 |
 | S6 — docs + health audit (the rule, the #2949 composition sentence, the heading change) | 3 | `we:docs/agent/backlog-workflow.md`, `we:scripts/audit-backlog-health.mjs` | S1 |
-| S7 — move hard-coded `## Done when` readers to the shared reader (Fork 3 ruling) | 3 | `we:scripts/lib/citation-check.mjs` (`PROVENANCE_ESCAPE_HEADINGS`), `we:scripts/check-standards-rules.mjs` (Must-cite, TODO-placeholder and scope guards), `we:scripts/check-standards.mjs`, `we:scripts/operations/codex-worker.mjs`, `we:scripts/lib/probation-launcher.mjs`, their tests | S1 |
+| S7 — move hard-coded `## Done when` readers to the shared reader (Fork 3 ruling) | 3 | `we:scripts/lib/citation-check.mjs` (`PROVENANCE_ESCAPE_HEADINGS`), `we:scripts/check-standards-rules.mjs` (Must-cite, TODO-placeholder and scope guards), `we:scripts/check-standards.mjs`, `we:scripts/operations/codex-worker.mjs`, `we:scripts/lib/probation-launcher.mjs`, plus `we:scripts/backlog/scaffold.mjs` (the skeleton's switch to `## Acceptance` lands here, once the readers recognize it), their tests | S1 |
 
 **S2, the refresh (Fork 1 ruling).**
 
