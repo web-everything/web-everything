@@ -164,6 +164,7 @@ export function redactSecrets(text) {
 export function buildCiHealComment({ actor = 'conveyor CI-heal agent', reason = '', headSha = '', attemptId = null, failed = false, detail = '' } = {}) {
   const why = reason === 'behind' ? 'the branch had fallen BEHIND `main`'
     : reason === 'red-ci' ? 'a required check had gone red after open'
+    : reason === 'codeql' ? 'the CodeQL check failed (new code-scanning alerts) and the drain refused to land it'
     : 'a required check regressed after open';
   const head = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
   return [

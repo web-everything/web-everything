@@ -68,6 +68,7 @@ import { getRequiredStatusChecks, withoutImpliedRequiredChecks } from '../lib/re
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { codeqlFailureEvidence } from '../lib/codeql-gate.mjs';
 import { makeFixEvidenceReader, checkFixFacts } from '../lib/fix-facts.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
@@ -1192,6 +1193,22 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
 }
 
 /**
+ * we:scripts/conveyor/reconcile-pass.mjs#enrichPrsWithCodeQL — card x8cnbii. Attach `codeqlFailure` (check-run id,
+ * head sha, and the alert rule/file/line/message read from the check-run annotations) to every PR the drain holds
+ * for a failed CodeQL check, so `planReconcile` can owe it a ci-heal. Pays for an annotations read ONLY for such
+ * PRs; a PR with no failed CodeQL (or the drain gate turned off) is returned untouched.
+ * @param {Array<object>} prs
+ * @param {{repo?:string|null, exec?:Function, settings?:{drainBlocksOnCodeQL:boolean}}} [o]
+ */
+export function enrichPrsWithCodeQL(prs, { repo = null, exec = (file, args) => execFileSyncThrottled(file, args, { encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }), settings } = {}) {
+  const list = Array.isArray(prs) ? prs : [];
+  return list.map((pr) => {
+    const codeqlFailure = codeqlFailureEvidence(pr, { repo, exec, ...(settings ? { settings } : {}) });
+    return codeqlFailure ? { ...pr, codeqlFailure } : pr;
+  });
+}
+
+/**
  * we:scripts/conveyor/reconcile-pass.mjs#runReconcilePass — read, decide, return. Every reader is injectable, so
  * the whole shell is exercisable with no network and no credential.
  * @param {{readPrs?:Function, readAgents?:Function, enrich?:Function, enrichMainRed?:Function,
@@ -1213,6 +1230,7 @@ export function runReconcilePass({
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
   enrichRulings = enrichPrsWithIgnoredRulings,
+  enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
   now = Date.now(), repo = null, defaultBranch = 'main', env = process.env,
@@ -1262,8 +1280,8 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt });
+  const prs = enrichCodeQL(enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const plan = planReconcile({

@@ -1968,6 +1968,40 @@ export function planReconcile({
       continue;
     }
 
+    // ── CODEQL-HELD PR (card x8cnbii) — LIVE 2026-10-08, PR #4370: ready-to-merge + review:accepted (phase `queued`)
+    // with every REQUIRED check green, but the drain refuses to land it because its non-required `CodeQL` check
+    // failed (`drainBlocksOnCodeQL`). Phase `queued` answers `nothing-owed`, so the drain skipped it every pass and
+    // nobody owned the repair. A PR the drain holds for CodeQL is owed a ci-heal (reason `codeql`), with the alert
+    // (rule/file/line/message from the check-run annotations, attached by `reconcile-pass.mjs#enrichPrsWithCodeQL`)
+    // carried on the row for the brief. `pr.codeqlFailure` exists ONLY when the drain gate is on, so turning the
+    // gate off turns this off with it. Bounded by the SAME durable ci-heal cap and head-scoped escalation as a red
+    // required check; every cap/escalation outcome is a logged refusal, never a silent skip.
+    if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
+      if (escalation) {
+        refuse('ci-heal-escalated', {
+          ...withPhase, headSha: escalation.headSha,
+          why: `the drain holds this PR for a failed CodeQL check, but ci-heal already escalated this exact head (\`${escalation.headSha}\`, ${escalation.outcome}) — nothing further is owed until a new push changes the head`,
+        });
+      } else if (healAttempts >= ciHealCap) {
+        refuse('cap-exhausted', {
+          ...withPhase, attempts: healAttempts, cap: ciHealCap,
+          why: `the drain holds this PR for a failed CodeQL check, and its durable CI-heal count is ${healAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
+        });
+        notes.push({
+          kind: 'ci-heal-exhausted', prNumber, attempts: healAttempts, cap: ciHealCap, lastFailureReason: 'CodeQL (drain gate)',
+          text: `PR #${prNumber}: ci-heal attempts exhausted (${healAttempts}/${ciHealCap}) — auto-heal cannot clear the CodeQL alert the drain is holding this PR for; a person must take it over. Last failure: CodeQL (drain gate)`,
+        });
+      } else {
+        dispatch.push({
+          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure,
+          why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`,
+        });
+      }
+      continue;
+    }
+
     if (ciRepairOwed) {
       // we:backlog/x9wz0ir-*.md (#4075/#3383) — LIVE INCIDENT 2026-09-25: PRs #2635/#2636 are BOTH `owed-ci-
       // rerun` (their required check failed inside one of `main`'s own red windows) AND `mergeStateStatus:
