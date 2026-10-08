@@ -71,7 +71,14 @@
  * PURE CORE / IO SHELL, the same split as `build-dispatch-daemon.mjs`.
  */
 
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import { readGit } from '../lib/proc-read.mjs';
+import { readBuildDelivery } from './build-delivery-evidence.mjs';
+import { recordBuildFailure } from './build-dispatch-failures.mjs';
+import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
 // Through the REGISTRY, never `dispatch-providers/build.mjs` directly: `detached-dispatch.mjs` imports the
@@ -184,6 +191,7 @@ export function resumeMarkerBindsRow(marker, row) {
  */
 export function classifyClaimLiveness({
   row: foundRow, resumeMarker, ownerPid = null, isPidAlive = defaultIsPidAlive, nowMs = Date.now(), claimedAt = null,
+  sessionLive = null,
 }) {
   // A run row that STARTED BEFORE this claim was taken is an older attempt's leftover, never this claim's own
   // dispatch (same rule as `build-dispatch-daemon.mjs#doneWhy`'s claimedAt guard). Live incident 2026-10-06:
@@ -219,7 +227,13 @@ export function classifyClaimLiveness({
   }
 
   const pid = detachedHandlePid(entry?.handle);
-  if (pid == null) return byOwnerPid(); // no handle to probe — same fallback as "no row at all".
+  if (pid == null) {
+    // xykwe0h — a `claude --bg` build's handle is a SESSION id, never a pid, and the claim's owner pid is the
+    // short-lived dispatching process: reading either as "dead" released every Claude build. The session's own
+    // job record (still working, or paused awaiting a verify verdict) is the evidence that counts.
+    if (sessionLive?.alive) return { status: 'alive', row, marker: null, reason: sessionLive.reason ?? 'session-live' };
+    return byOwnerPid(); // no handle to probe — same fallback as "no row at all".
+  }
   return { status: isPidAlive(pid) ? 'alive' : 'dead', row, marker: null };
 }
 
@@ -357,6 +371,74 @@ export function checkResumable({
   return { resumable: true, lanePath };
 }
 
+/** Job states of a `claude --bg` session that mean it is running. ONLY these ever read as alive (and only while fresh). */
+const ACTIVE_JOB_STATES = new Set(['working', 'running', 'idle', 'blocked']); // `blocked`: a live session (session-reaper.mjs documents it)
+/** Job states that mean it is finished. A state in neither set is UNKNOWN, never alive. */
+const TERMINAL_JOB_STATES = new Set(['done', 'stopped', 'failed', 'error', 'cancelled', 'killed']);
+/**
+ * An active job record untouched for this long belongs to a session that crashed or died with the host (its
+ * `state.json` still says `working`). Longer than lane-whois's 10-minute worker window on purpose: a foreground
+ * gate command legitimately runs up to 10 minutes without a record update, and mistaking that for death is the
+ * very relaunch bug this module exists to stop. A session parked on an await-verify record is judged by that
+ * record instead, not by this clock.
+ */
+export const SESSION_ACTIVE_WINDOW_MS = 30 * 60_000;
+/** An `updatedAt` further in the future than this is not a clock wobble but a bad record. */
+const SESSION_CLOCK_SKEW_MS = 5 * 60_000;
+
+/**
+ * Is the `claude --bg` session behind `handle` still alive, or paused awaiting its verify verdict? Reads the
+ * harness's own job record (`~/.claude/jobs/<id>/state.json`, matched by the handle's id prefix).
+ *   - an explicitly active state (`working`/`running`/`idle`) whose record updated within
+ *     {@link SESSION_ACTIVE_WINDOW_MS} is alive;
+ *   - a terminal state, or an active one gone stale, is alive ONLY while a live await-verify record parks that
+ *     session (it ended its turn on purpose to wait for a verdict), else it is not alive;
+ *   - a missing/empty/unrecognized state, or an active state with no readable `updatedAt`, is UNKNOWN (null):
+ *     never proof of life. The caller then falls back to the claim's owner pid.
+ * Never throws.
+ * @returns {{alive: boolean, reason?: string}|null}
+ */
+export function defaultSessionLiveness({ handle, num = null, jobsDir = join(homedir(), '.claude', 'jobs'), readdir = readdirSync, readFile = readFileSync, awaitingFor = makeAwaitingVerifyResolver(), now = Date.now } = {}) {
+  try {
+    const id = String(handle ?? '');
+    if (!/^[0-9a-f]{6,}/i.test(id)) return null;
+    const dir = readdir(jobsDir).find((d) => d.startsWith(id));
+    if (!dir) return null;
+    const state = JSON.parse(String(readFile(join(jobsDir, dir, 'state.json'), 'utf8')));
+    const name = String(state?.state ?? '').trim().toLowerCase();
+    const active = ACTIVE_JOB_STATES.has(name);
+    if (!active && !TERMINAL_JOB_STATES.has(name)) return null;
+    let stale = false;
+    if (active) {
+      // Only a full ISO timestamp counts (Date.parse alone reads "0" as the year 2000), and one in the future is
+      // clock skew or a corrupt record, never proof of life: both are UNKNOWN.
+      const raw = String(state?.updatedAt ?? '');
+      const updated = /^\d{4}-\d{2}-\d{2}T/.test(raw) ? Date.parse(raw) : NaN;
+      const age = now() - updated;
+      if (!Number.isFinite(age) || age < -SESSION_CLOCK_SKEW_MS) return null;
+      if (age <= SESSION_ACTIVE_WINDOW_MS) return { alive: true, reason: `session-${name}` };
+      stale = true;
+    }
+    const awaiting = awaitingFor({ sessionId: state?.sessionId ?? null, name: state?.name ?? (num != null ? `conveyor-${num}` : null), cwd: state?.cwd });
+    if (awaiting?.awaiting === true) return { alive: true, reason: 'awaiting-verify' };
+    return { alive: false, reason: stale ? 'session-stale' : 'session-ended' };
+  } catch { return null; }
+}
+
+/** Settle a run-store row with the build's REAL outcome (a PR, a merge, a resolved card), never `orphan-released`.
+ *  Only touches a row still `in-flight`; best-effort, like {@link settleOrphanRow}. */
+export function settleDeliveredRow({ runId, key, delivery }, store = createFileRunStore()) {
+  if (!runId || !key || !delivery?.outcome) return;
+  try {
+    const run = store.read(runId);
+    if (!run) return;
+    const entry = (run.effects || []).find((e) => e.key === key);
+    if (!entry || entry.status !== 'in-flight') return;
+    const outcome = delivery.outcome === 'pr-open' ? 'pr-opened' : delivery.outcome;
+    store.write(resolveInFlight(run, key, { status: 'applied', result: { outcome, pr: delivery.pr ?? null } }));
+  } catch { /* best-effort — never mask the release this settles alongside */ }
+}
+
 /** Best-effort: mark a stale, dead-wrapper run-store row settled (`failed`, with `outcome`) so it is never read
  *  as "still in flight" again. Never touched on the RESUME path — the resumed wrapper settles the row itself
  *  (it is handed `--run-id`/`--effect-key`). A no-op when `row` gave no `runId`/`key` at all (the #4382 shape —
@@ -416,7 +498,7 @@ export function spawnResumeDelivery({ num, lane, scope, sessionSlug, runId = nul
  *   - the resume marker is written PENDING before the spawn and completed with the pid after it, bound to the
  *     row it resumes, counting attempts — see {@link markBuildDispatchResume} and {@link decideOrphanAction}.
  *
- * @returns {Promise<Array<{num: string, action: 'leave'|'resume'|'release'|'exhausted'|'error', reason: string, pid?: number}>>}
+ * @returns {Promise<Array<{num: string, action: 'leave'|'resume'|'release'|'settled'|'exhausted'|'error', reason: string, pid?: number}>>}
  */
 export async function adoptOrphanedBuildClaims({
   allowResume = true,
@@ -437,6 +519,15 @@ export async function adoptOrphanedBuildClaims({
   placeHold = ({ num, reason }) => placeBuildDispatchHold({ num, reason }),
   spawnResume = (o) => spawnResumeDelivery(o),
   markResume = (o) => markBuildDispatchResume(o),
+  // xykwe0h — real-outcome evidence (a PR on the card's branch, or a resolved card) and session liveness.
+  readDelivery = (num) => readBuildDelivery(num),
+  settleDelivered = (o) => settleDeliveredRow(o),
+  sessionLivenessFor = (o) => defaultSessionLiveness(o),
+  // x87v3ed — a build that ended with NO delivery is a failed start: charge it to the card's backoff so the next tick
+  // does not relaunch it at once (14 of 25 launches on 2026-10-07 repeated a card), and hand back a lane lease the
+  // dispatch reserved for a worker that never used it. Both best-effort.
+  recordFailure = (o) => recordBuildFailure(o),
+  releaseLaneLease = (o) => releaseReservedLaneLease(o),
 } = {}) {
   let runsCache = null;
   const runs = () => (runsCache ??= listRuns());
@@ -449,12 +540,24 @@ export async function adoptOrphanedBuildClaims({
       const foundRow = findRow(num, runs);
       const resumeMarker = readResumeMarker(num);
       const ownerPid = Number.isInteger(claim.pid) ? claim.pid : null;
-      const liveness = classifyClaimLiveness({ row: foundRow, resumeMarker, ownerPid, isPidAlive, nowMs: now(), claimedAt: claim.meta?.claimedAt ?? null });
+      const handle = foundRow?.entry?.handle;
+      const sessionLive = foundRow && detachedHandlePid(handle) == null && handle ? sessionLivenessFor({ handle: String(handle), num }) : null;
+      const liveness = classifyClaimLiveness({ row: foundRow, resumeMarker, ownerPid, isPidAlive, nowMs: now(), claimedAt: claim.meta?.claimedAt ?? null, sessionLive });
       const row = liveness.row; // null when the found row predates this claim
       // A marker bound to some OLDER row (or to none at all) is stale — it must never answer for this claim
       // again.
       if (resumeMarker && !liveness.marker) clearMarker(num);
-      if (liveness.status !== 'dead') { results.push({ num, action: 'leave', reason: liveness.status }); continue; }
+      if (liveness.status !== 'dead') { results.push({ num, action: 'leave', reason: liveness.reason ? `${liveness.status} (${liveness.reason})` : liveness.status }); continue; }
+      // xykwe0h — a dead dispatch whose card was in fact DELIVERED (its session opened a PR, the PR merged, or the
+      // card is resolved) settles as that real outcome. It is neither resumed nor called `orphan-released`.
+      const delivery = readDelivery(num);
+      if (delivery?.outcome) {
+        releaseClaim({ num });
+        clearMarker(num);
+        settleDelivered({ runId: liveness.row?.runId, key: liveness.row?.entry?.key, delivery });
+        results.push({ num, action: 'settled', reason: `${delivery.outcome}: ${delivery.reason}` });
+        continue;
+      }
       // `row` may be null here (no run-store trace was ever found — #4382's own shape: killed before it ever
       // reached `in-flight`) — there is nothing to resume FROM in that case (no lane, no sessionSlug), so
       // resumability resolves to `no-lane-or-session` and this always falls straight to RELEASE.
@@ -491,6 +594,8 @@ export async function adoptOrphanedBuildClaims({
         releaseClaim({ num });
         clearMarker(num);
         settleRow({ runId: row?.runId, key: row?.entry?.key, outcome: exhausted ? 'orphan-resume-exhausted' : 'orphan-released' });
+        try { recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off` }); } catch { /* the release above already happened */ }
+        if (payload.lane != null && payload.sessionSlug) { try { releaseLaneLease({ lane: payload.lane, sessionSlug: payload.sessionSlug }); } catch { /* best-effort */ } }
         results.push({ num, action: decision.action, reason: exhausted ? decision.reason : `${decision.reason} (${resumability.reason})` });
       }
     } catch (e) {
@@ -498,4 +603,9 @@ export async function adoptOrphanedBuildClaims({
     }
   }
   return results;
+}
+
+/** x87v3ed — release the lane lease the dispatch reserved, by SESSION SLUG only (never forced: a lease that now belongs to another session is refused, so this cannot take someone else's lane). */
+export function releaseReservedLaneLease({ lane, sessionSlug }, { exec = execFileSync, cwd = REPO_ROOT } = {}) {
+  exec('node', ['scripts/lane-pool.mjs', 'release', `--lane=${lane}`, `--session=${sessionSlug}`], { cwd, stdio: 'ignore', timeout: 60_000 });
 }

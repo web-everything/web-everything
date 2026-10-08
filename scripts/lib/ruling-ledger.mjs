@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing } from './jury-core.mjs';
+import { readReferralRecords, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -100,7 +100,7 @@ export function rulingNeeded(pr, { humanAt = DEFAULT_HUMAN_AT, cardReadable = ()
     ...(typeof pr?.body === 'string' ? { body: pr.body } : {}), ...(pr?.createdAt ? { createdAt: pr.createdAt } : {}) });
   const live = new Map();
   for (const f of state.pendingFindings) {
-    if (f.attempted && !live.has(f.key)) live.set(f.key, { key: f.key, seat: f.seat, file: f.file, line: f.line, summary: f.summary, reason: 'pending' });
+    if (f.attempted && !live.has(f.key)) live.set(f.key, { key: f.key, seat: f.seat, file: f.file, line: f.line, summary: f.summary, judgmentCall: f.judgmentCall === true, reason: 'pending' });
   }
   const ig = ignoredRulings(pr, { humanAt });
   if (ig?.escalate) for (const m of ig.matches) if (!live.has(m.finding.key)) live.set(m.finding.key, { ...m.finding, reason: 'dispute' });
@@ -166,6 +166,9 @@ const operatorVerdictAfter = (comments, index) => (Array.isArray(comments) ? com
   && typeof c !== 'string' && isOperatorAuthored(c) && String(c?.body ?? '').trimStart().startsWith(OPERATOR_VERDICT));
 const hintMatchesFile = (hints, file) => !!file && hints.some((h) => String(file).toLowerCase().includes(h));
 
+/** A block that names a specific finding (a reviewer record's, or an `auto-policy` structured one), not free operator text. */
+const isFindingBlock = (b) => b.source === 'record' || b.source === 'structured';
+
 /**
  * Confirmed findings on the current head that repeat a finding already ruled `block` on an earlier head.
  * `misses` = distinct heads, after the ruling, on which the finding came back (the current head included).
@@ -214,10 +217,18 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     for (const x of parsed?.record?.rulings ?? []) {
       const ruled = allRecords.find((r) => r.runId === x.runId && r.head === parsed.record.head)?.referrals.find((f) => f.key === x.key);
       if (ruled) structured.push({ index, result: x.result, clearing: clearingView(ruled), supersedes: x.supersedes ?? [] });
+      // An `auto-policy` structured `block` (review.referralDefault=auto-block) is a standing block like a reviewer's: the
+      // same finding coming back on a later head is an ignored ruling, so a fixer that keeps missing escalates to the
+      // operator instead of being auto-blocked forever. The operator's own structured blocks are NOT registered here
+      // (operator mode is unchanged).
+      if (ruled && x.result === 'block' && String(parsed.record.actor ?? '').toLowerCase() === AUTO_POLICY_ACTOR) {
+        blocks.set(`structured:${index}:${x.runId}:${x.key}`, { source: 'structured', rulingId: operatorRulingId({ head: parsed.record.head, runId: x.runId, key: x.key, at: parsed.record.at }),
+          finding: findingView(ruled), clearing: clearingView(ruled), ruling: x.reason ?? parsed.record.reason, priorHead: parsed.record.head, index, at: sinceOf(c) });
+      }
     }
   });
   const overruled = (b) => {
-    if (b.source !== 'record') return false;
+    if (!isFindingBlock(b)) return false;
     // Held item 132: the LATEST operator ruling on the finding decides. It reaches the block either by naming the block's
     // id (`supersedes`, which survives a drifted line) or by being the same finding. A `block` never overrules.
     const latest = structured.filter((o) => o.index > b.index
@@ -225,9 +236,40 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     return !!latest && latest.result !== 'block';
   };
 
-  const matchesBlock = (view, b) => b.source === 'record'
+  const matchesBlock = (view, b) => isFindingBlock(b)
     ? sameFinding(view, b.finding)
     : hintMatchesFile(b.hints, view.file) && claimSimilarity(view.summary, b.text) >= SIMILARITY_FLOOR;
+
+  // Held item 141 (live #4361 @a5938d89, #4433 @4705dcf8, #4402): A BLOCK ON AN OLDER HEAD IS SATISFIED once the
+  // gate COUNTS a reviewer `not-real` with evidence for the finding on the current head, written after that block: the
+  // current-head reviewer's own ruling, or a reviewer not-real from a later head carried onto this one (the gate's
+  // `reviewerCarryBacking`). Only then did the finding not "come back". It once fired anyway on two paths: an
+  // auto-policy block ignored the current-head ruling, and a record block ignored a later-head not-real carried forward.
+  // The gate's own per-record state decides (`referralRecordState`), so a linked or contradicting block still holds.
+  const gateRecords = readReferralRecords(pr?.comments, { head }).records;
+  const stateCache = new Map();
+  const gateState = (record) => {
+    if (!stateCache.has(record.runId)) {
+      const full = gateRecords.find((r) => r.head === head && r.runId === record.runId) ?? record;
+      let state = null;
+      try {
+        state = referralRecordState(full, { head, records: gateRecords, operatorRulings,
+          ...(typeof pr?.body === 'string' ? { body: pr.body } : {}), ...(pr?.createdAt ? { createdAt: pr.createdAt } : {}) });
+      } catch { state = null; }
+      stateCache.set(record.runId, state);
+    }
+    return stateCache.get(record.runId);
+  };
+  const hasEvidence = (r) => Array.isArray(r?.evidence) && r.evidence.some((e) => oneLine(e).length > 0);
+  /** Thread position of the counted not-real-with-evidence ruling that clears `key` on this head, or null. */
+  const notRealClearanceAt = (record, key) => {
+    const state = gateState(record);
+    if (!state || state.pending.includes(key) || state.blocked.includes(key)) return null;
+    const ruling = state.rulings.filter((r) => r.key === key || (r.id && record.carried?.some((c) => c.key === key && c.from?.rulingId === r.id))).at(-1);
+    if (!ruling || ruling.result !== 'not-real' || !hasEvidence(ruling)) return null;
+    const seen = snaps.find((s) => s.record.rulings.some((x) => x.id === ruling.id && x.result === 'not-real'));
+    return seen ? seen.index : null;
+  };
 
   const matches = [];
   let worst = 0;
@@ -248,11 +290,13 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;
+      const clearedAt = notRealClearanceAt(record, f.key);
       for (const c of blocks.values()) {
         if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
         if (!matchesBlock(g, c)) continue;
         if (c.source === 'record' && rulingsHere(f.key).length) continue;
         if (overruled(c)) continue;
+        if (isFindingBlock(c) && clearedAt !== null && clearedAt > c.index) continue; // satisfied, not came back
         if (!b || c.index > b.index) b = c;
       }
       if (!b) continue;
@@ -264,7 +308,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (s.record.referrals.some((x) => matchesBlock(findingView(x), b))) heads.add(s.record.head);
       }
       worst = Math.max(worst, heads.size);
-      matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: b.source === 'record' ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
+      matches.push({ finding: g, runId: record.runId, blockRulingId: b.rulingId ?? null, ruledFinding: isFindingBlock(b) ? b.finding : null, ruling: b.ruling, priorHead: b.priorHead,
         ruledAt: b.at ? new Date(b.at).toISOString() : null, source: b.source, misses: heads.size });
     }
   }

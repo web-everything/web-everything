@@ -5,7 +5,15 @@
  *   in-memory-store convention for `ensureSettingsFileEnv`/`ensureSettingsFilePermissions`.
  */
 import { describe, it, expect } from 'vitest';
-import { DISPATCH_WORKTREE_SETTINGS, ensureWorktreeIsolationOff, hasWorktreeIsolationOff } from '../dispatch-bg-isolation.mjs';
+import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import {
+  DISPATCH_WORKTREE_SETTINGS, ensureWorktreeIsolationOff, hasWorktreeIsolationOff,
+  isolateDispatchSession, dispatchGuardHooks, ensureDispatchGuardHooks,
+} from '../dispatch-bg-isolation.mjs';
 
 function memoryFs(initial = {}) {
   const files = { ...initial };
@@ -91,5 +99,82 @@ describe('hasWorktreeIsolationOff', () => {
 
   it('is false when nothing has been written, never throws', () => {
     expect(hasWorktreeIsolationOff('/lane', { readFile: () => { throw new Error('ENOENT'); } })).toBe(false);
+  });
+});
+
+// xl5reby — a dispatched worker starts in a scratch dir with no repo settings; its OWN settings must carry the
+// repo's PreToolUse guards, by absolute path.
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+
+describe('xl5reby dispatched worker effective settings include the repo guard hooks', () => {
+  it('isolateDispatchSession (the one call every dispatch path makes) writes guard-bash and guard-lane by absolute path', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'dispatch-guards-'));
+    try {
+      const r = isolateDispatchSession(cwd);
+      expect(r.hooks.ok).toBe(true);
+      const settings = JSON.parse(readFileSync(join(cwd, '.claude', 'settings.local.json'), 'utf8'));
+      const cmds = settings.hooks.PreToolUse.flatMap((g) => g.hooks.map((h) => h.command));
+      expect(cmds.some((c) => c.includes('guard-bash.mjs'))).toBe(true);
+      expect(cmds.some((c) => c.includes('guard-lane.mjs'))).toBe(true);
+      for (const c of cmds) {
+        const m = /^node "(\/[^"]+\.mjs)"/.exec(c);
+        expect(m, c).not.toBeNull();
+        expect(existsSync(m[1]), m[1]).toBe(true);
+      }
+      const bash = settings.hooks.PreToolUse.find((g) => g.matcher === 'Bash');
+      expect(bash.hooks[0].command).toMatch(/guard-bash\.mjs"$/);
+      expect(settings.worktree).toEqual({ bgIsolation: 'none' });
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('the hooks ride only in the local file, never in the --settings worktree patch (no double run)', () => {
+    expect(isolateDispatchSession(mkdtempSync(join(tmpdir(), 'dispatch-guards-'))).worktreeSettings).toEqual({ bgIsolation: 'none' });
+  });
+
+  it('only PreToolUse deny guards are carried, never bookkeeping hooks', () => {
+    const repo = JSON.parse(readFileSync(join(REPO, '.claude', 'settings.json'), 'utf8'));
+    const all = dispatchGuardHooks({ preToolUse: repo.hooks.PreToolUse, repoRoot: '/r' }).flatMap((g) => g.hooks.map((h) => h.command));
+    expect(all).toContain('node "/r/scripts/guard-bash.mjs"');
+    expect(all).toContain('node "/r/scripts/lint-locus-prefix.mjs" --pre');
+    expect(all.join(' ')).not.toMatch(/bootstrap-session|session-reaper|broadcast-inject/);
+  });
+
+  it('falls back to the Bash and Edit/Write guards when the repo settings are unreadable', () => {
+    const fs = memoryFs();
+    const r = ensureDispatchGuardHooks({ cwd: '/w', repoRoot: '/nope', ...fs });
+    expect(r.ok).toBe(true);
+    const cmds = JSON.parse(fs.files['/w/.claude/settings.local.json']).hooks.PreToolUse.flatMap((g) => g.hooks.map((h) => h.command));
+    expect(cmds).toEqual(['node "/nope/scripts/guard-lane.mjs"', 'node "/nope/scripts/guard-bash.mjs"']);
+  });
+
+  it('is additive and idempotent: other keys and existing hooks survive, no duplicate on a second call', () => {
+    const path = '/w/.claude/settings.local.json';
+    const fs = memoryFs({ [path]: JSON.stringify({ env: { A: '1' }, hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'echo mine' }] }] } }) });
+    ensureDispatchGuardHooks({ cwd: '/w', repoRoot: '/nope', ...fs });
+    const once = fs.files[path];
+    ensureDispatchGuardHooks({ cwd: '/w', repoRoot: '/nope', ...fs });
+    expect(fs.files[path]).toBe(once);
+    const parsed = JSON.parse(once);
+    expect(parsed.env).toEqual({ A: '1' });
+    expect(parsed.hooks.PreToolUse.flatMap((g) => g.hooks.map((h) => h.command))).toContain('echo mine');
+  });
+
+  it('never throws on a write failure', () => {
+    const r = ensureDispatchGuardHooks({ cwd: '/w', repoRoot: '/nope', readFile: () => { throw new Error('x'); }, writeFile: () => { throw new Error('disk full'); }, mkdir: () => {} });
+    expect(r.ok).toBe(false);
+  });
+
+  it('the guard runs from a dispatch-style cwd with an absolute path and denies a redirect write at a primary checkout', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'dispatch-guards-'));
+    try {
+      const primary = resolve(REPO, '..', 'webeverything');
+      const ev = JSON.stringify({ tool_name: 'Bash', cwd: primary, tool_input: { command: 'echo x > scratch-should-never-exist.txt' } });
+      const out = spawnSync('node', [join(REPO, 'scripts', 'guard-bash.mjs')], { cwd, input: ev, encoding: 'utf8' });
+      expect(out.status).toBe(0);
+      // Only meaningful when a sibling primary exists on this machine; elsewhere the guard has nothing to protect.
+      if (existsSync(primary) && resolve(REPO, '..') === dirname(primary)) {
+        expect(JSON.parse(out.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+      }
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 });

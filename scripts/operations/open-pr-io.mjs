@@ -141,7 +141,9 @@ export function createPrLandRunner({ prePrReview = checkPrePrReview, loadSetting
     // xsjn0uf-incident — advisory: a card this PR adds whose bornAs is already on main / in another open PR.
     if (!argv.includes('--dry-run')) {
       let dups = [];
-      try { dups = dupBornAs({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD', branch: arg('branch') || '' }) || []; } catch { dups = []; }
+      // xbdzt01 — the scan must skip THIS PR. open-pr always hands pr-land `--ref=` (never `--branch=`), so the head
+      // ref is `ref`; reading only `branch` excluded nothing and flagged every card as "also in" the PR itself.
+      try { dups = dupBornAs({ base: arg('base') || 'main', sha: arg('sha') || 'HEAD', branch: arg('ref') || arg('branch') || '' }) || []; } catch { dups = []; }
       for (const w of dups) process.stderr.write(`open-pr: WARNING — duplicate card: ${w}\n`);
     }
     let item;

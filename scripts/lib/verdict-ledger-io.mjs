@@ -1,8 +1,8 @@
 /**
  * @file scripts/lib/verdict-ledger-io.mjs
  * @description THE GIT IO-SHELL OF THE VERDICT LEDGER (ledger plan slice C1 = #3255 part 1; plan section 3.2).
- *   Fetch, append, bounded retry, on the `ops/review-requests` git transport. NO CALLERS YET: nothing in the
- *   repo imports this until C2 (dual-write) lands.
+ *   Fetch, idempotent append, bounded retry, on the `ops/review-requests` git transport.
+ *   Sync primitives serve existing writers; the registered store exposes the async contract.
  *
  * THREE PROMISES, each pinned by a test:
  *   1. A READ THAT FAILS IS `unreadable`, NEVER "empty". `readVerdictLedger` (the home-dir reader) turns any read
@@ -18,15 +18,18 @@
  * Reuses `we:scripts/lib/git-transport-branch.mjs` (worktree dance, explicit refspec); does not duplicate it.
  */
 import {
+  assertPushRef,
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, parseLedgerEvents, serializeLedgerEvent, checkLedgerAppendRows } from './verdict-ledger.mjs';
+import { parseVerdictLog, parseLedgerEvents, ledgerEventId, checkLedgerAppendRows } from './verdict-ledger.mjs';
 import { registerLedgerStore } from './verdict-ledger-store.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
 export const LEDGER_DIR = 'verdict-ledger';
 export const DEFAULT_APPEND_ATTEMPTS = 5;
+/** The ONLY ref the ledger push path may write (operator decision 2026-10-08): never main, never a lane, never a force. */
+export const LEDGER_PUSH_REF = `refs/heads/${LEDGER_TRANSPORT_BRANCH}`;
 
 /** Repo-relative path of one repo's ledger on the transport branch. Same slug rule as `verdictLedgerPath`. */
 export function ledgerGitPath(repo) {
@@ -66,7 +69,7 @@ export function readLedgerFromGit({ board, repo, branch = LEDGER_TRANSPORT_BRANC
  * Append records to one repo's ledger on the git transport, retrying on a lost push race.
  * Validates every record first; an invalid one refuses the whole call and writes nothing.
  *
- * @returns {{status: 'appended', attempts: number, rows: number} }
+ * @returns {{status: 'appended', attempts: number, rows: number, duplicates: number} }
  * @throws {LedgerAppendExhaustedError} when every attempt failed (LOUD by design).
  */
 export function appendLedgerRows({
@@ -81,15 +84,16 @@ export function appendLedgerRows({
   ...seams // run / mkdir / write / read / rm / now, passed through to the transport
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
-  const lines = records.map((r) => {
-    const s = serializeLedgerEvent(r); // every v2 event type; a verdict row delegates to the v1 serializer, bytes unchanged
-    if (!s.ok) throw new TypeError(`verdict-ledger-io: invalid record refused, nothing written: ${s.errors.join('; ')}`);
-    return s.line;
-  });
+  assertPushRef(branch, LEDGER_PUSH_REF); // before any record is serialized or any git call: a wrong ref writes nothing
+  const check = checkLedgerAppendRows(records, repo);
+  if (!check.ok) throw new TypeError(`verdict-ledger-io: ${check.error}`);
+  const { lines, ids } = check;
   const path = ledgerGitPath(repo);
   const errors = [];
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
+      let written = 0;
+      let duplicates = 0;
       stageOnTransportBranch({
         board,
         branch,
@@ -98,12 +102,22 @@ export function appendLedgerRows({
           path,
           content: ({ existing }) => {
             const base = existing ?? '';
-            return `${base}${base && !base.endsWith('\n') ? '\n' : ''}${lines.join('\n')}\n`;
+            const seen = new Set(parseLedgerEvents(base).map(ledgerEventId));
+            const fresh = lines.filter((line, i) => {
+              if (seen.has(ids[i])) return false;
+              seen.add(ids[i]);
+              return true;
+            });
+            written = fresh.length;
+            duplicates = lines.length - written;
+            if (!written) return base; // identical bytes: transport skips commit and push
+            return `${base}${base && !base.endsWith('\n') ? '\n' : ''}${fresh.join('\n')}\n`;
           },
         }],
         ...seams,
+        allowRef: LEDGER_PUSH_REF, // after the seams: a caller cannot loosen it
       });
-      return { status: 'appended', attempts: attempt, rows: lines.length };
+      return { status: 'appended', attempts: attempt, rows: written, duplicates };
     } catch (e) {
       errors.push(e);
       if (attempt < attempts) {
@@ -116,31 +130,41 @@ export function appendLedgerRows({
 }
 
 /**
- * The git-branch store as a contract adapter (card xsij7u6). A thin wrapper: `append` and `read` delegate to
- * {@link appendLedgerRows} / {@link readLedgerFromGit} unchanged, turning the append's throw into `{ok: false}`.
- * `ctx` / `range` carry `board` (required) and any transport seams (`run`, `branch`, ...).
- * @param {{appendRows?: Function, readRows?: Function}} [impl] - test seams.
+ * Synchronous bridge for legacy writers. Validates/stamps ids, contains transport failures, and reports
+ * the count from the successful retry (including duplicate-only success). The appendRows seam is synchronous.
+ */
+export function appendGitRowsSync(rows, ctx = {}, { appendRows = appendLedgerRows } = {}) {
+  try {
+    const check = checkLedgerAppendRows(rows, ctx?.repo);
+    if (!check.ok) return { ok: false, appended: 0, error: check.error };
+    const { repo: _ctxRepo, ...rest } = ctx ?? {};
+    const result = appendRows({ ...rest, repo: check.repo, records: check.records });
+    return { ok: true, appended: result.rows ?? rows.length, duplicates: result.duplicates ?? 0 };
+  } catch (e) {
+    return { ok: false, appended: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
+  }
+}
+
+/**
+ * Async git store contract. ctx/range carry board and transport seams; underlying git primitives stay sync.
+ * Deduplication lives in appendLedgerRows's content callback so every push retry sees the current tip's ids.
  */
 export function createGitLedgerStore({ appendRows = appendLedgerRows, readRows = readLedgerFromGit } = {}) {
   return {
     name: 'git',
-    capabilities: { durable: true, shared: true, ordering: 'total' },
-    append(rows, ctx = {}) {
-      const check = checkLedgerAppendRows(rows, ctx?.repo);
-      if (!check.ok) return { ok: false, appended: 0, error: check.error };
-      try {
-        const { repo: _ctxRepo, ...rest } = ctx ?? {};
-        appendRows({ ...rest, repo: check.repo, records: check.records });
-        return { ok: true, appended: rows.length };
-      } catch (e) {
-        return { ok: false, appended: 0, error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
-      }
+    capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' },
+    async append(rows, ctx = {}) {
+      return appendGitRowsSync(rows, ctx, { appendRows });
     },
-    read(range = {}) {
-      const { repo, from = 0, ...rest } = range;
-      const r = readRows({ ...rest, repo });
-      if (r.status !== 'ok') return { status: 'unreadable', reason: r.reason, error: r.error };
-      return { status: 'ok', rows: parseLedgerEvents(r.text).filter((x) => x.repo === repo).slice(from) }; // every event type, not only v1 verdicts; only this repo's rows
+    async read(range = {}) {
+      try {
+        const { repo, from = 0, ...rest } = range;
+        const r = await readRows({ ...rest, repo });
+        if (r.status !== 'ok') return { status: 'unreadable', reason: r.reason, error: r.error };
+        return { status: 'ok', rows: parseLedgerEvents(r.text).filter((x) => x.repo === repo).slice(from) };
+      } catch (e) {
+        return { status: 'unreadable', reason: 'transport-read-failed', error: String(e?.message ?? e).split('\n')[0].slice(0, 300) };
+      }
     },
   };
 }

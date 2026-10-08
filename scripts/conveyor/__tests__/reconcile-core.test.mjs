@@ -53,12 +53,15 @@ import { CONVERTED_ADVISORY_NOTE_MARKER } from '../../lib/review-escalation.mjs'
 import { buildRebaseOntoMainComment, DEFAULT_MAX_REBASE_RETRIES_PER_SHA } from '../main-red-recovery.mjs';
 import { laneRefItemNum } from '../lease-reaper.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../../lib/jury-core.mjs';
-import { defaultReadPrs, defaultReadAgents, PR_LIST_JSON_FIELDS, PR_LIST_LIMIT } from '../reconcile-pass.mjs';
+import { defaultReadPrs, defaultReadAgents, PR_LIST_JSON_FIELDS, PR_LIST_LIMIT, enrichPrsWithIgnoredRulings } from '../reconcile-pass.mjs';
 import { reviewSessionSlug } from '../review-session-slug.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 import { buildReviewedShaMarker } from '../../lib/review-escalation.mjs';
 import { classifyPr } from '../../progress-board.mjs';
 import { reconcileHolds } from '../../operations/land-advance-items-io.mjs';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 
 // ── fixtures — measured shapes, 2026-08-26 ───────────────────────────────────────────────────────────────────
 const NOW = Date.parse('2026-08-26T17:34:00Z');
@@ -3706,5 +3709,43 @@ describe('card-batch extraction routing (#4703, xuz8m83)', () => {
     for (const headRefName of ['lane/2612-converge-pr-drive', 'lane/card-extract-5-abc1234', 'card-batch-prevention-1', 'lane/xx-card-batch-1']) {
       expect(plan({ headRefName }).dispatch.map((d) => d.kind)).toEqual(['fix']);
     }
+  });
+});
+
+it('a bounced PR whose head is the load-flake pushed fix is owed a re-arm, not another fixer (#4361)', () => {
+  const c = (body, createdAt) => ({ body, createdAt, author: AUTOMATION });
+  const alt = 'a5938d8938a20137e76d2145e49d40ee8fff4970';
+  const hold = c(loadHoldBody({ head: 'd7a3b14ac', alt: 'lane/build-outcomes-fix-4361-alt', altSha: alt }), '2026-10-08T15:01:01Z');
+  const pushed = c(loadResultBody({ altSha: alt, result: 'pushed' }), '2026-10-08T15:02:43Z');
+  const plan = (comments) => planReconcile({ prs: [pr1563({ comments: [finding(), hold, ...comments], headRefOid: alt, labels: lbl('review:changes', 'review:human') })], agents: [], durableCounts: {}, now: NOW });
+  const owed = plan([pushed]);
+  expect(owed.dispatch.some((d) => d.kind === 'fix')).toBe(false);
+  expect(owed.refusals).toEqual([expect.objectContaining({ kind: 'load-flake-rearm-owed', sha: alt })]);
+  // once re-armed (or bounced again on that head) the ordinary paths own it again
+  expect(plan([pushed, c('🔁 review — changes requested\n\nagain', '2026-10-08T16:00:00Z')]).refusals.map((r) => r.kind)).not.toContain('load-flake-rearm-owed');
+});
+
+// ── Held item 141 — the false "ruling dispute" / "owed a fix, not a review" ──────────────────────────────────────
+// Live 2026-10-08: #4361 (head a5938d89) and #4433 (head 4705dcf8) were sent to the operator as "N confirmed findings
+// the operator ruled block came back on the new head", although the reviewer on THAT head had ruled each one not-real
+// (fixed) with line evidence. Replays the recorded threads up to the moment the dispute fired.
+describe('held item 141: an older-head block the current-head reviewer ruled not-real is not "came back"', () => {
+  const fixtures = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+  const replay = (file, upto) => {
+    const fx = JSON.parse(readFileSync(join(fixtures, file), 'utf8'));
+    const [pr] = enrichPrsWithIgnoredRulings([{ number: fx.pr, state: 'OPEN', headRefName: `lane/pr-${fx.pr}`, headRefOid: fx.headRefOid,
+      body: fx.body, createdAt: fx.createdAt, labels: lbl('review:human', 'advisory:changes'), mergeStateStatus: 'CLEAN',
+      statusCheckRollup: [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }], comments: fx.comments.slice(0, upto ?? fx.comments.length) }]);
+    return planReconcile({ repo: 'we', prs: [pr], agents: [], now: Date.parse('2026-10-08T18:00:00Z') });
+  };
+  const disputeOrSendBack = (p) => [...p.dispatch.filter((d) => d.mode === 'ruling-not-addressed').map(() => 'ruling-not-addressed'),
+    ...p.refusals.filter((r) => r.kind === 'ruling-dispute').map(() => 'ruling-dispute'),
+    ...p.notes.filter((n) => n.kind === 'ruling-dispute').map(() => 'note')];
+  it.each([
+    ['#4361 @a5938d89', 'pr-4361-a5938d89-reviewer-cleared-dispute.json', 77],
+    ['#4433 @4705dcf8', 'pr-4433-4705dcf8-reviewer-cleared-dispute.json', 26],
+  ])('%s: no dispute and no "owed a fix" once the current-head reviewer ruled them; still fires while unruled', (_, file, beforeRulings) => {
+    expect(disputeOrSendBack(replay(file))).toEqual([]);
+    expect(disputeOrSendBack(replay(file, beforeRulings)).length).toBeGreaterThan(0);
   });
 });

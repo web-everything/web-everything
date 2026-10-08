@@ -6,20 +6,34 @@
  *
  * ONE CONTRACT. A store is an object:
  *   - `name`          string, the registry key (what `verdictLedger.store` selects).
- *   - `capabilities`  `{durable, shared, ordering}` (see {@link validateLedgerStore}).
- *   - `append(rows, ctx)` -> `{ok: true, appended: n}` | `{ok: false, appended: k, error}`. NEVER throws.
+ *   - `capabilities`  `{durable, shared, ordering, singleWriter}` (see {@link validateLedgerStore}).
+ *   - `append(rows, ctx)` -> Promise of `{ok: true, appended: n, duplicates: d}` | `{ok: false, appended: k, error}`.
+ *        Resolves, never throws or rejects. Append is idempotent by event id, including repeats within a batch.
+ *        An all-duplicate batch writes nothing. Each newly written row carries its event id.
  *        `rows` are a non-empty array of ledger events of ONE repo; `ctx.repo` names it. An invalid row refuses
  *        the whole call (`appended: 0`, nothing written), and a row is never repaired: one whose own `repo` is
  *        missing, malformed or different from `ctx.repo` is invalid. On an I/O failure `appended` is the count really
  *        written, so a caller never has to guess.
- *   - `read(range)`   -> `{status: 'ok', rows}` | `{status: 'unreadable', reason, error}`. NEVER throws.
+ *   - `read(range)`   -> Promise of `{status: 'ok', rows}` | `{status: 'unreadable', reason, error}`.
+ *        Resolves, never throws or rejects.
  *        `range` is `{repo, from?}`; `from` skips that many leading rows (default 0).
  *        A read that FAILS is `unreadable`, NEVER an empty `ok`. Only a store that was really read and has no
  *        rows for the repo answers `{status: 'ok', rows: []}`.
  *
+ * Capabilities explicitly declare whether rows are shared across machines (local stores say shared:false),
+ * and how concurrent writers avoid losing rows (singleWriter).
+ *
  * Callers select a store by name through {@link getLedgerStore}; a future store (Plateau) calls
  * {@link registerLedgerStore} and no caller changes.
  */
+
+export const LEDGER_SINGLE_WRITER = Object.freeze(['file-lock', 'push-race-retry', 'single-object', 'none']);
+
+/** Stable descriptor for reports; no I/O. */
+export function describeLedgerStore(store) {
+  const { durable, shared, ordering, singleWriter } = store.capabilities;
+  return { name: store.name, durable, shared, ordering, singleWriter };
+}
 
 export const LEDGER_ORDERINGS = Object.freeze(['none', 'append', 'total']);
 
@@ -38,6 +52,7 @@ export function validateLedgerStore(store) {
   else {
     if (typeof c.durable !== 'boolean') errors.push('capabilities.durable must be a boolean (survives the writing process)');
     if (typeof c.shared !== 'boolean') errors.push('capabilities.shared must be a boolean (visible to other machines)');
+    if (!LEDGER_SINGLE_WRITER.includes(c.singleWriter)) errors.push(`capabilities.singleWriter must be one of ${LEDGER_SINGLE_WRITER.join('|')}`);
     if (!LEDGER_ORDERINGS.includes(c.ordering)) errors.push(`capabilities.ordering must be one of ${LEDGER_ORDERINGS.join('|')}`);
   }
   return { ok: errors.length === 0, errors };

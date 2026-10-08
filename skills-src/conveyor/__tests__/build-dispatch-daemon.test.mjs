@@ -2859,3 +2859,12 @@ describe('tick-overrun speedups (card xwn53th) change timing only, never the ans
     });
   });
 });
+
+describe('x87v3ed — the daemon launch asks dispatch-lane to reserve the lane first', () => {
+  it('sets WE_DISPATCH_RESERVE_LANE=1 in the dispatch-lane launch env', () => {
+    let seen = null;
+    const exec = (_cmd, _argv, opts) => { seen = opts.env; return JSON.stringify({ steps: [] }); };
+    cliDispatch({ num: '5189', bookkeeping: {} }, { exec });
+    expect(seen?.WE_DISPATCH_RESERVE_LANE).toBe('1');
+  });
+});

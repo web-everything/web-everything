@@ -127,6 +127,10 @@ import { createGhProvider, writeOrder } from './lib/review-label-provider.mjs';
 // nobody re-ran it against. Also read by `decideSetLabel`'s `rearm` branch to keep the "at most one review:*
 // hold" invariant enforceable from ONE imported constant rather than a re-typed literal.
 import { ADVISORY_LABELS } from './lib/advisory-labels.mjs';
+// Held item 141 (live #4402): an accepted PR has nothing left to rule on, so `accepted` and `clear-human` drop the
+// derived `advisory:ruling-needed` label in the same swap. The per-tick sweep only reads OPEN PRs, so a PR merged
+// minutes after acceptance kept it for good.
+import { RULING_NEEDED_LABEL } from './lib/ruling-ledger.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 // #3631 slice — the LAST bare `execFileSync` in this file's own gh-adjacent write path. This exec closure is
 // `computeNetDiffText`'s injected exec, and today it is only ever invoked with `cmd==='git'` (a fetch/diff/
@@ -313,7 +317,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // on the PR through three more review rounds with no `review:human` left to explain it.
       removeLabels: [
         REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
-        ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES,
+        ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
       reason: 'gate-self CLEARED via --to=clear-human — review:human dropped, review:accepted added; drain may merge',
@@ -486,7 +490,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
     return {
       allowed: true,
       addLabel: REVIEW_LABELS.accepted,
-      removeLabels: [REVIEW_LABELS.pending, REVIEW_LABELS.changes],
+      removeLabels: [REVIEW_LABELS.pending, REVIEW_LABELS.changes, RULING_NEEDED_LABEL],
       keepsHuman: isHuman,
       reason: 'accepted — reviewer accepted; drain may merge',
     };

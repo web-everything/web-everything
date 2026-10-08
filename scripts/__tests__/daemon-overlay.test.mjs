@@ -89,6 +89,81 @@ function overlayStateFile(overlayDir, cloneDir) {
   return names.length ? JSON.parse(readFileSync(join(overlayDir, names[0]), 'utf8')) : null;
 }
 
+describe('daemon-overlay.mjs add — the no-PR warning (xkhtg2a)', () => {
+  function fixture(mode) {
+    const f = makeFixture();
+    delete f.env.WE_OVERLAY_NO_PR;
+    if (mode) f.env.WE_OVERLAY_NO_PR = mode;
+    pushBranch(f.originDir, 'lane/no-pr', (dir) => writeFile(dir, 'overlay.txt', 'overlay\n'));
+    return { ...f, args: ['add', `--clone=${f.cloneDir}`, '--ref=lane/no-pr'] };
+  }
+
+  function expectRegistered(f) {
+    expect(overlayStateFile(f.overlayDir, f.cloneDir).overlays.map((o) => o.ref)).toEqual(['lane/no-pr']);
+    const events = readdirSync(f.overlayDir).filter((n) => n.endsWith('.events.jsonl'));
+    const added = readFileSync(join(f.overlayDir, events[0]), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(added).toContainEqual(expect.objectContaining({ kind: 'added', noPr: true }));
+  }
+
+  it('warns by default and registers an overlay without a PR', () => {
+    const f = fixture();
+    const r = runCli(f.args, f.env);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/WARNING.*NO PR/);
+    expectRegistered(f);
+  });
+
+  it('does not warn when --pr=5 is supplied', () => {
+    const f = fixture('refuse');
+    const r = runCli([...f.args, '--pr=5'], f.env);
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toMatch(/NO PR/);
+  });
+
+  it('refuses before the conflict guard or add-guard lock and registers nothing', () => {
+    const f = fixture('refuse');
+    const lockDir = `${overlayFilePath(f.cloneDir, f.env)}.add-guard.lock`;
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, 'owner'), `${process.pid}:held`);
+    f.env.WE_DAEMON_OVERLAY_ADD_GUARD_WAIT_MS = '1';
+    const r = runCli([...f.args, '--ref=lane/missing'], f.env);
+    expect(r.status).toBe(3);
+    expect(r.stderr).toMatch(/REFUSED.*NO PR/);
+    expect(r.stderr).toContain('--pr=<N>');
+    expect(r.stderr).toContain('--allow-no-pr --reason=<why>');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+
+  it('allows a reasoned override in refuse mode, with a warning and audit event', () => {
+    const f = fixture('refuse');
+    const r = runCli([...f.args, '--allow-no-pr', '--reason=x'], f.env);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/WARNING.*NO PR/);
+    expectRegistered(f);
+  });
+
+  it('--allow-no-pr without --reason is a usage error', () => {
+    const f = fixture('refuse');
+    const r = runCli([...f.args, '--allow-no-pr'], f.env);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain('--allow-no-pr requires --reason');
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+
+  it.each([
+    ['warn', [], 0, true],
+    ['refuse', [], 3, false],
+    ['refuse', ['--allow-no-pr', '--reason=x'], 0, true],
+  ])('%s --check warns without registering (override %j)', (mode, override, status, wouldRegister) => {
+    const f = fixture(mode);
+    const r = runCli([...f.args, '--check', '--json', ...override], f.env);
+    expect(r.status).toBe(status);
+    expect(r.stderr).toMatch(/WARNING.*NO PR/);
+    expect(JSON.parse(r.stdout).wouldRegister).toBe(wouldRegister);
+    expect(overlayStateFile(f.overlayDir, f.cloneDir)?.overlays ?? []).toEqual([]);
+  });
+});
+
 describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
   it('REFUSES (exit 3) a conflicting overlay by default, and registers NOTHING', () => {
     const { originDir, cloneDir, overlayDir, env } = makeFixture();
@@ -141,7 +216,7 @@ describe('daemon-overlay.mjs add — the overlay-conflict guard', () => {
     pushBranch(originDir, 'lane/other', (dir) => writeFile(dir, 'b.mjs', 'b\n'));
     runCli(['add', `--clone=${cloneDir}`, '--ref=lane/fix-procedure'], env);
 
-    const r = runCli(['add', `--clone=${cloneDir}`, '--ref=lane/other'], env);
+    const r = runCli(['add', `--clone=${cloneDir}`, '--ref=lane/other', '--pr=5'], env);
     expect(r.status).toBe(0);
     expect(r.stderr).toBe('');
 

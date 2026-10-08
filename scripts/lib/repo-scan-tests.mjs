@@ -117,7 +117,8 @@ export const DEFERRED_SCAN_TESTS = Object.freeze({
   'scripts/review-corpus/__tests__/gates.test.mjs': 'reads one named backlog card as a fixture; not a rule scan',
   'scripts/conveyor/__tests__/fix-procedure.test.mjs': 'walks skills-src markdown for `--repo` on fix-* commands; markdown-only reach, large file, follow-up',
   'scripts/lib/__tests__/daemon-rebuild.test.mjs': 'walks a throwaway git dir it created, not the repo',
-  'scripts/operations/__tests__/run.test.mjs': 'lists a throwaway run directory, not the repo',
+  'scripts/operations/__tests__/unsized-kind-callers.test.mjs': 'greps scripts/ for a never-sized kind paired with a size (#x0h3pe4); cheap to run in CI, and every caller it guards also has its own wiring test',
+  'scripts/operations/__tests__/run.test.mjs':'lists a throwaway run directory, not the repo',
   'scripts/operations/__tests__/review-loop-cli.test.mjs': 'lists a throwaway temp root, not the repo',
   'scripts/__tests__/review-set-label.approval-prevention-filing.test.mjs': 'lists a throwaway temp root, not the repo',
 });

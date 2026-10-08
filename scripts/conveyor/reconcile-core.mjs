@@ -128,7 +128,7 @@ import {
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
   standDownComments,
 } from './stand-down.mjs';
-import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
@@ -279,7 +279,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  */
 export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
-  'stood-down', 'load-flake-hold', 'no-findings', 'cap-exhausted',
+  'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
   'owed-elsewhere', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
   // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — a ci-heal already escalated THIS EXACT
@@ -1233,6 +1233,29 @@ function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
+  // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
+  // #4361: +3277/-96 across 44 files for a ~5 file change, a stale base carrying other lanes' work). The daemon first
+  // tries the mechanical refresh onto main (one attempt per head, `pr.scopeBloat.refresh`); once that has been tried and
+  // the diff is still bloated, or the bloat is not a stale base, the PR is held and routed to a fixer to rebase.
+  if (!pr?.isDraft && pr?.scopeBloat) {
+    const sb = pr.scopeBloat;
+    const refreshPending = sb.stale && !sb.refresh;
+    if (!refreshPending && attempts < roundCap) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'scope-bloat-rebase', findings: 1, attempts, cap: roundCap,
+        scopeBloat: sb, ...extra,
+        why: `scope-bloat: ${sb.why}${sb.refresh ? ` (the mechanical refresh answered \`${sb.refresh.action ?? 'none'}\`)` : ''} — a fixer rebases it, no review reads this diff`,
+      });
+    } else {
+      refuse('scope-bloat', {
+        ...withPhase, ...extra, scopeBloat: sb,
+        why: refreshPending
+          ? `scope-bloat: ${sb.why} — the mechanical refresh onto main is tried first`
+          : `scope-bloat: ${sb.why} — the fix rounds for this PR are spent, so a person must take it`,
+      });
+    }
+    return;
+  }
   // ── `draft` (draft-first PRs, operator-approved 2026-09-27) — checked FIRST, ahead of every other refusal
   // in this function, including `already-reviewed-head`: a draft PR is never owed a review no matter what its
   // `review:*` label or its comment thread says, because GitHub itself will not surface it for review and
@@ -1687,6 +1710,17 @@ export function planReconcile({
     const loadHold = loadFlakeHoldState({ comments: pr?.comments, headRefOid: pr?.headRefOid, now });
     if (loadHold.live) {
       refuse('load-flake-hold', { why: `fix ready on ${loadHold.hold.alt.branch}; waiting for host load to fall to re-run verify and push — no human needed` });
+      continue;
+    }
+    // Live #4361: the reverify pass pushed the held fix after the fixer had released its claim, so `review:changes`
+    // still sits on a head that already IS the fix. That head is owed its re-arm (then a review), never another
+    // fixer against the old findings. The load-flake-reverify pass performs the re-arm.
+    const pushedFix = pushedLoadFlakeFixOwedRearm({ comments: pr?.comments, headRefOid: pr?.headRefOid, labels: labelNames(pr?.labels) });
+    if (pushedFix) {
+      refuse('load-flake-rearm-owed', {
+        sha: pushedFix.sha, pushedAt: pushedFix.pushedAt,
+        why: `the load-flake reverify pass pushed the fix (\`${pushedFix.sha.slice(0, 9)}\`) at ${pushedFix.pushedAt}; this head is owed its re-arm for review (load-flake-reverify runs it), not another fix`,
+      });
       continue;
     }
 

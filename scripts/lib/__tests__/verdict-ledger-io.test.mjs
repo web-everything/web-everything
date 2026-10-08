@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
-  appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
+  appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
 } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -83,6 +83,36 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
   it('refuses an invalid record before touching git', () => {
     const run = () => { throw new Error('git must not be called'); };
     expect(() => appendLedgerRows(base({ run, records: [{ nope: true }] }))).toThrow(/invalid record/);
+  });
+
+  // THE REFSPEC GUARD (operator decision 2026-10-08): the applier workflow holds `contents: write`, so the one
+  // push path may write refs/heads/ops/review-requests and nothing else - no other branch, no force.
+  describe('push-ref guard: only refs/heads/ops/review-requests, never forced', () => {
+    const bad = ['main', 'lane/x', 'refs/heads/main', 'refs/heads/ops/review-requests', '+ops/review-requests',
+      'ops/review-requests:main', 'ops/review-requests main', '--force', 'ops/review-requests-2', 'ops/'];
+    for (const branch of bad) {
+      it(`refuses branch ${JSON.stringify(branch)} before any git call`, () => {
+        const calls = [];
+        const run = (args) => { calls.push(args); return ''; };
+        expect(() => appendLedgerRows(base({ run, branch }))).toThrow(/refusing to push/);
+        expect(calls).toEqual([]);
+      });
+    }
+
+    it('pushes the full ref and never a force', () => {
+      const f = failing(0);
+      const calls = [];
+      const run = (args, o) => { calls.push(args); return f.run(args, o); };
+      appendLedgerRows(base({ run }));
+      const push = calls.find((a) => a[0] === 'push');
+      expect(push).toEqual(['push', '--quiet', 'origin', 'HEAD:refs/heads/ops/review-requests']);
+      for (const a of calls.filter((c) => c[0] === 'push').flat()) expect(a).not.toMatch(/^(-f|--force.*|\+.*)$/);
+    });
+
+    it('a caller cannot loosen the allowed ref through the passed-through seams', () => {
+      const run = () => '';
+      expect(() => appendLedgerRows(base({ run, allowRef: 'refs/heads/main', branch: 'main' }))).toThrow(/refusing to push/);
+    });
   });
 });
 
@@ -164,5 +194,51 @@ describe('real git', () => {
       expect(() => appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], attempts: 2, sleep: noSleep }))
         .toThrow(LedgerAppendExhaustedError);
     });
+  });
+});
+
+
+describe('idempotent git writes', () => {
+  it('duplicate-only append makes no commit or push, including legacy unstamped rows', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { [ledgerGitPath(REPO)]: JSON.stringify(row(1)) + '\n' });
+      const calls = [];
+      const run = (args, opts) => { calls.push(args[0]); return git(args, opts); };
+      const result = appendGitRowsSync([row(1), row(1)], { board: ctx.clone, repo: REPO, run });
+      expect(result).toEqual({ ok: true, appended: 0, duplicates: 2 });
+      expect(calls).not.toContain('commit');
+      expect(calls).not.toContain('push');
+      expect(readLedgerFromGit({ board: ctx.clone, repo: REPO }).records).toHaveLength(1);
+    });
+  });
+
+  it('a retry recomputes duplicates against the new tip', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const other = cloneOf(ctx, 'idempotent-rival');
+      let raced = false;
+      let pushes = 0;
+      const run = (args, opts) => {
+        if (args[0] === 'push') {
+          pushes++;
+          if (!raced) {
+            raced = true;
+            // A distinct commit message prevents identical rows in the same second producing the same commit.
+            appendLedgerRows({ board: other, repo: REPO, records: [row(1)], message: 'rival append' });
+          }
+        }
+        return git(args, opts);
+      };
+      const result = appendLedgerRows({ board: ctx.clone, repo: REPO, records: [row(1)], run, sleep: noSleep });
+      expect(result).toEqual({ status: 'appended', attempts: 2, rows: 0, duplicates: 1 });
+      expect(pushes).toBe(1);
+      expect(readLedgerFromGit({ board: other, repo: REPO }).records).toHaveLength(1);
+    });
+  });
+
+  it('sync helper contains throws and async read contains a throwing transport seam', async () => {
+    expect(appendGitRowsSync([{}], { repo: REPO })).toMatchObject({ ok: false, appended: 0 });
+    const store = createGitLedgerStore({ readRows: () => { throw new Error('offline'); } });
+    await expect(store.read({ repo: REPO })).resolves.toMatchObject({ status: 'unreadable', error: 'offline' });
   });
 });
