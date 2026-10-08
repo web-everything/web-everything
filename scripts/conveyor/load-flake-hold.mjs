@@ -9,9 +9,10 @@
  * Kept out of `stand-down.mjs` on purpose: that file is staged alone by the operator queue and must stay
  * import-light, while these rules pull in the advisory and operator-answer modules.
  */
-import { loadFlakeHolds as readHolds, loadFlakeHoldState as readHoldState, isStandDownSuperseded } from './stand-down.mjs';
+import { loadFlakeHolds as readHolds, loadFlakeHoldState as readHoldState, isStandDownSuperseded, loadFlakeResults } from './stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
 import { isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export function isLegacyLoadFlakeHoldSuperseded(comments, index) {
   return isStandDownSuperseded(comments, index)
@@ -22,6 +23,34 @@ export function isLegacyLoadFlakeHoldSuperseded(comments, index) {
 export const loadFlakeHolds = (comments) => readHolds(comments, isLegacyLoadFlakeHoldSuperseded);
 
 export const loadFlakeHoldState = (args) => readHoldState({ ...args, isSuperseded: isLegacyLoadFlakeHoldSuperseded });
+
+/** Leading lines that close a review round after a push: a re-arm, a bounce, an accept, or an advisory review. Literal
+ *  copies (not imports) keep this file import-light; each is the stable first line its writer posts. */
+const REVIEW_ROUND_MARKERS = Object.freeze([
+  '🔧 conveyor fix — re-armed for re-review',
+  '🔁 review — changes requested',
+  '✅ review — accepted',
+  '**⚠️ THIS IS AN ADVISORY REVIEW',
+]);
+
+/**
+ * A fix the reverify pass PUSHED for a bounced PR, still waiting for its re-arm (live #4361, 2026-10-08). The fixer
+ * stood down on a load-flake hold, so it never re-armed; the later push changed the head but left `review:changes`
+ * on it. The PR then read as "owed a fix" at a head that already IS the fix, and nobody worked it.
+ * Owed when: the PR still carries `review:changes`, its head is the latest `pushed` alt sha, and no trusted re-arm
+ * or review verdict has been posted since that push. Pure. Returns `{ sha, pushedAt }` or `null`.
+ */
+export function pushedLoadFlakeFixOwedRearm({ comments, headRefOid, labels = [] }) {
+  const names = (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
+  if (!names.includes('review:changes') || typeof headRefOid !== 'string' || !headRefOid) return null;
+  const pushed = loadFlakeResults(comments).filter((r) => r.result === 'pushed').at(-1);
+  if (!pushed || !(headRefOid.startsWith(pushed.sha) || pushed.sha.startsWith(headRefOid))) return null;
+  const pushedAt = Date.parse(pushed.createdAt);
+  const closed = (Array.isArray(comments) ? comments : []).some((c) => isTrustedMarkerAuthor(c)
+    && Date.parse(c?.createdAt) > pushedAt
+    && REVIEW_ROUND_MARKERS.some((m) => String(c?.body ?? '').trimStart().startsWith(m)));
+  return closed ? null : { sha: pushed.sha, pushedAt: pushed.createdAt };
+}
 
 /** Minutes a live hold may wait for the reverify pass before it counts as unattended. */
 export const loadFlakeNoPickupMinutes = (env = process.env) => {

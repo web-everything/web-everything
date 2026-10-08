@@ -3708,3 +3708,16 @@ describe('card-batch extraction routing (#4703, xuz8m83)', () => {
     }
   });
 });
+
+it('a bounced PR whose head is the load-flake pushed fix is owed a re-arm, not another fixer (#4361)', () => {
+  const c = (body, createdAt) => ({ body, createdAt, author: AUTOMATION });
+  const alt = 'a5938d8938a20137e76d2145e49d40ee8fff4970';
+  const hold = c(loadHoldBody({ head: 'd7a3b14ac', alt: 'lane/build-outcomes-fix-4361-alt', altSha: alt }), '2026-10-08T15:01:01Z');
+  const pushed = c(loadResultBody({ altSha: alt, result: 'pushed' }), '2026-10-08T15:02:43Z');
+  const plan = (comments) => planReconcile({ prs: [pr1563({ comments: [finding(), hold, ...comments], headRefOid: alt, labels: lbl('review:changes', 'review:human') })], agents: [], durableCounts: {}, now: NOW });
+  const owed = plan([pushed]);
+  expect(owed.dispatch.some((d) => d.kind === 'fix')).toBe(false);
+  expect(owed.refusals).toEqual([expect.objectContaining({ kind: 'load-flake-rearm-owed', sha: alt })]);
+  // once re-armed (or bounced again on that head) the ordinary paths own it again
+  expect(plan([pushed, c('🔁 review — changes requested\n\nagain', '2026-10-08T16:00:00Z')]).refusals.map((r) => r.kind)).not.toContain('load-flake-rearm-owed');
+});

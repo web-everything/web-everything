@@ -128,7 +128,7 @@ import {
   CONCURRENT_AUTHOR_PAUSE_MARKER, concurrentAuthorPauses, isConcurrentAuthorStandDown,
   standDownComments,
 } from './stand-down.mjs';
-import { loadFlakeHoldState } from './load-flake-hold.mjs';
+import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { FIX_BEGIN_MARKER, FIX_END_MARKER } from './fix-procedure.mjs';
 // #3850 — a stand-down answer's structured disposition (close-superseded), executed by the conveyor.
 import { answerDisposition, isCloseSupersededExecuted } from './stand-down-answer-core.mjs';
@@ -279,7 +279,7 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  */
 export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
-  'stood-down', 'load-flake-hold', 'no-findings', 'cap-exhausted',
+  'stood-down', 'load-flake-hold', 'load-flake-rearm-owed', 'no-findings', 'cap-exhausted',
   'live-process', 'awaiting-permission', 'liveness-unknown',
   'owed-elsewhere', 'owed-ci-rerun', 'nothing-owed', 'already-reviewed-head', 'already-landed',
   // we:backlog/heal-wait-for-rerun (landing-freeze fix, 2026-09-27) — a ci-heal already escalated THIS EXACT
@@ -1687,6 +1687,17 @@ export function planReconcile({
     const loadHold = loadFlakeHoldState({ comments: pr?.comments, headRefOid: pr?.headRefOid, now });
     if (loadHold.live) {
       refuse('load-flake-hold', { why: `fix ready on ${loadHold.hold.alt.branch}; waiting for host load to fall to re-run verify and push — no human needed` });
+      continue;
+    }
+    // Live #4361: the reverify pass pushed the held fix after the fixer had released its claim, so `review:changes`
+    // still sits on a head that already IS the fix. That head is owed its re-arm (then a review), never another
+    // fixer against the old findings. The load-flake-reverify pass performs the re-arm.
+    const pushedFix = pushedLoadFlakeFixOwedRearm({ comments: pr?.comments, headRefOid: pr?.headRefOid, labels: labelNames(pr?.labels) });
+    if (pushedFix) {
+      refuse('load-flake-rearm-owed', {
+        sha: pushedFix.sha, pushedAt: pushedFix.pushedAt,
+        why: `the load-flake reverify pass pushed the fix (\`${pushedFix.sha.slice(0, 9)}\`) at ${pushedFix.pushedAt}; this head is owed its re-arm for review (load-flake-reverify runs it), not another fix`,
+      });
       continue;
     }
 
