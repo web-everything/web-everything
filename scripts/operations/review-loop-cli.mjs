@@ -75,6 +75,7 @@ import {
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
 // label.mjs#fileApprovalPreventionCard` was fixed for under #4317: `fileItemForPrevention` below drives
@@ -316,8 +317,10 @@ export function defaultFindResumableRun({ repo, pr }, { readPr = defaultReadResu
 }
 
 function defaultReadResumePr({ repo, pr }) {
-  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,comments'],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }));
+  const { headRefOid } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+  // The complete, paginated thread: a ruling is the newest comment, which a 100-comment page can miss.
+  return { headRefOid, comments: readCompletePrComments(pr, { repo }) };
 }
 
 /**
