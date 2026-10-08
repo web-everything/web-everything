@@ -2,9 +2,10 @@
 bornAs: xykwe0h
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/build-dispatch-orphan-adopt.mjs", "we:scripts/conveyor/build-delivery-evidence.mjs", "we:scripts/operations/dispatch-lane.mjs", "we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/conveyor/__tests__/build-delivery-evidence.test.mjs", "we:scripts/conveyor/__tests__/build-dispatch-orphan-adopt.test.mjs"]
 dateOpened: "2026-10-07"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
