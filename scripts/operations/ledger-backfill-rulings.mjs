@@ -15,6 +15,8 @@ import { getLedgerStore } from '../lib/verdict-ledger-store.mjs';
 import '../lib/verdict-ledger-io.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readOperatorRulings } from '../lib/jury-core.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 const hashed = key => /^sha256:[0-9a-f]{64}$/.test(key);
 const oneLine200 = value => {
@@ -94,11 +96,11 @@ function readHome(repo) {
 }
 
 export async function main({
-  repos = ['web-everything/web-everything', 'plateauapp/plateau-app'], since = newYorkMidnight(), apply = false,
+  repos = Object.values(CONSTELLATION_REPOS).map(r => r.slug), since = newYorkMidnight(), apply = false,
   readHome: home = readHome,
   readGit = ctx => getLedgerStore('git').read(ctx),
   listOpenPrs = repo => ghJson(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '500', '--json', 'number']).map(pr => pr.number),
-  readThreadKeys = (repo, pr) => readOperatorRulings(ghJson(['pr', 'view', String(pr), '--repo', repo, '--json', 'comments']).comments).rulings.map(r => r.key),
+  readThreadKeys = (repo, pr) => readOperatorRulings(readCompletePrComments(pr, { repo })).rulings.map(r => r.key),
   appendGit = (rows, ctx) => getLedgerStore('git').append(rows, ctx),
   resolveBoard = repo => resolveLedgerBoard(repo, {}, process.env),
 } = {}) {
