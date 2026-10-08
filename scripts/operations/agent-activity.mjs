@@ -68,7 +68,7 @@ export function isAgedOut(row, { now, staleMs = STALE_ROW_MS }) {
 
 
 /** kind (from `parseSessionSlug`) → the design's role vocabulary (§1.2). */
-const ROLE_BY_KIND = Object.freeze({
+export const ROLE_BY_KIND = Object.freeze({
   conveyor: 'build', prepare: 'prepare', 'prepare-decision': 'prepare', 'prepare-item': 'prepare',
   review: 'review', fix: 'fix', 'ci-heal': 'ci-heal', inspect: 'inspect',
 });

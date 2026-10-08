@@ -75,6 +75,8 @@ import { liveStateOperation, LIVE_STATE_OP } from './live-state.mjs';
 import { collectLiveState } from './live-state-io.mjs';
 import { liveWorkOperation, LIVE_WORK_OP } from './live-work.mjs';
 import { collectLiveWork } from './live-work-io.mjs';
+import { sessionsOperation, SESSIONS_OP } from './sessions.mjs';
+import { createSessionHistoryReader, createLiveCollector } from './sessions-io.mjs';
 import { routePrOutcomeOperation, ROUTE_PR_OUTCOME_OP } from './route-pr-outcome.mjs';
 import { createRouteOutcomeReader } from './route-pr-outcome-io.mjs';
 import { createHistoryReader } from './gate-health-io.mjs';
@@ -505,6 +507,12 @@ export const OPERATIONS = Object.freeze({
   // liveness probe, the heavy-admission pool) are bound here, and ONLY here.
   [LIVE_WORK_OP]: () => ({
     declaration: liveWorkOperation({ collect: collectLiveWork }),
+    sinks: {},
+  }),
+  // Card x4z1vez (Plateau /sessions, S2) — one row per session: live-work rows plus ended Claude jobs inside
+  // `--ended-within`. Read-only, no sinks. Reads bound in `./sessions-io.mjs`.
+  [SESSIONS_OP]: () => ({
+    declaration: sessionsOperation({ collectLive: createLiveCollector(), readHistory: createSessionHistoryReader() }),
     sinks: {},
   }),
 });
