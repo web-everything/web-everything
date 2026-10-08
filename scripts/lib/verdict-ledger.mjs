@@ -1062,6 +1062,20 @@ export function verdictLedgerPath(repo) {
   return join(verdictLedgerDir(), `${slug}.jsonl`);
 }
 
+/** Whether a normalized ledger event CLEARS a hold (so a git miss must not leave a home row, F4). A verdict follows
+ *  {@link verdictClears}; a v2 event has no `verdict`, and a ruling that is not `block` clears its finding's hold. */
+function eventClears(row) {
+  if (row?.type === EVENT_TYPES.RULING) return row.ruling !== 'block';
+  return verdictClears(row?.verdict);
+}
+
+/** `type=value` for loud messages: `verdict=<v>` for a v1 verdict row, `ruling=<r>` / `<type>=` for a v2 event. */
+function eventLabel(row) {
+  if (row?.type === EVENT_TYPES.RULING) return `ruling=${row.ruling}`;
+  if (row?.type && row.type !== EVENT_TYPES.VERDICT) return `type=${row.type}`;
+  return `verdict=${row?.verdict}`;
+}
+
 /**
  * APPEND one verdict record. The only write path.
  *
@@ -1071,7 +1085,8 @@ export function verdictLedgerPath(repo) {
  * rather than being a silence. A lost verdict is worse than an interleaved line, and the line is one
  * `appendFileSync` of one newline-terminated string on a local filesystem.
  *
- * Validates before writing — an invalid record is REFUSED and nothing is written.
+ * Validates before writing — an invalid record is REFUSED and nothing is written. Accepts a v1 verdict record OR any v2
+ * event (`ruling`, `send-back`, ...) validated by {@link validateLedgerEvent}; both stores take every type.
  *
  * STORE (`verdictLedger.store`): `home` writes only the machine-local file; `dual` (default) writes home AND the git
  * transport via `verdict-ledger-io.mjs`; `git` writes git only. A git write miss follows the ratified F4 posture
@@ -1132,13 +1147,13 @@ export function appendVerdict(record, opts = {}) {
   };
   if (store === 'home') return { ...homeAppend(record), store };
   // Validate first: an invalid record is refused and nothing is written anywhere.
-  const v = serializeVerdictRecord(record);
+  const v = serializeLedgerEvent(record);
   if (!v.ok) return { ok: false, path: null, record: null, locked: false, errors: v.errors, store };
-  const clears = verdictClears(v.record.verdict);
+  const clears = eventClears(v.record);
   if (store === 'git') {
     const g = writeGit(v.record);
     if (g.status === 'appended') {
-      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} verdict=${v.record.verdict} to the git transport ONLY — readers still read home, so the fold does not see this row until the read slice lands (use store=dual)`);
+      loud(`verdict-ledger: store=git wrote ${v.record.repo}#${v.record.pr} ${eventLabel(v.record)} to the git transport ONLY — readers still read home, so the fold does not see this row until the read slice lands (use store=dual)`);
       return { ok: true, path: null, record: v.record, locked: false, errors: [], store, git: g };
     }
     // A clearing verdict that missed git writes NO home row (see the header). A holding one spills to home so the
@@ -1164,7 +1179,7 @@ export function appendVerdict(record, opts = {}) {
  *  exists (written first), so the hold stands: `ok` follows the home write, and `ledgerWriteMiss: true` carries the
  *  smell. Loud on stderr. When the home spill ALSO failed, its errors come first, so the cause is never hidden. */
 function finishGitMiss({ home, g, store, loud, record }) {
-  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} verdict=${record.verdict}: ${g.error} — hold still applies; ledger-write-miss`);
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — hold still applies; ledger-write-miss`);
   return { ...home, ok: home.ok, store, git: g, ledgerWriteMiss: true, errors: [...(home.errors ?? [])] };
 }
 
@@ -1174,7 +1189,7 @@ function finishGitMiss({ home, g, store, loud, record }) {
  *  (`ok: false`, `ledgerWriteMiss: true`) and a retry is a clean re-append. Every caller must honour `ok` before it
  *  swaps a label (`review-pr-io`, `merge-ai-prs` and `review-set-label` do). */
 function refuseClearingOnGitMiss({ g, store, loud, record }) {
-  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} verdict=${record.verdict}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; retry once the ledger transport is reachable`);
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; retry once the ledger transport is reachable`);
   return {
     ok: false, path: null, record: null, locked: false, store, git: g, ledgerWriteMiss: true,
     errors: [`ledger-write-miss: ${g.error}`],
@@ -1292,7 +1307,7 @@ function appendVerdictHome(record) {
 
   try {
     const raw = locked ? record : { ...record, unlocked: true };
-    const { ok, line, record: normalized, errors } = serializeVerdictRecord(raw);
+    const { ok, line, record: normalized, errors } = serializeLedgerEvent(raw);
     if (!ok) return { ok: false, path: null, record: null, locked, errors };
     const path = verdictLedgerPath(record.repo);
     mkdirSync(dirname(path), { recursive: true });

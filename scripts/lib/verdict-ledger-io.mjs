@@ -21,7 +21,7 @@ import {
   readFromTransportBranch,
   stageOnTransportBranch,
 } from './git-transport-branch.mjs';
-import { parseVerdictLog, serializeVerdictRecord } from './verdict-ledger.mjs';
+import { parseVerdictLog, serializeLedgerEvent } from './verdict-ledger.mjs';
 
 export const LEDGER_TRANSPORT_BRANCH = 'ops/review-requests';
 export const LEDGER_DIR = 'verdict-ledger';
@@ -81,7 +81,7 @@ export function appendLedgerRows({
 } = {}) {
   if (!Array.isArray(records) || !records.length) throw new TypeError('verdict-ledger-io: `records` must be a non-empty array');
   const lines = records.map((r) => {
-    const s = serializeVerdictRecord(r);
+    const s = serializeLedgerEvent(r); // every v2 event type; a verdict row delegates to the v1 serializer, bytes unchanged
     if (!s.ok) throw new TypeError(`verdict-ledger-io: invalid record refused, nothing written: ${s.errors.join('; ')}`);
     return s.line;
   });

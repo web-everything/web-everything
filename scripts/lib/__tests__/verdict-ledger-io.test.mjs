@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import {
   appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
 } from '../verdict-ledger-io.mjs';
-import { buildVerdictRecord } from '../verdict-ledger.mjs';
+import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 const REPO = 'web-everything/web-everything';
@@ -67,6 +67,17 @@ describe('appendLedgerRows: bounded retry, loud on exhaustion', () => {
     const f = failing(99);
     expect(() => appendLedgerRows(base({ run: f.run, attempts: 3 }))).toThrow(LedgerAppendExhaustedError);
     expect(f.pushes()).toBe(3);
+  });
+
+  it('accepts a v2 event row (ruling, send-back) with the same validation', () => {
+    const f = failing(0);
+    const at = '2026-10-07T12:00:00.000Z';
+    const records = [
+      buildLedgerEvent({ type: 'ruling', repo: REPO, pr: 1, at, source: 'test', findingKey: 'f1', ruling: 'block' }),
+      buildLedgerEvent({ type: 'send-back', repo: REPO, pr: 1, at, source: 'test', cause: 'block-ruling' }),
+    ];
+    expect(appendLedgerRows(base({ run: f.run, records }))).toMatchObject({ status: 'appended', rows: 2 });
+    expect(() => appendLedgerRows(base({ run: f.run, records: [{ ...records[0], ruling: 'maybe' }] }))).toThrow(/invalid record/);
   });
 
   it('refuses an invalid record before touching git', () => {
