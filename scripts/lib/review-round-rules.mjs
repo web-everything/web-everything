@@ -219,7 +219,8 @@ export function roundFindingStatus({ heldVerdict, deferred = false } = {}) {
  * round's own rows, on a replay). Rows from another PR or with an unknown status are ignored. PURE.
  * @param {Array<object>} rows - ledger events in append order.
  * @param {{pr: number, head?: string}} o
- * @returns {Map<string, {status: string, headSha: string, round: number, path: string, symbol: string, defectClass: string}>}
+ * @returns {Map<string, {status: string, headSha: string, round: number, path: string, symbol: string, defectClass: string,
+ *   lines: number[]}>}
  */
 export function foldFindingStatuses(rows, { pr, head = '' } = {}) {
   const out = new Map();
@@ -228,9 +229,24 @@ export function foldFindingStatuses(rows, { pr, head = '' } = {}) {
     if (r?.type !== 'finding' || Number(r.pr) !== Number(pr)) continue;
     if (!FINDING_STATUS_VALUES.includes(r.status) || typeof r.findingId !== 'string') continue;
     if (current && String(r.headSha ?? '').toLowerCase() === current) continue;
-    out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, path: r.path, symbol: r.symbol, defectClass: r.defectClass });
+    out.set(r.findingId, { status: r.status, headSha: r.headSha, round: r.round, path: r.path, symbol: r.symbol, defectClass: r.defectClass,
+      lines: Array.isArray(r.lines) ? r.lines.filter((n) => Number.isInteger(n) && n > 0) : [] });
   }
   return out;
+}
+
+/**
+ * Did the delta change code at a prior finding's cited lines (within the same window the round classifiers use)? An
+ * identity with no recorded line, or a delta that cannot be placed, answers `false`: the finding was NOT shown to be
+ * addressed, so a carry of it keeps blocking (the fail-closed direction). PURE.
+ * @param {{path?: string, lines?: number[]}} prior
+ * @param {object} scope - a `delta` scope.
+ * @returns {boolean}
+ */
+export function priorAddressedByDelta(prior, scope) {
+  if (!prior?.path || scope?.kind !== 'delta') return false;
+  return (Array.isArray(prior.lines) ? prior.lines : []).some((line) => findingChangeState(
+    { file: prior.path, line, summary: 'prior' }, { priorHead: scope.priorHead, head: scope.head, files: scope.files }) === 'near');
 }
 
 /**
@@ -247,15 +263,21 @@ export function bindingRoundDecision({ finding, identity, prior = null, scope } 
   if (!scope || scope.kind !== 'delta') return block(R.FULL_REVIEW);
   const f = normalizeFinding(finding);
   if (!f || !identity) return block(R.FULL_REVIEW);
-  if (requiresMandatoryReferral(f)) return block(R.CONFIRMED_BROKEN);
+  const change = identity.path ? findingChangeState(f, { priorHead: scope.priorHead, head: scope.head, files: scope.files }) : null;
+  // Confirmed-broken ALWAYS blocks, wherever it sits (the merge-gate floor). `change` is still reported, so the
+  // journal can show how many of these sit on unchanged code.
+  if (requiresMandatoryReferral(f)) return block(R.CONFIRMED_BROKEN, change);
   if (!identity.path) return block(R.NO_CITATION);
-  const change = findingChangeState(f, { priorHead: scope.priorHead, head: scope.head, files: scope.files });
   if (change === null) return block(R.FULL_REVIEW);
   if (change === 'near') return block(R.CHANGED_CODE, change);
   if (change === 'inconclusive') return block(R.CHANGE_UNPLACEABLE, change);
   // `far` or `untouched`: the cited code is unchanged since the last reviewed head.
+  // A sent-back identity re-raised on unchanged code: when the fix range changed code at the sent-back finding's own
+  // cited lines, the fixer addressed it, and a re-raise elsewhere in the same symbol is a re-raise of a fixed finding
+  // (P3 (4): advisory unless it says why the fix fails). When the range did not touch it, the sent-back finding is
+  // still owed: it blocks as today.
   if ((scope.carried ?? []).includes(identity.findingId) || prior?.status === FINDING_STATUSES.RAISED) {
-    return block(R.SENT_BACK_CARRY, change);
+    return priorAddressedByDelta(prior, scope) ? card(R.RERAISE_OF_FIXED, change) : block(R.SENT_BACK_CARRY, change);
   }
   if (prior?.status === FINDING_STATUSES.FIXED) return card(R.RERAISE_OF_FIXED, change);
   if (prior?.status === FINDING_STATUSES.TOLERATED) return card(R.TOLERATED_UNCHANGED, change);
@@ -289,7 +311,10 @@ export function shadowRound({ repo, pr, head, round, scope, findings = [], prior
     const rank = { raised: 3, carded: 2, tolerated: 1 };
     const existing = rows.find((r) => r.findingId === identity.findingId);
     if (existing) { if (rank[status] > rank[existing.status]) existing.status = status; }
-    else rows.push({ ...identity, status, round });
+    else rows.push({ ...identity, status, round, lines: [] });
+    const cited = normalizeFinding(item.finding)?.line;
+    const row = rows.find((r) => r.findingId === identity.findingId);
+    if (Number.isInteger(cited) && !row.lines.includes(cited) && row.lines.length < 20) row.lines.push(cited);
     seenIds.add(identity.findingId);
     if (item.heldVerdict === true && round > 1) {
       const p = priorMap.get(identity.findingId) ?? null;
@@ -303,11 +328,14 @@ export function shadowRound({ repo, pr, head, round, scope, findings = [], prior
   if (scope?.kind === 'delta') {
     for (const [findingId, p] of priorMap) {
       if (p.status !== FINDING_STATUSES.RAISED || seenIds.has(findingId) || !p.path) continue;
-      const touched = Object.hasOwn(scope.files ?? {}, p.path);
-      if (touched) rows.push({ findingId, path: p.path, symbol: p.symbol ?? '', defectClass: p.defectClass ?? 'unknown', status: FINDING_STATUSES.FIXED, round });
+      if (priorAddressedByDelta(p, scope)) {
+        rows.push({ findingId, path: p.path, symbol: p.symbol ?? '', defectClass: p.defectClass ?? 'unknown', status: FINDING_STATUSES.FIXED, round, lines: p.lines ?? [] });
+      }
     }
   }
-  const liveBlocked = ['changes', 'needs-human'].includes(String(liveVerdict)) || entries.length > 0;
+  // The live verdict decides whether the PR went back for another round; with no verdict recorded, any finding that
+  // held it counts.
+  const liveBlocked = liveVerdict ? ['changes', 'needs-human'].includes(String(liveVerdict)) : entries.length > 0;
   const blocked = entries.filter((e) => e.decision === ROUND_DECISIONS.BLOCK).length;
   const carded = entries.filter((e) => e.decision === ROUND_DECISIONS.CARD).length;
   // Fail closed: a live block with no finding we could attribute it to stays a block in shadow.
@@ -350,4 +378,37 @@ export function projectAvoidedRounds(summaries) {
   const idx = list.findIndex((s) => s?.roundAvoided === true);
   const laterRounds = list.filter((s) => Number(s?.round) > 1).length;
   return { rounds: list.length, laterRounds, avoided: idx < 0 ? 0 : list.length - 1 - idx, stopAt: idx < 0 ? null : list[idx].round };
+}
+
+/**
+ * REPLAY — run R3–R7 over one PR's recorded rounds in order, simulating the ledger the live sink would have written
+ * (each round's finding rows become the next round's prior statuses, and each round's head its last reviewed head).
+ * The replay fixtures and the replay CLI (we:scripts/operations/review-round-replay.mjs) both go through here, so a
+ * fixture proves exactly what the live sink computes. PURE.
+ * @param {Array<{head: string, findings: Array<object>, liveVerdict: string, humanRequired?: boolean,
+ *   delta?: object|null, acceptance?: string[]}>} rounds - in review order; `delta` is the fix range from the
+ *   previous round's head (ignored on the first).
+ * @param {{repo: string, pr: number, firstRound?: number}} o - `firstRound` > 1 when earlier rounds are not recorded.
+ * @returns {{rounds: Array<{head: string, summary: object, entries: Array<object>, rows: Array<object>}>,
+ *   projection: {rounds: number, laterRounds: number, avoided: number, stopAt: number|null}}}
+ */
+export function replayPrRounds(rounds, { repo, pr, firstRound = 1 } = {}) {
+  const ledger = [];
+  const out = [];
+  let priorHead = null;
+  (Array.isArray(rounds) ? rounds : []).forEach((r, i) => {
+    const head = String(r?.head ?? '').toLowerCase();
+    const round = firstRound + i;
+    const prior = foldFindingStatuses(ledger, { pr, head });
+    const sentBack = [...prior].filter(([, p]) => p.status === FINDING_STATUSES.RAISED && p.headSha === priorHead).map(([id]) => id);
+    const scope = round > 1 && priorHead
+      ? reviewScope({ priorHead, head, delta: r.delta ?? null, sentBack, acceptance: r.acceptance ?? [] })
+      : reviewScope({ priorHead: null, head });
+    const result = shadowRound({ repo, pr, head, round, scope, findings: r.findings, prior,
+      liveVerdict: r.liveVerdict, humanRequired: r.humanRequired === true });
+    for (const row of result.rows) ledger.push({ type: 'finding', pr, headSha: head, ...row });
+    out.push({ head, summary: result.summary, entries: result.entries, rows: result.rows });
+    priorHead = head;
+  });
+  return { rounds: out, projection: projectAvoidedRounds(out.map((x) => x.summary)) };
 }

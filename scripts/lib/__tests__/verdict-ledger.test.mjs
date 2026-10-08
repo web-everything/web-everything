@@ -878,6 +878,7 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     'send-back': { cause: 'block-ruling' },
     author: { author: 'agent-1' },
     'label-input': { label: 'review:human', sender: 'op', change: 'added' },
+    finding: { headSha: SHA, findingId: 'fi-0123456789ab', path: 'scripts/a.mjs', symbol: 'run', defectClass: 'fail-open', status: 'raised', round: 2, lines: [12] },
   };
 
   it('covers every non-verdict type in the closed set', () => {
@@ -898,6 +899,8 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
   it('defaults optional payload fields so they round-trip', () => {
     expect(buildLedgerEvent({ ...base, type: 'review-run', headSha: SHA, phase: 'started' }).posted).toBeNull();
     expect(buildLedgerEvent({ ...base, type: 'approval', approval: 'clear-human' }).delegation).toBeNull();
+    // Card 5469 — a finding row written without cited lines reads back with an empty list.
+    expect(buildLedgerEvent({ ...base, type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'tolerated', round: 1 }).lines).toEqual([]);
   });
 
   it.each([
@@ -908,6 +911,9 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     ['bad head sha', { type: 'review-run', headSha: 'zz', phase: 'started' }],
     ['bad delegation', { type: 'approval', approval: 'judge', delegation: { by: 'x' } }],
     ['bad label change', { type: 'label-input', label: 'l', sender: 's', change: 'moved' }],
+    ['bad finding status', { type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'maybe', round: 1 }],
+    ['bad finding id', { type: 'finding', headSha: SHA, findingId: 'f-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'raised', round: 1 }],
+    ['bad finding round', { type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'raised', round: 0 }],
   ])('refuses %s', (_n, over) => {
     expect(() => buildLedgerEvent({ ...base, ...over })).toThrow(TypeError);
   });
@@ -1272,6 +1278,7 @@ describe('ledger plan follow-up: the git store accepts every v2 event type (dual
     'send-back': { cause: 'block-ruling' },
     author: { author: 'agent-1' },
     'label-input': { label: 'review:human', sender: 'op', change: 'added' },
+    finding: { headSha: SHA, findingId: 'fi-0123456789ab', path: 'scripts/a.mjs', symbol: 'run', defectClass: 'fail-open', status: 'raised', round: 2, lines: [12] },
   };
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-v2git-'));

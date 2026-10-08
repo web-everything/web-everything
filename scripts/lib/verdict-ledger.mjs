@@ -618,11 +618,13 @@ const EVENT_PAYLOAD = Object.freeze({
     ['defectClass', isStr, (v) => oneLine(v, 100)],
     ['status', oneOf(FINDING_STATUS_VALUES), (v) => v],
     ['round', (v) => Number.isInteger(v) && v >= 1, (v) => v],
+    // The cited lines on this head (a fact for "did the next fix range touch it", never part of the identity).
+    ['lines', (v) => v === undefined || (Array.isArray(v) && v.length <= 20 && v.every((n) => Number.isInteger(n) && n > 0)), (v) => [...(v ?? [])]],
   ],
 });
 
 /** Missing optional payload fields take these defaults on build, so a field written as absent still round-trips. */
-const EVENT_DEFAULTS = Object.freeze({ posted: null, delegation: null });
+const EVENT_DEFAULTS = Object.freeze({ posted: null, delegation: null, lines: Object.freeze([]) });
 
 /** Which event types BEAR on whether a PR may land (plan 3.1). `review-run` bears on caps only; the others that
  *  bear do so through the derive function, which is a later slice. Pure. */

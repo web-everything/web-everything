@@ -432,7 +432,7 @@ export function readLatestFixRange(options = {}) {
       }
     }
     if (!priorHead) return { priorHead: null };
-    return readFixRange({ exec, priorHead, head: current });
+    return readFixRange({ exec, priorHead, head });
   } catch {
     return { priorHead, head, error: 'diff-unparseable' };
   }
@@ -450,7 +450,6 @@ export function readFixRange({ exec, priorHead, head } = {}) {
   try {
     if (typeof priorHead !== 'string' || !/^[0-9a-f]+$/i.test(priorHead)) return { priorHead, head, error: 'prior-head-invalid' };
     if (!current) return { priorHead, error: 'head-unpinned' };
-    head = current;
     let diff;
     try {
       diff = String(exec('git', ['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head], {
