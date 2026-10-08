@@ -26,6 +26,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { isUnderTest } from './under-test.mjs';
+
 export const ADVISOR_MODES = Object.freeze(['off', 'sample', 'on']);
 export const BUILT_IN_ADVISOR_SETTINGS = Object.freeze({ mode: 'off', model: 'opus', sampleRate: 0.5, kinds: Object.freeze(['fix']) });
 
@@ -62,8 +64,10 @@ export function resolveAdvisorSettings(raw = {}) {
  * Never throws. Missing / unreadable / not JSON / no valid `advisor.mode` / any ignored key => mode `off`, with
  * `error` naming why. `WE_ADVISOR_TRIAL_SETTINGS` names another file (tests, a one-off operator override).
  */
-export function loadAdvisorSettings({ env = process.env, path = env.WE_ADVISOR_TRIAL_SETTINGS || defaultAdvisorSettingsPath(), read = readFileSync } = {}) {
+export function loadAdvisorSettings({ env = process.env, path = env.WE_ADVISOR_TRIAL_SETTINGS || (isUnderTest(env) ? null : defaultAdvisorSettingsPath()), read = readFileSync } = {}) {
   const off = (error) => ({ settings: { ...resolveAdvisorSettings({}).settings, mode: 'off' }, ignored: [], error });
+  // Under test, a dispatch test never samples a real advisor arm unless it names a settings file explicitly.
+  if (!path) return off('under test with no explicit advisor settings — advisor off');
   let parsed;
   try { parsed = JSON.parse(read(path, 'utf8')); } catch (e) {
     return off(`advisor settings unreadable or not JSON (${path}: ${e?.message || e}) — advisor off`);
@@ -136,9 +140,11 @@ export function advisorLogLine({ decision, sessionSlug, runId, agentId = null })
 
 // ── the per-run ledger (the metrics row) ──────────────────────────────────────────────────────────────────────
 
-/** Next to the perf snapshot store (`perf-snapshot-io.mjs#defaultStore`). `WE_ADVISOR_TRIAL_LEDGER` overrides. */
+/** Next to the perf snapshot store (`perf-snapshot-io.mjs#defaultStore`). `WE_ADVISOR_TRIAL_LEDGER` overrides; `null` under test. */
 export function advisorLedgerPath(env = process.env, home = homedir()) {
   if (env.WE_ADVISOR_TRIAL_LEDGER) return env.WE_ADVISOR_TRIAL_LEDGER;
+  // Under test, never the host's real ledger (`os.homedir()` is not sandboxed in vitest workers).
+  if (isUnderTest(env)) return null;
   const store = env.WE_PERF_SNAPSHOT_STORE || join(home, 'workspace/.operations/metrics/perf/snapshots.jsonl');
   return join(dirname(store), 'advisor-trial.jsonl');
 }
@@ -155,6 +161,7 @@ export function advisorLedgerRow({ decision, runId, agentId = null, sessionSlug,
 
 /** Append one row. Never throws: a ledger fault must never fail a dispatch that already started. */
 export function recordAdvisorRun(row, { path = advisorLedgerPath(), append = appendFileSync, mkdir = mkdirSync } = {}) {
+  if (!path) return false;
   try {
     mkdir(dirname(path), { recursive: true });
     append(path, `${JSON.stringify(row)}\n`);

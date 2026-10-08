@@ -110,6 +110,11 @@ describe('advisor trial — ledger', () => {
     expect(JSON.parse(writes[0][1])).toEqual(row);
     expect(recordAdvisorRun(row, { path: '/p', mkdir: () => { throw new Error('ro'); } })).toBe(false);
   });
+  it('under test with no override: settings off, no ledger', () => {
+    expect(loadAdvisorSettings({ env: { VITEST: 'true' } }).settings.mode).toBe('off');
+    expect(advisorLedgerPath({ VITEST: 'true' }, '/h')).toBeNull();
+    expect(recordAdvisorRun({}, { path: null })).toBe(false);
+  });
   it('ledger path sits next to the perf store', () => {
     expect(advisorLedgerPath({}, '/h')).toBe('/h/workspace/.operations/metrics/perf/advisor-trial.jsonl');
     expect(advisorLedgerPath({ WE_ADVISOR_TRIAL_LEDGER: '/x.jsonl' }, '/h')).toBe('/x.jsonl');

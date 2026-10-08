@@ -23,6 +23,6 @@ The live fix workers launch through `claude --bg` in we:scripts/conveyor/reconci
 
 1. **Untrusted text** — the advisor model comes from the checked-in settings file and must match a strict model-name pattern (never a flag, never Fable); review comment bodies are only regex-matched for a verdict and a findings count.
 2. **Truncated reads** — bad ledger or transcript lines are skipped; a run with no transcript reports `n/a`, never 0 cost.
-3. **Shared state files** — the ledger is append-only, one JSON line per launch; tests redirect it (and the settings) via env in `we:vitest.setup.ts`.
+3. **Shared state files** — the ledger is append-only, one JSON line per launch; under test, with no explicit override, the settings read as off and no ledger row is written.
 4. **Fail closed** — a missing, unreadable or malformed settings file turns the advisor OFF; a ledger write fault never fails a dispatch that already started.
 5. **Identity scoping** — n/a: no auth or per-user state; the run id is the dispatcher-minted session id.
