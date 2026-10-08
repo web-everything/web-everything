@@ -30,7 +30,23 @@ describe('drain skip reasons (card 122 slice 1)', () => {
   it('accounts for a ready PR no bucket explained, and never lists a landed one', () => {
     const rows = buildSkipReasons({ verdicts: [{ num: 1, decision: 'merge' }, { num: 2, decision: 'merge' }], merged: [{ num: 1 }] });
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ num: 2, kind: 'other', source: 'unaccounted' });
+    expect(rows[0]).toMatchObject({ num: 2, kind: 'ready-not-reached', source: 'unaccounted' });
+  });
+  it('names the couple partner instead of "other" (plateau-app #212 sat 86 passes unexplained)', () => {
+    const rows = buildSkipReasons({ verdicts: [
+      { num: 212, repo: 'plateau-app', decision: 'merge', item: 4288 },
+      { num: 4288, repo: null, decision: 'skip', item: 4288, reason: 'required check "test" is not green' },
+    ] });
+    expect(rows.find((r) => r.num === 212)).toMatchObject({ kind: 'partner-pending', source: 'unaccounted' });
+    expect(rows.find((r) => r.num === 212).reason).toMatch(/#4288.*checks-pending/);
+  });
+  it('never emits the "other" bucket, for any skip reason', () => {
+    for (const r of ['', undefined, 'something new', 'not AI-generated (x)', 'base is not main (y)', 'CodeQL check failed',
+      'empty/whitespace description — x', 'could not re-read the PR fresh right before merging', 'test-gaming suspected']) {
+      expect(classifySkipReason(r)).not.toBe('other');
+    }
+    expect(classifySkipReason('something new')).toBe('unrecognized-reason');
+    expect(buildSkipReasons({ verdicts: [{ num: 9, decision: 'skip', reason: 'x', escalated: 'yes' }] })[0].kind).toBe('escalated');
   });
   it('the drain wires it into the result and the summary line', () => {
     const src = readFileSync(resolve(process.cwd(), 'scripts/merge-ai-prs.mjs'), 'utf8');
