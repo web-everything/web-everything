@@ -230,3 +230,159 @@ describe('gates read `## Acceptance` exactly as `## Done when`', () => {
     expect(a.digestHash).toBe(b.digestHash);
   });
 });
+
+describe('readTaskAgreement — HTML comments are skipped before sections are found (review round 2)', () => {
+  const REAL = ['## Acceptance', '', '- [A1] real item.', '', '## Non-goals', '', '- [N1] real non-goal.', ''];
+
+  it('does not let commented-out Acceptance and Non-goals headings replace the real sections', () => {
+    const card = [
+      '<!-- old draft', '## Acceptance', '', '- [A1] obsolete', '', '## Non-goals', '', '- [N1] obsolete', '-->', '', ...REAL,
+    ].join('\n');
+    const a = readTaskAgreement(card);
+    expect(a.acceptance).toEqual([{ id: 'A1', text: 'real item.' }]);
+    expect(a.nonGoals).toEqual([{ id: 'N1', text: 'real non-goal.' }]);
+    expect(a.problems).toEqual([]);
+  });
+
+  it('does not let a commented-out heading cut a real section short', () => {
+    const card = ['## Acceptance', '', '- [A1] one.', '<!--', '## Foo', '-->', '- [A2] two.', '', '## Non-goals', '', '- [N1] x.'].join('\n');
+    expect(readTaskAgreement(card).acceptance.map((i) => i.id)).toEqual(['A1', 'A2']);
+  });
+
+  it('ignores a fence marker inside a comment, and a comment marker inside a fence', () => {
+    const inComment = ['<!--', '```', '-->', ...REAL].join('\n');
+    expect(readTaskAgreement(inComment).problems).toEqual([]);
+    const inFence = ['```', '<!--', '```', ...REAL].join('\n');
+    expect(readTaskAgreement(inFence).problems).toEqual([]);
+  });
+
+  it('does not let a `<!--` quoted in prose or backticks swallow the rest of the card', () => {
+    const intro = readTaskAgreement(['# T', '', 'The reader skips `<!--` blocks.', '', ...REAL].join('\n'));
+    expect(intro.acceptance).toEqual([{ id: 'A1', text: 'real item.' }]);
+    expect(intro.nonGoals).toEqual([{ id: 'N1', text: 'real non-goal.' }]);
+    expect(intro.problems).toEqual([]);
+    const item = readTaskAgreement('## Acceptance\n\n- [A1] skips `<!--` in code.\n- [A2] two.\n\n## Non-goals\n\n- [N1] x.\n');
+    expect(item.acceptance.map((i) => i.id)).toEqual(['A1', 'A2']);
+    expect(item.nonGoals.map((i) => i.id)).toEqual(['N1']);
+  });
+
+  it('does not open a comment on a heading line, and tolerates a stray close', () => {
+    const a = readTaskAgreement(['## Acceptance', '', '- [A1] one.', '', '## Non-goals <!-- y', '- [N1] real.'].join('\n'));
+    expect(a.nonGoals).toEqual([{ id: 'N1', text: 'real.' }]);
+    expect(readTaskAgreement(['--> stray', ...REAL].join('\n')).problems).toEqual([]);
+  });
+
+  it('treats `<!-->` as an empty, already-closed comment', () => {
+    const a = readTaskAgreement(['## Acceptance', '', '<!-->', '- [A1] one.', '- [A2] two.', '', '## Non-goals', '', '- [N1] x.'].join('\n'));
+    expect(a.acceptance.map((i) => i.id)).toEqual(['A1', 'A2']);
+    expect(a.nonGoals.map((i) => i.id)).toEqual(['N1']);
+  });
+
+  it('reports a comment that is never closed instead of silently dropping the sections after it', () => {
+    const a = readTaskAgreement('## Acceptance\n\n- [A1] x\n\n<!-- never closed\n\n## Non-goals\n\n- [N1] y\n');
+    expect(a.problems.map((p) => p.code)).toEqual(expect.arrayContaining(['unterminated-comment', 'non-goals-missing']));
+    expect(() => readTaskAgreement('## Acceptance\n\n<!-- never closed\n- [A1] x\n')).not.toThrow();
+  });
+
+  it('reads CRLF cards the same as LF cards', () => {
+    const lf = ['<!-- old', '## Acceptance', '- [A9] hidden', '-->', ...REAL].join('\n');
+    expect(readTaskAgreement(lf.replace(/\n/g, '\r\n'))).toEqual(readTaskAgreement(lf));
+  });
+});
+
+describe('readTaskAgreement — nested bullets and continuation lines (review round 2)', () => {
+  const nested = (indent) => ['## Acceptance', '', '- [A1] parent.', `${indent}- detail`, '- [A2] sibling.', '', '## Non-goals', '', '- [N1] x.'].join('\n');
+
+  it.each([['2 spaces', '  '], ['3 spaces', '   '], ['4 spaces', '    '], ['a tab', '\t']])(
+    'folds a sub-bullet indented %s into its parent item instead of inventing an item',
+    (_name, indent) => {
+      const a = readTaskAgreement(nested(indent));
+      expect(a.acceptance).toEqual([{ id: 'A1', text: 'parent. - detail' }, { id: 'A2', text: 'sibling.' }]);
+      expect(a.problems).toEqual([]);
+    },
+  );
+
+  it('keeps a nested bullet that carries its own id as a separate, citable item', () => {
+    const a = readTaskAgreement('## Acceptance\n\n- [A1] one\n  - [A2] two\n\n## Non-goals\n\n- [N1] x.\n');
+    expect(a.acceptance).toEqual([{ id: 'A1', text: 'one' }, { id: 'A2', text: 'two' }]);
+    expect(a.problems).toEqual([]);
+  });
+
+  it('keeps siblings that share the first item\'s own indent as separate items', () => {
+    const a = readTaskAgreement('## Acceptance\n\n   - [A1] one.\n   - [A2] two.\n\n## Non-goals\n\n- [N1] x.\n');
+    expect(a.acceptance.map((i) => i.id)).toEqual(['A1', 'A2']);
+  });
+
+  it('keeps an indented continuation after a blank line with its item', () => {
+    const a = readTaskAgreement('## Acceptance\n\n- [A1] one.\n\n  more on one.\n- [A2] two.\n\n## Non-goals\n\n- [N1] x.\n');
+    expect(a.acceptance).toEqual([{ id: 'A1', text: 'one. more on one.' }, { id: 'A2', text: 'two.' }]);
+  });
+});
+
+describe('every gate accepts the same heading spellings as the reader (review round 2)', () => {
+  const ACCEPTANCE_SPELLINGS = ['Acceptance', 'acceptance', 'Acceptance criteria', 'Acceptance:', 'Done when', 'done when', 'Done when:'];
+  const NON_GOALS_SPELLINGS = ['Non-goals', 'Non-goal', 'non-goals', 'Non-goals:'];
+
+  it.each(ACCEPTANCE_SPELLINGS)('reads `## %s` as the acceptance section in the reader, the codex-worker and the orphan sweep', (spelling) => {
+    const a = readTaskAgreement(`## ${spelling}\n\n- [A1] it works.\n\n## Non-goals\n\n- [N1] x\n`);
+    expect(a.acceptance).toHaveLength(1);
+    const card = parseCard(`---\nscope: []\nstatus: open\n---\n# T\n\nDigest.\n\n## ${spelling}\n\n- [A1] it works.\n\n## Non-goals\n\n- [N1] x\n`);
+    expect(card.digest).toBe('Digest.');
+    expect(card.doneWhen).toContain('- [A1] it works.');
+    const head = '---\nstatus: open\nkind: task\n---\n# T\n\nIntro.\n';
+    const one = parseOrphanCard('backlog/xaaaaaa-t.md', `${head}\n## ${spelling}\n\n- [A1] one\n`);
+    const two = parseOrphanCard('backlog/xaaaaaa-t.md', `${head}\n## ${spelling}\n\n- [A1] two\n`);
+    expect(one.digestHash).toBe(two.digestHash);
+  });
+
+  it.each(ACCEPTANCE_SPELLINGS)('treats `## %s` as a provenance escape zone', (spelling) => {
+    const text = `## ${spelling}\n\n- [A1] \`notYetWritten\` exists.\n`;
+    expect(findUnresolvedIdentifiers(text, { resolves: () => false })).toEqual([]);
+  });
+
+  it.each(NON_GOALS_SPELLINGS)('reads `## %s` as non-goals in the reader and treats it as a provenance escape zone', (spelling) => {
+    expect(readTaskAgreement(`## Acceptance\n\n- [A1] a\n\n## ${spelling}\n\n- [N1] b\n`).nonGoals).toHaveLength(1);
+    const text = `## ${spelling}\n\n- [N1] \`neverBuilt\` stays unbuilt.\n`;
+    expect(findUnresolvedIdentifiers(text, { resolves: () => false })).toEqual([]);
+  });
+
+  it('keeps an unrelated heading out of the escape zone', () => {
+    const text = '## Acceptances elsewhere\n\n- `notYetWritten` exists.\n';
+    expect(findUnresolvedIdentifiers(text, { resolves: () => false })).not.toEqual([]);
+  });
+});
+
+describe('the codex-worker and the orphan sweep find the real acceptance section (review round 2)', () => {
+  const FRONT = '---\nscope: []\nstatus: open\nkind: task\n---\n# T\n\nDigest.\n\n';
+
+  it('ignore an `## Acceptance` quoted in a fenced example or a commented-out draft', () => {
+    const fenced = `${FRONT}\`\`\`md\n## Acceptance\n- [A1] example\n\`\`\`\n\n## Acceptance\n\n- [A1] real.\n\n## Non-goals\n\n- [N1] x\n`;
+    expect(parseCard(fenced).doneWhen).toBe('- [A1] real.');
+    expect(parseCard(fenced).digest).toContain('example');
+    const commented = `${FRONT}<!--\n## Acceptance\n- [A1] old\n-->\n\n## Acceptance\n\n- [A1] real.\n`;
+    expect(parseCard(commented).doneWhen).toBe('- [A1] real.');
+    const head = '---\nstatus: open\nkind: task\n---\n# T\n\nIntro.\n\n';
+    const a = parseOrphanCard('backlog/xaaaaaa-t.md', `${head}\`\`\`md\n## Done when\n\`\`\`\nTail guard text.\n\n## Acceptance\n\n- [A1] one\n`);
+    const b = parseOrphanCard('backlog/xaaaaaa-t.md', `${head}\`\`\`md\n## Done when\n\`\`\`\nTail guard text.\n\n## Acceptance\n\n- [A1] two\n`);
+    const c = parseOrphanCard('backlog/xaaaaaa-t.md', `${head}\`\`\`md\n## Done when\n\`\`\`\nOther text.\n\n## Acceptance\n\n- [A1] one\n`);
+    expect(a.digestHash).toBe(b.digestHash);
+    expect(a.digestHash).not.toBe(c.digestHash);
+  });
+
+  it('cut a CRLF card at its acceptance heading exactly as an LF card', () => {
+    const lf = '---\nstatus: open\nkind: task\n---\n# T\n\nIntro.\n\n## Acceptance\n\n- [A1] one\n';
+    const crlf = (s) => s.replace(/\n/g, '\r\n');
+    const hash = (s) => parseOrphanCard('backlog/xaaaaaa-t.md', s).digestHash;
+    expect(hash(crlf(lf))).toBe(hash(crlf(lf.replace('one', 'two'))));
+    expect(parseCard(crlf(lf)).doneWhen).toBe('- [A1] one');
+  });
+
+  it('scan a heading line with a long whitespace run in linear time', () => {
+    const heading = `## x${' '.repeat(100000)}y\n\n## Acceptance\n\n- [A1] one\n`;
+    const started = Date.now();
+    expect(parseCard(`# T\n\n${heading}`).doneWhen).toBe('- [A1] one');
+    parseOrphanCard('backlog/xaaaaaa-t.md', `---\nstatus: open\n---\n# T\n\n${heading}`);
+    readTaskAgreement(heading);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});

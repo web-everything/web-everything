@@ -3959,7 +3959,7 @@ function deliverableSections(body) {
   let on = false;
   for (const line of String(body || '').split('\n')) {
     const h = /^##\s+(.*?)\s*$/.exec(line);
-    if (h) { on = /^(MVP|Done when|Acceptance)\b/i.test(h[1]); continue; }
+    if (h) { on = /^MVP\b/i.test(h[1]) || ACCEPTANCE_HEADING_RE.test(h[1]); continue; }
     if (on) out.push(line);
   }
   return out.join('\n');
