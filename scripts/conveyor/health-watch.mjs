@@ -122,6 +122,24 @@ export function daemonDownEmergency(ep) {
   return { kind: 'daemon-down', downForMs };
 }
 
+/**
+ * Health smells whose episode IS a red main: their alert always breaks through quiet hours (`mainRed` breakthrough).
+ * NOTE: the tag only acts once the smell notifies at all. `pre-existing-red-on-main` is medium severity and is not in
+ * `NOTIFY_EVEN_IN_SHADOW`, which is an operator-owned list (see `health-smells-notify-list.mjs`), so today a red main
+ * raises no desktop alert; adding it there is the operator's call, and this tag then makes it an overnight emergency.
+ */
+export const MAIN_RED_SMELLS = new Set(['pre-existing-red-on-main']);
+
+/**
+ * The quietHours breakthrough tag for a health episode's alert, or undefined for a routine one. The real red-main
+ * alert is titled `Health: pre-existing-red-on-main — main:<sha>`; it is tagged here rather than left to the title
+ * fallback, which only guesses from the wording.
+ */
+export function breakthroughEmergency(ep) {
+  if (MAIN_RED_SMELLS.has(ep?.smell)) return { kind: 'main-red' };
+  return daemonDownEmergency(ep);
+}
+
 // ── paths ────────────────────────────────────────────────────────────────────────────────────────────────────
 
 export function defaultLogsDir(env = process.env) {
@@ -1260,10 +1278,10 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
     let sent;
-    const emergency = daemonDownEmergency(ep);
+    const emergency = breakthroughEmergency(ep);
     try { sent = notifyDesktopChecked({ title, body, emergency }); } catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
-    // Remember that quiet hours held this alert: the breakthrough depends on elapsed time, so it is re-checked below.
-    if (emergency && sent?.suppressed) ep.heldByQuietHours = true;
+    // Remember that quiet hours held this alert: the daemon-down breakthrough depends on elapsed time, so it is re-checked below.
+    if (emergency?.kind === 'daemon-down' && sent?.suppressed) ep.heldByQuietHours = true;
     notifications.push({ key: p.key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
   }
 

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import {
   isQuiet, breaksThrough, decideDelivery, sweepSkip, planDigest, mergeSettings, inWindow, toggleActive, DEFAULT_QUIET_SETTINGS,
 } from '../quiet-hours.mjs';
-import { gateAlert, flushDigest } from '../quiet-hours-io.mjs';
+import { gateAlert, flushDigest, SETTINGS_PATH } from '../quiet-hours-io.mjs';
 import { spawnSync } from 'node:child_process';
 
 // A pid that is certain to be dead: a child that has already exited (a hard-coded pid could belong to a live process).
@@ -56,6 +56,16 @@ describe('breakthrough rule', () => {
   it('main red always breaks through', () => {
     expect(breaksThrough({ title: 'x', emergency: { kind: 'main-red' } }, S).breaks).toBe(true);
     expect(breaksThrough({ title: 'CI: main is red on abc123' }, S).breaks).toBe(true);
+    // The real health title for a red main is `Health: pre-existing-red-on-main — main:<sha>`: the word order is
+    // "red ... main", which the title fallback must also read (it is the safety net for any caller that does not tag).
+    expect(breaksThrough({ title: 'Health: pre-existing-red-on-main — main:efd88abcc' }, S).breaks).toBe(true);
+    expect(breaksThrough({ title: 'Tests failing on main @ efd88abcc' }, S).breaks).toBe(true);
+    expect(breaksThrough({ title: 'Health: red-pr-unattended — PR #4461' }, S).breaks).toBe(false); // red, but not main
+    expect(breaksThrough({ title: 'Health: clone-behind-main — lane-3' }, S).breaks).toBe(false); // main, but not red
+    // ...and the shipped settings file (which overrides the default) must say the same thing.
+    const shipped = mergeSettings(JSON.parse(readFileSync(SETTINGS_PATH, 'utf8')));
+    expect(breaksThrough({ title: 'Health: pre-existing-red-on-main — main:efd88abcc' }, shipped).breaks).toBe(true);
+    expect(breaksThrough({ title: 'Health: red-pr-unattended — PR #4461' }, shipped).breaks).toBe(false);
     expect(breaksThrough({ title: 'x', emergency: { kind: 'main-red' } }, { ...S, breakthrough: { mainRed: false } }).breaks).toBe(false);
   });
   it('daemon down breaks through only past the threshold', () => {
@@ -241,9 +251,49 @@ describe('digest', () => {
     }
     {
       const { env, digest } = heldFixture(1);
-      renameSync(join(digest, 'held.jsonl'), claim(digest, live, `.r${DEAD}`)); // a sweeper that took it, then died
+      renameSync(join(digest, 'held.jsonl'), claim(digest, DEAD)); // a sweeper that took it, then died (a swept claim carries the SWEEPER's pid)
       expect(flushDigest({ send: ok, env, now: ET('08:30') }).count).toBe(1);
     }
+  });
+
+  it('IO: an alert written into the claim after the flusher read it (writer opened the queue before the rename) is re-queued, not deleted', () => {
+    const { env, digest } = heldFixture(1);
+    const late = JSON.stringify({ at: '2026-10-09T12:00:00Z', title: 'late', body: '' });
+    const send = () => { // during the send, a straggling writer's line lands in the claim file
+      const claim = readdirSync(digest).find((f) => f.includes('.flushing-'));
+      appendFileSync(join(digest, claim), `${late}\n`);
+      return { ok: true };
+    };
+    expect(flushDigest({ send, env, now: ET('08:00') })).toMatchObject({ flushed: true, count: 1 });
+    expect(readFileSync(join(digest, 'held.jsonl'), 'utf8')).toMatch(/"title":"late"/);
+    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1); // sent once, in the next digest
+  });
+
+  it('IO: a claim a sweeper just took is young again, so a second sweeper cannot take it mid-restore (no double delivery)', () => {
+    const { env, digest } = heldFixture(1);
+    const claims = () => readdirSync(digest).filter((f) => f.includes('.flushing-'));
+    const ok = vi.fn(() => ({ ok: true }));
+    // A flusher died 7 h ago, right after claiming the queue.
+    const original = join(digest, `held.jsonl.flushing-${DEAD}-${ET('01:00')}-1`);
+    renameSync(join(digest, 'held.jsonl'), original);
+    const entries = readFileSync(original, 'utf8');
+    // Sweeper S takes that claim, but its restore dies half way (the claim cannot be read: a directory stands in for
+    // the fault), so the claim stays on disk, owned by S.
+    rmSync(original); mkdirSync(original);
+    expect(flushDigest({ send: ok, env, now: ET('08:00') }).flushed).toBe(false);
+    const left = claims();
+    expect(left).toHaveLength(1);
+    // The claim's ORIGINAL age is 7 h, but S took it a moment ago. A second sweeper a minute later must see a young
+    // claim and leave it alone; recovering it now would restore and send the same alerts S is about to restore.
+    expect(flushDigest({ send: ok, env, now: ET('08:01') }).flushed).toBe(false);
+    expect(ok).not.toHaveBeenCalled();
+    expect(claims()).toEqual(left);
+    // Once it has gone quiet for the normal stale window it is recovered (the fault cleared), and sent exactly once.
+    rmSync(join(digest, left[0]), { recursive: true }); writeFileSync(join(digest, left[0]), entries);
+    expect(flushDigest({ send: ok, env, now: ET('08:30') }).count).toBe(1);
+    expect(ok).toHaveBeenCalledTimes(1);
+    expect(claims()).toEqual([]);
   });
 
   it('IO: the toggle file forces quiet by day; VITEST bypass and off switch deliver', () => {

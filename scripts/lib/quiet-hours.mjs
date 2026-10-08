@@ -26,7 +26,8 @@ export const DEFAULT_QUIET_SETTINGS = Object.freeze({
     /** A daemon-down alert that does not say how long it has been down: deliver it (fail loud) or hold it. */
     daemonDownUnknownDuration: 'deliver',
     /** Fallback for callers that do not tag `emergency`: a title matching this is treated as main red. */
-    mainRedTitlePattern: '\\bmain\\b.*\\b(red|failing)\\b',
+    // Either word order: "main is red" and the real health title "pre-existing-red-on-main — main:<sha>".
+    mainRedTitlePattern: '\\b(?:main\\b.*\\b(?:red|failing)|(?:red|failing)\\b.*\\bmain)\\b',
   }),
   sweeps: Object.freeze({ skipDuringQuiet: Object.freeze(['coroner', 'opus']) }),
   digest: Object.freeze({ enabled: true, maxTitles: 5 }),

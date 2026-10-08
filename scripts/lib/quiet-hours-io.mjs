@@ -76,6 +76,20 @@ function restoreClaim(claimed, held) {
   return true;
 }
 
+/**
+ * A writer that opened the queue just before it was renamed away can land its line in the CLAIM after we read it
+ * (`appendFileSync` opens, then writes). Before the claim is deleted, put anything beyond what was read back on the
+ * queue, so that alert is held for the next digest instead of lost. Never throws.
+ */
+function requeueLateWrites(claimed, readText, held) {
+  try {
+    const now = readFileSync(claimed, 'utf8');
+    if (now.length <= readText.length || !now.startsWith(readText)) return;
+    const tail = now.slice(readText.length);
+    if (tail.trim()) appendFileSync(held, `\n${tail}${tail.endsWith('\n') ? '' : '\n'}`);
+  } catch { /* best-effort: the alert is only delayed or, at worst, lost as before */ }
+}
+
 let claimSeq = 0;
 
 /**
@@ -95,13 +109,20 @@ function recoverStaleClaims(dir, held, now) {
     if (!Number.isFinite(claimedAt) || Math.abs(now - claimedAt) <= STALE_CLAIM_MS) continue;
     if (activeClaims.has(name)) continue;
     // Taking a claim from a flusher that is still alive would send its entries twice (it sends, we restore and send
-    // again). The owner is the process that last renamed it: the sweeper suffix `.r<pid>`, else the name's pid.
-    // Our own pid is never "another live process": a claim of ours that is not active is a failed restore.
-    const owner = Number(/\.r(\d+)$/.exec(name)?.[1] ?? m[1]);
+    // again). The owner is the pid in the name. Our own pid is never "another live process": a claim of ours that is
+    // not active is a failed restore.
+    const owner = Number(m[1]);
     if (owner !== process.pid && Math.abs(now - claimedAt) <= LIVE_OWNER_CLAIM_MS && pidAlive(owner)) continue;
-    const mine = join(dir, `${name}.r${process.pid}`); // keeps the original timestamp, so a crash here is stale again
+    // Take it under a NEW name stamped with this sweep (our pid, `now`). The rename is atomic, so only one sweeper wins;
+    // and the new stamp makes the claim young again, so a second sweeper cannot take it while we are still restoring it
+    // (with the old stamp it would look hours old and, being "owned" by a live pid past the hard limit, be taken, and
+    // its entries restored and sent twice). A crash mid-restore just leaves a claim that goes stale again in 10 minutes.
+    claimSeq += 1;
+    const swept = `${CLAIM_PREFIX}${process.pid}-${now}-${claimSeq}`;
+    const mine = join(dir, swept);
     try { renameSync(join(dir, name), mine); } catch { continue; }
-    restoreClaim(mine, held);
+    activeClaims.add(swept);
+    try { restoreClaim(mine, held); } finally { activeClaims.delete(swept); }
   }
 }
 
@@ -132,14 +153,15 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
     claimId = basename(claim);
     activeClaims.add(claimId);
     const entries = [];
-    for (const line of readFileSync(claimed, 'utf8').split('\n')) {
+    const raw = readFileSync(claimed, 'utf8');
+    for (const line of raw.split('\n')) {
       if (!line.trim()) continue;
       try { entries.push(JSON.parse(line)); } catch { /* torn line — skip */ }
     }
     // `digest.enabled=false` only stops NEW alerts being held (decideDelivery delivers them). Whatever was already
     // held is still owed to the operator, so it drains here, once, as a digest: never deleted, never stranded.
     const plan = planDigest(entries, { ...settings, digest: { ...settings.digest, enabled: true } });
-    if (!plan) { unlinkSync(claimed); claimed = null; return { flushed: false, reason: 'digest empty' }; } // only torn/untitled lines: nothing sendable
+    if (!plan) { requeueLateWrites(claimed, raw, held); unlinkSync(claimed); claimed = null; return { flushed: false, reason: 'digest empty' }; } // only torn/untitled lines: nothing sendable
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
     const mdPath = join(dir, `digest-${stamp}.md`);
     writeFileSync(mdPath, plan.markdown);
@@ -153,6 +175,7 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
       return { flushed: false, count: entries.length, mdPath, sent };
     }
     confirmed = true; // the sender reported success — the entries must not be restored from here
+    requeueLateWrites(claimed, raw, held);
     unlinkSync(claimed);
     claimed = null;
     return { flushed: true, count: entries.length, mdPath, sent };

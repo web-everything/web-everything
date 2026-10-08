@@ -9,7 +9,7 @@
     "mainRed": true,
     "daemonDownMin": 30,
     "daemonDownUnknownDuration": "deliver",
-    "mainRedTitlePattern": "\\bmain\\b.*\\b(red|failing)\\b"
+    "mainRedTitlePattern": "\\b(?:main\\b.*\\b(?:red|failing)|(?:red|failing)\\b.*\\bmain)\\b"
   },
   "sweeps": {
     "skipDuringQuiet": ["coroner", "opus"]

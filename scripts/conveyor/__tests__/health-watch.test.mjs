@@ -13,8 +13,9 @@ import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
-  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend,
+  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency,
 } from '../health-watch.mjs';
+import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
 
 
 // Keep the shell, persistence and real detector registry intact; supply deterministic probe results
@@ -1304,5 +1305,25 @@ describe('quietHours: a held daemon-silent alert is re-sent as an emergency once
     expect(silentCalls()[1].emergency.downForMs).toBeGreaterThanOrEqual(30 * minute);
     await run(40, '', false);
     expect(silentCalls()).toHaveLength(2); // delivered once: not nagged every tick
+  });
+});
+
+// quietHours (card xmvc6oc): the main-red breakthrough must be wired to the health alert a red main really produces
+// (`pre-existing-red-on-main`, titled `Health: pre-existing-red-on-main — main:<sha>`), not just to a title guess.
+describe('quietHours: the main-red health smell is tagged as a main-red emergency', () => {
+  const at2am = Date.parse('2026-10-09T02:00:00-04:00');
+  const redMain = { smell: 'pre-existing-red-on-main', subject: 'main:efd88abcc', measure: { baseSha: 'efd88abcc00' } };
+
+  it('breakthroughEmergency tags the red-main smell {kind:main-red} and a silent daemon {kind:daemon-down}', () => {
+    expect(breakthroughEmergency(redMain)).toEqual({ kind: 'main-red' });
+    expect(breakthroughEmergency({ smell: 'daemon-silent', measure: { silentForMs: 45 * 60_000 } })).toEqual({ kind: 'daemon-down', downForMs: 45 * 60_000 });
+    expect(breakthroughEmergency({ smell: 'red-pr-unattended', subject: 'PR #1' })).toBeUndefined();
+  });
+
+  it('the tagged red-main alert is delivered at 02:00 ET, an untagged routine smell is held', () => {
+    const title = `Health: ${redMain.smell} — ${redMain.subject}`;
+    const tagged = { title, emergency: breakthroughEmergency(redMain) };
+    expect(decideDelivery(tagged, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
   });
 });
