@@ -10,6 +10,8 @@
  * injected `exec(cmd, args) => stdout`.
  */
 
+import { ghRepoSlug } from './constellation-repos.mjs';
+
 const HASH = /^x[0-9a-z]{6}$/;
 const stemOf = (path) => String(path).split('/').pop().replace(/\.md$/, '');
 const hashOfStem = (stem) => stem.split('-')[0];
@@ -57,7 +59,7 @@ export function checkDuplicateBornAs({ exec, base = 'main', sha = 'HEAD', branch
     } catch { /* no match / no ref → nothing on main */ }
     let openPrFiles = [];
     try {
-      const prs = JSON.parse(exec('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,files']));
+      const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', ghRepoSlug('we'), '--state', 'open', '--limit', '200', '--json', 'number,headRefName,files']));
       openPrFiles = prs.filter((p) => !branch || p.headRefName !== branch)
         .flatMap((p) => (p.files || []).map((f) => ({ pr: p.number, path: f.path })));
     } catch { /* gh unavailable → skip the open-PR half */ }
