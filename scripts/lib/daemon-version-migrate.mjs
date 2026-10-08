@@ -80,6 +80,12 @@ export async function migrate({ clone, home, settings, dryRun = false, force = f
   const dirt = git(p.logical, ['status', '--porcelain', '--untracked-files=no']);
   if (dirt && !force) return { status: 'refused', reason: 'tracked-dirt', dirt: dirt.split('\n').slice(0, 20) };
   const sha = git(p.logical, ['rev-parse', '--verify', 'HEAD^{commit}']);
+  // v0 is built from this HEAD, so HEAD itself must understand the host-local enable file; otherwise the
+  // migrated daemon runs the old in-place rebuild inside a version folder (found live 2026-10-08, rolled back).
+  if (deps.requireHostEnable !== false
+    && gitIn(p.logical, ['grep', '-q', 'settings.local.json', sha, '--', 'scripts/lib/daemon-version-runtime.mjs']).status !== 0) {
+    return { status: 'refused', reason: 'clone-lacks-host-enable', hint: 'let the clone sync to a main that has card 89 S6' };
+  }
   const originUrl = git(p.logical, ['config', '--get', 'remote.origin.url']);
   const stateNow = config.statePaths.filter(path => stat(fs, join(p.logical, path)));
   if (dryRun) return { status: 'dry-run', name, sha, originUrl, root: p.root, wouldMove: stateNow };

@@ -44,6 +44,7 @@ describe('daemon version migrate / unmigrate', () => {
     fs.writeFileSync(join(clone, '.operations', 'run.json'), '1');
     settings = { statePaths: ['.conveyor', '.operations'], carryPaths: [] };
     deps = {
+      requireHostEnable: false,
       env: { ...process.env, WE_DAEMON_OVERLAY_DIR: join(fixture, 'overlays') },
       now: () => Date.parse('2026-10-08T12:00:00Z'),
       buildDeps: {
@@ -100,6 +101,12 @@ describe('daemon version migrate / unmigrate', () => {
     expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused' });
     await unmigrate({ clone, home, settings, deps });
     expect(await unmigrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'not-migrated' });
+  });
+
+  it('refuses a clone whose HEAD cannot read the host-local enable file', async () => {
+    deps.requireHostEnable = true;
+    expect(await migrate({ clone, home, settings, deps })).toMatchObject({ status: 'refused', reason: 'clone-lacks-host-enable' });
+    expect(fs.lstatSync(clone).isDirectory()).toBe(true);
   });
 
   it('refuses a failed smoke and changes nothing', async () => {
