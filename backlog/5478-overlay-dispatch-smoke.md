@@ -1,4 +1,5 @@
 ---
+bornAs: xkhtg2a
 kind: story
 size: 5
 status: open

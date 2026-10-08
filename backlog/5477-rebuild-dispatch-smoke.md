@@ -1,4 +1,5 @@
 ---
+bornAs: xhiqxz3
 kind: story
 size: 3
 status: open
@@ -11,7 +12,7 @@ tags: []
 
 The tick rebuild adopts overlays with only dry-run smokes, so a broken worker launch (s3b, 2026-10-08) can run for minutes before the gated load smokes it. The rebuild's candidate smoke now launches one real worker (#4481's runRealDispatchSmoke) when a new or moved overlay touches a dispatch-path file, and holds on last-good on failure.
 
-Stacked on #4481 (card xkhtg2a, unmerged at filing): reuses its `runRealDispatchSmoke`, `matchDispatchPaths` and
+Stacked on #4481 (card 5478, unmerged at filing): reuses its `runRealDispatchSmoke`, `matchDispatchPaths` and
 `overlaySafetySettings` (same `overlaySafety` settings) from we:scripts/lib/daemon-load-overlay.mjs.
 
 ## Done when
