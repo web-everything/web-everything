@@ -28,6 +28,8 @@
  * 8/9) are not in this subset.
  */
 
+import { ACCEPTANCE_HEADING_RE, NON_GOALS_HEADING_RE } from '../backlog/task-agreement.mjs';
+
 // ── Enforcement level. The gate ships at WARN, not ERROR (#2821 "don't break the gate on the existing
 // corpus"): a whole-repo scan surfaces ~39 anchor-ruling co-citations, ~429 drifted `we:<path>:<line>`
 // loci, and ~85 out-of-scope hash-slugs — all in HISTORICAL reports/research authored before the gate
@@ -679,8 +681,19 @@ export const PROVENANCE_ESCAPE_MARKERS = Object.freeze(['proposed', 'does not ex
  *  mark each token. The zone runs until the next heading at the SAME OR SHALLOWER level, so a `###`
  *  subsection of `## Done when` inherits it. Verified against the historical misses this gate exists to
  *  catch: none of them lived under an escape heading (`validateTodoMarkerBlock` was under
- *  `## Where it is today`, `enforceFlipReady` in the item lede, `collectOpenItemIds` in a JSDoc block). */
-export const PROVENANCE_ESCAPE_HEADINGS = Object.freeze(['done when', 'design']);
+ *  `## Where it is today`, `enforceFlipReady` in the item lede, `collectOpenItemIds` in a JSDoc block).
+ *  `## Acceptance` is the #5399 name for `## Done when`; `## Non-goals` names things deliberately not built.
+ *  An entry is a lowercase string (the heading, or the heading followed by a space or colon) or a RegExp tested
+ *  against the lowercased title. The agreement sections use the reader's own regexes, so a spelling the reader
+ *  accepts (`Acceptance criteria`, `Non-goal`, `Done when:`) can never fall outside the zone. */
+export const PROVENANCE_ESCAPE_HEADINGS = Object.freeze(['design', ACCEPTANCE_HEADING_RE, NON_GOALS_HEADING_RE]);
+
+/** Whether a (lowercased, markup-stripped) heading title opens an escape zone. */
+function isEscapeHeading(title, escapeHeadings) {
+  return escapeHeadings.some((k) => (k instanceof RegExp
+    ? k.test(title)
+    : title === k || title.startsWith(`${k} `) || title.startsWith(`${k}:`)));
+}
 
 /** The region escape, for a block that quotes MANY non-resolving names (a table of historical defects, a
  *  list of illustrative proposals) where a per-token marker would be pure noise. Two lines instead of N
@@ -925,7 +938,7 @@ export function findUnresolvedIdentifiers(text, {
         const title = h[2].replace(/[`*_]/g, '').trim().toLowerCase();
         // A heading at the same-or-shallower depth closes an open zone; a deeper one inherits it.
         if (escapeLevel !== null && depth <= escapeLevel) escapeLevel = null;
-        if (escapeLevel === null && escapeHeadings.some((k) => title === k || title.startsWith(`${k} `) || title.startsWith(`${k}:`)))
+        if (escapeLevel === null && isEscapeHeading(title, escapeHeadings))
           escapeLevel = depth;
         continue;
       }
