@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/conveyor/prep-review.mjs", "we:scripts/conveyor/prep-review-io.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/backlog/edge-case-classes.mjs"]
+scope: ["we:scripts/conveyor/prep-review.mjs", "we:scripts/conveyor/prep-review-io.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/backlog/edge-case-classes.mjs", "we:scripts/conveyor/__tests__/prep-review.test.mjs", "we:scripts/lib/__tests__/review-escalation.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
