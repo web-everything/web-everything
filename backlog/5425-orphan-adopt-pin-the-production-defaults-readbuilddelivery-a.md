@@ -1,15 +1,16 @@
 ---
+bornAs: xljfg47
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/build-dispatch-orphan-adopt.mjs", "we:scripts/conveyor/__tests__/"]
+scope: ["we:scripts/conveyor/build-dispatch-orphan-adopt.mjs", "we:scripts/conveyor/__tests__/", "we:scripts/conveyor/soak/breaks/build-dispatch-orphan-adopt.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Orphan-adopt: a session blocked on a human for over 30 minutes must not lose its build claim
+# Orphan-adopt: pin the production defaults readBuildDelivery and defaultSessionLiveness with an end-to-end test
 
-Follow-up from #4361 advisory review (operator approved with follow-up cards 2026-10-08). we:scripts/conveyor/build-dispatch-orphan-adopt.mjs:395 treats blocked as alive only while updatedAt is under 30 min, so a session waiting on a human longer is released as orphan-released and a second build of the same card can start. Give blocked its own longer window (setting) or treat it alive until terminal; add a defaultSessionLiveness test for a stale blocked record.
+Follow-up from #4361 advisory review (operator approved with follow-up cards 2026-10-08). we:scripts/conveyor/build-dispatch-orphan-adopt.mjs:520 defaults readDelivery=readBuildDelivery and sessionLivenessFor=defaultSessionLiveness are untested; the test wrapper overrides both. Add a default-wiring test (real adoptOrphanedBuildClaims with only gh exec + jobs dir injected) or extend the orphan-adopt soak break to cover a delivered claim and a paused await-verify claim.
 
 ## Done when
 

@@ -1,15 +1,16 @@
 ---
+bornAs: xa8yvqp
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/build-dispatch-orphan-adopt.mjs", "we:scripts/conveyor/__tests__/", "we:scripts/conveyor/soak/breaks/build-dispatch-orphan-adopt.mjs"]
+scope: ["we:scripts/conveyor/build-delivery-evidence.mjs", "we:scripts/conveyor/__tests__/"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Orphan-adopt: pin the production defaults readBuildDelivery and defaultSessionLiveness with an end-to-end test
+# Build delivery evidence: the fixed 100-row PR query can be crowded out by unrelated PRs
 
-Follow-up from #4361 advisory review (operator approved with follow-up cards 2026-10-08). we:scripts/conveyor/build-dispatch-orphan-adopt.mjs:520 defaults readDelivery=readBuildDelivery and sessionLivenessFor=defaultSessionLiveness are untested; the test wrapper overrides both. Add a default-wiring test (real adoptOrphanedBuildClaims with only gh exec + jobs dir injected) or extend the orphan-adopt soak break to cover a delivered claim and a paused await-verify claim.
+Follow-up from #4361 advisory review (operator approved with follow-up cards 2026-10-08). we:scripts/conveyor/build-delivery-evidence.mjs:201 lists at most 100 PRs, so unrelated or fork PRs can push the card's delivery PR out of the window and the build is not seen as delivered. Paginate or narrow the query to the card's lane ref, with a test of more than 100 rows.
 
 ## Done when
 

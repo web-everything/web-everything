@@ -1,15 +1,16 @@
 ---
+bornAs: xygnvxd
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/conveyor/build-delivery-evidence.mjs", "we:scripts/conveyor/__tests__/"]
+scope: ["we:scripts/conveyor/build-dispatch-orphan-adopt.mjs", "we:scripts/conveyor/__tests__/"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Build delivery evidence: the fixed 100-row PR query can be crowded out by unrelated PRs
+# Orphan-adopt: a session blocked on a human for over 30 minutes must not lose its build claim
 
-Follow-up from #4361 advisory review (operator approved with follow-up cards 2026-10-08). we:scripts/conveyor/build-delivery-evidence.mjs:201 lists at most 100 PRs, so unrelated or fork PRs can push the card's delivery PR out of the window and the build is not seen as delivered. Paginate or narrow the query to the card's lane ref, with a test of more than 100 rows.
+Follow-up from #4361 advisory review (operator approved with follow-up cards 2026-10-08). we:scripts/conveyor/build-dispatch-orphan-adopt.mjs:395 treats blocked as alive only while updatedAt is under 30 min, so a session waiting on a human longer is released as orphan-released and a second build of the same card can start. Give blocked its own longer window (setting) or treat it alive until terminal; add a defaultSessionLiveness test for a stale blocked record.
 
 ## Done when
 
