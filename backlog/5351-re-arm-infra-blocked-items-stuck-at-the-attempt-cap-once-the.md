@@ -2,9 +2,10 @@
 bornAs: xg44s2t
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/infra-blocked.mjs", "we:scripts/conveyor/__tests__/infra-auto-rearm.test.mjs", "we:scripts/conveyor/__tests__/infra-blocked.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
