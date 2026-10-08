@@ -2,9 +2,10 @@
 bornAs: x27r9a2
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lib/verdict-ledger-io.mjs", "we:scripts/lib/git-transport-branch.mjs", "we:scripts/__tests__/apply-review-request.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
