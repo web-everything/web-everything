@@ -21,7 +21,7 @@
  * PURE. A record is only read from a trusted author (`readReferralRecords` enforces that), and a comment that
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
-import { readReferralRecords, mandatoryReferralState, parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
+import { readReferralRecords, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -240,6 +240,37 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
     ? sameFinding(view, b.finding)
     : hintMatchesFile(b.hints, view.file) && claimSimilarity(view.summary, b.text) >= SIMILARITY_FLOOR;
 
+  // Held item 141 (live #4361 @a5938d89, #4433 @4705dcf8, #4402): A BLOCK ON AN OLDER HEAD IS SATISFIED once the
+  // gate COUNTS a reviewer `not-real` with evidence for the finding on the current head, written after that block: the
+  // current-head reviewer's own ruling, or a reviewer not-real from a later head carried onto this one (the gate's
+  // `reviewerCarryBacking`). Only then did the finding not "come back". It once fired anyway on two paths: an
+  // auto-policy block ignored the current-head ruling, and a record block ignored a later-head not-real carried forward.
+  // The gate's own per-record state decides (`referralRecordState`), so a linked or contradicting block still holds.
+  const gateRecords = readReferralRecords(pr?.comments, { head }).records;
+  const stateCache = new Map();
+  const gateState = (record) => {
+    if (!stateCache.has(record.runId)) {
+      const full = gateRecords.find((r) => r.head === head && r.runId === record.runId) ?? record;
+      let state = null;
+      try {
+        state = referralRecordState(full, { head, records: gateRecords, operatorRulings,
+          ...(typeof pr?.body === 'string' ? { body: pr.body } : {}), ...(pr?.createdAt ? { createdAt: pr.createdAt } : {}) });
+      } catch { state = null; }
+      stateCache.set(record.runId, state);
+    }
+    return stateCache.get(record.runId);
+  };
+  const hasEvidence = (r) => Array.isArray(r?.evidence) && r.evidence.some((e) => oneLine(e).length > 0);
+  /** Thread position of the counted not-real-with-evidence ruling that clears `key` on this head, or null. */
+  const notRealClearanceAt = (record, key) => {
+    const state = gateState(record);
+    if (!state || state.pending.includes(key) || state.blocked.includes(key)) return null;
+    const ruling = state.rulings.filter((r) => r.key === key || (r.id && record.carried?.some((c) => c.key === key && c.from?.rulingId === r.id))).at(-1);
+    if (!ruling || ruling.result !== 'not-real' || !hasEvidence(ruling)) return null;
+    const seen = snaps.find((s) => s.record.rulings.some((x) => x.id === ruling.id && x.result === 'not-real'));
+    return seen ? seen.index : null;
+  };
+
   const matches = [];
   let worst = 0;
   for (const { record } of cur) {
@@ -259,11 +290,13 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
       // the fixer the rungs that re-ruling bought instead of counting heads from the first ruling.
       let b = null;
+      const clearedAt = notRealClearanceAt(record, f.key);
       for (const c of blocks.values()) {
         if (c.index > firstIndex) continue; // written after this head's record: a fresh ruling on it
         if (!matchesBlock(g, c)) continue;
         if (c.source === 'record' && rulingsHere(f.key).length) continue;
         if (overruled(c)) continue;
+        if (isFindingBlock(c) && clearedAt !== null && clearedAt > c.index) continue; // satisfied, not came back
         if (!b || c.index > b.index) b = c;
       }
       if (!b) continue;
