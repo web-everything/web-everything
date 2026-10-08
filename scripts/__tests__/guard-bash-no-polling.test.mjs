@@ -142,10 +142,35 @@ describe('pollingLoopReason / decide — no polling', () => {
   });
   it('the deny message names the sanctioned alternatives', () => {
     const r = pollingLoopReason(INCIDENT);
-    expect(r).toMatch(/END YOUR TURN/);
     expect(r).toMatch(/#5137/);
     expect(r).toMatch(/check --wait=540000/);
     expect(r).toMatch(/report what is still pending/);
+  });
+  // Incident: two background subagents obeyed "END YOUR TURN and let the harness resume you" and sat idle for
+  // hours — nothing resumes a subagent. An agent session must be told: ONE bounded check, then CONTINUE or finish.
+  it('an AGENT session is never told to end its turn and wait; it is told to check once, continue, or finish', () => {
+    const r = pollingLoopReason(INCIDENT, { agentSession: true });
+    expect(r).toMatch(/POLLING LOOP/);
+    expect(r).not.toMatch(/END YOUR TURN and let the harness/);
+    expect(r).toMatch(/do NOT end your turn to wait/);
+    expect(r).toMatch(/ONE bounded check/);
+    expect(r).toMatch(/CONTINUE with the next step/);
+    expect(r).toMatch(/report what is still pending/);
+    expect(r).toMatch(/--wait=/);
+  });
+  it('the long-sleep and chained-sleep refusals carry the same agent advice', () => {
+    for (const c of ['sleep 600', 'sleep 20; sleep 20']) {
+      const r = pollingLoopReason(c, { agentSession: true });
+      expect(r).toMatch(/exceed/);
+      expect(r).toMatch(/CONTINUE with the next step/);
+      expect(r).not.toMatch(/END YOUR TURN and let the harness/);
+    }
+  });
+  it('decide() hands agentSession to the arm', () => {
+    expect(decide(INCIDENT, { agentSession: true })).toMatch(/CONTINUE with the next step/);
+  });
+  it('the interactive session never gets "end your turn and let the harness resume you" either', () => {
+    expect(pollingLoopReason(INCIDENT)).not.toMatch(/END YOUR TURN and let the harness/);
   });
   it('applies to every session kind (no agent scoping)', () => {
     expect(decide(INCIDENT, { agentSession: false })).toBeTruthy();
@@ -183,10 +208,11 @@ describe('pollingLoopReason / decide — no polling', () => {
 // /workflow + /conveyor tick loop in production).
 describe('heartbeat allowlist — end to end through decide() and the hook CLI', () => {
   const GUARD = join(dirname(fileURLToPath(import.meta.url)), '..', 'guard-bash.mjs');
-  const run = (command, toolInput = {}) => {
+  const run = (command, toolInput = {}, extraEnv = {}) => {
     const e = { ...process.env };
     delete e.WE_DISPATCH_KIND;
     delete e.WE_CONVEYOR_WORKER;
+    Object.assign(e, extraEnv);
     const out = execFileSync(process.execPath, [GUARD], {
       input: JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Bash', cwd: '/tmp', tool_input: { command, ...toolInput } }),
       encoding: 'utf8', env: e,
@@ -209,6 +235,11 @@ describe('heartbeat allowlist — end to end through decide() and the hook CLI',
     const r = run('sleep 120');
     expect(r.hookSpecificOutput.permissionDecision).toBe('deny');
     expect(r.hookSpecificOutput.permissionDecisionReason).toMatch(/exceed/);
+  });
+  it('CLI: a dispatched worker (WE_CONVEYOR_WORKER=1) gets the continue-or-finish advice', () => {
+    const r = run(INCIDENT, {}, { WE_CONVEYOR_WORKER: '1' });
+    expect(r.hookSpecificOutput.permissionDecisionReason).toMatch(/CONTINUE with the next step/);
+    expect(r.hookSpecificOutput.permissionDecisionReason).not.toMatch(/END YOUR TURN and let the harness/);
   });
   it('CLI: a polling loop is denied even with run_in_background:true', () => {
     const r = run('while true; do sleep 60; done', { run_in_background: true });

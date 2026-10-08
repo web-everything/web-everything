@@ -1,0 +1,32 @@
+---
+kind: story
+size: 2
+status: open
+scope: ["we:scripts/guard-bash.mjs", "we:scripts/__tests__/guard-bash-no-polling.test.mjs"]
+dateOpened: "2026-10-08"
+tags: []
+---
+
+# No-polling guard tells a subagent to end its turn and wait, which stalls it forever
+
+The POLLING LOOP refusal says END YOUR TURN and let the harness resume you. A subagent is never resumed, so it sat idle for hours twice. Tell agent sessions to do one bounded check, then continue or finish and report what is pending.
+
+## Done when
+
+1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Edge cases this change must handle
+
+One line per class: either the handling, or `n/a: <why>`.
+
+1. **Untrusted text** — TODO: the handling, or n/a: <why>.
+2. **Truncated reads** — TODO: the handling, or n/a: <why>.
+3. **Shared state files** — TODO: the handling, or n/a: <why>.
+4. **Fail closed** — TODO: the handling, or n/a: <why>.
+5. **Identity scoping** — TODO: the handling, or n/a: <why>.
+6. **State over time** — TODO: the handling, or n/a: <why>.
+7. **Who wrote it** — TODO: the handling, or n/a: <why>.
