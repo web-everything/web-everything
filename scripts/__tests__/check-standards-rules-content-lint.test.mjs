@@ -16,7 +16,7 @@ import {
   findHarnessScaffoldingMarkers, scanHarnessScaffolding,
   findStaleRatifiedClaims,
   findDuplicateKeysPerScope, validateNoDuplicateManifestKeys,
-  findBuriedForkSections, findNonBatchableMarkers, findTestPlanGaps, findMustWithoutDoneWhen, findDanglingBacklogRefs, findGuardRelaxationGaps, lintBacklogItemRendering,
+  findBuriedForkSections, findNonBatchableMarkers, findTestPlanGaps, findMustWithoutDoneWhen, findDanglingBacklogRefs, findGuardRelaxationGaps, lintBacklogItemRendering, findNewHealthSmellWithoutSiblingCheck,
   deriveResearchFreshness, addIsoDuration, RESEARCH_REVIEW_HORIZON_DEFAULT,
   validateCapabilityPresence, validateRetirementShape,
   validatePlugDualMode, PLUG_UNPLUGGED_TEST_ENFORCED,
@@ -238,6 +238,53 @@ describe('findDuplicateKeysPerScope — the #2149 Fork 1 dup-key merge gate for 
     expect(findings[0].message).toContain('package.json');
     expect(findings[0].message).toContain('"a"');
     expect(validateNoDuplicateManifestKeys('{ "a": 1 }', 'package.json')).toEqual([]);
+  });
+});
+
+describe('findNewHealthSmellWithoutSiblingCheck — a new health smell needs a sibling-smell grep (#4419)', () => {
+  const NEW = 'we:scripts/conveyor/health-smells/new-x.mjs';
+  const missing = () => false;
+  const flagged = (over = {}) => findNewHealthSmellWithoutSiblingCheck({ scope: [NEW], body: '## MVP\n\nBuild it.', fileExists: missing, ...over });
+
+  it('sibling smell: flags a new smell file with no sibling note', () => {
+    expect(flagged()).toEqual(['scripts/conveyor/health-smells/new-x.mjs']);
+    expect(flagged({ scope: ['scripts/conveyor/health-smells/new-x.mjs'] })).toHaveLength(1); // bare spelling
+  });
+  it('sibling smell: quiet when the body has a "sibling smells" line', () => {
+    expect(flagged()).toHaveLength(1); // control
+    expect(flagged({ body: 'Sibling smells grepped: none overlap.' })).toEqual([]);
+  });
+  it('sibling smell: quiet when the file already exists (editing is not adding)', () => {
+    expect(flagged()).toHaveLength(1); // control
+    expect(flagged({ fileExists: () => true })).toEqual([]);
+  });
+  it('sibling smell: quiet for unrelated scope paths', () => {
+    expect(flagged()).toHaveLength(1); // control
+    expect(flagged({ scope: ['we:scripts/conveyor/health-watch.mjs', 'we:scripts/conveyor/health-smells/__tests__/new-x.test.mjs'] })).toEqual([]);
+  });
+  it('sibling smell: a note inside a code fence does not count', () => {
+    expect(flagged({ body: 'Intro\n\n```\nsibling smells grepped\n```\n' })).toHaveLength(1);
+    expect(flagged({ body: '~~~\nsibling smells\n~~~\n' })).toHaveLength(1);
+  });
+  it('sibling smell: fails closed — bad scope, bad body, or a throwing probe yields no hit', () => {
+    expect(flagged()).toHaveLength(1); // control
+    expect(flagged({ scope: 'we:scripts/conveyor/health-smells/new-x.mjs' })).toEqual([]);
+    expect(flagged({ scope: undefined })).toEqual([]);
+    expect(flagged({ body: undefined })).toEqual([]);
+    expect(flagged({ fileExists: () => { throw new Error('EACCES'); } })).toEqual([]);
+    expect(flagged({ scope: [NEW, 42, null] })).toHaveLength(1);
+  });
+  it('sibling smell: wired into lintBacklogItemRendering — warns for open/active story/task, not resolved', () => {
+    const lint = (item, extra = {}) => lintBacklogItemRendering({
+      item: { id: 'x', kind: 'task', status: 'open', scope: [NEW], ...item }, body: 'Do it.', fileExists: missing, ...extra,
+    });
+    expect(lint({}).warnings.join()).toMatch(/new health smell .*new-x\.mjs.*sibling smells/);
+    expect(lint({ status: 'active', kind: 'story' }).warnings.join()).toMatch(/sibling smells/);
+    expect(lint({ status: 'resolved' }).warnings.join()).not.toMatch(/sibling smells/);
+    expect(lint({ kind: 'decision' }).warnings.join()).not.toMatch(/sibling smells/);
+    expect(lint({}).errors).toEqual([]);
+    // default probe is fail-quiet: no probe supplied → never warns
+    expect(lintBacklogItemRendering({ item: { id: 'x', kind: 'task', status: 'open', scope: [NEW] }, body: 'Do it.' }).warnings.join()).not.toMatch(/sibling smells/);
   });
 });
 
