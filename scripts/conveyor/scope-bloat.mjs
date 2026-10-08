@@ -24,6 +24,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { countRebaseOntoMainComments } from './main-red-recovery.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -138,7 +139,7 @@ export const scopeBloatRefreshFor = (pr, head) => refreshes.get(refreshKey(pr, h
  */
 export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'main', env = process.env, root = ROOT,
   readNet = readNetFiles, readScope = readCardScope } = {}) {
-  if (!Array.isArray(prs) || (repo && repo !== 'web-everything/web-everything')) return prs;
+  if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);
   return prs.map((pr) => {
     try {

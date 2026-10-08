@@ -475,7 +475,8 @@ export function runReviewTick({
     }),
     reconcileError: null, deferredForLanes, deferredForAuth,
     authPaused: paused, authPauseReason: paused ? pauseReason : null,
-    holdReconcile: holdReconcileResults, holdReconcileError, scopeBloatRefreshed,
+    holdReconcile: holdReconcileResults, holdReconcileError,
+    ...(scopeBloatRefreshed.length ? { scopeBloatRefreshed } : {}),
     // #3383 follow-up (live-caught 2026-09-26) — the PR numbers THIS tick's own reconcile refused
     // `live-process` (`we:scripts/conveyor/reconcile-core.mjs#assessLiveness`: "a bound session has a LIVE
     // pid — something is already working this PR, however stale its transcript looks"). Fed into the NEXT
