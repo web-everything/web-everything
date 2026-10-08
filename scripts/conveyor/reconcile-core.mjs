@@ -1233,6 +1233,29 @@ function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
+  // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
+  // #4361: +3277/-96 across 44 files for a ~5 file change, a stale base carrying other lanes' work). The daemon first
+  // tries the mechanical refresh onto main (one attempt per head, `pr.scopeBloat.refresh`); once that has been tried and
+  // the diff is still bloated, or the bloat is not a stale base, the PR is held and routed to a fixer to rebase.
+  if (!pr?.isDraft && pr?.scopeBloat) {
+    const sb = pr.scopeBloat;
+    const refreshPending = sb.stale && !sb.refresh;
+    if (!refreshPending && attempts < roundCap) {
+      dispatch.push({
+        ...base, ...withPhase, kind: 'fix', mode: 'scope-bloat-rebase', findings: 1, attempts, cap: roundCap,
+        scopeBloat: sb, ...extra,
+        why: `scope-bloat: ${sb.why}${sb.refresh ? ` (the mechanical refresh answered \`${sb.refresh.action ?? 'none'}\`)` : ''} — a fixer rebases it, no review reads this diff`,
+      });
+    } else {
+      refuse('scope-bloat', {
+        ...withPhase, ...extra, scopeBloat: sb,
+        why: refreshPending
+          ? `scope-bloat: ${sb.why} — the mechanical refresh onto ${'main'} is tried first`
+          : `scope-bloat: ${sb.why} — the fix rounds for this PR are spent, so a person must take it`,
+      });
+    }
+    return;
+  }
   // ── `draft` (draft-first PRs, operator-approved 2026-09-27) — checked FIRST, ahead of every other refusal
   // in this function, including `already-reviewed-head`: a draft PR is never owed a review no matter what its
   // `review:*` label or its comment thread says, because GitHub itself will not surface it for review and

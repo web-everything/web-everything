@@ -104,6 +104,7 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 
@@ -154,7 +155,7 @@ import { classifyPr as classifyPrLifecycle } from './pr-watch.mjs';
 // straight off each row (`pr.isDraft`) to gate review dispatch off drafts and to plan the `promote-draft`
 // effect once a draft's required checks are green. Costs nothing extra beyond this one query, same as `files`
 // above.
-export const PR_LIST_JSON_FIELDS = 'number,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt';
+export const PR_LIST_JSON_FIELDS = 'number,title,headRefName,headRefOid,baseRefName,labels,statusCheckRollup,mergeStateStatus,comments,body,files,isDraft,createdAt';
 
 /** How many open PRs one pass reads. The board's own `OPEN_LIMIT` is 30; a reconciler that silently stopped at
  *  the default page would leave the overflow unowned, which is this item's defect wearing a smaller hat. */
@@ -1230,6 +1231,7 @@ export function runReconcilePass({
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
   enrichRulings = enrichPrsWithIgnoredRulings,
+  enrichScopeBloat = enrichPrsWithScopeBloat, // card x29vm8a
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
@@ -1280,8 +1282,9 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichCodeQL(enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug });
+  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const plan = planReconcile({
