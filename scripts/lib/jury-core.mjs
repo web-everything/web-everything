@@ -1470,6 +1470,57 @@ export function classifyLaterRoundAdvisory(findings, options = {}) {
   return { kept, deferred, scope, fellBack: null };
 }
 
+export const REFERRAL_DEMOTED_REASONS = Object.freeze({
+  LATER_ROUND_SAME_HEAD: 'later-round-referral-same-head',
+  FIXER_ADDRESSED_RERAISE: 'fixer-addressed-reraise',
+});
+
+/**
+ * Card xq1xbsl — WHICH OF A ROUND'S MANDATORY-REFERRAL CANDIDATES MAY STILL BE MANDATORY. PURE.
+ *
+ * The later-round scoping rule (#3999, {@link classifyLaterRoundAdvisory}) already keeps a later round from blocking on
+ * code the fixer never touched; a mandatory referral is the same kind of claim and follows the same rule. Live
+ * 2026-10-08: #4361 and #4388 each parked for a ruling, got it, and were then reviewed AGAIN on the same head, the second
+ * panel raising referrals the first never did (and, on #4388, one the fixer had already fixed), so the PR went back to
+ * "ruling needed" and never reached the operator. Against the PR's finding-identity table (#76a, `identity`: one row
+ * per known finding with the heads it was referred on and its rulings) each candidate is exactly one of:
+ *   - `covered`  — the same finding (identity, never wording or line) is already referred on THIS head. It is already
+ *                  awaiting or holding its ruling; referring it again is the duplicate that re-parked the PR.
+ *   - `demoted`  — to a card suggestion, never a ruling owed: (a) it is new on a head that already carries referrals, so
+ *                  it was first raised in a later round of an unchanged head; or (b) it re-raises a finding that was
+ *                  ruled `block` on an earlier head and the fixer's latest push touched the cited file (the fix it
+ *                  asked for was made; `latestFix.files` is the push's changed-file set).
+ *   - `kept`     — anything else: a first sighting on a head with no referrals, or a re-raise the fixer did not touch
+ *                  (that one stays mandatory so the ignored-ruling path still sees it).
+ * @param {Array<{seat: string, original: object}>} candidates
+ * @param {{identity?: Array<object>, head?: (string|null), latestFix?: (object|null)}} o
+ * @returns {{kept: Array<object>, covered: Array<object>, demoted: Array<{candidate: object, reason: string}>}}
+ */
+export function classifyReferralsByRound(candidates, { identity = [], head = null, latestFix = null } = {}) {
+  const table = Array.isArray(identity) ? identity : [];
+  const list = Array.isArray(candidates) ? candidates : [];
+  const headHasReferrals = Boolean(head) && table.some((e) => (e.heads ?? []).includes(head));
+  const fixFiles = latestFix && typeof latestFix === 'object' && !latestFix.error && latestFix.files
+    && typeof latestFix.files === 'object' ? Object.keys(latestFix.files) : [];
+  const out = { kept: [], covered: [], demoted: [] };
+  for (const candidate of list) {
+    const id = bindFindingIds([candidate.original], table, { sameHead: headHasReferrals, ignoreLens: true })[0];
+    const entry = id ? table.find((e) => e.findingId === id) : null;
+    if (entry && head && (entry.heads ?? []).includes(head)) { out.covered.push(candidate); continue; }
+    if (entry) {
+      const blocked = (entry.rulings ?? []).some((r) => r.result === 'block');
+      const cited = typeof candidate.original?.file === 'string' ? exactCitedPath(candidate.original.file) : '';
+      const touched = Boolean(cited) && (fixFiles.includes(cited) || Boolean(matchCitedPath(candidate.original.file, fixFiles)));
+      if (blocked && touched) { out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.FIXER_ADDRESSED_RERAISE }); continue; }
+      out.kept.push(candidate);
+      continue;
+    }
+    if (headHasReferrals) { out.demoted.push({ candidate, reason: REFERRAL_DEMOTED_REASONS.LATER_ROUND_SAME_HEAD }); continue; }
+    out.kept.push(candidate);
+  }
+  return out;
+}
+
 /**
  * Juror text is untrusted (a PR author can plant it in the diff). Fold every line terminator JS's multiline `^`
  * recognises (and the other vertical-space characters) and drop backticks, so an interpolated value can never open

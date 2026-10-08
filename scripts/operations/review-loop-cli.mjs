@@ -63,7 +63,7 @@ import { fileURLToPath } from 'node:url';
 import {
   cwdFlagValue, driveRun, hasJsonFlag, outcomePayload, parseOperationArgv, renderOutcome, runOperationCli,
 } from './cli-adapter.mjs';
-import { startRun, runStatus } from './engine.mjs';
+import { startRun, runStatus, rewindRunToStep } from './engine.mjs';
 import { createFileRunStore, newRunId } from './run-store.mjs';
 import { REPO_ROOT as SCAFFOLD_ROOT } from './scaffold-io.mjs';
 import { resolveOperation, createCliJudgeFactory } from './run.mjs';
@@ -73,6 +73,8 @@ import {
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
 } from '../lib/review-loop-policy.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
+import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
+import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
 // label.mjs#fileApprovalPreventionCard` was fixed for under #4317: `fileItemForPrevention` below drives
@@ -296,6 +298,28 @@ export function parseFiledPayload(lines = []) {
   return (start === -1 ? null : tryParse(lines.slice(start).join('\n'))) ?? {};
 }
 
+/** The step a ruled, parked review is rewound to: the one that reads the rulings off the thread and re-reduces. */
+export const RESUME_STEP = 'mandatoryReferrals';
+
+/**
+ * Card xq1xbsl — THE PARKED RUN AN OPERATOR'S RULING RESUMES, if there is one. Reads the PR's live head and thread and
+ * the local run evidence, and asks the same pure rule the hold uses ({@link findResumableParkedRun}). Never throws: an
+ * unreadable PR or store answers `null`, which means "start a fresh review" exactly as before this existed.
+ * @returns {string|null} the run id to resume.
+ */
+export function defaultFindResumableRun({ repo, pr }, { readPr = defaultReadResumePr, readRuns = readReviewRunEvidence } = {}) {
+  try {
+    const view = readPr({ repo, pr });
+    if (!view?.headRefOid) return null;
+    return findResumableParkedRun({ ...view, number: Number(pr) }, readRuns(), { repo })?.id ?? null;
+  } catch { return null; }
+}
+
+function defaultReadResumePr({ repo, pr }) {
+  return JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid,comments'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }));
+}
+
 /**
  * DRIVE ONE ROUND, UNATTENDED. The whole file, as a function — mirrors `we:scripts/operations/cli-adapter.mjs
  * #runOperationCli`'s shape closely, on purpose, so the two are easy to read side by side and hard to let
@@ -327,7 +351,7 @@ export function parseFiledPayload(lines = []) {
 export async function runReviewLoopOnce({
   declaration, registry, argv, store, sinks, makeJudge, mintRunId, autoConfirm = reviewLoopAutoConfirm,
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
-  findFiledPrevention = findFiledPreventionCard,
+  findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   if (parsed.control.help) {
@@ -356,6 +380,19 @@ export async function runReviewLoopOnce({
       return { code: 2, lines: [`error: run ${run.id} is a \`${run.op}\` run, not \`${declaration.name}\``], run: null, stopped: 'refused' };
     }
   } else {
+    // Card xq1xbsl — A RULING ON AN UNCHANGED HEAD RESUMES THE PAUSED REVIEW; IT DOES NOT START A NEW PANEL. A fresh
+    // panel judges the same head again, raises referrals the first one did not, and parks the PR for a ruling it
+    // already had (live 2026-10-08, #4361/#4388). The parked run already holds the panel's verdict and findings, so it
+    // goes back to the step that reads the rulings and carries on from there. New referrals come only from a new push.
+    let resumedId = null;
+    if (parsed.input.repo && parsed.input.pr != null && process.env.WE_REVIEW_RESUME_PARKED !== '0') {
+      try { resumedId = findResumableRun({ repo: parsed.input.repo, pr: parsed.input.pr }); } catch { resumedId = null; }
+    }
+    const parked = resumedId ? store.read(resumedId) : null;
+    if (parked && parked.op === declaration.name && parked.pending?.kind === 'confirm') {
+      run = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
+      store.write(run);
+    } else {
     run = startRun({
       op: declaration.name,
       id: parsed.control.runId || mintRunId(),
@@ -365,6 +402,7 @@ export async function runReviewLoopOnce({
       registry,
     });
     store.write(run);
+    }
   }
 
   let resume = null;
@@ -647,6 +685,7 @@ if (IS_CLI) {
     sinks,
     makeJudge: createCliJudgeFactory(),
     mintRunId: () => newRunId(declaration.name),
+    findResumableRun: defaultFindResumableRun,
   })
     .then(({ code, lines }) => {
       writeAllSync(1, `${lines.join('\n')}\n`);

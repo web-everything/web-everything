@@ -30,7 +30,8 @@ export function reviewRunEvidence(run) {
   const head = read?.netBasis?.rev;
   const verdict = run.findings?.referralVerdict ?? run.verdict;
   const finish = run.stepTimings?.find(t => t.step === 'advise')?.finishedAt;
-  const startedAt = Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt);
+  // A resumed run (rewound to the step that reads rulings) starts again at the resume: the rulings that woke it are answered.
+  const startedAt = Math.max(Date.parse(run.stepTimings?.find(t => t.step === 'read')?.startedAt), Date.parse(run.resumedAt ?? '') || 0);
   const completedAt = Date.parse(finish);
   if (!sha(head) || !Number.isFinite(completedAt) || !Number.isFinite(startedAt)) return null;
   const state = run.findings?.mandatoryReferrals?.effects?.find(e => e.type === 'review.mandatory-referrals')?.result;
@@ -67,10 +68,14 @@ export function readReviewRunEvidence({ dir = resolveRunsDir() } = {}) {
   });
 }
 
-/** Bookkeeping, including our own notice and repeated referral snapshots, never wakes a panel. */
-function wakeTime(pr, run) {
+/** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or
+ * the operator's finding ruling on this run's head) is the only kind a RESUME answers; a re-arm, a send-back or a
+ * plain operator reply asks for a fresh look, so it is `fresh`. Bookkeeping, including our own notice and repeated
+ * referral snapshots, never wakes a panel.
+ */
+function wakeEvents(pr, run) {
   const knownRulings = new Set(run.rulings);
-  return Math.max(0, ...(pr.comments ?? []).flatMap(c => {
+  return (pr.comments ?? []).flatMap(c => {
     if (!isTrustedMarkerAuthor(c)) return [];
     const at = Date.parse(c.updatedAt ?? c.createdAt);
     if (!Number.isFinite(at)) return [];
@@ -79,18 +84,40 @@ function wakeTime(pr, run) {
     if (body.includes(`<!-- ${REFERRAL_RECORD_MARKER}:`)) {
       const { records } = readReferralRecords([c], { head: pr.headRefOid });
       return records.some(r => r.repo === run.repo && r.pr === run.pr && r.head === run.head
-        && r.rulings.some(ruling => !knownRulings.has(JSON.stringify(ruling)))) ? [at] : [];
+        && r.rulings.some(ruling => !knownRulings.has(JSON.stringify(ruling)))) ? [{ at, kind: 'ruling' }] : [];
     }
     // #4979 — an operator's block/card/not-real ruling on this run's head is a ruling like a reviewer's: it wakes.
     const operatorRuling = parseOperatorRulingComment(c);
     if (operatorRuling) {
       const r = operatorRuling.record;
-      return r && r.repo === run.repo && r.pr === run.pr && r.head === run.head ? [at] : [];
+      return r && r.repo === run.repo && r.pr === run.pr && r.head === run.head ? [{ at, kind: 'ruling' }] : [];
     }
-    if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [at];
+    if (body.startsWith(REARM_COMMENT_MARKER) || body.startsWith('🔁 review — changes requested')) return [{ at, kind: 'fresh' }];
     // An operator reply is a request to reconsider, never authority to clear the human gate.
-    return isOperatorAuthored(c) ? [at] : [];
-  }));
+    return isOperatorAuthored(c) ? [{ at, kind: 'fresh' }] : [];
+  });
+}
+
+function wakeTime(pr, run) {
+  return Math.max(0, ...wakeEvents(pr, run).map(e => e.at));
+}
+
+/**
+ * The parked run an operator's ruling should RESUME instead of starting a fresh panel (card xq1xbsl; live 2026-10-08,
+ * #4361 and #4388: a ruling on an unchanged head was followed by a full new review that raised NEW referrals, so the PR
+ * flipped back to `advisory:ruling-needed` and never reached the operator). The rule: the newest run on this PR is
+ * parked on mandatory referrals at the PR's CURRENT head, it persisted them, and everything that woke it since it began
+ * is a ruling. Any re-arm, send-back or operator reply since asks for a fresh look, so it answers `null`, as does a
+ * head that moved (a new push owes a new review) or a persistence failure (the retry budget owns that case). Pure.
+ * @returns {{id: string, head: string}|null}
+ */
+export function findResumableParkedRun(pr, runs, { repo } = {}) {
+  const history = runs.filter(r => r.repo === repo && r.pr === Number(pr.number)).sort((a, b) => b.completedAt - a.completedAt);
+  const last = history[0];
+  if (!last?.parked || last.head !== pr.headRefOid || !last.attempted || last.persistenceFailed) return null;
+  const events = wakeEvents(pr, last).filter(e => e.at > last.startedAt);
+  if (events.some(e => e.kind === 'fresh')) return null;
+  return events.length ? { id: last.id, head: last.head } : null;
 }
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');

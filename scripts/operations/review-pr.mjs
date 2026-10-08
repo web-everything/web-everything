@@ -1,4 +1,4 @@
-import { requiresMandatoryReferral, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
+import { requiresMandatoryReferral, classifyReferralsByRound, laterRoundAdvisoryScopeFromEnv, classifyLaterRoundAdvisory, explainPanelOutcome, foldUntrusted,
   referralKeyFinding, referralFindingKey, findingIdentityEntry, bindFindingIds, readReferralRecords, findingIdentityTable } from '../lib/jury-core.mjs';
 // Card 84 — the per-seat provider directive (`review.seatProvider.<lens>`). PURE; the settings are read by the caller.
 import { seatProviderDirective } from '../lib/review-seat-provider.mjs';
@@ -1096,7 +1096,8 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   let findingIdentity = [];
   try {
     findingIdentity = findingIdentityTable(readReferralRecords(raw.comments ?? []).records)
-      .map(({ findingId, path, lens, normSummary, anchor, forms, heads }) => ({ findingId, path, lens, normSummary, anchor, forms, heads }));
+      .map(({ findingId, path, lens, normSummary, anchor, forms, heads, rulings }) => ({ findingId, path, lens, normSummary, anchor, forms, heads,
+        rulings: (rulings ?? []).map(({ head, result }) => ({ head, result })) }));
   } catch { findingIdentity = []; }
   return {
     ...(findingIdentity.length ? { findingIdentity } : {}),
@@ -2536,10 +2537,21 @@ export function reviewPrOperation({
               + 'juror that may have reported blockers. Re-run the review; do not record a verdict on this run.',
             );
           }
-          for (const original of answer.findings ?? []) {
-            if (requiresMandatoryReferral(original)) referrals.push({ seat: seat.step, original });
-          }
-          const scoped = scopeFindingsToCitedFiles(answer.findings, { scope: citationScope });
+          // Card xq1xbsl — the later-round rule (#3999) applies to referrals too: a finding already referred on this head
+          // (matched by finding identity, #4233) is not referred twice, and one first raised in a later round of an
+          // unchanged head, or re-raised after the fixer touched the cited file, is a card suggestion. Neither stays in
+          // the verdict basis, or the PR would bounce on a finding it already holds a ruling for.
+          const roundScoped = classifyReferralsByRound(
+            (answer.findings ?? []).filter(requiresMandatoryReferral).map((original) => ({ seat: seat.step, original })),
+            { identity: read.findingIdentity, head: read.netBasis?.rev ?? null, latestFix: read.latestFix },
+          );
+          referrals.push(...roundScoped.kept);
+          const setAside = new Set([...roundScoped.covered.map((c) => c.original), ...roundScoped.demoted.map((d) => d.candidate.original)]);
+          deferredAdvisory.push(...roundScoped.demoted.map(({ candidate, reason }) => ({
+            ...candidate.original, deferred: reason, category: candidate.original.category ? `${seat.lens}/${candidate.original.category}` : seat.lens,
+          })));
+          const seatFindings = setAside.size ? (answer.findings ?? []).filter((f) => !setAside.has(f)) : answer.findings;
+          const scoped = scopeFindingsToCitedFiles(seatFindings, { scope: citationScope });
           const raw = scoped.findings;
           const classified = classifyLaterRoundAdvisory(scoped.admitted, {
             lens: seat.lens, scope: advisoryScope.scope, latestFix: read.latestFix,
