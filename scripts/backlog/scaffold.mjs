@@ -36,8 +36,11 @@ export const UNSIZED_KINDS = new Set(['task', 'feature']);
  * @returns {number|undefined}
  */
 export function parseSize(rawSize) {
-  return rawSize === undefined || rawSize === '' ? undefined : Number(rawSize);
+  return isAbsentSize(rawSize) ? undefined : Number(rawSize);
 }
+
+/** `--size` not passed: `undefined`, `''`, or whitespace only (`Number(' ')` is `0`, so a blank is never a size). */
+const isAbsentSize = (rawSize) => rawSize === undefined || (typeof rawSize === 'string' && rawSize.trim() === '');
 
 /**
  * The one shared answer to "is this `--size` acceptable for this kind?" (#x0h3pe4), used by both the
@@ -47,7 +50,7 @@ export function parseSize(rawSize) {
  * @returns {null | {reason: 'bad-size'|'size-not-allowed'|'story-needs-size', message: string}}
  */
 export function sizeRefusal(kind, rawSize) {
-  const passed = rawSize !== undefined && rawSize !== '';
+  const passed = !isAbsentSize(rawSize);
   if (passed && !Number.isFinite(Number(rawSize))) {
     return { reason: 'bad-size', message: `--size must be a number (got ${JSON.stringify(rawSize)})` };
   }

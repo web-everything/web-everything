@@ -2,7 +2,7 @@
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/backlog/scaffold.mjs", "we:scripts/operations/scaffold.mjs", "we:scripts/backlog.mjs", "we:scripts/held-cards.mjs", "we:scripts/held-cards-io.mjs", "we:scripts/conveyor/prepare-failure-policy.mjs", "we:scripts/conveyor/soak/breaks/prevention-card-lands-in-daemon-clone.mjs"]
+scope: ["we:scripts/backlog/scaffold.mjs", "we:scripts/operations/scaffold.mjs", "we:scripts/backlog.mjs", "we:scripts/held-cards.mjs", "we:scripts/held-cards-io.mjs", "we:scripts/operations/explore-io.mjs", "we:scripts/conveyor/prepare-failure-policy.mjs", "we:scripts/conveyor/soak/breaks/prevention-card-lands-in-daemon-clone.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---

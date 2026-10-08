@@ -89,6 +89,7 @@ import { fileURLToPath } from 'node:url';
 
 import { laneGuardDecision, resolveReal, workspaceRootOf } from '../guard-lane.mjs';
 import { assertPublishableContent } from '../backlog/guarded-write.mjs';
+import { UNSIZED_KINDS } from '../backlog/scaffold.mjs';
 import { localToday } from '../lib/local-date.mjs';
 import { runStatus } from './engine.mjs';
 import { inFlight, notApplied } from './effect-executor.mjs';
@@ -582,7 +583,9 @@ export function defaultScaffoldItem(payload, { exec = execFileSync, root = REPO_
   const argv = [
     join(root, 'scripts', 'backlog.mjs'), 'scaffold', '--json',
     `--kind=${payload.kind}`,
-    `--size=${payload.size}`,
+    // A task/feature is never sized and the CLI now refuses one that is (#x0h3pe4): pass `--size` only where it is
+    // allowed and present — never `--size=undefined`.
+    ...(payload.size != null && !UNSIZED_KINDS.has(payload.kind) ? [`--size=${payload.size}`] : []),
     `--title=${payload.title}`,
     `--digest=${payload.digest}`,
     ...(payload.parent ? [`--parent=${payload.parent}`] : []),

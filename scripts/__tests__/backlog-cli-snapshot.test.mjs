@@ -166,13 +166,21 @@ describe('backlog.mjs CLI — ephemeral-clone integration smoke (#2273/#2274)', 
     it('a sized task is REFUSED: non-zero exit, no card written', () => {
       const { res, added } = scaffoldOne(['--kind=task', '--size=2', '--title=sized task']);
       expect(res.code).not.toBe(0);
+      expect(res.json?.error).toMatch(/never sized/); // the refusal itself, not an unrelated crash
       expect(added).toEqual([]);
     });
 
     it('a non-numeric size is REFUSED: non-zero exit, no card written', () => {
       const { res, added } = scaffoldOne(['--kind=decision', '--size=big', '--title=bad size decision']);
       expect(res.code).not.toBe(0);
+      expect(res.json?.error).toMatch(/must be a number/);
       expect(added).toEqual([]);
+    });
+
+    it('a whitespace-only size is absent for a decision (never `size: 0`)', () => {
+      const { res, text } = scaffoldOne(['--kind=decision', '--size= ', '--title=blank size decision']);
+      expect(res.code).toBe(0);
+      expect(text).not.toMatch(/^size:/m);
     });
 
     it('a sized decision keeps its size', () => {

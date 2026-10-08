@@ -8,6 +8,7 @@
  *   Skill: `we:skills-src/held-cards/SKILL.md`.
  */
 import { retryTransientGit } from './lib/git-fetch-retry.mjs';
+import { parseSize } from './backlog/scaffold.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -134,7 +135,14 @@ export async function main(argv, deps = {}) {
     if (argv[0] === 'add') {
       const meta = {};
       for (const key of ['kind', 'size', 'scope', 'parent']) {
-        if (flags[key] !== undefined) meta[key] = key === 'size' ? Number(flags[key]) :
+        // An empty `--size=` is absent (never 0) and a non-number is refused, not nulled (#x0h3pe4: the shared rule).
+        if (key === 'size') {
+          const size = parseSize(flags.size);
+          if (size !== undefined && !Number.isFinite(size)) throw new Error(`--size must be a number (got ${JSON.stringify(flags.size)})`);
+          if (size !== undefined) meta.size = size;
+          continue;
+        }
+        if (flags[key] !== undefined) meta[key] =
           key === 'scope' ? String(flags[key]).split(',').map(s => s.trim()).filter(Boolean) : flags[key];
       }
       // Read, number and write under the list lock: two workers adding at once must not allocate one number.

@@ -18,6 +18,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sizeRefusal, parseSize } from '../../backlog/scaffold.mjs';
+import { defaultScaffoldItem } from '../explore-io.mjs';
 
 import { advanceWhileRunning, startRun } from '../engine.mjs';
 import { applyPendingEffects } from '../effect-executor.mjs';
@@ -142,6 +143,31 @@ describe('refusals', () => {
     };
     walk(scriptsDir);
     expect(offenders).toEqual([]);
+    // ~1200 files read synchronously: the 5s default flakes on a loaded host.
+  }, 60_000);
+
+  // explore's `file-stories` hands the CLI a juror-chosen kind: a task/feature (or an absent size) must reach the
+  // CLI with NO `--size` at all — never `--size=2` (refused) and never `--size=undefined` (bad-size).
+  it.each([
+    [{ kind: 'task', size: 2 }, false],
+    [{ kind: 'feature', size: 2 }, false],
+    [{ kind: 'story', size: undefined }, false],
+    [{ kind: 'story', size: 3 }, true],
+    [{ kind: 'decision', size: 2 }, true],
+  ])('explore scaffold argv for %j carries --size: %s', (payload, hasSize) => {
+    let argv;
+    const exec = (_node, args) => { argv = args; return JSON.stringify({ ok: true, num: 'xabc123', rel: 'backlog/x.md' }); };
+    defaultScaffoldItem({ title: 't', digest: 'd', ...payload }, { exec, root: '/tmp/none' });
+    expect(argv.some((a) => a.startsWith('--size='))).toBe(hasSize);
+    expect(argv).not.toContain('--size=undefined');
+  });
+
+  it('a whitespace-only size is ABSENT (Number(" ") is 0) at every entry point', () => {
+    expect(parseSize('  ')).toBeUndefined();
+    expect(sizeRefusal('decision', ' ')).toBeNull();
+    expect(sizeRefusal('task', '  ')).toBeNull();
+    expect(sizeRefusal('story', ' ')?.reason).toBe('story-needs-size');
+    expect(planScaffold(read(), { kind: 'decision', title: 'x', size: ' ' }).content).not.toMatch(/^size:/m);
   });
 
   it('every refusal reason is in the declared set', () => {
