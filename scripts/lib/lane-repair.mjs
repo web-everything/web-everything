@@ -282,6 +282,14 @@ export function repairCloneRefs(dir, { log = () => {}, allowReclone = true, quar
   if (out.pruned.length) log(`  ⚑ clone-repair ${name}: pruned ${out.pruned.length} dangling remote-tracking ref(s): ${out.pruned.slice(0, 5).join(', ')}${out.pruned.length > 5 ? ', …' : ''}`);
   for (const r of out.reported) log(`  ⚠ clone-repair ${name}: dangling ref NOT deleted — ${r}`);
 
+  // A stale commit-graph cache (naming commits that left the object store) breaks `fsck` and history walks even with
+  // every ref healthy (live: the drain data clone still failed fsck after its refs were pruned). It is a derived cache:
+  // move it aside and regenerate (shared helper from xsxu243; touches only this clone's objects/info/commit-graph*).
+  try {
+    const cg = healSharedCommitGraph(dir, { lockDir: join(dir, '.git', '.commit-graph-heal.lock'), log, waitMs: 5_000 });
+    if (cg.healed) out.commitGraphHealed = true;
+  } catch (e) { log(`  ⚠ clone-repair ${name}: commit-graph heal failed: ${String(e && e.message || e).split('\n')[0]}`); }
+
   const problems = diagnoseLane(dir).problems.filter((p) => !/ref\(s\) point at missing objects/.test(p));
   if (!problems.length && !out.reported.some((r) => r.includes('prune failed'))) return out;
   out.problems = problems;

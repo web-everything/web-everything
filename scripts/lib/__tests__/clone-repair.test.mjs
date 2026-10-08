@@ -6,7 +6,7 @@
  *   objects absent from the shared store ("invalid sha1 pointer"), and a drain overlay fetch was rejected.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -53,6 +53,18 @@ describe('repairCloneRefs', () => {
     expect(existsSync(join(clone, '.git/refs/heads/precious'))).toBe(true);
     expect(existsSync(join(clone, '.git/refs/tags/v0'))).toBe(true);
     expect(r.quarantinedTo).toBeUndefined(); // dangling non-remote refs alone never trigger a re-clone
+  });
+
+  it('heals a stale commit-graph that makes fsck fail even with healthy refs', () => {
+    g(clone, 'commit-graph', 'write', '--reachable');
+    const gp = join(clone, '.git/objects/info/commit-graph');
+    expect(existsSync(gp)).toBe(true);
+    chmodSync(gp, 0o644); const bytes = readFileSync(gp); bytes[bytes.length - 30] ^= 0xff; writeFileSync(gp, bytes); // corrupt the cache
+    expect(() => g(clone, 'commit-graph', 'verify')).toThrow();
+    const r = repairCloneRefs(clone);
+    expect(r.ok).toBe(true);
+    expect(r.commitGraphHealed).toBe(true);
+    expect(() => g(clone, 'fsck', '--connectivity-only')).not.toThrow();
   });
 
   it('is a no-op on a healthy clone and skips a non-clone', () => {
