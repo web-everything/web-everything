@@ -24,7 +24,7 @@ const CLAIMED = '2a2d454d13be533b1bd72519d1984bfb8a704c1d';
 export default {
   id: 'fixer-stuck-never-reclaimed',
   title: 'a fixer flagged fixer-stuck kept its PR fix claim and ci-heal slot for an hour because nothing consumed the escalation event',
-  card: 'we:backlog/xccgzu5 (epic #3383)',
+  card: 'we:backlog/5450 (epic #3383)',
   fixedBy: { sha: '1f7995d55', where: 'lane/fixer-stuck-reclaim', paths: ['scripts/conveyor/fixer-stuck-reclaim.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'] },
   fixPresent(root) { return existsSync(join(root, 'scripts/conveyor/fixer-stuck-reclaim.mjs')); },
   async run({ log } = {}) {
