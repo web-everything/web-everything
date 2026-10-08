@@ -443,11 +443,11 @@ describe('hung CI jobs', () => {
   const MIN = 60_000;
   const url = (run, job) => `https://github.com/web-everything/web-everything/actions/runs/${run}/job/${job}`;
   const done = (name, job, sec) => ({
-    name, status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: url(9, job),
+    name, workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: url(9, job),
     startedAt: new Date(T0 - 3600_000).toISOString(), completedAt: new Date(T0 - 3600_000 + sec * 1000).toISOString(),
   });
   const phantom = (job = 113380540047, run = 37796107550) => ({
-    name: 'daemon-soak', status: 'IN_PROGRESS', conclusion: 'SUCCESS', detailsUrl: url(run, job),
+    name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: 'SUCCESS', detailsUrl: url(run, job),
     startedAt: new Date(T0).toISOString(), completedAt: new Date(T0 + 3000).toISOString(),
   });
   const pr = (checks, number = 4450, head = 'db9f116') => ({ number, headRefOid: head, statusCheckRollup: checks });
@@ -462,6 +462,50 @@ describe('hung CI jobs', () => {
     expect(jobRefOf({ detailsUrl: url(37796107550, 113380540047) })).toEqual({ runId: 37796107550, jobId: 113380540047 });
     expect(jobRefOf({ detailsUrl: 'https://github.com/web-everything/web-everything/runs/113376158917' })).toBeNull();
     expect(jobRefOf({})).toBeNull();
+  });
+
+  // The details URL is attacker-influenceable (any app with checks:write sets it), and its ids drive writes made
+  // with the App's actions:write token — so it must be this repo's own Actions job URL, exactly.
+  it.each([
+    ['another repo', 'https://github.com/evil/other/actions/runs/1/job/2'],
+    ['another host', 'https://evil.example/web-everything/web-everything/actions/runs/1/job/2'],
+    ['a look-alike host', 'https://github.com.evil.example/web-everything/web-everything/actions/runs/1/job/2'],
+    ['http', 'http://github.com/web-everything/web-everything/actions/runs/1/job/2'],
+    ['userinfo', 'https://x:y@github.com/web-everything/web-everything/actions/runs/1/job/2'],
+    ['a prefix before the path', 'https://github.com/evil/other/x/web-everything/web-everything/actions/runs/1/job/2'],
+    ['the path inside the query', 'https://github.com/evil/other?u=/web-everything/web-everything/actions/runs/1/job/2'],
+    ['a suffix after the job id', 'https://github.com/web-everything/web-everything/actions/runs/1/job/2/../../../x'],
+    ['a run id past the safe-integer range', 'https://github.com/web-everything/web-everything/actions/runs/123456789012345678901234567890/job/2'],
+    ['a job id past the safe-integer range', 'https://github.com/web-everything/web-everything/actions/runs/1/job/123456789012345678901234567890'],
+  ])('jobRefOf rejects %s', async (_label, detailsUrl) => {
+    const { jobRefOf } = await import('../ci-queue-watch.mjs');
+    expect(jobRefOf({ detailsUrl })).toBeNull();
+  });
+
+  it('jobRefOf accepts a query string and compares the repo case-insensitively; a sibling repo needs its own slug', async () => {
+    const { jobRefOf } = await import('../ci-queue-watch.mjs');
+    expect(jobRefOf({ detailsUrl: 'https://github.com/Web-Everything/web-everything/actions/runs/7/job/8?pr=4450' })).toEqual({ runId: 7, jobId: 8 });
+    expect(jobRefOf({ detailsUrl: 'https://github.com/web-everything/frontierui/actions/runs/7/job/8' })).toBeNull();
+    expect(jobRefOf({ detailsUrl: 'https://github.com/web-everything/frontierui/actions/runs/7/job/8' }, 'web-everything/frontierui')).toEqual({ runId: 7, jobId: 8 });
+  });
+
+  // A third-party app with checks:write sets its own name, times and details URL — but not `workflowName`, which only
+  // Actions check runs carry. A perfect-looking Actions URL on a non-Actions check must not teach or trigger anything.
+  it('a non-Actions check carrying a perfect Actions URL is neither learned nor flagged', async () => {
+    const { findHungChecks, learnDurations } = await import('../ci-queue-watch.mjs');
+    const strip = (c) => { const { workflowName: _w, ...rest } = c; return rest; };
+    const forgedSuccess = strip({ ...done('daemon-soak', 77, 36_000) }); // a fake 10-hour "success" under a real check name
+    expect(learnDurations({}, [pr([forgedSuccess])])).toEqual({});
+    expect(findHungChecks([pr([strip(phantom())])], {}, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+    expect(findHungChecks([pr([{ ...phantom(), workflowName: '  ' }])], {}, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+  });
+
+  it('a foreign-repo URL feeds neither the hung scan nor the learned durations', async () => {
+    const { findHungChecks, learnDurations } = await import('../ci-queue-watch.mjs');
+    const foreign = 'https://github.com/evil/other/actions/runs/37796107550/job/113380540047';
+    const prs = [pr([{ ...phantom(), detailsUrl: foreign }, { ...done('test', 1, 60), detailsUrl: foreign }])];
+    expect(findHungChecks(prs, {}, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+    expect(learnDurations({}, prs)).toEqual({});
   });
 
   it('percentile is nearest-rank; empty is null', async () => {
@@ -520,7 +564,8 @@ describe('hung CI jobs', () => {
     const lines = [];
     return {
       calls, lines,
-      getRun: ({ runId }) => { calls.push(['getRun', runId]); return { status: typeof runStatus === 'function' ? runStatus() : runStatus }; },
+      getRun: ({ runId }) => { calls.push(['getRun', runId]); return { status: typeof runStatus === 'function' ? runStatus() : runStatus, head_sha: 'db9f116' }; },
+      getJob: ({ jobId }) => { calls.push(['getJob', jobId]); return { id: jobId, run_id: 37796107550, name: 'daemon-soak' }; },
       cancelRun: ({ runId }) => { calls.push(['cancelRun', runId]); },
       forceCancelRun: ({ runId }) => { calls.push(['forceCancelRun', runId]); },
       rerunJob: ({ jobId }) => { calls.push(['rerunJob', jobId]); },
@@ -535,7 +580,7 @@ describe('hung CI jobs', () => {
     const prs = [pr([phantom()])];
     const opts = { repo: 'web-everything/web-everything', listPrs: () => prs, statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
     const r1 = sweepHungJobs({ ...opts, now: () => T0 + 95 * MIN });
-    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
     expect(r1.actions).toEqual([expect.objectContaining({ action: 'rerun-job', jobId: 113380540047, ok: true })]);
     const entry = Object.values(readHungState(statePath).hung)[0];
     expect(entry).toMatchObject({ pr: 4450, headSha: 'db9f116', name: 'daemon-soak', reruns: 1, stage: 'rerun-requested', jobIds: [113380540047] });
@@ -569,13 +614,14 @@ describe('hung CI jobs', () => {
     const live = { ...phantom(), conclusion: null, completedAt: null };
     const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
     sweepHungJobs({ ...base, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN });
-    expect(f.calls).toEqual([['getRun', 37796107550], ['cancelRun', 37796107550]]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['cancelRun', 37796107550]]);
     expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'cancel-requested', reruns: 0 });
     // next sweep: the cancelled job no longer shows in_progress; the ledger drives the pending re-run
     f.calls.length = 0;
     status = 'completed';
     sweepHungJobs({ ...base, listPrs: () => [pr([{ ...live, status: 'COMPLETED', conclusion: 'CANCELLED' }])], now: () => T0 + 97 * MIN });
-    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    // the run was cancelled WHOLE (healthy sibling jobs included), so the whole run is re-run — never just the hung job
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]);
     expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
   });
 
@@ -599,7 +645,7 @@ describe('hung CI jobs', () => {
     f.rerunJob = ({ jobId }) => { f.calls.push(['rerunJob', jobId]); throw new Error('HTTP 403'); };
     const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
     const r = sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
-    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047], ['rerunRun', 37796107550]]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047], ['rerunRun', 37796107550]]);
     expect(r.actions.at(-1)).toMatchObject({ action: 'rerun-run', ok: true });
     rmSync(statePath, { force: true });
     f.calls.length = 0;
@@ -623,7 +669,7 @@ describe('hung CI jobs', () => {
     expect(f.lines.join('\n')).toMatch(/ci-job-hung: DEFERRED/);
     expect(readHungState(statePath).hung).toEqual({});
     sweepHungJobs({ ...base, now: () => T0 + 100 * MIN });
-    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
   });
 
   it('a throttled (not-sent) re-run is deferred and retried next sweep — no run-rerun fallback, no escalation', async () => {
@@ -631,12 +677,12 @@ describe('hung CI jobs', () => {
     const f = fakes('completed');
     const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
     sweepHungJobs({ ...base, rerunJob: ({ jobId }) => { f.calls.push(['rerunJob', jobId]); throw new Error(THROTTLED); }, now: () => T0 + 95 * MIN });
-    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
     expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-deferred', reruns: 0 });
     f.calls.length = 0;
     const r = sweepHungJobs({ ...base, now: () => T0 + 115 * MIN });
     expect(r.escalations).toEqual([]);
-    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
     expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
   });
 
@@ -647,6 +693,231 @@ describe('hung CI jobs', () => {
     expect(planHungActions([h], transient, { maxReruns: 1 })[0].action).toBe('recover');
     const refused = { [hungKey(h)]: { jobIds: [10], reruns: 0, stage: 'rerun-failed', actions: [{ action: 'rerun-run', ok: false, error: 'HTTP 403: Resource not accessible by integration' }] } };
     expect(planHungActions([h], refused, { maxReruns: 1 })[0].action).toBe('escalate');
+  });
+
+  // ── a recovery that started with a CANCEL keeps being driven from the ledger after the check leaves in_progress ──
+  // (review finding, impact "broken"): once the cancel lands, GitHub reports the check COMPLETED/CANCELLED, so
+  // `findHungChecks` never sees it again — the ledger is the only thing left that can finish or escalate it.
+  const cancelledSetup = async ({ rerunRun }) => {
+    const mod = await import('../ci-queue-watch.mjs');
+    let status = 'in_progress';
+    const f = fakes(() => status);
+    f.rerunRun = rerunRun(f);
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const cancelled = { ...live, status: 'COMPLETED', conclusion: 'CANCELLED' };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
+    mod.sweepHungJobs({ ...base, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN });
+    status = 'completed';
+    f.calls.length = 0;
+    f.lines.length = 0;
+    return { ...mod, f, base, cancelled, setStatus: (s) => { status = s; } };
+  };
+
+  it('retries a deferred rerun after cancellation completes', async () => {
+    let throttle = true;
+    const { sweepHungJobs, readHungState, f, base, cancelled } = await cancelledSetup({
+      rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); if (throttle) throw new Error(THROTTLED); },
+    });
+    const listPrs = () => [pr([cancelled])];
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 97 * MIN });
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-deferred', reruns: 0 });
+    // the cancelled check never returns to in_progress; only the ledger can retry the throttled re-run
+    throttle = false;
+    f.calls.length = 0;
+    const r = sweepHungJobs({ ...base, listPrs, now: () => T0 + 99 * MIN });
+    expect(r.escalations).toEqual([]);
+    expect(f.calls).toEqual([['rerunRun', 37796107550]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+    // …and once re-run, nothing further happens
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 101 * MIN });
+    expect(f.calls).toEqual([]);
+  });
+
+  it('escalates a refused rerun after cancellation completes', async () => {
+    const { sweepHungJobs, readHungState, f, base, cancelled } = await cancelledSetup({
+      rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); throw new Error('HTTP 403: Resource not accessible by integration'); },
+    });
+    const listPrs = () => [pr([cancelled])];
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 97 * MIN });
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-failed', reruns: 0 });
+    f.calls.length = 0;
+    f.lines.length = 0;
+    const r1 = sweepHungJobs({ ...base, listPrs, now: () => T0 + 99 * MIN });
+    expect(f.calls).toEqual([]); // a real refusal is never retried
+    expect(r1.escalations).toEqual([expect.objectContaining({ pr: 4450, name: 'daemon-soak' })]);
+    const esc = (lines) => lines.filter((l) => l.startsWith('ci-job-hung: ESCALATE '));
+    expect(esc(f.lines)).toHaveLength(1);
+    // logged on EVERY sweep while stranded, with a line that differs each time (the daemon log folds identical lines)
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 104 * MIN });
+    expect(esc(f.lines)).toHaveLength(1);
+    const body = (l) => JSON.parse(l.slice('ci-job-hung: ESCALATE '.length));
+    expect(body(esc(f.lines)[0]).inProgressMin).toBe(104);
+    expect(body(esc(f.lines)[0])).toMatchObject({ repo: 'web-everything/web-everything', pr: 4450, check: 'daemon-soak', runId: 37796107550, jobId: 113380540047, thresholdMin: 30, reruns: 0 });
+  });
+
+  it('the stranded-recovery ESCALATE line is accepted by the ci-job-hung smell (the two validators agree)', async () => {
+    const { default: ciJobHung } = await import('../health-smells/ci-job-hung.mjs');
+    const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({
+      rerunRun: () => () => { throw new Error('HTTP 403: Resource not accessible by integration'); },
+    });
+    const listPrs = () => [pr([cancelled])];
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 97 * MIN });
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 99 * MIN });
+    const out = ciJobHung.evaluate({ daemonLogs: [{ name: 'ci-queue-watch', text: f.lines.join('\n') }] });
+    expect(out).toEqual([expect.objectContaining({ subject: 'web-everything/web-everything#4450:daemon-soak', breach: true })]);
+  });
+
+  it('stops driving a cancelled recovery once its PR is gone, moved to a new head, or the check passed', async () => {
+    for (const next of [
+      [], // PR closed / merged
+      [pr([{ ...phantom(), status: 'COMPLETED', conclusion: 'CANCELLED' }], 4450, 'newhead')], // force-pushed
+    ]) {
+      rmSync(statePath, { force: true });
+      const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); throw new Error(THROTTLED); } });
+      sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 97 * MIN }); // defers
+      f.calls.length = 0;
+      f.lines.length = 0;
+      const r = sweepHungJobs({ ...base, listPrs: () => next, now: () => T0 + 99 * MIN });
+      expect(f.calls).toEqual([]);
+      expect(r.escalations).toEqual([]);
+    }
+    // a pending cancel-requested entry is not re-run for a PR that is gone either
+    rmSync(statePath, { force: true });
+    const { sweepHungJobs, f, base } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    // setup already cancelled; the run completed — but the PR is no longer open
+    sweepHungJobs({ ...base, listPrs: () => [], now: () => T0 + 97 * MIN });
+    expect(f.calls).toEqual([]);
+  });
+
+  // Review finding: the cancel kills the WHOLE run, so a later job-only re-run left cancelled siblings blocking the PR.
+  it('re-runs the whole run (not just the hung job) after cancelling a multi-job run', async () => {
+    const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    const sibling = { name: 'unit', workflowName: 'CI', status: 'COMPLETED', conclusion: 'CANCELLED', detailsUrl: url(37796107550, 555), startedAt: new Date(T0).toISOString() };
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled, sibling])], now: () => T0 + 97 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]);
+    expect(f.calls.some(([c]) => c === 'rerunJob')).toBe(false);
+  });
+
+  // Review finding (security): never write against a run or job the PR does not own.
+  it('refuses any write when the run belongs to a different head', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'in_progress', head_sha: 'someone-elses-release-sha' }; };
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550]]);
+    expect(r.actions).toEqual([]);
+    expect(readHungState(statePath).hung).toEqual({});
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: REFUSED/);
+  });
+
+  it('refuses a run read that carries no head_sha (fail closed)', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'completed' }; };
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550]]);
+    expect(r.actions).toEqual([]);
+  });
+
+  it('refuses a job re-run when the job id belongs to a different run than the details URL names', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.getJob = ({ jobId }) => { f.calls.push(['getJob', jobId]); return { id: jobId, run_id: 999, name: 'daemon-soak' }; }; // e.g. a deploy workflow's job
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047]]);
+    expect(r.actions).toEqual([]);
+    expect(readHungState(statePath).hung).toEqual({});
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: REFUSED/);
+  });
+
+  // Review (re-review of the repair): the CANCEL path writes by run id too, so the job must be tied to the run and to
+  // the check by name there as well — a third-party check may point its details URL at any real job of the same head.
+  it.each([
+    ['belongs to a different run', { run_id: 999, name: 'daemon-soak' }],
+    ['carries a different name than the check', { run_id: 37796107550, name: 'release-deploy' }],
+    ['has no name at all', { run_id: 37796107550 }],
+  ])('refuses to CANCEL a running run when the named job %s', async (_label, job) => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    f.getJob = ({ jobId }) => { f.calls.push(['getJob', jobId]); return { id: jobId, ...job }; };
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047]]);
+    expect(r.actions).toEqual([]);
+    expect(readHungState(statePath).hung).toEqual({});
+  });
+
+  // A check NAME is an attacker-chosen string used as a key: `constructor` / `__proto__` / `toString` resolved to
+  // Object's own members and made `list.some` throw at the top of the sweep, stopping recovery for the whole repo.
+  it.each(['constructor', '__proto__', 'toString', 'hasOwnProperty'])('a successful check named %s neither throws nor poisons the learned durations', async (name) => {
+    const { learnDurations, sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const prs = [pr([done(name, 1, 60), done('test', 2, 90)])];
+    const d = learnDurations({}, prs);
+    expect(Object.getOwnPropertyDescriptor(d, name)?.value).toEqual([{ jobId: 1, sec: 60 }]);
+    expect(d.test).toEqual([{ jobId: 2, sec: 90 }]);
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted')).toBe(false);
+    const f = fakes('completed');
+    expect(() => sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([done(name, 1, 60), phantom()])], now: () => T0 + 95 * MIN, ...f })).not.toThrow();
+    expect(f.calls.some(([c]) => c === 'rerunJob')).toBe(true); // recovery for the real hung job still ran
+    expect(Object.keys(readHungState(statePath).durations)).toContain(name);
+  });
+
+  it('caps how many distinct check names are learned', async () => {
+    const { learnDurations, MAX_DURATION_NAMES } = await import('../ci-queue-watch.mjs');
+    const checks = Array.from({ length: MAX_DURATION_NAMES + 25 }, (_, i) => done(`job-${i}`, 1000 + i, 60));
+    expect(Object.keys(learnDurations({}, [pr(checks)]))).toHaveLength(MAX_DURATION_NAMES);
+  });
+
+  it('canonicalises --repo (a key or a legacy form) before it anchors the details-URL check', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const r = sweepHungJobs({ repo: 'we', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(r.hung).toHaveLength(1);
+  });
+
+  // Truncated read: `gh pr list --limit 100` — a PR missing from a FULL page is unknown, not closed.
+  it('does not mistake a PR missing from a full 100-PR page for a closed one', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const { f, base } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    const fullPage = Array.from({ length: 100 }, (_, i) => pr([], 9000 + i, `${i}`.padStart(7, 'a')));
+    sweepHungJobs({ ...base, listPrs: () => fullPage, now: () => T0 + 97 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]);
+  });
+
+  // A cancel the job outran (it finished green before the cancel landed) must not re-run the whole, healthy run.
+  it('does not re-run the whole run when the hung job in fact finished green after the cancel', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const { f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    sweepHungJobs({ ...base, listPrs: () => [pr([{ ...cancelled, conclusion: 'SUCCESS' }])], now: () => T0 + 97 * MIN });
+    expect(f.calls.filter(([c]) => c.startsWith('rerun'))).toEqual([]);
+    expect(Object.values(readHungState(statePath).hung)[0].stage).not.toBe('cancel-requested');
+  });
+
+  it('a deferred cancel-origin recovery that the lagging snapshot still shows in_progress is retried as a WHOLE-run re-run', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    let throttle = true;
+    const { f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); if (throttle) throw new Error(THROTTLED); } });
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 97 * MIN }); // → rerun-deferred
+    throttle = false;
+    f.calls.length = 0;
+    const stale = { ...cancelled, status: 'IN_PROGRESS', conclusion: null };
+    sweepHungJobs({ ...base, listPrs: () => [pr([stale])], now: () => T0 + 99 * MIN });
+    expect(f.calls.some(([c]) => c === 'rerunJob')).toBe(false);
+    expect(f.calls.some(([c]) => c === 'rerunRun')).toBe(true);
+  });
+
+  it('the stranded-recovery alert says the re-run was refused after a cancel, not that a job "hung again"', async () => {
+    const { default: ciJobHung } = await import('../health-smells/ci-job-hung.mjs');
+    const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({ rerunRun: () => () => { throw new Error('HTTP 403: Resource not accessible by integration'); } });
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 97 * MIN });
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 99 * MIN });
+    const [alert] = ciJobHung.evaluate({ daemonLogs: [{ name: 'ci-queue-watch', text: f.lines.join('\n') }] });
+    expect(alert.summary).toMatch(/re-run was refused after it was cancelled/);
+    expect(alert.summary).not.toMatch(/hung again/);
+    expect(alert.recommendation).not.toMatch(/automatic re-run did not clear it/);
   });
 
   it('apply:false reports the plan with no GitHub writes', async () => {
@@ -664,7 +935,7 @@ describe('hung CI jobs', () => {
     sweepHungJobs({ ...base, listPrs: () => [pr(Array.from({ length: 10 }, (_, i) => done('soak', 100 + i, 600)))], now: () => T0 });
     expect(readHungState(statePath).durations.soak).toHaveLength(10);
     // 25 min in progress: past the 60 s floor but under 3 × p95 (30 min) — not hung
-    const running = { name: 'soak', status: 'IN_PROGRESS', detailsUrl: url(5, 500), startedAt: new Date(T0).toISOString() };
+    const running = { name: 'soak', workflowName: 'CI', status: 'IN_PROGRESS', detailsUrl: url(5, 500), startedAt: new Date(T0).toISOString() };
     const r = sweepHungJobs({ ...base, listPrs: () => [pr([running])], now: () => T0 + 25 * MIN });
     expect(r.hung).toEqual([]);
   });
@@ -677,7 +948,7 @@ describe('hung CLI verb', () => {
       const bin = join(dir, 'bin');
       mkdirSync(bin);
       const started = new Date(Date.now() - 120 * 60_000).toISOString();
-      const prs = [{ number: 4450, headRefOid: 'db9f116', statusCheckRollup: [{ name: 'daemon-soak', status: 'IN_PROGRESS', conclusion: 'SUCCESS', startedAt: started, detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/37796107550/job/113380540047' }] }];
+      const prs = [{ number: 4450, headRefOid: 'db9f116', statusCheckRollup: [{ name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: 'SUCCESS', startedAt: started, detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/37796107550/job/113380540047' }] }];
       writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(prs))});\n`);
       chmodSync(join(bin, 'gh'), 0o755);
       const out = JSON.parse(execFileSync('node', [CLI, 'hung', '--dry-run', '--json', '--repo=web-everything/web-everything'], {
@@ -689,5 +960,63 @@ describe('hung CLI verb', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// Review finding: the `WE_CI_HUNG_ACTION=0` kill switch and the `sweep` → hung-sweep wiring had no test (the only CLI
+// test used `--dry-run`). A fake `gh` that answers per-argv and LOGS every write lets the CLI prove both for real.
+describe('hung sweep wiring through the real CLI (kill switch + sweep integration)', () => {
+  let dir, writeLog;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ci-hung-wire-')); writeLog = join(dir, 'posts.log'); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function installGh() {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const started = new Date(Date.now() - 120 * 60_000).toISOString();
+    const prs = [{ number: 4450, headRefOid: 'db9f116', statusCheckRollup: [{ name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: 'SUCCESS', startedAt: started, detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/37796107550/job/113380540047' }] }];
+    writeFileSync(join(bin, 'gh'), [
+      '#!/usr/bin/env node',
+      'const fs = require("fs");',
+      'const a = process.argv.slice(2);',
+      `if (a.includes("-X")) { fs.appendFileSync(${JSON.stringify(writeLog)}, a.join(" ") + "\\n"); process.stdout.write("{}"); process.exit(0); }`,
+      'if (a[0] === "run") process.stdout.write("[]");',
+      `else if (a[0] === "pr") process.stdout.write(${JSON.stringify(JSON.stringify(prs))});`,
+      'else if (a[0] === "api" && /actions\\/runs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ status: "completed", head_sha: "db9f116" }));',
+      'else if (a[0] === "api" && /actions\\/jobs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ id: 113380540047, run_id: 37796107550, name: "daemon-soak" }));',
+      'else process.stdout.write("{}");',
+    ].join('\n'));
+    chmodSync(join(bin, 'gh'), 0o755);
+    return bin;
+  }
+  const runCli = (args, extraEnv = {}) => {
+    const bin = installGh();
+    return JSON.parse(execFileSync('node', [CLI, ...args, '--json', '--repo=web-everything/web-everything'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env, PATH: `${bin}:${process.env.PATH}`, CONVEYOR_CI_QUEUE_FILE: join(dir, 'history.json'),
+        WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), ...extraEnv,
+      },
+    }));
+  };
+  const writes = () => (existsSync(writeLog) ? readFileSync(writeLog, 'utf8').trim().split('\n') : []);
+
+  it('sweep runs the hung pass, attaches result.hung, and performs the re-run when writes are on', () => {
+    const out = runCli(['sweep'], { WE_CI_HUNG_ACTION: '' });
+    expect(out.hung).toEqual({ count: 1, actions: 1, escalations: 0 });
+    expect(writes()).toEqual([expect.stringContaining('jobs/113380540047/rerun')]);
+  });
+
+  it('WE_CI_HUNG_ACTION=0 turns every hung-job write off on `sweep` — the hang is still detected', () => {
+    const out = runCli(['sweep'], { WE_CI_HUNG_ACTION: '0' });
+    expect(out.hung).toEqual({ count: 1, actions: 0, escalations: 0 });
+    expect(writes()).toEqual([]);
+  });
+
+  it('WE_CI_HUNG_ACTION=0 turns the writes off on the `hung` verb too', () => {
+    const out = runCli(['hung'], { WE_CI_HUNG_ACTION: '0' });
+    expect(out.hung).toEqual([expect.objectContaining({ pr: 4450, action: 'recover' })]);
+    expect(out.actions).toEqual([]);
+    expect(writes()).toEqual([]);
   });
 });

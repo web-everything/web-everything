@@ -201,6 +201,8 @@ export const HUNG_FLOOR_ENV = 'WE_CI_HUNG_FLOOR_SEC';
 export const DEFAULT_HUNG_MAX_RERUNS = 1;
 /** Rolling window of successful durations kept per check name. */
 export const DEFAULT_DURATION_WINDOW = 50;
+/** How many distinct check names the duration history keeps (names are chosen by PR authors). */
+export const MAX_DURATION_NAMES = 200;
 /** After a cancel, how long to wait for the run to complete before force-cancelling it. */
 export const CANCEL_GRACE_MS = 5 * 60_000;
 /** Ledger entries older than this are dropped (their PR has long since moved on). */
@@ -208,13 +210,30 @@ export const HUNG_LEDGER_TTL_MS = 7 * 24 * 3600_000;
 /** Kill switch: `WE_CI_HUNG_ACTION=0` makes `sweep` detect and log only, never cancel or re-run. */
 export const HUNG_ACTION_ENV = 'WE_CI_HUNG_ACTION';
 
-const ACTIONS_JOB_URL_RE = /\/actions\/runs\/(\d+)\/job\/(\d+)/;
+const WE_SLUG = ghRepoSlug(DEFAULT_REPO_KEY);
+const ACTIONS_JOB_PATH_RE = /^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)\/job\/(\d+)$/;
 
-/** `{runId, jobId}` from a rollup entry's Actions `detailsUrl`; null for a check with no Actions job (no rerun
- *  handle — e.g. a third-party app's check run). PURE. */
-export function jobRefOf(check) {
-  const m = ACTIONS_JOB_URL_RE.exec(String(check?.detailsUrl || ''));
-  return m ? { runId: Number(m[1]), jobId: Number(m[2]) } : null;
+/** `{runId, jobId}` from a rollup entry's Actions `detailsUrl`; null for a check with no Actions job of THIS repo
+ *  (no rerun handle — e.g. a third-party app's check run). The URL is attacker-influenceable (any app holding
+ *  `checks:write` sets it) and its ids later drive cancel / re-run calls made with the App's `actions:write`
+ *  token, so it must be exactly `https://github.com/<repo>/actions/runs/<n>/job/<n>` (query and fragment ignored),
+ *  with both ids representable exactly as numbers. PURE. */
+export function jobRefOf(check, repo = WE_SLUG) {
+  let u;
+  try { u = new URL(String(check?.detailsUrl || '')); } catch { return null; }
+  if (u.protocol !== 'https:' || u.hostname !== 'github.com' || u.port || u.username || u.password) return null;
+  const m = ACTIONS_JOB_PATH_RE.exec(u.pathname);
+  if (!m || `${m[1]}/${m[2]}`.toLowerCase() !== String(repo).toLowerCase()) return null;
+  const runId = Number(m[3]);
+  const jobId = Number(m[4]);
+  return Number.isSafeInteger(runId) && Number.isSafeInteger(jobId) && runId > 0 && jobId > 0 ? { runId, jobId } : null;
+}
+
+/** True for a rollup entry that is a GitHub Actions check run. Only Actions check runs carry a `workflowName`; a
+ *  third-party app holding `checks:write` sets its own name, times and details URL but cannot set one — so without
+ *  this a forged "success" under a real check name could inflate the learned p95 and mask a real hang. PURE. */
+export function isActionsCheck(check) {
+  return typeof check?.workflowName === 'string' && check.workflowName.trim() !== '';
 }
 
 /** A successful, completed check's duration in seconds; null for anything else. PURE. */
@@ -237,14 +256,17 @@ export function percentile(values, p) {
 
 /** Fold the successful durations seen in `prs`' rollups into `durations` (`{name: [{jobId, sec}]}`), dedup by
  *  job id, newest last, capped to `window` per name. PURE (returns a new map). */
-export function learnDurations(durations, prs, { window = DEFAULT_DURATION_WINDOW } = {}) {
-  const out = {};
+export function learnDurations(durations, prs, { window = DEFAULT_DURATION_WINDOW, repo = WE_SLUG } = {}) {
+  // A check NAME is an attacker-chosen key: a null-prototype map, so `constructor` / `__proto__` / `toString` are
+  // ordinary names, never Object's own members. New names stop being learned at MAX_DURATION_NAMES.
+  const out = Object.create(null);
   for (const [name, list] of Object.entries(durations || {})) out[name] = Array.isArray(list) ? [...list] : [];
   for (const p of Array.isArray(prs) ? prs : []) {
     for (const c of p?.statusCheckRollup || []) {
       const sec = successDurationSec(c);
-      const ref = jobRefOf(c);
-      if (sec === null || !ref || !c.name) continue;
+      const ref = jobRefOf(c, repo);
+      if (sec === null || !ref || !c.name || !isActionsCheck(c)) continue;
+      if (!(c.name in out) && Object.keys(out).length >= MAX_DURATION_NAMES) continue;
       const list = out[c.name] || (out[c.name] = []);
       if (list.some((s) => s.jobId === ref.jobId)) continue;
       list.push({ jobId: ref.jobId, sec });
@@ -265,14 +287,14 @@ export function hungThreshold(samples, { k = DEFAULT_HUNG_K, floorSec = DEFAULT_
 
 /** Every `in_progress` check (with an Actions job behind it) running longer than its threshold. PURE.
  *  `now` is epoch ms. */
-export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC } = {}) {
+export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, repo = WE_SLUG } = {}) {
   const out = [];
   for (const p of Array.isArray(prs) ? prs : []) {
     for (const c of p?.statusCheckRollup || []) {
       if (String(c?.status || '').toUpperCase() !== 'IN_PROGRESS') continue;
-      const ref = jobRefOf(c);
+      const ref = jobRefOf(c, repo);
       const started = Date.parse(c.startedAt);
-      if (!ref || !c.name || !Number.isFinite(started)) continue;
+      if (!ref || !c.name || !isActionsCheck(c) || !Number.isFinite(started)) continue;
       const inProgressSec = (now - started) / 1000;
       const t = hungThreshold(durations?.[c.name], { k, floorSec });
       if (inProgressSec <= t.thresholdSec) continue;
@@ -448,8 +470,6 @@ export function sweepCiQueue({
 
 // ── HUNG CI JOBS: IO shell ────────────────────────────────────────────────────────────────────────────────
 
-const WE_SLUG = ghRepoSlug(DEFAULT_REPO_KEY);
-
 /** Every gh call below goes through `execFileSyncThrottled` (the shared gh-throttle semaphore + backoff), the
  *  same sanctioned path `defaultListRuns` uses. */
 function ghJson(exec, argv) {
@@ -458,13 +478,20 @@ function ghJson(exec, argv) {
   return text ? JSON.parse(text) : null;
 }
 
+/** The most open PRs one `gh pr list` call reads; a full page means the list may be cut off. */
+export const PR_LIST_LIMIT = 100;
+
 /** Open PRs with their check rollups (one `gh pr list` call). */
 export function defaultListPrs({ exec = execFileSyncThrottled, repo = WE_SLUG } = {}) {
-  const parsed = ghJson(exec, ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json', 'number,headRefOid,statusCheckRollup']);
+  const parsed = ghJson(exec, ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,headRefOid,statusCheckRollup']);
   return Array.isArray(parsed) ? parsed : [];
 }
 export function defaultGetRun({ exec = execFileSyncThrottled, repo = WE_SLUG, runId }) {
   return ghJson(exec, ['api', `repos/${repo}/actions/runs/${runId}`]) || {};
+}
+/** One job (`actions/jobs/<id>`) — read before a job-scoped write to confirm it belongs to the run the check names. */
+export function defaultGetJob({ exec = execFileSyncThrottled, repo = WE_SLUG, jobId }) {
+  return ghJson(exec, ['api', `repos/${repo}/actions/jobs/${jobId}`]) || {};
 }
 const ghPost = (path) => ({ exec = execFileSyncThrottled, repo = WE_SLUG, runId, jobId }) => {
   ghJson(exec, ['api', '-X', 'POST', `repos/${repo}/actions/${path({ runId, jobId })}`]);
@@ -496,25 +523,29 @@ const errText = (e) => String(e?.stderr || e?.message || e).trim().split('\n')[0
 
 /**
  * THE HUNG-JOB SWEEP. Learns durations, finds hung checks, and (when `apply`) recovers each first hang:
- * cancel its run if still running (re-run happens on a later sweep, once the run completes; a cancel that has
- * not taken after {@link CANCEL_GRACE_MS} is force-cancelled), else re-run the job (falling back to re-running
- * the whole run if GitHub refuses the job re-run). A second hang on the same head escalates (logged, never
- * retried). Every action is recorded in the ledger and logged as a `ci-job-hung:` line. Never throws on a
- * single GitHub write failing — it is recorded and the sweep moves on.
+ * cancel its run if still running (the WHOLE run is cancelled, healthy sibling jobs included, so the whole run
+ * is re-run on a later sweep once it completes; a cancel that has not taken after {@link CANCEL_GRACE_MS} is
+ * force-cancelled), else re-run the job (falling back to re-running the whole run if GitHub refuses the job
+ * re-run). A second hang on the same head escalates (logged, never retried). A recovery that began with a cancel
+ * is driven from the LEDGER from then on — the cancelled check leaves `in_progress`, so the hung scan never
+ * sees it again: a deferred re-run is retried, a refused one escalates every sweep while the check stays
+ * cancelled. No write is made unless the run belongs to the PR's head commit (and, for a job re-run, the job to
+ * that run): the check's details URL is untrusted input. Every action is recorded in the ledger and logged as a
+ * `ci-job-hung:` line. Never throws on a single GitHub write failing — it is recorded and the sweep moves on.
  */
 export function sweepHungJobs({
   repo = null, statePath = resolveHungStatePath(repo), now = () => Date.now(),
   k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, maxReruns = DEFAULT_HUNG_MAX_RERUNS, apply = true,
-  listPrs = defaultListPrs, getRun = defaultGetRun, cancelRun = defaultCancelRun, forceCancelRun = defaultForceCancelRun,
+  listPrs = defaultListPrs, getRun = defaultGetRun, getJob = defaultGetJob, cancelRun = defaultCancelRun, forceCancelRun = defaultForceCancelRun,
   rerunJob = defaultRerunJob, rerunRun = defaultRerunRun, log = (l) => writeLineSync(2, l),
 } = {}) {
-  const slug = repo || WE_SLUG;
+  const slug = repo ? ghRepoSlug(repo) : WE_SLUG; // the details-URL anchor and every API path use the canonical slug
   const nowMs = now();
   const at = new Date(nowMs).toISOString();
   const prs = listPrs({ repo: slug });
   return withHistoryLock(statePath, () => {
     const state = readHungState(statePath);
-    state.durations = learnDurations(state.durations, prs);
+    state.durations = learnDurations(state.durations, prs, { repo: slug });
     for (const [key, e] of Object.entries(state.hung)) {
       if (!(nowMs - Date.parse(e?.updatedAt || 0) < HUNG_LEDGER_TTL_MS)) delete state.hung[key];
     }
@@ -528,39 +559,100 @@ export function sweepHungJobs({
     };
     // A transient failure (the call never reached GitHub, or GitHub 5xx'd) is DEFERRED — retried next sweep, and
     // never answered with the heavier whole-run fallback. Only a real refusal falls back / ends in `-failed`.
-    const rerun = (entry, h) => {
-      try { rerunJob({ repo: slug, runId: h.runId, jobId: h.jobId }); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, 'rerun-job', h, true); return; }
-      catch (e) {
-        const msg = errText(e);
-        record(entry, 'rerun-job', h, false, msg);
-        if (isTransientGhError(msg)) { entry.stage = 'rerun-deferred'; return; }
+    // `viaCancel`: this recovery began by cancelling the WHOLE run, so the whole run is re-run (a job-only re-run
+    // would leave the cancelled healthy siblings cancelled and the PR blocked) — and a refusal is never papered
+    // over with a partial job re-run.
+    const rerun = (entry, h, { viaCancel = false } = {}) => {
+      const attempts = viaCancel
+        ? [['rerun-run', () => rerunRun({ repo: slug, runId: h.runId })]]
+        : [['rerun-job', () => rerunJob({ repo: slug, runId: h.runId, jobId: h.jobId })], ['rerun-run', () => rerunRun({ repo: slug, runId: h.runId })]];
+      for (const [i, [action, send]] of attempts.entries()) {
+        try { send(); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, action, h, true); return; }
+        catch (e) {
+          const msg = errText(e);
+          record(entry, action, h, false, msg);
+          if (isTransientGhError(msg)) { entry.stage = 'rerun-deferred'; return; }
+          if (i === attempts.length - 1) entry.stage = 'rerun-failed';
+        }
       }
-      try { rerunRun({ repo: slug, runId: h.runId }); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, 'rerun-run', h, true); }
-      catch (e) { const msg = errText(e); entry.stage = isTransientGhError(msg) ? 'rerun-deferred' : 'rerun-failed'; record(entry, 'rerun-run', h, false, msg); }
     };
-    // null = unreadable (never guessed: acting blind on an unknown run state re-ran a job whose status read had
-    // been refused, live 2026-10-08).
-    const runStatus = (h) => { try { return String(getRun({ repo: slug, runId: h.runId })?.status || '') || null; } catch (e) { return { error: errText(e) }; } };
-    const unreadable = (s) => s === null || typeof s === 'object';
+    // `{error}` = unreadable (never guessed: acting blind on an unknown run state re-ran a job whose status read
+    // had been refused, live 2026-10-08). `headSha` is the commit the run actually ran for.
+    const readRun = (h) => {
+      try {
+        const run = getRun({ repo: slug, runId: h.runId });
+        const status = String(run?.status || '');
+        return status ? { status, headSha: String(run?.head_sha || '') } : { error: 'empty' };
+      } catch (e) { return { error: errText(e) }; }
+    };
+    const readJob = (h) => {
+      try {
+        const job = getJob({ repo: slug, jobId: h.jobId });
+        return { runId: Number(job?.run_id), name: String(job?.name || '') };
+      } catch (e) { return { error: errText(e) }; }
+    };
+    const prByNumber = new Map(prs.map((p) => [p.number, p]));
+    // `gh pr list` returns at most PR_LIST_LIMIT PRs: a PR missing from a FULL page is unknown, not closed.
+    const listTruncated = prs.length >= PR_LIST_LIMIT;
+    const UNKNOWN = Symbol('pr-not-in-a-truncated-list');
+    // The PR's CURRENT check for a ledger entry — null once the PR has closed, moved to a new head, or no longer
+    // carries a check from the entry's run (nothing more is owed to that entry then); UNKNOWN when the PR list was
+    // cut off before it could be seen (the ledger keeps driving a cancel it already issued).
+    const liveCheck = (entry) => {
+      const p = prByNumber.get(entry.pr);
+      if (!p) return listTruncated ? UNKNOWN : null;
+      if (p.headRefOid !== entry.headSha) return null;
+      return (p.statusCheckRollup || []).find((c) => c?.name === entry.name && jobRefOf(c, slug)?.runId === entry.runId) || null;
+    };
+    const isCompleted = (c, wantSuccess) => String(c?.status || '').toUpperCase() === 'COMPLETED' && (String(c?.conclusion || '').toUpperCase() === 'SUCCESS') === wantSuccess;
+    const escalationView = (entry, h) => ({
+      repo: slug, pr: entry.pr, headSha: entry.headSha, check: entry.name, runId: entry.runId, jobId: h.jobId,
+      inProgressMin: Math.max(0, Math.round((nowMs - Date.parse(entry.startedAt || entry.detectedAt || at)) / 60_000)),
+      thresholdMin: Math.round((entry.thresholdSec ?? 0) / 60),
+    });
+    const escalations = [];
 
-    // 1. Pending re-runs the ledger owes (a cancel was issued on an earlier sweep).
-    if (apply) {
-      for (const entry of Object.values(state.hung)) {
-        if (entry.stage !== 'cancel-requested') continue;
-        const h = { pr: entry.pr, name: entry.name, runId: entry.runId, jobId: entry.jobIds?.at(-1) };
-        const status = runStatus(h);
-        if (unreadable(status)) continue;
-        if (status === 'completed') rerun(entry, h);
-        else if (nowMs - Date.parse(entry.cancelRequestedAt || 0) >= CANCEL_GRACE_MS && !entry.forceCancelledAt) {
+    // 1. The ledger's own work for a recovery that began with a cancel. The cancelled check leaves `in_progress`,
+    //    so step 2 never sees it again: only the ledger can finish, retry or escalate it.
+    for (const entry of Object.values(state.hung)) {
+      const h = { pr: entry.pr, name: entry.name, runId: entry.runId, jobId: entry.jobIds?.at(-1) };
+      const check = liveCheck(entry);
+      if (!check) continue;
+      if (entry.stage === 'cancel-requested') {
+        if (!apply) continue;
+        const run = readRun(h);
+        if (run.error) continue;
+        if (run.status === 'completed') {
+          // The cancel may have lost the race to the job (it finished green first): re-running a healthy run would
+          // reset its passed checks for nothing.
+          if (check !== UNKNOWN && isCompleted(check, true)) { entry.stage = 'cancel-outran'; entry.updatedAt = at; log(`ci-job-hung: RESOLVED ${JSON.stringify({ repo: slug, pr: entry.pr, check: entry.name, runId: entry.runId, reason: 'the job finished green before the cancel landed' })}`); }
+          else rerun(entry, h, { viaCancel: true });
+        } else if (nowMs - Date.parse(entry.cancelRequestedAt || 0) >= CANCEL_GRACE_MS && !entry.forceCancelledAt) {
           try { forceCancelRun({ repo: slug, runId: h.runId }); entry.forceCancelledAt = at; record(entry, 'force-cancel', h, true); }
           catch (e) { record(entry, 'force-cancel', h, false, errText(e)); }
         }
+        continue;
+      }
+      // A cancel-origin recovery whose re-run did not land and whose check is still cancelled (not passed, not
+      // re-running — an in_progress check is step 2's, via planHungActions).
+      const stranded = entry.cancelRequestedAt && /^rerun-(deferred|failed)$/.test(entry.stage || '')
+        && check !== UNKNOWN && isCompleted(check, false);
+      if (!stranded) continue;
+      const last = (entry.actions || []).at(-1);
+      if (entry.stage === 'rerun-deferred' || (last && !last.ok && isTransientGhError(last.error))) {
+        if (apply) rerun(entry, h, { viaCancel: true });
+      } else {
+        entry.escalatedAt = entry.escalatedAt || at;
+        entry.updatedAt = at;
+        escalations.push({ pr: entry.pr, headSha: entry.headSha, name: entry.name, runId: entry.runId, jobId: h.jobId, action: 'escalate', key: hungKey({ pr: entry.pr, headSha: entry.headSha, name: entry.name }) });
+        // Logged EVERY sweep while the check stays cancelled, with a minute count that grows each time (so log
+        // de-dup never folds it away) — the same contract as the step-2 escalation below.
+        log(`ci-job-hung: ESCALATE ${JSON.stringify({ ...escalationView(entry, h), reruns: entry.reruns ?? 0, reason: 'rerun-refused-after-cancel' })}`);
       }
     }
 
     // 2. Newly detected hangs.
-    const hung = planHungActions(findHungChecks(prs, state.durations, { now: nowMs, k, floorSec }), state.hung, { maxReruns });
-    const escalations = [];
+    const hung = planHungActions(findHungChecks(prs, state.durations, { now: nowMs, k, floorSec, repo: slug }), state.hung, { maxReruns });
     for (const h of hung) {
       const view = { repo: slug, pr: h.pr, headSha: h.headSha, check: h.name, runId: h.runId, jobId: h.jobId, inProgressMin: Math.round(h.inProgressSec / 60), thresholdMin: Math.round(h.thresholdSec / 60) };
       if (h.action === 'handled') continue;
@@ -576,20 +668,41 @@ export function sweepHungJobs({
       }
       log(`ci-job-hung: DETECTED ${JSON.stringify(view)}`);
       if (!apply) continue;
-      const status = runStatus(h);
-      if (unreadable(status)) {
-        log(`ci-job-hung: DEFERRED ${JSON.stringify({ ...view, reason: `run status unreadable: ${status?.error || 'empty'}` })}`);
+      const run = readRun(h);
+      if (run.error) {
+        log(`ci-job-hung: DEFERRED ${JSON.stringify({ ...view, reason: `run status unreadable: ${run.error}` })}`);
         continue;
       }
+      // The run id came from the check's own (untrusted) details URL: act only on a run for THIS PR head.
+      if (!run.headSha || run.headSha !== h.headSha) {
+        log(`ci-job-hung: REFUSED ${JSON.stringify({ ...view, reason: 'run does not belong to the PR head commit' })}`);
+        continue;
+      }
+      // The job id is a second untrusted number (a third-party check can name ANY real job of this repo): it must
+      // belong to that same run AND be this check's own job — before a cancel as much as before a job re-run.
+      const job = readJob(h);
+      if (job.error) {
+        log(`ci-job-hung: DEFERRED ${JSON.stringify({ ...view, reason: `job unreadable: ${job.error}` })}`);
+        continue;
+      }
+      if (job.runId !== h.runId || job.name !== h.name) {
+        log(`ci-job-hung: REFUSED ${JSON.stringify({ ...view, reason: 'job does not belong to the run and the check' })}`);
+        continue;
+      }
+      const status = run.status;
       const entry = state.hung[h.key] || (state.hung[h.key] = { pr: h.pr, headSha: h.headSha, name: h.name, reruns: 0, jobIds: [] });
       entry.jobIds = [...new Set([...(entry.jobIds || []), h.jobId])];
       entry.runId = h.runId;
       entry.detectedAt = at;
+      entry.startedAt = h.startedAt;
+      entry.thresholdSec = h.thresholdSec;
       if (status !== 'completed') {
         try { cancelRun({ repo: slug, runId: h.runId }); entry.stage = 'cancel-requested'; entry.cancelRequestedAt = at; record(entry, 'cancel', h, true); }
         catch (e) { const msg = errText(e); entry.stage = isTransientGhError(msg) ? 'cancel-deferred' : 'cancel-failed'; record(entry, 'cancel', h, false, msg); }
       } else {
-        rerun(entry, h);
+        // A recovery that began with a cancel killed the WHOLE run: finish it as one even if a lagging snapshot
+        // still shows the cancelled job in_progress.
+        rerun(entry, h, { viaCancel: !!entry.cancelRequestedAt });
       }
     }
     try { writeHungState(state, statePath); } catch { /* best-effort — the actions above already happened and were logged */ }
