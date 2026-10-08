@@ -206,8 +206,14 @@ export function healSharedCommitGraph(storeDir, { lockDir, log = () => {}, waitM
     }
     const w = runGit(['commit-graph', 'write', '--reachable', '--no-progress'], storeDir);
     const after = verifyCommitGraph(storeDir);
-    const ok = w.code === 0 && after.ok;
-    log(`  ⚑ lane-repair shared-store: commit-graph was corrupt (${before.detail}) — moved aside${movedTo ? ` → ${basename(movedTo)}` : ''} and ${ok ? 'regenerated with `git commit-graph write --reachable`' : `regeneration failed (${w.err.trim().split('\n')[0] || after.detail}); store runs without a graph, which git treats as valid`}`);
+    const wrote = existsSync(join(infoDir, 'commit-graph')) || existsSync(join(infoDir, 'commit-graphs'));
+    const outcome = w.code === 0 && after.ok && wrote
+      ? 'regenerated with `git commit-graph write --reachable`'
+      : w.code === 0 && after.ok
+        // git writes NOTHING (exit 0) for a shallow repository (the primary has .git/shallow); a missing graph is valid.
+        ? 'git wrote no new graph (e.g. a shallow store); the store now runs without one, which is valid and verifies clean'
+        : `regeneration failed (${w.err.trim().split('\n')[0] || after.detail}); store runs without a graph, which git treats as valid`;
+    log(`  ⚑ lane-repair shared-store: commit-graph was corrupt (${before.detail}) — moved aside${movedTo ? ` → ${basename(movedTo)}` : ''} and ${outcome}`);
     return { healed: true, reason: before.detail, movedTo };
   } finally {
     rmSync(lockDir, { recursive: true, force: true });
