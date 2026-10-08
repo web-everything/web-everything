@@ -259,7 +259,18 @@ describe('re-clone safety (review round 2)', () => {
 
   it('does not over-refuse for a tag that only names already-pushed work', () => {
     writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
-    g(clone, 'tag', 'v1');
+    g(clone, 'tag', '-a', 'v1', '-m', 'release'); // annotated: the tag object's sha differs from HEAD's, so it is judged on its own
+    g(clone, 'tag', 'v1-light');
+    loseObject(g(clone, 'rev-parse', 'HEAD~1'));
+    const r = repairCloneRefs(clone, RECLONE);
+    expect(r.ok).toBe(true);
+    expect(r.quarantinedTo).toBeTruthy();
+  });
+
+  it('does not let a refs/notes/* ref (conveyor metadata, synced outside refs/remotes) block the re-clone', () => {
+    writeFileSync(join(clone, 'b.txt'), 'b'); g(clone, 'add', 'b.txt'); g(clone, 'commit', '-qm', 'two'); g(clone, 'push', '-q', 'origin', 'HEAD:main');
+    g(clone, 'notes', 'add', '-m', 'drift', 'HEAD');
+    expect(g(clone, 'for-each-ref', 'refs/notes')).toMatch(/refs\/notes\//);
     loseObject(g(clone, 'rev-parse', 'HEAD~1'));
     const r = repairCloneRefs(clone, RECLONE);
     expect(r.ok).toBe(true);
@@ -523,11 +534,33 @@ describe('prepareRebuild after a mid-tick re-clone', () => {
     const env = { ...process.env, WE_DAEMON_STATE_DIR: stateDir, WE_DAEMON_CLONE_LOCK_ROOT: lockDir, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_REBUILD_SKIP_UNRELATED: '0' };
     delete env.LANE_POOL_ROOT;
     const runSmoke = async () => { throw new Error('the tick must end before any candidate is smoked'); };
+    // Persisted state from before the re-clone names the OLD clone's overlay merge as adopted / last-good.
+    const { writeRebuildState } = await import('../daemon-rebuild/state.mjs');
+    writeRebuildState(clone, {
+      ...readRebuildState(clone, env),
+      adopted: { head: overlayHead, inputsKey: 'old', mainSha: overlayHead, applied: [], at: new Date().toISOString() },
+      held: { since: new Date().toISOString(), reason: 'x', failed: 'x', details: [], lastGood: overlayHead, target: null, mainSha: null },
+    }, env);
     const r = await rebuildClone({ root: clone, env, log: { error() {}, log() {} }, runSmoke, prState: async () => null, lockOpts: { waitMs: 0 } });
     expect(r.reason).toBe('clone-recloned');
     expect(r.moved).toBe(false);
     expect(readdirSync(join(tmp, '.quarantine')).some((n) => !n.startsWith('.'))).toBe(true); // the old clone was kept
     expect(g(clone, 'rev-parse', 'HEAD')).not.toBe(overlayHead); // the fresh clone is plain origin/main
-    expect(readRebuildState(clone, env)?.adopted ?? null).toBeNull(); // nothing was adopted from the stale snapshot
+    const after = readRebuildState(clone, env);
+    expect(after.adopted).toBeNull(); // the old clone's adoption / last-good shas do not survive into the fresh clone
+    expect(after.held).toBeNull();
+  });
+
+  it('the self-sync wrapper runs no children on a clone that was re-cloned this tick', async () => {
+    const { withSelfSync } = await import('../daemon-self-sync.mjs');
+    let ticked = false;
+    const w = withSelfSync({ tickOnce: () => { ticked = true; return 'ticked'; } }, {
+      root: '/x', onRestart: () => 'restarted', rebuild: async () => ({ moved: false, reason: 'clone-recloned', quarantinedTo: '/q/x' }),
+      acquireRead: () => ({ ok: true }), releaseRead: () => {}, readState: () => ({ adopted: null, rejected: null, inProgress: null, quarantine: null }),
+      log: { error() {} },
+    });
+    const r = await w.tickOnce();
+    expect(r).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(ticked).toBe(false);
   });
 });

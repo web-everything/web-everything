@@ -213,7 +213,14 @@ export async function prepareRebuild({
   // A re-clone replaced the whole checkout: `prevHead`, `unsafe` and `state.adopted` above describe the OLD clone (its HEAD is
   // normally the deterministic overlay merge, which the fresh clone does not contain). End the tick here, before anything plans,
   // diffs or rolls back against them; the next tick re-reads HEAD and re-plans from the fresh clone.
-  if (cloneRepair.quarantinedTo) return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
+  // The persisted state names shas of the old clone too (the adopted overlay merge, a held last-good, a passed-but-unadopted
+  // candidate); none of them exists in the fresh clone, so drop them rather than let a later tick compare against them.
+  if (cloneRepair.quarantinedTo) {
+    for (const k of ['adopted', 'held', 'rejected', 'inProgress', 'unverified', 'quarantine', 'building', 'smokePassed']) state[k] = null;
+    writeState();
+    clearReadyCandidate(root, stEnv);
+    return terminal({ moved: false, reason: 'clone-recloned', quarantinedTo: cloneRepair.quarantinedTo });
+  }
   const fetchResult = fetchMainAndOverlays({ git, overlays: overlaysBefore, edgeResolve });
   if (!fetchResult.ok) {
     if (unsafe.untracked.length > 0) alert('untracked-kept', { paths: unsafe.untracked });

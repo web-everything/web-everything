@@ -400,7 +400,9 @@ function unpushedWork(dir, headSha) {
   for (const line of heads.out.split('\n').map((l) => l.trim()).filter(Boolean)) {
     const i = line.indexOf(' ');
     const ref = line.slice(i + 1);
-    if (ref.startsWith('refs/remotes/') || ref === 'refs/stash') continue;
+    // refs/notes/* are conveyor metadata force-fetched from / pushed to origin (branch-drift) outside refs/remotes, so they
+    // can never read as "pushed" here; counting them would refuse every re-clone of a clone that carries one.
+    if (ref.startsWith('refs/remotes/') || ref.startsWith('refs/notes/') || ref === 'refs/stash') continue;
     tips.set(line.slice(0, i), ref);
   }
   if (headSha && !tips.has(headSha)) tips.set(headSha, 'HEAD');

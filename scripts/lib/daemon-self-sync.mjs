@@ -650,6 +650,12 @@ export function withSelfSync(effects, {
       // 1. Rebuild (gated: takes the WRITE lock itself, runs the live smoke inside it). An adopted build
       //    restarts INSTEAD of ticking — the read lock below is never even acquired for this tick.
       const rebuildResult = await rebuild();
+      if (rebuildResult && rebuildResult.reason === 'clone-recloned') {
+        // The checkout was replaced under this process (plain origin/main, never smoked; this process's modules and cwd
+        // are the old tree's). Run no children on it; the next tick rebuilds the overlays and restarts onto them.
+        log.error?.(`daemon-self-sync: the clone was re-cloned this tick (old one kept at ${rebuildResult.quarantinedTo ?? '?'}) — skipping this tick, the next one rebuilds from the fresh clone`);
+        return skippedTick('clone-recloned');
+      }
       if (rebuildResult && rebuildResult.moved && rebuildResult.adopted) {
         if (restartGate(rebuildResult.head).restart) {
           log.error?.(`daemon-self-sync: rebuilt the clone onto ${rebuildResult.head} — restarting onto the new code (#4044)`);
