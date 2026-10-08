@@ -1807,24 +1807,23 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
     table: request.table ?? null,
     modelReason: request.modelReason ?? null,
   });
+  // advisor trial — recorded once the argv is final, before the launch (same rule as `dispatchFix`). Best-effort.
+  if (advisor.reason !== 'kind-not-in-trial') {
+    try {
+      console.error(advisorLogLine({ decision: advisor, sessionSlug: request.sessionSlug, runId: request.sessionId }));
+      (request.recordAdvisor ?? recordAdvisorRun)(advisorLedgerRow({
+        decision: advisor, runId: request.sessionId, sessionSlug: request.sessionSlug,
+        repo: request.repo ?? 'we', pr: request.pr ?? null, item: request.num ?? null, at: new Date().toISOString(),
+      }));
+    } catch { /* never fails a dispatch */ }
+  }
   const launchedModel = extractModelFlag(argv).value;
   let reportedModel = launchedModel;
   try { if (request.policyRoute) reportedModel = resolvePolicyModel('claude', launchedModel); } catch { /* Explicit reasoned pins may name models outside the policy catalogue. */ }
   request.reportModel?.(reportedModel);
   request.reportEffort?.(argv.find(arg => arg.startsWith('--effort='))?.slice(9) ?? argv[argv.indexOf('--effort') + 1]);
   const stdout = String(spawnAgent(argv, { cwd: request.cwd }) ?? '');
-  const agentId = parseBackgroundedId(stdout) || request.sessionId;
-  // Best-effort: the session already started, so nothing here may throw into the dispatch result.
-  if (advisor.kind && advisor.reason !== 'kind-not-in-trial') {
-    try {
-      console.error(advisorLogLine({ decision: advisor, sessionSlug: request.sessionSlug, runId: request.sessionId, agentId }));
-      (request.recordAdvisor ?? recordAdvisorRun)(advisorLedgerRow({
-        decision: advisor, runId: request.sessionId, agentId, sessionSlug: request.sessionSlug,
-        repo: request.repo ?? 'we', pr: request.pr ?? null, item: request.num ?? null, at: new Date().toISOString(),
-      }));
-    } catch { /* see above */ }
-  }
-  return agentId;
+  return parseBackgroundedId(stdout) || request.sessionId;
 }
 
 /**
