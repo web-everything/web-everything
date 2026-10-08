@@ -98,7 +98,8 @@ describe('held cards', () => {
     expect(plan[0].digest).toMatch(/\(Held-card #21 from the operator handoff list\.\)$/);
     expect(plan.slice(2, 5).map(i => i.kind)).toEqual(['epic', 'epic', 'epic']);
     expect(plan.at(-1)).toMatchObject({ kind: 'story', size: 3, scope: [], parent: null });
-    expect(planFiling([{ num: 1, title: 'Epic', text: '1. Epic', meta: { kind: 'task' } }])[0].kind).toBe('task');
+    expect(planFiling([{ num: 1, title: 'Epic', text: '1. Epic', meta: { kind: 'task' } }])[0]).toMatchObject({ kind: 'task', size: null }); // never sized — file-item refuses a sized task (#x0h3pe4)
+    expect(planFiling([{ num: 1, title: 'F', text: '1. F', meta: { kind: 'feature', size: 5 } }])[0].size).toBeNull();
   });
   it('marks only the first line and is idempotent', () => {
     const options = { dateEt: '2026-10-05', pr: 4242 };

@@ -206,7 +206,7 @@ export async function main(argv, deps = {}) {
     const plan = planFiling(items);
     if (!plan.length) { say('nothing to file'); return 0; }
     if (flags['dry-run']) {
-      say(flags.json ? JSON.stringify(plan) : plan.map(item => `${item.num}. ${item.kind} ${item.size} ${item.title}`).join('\n'));
+      say(flags.json ? JSON.stringify(plan) : plan.map(item => `${item.num}. ${item.kind} ${item.size ?? '-'} ${item.title}`).join('\n'));
       return 0;
     }
     // ONE filing run at a time. The list lock only covers a single read-modify-write, but a run spends minutes
@@ -233,7 +233,7 @@ export async function main(argv, deps = {}) {
       for (const item of pending) {
         try {
           const result = lastJson(operation(['file-item', `--title=${item.title}`, `--kind=${item.kind}`,
-            `--size=${item.size}`, `--digest=${item.digest}`, ...(item.scope.length ? [`--scope=${item.scope.join(',')}`] : []),
+            ...(item.size != null ? [`--size=${item.size}`] : []), `--digest=${item.digest}`, ...(item.scope.length ? [`--scope=${item.scope.join(',')}`] : []),
             ...(item.parent !== null ? [`--parent=${item.parent}`] : [])]));
           const card = result.run?.verdict ?? result.verdict;
           const id = card?.num ?? card?.id;
