@@ -18,6 +18,7 @@ import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -37,7 +38,7 @@ import { VERDICTS, appendVerdict, buildVerdictRecord, readVerdictLedger, parseLe
 // re-created copy of it (the same reason `createCliJudgeFactory` is exported and driven directly, #3151).
 import { cwdFlagValue } from '../cli-adapter.mjs';
 import { resolveOperation } from '../run.mjs';
-import { advanceWhileRunning, startRun } from '../engine.mjs';
+import { advanceWhileRunning, projectReads, startRun } from '../engine.mjs';
 
 let root;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'review-pr-io-')); });
@@ -227,6 +228,41 @@ describe('the ledger and notice sinks', () => {
       expect(referral.findingKeys).toHaveLength(1);
       expect(referral.findingKeys[0]).toMatch(/^sha256:[0-9a-f]{64}$/);
       expect(rows.find((r) => r.type === 'review-run').posted).toBe(true);
+    });
+
+    // END TO END: the sink tests above hand-write `referralKeys`, so they cannot see the operation-side derivation
+    // in `ledgerEvents` (`reduce.referrals` → `referralFindingKey`, inside a swallowing try/catch). This drives a
+    // REAL run whose advisory seat raises a CONFIRMED finding, takes the effect the DECLARED `ledgerEvents` step
+    // derives from that run's own findings, and applies it through the REAL sink. Dropping the `referralKeys.push`,
+    // or feeding it the wrong shape, leaves `referralKeys` empty, writes no referral row, and fails this test.
+    it('a run opening a referral persists its hashed finding key against the reviewed head', async () => {
+      const declaration = reviewPrOperation({ codexAdvisory: true, correctnessAdvisory: false, antigravityReview: false,
+        readPr: () => ({ state: 'OPEN', body: 'a PR body',
+          detail: { repo: 'o/n', pr: 7, title: 'referral ledger', labels: ['review:pending'], humanRequired: false,
+            reviewClass: 'pending', disposition: { mode: 'converge', autoLand: false }, diffStat: [] },
+          net: { paths: ['x.mjs'], base: 'b'.repeat(40), rev: HEAD, scored: true },
+          diff: { text: '--- a/x.mjs\n+++ b/x.mjs\n+change\n', scored: true },
+        }) });
+      const registry = createRegistry();
+      registry.register(declaration);
+      const original = { file: 'x.mjs', line: 1, summary: 'confirmed defect', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+      let run = advanceWhileRunning(startRun({ op: REVIEW_PR_OP, id: 'run-e2-referral', input: { repo: 'o/n', pr: 7 }, registry }), { registry });
+      while (run.pending?.kind === 'judge') {
+        run = advanceWhileRunning(run, { registry, resume: { value: run.pending.step === 'judgeAdvisory'
+          ? { summary: 'confirmed defect', findings: [original] } : { summary: 'nothing blocking', findings: [] } } });
+      }
+      expect(run.findings.reduce.referrals).toHaveLength(1);
+      const step = declaration.steps.find((s) => s.name === 'ledgerEvents').step;
+      const [effect] = step.effects(projectReads(run, step.reads));
+      const expectedKey = referralFindingKey('judgeAdvisory', original);
+      expect(effect.type).toBe(REVIEW_EFFECTS.LEDGER_EVENTS);
+      expect(effect.payload).toMatchObject({ headSha: HEAD, referralKeys: [expectedKey] });
+
+      const result = await createReviewPrSinks({ root })[REVIEW_EFFECTS.LEDGER_EVENTS](effect.payload, CTX);
+      expect(result.written).toEqual(['referral', 'review-run']);
+      const referral = readEvents().find((r) => r.type === 'referral');
+      expect(referral).toMatchObject({ pr: 7, headSha: HEAD });
+      expect(referral.findingKeys).toEqual([`sha256:${createHash('sha256').update(expectedKey).digest('hex')}`]);
     });
 
     it('writes nothing without a pinned head, and says so loudly instead of skipping silently', async () => {
