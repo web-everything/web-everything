@@ -608,6 +608,47 @@ describe('hung CI jobs', () => {
     expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ reruns: 0, stage: 'rerun-failed' });
   });
 
+  // Live 2026-10-08 (first live run on #4450): gh-throttle was in a shared core-API rate-limit backoff, so the
+  // run-status read AND both re-run writes were refused WITHOUT being sent. That is not GitHub refusing the
+  // recovery: it must be retried on a later sweep, never escalated, and never acted on blind.
+  const THROTTLED = 'gh-throttle: GitHub core API rate limit exceeded for this identity — shared backoff until 2026-10-08T17:17:36.000Z, call not sent (#gh-graphql-budget)';
+
+  it('an unreadable run status defers the recovery (no blind re-run, no ledger entry) and a later sweep recovers', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
+    const r = sweepHungJobs({ ...base, getRun: () => { throw new Error(THROTTLED); }, now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([]);
+    expect(r.actions).toEqual([]);
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: DEFERRED/);
+    expect(readHungState(statePath).hung).toEqual({});
+    sweepHungJobs({ ...base, now: () => T0 + 100 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+  });
+
+  it('a throttled (not-sent) re-run is deferred and retried next sweep — no run-rerun fallback, no escalation', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
+    sweepHungJobs({ ...base, rerunJob: ({ jobId }) => { f.calls.push(['rerunJob', jobId]); throw new Error(THROTTLED); }, now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-deferred', reruns: 0 });
+    f.calls.length = 0;
+    const r = sweepHungJobs({ ...base, now: () => T0 + 115 * MIN });
+    expect(r.escalations).toEqual([]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunJob', 113380540047]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+  });
+
+  it('a ledger left at rerun-failed by a transient (throttled) error is retried, not escalated', async () => {
+    const { planHungActions, hungKey } = await import('../ci-queue-watch.mjs');
+    const h = { pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: 1, jobId: 10 };
+    const transient = { [hungKey(h)]: { jobIds: [10], reruns: 0, stage: 'rerun-failed', actions: [{ action: 'rerun-run', ok: false, error: THROTTLED }] } };
+    expect(planHungActions([h], transient, { maxReruns: 1 })[0].action).toBe('recover');
+    const refused = { [hungKey(h)]: { jobIds: [10], reruns: 0, stage: 'rerun-failed', actions: [{ action: 'rerun-run', ok: false, error: 'HTTP 403: Resource not accessible by integration' }] } };
+    expect(planHungActions([h], refused, { maxReruns: 1 })[0].action).toBe('escalate');
+  });
+
   it('apply:false reports the plan with no GitHub writes', async () => {
     const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
     const f = fakes('completed');

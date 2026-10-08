@@ -282,6 +282,13 @@ export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorS
   return out;
 }
 
+/** True for a gh failure that says nothing about whether GitHub would accept the call: gh-throttle's shared
+ *  rate-limit backoff (the call was never sent — live 2026-10-08 on #4450's first recovery), a rate limit, a
+ *  timeout, or a GitHub 5xx. PURE. */
+export function isTransientGhError(message) {
+  return /call not sent|rate limit|backoff|timed? ?out|ETIMEDOUT|ECONNRESET|HTTP 5\d\d|\b50[234]\b/i.test(String(message || ''));
+}
+
 /** The ledger key: one recovery budget per (PR, head, check). PURE. */
 export function hungKey({ pr, headSha, name }) {
   return `${pr}@${headSha}:${name}`;
@@ -294,8 +301,12 @@ export function planHungActions(hung, ledger, { maxReruns = DEFAULT_HUNG_MAX_RER
     const key = hungKey(h);
     const e = ledger?.[key];
     let action = 'recover';
-    // A recovery GitHub refused (cancel/re-run failed) is not retried every sweep — it escalates instead.
-    if (e && /-failed$/.test(String(e.stage || ''))) action = 'escalate';
+    const stage = String(e?.stage || '');
+    const last = (e?.actions || []).at(-1);
+    // A recovery that never reached GitHub (throttle backoff, timeout, 5xx) is retried. One GitHub actually
+    // refused (cancel/re-run failed for real) is not retried every sweep — it escalates instead.
+    if (e && /-(failed|deferred)$/.test(stage) && last && !last.ok && isTransientGhError(last.error)) action = 'recover';
+    else if (e && /-failed$/.test(stage)) action = 'escalate';
     else if (e && (e.jobIds || []).includes(h.jobId)) action = 'handled';
     else if (e && (e.reruns ?? 0) >= maxReruns) action = 'escalate';
     return { ...h, key, action };
@@ -513,15 +524,24 @@ export function sweepHungJobs({
       entry.actions = [...(entry.actions || []), a].slice(-20);
       entry.updatedAt = at;
       actions.push(a);
-      log(`ci-job-hung: ${ok ? 'RECOVER' : 'FAILED'} ${JSON.stringify({ repo: slug, ...a })}`);
+      log(`ci-job-hung: ${ok ? 'RECOVER' : isTransientGhError(error) ? 'DEFERRED' : 'FAILED'} ${JSON.stringify({ repo: slug, ...a })}`);
     };
+    // A transient failure (the call never reached GitHub, or GitHub 5xx'd) is DEFERRED — retried next sweep, and
+    // never answered with the heavier whole-run fallback. Only a real refusal falls back / ends in `-failed`.
     const rerun = (entry, h) => {
       try { rerunJob({ repo: slug, runId: h.runId, jobId: h.jobId }); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, 'rerun-job', h, true); return; }
-      catch (e) { record(entry, 'rerun-job', h, false, errText(e)); }
+      catch (e) {
+        const msg = errText(e);
+        record(entry, 'rerun-job', h, false, msg);
+        if (isTransientGhError(msg)) { entry.stage = 'rerun-deferred'; return; }
+      }
       try { rerunRun({ repo: slug, runId: h.runId }); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, 'rerun-run', h, true); }
-      catch (e) { entry.stage = 'rerun-failed'; record(entry, 'rerun-run', h, false, errText(e)); }
+      catch (e) { const msg = errText(e); entry.stage = isTransientGhError(msg) ? 'rerun-deferred' : 'rerun-failed'; record(entry, 'rerun-run', h, false, msg); }
     };
-    const runStatus = (h) => { try { return String(getRun({ repo: slug, runId: h.runId })?.status || ''); } catch { return ''; } };
+    // null = unreadable (never guessed: acting blind on an unknown run state re-ran a job whose status read had
+    // been refused, live 2026-10-08).
+    const runStatus = (h) => { try { return String(getRun({ repo: slug, runId: h.runId })?.status || '') || null; } catch (e) { return { error: errText(e) }; } };
+    const unreadable = (s) => s === null || typeof s === 'object';
 
     // 1. Pending re-runs the ledger owes (a cancel was issued on an earlier sweep).
     if (apply) {
@@ -529,6 +549,7 @@ export function sweepHungJobs({
         if (entry.stage !== 'cancel-requested') continue;
         const h = { pr: entry.pr, name: entry.name, runId: entry.runId, jobId: entry.jobIds?.at(-1) };
         const status = runStatus(h);
+        if (unreadable(status)) continue;
         if (status === 'completed') rerun(entry, h);
         else if (nowMs - Date.parse(entry.cancelRequestedAt || 0) >= CANCEL_GRACE_MS && !entry.forceCancelledAt) {
           try { forceCancelRun({ repo: slug, runId: h.runId }); entry.forceCancelledAt = at; record(entry, 'force-cancel', h, true); }
@@ -555,14 +576,18 @@ export function sweepHungJobs({
       }
       log(`ci-job-hung: DETECTED ${JSON.stringify(view)}`);
       if (!apply) continue;
+      const status = runStatus(h);
+      if (unreadable(status)) {
+        log(`ci-job-hung: DEFERRED ${JSON.stringify({ ...view, reason: `run status unreadable: ${status?.error || 'empty'}` })}`);
+        continue;
+      }
       const entry = state.hung[h.key] || (state.hung[h.key] = { pr: h.pr, headSha: h.headSha, name: h.name, reruns: 0, jobIds: [] });
-      entry.jobIds = [...(entry.jobIds || []), h.jobId];
+      entry.jobIds = [...new Set([...(entry.jobIds || []), h.jobId])];
       entry.runId = h.runId;
       entry.detectedAt = at;
-      const status = runStatus(h);
-      if (status && status !== 'completed') {
+      if (status !== 'completed') {
         try { cancelRun({ repo: slug, runId: h.runId }); entry.stage = 'cancel-requested'; entry.cancelRequestedAt = at; record(entry, 'cancel', h, true); }
-        catch (e) { entry.stage = 'cancel-failed'; record(entry, 'cancel', h, false, errText(e)); }
+        catch (e) { const msg = errText(e); entry.stage = isTransientGhError(msg) ? 'cancel-deferred' : 'cancel-failed'; record(entry, 'cancel', h, false, msg); }
       } else {
         rerun(entry, h);
       }
