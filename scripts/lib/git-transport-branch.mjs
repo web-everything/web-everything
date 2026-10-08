@@ -60,6 +60,25 @@ export function trackingRefspec(branch) {
   return `+refs/heads/${branch}:refs/remotes/origin/${branch}`;
 }
 
+/**
+ * THE PUSH-REF GUARD (operator decision 2026-10-08, after PR #4318 gave the applier workflow `contents: write`).
+ * A write token that can push is only as safe as the ref it is allowed to push to. Pure.
+ * @param {string} branch the short branch name a transport wants to push to
+ * @param {string|null} allowRef when given, the ONE full ref this transport may push (`refs/heads/<name>`)
+ * @throws {Error} on a ref that is unsafe to push (forced `+`, option-like `-`, a refspec `:`, whitespace, a
+ *   non-branch namespace) or, with `allowRef`, anything other than exactly that ref
+ */
+export function assertPushRef(branch, allowRef = null) {
+  const b = String(branch ?? '');
+  if (!b || b.startsWith('+') || b.startsWith('-') || /[\s:^~?*\[\\]|\.\.|@\{|^refs\/|\/$|\.lock$/.test(b)) {
+    throw new Error(`git-transport-branch: refusing to push unsafe ref "${b}" (no force/+, no refspec ":", no refs/ prefix, no option-like or ref-syntax characters)`);
+  }
+  if (allowRef != null && `refs/heads/${b}` !== allowRef) {
+    throw new Error(`git-transport-branch: refusing to push "refs/heads/${b}": this transport may push ONLY ${allowRef}`);
+  }
+  return `refs/heads/${b}`;
+}
+
 export function stageOnTransportBranch({
   board,
   branch,
@@ -84,8 +103,12 @@ export function stageOnTransportBranch({
   // handoff home turns it on for its first push only; the new branch is an ORPHAN (no parent, only `files`),
   // never a fork of whatever `board` has checked out.
   createIfAbsent = false,
+  // The ONE full ref this transport may push, e.g. `refs/heads/ops/review-requests`. Checked BEFORE any git call
+  // (so a refused ref fetches, checks out and writes nothing) and the push then names that full ref.
+  allowRef = null,
 } = {}) {
   if (!board || !branch) throw new TypeError('git-transport-branch: `board` and `branch` are both required');
+  assertPushRef(branch, allowRef);
   if (!files.length) throw new TypeError('git-transport-branch: nothing to stage — `files` is empty');
 
   const wt = join(board, '.operations', 'transport', `wt-${now()}`);
@@ -103,7 +126,7 @@ export function stageOnTransportBranch({
       run(['worktree', 'add', '--force', '--no-checkout', '--detach', wt, 'HEAD'], { cwd: board });
       run(['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: wt });
       run(['read-tree', '--empty'], { cwd: wt });
-      return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board });
+      return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
     }
     // AN EXPLICIT REFSPEC, never a bare `fetch origin <branch>` (#3264). The bare form writes `FETCH_HEAD` and
     // creates `refs/remotes/origin/<branch>` only when the CLONE'S CONFIGURED refspec covers it — true of a full
@@ -117,7 +140,7 @@ export function stageOnTransportBranch({
     run(['worktree', 'add', '--force', '--detach', wt, `origin/${branch}`], { cwd: board });
     run(['checkout', '-B', branch, `origin/${branch}`], { cwd: wt });
 
-    return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board });
+    return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
   } finally {
     // ALWAYS, and in this order: remove the directory, then prune the registration. Dropping either one leaves
     // the next run on this branch wedged.
@@ -129,7 +152,7 @@ export function stageOnTransportBranch({
 }
 
 /** The tail both starts share: the caller's check, the writes, and the commit + push (never a force). */
-function writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board }) {
+function writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef }) {
   if (assertReady) assertReady({ run, wt, board, branch, created });
 
   for (const file of files) {
@@ -147,7 +170,7 @@ function writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, 
 
   run(['commit', '--quiet', '-m', message], { cwd: wt });
   // A FULL refname: on a created branch the remote has no `<branch>` for a short name to resolve against.
-  run(['push', '--quiet', 'origin', created ? `HEAD:refs/heads/${branch}` : `HEAD:${branch}`], { cwd: wt });
+  run(['push', '--quiet', 'origin', created || allowRef ? `HEAD:refs/heads/${branch}` : `HEAD:${branch}`], { cwd: wt });
   return { paths: files.map((f) => f.path), pushed: true, ...(created ? { created: true } : {}) };
 }
 
