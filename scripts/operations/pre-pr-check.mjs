@@ -24,7 +24,7 @@ export function assessPrePrCheck({ checkout, decision, error = '' }) {
   // FAIL CLOSED on a malformed decision too: no boolean `risk.gated` is an unreadable answer, never "not gated".
   if (error || !decision || typeof decision.risk?.gated !== 'boolean') {
     const summary = `GATED (check failed: ${error || 'no usable decision'})`;
-    return { checkout, gated: true, needsReview: true, mode: 'unknown', why: 'check-error', reasons: [`the check itself failed: ${error || 'no usable decision'}`], commands, next: commands.text, summary, headline: `${summary} — run the review: ${commands.text}` };
+    return { checkout, gated: true, needsReview: true, mode: 'unknown', why: 'check-error', reasons: [`the check itself failed: ${error || 'no usable decision'}`], commands, next: commands.text, summary };
   }
   const risk = decision.risk || {};
   const mode = decision.settings?.mode ?? 'unknown';
@@ -37,11 +37,10 @@ export function assessPrePrCheck({ checkout, decision, error = '' }) {
     : haveReceipt
       ? 'gated, and a valid receipt exists for this head — open-pr will pass'
       : `GATED (${reasons.join('; ')}); no valid receipt (${decision.why})`;
-  const headline = needsReview ? `${summary} — run the review: ${commands.text}` : summary;
   return {
     checkout, gated, needsReview, mode, why: decision.why, reasons,
     lines: risk.lines ?? null, subsystems: risk.subsystems ?? null, files: risk.files ?? null,
-    commands, next: needsReview ? commands.text : '', summary, headline,
+    commands, next: needsReview ? commands.text : '', summary,
   };
 }
 

@@ -10,14 +10,15 @@ export const shellWord = (s) => (/^[\w@%+=:,./~-]+$/.test(s) ? s : `'${String(s)
 
 /**
  * The exact commands that produce a pre-PR review receipt for `lane` (an absolute lane root; the literal `<lane>`
- * when unknown). ONE source for the helper (`pre-pr-check`), the open-pr advise/refuse message
- * (the briefs spell the same commands in prose; their test pins the key pieces). `loop` is the part no script can run for you: drive init/step to `land` via the /converge skill.
+ * when unknown). One source for the `pre-pr-check` helper and the open-pr advise/refuse message; the briefs spell
+ * the same commands in prose, and their test pins the key pieces. `loop` is the part no script can run for you:
+ * drive init/step to `land` via the /converge skill.
  * @returns {{state: string, init: string, loop: string, commit: string, receipt: string, text: string}}
  */
 export function prePrReviewCommands(lane = '<lane>') {
-  const state = lane === '<lane>' ? '<lane>/.converge-state.json' : `${lane.replace(/\/+$/, '')}/.converge-state.json`;
-  const q = lane === '<lane>' ? lane : shellWord(lane);
-  const qs = lane === '<lane>' ? state : shellWord(state);
+  const placeholder = lane === '<lane>';
+  const state = `${lane.replace(/\/+$/, '')}/.converge-state.json`;
+  const [q, qs] = placeholder ? [lane, state] : [shellWord(lane), shellWord(state)];
   const init = `node scripts/converge-cli.mjs init --lane=${q} --state=${qs} --care=elevated --goal="<one sentence: what this work does>"`;
   const loop = 'drive `step` to `land` per skills-src/converge/SKILL.md (the /converge skill), fixing findings in the lane';
   const commit = 'commit the fixes (the receipt needs a clean tracked tree)';

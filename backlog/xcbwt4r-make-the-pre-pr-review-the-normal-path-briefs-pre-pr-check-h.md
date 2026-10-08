@@ -25,7 +25,7 @@ Hint: For any receive or write endpoint, specify the body-size cap, rate limit, 
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — the lane path is shell-quoted in the printed command; nothing from the diff is echoed.
+1. **Untrusted text** — the lane path is shell-quoted in the printed command; the only diff-derived text printed is the risk reasons (file counts, never file content) and a git error message cut to 300 characters.
 2. **Truncated reads** — n/a: the helper reads the same bounded git output as open-pr and fails closed on an unreadable diff (reports gated).
 3. **Shared state files** — n/a: read-only; it reads the receipt file and never writes it.
 4. **Fail closed** — a check error prints gated with the error, never 'not gated'.
