@@ -679,8 +679,9 @@ export const PROVENANCE_ESCAPE_MARKERS = Object.freeze(['proposed', 'does not ex
  *  mark each token. The zone runs until the next heading at the SAME OR SHALLOWER level, so a `###`
  *  subsection of `## Done when` inherits it. Verified against the historical misses this gate exists to
  *  catch: none of them lived under an escape heading (`validateTodoMarkerBlock` was under
- *  `## Where it is today`, `enforceFlipReady` in the item lede, `collectOpenItemIds` in a JSDoc block). */
-export const PROVENANCE_ESCAPE_HEADINGS = Object.freeze(['done when', 'design']);
+ *  `## Where it is today`, `enforceFlipReady` in the item lede, `collectOpenItemIds` in a JSDoc block).
+ *  `## Acceptance` is the #5399 name for `## Done when`; `## Non-goals` names things deliberately not built. */
+export const PROVENANCE_ESCAPE_HEADINGS = Object.freeze(['done when', 'acceptance', 'non-goals', 'design']);
 
 /** The region escape, for a block that quotes MANY non-resolving names (a table of historical defects, a
  *  list of illustrative proposals) where a per-token marker would be pure noise. Two lines instead of N

@@ -133,7 +133,7 @@ const GUARD_LINE_RE = /^\d+\.\s+\S.*$/gm;
  * `digestHash` covers the numbered GUARD LINES only — never the frontmatter (`dateOpened`, `scope`, a landed
  * card's `bornAs`), the intro paragraph (the #2749 loop shape names its `reviewed head` sha there) or the
  * idempotency key (which pins a head) — so the same guard for the same PR hashes identically whatever day or
- * head it was filed at. The `## Done when` boilerplate is cut before the guard lines are read. A card with no
+ * head it was filed at. The `## Acceptance` (or legacy `## Done when`) boilerplate is cut before the guard lines are read. A card with no
  * numbered guard line at all falls back to its whole body minus frontmatter.
  * @param {string} rel - `backlog/x......-*.md`, as `git status` reported it.
  * @param {string} content
@@ -148,7 +148,7 @@ export function parseOrphanCard(rel, content) {
   const sourceRef = IDEMPOTENCY_KEY_RE.exec(content)?.[1] ?? titleRef;
   const body = String(content)
     .replace(/^---\n[\s\S]*?\n---\n/, '')
-    .split(/\n##\s+Done when[\s\S]*$/)[0];
+    .split(/\n##\s+(?:Done when|Acceptance)\b[\s\S]*$/)[0];
   const guards = body.match(GUARD_LINE_RE) ?? [];
   const digestBody = guards.length ? guards.map((g) => g.trim()).join('\n') : body.trim();
   const digestHash = createHash('sha256').update(digestBody).digest('hex');
