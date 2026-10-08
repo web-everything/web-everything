@@ -5081,7 +5081,7 @@ async function runCli() {
       const engineTier = engineTierForCandidate(score);
       const gate = decideDrainReviewGate({
         escalate: score.escalate, humanRequired: score.humanRequired, labels: v.prLabels,
-        engineTier, deviation: v.deviation,
+        engineTier, deviation: v.deviation, permissionChange: Array.isArray(score.signals?.permissionChange),
       }, { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
