@@ -148,7 +148,7 @@ describe('codeql brief treats annotation text as untrusted data (x8cnbii review)
     const out = codeqlBriefSection({ checkRunId: '1', alerts: [{ rule: 'r' + bidi, path: 'packages/@we/ui/a.js', line: 1, message: 'ＳＹＳ ok' }] }, { repo: 'o/r', pr: 1 });
     expect(out).toContain('file: packages/@we/ui/a.js');
     expect(out).toContain('message: SYS ok');
-    expect(out).not.toMatch(/[‮​]/);
+    expect(out).not.toMatch(/[\u202e\u200b]/);
   });
   it('sanitizes the read error line too', () => {
     const o = codeqlBriefSection({ alerts: [], readError: 'HTTP 403 token=ghp_abcdefghijklmnopqrstuvwxyz0123456789 ```' });
