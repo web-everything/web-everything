@@ -382,7 +382,7 @@ resolve rides the SAME PR — `claim`/`release`/`resolve` all run in the lane cl
 daemon merges the PR, and an item that fails in-lane is never left `resolved` (or `active`) on `main`. It comes
 AFTER the gate (step 5), the `/converge` run (step 6) and the visual self-review (step 7), because those can still
 change the diff and whether the card is really done, and BEFORE the commit so the flip is part of it (and of the
-final-HEAD verification below). Resolve **only if every `## Done when` item of `{{ITEM_SPEC_PATH}}` holds**; if one
+final-HEAD verification below). Resolve **only if every `## Acceptance` item of `{{ITEM_SPEC_PATH}}` holds** (older cards title the section `Done when`); if one
 does not, the card is not done — leave it `active`, do not resolve over it, and say so in your one-line return
 (step 10). Never resolve to make a stop look finished, and never on a step-0 not-ready / gate-red stop.
 
@@ -542,7 +542,7 @@ daemon lands the PR. Do NOT wait for it to merge or for CI to finish — no `sle
 **conveyor skill, not by you**, on the PR number `pr-land` reported for this item in step 8; its process exit
 (merged / parked / closed) wakes the main session and re-dispatches the freed lane. Your OWN process EXIT is the
 signal you are done. Return a one-line result to the conveyor: `#{{ITEM_NUM}} → PR #<n> (ready-to-merge |
-escalated <label> | gate-red | blocked-on-infra)` — and add `, card left active: <which Done-when item does not
+escalated <label> | gate-red | blocked-on-infra)` — and add `, card left active: <which acceptance item does not
 hold>` when step 8 did not resolve it. **A red gate / red CI is NOT watcher-visible** (it reads
 only state/labels), and **`blocked-on-infra` has no PR to watch at all** — your one-line RETURN is the only
 signal that surfaces either, so always report it explicitly.

@@ -15,6 +15,8 @@
  * whole point is to take a class of finding away from the reviewer, not to give it more to read.
  */
 
+import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
+
 /**
  * @typedef {object} Finding
  * @property {string} gate the gate's name.
@@ -35,12 +37,14 @@
  * and no failing test.
  */
 
-const DONE_WHEN_RX = /^#+\s*Done[- ]when\b/im;
+/** The acceptance heading at any level: the shared task-agreement reader's rule (`## Acceptance` or its
+ *  legacy alias, #5399 S7), plus the hyphenated legacy spelling this gate has always tolerated. */
+const isAcceptanceHeading = (title) => ACCEPTANCE_HEADING_RE.test(title) || /^done-when\b/i.test(title);
 
-/** Slice a markdown body to its "Done when" section (to the next heading of the same or higher level). */
+/** Slice a markdown body to its acceptance section (to the next heading of any level). */
 export function doneWhenSection(text) {
   if (typeof text !== 'string') return null;
-  const m = text.match(DONE_WHEN_RX);
+  const m = [...text.matchAll(/^#+[ \t]*(.*)$/gm)].find((h) => isAcceptanceHeading(h[1].trim()));
   if (!m) return null;
   const start = m.index;
   const after = text.slice(start + m[0].length);
@@ -198,7 +202,7 @@ export function doneWhenCriteria(body) {
   const out = [];
   let cur = null;
   for (let i = 0; i < lines.length; i += 1) {
-    if (/^\s*\d+\.\s+/.test(lines[i])) {
+    if (/^\s*(?:\d+\.|[-*+][ \t]+\[A\d+\])\s+/i.test(lines[i])) {
       if (cur) out.push(cur);
       cur = { text: lines[i], line: i };
     } else if (cur && lines[i].trim() !== '') {
