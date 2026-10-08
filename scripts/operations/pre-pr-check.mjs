@@ -10,7 +10,7 @@
  */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { prePrReviewCommands } from '../lib/pre-pr-review.mjs';
+import { prePrReviewCommands } from '../lib/pre-pr-commands.mjs';
 
 export const PRE_PR_CHECK_OP = 'pre-pr-check';
 

@@ -22,6 +22,9 @@ import { fileURLToPath } from 'node:url';
 import { isCardPath } from '../ci-card-only.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { classifySession } from '../operations/session-role.mjs';
+import { prePrReviewCommands, shellWord } from './pre-pr-commands.mjs';
+
+export { prePrReviewCommands };
 
 export const PRE_PR_MODES = Object.freeze(['off', 'advise', 'enforce']);
 export const BUILT_IN_PRE_PR_SETTINGS = Object.freeze({ mode: 'advise', maxLines: 264, maxSubsystems: 2, maxFiles: 5 });
@@ -128,26 +131,6 @@ export const isPreparedCard = (text) => {
  *  the tree hash and `receipt` skip it. A TRACKED file of the same name is real content and still counts. */
 export const CONVERGE_SCRATCH_RE = /^\.converge-[^/]*$/;
 export const isScratchPath = (p) => CONVERGE_SCRATCH_RE.test(p) || isAllowlistedLitterPath(p);
-
-/** One shell word: left bare when it is plainly safe, else single-quoted. */
-const shellWord = (s) => (/^[\w@%+=:,./~-]+$/.test(s) ? s : `'${String(s).replace(/'/g, `'\\''`)}'`);
-
-/**
- * The exact commands that produce a pre-PR review receipt for `lane` (an absolute lane root; the literal `<lane>`
- * when unknown). ONE source for the helper (`pre-pr-check`), the open-pr advise/refuse message and the briefs'
- * tests. `loop` is the part no script can run for you: drive init/step to `land` via the /converge skill.
- * @returns {{state: string, init: string, loop: string, commit: string, receipt: string, text: string}}
- */
-export function prePrReviewCommands(lane = '<lane>') {
-  const state = lane === '<lane>' ? '<lane>/.converge-state.json' : `${lane.replace(/\/+$/, '')}/.converge-state.json`;
-  const q = lane === '<lane>' ? lane : shellWord(lane);
-  const qs = lane === '<lane>' ? state : shellWord(state);
-  const init = `node scripts/converge-cli.mjs init --lane=${q} --state=${qs} --care=elevated --goal="<one sentence: what this work does>"`;
-  const loop = 'drive `step` to `land` per skills-src/converge/SKILL.md (the /converge skill), fixing findings in the lane';
-  const commit = 'commit the fixes (the receipt needs a clean tracked tree)';
-  const receipt = `node scripts/converge-cli.mjs receipt --lane=${q} --state=${qs}`;
-  return { state, init, loop, commit, receipt, text: `1) ${init}  2) ${loop}  3) ${commit}  4) ${receipt}` };
-}
 
 /**
  * The gate decision. `skip` is a recorded bypass reason. Never throws.
