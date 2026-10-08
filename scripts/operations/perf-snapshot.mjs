@@ -10,6 +10,10 @@
  *   - standards run time split scoped vs unscoped (a `--files=` check:standards is scoped);
  *   - CI wall per code PR, per test shard, soak shard, `test` job and card-only PRs (gh job timings);
  *   - code vs card-only PR counts and time-to-merge;
+ *   - VELOCITY (held card 129, `./perf-velocity.mjs`): story points resolved per day and per hour (ET), read from the card
+ *     history through `bornAs` and the `x<hash>` to `NNN` rename (real, sized cards), PRs merged per hour code vs card-only, and
+ *     points estimated from the PR brief for PRs with no sized card (`source: "estimated-from-brief"`, kept apart, calibrated
+ *     on sized-card PRs; `--estimate` runs the cheap model, rows persist in `perf-estimates.jsonl` beside the store);
  *   - change-request rounds, findings and fix minutes by root cause (the coroner `changeRequests` records, with the
  *     sweep's own keyword pass splitting round-1 findings into "checklist lacked it" vs "reinvented a primitive");
  *   - the attribute predictors of extra rounds (bucket means);
@@ -33,6 +37,7 @@
  */
 import { op } from './registry.mjs';
 import { compute, effect as effectStep } from './step-kinds.mjs';
+import { velocityLabel } from './perf-velocity.mjs';
 
 export const PERF_SNAPSHOT_OP = 'perf-snapshot';
 export const PERF_SNAPSHOT_EFFECT = 'perf-snapshot.run';
@@ -359,6 +364,9 @@ const AREA = [
 
 /** Sign convention: `better`, `worse`, or `neutral`. PURE. */
 export function judge(key, from, to) {
+  // Velocity is output, so a rise is good: points and PRs per time. Merge counts are volume (neutral).
+  if (/^velocity\.(points\.|prs\.\w+\.perHour$)/.test(key)) return to > from ? 'better' : to < from ? 'worse' : 'neutral';
+  if (/^velocity\.prs\.\w+\.merged$/.test(key)) return 'neutral';
   if (NEUTRAL_RE.test(key) || from === to) return 'neutral';
   return to < from ? 'better' : 'worse';
 }
@@ -379,7 +387,7 @@ export function diffSnapshots(ref, cur, { minPct = 5, minAbs = 0.05 } = {}) {
     const delta = b - a, pct = a === 0 ? null : (delta / Math.abs(a)) * 100;
     // Predictor buckets are means over a handful of PRs: a move under a quarter of a round is sampling noise.
     if (Math.abs(delta) < (/^pred\d*\./.test(key) ? 0.25 : minAbs) || (pct !== null && Math.abs(pct) < minPct)) continue;
-    changes.push({ key, from: was.v, to: now.v, delta: r1(delta * 100) / 100, pct: pct === null ? null : r1(pct), verdict: judge(key, a, b), approx: was.source === OPUS_REPORT || now.source === OPUS_REPORT, unit: now.unit ?? was.unit ?? '' });
+    changes.push({ key, from: was.v, to: now.v, delta: r1(delta * 100) / 100, pct: pct === null ? null : r1(pct), verdict: judge(key, a, b), approx: was.source === OPUS_REPORT || now.source === OPUS_REPORT, unit: now.unit ?? was.unit ?? '', source: now.source ?? was.source ?? '' });
   }
   return changes.sort((x, y) => (x.key < y.key ? -1 : 1));
 }
@@ -406,7 +414,7 @@ export function formatDiff(title, ref, cur, merged, opts = {}) {
     const tag = tagChange(c.key, merged);
     const prs = tag.prs.length ? ` PRs ${tag.prs.map((n) => `#${n}`).join(' ')}${tag.more ? ` (+${tag.more} others merged)` : ''}` : tag.more ? ` (${tag.more} PRs merged, none match this area)` : '';
     const pct = c.pct === null ? '' : `, ${c.pct > 0 ? '+' : ''}${c.pct}%`;
-    lines.push(`  ${c.verdict === 'better' ? 'better' : c.verdict === 'worse' ? 'WORSE ' : 'moved '} ${c.key}: ${c.approx ? '~' : ''}${fmtV(c.from)} -> ${fmtV(c.to)} ${c.unit}${pct}${prs}`);
+    lines.push(`  ${c.verdict === 'better' ? 'better' : c.verdict === 'worse' ? 'WORSE ' : 'moved '} ${c.key}${velocityLabel(c.key, c.source)}: ${c.approx ? '~' : ''}${fmtV(c.from)} -> ${fmtV(c.to)} ${c.unit}${pct}${prs}`);
   }
   lines.push(`  (${changes.length} of ${compared} compared metrics moved; "~" = one side is a report-sourced estimate)`);
   return lines;
@@ -431,7 +439,7 @@ export function shapePerfRead(raw) {
 }
 
 /** What a run would do. PURE. A backfill needs the archived baseline data; a snapshot needs nothing but the sources. */
-export function planPerfSnapshot(read, { apply = false, backfill = false, hours = 24, noCi = false } = {}) {
+export function planPerfSnapshot(read, { apply = false, backfill = false, hours = 24, noCi = false, estimate = false, estimateCap = 300 } = {}) {
   const refused = backfill && !read.archiveFound ? `no archived baseline data at ${read.archive}` : backfill && read.hasBaseline ? 'the baseline row already exists in the store (backfill is idempotent: nothing to do)' : null;
   const h = Number.isFinite(Number(hours)) && Number(hours) >= 1 ? Math.min(Math.floor(Number(hours)), 168) : 24;
   return {
@@ -440,9 +448,11 @@ export function planPerfSnapshot(read, { apply = false, backfill = false, hours 
     backfill: backfill === true,
     hours: h,
     noCi: noCi === true,
+    estimate: estimate === true && !backfill,
+    estimateCap: Number.isFinite(Number(estimateCap)) && Number(estimateCap) >= 0 ? Math.min(Math.floor(Number(estimateCap)), 1000) : 300,
     steps: backfill
       ? [`read ${read.archive}/coroner-24h.json + coroner-48h.json`, 'derive the metrics from the raw coroner JSON', 'add the report-sourced standards ranges (source "opus-report")', `append the ${BASELINE_DATE} baseline row to ${read.store}`]
-      : [`coroner window: last ${h} h`, 'derive the metrics (verify markers, admission ledgers, tick log, gh, change requests, fix outcomes, executors)', `keep the raw coroner JSON under ${read.dir}/<date>/`, `append one snapshot row to ${read.store}`, 'print the diff vs the baseline and vs the last snapshot'],
+      : [`coroner window: last ${h} h`, 'derive the metrics (verify markers, admission ledgers, tick log, gh, change requests, fix outcomes, executors, velocity from the card history)', ...(estimate ? [`calibrate the size estimator on sized-card PRs, then estimate up to ${estimateCap} unsized merged PRs from their briefs (perf-estimates.jsonl, source "${'estimated-from-brief'}")`] : []), `keep the raw coroner JSON under ${read.dir}/<date>/`, `append one snapshot row to ${read.store}`, 'print the diff vs the baseline and vs the last snapshot'],
     lastDate: read.rows.at(-1)?.date ?? null,
   };
 }
@@ -475,19 +485,22 @@ export function perfSnapshotOperation({ readFacts } = {}) {
       hours: { type: 'number', required: false, default: 24 },
       // Skip every gh read (CI wall, merged-PR tags, coroner CI + rounds). Offline runs are marked in the row's notes.
       noCi: { type: 'boolean', required: false, default: false },
+      // Run the cheap-model size estimator (calibration first) for unsized merged PRs; spends a little model budget.
+      estimate: { type: 'boolean', required: false, default: false },
+      estimateCap: { type: 'number', required: false, default: 300 },
     },
     verdictFrom: 'plan',
     read: compute({ reads: ['input.store'], fn: (view) => shapePerfRead(readFacts({ store: view.input.store })) }),
     plan: compute({
-      reads: ['findings.read', 'input.apply', 'input.backfill', 'input.hours', 'input.noCi'],
-      fn: (view) => planPerfSnapshot(view.findings.read, { apply: view.input.apply, backfill: view.input.backfill, hours: view.input.hours, noCi: view.input.noCi }),
+      reads: ['findings.read', 'input.apply', 'input.backfill', 'input.hours', 'input.noCi', 'input.estimate', 'input.estimateCap'],
+      fn: (view) => planPerfSnapshot(view.findings.read, { apply: view.input.apply, backfill: view.input.backfill, hours: view.input.hours, noCi: view.input.noCi, estimate: view.input.estimate, estimateCap: view.input.estimateCap }),
     }),
     apply: effectStep({
       reads: ['verdict', 'findings.read'],
       effects: (view) => {
         if (!view.verdict?.apply) return [];
         const r = view.findings.read;
-        return [{ type: PERF_SNAPSHOT_EFFECT, idempotent: view.verdict.backfill, payload: { store: r.store, dir: r.dir, now: r.now, archive: r.archive, backfill: view.verdict.backfill, hours: view.verdict.hours, noCi: view.verdict.noCi } }];
+        return [{ type: PERF_SNAPSHOT_EFFECT, idempotent: view.verdict.backfill, payload: { store: r.store, dir: r.dir, now: r.now, archive: r.archive, backfill: view.verdict.backfill, hours: view.verdict.hours, noCi: view.verdict.noCi, estimate: view.verdict.estimate, estimateCap: view.verdict.estimateCap } }];
       },
     }),
   });
