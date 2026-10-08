@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { describe, it, expect, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -116,6 +116,70 @@ describe('digest', () => {
     gateAlert({ title: 'r' }, { send: () => ({ ok: true }), env, now: ET('01:00') });
     expect(flushDigest({ send: () => ({ ok: false }), env, now: ET('08:00') }).flushed).toBe(false);
     expect(readdirSync(join(dir, 'digest'))).toContain('held.jsonl');
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1);
+  });
+
+  // Variants of "the queue was claimed (renamed away), then something went wrong before delivery was confirmed".
+  const heldFixture = (n = 2) => {
+    const dir = mkdtempSync(join(tmpdir(), 'quiet-'));
+    const settingsPath = join(dir, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify({ digestDir: join(dir, 'digest'), toggleFile: join(dir, 'none.json') }));
+    const env = { WE_QUIET_HOURS_SETTINGS: settingsPath };
+    for (let i = 1; i <= n; i += 1) gateAlert({ title: `r${i}` }, { send: () => ({ ok: true }), env, now: ET('01:00') });
+    return { dir, env, digest: join(dir, 'digest') };
+  };
+
+  it('IO: a throwing sender restores claimed entries for retry', () => {
+    const { env, digest } = heldFixture();
+    const r = flushDigest({ send: () => { throw new Error('boom'); }, env, now: ET('08:00') });
+    expect(r.flushed).toBe(false);
+    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(2);
+  });
+
+  it('IO: a digest file write failure restores claimed entries for retry', () => {
+    const { env, digest } = heldFixture();
+    mkdirSync(join(digest, 'latest-digest.md')); // writeFileSync onto a directory throws EISDIR after the md write
+    const send = vi.fn(() => ({ ok: true }));
+    expect(flushDigest({ send, env, now: ET('08:00') }).flushed).toBe(false);
+    expect(send).not.toHaveBeenCalled();
+    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    rmSync(join(digest, 'latest-digest.md'), { recursive: true });
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(2);
+  });
+
+  it('IO: a stale claim left by a crashed flusher is recovered by the next flush', () => {
+    const { env, digest } = heldFixture();
+    renameSync(join(digest, 'held.jsonl'), join(digest, `held.jsonl.flushing-4242-${ET('08:00')}`)); // crash right after the claim
+    expect(existsSync(join(digest, 'held.jsonl'))).toBe(false);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:05') }).flushed).toBe(false); // claim is young — maybe a live flusher
+    expect(readdirSync(digest).some((f) => f.includes('.flushing-4242-'))).toBe(true);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('09:00') }).count).toBe(2); // an hour old — recovered and sent
+    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+  });
+
+  it('IO: a stale claim merges with entries held since (nothing lost, one digest)', () => {
+    const { env, digest } = heldFixture(1);
+    renameSync(join(digest, 'held.jsonl'), join(digest, `held.jsonl.flushing-4242-${ET('07:00')}`));
+    gateAlert({ title: 'later' }, { send: () => ({ ok: true }), env, now: ET('22:30', '2026-10-09') }); // held again, next night
+    const sent = [];
+    expect(flushDigest({ send: (n) => { sent.push(n); return { ok: true }; }, env, now: ET('08:00', '2026-10-10') }).count).toBe(2);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('IO: a torn tail on the queue does not swallow the next held alert', () => {
+    const { env, digest } = heldFixture(1);
+    appendFileSync(join(digest, 'held.jsonl'), '{"at":"2026-10-09T02:00:00Z","title":"torn'); // a writer died mid-line, no newline
+    gateAlert({ title: 'after-tear' }, { send: () => ({ ok: true }), env, now: ET('03:00') });
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') }).count).toBe(2); // r1 + after-tear; only the torn line is lost
+  });
+
+  it('IO: a claim stamped in the future is swept too, and a failed send re-queues the raw lines', () => {
+    const { env, digest } = heldFixture(1);
+    renameSync(join(digest, 'held.jsonl'), join(digest, `held.jsonl.flushing-4242-${ET('08:00') + 24 * 3600_000}`));
+    expect(flushDigest({ send: () => ({ ok: false }), env, now: ET('08:00') }).flushed).toBe(false);
+    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    expect(readFileSync(join(digest, 'held.jsonl'), 'utf8')).toMatch(/"title":"r1"/);
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1);
   });
 
