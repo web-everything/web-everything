@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   classifyBuildDelivery, prBelongsToBuild, cardStatusFromText, cardOpenedFromText, readBuildDelivery, defaultListBuildPrs,
-  defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE,
+  defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isDocsOnlyPr, isBacklogOnlyPr,
 } from '../build-delivery-evidence.mjs';
-import { NON_IMPLEMENTING_REF_RE as IO_NON_IMPLEMENTING_REF_RE } from '../../operations/dispatch-lane-io.mjs';
+import { NON_IMPLEMENTING_REF_RE as IO_NON_IMPLEMENTING_REF_RE, filterAlreadyDoneCandidates } from '../../operations/dispatch-lane-io.mjs';
 import { publicationTitle } from '../../operations/machine-pr-title.mjs';
 
 const pr = (over) => ({ number: 1, state: 'OPEN', title: 'WE #4388: build', headRefName: 'lane/4388-fix', mergedAt: null, url: 'u', ...over });
@@ -149,11 +149,87 @@ describe('IO shell fails soft', () => {
   it('defaultListBuildPrs asks gh for ALL states by branch prefix and parses rows; a gh failure is null', () => {
     let argv;
     const rows = defaultListBuildPrs('4388', { exec: (_f, a) => { argv = a; return JSON.stringify([pr({})]); } });
-    expect(argv).toEqual(expect.arrayContaining(['--state', 'all', '--search', 'head:lane/4388-']));
-    expect(argv[argv.indexOf('--json') + 1].split(',')).toContain('isCrossRepository');
+    expect(argv).toEqual(expect.arrayContaining(['--state', 'all', '--search', 'head:lane/4388']));
+    expect(argv[argv.indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['isCrossRepository', 'files']));
     // fork rows are dropped AFTER the page limit, so the page must be wide enough that forks cannot crowd out the real PR
     expect(Number(argv[argv.indexOf('--limit') + 1])).toBeGreaterThanOrEqual(100);
     expect(rows).toHaveLength(1);
     expect(defaultListBuildPrs('4388', { exec: () => { throw new Error('x'); } })).toBeNull();
+  });
+});
+
+// Review of PR #4361 (policy ruling on head d7a3b14ac): the delivery gate must agree with the already-done gate
+// about backlog-only PRs, and its production query must reach every ref shape `prBelongsToBuild` accepts.
+describe('a backlog-only PR does not suppress the implementation build', () => {
+  const md = [{ path: 'backlog/4388-x.md' }, { path: 'backlog/index.md' }];
+  const code = [{ path: 'backlog/4388-x.md' }, { path: 'scripts/x.mjs' }];
+  it('isDocsOnlyPr: every changed file .md; absent or empty files never says docs-only', () => {
+    expect(isDocsOnlyPr({ files: md })).toBe(true);
+    expect(isDocsOnlyPr({ files: ['a.MD'] })).toBe(true);
+    expect(isDocsOnlyPr({ files: code })).toBe(false);
+    for (const files of [undefined, null, [], 'x']) expect(isDocsOnlyPr({ files })).toBe(false);
+  });
+  it('the delivery gate excludes only BACKLOG-only PRs: a doc card built by a non-backlog .md PR is still delivered', () => {
+    expect(isBacklogOnlyPr({ files: md })).toBe(true);
+    expect(isBacklogOnlyPr({ files: [{ path: 'backlog/a.md' }, { path: 'skills-src/conveyor/brief.md' }] })).toBe(false);
+    for (const files of [undefined, [], [{ path: 'backlog/a.mjs' }]]) expect(isBacklogOnlyPr({ files })).toBe(false);
+    const docCard = pr({ number: 79, state: 'OPEN', headRefName: 'lane/4388-brief', files: [{ path: 'skills-src/conveyor/brief.md' }, { path: 'backlog/4388-x.md' }] });
+    expect(classifyBuildDelivery({ num: '4388', prs: [docCard], cardStatus: 'open' })).toMatchObject({ outcome: 'pr-open', pr: 79 });
+  });
+  it.each([
+    ['merged, on the card lane ref, unrecognized title (a JIT-number commit)', { state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'drain: JIT-number x', headRefName: 'lane/4388-jit' }],
+    ['merged, title merely names the number', { state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'file the prevention card for 4388', headRefName: 'lane/other' }],
+    ['open, title merely names the number', { state: 'OPEN', title: 'prevention card for #4388', headRefName: 'lane/other' }],
+    ['open, on the card lane ref', { state: 'OPEN', headRefName: 'lane/4388b-notes' }],
+  ])('%s', (_name, over) => {
+    const row = pr({ number: 77, files: md, ...over });
+    expect(prBelongsToBuild(row, '4388')).toBe(false);
+    expect(classifyBuildDelivery({ num: '4388', prs: [row], cardStatus: 'open' })).toBeNull();
+    expect(readBuildDelivery('4388', { listPrs: () => [row], readCardStatus: () => 'open', readCardOpened: () => null })).toBeNull();
+  });
+  it('the same row with a code file still counts, and both gates agree on the same fixtures', () => {
+    const row = pr({ number: 78, state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'WE #4388: build', files: code });
+    expect(classifyBuildDelivery({ num: '4388', prs: [row] })).toMatchObject({ outcome: 'pr-merged', pr: 78 });
+    for (const files of [md, code]) {
+      const merged = pr({ state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'WE #4388: build', files });
+      expect(prBelongsToBuild(merged, '4388')).toBe(filterAlreadyDoneCandidates([merged], '4388').length === 1);
+    }
+  });
+});
+
+describe('the production query reaches every ref shape prBelongsToBuild accepts', () => {
+  // A gh stub with the real search semantics: `head:<prefix>` is a branch-PREFIX match on the head ref.
+  const ghWith = (all) => (_f, a) => {
+    const prefix = a[a.indexOf('--search') + 1].replace(/^head:/, '');
+    return JSON.stringify(all.filter((r) => r.headRefName.startsWith(prefix)));
+  };
+  it.each([
+    ['lane/4480-slug'], ['lane/4480b-slug'], ['lane/4480z-slug'], ['lane/4480'], ['lane/4480b'],
+  ])('%s is returned by defaultListBuildPrs and belongs to the build', (headRefName) => {
+    const row = pr({ number: 3074, state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'WE #4480: gate-failure fix', headRefName });
+    expect(prBelongsToBuild(row, '4480')).toBe(true);
+    const listed = defaultListBuildPrs('4480', { exec: ghWith([row]) });
+    expect(listed.map((r) => r.number)).toEqual([3074]);
+    expect(readBuildDelivery('4480', { listPrs: (n) => defaultListBuildPrs(n, { exec: ghWith([row]) }), readCardStatus: () => 'open', readCardOpened: () => null }))
+      .toMatchObject({ outcome: 'pr-merged', pr: 3074 });
+  });
+  it('replay card 4480: a closed first PR plus a merged retry-letter PR is delivered', () => {
+    const closed = pr({ number: 3070, state: 'CLOSED', title: 'WE #4480: build', headRefName: 'lane/4480-first' });
+    const retry = pr({ number: 3074, state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'WE #4480: gate-failure fix', headRefName: 'lane/4480b-prepare-stamp-works-on-an-actively-claimed-card-without-rese' });
+    expect(readBuildDelivery('4480', { listPrs: (n) => defaultListBuildPrs(n, { exec: ghWith([closed, retry]) }), readCardStatus: () => 'open', readCardOpened: () => null }))
+      .toMatchObject({ outcome: 'pr-merged', pr: 3074 });
+  });
+  it('the wider prefix also lists other cards (lane/44801-…); they are dropped by ref, never delivery', () => {
+    const other = pr({ number: 9, state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'WE #44801: other', headRefName: 'lane/44801-other' });
+    expect(prBelongsToBuild(other, '4480')).toBe(false);
+    expect(defaultListBuildPrs('4480', { exec: ghWith([other]) })).toEqual([]);
+  });
+  it('a 3-digit card: another card sharing the digits whose TITLE names this card cannot suppress its build', () => {
+    // card 448, query head:lane/448 also returns lane/4481-…; its title mentions "#448" so titleRe alone would accept it
+    const other = pr({ number: 10, state: 'OPEN', title: 'WE #4481: follow-up to #448', headRefName: 'lane/4481-follow-up' });
+    const mine = pr({ number: 11, state: 'MERGED', mergedAt: '2026-10-07T10:00:00Z', title: 'WE #448: build', headRefName: 'lane/448b-retry' });
+    const io = (all) => ({ listPrs: (n) => defaultListBuildPrs(n, { exec: ghWith(all) }), readCardStatus: () => 'open', readCardOpened: () => null });
+    expect(readBuildDelivery('448', io([other]))).toBeNull();
+    expect(readBuildDelivery('448', io([other, mine]))).toMatchObject({ outcome: 'pr-merged', pr: 11 });
   });
 });

@@ -63,7 +63,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
-import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isNonImplementingPr } from '../conveyor/build-delivery-evidence.mjs';
+import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isNonImplementingPr, isDocsOnlyPr } from '../conveyor/build-delivery-evidence.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
@@ -3032,7 +3032,7 @@ export function filterAlreadyDoneCandidates(prs, num) {
     .filter((p) => !isNonImplementingPr(p))
     // #3473 guard 4 — an all-.md changed-file set is pure backlog/doc housekeeping, never a real delivery.
     // A no-op when `files` is absent from the row (existing fixtures that don't set it stay green).
-    .filter((p) => !(Array.isArray(p?.files) && p.files.length > 0 && p.files.every((f) => /\.md$/i.test(String(f?.path ?? f)))))
+    .filter((p) => !isDocsOnlyPr(p))
     // #3473 guard 5 — the PR's own body explicitly disclaims resolving THIS id. A no-op when `body` is absent.
     .filter((p) => !disclaimerRe.test(String(p?.body ?? '')))
     // #3473 guard 6 — a blanket "no code changes" disclaimer excludes the PR outright (backstop for guard 4

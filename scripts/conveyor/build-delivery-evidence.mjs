@@ -67,10 +67,36 @@ export function isNonImplementingPr(pr) {
   return HASHED_AUTHORING_REF_RE.test(ref) || title === '';
 }
 
+/**
+ * Is this PR pure backlog/doc housekeeping: it has changed files and EVERY one is `.md`? THE one definition
+ * (#3473 guard 4): `filterAlreadyDoneCandidates` in `dispatch-lane-io` imports it, and {@link prBelongsToBuild}
+ * applies a backlog-only form of it ({@link isBacklogOnlyPr}), so the two "was this card already built?" readers cannot disagree about a backlog-only PR (a
+ * JIT-number commit, a "file the prevention card" PR) that merely sits on the card's lane ref or names its number.
+ * A no-op (false) when `files` is absent or empty, so a row from a list that did not request `files` is unchanged. PURE.
+ */
+export function isDocsOnlyPr(pr) {
+  const files = pr?.files;
+  return Array.isArray(files) && files.length > 0 && files.every((f) => /\.md$/i.test(String(f?.path ?? f)));
+}
+
 /** Settled outcomes this module can name, in preference order when several PRs match. */
 export const DELIVERY_OUTCOMES = Object.freeze(['pr-merged', 'pr-open', 'card-resolved']);
 
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Is this PR backlog housekeeping only: it has changed files and EVERY one is a `.md` under `backlog/`? The delivery
+ * gate uses this NARROWER form of {@link isDocsOnlyPr}: a card whose real deliverable is a doc (a `skills-src/` brief,
+ * a `docs/` page) is genuinely built by an all-`.md` PR, and treating it as undelivered would relaunch a duplicate
+ * build. A false hold is recoverable; a duplicate build is not. PURE.
+ */
+export function isBacklogOnlyPr(pr) {
+  const files = pr?.files;
+  return isDocsOnlyPr(pr) && files.every((f) => /^backlog\//.test(String(f?.path ?? f)));
+}
+
+/** The lane-ref shape of card `key`'s builds: `lane/<key>`, an optional retry letter, then `-` or end. PURE. */
+const laneRefRe = (key) => new RegExp(`^lane/${escapeRe(key)}[a-z]?(?:-|$)`, 'i');
 
 /** Does this PR row belong to card `num` as a build? PURE. */
 export function prBelongsToBuild(pr, num) {
@@ -81,7 +107,10 @@ export function prBelongsToBuild(pr, num) {
   if (pr.isCrossRepository === true) return false;
   const ref = String(pr.headRefName ?? '');
   if (isNonImplementingPr(pr)) return false;
-  const refRe = new RegExp(`^lane/${escapeRe(key)}[a-z]?(?:-|$)`, 'i');
+  // Backlog-only housekeeping on the card's ref or naming its number is not a build, open or merged (the same
+  // exclusion the already-done gate applies, review of PR #4361). Otherwise the build is silently skipped.
+  if (isBacklogOnlyPr(pr)) return false;
+  const refRe = laneRefRe(key);
   const titleRe = new RegExp(`(^|[^0-9])${escapeRe(key)}([^0-9]|$)`);
   return refRe.test(ref) || titleRe.test(String(pr.title ?? ''));
 }
@@ -159,15 +188,24 @@ export function defaultReadCardOpened(num, io = {}) {
   return cardOpenedFromText(readCardTextOnMain(num, io));
 }
 
-/** PRs (any state) on a `lane/<num>-` branch (a branch-PREFIX lookup: `--head` is exact-match only). null = the read failed. */
+/**
+ * PRs (any state) on a `lane/<num>` branch (a branch-PREFIX lookup: `--head` is exact-match only). null = the read failed.
+ * The prefix deliberately has NO trailing `-`: {@link prBelongsToBuild} accepts a retry-letter ref (`lane/4480b-…`),
+ * which `head:lane/4480-` can never return (verified live: it misses PR #3074). The wider prefix also returns other
+ * cards that merely start with the same digits (`lane/44801-…`); those are dropped here by ref, before any title test.
+ * `files` rides along so a backlog-only PR can be excluded ({@link isBacklogOnlyPr}).
+ */
 export function defaultListBuildPrs(num, { exec = execFileSyncThrottled, cwd = process.cwd() } = {}) {
   try {
     const key = normNum(num);
-    const out = exec('gh', ['pr', 'list', '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--state', 'all', '--search', `head:lane/${key}-`,
-      '--limit', '100', '--json', 'number,state,title,headRefName,mergedAt,url,isCrossRepository'],
+    const out = exec('gh', ['pr', 'list', '--repo', ghRepoSlug(DEFAULT_REPO_KEY), '--state', 'all', '--search', `head:lane/${key}`,
+      '--limit', '100', '--json', 'number,state,title,headRefName,mergedAt,url,isCrossRepository,files'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 4 * 1024 * 1024, timeout: 30_000, killSignal: 'SIGKILL', cwd });
     const parsed = JSON.parse(String(out));
-    return Array.isArray(parsed) ? parsed : null;
+    // The query is by REF prefix, so only a row whose ref is this card's own can be evidence: a card sharing the
+    // digit prefix (`lane/4481-…` for card 448) must not reach the title test and suppress this card's build.
+    const ours = laneRefRe(key);
+    return Array.isArray(parsed) ? parsed.filter((p) => ours.test(String(p?.headRefName ?? ''))) : null;
   } catch { return null; }
 }
 
