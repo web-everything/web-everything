@@ -2299,12 +2299,21 @@ function isSanctionedHeartbeat(command, { runInBackground = false, heartbeatMaxS
   const m = String(command || '').trim().match(/^sleep\s+(\d+)$/);
   return !!m && Number(m[1]) <= heartbeatMaxSeconds;
 }
-const POLLING_ADVICE = ' Do not wait in a shell. Instead: (a) END YOUR TURN and let the harness/daemon resume you (the #5137 await-verify flow — '
-  + 'request the gate, report what is pending, stop); (b) for the verify gate use ONE bounded foreground call, '
-  + '`node scripts/verify-lane.mjs check --wait=540000 --json` (it polls internally); or (c) report what is still pending and finish. '
-  + 'Ordinary non-waiting loops (`for f in *.mjs; do …; done`) and a short `sleep` (<= the limit) are fine. No override.';
+const POLLING_TAIL = 'Ordinary non-waiting loops (`for f in *.mjs; do …; done`) and a short `sleep` (<= the limit) are fine. No override.';
+// A SUBAGENT / dispatched worker is never resumed by anything: "end your turn and wait" stalled two background
+// agents for hours. So an agent is told to check ONCE, then keep going, or finish and report what is pending.
+const POLLING_ADVICE_AGENT = ' Do not wait in a shell, and do NOT end your turn to wait: nothing resumes a subagent or worker, so it would sit idle forever. '
+  + 'Instead: (a) do ONE bounded check right now (a single read, or for the verify gate ONE foreground call, '
+  + '`node scripts/verify-lane.mjs check --wait=540000 --json`, which polls internally; use one bounded `--wait=` call wherever the tool has it); '
+  + '(b) then CONTINUE with the next step of your task; (c) if nothing else is left, FINISH and report what is still pending (the daemon owns it from there). '
+  + POLLING_TAIL;
+const POLLING_ADVICE_INTERACTIVE = ' Do not wait in a shell. Instead: (a) do ONE bounded check now, then carry on with other work; '
+  + '(b) for the verify gate use ONE bounded foreground call, `node scripts/verify-lane.mjs check --wait=540000 --json` (it polls internally); '
+  + 'or (c) report what is still pending and stop (you, the operator, resume this session; the #5137 await-verify flow covers dispatched work). '
+  + POLLING_TAIL;
 /** The DENY reason for a polling loop / long sleep, else null. Pure; every session kind. `settings` is injectable for tests. */
-export function pollingLoopReason(command, { runInBackground = false, settings = loadPollingSettings() } = {}) {
+export function pollingLoopReason(command, { runInBackground = false, settings = loadPollingSettings(), agentSession = false } = {}) {
+  const POLLING_ADVICE = agentSession ? POLLING_ADVICE_AGENT : POLLING_ADVICE_INTERACTIVE;
   const raw = heredocScan(String(command || '')).text;
   if (!raw.trim()) return null;
   if (isSanctionedHeartbeat(raw, { runInBackground, heartbeatMaxSeconds: settings.heartbeatMaxSeconds })) return null;
@@ -4162,7 +4171,7 @@ export function decide(command, ctx = {}) {
   const waitPoll = agentWaitPollReason(command, { agentSession: ctx.agentSession });
   if (waitPoll) return waitPoll;
   // NO-POLLING — every session kind; after the agent-specific wait-poll arm so that one keeps its sharper message.
-  const polling = pollingLoopReason(fullCommand, { runInBackground: ctx.runInBackground });
+  const polling = pollingLoopReason(fullCommand, { runInBackground: ctx.runInBackground, agentSession: ctx.agentSession });
   if (polling) return polling;
   // #2968 — the pipe/xargs, while-read, and `-exec` enumerate-then-`git add` sink shapes all need more than
   // one segment to see (the enumeration source is a DIFFERENT segment, or the `git add` sits inside a
