@@ -1222,9 +1222,10 @@ function missingRunBodyHasExactLine(body, line) {
  * EVERY attempt marker regardless of outcome — a permanently-failing trigger must still trip the cap. PURE.
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @param {string|null} [headSha]
+ * @param {{baseRefName?:(string|null)}} [o] - the PR's CURRENT base; stacked-refusal markers from another base are stale
  * @returns {number}
  */
-export function countMissingRunComments(comments, headSha = null) {
+export function countMissingRunComments(comments, headSha = null, { baseRefName = null } = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (const c of comments) {
@@ -1236,6 +1237,11 @@ export function countMissingRunComments(comments, headSha = null) {
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
     // xgq539z — legacy wrong-owner credential refusals (see MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL) are not counted.
     if (body.includes(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL)) continue;
+    // A "stacked" refusal is bound to the base it was posted under. Once the drain retargets the PR (base changed,
+    // head sha unchanged), that refusal is stale: it said nothing about whether a push can start CI on the NEW
+    // base. Counting it burned the cap before the PR could ever be recovered (plateau-app #217, 2026-10-08).
+    const stackedBase = body.match(/PR is stacked or from a fork \(base ([^,\s)]+),/);
+    if (stackedBase && baseRefName && stackedBase[1] !== baseRefName) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
     n += 1;
   }

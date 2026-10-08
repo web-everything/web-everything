@@ -994,6 +994,42 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
     expect(result.dispatch).toEqual([]);
   });
 
+  // Live incident, plateauapp/plateau-app#217 (2026-10-08): stacked on #216, so two missing-run attempts were refused
+  // "stacked" and BOTH counted against the per-sha cap. Once #216 landed and the drain retargeted #217 to main (same
+  // head sha), the cap was already spent and the PR sat with no test/e2e forever. A stacked refusal is bound to the
+  // base it was posted under: after the retarget it is stale and must not count.
+  const PR_217 = {
+    number: 217, headRefName: 'lane/xadunn9-wip-deeplinks', baseRefName: 'main',
+    headRefOid: '8f8d2d05af6251de0688d219815f89b6179b8b13', mergeable: 'MERGEABLE', labels: [{ name: 'checking' }],
+    statusCheckRollup: [{ __typename: 'CheckRun', name: 'admit', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'Deploy alpha (temporary)' }],
+  };
+  const STACKED_217 = (n) => ({
+    body: `🚦 conveyor missing-run-recovery\n\nbranch: lane/xadunn9-wip-deeplinks\nsha: ${PR_217.headRefOid}\n\nconveyor missing-run-recovery attempted to trigger CI (pull-request-push) and it FAILED: PR is stacked or from a fork (base lane/xwtnr2y-sessions-page, head repo plateauapp/plateau-app); missing-run push recovery only handles same-repo PRs on main (attempt ${n})`,
+    author: { login: 'web-everything' },
+  });
+  it('plateau-app #217: stacked-refusal markers from the OLD base do not burn the cap after the retarget to main', () => {
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push', newHeadSha: 'c'.repeat(40) }));
+    const result = sweepMissingRunRecovery({
+      apply: true, repo: 'plateauapp/plateau-app', readOpenPrs: () => [PR_217], readRequiredContexts: () => null,
+      readDeclaredContexts: () => ['test', 'e2e'], readHeadCommittedAt: () => '2026-10-08T09:27:50Z',
+      readComments: () => [STACKED_217(1), STACKED_217(2)], trigger, postComment: vi.fn(), clearLabel: vi.fn(() => true),
+      now: Date.parse('2026-10-08T12:30:00Z'),
+    });
+    expect(result.refusals.filter((r) => r.kind === 'missing-run-cap-exhausted')).toEqual([]);
+    expect(result.dispatch.map((d) => d.prNumber)).toEqual([217]);
+    expect(trigger).toHaveBeenCalledTimes(1);
+  });
+  it('plateau-app #217: while it is STILL stacked on the same base, the markers still count (cap unchanged)', () => {
+    const trigger = vi.fn();
+    const result = sweepMissingRunRecovery({
+      apply: true, repo: 'plateauapp/plateau-app', readOpenPrs: () => [{ ...PR_217, baseRefName: 'lane/xwtnr2y-sessions-page' }],
+      readRequiredContexts: () => null, readDeclaredContexts: () => ['test', 'e2e'], readHeadCommittedAt: () => '2026-10-08T09:27:50Z',
+      readComments: () => [STACKED_217(1), STACKED_217(2)], trigger, now: Date.parse('2026-10-08T12:30:00Z'),
+    });
+    expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 217, kind: 'missing-run-cap-exhausted' })]);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+
   // Live incident, web-everything/web-everything#2793 (landing freeze, 2026-09-27) — real `gh pr view` shape: base
   // `main`, `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY`, empty rollup, head sha
   // 8be3bce0e51990837b7f9c016b407ec0f1657a1c already carrying 2 prior missing-run trigger-attempt comments.

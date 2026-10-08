@@ -854,7 +854,7 @@ export function sweepMissingRunRecovery({
     const headCommittedAt = readHeadCommittedAt(c.headSha, { repo });
     const comments = readComments(c.prNumber, { repo });
     return {
-      ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha),
+      ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName }),
     };
   });
   const plan = planMissingRunRecoveries({

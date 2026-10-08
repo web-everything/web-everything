@@ -34,7 +34,7 @@ export default {
     if (!live.notes.some(n => n.kind === 'stacked-awaiting-base' && n.basePrNumber === 3889)) violations.push('base PR not surfaced');
     if (live.dispatch.some(d => d.prNumber === 3915)) violations.push('unchecked stack dispatched');
     if (!pass([pr]).notes.some(n => n.kind === 'stacked-base-orphaned' && n.basePrNumber === null)) violations.push('orphan not surfaced');
-    if (!pass([{ ...pr, baseRefName: 'main' }]).refusals.some(r => r.kind === 'check-read-failed')) violations.push('main absence not refused');
+    if (!pass([{ ...pr, baseRefName: 'main' }]).owedTriggers.some(t => t.prNumber === 3915)) violations.push('main absence not owed a re-trigger');
     return { violations };
   },
   judge(report) { return report.violations; },
