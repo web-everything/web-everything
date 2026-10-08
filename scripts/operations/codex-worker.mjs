@@ -69,7 +69,7 @@ export function parseCard(markdown) {
     .trim().replace(/^(['"])(.*)\1$/, '$2');
   const heading = /^# (.+)$/m.exec(body);
   const rest = heading ? body.slice(heading.index + heading[0].length) : body;
-  const doneHeading = /^## Done when[ \t]*$/m.exec(rest);
+  const doneHeading = /^## (?:Done when|Acceptance)[ \t]*$/m.exec(rest);
   const acceptance = doneHeading ? rest.slice(doneHeading.index + doneHeading[0].length) : '';
   return {
     title: heading?.[1].trim() ?? '',
