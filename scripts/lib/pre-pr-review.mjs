@@ -151,7 +151,7 @@ export function decidePrePrReview({ settings, risk, receipt, headTree, baseSha =
       ? `the receipt is for tree ${String(receipt.tree).slice(0, 12)}, but HEAD is tree ${String(headTree).slice(0, 12)} (edited since the review)`
       : 'no pre-PR review receipt exists for this head';
   const msg = `pre-PR review required — this PR is risky (${risk.reasons.join('; ')}) and ${detail}. `
-    + `Run the review before open-pr (or run \`node scripts/operations/run.mjs pre-pr-check --checkout=${shellWord(lane)}\` to see it): ${prePrReviewCommands(lane).text}. `
+    + `Run the review before open-pr (or run \`node scripts/operations/run.mjs pre-pr-check --checkout=${lane === '<lane>' ? lane : shellWord(lane)}\` to see it): ${prePrReviewCommands(lane).text}. `
     + 'Then open the PR again. Bypass only with `--skipPrePrReview=<reason>` (the reason is recorded). A bypass also needs `--actor=<name>` and `--operatorInstruction="<quoted operator instruction>"`; a dispatched worker is refused a bypass.';
   if (settings.mode === 'advise') return { action: 'advise', why, message: msg };
   if (typeof skip === 'string' && skip.trim()) return { action: 'pass', why: 'bypass', message: '' };

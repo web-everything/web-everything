@@ -51,4 +51,13 @@ describe('createPrePrCheckReader (real git)', () => {
       expect(v).toMatchObject({ gated: true, needsReview: true, why: 'receipt-stale' });
     });
   });
+
+  it('a receipt for another base is not accepted: the helper says a review is needed (receipt-base-mismatch)', async () => {
+    await withBareOrigin(async ({ clone, commit }) => {
+      commit({ 'src/a.mjs': 'export const a = 1;\n' }, 'feat: code');
+      writeReceipt(clone, { tree: treeOf(clone), base: '0'.repeat(40), verdict: 'land' });
+      const v = assessPrePrCheck({ checkout: clone, decision: createPrePrCheckReader()({ checkout: clone }) });
+      expect(v).toMatchObject({ gated: true, needsReview: true, why: 'receipt-base-mismatch' });
+    });
+  });
 });

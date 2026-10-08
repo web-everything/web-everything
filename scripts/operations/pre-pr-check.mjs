@@ -21,9 +21,10 @@ export const PRE_PR_CHECK_OP = 'pre-pr-check';
  */
 export function assessPrePrCheck({ checkout, decision, error = '' }) {
   const commands = prePrReviewCommands(checkout);
-  if (error || !decision) {
-    const summary = `GATED (check failed: ${error || 'no decision'})`;
-    return { checkout, gated: true, needsReview: true, mode: 'unknown', why: 'check-error', reasons: [`the check itself failed: ${error || 'no decision'}`], commands, next: commands.text, summary, headline: `${summary} — run the review: ${commands.text}` };
+  // FAIL CLOSED on a malformed decision too: no boolean `risk.gated` is an unreadable answer, never "not gated".
+  if (error || !decision || typeof decision.risk?.gated !== 'boolean') {
+    const summary = `GATED (check failed: ${error || 'no usable decision'})`;
+    return { checkout, gated: true, needsReview: true, mode: 'unknown', why: 'check-error', reasons: [`the check itself failed: ${error || 'no usable decision'}`], commands, next: commands.text, summary, headline: `${summary} — run the review: ${commands.text}` };
   }
   const risk = decision.risk || {};
   const mode = decision.settings?.mode ?? 'unknown';

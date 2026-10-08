@@ -67,4 +67,20 @@ describe('open-pr advise message', () => {
 
 describe('prePrCheckOperation', () => {
   it('needs a reader', () => { expect(() => prePrCheckOperation({})).toThrow(/check reader/); });
+
+  it('a reader that throws becomes an error read, which assesses as gated (fail closed)', () => {
+    const decl = prePrCheckOperation({ check: () => { throw new Error('git exploded'); } });
+    const read = decl.steps.find((s) => s.name === 'read').step.fn({ input: { checkout: LANE } });
+    expect(read.error).toMatch(/git exploded/);
+    expect(assessPrePrCheck(read)).toMatchObject({ gated: true, needsReview: true, why: 'check-error' });
+  });
+});
+
+describe('assessPrePrCheck — malformed or special decisions', () => {
+  it('a decision with no usable risk reads as gated, never not gated', () => {
+    expect(assessPrePrCheck({ checkout: LANE, decision: { action: 'pass', why: 'receipt' } })).toMatchObject({ gated: true, needsReview: true, why: 'check-error' });
+  });
+  it('mode off reads as not gated', () => {
+    expect(assessPrePrCheck({ checkout: LANE, decision: { ...gatedDecision, settings: { mode: 'off' } } })).toMatchObject({ gated: false, needsReview: false });
+  });
 });
