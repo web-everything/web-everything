@@ -52,4 +52,7 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   // Operator order, 2026-10-07 (builder-starved-2): the builder starved twice in one day while this smell sat
   // record-only in shadow mode (opened 18:16Z, nobody told) — a starving builder must reach the operator.
   'builder-starved',
+  // Operator standing rule, 2026-10-08 (card xu1nixv): main was red ~5.5 h (17:04Z on) and nothing noticed. A red
+  // main must reach the operator, even in shadow mode and through quiet hours.
+  'main-ci-red',
 ]);
