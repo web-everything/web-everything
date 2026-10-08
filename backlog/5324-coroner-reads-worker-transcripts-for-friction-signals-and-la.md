@@ -1,4 +1,5 @@
 ---
+bornAs: xc12cpi
 kind: story
 size: 5
 status: open
