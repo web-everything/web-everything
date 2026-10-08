@@ -58,6 +58,26 @@ describe('repairCloneRefs', () => {
     expect(r.quarantinedTo).toBeUndefined(); // dangling non-remote refs alone never trigger a re-clone
   });
 
+  it('pruning a remote-tracking SYMREF removes only the alias, never the local branch or tag it points at', () => {
+    plant('refs/heads/precious'); plant('refs/tags/v0');
+    g(clone, 'symbolic-ref', 'refs/remotes/origin/alias', 'refs/heads/precious');
+    g(clone, 'symbolic-ref', 'refs/remotes/origin/tagalias', 'refs/tags/v0');
+    const r = repairCloneRefs(clone);
+    expect(r.pruned.sort()).toEqual(['refs/remotes/origin/alias', 'refs/remotes/origin/tagalias']);
+    expect(existsSync(join(clone, '.git/refs/heads/precious'))).toBe(true);
+    expect(existsSync(join(clone, '.git/refs/tags/v0'))).toBe(true);
+    expect(() => g(clone, 'symbolic-ref', '-q', 'refs/remotes/origin/alias')).toThrow(); // the alias itself is gone
+  });
+
+  it('a dangling origin/HEAD symref and its dangling remote target are both pruned, each by name', () => {
+    plant('refs/remotes/origin/main');
+    g(clone, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main');
+    const r = repairCloneRefs(clone);
+    expect(r.pruned.sort()).toEqual(['refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+    expect(r.reported.some((x) => x.includes('prune failed'))).toBe(false);
+    expect(() => g(clone, 'fsck', '--connectivity-only')).not.toThrow();
+  });
+
   it('NEVER re-clones over a dangling local branch or tag, even for a caller that is authorized to re-clone', () => {
     plant('refs/heads/precious'); plant('refs/tags/v0');
     const r = repairCloneRefs(clone, RECLONE);

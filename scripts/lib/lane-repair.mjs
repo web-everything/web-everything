@@ -84,7 +84,7 @@ export function healLaneRefs(dir, { log = () => {} } = {}) {
   const head = runGit(['symbolic-ref', '-q', 'HEAD'], dir).out.trim();
   for (const { ref, sha } of findBrokenRefs(dir)) {
     if (ref === head) continue; // the checked-out branch is a diagnoseLane concern (quarantine), not a ref prune
-    const r = runGit(['update-ref', '-d', ref], dir);
+    const r = runGit(['update-ref', '--no-deref', '-d', ref], dir); // a symref is removed itself, never its target
     actions.push(r.code === 0
       ? `deleted dangling ref ${ref} (target ${sha.slice(0, 8)} missing from the object store)`
       : `could not delete dangling ref ${ref}: ${r.err.trim().split('\n')[0]}`);
@@ -482,7 +482,9 @@ function repairCloneRefsUnguarded(dir, { log = () => {}, allowReclone = false, h
   const head = broken.length ? runGit(['symbolic-ref', '-q', 'HEAD'], dir).out.trim() : '';
   for (const { ref, sha } of broken) {
     if (ref.startsWith('refs/remotes/') && ref !== head) {
-      const r = runGit(['update-ref', '-d', ref], dir);
+      // --no-deref: the namespace check above names THIS ref; without it git follows a symref and deletes its
+      // target (a remote-tracking alias of a dangling local branch would take the branch with it).
+      const r = runGit(['update-ref', '--no-deref', '-d', ref], dir);
       if (r.code === 0) out.pruned.push(ref);
       else out.reported.push(`${ref} (target ${sha.slice(0, 8)} missing; prune failed: ${r.err.trim().split('\n')[0]})`);
     } else {
