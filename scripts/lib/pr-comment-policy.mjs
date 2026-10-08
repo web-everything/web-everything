@@ -84,7 +84,15 @@ export function isRepeatSuppressibleNote(note) {
 
 /** Visible text only: hidden HTML-comment markers (episode keys, hashes) and whitespace runs never count. */
 export function visibleCommentText(body) {
-  return String(body ?? '').replace(/<!--[\s\S]*?-->/g, '').replace(/\s+/g, ' ').trim();
+  let text = String(body ?? '');
+  // Strip until stable: one pass can splice a new marker together (`<!<!-- -->--`).
+  for (let prev = null; prev !== text; ) {
+    prev = text;
+    text = text.replace(/<!--[\s\S]*?-->/g, '');
+  }
+  // A marker that never closes is not visible text either.
+  text = text.replace(/<!--[\s\S]*$/, '');
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 /**

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   DEFAULT_PR_COMMENT_MODE, loadPrCommentSettings, isStatusOnlyNote, repeatsLatestComment,
-  isRepeatSuppressibleNote, isNoActionDrainReason, drainReasonCommentSuppressed,
+  isRepeatSuppressibleNote, isNoActionDrainReason, drainReasonCommentSuppressed, visibleCommentText,
 } from '../pr-comment-policy.mjs';
 
 const bot = (body) => ({ body, author: { login: 'web-everything' } });
@@ -113,6 +113,11 @@ describe('repeatsLatestComment', () => {
   it('ignores comments of other kinds and untrusted authors', () => {
     expect(repeatsLatestComment([bot('other\n\nsame text')], '🔔 x\n\nsame text', isNote)).toBe(false);
     expect(repeatsLatestComment([stranger('🔔 x\n\nsame text')], '🔔 x\n\nsame text', isNote)).toBe(false);
+  });
+  it('a marker spliced together by removing another is still hidden (CodeQL incomplete sanitization)', () => {
+    expect(visibleCommentText('a<!<!-- x -->-- y -->b')).toBe('ab');
+    expect(visibleCommentText('a <!-- never closed')).toBe('a');
+    expect(visibleCommentText('a <!-- k --> b')).toBe('a b');
   });
   it('tolerates a missing or odd comment list', () => {
     expect(repeatsLatestComment(null, '🔔 x', isNote)).toBe(false);
