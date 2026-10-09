@@ -179,8 +179,9 @@ describe('redaction covers every free-text field, not just the ones the card nam
 describe('every fail-closed outcome is redacted too, not only the valid-result path', () => {
   const TOKEN = 'ghp_abcdefghijklmnop12345';
   const leaves = (v, out = []) => { if (typeof v === 'string') out.push(v); else if (v && typeof v === 'object') Object.values(v).forEach((x) => leaves(x, out)); return out; };
+  const MENTION = new RegExp(`@(?!${String.fromCharCode(0x200b)})\\w`); // an @mention the redactor has NOT defanged
   const hostile = [TOKEN, '@someone', '<!-- x -->', '`tick`'];
-  const hasHostile = (result) => leaves(result).filter((s) => s.includes(TOKEN) || /@(?!​)\w/.test(s) || s.includes('<!--') || s.includes('`'));
+  const hasHostile = (result) => leaves(result).filter((s) => s.includes(TOKEN) || MENTION.test(s) || s.includes('<!--') || s.includes('`'));
 
   it('a worker-chosen KEY or VALUE in a schema violation never reaches evidence.text unredacted (value path)', () => {
     for (const bad of hostile) {
