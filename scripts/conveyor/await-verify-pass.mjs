@@ -688,9 +688,11 @@ export async function defaultAwaitVerifyIo({
       const incomplete = [];
       const why = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 160);
       // `session: null` = the whole population is unknown; a slug = only that session's record could not be read.
-      try { rows.push(...io.defaultListAgents({ all: true, env })); } catch (e) { incomplete.push({ reason: `claude agents listing failed: ${why(e)}`, session: null }); }
+      // A listing that is not an ARRAY shows nothing about any session (a string would even spread into character "rows").
+      const asRows = (value, what) => { if (!Array.isArray(value)) throw new Error(`${what} is not an array`); return value; };
+      try { rows.push(...asRows(io.defaultListAgents({ all: true, env }), 'claude agents listing')); } catch (e) { incomplete.push({ reason: `claude agents listing failed: ${why(e)}`, session: null }); }
       try {
-        const wrapped = listWrappedWorkers();
+        const wrapped = asRows(listWrappedWorkers(), 'wrapped worker listing');
         rows.push(...wrapped);
         incomplete.push(...(wrapped.incomplete ?? []));
       } catch (e) { incomplete.push({ reason: `wrapped worker listing failed: ${why(e)}`, session: null }); }

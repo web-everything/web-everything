@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { computeWorkingTreeHash } from '../../lib/verify-lane-gate.mjs';
 import { laneGitHardeningEnv, hardenLaneGitArgs, laneFilterDrivers, LANE_CONFIG_LIST_ARGS, LANE_GIT_CONFIG_PINS } from '../../lib/lane-git-hardening.mjs';
 import {
-  classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession,
+  classifyAwaitVerdict, isLoadFlakeRed, runAwaitVerifyPass, buildAwaitVerifyResumePrompt, findAwaitSession, lookupAwaitSession,
   formatAwaitVerifyLines, isHarnessRecord, AWAIT_VERIFY_LIMITS, pushShaFromScratch, claimBindingRefusal, isSessionBusy, defaultAwaitVerifyIo,
 } from '../await-verify-pass.mjs';
 
@@ -1065,6 +1065,21 @@ describe('default IO includes and resumes wrapped workers', () => {
     expect([...listed]).toEqual(failure === 'claude' ? [wrapped] : failure === 'wrapped' ? [claude] : [claude, wrapped]);
     expect(listed.incomplete ?? []).toHaveLength(failure === 'neither' ? 0 : 1);
   });
+  // A listing that "succeeds" with something other than an array (a JSON string would spread into characters, `null` or an
+  // object are not rows) shows nothing about a session's presence, so it must be recorded as a gap, never merged as rows.
+  it.each([['claude', 'a string', 'abc'], ['claude', 'null', null], ['claude', 'an object', {}], ['wrapped', 'a string', 'abc'], ['wrapped', 'null', null]])(
+    'treats a non-array %s listing (%s) as an incomplete listing, not as rows',
+    async (which, _what, value) => {
+      const io = await defaultAwaitVerifyIo({
+        dispatchIo: { defaultListAgents: () => (which === 'claude' ? value : []) },
+        listWrappedWorkers: () => (which === 'wrapped' ? value : []),
+      });
+      const listed = io.listSessions();
+      expect([...listed]).toEqual([]);
+      expect(listed.incomplete).toHaveLength(1);
+      expect(listed.incomplete[0]).toMatchObject({ session: null });
+      expect(() => lookupAwaitSession(rec(), listed)).toThrow(/session listing incomplete/);
+    });
   it('carries a wrapped listing\'s own incompleteness (an unreadable record) into the merged listing', async () => {
     const gap = { reason: 'wrapped record fix-9 unreadable', session: 'fix-9' };
     const wrapped = Object.defineProperty([], 'incomplete', { value: [gap] });
