@@ -73,7 +73,7 @@ the per-item chat-rename — a batch labels the session **once**.
    on the /backlog Active-work tab, see *Working an item* → *Keep it in sync*) →
    **gate in the item's own locus** (look up `LOCI[item.locus]` in `check-standards-rules.mjs`: run
    `gateCommand` in `repoPath`, probe `devServerProbe` for any render check, do any `closeoutDiscipline`;
-   a WE item is just `npm run check:standards`; prove any guard `## Done when` criteria via
+   a WE item is just `npm run check:standards`; prove any guard `## Acceptance` criteria (older cards: `Done when`) via
    `node scripts/operations/run.mjs mutation-check --checkout=<lane> --target=<file> --find="<pattern>" --replace="<pattern>" --suite=<suite>` — see *Prove a guard fails — mutation-check* below). **Pass `--scope=<batch-slug>` to the WE gates** —
    `npm run check:standards -- --scope=<batch-slug>` (file-keyed, #952) and `npm run check:health --
    --scope=<batch-slug>` (id-keyed, #957) both demote *concurrent* sessions' findings to non-failing notes
@@ -408,7 +408,7 @@ that risk is now handled at **drain** time (rebase-retry) rather than by a produ
 
 ## Prove a guard fails — mutation-check (#3219)
 
-When an item's `## Done when` criteria demand proving a guard actually fails when the bug it names returns, run the declared **`mutation-check`** operation (`we:scripts/operations/mutation-check.mjs`, #3219). It replaces ad-hoc shell or python heredocs with a safe, verified mutate → run → restore transaction in the target checkout:
+When an item's `## Acceptance` criteria (older cards: `Done when`) demand proving a guard actually fails when the bug it names returns, run the declared **`mutation-check`** operation (`we:scripts/operations/mutation-check.mjs`, #3219). It replaces ad-hoc shell or python heredocs with a safe, verified mutate → run → restore transaction in the target checkout:
 
 ```
 node scripts/operations/run.mjs mutation-check --checkout=<lane> --target=<file> --find="<pattern>" --replace="<pattern>" --suite=<suite> [--json]

@@ -26,6 +26,8 @@
  * `scripts/gen-decision-docket.mjs`'s header for the full scope note.
  */
 
+import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
+
 /** One rendered fork option's disposition. */
 export const OPTION_KINDS = Object.freeze({ DEFAULT: 'default', REJECTED: 'rejected', OPEN: 'open' });
 
@@ -163,14 +165,15 @@ function tidy(paragraph) {
 
 /**
  * Split a section's text into its numbered-list items ("1. …", "2) …"), joining each item's soft-wrapped
- * continuation lines. A `## Done when` section is often written as a numbered list with no blank line between
+ * continuation lines. An acceptance section is often written as a numbered list with no blank line between
  * items (so a blank-line paragraph split would glue every item into one blob) — this handles that directly,
  * the same way `parseForkSection` handles lettered option bullets that aren't blank-line separated either.
  * @param {string} text
  * @returns {string[]}
  */
 function splitNumberedList(text) {
-  const itemStartRe = /^\d+[.)]\s*/;
+  // A numbered item, or a task-agreement `- [A1] …` item (#5399 S7).
+  const itemStartRe = /^(?:\d+[.)]\s*|[-*+][ \t]+\[A\d+\])/i;
   const items = [];
   let current = null;
   const inFence = fenceTracker();
@@ -739,8 +742,8 @@ export function parseGateSections(sections) {
 /**
  * Parse a decision item's full markdown body (everything after the frontmatter) into the docket's clean data
  * shape: the digest paragraphs (before the first `##`, or a `## Digest` section when the item leads with one),
- * every `## Fork N` in source order — or, for an item with no forks, its validation-gate record — and the `##
- * Done when` bullets (used to derive "what happens once ratified" — never invented, always the item's own stated
+ * every `## Fork N` in source order — or, for an item with no forks, its validation-gate record — and the
+ * acceptance-section bullets (used to derive "what happens once ratified" — never invented, always the item's own stated
  * done-when). PURE. Never throws.
  * @param {string} rawBody - the file content AFTER the `---` frontmatter fence, including the `# Title` line.
  * @returns {{ digest: string[], forks: object[], gate: object|null, doneWhen: string[], parseOk: boolean, warnings: string[] }}
@@ -834,7 +837,8 @@ export function parseDecisionBody(rawBody) {
     return parsed;
   });
 
-  const doneSection = sections.find((s) => s.heading && /^Done when/i.test(s.heading));
+  // The acceptance section, by the shared task-agreement reader's heading rule (canonical or legacy alias, #5399 S7).
+  const doneSection = sections.find((s) => s.heading && ACCEPTANCE_HEADING_RE.test(s.heading));
   const doneWhen = doneSection ? splitNumberedList(doneSection.text) : [];
 
   // No forks: the item may be a validation gate (a one-sided go / no / not-yet call — no `## Fork N` by design).

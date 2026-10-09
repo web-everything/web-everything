@@ -1108,7 +1108,7 @@ mark("6d-quinquies. Unquoted-colon scalar in frontmatter (#453)");
       scopeReport(`Backlog item "${id}" scopes "${f.entry}" and mandates a test plan, but its tracked test "we:${f.testPath}" is not in scope: — the lease will not cover the test the build must edit (#4448). Add it, or add a \`scopeRationale:\` note.`, scopeDescriptor);
     const undeclared = bodyDeliverablesMissingFromScope(raw, body);
     if (undeclared.length)
-      scopeReport(`Backlog item "${id}" names deliverable${undeclared.length > 1 ? 's' : ''} ${JSON.stringify(undeclared)} under ## MVP / ## Done when that ${undeclared.length > 1 ? 'are' : 'is'} missing from scope: (#4448). Add ${undeclared.length > 1 ? 'them' : 'it'}, or add a \`scopeRationale:\` note.`, scopeDescriptor);
+      scopeReport(`Backlog item "${id}" names deliverable${undeclared.length > 1 ? 's' : ''} ${JSON.stringify(undeclared)} under ## MVP / the acceptance section that ${undeclared.length > 1 ? 'are' : 'is'} missing from scope: (#4448). Add ${undeclared.length > 1 ? 'them' : 'it'}, or add a \`scopeRationale:\` note.`, scopeDescriptor);
   }
 }
 
