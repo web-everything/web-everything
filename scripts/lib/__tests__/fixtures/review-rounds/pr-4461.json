@@ -1,0 +1,662 @@
+{
+ "v": 1,
+ "kind": "we.review-round-replay-fixture",
+ "repo": "web-everything/web-everything",
+ "pr": 4461,
+ "rounds": [
+  {
+   "runId": "review-pr-8b5854a3-f167-455d-8ab8-7647d41a5091",
+   "at": "2026-10-08T15:56:50.826Z",
+   "head": "7ce63a6a8ce907c01a101d04354ae0cfc338bfd7",
+   "liveVerdict": "needs-human",
+   "humanRequired": false,
+   "delta": null,
+   "findings": [
+    {
+     "finding": {
+      "file": "scripts/conveyor/health-watch.mjs",
+      "line": 1249,
+      "category": "correctness/correctness",
+      "summary": "The daemon-silent breakthrough uses `now - ep.openedAt` as the down duration, but the episode opens when this watch first notices the breach, so the first notify always has age of about 0 and is held as 'daemon down only 0 min < 30'.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "blocker"
+     },
+     "symbol": "tick",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/conveyor/branch-sync.mjs",
+      "line": 162,
+      "category": "correctness/test-coverage",
+      "summary": "None of the call-site wiring is tested: the default-gate selection (`spawnSyncFn === spawnSync`), the `emergency` tags in driver-watchdog and health-watch, and the `sweepSkipNow` / `flushDigest` calls in scheduled-sweep `main`. The only watchdog test change is an import allowlist entry.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "notifyDesktopChecked",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/conveyor/health-watch.mjs",
+      "line": 1249,
+      "category": "security",
+      "summary": "The daemon-silent breakthrough measures episode age at emission. A daemon-silent episode notifies once when it opens (age ≈ 0) and next on the 4h reminder, so the '>=30 min' breakthrough never fires at 30 min.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "blocker"
+     },
+     "symbol": "tick",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/conveyor/driver-watchdog.mjs",
+      "line": 816,
+      "category": "security",
+      "summary": "The STALE / ROLLED BACK notify is not tagged `emergency`, so a stale or unhealed driver is held overnight. No test asserts that the DOWN or daemon-silent notifications carry the `emergency` payload.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "runWatchdogOnce",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "line": 83,
+      "category": "codex-correctness/correctness",
+      "summary": "An exception after claiming the queue strands held alerts permanently outside subsequent flushes.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "flushDigest",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/__tests__/quiet-hours.test.mjs",
+      "line": 132,
+      "category": "codex-correctness/coverage",
+      "summary": "The claimed fail-open guarantee has no test that actually causes the holding operation to fail.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "describe:digest",
+     "heldVerdict": false,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "line": 53,
+      "category": "codex-correctness/coverage",
+      "summary": "The concurrent-flusher guarantee is supported only by sequential flush tests.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "quietContext",
+     "heldVerdict": false,
+     "deferred": false
+    }
+   ]
+  },
+  {
+   "runId": "review-pr-0c3d9f59-2924-4680-9132-f9d6a26b2b26",
+   "at": "2026-10-08T18:26:08.951Z",
+   "head": "5dae26038202d2d648db3f14d2c8df11906859e3",
+   "liveVerdict": "needs-human",
+   "humanRequired": true,
+   "delta": {
+    "priorHead": "7ce63a6a8ce907c01a101d04354ae0cfc338bfd7",
+    "head": "5dae26038202d2d648db3f14d2c8df11906859e3",
+    "files": {
+     "scripts/lib/__tests__/quiet-hours.test.mjs": [
+      1,
+      2,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      134,
+      135,
+      136,
+      137,
+      138,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      145,
+      146,
+      147,
+      148,
+      149,
+      150,
+      151,
+      152,
+      153,
+      154,
+      155,
+      156,
+      157,
+      158,
+      159,
+      160,
+      161,
+      162,
+      163,
+      164,
+      165,
+      166,
+      167,
+      168,
+      169,
+      170,
+      171,
+      172,
+      173,
+      174,
+      175,
+      176,
+      177,
+      178,
+      179,
+      180,
+      181,
+      182,
+      183,
+      184,
+      185
+     ],
+     "scripts/lib/quiet-hours-io.mjs": [
+      12,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      67,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      94,
+      95,
+      96,
+      99,
+      100,
+      101,
+      106,
+      107,
+      108,
+      111,
+      112,
+      113,
+      114,
+      121,
+      128,
+      129,
+      130,
+      131,
+      132,
+      134,
+      136,
+      137,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      163,
+      164
+     ]
+    }
+   },
+   "findings": [
+    {
+     "finding": {
+      "file": "scripts/conveyor/health-watch.mjs",
+      "line": 1249,
+      "category": "correctness/correctness",
+      "summary": "daemon-down `downForMs` is computed from episode age (`now - ep.openedAt`), not from how long the daemon has been silent, so the opening `daemon-silent` alert always has downForMs≈0 and is held overnight.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "tick",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/__tests__/quiet-hours.test.mjs",
+      "line": 1,
+      "category": "correctness/test-coverage",
+      "summary": "None of the five notify call sites that were wired (branch-sync, supervisor, driver-watchdog, health-watch, scheduled-sweep) has a test that the gate is applied or that `emergency` is tagged.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "line": 165,
+      "category": "security/availability-of-alerts",
+      "summary": "A held alert returns {ok:true, suppressed:true}, so callers record it as delivered. Fire-once emergencies (daemon-down) held below the threshold are never re-evaluated and can wait for the morning digest.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "gateAlert",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/__tests__/quiet-hours.test.mjs",
+      "line": 196,
+      "category": "security/coverage",
+      "summary": "The stated guarantee 'any gate error DELIVERS' and the emergency tagging in the wiring have no test that reddens when they break.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "describe:digest",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "category": "codex-correctness/correctness",
+      "summary": "Disabling the digest deletes held alerts without delivering or preserving them.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "unrecoverable",
+      "disposition": "blocker"
+     },
+     "symbol": "",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/conveyor/branch-sync.mjs",
+      "category": "codex-correctness/correctness",
+      "summary": "Best-effort notification senders acknowledge digest delivery before osascript succeeds.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "category": "codex-correctness/correctness",
+      "summary": "Concurrent stale-claim recovery can restore and deliver the same alerts twice.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/__tests__/quiet-hours.test.mjs",
+      "category": "codex-correctness/coverage",
+      "summary": "The claimed fail-open gate guarantee has no test that actually forces a gate failure.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "",
+     "heldVerdict": false,
+     "deferred": false
+    }
+   ]
+  },
+  {
+   "runId": "review-pr-afadaca8-9325-421e-baec-e16db59f8d47",
+   "at": "2026-10-08T20:19:14.641Z",
+   "head": "efd88abcc27906d4b0eef3288c6e5ca8ddec3ac4",
+   "liveVerdict": "needs-human",
+   "humanRequired": true,
+   "delta": {
+    "priorHead": "5dae26038202d2d648db3f14d2c8df11906859e3",
+    "head": "efd88abcc27906d4b0eef3288c6e5ca8ddec3ac4",
+    "files": {
+     "scripts/conveyor/branch-sync.mjs": [
+      166,
+      167,
+      168,
+      169,
+      182,
+      188,
+      189,
+      190,
+      191
+     ],
+     "scripts/conveyor/health-watch.mjs": [
+      94,
+      95,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      1263,
+      1265,
+      1266,
+      1270,
+      1271,
+      1272,
+      1273,
+      1274,
+      1275,
+      1276,
+      1277,
+      1278,
+      1279,
+      1280,
+      1281,
+      1282,
+      1283,
+      1284,
+      1285,
+      1286,
+      1287,
+      1288
+     ],
+     "scripts/lib/__tests__/quiet-hours.test.mjs": [
+      9,
+      10,
+      11,
+      12,
+      157,
+      160,
+      167,
+      183,
+      190,
+      191,
+      192,
+      193,
+      194,
+      195,
+      196,
+      197,
+      198,
+      199,
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215,
+      216,
+      217,
+      218,
+      219,
+      220,
+      221,
+      222,
+      223,
+      224,
+      225,
+      226,
+      227,
+      228,
+      229,
+      230,
+      231,
+      232,
+      233,
+      234,
+      235,
+      236,
+      237,
+      238,
+      239,
+      240,
+      241,
+      242,
+      243,
+      244,
+      245,
+      246,
+      247,
+      248
+     ],
+     "scripts/lib/quiet-hours-io.mjs": [
+      14,
+      52,
+      54,
+      55,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      92,
+      93,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      117,
+      132,
+      133,
+      139,
+      140,
+      141,
+      142,
+      148,
+      167,
+      168,
+      175,
+      176,
+      177,
+      178,
+      179,
+      181,
+      185
+     ],
+     "scripts/lib/quiet-hours.mjs": [
+      129,
+      130,
+      131
+     ]
+    }
+   },
+   "findings": [
+    {
+     "finding": {
+      "file": "scripts/conveyor/driver-watchdog.mjs",
+      "line": 782,
+      "category": "correctness/test-coverage",
+      "summary": "No test pins the driver-watchdog 'Conveyor driver DOWN' alert carrying emergency {kind:'daemon-down', downForMs}. The diff changes driver-watchdog.mjs but its only test edit is the import allowlist.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "runWatchdogOnce",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "line": 139,
+      "category": "correctness/efficiency",
+      "summary": "flushDigest writes a new timestamped digest-<stamp>.md before the send. A persistently failing send (e.g. osascript denied) leaves one new file per attempt, and attempts run every health-watch tick and every gated alert.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "flushDigest",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours.mjs",
+      "line": 29,
+      "category": "security/alert-suppression",
+      "summary": "The main-red breakthrough is not wired to any real alert. health-watch tags only daemon-silent as an emergency, and the title fallback regex does not match the real main-red health title.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "DEFAULT_QUIET_SETTINGS",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/quiet-hours-io.mjs",
+      "line": 99,
+      "category": "codex-correctness/correctness",
+      "summary": "Concurrent recovery can restore and deliver the same stale claim twice.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "blocker"
+     },
+     "symbol": "recoverStaleClaims",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/__tests__/quiet-hours.test.mjs",
+      "line": 258,
+      "category": "codex-correctness/coverage",
+      "summary": "The promised fail-open gate has no test that actually triggers a queue-write failure.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "describe:digest",
+     "heldVerdict": false,
+     "deferred": true
+    }
+   ]
+  }
+ ],
+ "expected": {
+  "summaries": [
+   {
+    "round": 1,
+    "liveBlocked": true,
+    "shadowBlocked": true,
+    "blocked": 0,
+    "carded": 0,
+    "roundAvoided": false
+   },
+   {
+    "round": 2,
+    "liveBlocked": true,
+    "shadowBlocked": true,
+    "blocked": 6,
+    "carded": 1,
+    "roundAvoided": false
+   },
+   {
+    "round": 3,
+    "liveBlocked": true,
+    "shadowBlocked": true,
+    "blocked": 3,
+    "carded": 1,
+    "roundAvoided": false
+   }
+  ],
+  "projection": {
+   "rounds": 3,
+   "laterRounds": 2,
+   "avoided": 0,
+   "stopAt": null
+  }
+ }
+}

@@ -1,0 +1,368 @@
+{
+ "v": 1,
+ "kind": "we.review-round-replay-fixture",
+ "repo": "web-everything/web-everything",
+ "pr": 4446,
+ "rounds": [
+  {
+   "runId": "review-pr-b7537e58-9315-4665-904e-f8636e9f840f",
+   "at": "2026-10-08T14:10:42.121Z",
+   "head": "7378329765b1765ebc15f01b39bf7c5aaaa8b617",
+   "liveVerdict": "needs-human",
+   "humanRequired": true,
+   "delta": null,
+   "findings": [
+    {
+     "finding": {
+      "file": "scripts/merge-ai-prs.mjs",
+      "line": 5084,
+      "category": "correctness/coverage",
+      "summary": "The drain call-site wiring `permissionChange: Array.isArray(score.signals?.permissionChange)` in merge-ai-prs.mjs is not defended by any test.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "carve-out"
+     },
+     "symbol": "runCli",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 46,
+      "category": "correctness/correctness",
+      "summary": "SCOPE_GRANT_RE only matches unquoted read/write/none values, so a quoted grant such as `contents: \"write\"` or a flow mapping on one line is missed.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "ALL_GRANT_RE",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/merge-ai-prs.mjs",
+      "line": 5084,
+      "category": "security/test-coverage",
+      "summary": "The drain call site that feeds `permissionChange` into the gate has no test; the new tests call `decideReviewGate` directly with a hand-supplied boolean.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "broken",
+      "disposition": "carve-out"
+     },
+     "symbol": "runCli",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 78,
+      "category": "security/fail-open",
+      "summary": "The sandbox surface returns null (no hold) when hunks are unavailable, unlike the workflow surface, which fails closed.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "permissionChangeKind",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 45,
+      "category": "security/detector-evasion",
+      "summary": "The line-anchored, token-denylist regexes miss common equivalent spellings of a permission or sandbox grant.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "ALL_GRANT_RE",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 76,
+      "category": "codex-correctness/correctness",
+      "summary": "Multiline sandbox grants can widen without triggering the permission-change hold.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "carve-out"
+     },
+     "symbol": "permissionChangeKind",
+     "heldVerdict": true,
+     "deferred": false
+    }
+   ]
+  },
+  {
+   "runId": "review-pr-b93c9755-0fad-44d6-98b6-5f83145cb72e",
+   "at": "2026-10-08T17:13:51.952Z",
+   "head": "24cedb4ccc13ba35a8f0896134affccae1ba9805",
+   "liveVerdict": "needs-human",
+   "humanRequired": true,
+   "delta": {
+    "priorHead": "7378329765b1765ebc15f01b39bf7c5aaaa8b617",
+    "head": "24cedb4ccc13ba35a8f0896134affccae1ba9805",
+    "files": {
+     "scripts/lib/permission-change.mjs": [
+      17,
+      18,
+      19,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      66,
+      68,
+      69,
+      70,
+      71,
+      72,
+      73,
+      78,
+      79,
+      80,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      113,
+      114,
+      115,
+      116,
+      117,
+      118,
+      119,
+      120,
+      121,
+      122,
+      123,
+      124,
+      125,
+      126,
+      127,
+      128,
+      129,
+      130,
+      131,
+      132,
+      133,
+      134,
+      135,
+      136,
+      137,
+      138,
+      139,
+      140,
+      141,
+      142,
+      143,
+      144,
+      145,
+      146,
+      147,
+      148,
+      149,
+      150,
+      151,
+      152,
+      153,
+      172
+     ],
+     "scripts/merge-ai-prs.mjs": [
+      3773,
+      3774,
+      3775,
+      3776,
+      3777,
+      3778,
+      3779,
+      3780,
+      3781,
+      3782,
+      3783,
+      3784,
+      3785,
+      3786,
+      3787,
+      3788,
+      3789,
+      3790,
+      3791,
+      3792,
+      3793,
+      3794,
+      3795,
+      3796,
+      3797,
+      3798,
+      3799,
+      3800,
+      5109,
+      5110,
+      5111
+     ]
+    }
+   },
+   "findings": [
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 43,
+      "category": "correctness/correctness",
+      "summary": "The workflow-permission detector only recognises a hardcoded list of scope names. A grant to a scope outside that list (for example a newly added GitHub token scope) is not held.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "SANDBOX_TOKEN_RE",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 162,
+      "category": "correctness/correctness",
+      "summary": "A pure rename of a file into `.github/workflows/` at 100% similarity has no hunks, so a section with no readable permission lines is treated as no change and the file is not held.",
+      "verdict": "PLAUSIBLE",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "permissionChangeKind",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 63,
+      "category": "security/security",
+      "summary": "Workflow-permission detection is line-regex only: a grant added inside an unchanged `permissions:` block is missed when the value is not on the same line as a known scope key.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "carve-out"
+     },
+     "symbol": "DIFF_HEADER_RE",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 175,
+      "category": "security/security",
+      "summary": "Sandbox-widening detection fails open when the diff hunks are unavailable, which is exactly the #4359 file class.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "carve-out"
+     },
+     "symbol": "permissionChangeKind",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 88,
+      "category": "security/security",
+      "summary": "The `isComment` filter and the file-type allow-list let sandbox grants through on lines that start with a block comment, or in non-`.mjs` code.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "degraded",
+      "disposition": "carve-out"
+     },
+     "symbol": "BARE_ADD_DIR_RE",
+     "heldVerdict": true,
+     "deferred": false
+    },
+    {
+     "finding": {
+      "file": "scripts/lib/permission-change.mjs",
+      "line": 167,
+      "category": "codex-correctness/correctness / coverage",
+      "summary": "Empty workflow hunks bypass the promised fail-closed permission hold.",
+      "verdict": "CONFIRMED",
+      "impactIfUnfixed": "broken",
+      "disposition": "carve-out"
+     },
+     "symbol": "permissionChangeKind",
+     "heldVerdict": false,
+     "deferred": true
+    }
+   ]
+  }
+ ],
+ "expected": {
+  "summaries": [
+   {
+    "round": 1,
+    "liveBlocked": true,
+    "shadowBlocked": true,
+    "blocked": 0,
+    "carded": 0,
+    "roundAvoided": false
+   },
+   {
+    "round": 2,
+    "liveBlocked": true,
+    "shadowBlocked": true,
+    "blocked": 4,
+    "carded": 1,
+    "roundAvoided": false
+   }
+  ],
+  "projection": {
+   "rounds": 2,
+   "laterRounds": 1,
+   "avoided": 0,
+   "stopAt": null
+  }
+ }
+}

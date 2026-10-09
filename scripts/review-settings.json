@@ -1,3 +1,4 @@
 {
-  "referralDefault": "auto-block"
+  "referralDefault": "auto-block",
+  "scopedRereview": "shadow"
 }
