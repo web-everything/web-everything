@@ -4,7 +4,7 @@ size: 3
 parent: "5399"
 status: open
 blockedBy: ["xdeqs8k"]
-scope: ["we:scripts/lib/citation-check.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/operations/codex-worker.mjs", "we:scripts/lib/probation-launcher.mjs", "we:scripts/backlog/scaffold.mjs", "we:scripts/backlog/__tests__/scaffold.test.mjs"]
+scope: ["we:scripts/lib/citation-check.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/operations/codex-worker.mjs", "we:scripts/lib/probation-launcher.mjs", "we:scripts/backlog/scaffold.mjs", "we:scripts/backlog/__tests__/scaffold.test.mjs", "we:scripts/__tests__/citation-check.test.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/operations/__tests__/codex-worker.test.mjs", "we:scripts/lib/__tests__/probation-launcher.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---

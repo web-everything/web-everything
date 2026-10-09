@@ -17,7 +17,8 @@ Slice S2 of #5399 (ruled 2026-10-08, Fork 1 = both): a refresh runner writes `##
 ## Acceptance
 
 - [A1] **Executable** — a refresh-runner test shows: a card with `## Done when` gets it renamed to `## Acceptance` with `[A#]` ids and unchanged meaning; an `active`, PR-held or already-agreed card is skipped; a resolved card is never read for writing.
-- [A2] **Executable** — the shape check refuses a section with a TODO line, a missing id, or a bare `none`, sends it back once, and leaves the card untouched and logged on a second failure.
+- [A2] **Executable** — the shape check refuses a section with a TODO line, a missing id, a bare `none`, or a missing or altered draft-marker line, sends it back once, and leaves the card untouched and logged on a second failure.
+- [A5] **Executable** — a refresh-runner test shows the runner's code inserts the visible `Draft: model-written, not yet confirmed.` line as the first non-blank line under every section it writes, after the model output: model output that omits the marker, or that carries a different or hand-edited marker, still lands with the exact marker line, and a section whose marker is missing at the final shape check is refused, never written as agreed. The model is never trusted to write the marker.
 - [A3] **Observable** — every open story the refresh processed has both sections with ids and the visible `Draft: model-written, not yet confirmed.` line (never an HTML comment) that the S1 reader reports even after comment stripping, landed in PRs of about 50 cards each through `open-pr`, nearest-to-build first.
 - [A4] **Executable** — a refresh-runner test with an injected free-scope check shows the ownership check runs again immediately before each card is written, not only when the batch is planned: a card that was free at plan time but is claimed by an open PR, or falls under a registered scope, before its write is skipped, left byte-identical and logged with the reason; a card whose ownership did not change is still written; a check that errors or times out skips the card (fail closed), never writes it.
 
@@ -37,4 +38,4 @@ One line per class: either the handling, or `n/a: <why>`.
 4. **Fail closed** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 5. **Identity scoping** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 6. **State over time** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
-7. **Who wrote it** — sections are marked draft so the S4 gate never mistakes model-written criteria for the preparer's agreement.
+7. **Who wrote it** — sections are marked draft so the S4 gate never mistakes model-written criteria for the preparer's agreement. The marker is inserted by the runner's code, not by the model, so a model that forgets it cannot produce a section that reads as agreed (tested by [A5]).

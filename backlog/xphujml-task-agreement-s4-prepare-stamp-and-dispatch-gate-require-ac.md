@@ -3,8 +3,8 @@ kind: story
 size: 5
 parent: "5399"
 status: open
-blockedBy: ["xdeqs8k"]
-scope: ["we:scripts/conveyor/prepare-result.mjs", "we:scripts/readiness/dispatch-plan.mjs", "we:scripts/backlog.mjs", "we:skills-src/conveyor/prepare-item-agent-brief.md", "we:scripts/readiness/__tests__/dispatch-plan.test.mjs", "we:scripts/conveyor/__tests__/prepare-result.test.mjs"]
+blockedBy: ["xdeqs8k", "x251p1l"]
+scope: ["we:scripts/conveyor/prepare-result.mjs", "we:scripts/readiness/dispatch-plan.mjs", "we:scripts/backlog.mjs", "we:skills-src/conveyor/prepare-item-agent-brief.md", "we:scripts/readiness/__tests__/dispatch-plan.test.mjs", "we:scripts/conveyor/__tests__/prepare-result.test.mjs", "we:scripts/__tests__/backlog-prepare-stamp-status.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
@@ -19,6 +19,8 @@ Slice S4 of #5399 (ruled 2026-10-08, Forks 1 and 2): prepareCardStatus requires 
 - [A2] **Executable** — a `prepare-result` test shows `prepareCardStatus` refuses a stamp without both sections under `enforce` and only reports it under `advise`.
 - [A3] **Observable** — the new hold reason appears in the dispatch-eligibility output and routes the card to the prepare agent; the prepare brief writes both sections and moves its out-of-scope sentence to `## Non-goals`.
 - [A4] **Executable** — a `dispatch-plan` test shows that under `enforce` a story whose section cannot be parsed is held as `needs-task-agreement`, and that a story stamped before the flip with no `## Non-goals` is held at dispatch even though its stamp is still current.
+- [A5] **Executable** — an integration test goes through the real `we:scripts/backlog.mjs` IO-shell path, not an injected policy: with the real loader pointed at a fixture policy file set to `enforce` (the committed `we:scripts/lib/task-agreement-policy.json` is never rewritten by the test), a stamped story without `## Non-goals` is held as `needs-task-agreement`; with it set to `advise`, the same story dispatches. A missing, unreadable or invalid policy file is never read as `advise`: it is read as `enforce` and the reason is reported in the dispatch output.
+- [A6] **Executable** — a `prepare-result` test passes the section text the prepare brief writes (`## Acceptance` and `## Non-goals`) through the Must-cite, TODO-placeholder and provenance-escape readers and shows they see the sections, so no prepared card loses a check. This slice waits for S7, which moves those readers to the shared reader.
 
 ## Non-goals
 
@@ -33,7 +35,7 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 2. **Truncated reads** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 3. **Shared state files** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
-4. **Fail closed** — under `enforce`, an unparseable or draft section reads as not agreed (hold), never as agreed.
+4. **Fail closed** — under `enforce`, an unparseable or draft section reads as not agreed (hold), never as agreed. A missing or invalid policy file reads as `enforce` with the reason reported, never as a silent `advise` (tested by [A5]).
 5. **Identity scoping** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 6. **State over time** — a card stamped before the rule is re-checked at dispatch, so the flip applies to old stamps too.
 7. **Who wrote it** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
