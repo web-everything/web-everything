@@ -868,7 +868,7 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     let seen;
     // Stands in for the launch harness + the worker: records what it was given, then does what the prompt tells it.
     const spawn = vi.fn((_node, args, opts) => {
-      const [, , , tree, slug, kind, pr, sessionId, prompt] = args;
+      const [, tree, slug, kind, pr, sessionId, prompt] = args;
       seen = { tree, slug, kind, pr, sessionId, prompt, env: opts.env };
       const [, marker, nonce] = prompt.match(/process\.argv\[2\]\)" '([^']+)' '([^']+)'/);
       writeFileSync(marker, nonce);
@@ -898,7 +898,7 @@ describe('runRealDispatchSmoke — the smoke worker\'s completion record goes to
     const settings = { ...overlaySafetySettings({}, { readSettings: () => null }), smokeTimeoutMs: 20_000 };
     const reportOutputs = [];
     const spawn = vi.fn((_node, args, opts) => {
-      const [, , , , slug, , , , prompt] = args;
+      const [, , slug, , , , prompt] = args;
       const [, marker, nonce] = prompt.match(/process\.argv\[2\]\)" '([^']+)' '([^']+)'/);
       writeFileSync(marker, nonce);
       // (a) the worker's literal step 3, exactly as the prompt spells it, run with the PARENT's env pointing at the real store
