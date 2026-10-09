@@ -93,6 +93,8 @@ import { defaultDrainHistoryPath } from '../operations/live-state-io.mjs';
 import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { stuckOnPermissionPrompt } from './health-smells/dispatch-permission-stall.mjs';
 import { notifyDesktopChecked } from './branch-sync.mjs';
+import { flushDigest, loadQuietSettings } from '../lib/quiet-hours-io.mjs';
+import { breaksThrough } from '../lib/quiet-hours.mjs';
 import { DAEMON_MANIFEST } from '../../skills-src/conveyor/daemon-manifest.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 import { collectDaemonStatus } from '../operations/daemon-status-io.mjs';
@@ -107,6 +109,62 @@ export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
 export const GH_CADENCE_MS = 15 * MINUTE;
 export const CHILD_TIMEOUT_MS = 30_000;
+
+/**
+ * quietHours breakthrough tag (card xmvc6oc): a daemon silent long enough is an emergency overnight. The duration
+ * is how long the daemon has been SILENT (the smell's own `silentForMs`, from its last tick), never how old the
+ * episode is — an episode opens only once the silence already exceeds the threshold, and its age is ~0 on the
+ * opening alert, which would hold the very alert the breakthrough exists for. Unknown silence → null (delivered).
+ */
+export function daemonDownEmergency(ep) {
+  if (ep?.smell !== 'daemon-silent') return undefined;
+  const ms = ep.measure?.silentForMs;
+  const min = ep.measure?.silentForMin; // episodes persisted before `silentForMs` existed
+  const downForMs = Number.isFinite(ms) ? Math.max(0, ms) : Number.isFinite(min) ? Math.max(0, min) * MINUTE : null;
+  return { kind: 'daemon-down', downForMs };
+}
+
+/**
+ * Health smells whose episode IS a red main: their alert always breaks through quiet hours (`mainRed` breakthrough).
+ * The tag only acts once the smell notifies at all: both are listed in `NOTIFY_EVEN_IN_SHADOW` (the operator-owned
+ * list in `health-smells-notify-list.mjs`; operator rulings 2026-10-08 and 2026-10-09), so a red main raises a desktop
+ * alert in shadow mode, and this tag makes it break through quiet hours.
+ */
+export const MAIN_RED_SMELLS = new Set(['pre-existing-red-on-main', 'main-ci-red']);
+
+/**
+ * Smells that alert ONCE per break (operator ruling 2026-10-09: one alert per broken main commit). Their subject is
+ * the lane's `origin/main` tip, which changes with every merge while main stays red, and the smell reads lane markers
+ * that come and go, so a per-subject or per-episode alert would storm. They are sent by their own block in `tick`
+ * (not from the plan), once per continuous red window, and retried until delivered.
+ */
+export const ALERT_ONCE_PER_SUBJECT = new Set(['pre-existing-red-on-main']);
+
+/** A red main whose episodes are separated by less than this is the same break. */
+export const MAIN_RED_CONTINUITY_MS = 60 * MINUTE;
+
+/**
+ * Should this ALERT_ONCE episode's alert be withheld? PURE. Yes when: `main-ci-red` is already open (it tells the
+ * operator about the same break, keyed on the first red commit), or an earlier episode of this smell already DELIVERED
+ * its alert and is still open or closed less than {@link MAIN_RED_CONTINUITY_MS} ago (the same continuous red window).
+ */
+export function isRepeatAlert(ep, state, now) {
+  if (!ALERT_ONCE_PER_SUBJECT.has(ep?.smell)) return false;
+  const open = Object.values(state?.episodes ?? {});
+  if (open.some((e) => e?.smell === 'main-ci-red' && e.status !== 'pending')) return true;
+  return [...open, ...(state?.history ?? [])].some((e) => e?.smell === ep.smell && e.id !== ep.id && Number.isFinite(e.alertedAt)
+    && (e.closedAt == null || now - e.closedAt < MAIN_RED_CONTINUITY_MS));
+}
+
+/**
+ * The quietHours breakthrough tag for a health episode's alert, or undefined for a routine one. The real red-main
+ * alert is titled `Health: pre-existing-red-on-main — main:<sha>`; it is tagged here rather than left to the title
+ * fallback, which only guesses from the wording.
+ */
+export function breakthroughEmergency(ep) {
+  if (MAIN_RED_SMELLS.has(ep?.smell)) return { kind: 'main-red' };
+  return daemonDownEmergency(ep);
+}
 
 // ── paths ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -1254,11 +1312,58 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     // `--dry-run`/`--no-notify` both skip actually SENDING one (an OS-visible side effect, unlike the
     // read-only diagnoses above) — a dry-run reports what it would have sent via `result.plan` already.
     if (!ep || flags['no-notify'] || flags['dry-run']) continue;
+    if (ALERT_ONCE_PER_SUBJECT.has(ep.smell)) continue; // sent once per break by the block below
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
     let sent;
-    try { sent = notifyDesktopChecked({ title, body }); } catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+    const emergency = breakthroughEmergency(ep);
+    try { sent = notifyDesktopChecked({ title, body, emergency }); } catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+    // Remember that quiet hours held this alert: the daemon-down breakthrough depends on elapsed time, so it is re-checked below.
+    if (emergency?.kind === 'daemon-down' && sent?.suppressed) ep.heldByQuietHours = true;
     notifications.push({ key: p.key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+  }
+
+  // A red main (operator ruling 2026-10-09): one alert per break, retried until delivered. Every open, untracked episode
+  // of an ALERT_ONCE smell that has not delivered yet is sent here, so a failed send is retried next tick and an episode
+  // that opened while another one's alert was still fresh stays quiet (see `isRepeatAlert`). The delivery time is stamped
+  // on the episode (`alertedAt`), which is what later episodes of the same break check.
+  if (!flags['no-notify'] && !flags['dry-run']) {
+    for (const [key, ep] of Object.entries(state.episodes)) {
+      if (!ALERT_ONCE_PER_SUBJECT.has(ep.smell) || ep.status === 'pending' || ep.tracked || Number.isFinite(ep.alertedAt)) continue;
+      if (!result.plan.some((x) => x.key === key && x.kind === 'notify' && !x.suppressed) && !Number.isFinite(ep.alertAttemptedAt)) continue; // first attempt rides the open-time plan entry
+      if (isRepeatAlert(ep, state, now)) continue;
+      let sent;
+      try { sent = notifyDesktopChecked({ title: `Health: ${ep.smell} — ${ep.subject}`, body: scrubText(ep.recommendation || ep.summary || 'See the health report.'), emergency: breakthroughEmergency(ep) }); }
+      catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+      ep.alertAttemptedAt = now;
+      if (sent?.ok === true) ep.alertedAt = now;
+      notifications.push({ key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+    }
+  }
+
+  // quietHours (card xmvc6oc): a daemon that dies at 02:00 is first seen minutes later — below the 30-minute
+  // breakthrough, so its opening alert is held. Nothing else re-alerts for hours, so once the silence crosses
+  // the threshold the held alert is re-sent as the emergency it has become (once: the flag clears on delivery).
+  if (!flags['no-notify'] && !flags['dry-run']) {
+    let quietSettings = null;
+    for (const [key, ep] of Object.entries(state.episodes)) {
+      if (!ep.heldByQuietHours || ep.status === 'pending') continue;
+      const emergency = daemonDownEmergency(ep);
+      if (!emergency) continue;
+      try { quietSettings ??= loadQuietSettings(); } catch { continue; }
+      if (!breaksThrough({ emergency }, quietSettings).breaks) continue;
+      let sent;
+      try { sent = notifyDesktopChecked({ title: `Health: ${ep.smell} — ${ep.subject}`, body: scrubText(ep.recommendation || ep.summary || 'See the health report.'), emergency }); }
+      catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+      if (sent?.ok === true && !sent.suppressed) delete ep.heldByQuietHours;
+      notifications.push({ key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+    }
+  }
+
+  // quietHours (card xmvc6oc): this tick runs often, so it is the reliable place to send the ONE held-alerts
+  // digest soon after quiet hours end (a no-op while quiet or when nothing is held).
+  if (!flags['no-notify'] && !flags['dry-run']) {
+    try { flushDigest({ send: (n) => notifyDesktopChecked(n, { quietGate: null }) }); } catch { /* best-effort */ }
   }
 
   const completedAt = Date.now();

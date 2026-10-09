@@ -55,4 +55,9 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   // Operator standing rule, 2026-10-08 (card xu1nixv): main was red ~5.5 h (17:04Z on) and nothing noticed. A red
   // main must reach the operator, even in shadow mode and through quiet hours.
   'main-ci-red',
+  // Operator ruling, 2026-10-09 ("Add it", PR #4461): the lane-verify view of a red main (`pre-existing-red-on-main`)
+  // also alerts through quiet hours. One alert per broken main: the subject `main:<sha>` moves with every merge while
+  // main stays red, so health-watch sends it once per continuous red window (no reminder, no re-alert on a new tip or
+  // on an episode reopened within the hour), and not at all while `main-ci-red` is already open.
+  'pre-existing-red-on-main',
 ]);
