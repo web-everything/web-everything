@@ -43,7 +43,7 @@ const REVIEW_ROUND_MARKERS = Object.freeze([
 export function pushedLoadFlakeFixOwedRearm({ comments, headRefOid, labels = [] }) {
   const names = (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
   if (!names.includes('review:changes') || typeof headRefOid !== 'string' || !headRefOid) return null;
-  const pushed = loadFlakeResults(comments).filter((r) => r.result === 'pushed').at(-1);
+  const pushed = loadFlakeResults(comments).filter((r) => !r.redispatch && r.result === 'pushed').at(-1);
   if (!pushed || !(headRefOid.startsWith(pushed.sha) || pushed.sha.startsWith(headRefOid))) return null;
   const pushedAt = Date.parse(pushed.createdAt);
   const closed = (Array.isArray(comments) ? comments : []).some((c) => isTrustedMarkerAuthor(c)

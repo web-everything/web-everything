@@ -1,4 +1,4 @@
-import { recordPrepareFailure, readFailureState } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
+import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
@@ -1754,6 +1754,44 @@ describe('automatic item preparation', () => {
     expect(effects.dispatch.mock.calls.length).toBeGreaterThan(0);
     expect(effects.dispatch.mock.calls.every(([r]) => r.prepareFallback === false)).toBe(true);
   });
+  // Live 2026-10-09 16:47–18:28Z — the ONE detached launch per tick (78b) always went to a build first, and a build
+  // was planned on every tick its predecessor settled: prepare.planned had 6 items with 6 free slots for 13 ticks,
+  // prepare.launched stayed [], and no prepare PR opened. The slot now alternates when both kinds want it.
+  describe('the one detached-launch slot is shared between builds and prepares', () => {
+    function shared(settledKind, { prepareHeld = false } = {}) {
+      const effects = fixture();
+      effects.dispatch = vi.fn(() => ({ dispatching: true, pending: true }));
+      const preparePlan = effects.planTick;
+      effects.planTick = (bk) => {
+        const out = preparePlan(bk);
+        out.decisions.spawnBuilds = [{ num: '4503', lane: 3 }];
+        out.decisions.admission = { queue: [{ num: '4503', scope: ['we:scripts/example.mjs'] }] };
+        return out;
+      };
+      effects.acquireClaim = vi.fn(() => ({ ok: true }));
+      effects.releaseClaim = vi.fn();
+      effects.settleLaunches = () => ({ pending: [], settled: settledKind
+        ? [{ num: '4490', kind: settledKind, outcome: { dispatching: true } }] : [] });
+      if (prepareHeld) effects.listHolds = () => ['4501', '4502'].map((num) => ({ num, reason: 'prepare-unstamped' }));
+      if (prepareHeld) effects.readPrepareStatus = () => ({ preparedDate: null, hasSections: false });
+      return runBuildDispatchTick({ live: true, effects });
+    }
+    it('gives the slot to a planned prepare when the last settled launch was a build', async () => {
+      const tick = await shared('build');
+      expect(tick.prepare.launched.map((s) => s.num)).toEqual(['4501']);
+      expect(tick.dispatched).toEqual([]);
+    });
+    it('gives the slot to the build when the last settled launch was a prepare (no prepare monopoly either)', async () => {
+      const tick = await shared('prepare-item');
+      expect(tick.dispatched.map((s) => s.num)).toEqual(['4503']);
+      expect(tick.prepare.launched).toEqual([]);
+    });
+    it('still launches the build when no prepare can use the slot', async () => {
+      const tick = await shared('build', { prepareHeld: true });
+      expect(tick.prepare.launched).toEqual([]);
+      expect(tick.dispatched.map((s) => s.num)).toEqual(['4503']);
+    });
+  });
   it('excludes two persistent holds before core planning, freeing both slots', async () => {
     const effects = fixture();
     effects.listHolds = () => ['4544', '4560'].map((num) => ({ num, reason: 'prepare-unstamped' }));
@@ -1778,6 +1816,20 @@ describe('automatic item preparation', () => {
     expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501', reason: 'prepare-stamp-pending' });
     expect(tick.prepare.failures).toEqual([]);
     expect(tick.prepare.inFlight).not.toContain('4501');
+  });
+  // Live 2026-10-09 — 8 re-prepares (4435, 4436, 4648, …) whose attempts ended with no new result were routed to stamp
+  // recovery every tick because main still carries the stamp they were REPLACING (read as unprepared + sectioned). The
+  // stamp worker saw that old stamp, logged `already-stamped` and exited: 8 spawns a tick, no PR, the items stuck.
+  it('never routes a re-prepare to stamp recovery on the sections of the stamp it was replacing', async () => {
+    const effects = fixture();
+    claimed(effects);
+    effects.readPrepareStatus = () => ({ preparedDate: null, replacedPreparedDate: '2026-09-30', hasSections: true,
+      pr: { state: 'MERGED', preparedDate: '2026-09-30', hasSections: true } });
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.stampPrepare).not.toHaveBeenCalled();
+    expect(tick.prepare.stamping).toEqual([]);
+    expect(tick.prepare.held).toEqual([{ num: '4501', reason: 'prepare-unstamped' }]);
   });
   it('holds incomplete results without attempting a mechanical stamp', async () => {
     const effects = fixture();
@@ -2194,6 +2246,160 @@ describe('automatic item preparation', () => {
     expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
     if (outcome === 'prepare-needs-you') expect(tick.needsYou).toContainEqual(expect.objectContaining({ num: '4501', step: 'prepare', reason: expect.stringContaining('scope is wrong') }));
     else expect(tick.needsYou).toEqual([]);
+  });
+  it('an already-done route recorded this tick whose hold cannot be placed is handed out again, not lost (review of #4643)', async () => {
+    const commit = '10fedba67afc9550fb9a6592282603117284c0c2';
+    const effects = fixture();
+    const path = join(lockRoot, 'failures.json');
+    effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard: vi.fn() });
+    effects.requeuePrepareRouteHold = (num, reason) => requeuePrepareRouteHold(num, reason, path);
+    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+    effects.listSettledPrepares = () => [{ num: '4501', source: 'run:done', startedAt: '2026-09-29', outcome: 'wrapper-failed',
+      evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${commit}'` } }];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    effects.placePrepareHold = vi.fn(() => { throw new Error('disk full'); });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try { await runBuildDispatchTick({ live: true, effects }); } finally { log.mockRestore(); }
+    expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501', reason: `spec already done on main: commit ${commit}` });
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4501', reason: `spec already done on main: commit ${commit}` }]);
+  });
+  it.each(['lane-busy', 'infra-transient'])('a reviewed release of an exhausted %s hold starts a fresh retry budget (review of #4643)', async (cause) => {
+    const effects = fixture();
+    const path = join(lockRoot, 'failures.json');
+    const key = '4501:run x:result';
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { [key]: { num: '4501', attempt: 'run x', stage: 'result', cause, retry: false, held: true, exhausted: true,
+      holdReason: 'needs-you: prepare exhausted - clear it with a reviewed prepare release', evidence: { error: 'could not acquire a lane: a LIVE lease' }, recordedAt: '2026-10-09T00:00:00.000Z' } } }));
+    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+    effects.completePrepareFailures = num => completePrepareFailures(num, path);
+    effects.listPrepareReleases = () => [{ target: '4501', attempt: 'run x' }];
+    effects.listHolds = () => [];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(readFailureState(path).failures[key].completed).toBe(true);
+    expect(tick.needsYou.find(n => n.num === '4501')).toBeUndefined();
+  });
+  it('a token quoted in a handled needs-you outcome never reaches the tick needsYou line (review of #4643)', async () => {
+    const effects = fixture();
+    effects.listSettledPrepares = () => [{ num: '4501', source: 'run:handled', startedAt: '2026-09-29', outcome: 'prepare-needs-you', evidence: { error: 'needs-you: prepare blocked (spec-defect) - leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 here' } }];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    const line = tick.needsYou.find(n => n.num === '4501');
+    expect(line.reason).toContain('leaked');
+    expect(line.reason).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+  });
+  // Live 2026-10-09: 28 prepares sat held after ONE attempt. The tick re-classifies the held ledger itself.
+  describe('held prepare ledger is re-classified on the next tick (live 2026-10-09)', () => {
+    const sha = '10fedba67afc9550fb9a6592282603117284c0c2';
+    const seed = (path, failures) => writeFileSync(path, JSON.stringify({ cards: {}, failures }));
+    const wire = (effects, path) => {
+      effects.releaseDuePrepareRetries = () => releaseDuePrepareRetries({ path });
+      effects.takePrepareRouteHolds = () => takePrepareRouteHolds({ path });
+      effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+      effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard: vi.fn() });
+      effects.readPrepareStatus = () => ({ preparedDate: null });
+    };
+    it('a lane-busy hold re-enters prepare on the next tick', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'no-session', retry: false, held: true, recordedAt: '2026-10-09T00:00:00.000Z',
+        evidence: { error: 'could not acquire a lane: ✗ lane-10 is leased by review-4484 (review-loop) — a LIVE lease; --force does not override it', sessionAbsent: true } } });
+      let holds = [{ num: '4501', reason: 'prepare-unstamped' }];
+      effects.listHolds = () => holds;
+      effects.releasePrepareHold = vi.fn(({ num }) => { holds = holds.filter(h => h.num !== num); });
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.releasePrepareHold).toHaveBeenCalledWith({ num: '4501' });
+      expect(tick.prepare.launched.map(r => r.num)).toContain('4501');
+    });
+    it('an already-done report is routed to the resolve hold (once), never left prepare-unstamped', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'` } } });
+      let holds = [{ num: '4501', reason: 'prepare-unstamped' }];
+      effects.listHolds = () => holds;
+      effects.releasePrepareHold = vi.fn(({ num }) => { holds = holds.filter(h => h.num !== num); });
+      effects.placePrepareHold = vi.fn(h => { holds = [...holds.filter(x => x.num !== h.num), h]; });
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501', reason: `spec already done on main: commit ${sha}` });
+      expect(tick.holdRouting).toContainEqual(expect.objectContaining({ num: '4501', route: 'already-done', commit: sha }));
+      expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
+      await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
+      expect(effects.placePrepareHold).toHaveBeenCalledTimes(1);
+    });
+    // PR #4643 review — remapping a hold to a `needs-you:` reason must not take it out of the prepare-hold checks.
+    it('a needs-you-held card that is later stamped on main has its hold released and its ledger record completed', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      effects.completePrepareFailures = num => completePrepareFailures(num, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'needs-you', retry: false, held: true,
+        holdReason: 'needs-you: prepare blocked (needs-ruling) - a policy choice; re-scope the card by hand or close it',
+        evidence: { error: 'prepare requires a card-only diff; worker report: **could-not-prepare** — a policy choice' } } });
+      let holds = [{ num: '4501', reason: 'prepare-unstamped' }];
+      effects.listHolds = () => holds;
+      effects.releasePrepareHold = vi.fn(({ num }) => { holds = holds.filter(h => h.num !== num); });
+      // An operator resolved it by hand: the stamped card landed on main.
+      effects.readPrepareStatus = () => ({ preparedDate: '2026-10-09' });
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(effects.releasePrepareHold).toHaveBeenCalledWith({ num: '4501' });
+      expect(Object.values(readFailureState(path).failures)[0]).toMatchObject({ completed: true });
+      expect(tick.needsYou).toEqual([]);
+      // And it does not come back on the next tick.
+      const next = await runBuildDispatchTick({ live: true, effects, bookkeeping: tick.nextBookkeeping });
+      expect(next.needsYou).toEqual([]);
+    });
+    // PR #4643 review — one failed hold placement must not drop the other routes already stamped as handed out.
+    it('a throw while placing one already-done route does not drop the others', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      const done = n => [`${n}:run x:result`, { num: n, attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'` }, recordedAt: '2026-10-09T00:00:00.000Z' }];
+      seed(path, Object.fromEntries([done('4501'), done('4502')]));
+      effects.listHolds = () => [];
+      const placed = [];
+      effects.placePrepareHold = vi.fn(h => { if (h.num === '4501') throw new Error('disk full'); placed.push(h.num); });
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try { await runBuildDispatchTick({ live: true, effects }); } finally { log.mockRestore(); }
+      expect(placed).toContain('4502');
+    });
+    it('a route whose hold could not be placed is handed out again on the next tick', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      effects.requeuePrepareRouteHold = (num, reason) => requeuePrepareRouteHold(num, reason, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'` }, recordedAt: '2026-10-09T00:00:00.000Z' } });
+      effects.listHolds = () => [];
+      let failing = true;
+      const placed = [];
+      effects.placePrepareHold = vi.fn(h => { if (failing) throw new Error('disk full'); placed.push(h.num); });
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await runBuildDispatchTick({ live: true, effects });
+        expect(placed).toEqual([]);
+        failing = false;
+        await runBuildDispatchTick({ live: true, effects });
+      } finally { log.mockRestore(); }
+      expect(placed).toEqual(['4501']);
+    });
+    it('a could-not-prepare report is surfaced under needsYou with a needs-you hold reason, not a silent prepare-unstamped', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: 'prepare requires a card-only diff; worker report: **could-not-prepare** — boost within the tier, or pin? a policy choice' } } });
+      effects.listHolds = () => [{ num: '4501', reason: 'prepare-unstamped' }];
+      const tick = await runBuildDispatchTick({ live: true, effects });
+      expect(tick.needsYou).toContainEqual(expect.objectContaining({ num: '4501', step: 'prepare', reason: expect.stringMatching(/^needs-you: prepare blocked/) }));
+      expect(tick.holdRouting).toContainEqual(expect.objectContaining({ num: '4501', route: 'other', reason: expect.stringMatching(/^needs-you: /) }));
+      // Tracked like every other prepare hold, but reported under its own reason, never `prepare-unstamped`.
+      expect(tick.prepare.held).toEqual([{ num: '4501', reason: expect.stringMatching(/^needs-you: /) }]);
+      expect(tick.needsYou.filter(n => n.num === '4501')).toHaveLength(1);
+      expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
+    });
   });
   it('prepare kill switch and global freeze each prevent launches', async () => {
     const effects = fixture();

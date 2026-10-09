@@ -2,6 +2,7 @@
 bornAs: xlsepow
 kind: story
 size: 2
+priority: high
 parent: "5467"
 status: open
 blockedBy: ["5469", "5470"]

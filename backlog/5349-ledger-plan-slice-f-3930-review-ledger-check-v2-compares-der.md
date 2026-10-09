@@ -2,9 +2,11 @@
 bornAs: xbm2jo5
 kind: task
 parent: "2405"
-status: open
+status: resolved
 scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/__tests__/review-ledger-check.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
+graduatedTo: 72020d9ac050c73b8c78a3995a4940f82d65a051
 tags: []
 ---
 
