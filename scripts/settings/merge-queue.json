@@ -9,6 +9,7 @@
   "mergeFreshness": {
     "enabled": true,
     "maxAgeMinutes": 30,
-    "allowDisjointMainMoves": true
+    "allowDisjointMainMoves": true,
+    "nonCodePaths": ["backlog/", "docs/"]
   }
 }

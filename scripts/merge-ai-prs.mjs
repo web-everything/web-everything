@@ -5497,7 +5497,7 @@ async function runCli() {
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
   const MERGE_QUEUE = loadMergeQueueSettings();
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
-  if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
+  if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainRedPriority() : null;
   /**
@@ -5730,7 +5730,7 @@ async function runCli() {
           // card xs1hdl7 — THE MERGE-QUEUE FRESHNESS HOOK. Every existing gate above has passed; before any land-side
           // stamp or the merge write, ask the freshness rule (we:scripts/lib/merge-freshness.mjs) whether the green
           // pass still proves THIS merge: the pass is on the pinned head, main moved only on files this PR does not
-          // touch (allowDisjointMainMoves), and the pass is younger than maxAgeMinutes. Not fresh → refresh the PR onto
+          // touch AND only on non-code paths (allowDisjointMainMoves + nonCodePaths, the middle-ground mode), and the pass is younger than maxAgeMinutes. Not fresh → refresh the PR onto
           // main once per head through the sanctioned refreshOntoMain path (or re-run its check when it is already on
           // the main tip) and skip this pass. It only ADDS a requirement; with `mergeFreshness.enabled` off (the built-in
           // default) no freshness read happens and the merge proceeds exactly as before.

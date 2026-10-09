@@ -9,7 +9,8 @@
  *   - #4547 merged 11:23:30Z. Its `test` pass: 09:15:14Z on head 028cf083 (128 min old). Its base 7fd484e3 was 81
  *     commits behind main d1462678 (which already held #4453); main moved on 45 files, none of #4547's 71 files.
  *     Main went red at 11:44Z (07:44 ET): the two were green alone and broke together.
- *   The hook lets #4453 merge and refreshes #4547 instead of merging it.
+ *   The hook lets #4453 merge and refreshes #4547 instead of merging it — under the middle-ground mode even with a
+ *   5-min-old pass, because main gained #4453's code since #4547's base.
  */
 import { describe, it, expect } from 'vitest';
 import { SETTINGS_DIR } from '../settings-files.mjs';
@@ -18,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   loadMergeQueueSettings, hookEnabled, readMergeFreshnessFacts, decideMergeQueueAction, requiredCheckFact,
-  prioritizeMainFix, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
+  prioritizeMainFix, isNonCodePath, mainGainedCode, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
 } from '../merge-queue-hook.mjs';
 
 const SETTINGS_FILE = JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8'));
@@ -65,7 +66,7 @@ describe('settings: the operator-chosen mode is ON in scripts/settings/merge-que
   it('disjoint main moves allowed, 30 min, batch size 1, main-fix first', () => {
     expect(LIVE.errors).toEqual([]);
     expect(hookEnabled(LIVE)).toBe(true);
-    expect(LIVE.freshness).toMatchObject({ enabled: true, maxAgeMinutes: 30, allowDisjointMainMoves: true });
+    expect(LIVE.freshness).toMatchObject({ enabled: true, maxAgeMinutes: 30, allowDisjointMainMoves: true, nonCodePaths: ['backlog/', 'docs/'] });
     expect(LIVE.queue).toMatchObject({ enabled: true, batchSize: 1, classOrder: ['main-fix', 'normal'] });
   });
   it('built-in default (no file) is off = today; the env switch forces off', () => {
@@ -96,13 +97,33 @@ describe('replay 2026-10-09: #4453 then #4547 (main red 07:44 ET)', () => {
     expect(r.facts.pr.baseSha).toBe(SEQ[4453].base);
     expect(r.action).toBe('merge');
   });
-  it('#4547 (second) is NOT merge-fresh: 128-min-old pass → refresh instead of merge', () => {
+  it('#4547 (second) is NOT merge-fresh: main gained code AND a 128-min-old pass → refresh instead of merge', () => {
     const r = replay(4547);
     expect(r.facts.errors).toEqual([]);
     expect(r.facts.main).toMatchObject({ commitsSinceBase: 81, complete: true });
     expect(r.facts.pr.requiredCheck).toMatchObject({ state: 'passed', runId: '37908827763' });
     expect(r.action).toBe('refresh');
-    expect(r.reasons).toEqual(['pass-too-old']);
+    expect(r.reasons).toEqual(['main-gained-code', 'base-behind-main', 'pass-too-old']);
+  });
+  it('MIDDLE GROUND: #4547 is refreshed even with a 5-min-old pass, because main gained #4453\'s code', () => {
+    const s = { ...SEQ[4547], completed: new Date(Date.parse(SEQ[4547].mergedAt) - 5 * 60_000).toISOString() };
+    const facts = readMergeFreshnessFacts({ repo: REPO, num: 4547, headSha: s.head, gh: fakeGh(s, 4547) });
+    expect(mainGainedCode(facts.main, LIVE.freshness.nonCodePaths)).toBe(true); // scripts/merge-ai-prs.mjs, prep-review…
+    const r = decideMergeQueueAction({ key: `${REPO}#4547`, num: 4547, facts, nowMs: Date.parse(s.mergedAt), settings: LIVE });
+    expect(r).toEqual({ action: 'refresh', reasons: ['main-gained-code', 'base-behind-main'] });
+  });
+  it('MIDDLE GROUND: a young pass while main moved only on backlog cards / docs still merges', () => {
+    const s = { ...SEQ[4453] }; // main moved on 5 backlog cards only
+    const facts = readMergeFreshnessFacts({ repo: REPO, num: 4453, headSha: s.head, gh: fakeGh(s, 4453) });
+    expect(mainGainedCode(facts.main, LIVE.freshness.nonCodePaths)).toBe(false);
+    expect(decideMergeQueueAction({ key: 'k', num: 4453, facts, nowMs: Date.parse(s.mergedAt), settings: LIVE }).action).toBe('merge');
+  });
+  it('non-code paths: prefixes and exact paths; skills-src/.github/scripts are code', () => {
+    expect(isNonCodePath('backlog/x.md')).toBe(true);
+    expect(isNonCodePath('docs/agent/a.md')).toBe(true);
+    for (const f of ['scripts/a.mjs', 'skills-src/x/SKILL.md', '.github/workflows/t.yml', 'package.json', 'AGENTS.md']) expect(isNonCodePath(f)).toBe(false);
+    expect(isNonCodePath('AGENTS.md', ['AGENTS.md'])).toBe(true);
+    expect(loadMergeQueueSettings({ file: { mergeFreshness: { nonCodePaths: 'docs/' } }, env: {} }).errors).toEqual(['mergeFreshness: nonCodePaths must be a list of non-empty path strings']);
   });
   it('with the rule off (today), #4547 merged — the incident', () => {
     expect(replay(4547, loadMergeQueueSettings({ file: {}, env: {} })).action).toBe('merge');

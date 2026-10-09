@@ -40,7 +40,7 @@ if (a[0] === 'api') {
       started_at: p.passAt, completed_at: p.passAt, details_url: 'https://github.com/o/r/actions/runs/99' + p.number + '/job/1' }] }]);
   }
   if (/\\/branches\\/main$/.test(path)) out({ sha: 'tip' });
-  if ((m = /compare\\/(sha-\\d+)\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['elsewhere.md'], n: 1 });
+  if ((m = /compare\\/(sha-\\d+)\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
   if ((m = /pulls\\/(\\d+)\\/files/.exec(path))) out([[{ filename: 'backlog/leaf-' + m[1] + '.md' }]]);
 }
 process.exit(0);
@@ -59,7 +59,7 @@ function runCli({ hookOn, seedRefreshed = null }) {
     mkdirSync(bin);
     for (const [name, code] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
-    // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a file neither touches.
+    // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
     writeFileSync(fixture, JSON.stringify([[3001, 5], [3002, 120]].map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
       baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',

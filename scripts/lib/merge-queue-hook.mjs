@@ -68,6 +68,10 @@ export function loadMergeQueueSettings({ file, env = process.env } = {}) {
     errors.push('mergeFreshness: maxAgeMinutes must be a positive number');
     freshness.maxAgeMinutes = MERGE_FRESHNESS_DEFAULTS.maxAgeMinutes;
   }
+  if (freshness.nonCodePaths !== undefined && !(Array.isArray(freshness.nonCodePaths) && freshness.nonCodePaths.every((p) => typeof p === 'string' && p))) {
+    errors.push('mergeFreshness: nonCodePaths must be a list of non-empty path strings');
+    freshness.nonCodePaths = [...DEFAULT_NON_CODE_PATHS];
+  }
   if (String(env?.[MERGE_QUEUE_OFF_ENV] ?? '').trim().toLowerCase() === 'off') { queue.enabled = false; freshness.enabled = false; }
   return { queue, freshness, errors };
 }
@@ -160,16 +164,40 @@ function defaultReadTip(laneRef, root) {
 function firstLine(e) { return String(e?.stderr || e?.message || e).split('\n')[0].slice(0, 200); }
 
 /**
+ * The MIDDLE-GROUND mode (operator decision 2026-10-09). "Main moved only on files the PR does not touch" counts as
+ * fresh ONLY when everything main gained since the PR's base is non-code (docs / backlog cards). Any code change on
+ * main since then ⇒ refresh, however young the pass. Why: #4453 and #4547 touched different files and still broke
+ * main together — file-disjointness alone does not prove two code changes compose.
+ * `nonCodePaths` (setting): `dir/` = a path prefix; anything else = an exact path. Default below.
+ */
+export const DEFAULT_NON_CODE_PATHS = Object.freeze(['backlog/', 'docs/']);
+
+/** PURE. Is this changed path non-code under the configured patterns? */
+export function isNonCodePath(file, patterns = DEFAULT_NON_CODE_PATHS) {
+  const f = String(file ?? '');
+  return !!f && patterns.some((p) => (p.endsWith('/') ? f.startsWith(p) : f === p));
+}
+
+/** PURE. Did main gain any code since the PR's base? (Unknown file lists are handled by the rule: fail closed.) */
+export function mainGainedCode(main, patterns = DEFAULT_NON_CODE_PATHS) {
+  return (main?.commitsSinceBase ?? 0) > 0 && (main?.filesChangedSinceBase ?? []).some((f) => !isNonCodePath(f, patterns));
+}
+
+/**
  * PURE. The action for one landing candidate (batch size 1: the candidate is the queue head).
  * @returns {{action: 'merge'|'refresh'|'wait'|'refuse'|'queued', reasons: string[]}}
  */
 export function decideMergeQueueAction({ key, num, facts, nowMs, refreshed = {}, settings }) {
+  const freshness = { ...settings.freshness };
+  const codeMoved = freshness.allowDisjointMainMoves && mainGainedCode(facts.main, freshness.nonCodePaths ?? DEFAULT_NON_CODE_PATHS);
+  if (codeMoved) freshness.allowDisjointMainMoves = false; // disjointness only excuses non-code moves
   const [row] = planQueue({
     queue: [{ key, num, ...facts.pr }], main: () => facts.main, nowMs, refreshed,
     // The queue order is applied by the drain's own cascade (and `prioritizeMainFix`); here the candidate IS the head.
-    queueSettings: { ...settings.queue, batchSize: 1 }, freshnessSettings: settings.freshness,
+    queueSettings: { ...settings.queue, batchSize: 1 }, freshnessSettings: freshness,
   });
-  return { action: row.action, reasons: row.reasons };
+  const reasons = codeMoved && row.reasons.includes('base-behind-main') ? ['main-gained-code', ...row.reasons] : row.reasons;
+  return { action: row.action, reasons };
 }
 
 /** Durable "already refreshed this head" record (the drain runs one process per pass). */
