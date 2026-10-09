@@ -1,4 +1,5 @@
 ---
+bornAs: xrw21vx
 kind: story
 size: 2
 status: active
@@ -10,7 +11,7 @@ tags: []
 
 # Red main: review-pr ledger-events rows keyed on wall-clock, so same-ms runs collapse and replays double-count
 
-review-pr-io LEDGER_EVENTS sink builds rows whose event id is the sha256 of the whole row including at (ms). Since #x7b0be5 made home append idempotent by event id, three review-run rows written in one millisecond hash equal and collapse to one (CI flake: expected 3 rows, got 2). The effect is declared idempotent:true but the sink is not: a replay writes a fresh at, so a second row. Fix: stamp each row's id from the effect key (ctx.key) plus row type, so one effect = one row across replays and distinct runs never collide.
+review-pr-io LEDGER_EVENTS sink builds rows whose event id is the sha256 of the whole row including at (ms). Since #5462 made home append idempotent by event id, three review-run rows written in one millisecond hash equal and collapse to one (CI flake: expected 3 rows, got 2). The effect is declared idempotent:true but the sink is not: a replay writes a fresh at, so a second row. Fix: stamp each row's id from the effect key (ctx.key) plus row type, so one effect = one row across replays and distinct runs never collide.
 
 ## Done when
 

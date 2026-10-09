@@ -1,4 +1,5 @@
 ---
+bornAs: xh6ij2v
 kind: story
 size: 1
 status: active
@@ -11,7 +12,7 @@ tags: []
 
 # Red main: build-dispatch-orphan-adopt soak reads the real backlog for delivery evidence
 
-Since xykwe0h (settle builds by real outcome) adoptOrphanedBuildClaims reads real delivery evidence (gh PRs + origin/main card status). The soak scenario uses real card numbers (#4382, #4468) that are resolved on main, so they now settle as card-resolved instead of release and main CI soak-shard fails. Make the scenario inject its own delivery evidence (none for the release shapes) and add a delivered-card shape asserting settled.
+Since 5422 (settle builds by real outcome) adoptOrphanedBuildClaims reads real delivery evidence (gh PRs + origin/main card status). The soak scenario uses real card numbers (#4382, #4468) that are resolved on main, so they now settle as card-resolved instead of release and main CI soak-shard fails. Make the scenario inject its own delivery evidence (none for the release shapes) and add a delivered-card shape asserting settled.
 
 ## Done when
 
