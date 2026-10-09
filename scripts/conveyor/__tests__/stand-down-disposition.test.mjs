@@ -11,6 +11,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   answerDisposition, buildOperatorAnswer, parseOperatorAnswer, withOperatorAnswer, DISPOSITIONS, isCloseSupersededExecuted,
+  isOperatorAnswerStandDownSuperseded,
 } from '../stand-down-answer-core.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import {
@@ -137,5 +138,72 @@ describe('#3850 — the promote-draft pass executes the disposition', () => {
 
   it('the comment escapes HTML-comment openers in the quoted ruling', () => {
     expect(closeSupersededComment({ reason: 'x <!-- y', actor: 'a', channel: 'c' })).toContain('&lt;!-- y');
+  });
+});
+
+describe('#4522 — a close-superseded ruling resolves EVERY earlier stand-down, not only the one it names', () => {
+  // Live 2026-10-09: #4522 carried TWO stand-downs (a fix agent's at 04:36Z, supersede-watch's at 05:38Z). The
+  // operator's `--disposition=close-superseded` answer named the LATEST one, so the earlier stand-down still
+  // counted as unresolved, REFUSAL 1 (`stood-down`) fired before the disposition branch, and the PR stayed open.
+  const comments4522 = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', '4522-two-stand-downs-close-superseded.json'), 'utf8'));
+  const pr4522 = {
+    number: 4522, isDraft: false, headRefName: 'lane/main-red-soak', headRefOid: '22052c0d1',
+    labels: [{ name: 'review:changes' }, { name: 'merge-status:conflicting' }, { name: 'review-status:stood-down' }, { name: 'superseded' }],
+    comments: comments4522, commits: [], statusCheckRollup: [], mergeStateStatus: 'DIRTY', mergeable: 'CONFLICTING',
+  };
+  const now = Date.parse('2026-10-09T11:30:00Z');
+
+  it('the live #4522 thread is planned close-superseded (not refused stood-down)', () => {
+    const plan = planReconcile({ prs: [pr4522], agents: [], durableCounts: {}, now });
+    expect(plan.refusals.filter((r) => r.prNumber === 4522).map((r) => r.kind)).not.toContain('stood-down');
+    expect(plan.dispatch.filter((d) => d.prNumber === 4522).map((d) => d.kind)).toEqual(['close-superseded']);
+  });
+
+  it('only a DISPOSITION widens: an ordinary answer to the later stand-down leaves the earlier one terminal', () => {
+    const answerAt = comments4522.findIndex((c) => String(c.body).startsWith('<!-- conveyor-stand-down-answer:v1 -->'));
+    const rec = parseOperatorAnswer(comments4522[answerAt]);
+    const plain = { ...comments4522[answerAt], body: buildOperatorAnswer({ standDownId: rec.standDownId, reason: 'Fix the test instead', actor: 'chalbert', channel: 'chat' }) };
+    const thread = [...comments4522.slice(0, answerAt), plain];
+    const plan = planReconcile({ prs: [{ ...pr4522, comments: thread }], agents: [], durableCounts: {}, now });
+    expect(plan.refusals.filter((r) => r.prNumber === 4522).map((r) => r.kind)).toContain('stood-down');
+  });
+
+  it('a stand-down posted AFTER the disposition is still terminal, and a live fix claim still wins', () => {
+    const firstStandDown = comments4522.find((c) => /stood down, human judgment needed/.test(String(c.body)));
+    const later = [...comments4522, { ...firstStandDown, id: 'IC_after', createdAt: '2026-10-09T12:00:00Z' }];
+    const plan = planReconcile({ prs: [{ ...pr4522, comments: later }], agents: [], durableCounts: {}, now });
+    expect(plan.dispatch.filter((d) => d.kind === 'close-superseded')).toEqual([]);
+    expect(plan.refusals.filter((r) => r.prNumber === 4522).map((r) => r.kind)).toContain('stood-down');
+    const claimed = planReconcile({ prs: [{ ...pr4522, fixClaim: { who: 'fix-4522' } }], agents: [], durableCounts: {}, now });
+    expect(claimed.dispatch.filter((d) => d.prNumber === 4522)).toEqual([]);
+  });
+});
+
+describe('#4522 — the widened resolution keeps the answer trust boundary', () => {
+  const comments4522 = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures', '4522-two-stand-downs-close-superseded.json'), 'utf8'));
+  const answerAt = comments4522.findIndex((c) => String(c.body).startsWith('<!-- conveyor-stand-down-answer:v1 -->'));
+  const firstStandDownAt = comments4522.findIndex((c) => /stood down, human judgment needed/.test(String(c.body)));
+  const pr = (comments) => ({ number: 4522, headRefName: 'lane/main-red-soak', headRefOid: '22052c0d1', labels: [{ name: 'review:changes' }], comments, commits: [], statusCheckRollup: [], mergeStateStatus: 'DIRTY' });
+  const kinds = (comments) => {
+    const plan = planReconcile({ prs: [pr(comments)], agents: [], durableCounts: {}, now: Date.parse('2026-10-09T11:30:00Z') });
+    return { dispatch: plan.dispatch.map((d) => d.kind), refusals: plan.refusals.map((r) => r.kind) };
+  };
+
+  it('a disposition answer posted by an untrusted login widens nothing', () => {
+    const forged = { ...comments4522[answerAt], author: { login: 'random-contributor' }, authorAssociation: 'CONTRIBUTOR' };
+    const thread = [...comments4522.slice(0, answerAt), forged];
+    expect(isOperatorAnswerStandDownSuperseded(thread, firstStandDownAt)).toBe(false);
+    expect(kinds(thread)).toMatchObject({ dispatch: [], refusals: ['stood-down'] });
+  });
+
+  it('a disposition answer naming no earlier terminal comment widens nothing', () => {
+    const orphan = { author: { login: 'chalbert' }, body: buildOperatorAnswer({ standDownId: 'IC_nowhere', reason: 'drop it', actor: 'chalbert', channel: 'chat', disposition: 'close-superseded' }) };
+    const thread = [...comments4522.slice(0, answerAt), orphan];
+    expect(isOperatorAnswerStandDownSuperseded(thread, firstStandDownAt)).toBe(false);
+    expect(kinds(thread).refusals).toContain('stood-down');
+  });
+
+  it('a non-array thread fails closed', () => {
+    expect(isOperatorAnswerStandDownSuperseded(null, 0)).toBe(false);
   });
 });
