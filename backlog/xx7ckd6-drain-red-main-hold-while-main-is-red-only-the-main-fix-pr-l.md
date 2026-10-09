@@ -29,6 +29,7 @@ Held items 164+166. Freeze marker lived in the importing clone's .conveyor/; the
 2. **Truncated reads** — an unreadable or malformed record reads as absent (no hold); same as the builder's main-red freeze.
 3. **Shared state files** — one marker in the coordination root, written atomically; tests keep the per-clone path.
 4. **Fail closed** — a red signal with no published fix PR holds every local PR.
-5. **Identity scoping** — only local-repo (WE) PRs are held; a priority record for another repo exempts nothing.
+5. **Identity scoping** — a PUBLISHED red holds only local-repo (WE) PRs; a priority record for another repo exempts nothing, and the fix-PR exemption is local-only. A MANUAL freeze is the operator's stop-the-line and holds every repo's PRs (quarantine mode never relaxes it). The legacy freeze marker is looked for in every clone (primary, both drain-daemon clones, registered daemon clones), not only the importing one.
+8. **Quarantine precision** — a `file::test name` entry names one test: it never expands to a whole-file `--exclude` or to other tests of that file; unknown main-fix PR files stay `null` (fail closed), never `[]`.
 6. **State over time** — records carry expiresAt (30 min TTL); a stopped health watch cannot hold the queue past it.
 7. **Who wrote it** — health watch (published records) or the operator (manual freeze CLI).
