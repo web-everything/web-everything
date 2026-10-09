@@ -189,6 +189,7 @@ import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overla
 import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
+import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -5492,6 +5493,66 @@ async function runCli() {
   // left `skip` so it keeps blocking its dependents and is re-read fresh next pass.
   const revalidationAborted = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
+  // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
+  const MERGE_QUEUE = loadMergeQueueSettings();
+  if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
+  if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
+  const MERGE_QUEUE_STATE = refreshedStatePath();
+  const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
+  /**
+   * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
+   * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per pass, through
+   * `refreshOntoMain`, or a re-run of its required run when it is already on the main tip), or it waits / refuses;
+   * it has logged the reason and recorded it in `revalidationAborted`. The caller only skips. Freshness is never cached
+   * across merges: a WE carrier judged at its impl half's pre-check (`precheck: true`) is judged again at its own turn,
+   * since merges in between move main. The one carry-over is `couplePins`: a carrier the pre-check cleared stays
+   * cleared at its own turn while its head AND the main tip are unchanged and only its pass aged out in the gap
+   * (`couplePinExcuses`) — otherwise the second judgment could refresh the carrier after the impl half had landed.
+   */
+  const couplePins = new Map(); // mqKey → {head, tip} the pre-check judged `merge`
+  const mergeQueueGate = async (cand, headSha, { precheck = false } = {}) => {
+    if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
+    const mqKey = `${cand.repo || localSlug || 'cwd'}#${cand.num}`;
+    // A carrier with several impl halves is pre-checked once per half; each pre-check honours the pin the first one set.
+    const pin = couplePins.get(mqKey);
+    if (!precheck) couplePins.delete(mqKey); // consumed by the carrier's own-turn judgment
+    const facts = readMergeFreshnessFacts({
+      repo: cand.repo, num: cand.num, headSha, requiredCheck: REQUIRED,
+      defaultBranch: defaultBranchOf(cand.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+    });
+    const mq = decideMergeQueueAction({ key: mqKey, num: cand.num, facts, nowMs: Date.now(), refreshed: readRefreshed(MERGE_QUEUE_STATE), settings: MERGE_QUEUE });
+    const why = `${mq.reasons.join(', ') || 'fresh'}${facts.errors.length ? `; read errors: ${facts.errors.join('; ')}` : ''}`;
+    if (mq.action === 'merge') {
+      if (!AS_JSON) process.stderr.write(`  ✓ merge-queue: PR ${repoTag(cand.repo)}${cand.num} merge-fresh (pass ${Math.round((Date.now() - (facts.pr.requiredCheck?.completedAtMs ?? Date.now())) / 60000)} min old, main +${facts.main.commitsSinceBase ?? '?'} since base)\n`);
+      if (precheck && facts.main.tipSha) couplePins.set(mqKey, { head: headSha, tip: facts.main.tipSha, atMs: Date.now() });
+      return true;
+    }
+    if (couplePinExcuses(pin, { headSha, mainTip: facts.main.tipSha, action: mq.action, reasons: mq.reasons, nowMs: Date.now(), windowMs: MERGE_QUEUE.freshness.maxAgeMinutes * 60_000 })) {
+      if (!AS_JSON) process.stderr.write(`  ✓ merge-queue: PR ${repoTag(cand.repo)}${cand.num} stays merge-fresh — its pass aged out only after the couple's pre-check cleared it ${Math.round((Date.now() - pin.atMs) / 1000)}s ago (same head, same main tip), so the couple lands together\n`);
+      return true;
+    }
+    if (mq.action !== 'refresh') {
+      revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: ${mq.action} (${why})` });
+      if (!AS_JSON) process.stderr.write(`  ⏸ merge-queue: ${mq.action} PR ${repoTag(cand.repo)}${cand.num} (${why}) — not merged this pass\n`);
+      return false;
+    }
+    const cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
+    let out;
+    if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
+    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
+    else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
+    // Once per pass on a head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git
+    // error, no clone) is retried next pass rather than parking the head as `wait` forever. The record names the pass
+    // it was requested against, so a re-run that finished (a new pass on the SAME head) lapses it — see liveRefreshed.
+    if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, headSha, { pass: facts.pr.requiredCheck });
+    if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(cand, { action: 'rebased' })) {
+      const rs = restampAcceptance({ pr: cand.num, repo: cand.repo, newHead: out.newCommit, cwd: isLocalRepo(cand.repo) ? undefined : cloneDir });
+      if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(cand.repo)}${cand.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
+    }
+    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}` });
+    if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
+    return false;
+  };
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
@@ -5567,6 +5628,11 @@ async function runCli() {
       staleLandedOpenItems = plan.staleLandedOpenItems || [];
       if (!plan.ready.length) break;
       let progressed = false;
+      // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
+      // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
+      coupleStep.ordered = prioritizeMainFix(coupleStep.ordered, {
+        mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue, isCoupleHalf: (x) => isImplHalf(x) || isCoupleCarrier(x), repoKeyOf: repoKeyOfVerdict,
+      });
       for (const c of coupleStep.ordered) {
         if (heldThisIteration.has(candKey(c))) continue;
         // fix-couple-split — impl half: its carrier must still pass a FRESH pre-merge read right now, else hold both.
@@ -5584,6 +5650,36 @@ async function runCli() {
             if (carrier) holdCouple(carrier, 'carrier', `its impl half ${repoTag(c.repo)}${c.num} was held (${pf.reason})`);
             continue;
           }
+          // card xs1hdl7 — the WE carrier lands AFTER its impl half, so its merge-freshness is judged HERE, before the
+          // impl merges: a stale carrier is refreshed and the couple is held together, never split by the gate.
+          if (carrier && fresh?.decision === 'merge' && !(await mergeQueueGate(carrier, fresh.headSha, { precheck: true }))) {
+            const why = 'its WE carrier is not merge-fresh (merge-queue) — refreshed/held; the couple lands together later';
+            holdCouple(c, 'impl', why);
+            holdCouple(carrier, 'carrier', `not merge-fresh (merge-queue); impl half ${repoTag(c.repo)}${c.num} held with it`);
+            continue;
+          }
+          // Review of #4619 (codex-correctness) — the same applies to every OTHER impl half of this carrier that has not
+          // merged yet: each is gated only at its own turn, so a fresh first half could land and a stale second half
+          // then be refreshed-and-skipped, splitting the couple. Judge them all HERE, before this half merges: any
+          // stale / refused member holds the whole couple (the stale one has been refreshed by its gate).
+          const siblings = !mergeQueueHookEnabled(MERGE_QUEUE) ? [] : coupleStep.ordered.filter((x) => x !== c && isImplHalf(x) && `${x.coupleCarrier.repo || 'cwd'}::${x.coupleCarrier.num}` === ck
+            && !heldThisIteration.has(candKey(x)) && !merged.some((m) => candKey(m) === candKey(x)));
+          let siblingHold = null;
+          for (const sib of siblings) {
+            const sibFresh = await revalidateFresh(sib.repo, sib.num, {
+              requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(sib.num)) || (!!escalationRelief.passWide && !!label),
+              defaultBranch: defaultBranchOf(sib.repo), expectedHeadSha: sib.listedHeadSha || sib.headSha || null,
+            });
+            if (sibFresh.decision !== 'merge') { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} would not merge (${sibFresh.reason})` }; break; }
+            if (!(await mergeQueueGate(sib, sibFresh.headSha, { precheck: true }))) { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} is not merge-fresh (merge-queue) — refreshed/held` }; break; }
+          }
+          if (siblingHold) {
+            const why = `${siblingHold.why}; the couple lands together later`;
+            holdCouple(c, 'impl', why);
+            for (const s of siblings) holdCouple(s, 'impl', `${s === siblingHold.sib ? 'not merge-fresh' : 'held with it'} (merge-queue); the couple lands together later`);
+            if (carrier) holdCouple(carrier, 'carrier', `impl half ${repoTag(siblingHold.sib.repo)}${siblingHold.sib.num} not merge-fresh (merge-queue); held with it`);
+            continue;
+          }
         }
         // fix-couple-split — carrier: every impl half ordered ahead of it in this group must have merged.
         let carrierImplsLanded = null;
@@ -5599,6 +5695,17 @@ async function runCli() {
         // fix-couple-split residual — the carrier did not land AFTER its impl half(s) did. Two repos cannot merge
         // atomically, so this is reported loudly (JSON `coupleSplit` + stderr), never silently.
         const noteSplit = (why) => {
+          // Review of #4619 — an impl half refused at its OWN turn after a sibling impl half of the same carrier already
+          // merged (a main move between the preflight above and this turn, past the pin) is a split too: report it loudly.
+          if (isImplHalf(c)) {
+            const ck = `${c.coupleCarrier.repo || 'cwd'}::${c.coupleCarrier.num}`;
+            const landedSibs = merged.filter((m) => candKey(m) !== candKey(c) && coupleStep.ordered.some((x) => candKey(x) === candKey(m) && isImplHalf(x) && `${x.coupleCarrier.repo || 'cwd'}::${x.coupleCarrier.num}` === ck));
+            if (landedSibs.length) {
+              coupleSplit.push({ carrier: { num: c.coupleCarrier.num, repo: c.coupleCarrier.repo ?? null }, landedImpls: landedSibs.map((x) => ({ num: x.num, repo: x.repo ?? null })), unlandedImpl: { num: c.num, repo: c.repo ?? null }, reason: why });
+              if (!AS_JSON) process.stderr.write(`  ‼ COUPLE SPLIT: impl half ${repoTag(c.repo)}${c.num} did not land after its sibling impl half ${landedSibs.map((x) => repoTag(x.repo) + x.num).join(', ')} — ${why}\n`);
+            }
+            return;
+          }
           if (!carrierImplsLanded || !carrierImplsLanded.length) return;
           coupleSplit.push({ carrier: { num: c.num, repo: c.repo ?? null }, landedImpls: carrierImplsLanded.map((x) => ({ num: x.num, repo: x.repo ?? null })), reason: why });
           if (!AS_JSON) process.stderr.write(`  ‼ COUPLE SPLIT: ${repoTag(c.repo)}${c.num} (WE carrier) did not land after its impl half ${carrierImplsLanded.map((x) => repoTag(x.repo) + x.num).join(', ')} — ${why}\n`);
@@ -5663,6 +5770,19 @@ async function runCli() {
             }
             revalidationAborted.push({ num: c.num, repo: c.repo, reason: revalidated.reason });
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} no longer safe to merge on a fresh re-read (${revalidated.reason}) — the pass-start decision is stale; refusing to merge this pass (xvzc4v4)\n`);
+            continue;
+          }
+          // card xs1hdl7 — THE MERGE-QUEUE FRESHNESS HOOK. Every existing gate above has passed; before any land-side
+          // stamp or the merge write, ask the freshness rule (we:scripts/lib/merge-freshness.mjs) whether the green
+          // pass still proves THIS merge: the pass is on the pinned head, main moved only on files this PR does not
+          // touch AND only on non-code paths (allowDisjointMainMoves + nonCodePaths, the middle-ground mode), and the pass is younger than maxAgeMinutes. Not fresh → refresh the PR onto
+          // main once per head through the sanctioned refreshOntoMain path (or re-run its check when it is already on
+          // the main tip) and skip this pass. It only ADDS a requirement; with `mergeFreshness.enabled` off (the built-in
+          // default) no freshness read happens and the merge proceeds exactly as before.
+          // Live 2026-10-09: #4547 merged on a 128-min-old pass after #4453 landed; main went red at 07:44 ET.
+          if (!(await mergeQueueGate(c, revalidated.headSha))) {
+            const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // re-judged next pass
+            noteSplit('merge-queue: not merge-fresh');
             continue;
           }
           // xnsk54v follow-up (land-path tamper-evidence) — the park/skip comment paths only fire when the drain
