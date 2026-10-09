@@ -8,5 +8,6 @@
     "borrowBuildSlots": "on",
     "borrowAfterMinutes": 15,
     "borrowExecutor": "codex"
-  }
+  },
+  "freeze": { "mainRed": "on" }
 }

@@ -79,6 +79,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
+import { probeAndOwnMainCi } from './main-ci-red-io.mjs';
 import { collectCredentialInventory, normalizeInventory } from './credential-inventory.mjs';
 import { readGithubAppStatus, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { resolvePrLimit, readLimitState, isGlobalOffNow } from '../lib/pr-limit.mjs';
@@ -1087,6 +1088,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     probes.externalRuns = attempt('externalRuns', () => probeExternalRuns({
       runsDir: process.env.OPERATION_RUNS_DIR || join(workspaceOf(REPO_ROOT), '.operations', 'coordination', 'build-dispatch-runs'),
       lanesRoot: process.env.LANE_POOL_ROOT || join(workspaceOf(REPO_ROOT), '.lanes'), nowMs: now }));
+  }
+  // Card xu1nixv — main's own CI workflow runs (read by workflow, never across all workflows) and its ONE owner per
+  // broken commit, every tick (main red is the priority). The result is the `main-ci-red` smell's probe. A fixture
+  // (`--main-ci-runs-fixture=<file>`) replays recorded runs and never dispatches; other fixture ticks skip it.
+  if (flags['main-ci-runs-fixture'] || (!flags['no-gh'] && !flags['lock-root'] && !flags['state-root'])) {
+    const fixture = flags['main-ci-runs-fixture'];
+    probes.mainCiRuns = await attempt('mainCiRuns', () => probeAndOwnMainCi({
+      dir, now, config, weRoot: REPO_ROOT, dryRun: !!flags['dry-run'] || !!fixture,
+      ...(fixture ? { readRuns: () => JSON.parse(readFileSync(fixture, 'utf8')), readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }) } : {}),
+    }));
   }
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());

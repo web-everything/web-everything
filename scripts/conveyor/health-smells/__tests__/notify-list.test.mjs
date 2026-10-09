@@ -44,11 +44,13 @@ const ADDED_2026_10_04 = ['ruling-needed-waiting'];
 const ADDED_2026_10_06 = ['build-session-idle', 'build-session-overrun', 'build-session-looping', 'external-run-stalled'];
 // Operator order 2026-10-07 (builder-starved-2): the starving builder must reach the operator.
 const ADDED_2026_10_07 = ['builder-starved'];
-const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07])];
+// Operator standing rule 2026-10-08 (card xu1nixv): a red main must reach the operator.
+const ADDED_2026_10_08 = ['main-ci-red'];
+const APPROVED = [...new Set([...PREVIOUSLY_APPROVED, ...ADDED_2026_09_27, ...ADDED_2026_09_30, ...ADDED_2026_10_01, ...ADDED_2026_10_04, ...ADDED_2026_10_06, ...ADDED_2026_10_07, ...ADDED_2026_10_08])];
 
 describe('NOTIFY_EVEN_IN_SHADOW', () => {
-  it('is exactly the union of the approved operator decisions — 22 entries', () => {
-    expect(APPROVED).toHaveLength(22);
+  it('is exactly the union of the approved operator decisions — 23 entries', () => {
+    expect(APPROVED).toHaveLength(23);
     expect([...NOTIFY_EVEN_IN_SHADOW].sort()).toEqual([...APPROVED].sort());
   });
 
