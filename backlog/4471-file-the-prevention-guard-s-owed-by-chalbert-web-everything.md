@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs", "we:scripts/lib/review-core.mjs", "we:scripts/lib/__tests__/review-core.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-01"
-preparedAgainstSha: "dda3ff3277860f2c27e594dc68e0cda7052f201e"
+preparedDate: "2026-10-09"
+preparedAgainstSha: "b701f463d2111a777f9876514c58a60707560d27"
 tags: []
 ---
 
@@ -62,6 +62,16 @@ For the review guard, inspect the actual `buildPanelMandate` output for simplici
 
 The `we:` tokens above identify the repository; strip them from executable arguments when running from the WE checkout root.
 
+## Edge cases this change must handle
+
+1. **Untrusted text:** card bodies are untrusted input to the detector; it only counts lines and words and never passes text to a shell, argv, path or regex built from it. Warning text must not echo body lines verbatim (cite line numbers only). Test: a body line with backticks and newlines does not alter the warning text.
+2. **Truncated reads:** n/a: the detector is pure over the in-memory `body` string passed to `lintBacklogItemRendering`; it performs no `gh`/`git` read.
+3. **Shared state files:** n/a: no state file is read or written.
+4. **Fail closed:** a missing `## Done when` section, or an unterminated fence, yields no false warning and no throw; an unterminated fence is treated as running to end of section. Test both.
+5. **Identity scoping:** n/a: findings key on the item `id` already passed in and are not stored.
+6. **State over time:** n/a: stateless and recomputed each run; thresholds (5 shell lines, 80 prose words) are constants, tested at the boundary.
+7. **Who wrote it:** n/a: no trust is granted from any comment, ref, label or job name; the review-lens text is instruction to a reviewer, not a trust signal.
+
 ## Follow-ups
 
 No follow-up is required to deliver these guards. A corpus cleanup or promotion of a heuristic warning to a hard error would be separately scoped work, supported by measured false positives. Review-algorithm comments must remain distinguishable from incidental review narration.
@@ -71,4 +81,5 @@ No follow-up is required to deliver these guards. A corpus cleanup or promotion 
 - **Premise checked during preparation:** the original scope listed `we:backlog/4297-catch-up-with-main-once-right-before-the-final-gate.md` and `we:scripts/__tests__/conveyor-brief-main-catchup-policy.test.mjs` as though those were the guard homes. Both still exist. The former's Done-when still contains the one-time stash procedure and extended explanation; the latter still has review-history comments at lines 36–38 and 67–69. No moved-file correction was needed, and neither example has been silently cleaned up.
 - **Corrected scope:** those files supply regression evidence. Implementation belongs in `we:scripts/check-standards-rules.mjs`, matched by existing `we:scripts/__tests__/check-standards-rules-content-lint.test.mjs`, and `we:scripts/lib/review-core.mjs`, matched by existing `we:scripts/lib/__tests__/review-core.test.mjs`. Both source/test pairs are now listed in scope. The existing standards caller requires no edit.
 - **Corrected premise:** “only simple, repeatable commands” cannot mean banning all acceptance prose: the acceptance ladder in `we:docs/agent/backlog-workflow.md` explicitly permits observable and assertable criteria and a doc-only exemption. Preserve that contract while flagging oversized reproduction procedures and narration. `lintBacklogItemRendering` already carries warning-level prose checks; `LENS_HUNT_BRIEF` currently contains claim-accuracy only, and `buildPanelMandate` already appends registered briefs. These observed extension points support both owed guards without changing policy or building another review path.
+- **Re-prepare 2026-10-09 (stamp had gone stale):** since base `dda3ff32`, `we:scripts/check-standards-rules.mjs` (+223 lines), `we:scripts/lib/review-core.mjs` (+11), and both test files changed, but a grep of both source files for a Done-when-section lint or a comment-history hunt brief finds none: the goal is still undelivered and `git log --grep` for `4471` shows only the card's own prepare/filing merges. Re-verified anchors: `lintBacklogItemRendering` is at `we:scripts/check-standards-rules.mjs:1220`; `LENS_HUNT_BRIEF` is at `we:scripts/lib/review-core.mjs:1933` (claim-accuracy only); `buildPanelMandate` at `:1107` appends `huntBriefForLens(lens)` at `:1130`. The #4297 example comments are still at `we:scripts/__tests__/conveyor-brief-main-catchup-policy.test.mjs:36` and `:67`. Design unchanged; added the now-required edge-cases section. Builder should re-read the current line numbers, since the files keep moving.
 - **Delivery status:** inspection of the named examples, current lint helpers and hunt-brief registry found the prevention work still outstanding. This preparation changes only this card's body and scope; implementation, test execution, stamping and review remain with the subsequent delivery/runner steps.
