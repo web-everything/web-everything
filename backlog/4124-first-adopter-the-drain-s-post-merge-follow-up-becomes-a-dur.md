@@ -2,6 +2,7 @@
 bornAs: xf4av69
 kind: story
 size: 5
+priority: high
 parent: "4075"
 status: open
 blockedBy: ["4125", "4127", "4134", "4121"]

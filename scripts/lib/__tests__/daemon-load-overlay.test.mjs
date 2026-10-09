@@ -26,7 +26,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
-import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay } from '../daemon-load-overlay.mjs';
+import { runDaemonLoadOverlay, mergeOverlayRef, dryRunOverlay, overlayInstalled } from '../daemon-load-overlay.mjs';
 
 describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunRebuildFn)', () => {
   it('requires --clone', async () => {
@@ -41,7 +41,7 @@ describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunR
     const order = [];
     const addOverlayFn = vi.fn(() => { order.push('addOverlay'); });
     const rebuild = vi.fn(async () => { order.push('rebuild'); return { moved: false, reason: 'up-to-date' }; });
-    const result = await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', addOverlayFn, rebuild });
+    const result = await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), addOverlayFn, rebuild });
     expect(order).toEqual(['addOverlay', 'rebuild']);
     expect(result).toMatchObject({ registered: true, mergedAnything: false, adopted: false, reason: 'up-to-date' });
   });
@@ -49,14 +49,14 @@ describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunR
   it('an ADOPTED rebuild is reported adopted:true, with the new head', async () => {
     const addOverlayFn = vi.fn();
     const rebuild = vi.fn(async () => ({ moved: true, adopted: true, head: 'deadbeef', alerts: [] }));
-    const result = await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', addOverlayFn, rebuild });
+    const result = await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), addOverlayFn, rebuild });
     expect(result).toMatchObject({ mergedAnything: true, adopted: true, head: 'deadbeef' });
   });
 
   it('a REJECTED rebuild (smoke-rejected) is reported adopted:false, the reason surfaced', async () => {
     const addOverlayFn = vi.fn();
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'smoke-rejected', rolledBack: true, alerts: [{ kind: 'smoke-rejected', detail: { failed: 'gh-api-repo' } }] }));
-    const result = await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', addOverlayFn, rebuild });
+    const result = await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), addOverlayFn, rebuild });
     expect(result.adopted).toBe(false);
     expect(result.reason).toBe('smoke-rejected');
     expect(result.alerts[0].detail.failed).toBe('gh-api-repo');
@@ -76,7 +76,7 @@ describe('runDaemonLoadOverlay — wiring (injected addOverlayFn/rebuild/dryRunR
   it('rebuild always runs with mainOnly:false — a manual overlay load is never the main-only case', async () => {
     const addOverlayFn = vi.fn();
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
-    await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', addOverlayFn, rebuild });
+    await runDaemonLoadOverlay({ clone: '/some/clone', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), addOverlayFn, rebuild });
     expect(rebuild).toHaveBeenCalledWith(expect.objectContaining({ mainOnly: false }));
   });
 
@@ -227,6 +227,35 @@ describe('mergeOverlayRef / dryRunOverlay — REAL git (temp repos), proving the
     git(dir, 'clone', '-q', '-b', 'main', 'origin.git', 'daemon');
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  describe('the race: overlay registered AFTER the build being adopted was smoked (live 2026-10-09, PR #4669)', () => {
+    it.each([1, 0])('checks actual installed ancestry with %s follow-up rebuilds', async (followUpRebuilds) => {
+      const daemon = join(dir, 'daemon');
+      git(daemon, 'fetch', 'origin');
+      const head = git(daemon, 'rev-parse', 'HEAD').trim();
+      const tip = git(daemon, 'rev-parse', 'origin/lane/overlay').trim();
+      expect(overlayInstalled({ root: daemon, ref: 'lane/overlay', run: realRun }))
+        .toEqual({ inHead: false, tip, head, reason: 'not-in-head' });
+      const rebuild = vi.fn()
+        .mockResolvedValueOnce({ moved: true, adopted: true, head, reason: 'ready-adopted' })
+        .mockImplementationOnce(async () => {
+          expect(realRun(['merge', '--no-edit', 'origin/lane/overlay'], { cwd: daemon }).status).toBe(0);
+          return { moved: true, adopted: true, head: git(daemon, 'rev-parse', 'HEAD').trim() };
+        });
+      const result = await runDaemonLoadOverlay({
+        clone: daemon, ref: 'lane/overlay', pr: 1, versions: null, log: quietLog,
+        settings: overlaySafetySettings({ WE_OVERLAY_DISPATCH_SMOKE: 'off' }, { readSettings: () => null }),
+        addOverlayFn: vi.fn(), rebuild, followUpRebuilds,
+        installed: (o) => overlayInstalled({ ...o, run: realRun }),
+      });
+      expect(result.staleAdopt).toEqual({ head, tip, reason: 'not-in-head' });
+      expect(result.followUps).toBe(followUpRebuilds);
+      expect(rebuild).toHaveBeenCalledTimes(1 + followUpRebuilds);
+      expect(result.adopted).toBe(!!followUpRebuilds);
+      expect(realRun(['merge-base', '--is-ancestor', tip, 'HEAD'], { cwd: daemon }).status).toBe(followUpRebuilds ? 0 : 1);
+      if (!followUpRebuilds) expect(result).toMatchObject({ reason: 'installed-build-lacks-overlay', pending: true });
+    });
+  });
 
   it('a clean overlay merges into `main` while the clone stays ON `main` the whole time', () => {
     const d = join(dir, 'daemon');
@@ -480,7 +509,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
   it('passes a dispatch-smoke-wrapped runSmoke into the gated rebuild', async () => {
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
     await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, settings: settingsOn, log: quietLog,
       inspect: () => ({ inTree: false, required: false }),
     });
     expect(typeof rebuild.mock.calls[0][0].runSmoke).toBe('function');
@@ -498,7 +527,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
       return { moved: false, reason: 'up-to-date' };
     });
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn, settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn, settings: settingsOn, log: quietLog,
       baseSmoke: async () => ({ verdict: 'pass' }),
       inspect: () => ({ inTree: true, required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'] }),
       dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied', detail: 'This command requires approval' }),
@@ -521,7 +550,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
       return { moved: false, reason: 'up-to-date' };
     });
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
       baseSmoke: async () => ({ verdict: 'pass' }),
       inspect: ({ tree }) => ({ inTree: tree === '/cand', required: true, matched: ['scripts/operations/worker-wrapper-launch.mjs'] }),
       dispatchSmoke: async () => { throw new Error('spawn EMFILE'); },
@@ -545,7 +574,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
       return { moved: false, reason: 'up-to-date' };
     });
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
       baseSmoke: async () => ({ verdict: 'pass' }),
       inspect: ({ tree }) => ({ inTree: tree === '/cand', required: true, matched: ['x'] }),
       dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied' }),
@@ -556,7 +585,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
 
   it('a rebuild that rejects with NO failed smoke is not swallowed', async () => {
     await expect(runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild: async () => { throw new Error('boom'); }, settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild: async () => { throw new Error('boom'); }, settings: settingsOn, log: quietLog,
       baseSmoke: async () => ({ verdict: 'pass' }), inspect: () => ({ inTree: false, required: false }),
     })).rejects.toThrow('boom');
   });
@@ -565,7 +594,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     const rebuildWithout = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
     const dispatchSmoke = async () => ({ ok: false, reason: 'no-commands-ran' });
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: true, adopted: true, reason: 'adopted' })),
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: true, adopted: true, reason: 'adopted' })),
       removeOverlayFn: () => { throw new Error('overlay list lock timeout'); }, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
       dispatchSmoke, inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
     });
@@ -576,7 +605,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
   it('a dispatch smoke that resolves to a non-object is a failed smoke, not a TypeError outside every guard', async () => {
     const removeOverlayFn = vi.fn(() => ({ removed: true, list: [] }));
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: true, adopted: true, reason: 'adopted' })),
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: true, adopted: true, reason: 'adopted' })),
       removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
       dispatchSmoke: async () => undefined, inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
     });
@@ -588,7 +617,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     const removeOverlayFn = vi.fn(() => ({ removed: true, list: [] }));
     const dispatchSmoke = vi.fn(async () => ({ ok: false, reason: 'no-commands-ran' }));
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: true, adopted: true, reason: 'adopted', head: 'h' })),
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild: vi.fn(async () => ({ moved: true, adopted: true, reason: 'adopted', head: 'h' })),
       removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog, dispatchSmoke,
       inspect: () => { throw new Error('git diff unreadable'); },
     });
@@ -604,7 +633,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
       .mockResolvedValueOnce({ moved: true, adopted: true, head: 'h0' });
     const dispatchSmoke = vi.fn(async () => ({ ok: false, reason: 'no-commands-ran' }));
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
       inspect: () => ({ inTree: true, required: true, matched: ['x'] }), dispatchSmoke,
     });
     expect(dispatchSmoke).toHaveBeenCalledWith(expect.objectContaining({ tree: '/c' }));
@@ -616,7 +645,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     const removeOverlayFn = vi.fn();
     const rebuild = vi.fn(async ({ runSmoke }) => { await runSmoke({ root: '/cand', env: {} }); return { moved: true, adopted: true, head: 'h1' }; });
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, settings: settingsOn, log: quietLog,
       baseSmoke: async () => ({ verdict: 'pass' }),
       inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
       dispatchSmoke: async () => ({ ok: true, reason: 'passed' }),
@@ -629,7 +658,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     const errors = [];
     const addOverlayFn = vi.fn();
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: null, addOverlayFn, rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: null, addOverlayFn, rebuild: async () => ({ moved: false, reason: 'up-to-date' }),
       settings: settingsOn, log: { error: (m) => errors.push(m) }, inspect: () => ({ inTree: false, required: false }),
     });
     expect(addOverlayFn).toHaveBeenCalled();
@@ -641,7 +670,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
     const addOverlayFn = vi.fn();
     const rebuild = vi.fn();
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: null, addOverlayFn, rebuild, settings: { ...settingsOn, noPr: 'refuse' }, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: null, addOverlayFn, rebuild, settings: { ...settingsOn, noPr: 'refuse' }, log: quietLog,
     });
     expect(addOverlayFn).not.toHaveBeenCalled();
     expect(rebuild).not.toHaveBeenCalled();
@@ -651,7 +680,7 @@ describe('runDaemonLoadOverlay — dispatch smoke wiring, rollback of ONLY this 
   it('dispatchSmoke=off → the plain rebuild smoke, no wrapper', async () => {
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'up-to-date' }));
     await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, settings: { ...settingsOn, dispatchSmoke: 'off' }, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, settings: { ...settingsOn, dispatchSmoke: 'off' }, log: quietLog,
       baseSmoke: 'BASE',
     });
     expect(rebuild.mock.calls[0][0].runSmoke).toBe('BASE');
@@ -664,7 +693,7 @@ describe('runDaemonLoadOverlay — versioned clone (the in-tick updater builds; 
   const settingsOn = overlaySafetySettings({}, { readSettings: () => null });
   const vctx = { name: 'v', dir: '/v' };
   const versionedBase = {
-    clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), settings: settingsOn, versions: vctx, wait: true,
+    clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), settings: settingsOn, versions: vctx, wait: true,
     rebuild: () => { throw new Error('a versioned clone is never rebuilt from this CLI'); },
   };
 
@@ -935,7 +964,7 @@ describe('runDaemonLoadOverlay — a non-versioned load whose overlay never reac
   it('rebuild rejected / lock busy (overlay not in the live tree) → no worker, a warning', async () => {
     const dispatchSmoke = vi.fn();
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild: async () => ({ moved: true, adopted: false, reason: 'smoke-rejected' }),
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild: async () => ({ moved: true, adopted: false, reason: 'smoke-rejected' }),
       settings: settingsOn, log: quietLog, dispatchSmoke, inspect: () => ({ inTree: false, required: false }),
     });
     expect(dispatchSmoke).not.toHaveBeenCalled();
@@ -946,10 +975,126 @@ describe('runDaemonLoadOverlay — a non-versioned load whose overlay never reac
     const removeOverlayFn = vi.fn();
     const rebuild = vi.fn().mockResolvedValueOnce({ moved: true, adopted: true, head: 'h1' }).mockResolvedValueOnce({ moved: true, adopted: true, head: 'h0' });
     const r = await runDaemonLoadOverlay({
-      clone: '/c', ref: 'lane/x', pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
+      clone: '/c', ref: 'lane/x', installed: () => ({ inHead: true, tip: 'abc', head: 'deadbeef', reason: 'in-head' }), pr: 1, addOverlayFn: vi.fn(), rebuild, removeOverlayFn, appendEventFn: vi.fn(), settings: settingsOn, log: quietLog,
       inspect: () => ({ inTree: true, required: true, matched: ['x'] }), dispatchSmoke: async () => { throw new Error('boom'); },
     });
     expect(removeOverlayFn).toHaveBeenCalledTimes(1);
     expect(r).toMatchObject({ rolledBack: true, head: 'h0', dispatchSmoke: { result: { reason: 'smoke-threw' } } });
+  });
+});
+
+describe('overlayInstalled — fail-closed injected git', () => {
+  it.each([
+    [1, 0, 0, 'ref-unresolved', null, 'head'],
+    [0, 1, 0, 'head-unresolved', 'tip', null],
+    [0, 0, 128, 'check-failed', 'tip', 'head'],
+    [0, 0, 1, 'not-in-head', 'tip', 'head'],
+    [0, 0, 0, 'in-head', 'tip', 'head'],
+  ])('handles git statuses %s/%s/%s', (tipStatus, headStatus, status, reason, tip, head) => {
+    const run = vi.fn()
+      .mockReturnValueOnce({ status: tipStatus, stdout: 'tip\n' })
+      .mockReturnValueOnce({ status: headStatus, stdout: 'head\n' })
+      .mockReturnValueOnce({ status });
+    expect(overlayInstalled({ root: '/c', ref: 'lane/x', run }))
+      .toEqual({ inHead: reason === 'in-head', tip, head, reason });
+    expect(run).toHaveBeenNthCalledWith(1, ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/lane/x^{commit}'],
+      { cwd: '/c', timeout: 60_000, killSignal: 'SIGKILL' });
+    expect(run).toHaveBeenNthCalledWith(2, ['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'],
+      { cwd: '/c', timeout: 60_000, killSignal: 'SIGKILL' });
+    if (tip && head) expect(run).toHaveBeenNthCalledWith(3, ['merge-base', '--is-ancestor', tip, head], expect.anything());
+    else expect(run).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed when git throws', () => {
+    expect(overlayInstalled({ root: '/c', ref: 'lane/x', run: () => { throw new Error('git'); } }))
+      .toEqual({ inHead: false, tip: null, head: null, reason: 'check-threw' });
+  });
+});
+
+describe('the race: overlay registered AFTER the build being adopted was smoked (live 2026-10-09, PR #4669)', () => {
+  const stale = { inHead: false, tip: 'abc', head: 'stale1', reason: 'not-in-head' };
+  const options = () => ({
+    clone: '/c', ref: 'lane/x', pr: 1, versions: null, addOverlayFn: vi.fn(), log: quietLog,
+    settings: overlaySafetySettings({ WE_OVERLAY_DISPATCH_SMOKE: 'off' }, { readSettings: () => null }),
+  });
+  const first = { moved: true, adopted: true, head: 'stale1', reason: 'ready-adopted', alerts: [{ kind: 'first' }] };
+
+  it('rebuilds the newly registered overlay and reports the fresh installed head', async () => {
+    const rebuild = vi.fn().mockResolvedValueOnce(first)
+      .mockResolvedValueOnce({ moved: true, adopted: true, head: 'fresh2', alerts: [{ kind: 'second' }] });
+    const installed = vi.fn().mockReturnValueOnce(stale)
+      .mockReturnValueOnce({ inHead: true, tip: 'abc', head: 'fresh2', reason: 'in-head' });
+    const result = await runDaemonLoadOverlay({ ...options(), rebuild, installed });
+    expect(result).toMatchObject({
+      adopted: true, head: 'fresh2', overlayInHead: true, followUps: 1,
+      staleAdopt: { head: 'stale1', tip: 'abc', reason: 'not-in-head' },
+      alerts: [{ kind: 'first' }, { kind: 'second' }],
+    });
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(rebuild.mock.calls[1][0]).toEqual(rebuild.mock.calls[0][0]);
+    expect(installed).toHaveBeenCalledTimes(2);
+  });
+
+  it('stops when another rebuild owns the work and leaves a pending verdict', async () => {
+    const rebuild = vi.fn().mockResolvedValueOnce(first)
+      .mockResolvedValueOnce({ moved: false, reason: 'rebuild-in-progress' });
+    const result = await runDaemonLoadOverlay({ ...options(), rebuild, installed: () => stale, followUpRebuilds: 3 });
+    expect(result).toMatchObject({
+      adopted: false, reason: 'installed-build-lacks-overlay', rebuildReason: 'rebuild-in-progress',
+      pending: true, followUps: 1, overlayInHead: false, installedCheck: stale,
+      checkCommand: expect.stringContaining('merge-base --is-ancestor'),
+    });
+    expect(rebuild).toHaveBeenCalledTimes(2);
+  });
+
+  it('never reports adoption when the installed checker throws', async () => {
+    const result = await runDaemonLoadOverlay({
+      ...options(), rebuild: vi.fn().mockResolvedValue(first),
+      installed: () => { throw new Error('cannot inspect'); },
+    });
+    expect(result).toMatchObject({
+      adopted: false, pending: true, reason: 'installed-build-lacks-overlay',
+      installedCheck: { inHead: false, reason: 'check-threw' }, followUps: 1,
+    });
+  });
+
+  it('keeps a non-adopted rebuild verdict unchanged while including the ancestry check', async () => {
+    const rebuild = vi.fn().mockResolvedValue({ moved: false, adopted: false, reason: 'smoke-rejected' });
+    const result = await runDaemonLoadOverlay({ ...options(), rebuild, installed: () => stale });
+    expect(result).toMatchObject({
+      adopted: false, reason: 'smoke-rejected', overlayInHead: false, installedCheck: stale, followUps: 0,
+    });
+    expect(result.staleAdopt).toBeUndefined();
+    expect(result.pending).toBeUndefined();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  it('rolls back only this overlay when the follow-up throws after a failed dispatch smoke', async () => {
+    const rebuild = vi.fn().mockResolvedValueOnce(first)
+      .mockImplementationOnce(async ({ runSmoke }) => {
+        await runSmoke({ root: '/candidate', env: {} });
+      })
+      .mockResolvedValueOnce({ moved: true, adopted: true, head: 'recovered', reason: 'adopted' });
+    const removeOverlayFn = vi.fn();
+    const baseSmoke = vi.fn(async () => ({ verdict: 'pass' }));
+    const result = await runDaemonLoadOverlay({
+      ...options(), rebuild, installed: () => stale, removeOverlayFn, appendEventFn: vi.fn(), baseSmoke,
+      settings: overlaySafetySettings({}, { readSettings: () => null }),
+      inspect: () => ({ inTree: true, required: true, matched: ['x'] }),
+      dispatchSmoke: async () => ({ ok: false, reason: 'commands-denied' }),
+    });
+    expect(result).toMatchObject({
+      adopted: false, registered: false, rolledBack: true, reason: 'dispatch-smoke-failed',
+      followUps: 1, head: 'recovered', rollback: { adopted: true },
+    });
+    expect(removeOverlayFn).toHaveBeenCalledTimes(1);
+    expect(removeOverlayFn).toHaveBeenCalledWith('/c', 'lane/x', expect.anything());
+    expect(rebuild).toHaveBeenCalledTimes(3);
+    expect(rebuild.mock.calls[2][0].runSmoke).toBe(baseSmoke);
+  });
+
+  it('propagates a follow-up rebuild error without a failed dispatch smoke', async () => {
+    const rebuild = vi.fn().mockResolvedValueOnce(first).mockRejectedValueOnce(new Error('follow-up failed'));
+    await expect(runDaemonLoadOverlay({ ...options(), rebuild, installed: () => stale })).rejects.toThrow('follow-up failed');
   });
 });

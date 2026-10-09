@@ -1,22 +1,21 @@
 ---
-bornAs: x6z3usv
+bornAs: xn9oy43
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md"]
+scope: ["we:backlog/4647-consume-the-real-dispatch-cli-outcome-without-releasing-succ.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that blocks moving a card from open to in-progress, or landing code ag… (from web-everything/web-everything#4659 review)
+# Prevention — Require each acceptance predicate in preparation cards to map to a named planned negative test an… (from web-everything/web-everything#4674 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md:24` — Add a check:standards rule that blocks moving a card from open to in-progress, or landing code against it, while it still contains `TODO:` placeholders in Acceptance or Edge cases. For scope paths that touch lock files, also require a concrete fail-closed line.
-2. `we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md:16` — Add a deterministic backlog readiness gate that rejects placeholder acceptance criteria and requires repository-qualified named tests with observable assertions before implementation begins.
+1. `we:backlog/4647-consume-the-real-dispatch-cli-outcome-without-releasing-succ.md:55` — Require each acceptance predicate in preparation cards to map to a named planned negative test and observable assertions; implementation should verify that removing the predicate makes that test fail.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4659@4a4098945e70c66e7cdf5ab84fb1396dbd797aea
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4674@93aef2150b82793b3a0fea27f8562b20fe22408e
 
 ## Acceptance
 

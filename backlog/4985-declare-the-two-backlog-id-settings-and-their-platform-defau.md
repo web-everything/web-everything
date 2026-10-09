@@ -23,7 +23,7 @@ tags: []
 
 ## Design
 
-Mirror the `crossProviderFallback` dimension (xb1e9nj), the closest precedent.
+Mirror the `crossProviderFallback` dimension (4772), the closest precedent.
 
 - `we:config/defineConfig.ts` (beside `CrossProviderFallbackPolicy`, line 92; keys go in `WebEverythingConfig` next to `crossProviderFallback`, line 130): add the unions `BacklogIdNumberingSetting = 'producer-at-pr-open' | 'integration-branch'` and `BacklogIdReachSetting = 'tip-tree' | 'full-history-squash'`, plus two optional keys on `WebEverythingConfig` (`backlogIdNumbering`, `backlogIdReach`) typed `DimensionEntry<…>`. Both unions list the unbuilt value so it can be declared.
 - `we:config/platformDefaults.ts`: add the two defaults as data to `PLATFORM_FLAVOR_DEFAULTS` (`producer-at-pr-open`, `tip-tree`), and a data-only `PLATFORM_BACKLOG_ID_BUILT_VALUES` listing which values are built (the two defaults only; the statute says "the two defaults are the only values this ruling asks to be built").
@@ -71,6 +71,6 @@ Write the test first and run it with vitest in the lane before the module exists
 
 ## Progress
 
-- Premise check 2026-10-09: `git log` for `4985`/`x2rabof` shows only the numbering commit; no backlog-id setting exists in `we:config/`. Not delivered.
+- Premise check 2026-10-09: `git log` for `4985`/`4985` shows only the numbering commit; no backlog-id setting exists in `we:config/`. Not delivered.
 - Scope drift corrected: dropped `we:scripts/lib/gate-config.mjs` (trust-chain path list, no config settings); added `we:config/index.ts` (the barrel must export the resolver). Goal and size unchanged.
 - Review round 1: moved the resolver from WE's TS to repo tooling (statute rule 3, #1282), defined the bare-string rule, fixed line refs and the vitest path.
