@@ -424,6 +424,27 @@ describe('card 80 — prepare just in time', () => {
     expect(prepareAheadNums({ queue, launch, held, window: 4 }).has('6')).toBe(false);
   });
 
+  it('prepareAheadNums puts delivery class before pinned cards', () => {
+    const queue = [{ num: '7', tier: 'pinned', priorityClass: 'P3' }, { num: '1', priorityClass: 'P3' }, { num: '9', priorityClass: 'P1' }];
+    const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
+    expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual(['9']);
+    expect([...prepareAheadNums({ queue, held, window: 2 })]).toEqual(['9', '7']);
+  });
+
+  it('prepareAheadNums treats missing and unknown classes as P3 and orders all classes', () => {
+    const queue = [
+      { num: '4', priorityClass: 'P4', tier: 'pinned' },
+      { num: '3', priorityClass: 'unknown', tier: 'pinned' },
+      { num: '8' },
+      { num: '7', priorityClass: 'P3' },
+      { num: '2', priorityClass: 'P2' },
+      { num: '1', priorityClass: 'P1' },
+      { num: '0', priorityClass: 'P0' },
+    ];
+    const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
+    expect([...prepareAheadNums({ queue, held, window: 7 })]).toEqual(['0', '1', '2', '3', '8', '7', '4']);
+  });
+
   it('prepareAheadNums is off (null) for a non-finite or negative window', () => {
     expect(prepareAheadNums({ queue: [{ num: '1' }], window: Infinity })).toBeNull();
     expect(prepareAheadNums({ queue: [{ num: '1' }], window: -1 })).toBeNull();
