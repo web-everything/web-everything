@@ -17,9 +17,11 @@ Held items 164+166. Freeze marker lived in the importing clone's .conveyor/; the
 - [A2] **Live** — while main is red, a drain pass logs `skip-reasons` rows of kind `red-main-hold` for every non-fix local PR; the fix PR is not held.
 - [A3] **Must** — the hold only ADDS a skip after every other gate: an allowed fix PR still passes every merge gate. Setting `off` restores the old full stop on a manual freeze.
 
+- [A4] **Quarantine mode (OFF, `redMainMode: stop`)** — `npm run test:unit -- we:scripts/lib/__tests__/red-main-quarantine.test.mjs we:scripts/lib/__tests__/red-main-quarantine-io.test.mjs` passes: only red-main-safety-net/operator write `ops/quarantine` (push-ref guard, exact ref), add/remove events in `events.jsonl`, the main-fix PR skips nothing, entries removed on green, PRs overlapping the fix PR or the test area held (replay: #4613 held on 2026-10-09), no live entry ⇒ stop.
+
 ## Non-goals
 
-- [N1] Auto-clearing a MANUAL freeze marker (it still needs `unfreeze`); rebasing the fix PR (the merge-queue refresh does that).
+- [N1] Turning quarantine on (needs a red-team review), wiring the CI skip step into we:.github/workflows/ci.yml and the health watch's auto add/prune (CLI ready: we:scripts/lib/red-main-quarantine-io.mjs). Auto-clearing a MANUAL freeze marker (it still needs `unfreeze`); rebasing the fix PR (the merge-queue refresh does that).
 
 ## Edge cases this change must handle
 

@@ -191,7 +191,9 @@ import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
-import { resolveRedMainHoldSetting, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
+import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { decideQuarantineHold } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
+import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -5386,12 +5388,26 @@ async function runCli() {
       const sig = redMainSignal({ mainRedState: readMainRedState(), priority: readMainRedPriority(), manualFreeze: readFreeze(), now: Date.now() });
       if (sig.red) {
         let held = 0;
+        // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
+        // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
+        const mode = resolveRedMainMode();
+        let qList = null;
+        let filesOf = () => null;
+        if (mode.value === 'quarantine') {
+          const q = readQuarantine();
+          qList = q.ok ? q.list : null;
+          const localPrs = [...(openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map())].filter(([r]) => isLocalRepo(r)).flatMap(([, prs]) => prs || []);
+          filesOf = (n) => { const p = localPrs.find((x) => Number(x?.number) === Number(n)); return Array.isArray(p?.files) ? p.files.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : null; };
+        }
+        const fixFiles = mode.value === 'quarantine' ? (sig.fixPrs.length ? sig.fixPrs.flatMap((n) => filesOf(n) ?? []) : []) : null;
         for (const v of verdicts) {
           if (v.decision !== 'merge') continue;
-          const d = decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: holdSetting.value });
+          const d = mode.value === 'quarantine' && isLocalRepo(v.repo)
+            ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
+            : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: holdSetting.value });
           if (d.hold) { v.decision = 'skip'; v.reason = d.reason; v.redMainHold = true; held++; }
         }
-        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
+        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
     }
   }

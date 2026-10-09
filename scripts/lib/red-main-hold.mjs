@@ -38,6 +38,19 @@ export function resolveRedMainHoldSetting({ env = process.env, file = RED_MAIN_H
   return { value: 'on', source: 'default' };
 }
 
+/**
+ * Containment mode while main is red (card x5wnfcg cascade): `stop` (built-in; only the main-fix PR lands) or
+ * `quarantine` (we:scripts/lib/red-main-quarantine.mjs — known failing tests skipped, others keep landing; OFF until
+ * its red-team review). env `WE_DRAIN_RED_MAIN_MODE` > settings `redMainMode` > `stop`.
+ */
+export function resolveRedMainMode({ env = process.env, file = RED_MAIN_HOLD_SETTINGS_FILE } = {}) {
+  const m = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'stop' || x === 'quarantine' ? x : null; };
+  const fromEnv = m(env?.WE_DRAIN_RED_MAIN_MODE);
+  if (fromEnv) return { value: fromEnv, source: 'env' };
+  try { const f = m(JSON.parse(readFileSync(file, 'utf8'))?.redMainMode); if (f) return { value: f, source: 'settings' }; } catch { /* built-in */ }
+  return { value: 'stop', source: 'default' };
+}
+
 const live = (r, now) => !!r && Number.isFinite(r.expiresAt) && now < r.expiresAt;
 
 /**

@@ -1,39 +1,233 @@
 {
-  "source": "drain daemon log /Users/nicolasgilbert/workspace/plateau-app/.drain-daemon/daemon.log ('pass at … merged N (#…)' lines) + live coordination records main-ci-red-state.json / main-red-priority.json read 2026-10-09T14:11Z",
+  "source": "drain daemon log /Users/nicolasgilbert/workspace/plateau-app/.drain-daemon/daemon.log ('pass at \u2026 merged N (#\u2026)' lines) + live coordination records main-ci-red-state.json / main-red-priority.json read 2026-10-09T14:11Z",
   "windows": [
     {
-      "name": "2026-10-09 01:03Z manual freeze (held items 164/166) — fix PR #4532",
-      "manualFreeze": { "frozen": true, "at": "2026-10-09T01:03:00Z", "reason": "raised by hand per operator", "mergeSha": null },
+      "name": "2026-10-09 01:03Z manual freeze (held items 164/166) \u2014 fix PR #4532",
+      "manualFreeze": {
+        "frozen": true,
+        "at": "2026-10-09T01:03:00Z",
+        "reason": "raised by hand per operator",
+        "mergeSha": null
+      },
       "manualFreezeFrom": "2026-10-09T01:03:00Z",
       "manualFreezeUntil": "2026-10-09T01:53:00Z",
-      "priority": { "repo": "we", "pr": 4532, "prs": [4532], "reason": "owns the red-main fix" },
+      "priority": {
+        "repo": "we",
+        "pr": 4532,
+        "prs": [
+          4532
+        ],
+        "reason": "owns the red-main fix"
+      },
       "landed": [
-        { "num": 4524, "at": "2026-10-09T00:40:04Z" },
-        { "num": 4537, "at": "2026-10-09T01:21:40Z" },
-        { "num": 4539, "at": "2026-10-09T01:24:12Z" },
-        { "num": 4532, "at": "2026-10-09T01:51:39Z" },
-        { "num": 4540, "at": "2026-10-09T03:07:32Z" }
+        {
+          "num": 4524,
+          "at": "2026-10-09T00:40:04Z",
+          "files": [
+            "backlog/placeholder.md"
+          ]
+        },
+        {
+          "num": 4537,
+          "at": "2026-10-09T01:21:40Z",
+          "files": [
+            "backlog/4455-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"
+          ]
+        },
+        {
+          "num": 4539,
+          "at": "2026-10-09T01:24:12Z",
+          "files": [
+            "backlog/xzvpinm-prevention-when-a-plan-changes-the-meaning-of-a-shared-repor.md"
+          ]
+        },
+        {
+          "num": 4532,
+          "at": "2026-10-09T01:51:39Z",
+          "files": [
+            "backlog/xh6ij2v-orphan-adopt-soak-hermetic-delivery.md",
+            "backlog/xrw21vx-red-main-review-pr-ledger-events-rows-keyed-on-wall-clock-so.md",
+            "scripts/conveyor/soak/breaks/build-dispatch-orphan-adopt.mjs",
+            "scripts/operations/__tests__/probation-heal-run.test.mjs",
+            "scripts/operations/__tests__/review-pr-io.test.mjs",
+            "scripts/operations/review-pr-io.mjs"
+          ]
+        },
+        {
+          "num": 4540,
+          "at": "2026-10-09T03:07:32Z",
+          "files": [
+            "backlog/placeholder.md"
+          ]
+        }
       ],
-      "expect": { "held": [4537, 4539], "fix": [4532], "free": [4524, 4540] }
+      "expect": {
+        "held": [
+          4537,
+          4539
+        ],
+        "fix": [
+          4532
+        ],
+        "free": [
+          4524,
+          4540
+        ]
+      },
+      "quarantine": {
+        "brokenSha": "0cddd041e",
+        "tests": [
+          "scripts/operations/__tests__/probation-heal-run.test.mjs",
+          "scripts/operations/__tests__/review-pr-io.test.mjs"
+        ],
+        "$note": "brokenSha is a stand-in (the manual freeze carried no mergeSha); the window's signal has no firstRedSha, so the entry matches by being live"
+      },
+      "expectQuarantine": {
+        "held": [],
+        "fix": [
+          4532
+        ]
+      }
     },
     {
-      "name": "2026-10-09 main red at 7e5137663 (published by the health watch) — fix PR #4617",
-      "mainRedState": { "red": true, "firstRedSha": "7e51376635bbb571dfc596f1986960bf35a03fd6", "since": "2026-10-09T13:06:06Z" },
-      "priority": { "repo": "we", "pr": 4617, "prs": [4617], "firstRedSha": "7e51376635bbb571dfc596f1986960bf35a03fd6", "reason": "owns the red-main fix" },
+      "name": "2026-10-09 main red at 7e5137663 (published by the health watch) \u2014 fix PR #4617",
+      "mainRedState": {
+        "red": true,
+        "firstRedSha": "7e51376635bbb571dfc596f1986960bf35a03fd6",
+        "since": "2026-10-09T13:06:06Z"
+      },
+      "priority": {
+        "repo": "we",
+        "pr": 4617,
+        "prs": [
+          4617
+        ],
+        "firstRedSha": "7e51376635bbb571dfc596f1986960bf35a03fd6",
+        "reason": "owns the red-main fix"
+      },
       "landed": [
-        { "num": 4478, "at": "2026-10-09T13:02:40Z" },
-        { "num": 4560, "at": "2026-10-09T13:05:08Z" },
-        { "num": 4563, "at": "2026-10-09T13:18:48Z" },
-        { "num": 4604, "at": "2026-10-09T13:35:01Z" },
-        { "num": 4615, "at": "2026-10-09T13:35:01Z" },
-        { "num": 4603, "at": "2026-10-09T13:46:00Z" },
-        { "num": 4618, "at": "2026-10-09T13:46:00Z" },
-        { "num": 4606, "at": "2026-10-09T13:47:58Z" },
-        { "num": 4616, "at": "2026-10-09T13:50:32Z" },
-        { "num": 4613, "at": "2026-10-09T13:57:29Z" },
-        { "num": 4617, "at": "2026-10-09T14:20:00Z" }
+        {
+          "num": 4478,
+          "at": "2026-10-09T13:02:40Z",
+          "files": [
+            "backlog/placeholder.md"
+          ]
+        },
+        {
+          "num": 4560,
+          "at": "2026-10-09T13:05:08Z",
+          "files": [
+            "backlog/placeholder.md"
+          ]
+        },
+        {
+          "num": 4563,
+          "at": "2026-10-09T13:18:48Z",
+          "files": [
+            "backlog/xrxmm8e-overlay-pileup-settings.md",
+            "scripts/conveyor/__tests__/health-responder-core.test.mjs",
+            "scripts/conveyor/fixer-slot-rules.mjs",
+            "scripts/conveyor/health-smells/overlay-dropped.mjs",
+            "scripts/lib/daemon-rebuild/plan.mjs",
+            "scripts/lib/settings-files.mjs",
+            "scripts/settings/overlay-dropped.json"
+          ]
+        },
+        {
+          "num": 4604,
+          "at": "2026-10-09T13:35:01Z",
+          "files": [
+            "backlog/xwnyn85-daemon-migrate-tool-fix-plist-rewrite-anchor-atomic-lock-tak.md"
+          ]
+        },
+        {
+          "num": 4615,
+          "at": "2026-10-09T13:35:01Z",
+          "files": [
+            "backlog/xd7paj2-prevention-add-a-retry-pass-test-where-a-later-overlay-subsu.md"
+          ]
+        },
+        {
+          "num": 4603,
+          "at": "2026-10-09T13:46:00Z",
+          "files": [
+            "backlog/4500-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"
+          ]
+        },
+        {
+          "num": 4618,
+          "at": "2026-10-09T13:46:00Z",
+          "files": [
+            "backlog/x0y2dzv-prevention-add-a-check-standards-rule-for-backlog-cards-ever.md"
+          ]
+        },
+        {
+          "num": 4606,
+          "at": "2026-10-09T13:47:58Z",
+          "files": [
+            "backlog/xwnyn85-daemon-migrate-tool-fix-plist-rewrite-anchor-atomic-lock-tak.md",
+            "backlog/xx12qvd-permission-change-hold-parse-workflow-and-sandbox-config-ins.md"
+          ]
+        },
+        {
+          "num": 4616,
+          "at": "2026-10-09T13:50:32Z",
+          "files": [
+            "backlog/x17044r-a-ruling-or-send-back-clears-the-stale-review-status-needs-h.md"
+          ]
+        },
+        {
+          "num": 4613,
+          "at": "2026-10-09T13:57:29Z",
+          "files": [
+            "scripts/conveyor/health-watch.mjs",
+            "scripts/lib/git-transport-branch.mjs",
+            "scripts/lib/daemon-rebuild/prepare.mjs",
+            "skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs"
+          ]
+        },
+        {
+          "num": 4617,
+          "at": "2026-10-09T14:20:00Z",
+          "files": [
+            "skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs"
+          ]
+        }
       ],
-      "expect": { "held": [4563, 4604, 4615, 4603, 4618, 4606, 4616, 4613], "fix": [4617], "free": [4478, 4560] }
+      "expect": {
+        "held": [
+          4563,
+          4604,
+          4615,
+          4603,
+          4618,
+          4606,
+          4616,
+          4613
+        ],
+        "fix": [
+          4617
+        ],
+        "free": [
+          4478,
+          4560
+        ]
+      },
+      "quarantine": {
+        "brokenSha": "7e51376635bbb571dfc596f1986960bf35a03fd6",
+        "tests": [
+          "skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs"
+        ]
+      },
+      "expectQuarantine": {
+        "held": [
+          4613
+        ],
+        "fix": [
+          4617
+        ]
+      }
     }
-  ]
+  ],
+  "filesSource": "gh pr view <n> --json files, read 2026-10-09T14:45Z (4524/4540/4478/4560 outside the red windows: files not needed)"
 }
