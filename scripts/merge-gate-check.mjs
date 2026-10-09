@@ -32,6 +32,7 @@ import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine } from './lib/m
 import { readSettings } from './lib/settings-files.mjs';
 import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
@@ -41,7 +42,7 @@ const BODY_HISTORY_QUERY = 'query($o:String!,$n:String!,$pr:Int!){repository(own
 const QUEUE_QUERY = 'query($o:String!,$n:String!,$b:String!){repository(owner:$o,name:$n){mergeQueue(branch:$b){entries(first:100){nodes{position headCommit{oid} pullRequest{number}}}}}}';
 
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, redMain = null, exec = execFileSync }) {
   const facts = { repo, num };
   try { facts.pr = ghJson(['pr', 'view', String(num), '--repo', repo, '--json', PR_FIELDS], exec); }
   catch (e) { facts.prReadError = firstLine(e); return facts; }
@@ -98,8 +99,9 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   const mainDup = scan(join(cwd, 'backlog'));
   facts.duplicateIds = mainDup === null ? { error: `no backlog dir at ${cwd}` } : { main: mainDup, ...(groupDuplicateIds ? { group: groupDuplicateIds } : {}) };
 
-  // Red-main freeze: no shared source exists yet (the marker is local to the drain host) → evaluator fails closed.
-  facts.redMain = { source: null };
+  // Red-main freeze: the SHARED copy on the ops branch (xyd06qo), read once per run by the caller. Not passed, or
+  // unreadable → `{source:null}` / `{error}` → the evaluator fails closed.
+  facts.redMain = redMain ?? { source: null };
   // Enqueue clearance (drain-stamped) is not wired yet → manifest couples/blockedBy fail closed in the evaluator.
   facts.enqueueClearance = null;
   return facts;
@@ -157,7 +159,10 @@ async function main() {
   }
 
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
-  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup }), { policy, blockOnCodeQL }));
+  // One read of the shared red-main freeze for the whole run (xyd06qo); branch name from the same policy cascade.
+  const redMain = readSharedFreeze({ board: cwd, branch: policy.redMainFreezeBranch });
+  process.stderr.write(`red-main freeze (${redMain.source}): ${redMain.error ? `UNREADABLE — ${redMain.error}` : redMain.frozen ? `FROZEN — ${redMain.reason}` : 'clear'}\n`);
+  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, redMain }), { policy, blockOnCodeQL }));
   const verdict = f['merge-group'] ? evaluateGroup(prs) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, policy, prs }, null, 2)}\n`);
   else {

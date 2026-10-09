@@ -187,10 +187,14 @@ function runCli(argv) {
     const d = decidePostLand({ trigger: flags.trigger, ref: flags.ref, result: flags.result, mergeSha: flags['merge-sha'] });
     writeAllSync(1, JSON.stringify(d, null, 2) + '\n');
     if (d.action === 'stop-the-line' && flags.apply) freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'] });
+  } else if (cmd === 'publish') {
+    // republish the current local state to the shared branch (below) — the retry after a failed publish
   } else {
-    process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide> [--flags]\n');
+    process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide|publish> [--flags]\n');
     process.exit(2);
   }
+  // xyd06qo: every raise/clear ALSO publishes the local marker's state to the shared ops/* branch CI's merge-gate reads.
+  if (['freeze', 'unfreeze', 'publish'].includes(cmd) || (cmd === 'decide' && flags.apply)) return import('../lib/red-main-freeze-shared.mjs').then((s) => s.publishFreezeFromCli({ marker: readFreeze() }));
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
