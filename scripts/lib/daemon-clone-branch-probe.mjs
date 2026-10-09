@@ -13,7 +13,7 @@ import { daemonCloneRoots } from './daemon-clone-registry.mjs';
 
 export const WRONG_BRANCH_RE = /^ops\//;
 
-const defaultExec = (args) => execFileSync('git', args, { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'ignore'] });
+const defaultExec = (args) => execFileSync('git', args, { encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
 
 /** @returns {{cloneRoot: string, branch: string}[]} clones currently on an `ops/*` branch. Never throws. */
 export function probeDaemonCloneBranches({ roots, workspace, exec = defaultExec } = {}) {
