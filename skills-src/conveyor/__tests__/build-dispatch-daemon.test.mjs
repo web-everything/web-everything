@@ -2195,6 +2195,37 @@ describe('automatic item preparation', () => {
     if (outcome === 'prepare-needs-you') expect(tick.needsYou).toContainEqual(expect.objectContaining({ num: '4501', step: 'prepare', reason: expect.stringContaining('scope is wrong') }));
     else expect(tick.needsYou).toEqual([]);
   });
+  it('an already-done route recorded this tick whose hold cannot be placed is handed out again, not lost (review of #4643)', async () => {
+    const commit = '10fedba67afc9550fb9a6592282603117284c0c2';
+    const effects = fixture();
+    const path = join(lockRoot, 'failures.json');
+    effects.recordPrepareFailure = input => recordPrepareFailure(input, { path, fileCard: vi.fn() });
+    effects.requeuePrepareRouteHold = (num, reason) => requeuePrepareRouteHold(num, reason, path);
+    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+    effects.listSettledPrepares = () => [{ num: '4501', source: 'run:done', startedAt: '2026-09-29', outcome: 'wrapper-failed',
+      evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${commit}'` } }];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    effects.placePrepareHold = vi.fn(() => { throw new Error('disk full'); });
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try { await runBuildDispatchTick({ live: true, effects }); } finally { log.mockRestore(); }
+    expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501', reason: `spec already done on main: commit ${commit}` });
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4501', reason: `spec already done on main: commit ${commit}` }]);
+  });
+  it.each(['lane-busy', 'infra-transient'])('a reviewed release of an exhausted %s hold starts a fresh retry budget (review of #4643)', async (cause) => {
+    const effects = fixture();
+    const path = join(lockRoot, 'failures.json');
+    const key = '4501:run x:result';
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { [key]: { num: '4501', attempt: 'run x', stage: 'result', cause, retry: false, held: true, exhausted: true,
+      holdReason: 'needs-you: prepare exhausted - clear it with a reviewed prepare release', evidence: { error: 'could not acquire a lane: a LIVE lease' }, recordedAt: '2026-10-09T00:00:00.000Z' } } }));
+    effects.listPrepareFailures = () => Object.values(readFailureState(path).failures);
+    effects.completePrepareFailures = num => completePrepareFailures(num, path);
+    effects.listPrepareReleases = () => [{ target: '4501', attempt: 'run x' }];
+    effects.listHolds = () => [];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(readFailureState(path).failures[key].completed).toBe(true);
+    expect(tick.needsYou.find(n => n.num === '4501')).toBeUndefined();
+  });
   it('a token quoted in a handled needs-you outcome never reaches the tick needsYou line (review of #4643)', async () => {
     const effects = fixture();
     effects.listSettledPrepares = () => [{ num: '4501', source: 'run:handled', startedAt: '2026-09-29', outcome: 'prepare-needs-you', evidence: { error: 'needs-you: prepare blocked (spec-defect) - leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 here' } }];
@@ -2286,7 +2317,7 @@ describe('automatic item preparation', () => {
       const effects = fixture();
       const path = join(lockRoot, 'failures.json');
       wire(effects, path);
-      effects.requeuePrepareRouteHold = num => requeuePrepareRouteHold(num, path);
+      effects.requeuePrepareRouteHold = (num, reason) => requeuePrepareRouteHold(num, reason, path);
       seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
         evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'` }, recordedAt: '2026-10-09T00:00:00.000Z' } });
       effects.listHolds = () => [];

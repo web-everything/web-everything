@@ -303,13 +303,17 @@ export function takePrepareRouteHolds({ path = failureStatePath(), now = Date.no
 
 /** Un-stamp a route {@link takePrepareRouteHolds} handed out but the daemon could not place, so the next tick hands it
  * out again instead of leaving the card to a paid re-prepare that may not re-report the same outcome. */
-export function requeuePrepareRouteHold(num, path = failureStatePath()) {
+export function requeuePrepareRouteHold(num, reason, path = failureStatePath()) {
   const state = readFailureState(path);
-  let changed = false;
-  for (const f of Object.values(state.failures)) {
-    if (f.num === num && f.routeHold && f.routeHoldPlacedAt && !f.completed) { delete f.routeHoldPlacedAt; changed = true; }
-  }
-  if (changed) save(state, path);
+  // Only the route that failed to place: other uncompleted routes of this card were placed (and may already be landed
+  // by the hold router), and un-stamping them would re-hold a card that is done. Several records can carry the same
+  // route text, so take the most recently stamped one.
+  const candidates = Object.values(state.failures)
+    .filter(f => f.num === num && f.routeHold && f.routeHold === reason && f.routeHoldPlacedAt && !f.completed)
+    .sort((a, b) => String(b.routeHoldPlacedAt).localeCompare(String(a.routeHoldPlacedAt)));
+  if (!candidates.length) return;
+  delete candidates[0].routeHoldPlacedAt;
+  save(state, path);
 }
 
 /** The pre-#4148 launch-confirmation bug recorded healthy launches as "not confirmed" and held the card for good. */

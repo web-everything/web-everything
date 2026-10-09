@@ -17,6 +17,8 @@
  *   done                           -> the normal card-only diff
  */
 
+import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+
 export const PREPARE_OUTCOMES = Object.freeze(['done', 'no-change', 'blocked', 'not-applicable']);
 export const PREPARE_BLOCKER_KINDS = Object.freeze(['spec-defect', 'needs-ruling']);
 
@@ -131,7 +133,10 @@ export function needsYouReason(kind, detail) {
   // lane work on them; a needs-you reason must never trigger that, so those phrases are defused.
   // Strip and collapse FIRST, then defuse: a phrase split by `<`, a backtick or a control character
   // (`already <done on main`) would otherwise collapse into the very phrase the router matches.
-  const clean = String(detail ?? '').replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
+  // The detail is raw WORKER text that lands in a hold reason, the findings ledger and the tick line, so a token-shaped
+  // string in it is redacted here, in the one shared sink every caller (daemon, ledger, runner) goes through - and BEFORE
+  // the truncation, so the cut can never leave a partial secret no pattern matches any more.
+  const clean = redactSpawnText(String(detail ?? '')).replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
     .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue').replace(/already done on main/gi, 'done elsewhere')
     .replace(/^\s*worker-declined/i, 'declined').trim().slice(0, 300);
   return `needs-you: prepare blocked (${kind}) - ${clean || 'no detail'}; re-scope the card by hand or close it`;

@@ -340,7 +340,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         try { effects.placePrepareHold?.({ num: r.num, reason: r.reason }); }
         catch (e) {
           console.error(`build-dispatch-daemon: already-done route hold for #${r.num} not placed: ${String(e?.message || e).split('\n')[0]}`);
-          try { effects.requeuePrepareRouteHold?.(r.num); } catch { /* the next tick's re-prepare still routes it */ }
+          try { effects.requeuePrepareRouteHold?.(r.num, r.reason); } catch { /* the next tick's re-prepare still routes it */ }
         }
       }
     } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
@@ -410,7 +410,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   for (const failure of failureRecords) {
     if (releasedAttempt(releases, failure.num, failure.attempt)
       && !failureRecords.some(f => f.num === failure.num && f.held && !f.completed && !releasedAttempt(releases, f.num, f.attempt))
-      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) released.add(failure.num);
+      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) {
+      released.add(failure.num);
+      // A reviewed release of an EXHAUSTED retry hold (lane-busy / infra-transient: the hold text tells the operator to
+      // clear it with a release) starts a fresh budget: left uncompleted, its record would still count against the next
+      // failure, which would be exhausted at once and go straight back to needs-you.
+      if (live && failure.holdReason && ['lane-busy', 'infra-transient'].includes(failure.cause)) effects.completePrepareFailures?.(failure.num);
+    }
   }
   holds = holds.filter(h => {
     if (!released.has(normNum(h.num)) || !(h.reason?.startsWith('prepare-') || h.ledger)) return true;
@@ -616,7 +622,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
-  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num)) needsYou.push({ num, step: 'prepare', reason });
+  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num) && !released.has(normNum(num))) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
     const step = outcome?.stepRefused?.step ?? null;
@@ -730,7 +736,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepare.failures.push({ num, stage, reason, cause: failure.cause, retry: failure.retry, prevention: failure.prevention });
     if (live && failure.held) effects.placePrepareHold({ num, reason: 'prepare-unstamped', ...holdStamp(num) });
     // An already-done report: the resolve route hold (the ledger hands it out once, stamped at record time).
-    if (live && failure.routeHold) effects.placePrepareHold({ num, reason: failure.routeHold });
+    // (Stamped at record time, so a failed placement is un-stamped again and handed out on the next tick, exactly like
+    // the retry-release placement above; without that the stamp would leave the route lost.)
+    if (live && failure.routeHold) {
+      try { effects.placePrepareHold({ num, reason: failure.routeHold }); }
+      catch (e) {
+        console.error(`build-dispatch-daemon: already-done route hold for #${num} not placed: ${String(e?.message || e).split('\n')[0]}`);
+        try { effects.requeuePrepareRouteHold?.(num, failure.routeHold); } catch { /* the next tick's re-prepare still routes it */ }
+      }
+    }
     if (failure.held || failure.routeHold) heldNums.add(num);
     if (failure.holdReason) needsYou.push({ num: normNum(num), step: 'prepare', reason: failure.holdReason });
     return failure;
@@ -1947,7 +1961,7 @@ function cliEffects() {
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     takePrepareRouteHolds: () => takePrepareRouteHolds(),
-    requeuePrepareRouteHold: (num) => requeuePrepareRouteHold(num),
+    requeuePrepareRouteHold: (num, reason) => requeuePrepareRouteHold(num, reason),
     killSwitch: cliKillSwitch,
     mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,

@@ -109,6 +109,13 @@ describe('re-scope probe', () => {
 });
 
 describe('needsYouReason', () => {
+  it('redacts a token-shaped string in the worker text at the shared sink, before the truncation (review of #4643)', () => {
+    const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    expect(needsYouReason('spec-defect', `leaked ${token} here`)).not.toContain(token);
+    // A token straddling the 300-char cut must not leave a prefix behind either.
+    const cut = needsYouReason('spec-defect', `${'x '.repeat(145)}${token}`);
+    expect(cut).not.toContain('ghp_');
+  });
   it('is plain, names the way out, and can never steer the hold router into lane work', () => {
     const r = needsYouReason('spec-defect', 'worker-declined: spec already done on main: commit abcdef1 `x` <b>');
     expect(r).toMatch(/^needs-you: prepare blocked \(spec-defect\)/);

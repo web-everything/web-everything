@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases, releaseDuePrepareRetries, takePrepareRouteHolds } from '../prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold } from '../prepare-failure-policy.mjs';
 import { planScaffold, shapeScaffoldRead } from '../../operations/scaffold.mjs';
 import { writeFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -313,6 +313,19 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
     const again = await recordPrepareFailure({ num: '4560', attempt: 'run again', stage: 'result', evidence: alreadyDone }, { path, fileCard: vi.fn() });
     expect(again).toMatchObject({ cause: 'already-done', held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
     expect(Object.values(readFailureState(path).failures).filter(f => f.num === '4560' && f.routeHold && !f.completed)).toHaveLength(2);
+    // The recovery is the fresh record's route, placed by the daemon right after recording; if THAT placement fails too,
+    // the requeue hands it out again - and only it, never the stale stamped one (review of #4643).
+    requeuePrepareRouteHold('4560', again.routeHold, path);
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
+    expect(takePrepareRouteHolds({ path })).toEqual([]);
+  });
+  it('requeuePrepareRouteHold un-stamps only the route that failed to place', () => {
+    const rec = (attempt, reason, at) => [`4560:${attempt}:result`, { num: '4560', attempt, stage: 'result', cause: 'already-done', retry: true, held: false, routeHold: reason, routeHoldPlacedAt: at }];
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: Object.fromEntries([
+      rec('a', 'spec already done on main: commit aaaaaaa', '2026-10-09T01:00:00.000Z'),
+      rec('b', 'spec already done on main: commit bbbbbbb', '2026-10-09T02:00:00.000Z')]) }));
+    requeuePrepareRouteHold('4560', 'spec already done on main: commit bbbbbbb', path);
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: 'spec already done on main: commit bbbbbbb' }]);
   });
   it('a needs-you hold is releasable by a reviewed, commit-cited release entry', () => {
     const entry = { target: '4355', attempt: 'run 4355', cause: 'needs-you', evidence: 'ruled in the card', fixCommit: 'a'.repeat(40) };
