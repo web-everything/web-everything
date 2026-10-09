@@ -1,0 +1,226 @@
+[
+  {
+    "name": "replay-4441-evidence-has-no-sweep",
+    "source": "PR 4441 fixer evidence comment, 2026-10-08",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "## 🔧 fix evidence — review round 3 (PR #4441)\n\nVerify is GREEN for `697fa7c05` (diff-selected gate, 86 tests within 1 import hop plus the repo-scan tests); the harness pushed that sha to `lane/review-ruling-resume`.\n\n### Finding 1 — security: `covered` suppression used the loose #76a identity (PLAUSIBLE)\n\n**Before (red)** — new tests on the unfixed code: a different defect on the same path and quote anchor was `covered` at every lens.\n```\nFAIL classifyReferralsByRound — \"covered\" needs the same claim, not just a shared quote anchor\n  > a DIFFERENT defect on the same path and quote anchor is not covered (\"correctness\" lens)\n  > ... (\"security\" lens) / (\"simplicity\" lens) / (undefined lens)\nTests  4 failed | 69 passed (73)\n```\n**After (green)** — `review-ruling-resume`, `review-referral-hold`, `jury-core`: 535 passed. `covered` now needs an active referral on THIS head holding the identical claim (`exactClaimKey`, line refs kept; stored per head as `activeInstances` in the identity table and projected through `review-pr.mjs`), checked across ALL bound entries. A look-alike that is not covered takes the round rule (gate lens → referral, advisory lens → card suggestion).\n\nWiring mutation: dropping `activeInstances` from the `review-pr.mjs` projection reddens the reduce-level test \"the repeated finding is covered by identity…\" (1 failed), so a missing projection cannot silently bring back the re-park.\n\n### Finding 2 — codex-correctness: the no-cited-line test could not exercise its guard (CONFIRMED)\nNew test: an advisory seat re-raising with no usable cited line (undefined / null / 0 / '' / 'x') and changed lines `[1]` stays mandatory, with a cited-line positive control that IS demoted.\nMutation (guard replaced by coercing a missing line to 0): `5 failed | 68 passed`. With the guard restored: green.\n\n### Variants considered\nDefect class: a loose match removes (or lets through) a gate-lens finding on identity that cannot tell a re-wording from a different defect.\n- Shared quote anchor, different claim, same path → **fixed** (jury-core `classifyReferralsByRound`, `coveredByActiveClaim`).\n- Same path + anchor, different LENS entries kept apart by the table; first-match shadowing → **fixed** (all bound entries are checked; test \"finds the exact claim on a LATER entry\").\n- Claim differing only in a `:line` reference (templated summary; `normSummary` folds it to `:N`) → **fixed** (`exactClaimKey` keeps line refs; test \"a templated claim differing only in its :line reference…\").\n- Exact claim covered on ANOTHER head → **fixed** (per-head `activeInstances`; test \"an exact-claim match on ANOTHER head…\").\n- Table built without `activeInstances` (stale caller / resumed old read) → not covered, the safe direction (`?? []`).\n- Re-wording of the same claim by a gate seat is now referred again rather than covered: **accepted on purpose** (\"when unsure, keep separate\"). The cost is one extra ruling, not a skipped gate finding. I chose a claim-only test over `sameInstanceForCarry` (line window 8 + severity) because that window would break the #4361 replay (re-raise at line 43, original at 29); a same claim at a drifted line on the same unchanged head is the same defect.\n- Advisory `FIXER_ADDRESSED_RERAISE` demotion still binds loosely: **n/a** — advisory-only and the finding becomes a recorded card suggestion, not a drop; it now at least picks a block-ruled entry among all bound entries instead of the first. Filed as a prevention note below.\n- `review-pr.mjs` `bindFindingIds` promotion of blocked referrals only tightens; `review-shadow-agreement.mjs` only labels: **n/a**.\n- `activeReferrals` vs `liveReferrals` (superseded/carried count as active): pre-existing `activeHeads` semantics, not changed here.\n\n| matrix row | status |\n|---|---|\n| untrusted text | n/a — no text interpolated; claim is only compared |\n| truncated read | n/a — missing/unreadable record means \"not covered\" |\n| shared state | n/a — pure function over the already-read thread |\n| rollback / switch | n/a |\n| normalization | fixed — one `exactClaimKey` used at table build and at candidate time; line refs kept |\n| resource bounds | n/a — `activeInstances` is deduped per (head, claim) |\n| trust boundary | n/a — only trusted-author records are read (unchanged) |\n\nPre-PR review: an independent adversarial subagent reviewed the diff; its findings (stricter claim key, entry shadowing, naming) were applied. `pre-pr-check` reports GATED on whole-PR size (advise mode); the full `/converge` ceremony was not run for this small repair.\n\nPrevention (OWED, not done here): a lint/test rule that any path removing a gate-lens finding goes through an exact-instance check.\n\n"
+    },
+    "expect": {
+      "status": "missing",
+      "reason": "no-class-sweep-block",
+      "blocking": false
+    }
+  },
+  {
+    "name": "replay-4481-evidence-has-no-sweep",
+    "source": "PR 4481 fixer evidence comment, 2026-10-08 (the uncovered sibling path)",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "## 🔧 conveyor fix — review round (auto-policy blocks on head a0f7ad9e8)\n\n**Fixed head:** `ee9b4e33a` — harness verify GREEN for exactly this sha (#5137), pushed by the harness.\n\n### Findings 1 + 3 — a throwing candidate smoke left the overlay registered (`daemon-load-overlay.mjs:433`)\n**Before** (new tests against `a0f7ad9e8`, red): `Tests 11 failed | 65 passed (76)`, among them\n- `withDispatchSmoke … a worker launch that THROWS is recorded as a failed smoke in ctl` — got the raw `spawn EMFILE`, `ctl` empty\n- `runDaemonLoadOverlay … a candidate worker launch that THROWS removes ONLY this overlay` — `expected \"spy\" to be called 1 times, but got 0 times` (removeOverlay never ran; only a `smoke-threw` hold)\n- `… inspect THROWING fails CLOSED` (candidate and live-clone) — `Error: git diff unreadable` escaped as a rejection\n\n**After:** `daemon-load-overlay.test.mjs` + `daemon-overlay.test.mjs`: `Tests 103 passed (103)`.\n- `withDispatchSmoke` now runs the launch through `runDispatchSmokeSafely`: a throw becomes `{ok:false, reason:'smoke-threw'}` in `ctl`, then still throws `dispatch-smoke-failed` so the rebuild holds on last-good (checked in `daemon-rebuild/smoke.mjs`: a `runSmoke` throw → `smoke-threw` hold). The caller then sees `ctl.ran && !ok` and removes ONLY this overlay and rebuilds without it.\n- `inspect` failures fail CLOSED (`inspectClosed`) in all three places (candidate, live post-adopt, versioned).\n\n### Finding 4 — version rollback could undo a newer adoption\n**Before:** the daemon's `rollback` flips `current → previous` with `expectCurrent` read at call time, so after a newer adoption it re-adopted the failed version. New tests red: the rollback was not told the failed `versionId`; no `rollbackVersionIfCurrent`.\n**After:** `rollbackVersionIfCurrent` reads `status()`, does nothing unless `current === versionId` (`current-moved`), else `switchCurrent({id: previous, expectCurrent: versionId, rollback: true, reject: versionId})` — re-checked under the version lock. A moved `current` is reported as `superseded` with the `actual` version, with neutral wording (\"left untouched … check that it does not carry this overlay\"), never \"recovered\".\n\n### Finding 2 — versioned loads return before smoke (`:490`)\nNo new code: answered in round 1 (`5a7ba97cd`): `--wait` smokes the version the request adopted; no `--wait` / not adopted / overlay not in the version runs no worker and says so (`dispatch-smoke-not-run` warning). The in-tick updater builds origin/main only (`overlaysApplied:false`), so an overlay is not applied on a versioned clone today. Making the load refuse or remove instead is a contract change for the updater slice, recorded in the card (acceptance 6) as the `xkhtg2a` follow-up. Raised here for the reviewer; not changed in this round.\n\n### Variants considered (from the adversarial self-review, all fixed unless noted)\nDefect class: a throw or stale state on the rollback path that leaves a failed overlay registered / undoes the wrong tree.\n- candidate launch throws ✅ · launch resolves to a non-object (`smoke-bad-result`) ✅ · inspect throws (3 sites) ✅ closed\n- `removeOverlay` throws (list lock) ✅ reported `removed:false`, STILL REGISTERED, no rebuild on the old list\n- rebuild rejects after a failed candidate smoke ✅ still rolls back; a rebuild rejection with no failed smoke is not swallowed (test)\n- stale rollback: `current` moved ✅ no switch; moved between read and lock ✅ `aborted/current-moved` passed through\n- Matrix — shared state: version flip via `switchCurrent` under the version lock, overlay list only via `removeOverlay` ✅. rollback/switch: target from the result's `versionId`, explicit CAS ✅. trust boundary / untrusted text: `versionId` pattern-checked before joining a path (unchanged) ✅. resource bounds: **out of class, not changed** — the real smoke leaves a live worker if `observe()`/`mkdtemp` throws, `detail` is unbounded, `smokeTimeoutMs` has no upper bound; these are in the smoke-runner, not the overlay-left-registered class. n/a: truncated read, normalization.\n- Known low-severity residue: `previous` is read outside the lock; a `current` that goes v1→v2→v1 between read and swap would target a stale `previous`. Not reachable by this CLI's single request.\n- No soak scenario: the PR's `soak-waiver` stands (manual load CLI, not a daemon pass). The mutation check on implementation code was not run.\n\n"
+    },
+    "expect": {
+      "status": "missing",
+      "reason": "no-class-sweep-block",
+      "blocking": false
+    }
+  },
+  {
+    "name": "replay-4478-prose-sweep-is-not-a-record",
+    "source": "PR 4478 fixer evidence comment — swept the class in prose, 2026-10-08",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "🔧 conveyor fix (advisory-fix mode) — evidence for PR #4478, head `fd6867c83`\n\n**Finding (correctness, CONFIRMED):** the draft marker `<!-- task-agreement: draft -->` is an HTML comment; `prepareCardStatus` (scripts/conveyor/prepare-result.mjs:38) strips `<!--…-->` before reading sections, so the S4 gate would never see it and would fail open.\n\n**Before (reproduced on b054851da, plan-only PR so the repro is the cards + the real code path):**\n```\n$ sed -n 38p scripts/conveyor/prepare-result.mjs   # (body = raw.replace(/<!--[^]*?-->/g, ''))\n$ grep -n 'task-agreement: draft' backlog/5399-*.md\n189:- Every section the refresh writes carries a draft marker ... (for example `<!-- task-agreement: draft -->` ...)\n```\nA marker written as the card suggests is removed by the same strip the prepare path applies, so `draft:false` is reported.\n\n**After (fd6867c83):**\n- #5399 Fork 2 now pins the marker as a visible line, `Draft: model-written, not yet confirmed.`, first non-blank line under the heading — never an HTML comment — and says why.\n- S1 A1: the reader test also runs a full card (frontmatter + comments) through the real `prepareCardStatus` strip path and asserts the draft flag survives; an HTML-comment marker must NOT read as draft.\n- S2 A3 and S4 A1: same format; S4's draft-held case feeds a full card through the real `prepareCardStatus` + dispatch path.\n- Security/coverage finding (plausible): S5 A1/A4 now require a build PR with no resolvable card id, or a branch/title naming a different card than the one it edits, to be marked `unverified against task agreement` (not silently title-only), with a mandate test for an unresolvable and a sibling-card branch.\n\nVerify: GREEN for `fd6867c83` (card-only diff; local gate skipped per CI's definition, CI's check:standards stays the merge authority); harness pushed it to `lane/prepare-xx2620y`.\n\n**Variants considered:** defect class = a marker/flag the gate reads but a pre-processing step erases. Variants: HTML comment (fixed — replaced), marker in frontmatter (n/a: frontmatter is also stripped by `prepareCardStatus`, and this design uses no frontmatter marker), marker in S2 text vs S1 reader vs S4 gate (fixed at #5399:189, S1 A1, S2 A3, S4 A1/line 36 rule unchanged). Matrix: untrusted text n/a (card text only); truncated read n/a; shared state n/a; rollback n/a; normalization — fixed (the same marker format is asserted in S1, S2, S4 through the comment-stripped path); resource bounds n/a; trust boundary n/a (plan-only, no new writer).\n\n"
+    },
+    "expect": {
+      "status": "missing",
+      "reason": "no-class-sweep-block",
+      "blocking": false
+    }
+  },
+  {
+    "name": "replay-4481-off-is-today",
+    "source": "PR 4481 evidence, mode off (today)",
+    "facts": {
+      "mode": "off",
+      "changeKind": "fix",
+      "evidence": "## 🔧 conveyor fix — review round (auto-policy blocks on head a0f7ad9e8)\n\n**Fixed head:** `ee9b4e33a` — harness verify GREEN for exactly this sha (#5137), pushed by the harness.\n\n### Findings 1 + 3 — a throwing candidate smoke left the overlay registered (`daemon-load-overlay.mjs:433`)\n**Before** (new tests against `a0f7ad9e8`, red): `Tests 11 failed | 65 passed (76)`, among them\n- `withDispatchSmoke … a worker launch that THROWS is recorded as a failed smoke in ctl` — got the raw `spawn EMFILE`, `ctl` empty\n- `runDaemonLoadOverlay … a candidate worker launch that THROWS removes ONLY this overlay` — `expected \"spy\" to be called 1 times, but got 0 times` (removeOverlay never ran; only a `smoke-threw` hold)\n- `… inspect THROWING fails CLOSED` (candidate and live-clone) — `Error: git diff unreadable` escaped as a rejection\n\n**After:** `daemon-load-overlay.test.mjs` + `daemon-overlay.test.mjs`: `Tests 103 passed (103)`.\n- `withDispatchSmoke` now runs the launch through `runDispatchSmokeSafely`: a throw becomes `{ok:false, reason:'smoke-threw'}` in `ctl`, then still throws `dispatch-smoke-failed` so the rebuild holds on last-good (checked in `daemon-rebuild/smoke.mjs`: a `runSmoke` throw → `smoke-threw` hold). The caller then sees `ctl.ran && !ok` and removes ONLY this overlay and rebuilds without it.\n- `inspect` failures fail CLOSED (`inspectClosed`) in all three places (candidate, live post-adopt, versioned).\n\n### Finding 4 — version rollback could undo a newer adoption\n**Before:** the daemon's `rollback` flips `current → previous` with `expectCurrent` read at call time, so after a newer adoption it re-adopted the failed version. New tests red: the rollback was not told the failed `versionId`; no `rollbackVersionIfCurrent`.\n**After:** `rollbackVersionIfCurrent` reads `status()`, does nothing unless `current === versionId` (`current-moved`), else `switchCurrent({id: previous, expectCurrent: versionId, rollback: true, reject: versionId})` — re-checked under the version lock. A moved `current` is reported as `superseded` with the `actual` version, with neutral wording (\"left untouched … check that it does not carry this overlay\"), never \"recovered\".\n\n### Finding 2 — versioned loads return before smoke (`:490`)\nNo new code: answered in round 1 (`5a7ba97cd`): `--wait` smokes the version the request adopted; no `--wait` / not adopted / overlay not in the version runs no worker and says so (`dispatch-smoke-not-run` warning). The in-tick updater builds origin/main only (`overlaysApplied:false`), so an overlay is not applied on a versioned clone today. Making the load refuse or remove instead is a contract change for the updater slice, recorded in the card (acceptance 6) as the `xkhtg2a` follow-up. Raised here for the reviewer; not changed in this round.\n\n### Variants considered (from the adversarial self-review, all fixed unless noted)\nDefect class: a throw or stale state on the rollback path that leaves a failed overlay registered / undoes the wrong tree.\n- candidate launch throws ✅ · launch resolves to a non-object (`smoke-bad-result`) ✅ · inspect throws (3 sites) ✅ closed\n- `removeOverlay` throws (list lock) ✅ reported `removed:false`, STILL REGISTERED, no rebuild on the old list\n- rebuild rejects after a failed candidate smoke ✅ still rolls back; a rebuild rejection with no failed smoke is not swallowed (test)\n- stale rollback: `current` moved ✅ no switch; moved between read and lock ✅ `aborted/current-moved` passed through\n- Matrix — shared state: version flip via `switchCurrent` under the version lock, overlay list only via `removeOverlay` ✅. rollback/switch: target from the result's `versionId`, explicit CAS ✅. trust boundary / untrusted text: `versionId` pattern-checked before joining a path (unchanged) ✅. resource bounds: **out of class, not changed** — the real smoke leaves a live worker if `observe()`/`mkdtemp` throws, `detail` is unbounded, `smokeTimeoutMs` has no upper bound; these are in the smoke-runner, not the overlay-left-registered class. n/a: truncated read, normalization.\n- Known low-severity residue: `previous` is read outside the lock; a `current` that goes v1→v2→v1 between read and swap would target a stale `previous`. Not reachable by this CLI's single request.\n- No soak scenario: the PR's `soak-waiver` stands (manual load CLI, not a daemon pass). The mutation check on implementation code was not run.\n\n"
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "mode-off",
+      "blocking": false
+    }
+  },
+  {
+    "name": "replay-4481-enforce-blocks",
+    "source": "PR 4481 evidence, mode enforce",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "evidence": "## 🔧 conveyor fix — review round (auto-policy blocks on head a0f7ad9e8)\n\n**Fixed head:** `ee9b4e33a` — harness verify GREEN for exactly this sha (#5137), pushed by the harness.\n\n### Findings 1 + 3 — a throwing candidate smoke left the overlay registered (`daemon-load-overlay.mjs:433`)\n**Before** (new tests against `a0f7ad9e8`, red): `Tests 11 failed | 65 passed (76)`, among them\n- `withDispatchSmoke … a worker launch that THROWS is recorded as a failed smoke in ctl` — got the raw `spawn EMFILE`, `ctl` empty\n- `runDaemonLoadOverlay … a candidate worker launch that THROWS removes ONLY this overlay` — `expected \"spy\" to be called 1 times, but got 0 times` (removeOverlay never ran; only a `smoke-threw` hold)\n- `… inspect THROWING fails CLOSED` (candidate and live-clone) — `Error: git diff unreadable` escaped as a rejection\n\n**After:** `daemon-load-overlay.test.mjs` + `daemon-overlay.test.mjs`: `Tests 103 passed (103)`.\n- `withDispatchSmoke` now runs the launch through `runDispatchSmokeSafely`: a throw becomes `{ok:false, reason:'smoke-threw'}` in `ctl`, then still throws `dispatch-smoke-failed` so the rebuild holds on last-good (checked in `daemon-rebuild/smoke.mjs`: a `runSmoke` throw → `smoke-threw` hold). The caller then sees `ctl.ran && !ok` and removes ONLY this overlay and rebuilds without it.\n- `inspect` failures fail CLOSED (`inspectClosed`) in all three places (candidate, live post-adopt, versioned).\n\n### Finding 4 — version rollback could undo a newer adoption\n**Before:** the daemon's `rollback` flips `current → previous` with `expectCurrent` read at call time, so after a newer adoption it re-adopted the failed version. New tests red: the rollback was not told the failed `versionId`; no `rollbackVersionIfCurrent`.\n**After:** `rollbackVersionIfCurrent` reads `status()`, does nothing unless `current === versionId` (`current-moved`), else `switchCurrent({id: previous, expectCurrent: versionId, rollback: true, reject: versionId})` — re-checked under the version lock. A moved `current` is reported as `superseded` with the `actual` version, with neutral wording (\"left untouched … check that it does not carry this overlay\"), never \"recovered\".\n\n### Finding 2 — versioned loads return before smoke (`:490`)\nNo new code: answered in round 1 (`5a7ba97cd`): `--wait` smokes the version the request adopted; no `--wait` / not adopted / overlay not in the version runs no worker and says so (`dispatch-smoke-not-run` warning). The in-tick updater builds origin/main only (`overlaysApplied:false`), so an overlay is not applied on a versioned clone today. Making the load refuse or remove instead is a contract change for the updater slice, recorded in the card (acceptance 6) as the `xkhtg2a` follow-up. Raised here for the reviewer; not changed in this round.\n\n### Variants considered (from the adversarial self-review, all fixed unless noted)\nDefect class: a throw or stale state on the rollback path that leaves a failed overlay registered / undoes the wrong tree.\n- candidate launch throws ✅ · launch resolves to a non-object (`smoke-bad-result`) ✅ · inspect throws (3 sites) ✅ closed\n- `removeOverlay` throws (list lock) ✅ reported `removed:false`, STILL REGISTERED, no rebuild on the old list\n- rebuild rejects after a failed candidate smoke ✅ still rolls back; a rebuild rejection with no failed smoke is not swallowed (test)\n- stale rollback: `current` moved ✅ no switch; moved between read and lock ✅ `aborted/current-moved` passed through\n- Matrix — shared state: version flip via `switchCurrent` under the version lock, overlay list only via `removeOverlay` ✅. rollback/switch: target from the result's `versionId`, explicit CAS ✅. trust boundary / untrusted text: `versionId` pattern-checked before joining a path (unchanged) ✅. resource bounds: **out of class, not changed** — the real smoke leaves a live worker if `observe()`/`mkdtemp` throws, `detail` is unbounded, `smokeTimeoutMs` has no upper bound; these are in the smoke-runner, not the overlay-left-registered class. n/a: truncated read, normalization.\n- Known low-severity residue: `previous` is read outside the lock; a `current` that goes v1→v2→v1 between read and swap would target a stale `previous`. Not reachable by this CLI's single request.\n- No soak scenario: the PR's `soak-waiver` stands (manual load CLI, not a daemon pass). The mutation check on implementation code was not run.\n\n"
+    },
+    "expect": {
+      "status": "missing",
+      "reason": "no-class-sweep-block",
+      "blocking": true
+    }
+  },
+  {
+    "name": "4481-with-a-complete-sweep",
+    "source": "synthetic: the 4481 evidence plus a complete block",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "evidence": "## 🔧 conveyor fix — review round (auto-policy blocks on head a0f7ad9e8)\n\n**Fixed head:** `ee9b4e33a` — harness verify GREEN for exactly this sha (#5137), pushed by the harness.\n\n### Findings 1 + 3 — a throwing candidate smoke left the overlay registered (`daemon-load-overlay.mjs:433`)\n**Before** (new tests against `a0f7ad9e8`, red): `Tests 11 failed | 65 passed (76)`, among them\n- `withDispatchSmoke … a worker launch that THROWS is recorded as a failed smoke in ctl` — got the raw `spawn EMFILE`, `ctl` empty\n- `runDaemonLoadOverlay … a candidate worker launch that THROWS removes ONLY this overlay` — `expected \"spy\" to be called 1 times, but got 0 times` (removeOverlay never ran; only a `smoke-threw` hold)\n- `… inspect THROWING fails CLOSED` (candidate and live-clone) — `Error: git diff unreadable` escaped as a rejection\n\n**After:** `daemon-load-overlay.test.mjs` + `daemon-overlay.test.mjs`: `Tests 103 passed (103)`.\n- `withDispatchSmoke` now runs the launch through `runDispatchSmokeSafely`: a throw becomes `{ok:false, reason:'smoke-threw'}` in `ctl`, then still throws `dispatch-smoke-failed` so the rebuild holds on last-good (checked in `daemon-rebuild/smoke.mjs`: a `runSmoke` throw → `smoke-threw` hold). The caller then sees `ctl.ran && !ok` and removes ONLY this overlay and rebuilds without it.\n- `inspect` failures fail CLOSED (`inspectClosed`) in all three places (candidate, live post-adopt, versioned).\n\n### Finding 4 — version rollback could undo a newer adoption\n**Before:** the daemon's `rollback` flips `current → previous` with `expectCurrent` read at call time, so after a newer adoption it re-adopted the failed version. New tests red: the rollback was not told the failed `versionId`; no `rollbackVersionIfCurrent`.\n**After:** `rollbackVersionIfCurrent` reads `status()`, does nothing unless `current === versionId` (`current-moved`), else `switchCurrent({id: previous, expectCurrent: versionId, rollback: true, reject: versionId})` — re-checked under the version lock. A moved `current` is reported as `superseded` with the `actual` version, with neutral wording (\"left untouched … check that it does not carry this overlay\"), never \"recovered\".\n\n### Finding 2 — versioned loads return before smoke (`:490`)\nNo new code: answered in round 1 (`5a7ba97cd`): `--wait` smokes the version the request adopted; no `--wait` / not adopted / overlay not in the version runs no worker and says so (`dispatch-smoke-not-run` warning). The in-tick updater builds origin/main only (`overlaysApplied:false`), so an overlay is not applied on a versioned clone today. Making the load refuse or remove instead is a contract change for the updater slice, recorded in the card (acceptance 6) as the `xkhtg2a` follow-up. Raised here for the reviewer; not changed in this round.\n\n### Variants considered (from the adversarial self-review, all fixed unless noted)\nDefect class: a throw or stale state on the rollback path that leaves a failed overlay registered / undoes the wrong tree.\n- candidate launch throws ✅ · launch resolves to a non-object (`smoke-bad-result`) ✅ · inspect throws (3 sites) ✅ closed\n- `removeOverlay` throws (list lock) ✅ reported `removed:false`, STILL REGISTERED, no rebuild on the old list\n- rebuild rejects after a failed candidate smoke ✅ still rolls back; a rebuild rejection with no failed smoke is not swallowed (test)\n- stale rollback: `current` moved ✅ no switch; moved between read and lock ✅ `aborted/current-moved` passed through\n- Matrix — shared state: version flip via `switchCurrent` under the version lock, overlay list only via `removeOverlay` ✅. rollback/switch: target from the result's `versionId`, explicit CAS ✅. trust boundary / untrusted text: `versionId` pattern-checked before joining a path (unchanged) ✅. resource bounds: **out of class, not changed** — the real smoke leaves a live worker if `observe()`/`mkdtemp` throws, `detail` is unbounded, `smokeTimeoutMs` has no upper bound; these are in the smoke-runner, not the overlay-left-registered class. n/a: truncated read, normalization.\n- Known low-severity residue: `previous` is read outside the lock; a `current` that goes v1→v2→v1 between read and swap would target a stale `previous`. Not reachable by this CLI's single request.\n- No soak scenario: the PR's `soak-waiver` stands (manual load CLI, not a daemon pass). The mutation check on implementation code was not run.\n\n\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"unhandled throw in a launch path\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"},{\"path\":\"recovery\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#cleanupOverlay\",\"status\":\"checked\",\"note\":\"the new cleanup itself cannot throw past the catch\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "complete",
+      "reason": "every-finding-has-class-and-four-sibling-paths",
+      "blocking": false
+    }
+  },
+  {
+    "name": "recovery-path-not-swept",
+    "source": "synthetic: the #4433 lesson — the fix's own new recovery path is not listed",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"unhandled throw in a launch path\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "incomplete",
+      "reason": "F1: missing-recovery",
+      "blocking": false
+    }
+  },
+  {
+    "name": "ci-heal-is-a-fix",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "ci-heal",
+      "evidence": "\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"unhandled throw in a launch path\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"},{\"path\":\"recovery\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#cleanupOverlay\",\"status\":\"checked\",\"note\":\"the new cleanup itself cannot throw past the catch\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "complete",
+      "reason": "every-finding-has-class-and-four-sibling-paths",
+      "blocking": false
+    }
+  },
+  {
+    "name": "not-a-fix",
+    "source": "synthetic: a review or delivery session",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "delivery",
+      "evidence": ""
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "not-a-fix",
+      "blocking": false
+    }
+  },
+  {
+    "name": "unknown-mode-reads-as-off",
+    "source": "synthetic",
+    "facts": {
+      "mode": "strict",
+      "changeKind": "fix",
+      "evidence": ""
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "mode-off",
+      "blocking": false
+    }
+  },
+  {
+    "name": "no-evidence-text",
+    "source": "synthetic: the evidence file could not be read",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "evidence": null
+    },
+    "expect": {
+      "status": "missing",
+      "reason": "no-evidence-text",
+      "blocking": true
+    }
+  },
+  {
+    "name": "block-not-json",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "```class-sweep\nF1: checked everything\n```"
+    },
+    "expect": {
+      "status": "malformed",
+      "reason": "block-not-json",
+      "blocking": false
+    }
+  },
+  {
+    "name": "two-blocks-are-ambiguous",
+    "source": "synthetic",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "evidence": "\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"unhandled throw in a launch path\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"},{\"path\":\"recovery\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#cleanupOverlay\",\"status\":\"checked\",\"note\":\"the new cleanup itself cannot throw past the catch\"}]}]}\n```\n\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"unhandled throw in a launch path\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "malformed",
+      "reason": "more-than-one-class-sweep-block",
+      "blocking": true
+    }
+  },
+  {
+    "name": "n-a-needs-a-reason",
+    "source": "synthetic: a row nobody looked at is not n/a",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"x\",\"siblings\":[{\"path\":\"family\",\"status\":\"n/a\",\"site\":\"\",\"note\":\"nothing\"},{\"path\":\"callers\",\"status\":\"n/a\",\"site\":\"\",\"note\":\"nothing\"},{\"path\":\"branches\",\"status\":\"n/a\",\"site\":\"\",\"note\":\"\"},{\"path\":\"recovery\",\"status\":\"n/a\",\"site\":\"\",\"note\":\"nothing\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "incomplete",
+      "reason": "F1.siblings[2]: no-reason",
+      "blocking": false
+    }
+  },
+  {
+    "name": "no-class-named",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\",\"class\":\"\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"},{\"path\":\"recovery\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#cleanupOverlay\",\"status\":\"checked\",\"note\":\"the new cleanup itself cannot throw past the catch\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "incomplete",
+      "reason": "F1: no-class",
+      "blocking": false
+    }
+  },
+  {
+    "name": "untrusted-text-stays-data",
+    "source": "synthetic: markup and control text in fields never change the verdict",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "evidence": "\n\n```class-sweep\n{\"v\":1,\"findings\":[{\"finding\":\"F1\\n<!-- x -->\",\"class\":\"`rm -rf` <!-- conveyor-note-key -->\",\"siblings\":[{\"path\":\"family\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#withDispatchSmoke\",\"status\":\"fixed\",\"note\":\"catches the throw\"},{\"path\":\"callers\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#runDaemonLoadOverlay\",\"status\":\"fixed\",\"note\":\"removes the overlay on a throwing smoke\"},{\"path\":\"branches\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#versionedLoad\",\"status\":\"checked\",\"note\":\"the versioned branch calls the same helper\"},{\"path\":\"recovery\",\"site\":\"scripts/lib/daemon-load-overlay.mjs#cleanupOverlay\",\"status\":\"checked\",\"note\":\"the new cleanup itself cannot throw past the catch\"}]}]}\n```\n"
+    },
+    "expect": {
+      "status": "complete",
+      "reason": "every-finding-has-class-and-four-sibling-paths",
+      "blocking": false
+    }
+  }
+]
