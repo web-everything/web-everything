@@ -293,6 +293,13 @@ describe('configured store check run', () => {
     if (json) expect(JSON.parse(out)).toEqual({ repo: REPO, store, status: 'unreadable', reason: 'no-board', error: 'no board configured' });
   });
 
+  it('passes the repo to the facts reader so another repo\'s PRs are readable (xhetzpl)', () => {
+    const seen = [];
+    buildDerivedRows({ repo: 'plateauapp/plateau-app', prs: [{ number: 3, labels: [] }], events: [],
+      readFacts: (pr, o) => { seen.push([pr, o]); return null; } });
+    expect(seen).toEqual([[3, { repo: 'plateauapp/plateau-app' }]]);
+  });
+
   it('reads once and uses the same verdict/event snapshot for both comparisons', async () => {
     let reads = 0;
     let output = '';

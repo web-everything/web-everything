@@ -307,7 +307,7 @@ export function appendCheckRun({ repo, summary, phase1, at = new Date().toISOStr
 export function buildDerivedRows({ repo, prs, events, readFacts = readPrFacts, settings = {} }) {
   return prs.filter((p) => Number.isInteger(p?.number)).sort((a, b) => a.number - b.number).map((p) => {
     let facts = null;
-    try { facts = readFacts(p.number); } catch { facts = null; }
+    try { facts = readFacts(p.number, { repo }); } catch { facts = null; }
     return deriveRow({ pr: p.number, repo, events, facts, liveLabels: names(p.labels), settings });
   });
 }
@@ -327,7 +327,7 @@ function parseFlags(argv) {
 export async function runCheck({
   repo = DEFAULT_REPO, store, limit = 200, json = false, showAll = false, noRecord = false,
   readEvents = readLedgerEventsFromStore, listPrs = readOpenPrs,
-  readFacts = repo === DEFAULT_REPO ? undefined : () => null, appendRun = appendCheckRun,
+  readFacts = undefined, appendRun = appendCheckRun,
   stdout = (text) => writeAllSync(1, text), stderr = (text) => process.stderr.write(text),
 } = {}) {
   const ledger = await readEvents(repo, { store });
