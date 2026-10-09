@@ -150,7 +150,7 @@ export function readNetSets(rows, { dir, git = noBaseFetchGit(), base = 'main', 
 }
 
 /** Each open PR's head sha, from one `git ls-remote` (no GitHub API budget). Map(prNumber → sha); empty on failure. */
-export function readPrHeads(dir, numbers, { run = (args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', timeout: 60e3, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
+export function readPrHeads(dir, numbers, { run = (args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
   const heads = new Map();
   const wanted = [...new Set(numbers.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
   if (!wanted.length) return heads;
