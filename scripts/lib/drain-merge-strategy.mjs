@@ -125,7 +125,6 @@ export function createDrainMergeStrategy({
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
   const enqueues = (repo) => enqueueMode && !!isLocalRepo(repo);
   const slugOf = (repo) => repo || localSlug;
-  const repoFlag = (repo) => (repo ? ['--repo', repo] : []);
 
   return {
     policy,
@@ -156,7 +155,7 @@ export function createDrainMergeStrategy({
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
       if (!Array.isArray(comments) || !hasClearanceFor(comments, headSha)) {
-        try { exec('gh', ['pr', 'comment', String(c.num), ...repoFlag(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, exec });
@@ -182,7 +181,7 @@ export function createDrainMergeStrategy({
       const keep = [];
       for (const p of state.pending) {
         let v;
-        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), ...repoFlag(p.repo), '--json', 'number,state,mergedAt,mergeCommit'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
+        try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
         catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); keep.push(p); continue; }
         if (v?.state === 'MERGED') facts.push({ p, v });
         else if (v?.state === 'CLOSED') say(`  · ${keyOf(p.repo, p.num)} left the merge queue CLOSED without merging — dropped from the follow-up list`);
