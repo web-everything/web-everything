@@ -2,9 +2,11 @@
 bornAs: xmzgy3d
 kind: task
 parent: "3929"
-status: open
+status: resolved
 scope: ["we:scripts/pr-land.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/pr-land.test.mjs", "we:scripts/__tests__/merge-ai-prs-drain-verdict-ledger.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
+graduatedTo: f330efefa60cfd4e7280c21e3955432b1190ccec
 tags: []
 ---
 
