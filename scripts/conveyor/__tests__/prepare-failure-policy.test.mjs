@@ -185,6 +185,35 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
     // Idempotent: a second tick changes nothing.
     expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:01:00Z') })).toEqual([]);
   });
+  // Live 2026-10-09: #4354/#4411/#4476/#4488 stopped could-not-prepare, the operator ruled (a `## Ruling` landed on
+  // each card on main), and the holds never moved. A card edit on origin/main AFTER the hold releases it, so the
+  // next prepare reads the ruling; an edit from before the hold, or none, keeps it held.
+  it('a needs-you hold is released when the card changed on origin/main after the hold, and only then', () => {
+    const held = (num, recordedAt) => [`${num}:run ${num}:result`, { num, attempt: `run ${num}`, stage: 'result', cause: 'needs-you',
+      evidence: couldNot, holdReason: 'needs-you: prepare blocked (needs-ruling) - x', retry: false, held: true, recordedAt }];
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: Object.fromEntries([
+      held('4354', '2026-10-09T00:35:58.789Z'), held('4411', '2026-10-07T22:32:41.990Z'), held('4500', '2026-10-09T18:00:00.000Z'),
+    ]) }));
+    const ruling = { '4354': { commit: 'a'.repeat(40), at: '2026-10-09T17:00:32Z' }, '4411': { commit: 'b'.repeat(40), at: '2026-10-09T17:08:52Z' },
+      // #4500's card last changed BEFORE its hold: no ruling yet.
+      '4500': { commit: 'c'.repeat(40), at: '2026-10-09T12:00:00Z' } };
+    const asked = [];
+    const cardChange = (num, since) => { asked.push([num, since]); const c = ruling[num]; return c && Date.parse(c.at) > Date.parse(since) ? c : null; };
+    const released = releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T19:00:00Z'), cardChange });
+    expect(released.sort()).toEqual(['4354', '4411']);
+    expect(asked).toContainEqual(['4354', '2026-10-09T00:35:58.789Z']);
+    const f = readFailureState(path).failures;
+    expect(f['4354:run 4354:result']).toMatchObject({ held: false, retry: true, releasedBy: { cardChange: 'a'.repeat(40), at: '2026-10-09T17:00:32Z' } });
+    expect(f['4500:run 4500:result']).toMatchObject({ held: true, cause: 'needs-you' });
+    // Idempotent; and without a card-change reader nothing is released.
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T19:01:00Z'), cardChange })).toEqual([]);
+  });
+  it('a card-change reader that throws keeps the hold (fail closed) and never stops the tick', () => {
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4354:r:result': { num: '4354', attempt: 'r', stage: 'result', cause: 'needs-you',
+      evidence: couldNot, retry: false, held: true, recordedAt: '2026-10-09T00:00:00Z' } } }));
+    expect(releaseDuePrepareRetries({ path, now: Date.now(), cardChange: () => { throw new Error('git broke'); } })).toEqual([]);
+    expect(readFailureState(path).failures['4354:r:result']).toMatchObject({ held: true });
+  });
   it('a needs-you hold is releasable by a reviewed, commit-cited release entry', () => {
     const entry = { target: '4355', attempt: 'run 4355', cause: 'needs-you', evidence: 'ruled in the card', fixCommit: 'a'.repeat(40) };
     expect(validatePrepareRelease(entry, () => true)).toEqual(entry);

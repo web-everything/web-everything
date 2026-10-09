@@ -643,6 +643,22 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     costDecisions.push({ num: normNum(num), kind, ...admitLaunch({ kind: kind === 'prepare' ? 'prepare-item' : kind, settings: costSettings, legacy: gate }) });
     return gate;
   };
+  // Live 2026-10-09 (#4413 at 18:35Z) — dispatch-lane refuses to run from a clone behind origin/main on its code
+  // (#3439); the daemon launched anyway, the refusal released the claim, and the same card was re-launched (and
+  // refused) every few ticks. The daemon now runs that SAME check itself, once per tick, before its first launch:
+  // a refusal holds every launch of the tick (no claim, no failure record) and `cloneStale` asks self-sync for an
+  // immediate gated rebuild. The guard is unchanged; this only stops the daemon planning a launch it will refuse.
+  let cloneFresh;
+  const cloneGate = async (kind, num) => {
+    if (cloneFresh === undefined) {
+      try { cloneFresh = (await effects.dispatcherFresh?.()) ?? { fresh: true }; }
+      catch (e) { cloneFresh = { fresh: false, why: String(e?.message || e).split('\n')[0] }; }
+    }
+    if (cloneFresh.fresh) return true;
+    loadHolds.push({ num: normNum(num), kind, reason: 'clone-stale', why: cloneFresh.why });
+    console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (clone-stale): ${cloneFresh.why}`);
+    return false;
+  };
   // A LIGHT launch under the rule ON: its own budget / cap / CPU floor; the heavy host gate is not consulted.
   const lightGateFor = (kind, num, lightInFlight) => {
     const d = admitLaunch({ kind, settings: costSettings, facts: { ...readFacts(), lightInFlight } });
@@ -656,6 +672,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const launchBuilds = async () => {
     for (const pick of plan.dispatch) {
       if (launchSlotBusy()) continue;
+      if (!(await cloneGate('build', pick.num))) continue;
       const gate = loadGateFor('build', pick.num);
       if (!gate.admit) continue;
       const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
@@ -896,6 +913,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
+      if (!(await cloneGate('prepare', num))) continue;
       if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
       // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
       // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
@@ -961,6 +979,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     dispatched,
     // 78b/#4139 — launches deferred by the host-load gate, and the detached-launch settlement this tick did.
     loadHolds,
+    // The stale-code refusal this tick's launches were held on (null when the clone was fresh or nothing launched).
+    cloneStale: cloneFresh && !cloneFresh.fresh ? cloneFresh.why : null,
     // Card x60i0ie — the one cost-class admission line for this tick (heavy vs light, admitted/refused and why).
     costAdmission: { ...summarizeCostAdmission(costDecisions, { settings: costSettings, facts: costOn ? readFacts() : (costFacts ?? {}) }), decisions: costDecisions },
     launchSettlement,
@@ -1327,6 +1347,34 @@ export function cliHostLoadGate(kind = 'build', opts = {}) {
   const { env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample } = opts;
   try { return gateHost({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); }
   catch { return { admit: true }; }
+}
+
+/**
+ * The clone-stale launch gate's real check: dispatch-lane's OWN freshness guard (`assertDispatcherFresh`, #3439),
+ * run in this process against this clone, so a launch it would refuse is never started. Only on a daemon-managed
+ * clone: elsewhere dispatch-lane fast-forwards a clean, behind checkout itself, so there is nothing to predict.
+ */
+export async function cliDispatcherFresh({ env = process.env, assertFresh = null, root = REPO_ROOT } = {}) {
+  if (env.WE_DAEMON_MANAGED_CLONE !== '1') return { fresh: true, skipped: 'not-managed' };
+  const check = assertFresh ?? (await import('../../scripts/operations/dispatch-lane-io.mjs')).assertDispatcherFresh;
+  try { check(root); return { fresh: true }; }
+  catch (e) { return { fresh: false, why: redactSpawnText(String(e?.message || e).split('\n')[0]).slice(0, 400) }; }
+}
+
+/**
+ * The newest origin/main commit that changed card `num`'s file after `since` — `{commit, at}` (the first-parent
+ * commit time: when it landed on main), or null. Releases a held could-not-prepare once the operator's ruling
+ * lands on the card (`releaseDuePrepareRetries`'s `cardChange`). Throws on a git failure (the caller keeps the hold).
+ */
+export function cliCardChangedSince(num, since, { root = REPO_ROOT, run = execFileSync } = {}) {
+  const git = (args) => String(run('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }));
+  const prefix = `backlog/${normNum(num)}-`;
+  const path = git(['ls-tree', '--name-only', 'origin/main', 'backlog/']).split('\n')
+    .find((p) => p.startsWith(prefix) && p.endsWith('.md'));
+  if (!path) return null;
+  const [commit, at] = git(['log', '-1', '--first-parent', '--format=%H %cI', 'origin/main', '--', path]).trim().split(' ');
+  if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !(Date.parse(at) > Date.parse(since))) return null;
+  return { commit, at: new Date(Date.parse(at)).toISOString().replace('.000Z', 'Z') };
 }
 
 /** Card xu1nixv — the builder's `main-red` freeze from the health watch's published main-red record (TTL'd). */
@@ -1886,7 +1934,8 @@ function cliEffects() {
   let prepareReader;
   return {
     completePrepareFailures,
-    releaseDuePrepareRetries: () => releaseDuePrepareRetries(),
+    releaseDuePrepareRetries: () => releaseDuePrepareRetries({ cardChange: (num, since) => cliCardChangedSince(num, since) }),
+    dispatcherFresh: () => cliDispatcherFresh(),
     recordBuildFailure: (o) => recordBuildFailure(o),
     clearBuildFailure: ({ num }) => clearBuildFailure(num),
     listBuildBackoffs: () => listBuildBackoffs(),
@@ -2218,7 +2267,8 @@ async function live(flags) {
   const tickOnce = gatePausedTicks({
     tickOnce: rawTickOnce,
     wrapSync: flags['self-sync'] === true
-      ? (t) => wireSelfSyncAndAppAuth({ tickOnce: t, root: REPO_ROOT, selfSync: true, onRestart: () => { release(); process.exit(0); } })
+      // A tick whose launches were held clone-stale asks for the gated rebuild at once (#3383 bug 1's hook).
+      ? (t) => wireSelfSyncAndAppAuth({ tickOnce: t, root: REPO_ROOT, selfSync: true, hasStaleRefusal: (r) => Boolean(r?.cloneStale), onRestart: () => { release(); process.exit(0); } })
       : null,
     killSwitch: cliKillSwitch,
   });

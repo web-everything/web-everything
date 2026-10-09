@@ -183,7 +183,13 @@ export function completePrepareFailures(num, path = failureStatePath()) {
 
 /** Held transient failures whose backoff has elapsed become retryable again. Returns the card numbers that now have
  * NO remaining held failure (their hold files can be released). Exhausted failures are never released here. */
-export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings() } = {}) {
+/**
+ * @param {{path?: string, now?: number, settings?: object,
+ *   cardChange?: ((num: string, sinceIso: string) => ({commit: string, at: string}|null))|null}} [o] - `cardChange`
+ *   names the newest origin/main commit that changed the card's file AFTER `sinceIso` (null when none); it releases
+ *   a held `needs-you` record (step e). Omitted, needs-you holds are left alone.
+ */
+export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date.now(), settings = readBackoffSettings(), cardChange = null } = {}) {
   const state = readFailureState(path);
   const touched = new Set();
   // builder-starved (2026-10-07) — SELF-HEAL held dispatch failures the CURRENT policy would never have held:
@@ -231,6 +237,24 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
         : { holdReason: route.holdReason });
       if (route.routeHold) touched.add(f.num);
       healed = true;
+    }
+  }
+  // Live 2026-10-09 — (e) a could-not-prepare (`needs-you`) hold waits for the operator's ruling, and the ruling lands
+  // as an edit to the card on main (#4354/#4411/#4476/#4488 each got a `## Ruling` section and stayed held: nothing
+  // ever looked). Any change to the card's file on origin/main after the hold was recorded releases it, so the next
+  // prepare reads the card as it is now. If the edit did not settle the choice, that prepare stops could-not-prepare
+  // again and a NEW record holds it (its own, later `recordedAt`) — one extra prepare per card edit, never a loop.
+  // An unreadable history keeps the hold (fail closed).
+  if (typeof cardChange === 'function') {
+    for (const f of Object.values(state.failures)) {
+      if (!f.held || f.completed || f.cause !== 'needs-you') continue;
+      const since = f.recordedAt ?? f.healedAt;
+      if (!since || !Number.isFinite(Date.parse(since))) continue;
+      let change = null;
+      try { change = cardChange(String(f.num), since); } catch { change = null; }
+      if (!change?.commit || !(Date.parse(change.at) > Date.parse(since))) continue;
+      Object.assign(f, { held: false, retry: true, releasedAt: new Date(now).toISOString(), releasedBy: { cardChange: change.commit, at: change.at } });
+      touched.add(f.num);
     }
   }
   for (const f of Object.values(state.failures)) {
