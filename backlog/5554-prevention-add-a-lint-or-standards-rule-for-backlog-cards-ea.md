@@ -1,9 +1,10 @@
 ---
+bornAs: x7okl89
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xjpk13o-worker-contract-s3a-unified-wrapper.md", "we:scripts/operations/worker-result-router.mjs", "we:scripts/operations/__tests__/worker-wrapper.test.mjs", "we:scripts/operations/__tests__/worker-result-router.test.mjs"]
+scope: ["we:backlog/5549-worker-contract-s3a-unified-wrapper.md", "we:scripts/operations/worker-result-router.mjs", "we:scripts/operations/__tests__/worker-wrapper.test.mjs", "we:scripts/operations/__tests__/worker-result-router.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xjpk13o-worker-contract-s3a-unified-wrapper.md:33` — Add a lint or standards rule for backlog cards. Each "Edge cases this change must handle" line that makes a guarantee must name a test file or test case, or say n/a.
+1. `we:backlog/5549-worker-contract-s3a-unified-wrapper.md:33` — Add a lint or standards rule for backlog cards. Each "Edge cases this change must handle" line that makes a guarantee must name a test file or test case, or say n/a.
 2. `we:scripts/operations/worker-result-router.mjs:33` — Restore `@` only when the path matches a strict `node_modules/@scope/` shape. Add a test that a hostile `/@user` in scope and transcriptPath is still defanged. A write-gate cannot decide this, so a unit test is the guard.
 3. `we:scripts/operations/worker-result-router.mjs:301` — Add a per-session or per-role sub-cap (or rate limit) on new drafts, and take a store-level lock around the cap check. Add a test where one session floods the cap and a second session still gets a draft. File this as a backlog item for the 114 drafts store.
 4. `we:scripts/operations/__tests__/worker-wrapper.test.mjs:338` — Add a deterministic test in we:web-everything/scripts/operations/__tests__/worker-wrapper.test.mjs named 'caps bytes read when the result file grows after fstat'; instrument the filesystem seam and assert total bytes requested/read never exceeds maxBytes + 1 and overflow is refused.
