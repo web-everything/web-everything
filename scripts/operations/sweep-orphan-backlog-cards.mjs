@@ -134,7 +134,7 @@ const GUARD_LINE_RE = /^\d+\.\s+\S.*$/gm;
  * `digestHash` covers the numbered GUARD LINES only — never the frontmatter (`dateOpened`, `scope`, a landed
  * card's `bornAs`), the intro paragraph (the #2749 loop shape names its `reviewed head` sha there) or the
  * idempotency key (which pins a head) — so the same guard for the same PR hashes identically whatever day or
- * head it was filed at. The `## Acceptance` (or legacy `## Done when`) boilerplate is cut before the guard lines are read. A card with no
+ * head it was filed at. The acceptance-section boilerplate is cut before the guard lines are read. A card with no
  * numbered guard line at all falls back to its whole body minus frontmatter.
  * @param {string} rel - `backlog/x......-*.md`, as `git status` reported it.
  * @param {string} content

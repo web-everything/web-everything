@@ -86,6 +86,50 @@ function overlaps(file, h) {
   if (CARD_FOLDER.test(file) && CARD_FOLDER.test(h.file)) return false;
   return scopeEntriesOverlap(file, h.file);
 }
+// Live 2026-10-08 (xl5oele): GitHub's PR file list is the wrong witness for "which files does this PR hold?".
+//   - It stops at 100 files (`gh pr list --json files`), so one big PR (#4461) made EVERY check UNKNOWN.
+//   - After the drain merges main into a lane branch, it still diffs against the PR's old base, so main's own
+//     changes read as the PR's: #4502, #4508 and #4512 falsely held jury-core.mjs, review-pr.mjs, verdict-ledger.mjs.
+// The real file set is git's: the PR head against its merge-base with current main (`net`). The GitHub lists are
+// fallbacks only, and a list at its cap is never trusted as complete.
+/** `gh pr list --json files` shows at most this many files per PR; a list this long may be cut off. */
+export const GH_LIST_FILE_CAP = 100;
+/** GitHub's paginated PR-files API stops at this many files; a list this long may be cut off. */
+export const GH_API_FILE_CAP = 3000;
+/**
+ * Pick ONE PR's file set from the reads made for it, best witness first. PURE.
+ * Each read is `{ ok: true, files: string[], added?: string[] }` or `{ ok: false, reason }`, or absent.
+ *   net    — git: head vs its merge-base with current main. Exact, uncapped.
+ *   paged  — GitHub's paginated files API. Uncapped up to GH_API_FILE_CAP, but may include main's changes.
+ *   listed — the `gh pr list` files. Capped at GH_LIST_FILE_CAP, and may include main's changes.
+ * Returns `{ source, files, added }`, or `{ source: null, reason }` when no complete list was readable.
+ */
+export function choosePrFileSet({ net, paged, listed } = {}) {
+  const pick = (source, read) => ({ source, files: read.files, added: read.added || [] });
+  if (net?.ok) return pick('git', net);
+  if (paged?.ok && paged.files.length < GH_API_FILE_CAP) return pick('github-api', paged);
+  if (listed?.ok && listed.files.length < GH_LIST_FILE_CAP) return pick('github-list', listed);
+  const why = [
+    net && !net.ok && `git: ${net.reason}`,
+    paged && (paged.ok ? `github api lists ${paged.files.length} files (its cap)` : `github api: ${paged.reason}`),
+    listed && (listed.ok ? `lists ${listed.files.length} files (the gh cap) and may touch more` : `gh list: ${listed.reason}`),
+  ].filter(Boolean);
+  return { source: null, reason: why.join('; ') || 'no file list was read' };
+}
+/** Does this open PR hold `file`? PURE: the same overlap rule `assessFreeScope` applies to every holder. */
+export function prHoldsFile(pr, file) {
+  const target = qualifyFile(file);
+  return prHolders(pr).some((h) => overlaps(target, h));
+}
+/** One holder row per file the PR changes; a card the PR adds holds only its own exact path. */
+function prHolders(pr) {
+  const added = new Set(pr.added || []);
+  return pr.files.map((path) => {
+    const file = qualifyFile(path, repoKeyFor(pr.repo));
+    return { type: 'pr', repo: pr.repo, number: pr.number, title: pr.title, url: pr.url, file,
+      ...(added.has(path) && CARD_PATH.test(file) ? { newCard: true } : {}) };
+  });
+}
 const holderName = (h) => h.type === 'pr' ? `PR #${h.number} (${h.repo})` : `agent ${h.agent}`;
 /** `excludeOwner` narrows `excludeAgent` to the caller's own entry; left undefined, every entry of that name is excluded. */
 export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAgent = '', excludeOwner, excludePr = 0, excludeRepo = DEFAULT_REPOS[0], unreadable = [] }) {
@@ -96,12 +140,7 @@ export function assessFreeScope({ files, prs = [], agents = [], nowMs, excludeAg
   const candidates = [];
   for (const pr of prs) {
     if (excludePr > 0 && pr.number === excludePr && pr.repo === excludeRepo) continue;
-    const added = new Set(pr.added || []);
-    for (const path of pr.files) {
-      const file = qualifyFile(path, repoKeyFor(pr.repo));
-      candidates.push({ type: 'pr', repo: pr.repo, number: pr.number, title: pr.title, url: pr.url, file,
-        ...(added.has(path) && CARD_PATH.test(file) ? { newCard: true } : {}) });
-    }
+    candidates.push(...prHolders(pr));
   }
   for (const entry of live) for (const file of qualified(entry.files || [])) candidates.push({ type: 'agent',
     agent: entry.agent, purpose: entry.purpose, startedAt: entry.startedAt,

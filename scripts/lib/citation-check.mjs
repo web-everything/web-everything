@@ -675,24 +675,25 @@ export function findDanglingMemoryHashSlugs(text, { pendingHashes = new Set(), b
  */
 export const PROVENANCE_ESCAPE_MARKERS = Object.freeze(['proposed', 'does not exist', 'example']);
 
-/** Heading zones where an unresolved name is conventional and expected (#3026). A `## Done when` section
- *  names the functions the item will WRITE; a `## Design` section names the shape it proposes. Both are
- *  already the conventional homes for not-yet-real names, so an author writing there does not also have to
- *  mark each token. The zone runs until the next heading at the SAME OR SHALLOWER level, so a `###`
- *  subsection of `## Done when` inherits it. Verified against the historical misses this gate exists to
- *  catch: none of them lived under an escape heading (`validateTodoMarkerBlock` was under
- *  `## Where it is today`, `enforceFlipReady` in the item lede, `collectOpenItemIds` in a JSDoc block).
- *  `## Acceptance` is the #5399 name for `## Done when`; `## Non-goals` names things deliberately not built.
- *  An entry is a lowercase string (the heading, or the heading followed by a space or colon) or a RegExp tested
- *  against the lowercased title. The agreement sections use the reader's own regexes, so a spelling the reader
- *  accepts (`Acceptance criteria`, `Non-goal`, `Done when:`) can never fall outside the zone. */
-export const PROVENANCE_ESCAPE_HEADINGS = Object.freeze(['design', ACCEPTANCE_HEADING_RE, NON_GOALS_HEADING_RE]);
+/** Heading zones where an unresolved name is conventional and expected (#3026). The task agreement's
+ *  acceptance section names the functions the item will WRITE; its non-goals section names things
+ *  deliberately not built; a `## Design` section names the shape it proposes. All three are the
+ *  conventional homes for not-yet-real names, so an author writing there does not also have to mark each
+ *  token. The zone runs until the next heading at the SAME OR SHALLOWER level, so a `###` subsection
+ *  inherits it. Verified against the historical misses this gate exists to catch: none of them lived under
+ *  an escape heading (`validateTodoMarkerBlock` was under `## Where it is today`, `enforceFlipReady` in the
+ *  item lede, `collectOpenItemIds` in a JSDoc block).
+ *  The acceptance and non-goals headings (canonical `## Acceptance`, its legacy alias, `## Non-goals`) are
+ *  recognized through the shared task-agreement reader's heading rules (#5399 S7), so they never drift from
+ *  what every other gate reads; this list holds only the OTHER escape headings. */
+export const PROVENANCE_ESCAPE_HEADINGS = Object.freeze(['design']);
 
-/** Whether a (lowercased, markup-stripped) heading title opens an escape zone. */
-function isEscapeHeading(title, escapeHeadings) {
-  return escapeHeadings.some((k) => (k instanceof RegExp
-    ? k.test(title)
-    : title === k || title.startsWith(`${k} `) || title.startsWith(`${k}:`)));
+/** True when a markdown heading's text opens a provenance escape zone: a task-agreement section (shared
+ *  reader rule) or one of `escapeHeadings` (exact, or followed by a space or colon). Case-insensitive. */
+export function isProvenanceEscapeHeading(title, escapeHeadings = PROVENANCE_ESCAPE_HEADINGS) {
+  const t = String(title ?? '').replace(/[`*_]/g, '').trim().toLowerCase();
+  if (ACCEPTANCE_HEADING_RE.test(t) || NON_GOALS_HEADING_RE.test(t)) return true;
+  return escapeHeadings.some((k) => t === k || t.startsWith(`${k} `) || t.startsWith(`${k}:`));
 }
 
 /** The region escape, for a block that quotes MANY non-resolving names (a table of historical defects, a
@@ -869,7 +870,7 @@ function hasInlineEscape(rest) {
  *
  * The state that decides an escape (fenced-code, heading zone, `provenance-lint: off` region) is computed
  * over the WHOLE text, not just the added lines, because a line added inside a pre-existing fence or under
- * an untouched `## Done when` heading must inherit that context. Hence: scan everything, report the subset.
+ * an untouched acceptance heading must inherit that context. Hence: scan everything, report the subset.
  *
  * WHAT THIS PROVES, AND WHAT IT DOES NOT. Resolution here is deliberately LOOSE — a token resolves if the
  * name appears anywhere in the tree's source files. The question the gate answers is "does this name exist
@@ -935,11 +936,9 @@ export function findUnresolvedIdentifiers(text, {
       const h = line.match(/^(#{1,6})\s+(.+?)\s*$/);
       if (h) {
         const depth = h[1].length;
-        const title = h[2].replace(/[`*_]/g, '').trim().toLowerCase();
         // A heading at the same-or-shallower depth closes an open zone; a deeper one inherits it.
         if (escapeLevel !== null && depth <= escapeLevel) escapeLevel = null;
-        if (escapeLevel === null && isEscapeHeading(title, escapeHeadings))
-          escapeLevel = depth;
+        if (escapeLevel === null && isProvenanceEscapeHeading(h[2], escapeHeadings)) escapeLevel = depth;
         continue;
       }
     }

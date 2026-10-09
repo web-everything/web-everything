@@ -372,6 +372,31 @@ look at is not `n/a`.
 
 The self-review below asks: **which row did this fix not cover?**
 
+**The class sweep (structured record, card xet6iu0).** For each finding you repaired, name its defect class and walk
+the four sibling paths where the same defect can hide: `family` (the same function family — the other readers,
+writers or parsers built like the one you fixed), `callers` (every caller of the code you changed), `branches`
+(parallel branches: the other mode, kind, role or repo that takes a near-copy of this path), and `recovery` (the
+recovery, retry and error paths your fix itself added — fixes keep shipping holes there). Mark each one `fixed`
+(with its site), `checked` (with its site and why it is safe) or `n/a` (with the reason). Put it in your evidence
+file (step 6) as ONE fenced block with the info string `class-sweep`, JSON inside:
+
+````
+```class-sweep
+{"v":1,"findings":[{"finding":"F1","class":"<the defect class, one line>","siblings":[
+  {"path":"family","site":"<file#function>","status":"fixed|checked|n/a","note":"<why>"},
+  {"path":"callers","site":"…","status":"…","note":"…"},
+  {"path":"branches","site":"…","status":"…","note":"…"},
+  {"path":"recovery","site":"…","status":"…","note":"…"}]}]}
+```
+````
+
+Then run the check on that file. It prints one line and records the sweep for this session; paste the line into the
+evidence comment. In `warn` mode it never blocks; it tells you what is missing:
+
+```bash
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}}
+```
+
 ### 4. Run the gate GREEN (the item's own locus gate)
 
 **The harness owns the wait, not you (#5137).** The gate verifies a COMMIT and the harness pushes exactly that

@@ -42,7 +42,8 @@ describe('every surface carries all seven classes', () => {
     const card = renderItem({ kind: 'story', size: 2, slug: 'x', title: 'X', num: '900', digest: 'd', today: '2026-10-07' });
     expect(card).toContain(EDGE_CASES_HEADING);
     for (const c of EDGE_CASE_CLASSES) expect(card).toContain(`**${c.label}** — TODO`);
-    expect(card.indexOf('## Done when')).toBeLessThan(card.indexOf(EDGE_CASES_HEADING));
+    expect(card.indexOf('## Acceptance')).toBeGreaterThan(-1);
+    expect(card.indexOf('## Acceptance')).toBeLessThan(card.indexOf(EDGE_CASES_HEADING));
   });
   it('the file-item skill tells the filer to fill the section', () => {
     const text = flat(read('skills-src/file-item/SKILL.md'));

@@ -23,6 +23,7 @@ import {
   findRelativeNodeScriptsAfterLaneCd, WE_ONLY_LANE_CONVEYOR_BRIEFS,
 } from '../check-standards-rules.mjs';
 import { require, ROOT, SRC } from './fixtures/check-standards-rules-fixtures.mjs';
+import { renderItem } from '../backlog/scaffold.mjs';
 
 describe('module-resolution exports-lock (#274/#271)', () => {
   it('isExportsSafeTarget: URL / node_modules / bare specifier are safe', () => {
@@ -868,6 +869,56 @@ describe('findGuardRelaxationGaps — #4409 guard-relaxation Must lines', () => 
     const body = 'Relax the refusal only when X.\n';
     expect(lintBacklogItemRendering({ item: { id: '9', kind: 'story', status: 'open' }, body }).warnings.some((w) => /relaxes a refusal/.test(w))).toBe(true);
     expect(lintBacklogItemRendering({ item: { id: '9', kind: 'story', status: 'resolved' }, body }).warnings.some((w) => /relaxes a refusal/.test(w))).toBe(false);
+  });
+});
+
+// #5399 S7 — the Must-cite and TODO-placeholder guards read the acceptance section through the shared
+// task-agreement reader, so a card titled `## Acceptance` gets exactly the verdict of its `## Done when` twin.
+describe('Must-cite and TODO-placeholder guards: `## Acceptance` reads exactly as `## Done when` (#5399 S7)', () => {
+  const MVP = '## Explicit MVP cut\n\n**Must (MVP):**\n1. a\n2. b\n3. c\n\n**Out:** x\n\n';
+  const lint = (body) => lintBacklogItemRendering({ item: { id: '4999', kind: 'story', status: 'open' }, body });
+  const pair = (items) => ['Done when', 'Acceptance'].map((h) => `${MVP}## ${h}\n\n${items}\n`);
+  it.each([
+    ['numbered cites', '1. Must 1 holds.\n2. Musts 2-3 hold.'],
+    ['a partial cite', '- [A1] Must 2 holds.'],
+    ['no cite at all', '- [A1] it works.'],
+  ])('Must-cite: %s', (_, items) => {
+    const [legacy, canonical] = pair(items);
+    expect(findMustWithoutDoneWhen(canonical)).toEqual(findMustWithoutDoneWhen(legacy));
+    expect(lint(canonical).warnings).toEqual(lint(legacy).warnings);
+  });
+  it('Must-cite: a cite OUTSIDE the acceptance section never counts, under either heading', () => {
+    for (const h of ['Done when', 'Acceptance'])
+      expect(findMustWithoutDoneWhen(`${MVP}## Progress\n\nMusts 1-3\n\n## ${h}\n\n- [A1] x\n`)).toHaveLength(3);
+  });
+  it.each([
+    ['placeholder + claim', 'Mutation proof: it fails.', '- [A1] **Executable** — TODO: a command that fails first.', 1],
+    ['placeholder, no claim', 'Plain.', '- [A1] **Executable** — TODO: a command that fails first.', 0],
+    ['real command + claim', 'Mutation proof: it fails.', '- [A1] **Executable** — `npm test` passes.', 0],
+  ])('TODO-placeholder: %s', (_, top, items, n) => {
+    const errs = (h) => lint(`${top}\n\n## ${h}\n\n${items}\n`).errors.filter((e) => /unfinished executable acceptance/.test(e));
+    expect(errs('Acceptance')).toHaveLength(n);
+    expect(errs('Done when')).toHaveLength(n);
+  });
+
+  // A4 — the scaffold's skeleton is now `## Acceptance` + `## Non-goals`; both guards must still see it.
+  it('a scaffolded body carries ## Acceptance [A1] and ## Non-goals [N1] TODO lines, and no ## Done when', () => {
+    const out = renderItem({ kind: 'story', size: 3, slug: 'x', title: 'X', today: '2026-10-08' });
+    expect(out).toMatch(/^## Acceptance\n\n- \[A1\] \*\*Executable\*\* — TODO: a command/m);
+    expect(out).toMatch(/^## Non-goals\n\n- \[N1\] TODO:/m);
+    expect(out).not.toMatch(/^## Done when/m);
+  });
+  it('the TODO-placeholder guard sees the scaffolded acceptance section', () => {
+    const out = renderItem({ kind: 'story', size: 3, slug: 'x', title: 'X', today: '2026-10-08', digest: 'Mutation proof: remove it and the test fails.' });
+    const body = out.replace(/^---\n[\s\S]*?\n---\n/, '');
+    expect(lint(body).errors.filter((e) => /unfinished executable acceptance/.test(e))).toHaveLength(1);
+  });
+  it('the Must-cite check sees the scaffolded acceptance section', () => {
+    const out = renderItem({ kind: 'story', size: 3, slug: 'x', title: 'X', today: '2026-10-08', digest: `Digest.\n\n${MVP.trim()}` });
+    const body = out.replace(/^---\n[\s\S]*?\n---\n/, '');
+    expect(findMustWithoutDoneWhen(body).map((g) => g.must)).toEqual([1, 2, 3]);
+    const cited = body.replace('TODO: a command that fails before this item lands and passes after.', 'Musts 1-3: `npm test` passes.');
+    expect(findMustWithoutDoneWhen(cited)).toEqual([]);
   });
 });
 
