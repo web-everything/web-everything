@@ -1,7 +1,7 @@
 /** derivePrState over ledger events: one table row per lifecycle state, the hold rules, #5083 and the replays. */
 import { describe, it, expect } from 'vitest';
 import { derivePrState, labelsToLedgerState, ledgerView } from '../../pr-state.mjs';
-import { deriveReferrals } from '../referrals.mjs';
+import { deriveReferrals, ledgerFindingKey } from '../referrals.mjs';
 import { evaluateHolds } from '../holds/index.mjs';
 import { LIFECYCLE_STATE_NAMES, renderLabels, HUMAN_HOLD_CI_RED } from '../../../conveyor/pr-lifecycle.mjs';
 import { buildVerdictRecord, buildLedgerEvent, VERDICTS } from '../../verdict-ledger.mjs';
@@ -133,6 +133,25 @@ describe('referrals (#5083: a later accept on a new head closes them)', () => {
   it('only the closed keys close: another open key keeps the PR in NEEDS-RULING', () => {
     const r = deriveReferrals([referral(1, H1, 'k1'), verdict(VERDICTS.ACCEPTED, 5, H2), referral(6, H3, 'k2')]);
     expect([r.get('k1').state, r.get('k2').state]).toEqual(['resolved-by-fix', 'open']);
+  });
+});
+
+describe('finding keys: a ruling closes the referral whichever form it names (slice H shadow, ruling-key-unhashed)', () => {
+  const raw = '["judgeCorrectnessAdvisory","scripts/x.mjs",12,"a finding"]';
+  const hashed = ledgerFindingKey(raw);
+  it('the ledger form is sha256:<hex> of the raw key, and hashing twice is a no-op', () => {
+    expect(hashed).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(ledgerFindingKey(hashed)).toBe(hashed);
+  });
+  it('a hashed ruling closes a hashed referral', () => {
+    expect(deriveReferrals([referral(1, H1, hashed), ruling(5, hashed, 'not-real')]).get(hashed).state).toBe('ruled');
+  });
+  it('an OLD raw-key ruling row still closes the hashed referral it answers', () => {
+    expect(deriveReferrals([referral(1, H1, hashed), ruling(5, raw, 'block')]).get(hashed)).toMatchObject({ state: 'blocking', ruling: 'block' });
+    expect(state([referral(1, H1, hashed), ruling(5, raw, 'card')], facts()).holds.map(h => h.code)).not.toContain('referral-unruled');
+  });
+  it('a ruling for a different finding closes nothing', () => {
+    expect(deriveReferrals([referral(1, H1, hashed), ruling(5, 'another', 'not-real')]).get(hashed).state).toBe('open');
   });
 });
 
