@@ -49,6 +49,8 @@ export const REAL_REPOS_ENV = 'WE_HERMETIC_REAL_REPOS';
 /** A test that WANTS the deterministic "gh is not logged in" failure declares it: `WE_HERMETIC_GH=unauthenticated`. */
 export const GH_FIXTURE_ENV = 'WE_HERMETIC_GH';
 export const GH_FIXTURE_UNAUTHENTICATED = 'unauthenticated';
+/** Set (to '1') while a `hermeticDebt` file runs: the git shim records but passes through, even under CI. */
+export const DEBT_ENV = 'WE_HERMETIC_DEBT';
 /** Diagnostic run only: append every violation as JSON lines here instead of failing. */
 export const REPORT_FILE_ENV = 'WE_HERMETIC_REPORT_FILE';
 
@@ -98,6 +100,10 @@ export function parseHermeticSettings(raw) {
   }
   if (typeof live?.schedule?.cron !== 'string') problems.push('liveSuite.schedule.cron is required');
   if (!Number.isFinite(live?.schedule?.intervalHours) || live.schedule.intervalHours <= 0) problems.push('liveSuite.schedule.intervalHours must be > 0');
+  for (const [i, d] of (s?.hermeticDebt?.files || []).entries()) {
+    if (!d || typeof d.file !== 'string' || !d.file) problems.push(`hermeticDebt.files[${i}].file is required`);
+    if (!d || typeof d.reason !== 'string' || d.reason.trim().length < 10) problems.push(`hermeticDebt.files[${i}].reason must say why it is not fixed yet`);
+  }
   if (!Array.isArray(s?.guardedRoots)) problems.push('guardedRoots must be an array');
   for (const [i, g] of (s?.guardedRoots || []).entries()) {
     if (!g?.id || !g?.path) problems.push(`guardedRoots[${i}] needs id + path`);
@@ -121,6 +127,11 @@ export const DEFAULT_REPO_ROOT = urlToFsPath(new URL('../../', import.meta.url))
 
 export function loadHermeticSettings(repoRoot = DEFAULT_REPO_ROOT) {
   return parseHermeticSettings(readFileSync(join(repoRoot, SETTINGS_PATH), 'utf8'));
+}
+
+/** Blocking test files whose live accesses are recorded but not (yet) failed — a list that may only shrink. */
+export function hermeticDebtFiles(settings) {
+  return (settings.hermeticDebt?.files || []).map((d) => d.file);
 }
 
 /** The files of the scheduled live suite — what every BLOCKING config must exclude. */
@@ -341,6 +352,7 @@ if [ -n "$_we_hit" ]; then
     case "$_we_abs/" in "$_we_r"/*)
       IFS=$_we_ifs
       _we_record "git $* (in $_we_abs)"
+      if [ "\${${DEBT_ENV}:-}" = "1" ]; then exec "$_we_real" "$@"; fi
       if [ "\${${HERMETIC_MODE_ENV}:-}" = "report" ] && [ -z "\${CI:-}" ]; then exec "$_we_real" "$@"; fi
       exit 128;;
     esac

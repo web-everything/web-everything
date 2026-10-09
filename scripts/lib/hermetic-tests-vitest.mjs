@@ -13,7 +13,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import os from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import {
-  HERMETIC_MODE_ENV, LIVE_ACCESS_MESSAGE, LIVE_GITHUB_ENV_KEYS, REAL_REPOS_ENV, REPORT_FILE_ENV, TEST_ID_ENV, TEST_NAME_ENV,
+  DEBT_ENV, HERMETIC_MODE_ENV, LIVE_ACCESS_MESSAGE, hermeticDebtFiles, LIVE_GITHUB_ENV_KEYS, REAL_REPOS_ENV, REPORT_FILE_ENV, TEST_ID_ENV, TEST_NAME_ENV,
   VIOLATIONS_DIR_ENV, VIOLATIONS_FILE, buildGuardContext, hermeticMessage, hermeticMode, installHermeticGuards,
   fakeHomeEnv, loadHermeticSettings, parseViolationLog,
 } from './hermetic-tests.mjs';
@@ -66,7 +66,8 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
     onViolation: (v) => inProcess.push({ ...v, testId: process.env[TEST_ID_ENV] || 'outside-a-test' }),
     testName: () => process.env[TEST_NAME_ENV],
   };
-  installHermeticGuards({ fs, fsPromises, syncBuiltinESMExports, state });
+  // The guard object is shared per worker (installed once); this file's state is copied into it.
+  const guard = installHermeticGuards({ fs, fsPromises, syncBuiltinESMExports, state });
 
   // A private, empty HOME per test file: every home-derived default (~/.claude/*, ~/workspace/.lanes, …) lands in a
   // throwaway fixture. The guard above still fails anything that reaches the REAL roots by another route.
@@ -85,6 +86,8 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
   let seq = 0;
   let current = null;
   let fileLabel = 'this test file';
+  const debtFiles = new Set(hermeticDebtFiles(settings));
+  let inDebt = false;
   let consumed = 0;
   const readNewLog = () => {
     if (!existsSync(logFile)) return [];
@@ -98,6 +101,11 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
   const settle = (testLabel, violations) => {
     if (!violations.length) return;
     const lines = violations.map((v) => `  - ${v.kind} ${v.target}`).join('\n');
+    if (inDebt) {
+      // A declared hermeticDebt file: recorded and printed, never failed (the pre-card behaviour) — see the settings.
+      process.stderr.write(`[hermetic-debt] ${testLabel}: ${violations.length} live access(es) (listed in hermeticDebt; fix and remove the entry)\n`);
+      return;
+    }
     if (!enforce) {
       const file = reportFile;
       if (file) {
@@ -117,6 +125,9 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
     seq += 1;
     const file = st.testPath ? relative(repo, real(st.testPath)) : '?';
     fileLabel = file;
+    inDebt = debtFiles.has(file);
+    guard.enforce = enforce && !inDebt;
+    if (inDebt) process.env[DEBT_ENV] = '1'; else delete process.env[DEBT_ENV];
     const name = `${file} > ${st.currentTestName ?? '?'}`;
     current = { id: `${process.pid}-${seq}`, name };
     process.env[TEST_ID_ENV] = current.id;

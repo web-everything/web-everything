@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   GH_FIXTURE_ENV, HERMETIC_ENV, HermeticAccessError, LIVE_ACCESS_MESSAGE, REAL_REPOS_ENV, TEST_ID_ENV, TEST_NAME_ENV,
   VIOLATIONS_DIR_ENV, VIOLATIONS_FILE, buildGuardContext, classifyFetchUrl, classifyFsPath, classifyGitArgs,
-  fakeGhScript, fakeHomeEnv, gitShimScript, gitTargetDir, urlToFsPath, hermeticMode, installHermeticGuards, isHermetic, liveSuiteFiles,
+  fakeGhScript, fakeHomeEnv, hermeticDebtFiles, gitShimScript, gitTargetDir, urlToFsPath, hermeticMode, installHermeticGuards, isHermetic, liveSuiteFiles,
   loadHermeticSettings, parseHermeticSettings, parseViolationLog,
 } from '../hermetic-tests.mjs';
 
@@ -252,6 +252,17 @@ describe('declared settings', () => {
   const settings = loadHermeticSettings(ROOT);
   it('parse, and every live-suite test exists with a reason', () => {
     for (const f of liveSuiteFiles(settings)) expect(existsSync(join(ROOT, f)), f).toBe(true);
+  });
+  it('hermetic debt may only shrink: at most HERMETIC_DEBT_MAX files, each real, each with a reason, none live', () => {
+    // Lower this number when you fix a debt file. Never raise it: a new live access is fixed, not listed.
+    const HERMETIC_DEBT_MAX = 4;
+    const debt = hermeticDebtFiles(settings);
+    expect(debt.length).toBeLessThanOrEqual(HERMETIC_DEBT_MAX);
+    for (const f of debt) {
+      expect(existsSync(join(ROOT, f)), f).toBe(true);
+      expect(liveSuiteFiles(settings), f).not.toContain(f);
+    }
+    expect(() => parseHermeticSettings({ ...settings, hermeticDebt: { files: [{ file: 'x.test.mjs' }] } })).toThrow(/hermeticDebt/);
   });
   it('a malformed allowlist fails closed', () => {
     expect(() => parseHermeticSettings({ liveSuite: { tests: [{ file: 'x' }] }, guardedRoots: [] })).toThrow(/reason/);

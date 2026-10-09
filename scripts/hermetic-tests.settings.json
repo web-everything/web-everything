@@ -11,6 +11,15 @@
       }
     ]
   },
+  "hermeticDebt": {
+    "$comment": "Blocking-suite test files still making live accesses that could not be fixed in card xcu4cqf because another open PR holds the file (free-scope). Their accesses are RECORDED and printed, not failed: the old behaviour (fake gh, real git/fs). The list may only shrink — we:scripts/lib/__tests__/hermetic-tests.test.mjs pins its maximum length; remove an entry by fixing the file once its blocking PR lands.",
+    "files": [
+      { "file": "scripts/conveyor/__tests__/reconcile-pass.test.mjs", "reason": "reconcile pass reads origin/main in the real checkout (rev-parse/diff); file held by open PRs #4527 #4525 #4522 #4512 #4511 #4510 #4502" },
+      { "file": "scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs", "reason": "one gh api branch-protection read (frontierui); file held by open PRs #4527 #4525 #4522 #4512 #4511 #4510 #4502" },
+      { "file": "scripts/lib/__tests__/daemon-live-smoke.test.mjs", "reason": "gh pr view 900001 through the default runner; file held by open PRs #4453 #4439" },
+      { "file": "scripts/conveyor/__tests__/health-watch.test.mjs", "reason": "gh api rate_limit / secrets reads through default runners; file held by open PR #4461" }
+    ]
+  },
   "guardedRoots": [
     { "id": "conveyor-state", "path": "~/.claude/daemon-self-sync-state", "why": "the machine-wide automation state home: the build queue, run scorecards, daemon last-good" },
     { "id": "conveyor-home", "path": "~/.claude/conveyor", "why": "the conveyor runner's own state" },
