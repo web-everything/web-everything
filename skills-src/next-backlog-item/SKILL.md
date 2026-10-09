@@ -161,7 +161,7 @@ With no item named, run the full selection flow below.
 2. **Bias to Tier A — agent-ready first.** Prefer `issue`/`idea` items with a concrete, bounded build
    against proven infra and no open design fork. De-prioritize `decision`/`review` items; surface them
    for discussion rather than picking them. **Tie-break toward proof (#2949):** between otherwise-similar
-   candidates, prefer the one already carrying a `## Done when`/`## Acceptance` section with a tier-1/2
+   candidates, prefer the one already carrying an `## Acceptance` section (older cards: `Done when`) with a tier-1/2
    entry (*backlog-workflow.md → Acceptance criteria*) — less review-cost ambiguity to resolve later.
 3. **Present, then offer clickable options.** Output a short ranked shortlist (top 3–5, grouped by tier,
    one-line rationale each) plus the recommended item with its reasoning — the discussion context. **Use
@@ -261,7 +261,7 @@ an item*). The backlog file is the durable, resumable record — the item body *
 6. **Resume, don't re-pick, an `active` item.** Asked to continue one (or finding a stranded claim): read
    its `## Progress`, check out its branch, continue from **Next**.
 7. **Close it out when done — mark it `resolved`** (*backlog-workflow.md → Closing out a completed item*).
-   Confirm done — prove any guard `## Done when` criteria fail under mutation via `node scripts/operations/run.mjs mutation-check --checkout=<lane> --target=<file> --find="<pattern>" --replace="<pattern>" --suite=<suite>` (see *Prove a guard fails — mutation-check* below), then verify with `node scripts/operations/run.mjs verify --checkout=<lane> --json`, whose `verdict.ok` is true
+   Confirm done — prove any guard `## Acceptance` criteria (older cards: `Done when`) fail under mutation via `node scripts/operations/run.mjs mutation-check --checkout=<lane> --target=<file> --find="<pattern>" --replace="<pattern>" --suite=<suite>` (see *Prove a guard fails — mutation-check* below), then verify with `node scripts/operations/run.mjs verify --checkout=<lane> --json`, whose `verdict.ok` is true
    only when every check PASSED (an `unrun` check is not a pass; see *backlog-workflow.md → Closing out*) — take a **careful last look for leftovers** and capture
    each as its **own new item** via the OPERATION — **`node scripts/operations/run.mjs scaffold
    --title='…' --workItem=… --size=… --digest='…' [--parent=NNN] [--blockedBy=NNN,xhash] --json`** (#xrrpfo7).
@@ -321,7 +321,7 @@ an item*). The backlog file is the durable, resumable record — the item body *
 
 ## Prove a guard fails — mutation-check (#3219)
 
-When an item's `## Done when` criteria demand proving a guard actually fails when the bug it names returns, run the declared **`mutation-check`** operation (`we:scripts/operations/mutation-check.mjs`, #3219). It replaces ad-hoc shell or python heredocs with a safe, verified mutate → run → restore transaction in the target checkout:
+When an item's `## Acceptance` criteria (older cards: `Done when`) demand proving a guard actually fails when the bug it names returns, run the declared **`mutation-check`** operation (`we:scripts/operations/mutation-check.mjs`, #3219). It replaces ad-hoc shell or python heredocs with a safe, verified mutate → run → restore transaction in the target checkout:
 
 ```
 node scripts/operations/run.mjs mutation-check --checkout=<lane> --target=<file> --find="<pattern>" --replace="<pattern>" --suite=<suite> [--json]
