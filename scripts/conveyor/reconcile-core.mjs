@@ -156,7 +156,7 @@ import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advi
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
 // (see its own docblock for the full incident and the two facts it needs); this file only calls it.
 // Card xu1nixv — the red-main fix PR's fast lane (pure rank over the published priority record).
-import { mainRedPriorityRank } from './main-ci-red-core.mjs';
+import { mainRedPriorityRank, mainFixHeldFor } from './main-ci-red-core.mjs';
 import {
   isPrCiFailureOwedRerun, classifyMainDefect, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // landing-freeze fix (2026-09-27) — used only to word the `owed-ci-rerun` refusal's `why` accurately when
@@ -2097,8 +2097,12 @@ export function planReconcile({
       // a PR already sitting `cap-exhausted` from burning its heal count on main's own now-fixed regression is
       // NOT re-capped or specially reset: the cap is simply never consulted on this path, so the very next tick
       // this fires it reads `owed-ci-rerun` instead, with no separate "re-arm" bookkeeping needed.
-      // xu1nixv — never tell the red-main fix PR to wait for main to recover: main is waiting for IT.
-      if (!mainFixPriority && !mergeDirty && !rebaseCapExhausted && isPrCiFailureOwedRerun({
+      // xu1nixv — never tell the red-main fix PR to wait for main to recover: main is waiting for IT. EXCEPT
+      // (live 2026-10-08 ~00:10Z, #4522/#4532) a fix PR whose every failing job is a main cause ANOTHER fix PR fixes:
+      // that failure is not its own (no ci-heal); it waits for the other fix, or — when the fix PRs wait on each
+      // other — for the ONE combine session the health watch sends (`main-ci-red-core.mjs#planCombinedFix`).
+      const fixHold = mainFixPriority ? mainFixHeldFor(prNumber, mainRedPriority) : null;
+      if (fixHold || (!mainFixPriority && !mergeDirty && !rebaseCapExhausted && isPrCiFailureOwedRerun({
         comments: pr?.comments, headSha: pr?.headRefOid,
         requiredCheckCompletedAt: base.requiredCheckCompletedAt,
         aheadBy: base.aheadByOnMain,
@@ -2109,7 +2113,19 @@ export function planReconcile({
         mergeBaseCheckRuns: base.mergeBaseCheckRuns,
         mergeBaseRunConclusion: base.mergeBaseRunConclusion,
         mainFixedSignature: base.mainFixedSignature,
-      })) {
+      }))) {
+        if (fixHold) {
+          refuse(fixHold.kind, { ...withPhase, why: fixHold.why });
+          if (withPhase.labels.includes('review:pending')) {
+            const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
+            dispatchReviewRow({
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
+              extra: { owedCiRerun: true },
+            });
+          }
+          continue;
+        }
         // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
         const viaClass = classifyMainDefect({
           comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,

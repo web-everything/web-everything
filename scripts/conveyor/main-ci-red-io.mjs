@@ -24,10 +24,10 @@ import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
-  mainCiRedSettings, mainRedState, findOwner, findOwnerPr, decideOwner, buildOwnerBrief, ownerSessionSlug, classifyRun,
+  mainCiRedSettings, mainRedState, findOwner, findOwnerPrs, isRedLongEnough, decideOwner, planCombinedFix, combineKey, buildCombineBrief, buildOwnerBrief, ownerSessionSlug, classifyRun,
   planPriority,
 } from './main-ci-red-core.mjs';
-import { writeMainRedPriority } from '../lib/main-red-priority.mjs';
+import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priority.mjs';
 
 /** Main's repo: the WE entry of the constellation registry (never a hand-typed slug). */
 export const DEFAULT_REPO_SLUG = CONSTELLATION_REPOS.we.slug;
@@ -96,10 +96,28 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
   return { runs: sorted, failing };
 }
 
+/**
+ * One fix PR's CI for the combine rule: its latest FINISHED ci.yml run on the PR head, with a complete job list.
+ * `{status:'green'|'red'|'pending'|'unknown', failedJobs}` — anything not provable is `pending`/`unknown`.
+ */
+export function readFixPrCi(pr, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings() } = {}) {
+  try {
+    const runs = ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', String(pr.headRefName),
+      '--limit', '5', '--json', 'databaseId,conclusion,status,createdAt,headSha']);
+    const done = (Array.isArray(runs) ? runs : []).filter((r) => classifyRun(r) !== 'ignore')
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    if (!done) return { status: 'pending', failedJobs: [] };
+    if (pr.headRefOid && done.headSha !== pr.headRefOid) return { status: 'pending', failedJobs: [] };
+    if (classifyRun(done) === 'green') return { status: 'green', failedJobs: [] };
+    const jobs = readRunJobs(done.databaseId, { exec, repoSlug });
+    return jobs.complete ? { status: 'red', failedJobs: jobs.failed.map((j) => j.name) } : { status: 'unknown', failedJobs: [] };
+  } catch { return { status: 'unknown', failedJobs: [] }; }
+}
+
 /** Open PRs for the owner check, or `null` when unreadable or possibly cut off (= ownership unknown). */
 export function readOpenPrsForOwner({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
   try {
-    const rows = ghJson(exec, ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,body,headRefName,createdAt,state']);
+    const rows = ghJson(exec, ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,body,headRefName,headRefOid,createdAt,state']);
     if (!Array.isArray(rows) || rows.length >= OPEN_PR_LIMIT) return null;
     return rows;
   } catch { return null; }
@@ -150,6 +168,8 @@ export async function probeAndOwnMainCi({
   readRuns = (o) => probeMainCiRuns(o), readPrs = () => readOpenPrsForOwner({ repoSlug }),
   listAgents = async () => (await import('../operations/dispatch-lane-io.mjs')).defaultListAgents(),
   gates = defaultGates, dispatch = defaultDispatchOwner, publishPriority = writeMainRedPriority,
+  publishState = writeMainRedState,
+  readPrCi = (pr) => readFixPrCi(pr, { repoSlug }),
 } = {}) {
   const settings = mainCiRedSettings(config);
   const probe = readRuns({ repoSlug, settings });
@@ -159,6 +179,8 @@ export async function probeAndOwnMainCi({
   if (state.status !== 'red') {
     if (state.status === 'green' && !dryRun) {
       publishPriority(null);
+      publishState(null); // the builder's `main-red` freeze lifts
+
       // Mark the end of any red streak, so a later red window never inherits this window's owner.
       const path = ledgerPathIn(dir);
       mkdirSync(dirname(path), { recursive: true });
@@ -166,11 +188,52 @@ export async function probeAndOwnMainCi({
     }
     return { ...base, decision: { owed: false, reason: state.status === 'green' ? 'main-green' : 'main-state-unknown' } };
   }
-  // Main red: the PR that owns the fix (if any) goes first in every queue, from the moment main is red.
+  // Main red past the threshold (the smell's own definition): publish it for the builder's `main-red` freeze.
+  const mainRedRecord = settings.mainCiRedEnabled && isRedLongEnough(state, { now, thresholdMs: settings.mainCiRedThresholdMs })
+    ? { red: true, firstRedSha: state.firstRed.sha, since: state.redSinceMs, latestRedSha: state.latestRed?.sha ?? null, setAt: now, expiresAt: now + settings.mainCiRedPriorityTtlMs }
+    : null;
+  if (!dryRun) publishState(mainRedRecord);
+  base.mainRed = mainRedRecord;
+  // Main red: every PR that fixes it (one per red cause) goes first in every queue, from the moment main is red.
   const prs = readPrs();
-  const priority = prs === null ? null : planPriority({ state, ownerPr: findOwnerPr({ firstRed: state.firstRed, prs, settings }), now, settings });
+  const ownerPrs = prs === null ? [] : findOwnerPrs({ firstRed: state.firstRed, prs, settings });
+  const priority = prs === null ? null : planPriority({ state, ownerPrs, now, settings });
+  // Several fix PRs (one per red cause) can deadlock — each failing CI on the other's cause (live 2026-10-08).
+  let combine = null;
+  if (priority && settings.mainCiRedCombineFixPrs && ownerPrs.length >= 2) {
+    const full = new Map((prs || []).map((p) => [Number(p.number), p]));
+    const fixPrs = ownerPrs.map((o) => { const p = full.get(o.number) ?? o; return { number: o.number, createdAt: p.createdAt, headRefName: p.headRefName ?? null, ci: readPrCi(p) }; });
+    combine = planCombinedFix({ mainFailingJobs: probe.failing?.jobs ?? [], fixPrs });
+    if (combine.owedElsewhere.length || combine.deadlock) priority.combine = combine;
+  }
   if (prs !== null && !dryRun) publishPriority(priority);
   base.priority = priority;
+  // A deadlock gets ONE combine session (ledger key per PR set; never a second one, never while one is reserved).
+  if (combine?.deadlock && !dryRun && settings.mainCiRedOwnerDispatch && !(await gates()).killed) {
+    const path = ledgerPathIn(dir);
+    mkdirSync(dirname(path), { recursive: true });
+    const key = combineKey(combine.deadlock);
+    let owed = false;
+    withFileLock(`${path}.lock`, () => {
+      const l = readOwnerLedger(path);
+      if (l[key]) return;
+      l[key] = { at: now, status: 'dispatching', carrier: combine.deadlock.carrier };
+      writeJsonAtomic(path, l);
+      owed = true;
+    }, { timeoutMs: 30_000 });
+    if (owed) {
+      const sessionSlug = `main-fix-combine-${combine.deadlock.carrier}`;
+      let out;
+      try { out = await dispatch({ prompt: buildCombineBrief({ deadlock: combine.deadlock, weRoot: weRoot ?? process.cwd(), repoSlug, firstRedSha: state.firstRed.sha }), sessionSlug, state }); }
+      catch (e) { out = e?.notApplied ? { held: true } : { handle: null }; }
+      withFileLock(`${path}.lock`, () => {
+        const l = readOwnerLedger(path);
+        if (out?.held) delete l[key]; else l[key] = { ...l[key], status: 'dispatched', sessionSlug, handle: out?.handle ?? null };
+        writeJsonAtomic(path, l);
+      }, { timeoutMs: 30_000 });
+      if (!out?.held) base.combineDispatched = { sessionSlug, carrier: combine.deadlock.carrier };
+    }
+  }
   // Cheap verdicts first: no agent/gate read while main is not red long enough or dispatch is off.
   const pre = decideOwner({ state, now, settings, owner: null, prs: [] });
   if (!pre.owed) {

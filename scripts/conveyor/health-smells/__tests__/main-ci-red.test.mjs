@@ -12,8 +12,9 @@ import { fileURLToPath } from 'node:url';
 import {
   MAIN_CI_RED_DEFAULTS, mainCiRedSettings, classifyRun, mainRedState, isRedLongEnough, runsAsOf, findOwner,
   decideOwner, buildOwnerBrief, ownerSessionSlug, findOwnerPr, planPriority, isPriorityActive, mainRedPriorityRank,
+  findOwnerPrs, mainRedBuildFreeze,
 } from '../../main-ci-red-core.mjs';
-import { readMainRedPriority, writeMainRedPriority } from '../../../lib/main-red-priority.mjs';
+import { readMainRedPriority, writeMainRedPriority, readMainRedState, writeMainRedState, resolveFreezeMainRed } from '../../../lib/main-red-priority.mjs';
 import { probeAndOwnMainCi, ledgerPathIn, probeMainCiRuns } from '../../main-ci-red-io.mjs';
 import smell from '../main-ci-red.mjs';
 import { emptyHealthState, runHealthTick } from '../../health-watch-core.mjs';
@@ -31,17 +32,19 @@ const PR_4523 = { number: 4523, title: 'backlog: file xu1nixv — a red main get
 const run = (o) => ({ status: 'completed', databaseId: 1, headSha: 'a'.repeat(40), createdAt: '2026-10-08T10:00:00Z', updatedAt: '2026-10-08T10:10:00Z', ...o });
 
 let dir;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'main-ci-red-')); published = []; });
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'main-ci-red-')); published = []; publishedState = []; });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 /** One tick of the IO pass at `t` over the fixture as it looked then. */
 let published = [];
+let publishedState = [];
 function tickAt(t, { prs = [], dispatched, config = {}, gates } = {}) {
   return probeAndOwnMainCi({
     dir, now: t, config, weRoot: '/we',
     readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: { jobs: ['soak-shard (3)', 'daemon-soak'], tests: [] } }),
     readPrs: () => prs.filter((p) => T(p.createdAt) <= t),
-    listAgents: async () => [], publishPriority: (r) => published.push(r),
+    listAgents: async () => [], publishState: (r) => publishedState.push(r), publishPriority: (r) => published.push(r),
+    readPrCi: () => ({ status: 'unknown', failedJobs: [] }),
     gates: gates ?? (async () => ({ killed: false, fixGate: { admit: true } })),
     dispatch: async (req) => { dispatched.push({ at: new Date(t).toISOString(), ...req }); return { handle: `h-${dispatched.length}` }; },
   });
@@ -207,7 +210,7 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
   it('a launch that provably started nothing is retried next tick; an unreadable PR list never dispatches', async () => {
     const t = T('2026-10-08T18:00:00Z');
     const held = await probeAndOwnMainCi({
-      dir, now: t, weRoot: '/we', publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
+      dir, now: t, weRoot: '/we', publishState: (r) => publishedState.push(r), publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
       listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }),
       dispatch: async () => { const e = new Error('no claude'); e.notApplied = true; throw e; },
     });
@@ -215,7 +218,7 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
     expect(JSON.parse(readFileSync(ledgerPathIn(dir), 'utf8'))).toEqual({});
     const dispatched = [];
     const blind = await probeAndOwnMainCi({
-      dir, now: t, weRoot: '/we', publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => null,
+      dir, now: t, weRoot: '/we', publishState: (r) => publishedState.push(r), publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => null,
       listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), dispatch: async (r) => { dispatched.push(r); return {}; },
     });
     expect(blind.decision.reason).toBe('owner-unknown');
@@ -227,7 +230,7 @@ describe('replay: 2026-10-08, main red from 17:04Z', () => {
   it('dry-run decides but neither dispatches nor writes', async () => {
     const t = T('2026-10-08T18:00:00Z');
     const out = await probeAndOwnMainCi({
-      dir, now: t, dryRun: true, publishPriority: () => { throw new Error('must not publish'); }, readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
+      dir, now: t, dryRun: true, publishState: (r) => publishedState.push(r), publishPriority: () => { throw new Error('must not publish'); }, readRuns: () => ({ runs: runsAsOf(FIXTURE, t), failing: {} }), readPrs: () => [],
       listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), dispatch: async () => { throw new Error('must not dispatch'); },
     });
     expect(out.decision.owed).toBe(true);
@@ -266,14 +269,14 @@ describe('red-main owner PR priority (operator context 2026-10-08: red main bloc
     await tickAt(now, { dispatched: [], prs: [PR_4522, PR_4523] });
     expect(published.at(-1)).toMatchObject({ pr: 4522 });
     // The real fixture never goes green, so feed one green run after the window.
-    await probeAndOwnMainCi({ dir, now, publishPriority: (r) => published.push(r),
+    await probeAndOwnMainCi({ dir, now, publishState: (r) => publishedState.push(r), publishPriority: (r) => published.push(r),
       readRuns: () => ({ runs: [...runsAsOf(FIXTURE, now), { databaseId: 9, headSha: 'f'.repeat(40), status: 'completed', conclusion: 'success', createdAt: '2026-10-08T22:48:00Z', updatedAt: '2026-10-08T23:00:00Z' }], failing: {} }),
       readPrs: () => { throw new Error('no PR read while green'); } });
     expect(published.at(-1)).toBeNull();
   });
 
   it('an unreadable PR list publishes nothing (the old record just expires)', async () => {
-    await probeAndOwnMainCi({ dir, now, publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, now), failing: {} }),
+    await probeAndOwnMainCi({ dir, now, publishState: (r) => publishedState.push(r), publishPriority: (r) => published.push(r), readRuns: () => ({ runs: runsAsOf(FIXTURE, now), failing: {} }),
       readPrs: () => null, listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), dispatch: async () => ({}) });
     expect(published).toHaveLength(0);
   });
@@ -306,7 +309,7 @@ describe('a truncated read window (live 2026-10-08: 60 runs did not reach the la
     const dispatched = [];
     for (let t = T('2026-10-08T18:00:00Z'); t <= T('2026-10-08T22:45:00Z'); t += 5 * MIN) {
       const window = runsAsOf(FIXTURE, t).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).slice(0, 25); // no green inside
-      await probeAndOwnMainCi({ dir, now: t, weRoot: '/we', publishPriority: () => {}, readRuns: () => ({ runs: window, failing: {} }),
+      await probeAndOwnMainCi({ dir, now: t, weRoot: '/we', publishState: (r) => publishedState.push(r), publishPriority: () => {}, readRuns: () => ({ runs: window, failing: {} }),
         readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }),
         dispatch: async (r) => { dispatched.push(r.sessionSlug); return { handle: 'h' }; } });
     }
@@ -317,7 +320,7 @@ describe('a truncated read window (live 2026-10-08: 60 runs did not reach the la
 describe('red streaks', () => {
   it('a NEW red window after main went green gets its own owner', async () => {
     const dispatched = [];
-    const gate = { listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), publishPriority: () => {}, readPrs: () => [] };
+    const gate = { listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }), publishState: (r) => publishedState.push(r), publishPriority: () => {}, readPrs: () => [] };
     const r = (sha, conclusion, at) => ({ databaseId: at, headSha: sha.padEnd(40, '0'), status: 'completed', conclusion, createdAt: new Date(at).toISOString(), updatedAt: new Date(at + 5 * MIN).toISOString() });
     const base = T('2026-10-09T01:00:00Z');
     const w1 = [r('aaa', 'success', base), r('bbb', 'failure', base + MIN)];
@@ -338,7 +341,7 @@ describe('several red causes on one red commit (2026-10-08: soak + flaky review-
     const t = T('2026-10-08T23:40:00Z');
     const two = { jobs: ['soak-shard (2)', 'daemon-soak', 'test-shard (2)'], tests: ['build-dispatch-orphan-adopt.soak.test.mjs > …', 'review-pr-io.test.mjs > 3 runs on one head yield 3 rows'] };
     for (const at of [t, t + 5 * MIN]) {
-      await probeAndOwnMainCi({ dir, now: at, weRoot: '/we', publishPriority: () => {}, readRuns: () => ({ runs: runsAsOf(FIXTURE, T('2026-10-08T22:45:00Z')), failing: two }),
+      await probeAndOwnMainCi({ dir, now: at, weRoot: '/we', publishState: (r) => publishedState.push(r), publishPriority: () => {}, readRuns: () => ({ runs: runsAsOf(FIXTURE, T('2026-10-08T22:45:00Z')), failing: two }),
         readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }),
         dispatch: async (r) => { dispatched.push(r); return { handle: 'h' }; } });
     }
@@ -346,5 +349,85 @@ describe('several red causes on one red commit (2026-10-08: soak + flaky review-
     expect(dispatched[0].prompt).toContain('test-shard (2)');
     expect(dispatched[0].prompt).toContain('review-pr-io.test.mjs');
     expect(dispatched[0].prompt).toContain('fix every failing job');
+  });
+});
+
+// ── Restart slice (incident review 2026-10-08 23:45Z): two red causes, two fix PRs, and the builder freeze ─────────
+// The second cause (`review-pr-io`) was fixed on `lane/red-main-review-pr-io`; card PR #4527 (`lane/main-red-owner`)
+// is NOT a fix PR and must never be fast-tracked.
+const PR_PRIO = { number: 4531, title: 'WE #xrw21vx: review-pr-io keeps every run row', headRefName: 'lane/red-main-review-pr-io', createdAt: '2026-10-08T23:58:00Z', state: 'OPEN', body: '' };
+const PR_4527 = { number: 4527, title: 'health: a red main gets an owner — main-ci-red smell + one fixer per broken commit', headRefName: 'lane/main-red-owner', createdAt: '2026-10-08T22:52:00Z', state: 'OPEN', body: '' };
+
+describe('every fix PR of a red window is recognised (one per red cause), still ONE owner', () => {
+  const firstRed = { sha: '7c731a95e'.padEnd(40, '0'), createdAt: '2026-10-08T17:04:20Z' };
+  it('recognises #4522 (title) and the review-pr-io fix (branch), not the card PRs', () => {
+    expect(findOwnerPrs({ firstRed, prs: [PR_4522, PR_4523, PR_4527, PR_PRIO] }).map((p) => p.number)).toEqual([4522, 4531]);
+  });
+  it('the priority record fast-tracks both; rank 0 for each, 1 for every other PR', () => {
+    const state = { status: 'red', firstRed };
+    const now = T('2026-10-09T00:00:00Z');
+    const rec = planPriority({ state, ownerPrs: findOwnerPrs({ firstRed, prs: [PR_4522, PR_PRIO, PR_4527] }), now });
+    expect(rec).toMatchObject({ pr: 4522, prs: [4522, 4531] });
+    expect([4522, 4531, 4527, 4512].map((n) => mainRedPriorityRank(n, rec, { now }))).toEqual([0, 0, 1, 1]);
+  });
+  it('an older single-PR record still ranks (backward compatible)', () => {
+    const now = 1000;
+    expect(mainRedPriorityRank(4522, { repo: 'we', pr: 4522, expiresAt: 2000 }, { now })).toBe(0);
+  });
+  it('the branch pattern can be switched off', () => {
+    const settings = mainCiRedSettings({ mainCiRedOwnerBranchPattern: '' });
+    expect(findOwnerPrs({ firstRed, prs: [PR_PRIO], settings })).toEqual([]);
+  });
+  it('a second cause on the same red streak never dispatches a second owner', async () => {
+    const dispatched = [];
+    await tickAt(T('2026-10-08T17:25:00Z'), { dispatched });
+    await tickAt(T('2026-10-08T23:45:00Z'), { dispatched, prs: [PR_4522] });
+    await tickAt(T('2026-10-08T23:59:00Z'), { dispatched, prs: [PR_4522, PR_PRIO] });
+    expect(dispatched.map((d) => d.sessionSlug)).toEqual(['main-fix-7c731a95e']);
+  });
+});
+
+describe('builder freeze kind `main-red` (setting freeze.mainRed, default on)', () => {
+  it('pure rule: red → frozen; off / unknown / expired / green → not frozen', () => {
+    const rec = { red: true, firstRedSha: '7c731a95e', since: T('2026-10-08T17:04:20Z'), expiresAt: T('2026-10-08T18:00:00Z') };
+    const now = T('2026-10-08T17:30:00Z');
+    expect(mainRedBuildFreeze(rec, { now })).toMatchObject({ frozen: true });
+    expect(mainRedBuildFreeze(rec, { now }).reason).toMatch(/main CI red since 2026-10-08T17:04:20/);
+    expect(mainRedBuildFreeze(rec, { now, setting: 'off' }).frozen).toBe(false);
+    expect(mainRedBuildFreeze(null, { now }).frozen).toBe(false);
+    expect(mainRedBuildFreeze(rec, { now: T('2026-10-08T18:00:00Z') }).frozen).toBe(false);
+    expect(mainRedBuildFreeze({ ...rec, exemptNums: ['xh6ij2v'] }, { now }).exemptNums).toEqual(['xh6ij2v']);
+  });
+  it('setting: env > dispatch-settings.json > built-in on', () => {
+    expect(resolveFreezeMainRed({ env: {} })).toBe('on');
+    expect(resolveFreezeMainRed({ env: { WE_BUILD_FREEZE_MAIN_RED: 'off' } })).toBe('off');
+    expect(resolveFreezeMainRed({ env: {}, file: join(dir, 'missing.json') })).toBe('on');
+  });
+  it('the state record round-trips and expires', () => {
+    const path = join(dir, 'main-ci-red-state.json');
+    writeMainRedState({ red: true, firstRedSha: 'abc', since: 1, expiresAt: 5000 }, { path });
+    expect(readMainRedState({ path, now: 4000 })).toMatchObject({ red: true });
+    expect(readMainRedState({ path, now: 5000 })).toBeNull();
+    writeMainRedState(null, { path });
+    expect(existsSync(path)).toBe(false);
+  });
+  it('replay 2026-10-08: the builder is frozen from the first decisive red run, all through the red window', async () => {
+    const dispatched = [];
+    const frozenAt = [];
+    for (let t = T('2026-10-08T16:50:00Z'); t <= T('2026-10-08T23:45:00Z'); t += 5 * MIN) {
+      publishedState = [];
+      await tickAt(t, { dispatched, prs: [PR_4522].filter((p) => T(p.createdAt) <= t) });
+      const rec = publishedState.at(-1) ?? null;
+      if (mainRedBuildFreeze(rec, { now: t }).frozen) frozenAt.push(new Date(t).toISOString());
+    }
+    // Frozen from the first tick after the 17:04Z red run turned decisive (17:18Z), and never released while red.
+    expect(frozenAt[0]).toBe('2026-10-08T17:20:00.000Z');
+    expect(frozenAt.at(-1)).toBe('2026-10-08T23:45:00.000Z');
+    expect(frozenAt.length).toBe((T('2026-10-08T23:45:00Z') - T('2026-10-08T17:20:00Z')) / (5 * MIN) + 1);
+  });
+  it('off value: with the smell off the builder is never frozen (before this card)', async () => {
+    const dispatched = [];
+    await tickAt(T('2026-10-08T20:00:00Z'), { dispatched, config: { mainCiRedEnabled: false } });
+    expect(publishedState.filter(Boolean)).toEqual([]);
   });
 });

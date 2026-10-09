@@ -355,7 +355,9 @@ export function resolveDraft({ mode, optOut, ref = '', title = '' }) {
  *  declared pattern — the same rule that recognises the owner). Pure. */
 export function isMainFixPr({ ref = '', title = '' } = {}) {
   const d = MAIN_CI_RED_DEFAULTS;
-  if (String(ref).replace(/^refs\/heads\//, '').startsWith(d.mainCiRedOwnerBranchPrefix)) return true;
+  const branch = String(ref).replace(/^refs\/heads\//, '');
+  if (branch.startsWith(d.mainCiRedOwnerBranchPrefix)) return true;
+  try { if (d.mainCiRedOwnerBranchPattern && new RegExp(d.mainCiRedOwnerBranchPattern, 'i').test(branch)) return true; } catch { /* bad pattern: title only */ }
   try { return new RegExp(d.mainCiRedOwnerTitlePattern, 'i').test(String(title)); } catch { return false; }
 }
 

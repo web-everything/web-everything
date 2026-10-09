@@ -77,6 +77,8 @@ import { settleDispatchEffect } from '../../scripts/operations/deliver-item-sett
 import { prepareCardStatus } from '../../scripts/conveyor/prepare-result.mjs';
 import { readField } from '../../scripts/backlog/frontmatter.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { readMainRedState, resolveFreezeMainRed } from '../../scripts/lib/main-red-priority.mjs'; // card xu1nixv
+import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'; // card xu1nixv
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
@@ -580,6 +582,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const plan = planBuildDispatch({
     candidates, inFlight, openPrs, externalBuilding, killSwitch: effects.killSwitch(), policy, dispatchedByBuilder,
     fixInFlight: effects.listFixClaims ? effects.listFixClaims() : [],
+    // Card xu1nixv — freeze kind `main-red` (setting freeze.mainRed); an effect that is absent or throws = no freeze.
+    mainRedFreeze: (() => { try { return effects.mainRedFreeze ? effects.mainRedFreeze() : null; } catch { return null; } })(),
   });
 
   const dispatched = [];
@@ -1273,6 +1277,11 @@ export function cliHostLoadGate(kind = 'build', opts = {}) {
   catch { return { admit: true }; }
 }
 
+/** Card xu1nixv — the builder's `main-red` freeze from the health watch's published main-red record (TTL'd). */
+function cliMainRedFreeze() {
+  return mainRedBuildFreeze(readMainRedState(), { setting: resolveFreezeMainRed(), now: Date.now() });
+}
+
 function cliKillSwitch() {
   const killFilePath = join(resolveCoordinationRoot(), KILL_SWITCH_FILENAME);
   return readKillSwitch({ env: process.env, killFileExists: existsSync(killFilePath), killFilePath });
@@ -1881,6 +1890,7 @@ function cliEffects() {
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     killSwitch: cliKillSwitch,
+    mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,
     settleLaunches: (o) => cliSettleLaunches({ confirmed: cliLaunchConfirmed, ...o }),
     hostLoadGate: cliHostLoadGate,
@@ -2037,7 +2047,7 @@ async function dryRun(flags) {
     const route = await cliPredictRoute(c.num, scope);
     reportCandidates.push({ num: c.num, lane: c.lane, scope, route, executor: route.executor });
   }
-  const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight() });
+  const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight(), mainRedFreeze: cliMainRedFreeze() });
   const focus = String(flags.focus || '').split(',').map(normNum).filter(Boolean);
   const rows = [];
   const holdByNum = new Map((tick.buildHolds || []).map((h) => [normNum(h.num), h]));
