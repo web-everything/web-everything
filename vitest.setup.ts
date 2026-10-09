@@ -38,7 +38,9 @@ function lazyRoot(name: string): string {
 const ownedTmpDirs: string[] = [];
 const fixtureRootKeys: string[] = [];
 let addedPathPrefix: string | undefined;
-afterAll(() => {
+// Registered as its own afterAll only when hermetic mode is off; otherwise it runs from the hermetic afterAll (below),
+// after that hook has read the shim log that lives under `fileTmpBase`.
+function cleanupFileTmp() {
   // Retries: a child the file spawned (e.g. a cache writer under the per-file fake HOME) can still be finishing.
   if (fileTmpBase && existsSync(fileTmpBase)) {
     try { rmSync(fileTmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* run-wide sweep in vitest.globalSetup.mjs */ }
@@ -51,7 +53,8 @@ afterAll(() => {
   if (addedPathPrefix && process.env.PATH?.startsWith(`${addedPathPrefix}:`)) {
     process.env.PATH = process.env.PATH.slice(addedPathPrefix.length + 1);
   }
-});
+}
+if (!hermetic) afterAll(cleanupFileTmp);
 
 // #xpc3krl (ci-heal-2684, 2026-09-25; extended by operator-approved follow-up the same day) — SANDBOX BY
 // DEFAULT, FIRST, before anything below reads `process.env`. Live-caught on this Mac: 6 tests across
@@ -121,7 +124,7 @@ if (hermetic) {
   }
   addedPathPrefix = fakeGhDir;
   process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
-  const hermeticSettings = setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home') }).settings;
+  const hermeticSettings = setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home'), afterSettle: cleanupFileTmp }).settings;
   // Roots found from the checkout's location rather than the home (lane pool, telemetry): a private per-file dir.
   for (const [key, name] of Object.entries(hermeticSettings.fixtureRootEnv || {})) {
     if (key.startsWith('$') || process.env[key] !== undefined) continue;

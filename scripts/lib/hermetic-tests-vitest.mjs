@@ -49,11 +49,14 @@ const expandHome = (p, home) => (p && p.startsWith('~/') ? join(home, p.slice(2)
  * @param {string} o.repoRoot the checkout under test
  * @param {Record<string,string|undefined>} o.ambient the LAUNCHING env, captured before any sandbox strip
  * @param {string} o.violationsDir per-file dir the shims append to
+ * @param {Function} [o.afterSettle] the caller's own end-of-file cleanup. It runs inside THIS `afterAll`, after the late
+ *   rows are read (and still when they fail the file): vitest 1.x runs separate `afterAll` hooks in registration order,
+ *   so a sibling hook that removed the dir holding the shim log would delete a late row unread.
  * @param {object} [o.guardFs] the `fs` / `fs/promises` / fetch host the in-process guard patches — the real ones by
  *   default; a test of this function passes stubs so it never re-patches (or re-points the sink of) the worker's real guard
  */
 export function setupHermeticTestFile({
-  beforeEach, afterEach, afterAll, expect, repoRoot, ambient, violationsDir, fakeHome,
+  beforeEach, afterEach, afterAll, expect, repoRoot, ambient, violationsDir, fakeHome, afterSettle,
   guardFs = { fs, fsPromises, fetchHost: globalThis },
 }) {
   const home = realHomedir();
@@ -155,9 +158,13 @@ export function setupHermeticTestFile({
   });
 
   afterAll(() => {
-    const leftovers = [...inProcess.splice(0), ...late.splice(0), ...readNewLog()];
-    try { rmSync(violationsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    settle(`${fileLabel} > (outside any single test, or a child that outlived its test)`, leftovers);
+    try {
+      const leftovers = [...inProcess.splice(0), ...late.splice(0), ...readNewLog()];
+      try { rmSync(violationsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      settle(`${fileLabel} > (outside any single test, or a child that outlived its test)`, leftovers);
+    } finally {
+      afterSettle?.(); // after the shim log is read, even when settling fails the file
+    }
   });
 
   return state;

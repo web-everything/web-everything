@@ -324,8 +324,9 @@ describe('in-process guard', () => {
 // the worker's own guard is never re-pointed) and a throwaway checkout — see hermetic-tests-vitest.mjs#guardFs.
 describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', () => {
   const ENV_KEYS = [HERMETIC_MODE_ENV, DEBT_ENV, TEST_ID_ENV, TEST_NAME_ENV, REAL_REPOS_ENV, VIOLATIONS_DIR_ENV, 'CI', 'GITHUB_ACTIONS', ...LIVE_GITHUB_ENV_KEYS];
-  let saved; let box;
+  let saved; let box; let seq = 0;
   beforeEach(() => {
+    seq = 0;
     saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
     box = realpathSync(mkdtempSync(join(tmpdir(), 'hermetic-lifecycle-')));
   });
@@ -335,8 +336,8 @@ describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', 
   });
 
   /** A throwaway checkout + a live root beside it; returns the driven hooks and the stub fs. */
-  function harness({ ambient = {}, testFile = 'a/some.test.mjs', debt = [] } = {}) {
-    const repo = join(box, 'repo'); const live = join(box, 'live'); const violationsDir = join(box, 'viol');
+  function harness({ ambient = {}, testFile = 'a/some.test.mjs', debt = [], afterSettle } = {}) {
+    const repo = join(box, `repo${seq += 1}`); const live = join(box, 'live'); const violationsDir = join(box, `viol${seq}`);
     mkdirSync(join(repo, 'scripts'), { recursive: true }); mkdirSync(live, { recursive: true });
     writeFileSync(join(repo, 'scripts', 'hermetic-tests.settings.json'), JSON.stringify({
       liveSuite: { schedule: { cron: '0 * * * *', intervalHours: 1 }, tests: [] },
@@ -349,7 +350,7 @@ describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', 
     setupHermeticTestFile({
       beforeEach: (fn) => hooks.beforeEach.push(fn), afterEach: (fn) => hooks.afterEach.push(fn), afterAll: (fn) => hooks.afterAll.push(fn),
       expect: { getState: () => ({ testPath: join(repo, testFile), currentTestName: 'case one' }) },
-      repoRoot: repo, ambient, violationsDir, guardFs: { fs, fsPromises: {}, fetchHost: null },
+      repoRoot: repo, ambient, violationsDir, afterSettle, guardFs: { fs, fsPromises: {}, fetchHost: null },
     });
     const run = (hook) => hooks[hook].forEach((fn) => fn());
     const logRow = (testId, kind, target) => {
@@ -397,6 +398,22 @@ describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', 
     expect(() => h.run('afterEach')).not.toThrow();
     expect(() => h.run('afterAll')).toThrow(/outside any single test, or a child that outlived its test/);
     expect(existsSync(h.violationsDir)).toBe(false); // afterAll removes the shim log dir even when it fails the file
+  });
+
+  it('afterSettle runs AFTER the late rows are read, and still runs when settling fails the file', () => {
+    // vitest.setup.ts removes the per-file tmp base (which holds the shim log) from here: if that ran first, a row
+    // logged after the last afterEach would be deleted unread and the file would pass (hooks run in registration
+    // order under vitest 1.x's default parallel sequence).
+    const order = [];
+    const h = harness({ afterSettle: () => { order.push(`cleanup:logDirExists=${existsSync(join(h.violationsDir, VIOLATIONS_FILE))}`); } });
+    h.run('beforeEach'); h.run('afterEach');
+    h.logRow('999-detached-child', 'gh', 'gh pr list');
+    expect(() => h.run('afterAll')).toThrow(/outside any single test, or a child that outlived its test/);
+    expect(order).toEqual(['cleanup:logDirExists=false']); // the log was read (and its dir dropped) before cleanup, which still ran after the throw
+    const clean = harness({ afterSettle: () => order.push('clean-file') });
+    clean.run('beforeEach'); clean.run('afterEach');
+    expect(() => clean.run('afterAll')).not.toThrow();
+    expect(order).toEqual(['cleanup:logDirExists=false', 'clean-file']);
   });
 
   it('an in-process access made after its test ended also fails in afterAll', () => {
