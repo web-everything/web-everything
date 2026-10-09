@@ -1,4 +1,4 @@
-import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
+import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
@@ -2210,7 +2210,7 @@ describe('automatic item preparation', () => {
       const effects = fixture();
       const path = join(lockRoot, 'failures.json');
       wire(effects, path);
-      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'no-session', retry: false, held: true,
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'no-session', retry: false, held: true, recordedAt: '2026-10-09T00:00:00.000Z',
         evidence: { error: 'could not acquire a lane: ✗ lane-10 is leased by review-4484 (review-loop) — a LIVE lease; --force does not override it', sessionAbsent: true } } });
       let holds = [{ num: '4501', reason: 'prepare-unstamped' }];
       effects.listHolds = () => holds;
@@ -2246,8 +2246,57 @@ describe('automatic item preparation', () => {
       const tick = await runBuildDispatchTick({ live: true, effects });
       expect(tick.needsYou).toContainEqual(expect.objectContaining({ num: '4501', step: 'prepare', reason: expect.stringMatching(/^needs-you: prepare blocked/) }));
       expect(tick.holdRouting).toContainEqual(expect.objectContaining({ num: '4501', route: 'other', reason: expect.stringMatching(/^needs-you: /) }));
-      expect(tick.prepare.held).toEqual([]);
+      // Still reported as held, now under its own reason rather than a silent prepare-unstamped.
+      expect(tick.prepare.held).toEqual([expect.objectContaining({ num: '4501', reason: expect.stringMatching(/^needs-you: /) })]);
       expect(tick.prepare.launched.map(r => r.num)).not.toContain('4501');
+    });
+    // PR #4643 review: remapping a hold to its `needs-you:` reason must not take it out of the prepare-hold checks.
+    it('a needs-you hold whose card is then stamped on main is released, its failure closed, and it leaves needsYou', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: 'prepare requires a card-only diff; worker report: **could-not-prepare** — boost within the tier, or pin? a policy choice' } } });
+      let holds = [{ num: '4501', reason: 'prepare-unstamped' }];
+      effects.listHolds = () => holds;
+      effects.releasePrepareHold = vi.fn(({ num }) => { holds = holds.filter(h => h.num !== num); });
+      effects.completePrepareFailures = vi.fn(num => completePrepareFailures(num, path));
+      const waiting = await runBuildDispatchTick({ live: true, effects });
+      expect(waiting.needsYou).toContainEqual(expect.objectContaining({ num: '4501', reason: expect.stringMatching(/^needs-you: /) }));
+      expect(effects.releasePrepareHold).not.toHaveBeenCalled();
+      // An operator resolves the card by hand: a stamped card lands on main.
+      effects.readPrepareStatus = () => ({ preparedDate: '2026-10-09' });
+      const stamped = await runBuildDispatchTick({ live: true, effects, bookkeeping: waiting.nextBookkeeping });
+      expect(effects.releasePrepareHold).toHaveBeenCalledWith({ num: '4501' });
+      expect(effects.completePrepareFailures).toHaveBeenCalledWith('4501');
+      expect(stamped.needsYou.filter(n => n.num === '4501')).toEqual([]);
+      expect(Object.values(readFailureState(path).failures)[0]).toMatchObject({ completed: true });
+      // And it stays gone: the next tick does not bring the hold or the needs-you line back.
+      const after = await runBuildDispatchTick({ live: true, effects, bookkeeping: stamped.nextBookkeeping });
+      expect(after.needsYou.filter(n => n.num === '4501')).toEqual([]);
+    });
+    it('an already-done route handed out but never placed (daemon died) leaves the card retryable: the next tick re-prepares it', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'` } } });
+      let holds = [{ num: '4501', reason: 'prepare-unstamped' }];
+      effects.listHolds = () => holds;
+      effects.releasePrepareHold = vi.fn(({ num }) => { holds = holds.filter(h => h.num !== num); });
+      // The crash: the route is stamped as handed out, then placing it throws.
+      effects.placePrepareHold = vi.fn(() => { throw new Error('daemon died'); });
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      let tick;
+      try {
+        tick = await runBuildDispatchTick({ live: true, effects });
+        expect(effects.placePrepareHold).toHaveBeenCalledTimes(1);
+      } finally { log.mockRestore(); }
+      // The route is stamped (never handed out twice) but the card is not held: the same tick re-prepares it, and
+      // the worker's next report is recorded and routed afresh.
+      expect(takePrepareRouteHolds({ path })).toEqual([]);
+      expect(holds).toEqual([]);
+      expect(tick.prepare.launched.map(r => r.num)).toContain('4501');
     });
   });
   it('prepare kill switch and global freeze each prevent launches', async () => {
