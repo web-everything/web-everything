@@ -15,22 +15,25 @@
  *          numbers, one per line, and exit)
  * Exit: 0 every PR passes · 1 a gate holds or fails closed · 3 usage error.
  *
- * SECURITY: the workflow runs THIS script from `main` (never the PR's ref), so a PR cannot neuter its own gate.
- * The PR's body/labels/diff are read as DATA only.
+ * SECURITY: the workflow runs THIS script from `main` (never the PR's ref), so a PR cannot neuter the gate's
+ * SCRIPTS. It can still edit the workflow YAML itself (GitHub reads that from the PR's merge ref / the group
+ * commit), so the defence there is review escalation of any `.github/workflows/*` diff — pinned by a test — not
+ * this script. The PR's body/labels/diff are read as DATA only.
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { evaluatePrGates, evaluateGroup, groupPrNumbers, formatPrResult } from './lib/merge-gate-ci.mjs';
+import { evaluatePrGates, evaluateGroup, groupMembership, prNumberOfSubject, formatPrResult } from './lib/merge-gate-ci.mjs';
 import { readDrainAcceptance, computeNetDiffSignals } from './merge-ai-prs.mjs';
 import { extractManifestFromBody } from './readiness/lane-manifest.mjs';
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
 import { findDuplicateIds } from './lib/duplicate-id-tripwire.mjs';
 import { loadDrainGateSettings } from './lib/codeql-gate.mjs';
 import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine } from './lib/merge-delivery-policy.mjs';
-import { readSettings } from './lib/settings-files.mjs';
+import { readSettings, readDeclaredSettings } from './lib/settings-files.mjs';
 import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
+import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
@@ -40,9 +43,38 @@ const PR_FIELDS = 'number,title,body,labels,commits,headRefName,headRefOid,baseR
 const BODY_HISTORY_QUERY = 'query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){userContentEdits(first:100){totalCount nodes{diff}}}}}';
 const QUEUE_QUERY = 'query($o:String!,$n:String!,$b:String!){repository(owner:$o,name:$n){mergeQueue(branch:$b){entries(first:100){nodes{position headCommit{oid} pullRequest{number}}}}}}';
 
+/**
+ * The configured `mergeGate.reviewAuthority` as the `ledger` gate's fact. `authority` is passed through verbatim
+ * (an unknown value is read as the stricter `both` by `decideLedgerGate`, never as `labels`); an unset one is the
+ * drain's own default. Any problem reading the settings files is an `error` → the gate fails closed, because a
+ * skipped settings file could be the one that carried the stricter authority. Never throws.
+ */
+export function readLedgerConfig(read = readDeclaredSettings) {
+  // SINGLE SOURCE: the declared settings files (`scripts/dispatch-settings.json` + `scripts/settings/*.json`, key
+  // `mergeGate.reviewAuthority`) — the same layer `loadMergeDeliveryPolicy` reads. `config/platformDefaults.ts`
+  // only declares the default; nothing on the live path reads it, so it is not a second source here.
+  try {
+    const { settings, errors, duplicates } = read();
+    if (errors?.length) return { error: errors.map((e) => `${e.source}: ${e.error}`).join('; ').slice(0, 300) };
+    // Two files setting the same key would silently let the last one win.
+    const dup = (duplicates || []).find((d) => /^mergeGate(\.|$)/.test(String(d?.path)));
+    if (dup) return { error: `mergeGate set by more than one settings file (${(dup.sources || []).join(', ')})` };
+    const block = settings?.mergeGate;
+    if (block !== undefined && (block === null || typeof block !== 'object' || Array.isArray(block))) return { error: 'mergeGate settings block is not an object' };
+    const authority = block?.reviewAuthority;
+    // Strict allow-list: an explicit null / non-string / unknown value must not silently become `labels`.
+    if (authority !== undefined && !REVIEW_AUTHORITIES.includes(authority)) return { error: `unknown mergeGate.reviewAuthority ${JSON.stringify(authority)}` };
+    return { authority };
+  } catch (e) { return { error: firstLine(e) }; }
+}
+
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, exec = execFileSync }) {
   const facts = { repo, num };
+  // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
+  // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. The ledger evidence
+  // itself (folded/derived) is not wired yet → null, which `ledger`/`both` defer (fail closed).
+  facts.ledger = ledgerConfig ? { ...ledgerConfig, folded: null, derived: null } : { error: 'ledgerConfig not supplied', folded: null, derived: null };
   try { facts.pr = ghJson(['pr', 'view', String(num), '--repo', repo, '--json', PR_FIELDS], exec); }
   catch (e) { facts.prReadError = firstLine(e); return facts; }
   facts.defaultBranch = defaultBranch;
@@ -115,20 +147,36 @@ function parseArgs(argv) {
   return f;
 }
 
-/** The PR numbers in a merge group, from every source (fail closed upstream when empty). */
+/**
+ * The PR numbers in a merge group AND whether that list is provably complete (`groupMembership`). The queue API is
+ * supplemental (it can only add PRs); the first-parent history is the cross-check — it must be readable and every
+ * commit in it must map to a PR, else `complete` is false and BOTH callers (`--list-group`, the group verdict)
+ * fail closed: a partial list would let the unlisted PRs merge unevaluated.
+ * @returns {{nums:number[], complete:boolean, reasons:string[]}}
+ */
 export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'main', exec = execFileSync }) {
   let entries = [];
-  let commitSubjects = [];
+  let commits = [];
+  let commitsRead = true;
   try {
     const [o, n] = repo.split('/');
     entries = ghJson(['api', 'graphql', '-f', `query=${QUEUE_QUERY}`, '-f', `o=${o}`, '-f', `n=${n}`, '-f', `b=${base}`], exec)?.data?.repository?.mergeQueue?.entries?.nodes || [];
-  } catch { /* other sources still count */ }
+  } catch { /* supplemental: it can only add PRs; the history cross-check below is what proves completeness */ }
   try {
-    commitSubjects = String(exec('git', ['log', '--first-parent', '--format=%s', `${baseSha}..${headSha}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).split('\n').filter(Boolean);
-  } catch { /* other sources still count */ }
-  // --first-parent: only the queue's own per-PR commits, never a PR's internal commits (whose "(#NNN)" subjects
-  // name backlog items, not PRs).
-  return groupPrNumbers({ headRef, headSha, entries, commitSubjects });
+    // --first-parent: only the queue's own per-PR commits, never a PR's internal commits (whose "(#NNN)" subjects
+    // name backlog items, not PRs).
+    commits = String(exec('git', ['log', '--first-parent', '--format=%H%x09%s', `${baseSha}..${headSha}`], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }))
+      .split('\n').filter(Boolean).map((line) => { const i = line.indexOf('\t'); return { sha: line.slice(0, i), subject: line.slice(i + 1) }; });
+  } catch { commitsRead = false; }
+  // A commit whose subject names no PR (squash/rebase merge, a hand-made commit) is resolved through the
+  // commit→PR API; anything still unmapped makes the group incomplete.
+  const resolved = {};
+  for (const c of commits) {
+    if (prNumberOfSubject(c.subject)) continue;
+    try { resolved[c.sha] = (ghJson(['api', `repos/${repo}/commits/${c.sha}/pulls`], exec) || []).map((p) => Number(p?.number)).filter((x) => Number.isInteger(x) && x > 0); }
+    catch { resolved[c.sha] = []; }
+  }
+  return groupMembership({ headRef, headSha, entries, commits, commitsRead, resolved });
 }
 
 async function main() {
@@ -144,9 +192,15 @@ async function main() {
 
   let nums;
   let groupDup = null;
+  let membership = null;
   if (f['merge-group']) {
-    nums = readGroupPrs({ repo, headSha: f['head-sha'], baseSha: f['base-sha'], headRef: f['head-ref'] || '', cwd, base: defaultBranch || 'main' });
-    if (f['list-group']) { writeAllSync(1, nums.map((x) => `${x}\n`).join('')); process.exit(nums.length ? 0 : 1); }
+    membership = readGroupPrs({ repo, headSha: f['head-sha'], baseSha: f['base-sha'], headRef: f['head-ref'] || '', cwd, base: defaultBranch || 'main' });
+    nums = membership.nums;
+    if (f['list-group']) {
+      // An incomplete list is refused outright (no numbers printed): a caller must never act on part of a group.
+      if (!membership.complete) { process.stderr.write(`merge-gate-check: merge group membership incomplete — ${membership.reasons.join('; ')}\n`); process.exit(1); }
+      writeAllSync(1, nums.map((x) => `${x}\n`).join('')); process.exit(nums.length ? 0 : 1);
+    }
     if (typeof f['group-tree'] === 'string') {
       const d = join(resolve(f['group-tree']), 'backlog');
       groupDup = existsSync(d) ? findDuplicateIds(d) : [{ id: `group tree has no backlog dir (${d})` }];
@@ -157,8 +211,9 @@ async function main() {
   }
 
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
-  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup }), { policy, blockOnCodeQL }));
-  const verdict = f['merge-group'] ? evaluateGroup(prs) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
+  const ledgerConfig = readLedgerConfig();
+  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig }), { policy, blockOnCodeQL }));
+  const verdict = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, policy, prs }, null, 2)}\n`);
   else {
     for (const p of prs) writeAllSync(1, `${formatPrResult(p)}\n`);
