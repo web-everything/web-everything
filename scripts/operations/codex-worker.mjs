@@ -30,6 +30,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { ACCEPTANCE_HEADING, ACCEPTANCE_HEADING_RE, findLevel2Headings } from '../backlog/task-agreement.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const RECORD_FILE = join(homedir(), 'workspace/.operations/coordination/codex-pilot.jsonl');
@@ -69,12 +70,18 @@ export function parseCard(markdown) {
     .trim().replace(/^(['"])(.*)\1$/, '$2');
   const heading = /^# (.+)$/m.exec(body);
   const rest = heading ? body.slice(heading.index + heading[0].length) : body;
-  const doneHeading = /^## Done when[ \t]*$/m.exec(rest);
-  const acceptance = doneHeading ? rest.slice(doneHeading.index + doneHeading[0].length) : '';
+  // The same heading set the reader and every other gate use (`## Acceptance`, `## Acceptance criteria`, `## Done when`, any
+  // case), found outside code fences and HTML comments; the section ends at the next level-two heading or a `Hint:` line.
+  const headings = findLevel2Headings(rest);
+  const doneAt = headings.findIndex((h) => ACCEPTANCE_HEADING_RE.test(h.title));
+  const doneHeading = doneAt === -1 ? null : headings[doneAt];
+  const acceptance = doneHeading ? rest.slice(doneHeading.end) : '';
+  const nextHeading = doneHeading ? headings[doneAt + 1] : null;
+  const section = nextHeading ? rest.slice(doneHeading.end, nextHeading.index) : acceptance;
   return {
     title: heading?.[1].trim() ?? '',
     digest: (doneHeading ? rest.slice(0, doneHeading.index) : rest).trim(),
-    doneWhen: acceptance.split(/^(?:## |Hint:)/m)[0].trim(),
+    doneWhen: section.split(/^Hint:/m)[0].trim(),
     scope, status,
   };
 }
@@ -239,11 +246,11 @@ export const REPO_RULES_PREAMBLE = `1. You are in a lane clone of the repo. Only
 3. Run tests only via npm run test:unit -- <test files> (never the whole suite).
 4. No network except what git/gh need; never npm install. Do not commit, push, or open a PR — the wrapper does that.
 5. Keep the diff minimal and in the existing style; read AGENTS.md for repo conventions.
-6. If the Done-when is a TODO placeholder, replace it in the card file with a concrete executable line naming the test file(s) that prove the change.
+6. If the acceptance section is a TODO placeholder, replace it in the card file with a concrete executable line naming the test file(s) that prove the change.
 7. End with a short final message: what changed and which tests prove it.`;
 
 export function composeTask({ cardId, title, digest, doneWhen, allowed, briefText }) {
-  return `${REPO_RULES_PREAMBLE}\n\n# Card #${cardId ?? 'brief'}: ${title}\n\n## Problem\n${briefText ?? digest ?? ''}\n\n## Done when\n${doneWhen ?? ''}\n\n## Allowed files\n${allowed.join('\n')}\n`;
+  return `${REPO_RULES_PREAMBLE}\n\n# Card #${cardId ?? 'brief'}: ${title}\n\n## Problem\n${briefText ?? digest ?? ''}\n\n${ACCEPTANCE_HEADING}\n${doneWhen ?? ''}\n\n## Allowed files\n${allowed.join('\n')}\n`;
 }
 
 export function planBranch(cardId, title) {
@@ -266,7 +273,7 @@ ${title}
 
 ${cardId != null ? `Card: #${cardId}` : 'Card: brief'}
 
-## Done when
+${ACCEPTANCE_HEADING}
 ${doneWhen ?? ''}
 
 ## Allowed files

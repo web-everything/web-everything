@@ -11,7 +11,7 @@ import { countFindings } from '../reconcile-core.mjs';
 import {
   reviewRunEvidence, readReviewRunEvidence, decideReferralHold, enrichPrsWithReferralHolds,
   notifyReferralHold, REFERRAL_RETRY_MS, decideSameHeadHold, resolveSameHeadMaxReviews, PENDING_REASON_TOKENS,
-  GH_LIST_COMMENT_CAP,
+  GH_LIST_COMMENT_CAP, findResumableParkedRun,
 } from '../review-referral-hold.mjs';
 
 const repo = 'web-everything/web-everything';
@@ -461,5 +461,80 @@ describe('same-head hold never silences a review whose verdict never landed (liv
   it('still holds when a verdict label landed, or the run is too fresh to judge', () => {
     expect(decideSameHeadHold(labelled(['review:pending', 'review:changes']), [lost()], { repo, env: {} })).not.toBeNull();
     expect(decideSameHeadHold(labelled(['review:pending']), [lost({ completedAt: Date.now() - 60_000 })], { repo, env: {} })).not.toBeNull();
+  });
+});
+
+// Card xq1xbsl — live 2026-10-08, #4361: the operator ruled at 12:09Z on an unchanged head and a FRESH full review
+// started at 12:15Z, raising two new referrals. RED on the old code, which has no resume decision at all.
+describe('a ruling on an unchanged head resumes the parked run (replay of #4361)', () => {
+  const ruledRecord = (result = 'not-real') => {
+    const r = record();
+    r.rulings = [{ id: 'r1', key, reviewerId: r.reviewer.id, lens: r.reviewer.lens, result, rationale: 'checked', evidence: ['diff'] }];
+    return r;
+  };
+  const thread = (extra = []) => [comment(renderReferralRecord(record()), at - 120_000), ...extra];
+  const ruling = comment(renderReferralRecord(ruledRecord()), at + 60_000);
+  const find = (p, runs = [evidence()]) => findResumableParkedRun(p, runs, { repo });
+
+  it('names the parked run when the only thing since it began is a ruling', () => {
+    expect(find(pr({ comments: thread([ruling]) }))).toEqual({ id: 'review-pr-parked', head });
+  });
+  it('names nothing while no ruling has arrived (the hold stays, no review at all)', () => {
+    expect(find(pr({ comments: thread() }))).toBeNull();
+  });
+  it('a new push, a re-arm, a send-back or an operator reply still owe a FRESH review', () => {
+    expect(find(pr({ headRefOid: 'b'.repeat(40), comments: thread([ruling]) }))).toBeNull();
+    expect(find(pr({ comments: thread([ruling, comment(`${REARM_COMMENT_MARKER} round 2`, at + 90_000)]) }))).toBeNull();
+    expect(find(pr({ comments: thread([ruling, comment('🔁 review — changes requested', at + 90_000)]) }))).toBeNull();
+    expect(find(pr({ comments: thread([ruling, comment('please look again', at + 90_000, 'chalbert')]) }))).toBeNull();
+  });
+  it('does not resume a run whose referrals never persisted (the retry budget owns that case)', () => {
+    const failed = reviewRunEvidence(run({ failure: true }));
+    expect(find(pr({ comments: thread([ruling]) }), [failed])).toBeNull();
+  });
+  it('a run that was already resumed does not resume on the ruling it already answered', () => {
+    const resumed = reviewRunEvidence({ ...run(), resumedAt: iso(at + 120_000) });
+    expect(find(pr({ comments: thread([ruling]) }), [resumed])).toBeNull();
+    // ...and its still-pending referrals stay held rather than waking the next tick again.
+    expect(decideReferralHold(pr({ comments: thread([ruling]) }), [resumed], { repo, now: at + 130_000,
+      env: { WE_REFERRAL_HOLD_LIVE_RELEASE: '0' } })).not.toBeNull();
+  });
+  // PR #4441 review round 2 (correctness): the rewind drops the verdict and the referral step and saves the record before
+  // the resumed pass finishes. A resume that dies in between must still read as the parked run (`resumeOf`), and stay
+  // wakeable by the ruling that started it, or the next tick starts the fresh panel this card exists to stop.
+  describe('a resume that never finished', () => {
+    const unfinished = () => {
+      const parked = run();
+      const { referralVerdict, mandatoryReferrals, ...kept } = parked.findings;
+      // `advise` follows the referral step, so the rewind drops its timing along with the verdict.
+      const adviseFinishedAt = parked.stepTimings.find((t) => t.step === 'advise').finishedAt;
+      return { ...parked, findings: kept, verdict: null, pending: null, resumedAt: iso(at + 120_000),
+        stepTimings: parked.stepTimings.filter((t) => t.step !== 'advise'),
+        resumeOf: { verdict: referralVerdict, mandatoryReferrals, adviseFinishedAt } };
+    };
+    it('still reads as the parked run it was, and is resumed again by the same ruling', () => {
+      const evidenceOf = reviewRunEvidence(unfinished());
+      expect(evidenceOf).toMatchObject({ id: 'review-pr-parked', parked: true, attempted: true, pending: [key] });
+      expect(evidenceOf.startedAt).toBe(reviewRunEvidence(run()).startedAt);       // the resume answered nothing yet
+      expect(find(pr({ comments: thread([ruling]) }), [evidenceOf])).toEqual({ id: 'review-pr-parked', head });
+    });
+    it('a re-arm that arrived meanwhile still owes a fresh review', () => {
+      const rearm = comment(`${REARM_COMMENT_MARKER} round 2`, at + 90_000);
+      expect(find(pr({ comments: thread([ruling, rearm]) }), [reviewRunEvidence(unfinished())])).toBeNull();
+    });
+    it('once the resumed pass has run `advise`, the ruling it answered no longer wakes it', () => {
+      const adviseFinishedAt = iso(at + 125_000);
+      const finished = { ...unfinished(), verdict: { verdict: 'needs-human', pendingReferrals: [key], referrals: [] },
+        stepTimings: [...unfinished().stepTimings, { step: 'advise', stepIndex: 6, startedAt: iso(at + 124_000), finishedAt: adviseFinishedAt, durationMs: 1000 }] };
+      expect(find(pr({ comments: thread([ruling]) }), [reviewRunEvidence(finished)])).toBeNull();
+    });
+    // The step order is referral step -> referralVerdict -> advise -> confirm: a pass that died AFTER it produced a
+    // verdict but BEFORE `advise` is as unfinished as one that died in the referral step.
+    it('a pass that died after its own verdict but before `advise` is still unfinished and resumable', () => {
+      const late = { ...unfinished(), verdict: { verdict: 'needs-human', pendingReferrals: [], referrals: [] } };
+      late.findings = { ...late.findings, referralVerdict: late.verdict };
+      expect(reviewRunEvidence(late)).toMatchObject({ parked: true, pending: [key] });
+      expect(find(pr({ comments: thread([ruling]) }), [reviewRunEvidence(late)])).toEqual({ id: 'review-pr-parked', head });
+    });
   });
 });

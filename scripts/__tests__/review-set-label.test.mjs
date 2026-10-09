@@ -28,6 +28,7 @@ import {
 // #3334, routes 2 and 3 — asserted through the OTHER two sanctioned paths' own entry points, because a shared
 // core one caller forgets to ask is the defect this item closes.
 import { buildDelegationMarker } from '../lib/delegation-marker.mjs';
+import { RULING_NEEDED_LABEL } from '../lib/ruling-ledger.mjs';
 import { readStore } from '../conveyor/run-scorecard-store.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { REVIEW_PR_CHANNEL } from '../operations/review-pr.mjs';
@@ -60,19 +61,38 @@ describe('decideSetLabel — INVARIANT 2 (review:human is human-ceremony-only)',
   });
 });
 
+// Held item 141 (live #4402, 2026-10-08): `advisory:ruling-needed` stayed on after the operator's clear-human
+// (review:accepted 14:34:59Z, merged 14:37:40Z): the derived-label sweep only runs on open PRs each tick, and it never
+// ran in between. An accepted PR has nothing left to rule on, so the acceptance itself drops the label.
+describe('decideSetLabel — acceptance drops advisory:ruling-needed (held item 141)', () => {
+  it.each([
+    ['clear-human', [...human, { name: RULING_NEEDED_LABEL }]],
+    ['accepted', [...pending, { name: RULING_NEEDED_LABEL }]],
+  ])('%s removes advisory:ruling-needed', (to, currentLabels) => {
+    const d = decideSetLabel({ to, currentLabels });
+    expect(d.allowed).toBe(true);
+    expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
+    expect(d.removeLabels).toContain(RULING_NEEDED_LABEL);
+  });
+  it('a send-back keeps it (the ruling is still owed on the next head)', () => {
+    expect(decideSetLabel({ to: 'changes', findingCount: 1, currentLabels: [...pending, { name: RULING_NEEDED_LABEL }] }).removeLabels)
+      .not.toContain(RULING_NEEDED_LABEL);
+  });
+});
+
 describe('decideSetLabel — accepted', () => {
   it('on a review:pending PR: adds review:accepted, removes review:pending (and the always-requested changes)', () => {
     const d = decideSetLabel({ to: 'accepted', currentLabels: pending });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.changes]);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.changes, RULING_NEEDED_LABEL]);
   });
 
   it('with neither human nor pending: still allowed (no human gate), adds review:accepted', () => {
     const d = decideSetLabel({ to: 'accepted', currentLabels: neither });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe(REVIEW_LABELS.accepted);
-    expect(d.removeLabels).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.changes]);
+    expect(d.removeLabels).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.changes, RULING_NEEDED_LABEL]);
   });
 
   // #2974 — the bug: accepting a bounced-but-fixed PR left BOTH review:accepted and review:changes on it, and
@@ -2365,6 +2385,7 @@ describe('the write arc and its #2964 ordering', () => {
           'scripts/lib/poc-branches.mjs',
           'scripts/lib/constellation-repos.mjs',
           'scripts/lib/prototype-tracker-data.mjs',
+          'scripts/backlog/task-agreement.mjs',
           'scripts/lib/local-date.mjs',
         ];
         for (const file of hookFiles) {

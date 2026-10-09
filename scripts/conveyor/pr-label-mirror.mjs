@@ -9,10 +9,11 @@
  * mirror can never disagree about what drift is. `missing` there is an ADD here; `extra` is a REMOVE.
  * A PR whose ledger or GitHub facts cannot be read is `unreadable`: nothing is planned for it (unknown is not drift).
  *
- * Usage: node scripts/conveyor/pr-label-mirror.mjs [--repo=<owner/name>] [--limit=<n>] [--json]
+ * Usage: node scripts/conveyor/pr-label-mirror.mjs [--repo=<owner/name>] [--limit=<n>] [--store=<name>] [--json]
  */
 import { pathToFileURL } from 'node:url';
-import { DEFAULT_REPO, readOpenPrs, readRepoEvents, buildDerivedRows } from '../review-ledger-check.mjs';
+import { DEFAULT_REPO, readOpenPrs, buildDerivedRows } from '../review-ledger-check.mjs';
+import { readLedgerEventsFromStore } from '../lib/verdict-ledger.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
@@ -42,6 +43,8 @@ export function renderPlan(plan, { repo = DEFAULT_REPO } = {}) {
   const lines = [`LABEL MIRROR (report only; zero writes) ${repo}`,
     `  ${plan.total} open PR(s): ${plan.inSync} in sync, ${plan.changes.length} would change, ${plan.unreadable} unreadable (planned nothing)`,
     `  would add ${plan.counts.add} label(s), would remove ${plan.counts.remove} label(s)`];
+  if (plan.store) lines.splice(1, 0, `ledger store: ${plan.store.name} (${plan.store.shared ? 'shared' : 'NOT shared - rows written on other machines are invisible here'})`);
+  if (plan.ledgerUnreadable) lines.push(`  ledger unreadable (${plan.ledgerUnreadable.reason}): ${plan.ledgerUnreadable.error}`);
   for (const c of plan.changes) {
     lines.push(`  #${c.pr} (${c.lifecycleState}): add [${c.add.join(', ')}] remove [${c.remove.join(', ')}]`);
   }
@@ -49,24 +52,26 @@ export function renderPlan(plan, { repo = DEFAULT_REPO } = {}) {
 }
 
 /** Read-only run: list PRs, read the ledger, derive, plan. Every input is injectable; none of them writes. */
-export function runMirrorReport({ repo = DEFAULT_REPO, limit = 200, listPrs = readOpenPrs, readEvents = readRepoEvents, buildRows = buildDerivedRows } = {}) {
-  const prs = listPrs({ repo, limit });
-  const events = readEvents(repo);
+export async function runMirrorReport({ repo = DEFAULT_REPO, store, limit = 200, listPrs = readOpenPrs, readEvents = readLedgerEventsFromStore, buildRows = buildDerivedRows } = {}) {
+  const prs = await listPrs({ repo, limit });
+  const ledger = await readEvents(repo, { store });
+  const events = ledger.status === 'ok' ? ledger.rows : null;
   const rows = buildRows({ repo, prs, events, ...(repo === DEFAULT_REPO ? {} : { readFacts: () => null }) });
-  return planMirror(rows);
+  return { ...planMirror(rows), store: ledger.store, ...(ledger.status === 'ok' ? {} : { ledgerUnreadable: { reason: ledger.reason, error: ledger.error } }) };
 }
 
-function main(argv) {
+async function main(argv) {
   const flags = Object.fromEntries(argv.filter((a) => a.startsWith('--')).map((a) => { const i = a.indexOf('='); return i < 0 ? [a.slice(2), true] : [a.slice(2, i), a.slice(i + 1)]; }));
   const repo = typeof flags.repo === 'string' && flags.repo ? flags.repo : DEFAULT_REPO;
-  if (!REPO_RE.test(repo)) { process.stderr.write('pr-label-mirror: --repo must be <owner/name>\n'); process.exit(2); }
+  if (!REPO_RE.test(repo)) { process.stderr.write('pr-label-mirror: --repo must be <owner/name>\n'); return 2; }
   const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
   let plan;
-  try { plan = runMirrorReport({ repo, limit }); } catch (e) {
+  try { plan = await runMirrorReport({ repo, store: flags.store, limit }); } catch (e) {
     process.stderr.write(`pr-label-mirror: ${String(e?.message ?? e).split('\n')[0]}\n`);
-    process.exit(2);
+    return 2;
   }
   writeAllSync(1, flags.json ? `${JSON.stringify({ repo, ...plan }, null, 2)}\n` : `${renderPlan(plan, { repo })}\n`);
+  return 0;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) main(process.argv.slice(2));
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) process.exitCode = await main(process.argv.slice(2));

@@ -104,6 +104,8 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
+import { ledgerHoldStep, failClosedHolds, ledgerDeciding, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
@@ -380,7 +382,18 @@ export function defaultReadMainRuns({
       // Only the first page is read, so the inventory must be provably COMPLETE: a real failure on a later page would
       // otherwise be invisible and the run wrongly judged infra-only. An unverifiable or truncated inventory stays red.
       const complete = Array.isArray(jobs) && Number.isInteger(page.total_count) && page.total_count === jobs.length;
-      return complete && isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true } : r;
+      if (!complete) return r;
+      // xd3dkzx — each job's own verdict (job name = check name), so recovery can be judged per failing check
+      // (`main-red-recovery.mjs#isMainRecoveredForCheck`). Only from a COMPLETE inventory: absence then means
+      // "did not run"; a truncated/unread page leaves no map, which that predicate reads as "not recovered".
+      // Duplicate job names (matrix / reusable workflows): any non-success wins, so a later green never hides a red.
+      const checkConclusions = {};
+      for (const j of jobs) {
+        if (!j?.name) continue;
+        const c = String(j.conclusion ?? '');
+        if (!(j.name in checkConclusions) || checkConclusions[j.name] === 'success') checkConclusions[j.name] = c;
+      }
+      return isInfraCancelledOnlyRun(jobs) ? { ...r, infraCancelledOnly: true, checkConclusions } : { ...r, checkConclusions };
     } catch { return r; }
   });
 }
@@ -1059,7 +1072,7 @@ export function enrichPrsWithFixClaims(prs, { repo = 'we', readClaim = readLiveF
  * @param {{dispatch:Array<object>, refusals:Array<object>, notes:Array<object>}} plan
  * @returns {string}
  */
-export function formatReport({ dispatch = [], refusals = [], notes = [] } = {}) {
+export function formatReport({ dispatch = [], refusals = [], notes = [], owedTriggers = [] } = {}) {
   const lines = [];
   lines.push(`reconcile — ${dispatch.length} dispatch, ${refusals.length} refusal(s), ${notes.length} surfaced`);
 
@@ -1078,6 +1091,7 @@ export function formatReport({ dispatch = [], refusals = [], notes = [] } = {}) 
       lines.push(`  ✗ ${kind} PR #${r.prNumber} — ${r.why}${bind}`);
     }
   }
+  for (const t of owedTriggers) lines.push(`  ⟳ ${t.kind} PR #${t.prNumber} — ${t.why}`);
   for (const n of notes) lines.push(`  ! ${n.text}`);
   return lines.join('\n');
 }
@@ -1117,7 +1131,7 @@ export function readStackedPrCheckPolicy(env = process.env) {
 
 function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch }) {
   const cache = new Map();
-  const ready = [], refusals = [], notes = [];
+  const ready = [], refusals = [], notes = [], owedTriggers = [];
   const stackedPolicy = readStackedPrCheckPolicy();
   for (const pr of prs) {
     const runs = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
@@ -1175,7 +1189,16 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     }
     const result = cache.get(key);
     // A conflicting head's incomplete required set is expected (see above); only a real read error still refuses.
-    const refused = result.error ?? (conflicting ? null : result.incomplete);
+    // A readable feed that simply has no entry for a required name is NOT a failed read: the check never started
+    // (live: plateauapp/plateau-app #217 after the drain retargeted it, web-everything #4402/#4439). The PR is
+    // owed a CI trigger, which the missing-run recovery (ci-red-recovery-watch) performs; surface it as such.
+    // Evidence stays withheld (`unchecked`) exactly as before, only the false "read failed" label goes away.
+    const neverStarted = !result.error && !conflicting && result.incomplete ? result.incomplete : null;
+    if (neverStarted) {
+      owedTriggers.push({ kind: 'ci-trigger-owed', prNumber: pr.number, headRefOid: sha,
+        why: `required checks never started for ${repo}@${sha} (${neverStarted}) — owed a CI re-trigger by missing-run recovery, not a read failure` });
+    }
+    const refused = result.error ?? null;
     if (refused) {
       refusals.push({ kind: 'check-read-failed', prNumber: pr.number, headRefOid: sha,
         why: `required-check hydration refused for ${repo}@${sha}: ${refused}` });
@@ -1188,9 +1211,9 @@ function hydrateChecks(prs, { repo, requiredChecks, readChecks, defaultBranch })
     // scheduling recovery on this tick. A truncated snapshot that merely looks green is NOT kept — a later,
     // unread rerun could contradict it, so it stays `unchecked`.
     const known = runs.length && ['red', 'pending'].includes(reduceCheckState(runs, requiredChecks).state) ? runs : null;
-    ready.push({ ...pr, statusCheckRollup: refused && known ? known : result.error ? [] : result.rows });
+    ready.push({ ...pr, statusCheckRollup: (refused || neverStarted) && known ? known : result.error ? [] : result.rows });
   }
-  return { prs: ready, refusals, notes };
+  return { prs: ready, refusals, notes, owedTriggers };
 }
 
 /**
@@ -1207,6 +1230,30 @@ export function enrichPrsWithCodeQL(prs, { repo = null, exec = (file, args) => e
     const codeqlFailure = codeqlFailureEvidence(pr, { repo, exec, ...(settings ? { settings } : {}) });
     return codeqlFailure ? { ...pr, codeqlFailure } : pr;
   });
+}
+
+/**
+ * Ledger plan slice H (card xqh3tkh): run the ledger hold step over the PRs `enrichReferralHolds` just decided.
+ * In the default `both` mode it only journals and logs; a family set to `ledger` decides from the ledger. It never
+ * throws: a failed step leaves `both` decisions untouched and HOLDS a `ledger` family. Off under a test run: the step
+ * reads a real store.
+ */
+export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = process.env, step = ledgerHoldStep,
+  log = (line) => console.error(line) } = {}) {
+  // An injected env never re-arms the default step under a test run, but a family set to `ledger` is never skipped
+  // (a daemon that inherits a stray VITEST must not fail open).
+  if ((isUnderTest(env) || isUnderTest()) && step === ledgerHoldStep && !ledgerDeciding(env)) return prs;
+  try {
+    const { prs: out, summary } = step(prs, { repo, now, env });
+    const line = renderLedgerShadowSummary(summary);
+    if (line) log(line);
+    return out;
+  } catch (e) {
+    // A family on `ledger` is fail-closed: a step that cannot answer holds the review, it never releases it.
+    const out = failClosedHolds(prs, { repo, env });
+    log(`ledger-shadow ${repo}: step failed (${out === prs ? 'decisions unchanged' : 'ledger families held'}): ${String(e?.message ?? e).split('\n')[0]}`);
+    return out;
+  }
 }
 
 /**
@@ -1230,6 +1277,10 @@ export function runReconcilePass({
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
   enrichReferralHolds = enrichPrsWithReferralHolds,
+  // Ledger plan slice H (card xqh3tkh): the same hold decisions derived from the verdict ledger, per family
+  // (`verdictLedger.readSource.<family>`, default `both` = shadow: today's decision stands and disagreements are
+  // journaled). Injectable like every other enrich step; see {@link enrichPrsWithLedgerHolds}.
+  enrichLedgerHolds = enrichPrsWithLedgerHolds,
   enrichRulings = enrichPrsWithIgnoredRulings,
   enrichScopeBloat = enrichPrsWithScopeBloat, // card x29vm8a
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
@@ -1282,8 +1333,8 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
-    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
+  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+    { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
@@ -1292,7 +1343,7 @@ export function runReconcilePass({
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
   });
-  return { ...plan, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
+  return { ...plan, owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100
       ? pr.files.map((file) => typeof file === 'string' ? file : file.path) : null })),
   };

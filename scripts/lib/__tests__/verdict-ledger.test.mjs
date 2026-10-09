@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { appendLedgerRows, ledgerGitPath, LEDGER_TRANSPORT_BRANCH } from '../verdict-ledger-io.mjs';
-import { withBareOrigin } from '../../operations/__tests__/helpers/real-repo.mjs';
+import { withBareOrigin, git } from '../../operations/__tests__/helpers/real-repo.mjs';
 
 import {
   VERDICTS, VERDICT_VALUES, VERDICT_LEDGER_VERSION, VERDICT_LEDGER_KIND, ACTOR_PROVES,
@@ -23,11 +23,12 @@ import {
   verdictClears, verdictLabel, verdictForLabelTarget, labelVerdictOf, foldVerdictLedger, ledgerCoversHead,
   compareLedgerToLabels, summarizeAgreement, summarizeShadowAgreement,
   NON_BEARING, verdictBears,
-  appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
-  listLedgerRepos,
+  appendVerdictAsync, ledgerEventId, checkLedgerAppendRows, homeLedgerStore, appendVerdict, resolveLedgerBoard, resolveLedgerStore, resolveLedgerStoreChoice, resetLedgerDowngradeWarning, DEFAULT_VERDICT_LEDGER_STORE, readVerdictLedger, foldRepo, verdictLedgerPath, verdictLedgerDir, defaultVerdictLedgerDir,
+  listLedgerRepos, DEFAULT_VERDICT_LEDGER_READ_STORE, resolveLedgerReadStore, readLedgerEventsFromStore, foldRepoFromStore,
   EVENT_TYPES, EVENT_TYPE_VALUES, LEDGER_EVENT_VERSION, eventBears,
   buildLedgerEvent, validateLedgerEvent, serializeLedgerEvent, parseLedgerEvents,
 } from '../verdict-ledger.mjs';
+import { registerLedgerStore } from '../verdict-ledger-store.mjs';
 import { createHash } from 'node:crypto';
 import { REVIEW_LABELS, normalizeContributionFingerprint, decideReviewGate } from '../review-escalation.mjs';
 import { REVIEW_LABEL_TARGETS } from '../../review-set-label.mjs';
@@ -877,6 +878,7 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     'send-back': { cause: 'block-ruling' },
     author: { author: 'agent-1' },
     'label-input': { label: 'review:human', sender: 'op', change: 'added' },
+    finding: { headSha: SHA, findingId: 'fi-0123456789ab', path: 'scripts/a.mjs', symbol: 'run', defectClass: 'fail-open', status: 'raised', round: 2, lines: [12] },
   };
 
   it('covers every non-verdict type in the closed set', () => {
@@ -897,6 +899,8 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
   it('defaults optional payload fields so they round-trip', () => {
     expect(buildLedgerEvent({ ...base, type: 'review-run', headSha: SHA, phase: 'started' }).posted).toBeNull();
     expect(buildLedgerEvent({ ...base, type: 'approval', approval: 'clear-human' }).delegation).toBeNull();
+    // Card 5469 — a finding row written without cited lines reads back with an empty list.
+    expect(buildLedgerEvent({ ...base, type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'tolerated', round: 1 }).lines).toEqual([]);
   });
 
   it.each([
@@ -907,6 +911,9 @@ describe('plan slice B: v2 event types round-trip, and the v1 fold is byte-ident
     ['bad head sha', { type: 'review-run', headSha: 'zz', phase: 'started' }],
     ['bad delegation', { type: 'approval', approval: 'judge', delegation: { by: 'x' } }],
     ['bad label change', { type: 'label-input', label: 'l', sender: 's', change: 'moved' }],
+    ['bad finding status', { type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'maybe', round: 1 }],
+    ['bad finding id', { type: 'finding', headSha: SHA, findingId: 'f-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'raised', round: 1 }],
+    ['bad finding round', { type: 'finding', headSha: SHA, findingId: 'fi-0123456789ab', path: '', symbol: '', defectClass: 'x', status: 'raised', round: 0 }],
   ])('refuses %s', (_n, over) => {
     expect(() => buildLedgerEvent({ ...base, ...over })).toThrow(TypeError);
   });
@@ -1166,15 +1173,15 @@ describe('#3255 C2 review fix: the production default path, home-fails-too spill
     expect(hold.errors).toEqual(['home boom']);
   });
 
-  it('store=git success is announced loudly: readers still read home, so a git-only row is invisible to the fold', () => {
+  it('store=git success is announced loudly: the home-only fold (review-pr) does not see a git-only row', () => {
     const warns = [];
     const r = appendVerdict(mk('human'), {
       store: 'git', board: '/board', gitAppend: () => ({ status: 'appended' }), warn: (m) => warns.push(m),
     });
     expect(r.ok).toBe(true);
     expect(warns.join()).toMatch(/store=git/);
-    expect(warns.join()).toMatch(/readers still read home/);
-    // The documented consequence the warning names: the fold does not see the git-only hold.
+    expect(warns.join()).toMatch(/home-only readers \(review-pr's foldRepo\) do not/);
+    // The documented consequence the warning names: the home-only fold does not see the git-only hold.
     expect(foldRepo(REPO).get(21)).toBeUndefined();
   });
   it('a THROWING home write in dual/home mode is an ok:false result with its reason, never an escape (and the reason is one capped line)', () => {
@@ -1271,6 +1278,7 @@ describe('ledger plan follow-up: the git store accepts every v2 event type (dual
     'send-back': { cause: 'block-ruling' },
     author: { author: 'agent-1' },
     'label-input': { label: 'review:human', sender: 'op', change: 'added' },
+    finding: { headSha: SHA, findingId: 'fi-0123456789ab', path: 'scripts/a.mjs', symbol: 'run', defectClass: 'fail-open', status: 'raised', round: 2, lines: [12] },
   };
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'we-verdict-ledger-v2git-'));
@@ -1507,5 +1515,214 @@ describe('PR 4311 operator ruling: the default dual reaches git in production, a
         expect(readVerdictLedger(REPO)).toHaveLength(0);
       });
     });
+  });
+});
+
+
+describe('event identity and async writes (Part A)', () => {
+  let dir;
+  const prev = process.env.WE_VERDICT_LEDGER_DIR;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-ledger-async-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    if (prev === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+
+  it('hashes normalized canonical records, ignoring unlocked and input key order', () => {
+    const row = rec();
+    const reversed = Object.fromEntries(Object.entries(row).reverse());
+    reversed.actor = Object.fromEntries(Object.entries(row.actor).reverse());
+    expect(ledgerEventId(row)).toMatch(/^sha256:[a-f0-9]{64}$/);
+    expect(ledgerEventId(reversed)).toBe(ledgerEventId(row));
+    expect(ledgerEventId({ ...row, unlocked: true, ignored: 'extra' })).toBe(ledgerEventId(row));
+    expect(ledgerEventId({ ...row, reason: 'different event' })).not.toBe(ledgerEventId(row));
+    const sorted = (v) => v && typeof v === 'object'
+      ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
+    expect(ledgerEventId(row)).toBe('sha256:' + createHash('sha256')
+      .update(JSON.stringify(sorted(validateLedgerEvent(row).record))).digest('hex'));
+  });
+
+  it('honours explicit ids and rejects every present invalid id for both schemas', () => {
+    const event = buildLedgerEvent({ type: 'ruling', repo: REPO, pr: 1, at: AT, source: 'test', findingKey: 'f', ruling: 'block' });
+    for (const row of [rec(), event]) {
+      expect(ledgerEventId({ ...row, id: 'event:explicit-1' })).toBe('event:explicit-1');
+      expect(validateLedgerEvent({ ...row, id: 'event:explicit-1' }).record.id).toBe('event:explicit-1');
+      for (const id of [undefined, null, 7, '', 'short', 'a'.repeat(129), 'invalid space']) {
+        expect(validateLedgerEvent({ ...row, id }).valid).toBe(false);
+        if (!row.type) expect(validateVerdictRecord({ ...row, id }).valid).toBe(false);
+      }
+    }
+    const checked = checkLedgerAppendRows([rec(), event], REPO);
+    expect(checked.ids).toEqual([ledgerEventId(rec()), ledgerEventId(event)]);
+    expect(checked.lines.map((line) => JSON.parse(line).id)).toEqual(checked.ids);
+  });
+
+  it('sync home append skips legacy rows and repeats without writing bytes', () => {
+    const row = rec();
+    writeFileSync(verdictLedgerPath(REPO), JSON.stringify(row) + '\n');
+    const before = readFileSync(verdictLedgerPath(REPO), 'utf8');
+    expect(appendVerdict(row, { store: 'home' })).toMatchObject({ ok: true, duplicate: true });
+    expect(readFileSync(verdictLedgerPath(REPO), 'utf8')).toBe(before);
+    expect(appendVerdict(rec({ pr: 2 }), { store: 'home' }).record.id).toBe(ledgerEventId(rec({ pr: 2 })));
+  });
+
+  it.each(['accepted', 'human'])('async dual shares F4 order and miss posture for %s', async (verdict) => {
+    const order = [];
+    const row = rec({ verdict });
+    const opts = {
+      store: 'dual', board: '/board', warn: () => {},
+      homeAppend: async (r) => { order.push('home'); return { ok: true, record: r, errors: [] }; },
+      gitAppend: () => { order.push('git'); return { status: 'appended' }; },
+    };
+    expect((await appendVerdictAsync(row, opts)).ok).toBe(true);
+    expect(order).toEqual(verdict === 'accepted' ? ['git', 'home'] : ['home', 'git']);
+    const miss = await appendVerdictAsync(row, { ...opts, homeAppend: undefined, gitAppend: () => { throw new Error('down'); } });
+    expect(miss).toMatchObject({ ok: verdict !== 'accepted', ledgerWriteMiss: true });
+    expect(readVerdictLedger(REPO)).toHaveLength(verdict === 'accepted' ? 0 : 1);
+  });
+
+  it('async git-only and dual writes persist through the real store contract', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      for (const store of ['git', 'dual']) {
+        const row = rec({ pr: store === 'git' ? 91 : 92 });
+        expect(await appendVerdictAsync(row, { store, board: ctx.clone, warn: () => {} }))
+          .toMatchObject({ ok: true, store });
+        const stored = JSON.parse(ctx.showOnOrigin(LEDGER_TRANSPORT_BRANCH, ledgerGitPath(REPO)).trim().split('\n').at(-1));
+        expect(stored.id).toBe(ledgerEventId(row));
+      }
+      expect(readVerdictLedger(REPO).map((row) => row.pr)).toEqual([92]);
+    });
+  });
+
+  it('async built-in home writes use the contract and remain idempotent', async () => {
+    const original = homeLedgerStore.append;
+    let calls = 0;
+    homeLedgerStore.append = async (...args) => { calls++; return original(...args); };
+    try {
+      expect((await appendVerdictAsync(rec(), { store: 'home' })).ok).toBe(true);
+      expect(await appendVerdictAsync(rec(), { store: 'home' })).toMatchObject({ ok: true, duplicate: true });
+      expect(calls).toBe(2);
+      expect(readVerdictLedger(REPO)).toHaveLength(1);
+    } finally { homeLedgerStore.append = original; }
+  });
+
+  it('sync plugged writes miss without calling the adapter; async writes await it and contain rejection', async () => {
+    let calls = 0;
+    let fails = false;
+    registerLedgerStore({
+      name: 'async-test', capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'single-object' },
+      append: async () => { calls++; await Promise.resolve(); if (fails) throw new Error('down'); return { ok: true, appended: 1, duplicates: 0 }; },
+      read: async () => ({ status: 'ok', rows: [] }),
+    });
+    const opts = { store: 'async-test', env: {}, warn: () => {} };
+    const clear = appendVerdict(rec(), opts);
+    expect(clear).toMatchObject({ ok: false, ledgerWriteMiss: true, git: { error: 'plugged store async-test is async; use appendVerdictAsync' } });
+    expect(readVerdictLedger(REPO)).toEqual([]);
+    expect(appendVerdict(rec({ verdict: 'human' }), opts)).toMatchObject({ ok: true, ledgerWriteMiss: true });
+    expect(calls).toBe(0);
+    expect(await appendVerdictAsync(rec(), opts)).toMatchObject({ ok: true, store: 'async-test' });
+    fails = true;
+    expect(await appendVerdictAsync(rec(), opts)).toMatchObject({ ok: false, ledgerWriteMiss: true });
+    expect(await appendVerdictAsync(rec({ verdict: 'human' }), opts)).toMatchObject({ ok: true, ledgerWriteMiss: true });
+    expect(calls).toBe(3);
+  });
+});
+
+
+describe('configured shared ledger readers (Part B)', () => {
+  let dir;
+  const prev = process.env.WE_VERDICT_LEDGER_DIR;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'we-ledger-read-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+  });
+  afterEach(() => {
+    if (prev === undefined) delete process.env.WE_VERDICT_LEDGER_DIR;
+    else process.env.WE_VERDICT_LEDGER_DIR = prev;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(`${dir}-locks`, { recursive: true, force: true });
+  });
+
+  it('pins the read and write defaults to platformDefaults.ts', () => {
+    const src = readFileSync(join(process.cwd(), 'config/platformDefaults.ts'), 'utf8');
+    const settings = src.match(/PLATFORM_VERDICT_LEDGER_DEFAULTS = \{([\s\S]*?)\}/)[1];
+    expect(settings.match(/\bstore: '([^']+)'/)[1]).toBe(DEFAULT_VERDICT_LEDGER_STORE);
+    expect(settings.match(/\breadStore: '([^']+)'/)[1]).toBe(DEFAULT_VERDICT_LEDGER_READ_STORE);
+  });
+
+  it('resolves registered read stores independently of the write setting', () => {
+    expect(resolveLedgerReadStore(undefined, {})).toBe('git');
+    expect(resolveLedgerReadStore('bogus', {})).toBe('git');
+    expect(resolveLedgerReadStore(undefined, { VITEST: 'true' })).toBe('home');
+    expect(resolveLedgerReadStore('bogus', { WE_UNDER_TEST: '1' })).toBe('home');
+    expect(resolveLedgerReadStore(undefined, { WE_VERDICT_LEDGER_READ_STORE: ' Git ', VITEST: '1' })).toBe('git');
+    expect(resolveLedgerReadStore('home', { WE_VERDICT_LEDGER_READ_STORE: 'git' })).toBe('home');
+    expect(resolveLedgerReadStore(undefined, { WE_VERDICT_LEDGER_STORE: 'home' })).toBe('git');
+  });
+
+  it('reads git-only events from a real shared branch while home stays empty; folds verdicts only', async () => {
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { 'README.md': 'transport\n' });
+      const event = buildLedgerEvent({ type: 'ruling', repo: REPO, pr: 1, at: AT, source: 'test', findingKey: 'f1', ruling: 'block' });
+      appendLedgerRows({ repo: REPO, board: ctx.clone, records: [rec(), event], sleep: () => {} });
+      const opts = { board: ctx.clone, env: { WE_VERDICT_LEDGER_READ_STORE: 'git' } };
+      const shared = await readLedgerEventsFromStore(REPO, opts);
+      expect(shared).toMatchObject({ status: 'ok', store: { name: 'git', shared: true } });
+      expect(shared.rows.map((r) => r.id)).toEqual([ledgerEventId(rec()), ledgerEventId(event)]);
+      expect(await readLedgerEventsFromStore(REPO, { store: 'home' }))
+        .toMatchObject({ status: 'ok', rows: [], store: { name: 'home', shared: false } });
+      const folded = await foldRepoFromStore(REPO, opts);
+      expect(folded.rows).toEqual(shared.rows);
+      expect(folded.folded).toEqual(foldVerdictLedger([{ ...rec(), id: ledgerEventId(rec()) }]));
+      expect(folded.folded.get(1).history[0]).not.toHaveProperty('type');
+      expect((await readLedgerEventsFromStore(REPO, { ...opts, from: 1 })).rows).toEqual([shared.rows[1]]);
+      git(['remote', 'set-url', 'origin', join(ctx.tmp, 'missing.git')], { cwd: ctx.clone });
+      const broken = await readLedgerEventsFromStore(REPO, opts);
+      expect(broken).toMatchObject({ status: 'unreadable', store: { name: 'git' } });
+      expect(broken.rows).toBeUndefined();
+    });
+  });
+
+  it('no board or an unknown override is unreadable, even when home has a verdict', async () => {
+    appendVerdict(rec(), { store: 'home' });
+    expect(await readLedgerEventsFromStore(REPO, { store: 'git', boardRoot: null, env: {} }))
+      .toMatchObject({ status: 'unreadable', reason: 'no-board', store: { name: 'git' } });
+    expect(await foldRepoFromStore(REPO, { store: 'missing-store', env: {} }))
+      .toMatchObject({ status: 'unreadable', reason: 'unknown-store', store: { name: 'missing-store' } });
+  });
+
+  it('passes options to plugged stores and contains rejected or thrown reads', async () => {
+    let seen;
+    registerLedgerStore({ name: 'read-test', capabilities: { ...homeLedgerStore.capabilities, shared: true },
+      append: async () => ({ ok: true, appended: 0, duplicates: 0 }),
+      read: async (opts) => { seen = opts; return { status: 'ok', rows: [] }; } });
+    expect(resolveLedgerReadStore('read-test', {})).toBe('read-test');
+    const run = () => {};
+    expect(await readLedgerEventsFromStore(REPO, { store: 'read-test', board: '/fixture', run }))
+      .toMatchObject({ status: 'ok', store: { name: 'read-test', shared: true } });
+    expect(seen).toMatchObject({ repo: REPO, board: '/fixture', run });
+    for (const read of [() => { throw new Error('sync read failed'); }, async () => { throw new Error('async read failed'); }]) {
+      registerLedgerStore({ ...homeLedgerStore, name: 'read-test', read });
+      expect(await readLedgerEventsFromStore(REPO, { store: 'read-test' }))
+        .toMatchObject({ status: 'unreadable', error: expect.stringContaining('read failed'), store: { name: 'read-test' } });
+    }
+  });
+
+  it.each(['show', 'shadow-agreement'])('CLI %s honors the selected store and exits 2 on unreadable', (sub) => {
+    appendVerdict(rec(), { store: 'home' });
+    const cli = join(process.cwd(), 'scripts/lib/verdict-ledger.mjs');
+    const run = (store) => execFileSync(process.execPath, [cli, sub, `--repo=${REPO}`, `--store=${store}`, '--json'],
+      { encoding: 'utf8', env: { ...process.env, WE_UNDER_TEST: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    expect(() => JSON.parse(run('home'))).not.toThrow();
+    let failure;
+    try { run('missing-store'); } catch (e) { failure = e; }
+    expect(failure?.status).toBe(2);
+    expect(String(failure?.stderr)).toMatch(/missing-store.*unknown-store/);
   });
 });

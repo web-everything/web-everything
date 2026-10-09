@@ -9,9 +9,10 @@
  */
 
 import { renderEdgeCasesSkeleton } from './edge-case-classes.mjs';
+import { NON_GOALS_HEADING, renderTaskAgreementSkeleton } from './task-agreement.mjs';
 
 /**
- * Authoring hint emitted in the `## Done when` skeleton (#4409). Pinned verbatim by a test; the
+ * Authoring hint emitted in the `## Acceptance` skeleton (#4409). Pinned verbatim by a test; the
  * guard-relaxation lint (`findGuardRelaxationGaps`) strips this exact line before scanning so a
  * hint left in place can never trigger or satisfy it.
  */
@@ -20,6 +21,49 @@ export const GUARD_RELAXATION_HINT =
 
 /** Zero-pad a number to the repo's 3-digit `NNN` convention (`7` → `"007"`). */
 export const pad3 = (n) => String(n).padStart(3, '0');
+
+/**
+ * Kinds that are NEVER sized. A `task` rolls up to its parent (check:standards errors on a sized task); a
+ * `feature` is a non-buildable grouping root (#2691, "never sized as buildable work"). Every other kind keeps
+ * a passed `--size` — including a `decision` (its analysis effort) and an UNSLICED `epic` (a sized epic only
+ * errors once it gains children, `we:scripts/lib/workflow-invariants.cjs`).
+ */
+export const UNSIZED_KINDS = new Set(['task', 'feature']);
+
+/**
+ * The one shared reading of a raw `--size` flag: `undefined`/`''` mean "not passed" (→ `undefined`), anything
+ * else is `Number(raw)`. Both entry points (`backlog.mjs scaffold`, the `scaffold`/`file-item` operations)
+ * use it so an empty `--size=` is "absent" in both — `Number('')` is `0`, which would write `size: 0`.
+ * @returns {number|undefined}
+ */
+export function parseSize(rawSize) {
+  return isAbsentSize(rawSize) ? undefined : Number(rawSize);
+}
+
+/** `--size` not passed: `undefined`, `''`, or whitespace only (`Number(' ')` is `0`, so a blank is never a size). */
+const isAbsentSize = (rawSize) => rawSize === undefined || (typeof rawSize === 'string' && rawSize.trim() === '');
+
+/**
+ * The one shared answer to "is this `--size` acceptable for this kind?" (#x0h3pe4), used by both the
+ * `scaffold`/`file-item` operations and the `backlog.mjs scaffold` CLI so neither ever silently drops a
+ * passed size. PURE. `rawSize` is the flag as given (`undefined`/`''` = not passed).
+ *
+ * @returns {null | {reason: 'bad-size'|'size-not-allowed'|'story-needs-size', message: string}}
+ */
+export function sizeRefusal(kind, rawSize) {
+  const passed = !isAbsentSize(rawSize);
+  if (passed && !Number.isFinite(Number(rawSize))) {
+    return { reason: 'bad-size', message: `--size must be a number (got ${JSON.stringify(rawSize)})` };
+  }
+  if (passed && UNSIZED_KINDS.has(kind)) {
+    return {
+      reason: 'size-not-allowed',
+      message: `a ${kind} is never sized (got --size=${rawSize}) — drop --size, or file it as a story/epic/decision`,
+    };
+  }
+  if (!passed && kind === 'story') return { reason: 'story-needs-size', message: 'a story needs --size=<Fibonacci>' };
+  return null;
+}
 
 /**
  * A free `NNN` for a NEW item, as a padded string. #2292 (interim, under #2289) — allocate a RANDOM free
@@ -90,7 +134,11 @@ export function renderItem(spec) {
   const { kind, size, title, today, blockedBy = [], parent, digest, scaffoldedBy, scope = [] } = spec;
   const scopeEntries = normalizeScope(scope);
   const fm = ['---', `kind: ${kind}`];
-  if (kind === 'story' || (kind === 'epic' && typeof size === 'number')) fm.push(`size: ${size}`);
+  // A story always carries its size; every other kind carries it exactly when one was passed. Kinds that can
+  // never be sized (`UNSIZED_KINDS`) are refused upstream (`we:scripts/operations/scaffold.mjs#planScaffold`,
+  // `we:scripts/backlog.mjs scaffold`) — never silently dropped here (#x0h3pe4: a sized decision was born
+  // unsized because this line only emitted size for story/epic).
+  if (kind === 'story' || (typeof size === 'number' && !UNSIZED_KINDS.has(kind))) fm.push(`size: ${size}`);
   if (parent) fm.push(`parent: "${parent}"`);
   // Born-active when a creating session owns it (#670): scaffold --session stamps `scaffoldedBy`, marking
   // the item owned-until-settled so a concurrent batch can't claim a half-authored spin-off (born-public
@@ -108,12 +156,15 @@ export function renderItem(spec) {
   if (scopeEntries.length) fm.push(`scope: [${scopeEntries.map((p) => `"${p}"`).join(', ')}]`);
   fm.push(`dateOpened: "${today}"`, 'tags: []', '---', '');
   const lead = digest || 'TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).';
-  // `## Done when` skeleton (#2949) — acceptance criteria are authored at file time, not left to the
-  // implementing lane to invent at review time (docs/agent/backlog-workflow.md → the determinism
-  // ladder). Emits one `**Executable**` TODO line; the author fills in a real tier-1 command, or drops
-  // to tier-2/3 (or an explicit "why not" line) when no command applies.
-  const doneWhen = '## Done when\n\n1. **Executable** — TODO: a command that fails before this item lands and passes after.\n\n'
-    + `${GUARD_RELAXATION_HINT}\n\n`
-    + 'Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.\n';
-  return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${doneWhen}\n${renderEdgeCasesSkeleton()}`;
+  // Task-agreement skeleton (#2949, #5399 S7) — acceptance criteria and non-goals are authored at file time,
+  // not left to the implementing lane to invent at review time (docs/agent/backlog-workflow.md → the
+  // determinism ladder). The shared reader renders `## Acceptance` with an `[A1]` **Executable** TODO line and
+  // `## Non-goals` with an `[N1]` TODO line; the authoring hints sit at the end of the acceptance section
+  // (the reader skips `Hint:` lines), so the hints stay beside the criteria they are about.
+  const skeleton = renderTaskAgreementSkeleton();
+  const split = skeleton.indexOf(`${NON_GOALS_HEADING}\n`);
+  const agreement = `${skeleton.slice(0, split)}${GUARD_RELAXATION_HINT}\n\n`
+    + 'Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.\n\n'
+    + skeleton.slice(split);
+  return `${fm.join('\n')}\n# ${title}\n\n${lead}\n\n${agreement}\n${renderEdgeCasesSkeleton()}`;
 }

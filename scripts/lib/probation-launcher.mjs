@@ -28,6 +28,7 @@
 
 import { machinePrTitle, boundedTitle } from '../operations/machine-pr-title.mjs';
 import { isTestPath } from './dispatch-task-type.mjs';
+import { ACCEPTANCE_HEADING } from '../backlog/task-agreement.mjs';
 import { DISPATCH_MACHINERY_PATHS, isStatuteTierPath, PROVEN_TASK_ENVELOPES } from './provider-routing.mjs';
 
 /** The launcher scripts a probation worker may name, repo-relative. */
@@ -141,7 +142,7 @@ export function buildDocFixTask({ num, title = '', spec, scope = [], taskType = 
     `# Build backlog item #${num}${title ? `: ${title}` : ''} (${taskType} probation launch)`,
     '',
     'This working directory is a fresh lane clone, freshly reset onto the current `main`. Build the item below',
-    'to spec — every `## Done when` clause it states must hold when you are finished.',
+    `to spec — every item of its \`${ACCEPTANCE_HEADING}\` section (older cards title it Done when) must hold when you are finished.`,
     '',
     'Rules:',
     taskType === 'test-fix'

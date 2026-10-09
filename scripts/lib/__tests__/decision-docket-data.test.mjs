@@ -464,6 +464,15 @@ Some grounding text, not a fork.
     expect(parsed.doneWhen[0]).toMatch(/^1\. \*\*Executable\*\*/);
   });
 
+  it('reads `## Acceptance` `[A#]` items exactly as `## Done when` numbered items (#5399 S7)', () => {
+    const card = (h, items) => `# T\n\nDigest.\n\n## Fork 1 — q\n\n- **(a)** A. **Rejected**: no.\n- **(b)** **B** ← **RECOMMENDED**.\n\n## ${h}\n\n${items}\n`;
+    const legacy = parseDecisionBody(card('Done when', '1. **Executable** — a command passes.\n   It wraps.\n2. Something else happens.'));
+    const canonical = parseDecisionBody(card('Acceptance', '- [A1] **Executable** — a command passes.\n   It wraps.\n- [A2] Something else happens.'));
+    expect(canonical.doneWhen).toHaveLength(2);
+    expect(canonical.doneWhen.map((d) => d.replace(/^- \[A(\d+)\]/, '$1.'))).toEqual(legacy.doneWhen);
+    expect(canonical.parseOk).toBe(legacy.parseOk);
+  });
+
   it('reports no forks found rather than fabricating one', () => {
     const parsed = parseDecisionBody('# Title\n\nJust a digest, no forks, no Done-when.');
     expect(parsed.forks).toHaveLength(0);

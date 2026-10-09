@@ -40,7 +40,7 @@ import { createRequire } from 'node:module';
 import { applyTransition, applySettle, readField, setFrontmatterField, removeFrontmatterField, accrueCost } from './backlog/frontmatter.mjs';
 import { planEpicResolveOnLand, hasBlockedBy } from './backlog/epic-resolve.mjs';
 import { parseCostTokens, formatCostTokens } from './backlog/cost-rates.mjs';
-import { nextNum, slugify, renderItem } from './backlog/scaffold.mjs';
+import { nextNum, slugify, renderItem, sizeRefusal, parseSize } from './backlog/scaffold.mjs';
 import { nextHash, normalizeId, idFromName, isHash, slugFromName } from './backlog/id.mjs';
 import { parseReservations, emptyState, addHolds, removeBySession, removeNums, pruneExpired, serialize, sessionForNum } from './readiness/reservations.mjs';
 // #2803 resolve-time scope reconciliation. Every one of these graphs is light and adds no measurable startup
@@ -692,10 +692,12 @@ function scaffold() {
     else kind = 'story';
   }
   if (!BACKLOG_KINDS.has(kind)) die(`--kind must be one of ${[...BACKLOG_KINDS].join('|')} (got "${kind}")`);
-  const size = flag('size') !== undefined ? Number(flag('size')) : undefined;
+  const size = parseSize(flag('size'));
   const title = flag('title');
   if (!title) die('scaffold needs --title="…"');
-  if (kind === 'story' && !Number.isFinite(size)) die('a story needs --size=<Fibonacci>');
+  // Shared with the `scaffold`/`file-item` operations (#x0h3pe4): never silently drop a passed --size.
+  const sizeProblem = sizeRefusal(kind, flag('size'));
+  if (sizeProblem) die(sizeProblem.message);
   const slug = flag('slug') || slugify(title);
   // Cross-refs may point at a landed item (NNN) or an in-flight sibling (hash) — normalize each, never
   // blindly zero-pad (padding a hash would corrupt it). #2288.

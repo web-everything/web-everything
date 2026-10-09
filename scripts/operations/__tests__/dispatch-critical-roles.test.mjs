@@ -47,6 +47,7 @@ function runReadTick(launchKind, { item = ITEM, scorecards = [], deliveryAgentOv
     recordLiveness: (s) => s,
     laneRefForPr: () => 'lane/9001',
     checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+    checkBuildDelivery: () => null,
     // #3906 — hermetic routing evidence: never the host's shared scorecard store.
     readScorecards: () => scorecards,
     readDeliveryAgentOverride: () => deliveryAgentOverride,

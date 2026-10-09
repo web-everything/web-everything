@@ -55,6 +55,9 @@ import {
 } from './runner-lock.mjs';
 import { runReconcileFixDispatch } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
+// xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
+import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
+import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
 import { runReconcileCiHealDispatch } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
@@ -601,6 +604,9 @@ export async function runTickAllRepos({
   // #5137 slices 2+3 — the verify-verdict pass (we:scripts/conveyor/await-verify-pass.mjs). Injectable like every
   // other half; a test tick (fixTick/ciHealTick injected) never runs the real one.
   awaitVerifyTick,
+  // card xccgzu5 — the consumer of the session watchdog's fixer-stuck events (we:scripts/conveyor/fixer-stuck-reclaim.mjs).
+  // Injectable like every other half; a test tick never runs the real one.
+  stuckFixerTick,
   // #3383 follow-up (live-caught 2026-09-26, PR #2771) — apply this daemon's OWN `review-status:*` tag the
   // instant it dispatches a fix/ci-heal session, never waiting on the SEPARATE Review daemon's own tick to
   // notice (see `we:scripts/conveyor/review-status-tag.mjs#applyReviewStatus`'s own docblock for the full
@@ -626,8 +632,15 @@ export async function runTickAllRepos({
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
+  // xn025gx (R4 push-wake-cadence): with all three fixDispatch push-on-green settings off (loop seconds 0, the two switches off) this is exactly the pass above; with the fast loop
+  // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
   const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
-    : (realTick ? await runAwaitVerifyPassDefault({ allowResume: !authGate.paused }) : { rows: [] });
+    : (realTick ? await buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] });
+  // card xccgzu5 — SECOND, still before any fresh dispatch: a fixer the watchdog flagged stuck (live 2026-10-08,
+  // ci-heal-4453 idle 1h on a verify for a commit it had already pushed) is stopped and its claims released here,
+  // so THIS tick's ci-heal/fix halves see the PR unowned and re-dispatch it, and its reserved slot frees up.
+  const stuckFixers = stuckFixerTick ? await stuckFixerTick()
+    : (realTick ? await runFixerStuckReclaimPass() : { rows: [] });
   const pausedDispatchResult = () => ({
     repos: repos.map((repo) => ({ repo, result: { dispatched: [], refusals: [] } })),
     dispatched: [], refusals: [], reconcileRefusals: [],
@@ -638,7 +651,9 @@ export async function runTickAllRepos({
   // x5kagse — no reason to read live queue capacity for a pass that is about to dispatch nothing at all).
   const queueAdmission = (authGate.paused || (fixTick && ciHealTick)) ? null : createQueueBudget(resolveLiveQueueBaseline({ checkoutRoot: DAEMON_REPO_ROOT }));
   // ONE throttle per pass shared by fix + ci-heal: live fix/ci-heal cap and host-load gate (defer-only).
-  const dispatchThrottle = queueAdmission ? createDispatchThrottle({ listClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }) }) : null;
+  // xn025gx (R2 fix-slot-count): a session parked on verify gives its slot back; a decided resume keeps one. Setting off →
+  // the same live-claim list as before.
+  const dispatchThrottle = queueAdmission ? buildFixThrottle() : null;
   // Card 87 — ONE borrow gate per pass (fix only; ci-heal never borrows). OFF unless `fixDispatch.borrowBuildSlots` is on.
   const borrowGate = dispatchThrottle ? createFixBorrowGate({
     listBuildClaims: () => listBuildDispatchClaims(), listFixClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }),
@@ -703,6 +718,7 @@ export async function runTickAllRepos({
     noteComments: notes.comments, // #4191 — one row per note: posted / would-post (dryRun) / already-posted
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
     awaitVerify, // #5137 — one row per recorded verify wait this tick read (wait / push / rerequest / resume)
+    stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
   };
 }
@@ -827,6 +843,50 @@ export function formatNoteCommentLine(c) {
   return `${head} — FAILED to post${c?.error ? ` (${c.error})` : ''}`;
 }
 
+// xn025gx — the three pieces of glue between the tick/main() and the push-on-green core. Each is its own factory so a
+// test drives the real wiring (PR #4510 review: the glue was guarded only by source-text regexes).
+/** The tick's verify-verdict step (R4): the core's `runTickAwaitVerify`, with the unchanged legacy pass as its off-switch fallback. */
+export function buildAwaitVerifyStep({ run = runTickAwaitVerify, legacyPass = runAwaitVerifyPassDefault } = {}) {
+  return ({ allowResume }) => run({ allowResume, legacyPass });
+}
+/** The fix/ci-heal dispatch throttle, counting the cap with R2's active-only claim list. */
+export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, ...rest } = {}) {
+  return createDispatchThrottle({ ...rest, listClaims: () => slotClaims() });
+}
+/**
+ * main()'s three exits: SIGTERM/SIGINT (`shutdown`), restart-onto-new-code (`restartOntoNewCode`) and `runDaemonLoop`
+ * returning on its own (`loopEnded`). Each stops the await-verify loop child FIRST, then releases the lease (the first two
+ * then exit) — a child outliving its daemon would keep pushing and waking with no one supervising it.
+ */
+export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => process.exit(code), log = console } = {}) {
+  let stopping = false;
+  return {
+    isStopping: () => stopping,
+    shutdown: (signal) => {
+      if (stopping) return;
+      stopping = true;
+      awaitLoop.stop();
+      log.error(`reconcile-fix-dispatch-daemon: ${signal} — releasing the lease and exiting.`);
+      releaseLease();
+      exit(0);
+    },
+    restartOntoNewCode: () => {
+      stopping = true;
+      awaitLoop.stop();
+      releaseLease();
+      exit(0);
+    },
+    // The third exit: `runDaemonLoop` returned on its own. The loop child is a ref'd handle that only ends when its parent
+    // PID dies, so leaving it running would keep this process alive with no lease and nobody supervising the child.
+    loopEnded: (reason) => {
+      awaitLoop.stop();
+      if (stopping) return;
+      log.error(`reconcile-fix-dispatch-daemon: loop stopped (${reason}) — releasing the lease and exiting.`);
+      releaseLease();
+    },
+  };
+}
+
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
@@ -839,10 +899,13 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
     onTick: (result) => {
       const {
         repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, missingRun, promoteDraft, notes = [], noteComments = [],
-        authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null,
+        authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null, stuckFixers = null,
       } = result || {};
+      // card xccgzu5 — one line per fixer-stuck event this tick reclaimed, held or acknowledged.
+      for (const line of formatFixerStuckReclaimLines(stuckFixers)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // #5137 — one line per verify wait the harness acted on (pushed / re-requested / resumed), plus a waiting count.
       for (const line of formatAwaitVerifyLines(awaitVerify)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
+      for (const line of formatReleaseLines(awaitVerify)) log.error(`reconcile-fix-dispatch-daemon: ${line}`); // xn025gx R5
       if (result?.factsStats) {
         const w = result.factsWarm;
         log.error(`reconcile-fix-dispatch-daemon: pr-facts ${w?.skipped ? `off (${w.skipped})` : (w?.warmed ?? []).map((x) => `${x.repo.split('/')[1]}=${x.ok ? 'store' : `github (${x.reason})`}`).join(' ')} — reads: ${formatFixReadStats(result.factsStats)}`);
@@ -963,35 +1026,25 @@ async function main() {
     console.error(`reconcile-fix-dispatch-daemon: a live instance already holds the lease (${acquired.heldBy}) — exiting.`);
     return;
   }
-  let stopping = false;
-  const shutdown = (signal) => {
-    if (stopping) return;
-    stopping = true;
-    console.error(`reconcile-fix-dispatch-daemon: ${signal} — releasing the lease and exiting.`);
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
-    process.exit(0);
-  };
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
+  // xn025gx (R4) — the fast push-on-green loop runs as this daemon's own child (the tick blocks the event loop for
+  // minutes, so a timer here would starve). It exits on its own when this process is gone; the supervisor restarts it
+  // (at most once a minute) if it dies, and stops it by PID — ours — on shutdown/restart. Setting off → never spawned.
+  const awaitLoop = superviseAwaitVerifyLoop();
+  const exits = buildDaemonExits({ awaitLoop, releaseLease: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY }) });
+  process.on('SIGTERM', () => exits.shutdown('SIGTERM'));
+  process.on('SIGINT', () => exits.shutdown('SIGINT'));
   console.error(`reconcile-fix-dispatch-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms.`);
   // xv6fciw — keep this daemon's dedicated clone on origin/main, and restart onto new code BETWEEN ticks
   // (launchd KeepAlive brings it back), instead of refusing every dispatch until someone re-syncs by hand.
   const selfRoot = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
-  const restartOntoNewCode = () => {
-    stopping = true;
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
-    process.exit(0);
-  };
+  awaitLoop.start();
   // Webhook-driven wake (flag WE_PR_EVENTS, default OFF → effects unchanged) — see we:scripts/lib/pr-events.mjs.
   const { stoppedReason } = await runDaemonLoop(
     withPrEvents(withSelfSync(withGithubAppAuth(withFixDispatchClaimRefresh(buildCliDaemonEffects({ owner })), FIX_DISPATCH_APP_AUTH_OPTS), {
-      root: selfRoot, onRestart: restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
+      root: selfRoot, onRestart: exits.restartOntoNewCode, hasStaleRefusal: hasStaleMainRefusal,
     }), { role: 'fix', repos: FIX_DISPATCH_DAEMON_REPOS }),
   );
-  if (!stopping) {
-    console.error(`reconcile-fix-dispatch-daemon: loop stopped (${stoppedReason}) — releasing the lease and exiting.`);
-    releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: RECONCILE_FIX_DISPATCH_LEASE_KEY });
-  }
+  exits.loopEnded(stoppedReason);
 }
 
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));

@@ -63,6 +63,7 @@ import { cachedClaudeAgents } from '../lib/claude-agents-cache.mjs';
 // these ran SIMULTANEOUSLY in a single `ps aux` snapshot, none logged anywhere, spending the shared `graphql`
 // bucket (8943 points/hour that hour, 6365.2 UNATTRIBUTED — `gh-spend.mjs report --hours=1 --by=caller`).
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { readBuildDelivery, defaultListBuildPrs, defaultReadCardStatus, defaultReadCardOpened, NON_IMPLEMENTING_REF_RE, isNonImplementingPr, isDocsOnlyPr } from '../conveyor/build-delivery-evidence.mjs';
 import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createHash, randomUUID } from 'node:crypto';
@@ -293,6 +294,8 @@ export function readTick({
   recordLiveness = (stamped) => { persistLastSeenLive(stamped, { now }); return stamped; },
   laneRefForPr = (pr) => defaultLaneRefForPr(pr, { exec }),
   checkAlreadyDone = (n) => defaultCheckAlreadyDone(n, { exec }),
+  // xykwe0h — build only: an OPEN or MERGED build PR, or a resolved card, means the build must not run again.
+  checkBuildDelivery = (n) => readBuildDelivery(n, { listPrs: (k) => defaultListBuildPrs(k, { exec, cwd: root }), readCardStatus: (k) => defaultReadCardStatus(k, { cwd: root }), readCardOpened: (k) => defaultReadCardOpened(k, { cwd: root }) }),
   // #3717 — THE ROUTER'S EVIDENCE. `selectProvider`/`selectSupervisionLevel` are pure and read their trial
   // history from their caller, so the scorecards are loaded at this io edge and handed across as data. A
   // missing or unreadable store reads as NO trials, which is the fail-closed direction: with no clean trials
@@ -411,7 +414,7 @@ export function readTick({
     return keys.map((id) => readTick({
       num: id, root, exec, bookkeepingFile,
       runNode: () => tickJson, readText: cachedText, loadItems: () => items,
-      listInFlightDispatches, listAgents: cachedAgents, isPidAlive, recordLiveness, laneRefForPr, checkAlreadyDone,
+      listInFlightDispatches, listAgents: cachedAgents, isPidAlive, recordLiveness, laneRefForPr, checkAlreadyDone, checkBuildDelivery,
       readScorecards: scorecardsOnce, readSizePolicy: sizePolicyOnce, readPromotions: promotionsOnce,
       enforceSupervision, readDeliveryAgentOverride, dispatchModes: modesOnce,
       now: () => observedAt,
@@ -509,6 +512,9 @@ export function readTick({
   // `#3434` incident was a WASTED `prepare-decision` dispatch, not a build, so every launch kind needs the
   // check, not build/fix/ci-heal only.
   const alreadyDone = launch ? checkAlreadyDone(key) : { done: false, pr: null, checked: false };
+  // xykwe0h — fail-soft: an unreadable delivery check never blocks a launch.
+  let buildDelivery = null;
+  if (launch && launchKind === 'build') { try { buildDelivery = checkBuildDelivery(key) ?? null; } catch { buildDelivery = null; } }
 
   // #3717/#3906 — THE ROUTING DECISION, computed only when something was cleared for launch (a read that will
   // not dispatch has nothing to route). Computed HERE rather than in the pure declaration: `decideDispatchRoute`
@@ -581,6 +587,7 @@ export function readTick({
     repoTokens,
     // #3457/#3460 — the ground-truth verdict, or the not-checked default when nothing was cleared for launch.
     alreadyDone,
+    buildDelivery,
     // #3717/#3906 — the routing record (`decideDispatchRoute`'s answer), or `null` when nothing was cleared.
     routing,
     locus: launchKind === 'build' ? deliveryLocusForScope(item?.scope) : null,
@@ -1328,6 +1335,47 @@ export function isTrustRefusal(error) {
 }
 
 /**
+ * x87v3ed — RESERVE THE LANE BEFORE THE BUILD SESSION LAUNCHES. The tick plans a lane NUMBER from a free-lane read,
+ * and the brief's own `acquire --lane=N` runs minutes later, so another role (review-loop, ledger, prevention-card)
+ * could lease it in between: 3 of 7 Claude builds on 2026-10-07 ended "not started: lane already leased" and the card
+ * was relaunched again and again. The daemon's launch now takes the lease HERE, under the session slug the worker
+ * will use, so the worker's own `acquire --lane=N --session=<slug> --adopt` is a self-refresh of a lease it already
+ * holds. Returns `{reserved, lane, session}`. A lane that is leased by someone else makes this THROW `notApplied`
+ * before any process exists, so the failure is recorded against the card and the card backs off.
+ *
+ * ON ONLY WHEN `WE_DISPATCH_RESERVE_LANE=1` (the build daemon sets it on its `dispatch-lane` launches); every other
+ * caller (a hand dispatch, a test) keeps today's behaviour: the worker acquires its own lane.
+ *
+ * @param {object} payload - the dispatch effect payload (`launchKind`, `lane`, `sessionSlug`, `scope`, `num`).
+ * @param {{enabled?: boolean, run?: Function, root?: string, env?: object}} [o]
+ */
+export function reserveBuildLane(payload, { enabled = process.env.WE_DISPATCH_RESERVE_LANE === '1', run = execFileSync, root = REPO_ROOT, env = process.env } = {}) {
+  const lane = Number(payload?.lane);
+  const session = String(payload?.sessionSlug ?? '').trim();
+  if (!enabled || (payload?.launchKind ?? 'build') !== 'build' || !Number.isInteger(lane) || lane < 1 || !session) return { reserved: false, lane: null, session: null };
+  const scope = Array.isArray(payload?.scope) ? payload.scope.join(',') : '';
+  const argv = ['scripts/lane-pool.mjs', 'acquire', `--lane=${lane}`, '--purpose=conveyor-delivery', `--session=${session}`,
+    ...(scope ? [`--scope=${scope}`] : []), ...(payload?.num != null ? [`--item=${payload.num}`] : [])];
+  try {
+    run('node', argv, { cwd: root, env: { ...env, LANE_SESSION: session }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 });
+  } catch (e) {
+    const why = String(e?.stderr || e?.message || e).replace(/\s+/g, ' ').slice(0, 240);
+    throw notApplied(`lane-reserve-failed: lane-${lane} could not be reserved before launch for #${payload?.num ?? '?'} — ${why}`, { sessionId: session });
+  }
+  return { reserved: true, lane, session };
+}
+
+/** x87v3ed — hand a reserved lane back when the launch itself failed (no worker will ever use it). Best-effort. */
+export function releaseReservedLane(reservation, { run = execFileSync, root = REPO_ROOT, env = process.env } = {}) {
+  if (!reservation?.reserved) return false;
+  try {
+    run('node', ['scripts/lane-pool.mjs', 'release', `--lane=${reservation.lane}`, `--session=${reservation.session}`],
+      { cwd: root, env, encoding: 'utf8', stdio: 'ignore', timeout: 60_000 });
+    return true;
+  } catch { return false; }
+}
+
+/**
  * THE SINK — the one thing in this repo that starts a delivery agent.
  *
  * THE HANDLE IS THE ONE THE CLI PRINTS BACK — NOT A MINTED ONE. CORRECTED 2026-09-11 (#3331); this paragraph
@@ -1429,6 +1477,9 @@ export function createDispatchSinks({
   }),
   mintSessionId = () => randomUUID(),
   now = () => new Date(),
+  // x87v3ed — see {@link reserveBuildLane}. Injectable so a test can assert the order without a real lane pool.
+  reserveLane = (payload) => reserveBuildLane(payload, { root }),
+  releaseLane = (reservation) => releaseReservedLane(reservation, { root }),
   extraArgs = [],
   // #x8mpubm — resolved ONCE per dispatch, here at the sink (the one place real fs/env effects belong in this
   // file), never inside `defaultClaudeProvider`/`buildAgentArgv` themselves, both of which stay side-effect-free
@@ -1478,6 +1529,9 @@ export function createDispatchSinks({
       if (payload?.occupancyWarning) {
         console.error(`dispatch-lane: ${payload.occupancyWarning}`);
       }
+      // x87v3ed — take the lane lease BEFORE anything is spawned; a lane that went to another role in the meantime
+      // throws `notApplied` here, so no session is started just to say "lane already leased".
+      const reservation = reserveLane(payload) ?? { reserved: false };
       const sessionId = String(mintSessionId());
       // #4174 — THE FIX: the session's cwd is a scratch directory OUTSIDE this checkout, never `root` itself.
       // See `dispatchSessionCwd`'s own header for why this location and not, say, an `os.tmpdir()` mkdtemp.
@@ -1553,6 +1607,9 @@ export function createDispatchSinks({
           worktreeSettings,
         });
       } catch (e) {
+        // x87v3ed — a launch that definitely started nothing hands its reserved lane back; an INDETERMINATE one
+        // (below) keeps it, because a session may be running in it.
+        if (e && (e.notApplied || isPreSpawnRefusal(e) || isTrustRefusal(e))) releaseLane(reservation);
         // A validation failure `buildAgentArgv` already proved happened before any process existed (e.g. an
         // empty prompt) carries `.notApplied` — rethrow it as-is rather than reclassifying it as indeterminate.
         if (e && e.notApplied) throw e;
@@ -2961,7 +3018,7 @@ export const ALREADY_DONE_JSON_FIELDS = 'number,title,url,mergedAt,headRefName,b
  * before the build has even started. Excluding the two authoring ref shapes is what keeps the check aimed at
  * "was the ITEM implemented", not "was the item's card ever touched".
  */
-export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
+export { NON_IMPLEMENTING_REF_RE }; // defined once in build-delivery-evidence.mjs (xykwe0h); re-exported for existing importers
 
 /**
  * PURE — which of a `gh pr list --search` page's rows are real evidence that `num` is ALREADY DONE, most
@@ -2977,8 +3034,9 @@ export const NON_IMPLEMENTING_REF_RE = /^lane\/\d+[a-z]?-(scope|prepare)-/i;
  *   2. A WORD-BOUNDARY match on `title` — `in:title` search already scopes to the title field, but a bare
  *      substring test would let item `343` match a PR titled "WE #3435: …"; the boundary keeps `343` from
  *      matching inside `3435`.
- *   3. {@link NON_IMPLEMENTING_REF_RE} — excludes prepare-scope/prepare-decision authoring PRs (see that
- *      constant's own docblock for the live case this closes).
+ *   3. `isNonImplementingPr` — excludes prepare-scope/prepare-decision authoring PRs (see
+ *      {@link NON_IMPLEMENTING_REF_RE}'s docblock for the live case this closes), by title as well as ref, so a
+ *      build of a card whose slug starts with scope-/prepare- is still counted (review of PR #4361).
  *   4. (#3473) ALL-MARKDOWN DIFF — a PR whose entire changed-file set is `.md` is pure backlog housekeeping,
  *      never a real implementation, however its title reads. Live false positive: `#3096`'s dispatch-time
  *      already-done hold was fed by TWO merged PRs that both title-boundary-match "3096" — PR #1599 (ref
@@ -3041,10 +3099,10 @@ export function filterAlreadyDoneCandidates(prs, num) {
     .filter((p) => p && typeof p === 'object')
     .filter((p) => p.state === undefined || p.state === 'MERGED') // undefined: a caller that omitted `state`
     .filter((p) => boundary.test(String(p?.title ?? '')))
-    .filter((p) => !NON_IMPLEMENTING_REF_RE.test(String(p?.headRefName ?? '')))
+    .filter((p) => !isNonImplementingPr(p))
     // #3473 guard 4 — an all-.md changed-file set is pure backlog/doc housekeeping, never a real delivery.
     // A no-op when `files` is absent from the row (existing fixtures that don't set it stay green).
-    .filter((p) => !(Array.isArray(p?.files) && p.files.length > 0 && p.files.every((f) => /\.md$/i.test(String(f?.path ?? f)))))
+    .filter((p) => !isDocsOnlyPr(p))
     // #3473 guard 5 — the PR's own body explicitly disclaims resolving THIS id. A no-op when `body` is absent.
     .filter((p) => !disclaimerRe.test(String(p?.body ?? '')))
     // #3473 guard 6 — a blanket "no code changes" disclaimer excludes the PR outright (backstop for guard 4

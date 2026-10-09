@@ -318,27 +318,10 @@ function isAlive(pid) {
 
 const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 
-/** Runs INSIDE the tree under test (its own modules, its own launch path): the same request `createDispatchSinks`
- *  hands `defaultClaudeProvider` for a ci-heal/fix dispatch. Prints `{handle, wrapperPid, cwd}` as its last line. */
-const LAUNCH_HARNESS = `
-const [tree, slug, kind, pr, sessionId, prompt] = process.argv.slice(1);
-const { pathToFileURL } = await import('node:url');
-const { join } = await import('node:path');
-const imp = (p) => import(pathToFileURL(join(tree, p)).href);
-const io = await imp('scripts/operations/dispatch-lane-io.mjs');
-const iso = await imp('scripts/lib/dispatch-bg-isolation.mjs');
-const cwd = io.ensureDispatchSessionCwd(io.dispatchSessionCwd(sessionId, { root: tree }));
-const isolated = iso.isolateDispatchSession(cwd);
-const resolveEnv = io.resolveDispatchSettingsEnv || io.resolveGhShimSettingsEnv;
-let wrapperPid = null;
-const handle = io.defaultClaudeProvider({
-  sessionId, cwd, prompt, sessionSlug: slug, launchKind: kind, pr,
-  systemPromptFile: io.DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, settingsEnv: resolveEnv(cwd),
-  worktreeSettings: (isolated && isolated.worktreeSettings) || null,
-  reportWrapped: (pid) => { wrapperPid = pid; },
-});
-process.stdout.write('\\n' + JSON.stringify({ handle, wrapperPid, cwd }) + '\\n');
-`;
+/** The launch harness runs INSIDE the tree under test (its own modules, its own launch path). It is a separate file
+ *  that is spawned, never imported: its computed `import(...)` must stay out of this module's static closure (it
+ *  would mark the review/promote code-path closure incomplete and put every file on that path). */
+const LAUNCH_HARNESS_FILE = join(dirname(fileURLToPath(import.meta.url)), 'dispatch-smoke-launch.mjs');
 
 /** The smoke worker's task: three commands, the first of the kind the incident's workers were refused. */
 export function dispatchSmokePrompt({ tree, store, marker, nonce, slug, kind, pr }) {
@@ -375,7 +358,7 @@ export async function runRealDispatchSmoke({
   const childEnv = { ...env, OPERATION_COMPLETIONS_DIR: store, WE_POSTMORTEM_MODE: 'off' };
   const base = { sessionId, scratch };
   log.error?.(`daemon-load-overlay: dispatch smoke — launching one real ${kind} worker from ${tree} (scratch store ${store})`);
-  const launch = spawn(process.execPath, ['--input-type=module', '-e', LAUNCH_HARNESS, tree, slug, kind, pr, sessionId, prompt], {
+  const launch = spawn(process.execPath, [LAUNCH_HARNESS_FILE, tree, slug, kind, pr, sessionId, prompt], {
     cwd: tree, env: childEnv, encoding: 'utf8', timeout: 120_000, killSignal: 'SIGKILL',
   });
   if (launch.status !== 0) {

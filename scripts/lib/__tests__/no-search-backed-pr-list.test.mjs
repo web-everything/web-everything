@@ -42,6 +42,9 @@ const ALLOWLIST = {
   // prepare prefix and excludes forks. Missing claim dates omit the date filter (limit 1000 vs 500). A saturated
   // or too-recently-dated shared listing falls back to a per-item `head:lane/<n>-prepare-` search (fails closed at 100).
   'skills-src/conveyor/build-dispatch-daemon.mjs': ['--search'],
+  // `defaultListBuildPrs` (xykwe0h): `--search 'head:lane/<item>-' --state all`, the same branch-PREFIX lookup, run only for
+  // a build about to launch (once per dispatch attempt) and for a claim already confirmed dead -- never a polling loop.
+  'scripts/conveyor/build-delivery-evidence.mjs': ['--search'],
 };
 
 function trackedSourceFiles() {
@@ -102,6 +105,17 @@ describe('no-search-backed-pr-list (#no-label-search)', () => {
     }
     expect(offenders).toEqual([]);
   });
+
+  // xykwe0h review (security): a branch-prefix `--search` returns FORK PRs too, and an outside party can open a
+  // fork PR on `lane/<num>-…` to suppress a card's dispatch. A file allowlisted for `--search` that DECIDES TRUST
+  // from the rows must therefore request `isCrossRepository` so it can drop them.
+  for (const file of ['scripts/conveyor/build-delivery-evidence.mjs']) {
+    it(`${file} (allowlisted --search that gates dispatch) requests and honours isCrossRepository`, () => {
+      const src = readFileSync(join(ROOT, file), 'utf8');
+      expect(src).toMatch(/--json',\s*'[^']*\bisCrossRepository\b/);
+      expect(src).toMatch(/isCrossRepository\s*===\s*true/);
+    });
+  }
 });
 
 // Review finding (PR #2798, correctness): client-side filtering reused the OLD `--limit` (100/200), which once

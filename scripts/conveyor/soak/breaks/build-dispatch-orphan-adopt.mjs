@@ -7,7 +7,7 @@
  * settles one, and it never ran). The claim sat "in flight" forever, occupying a builder slot, while the
  * agent's own finished work — a real commit, already pushed into the lane — was silently abandoned.
  *
- * SIX real shapes, all reproduced in one run (the sixth, #4688, is listed after the five below):
+ * SEVEN shapes, all reproduced in one run (six real ones, then the #9001 delivered shape):
  *   - #4131-A: an in-flight row, dead pid, report says done, lane still has the commit → RESUME.
  *   - #4382: an in-flight row, dead pid, nothing resumable at all → RELEASE, no hold.
  *   - #4400 (PR #2921 review): a LIVE re-dispatch (its own pid alive) whose item still carries a STALE resume
@@ -22,6 +22,15 @@
  *     started BEFORE this claim) → the older row is ignored, the owner pid decides → RELEASE.
  *   Fixture ordering matters: every row a claim legitimately owns starts AFTER that claim (a row that predates
  *   its claim is, by definition, an older attempt's — `classifyClaimLiveness`'s `claimedAt` guard).
+ *   - #9001 (xykwe0h, PR #4361): an in-flight row, dead pid, but the card WAS delivered (a merged PR) → SETTLED
+ *     as that real outcome: claim released, row settled `applied`, never resumed, never charged as a failed start.
+ *
+ * HERMETIC DELIVERY EVIDENCE (card xh6ij2v). Since PR #4361 the pass first asks "was this card already delivered?"
+ * (`readDelivery`: PRs on `lane/<num>-…` via gh + the card's status on origin/main). The fixture numbers above are
+ * REAL card numbers, and #4382/#4468 are long since resolved with merged PRs, so the default reader made them
+ * `settled` and turned main red (2026-10-08, from 17:04Z). The release shapes encode "nothing was delivered", so the
+ * scenario now declares its delivery evidence itself (`deliveryByNum`) and fakes the two other new host side
+ * effects (failed-start backoff, lane-lease release) so a soak run never writes to the real queue or lane pool.
  *
  * Fix: `scripts/conveyor/build-dispatch-orphan-adopt.mjs#adoptOrphanedBuildClaims`, wired into
  * `skills-src/conveyor/build-dispatch-daemon.mjs`'s own live tick (`effects.adoptOrphans`, called before the
@@ -91,7 +100,7 @@ export default {
   async run({ log } = {}) {
     const violations = [];
     const {
-      adoptOrphanedBuildClaims, checkResumable, findLatestBuildRow,
+      adoptOrphanedBuildClaims, checkResumable, findLatestBuildRow, settleDeliveredRow,
     } = await import(resolve(REPO_ROOT, 'scripts/conveyor/build-dispatch-orphan-adopt.mjs'));
     const {
       acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -209,6 +218,17 @@ export default {
     acquireBuildDispatchClaim({ num: '4688', scope: [], lockRoot: claimRoot, pid: deadPid });
     const rowE = writeOlderSettledRow('4688', { lane: 11, sessionSlug: 'conveyor-4688' });
 
+    // ── #9001 shape (xykwe0h, PR #4361): an IN-FLIGHT row, dead pid, but the card WAS delivered (merged PR) →
+    // SETTLED as the real outcome, never released as `orphan-released`, never resumed. ─────────────────────────
+    acquireBuildDispatchClaim({ num: '9001', scope: [], lockRoot: claimRoot });
+    const rowF = writeInFlightRow('9001', { lane: 12, sessionSlug: 'conveyor-9001', deadPid });
+
+    // The scenario's OWN delivery evidence (see the file docblock): only #9001 was delivered. Never the real
+    // gh/origin-main reader — fixture numbers are real cards whose real state drifts.
+    const deliveryByNum = { 9001: { outcome: 'pr-merged', pr: 9002, url: null, reason: 'PR #9002 merged' } };
+    const failuresRecorded = [];
+    const leasesReleased = [];
+
     const laneByLaneNum = { 9: resumableLane, 11: emptyLane, 30: recycledLane };
     // The lane-lease-currency check ({@link checkResumable}'s own safety fix) needs to see #4131's lane (9) as
     // STILL leased under its own matching session — this soak sandbox has no real lane-pool state, so the
@@ -216,7 +236,7 @@ export default {
     // currently leased to a DIFFERENT session (`conveyor-9999`) — a later item that recycled it, exactly as
     // #4131's own real lane (8) was recycled twice before this fix landed.
     const sessionByLaneNum = { 9: 'conveyor-4131', 11: 'conveyor-4382', 30: 'conveyor-9999' };
-    const rowByNum = { 4131: rowA, 4382: rowB, 4400: rowC, 4468: rowD, 4688: rowE };
+    const rowByNum = { 4131: rowA, 4382: rowB, 4400: rowC, 4468: rowD, 4688: rowE, 9001: rowF };
 
     let results;
     try {
@@ -237,6 +257,13 @@ export default {
         settleRow,
         spawnResume: (o) => { spawnedResumeWith = o; return 424242; }, // FAKE — never a real agent in a soak sandbox.
         markResume: (o) => markBuildDispatchResume({ ...o, lockRoot: resumeRoot }),
+        // xykwe0h — the scenario's own delivery evidence; the REAL settle primitive, on this sandbox's store.
+        readDelivery: (num) => deliveryByNum[num] ?? null,
+        settleDelivered: (o) => settleDeliveredRow(o, store),
+        sessionLivenessFor: () => null, // every fixture handle is a pid (or none); no real ~/.claude/jobs read.
+        // x87v3ed — recorded, never written to the host's real backoff store / lane pool.
+        recordFailure: (o) => { failuresRecorded.push(String(o.num)); },
+        releaseLaneLease: (o) => { leasesReleased.push(o); },
       });
     } catch (e) {
       violations.push({ invariant: 'crash', detail: String(e?.stack || e) });
@@ -305,6 +332,26 @@ export default {
     }
     if (claimsAfter.includes('4688')) {
       violations.push({ invariant: 'older-row-claim-stuck', detail: '#4688\'s claim is STILL held — the exact live shape: an older attempt\'s settled row pinned a dead daemon\'s claim for the full TTL' });
+    }
+
+    // #9001 (xykwe0h) — a DELIVERED card's dead dispatch settles as its real outcome: claim released, row settled
+    // `applied` with the delivery outcome, never resumed and never charged as a failed start.
+    if (byNum['9001']?.action !== 'settled') {
+      violations.push({ invariant: 'delivered-not-settled', detail: `#9001 (dead dispatch, merged PR) got action ${JSON.stringify(byNum['9001'])}, expected 'settled'` });
+    }
+    if (claimsAfter.includes('9001')) {
+      violations.push({ invariant: 'delivered-claim-stuck', detail: '#9001\'s claim is STILL held after its delivery was settled' });
+    }
+    const rowFAfter = (store.read(rowF).effects || []).find((e) => e.key === 'step:1:0');
+    if (rowFAfter?.status !== 'applied' || rowFAfter?.result?.outcome !== 'pr-merged') {
+      violations.push({ invariant: 'delivered-row-not-settled', detail: `#9001's row was not settled as its real outcome: ${JSON.stringify({ status: rowFAfter?.status, result: rowFAfter?.result })}` });
+    }
+    if (failuresRecorded.includes('9001')) {
+      violations.push({ invariant: 'delivered-charged-as-failure', detail: '#9001 was delivered but was backed off as a failed start' });
+    }
+    // x87v3ed — a plain orphan release IS a failed start: the card is backed off so the next tick does not relaunch it.
+    if (!failuresRecorded.includes('4382')) {
+      violations.push({ invariant: 'release-not-backed-off', detail: `#4382 was released with no failed-start backoff recorded (recorded: ${JSON.stringify(failuresRecorded)})` });
     }
 
     // cleanup — best-effort, never masks a violation already recorded.
