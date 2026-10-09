@@ -24,6 +24,7 @@
  */
 
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { defineJobKind, kindRegistry } from '../../scripts/lib/daemon-jobs.mjs';
 
 /** Every mechanical pass ran at this same cadence as one of `runner.mjs`'s own `makeCliMechanicalPasses`
  *  steps — unchanged here, since #3873 wires the SAME passes onto standalone daemons, not a redesign of how
@@ -199,6 +200,26 @@ export const DAEMON_MANIFEST = {
   'coroner-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'coroner'], intervalMs: 6 * 60 * 60_000, defaultLaunch: false },
   'opus-sweep': { script: 'scripts/operations/scheduled-sweep.mjs', args: ['run', 'opus'], intervalMs: 24 * 60 * 60_000, defaultLaunch: false },
 };
+
+/**
+ * #4131 (statute `#daemon-jobs`, first adopter) — the health watch's JOB KINDS. A slow health read runs as a
+ * detached job with a durable record under `~/.claude/daemon-jobs/health-watch/`; the tick only queues it,
+ * reattaches it and consumes its result (we:scripts/conveyor/health-watch-job.mjs).
+ *   - `health-gh-probe` — the gh-cadence probe group (open PRs, agents and their reads, stale-state, merged
+ *     PRs). Only reads, so it runs from a pinned code snapshot of the clone (`readonly-tree`) with the clone's
+ *     own `node_modules` cloned into a lockfile-keyed store.
+ * `HEALTH_WATCH_JOB_CAP` is the daemon's job cap (the runtime has no default: the adopter states it).
+ * `HEALTH_WATCH_JOB_SWITCHES` is each kind's DEFAULT rollout switch: `true` runs the group as a job, `false` keeps
+ * the old inline path. The health config file's `jobs` block overrides it per kind without a deploy (for example
+ * `jobs: { ghProbes: true }` to turn it on before the default flips, or `false` to roll back after).
+ */
+export const HEALTH_WATCH_JOB_DAEMON = 'health-watch';
+export const HEALTH_WATCH_JOB_CAP = 2;
+export const HEALTH_GH_PROBE_KIND = defineJobKind({
+  kind: 'health-gh-probe', entry: 'scripts/conveyor/health-watch-job.mjs', codeMode: 'readonly-tree', nodeModules: true,
+});
+export const HEALTH_WATCH_JOB_KINDS = kindRegistry([HEALTH_GH_PROBE_KIND]);
+export const HEALTH_WATCH_JOB_SWITCHES = Object.freeze({ ghProbes: false });
 
 /** A script path may be `undefined` is never intended; it must be a plain repo-relative path with no `..`
  *  traversal and no leading `/` — the same shape every `we:` locus-prefixed reference in this repo already
