@@ -3,9 +3,10 @@ bornAs: xemxk3h
 kind: story
 size: 3
 priority: high
-status: open
+status: resolved
 scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:scripts/conveyor/draft-promotion-rule.mjs", "we:scripts/conveyor/draft-promotion-loop.mjs"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
