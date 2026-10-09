@@ -48,6 +48,7 @@
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from '../operations/pr-status.mjs';
@@ -1296,6 +1297,8 @@ export function runReconcilePass({
   // Best-effort — see {@link defaultResolveMainSha}'s own docblock; a failed read degrades to `null`, which
   // `planReconcile` already treats as "ref-only comparison", never a hard failure of this whole pass.
   resolveMainSha = defaultResolveMainSha,
+  // Card xu1nixv — the published red-main priority (injectable; a test passes its own record or `() => null`).
+  readPriority = () => readMainRedPriority({ now, env }),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-pass: --repo ${repo} is not a constellation repo`);
@@ -1342,6 +1345,8 @@ export function runReconcilePass({
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
+    // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
+    mainRedPriority: readPriority(),
   });
   return { ...plan, owedTriggers: hydrated.owedTriggers, notes: [...hydrated.notes, ...plan.notes], refusals: [...hydrated.refusals, ...plan.refusals], prs: rawPrs.length, agents: agents.length,
     openPrFiles: rawPrs.map((pr) => ({ pr: pr.number, files: Array.isArray(pr.files) && pr.files.length < 100

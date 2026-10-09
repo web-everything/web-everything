@@ -2967,6 +2967,22 @@ describe('watchParkedPrConflicts — idle conflict-bounce re-assertion (landing-
     expect(provider.calls).toEqual([]);
   });
 
+  it.each([
+    ['throws', () => { throw new Error('gh: HTTP 502'); }],
+    ['returns null', () => null],
+    ['returns a non-array', () => ({ message: 'rate limited' })],
+  ])('an unreadable comment thread (listPrComments %s) posts nothing — it cannot hide a spent round cap', (_name, listPrComments) => {
+    const provider = fakeProvider();
+    const routed = [];
+    const results = watchParkedPrConflicts({
+      repo: 'web-everything/web-everything', listPrs: () => [PR_2793], provider,
+      postFinding: (o) => routed.push(o.pr.number), listPrComments,
+    });
+    expect(results).toEqual([]);
+    expect(routed).toEqual([]);
+    expect(provider.calls).toEqual([]);
+  });
+
   it('a PR still carrying a LIVE `review:changes` bounce is left alone — a fix cycle may genuinely be in flight', () => {
     const provider = fakeProvider();
     const postFinding = vi.fn();

@@ -35,7 +35,7 @@ function flag(argv, name, fallback) {
 
 /** The part of the tree the simulator runs (`sim/world.mjs#buildWeTemplate` snapshots exactly these) — the copy
  *  and the reverse-applied fix are both narrowed to it. */
-export const RUNTIME_PATHS = Object.freeze(['scripts', 'skills-src', 'package.json', 'package-lock.json', '.gitignore', 'src/_data']);
+export const RUNTIME_PATHS = Object.freeze(['scripts', 'skills-src', 'package.json', 'package-lock.json', '.gitignore', 'src/_data', 'schemas/worker-result.v1.json']);
 
 /** Copy this tree's runtime part (tracked + untracked-not-ignored) into a fresh temp dir, git-init'd so `git apply` works. */
 export function copyTree(root = REPO_ROOT) {

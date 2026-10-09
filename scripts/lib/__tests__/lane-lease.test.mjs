@@ -632,3 +632,127 @@ describe('renewedLease — a still-working holder keeps its lane (#3383)', () =>
     expect(renewedLease(null, 'x')).toBeNull();
   });
 });
+
+// ── The lane hold rule (xbdixjc): replay fixtures — plain facts in, decision out. A second implementation of
+// "may this lane be released/reset/removed/reclaimed?" must produce the same `allowed` + `hold` for each row.
+import {
+  LANE_HOLD_RULE, BUILT_IN_LANE_HOLD_SETTINGS, LANE_HOLD_SETTING_ENV, resolveLaneHoldSettings,
+  laneHoldVerdict, laneHoldNeedsWorkState,
+} from '../lane-lease.mjs';
+
+describe('lane hold rule — replay fixtures', () => {
+  const NOW = Date.parse('2026-10-08T18:38:41Z');
+  const min = (m) => NOW - m * 60_000;
+  const facts = (extra = {}) => ({ action: 'release', byHolder: false, nowMs: NOW, awaits: [], verify: null, revision: 'r2', unpushed: false, ...extra });
+  const FIXTURES = [
+    // [name, facts, expected {allowed, hold}]
+    ['no signals: the reaper may release', facts(), { allowed: true, hold: null }],
+    ['no signals, unpushed work: the rule leaves unpushed-only lanes to the destructive-action guard', facts({ unpushed: true }), { allowed: true, hold: null }],
+    // the 2026-10-08 18:38:41Z lane-5 case: ci-heal-4453 parked on await-verify, reaper said session-gone
+    ['parked fixer (await 20 min old): reaper release refused', facts({ awaits: [{ requestedAtMs: min(20) }], unpushed: true }), { allowed: false, hold: 'awaiting-verify' }],
+    ['parked fixer: acquire reset refused', facts({ action: 'reset', awaits: [{ requestedAtMs: min(20) }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['parked fixer: stale-lease take-over refused', facts({ action: 'take-over', awaits: [{ requestedAtMs: min(1) }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['parked fixer: trim remove refused', facts({ action: 'remove', awaits: [{ requestedAtMs: min(149) }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['parked fixer: reclaim refused', facts({ action: 'reclaim', awaits: [{ requestedAtMs: min(5) }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['await past the hold window (151 min): allowed', facts({ awaits: [{ requestedAtMs: min(151) }] }), { allowed: true, hold: null }],
+    ['await with an unreadable time does not hold', facts({ awaits: [{ requestedAtMs: NaN }] }), { allowed: true, hold: null }],
+    ['the holder releases its own parked lane', facts({ byHolder: true, awaits: [{ requestedAtMs: min(5) }] }), { allowed: true, hold: null }],
+    ['the holder may not reset its lane past the rule (only release is the holder\'s)', facts({ action: 'reset', byHolder: true, awaits: [{ requestedAtMs: min(5) }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['verify running: refused', facts({ action: 'reset', verify: { state: 'running', revision: 'r1', atMs: min(10) } }), { allowed: false, hold: 'verifying' }],
+    ['verify running but abandoned past the window: allowed', facts({ verify: { state: 'running', revision: 'r2', atMs: min(200) } }), { allowed: true, hold: null }],
+    // the lane-5 17:56Z case: fix-4468's verified 4b254297, never pushed, reset by an acquire
+    ['verified commit at the lane head, unpushed: refused', facts({ action: 'reset', verify: { state: 'passed', revision: 'r2', atMs: min(4) }, unpushed: true }), { allowed: false, hold: 'verified-unpushed' }],
+    ['verified commit at the lane head, pushed: allowed', facts({ verify: { state: 'passed', revision: 'r2', atMs: min(4) }, unpushed: false }), { allowed: true, hold: null }],
+    ['verified at the head, push state unknown: refused (fail closed)', facts({ verify: { state: 'passed', revision: 'r2', atMs: min(4) }, unpushed: null }), { allowed: false, hold: 'work-state-unknown' }],
+    ['verified an OLDER commit, head unpushed: not this rule\'s hold', facts({ verify: { state: 'passed', revision: 'r1', atMs: min(4) }, unpushed: true }), { allowed: true, hold: null }],
+    ['verify failed, unpushed: not held (no verified work to strand)', facts({ verify: { state: 'failed', revision: 'r2', atMs: min(4) }, unpushed: true }), { allowed: true, hold: null }],
+    ['verified unpushed but past the window: salvage may take it', facts({ verify: { state: 'passed', revision: 'r2', atMs: min(151) }, unpushed: true }), { allowed: true, hold: null }],
+    ['unreadable verify record, unpushed: refused', facts({ verify: { state: 'unreadable', revision: null, atMs: min(1) }, unpushed: true }), { allowed: false, hold: 'verify-unreadable' }],
+    ['unreadable verify record, nothing unpushed: allowed', facts({ verify: { state: 'unreadable', revision: null, atMs: min(1) }, unpushed: false }), { allowed: true, hold: null }],
+    // A hold must END: a future-dated time (a clock-skewed writer, a corrupt or hand-edited record) has a
+    // negative age, and `age <= window` alone would keep it live forever. Small forward skew is tolerated.
+    ['await dated a year ahead: not a live hold', facts({ awaits: [{ requestedAtMs: NOW + 365 * 86_400_000 }] }), { allowed: true, hold: null }],
+    ['await dated 2 min ahead (clock skew): still held', facts({ awaits: [{ requestedAtMs: NOW + 2 * 60_000 }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['await dated 1 hour ahead: not a live hold', facts({ awaits: [{ requestedAtMs: NOW + 60 * 60_000 }] }), { allowed: true, hold: null }],
+    ['running verify dated a year ahead: not a live hold', facts({ action: 'reset', verify: { state: 'running', revision: 'r2', atMs: NOW + 365 * 86_400_000 } }), { allowed: true, hold: null }],
+    ['verified-unpushed dated a year ahead: not a live hold', facts({ verify: { state: 'passed', revision: 'r2', atMs: NOW + 365 * 86_400_000 }, unpushed: true }), { allowed: true, hold: null }],
+    ['verified record naming no commit: cannot compare, refused', facts({ verify: { state: 'passed', revision: null, atMs: min(4) }, unpushed: true }), { allowed: false, hold: 'work-state-unknown' }],
+    ['verified record, lane head unreadable: cannot compare, refused', facts({ revision: null, verify: { state: 'passed', revision: 'r2', atMs: min(4) }, unpushed: true }), { allowed: false, hold: 'work-state-unknown' }],
+    ['malformed facts: refused (never act blind)', { action: 'release' }, { allowed: false, hold: 'work-state-unknown' }],
+    ['unknown action: refused', facts({ action: 'delete-everything' }), { allowed: false, hold: 'work-state-unknown' }],
+  ];
+  it.each(FIXTURES)('%s', (_name, f, expected) => {
+    const v = laneHoldVerdict(f);
+    expect({ allowed: v.allowed, hold: v.hold }).toEqual(expected);
+    if (!v.allowed) expect(v.reason.startsWith(`${LANE_HOLD_RULE}:`)).toBe(true);
+  });
+  it.each(FIXTURES)('mode off reproduces the pre-rule behaviour (always allowed): %s', (_name, f) => {
+    expect(laneHoldVerdict(f, { ...BUILT_IN_LANE_HOLD_SETTINGS, mode: 'off' }).allowed).toBe(true);
+  });
+  // Malformed NESTED facts must fail closed too, never throw: a throw escapes the IO shell's guard as a crash,
+  // which is neither a hold nor an allow.
+  it.each([
+    ['awaits an object', { awaits: {} }],
+    ['awaits a string', { awaits: 'parked' }],
+    ['awaits a number', { awaits: 3 }],
+    ['awaits a boolean', { awaits: true }],
+    ['verify an array', { verify: [] }],
+    ['verify a string', { verify: 'green' }],
+    ['verify a number', { verify: 7 }],
+    ['an awaits entry null', { awaits: [null] }],
+    ['an awaits entry a string', { awaits: ['x'] }],
+    ['an awaits entry an array', { awaits: [[]] }],
+    ['verify with no state', { verify: {} }],
+    ['verify with a state nobody writes', { verify: { state: 'bogus', atMs: NOW } }],
+  ])('malformed nested facts (%s) return work-state-unknown without throwing', (_label, over) => {
+    let v;
+    expect(() => { v = laneHoldVerdict(facts(over)); }).not.toThrow();
+    expect({ allowed: v.allowed, hold: v.hold }).toEqual({ allowed: false, hold: 'work-state-unknown' });
+    expect(() => laneHoldNeedsWorkState(facts(over))).not.toThrow();
+  });
+  it('the exact shape the reviewer named (awaits {} with nowMs 0) is refused, not thrown', () => {
+    expect(laneHoldVerdict({ action: 'release', nowMs: 0, awaits: {} })).toMatchObject({ allowed: false, hold: 'work-state-unknown' });
+  });
+  it('absent awaits / verify (null or undefined) are an ordinary empty lane, not malformed', () => {
+    expect(laneHoldVerdict(facts({ awaits: undefined, verify: undefined }))).toMatchObject({ allowed: true });
+    expect(laneHoldVerdict(facts({ awaits: null, verify: null }))).toMatchObject({ allowed: true });
+  });
+  it('the holder releasing its own lane is still allowed whatever the nested facts say', () => {
+    expect(laneHoldVerdict(facts({ byHolder: true, awaits: {} }))).toMatchObject({ allowed: true });
+  });
+  it('holdMinutes is the window for every signal', () => {
+    const f = facts({ awaits: [{ requestedAtMs: min(31) }] });
+    expect(laneHoldVerdict(f, { ...BUILT_IN_LANE_HOLD_SETTINGS, holdMinutes: 30 }).allowed).toBe(true);
+    expect(laneHoldVerdict(f, { ...BUILT_IN_LANE_HOLD_SETTINGS, holdMinutes: 60 }).allowed).toBe(false);
+  });
+  it('the rule never mentions a git, GitHub or label string in its facts or decisions', () => {
+    const src = laneHoldVerdict.toString() + laneHoldNeedsWorkState.toString();
+    expect(src).not.toMatch(/\bgit\b|github|\bgh\b|label|origin\/|\.lane-|\.fix-/i);
+  });
+  it('asks for the work state only when the answer depends on it', () => {
+    expect(laneHoldNeedsWorkState(facts())).toBe(false);
+    expect(laneHoldNeedsWorkState(facts({ awaits: [{ requestedAtMs: min(1) }] }))).toBe(false);
+    expect(laneHoldNeedsWorkState(facts({ verify: { state: 'running', atMs: min(1) } }))).toBe(false);
+    expect(laneHoldNeedsWorkState(facts({ verify: { state: 'passed', revision: 'r2', atMs: min(1) } }))).toBe(true);
+    expect(laneHoldNeedsWorkState(facts({ verify: { state: 'passed', revision: 'r1', atMs: min(1) } }))).toBe(false);
+    expect(laneHoldNeedsWorkState(facts({ verify: { state: 'unreadable', atMs: min(1) } }))).toBe(true);
+    expect(laneHoldNeedsWorkState(facts({ byHolder: true, verify: { state: 'unreadable', atMs: min(1) } }))).toBe(false);
+  });
+});
+
+describe('lane hold settings', () => {
+  it('declares built-ins, one env key per setting, and the off values', () => {
+    expect(BUILT_IN_LANE_HOLD_SETTINGS).toEqual({ mode: 'enforce', holdMinutes: 150, aheadEquivalence: 'every' });
+    expect(Object.keys(LANE_HOLD_SETTING_ENV).sort()).toEqual(Object.keys(BUILT_IN_LANE_HOLD_SETTINGS).sort());
+    expect(resolveLaneHoldSettings({ env: { WE_LANE_HOLD: 'off', WE_LANE_AHEAD_EQUIVALENCE: 'any' } }))
+      .toEqual({ mode: 'off', holdMinutes: 150, aheadEquivalence: 'any' });
+  });
+  it('a malformed value keeps the built-in, never a looser one', () => {
+    expect(resolveLaneHoldSettings({ env: { WE_LANE_HOLD: 'maybe', WE_LANE_HOLD_MINUTES: '-3', WE_LANE_AHEAD_EQUIVALENCE: 'some' } }))
+      .toEqual(BUILT_IN_LANE_HOLD_SETTINGS);
+    expect(resolveLaneHoldSettings({ raw: { holdMinutes: 'x', mode: 'off' } })).toEqual({ ...BUILT_IN_LANE_HOLD_SETTINGS, mode: 'off' });
+  });
+  it('env wins over a settings object', () => {
+    expect(resolveLaneHoldSettings({ raw: { holdMinutes: 60 }, env: { WE_LANE_HOLD_MINUTES: '90' } }).holdMinutes).toBe(90);
+  });
+});
