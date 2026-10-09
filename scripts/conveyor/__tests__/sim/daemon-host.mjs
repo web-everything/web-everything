@@ -88,7 +88,14 @@ async function bootInProcess(modulePath) {
     withGithubAppAuth(daemonModule.buildCliDaemonEffects({ owner: `sim-${KIND}`, log }), { log }),
     // #4044: `entries` = the daemon's own script, exactly what `process.argv[1]` is in production (here argv[1]
     // is this host), so the restart gate walks the real daemon's import closure.
-    { root: SIM_CLONE, onRestart, hasStaleRefusal: daemonModule.hasStaleMainRefusal, log, entries: [join(SIM_CLONE, modulePath)] },
+    // x44lnnt: pin the INLINE rebuild path (`background: null`) — the shipped settings file turns background builds
+    // on for the fix-dispatch daemon, which skips the same-tick stale-main restart (I-18) these scenarios assert,
+    // and its tick-progress store would write real daemon state. A no-op store keeps the host hermetic.
+    {
+      root: SIM_CLONE, onRestart, hasStaleRefusal: daemonModule.hasStaleMainRefusal, log, entries: [join(SIM_CLONE, modulePath)],
+      background: null,
+      tickProgress: { read: () => null, markSeen() {}, markTickDone() {}, alert() {} },
+    },
   );
 
   let tickCount = 0;
