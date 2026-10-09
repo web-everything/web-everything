@@ -1308,20 +1308,35 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const diagnosisRuns = new Map();
   const diagnoseDeadline = started + (config.tickBudgetMs ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs) * 1.5;
   const deferredDiagnoses = [];
-  for (const p of result.plan.filter((x) => x.kind === 'diagnose')) {
+  // A diagnosis the budget deferred leaves `diagnosisDeferredAt` on its episode (state.json). The planner only
+  // asks for a diagnosis on an open/flapping transition, so without this the skipped work would never be asked
+  // for again. Carried-over deferrals run first, oldest first, so a slow tick cannot starve them.
+  const smellById = Object.fromEntries((deps.smells || SMELLS).map((s) => [s.id, s]));
+  const planned = new Set(result.plan.filter((x) => x.kind === 'diagnose').map((x) => x.key));
+  const carriedDiagnoses = Object.values(state.episodes)
+    .filter((e) => Number.isFinite(e.diagnosisDeferredAt) && (e.status === 'open' || e.status === 'flapping')
+      && !planned.has(e.key) && smellById[e.smell]?.diagnose)
+    .sort((a, b) => a.diagnosisDeferredAt - b.diagnosisDeferredAt)
+    .map((e) => ({ kind: 'diagnose', key: e.key, diagnose: smellById[e.smell].diagnose }));
+  for (const p of [...carriedDiagnoses, ...result.plan.filter((x) => x.kind === 'diagnose')]) {
     const ep = state.episodes[p.key];
     if (!ep || flags['no-diagnose']) continue;
     const { command, args = [], timeoutMs = CHILD_TIMEOUT_MS } = p.diagnose;
     const commandLine = [command, ...args].join(' ');
     let d = diagnosisRuns.get(commandLine);
     if (!d) {
-      if ((deps.clock || Date.now)() > diagnoseDeadline) { deferredDiagnoses.push(p.key); continue; }
+      if ((deps.clock || Date.now)() > diagnoseDeadline) {
+        deferredDiagnoses.push(p.key);
+        ep.diagnosisDeferredAt ??= now; // keeps the first deferral time across ticks
+        continue;
+      }
       try { d = { command: commandLine, code: 0, output: (deps.runDiagnosis || run)(command, args, { timeoutMs }) }; }
       catch (e) { d = { command: commandLine, code: e?.status ?? null, timedOut: e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM', output: `${e?.stdout || ''}${e?.stderr || ''}` || String(e?.message || e) }; }
       d.output = scrubText(summarizeDiagnosisOutput(d.output)); // scrubbed at capture: every persisted copy is redacted
       diagnosisRuns.set(commandLine, d);
     }
     ep.diagnosis = { ...d };
+    delete ep.diagnosisDeferredAt;
     diagnoses.push({ key: p.key, command: d.command, code: d.code });
   }
   if (deferredDiagnoses.length) probeErrors.diagnoseDeferred = `${deferredDiagnoses.length} diagnosis(es) skipped past the tick budget: ${deferredDiagnoses.slice(0, 5).join(', ')}`;

@@ -260,4 +260,27 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(past.diagnoses).toHaveLength(0);
     expect(past.probeErrors.diagnoseDeferred).toMatch(/^3 diagnosis\(es\) skipped past the tick budget/);
   }, 30000);
+
+  it('retries budget-deferred diagnoses on the next tick, without another episode transition', async () => {
+    const smell = {
+      id: 'fake-retry', probes: ['machineLoad'], severity: 'medium', openAfter: 1, diagnose: { command: 'node', args: ['-e', 'retry'] },
+      evaluate: () => ['a', 'b'].map((x) => ({ subject: x, breach: true, measure: {}, summary: `s ${x}`, recommendation: 'r' })),
+    };
+    const { flags } = setup('diag-retry', { ghProbes: false });
+    const base = { ...flags, 'no-gh': true, 'no-diagnose': false };
+    const calls = [];
+    const runDiagnosis = (c, a) => { calls.push(a.join(' ')); return 'ok'; };
+    // Tick 1: the budget is already spent, so the episodes open undiagnosed and the deferral is remembered.
+    const first = await tick({ ...base, now: '2026-10-09T12:00:00Z' }, { smells: [smell], runDiagnosis, clock: () => Date.now() + 10 * 60_000 });
+    expect(calls).toHaveLength(0);
+    expect(first.probeErrors.diagnoseDeferred).toMatch(/^2 diagnosis\(es\)/);
+    // Tick 2: nothing transitions (both episodes stay open), yet the deferred diagnosis runs once and is recorded.
+    const second = await tick({ ...base, now: '2026-10-09T12:05:00Z' }, { smells: [smell], runDiagnosis });
+    expect(calls).toEqual(['-e retry']);
+    expect(second.diagnoses.map((d) => d.key).sort()).toHaveLength(2);
+    expect(second.probeErrors.diagnoseDeferred).toBeUndefined();
+    // Tick 3: the deferral is cleared, so it is not asked for again.
+    await tick({ ...base, now: '2026-10-09T12:10:00Z' }, { smells: [smell], runDiagnosis });
+    expect(calls).toEqual(['-e retry']);
+  }, 30000);
 });
