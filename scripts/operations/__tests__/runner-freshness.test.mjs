@@ -94,6 +94,7 @@ describe('runner freshness policy', () => {
         "record-verdict",
         "resolve",
         "restart-runner",
+        "revert-red-check",
         "review-pr",
         "review-prep",
         "review-seat-caps",
