@@ -336,6 +336,26 @@ describe('ignoredRulings — an older-head block the current-head reviewer ruled
     const unruled = ignoredRulings({ headRefOid: H2, comments: [comment(r1, 1), autoBlock(r1, 3), comment(record({ head: H2, runId: 'run-2' }), 10)] });
     expect(unruled?.matches).toHaveLength(1);
     expect(unruled.matches[0].source).toBe('structured');
+    // auto-policy blocks it AGAIN on the current head: no person looked, so it still came back (plateau-app #217)
+    const r2 = record({ head: H2, runId: 'run-2' });
+    const reblocked = ignoredRulings({ headRefOid: H2, comments: [comment(r1, 1), autoBlock(r1, 3), comment(r2, 10), autoBlock(r2, 12)] });
+    expect(reblocked?.matches).toHaveLength(1);
+    expect(reblocked.misses).toBe(1);
+  });
+  it('an OPERATOR block on the current head is them looking at it: settled, not came back (control)', () => {
+    const r1 = record({ head: H1, runId: 'run-1' });
+    const r2 = record({ head: H2, runId: 'run-2' });
+    const operatorBlock = { author: { login: 'chalbert' }, createdAt: t(12),
+      body: buildOperatorRulingComment({ version: 1, repo, pr: r2.pr, head: H2, actor: 'chalbert', channel: 'review cli',
+        reason: 'still blocked', at: t(12), clearerId: '', rulings: [{ runId: 'run-2', key: r2.referrals[0].key, result: 'block' }] }) };
+    expect(ignoredRulings({ headRefOid: H2, comments: [comment(r1, 1), autoBlock(r1, 3), comment(r2, 10), operatorBlock] })).toBeNull();
+  });
+  it('replay plateau-app #217 @dfa0b5c7: an auto-block re-raised on the fix head reaches the ladder instead of an endless fixer loop', () => {
+    const fx = fixture('pr-pa217-dfa0b5c7-auto-block-came-back.json');
+    const ig = ignoredRulings({ number: fx.pr, headRefOid: fx.headRefOid, body: fx.body, createdAt: fx.createdAt, comments: fx.comments });
+    expect(ig?.matches).toHaveLength(1);
+    expect(ig.matches[0].finding.file).toBe('src/wip/glance/glance-mount.ts');
+    expect(ig.misses).toBe(1);
   });
   it('a record block is satisfied by a later head\'s reviewer not-real carried onto the current head', () => {
     const r2 = record({ head: H2, runId: 'run-2', rulings: [fixed] });
