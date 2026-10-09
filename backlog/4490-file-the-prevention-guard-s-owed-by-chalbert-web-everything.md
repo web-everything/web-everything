@@ -26,7 +26,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 ## Progress
 
-- Premise check (2026-10-09, `main` d94901c): goal NOT delivered. `git log` shows only the filing commit (c6383dfa2) and its JIT renumber xt4jynt→#4490; no `runGitGrepGate` exists anywhere under the scripts tree.
+- Premise check (2026-10-09, `main` d94901c): goal NOT delivered. `git log` shows only the filing commit (c6383dfa2) and its JIT renumber 4490→#4490; no `runGitGrepGate` exists anywhere under the scripts tree.
 - Drift corrected: the card's cites `we:scripts/check-standards.mjs:1783` and `we:scripts/lib/citation-check.mjs:173` moved. Current sites: raw `git grep` + exit-code handling at `we:scripts/check-standards.mjs:230` (`gitGrep`, swallows every error), `we:scripts/check-standards.mjs:288` (`scopedGrepLines`, status 1 → `[]`, else `null`), `we:scripts/check-standards.mjs:1827` (gate 6f-ii-c, catch-all swallow), `we:scripts/check-standards.mjs:1892` (gate 6f-ii-d, status≠1 → emit4 scan-error). Second guard: `buildBacklogResolvableIds` at `we:scripts/lib/citation-check.mjs:173` area (`String(b.num)`).
 - Scope corrected: old scope named `we:scripts/__tests__/check-standards.test.mjs` and a non-existent `we:scripts/lib/__tests__/citation-check.test.mjs`. Real citation tests live in `we:scripts/__tests__/citation-check.test.mjs`; lib module tests live under `we:scripts/lib/__tests__/` (vitest only collects `we:scripts/**/__tests__/**/*.test.mjs`; a test placed beside its module is not run). New helper + its test (`we:scripts/lib/__tests__/git-grep-gate.test.mjs`) added to scope; `we:scripts/__tests__/check-standards.test.mjs` stays in scope for the gate-wiring test. size unchanged (3).
 
