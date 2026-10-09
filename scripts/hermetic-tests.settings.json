@@ -31,6 +31,11 @@
       "BUN_INSTALL": "~/.bun"
     }
   },
+  "fixtureRootEnv": {
+    "$comment": "Roots NOT derived from the home (the lane pool and telemetry dir are found from the checkout's own location, so a test run inside a lane would otherwise read its sibling lanes). Hermetic runs point each at a private, empty per-file dir unless the launcher already set it.",
+    "LANE_POOL_ROOT": "lanes",
+    "OPERATION_TELEMETRY_DIR": "telemetry"
+  },
   "ambientRootEnv": ["CONVEYOR_STATE_ROOT", "WE_DAEMON_STATE_DIR", "LANE_POOL_ROOT", "WE_COORDINATION_ROOT", "WE_GH_THROTTLE_LOCK_ROOT"],
   "siblingRepos": ["frontierui", "plateau-app"],
   "primaryCheckout": "~/workspace/webeverything",

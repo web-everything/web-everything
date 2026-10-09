@@ -80,6 +80,11 @@ const GIT_CASES = [
   [['show', 'HEAD:backlog/x.md'], null],
   [['-c', 'origin/main=1', 'status'], null],
   [['commit', '-m', 'fix'], null],
+  [['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], null],
+  [['ls-remote', '--heads', '/tmp/fixture/origin.git'], null],
+  [['ls-remote', 'git@example.invalid:o/r.git'], null],
+  [['ls-remote', 'https://github.com/o/r.git'], 'ls-remote'],
+  [['fetch', '--quiet', '--end-of-options', 'origin', '+main:refs/remotes/origin/main'], '+main:refs/remotes/origin/main'],
 ];
 
 describe('git remote-read classification', () => {

@@ -62,7 +62,7 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
   const reportFile = ambient[REPORT_FILE_ENV];
   const inProcess = [];
   const state = {
-    ctx, enforce, enabled: true,
+    ctx, enforce, enabled: true, settings,
     onViolation: (v) => inProcess.push({ ...v, testId: process.env[TEST_ID_ENV] || 'outside-a-test' }),
     testName: () => process.env[TEST_NAME_ENV],
   };

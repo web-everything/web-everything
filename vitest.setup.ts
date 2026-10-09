@@ -36,10 +36,11 @@ function lazyRoot(name: string): string {
   return join(fileTmpBase, name);
 }
 const ownedTmpDirs: string[] = [];
+const fixtureRootKeys: string[] = [];
 let addedPathPrefix: string | undefined;
 afterAll(() => {
   if (fileTmpBase && existsSync(fileTmpBase)) rmSync(fileTmpBase, { recursive: true, force: true });
-  for (const key of ['WE_COORDINATION_ROOT', 'WE_GH_THROTTLE_LOCK_ROOT', 'WE_DAEMON_STATE_DIR']) {
+  for (const key of ['WE_COORDINATION_ROOT', 'WE_GH_THROTTLE_LOCK_ROOT', 'WE_DAEMON_STATE_DIR', ...fixtureRootKeys.splice(0)]) {
     const v = process.env[key];
     if (fileTmpBase && v && v.startsWith(`${fileTmpBase}/`)) delete process.env[key];
   }
@@ -117,7 +118,13 @@ if (hermetic) {
   }
   addedPathPrefix = fakeGhDir;
   process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
-  setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home') });
+  const hermeticSettings = setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home') }).settings;
+  // Roots found from the checkout's location rather than the home (lane pool, telemetry): a private per-file dir.
+  for (const [key, name] of Object.entries(hermeticSettings.fixtureRootEnv || {})) {
+    if (key.startsWith('$') || process.env[key] !== undefined) continue;
+    process.env[key] = lazyRoot(String(name));
+    fixtureRootKeys.push(key);
+  }
 }
 
 process.env.WE_UNDER_TEST = '1';

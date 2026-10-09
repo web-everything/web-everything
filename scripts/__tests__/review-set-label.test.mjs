@@ -11,7 +11,8 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, readdirSync, existsSync, realpathSync, symlinkSync, copyFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
+const OUTSIDE_EVERY_ROOT = '/etc';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -3040,8 +3041,10 @@ describe('checkBodyFileLocation (#2897)', () => {
 
   // THE GUARD IS INTACT. This is the direction that matters: the check exists to stop the CLI publishing
   // whatever a stale shell variable happened to point at.
+  // `/etc` stands in for "a real directory outside every root" (the home used to, but hermetic test runs give each
+  // file a private HOME under the temp dir, which IS a root — card xcu4cqf).
   it('still refuses a path outside every root', () => {
-    for (const p of [join(homedir(), '.ssh', 'config'), '/etc/passwd', join(homedir(), 'notes.md')]) {
+    for (const p of [join(OUTSIDE_EVERY_ROOT, '.ssh', 'config'), '/etc/passwd', join(OUTSIDE_EVERY_ROOT, 'notes.md')]) {
       expect(checkBodyFileLocation(p, bodyFileRoots()).ok).toBe(false);
     }
   });
@@ -3055,8 +3058,8 @@ describe('checkBodyFileLocation (#2897)', () => {
       expect(checkBodyFileLocation(join(link, 'v.md'), bodyFileRoots()).ok).toBe(true);
       // …and a symlink pointing OUT of the allowlist is still refused, which is the half that matters.
       const escape = join(TMP, `bodyfile-escape-${process.pid}`);
-      symlinkSync(homedir(), escape);
-      expect(checkBodyFileLocation(join(escape, '.ssh', 'config'), bodyFileRoots()).ok).toBe(false);
+      symlinkSync(OUTSIDE_EVERY_ROOT, escape);
+      expect(checkBodyFileLocation(join(escape, 'passwd'), bodyFileRoots()).ok).toBe(false);
       rmSync(escape, { force: true });
     } finally {
       rmSync(link, { force: true });
@@ -3099,7 +3102,7 @@ describe('checkBodyFileLocation (#2897)', () => {
 
   it('still refuses a nonexistent path OUTSIDE every root — resolving the ancestor is not a loophole', () => {
     expect(checkBodyFileLocation('/nowhere/at/all/verdict.md', bodyFileRoots()).ok).toBe(false);
-    expect(checkBodyFileLocation(join(homedir(), 'no-such-dir', 'v.md'), bodyFileRoots()).ok).toBe(false);
+    expect(checkBodyFileLocation(join(OUTSIDE_EVERY_ROOT, 'no-such-dir', 'v.md'), bodyFileRoots()).ok).toBe(false);
   });
 
   // A root that does not resolve is dropped rather than compared as written, so a platform without `/tmp`

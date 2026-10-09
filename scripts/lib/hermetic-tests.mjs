@@ -179,7 +179,7 @@ const REMOTE_REF = /(?:^|[^\w-])origin\/|^refs\/remotes\/|^FETCH_HEAD$|@\{(?:u|u
  * whether the cwd is a real checkout ({@link gitShimScript} mirrors this exact rule in sh; a test pins parity).
  */
 export function classifyGitArgs(args) {
-  let sub = null; let hit = null;
+  let sub = null; let hit = null; let remote;
   for (let i = 0; i < args.length; i += 1) {
     const a = String(args[i]);
     if (sub === null) {
@@ -187,10 +187,20 @@ export function classifyGitArgs(args) {
       if (a.startsWith('-')) continue;
       sub = a; continue;
     }
+    if (remote === undefined && !a.startsWith('-')) remote = a;
     if (!hit && REMOTE_REF.test(a)) hit = a;
   }
-  if (sub && REMOTE_SUBCOMMANDS.has(sub)) hit = hit || sub;
+  // `symbolic-ref refs/remotes/origin/HEAD` names the default BRANCH, not remote content: stable, not live.
+  if (sub === 'symbolic-ref') return null;
+  // A network verb is live when it talks to the real remote: `origin`, no remote at all (= origin), or GitHub.
+  // `git ls-remote /tmp/fixture/origin.git` (a test's own bare repo) is not.
+  if (sub && REMOTE_SUBCOMMANDS.has(sub) && isLiveRemote(remote)) hit = hit || sub;
   return hit ? { subcommand: sub, hit } : null;
+}
+
+/** Is a fetch/push/ls-remote target the real remote? Pure. Absent → the default remote, which is live. */
+export function isLiveRemote(remote) {
+  return remote === undefined || remote === 'origin' || /github\.com/i.test(remote);
 }
 
 /**
@@ -290,7 +300,7 @@ export function gitShimScript({ realGit }) {
 _we_real=${shQuote(realGit)}
 if [ "\${${HERMETIC_ENV}:-1}" = "0" ] || [ -z "\${${REAL_REPOS_ENV}:-}" ]; then exec "$_we_real" "$@"; fi
 ${SH_RECORD('git')}
-_we_sub=""; _we_hit=""; _we_dir="."; _we_next=""; _we_explicit="\${GIT_DIR:-}"
+_we_sub=""; _we_hit=""; _we_pos1=""; _we_pos1_set=""; _we_dir="."; _we_next=""; _we_explicit="\${GIT_DIR:-}"
 for _we_a in "$@"; do
   if [ -n "$_we_next" ]; then
     case "$_we_next" in
@@ -309,13 +319,20 @@ for _we_a in "$@"; do
       *) _we_sub="$_we_a"; continue;;
     esac
   fi
+  if [ -z "$_we_pos1_set" ]; then case "$_we_a" in -*) ;; *) _we_pos1="$_we_a"; _we_pos1_set=1;; esac; fi
   if [ -z "$_we_hit" ]; then
     case "$_we_a" in
       origin/*|*[!a-zA-Z0-9_-]origin/*|refs/remotes/*|FETCH_HEAD|*@{u}*|*@{upstream}*|*@{push}*) _we_hit="$_we_a";;
     esac
   fi
 done
-case "$_we_sub" in fetch|pull|push|ls-remote) [ -z "$_we_hit" ] && _we_hit="$_we_sub";; esac
+[ "$_we_sub" = "symbolic-ref" ] && _we_hit=""
+case "$_we_sub" in fetch|pull|push|ls-remote)
+  _we_live=""
+  if [ -z "$_we_pos1_set" ] || [ "$_we_pos1" = "origin" ]; then _we_live=1; fi
+  case "$_we_pos1" in *github.com*|*GITHUB.COM*|*GitHub.com*) _we_live=1;; esac
+  [ -n "$_we_live" ] && [ -z "$_we_hit" ] && _we_hit="$_we_sub";;
+esac
 if [ -n "$_we_hit" ]; then
   [ -n "$_we_explicit" ] && _we_dir="$_we_explicit"
   _we_abs=$(cd "$_we_dir" 2>/dev/null && pwd -P)
