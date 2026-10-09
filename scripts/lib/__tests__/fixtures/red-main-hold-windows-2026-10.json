@@ -1,0 +1,39 @@
+{
+  "source": "drain daemon log /Users/nicolasgilbert/workspace/plateau-app/.drain-daemon/daemon.log ('pass at … merged N (#…)' lines) + live coordination records main-ci-red-state.json / main-red-priority.json read 2026-10-09T14:11Z",
+  "windows": [
+    {
+      "name": "2026-10-09 01:03Z manual freeze (held items 164/166) — fix PR #4532",
+      "manualFreeze": { "frozen": true, "at": "2026-10-09T01:03:00Z", "reason": "raised by hand per operator", "mergeSha": null },
+      "manualFreezeFrom": "2026-10-09T01:03:00Z",
+      "manualFreezeUntil": "2026-10-09T01:53:00Z",
+      "priority": { "repo": "we", "pr": 4532, "prs": [4532], "reason": "owns the red-main fix" },
+      "landed": [
+        { "num": 4524, "at": "2026-10-09T00:40:04Z" },
+        { "num": 4537, "at": "2026-10-09T01:21:40Z" },
+        { "num": 4539, "at": "2026-10-09T01:24:12Z" },
+        { "num": 4532, "at": "2026-10-09T01:51:39Z" },
+        { "num": 4540, "at": "2026-10-09T03:07:32Z" }
+      ],
+      "expect": { "held": [4537, 4539], "fix": [4532], "free": [4524, 4540] }
+    },
+    {
+      "name": "2026-10-09 main red at 7e5137663 (published by the health watch) — fix PR #4617",
+      "mainRedState": { "red": true, "firstRedSha": "7e51376635bbb571dfc596f1986960bf35a03fd6", "since": "2026-10-09T13:06:06Z" },
+      "priority": { "repo": "we", "pr": 4617, "prs": [4617], "firstRedSha": "7e51376635bbb571dfc596f1986960bf35a03fd6", "reason": "owns the red-main fix" },
+      "landed": [
+        { "num": 4478, "at": "2026-10-09T13:02:40Z" },
+        { "num": 4560, "at": "2026-10-09T13:05:08Z" },
+        { "num": 4563, "at": "2026-10-09T13:18:48Z" },
+        { "num": 4604, "at": "2026-10-09T13:35:01Z" },
+        { "num": 4615, "at": "2026-10-09T13:35:01Z" },
+        { "num": 4603, "at": "2026-10-09T13:46:00Z" },
+        { "num": 4618, "at": "2026-10-09T13:46:00Z" },
+        { "num": 4606, "at": "2026-10-09T13:47:58Z" },
+        { "num": 4616, "at": "2026-10-09T13:50:32Z" },
+        { "num": 4613, "at": "2026-10-09T13:57:29Z" },
+        { "num": 4617, "at": "2026-10-09T14:20:00Z" }
+      ],
+      "expect": { "held": [4563, 4604, 4615, 4603, 4618, 4606, 4616, 4613], "fix": [4617], "free": [4478, 4560] }
+    }
+  ]
+}

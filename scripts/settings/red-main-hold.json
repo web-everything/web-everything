@@ -1,0 +1,4 @@
+{
+  "$comment": "Platform preference (card x5wnfcg): while main's CI is red the drain lands only the P0 main-fix PR(s); every other local PR is held with reason red-main-hold. on | off. Tool override: env WE_DRAIN_RED_MAIN_HOLD. See scripts/lib/red-main-hold.mjs.",
+  "redMainHold": "on"
+}

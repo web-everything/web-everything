@@ -39,6 +39,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, rmSync 
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..'); // scripts/readiness → repo root
@@ -46,7 +47,22 @@ const ROOT = resolve(HERE, '..', '..'); // scripts/readiness → repo root
 /** The durable dispatch-freeze marker: a GITIGNORED `.conveyor/` sidecar (the same convention as the #2680
  *  dispatch log / #2659 infra-blocked state). Present ⇒ the line is STOPPED; absent ⇒ dispatch is clear.
  *  Env-overridable so a drain-only session (or a test) can point at a specific copy. */
-export const FREEZE_MARKER_PATH = process.env.WE_RED_MAIN_FREEZE || join(ROOT, '.conveyor', 'red-main-freeze.json');
+export const FREEZE_MARKER_PATH = resolveFreezeMarkerPath();
+
+/**
+ * ONE well-defined freeze source (2026-10-09, held items 164/166). The marker used to live in `<ROOT>/.conveyor/`,
+ * where ROOT is the clone the script is imported FROM — and the drain daemon flips its pass code root between the
+ * data clone (`we-drain-daemon/lane-1`, no overlays) and the code clone (`we-drain-daemon/code`, overlays). A freeze
+ * raised from the code clone on 2026-10-09 01:03Z was invisible to passes running from lane-1, so #4537/#4539/#4532
+ * merged through it. The marker now lives in the host's coordination root (the same root as the safety net's
+ * published `main-ci-red-state.json`), whatever clone writes or reads it. `WE_RED_MAIN_FREEZE` still overrides;
+ * inside a test run the per-clone path is kept so a test can never read or write the live marker.
+ */
+export function resolveFreezeMarkerPath(env = process.env) {
+  if (env.WE_RED_MAIN_FREEZE) return env.WE_RED_MAIN_FREEZE;
+  if (env.VITEST || env.WE_UNDER_TEST) return join(ROOT, '.conveyor', 'red-main-freeze.json');
+  return join(resolveCoordinationRoot({ env }), 'red-main-freeze.json');
+}
 
 /**
  * A one-line spec of the remediation, for logs / operator surfaces. Keeping the spec ADJACENT to the mechanism
@@ -182,7 +198,7 @@ function runCli(argv) {
     unfreezeDispatch();
     writeAllSync(1, JSON.stringify({ frozen: false }, null, 2) + '\n');
   } else if (cmd === 'status') {
-    writeAllSync(1, JSON.stringify({ frozen: isDispatchFrozen(), marker: readFreeze() }, null, 2) + '\n');
+    writeAllSync(1, JSON.stringify({ frozen: isDispatchFrozen(), path: FREEZE_MARKER_PATH, marker: readFreeze() }, null, 2) + '\n');
   } else if (cmd === 'decide') {
     const d = decidePostLand({ trigger: flags.trigger, ref: flags.ref, result: flags.result, mergeSha: flags['merge-sha'] });
     writeAllSync(1, JSON.stringify(d, null, 2) + '\n');

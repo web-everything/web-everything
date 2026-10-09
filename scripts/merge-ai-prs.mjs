@@ -190,7 +190,8 @@ import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
-import { readMainRedPriority } from './lib/main-red-priority.mjs';
+import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
+import { resolveRedMainHoldSetting, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -5373,6 +5374,27 @@ async function runCli() {
   // land while the carrier sat parked (R5). The join mutates `verdicts` in place (stamping `coupleDefer`); the
   // cascade below re-orders those same stamped verdicts. This is runCli's SINGLE plan producer (R4) — the
   // `replan` closure below only re-orders across merges, it never re-derives the join wiring.
+  // ── red-main-hold — the "contain" third of the red-main safety net ─────────────────────────────────────────
+  // While main's CI is red (the health watch's published record, its fix-owner priority record, or the manual
+  // freeze marker), only the published main-fix PR(s) may land; every other local PR becomes `skip` with reason
+  // `red-main-hold`. Applied AFTER every other decision and BEFORE the couple join, so it only ever ADDS a hold
+  // (a fix PR still passes every gate above) and a held WE carrier defers its impl half the usual way. Lifts by
+  // itself when main is green (the health watch removes its record; both records also expire on their TTL).
+  {
+    const holdSetting = resolveRedMainHoldSetting();
+    if (!redMainBypass && holdSetting.value === 'on') {
+      const sig = redMainSignal({ mainRedState: readMainRedState(), priority: readMainRedPriority(), manualFreeze: readFreeze(), now: Date.now() });
+      if (sig.red) {
+        let held = 0;
+        for (const v of verdicts) {
+          if (v.decision !== 'merge') continue;
+          const d = decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: holdSetting.value });
+          if (d.hold) { v.decision = 'skip'; v.reason = d.reason; v.redMainHold = true; held++; }
+        }
+        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
+      }
+    }
+  }
   const candidateHeldByKey = new Map();
   for (const v of verdicts) candidateHeldByKey.set(`${v.repo || 'cwd'}::${v.num}`, v.decision !== 'merge');
   // #4308 — one overlap-yield computation per planLabelDrain/replan CALL (never hoisted out of the cascade):
@@ -5455,7 +5477,9 @@ async function runCli() {
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
     for (const v of skipped) {
-      if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed) continue;
+      // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
+      // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).
+      if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed || v.redMainHold) continue;
       if (!(v.certifyLabel || v.aiGenerated)) continue;
       // xnsk54v follow-up — mirror the park path: record the acted-on manifest values into the durable skip
       // comment for a manifest-carrying PR (tamper-evidence), leaving orphan/impl skip comments unchanged.
@@ -6220,8 +6244,11 @@ async function runCli() {
   // Consulted BEFORE the one-shot land AND at the top of every WATCH pass (a freeze can be raised MID-watch, so
   // like the dup-id stop below it must be re-checked each pass — reading `redMainFreezeStop()` per pass).
   const redMainBypass = !!flags['no-red-main-freeze'] || process.env.WE_MERGE_BREAK_GLASS === '1';
+  // red-main-hold (contain): with the hold ON, a manual freeze no longer stops the whole line — it feeds the
+  // per-PR hold in `sweepOnce`, which still holds EVERY PR except the published main-fix PR(s). OFF = the old stop.
   const redMainFreezeStop = () => {
     if (redMainBypass || !isDispatchFrozen()) return null;
+    if (resolveRedMainHoldSetting().value === 'on') return null;
     const fr = readFreeze();
     return {
       marker: fr,
