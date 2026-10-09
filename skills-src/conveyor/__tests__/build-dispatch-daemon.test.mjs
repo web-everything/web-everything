@@ -1754,6 +1754,44 @@ describe('automatic item preparation', () => {
     expect(effects.dispatch.mock.calls.length).toBeGreaterThan(0);
     expect(effects.dispatch.mock.calls.every(([r]) => r.prepareFallback === false)).toBe(true);
   });
+  // Live 2026-10-09 16:47–18:28Z — the ONE detached launch per tick (78b) always went to a build first, and a build
+  // was planned on every tick its predecessor settled: prepare.planned had 6 items with 6 free slots for 13 ticks,
+  // prepare.launched stayed [], and no prepare PR opened. The slot now alternates when both kinds want it.
+  describe('the one detached-launch slot is shared between builds and prepares', () => {
+    function shared(settledKind, { prepareHeld = false } = {}) {
+      const effects = fixture();
+      effects.dispatch = vi.fn(() => ({ dispatching: true, pending: true }));
+      const preparePlan = effects.planTick;
+      effects.planTick = (bk) => {
+        const out = preparePlan(bk);
+        out.decisions.spawnBuilds = [{ num: '4503', lane: 3 }];
+        out.decisions.admission = { queue: [{ num: '4503', scope: ['we:scripts/example.mjs'] }] };
+        return out;
+      };
+      effects.acquireClaim = vi.fn(() => ({ ok: true }));
+      effects.releaseClaim = vi.fn();
+      effects.settleLaunches = () => ({ pending: [], settled: settledKind
+        ? [{ num: '4490', kind: settledKind, outcome: { dispatching: true } }] : [] });
+      if (prepareHeld) effects.listHolds = () => ['4501', '4502'].map((num) => ({ num, reason: 'prepare-unstamped' }));
+      if (prepareHeld) effects.readPrepareStatus = () => ({ preparedDate: null, hasSections: false });
+      return runBuildDispatchTick({ live: true, effects });
+    }
+    it('gives the slot to a planned prepare when the last settled launch was a build', async () => {
+      const tick = await shared('build');
+      expect(tick.prepare.launched.map((s) => s.num)).toEqual(['4501']);
+      expect(tick.dispatched).toEqual([]);
+    });
+    it('gives the slot to the build when the last settled launch was a prepare (no prepare monopoly either)', async () => {
+      const tick = await shared('prepare-item');
+      expect(tick.dispatched.map((s) => s.num)).toEqual(['4503']);
+      expect(tick.prepare.launched).toEqual([]);
+    });
+    it('still launches the build when no prepare can use the slot', async () => {
+      const tick = await shared('build', { prepareHeld: true });
+      expect(tick.prepare.launched).toEqual([]);
+      expect(tick.dispatched.map((s) => s.num)).toEqual(['4503']);
+    });
+  });
   it('excludes two persistent holds before core planning, freeing both slots', async () => {
     const effects = fixture();
     effects.listHolds = () => ['4544', '4560'].map((num) => ({ num, reason: 'prepare-unstamped' }));
@@ -1778,6 +1816,20 @@ describe('automatic item preparation', () => {
     expect(effects.placePrepareHold).toHaveBeenCalledWith({ num: '4501', reason: 'prepare-stamp-pending' });
     expect(tick.prepare.failures).toEqual([]);
     expect(tick.prepare.inFlight).not.toContain('4501');
+  });
+  // Live 2026-10-09 — 8 re-prepares (4435, 4436, 4648, …) whose attempts ended with no new result were routed to stamp
+  // recovery every tick because main still carries the stamp they were REPLACING (read as unprepared + sectioned). The
+  // stamp worker saw that old stamp, logged `already-stamped` and exited: 8 spawns a tick, no PR, the items stuck.
+  it('never routes a re-prepare to stamp recovery on the sections of the stamp it was replacing', async () => {
+    const effects = fixture();
+    claimed(effects);
+    effects.readPrepareStatus = () => ({ preparedDate: null, replacedPreparedDate: '2026-09-30', hasSections: true,
+      pr: { state: 'MERGED', preparedDate: '2026-09-30', hasSections: true } });
+    effects.stampPrepare = vi.fn(() => ({ spawned: true }));
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    expect(effects.stampPrepare).not.toHaveBeenCalled();
+    expect(tick.prepare.stamping).toEqual([]);
+    expect(tick.prepare.held).toEqual([{ num: '4501', reason: 'prepare-unstamped' }]);
   });
   it('holds incomplete results without attempting a mechanical stamp', async () => {
     const effects = fixture();

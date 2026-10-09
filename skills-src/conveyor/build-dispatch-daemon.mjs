@@ -653,7 +653,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     } else console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${d.why}`);
     return d;
   };
-  if (live) {
+  const launchBuilds = async () => {
     for (const pick of plan.dispatch) {
       if (launchSlotBusy()) continue;
       const gate = loadGateFor('build', pick.num);
@@ -671,7 +671,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
       }
     }
-  }
+  };
+  // Live 2026-10-09 16:47–18:28Z: prepare.planned stayed non-empty with 6 free slots for 13 ticks
+  // while every slot went to a build; the slot alternates when both kinds want it.
+  const preparesFirst = launchSettlement.settled.length > 0 && launchSettlement.settled.every((s) => s.kind !== 'prepare-item');
+  if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
   const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
@@ -694,6 +698,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
@@ -788,16 +793,19 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           || (!worker && liveness.status === 'dead')) why = 'dead prepare owner past heartbeat TTL';
       }
       const wasUnstamped = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+      // Live 2026-10-09 (4435/4436/4648): 8 stamp spawns per tick, worker `already-stamped`, no PR.
+      // Sections of the replaced stamp are not a result of this re-prepare attempt.
+      const mainHasResult = Boolean(status?.hasSections) && !status?.replacedPreparedDate;
       // A dead session that left sections behind is a finished-but-unstamped run: route it to stamp recovery.
       const deadWithWork = why === 'prepare-session-dead' && status && !status.preparedDate
-        && (status.hasSections || (awaitingPr && status.pr.hasSections));
+        && (mainHasResult || (awaitingPr && status.pr.hasSections));
       const ended = prDone || why === 'dead prepare owner past heartbeat TTL' || wasUnstamped || deadWithWork
         || (currentSettled && !prepareBusy.has(num));
       // An open, stamped PR is a valid finished agent run awaiting landing; main is not stamped yet.
       let unstamped = status && !status.preparedDate && ended && !(awaitingPr && status.pr.preparedDate);
       const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
       const failureHeld = Boolean(priorFailure);
-      const recoverable = !failureHeld && unstamped && (status.hasSections || (awaitingPr && status.pr.hasSections));
+      const recoverable = !failureHeld && unstamped && (mainHasResult || (awaitingPr && status.pr.hasSections));
       if (recoverable) {
         // Mechanical completion is separate from agent capacity; failures use the same evidence policy.
         if (live) effects.placePrepareHold({ num, reason: 'prepare-stamp-pending', ...holdStamp(num) });
@@ -923,6 +931,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
     }
   }
+  if (live && preparesFirst) await launchBuilds();
   // #4348-open-pr-retry — ONE resume pass per LIVE tick, reusing #2659's own backoff/attempt-cap state machine
   // (`scripts/conveyor/infra-blocked.mjs retry`) wholesale rather than re-deriving it here: a `blocked-on-infra`
   // PR-open (the lane ref is already pushed; `deliver-item-wrapper.mjs` now settles this as `open-pending`,
