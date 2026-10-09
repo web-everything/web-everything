@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-01"
-preparedAgainstSha: "bd19057d59fa45c863fcc4889b8de79f3ccacbbf"
+preparedDate: "2026-10-09"
+preparedAgainstSha: "0007875ad3f13546d089e71c49a89d50264feb15"
 tags: []
 ---
 
@@ -23,8 +23,10 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 
 - Original premise/scope: this card scoped only we:backlog/4479-soak-replay-gate-re-reads-the-live-pr-body-on-rerun-so-an-ad.md and cited its line 13 as the location for a filing-time verification note. That line is now frontmatter; the relevant history is in that card's Progress section. Its original proposal included adding an `edited` trigger, which preparation found already present.
 - Corrected premise/scope: the reusable note belongs beside “Review before adding (dedup)” under Rules in we:docs/agent/backlog-workflow.md:1215. The existing Rules cover deduplication and authoring hygiene but do not explicitly require checking workflow behaviour against its source at filing time. The broader verification discipline in we:docs/agent/conventions.md under “Provenance” distinguishes a resolvable citation from a true behavioural claim; this note applies that discipline at the filing step.
-- Source evidence checked at checkout `bd19057d59fa45c863fcc4889b8de79f3ccacbbf`: we:.github/workflows/soak-replay-gate.yml:38 includes `edited`; its lines 75–78 now fetch the live body and fail on retrieval error. Commit `ef4cb7125` delivered #4479's workflow change. The matching existing test is we:scripts/lib/__tests__/soak-replay-gate-workflow.test.mjs, which reads the actual workflow and exercises its shell. These are evidence, not this story's write targets. No live Actions result is inferred from reading them.
+- Source evidence checked at checkout `bd19057d59fa45c863fcc4889b8de79f3ccacbbf`: we:.github/workflows/soak-replay-gate.yml:39 (as of 0007875a; earlier checkout bd19057d: line 38) includes `edited`; its lines 80–82 (as of 0007875a) now fetch the live body and fail on retrieval error. Commit `ef4cb7125` delivered #4479's workflow change. The matching existing test is we:scripts/lib/__tests__/soak-replay-gate-workflow.test.mjs, which reads the actual workflow and exercises its shell. These are evidence, not this story's write targets. No live Actions result is inferred from reading them.
 - The resolved runtime fix does not deliver this separate documentation note. Narrow the write scope to the single documentation file; no runtime source entry remains, so no matching executable test file is required in scope. Adding a text-matching unit test would not prove an author verified a behavioural claim. The documentation review and observable proof below are the appropriate checks.
+
+- Re-prepared 2026-10-09 at 0007875a: premise re-checked on main — the "Verify workflow claims before filing" bullet is still absent from we:docs/agent/backlog-workflow.md and the dedup bullet anchor remains at line 1215; plan unchanged, stamp refreshed.
 
 ## Design
 
@@ -38,6 +40,16 @@ Use #4479 as a short example: `edited` was already configured, whereas live PR-b
 2. **Must 2:** Include the historically qualified #4479 example and explicitly distinguish source inspection from proof of a live Actions run.
 
 Deliver as one documentation change. Preserve size 3 and all unrelated metadata. Preparation review, checks, stamping, and delivery are runner-owned in this worker task.
+
+## Edge cases this change must handle
+
+1. Untrusted text: n/a: documentation-only bullet, no text reaches a shell, argv, path or regex.
+2. Truncated reads: the bullet tells authors to read the whole cited workflow block, not a grep excerpt.
+3. Shared state files: n/a: single doc edit, no state file.
+4. Fail closed: if the cited workflow cannot be opened or traced, the claim is not filed as fact; the bullet says so.
+5. Identity scoping: citations are repo-qualified (we:path:line) at the checkout used; the note covers a claim that depends on a delegated script and a workflow with several triggers.
+6. State over time: a historical report that is no longer true is labelled historical (the #4479 example); a source read is never claimed as proof of a live Actions run.
+7. Who wrote it: n/a: the note grants no trust; it asks authors to verify rather than rely on the report.
 
 ## Test plan
 
