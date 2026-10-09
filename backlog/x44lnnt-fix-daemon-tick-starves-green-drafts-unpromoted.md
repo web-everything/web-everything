@@ -15,6 +15,9 @@ Live 2026-10-09: drafts #4567/#4563/#4535/#4569/#4570/#4572 green but draft up t
 - [A1] **Executable** — a unit test drives `withSelfSync` (we:scripts/lib/daemon-self-sync.mjs) through boot → adopted rebuild → restart → boot with `main` moving on every rebuild, and asserts at least one real tick runs per process; it fails on today's code (zero ticks) and passes after.
 - [A2] **Live** — the fix-daemon log shows a completed tick between consecutive `rebuilt the clone … restarting` lines over an hour of fast `main` movement.
 
+- [A3] **Executable** — the tick's own promote path (we:scripts/operations/promote-draft-pr-dispatch.mjs) is covered for two variants the PR #4575 review found in the new fast step and fixed there (fast step only): a cross-repository `lane/*` draft is not promoted, and a head that moves between the check read and `gh pr ready` is refused (re-read `headRefOid` with the label read). A test per variant fails on today's tick and passes after.
+- [A4] **Executable** — a lint (`check:standards`) flags an agent-authorship test of the form `startsWith('lane/')` that has no `isCrossRepository` guard beside it.
+
 ## Non-goals
 
 - [N1] Promoting drafts — already moved off the tick (we:scripts/conveyor/draft-promotion-loop.mjs). Never weakens the rebuild smoke or the stale-main guard.

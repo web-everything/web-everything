@@ -13,9 +13,14 @@
  * see `draft-promotion-loop.mjs`). This rule is the decision; the caller re-reads the head's checks and labels
  * immediately before the one write (the #2811 stale-green guard), exactly like the tick's promote half.
  *
- * Owed promotion = open + draft + an agent lane branch (`lane/*`, what `pr-land --park` opens) + every required check
- * green FOR THE CURRENT HEAD + not withdrawn (`review-status:draft-withdrawn`). It never decides a review, a merge or
- * a label: un-drafting only lets the review daemon's own gates run (it still refuses fix-claimed, live-process, …).
+ * Owed promotion = open + draft + a same-repo agent lane branch (`lane/*`, what `pr-land --park` opens) + every
+ * required check green FOR THE CURRENT HEAD + not withdrawn (`review-status:draft-withdrawn`). It never decides a
+ * review, a merge or a label.
+ *
+ * This rule is only the CHEAP half. The loop (`draft-promotion-loop.mjs`) also asks `planReconcile` — the tick's own
+ * classifier — about the one PR, so every refusal the tick runs BEFORE its `promote-draft` branch (live fix claim,
+ * stand-down, close-superseded disposition, concurrent-author pause, load-flake hold, a live session) applies here
+ * too. Review of PR #4575 found the first version hand-wrote only the stale-green and withdrawn checks.
  *
  * Declared setting `draft-promotion-settings.json` (`{ "draftPromotion": { "loop": "on", "intervalSeconds": 60 } }`).
  * Env `WE_DRAFT_PROMOTION_LOOP` / `WE_DRAFT_PROMOTION_INTERVAL_SECONDS` beat the file. A missing or malformed switch
@@ -69,6 +74,8 @@ const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => 
 export function isDraftOwedPromotion({ pr = {}, checks = null } = {}) {
   if (String(pr?.state ?? 'OPEN').toUpperCase() !== 'OPEN') return { owed: false, why: 'not open' };
   if (pr?.isDraft !== true) return { owed: false, why: 'not a draft' };
+  // A `lane/` prefix is only proof of agent authorship when the branch lives in THIS repo: a fork can name its branch anything.
+  if (pr?.isCrossRepository === true) return { owed: false, why: 'cross-repository (fork) branch — a lane/ prefix there is not agent authorship' };
   if (!String(pr?.headRefName ?? '').startsWith(AGENT_HEAD_PREFIX)) return { owed: false, why: 'not an agent lane branch (draft-first covers lane/* only)' };
   if (labelNames(pr?.labels).includes(WITHDRAWN_LABEL)) return { owed: false, why: 'draft is withdrawn — explicit release is required before promotion' };
   if (!checks) return { owed: false, why: 'required checks not read yet' };
