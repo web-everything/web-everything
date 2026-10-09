@@ -40,6 +40,14 @@ import { clusterByCause } from '../../conveyor/infra-blocked.mjs';
 import { bornAsIndexFromItems, resolveBornAsRefs } from '../../conveyor/queue-store.mjs';
 
 describe('shapeQueue — ready/queued build-queue rows → the tick queue shape', () => {
+  it('passes priorityClass through only when the build queue enforces class order', () => {
+    expect(shapeQueue({ priorityMode: 'enforce', queue: [{ num: '1', priorityClass: 'P1' }] })[0].priorityClass).toBe('P1');
+    expect(shapeQueue({ priorityMode: 'enforce', queue: [{ num: '1' }] })[0]).not.toHaveProperty('priorityClass');
+    // shadow = log only, never reorder: the class is not handed to the prepare-ahead window
+    expect(shapeQueue({ priorityMode: 'shadow', queue: [{ num: '1', priorityClass: 'P1' }] })[0]).not.toHaveProperty('priorityClass');
+    expect(shapeQueue([{ num: '1', priorityClass: 'P1' }])[0]).not.toHaveProperty('priorityClass');
+  });
+
   it('maps num/rank/buildQueued and defaults openBlockers/scope defensively', () => {
     const buildQueue = { queue: [{ num: '554', rank: null, buildQueued: false }, { num: 42, rank: 3, buildQueued: true }] };
     expect(shapeQueue(buildQueue)).toEqual([
