@@ -5586,11 +5586,15 @@ async function runCli() {
     // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git error,
     // no clone) is retried next pass rather than parking the head as `wait` forever.
     if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, headSha);
+    // The re-stamp outcome rides the skip reason: the daemon runs `--json`, so the stderr warning alone never reached
+    // its log (plateau-app #217, 2026-10-09: rebased, then re-parked as stale with no trace of why).
+    let restampNote = '';
     if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(cand, { action: 'rebased' })) {
       const rs = restampAcceptance({ pr: cand.num, repo: cand.repo, newHead: out.newCommit, cwd: isLocalRepo(cand.repo) ? undefined : cloneDir });
+      restampNote = rs.ok ? '; acceptance re-stamped' : `; acceptance re-stamp FAILED (${String(rs.reason || 'unknown').slice(0, 200)})`;
       if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(cand.repo)}${cand.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
-    }
-    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}` });
+    } else if (out.ok && out.action === 'rebased') restampNote = `; no acceptance re-stamp (${cand.humanCleared ? 'review hold live' : 'no review:accepted on the candidate'})`;
+    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}${restampNote}` });
     if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
     return false;
   };
