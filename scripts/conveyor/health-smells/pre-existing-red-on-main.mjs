@@ -28,7 +28,8 @@ export default {
     for (const m of laneVerifyMarkers || []) {
       if (m.status !== 'red' || m.redCause !== 'pre-existing-on-main' || !m.head || m.sha !== m.head) continue;
       const baseSha = m.redCauseEvidence?.baseSha;
-      if (!baseSha) continue;
+      // A lane-written marker raises a quiet-hours-breaking alert, so the sha must look like one (and must not throw below).
+      if (typeof baseSha !== 'string' || !/^[0-9a-f]{7,40}$/i.test(baseSha)) continue;
       const entry = bySha.get(baseSha) ?? { tests: new Set(), lanes: [] };
       for (const t of m.redCauseEvidence.tests ?? []) entry.tests.add(t.name ? `${t.file} > ${t.name}` : t.file);
       entry.lanes.push(`${m.pool}/lane-${m.lane}`);

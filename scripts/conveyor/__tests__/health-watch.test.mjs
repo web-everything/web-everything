@@ -1362,23 +1362,47 @@ describe('quietHours: a red main is wired end to end (real tick, shadow mode →
     expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: start, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
   });
 
-  it('alerts once per broken main commit: no repeat on later ticks, past the 4 h reminder, or after a close and reopen', async () => {
+  it('alerts once per break: no repeat on later ticks, past the 4 h reminder, as main\'s tip moves, or after a close and reopen', async () => {
     const { run, redCalls } = setup();
     await run(0, ['efd88abcc00']);
     await run(1, ['efd88abcc00']);
     await run(5 * 60, ['efd88abcc00']); // past reminderAfterMs (4 h): the reminder must not re-alert
     expect(redCalls()).toHaveLength(1);
-    await run(5 * 60 + 1, []); await run(5 * 60 + 2, []); // lanes stop showing the sha → episode closes
-    await run(5 * 60 + 3, ['efd88abcc00']); // the same sha reappears → reopened, still no second alert
+    await run(5 * 60 + 1, ['0123456789ab']); // main merged: lanes now verify at a NEW tip while main is still red
+    await run(5 * 60 + 2, ['0123456789ab', 'aaaaaaaaaaaa']); // two lanes, two tips, same tick
+    await run(5 * 60 + 5, ['aaaaaaaaaaaa']);
+    await run(5 * 60 + 6, []); await run(5 * 60 + 7, []); // lanes go quiet briefly → episode closes
+    await run(5 * 60 + 8, ['aaaaaaaaaaaa']); // reappears inside the 60 min window → same break
     expect(redCalls()).toHaveLength(1);
-    await run(5 * 60 + 4, ['efd88abcc00', '0123456789ab']); // a NEW broken commit alerts
+    await run(5 * 60 + 9 + 120, ['bbbbbbbbbbbb']); // red again two hours later, after a gap → a new break alerts
     expect(redCalls()).toHaveLength(2);
-    expect(redCalls()[1].title).toBe('Health: pre-existing-red-on-main — main:012345678');
+    expect(redCalls()[1].title).toBe('Health: pre-existing-red-on-main — main:bbbbbbbbb');
   });
 
-  it('isRepeatAlert only affects the once-per-subject smells (main-ci-red keeps its reminder)', () => {
-    expect(isRepeatAlert({ reason: 'reminder' }, { smell: 'main-ci-red', subject: 'main:abc' }, [])).toBe(false);
-    expect(isRepeatAlert({ reason: 'reminder' }, { smell: 'pre-existing-red-on-main', subject: 'main:abc' }, [])).toBe(true);
+  it('retries a failed send on the next tick until it is delivered, then stops', async () => {
+    const { run, redCalls } = setup();
+    episodeReplay.send.mockImplementation(() => ({ ok: false, error: 'osascript failed' }));
+    await run(0, ['efd88abcc00']);
+    await run(1, ['efd88abcc00']);
+    expect(redCalls()).toHaveLength(2);
+    episodeReplay.send.mockImplementation(() => ({ ok: true }));
+    await run(2, ['efd88abcc00']);
+    await run(3, ['efd88abcc00']);
+    expect(redCalls()).toHaveLength(3);
+  });
+
+  it('yields to an open main-ci-red episode (it already tells the operator about this break)', () => {
+    const redMain = { id: 'a', smell: 'pre-existing-red-on-main', subject: 'main:abc' };
+    const ciRed = { id: 'c', smell: 'main-ci-red', subject: 'main:def', status: 'open' };
+    expect(isRepeatAlert(redMain, { episodes: { c: ciRed }, history: [] }, start)).toBe(true);
+    expect(isRepeatAlert(redMain, { episodes: {}, history: [] }, start)).toBe(false);
+    expect(isRepeatAlert(ciRed, { episodes: { c: ciRed }, history: [] }, start)).toBe(false); // main-ci-red is never held back
     expect(breakthroughEmergency({ smell: 'main-ci-red' })).toEqual({ kind: 'main-red' });
+  });
+
+  it('ignores a marker whose baseSha is not a sha (a lane-written marker must not raise or crash a main-red alert)', async () => {
+    const { run, redCalls } = setup();
+    await run(0, [{ not: 'a string' }, 'zz; rm -rf', '']);
+    expect(redCalls()).toHaveLength(0);
   });
 });

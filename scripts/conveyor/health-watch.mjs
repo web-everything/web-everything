@@ -132,17 +132,27 @@ export function daemonDownEmergency(ep) {
 export const MAIN_RED_SMELLS = new Set(['pre-existing-red-on-main', 'main-ci-red']);
 
 /**
- * Smells that alert ONCE per subject (operator ruling 2026-10-09: one alert per broken main commit). Their subject is
- * `main:<sha>`, so a second send for the same subject is suppressed: the 4-hour reminder, and a reopened episode for a
- * sha whose earlier episode already closed (the smell reads lane verify markers, which come and go while main stays red).
+ * Smells that alert ONCE per break (operator ruling 2026-10-09: one alert per broken main commit). Their subject is
+ * the lane's `origin/main` tip, which changes with every merge while main stays red, and the smell reads lane markers
+ * that come and go, so a per-subject or per-episode alert would storm. They are sent by their own block in `tick`
+ * (not from the plan), once per continuous red window, and retried until delivered.
  */
 export const ALERT_ONCE_PER_SUBJECT = new Set(['pre-existing-red-on-main']);
 
-/** True when a plan entry would be a repeat alert for an ALERT_ONCE_PER_SUBJECT smell. PURE. */
-export function isRepeatAlert(p, ep, history = []) {
+/** A red main whose episodes are separated by less than this is the same break. */
+export const MAIN_RED_CONTINUITY_MS = 60 * MINUTE;
+
+/**
+ * Should this ALERT_ONCE episode's alert be withheld? PURE. Yes when: `main-ci-red` is already open (it tells the
+ * operator about the same break, keyed on the first red commit), or an earlier episode of this smell already DELIVERED
+ * its alert and is still open or closed less than {@link MAIN_RED_CONTINUITY_MS} ago (the same continuous red window).
+ */
+export function isRepeatAlert(ep, state, now) {
   if (!ALERT_ONCE_PER_SUBJECT.has(ep?.smell)) return false;
-  if (p?.reason === 'reminder') return true;
-  return history.some((h) => h?.smell === ep.smell && h?.subject === ep.subject && h?.id !== ep.id);
+  const open = Object.values(state?.episodes ?? {});
+  if (open.some((e) => e?.smell === 'main-ci-red' && e.status !== 'pending')) return true;
+  return [...open, ...(state?.history ?? [])].some((e) => e?.smell === ep.smell && e.id !== ep.id && Number.isFinite(e.alertedAt)
+    && (e.closedAt == null || now - e.closedAt < MAIN_RED_CONTINUITY_MS));
 }
 
 /**
@@ -1300,7 +1310,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     // `--dry-run`/`--no-notify` both skip actually SENDING one (an OS-visible side effect, unlike the
     // read-only diagnoses above) — a dry-run reports what it would have sent via `result.plan` already.
     if (!ep || flags['no-notify'] || flags['dry-run']) continue;
-    if (isRepeatAlert(p, ep, state.history)) continue; // one alert per broken main commit
+    if (ALERT_ONCE_PER_SUBJECT.has(ep.smell)) continue; // sent once per break by the block below
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
     let sent;
@@ -1309,6 +1319,24 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     // Remember that quiet hours held this alert: the daemon-down breakthrough depends on elapsed time, so it is re-checked below.
     if (emergency?.kind === 'daemon-down' && sent?.suppressed) ep.heldByQuietHours = true;
     notifications.push({ key: p.key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+  }
+
+  // A red main (operator ruling 2026-10-09): one alert per break, retried until delivered. Every open, untracked episode
+  // of an ALERT_ONCE smell that has not delivered yet is sent here, so a failed send is retried next tick and an episode
+  // that opened while another one's alert was still fresh stays quiet (see `isRepeatAlert`). The delivery time is stamped
+  // on the episode (`alertedAt`), which is what later episodes of the same break check.
+  if (!flags['no-notify'] && !flags['dry-run']) {
+    for (const [key, ep] of Object.entries(state.episodes)) {
+      if (!ALERT_ONCE_PER_SUBJECT.has(ep.smell) || ep.status === 'pending' || ep.tracked || Number.isFinite(ep.alertedAt)) continue;
+      if (!result.plan.some((x) => x.key === key && x.kind === 'notify' && !x.suppressed) && !Number.isFinite(ep.alertAttemptedAt)) continue; // first attempt rides the open-time plan entry
+      if (isRepeatAlert(ep, state, now)) continue;
+      let sent;
+      try { sent = notifyDesktopChecked({ title: `Health: ${ep.smell} — ${ep.subject}`, body: scrubText(ep.recommendation || ep.summary || 'See the health report.'), emergency: breakthroughEmergency(ep) }); }
+      catch (e) { sent = { ok: false, error: String(e?.message || e) }; }
+      ep.alertAttemptedAt = now;
+      if (sent?.ok === true) ep.alertedAt = now;
+      notifications.push({ key, ok: sent?.ok === true, error: sent?.ok === true ? null : scrubText(sent?.error ?? 'unknown') });
+    }
   }
 
   // quietHours (card xmvc6oc): a daemon that dies at 02:00 is first seen minutes later — below the 30-minute
