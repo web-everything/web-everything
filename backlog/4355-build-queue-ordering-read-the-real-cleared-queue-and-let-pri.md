@@ -41,3 +41,10 @@ class, not a score boost or a pin. Aging moves an item up one class after 8 h, n
   `addedAt`), aging +1 class after `agingHours`, never into P0.
 - Sort: class → tier (hand pin, within a class) → fix-queue score (unblocks × 60 + minutes waited) → WSJF → rank →
   date → num. Mode `off` in `we:scripts/lib/delivery-priority-settings.json` gives the exact pre-class order.
+
+## Follow-up 2026-10-09 (operator ruling ~13:50 ET)
+
+Shadow keeps one meaning everywhere: log only, never reorder. The build queue now has its own key
+`buildQueuePriority.mode` in `we:scripts/settings/build-queue-priority.json`, set to `enforce`.
+The cascade is standard default → platform `deliveryPriority` → tool `buildQueuePriority` → env
+`WE_BUILD_QUEUE_PRIORITY_MODE`. The shared/fix-queue `deliveryPriority.mode` stays `shadow`.

@@ -18,7 +18,24 @@
  * pullable, nor block a ready one.
  */
 
-import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES } from './delivery-priority.mjs';
+import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './delivery-priority.mjs';
+
+/** PURE policy cascade: standard defaults → platform preference → tool override → environment. */
+export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) {
+  let merged = resolvePrioritySettings(undefined);
+  let source = 'default';
+  for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
+    if (!layer || typeof layer !== 'object' || Array.isArray(layer)) continue;
+    merged = { ...merged, ...layer };
+    if (Object.hasOwn(layer, 'mode')) source = name;
+  }
+  if (env && typeof env === 'object' && !Array.isArray(env) &&
+      PRIORITY_MODES.includes(env.WE_BUILD_QUEUE_PRIORITY_MODE)) {
+    merged.mode = env.WE_BUILD_QUEUE_PRIORITY_MODE;
+    source = 'env';
+  }
+  return { ...resolvePrioritySettings(merged), source };
+}
 
 // ── Tiers (fixed enum; the primary sort key AND the human override) ─────────────────────────────────
 export const TIERS = ['pinned', 'normal', 'someday', "won't"];
@@ -210,10 +227,12 @@ function tierRank(item) {
  * effective WSJF score, aging folded in), `unblocks` (dependents freed), and `rank` (the LexoRank override).
  * Exposed so a display surface (the console queue view #2529) and the builder (#2530) can show/act on WHY an
  * item ranks where it does WITHOUT recomputing the engine's math (one source of truth). {@link orderQueue}
- * is this mapped back to bare items. Sort keys, in order: delivery class (P0 first, #4355) → tier (pinned
+ * is this mapped back to bare items. Enforce sort keys, in order: delivery class (P0 first, #4355) → tier (pinned
  * first, the hand pin WITHIN a class) → fix-queue score (desc: unblocks + minutes waited, Q2) → effectiveScore
  * (desc) → rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total order).
- * `opts.priority` is the delivery-priority settings; omitted or mode `off` → every row P3, score 0 → today's order.
+ * `opts.priority` omitted or mode `off` → every row P3, priorityScore 0, legacy order.
+ * Mode `shadow` computes real classes, scores and reasons but retains the legacy keys only:
+ * tier → effectiveScore → rank → dateOpened → num. Only `enforce` applies class-first ordering.
  */
 export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now(), { priority } = {}) {
   const byId = indexItems(items);
@@ -239,17 +258,34 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         num: numOr(Number(it.num), Infinity),
       };
     });
-  ready.sort(
-    (a, b) =>
-      PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
-      a.tierOrder - b.tierOrder ||
-      b.priorityScore - a.priorityScore ||
-      b.score - a.score ||
-      cmp(a.rank, b.rank) ||
-      cmp(a.opened, b.opened) ||
-      a.num - b.num,
-  );
+  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder : compareLegacyOrder);
   return ready;
+}
+
+function compareLegacyTail(a, b) {
+  return b.score - a.score || cmp(a.rank, b.rank) || cmp(a.opened, b.opened) || a.num - b.num;
+}
+
+function compareLegacyOrder(a, b) {
+  return a.tierOrder - b.tierOrder || compareLegacyTail(a, b);
+}
+
+function compareClassOrder(a, b) {
+  return PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
+    a.tierOrder - b.tierOrder || b.priorityScore - a.priorityScore || compareLegacyTail(a, b);
+}
+
+/** PURE: a copy of enriched rows in enforce order; never mutates the input. */
+export function classOrder(rows) {
+  return [...rows].sort(compareClassOrder);
+}
+
+/** PURE: bounded, single-line observation of class order without changing queue order. */
+export function formatBuildQueuePriorityShadowLine(rows, mode) {
+  const ordered = classOrder(rows);
+  const entries = ordered.slice(0, 25).map((r) => `#${r.item.num} ${r.priorityClass} score ${r.priorityScore}`);
+  if (ordered.length > 25) entries.push(`… +${ordered.length - 25} more`);
+  return `build-queue: priority-shadow mode=${mode} ${rows.length} item(s) — class order ${entries.join(' | ')} (order unchanged)`;
 }
 
 /**

@@ -1,16 +1,76 @@
 import { describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { orderQueueDetailed, DEFAULT_CONFIG, buildQueuePriorityFacts } from '../build-queue.mjs';
+import { orderQueueDetailed, DEFAULT_CONFIG, buildQueuePriorityFacts, resolveBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from '../build-queue.mjs';
 
 const item = (num, over = {}) => ({ num: String(num), id: `${num}-x`, status: 'open', dateOpened: '2026-07-16', ...over });
 const NOW = Date.parse('2026-07-16T12:00:00Z');
 const ON = { mode: 'enforce', agingHours: 8, maxLiveP0: 2, unblockWeightMinutes: 60 };
 const queuedAgo = (hours) => new Date(NOW - hours * 3600e3).toISOString();
 const enforce = (items) => orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { priority: ON });
+
+describe('build queue priority settings cascade', () => {
+  it('layers mode ownership while preserving other platform preferences', () => {
+    const platform = { mode: 'shadow', agingHours: 8 };
+    const tool = { mode: 'enforce' };
+    expect(resolveBuildQueuePrioritySettings()).toMatchObject({ mode: 'off', source: 'default' });
+    expect(resolveBuildQueuePrioritySettings({ platform })).toMatchObject({ mode: 'shadow', source: 'platform' });
+    expect(resolveBuildQueuePrioritySettings({ platform, tool })).toMatchObject({
+      mode: 'enforce', source: 'tool', agingHours: 8,
+    });
+    expect(resolveBuildQueuePrioritySettings({ platform, tool, env: { WE_BUILD_QUEUE_PRIORITY_MODE: 'off' } }))
+      .toMatchObject({ mode: 'off', source: 'env', agingHours: 8 });
+    expect(resolveBuildQueuePrioritySettings({ platform, tool, env: { WE_BUILD_QUEUE_PRIORITY_MODE: 'invalid' } }))
+      .toMatchObject({ mode: 'enforce', source: 'tool', agingHours: 8 });
+    expect(resolveBuildQueuePrioritySettings({ platform, tool: { maxLiveP0: 3 } }))
+      .toMatchObject({ mode: 'shadow', source: 'platform', maxLiveP0: 3 });
+  });
+
+  it.each([null, false, 'enforce', 4, []])('ignores non-object layers: %j', (layer) => {
+    expect(resolveBuildQueuePrioritySettings({ platform: layer, tool: layer, env: layer }))
+      .toMatchObject({ mode: 'off', source: 'default' });
+  });
+});
+
+describe('build queue shadow observations', () => {
+  it('retains legacy order with real priority metadata and previews enforce order without mutation', () => {
+    const items = [
+      item(1, { value: 5 }),
+      item(2, { value: 1, priority: 'high', queuedAt: queuedAgo(1) }),
+      item(3, { value: 4 }),
+      item(4, { value: 2, queuedAt: queuedAgo(2) }),
+    ];
+    const rows = (mode) => orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { priority: { ...ON, mode } });
+    const nums = (rs) => rs.map((r) => r.item.num);
+    const off = rows('off');
+    const shadow = rows('shadow');
+    const enforced = rows('enforce');
+    expect(nums(off)).toEqual(['1', '3', '4', '2']);
+    expect(off.every((r) => r.priorityClass === 'P3' && r.priorityScore === 0)).toBe(true);
+    expect(nums(shadow)).toEqual(nums(off));
+    expect(shadow.find((r) => r.item.num === '2')).toMatchObject({
+      priorityClass: 'P2', priorityScore: 60, priorityReasons: ['card priority: high'],
+    });
+    expect(nums(enforced)).toEqual(['2', '4', '1', '3']);
+    expect(classOrder(shadow)).toEqual(enforced);
+    expect(nums(shadow)).toEqual(nums(off));
+    expect(formatBuildQueuePriorityShadowLine(shadow, 'shadow')).toBe(
+      'build-queue: priority-shadow mode=shadow 4 item(s) — class order #2 P2 score 60 | #4 P3 score 120 | #1 P3 score 0 | #3 P3 score 0 (order unchanged)',
+    );
+  });
+
+  it('caps the shadow line at 25 entries', () => {
+    const rows = enforce(Array.from({ length: 27 }, (_, i) => item(i + 1)));
+    const line = formatBuildQueuePriorityShadowLine(rows, 'shadow');
+    expect(line).toContain('27 item(s)');
+    expect(line).toContain('#25 P3 score 0 | … +2 more (order unchanged)');
+    expect(line).not.toContain('#26');
+    expect(formatBuildQueuePriorityShadowLine([], 'shadow')).toContain('0 item(s)');
+  });
+});
 
 describe('#4355 build-queue orders by delivery class (rulings Q1/Q2)', () => {
   it('keeps the legacy order and reports P3 when priority is omitted or off', () => {
@@ -113,13 +173,45 @@ describe('#4355 build-queue --json reads the cleared set through the queue-store
       // No CONVEYOR_QUEUE_FILE: the read must go through the state-home default (CONVEYOR_STATE_ROOT pins it).
       const env = { ...process.env, CONVEYOR_STATE_ROOT: stateDir, WE_BUILD_QUEUE_CACHE: '0' };
       delete env.CONVEYOR_QUEUE_FILE;
+      delete env.WE_BUILD_QUEUE_PRIORITY_MODE;
       const out = JSON.parse(execFileSync('node', [BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`], { encoding: 'utf8', env }));
+      expect(out).toMatchObject({ priorityMode: 'enforce', prioritySource: 'tool' });
       expect(out.cleared).toBe(2);
       expect(out.sidecar).toMatchObject({ path: queueFile, entries: 3 });
       const cleared = out.queue.filter((r) => r.buildQueued).map((r) => String(r.num));
       expect(cleared).toEqual(['9102', '9101']);
       expect(out.queue.find((r) => String(r.num) === '9102').priorityClass).toBe('P2');
       expect(out.queue.find((r) => String(r.num) === '9103').buildQueued).toBe(false);
+      const run = (mode, next = false) => {
+        const result = spawnSync('node', [
+          BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`, ...(next ? ['--next'] : []),
+        ], { encoding: 'utf8', env: { ...env, WE_BUILD_QUEUE_PRIORITY_MODE: mode } });
+        expect(result.status, result.stderr).toBe(0);
+        return { payload: JSON.parse(result.stdout), stderr: result.stderr };
+      };
+      const modes = Object.fromEntries(['off', 'shadow', 'enforce'].map((mode) => [mode, run(mode)]));
+      const clearedOrder = (payload) => payload.queue.filter((r) => r.buildQueued).map((r) => String(r.num));
+      expect(clearedOrder(modes.off.payload)).toEqual(['9101', '9102']);
+      expect(modes.off.payload.queue.every((r) => r.priorityClass === 'P3' && r.priorityScore === 0)).toBe(true);
+      expect(clearedOrder(modes.shadow.payload)).toEqual(clearedOrder(modes.off.payload));
+      expect(clearedOrder(modes.enforce.payload)).toEqual(['9102', '9101']);
+      expect(String(modes.shadow.payload.shadowClassOrder[0])).toBe('9102');
+      expect(modes.shadow.stderr).toContain('priority-shadow mode=shadow');
+      for (const [mode, result] of Object.entries(modes)) {
+        expect(result.payload).toMatchObject({ priorityMode: mode, prioritySource: 'env' });
+        const next = run(mode, true);
+        expect(next.payload).toMatchObject({ priorityMode: mode, prioritySource: 'env' });
+        expect(String(next.payload.next.num)).toBe(clearedOrder(result.payload)[0]);
+        if (mode === 'shadow') {
+          expect(next.payload.shadowClassOrder).toEqual(result.payload.shadowClassOrder);
+          expect(next.stderr).toContain('priority-shadow mode=shadow');
+        } else {
+          expect(result.payload).not.toHaveProperty('shadowClassOrder');
+          expect(next.payload).not.toHaveProperty('shadowClassOrder');
+          expect(result.stderr).not.toContain('priority-shadow');
+        }
+      }
+
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -58,12 +58,13 @@ import { fitAffineCost, budgetFromFit, impliedCapacity, isKnownStopReason, KNOWN
 import { BACKLOG_KINDS } from './check-standards-rules.mjs';
 import { numberPendingHashes, landedNumberFor } from './lane-drain.mjs';
 import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
-import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed } from './lib/build-queue.mjs';
+import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, resolveBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
 import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
 import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
-import { readDeliveryPrioritySettings, DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
+import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
+import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
 import { writeAllSync, writeLineSync } from './lib/write-all-sync.mjs';
 import { writeBacklogMd as writeBacklogMdCore, writeBacklogMdUnguarded as writeBacklogMdUnguardedCore } from './backlog/guarded-write.mjs';
 // #3034 — `claim` runs through this declared operation, not a second hand-rolled implementation. See
@@ -1090,7 +1091,8 @@ function buildQueue() {
   const baseKey = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;
   const key = baseKey === null ? null
-    : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH)]);
+    : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH),
+      mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
@@ -1138,10 +1140,17 @@ function buildQueue() {
     catch { rawTier = undefined; }
     return { ...it, tier: rawTier, ...queue };
   });
-  // Rulings Q1/Q2 (#4355): order by delivery class first, from the ONE shared rule + its declared settings. Mode
-  // `off` in we:scripts/lib/delivery-priority-settings.json restores the pre-class order exactly.
-  const priority = readDeliveryPrioritySettings();
+  // Keep platform preferences raw so the tool and environment override only their declared keys.
+  let platform;
+  try { platform = JSON.parse(readFileSync(DELIVERY_PRIORITY_SETTINGS_PATH, 'utf8')).deliveryPriority; }
+  catch { platform = undefined; }
+  const priority = resolveBuildQueuePrioritySettings({
+    platform, tool: readSettings().buildQueuePriority, env: process.env,
+  });
   const detailed = orderQueueDetailed(items, config, Date.now(), { priority });
+  const shadow = priority.mode === 'shadow'
+    ? { shadowClassOrder: classOrder(detailed).map((r) => r.item.num) } : {};
+  if (priority.mode === 'shadow') console.error(formatBuildQueuePriorityShadowLine(detailed, priority.mode));
   const rows = detailed.map((r) => ({
     num: r.item.num,
     id: r.item.id,
@@ -1162,14 +1171,14 @@ function buildQueue() {
     // The builder's ACTUAL next = the top-ordered item the human has CLEARED for build (#2530), not merely the
     // top ready one. A ready, high-tier item that hasn't been cleared is never auto-built.
     const head = rows.find((r) => r.buildQueued) ?? null;
-    return emit({ verb: 'build-queue', next: head, config, priorityMode: priority.mode },
+    return emit({ verb: 'build-queue', next: head, config, priorityMode: priority.mode, prioritySource: priority.source, ...shadow },
       head ? `${GRN}next → #${head.num}${RST} ${DIM}[${head.priorityClass} · ${head.tier} · ${head.score.toFixed(2)}] ${head.title}${RST}`
            : `${DIM}build queue empty (no items cleared for build)${RST}`);
   }
   const clearedCount = rows.filter((r) => r.buildQueued).length;
   const sidecarInfo = { path: queueSrc.path, source: queueSrc.source, entries: sidecar.length };
-  return emit({ verb: 'build-queue', count: rows.length, cleared: clearedCount, sidecar: sidecarInfo, priorityMode: priority.mode, queue: rows, config },
-    `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build (${sidecar.length} in ${queueSrc.path}) · class-first order, priority ${priority.mode})${RST}\n` +
+  return emit({ verb: 'build-queue', count: rows.length, cleared: clearedCount, sidecar: sidecarInfo, priorityMode: priority.mode, prioritySource: priority.source, ...shadow, queue: rows, config },
+    `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build (${sidecar.length} in ${queueSrc.path}) · ${priority.mode === 'enforce' ? 'class-first order' : 'next-to-build order'}, priority ${priority.mode})${RST}\n` +
     rows.slice(0, 25).map((r, i) => `  ${String(i + 1).padStart(2)}. ${r.buildQueued ? `${GRN}✓${RST}` : ' '} ${BLD}#${r.num}${RST} ${DIM}[${r.priorityClass} · ${r.tier} · ${r.score.toFixed(2)}] ${r.priorityReasons.join('; ')}${RST} ${r.title}`).join('\n') +
     (rows.length > 25 ? `\n  ${DIM}… +${rows.length - 25} more${RST}` : ''));
 }
