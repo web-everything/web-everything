@@ -650,7 +650,7 @@ describe('wrapped verification waits', () => {
     const text = (await runWorker(h.s, h.io)).result.blocker.evidence.text;
     expect(text).toContain('[redacted]');
     for (const raw of ['ghp_abcdefghijklmnopqrstuvwxyz', '<!--', '`x`']) expect(text).not.toContain(raw);
-    expect(text).not.toMatch(/(^|[^​])@octocat/);
+    expect(text).not.toMatch(new RegExp(`(^|[^${String.fromCharCode(0x200b)}])@octocat`));
   });
   it('an intermediate turn that is not done is left as the worker said it', async () => {
     const h = harness();
