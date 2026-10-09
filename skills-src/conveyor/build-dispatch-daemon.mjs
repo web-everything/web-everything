@@ -83,7 +83,7 @@ import { readMainRedState, resolveFreezeMainRed } from '../../scripts/lib/main-r
 import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'; // card xu1nixv
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
@@ -333,11 +333,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       if (due.length) releaseOwnPrepareHolds({ nums: due, holds: effects.listHolds?.() ?? [], release: effects.releasePrepareHold });
       // Live 2026-10-09 — a held prepare whose worker reported already-done (with a commit) becomes an ordinary
       // dispatch hold the hold router lands as a resolve (graduatedTo that commit), exactly as the runner does.
-      // Each route is already stamped as handed out, so one failed placement must not drop the rest: a card whose
-      // hold was never placed is simply prepared again (not held), re-reports, and is routed by that fresh record.
+      // Each route is already stamped as handed out, so one failed placement must not drop the rest: it is un-stamped
+      // again and handed out on the next tick. (A crash between the stamp and the placement only lets the card be
+      // prepared again, which re-reports it.)
       for (const r of effects.takePrepareRouteHolds?.() ?? []) {
         try { effects.placePrepareHold?.({ num: r.num, reason: r.reason }); }
-        catch (e) { console.error(`build-dispatch-daemon: already-done route hold for #${r.num} not placed: ${String(e?.message || e).split('\n')[0]}`); }
+        catch (e) {
+          console.error(`build-dispatch-daemon: already-done route hold for #${r.num} not placed: ${String(e?.message || e).split('\n')[0]}`);
+          try { effects.requeuePrepareRouteHold?.(r.num); } catch { /* the next tick's re-prepare still routes it */ }
+        }
       }
     } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
   }
@@ -1943,6 +1947,7 @@ function cliEffects() {
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     takePrepareRouteHolds: () => takePrepareRouteHolds(),
+    requeuePrepareRouteHold: (num) => requeuePrepareRouteHold(num),
     killSwitch: cliKillSwitch,
     mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,

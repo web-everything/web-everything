@@ -245,6 +245,22 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
       const f = await recordPrepareFailure({ num: '4801', attempt: 'run 9', stage: 'stamp', evidence: refLock }, { path, fileCard: vi.fn(), now: t0 });
       expect(f).toMatchObject({ cause: 'infra-transient', retry: true, held: false });
     });
+    it('an infra-transient card whose retry budget is spent is surfaced as needs-you, never held silently', async () => {
+      const fileCard = vi.fn();
+      const seen = [];
+      for (let n = 1; n <= 3; n++) seen.push(await recordPrepareFailure({ num: '4803', attempt: `run ${n}`, stage: 'stamp', evidence: refLock }, { path, fileCard, now: t0 }));
+      expect(seen.map(f => f.retry)).toEqual([true, true, false]);
+      expect(seen[0].holdReason).toBeUndefined();
+      expect(seen[2]).toMatchObject({ cause: 'infra-transient', held: true });
+      expect(seen[2].holdReason).toMatch(/^needs-you: /);
+    });
+    it('a worker report that merely MENTIONS an infra signal does not steer the classification', () => {
+      for (const text of ['rate limit exceeded', 'ECONNRESET', 'cannot lock ref \'refs/x\'', 'could not acquire a lane: lane-1 is a LIVE lease']) {
+        expect(classifyPrepareFailure({ error: `prepare requires a card-only diff; worker report: I changed the retry for ${text} in the doc` }, 'result')).toBe('unknown');
+      }
+      // The same text BEFORE the report is still the signal.
+      expect(classifyPrepareFailure({ error: 'HTTP 429 from the API; worker report: stopped' }, 'result')).toBe('infra-transient');
+    });
     it('a reviewed release can clear an exhausted lane-busy hold', () => {
       const entry = { target: '4800', attempt: 'run 8', cause: 'lane-busy', evidence: 'lanes freed', fixCommit: 'a'.repeat(40) };
       expect(validatePrepareRelease(entry, () => true)).toEqual(entry);

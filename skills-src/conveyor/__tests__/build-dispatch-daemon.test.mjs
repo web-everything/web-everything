@@ -1,4 +1,4 @@
-import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
+import { recordPrepareFailure, readFailureState, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, completePrepareFailures } from '../../../scripts/conveyor/prepare-failure-policy.mjs';
 import { planPrepareSpawns } from '../../../scripts/conveyor/tick-core.mjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, appendFileSync, readFileSync, statSync, existsSync, renameSync, utimesSync, readdirSync } from 'node:fs';
@@ -2272,6 +2272,26 @@ describe('automatic item preparation', () => {
       const log = vi.spyOn(console, 'error').mockImplementation(() => {});
       try { await runBuildDispatchTick({ live: true, effects }); } finally { log.mockRestore(); }
       expect(placed).toContain('4502');
+    });
+    it('a route whose hold could not be placed is handed out again on the next tick', async () => {
+      const effects = fixture();
+      const path = join(lockRoot, 'failures.json');
+      wire(effects, path);
+      effects.requeuePrepareRouteHold = num => requeuePrepareRouteHold(num, path);
+      seed(path, { '4501:run x:result': { num: '4501', attempt: 'run x', stage: 'result', cause: 'unknown', retry: false, held: true,
+        evidence: { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'` }, recordedAt: '2026-10-09T00:00:00.000Z' } });
+      effects.listHolds = () => [];
+      let failing = true;
+      const placed = [];
+      effects.placePrepareHold = vi.fn(h => { if (failing) throw new Error('disk full'); placed.push(h.num); });
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        await runBuildDispatchTick({ live: true, effects });
+        expect(placed).toEqual([]);
+        failing = false;
+        await runBuildDispatchTick({ live: true, effects });
+      } finally { log.mockRestore(); }
+      expect(placed).toEqual(['4501']);
     });
     it('a could-not-prepare report is surfaced under needsYou with a needs-you hold reason, not a silent prepare-unstamped', async () => {
       const effects = fixture();

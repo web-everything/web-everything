@@ -62,6 +62,8 @@ export function preparedReportRoute(evidence = {}) {
 }
 /** The hold reason of a lane-busy card whose whole backoff window was spent: surfaced, never silently held. */
 const LANE_BUSY_EXHAUSTED = 'needs-you: prepare lane-busy - every lane stayed leased for the whole retry window; clear it with a reviewed prepare release once a lane is free';
+/** The hold reason of an infra-transient card whose whole retry budget was spent: surfaced, never silently held. */
+const INFRA_EXHAUSTED = `needs-you: prepare infra-transient - the ${INFRA_RETRY_BUDGET} retries for temporary infrastructure failures were spent; clear it with a reviewed prepare release once the infrastructure is healthy`;
 /** How many unfinished, not-yet-re-armed failures of `cause` this card has, counting the one being recorded. */
 const backoffAttempts = (state, num, cause, except = null) => Object.values(state.failures)
   .filter(f => f.num === num && f.cause === cause && f !== except && !f.completed && !f.rearmedAt && !f.budgetResetAt).length + 1;
@@ -73,9 +75,12 @@ export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   if (route) return route.cause;
   // A failure of the dispatch launch (a backoff reason code) may QUOTE any infra text; it keeps its own backoff.
   const launchOwned = stage === DISPATCH_TRANSIENT_STAGE && Boolean(evidenceReasonCode(evidence));
-  if (!launchOwned && INFRA_TRANSIENT_RE.test(error)) return 'infra-transient';
-  if (!launchOwned && LANE_BUSY_RE.test(error)) return 'lane-busy';
-  if (!launchOwned && INFRA_LATE_RE.test(error)) return 'infra-transient';
+  // The quoted `worker report: …` tail is worker prose, not a failure signal: a worker that MENTIONS a rate limit or a
+  // live lease must not steer its own classification, so the infra patterns read only what precedes it.
+  const infraText = error.replace(/\bworker report:[\s\S]*$/i, '');
+  if (!launchOwned && INFRA_TRANSIENT_RE.test(infraText)) return 'infra-transient';
+  if (!launchOwned && LANE_BUSY_RE.test(infraText)) return 'lane-busy';
+  if (!launchOwned && INFRA_LATE_RE.test(infraText)) return 'infra-transient';
   if (ORPHAN_RETIRED_RE.test(error) || PREPARE_CARD_RULE_RE.test(error)) return 'infra-transient';
   // builder-starved-2 (2026-10-07) — the agent never got a lane: `lane-pool.mjs acquire` could not resolve an origin
   // from its scratch cwd (#4174). That is the launcher's fault, not the card's, so it is retried, never held for good.
@@ -156,6 +161,8 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
   const previous = Object.values(state.failures).filter(f => f.num === num && f.cause === 'infra-transient').length;
   const retry = cause === 'infra-transient' && previous < INFRA_RETRY_BUDGET;
   const failure = { num, attempt, stage, cause, evidence: redactEvidence(evidence), retry, held: !retry, recordedAt: new Date(now).toISOString() };
+  // The infra budget spent: held for good, so surface it like an exhausted lane-busy instead of holding it silently.
+  if (cause === 'infra-transient' && !retry) failure.holdReason = INFRA_EXHAUSTED;
   // Read off the RAW evidence (redaction never changes a route). The caller places a fresh route hold itself.
   const route = preparedReportRoute(evidence);
   if (route?.routeHold) Object.assign(failure, { retry: true, held: false, commit: route.commit, routeHold: route.routeHold, routeHoldPlacedAt: new Date(now).toISOString() });
@@ -292,6 +299,17 @@ export function takePrepareRouteHolds({ path = failureStatePath(), now = Date.no
   for (const f of due) f.routeHoldPlacedAt = new Date(now).toISOString();
   save(state, path);
   return due.map(f => ({ num: f.num, reason: f.routeHold }));
+}
+
+/** Un-stamp a route {@link takePrepareRouteHolds} handed out but the daemon could not place, so the next tick hands it
+ * out again instead of leaving the card to a paid re-prepare that may not re-report the same outcome. */
+export function requeuePrepareRouteHold(num, path = failureStatePath()) {
+  const state = readFailureState(path);
+  let changed = false;
+  for (const f of Object.values(state.failures)) {
+    if (f.num === num && f.routeHold && f.routeHoldPlacedAt && !f.completed) { delete f.routeHoldPlacedAt; changed = true; }
+  }
+  if (changed) save(state, path);
 }
 
 /** The pre-#4148 launch-confirmation bug recorded healthy launches as "not confirmed" and held the card for good. */
