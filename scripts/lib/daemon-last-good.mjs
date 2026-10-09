@@ -100,18 +100,29 @@ export function readRebuildStateFile(root, env = process.env) {
  * same window as `daemon-rebuild.mjs#buildLeaseIsLive`, same env override). A clone that is merely
  * behind because `origin/main` moved since its last rebuild is NOT held: the staleness guard must still refuse
  * it, so `daemon-self-sync.mjs#withSelfSync` re-syncs and restarts within the same tick (#3383 I-18) instead of
- * dispatching off stale code until the next interval. `heldSince`/`ageMs`/`overAge` come from `state.held`
+ * dispatching off stale code until the next interval — EXCEPT while the adoption itself is fresh (`freshAdoptMs`,
+ * the `WE_STALE_GUARD_REBUILD_GRACE_MS` window in {@link lastGoodForClone}): live 2026-10-09 19:18:51Z, PR #4624,
+ * a just-adopted build was refused for a whole fix pass in the gap before its next rebuild began. `heldSince`/`ageMs`/`overAge` come from `state.held`
  * when recorded; with no `held` record the age is unknown (`null`, never over).
  * @param {{headSha:string|null, state:object|null, dirty?:boolean, nowMs:number, maxAgeMs:number}} o
  * @returns {{onLastGood:boolean, lastGood:string|null, held:object|null, heldSince:string|null,
  *   ageMs:number|null, overAge:boolean}}
  */
-export function decideLastGood({ headSha, state, dirty = false, nowMs, maxAgeMs, leaseStaleMs = REBUILD_LEASE_STALE_MS_DEFAULT }) {
+export function decideLastGood({
+  headSha, state, dirty = false, nowMs, maxAgeMs, leaseStaleMs = REBUILD_LEASE_STALE_MS_DEFAULT, freshAdoptMs = 0,
+}) {
   const lastGood = state?.adopted?.head ?? null;
   const held = state?.held ?? null;
   const leaseStartedMs = Date.parse(state?.building?.startedAt || '');
   const building = Number.isFinite(leaseStartedMs) && nowMs - leaseStartedMs <= leaseStaleMs;
-  const holding = !!held || building;
+  // Live 2026-10-09 19:18:51Z (PR #4624): the fix daemon restarted onto build 26442e4a (adopted 19:09:36Z), main
+  // moved, and in the gap before the next background build started (neither held nor building) the guard refused
+  // the whole fix pass. A build adopted moments ago IS the last smoke-verified build; the self-sync starts the
+  // next rebuild at every tick end anyway, so refusing gains nothing and costs a full pass. Bounded: only while
+  // the adoption is younger than `freshAdoptMs` (0 = off, the pre-fix rule).
+  const adoptedMs = Date.parse(state?.adopted?.at || '');
+  const freshAdoption = freshAdoptMs > 0 && Number.isFinite(adoptedMs) && nowMs - adoptedMs <= freshAdoptMs;
+  const holding = !!held || building || freshAdoption;
   const onLastGood = !!(lastGood && headSha && headSha === lastGood && !dirty && holding);
   const sinceMs = Date.parse(held?.since || '');
   const ageMs = Number.isFinite(sinceMs) ? Math.max(0, nowMs - sinceMs) : null;
@@ -136,6 +147,7 @@ export function lastGoodForClone({
   return decideLastGood({
     headSha, state: readState(root, env), dirty, nowMs: now, maxAgeMs: lastGoodMaxAgeMs(env),
     leaseStaleMs: Number(env?.[REBUILD_LEASE_STALE_ENV]) > 0 ? Number(env[REBUILD_LEASE_STALE_ENV]) : REBUILD_LEASE_STALE_MS_DEFAULT,
+    freshAdoptMs: staleGuardRebuildGraceMs(env),
   });
 }
 
