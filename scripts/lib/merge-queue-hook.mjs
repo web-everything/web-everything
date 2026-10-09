@@ -72,6 +72,11 @@ export function loadMergeQueueSettings({ file, env = process.env } = {}) {
     errors.push('mergeFreshness: nonCodePaths must be a list of non-empty path strings');
     freshness.nonCodePaths = [...DEFAULT_NON_CODE_PATHS];
   }
+  const byRepo = freshness.nonCodePathsByRepo;
+  if (byRepo !== undefined && !(isObj(byRepo) && Object.values(byRepo).every((l) => Array.isArray(l) && l.every((p) => typeof p === 'string' && p)))) {
+    errors.push('mergeFreshness: nonCodePathsByRepo must map repo slugs to lists of non-empty path strings');
+    delete freshness.nonCodePathsByRepo;
+  }
   if (String(env?.[MERGE_QUEUE_OFF_ENV] ?? '').trim().toLowerCase() === 'off') { queue.enabled = false; freshness.enabled = false; }
   return { queue, freshness, errors };
 }
@@ -178,6 +183,16 @@ export function isNonCodePath(file, patterns = DEFAULT_NON_CODE_PATHS) {
   return !!f && patterns.some((p) => (p.endsWith('/') ? f.startsWith(p) : f === p));
 }
 
+/**
+ * PURE. The non-code patterns for one repo. `nonCodePathsByRepo` (setting, keyed by `owner/repo`) overrides the
+ * global list for a repo whose layout differs: plateau-app has no `backlog/`, and keeps reports in `reports/`.
+ * `repo` null (the drain's local repo) → the global list.
+ */
+export function nonCodePathsFor(freshness, repo) {
+  const own = repo ? freshness?.nonCodePathsByRepo?.[repo] : undefined;
+  return Array.isArray(own) ? own : (freshness?.nonCodePaths ?? DEFAULT_NON_CODE_PATHS);
+}
+
 /** PURE. Did main gain any code since the PR's base? (Unknown file lists are handled by the rule: fail closed.) */
 export function mainGainedCode(main, patterns = DEFAULT_NON_CODE_PATHS) {
   return (main?.commitsSinceBase ?? 0) > 0 && (main?.filesChangedSinceBase ?? []).some((f) => !isNonCodePath(f, patterns));
@@ -187,9 +202,9 @@ export function mainGainedCode(main, patterns = DEFAULT_NON_CODE_PATHS) {
  * PURE. The action for one landing candidate (batch size 1: the candidate is the queue head).
  * @returns {{action: 'merge'|'refresh'|'wait'|'refuse'|'queued', reasons: string[]}}
  */
-export function decideMergeQueueAction({ key, num, facts, nowMs, refreshed = {}, settings }) {
+export function decideMergeQueueAction({ key, num, repo = null, facts, nowMs, refreshed = {}, settings }) {
   const freshness = { ...settings.freshness };
-  const codeMoved = freshness.allowDisjointMainMoves && mainGainedCode(facts.main, freshness.nonCodePaths ?? DEFAULT_NON_CODE_PATHS);
+  const codeMoved = freshness.allowDisjointMainMoves && mainGainedCode(facts.main, nonCodePathsFor(freshness, repo));
   if (codeMoved) freshness.allowDisjointMainMoves = false; // disjointness only excuses non-code moves
   const [row] = planQueue({
     queue: [{ key, num, ...facts.pr }], main: () => facts.main, nowMs, refreshed,

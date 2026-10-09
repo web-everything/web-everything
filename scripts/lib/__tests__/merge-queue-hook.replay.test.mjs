@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   loadMergeQueueSettings, hookEnabled, readMergeFreshnessFacts, decideMergeQueueAction, requiredCheckFact,
-  prioritizeMainFix, isNonCodePath, mainGainedCode, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
+  prioritizeMainFix, isNonCodePath, mainGainedCode, nonCodePathsFor, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
 } from '../merge-queue-hook.mjs';
 
 const SETTINGS_FILE = JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8'));
@@ -124,6 +124,25 @@ describe('replay 2026-10-09: #4453 then #4547 (main red 07:44 ET)', () => {
     for (const f of ['scripts/a.mjs', 'skills-src/x/SKILL.md', '.github/workflows/t.yml', 'package.json', 'AGENTS.md']) expect(isNonCodePath(f)).toBe(false);
     expect(isNonCodePath('AGENTS.md', ['AGENTS.md'])).toBe(true);
     expect(loadMergeQueueSettings({ file: { mergeFreshness: { nonCodePaths: 'docs/' } }, env: {} }).errors).toEqual(['mergeFreshness: nonCodePaths must be a list of non-empty path strings']);
+  });
+  it('per-repo non-code paths: plateau-app has no backlog/; docs/ and reports/ are its non-code', () => {
+    expect(LIVE.freshness.nonCodePathsByRepo).toEqual({ 'plateauapp/plateau-app': ['docs/', 'reports/'] });
+    expect(nonCodePathsFor(LIVE.freshness, 'plateauapp/plateau-app')).toEqual(['docs/', 'reports/']);
+    expect(nonCodePathsFor(LIVE.freshness, REPO)).toEqual(['backlog/', 'docs/']);
+    expect(nonCodePathsFor(LIVE.freshness, null)).toEqual(['backlog/', 'docs/']);
+    // #217's live main moves (tools/drain-daemon/*) are code there → refresh, never a blind merge.
+    const main = { commitsSinceBase: 2, filesChangedSinceBase: ['tools/drain-daemon/lib.mjs', 'tools/drain-daemon/README.md'] };
+    expect(mainGainedCode(main, nonCodePathsFor(LIVE.freshness, 'plateauapp/plateau-app'))).toBe(true);
+    expect(mainGainedCode({ commitsSinceBase: 1, filesChangedSinceBase: ['reports/x.md'] }, nonCodePathsFor(LIVE.freshness, 'plateauapp/plateau-app'))).toBe(false);
+    expect(loadMergeQueueSettings({ file: { mergeFreshness: { nonCodePathsByRepo: { 'a/b': 'docs/' } } }, env: {} }).errors)
+      .toEqual(['mergeFreshness: nonCodePathsByRepo must map repo slugs to lists of non-empty path strings']);
+  });
+  it('decideMergeQueueAction uses the candidate repo\'s non-code paths', () => {
+    const facts = { pr: { headSha: 'h', baseSha: 'b', files: ['src/a.ts'], filesComplete: true, requiredCheck: { state: 'passed', headSha: 'h', completedAtMs: 1000, runId: '1' } },
+      main: { tipSha: 't', commitsSinceBase: 1, filesChangedSinceBase: ['reports/x.md'], complete: true }, errors: [] };
+    // reports/ is non-code for plateau-app (young pass, disjoint) → merge; for WE it is code → refresh.
+    expect(decideMergeQueueAction({ key: 'k', num: 1, repo: 'plateauapp/plateau-app', facts, nowMs: 2000, settings: LIVE }).action).toBe('merge');
+    expect(decideMergeQueueAction({ key: 'k', num: 1, repo: REPO, facts, nowMs: 2000, settings: LIVE }).action).toBe('refresh');
   });
   it('with the rule off (today), #4547 merged — the incident', () => {
     expect(replay(4547, loadMergeQueueSettings({ file: {}, env: {} })).action).toBe('merge');

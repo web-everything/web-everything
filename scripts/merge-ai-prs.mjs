@@ -190,6 +190,7 @@ import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
+import { ensureSiblingClone } from './lib/sibling-clone.mjs'; // plateau-app #217 — the merge-queue refresh provisions a missing sibling clone
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { decideQuarantineHold } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
@@ -5554,7 +5555,7 @@ async function runCli() {
       repo: cand.repo, num: cand.num, headSha, requiredCheck: REQUIRED,
       defaultBranch: defaultBranchOf(cand.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
     });
-    const mq = decideMergeQueueAction({ key: mqKey, num: cand.num, facts, nowMs: Date.now(), refreshed: readRefreshed(MERGE_QUEUE_STATE), settings: MERGE_QUEUE });
+    const mq = decideMergeQueueAction({ key: mqKey, num: cand.num, repo: cand.repo ?? null, facts, nowMs: Date.now(), refreshed: readRefreshed(MERGE_QUEUE_STATE), settings: MERGE_QUEUE });
     const why = `${mq.reasons.join(', ') || 'fresh'}${facts.errors.length ? `; read errors: ${facts.errors.join('; ')}` : ''}`;
     if (mq.action === 'merge') {
       if (!AS_JSON) process.stderr.write(`  ✓ merge-queue: PR ${repoTag(cand.repo)}${cand.num} merge-fresh (pass ${Math.round((Date.now() - (facts.pr.requiredCheck?.completedAtMs ?? Date.now())) / 60000)} min old, main +${facts.main.commitsSinceBase ?? '?'} since base)\n`);
@@ -5565,10 +5566,22 @@ async function runCli() {
       if (!AS_JSON) process.stderr.write(`  ⏸ merge-queue: ${mq.action} PR ${repoTag(cand.repo)}${cand.num} (${why}) — not merged this pass\n`);
       return false;
     }
-    const cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
+    let cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
+    // plateau-app #217 (2026-10-09): the resident drain's pool never had `../plateau-app`, so every cross-repo refresh
+    // was `skipped-remote` and the PR could never merge. Provision the sibling clone here (once; reused after), the
+    // way the WE lane pool does — a clone, not the update-branch API, because the review gate's acceptance re-check
+    // on the moved head needs a checkout of that repo too (see we:scripts/lib/sibling-clone.mjs).
+    let provisionError = null;
+    if (!cloneDir && !DRY_RUN) {
+      const prov = ensureSiblingClone({ repo: cand.repo, name: siblingCloneName(cand.repo), cwd: process.cwd() });
+      if (prov.ok) {
+        cloneDir = prov.dir;
+        if (prov.created && !AS_JSON) process.stderr.write(`  ⊕ merge-queue: provisioned the ${cand.repo} sibling clone at ${prov.dir}\n`);
+      } else provisionError = prov.error;
+    }
     let out;
     if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
-    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
+    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned${provisionError ? ` (${provisionError})` : ''}` };
     else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
     // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git error,
     // no clone) is retried next pass rather than parking the head as `wait` forever.

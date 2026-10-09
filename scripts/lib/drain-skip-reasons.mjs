@@ -15,13 +15,20 @@ export const SKIP_KINDS = Object.freeze([
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
   'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
-  'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason',
+  'partner-pending', 'ready-not-reached', 'red-main-hold',
+  // The merge-queue freshness hook (we:scripts/lib/merge-queue-hook.mjs): refreshed this pass (awaiting the new
+  // run), the refresh failed (e.g. plateau-app #217: no clone), or held (wait / refuse / queued).
+  'mq-refreshed', 'mq-refresh-failed', 'mq-held',
+  'unrecognized-reason',
 ]);
 
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {
   const r = String(reason ?? '');
   if (/^red-main-hold\b/.test(r)) return 'red-main-hold'; // we:scripts/lib/red-main-hold.mjs — main is red, only the fix PR lands
+  // Ahead of the generic patterns: a merge-queue reason can quote read errors ("required check … not green").
+  if (/^merge-queue: refresh\b/.test(r)) return / failed: /.test(r) ? 'mq-refresh-failed' : 'mq-refreshed';
+  if (/^merge-queue: (wait|refuse|queued)\b/.test(r)) return 'mq-held';
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';
   if (/\bBEHIND\b/.test(r)) return 'behind';

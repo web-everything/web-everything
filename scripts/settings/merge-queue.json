@@ -10,6 +10,9 @@
     "enabled": true,
     "maxAgeMinutes": 30,
     "allowDisjointMainMoves": true,
-    "nonCodePaths": ["backlog/", "docs/"]
+    "nonCodePaths": ["backlog/", "docs/"],
+    "nonCodePathsByRepo": {
+      "plateauapp/plateau-app": ["docs/", "reports/"]
+    }
   }
 }

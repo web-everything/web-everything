@@ -27,6 +27,16 @@ describe('drain skip reasons (card 122 slice 1)', () => {
     expect(classifySkipReason('unsatisfied review hold ("review:human") present without review:accepted')).toBe('review-hold');
     expect(classifySkipReason('head moved since the pass-start decision (a → b)')).toBe('head-moved');
   });
+  it('names the merge-queue freshness outcomes (plateau-app #217 sat as unrecognized-reason every pass)', () => {
+    // Verbatim skip record from the plateau drain log, 2026-10-09.
+    const rec217 = { num: 217, repo: 'plateauapp/plateau-app', reason: 'merge-queue: refresh (main-gained-code, base-behind-main, pass-too-old) → skipped-remote failed: no plateauapp/plateau-app clone provisioned' };
+    const rows = buildSkipReasons({ verdicts: [{ ...rec217, decision: 'merge' }], revalidationAborted: [rec217] });
+    expect(rows).toEqual([{ ...rec217, kind: 'mq-refresh-failed', source: 'revalidationAborted' }]);
+    expect(classifySkipReason('merge-queue: refresh (pass-too-old) → rebased')).toBe('mq-refreshed');
+    expect(classifySkipReason('merge-queue: refresh (base-behind-main) → rerun')).toBe('mq-refreshed');
+    expect(classifySkipReason('merge-queue: wait (refresh-already-requested)')).toBe('mq-held');
+    expect(classifySkipReason('merge-queue: refuse (facts-incomplete; read errors: required check "test" is not green)')).toBe('mq-held');
+  });
   it('accounts for a ready PR no bucket explained, and never lists a landed one', () => {
     const rows = buildSkipReasons({ verdicts: [{ num: 1, decision: 'merge' }, { num: 2, decision: 'merge' }], merged: [{ num: 1 }] });
     expect(rows).toHaveLength(1);
