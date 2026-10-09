@@ -3,9 +3,10 @@ bornAs: xps83ev
 kind: story
 size: 1
 priority: now
-status: open
+status: resolved
 scope: ["plateau:docs/wip-page.md"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
