@@ -3,7 +3,7 @@ bornAs: xlou1je
 kind: story
 size: 8
 status: open
-scope: ["we:scripts/lib/lane-lease.mjs", "we:scripts/lib/lane-hold-io.mjs", "we:scripts/lane-pool.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/lib/account-identity.mjs", "we:scripts/operations/worker-launch-record.mjs", "we:scripts/operations/resume-report.mjs", "we:.claude/settings.json", "we:.claude/commands/continue.md", "we:docs/agent/dispatcher-runbook.md"]
+scope: ["we:scripts/lib/lane-lease.mjs", "we:scripts/lib/__tests__/lane-lease.test.mjs", "we:scripts/lib/lane-hold-io.mjs", "we:scripts/lib/__tests__/lane-hold-io.test.mjs", "we:scripts/lane-pool.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/lib/__tests__/account-identity.test.mjs", "we:scripts/operations/__tests__/worker-launch-record.test.mjs", "we:scripts/operations/__tests__/resume-report.test.mjs", "we:scripts/lib/account-identity.mjs", "we:scripts/operations/worker-launch-record.mjs", "we:scripts/operations/resume-report.mjs", "we:.claude/settings.json", "we:.claude/commands/continue.md", "we:docs/agent/dispatcher-runbook.md"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "0c6c1fb5caf43602aeff444ed5731b4c39e1c1ec"
@@ -109,34 +109,34 @@ Deliberately OUT (see Follow-ups): auto-salvage of a held lane, a health smell f
 Slice A, in we:scripts/lib/__tests__/lane-lease.test.mjs, we:scripts/lib/__tests__/lane-hold-io.test.mjs and we:scripts/conveyor/__tests__/lease-reaper.test.mjs:
 - `laneHoldVerdict` release, not holder, no verify record, `work.unpushedCommits = 1` → `allowed:false`, `hold:'unpreserved-work'`. RED today: returns `allow('no hold signal')`.
 - same with `work.workDirty = 6` (the lane-8 shape) → held. RED today for the same reason.
-- same with `workDirty = 0, unpushedCommits = 0` → allowed (an empty lane is still reaped; the Risk 1 guard).
+- same with `workDirty = 0, unpushedCommits = 0` → allowed (an empty lane is still reaped; the Risk 1 guard). Preservation, GREEN today; mutation proof: make the new hold fire on any lane, and this case fails.
 - `work.workDirty = null` → `work-state-unknown` (fail closed). RED today: allowed.
-- `byHolder: true` release → allowed whatever the work state (the holder releases its own lane).
-- a litter-only lane (only `.commit-msg.txt` dirty) → allowed (`workDirty` excludes litter). Guards against filling the pool with unreapable lanes.
+- `byHolder: true` release → allowed whatever the work state (the holder releases its own lane). Preservation, GREEN today; mutation proof: drop the `byHolder` early return and this case fails.
+- a litter-only lane (only `.commit-msg.txt` dirty) → allowed (`workDirty` excludes litter). Guards against filling the pool with unreapable lanes. Preservation, GREEN today; mutation proof: swap `workDirty` for the raw `dirty` count and this case fails.
 - `laneHoldNeedsWorkState` is true for a non-holder release with no verify record. RED today: false, so the work state is never read.
 - `checkLaneHold` on a real temp git repo (one unpushed commit, no verify record) → held with facts populated. RED today: allowed.
 - `checkLaneHold` called the way `release` calls it (a pre-supplied boolean `unpushed: true` and a `work` option) still holds, and with a boolean but no `work` it reads the state itself rather than treating `work` as absent. RED today: allowed.
 - stale-ref guard: a lane with zero `workDirty` whose head is on the live remote (`remoteHas` true) or whose commits are patch-equivalent to origin (squash-merged, branch pruned) → allowed; the same lane with one uncommitted tracked file → held (uncommitted work is never excused). The first half passes today (a guard); the second is RED today.
 - `applyLaneHold` over a candidate the reaper classified reapable (session gone) with the real check on that temp repo → moved to `keep` with reason `held:unpreserved-work`; `wouldHaveBeen` carries the original reason. RED today: it stays in `reap`.
 - the `release --force` command of we:scripts/lane-pool.mjs, run by a non-holder on a lane with an uncommitted tracked file, refuses and leaves the marker. RED today: marker dropped.
-- `reclaim --salvage` on the same lane still succeeds (it preserves first). Guards that slice A does not trap the explicit rescue path.
+- `reclaim --salvage` on the same lane still succeeds (it preserves first). Guards that slice A does not trap the explicit rescue path. Preservation, GREEN today; mutation proof: extend the new hold to the `reclaim` action and this case fails.
 
 Slice B, in we:scripts/operations/__tests__/worker-launch-record.test.mjs and we:scripts/operations/__tests__/resume-report.test.mjs:
 - hook build function: a captured live `PostToolUse` Agent payload fixture (captured during the build, see Proof plan) → one record with the expected fields; malformed or empty stdin → no record, exit 0, no throw. RED before the module exists.
-- unsafe session id (`../x`, leading `--`) → refused, nothing written outside the records directory.
-- repeated fire of the same event → one file, same content.
-- `classifyLaneContentState` table: every combination of null/0/positive for `workDirty`, `unpushedCommits`, `ahead` → the documented state; null always `unknown`.
-- pre phase writes a record with no `agentId`; the post phase for the same tool-use id fills it in and leaves other fields unchanged (one file). A foreground launch with only a pre event still yields a record.
-- ambiguous join: two records and two leases sharing one `ownerSession`, no lane named → both rows read `lane ambiguous` listing both lanes; neither is silently paired.
-- report join: a record with a matching lease → `launch-record` row with the lane state; a lease with no record → `unrecorded` row (the fallback); a record whose lane was released → `lane released`; a lease re-acquired after the launch time does not match the old record.
-- liveness: a failed `claude agents` read → `unknown`, never `dead`.
-- hostile description text (newline, backticks, `--flag`) → folded in table and JSON output.
+- unsafe session id (`../x`, leading `--`) → refused, nothing written outside the records directory. RED before the module exists.
+- repeated fire of the same event → one file, same content. RED before the module exists.
+- `classifyLaneContentState` table: every combination of null/0/positive for `workDirty`, `unpushedCommits`, `ahead` → the documented state; null always `unknown`. RED before the module exists.
+- pre phase writes a record with no `agentId`; the post phase for the same tool-use id fills it in and leaves other fields unchanged (one file). A foreground launch with only a pre event still yields a record. RED before the module exists.
+- ambiguous join: two records and two leases sharing one `ownerSession`, no lane named → both rows read `lane ambiguous` listing both lanes; neither is silently paired. RED before the module exists.
+- report join: a record with a matching lease → `launch-record` row with the lane state; a lease with no record → `unrecorded` row (the fallback); a record whose lane was released → `lane released`; a lease re-acquired after the launch time does not match the old record. RED before the module exists.
+- liveness: a failed `claude agents` read → `unknown`, never `dead`. RED before the module exists.
+- hostile description text (newline, backticks, `--flag`) → folded in table and JSON output. RED before the module exists.
 
 Slice C, in we:scripts/lib/__tests__/account-identity.test.mjs:
-- parse of a `claude auth status --json` fixture → stable `fp`, masked `label`, no raw email anywhere in the returned object (assert by serialising it and searching for the address).
-- `loggedIn:false`, exec throw, unparseable output → `unknown`.
-- comparison: same fp → `same`; different → `switched`; either side unknown → `unknown` (never `same`).
-- `leaseBody` with and without an `account` field is backward compatible (older leases lack it → `unknown`).
+- parse of a `claude auth status --json` fixture → stable `fp`, masked `label`, no raw email anywhere in the returned object (assert by serialising it and searching for the address). RED before the module exists.
+- `loggedIn:false`, exec throw, unparseable output → `unknown`. RED before the module exists.
+- comparison: same fp → `same`; different → `switched`; either side unknown → `unknown` (never `same`). RED before the module exists.
+- `leaseBody` with and without an `account` field is backward compatible (older leases lack it → `unknown`). Preservation for the without-`account` half, GREEN today; mutation proof: make `account` required in `leaseBody` and it fails. The with-`account` half is RED today.
 
 ## Proof plan
 
