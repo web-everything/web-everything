@@ -29,6 +29,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 
+import { readGit } from '../lib/proc-read.mjs';
 import { createJobStore, enqueueJob, reattachTick, runJob } from '../lib/daemon-jobs-runtime.mjs';
 import { detectSleep } from '../lib/daemon-jobs.mjs';
 import { evictSnapshots, npmCiInstaller } from '../lib/daemon-job-snapshots.mjs';
@@ -93,7 +94,7 @@ export function cloneNodeModulesInstaller(sourceRoot, { exec = execFileSync, fal
 }
 
 function readHeadSha(sourceRoot) {
-  return execFileSync('git', ['-C', sourceRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  return readGit(['-C', sourceRoot, 'rev-parse', 'HEAD'], { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 }
 
 function readResult(dir, id) {

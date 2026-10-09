@@ -5,7 +5,7 @@ size: 5
 parent: "4075"
 status: open
 blockedBy: ["4125"]
-scope: ["we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-watch-job.mjs", "we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs", "we:scripts/conveyor/__tests__/health-watch-job.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
+scope: ["we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-watch-job.mjs", "we:scripts/conveyor/__tests__/health-watch*.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
 dateOpened: "2026-09-24"
 preparedDate: "2026-10-08"
 preparedAgainstSha: "47d73d01f584ded51a3a021b444c2b7f25bd7349"
