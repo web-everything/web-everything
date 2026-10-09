@@ -142,6 +142,32 @@ describe('parseSupersedes', () => {
       parseSupersedes(body);
       expect(performance.now() - started).toBeLessThan(1500);
     });
+  // PR #4560 review: three `[ \t]*` separated only by optional tokens made a NON-matching `Supersedes` line backtrack
+  // cubically in its spaces (8,000 spaces ≈ 110 s of synchronous event loop in the daemon). Every shape below must be
+  // rejected (or read) in linear time.
+  it.each([
+    ['spaces after the keyword', `Supersedes${' '.repeat(4000)}x`], // the old regex needed ~15 s here, so a revert goes red without hanging the run
+    ['tabs after the keyword', `Supersedes${'\t'.repeat(4000)}x`],
+    ['spaces around a colon and bold', `Supersedes**${' '.repeat(50000)}:${' '.repeat(50000)}**${' '.repeat(50000)}x`],
+    ['a bold keyword with spaces', `**Supersedes**${' '.repeat(50000)}**${' '.repeat(50000)}`],
+    ['spaces after a PR list', `Supersedes #1${' '.repeat(100000)}x`],
+    ['a long PR list', `Supersedes ${'#1 , '.repeat(20000)}x`],
+    ['a long and-chain', `Supersedes ${'#1 and '.repeat(16000)}x`],
+    ['spaces after a heading hash', `#${' '.repeat(100000)}Supersedes x`],
+  ])('rejects a long line of %s quickly', (_name, line) => {
+    const started = performance.now();
+    parseSupersedes(line);
+    expect(performance.now() - started).toBeLessThan(1500);
+  });
+  it.each([
+    ['colon then bold', 'Supersedes: **#7', [7]],
+    ['bold keyword then colon', '**Supersedes**: #7', [7]],
+    ['a space before the colon', 'Supersedes : #7', [7]],
+    ['bold after spaces', 'Supersedes **#7', [7]],
+    ['bold on both sides of the colon', 'Supersedes**: **#7', [7]],
+    ['no separator but a space', 'Supersedes #7 and #8, #9', [7, 8, 9]],
+    ['a colon with no PR after it', 'Supersedes: soon', []],
+  ])('still reads the separator shape: %s', (_name, body, expected) => expect(parseSupersedes(body)).toEqual(expected));
   it('caps the targets one body may declare', () => {
     const body = `Supersedes ${Array.from({ length: 3000 }, (_, i) => `#${i + 1}`).join(', ')}`;
     expect(parseSupersedes(body)).toHaveLength(MAX_SUPERSEDE_TARGETS);

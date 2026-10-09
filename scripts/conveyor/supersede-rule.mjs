@@ -54,8 +54,10 @@ export function resolveSupersedeSettings(env = process.env, { path = supersedeSe
 }
 
 /** One marker line: heading, bold, `Supersedes`, optional `:` (bold may close either side of it), then the PR list.
- *  Text after the list (`Supersedes #4522 (lane/main-red-soak)`) is allowed; text before `Supersedes` is not. */
-const MARKER_LINE_RE = /^ {0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \t]*:?[ \t]*(?:\*\*)?[ \t]*(#\d+(?:(?:[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]+)#\d+)*)(?!\w)/;
+ *  Text after the list (`Supersedes #4522 (lane/main-red-soak)`) is allowed; text before `Supersedes` is not.
+ *  Each run of spaces is owned by exactly one quantifier (a `[ \t]*` is only ever followed by the `:` / `**` it
+ *  introduces, or by the list), so a line that does not match backtracks linearly, not cubically in its spaces. */
+const MARKER_LINE_RE = /^ {0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?(?:[ \t]*:)?(?:[ \t]*\*\*)?[ \t]*(#\d+(?:(?:[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]+)#\d+)*)(?!\w)/;
 
 /** A fence line: up to 3 SPACES (a tab or no-break space is indented code / not a fence), a run of 3+ backticks or
  *  3+ tildes, then the rest of the line. */
