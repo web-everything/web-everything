@@ -5575,10 +5575,11 @@ async function runCli() {
       if (!plan.ready.length) break;
       let progressed = false;
       // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
-      const cascadeOrder = prioritizeMainFix(coupleStep.ordered, {
+      // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
+      coupleStep.ordered = prioritizeMainFix(coupleStep.ordered, {
         mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue, isCoupleHalf: (x) => isImplHalf(x) || isCoupleCarrier(x),
       });
-      for (const c of cascadeOrder) {
+      for (const c of coupleStep.ordered) {
         if (heldThisIteration.has(candKey(c))) continue;
         // fix-couple-split — impl half: its carrier must still pass a FRESH pre-merge read right now, else hold both.
         if (isImplHalf(c)) {
