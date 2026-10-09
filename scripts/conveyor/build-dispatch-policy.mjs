@@ -214,8 +214,11 @@ export function planBuildDispatch({
   const hold = [];
   const dispatch = [];
   const freezeReasons = [];
-  if (killSwitch?.engaged) freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`);
-  if (openPrs.length > policy.maxOpenPrs) freezeReasons.push(`${openPrs.length} open PRs > maxOpenPrs ${policy.maxOpenPrs}`);
+  // Card x60i0ie — WHY the queue is frozen, as stable kinds (`kill-switch` | `open-prs` | `label`), so a caller can
+  // tell an open-PR-count freeze (a build-WIP limit) from a kill switch or a freeze label (hold everything).
+  const freezeKinds = new Set();
+  if (killSwitch?.engaged) { freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`); freezeKinds.add('kill-switch'); }
+  if (openPrs.length > policy.maxOpenPrs) { freezeReasons.push(`${openPrs.length} open PRs > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
   // GLOBAL freeze set — `blocked:daemon-bug` only (#3383 continuation, live incident 2026-09-28). A per-PR
   // `*-stalled` label never reaches this set any more; it is still an ordinary open PR below, so the
   // `scope-vs-open-prs` loop still holds any candidate whose scope overlaps ITS files. Falls back to the full
@@ -224,7 +227,7 @@ export function planBuildDispatch({
   const freezeSet = new Set(policy.globalFreezeLabels ?? policy.freezeLabels ?? []);
   for (const pr of openPrs) {
     const hit = pr.labels.find((l) => freezeSet.has(l));
-    if (hit) freezeReasons.push(`${pr.repo}#${pr.number} is labelled ${hit}`);
+    if (hit) { freezeReasons.push(`${pr.repo}#${pr.number} is labelled ${hit}`); freezeKinds.add('label'); }
   }
   const frozen = freezeReasons.length > 0;
 
@@ -322,7 +325,7 @@ export function planBuildDispatch({
     dispatch.push(pick);
   }
   return {
-    freeze: { frozen, reasons: freezeReasons }, inFlight: running, busy, slots: slotsByClass.claude, slotsByClass, dispatch, hold,
+    freeze: { frozen, reasons: freezeReasons, kinds: [...freezeKinds] }, inFlight: running, busy, slots: slotsByClass.claude, slotsByClass, dispatch, hold,
     // Card x3vs6tu — logged signal only (never gates `busy`/`slots` above): the machine-wide "building" count
     // the tick core passed in, visible to a dry-run/status line even though this cap no longer reads it.
     externalBuilding: Number(externalBuilding) || 0,
