@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases } from '../prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases, releaseDuePrepareRetries, takePrepareRouteHolds } from '../prepare-failure-policy.mjs';
 import { planScaffold, shapeScaffoldRead } from '../../operations/scaffold.mjs';
 import { writeFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -111,5 +111,82 @@ describe('builder-starved-2 — a prepare that never got a lane is infrastructur
     const { releaseDuePrepareRetries } = await import('../prepare-failure-policy.mjs');
     expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-07T19:00:00Z') })).toEqual(['4560']);
     expect(readFailureState(path).failures['4560:run x:result']).toMatchObject({ held: false, retry: true, cause: 'infra-transient', healedFrom: 'unknown' });
+  });
+});
+
+// Live 2026-10-09 16:47Z: the builder's last tick listed 28 held prepares, each held after ONE attempt. Every shape
+// below is copied from that ledger (we:.operations/coordination/prepare-failures.json), trimmed.
+describe('held prepares (live 2026-10-09) — each failure class is handled, never held silently', () => {
+  let dir, path;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'prepare-held-')); path = join(dir, 'prepare-failures.json'); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  const sha = '10fedba67afc9550fb9a6592282603117284c0c2';
+  const laneBusy = { error: 'unexpected error: could not acquire a lane: ✗ lane-10 is leased by review-4484 (review-loop) @ 2026-10-08T22:25:28.468Z — a LIVE lease; --force does not override it (#2337).', sessionAbsent: true, resultAuthored: false, resultDiscarded: false, reason: 'prepare-unstamped' };
+  const orphan = { error: 'build-dispatch-orphan-adopt: dispatch retired (prepare-unstamped)', terminal: 'Prefixing the bare paths so the gate passes.', stoppedBeforeCompletion: false, reason: 'prepare-unstamped' };
+  const refLock = { reason: "Command failed: git fetch -q origin main\nerror: cannot lock ref 'refs/remotes/origin/main': is at a04b734 but expected adde7a6\n" };
+  const untrusted = { error: 'claude could not be started (workspace not trusted for /Users/x/workspace/.operations/dispatch/3fa49e22) — no agent exists', reason: 'prepare-unstamped' };
+  const ownCard = { error: "not built: the worker edited the item's own backlog card — refusing", sessionAbsent: false, resultAuthored: true, resultDiscarded: true, reason: 'prepare-unstamped' };
+  const alreadyDone = { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}', which explicitly references this card's birth ID`, reason: 'prepare-unstamped' };
+  const orphanDone = { error: 'build-dispatch-orphan-adopt: dispatch retired (prepare-unstamped)', terminal: '#4444 prepare-item → already-done — 4e75771b7 (#487 single-kind-axis migration) plus the validateBacklogItem rules.', reason: 'prepare-unstamped' };
+  const couldNot = { error: 'prepare requires a card-only diff; worker report: **could-not-prepare** — #4355 leaves a genuine policy choice unresolved: boost within the tier, or pin?', reason: 'prepare-unstamped' };
+  it.each([
+    ['lane busy (a LIVE lease)', laneBusy, 'result', 'infra-transient'],
+    ['orphan-adopt retirement', orphan, 'result', 'infra-transient'],
+    ['raw git ref lock at the stamp stage', refLock, 'stamp', 'infra-transient'],
+    ['workspace not trusted', untrusted, 'result', 'infra-transient'],
+    ['prepare judged by a superseded card rule', ownCard, 'result', 'infra-transient'],
+    ['worker report: already-done with a commit', alreadyDone, 'result', 'already-done'],
+    ['orphan terminal: already-done with a commit', orphanDone, 'result', 'already-done'],
+    ['worker report: could-not-prepare', couldNot, 'result', 'needs-you'],
+  ])('%s classifies as %s', (_, evidence, stage, cause) => expect(classifyPrepareFailure(evidence, stage)).toBe(cause));
+  it('a genuinely unrecognised failure is still unknown (held + diagnose card)', () => {
+    expect(classifyPrepareFailure({ error: 'wrapper-failed' }, 'result')).toBe('unknown');
+    expect(classifyPrepareFailure({ error: 'prepare requires a card-only diff; worker report: I rewrote the card' }, 'result')).toBe('unknown');
+  });
+  it('a fresh already-done is routed to the resolve hold, a fresh could-not-prepare is held as needs-you; neither files a diagnose card', async () => {
+    const fileCard = vi.fn();
+    const done = await recordPrepareFailure({ num: '4560', attempt: 'run a', stage: 'result', evidence: alreadyDone }, { path, fileCard });
+    expect(done).toMatchObject({ cause: 'already-done', held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
+    const needs = await recordPrepareFailure({ num: '4355', attempt: 'run b', stage: 'result', evidence: couldNot }, { path, fileCard });
+    expect(needs).toMatchObject({ cause: 'needs-you', held: true, retry: false });
+    expect(needs.holdReason).toMatch(/^needs-you: prepare blocked \(needs-ruling\) - /);
+    expect(fileCard).not.toHaveBeenCalled();
+    // The route hold is handed out once (the daemon places it right after recording).
+    expect(takePrepareRouteHolds({ path })).toEqual([]);
+  });
+  it('re-classifies the live held ledger on the next tick: transients retry (bounded), already-done routes, could-not-prepare is needs-you', () => {
+    const held = (num, stage, cause, evidence) => [`${num}:run ${num}:${stage}`, { num, attempt: `run ${num}`, stage, cause, evidence, retry: false, held: true, recordedAt: '2026-10-09T00:00:00.000Z' }];
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: Object.fromEntries([
+      held('4425', 'result', 'no-session', laneBusy),
+      held('4414', 'result', 'unknown', orphan),
+      held('4341', 'stamp', 'unknown', refLock),
+      held('4426', 'result', 'unknown', untrusted),
+      held('4392', 'result', 'result-lost', ownCard),
+      held('4560', 'result', 'unknown', alreadyDone),
+      held('4355', 'result', 'unknown', couldNot),
+      held('4423', 'result', 'no-session', laneBusy),
+      // #4423 already spent its infra budget: it stays held.
+      ['4423:a:dispatch', { num: '4423', attempt: 'a', stage: 'dispatch', cause: 'infra-transient', evidence: {}, retry: true, held: false }],
+      ['4423:b:dispatch', { num: '4423', attempt: 'b', stage: 'dispatch', cause: 'infra-transient', evidence: {}, retry: true, held: false }],
+      held('9999', 'result', 'unknown', { error: 'wrapper-failed' }),
+    ]) }));
+    const released = releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') });
+    expect(released.sort()).toEqual(['4341', '4392', '4414', '4425', '4426', '4560']);
+    const f = readFailureState(path).failures;
+    for (const n of ['4425', '4414', '4426', '4392']) expect(f[`${n}:run ${n}:result`]).toMatchObject({ cause: 'infra-transient', held: false, retry: true });
+    expect(f['4341:run 4341:stamp']).toMatchObject({ cause: 'infra-transient', held: false, retry: true, healedFrom: 'unknown' });
+    expect(f['4560:run 4560:result']).toMatchObject({ cause: 'already-done', held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
+    expect(f['4355:run 4355:result']).toMatchObject({ cause: 'needs-you', held: true, retry: false });
+    expect(f['4355:run 4355:result'].holdReason).toMatch(/^needs-you: /);
+    expect(f['4423:run 4423:result']).toMatchObject({ held: true });
+    expect(f['9999:run 9999:result']).toMatchObject({ cause: 'unknown', held: true });
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
+    expect(takePrepareRouteHolds({ path })).toEqual([]);
+    // Idempotent: a second tick changes nothing.
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:01:00Z') })).toEqual([]);
+  });
+  it('a needs-you hold is releasable by a reviewed, commit-cited release entry', () => {
+    const entry = { target: '4355', attempt: 'run 4355', cause: 'needs-you', evidence: 'ruled in the card', fixCommit: 'a'.repeat(40) };
+    expect(validatePrepareRelease(entry, () => true)).toEqual(entry);
   });
 });

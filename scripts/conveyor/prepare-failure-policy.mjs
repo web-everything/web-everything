@@ -6,16 +6,56 @@ import { execFileSync } from 'node:child_process';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { readBackoffSettings, backoffVerdict, evidenceReasonCode, BACKOFF_REASON_CODES, isCloneWideReasonCode } from './retry-backoff.mjs';
 import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+import { classifyPrepareReport, needsYouReason } from './prepare-outcome.mjs';
 
 export const INFRA_RETRY_BUDGET = 2;
 /** builder-starved-2 — the lane-acquire infrastructure failure a prepare agent reports when it never got a lane. */
 export const LANE_ACQUIRE_INFRA_RE = /could not determine an origin URL/i;
 /** Only a failure of the dispatch launch itself is a known-transient candidate. */
 export const DISPATCH_TRANSIENT_STAGE = 'dispatch';
+/**
+ * Live 2026-10-09 16:47Z: the builder listed 28 prepares held after ONE attempt. These classes were not the card's
+ * fault and are retried within {@link INFRA_RETRY_BUDGET} (each one observed text, never the prompt):
+ *  - another dispatch holds the lane (`could not acquire a lane: … a LIVE lease`, #4423/#4425/#4433/#4440-#4442);
+ *  - the raw git ref-lock race at ANY stage (`cannot lock ref 'refs/remotes/origin/main'`, stamp-stage #4341/#4647);
+ *  - the dispatch scratch dir lost its CLI trust grant to a concurrent `~/.claude.json` write (#4426; the grant
+ *    itself exists, we:scripts/operations/dispatch-lane-io.mjs#grantDispatchTrust);
+ *  - the worker was retired by orphan adoption across a daemon restart (#4319/#4322/#4327/#4414/#4445);
+ *  - a prepare result refused by the card-edit rule as it stood THEN (#4392/#4421/#4469 ran 2026-10-01, before
+ *    `size:` became prepare-owned on 2026-10-03, #4670): re-running under today's rule is the fix.
+ */
+const INFRA_TRANSIENT_RE = /\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)|git-ref-lock-transient|cannot lock ref '[^'\n]*'|could not acquire a lane:[^\n]*\ba LIVE lease\b|workspace not trusted\b/i;
+const ORPHAN_RETIRED_RE = /^build-dispatch-orphan-adopt: dispatch retired\b/;
+const PREPARE_CARD_RULE_RE = /^not built: the worker edited the item's own backlog card\b/;
+const ALREADY_DONE_HOLD = (commit) => `spec already done on main: commit ${commit}`;
+/** The worker's own final report carried by the evidence: the runner's `worker report: …` suffix, or the terminal
+ * message of an orphan-retired worker. `null` when there is none. */
+function workerReport(evidence) {
+  const error = String(evidence.error ?? '');
+  const tail = /\bworker report:\s*([\s\S]+)$/i.exec(error);
+  if (tail) return tail[1];
+  return ORPHAN_RETIRED_RE.test(error) && typeof evidence.terminal === 'string' ? evidence.terminal : null;
+}
+/** What a held prepare should become instead of a silent hold: the resolve route for a cited already-done, a
+ * needs-you hold for a decline. `null` when the worker declined nothing. Card/worker text never reaches the
+ * already-done reason (only a hex sha does); a needs-you reason is defused by {@link needsYouReason}. */
+export function preparedReportRoute(evidence = {}) {
+  const report = workerReport(evidence);
+  if (!report) return null;
+  const r = classifyPrepareReport(report);
+  if (r.outcome === 'no-change' && r.commit) return { cause: 'already-done', commit: r.commit, routeHold: ALREADY_DONE_HOLD(r.commit) };
+  if (r.outcome === 'no-change') return { cause: 'needs-you', holdReason: needsYouReason('already-done', 'the worker said the card is already done but cited no delivering commit') };
+  if (r.outcome === 'blocked') return { cause: 'needs-you', holdReason: needsYouReason(r.blocker.kind, r.summary.replace(/^.*?could[- ]not[- ]prepare\W*/i, '')) };
+  return null;
+}
 export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   // Match observed error output, never the prompt (which can mention hypothetical failures).
   const error = String(evidence.error ?? evidence.reason ?? '');
-  if (/\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)|git-ref-lock-transient/i.test(error)) return 'infra-transient';
+  // A worker that REPORTED (already-done / could-not-prepare) is an outcome, not a failure: route it.
+  const route = preparedReportRoute(evidence);
+  if (route) return route.cause;
+  if (INFRA_TRANSIENT_RE.test(error)) return 'infra-transient';
+  if (ORPHAN_RETIRED_RE.test(error) || PREPARE_CARD_RULE_RE.test(error)) return 'infra-transient';
   // builder-starved-2 (2026-10-07) — the agent never got a lane: `lane-pool.mjs acquire` could not resolve an origin
   // from its scratch cwd (#4174). That is the launcher's fault, not the card's, so it is retried, never held for good.
   if (LANE_ACQUIRE_INFRA_RE.test(`${error}\n${String(evidence.terminal ?? '')}`)) return 'infra-transient';
@@ -29,7 +69,8 @@ export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   return 'unknown';
 }
 export function validatePrepareRelease(entry, verifyCommit) {
-  if (!entry?.target || !entry?.attempt || !entry?.cause || !['agent-stopped-early', 'no-session', 'result-lost', 'infra-transient'].includes(entry.cause)
+  // `needs-you` is released by the commit that made the ruling the worker asked for.
+  if (!entry?.target || !entry?.attempt || !entry?.cause || !['agent-stopped-early', 'no-session', 'result-lost', 'infra-transient', 'needs-you'].includes(entry.cause)
       || !entry.evidence || !/^[a-f0-9]{40}$/.test(entry.fixCommit ?? '')) {
     throw new Error('prepare release refused: target, exact attempt, known cause, evidence and full fix commit required');
   }
@@ -94,6 +135,10 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
   const previous = Object.values(state.failures).filter(f => f.num === num && f.cause === 'infra-transient').length;
   const retry = cause === 'infra-transient' && previous < INFRA_RETRY_BUDGET;
   const failure = { num, attempt, stage, cause, evidence: redactEvidence(evidence), retry, held: !retry, recordedAt: new Date(now).toISOString() };
+  // Read off the RAW evidence (redaction never changes a route). The caller places a fresh route hold itself.
+  const route = preparedReportRoute(evidence);
+  if (route?.routeHold) Object.assign(failure, { retry: true, held: false, commit: route.commit, routeHold: route.routeHold, routeHoldPlacedAt: new Date(now).toISOString() });
+  if (route?.holdReason) failure.holdReason = route.holdReason;
   if (cause === 'dispatch-transient') {
     // Backoff: held until `retryAfter`, then `releaseDuePrepareRetries` lets it be dispatched again. Attempts
     // count every unfinished, not-yet-re-armed transient failure of this card; at the cap it stays held
@@ -165,12 +210,28 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
   // builder-starved-2 (2026-10-07) — (c) a held `unknown` failure of ANY stage whose evidence now classifies
   // `infra-transient` (the agent never acquired a lane) is released, within the same per-card infra retry budget a
   // fresh one gets. Live: #4560 sat `prepare-unstamped` on exactly this, waiting on a prevention card nobody built.
+  // Live 2026-10-09 — (d) the same for every held record today's policy classifies differently: a `no-session` lane-busy
+  // or a `result-lost` card-rule refusal retries like (c); a worker report becomes its route (already-done: a resolve
+  // hold the caller places once; could-not-prepare: a held needs-you reason the tick surfaces). This is what moves a
+  // hold recorded by older code — the ledger is never edited by hand.
   for (const f of Object.values(state.failures)) {
-    if (!f.held || f.completed || f.cause !== 'unknown' || classifyPrepareFailure(f.evidence, f.stage) !== 'infra-transient') continue;
-    const used = Object.values(state.failures).filter(o => o.num === f.num && o !== f && o.cause === 'infra-transient').length;
-    if (used >= INFRA_RETRY_BUDGET) continue;
-    Object.assign(f, { cause: 'infra-transient', healedFrom: 'unknown', held: false, retry: true, healedAt: new Date(now).toISOString() });
-    touched.add(f.num); healed = true;
+    if (!f.held || f.completed || !RECLASSIFIABLE_CAUSES.includes(f.cause)) continue;
+    const cause = classifyPrepareFailure(f.evidence, f.stage);
+    if (cause === f.cause) continue;
+    const healedAt = new Date(now).toISOString();
+    if (cause === 'infra-transient') {
+      const used = Object.values(state.failures).filter(o => o.num === f.num && o !== f && o.cause === 'infra-transient').length;
+      if (used >= INFRA_RETRY_BUDGET) continue;
+      Object.assign(f, { cause, healedFrom: f.cause, held: false, retry: true, healedAt });
+      touched.add(f.num); healed = true;
+    } else if (cause === 'already-done' || cause === 'needs-you') {
+      const route = preparedReportRoute(f.evidence);
+      Object.assign(f, { cause, healedFrom: f.cause, healedAt }, route.routeHold
+        ? { held: false, retry: true, commit: route.commit, routeHold: route.routeHold }
+        : { holdReason: route.holdReason });
+      if (route.routeHold) touched.add(f.num);
+      healed = true;
+    }
   }
   for (const f of Object.values(state.failures)) {
     if (f.held && !f.completed && !f.exhausted && f.retryAfter && Date.parse(f.retryAfter) <= now) {
@@ -181,6 +242,21 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
   if (!touched.size) { if (healed) save(state, path); return []; }
   save(state, path);
   return [...touched].filter(num => !Object.values(state.failures).some(f => f.num === num && f.held && !f.completed));
+}
+
+/** Causes an older policy recorded for evidence today's {@link classifyPrepareFailure} may read differently. */
+const RECLASSIFIABLE_CAUSES = ['unknown', 'no-session', 'result-lost'];
+
+/** Already-done routes not yet handed to the daemon: each is returned ONCE (stamped `routeHoldPlacedAt`), and the
+ * daemon places it as an ordinary TTL'd dispatch hold the hold router lands (resolve, graduatedTo the commit). A
+ * crash between the stamp and the placement only lets the card be prepared again, which re-reports it. */
+export function takePrepareRouteHolds({ path = failureStatePath(), now = Date.now() } = {}) {
+  const state = readFailureState(path);
+  const due = Object.values(state.failures).filter(f => f.routeHold && !f.routeHoldPlacedAt && !f.completed);
+  if (!due.length) return [];
+  for (const f of due) f.routeHoldPlacedAt = new Date(now).toISOString();
+  save(state, path);
+  return due.map(f => ({ num: f.num, reason: f.routeHold }));
 }
 
 /** The pre-#4148 launch-confirmation bug recorded healthy launches as "not confirmed" and held the card for good. */
