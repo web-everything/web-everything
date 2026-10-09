@@ -139,7 +139,9 @@ describe('permissionChangeKind - entries added inside an existing multi-line san
     expect(permissionChangeKind('.codex/sandbox.yaml', two('-effort: low\n+effort: high', '   - /a\n+  - /b'))).toBe('sandbox-widening');
     // a dangling opener at the end of hunk 1 must not adopt an unrelated edit in hunk 2
     expect(permissionChangeKind(CODE, two('   writableRoots: [\n     a,', '   names: [\n+    b,\n   ],'))).toBeNull();
-    expect(permissionChangeKind(CODE, two('   writableRoots: [\n     a,', '+    b,'))).toBeNull();
+    expect(permissionChangeKind(CODE, two('   writableRoots: [\n     a,', '+    const b = 1;'))).toBeNull();
+    // a bare list entry with no owner in ITS hunk fails closed in a sandbox-bearing file (it is not adopted, it is unreadable)
+    expect(permissionChangeKind(CODE, two('   writableRoots: [\n     a,', '+    b,'))).toBe('sandbox-widening');
     // while each hunk on its own still holds
     expect(permissionChangeKind(CODE, two('-x', '   writableRoots: [\n+    b,'))).toBe('sandbox-widening');
   });
@@ -148,7 +150,9 @@ describe('permissionChangeKind - entries added inside an existing multi-line san
     expect(permissionChangeKind(CODE, h('   names: [\n     a,\n+    b,\n   ],'))).toBeNull();
     expect(permissionChangeKind(CODE, h('   writableRoots: [a],\n+  names: [\n+    b,\n+  ],'))).toBeNull();
     expect(permissionChangeKind(CODE, h('   writableRoots: [\n     a,\n   ],\n+  names: [\n+    b,\n+  ],'))).toBeNull();
-    expect(permissionChangeKind(CODE, h('   // writableRoots: [\n+    b,'))).toBeNull();
+    // a commented-out owner names nothing: a plain script reads as free, a sandbox-bearing one fails closed (no owner in reach)
+    expect(permissionChangeKind('scripts/lib/ordinary.mjs', h('   // writableRoots: [\n+    b,'))).toBeNull();
+    expect(permissionChangeKind(CODE, h('   // writableRoots: [\n+    b,'))).toBe('sandbox-widening');
   });
   it('tests and docs are still exempt', () => {
     expect(permissionChangeKind('scripts/lib/__tests__/x.test.mjs', h('   writableRoots: [\n+    b,'))).toBeNull();
@@ -345,6 +349,165 @@ describe('permissionChangeKind - second advisory round: spellings, case and reso
       const [r, ms] = timed(() => permissionChangeKind('scripts/lib/big.mjs', sbHunk(filler)));
       expect(r).toBeNull();
       expect(ms).toBeLessThan(2000);
+    });
+  });
+});
+
+describe('permissionChangeKind - grants whose owner or value sits outside the diff context (PR #4446 block-ruled referrals)', () => {
+  const wfHunk = (body, heading = '') => `diff --git a/${WF} b/${WF}\n--- a/${WF}\n+++ b/${WF}\n@@ -20,4 +20,5 @@${heading}\n${body}\n`;
+  const sbHunk = (body) => `diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -40,3 +40,4 @@\n${body}\n`;
+  const BEARING = 'scripts/lib/isolation-provider.mjs';
+  const CODEX = '.codex/config.toml';
+  const CLAUDE = '.claude/settings.json';
+
+  describe('sandbox list entry added where the owning key is beyond the three context lines', () => {
+    it.each([
+      ['quoted js entry, bearing script', BEARING, '     "/a",\n+    "/b",\n     "/c",'],
+      ['single-quoted js entry', BEARING, "     '/a',\n+    '/b',\n     '/c',"],
+      ['template-string entry', BEARING, '     `${a}/x`,\n+    `${b}/y`,\n     `${c}/z`,'],
+      ['bare identifier entry', BEARING, '     rootA,\n+    rootB,\n     rootC,'],
+      ['bare path entry', BEARING, '     /a,\n+    /b,\n     /c,'],
+      ['yaml dash entry', BEARING, '   - /a\n+  - /b\n   - /c'],
+      ['json entry in claude settings', CLAUDE, '     "/a",\n+    "/b",\n     "/c"'],
+      ['removed entry in claude settings', CLAUDE, '     "/a",\n-    "/b",\n     "/c"'],
+      ['codex yaml entry', '.codex/sandbox.yaml', '   - /a\n+  - /b\n   - /c'],
+    ])('%s holds', (_n, file, body) => expect(permissionChangeKind(file, sbHunk(body))).toBe('sandbox-widening'));
+
+    it('an entry under a visible, unrelated owner stays free', () => {
+      expect(permissionChangeKind(BEARING, sbHunk('   names: [\n     "/a",\n+    "/b",\n   ],'))).toBeNull();
+    });
+    it('a non-list line in a bearing file stays free', () => {
+      expect(permissionChangeKind(BEARING, sbHunk('     const a = 1;\n+    const b = 2;\n     return a + b;'))).toBeNull();
+    });
+    it('a script that is not sandbox-bearing keeps reading only its own lines', () => {
+      expect(permissionChangeKind('scripts/lib/ordinary.mjs', sbHunk('     "/a",\n+    "/b",\n     "/c",'))).toBeNull();
+    });
+  });
+
+  describe('multi-line grant: the key or flag is on a different line than the changed value', () => {
+    it.each([
+      ['argv pair, flag on the previous line, in an array', BEARING, "const args = [\n  '--ask-for-approval',\n+  'never',\n];"],
+      ['argv pair, flag two lines up', BEARING, "  '--ask-for-approval',\n  // why\n+  'never',"],
+      ['key then value on the next line (yaml)', '.codex/sandbox.yaml', '   approval_policy:\n-    on-request\n+    never'],
+      ['key then value on the next line (js)', BEARING, '   approvalPolicy:\n+    "never",'],
+      ['toml key then value on the next line', CODEX, '   network_access =\n+    true'],
+      ['shell continuation, flag then value', 'scripts/run-agent.sh', '   codex exec --ask-for-approval \\\n+    never'],
+      ['string concatenation', BEARING, "   const flag = '--ask-for-approval=' +\n+    'never';"],
+      ['json key then value on the next line', CLAUDE, '   "network_access":\n+    true'],
+      ['removed value under a kept key', CLAUDE, '   "approval_policy":\n-    "untrusted"'],
+    ])('%s holds', (_n, file, body) => expect(permissionChangeKind(file, sbHunk(body))).toBe('sandbox-widening'));
+
+    it('a line after a finished statement is not adopted by an earlier token', () => {
+      expect(permissionChangeKind(BEARING, sbHunk("   args.push('--sandbox', mode);\n+  doOtherThing();"))).toBeNull();
+      expect(permissionChangeKind(BEARING, sbHunk("   args.push('--sandbox', mode);\n\n+  const x = 1;"))).toBeNull();
+    });
+  });
+
+  describe('workflow: grant added under a permissions block whose key is outside the context', () => {
+    it.each([
+      ['unlisted scope from an expression', '     issues: read\n+    new-scope: ${{ inputs.level }}\n     statuses: read', ' permissions:'],
+      ['merge key aliasing a grant map', '     issues: read\n+    <<: *wide\n     statuses: read', ' permissions:'],
+      ['merge key, chain unknown (heading is jobs)', '     issues: read\n+    <<: *wide\n     statuses: read', ' jobs:'],
+      ['merge key, no heading at all', '     issues: read\n+    <<: *wide\n     statuses: read', ''],
+      ['expression on a lowercase key, chain unknown', '     issues: read\n+    copilot-requests: ${{ inputs.level }}\n     statuses: read', ' jobs:'],
+      ['block scalar value on the next line, chain unknown', '     issues: read\n+    contents: >-\n+      write\n     statuses: read', ' jobs:'],
+      ['tag only, value on the next line, chain unknown', '     issues: read\n+    contents: !!str\n+      write\n     statuses: read', ' jobs:'],
+      ['heading is the permissions key itself', '     issues: read\n+    anything: true\n     statuses: read', ' permissions:'],
+    ])('%s holds', (_n, body, heading) => expect(permissionChangeKind(WF, wfHunk(body, heading))).toBe('workflow-permissions'));
+
+    it('an edit whose full ancestor chain is visible and is not permissions stays free', () => {
+      expect(permissionChangeKind(WF, wfHunk('   env:\n     A: 1\n+    B: ${{ inputs.level }}'))).toBeNull();
+      expect(permissionChangeKind(WF, wfHunk('   build:\n     steps:\n+      - uses: actions/checkout@v4'))).toBeNull();
+      expect(permissionChangeKind(WF, wfHunk('   with:\n+    node-version: 20', ' jobs:'))).toBeNull();
+    });
+    it('uppercase env expressions stay free even when the chain is unknown', () => {
+      expect(permissionChangeKind(WF, wfHunk('     A: 1\n+    TOKEN: ${{ secrets.X }}\n     B: 2', ' jobs:'))).toBeNull();
+      expect(permissionChangeKind(WF, wfHunk('+    FOO: bar', ' jobs:'))).toBeNull();
+    });
+  });
+});
+
+describe('permissionChangeKind - adversarial round on the block-ruled repair (PR #4446)', () => {
+  const wf = (body, heading = '') => `diff --git a/${WF} b/${WF}\n--- a/${WF}\n+++ b/${WF}\n@@ -20,4 +20,5 @@${heading}\n${body}\n`;
+  const sb = (body) => `diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -50,3 +50,4 @@\n${body}\n`;
+  const BEARING = 'scripts/operations/run.mjs';
+  const CODEX = '.codex/config.toml';
+
+  it.each([
+    ['trailing # comment (toml)', CODEX, ' "/a",\n "/b",\n+"/c", # tmp'],
+    ['trailing // comment (js)', BEARING, " '/a',\n '/b',\n+'/c', // tmp"],
+    ['inline table entry (toml)', CODEX, ' { path = "/a" },\n+{ path = "/etc" },'],
+    ['object entry (json)', '.claude/settings.json', ' {"path": "/a"},\n+{"path": "/etc"},'],
+    ['call entry', BEARING, " path.join(a, 'x'),\n+path.join(home, '.ssh'),"],
+    ['concatenation entry', BEARING, " a + '/x',\n+home + '/.ssh',"],
+    ['final unquoted element, no comma', BEARING, '   ONE,\n+  ETC'],
+  ])('unowned list element: %s holds', (_n, file, body) => expect(permissionChangeKind(file, sb(body))).toBe('sandbox-widening'));
+
+  it('statements, block edges and key/value pairs in a bearing file stay free', () => {
+    for (const body of ['+  const x = 1;', '+  }', '+  if (a) {', '+  return a + b;', '+  name: value', '+  ]);']) {
+      expect(permissionChangeKind(BEARING, sb(body))).toBeNull();
+    }
+  });
+
+  describe('bounds: what cannot be read within them cannot be cleared', () => {
+    const timed = (fn) => { const t = Date.now(); const r = fn(); return [r, Date.now() - t]; };
+    it('a hunk over the owner-read line cap holds in a grant-bearing file and stays free elsewhere', () => {
+      const body = Array.from({ length: 20001 }, (_, i) => `+  "/p${i}",`).join('\n');
+      expect(permissionChangeKind(CODEX, sb(body))).toBe('sandbox-widening');
+      const filler = Array.from({ length: 20001 }, () => '+const a = 1;').join('\n');
+      expect(permissionChangeKind(BEARING, sb(filler))).toBe('sandbox-widening');
+      expect(permissionChangeKind('scripts/lib/ordinary.mjs', sb(filler))).toBeNull();
+    });
+    it('very long lines hold in a grant-bearing file in bounded time', () => {
+      const body = Array.from({ length: 800 }, (_, i) => `+  ${'x'.repeat(8000)}${i}`).join('\n');
+      const [r, ms] = timed(() => permissionChangeKind(BEARING, sb(body)));
+      expect(r).toBe('sandbox-widening');
+      expect(ms).toBeLessThan(2000);
+      const [free, ms2] = timed(() => permissionChangeKind('scripts/lib/ordinary.mjs', sb(body)));
+      expect(free).toBeNull();
+      expect(ms2).toBeLessThan(2000);
+    });
+    it('a workflow with a long CONTEXT line holds', () => {
+      expect(permissionChangeKind(WF, wf(` note: ${'x'.repeat(5000)}\n+  FOO: bar`))).toBe('workflow-permissions');
+    });
+  });
+
+  describe('line endings and separators inside the diff text', () => {
+    const crlf = (s) => s.replace(/\n/g, '\r\n');
+    it('a CRLF diff reads like the LF one, trailing comments included', () => {
+      const body = '      contents:\n-        read # was\n+        write # now';
+      expect(permissionChangeKind(WF, wf(body))).toBe('workflow-permissions');
+      expect(permissionChangeKind(WF, crlf(wf(body)))).toBe('workflow-permissions');
+      expect(permissionChangeKind(WF, crlf(wf('     issues: read\n+    contents: # need\n+      write\n     statuses: read', ' jobs:')))).toBe('workflow-permissions');
+      expect(permissionChangeKind(CODEX, crlf(sb(' "/a",\n "/b",\n+"/c", # tmp')))).toBe('sandbox-widening');
+    });
+    it('U+2028 / U+2029 / a lone CR inside a comment do not hide the value', () => {
+      for (const sep of [' ', ' ', '\r', '\u0085']) {
+        expect(permissionChangeKind(WF, wf(`      contents:\n+        write # x${sep}y`))).toBe('workflow-permissions');
+      }
+    });
+    it('a separator inside a changed line does not strip its marker (the token after it is still read)', () => {
+      expect(permissionChangeKind(BEARING, sb('+  x = 1;   approval_policy = "never"'))).toBe('sandbox-widening');
+    });
+    it('a CRLF diff with no hunk header still fails closed', () => {
+      expect(permissionChangeKind(WF, 'diff --git a/x b/y\r\nsimilarity index 100%\r\n')).toBe('workflow-permissions');
+    });
+  });
+
+  describe('workflow: values that are not grant words, and a heading that cannot clear a line', () => {
+    it.each([
+      ['expression on its own line under an empty key', '       pages: read\n+      copilot-requests:\n+        ${{ inputs.l }}'],
+      ['block scalar then an expression', '       pages: read\n+      contents: >-\n+        ${{ inputs.l }}'],
+      ['alias on its own line', '       pages: read\n+      contents:\n+        *wide'],
+      ['lone expression under an unchanged key', '      contents:\n+        ${{ inputs.l }}'],
+    ])('%s holds', (_n, body) => expect(permissionChangeKind(WF, wf(body, ' jobs:'))).toBe('workflow-permissions'));
+
+    it('a non-permissions heading does not clear an unknown chain', () => {
+      expect(permissionChangeKind(WF, wf('     scope1: read\n+    copilot-requests: ${{ inputs.l }}\n     scope2: read', ' on: push'))).toBe('workflow-permissions');
+      expect(permissionChangeKind(WF, wf('     scope1: read\n+    <<: *wide', ' env:'))).toBe('workflow-permissions');
+    });
+    it('an expression on its own line under a free-text key stays free', () => {
+      expect(permissionChangeKind(WF, wf('   run:\n+    ${{ inputs.cmd }}', ' jobs:'))).toBeNull();
     });
   });
 });

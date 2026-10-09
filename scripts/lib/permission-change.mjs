@@ -11,7 +11,10 @@
  * THREE SURFACES, each read from the file's OWN hunks (`fileHunksResolver`, the same lookup the statute gate uses):
  *   1. WORKFLOW PERMISSIONS - a changed `permissions:` line, any changed line UNDER a `permissions:` key, or a grant
  *      word (`read`/`write`/`none`/`*-all`, quoted, anchored or tagged, on the line or the next) as the value of any
- *      non-free-text key, in `.github/workflows/*.yml`. The scope list is not closed. A workflow file whose hunks
+ *      non-free-text key, in `.github/workflows/*.yml`. The scope list is not closed. A `permissions:` key can sit
+ *      above the three context lines (a long block), so a line whose ancestor chain leaves the hunk is `unknown` and
+ *      holds when it takes a shape only a grant map takes (a merge key, a lowercase scope-like key with an
+ *      expression); git's section heading resolves the chain when it names the top-level key. A workflow file whose hunks
  *      cannot be read, or whose section has no hunk at all (a pure rename, an empty new file), FAILS CLOSED (any
  *      touch counts), exactly like `isStatuteAnchorEdit`.
  *   2. SANDBOX WIDENING - a changed (non-comment) code line naming a sandbox grant: `writableRoots`,
@@ -19,7 +22,9 @@
  *      in `scripts/` code (any script extension), Codex config or `.claude/settings*.json`. Tests, docs and
  *      comment-only edits do not count; a line that only STARTS with a block comment is still code. An entry added
  *      inside an existing multi-line list counts too: the list's owning key is read from the hunk's unchanged context
- *      lines (and a Codex config entry whose key is out of the context's reach fails closed). With NO readable
+ *      lines; in the config files above and `SANDBOX_BEARING_FILES` a list entry whose key is out of the context's
+ *      reach fails closed. A value split from its flag or key by a line break (`'--ask-for-approval',` newline
+ *      `'never'`) holds when a sandbox token is spelled earlier in the same statement. With NO readable
  *      hunks, the config files above and `SANDBOX_BEARING_FILES` fail closed.
  *   3. BRANCH-PROTECTION-ADJACENT CONFIG - CODEOWNERS, rulesets, branch-protection files and the required-checks
  *      roster. Path-based: any touch counts.
@@ -53,6 +58,17 @@ export const SANDBOX_TOKEN_RE = /writable[_-]?roots|--add-dir|\badd-dir\b|sandbo
 const SCAN_WINDOW = 200;
 const MAX_WORKFLOW_HUNK_LINES = 5000;
 const MAX_OWNER_HUNK_LINES = 20000;
+const MAX_SANDBOX_LINE_CHARS = 2000;
+const MAX_SANDBOX_HUNK_CHARS = 500000;
+
+/**
+ * A diff line ends at `\n` only (git's rule), so a `\r` at the end is CRLF, not content, and U+2028/2029/lone CR inside
+ * a line are content: they must NOT split it (the text after one would lose its `+`/`-` marker and read as context,
+ * hiding a grant). `.` stops at all of them though, so every comment/tail pattern below uses `[^\n]`, not `.`.
+ */
+const splitDiffLines = (hunks) => String(hunks).split('\n').map((l) => (l.endsWith('\r') ? l.slice(0, -1) : l));
+/** Does this section carry at least one hunk header line (a line starting `@@`, split the way the reader splits)? */
+const hasHunkHeader = (hunks) => typeof hunks === 'string' && splitDiffLines(hunks).some((l) => l.startsWith('@@'));
 const MAX_WORKFLOW_LINE_CHARS = 4000;
 
 /**
@@ -106,10 +122,17 @@ const ALL_GRANT_RE = new RegExp(`${KEY_START}["']?permissions["']?\\s*:\\s*${VAL
 /** `key: <value>` pairs on a line (also after a flow `{`/`,`): group 1 the key, group 2 a grant word, `*alias` or `${{`. */
 const KEY_VALUE_G = new RegExp(`${KEY_START}(?:-\\s+)?["']?([\\w.-]+)["']?\\s*:\\s*(?:${VALUE_DECOR}(${GRANT_WORDS})["']?(?=[\\s,}#]|$)|(\\*\\S+|\\$\\{\\{))`, 'gi');
 /** A bare grant scalar on a line of its own - the value of a `key:` on the line above (`contents:` newline `  write`). */
-const BARE_GRANT_RE = new RegExp(`^\\s*${VALUE_DECOR}(?:${GRANT_WORDS})["']?\\s*(?:#.*)?$`, 'i');
+const BARE_GRANT_RE = new RegExp(`^\\s*${VALUE_DECOR}(?:${GRANT_WORDS})["']?\\s*(?:#[^\\n]*)?$`, 'i');
+/** An alias or an expression on a line of its own: opaque, it may resolve to any grant. */
+const BARE_OPAQUE_RE = /^\s*(?:(?:&[^\s,{}]+|![^\s,{}]*)\s+)*["']?(?:\*[^\s,{}]+|\$\{\{[^\n]*\}\})["']?\s*(?:#[^\n]*)?$/;
 /** A `key:` with no value yet (the value is on the next line). Group 1 is the key. */
 // Decorations exclude `&`/`!` from their own body, so a run of them has exactly one way to split (no backtracking blowup).
-const EMPTY_KEY_RE = /^\s*(?:-\s+)?["']?([\w.-]+)["']?\s*:\s*(?:(?:&[^\s&!]*|![^\s&!]*)\s*)*(?:#.*)?$/;
+// A block-scalar indicator (`contents: >-`) also leaves the value to the next line.
+const EMPTY_KEY_RE = /^\s*(?:-\s+)?["']?([\w.-]+)["']?\s*:\s*(?:(?:&[^\s&!]*|![^\s&!]*)\s*)*(?:[|>][+-]?\d?\s*)?(?:#[^\n]*)?$/;
+/** A YAML merge key (`<<: *grants`) splices a whole mapping in: opaque inside a permissions block. */
+const MERGE_KEY_RE = /^\s*(?:-\s+)?["']?<<["']?\s*:/;
+/** `key: ${{ ... }}` with a lowercase kebab key - the shape of a scope name, unlike an UPPER_SNAKE env var. */
+const SCOPE_LIKE_EXPR_RE = /^\s*(?:-\s+)?["']?([a-z][a-z0-9]*(?:-[a-z0-9]+)*)["']?\s*:\s*(?:(?:&[^\s,{}]+|![^\s,{}]*)\s+)*["']?\$\{\{/;
 
 const DIFF_HEADER_RE = /^(diff --git |index |new file mode |deleted file mode |similarity index |rename (from|to) |(---|\+\+\+) (a\/|b\/|\/dev\/null))/;
 
@@ -125,8 +148,13 @@ const DIFF_HEADER_RE = /^(diff --git |index |new file mode |deleted file mode |s
  */
 function parseHunks(hunks) {
   const out = [[]];
-  for (const line of String(hunks).split('\n')) {
-    if (line.startsWith('@@')) { if (out[out.length - 1].length) out.push([]); continue; }
+  for (const line of splitDiffLines(hunks)) {
+    if (line.startsWith('@@')) {
+      if (out[out.length - 1].length) out.push([]);
+      // git's section heading: the nearest column-0 line ABOVE the hunk (for YAML, the top-level key that owns it).
+      out[out.length - 1].heading = /^@@[^@]*@@[ \t]*(.*)$/.exec(line)?.[1] ?? '';
+      continue;
+    }
     if (DIFF_HEADER_RE.test(line) || line.startsWith('\\')) continue;
     const marker = line[0];
     const cur = out[out.length - 1];
@@ -137,23 +165,37 @@ function parseHunks(hunks) {
 }
 
 // A LEADING block comment is not the whole line: `/* note */ writableRoots: [a]` is code, `/* note */` alone is not.
-const LEADING_BLOCK_COMMENTS_RE = /^\s*(?:\/\*.*?\*\/\s*)+/;
+const LEADING_BLOCK_COMMENTS_RE = /^\s*(?:\/\*[^\n]*?\*\/\s*)+/;
 const isComment = (l) => {
   const rest = l.replace(LEADING_BLOCK_COMMENTS_RE, '');
   return rest !== l && !/\S/.test(rest) ? true : /^\s*(#|\/\/|\*|\/\*)/.test(rest);
 };
+/** YAML has one comment form, `#`: a line starting `*` is an alias value and `//`, `/*` are plain scalars, never skipped. */
+const isYamlComment = (l) => /^\s*#/.test(l);
 const isBlank = (l) => !/\S/.test(l);
 const indentOf = (l) => l.match(/^\s*/)[0].length;
 const OPENERS = '[({';
 const CLOSERS = '])}';
 /** A bare list element: a YAML `- x` item or a lone quoted string (the `"/a",` shape of a TOML/JSON array). */
-const LIST_ENTRY_RE = /^\s*(-\s+\S|["'`][^"'`]*["'`]\s*,?\s*$)/;
+const TRAILING_COMMENT_RE = /\s(?:#|\/\/)[^\n]*$/;
+const COMPLETE_PAIR_LINE_RE = /^\s*["'`]?[\w$.-]+["'`]?\s*[:=]\s*\S/;
+/**
+ * A changed line in a grant-bearing file, with no owner in the hunk's reach, that could be an ELEMENT of a list whose key
+ * is further up: a quoted string, a `- item`, a bare word or path, an inline table (`{ path = "/etc" },`), a call or a
+ * concatenation (`path.join(home, '.ssh'),`), with or without a trailing comma or comment. What is NOT an element: a
+ * `;`-terminated statement, a line that opens or closes a block, and a `key: value` / `key = value` pair.
+ */
+function isUnownedElement(text) {
+  const t = text.replace(TRAILING_COMMENT_RE, '').trim();
+  if (!t || /^[)\]}]/.test(t) || /[;{([]$/.test(t)) return false;
+  return !COMPLETE_PAIR_LINE_RE.test(t);
+}
 const BARE_ADD_DIR_RE = /^\s*["'`]?--add-dir["'`]?\s*,?\s*$/;
 
 /** The nearest earlier line that is neither blank nor a comment, or `null`. */
-function previousCodeLine(lines, i) {
+function previousCodeLine(lines, i, comment = isComment) {
   for (let j = i - 1; j >= Math.max(0, i - SCAN_WINDOW); j -= 1) {
-    if (!isBlank(lines[j].text) && !isComment(lines[j].text)) return lines[j].text;
+    if (!isBlank(lines[j].text) && !comment(lines[j].text)) return lines[j].text;
   }
   return null;
 }
@@ -166,20 +208,20 @@ function previousCodeLine(lines, i) {
  *   - the bare `--add-dir` flag directly above a changed argument.
  * `keySeen` is false when the hunk showed no owner at all (the key is further up than the context reaches).
  */
-function owningKeyTexts(lines, i) {
+function owningKeyTexts(lines, i, comment = isComment) {
   const texts = [];
   let depth = 0;
   const floor = Math.max(0, i - SCAN_WINDOW);
   for (let j = i - 1; j >= floor; j -= 1) {
     const text = lines[j].text;
-    if (isComment(text)) continue;
+    if (comment(text)) continue;
     for (let c = text.length - 1; c >= 0; c -= 1) {
       if (CLOSERS.includes(text[c])) depth += 1;
       else if (OPENERS.includes(text[c])) {
         if (depth > 0) depth -= 1;
         else {
           const before = text.slice(0, c);
-          texts.push(/[\w-]/.test(before) ? before : (previousCodeLine(lines, j) ?? ''));
+          texts.push(/[\w-]/.test(before) ? before : (previousCodeLine(lines, j, comment) ?? ''));
         }
       }
     }
@@ -189,34 +231,73 @@ function owningKeyTexts(lines, i) {
     let indent = indentOf(self);
     for (let j = i - 1; j >= floor && indent > 0; j -= 1) {
       const text = lines[j].text;
-      if (isBlank(text) || isComment(text) || indentOf(text) >= indent) continue;
+      if (isBlank(text) || comment(text) || indentOf(text) >= indent) continue;
       texts.push(text);
       indent = indentOf(text);
     }
   }
-  const above = previousCodeLine(lines, i);
+  const above = previousCodeLine(lines, i, comment);
   if (above !== null && BARE_ADD_DIR_RE.test(above)) texts.push(above);
   return texts;
 }
 
 /** The nearest later line that is neither blank nor a comment, or `null`. */
-function nextCodeLine(lines, i) {
+function nextCodeLine(lines, i, comment = isComment) {
   for (let j = i + 1; j < Math.min(lines.length, i + 1 + SCAN_WINDOW); j += 1) {
-    if (!isBlank(lines[j].text) && !isComment(lines[j].text)) return lines[j].text;
+    if (!isBlank(lines[j].text) && !comment(lines[j].text)) return lines[j].text;
   }
   return null;
 }
 
-/** Is the changed line inside a `permissions:` mapping - a YAML ancestor in the hunk's context, or an open flow `{`? */
-function underPermissionsKey(lines, i) {
+/**
+ * Is a sandbox token spelled in the same statement, ABOVE the changed line? A grant can be split across lines with the
+ * flag or key on one and its value on another (`'--ask-for-approval',` newline `'never'`; `approval_policy:` newline
+ * `never`), so the changed value names nothing itself. Reads back over the code lines of the same group (never past the
+ * opener that encloses the line, a blank line, or a line that ends a statement with `;`), at most SIBLING_LINES lines.
+ * A gap here only ever over-holds: it applies to files that spell a sandbox token anyway.
+ */
+const SIBLING_LINES = 8;
+const COMPLETE_PAIR_RE = /^\s*["'`]?[\w$.-]+["'`]?\s*[:=]\s*\S/;
+/** A line that finishes its statement or property (`x();`, `key: value,`, `key = true`) - the next line starts afresh. */
+const endsStatement = (text) => /;\s*(?:\/\/[^\n]*)?$/.test(text) || (COMPLETE_PAIR_RE.test(text) && !/[+\\|&?]\s*$/.test(text));
+function sandboxTokenAbove(lines, i) {
+  let depth = 0;
+  let seen = 0;
+  for (let j = i - 1; j >= Math.max(0, i - SCAN_WINDOW) && seen < SIBLING_LINES; j -= 1) {
+    const text = lines[j].text;
+    if (isBlank(text)) break;
+    if (isComment(text)) continue;
+    if (depth === 0 && endsStatement(text)) break;
+    seen += 1;
+    if (depth === 0 && SANDBOX_TOKEN_RE.test(text)) return true;
+    for (let c = text.length - 1; c >= 0; c -= 1) {
+      if (CLOSERS.includes(text[c])) depth += 1;
+      else if (OPENERS.includes(text[c])) { if (depth > 0) depth -= 1; else return SANDBOX_TOKEN_RE.test(text); }
+    }
+  }
+  return false;
+}
+
+/**
+ * Is the changed line inside a `permissions:` mapping? `'under'` - a YAML ancestor in the hunk's context, an open flow
+ * `{`, or the hunk's section heading says so. `'not-under'` - the ancestor chain is visible all the way to a top-level
+ * key and none is `permissions:`. `'unknown'` - the chain leaves the context (a long block: the `permissions:` key may
+ * sit above the three context lines), so the line may still belong to one.
+ */
+function permissionsChain(lines, i) {
   let indent = indentOf(lines[i].text);
   for (let j = i - 1; j >= Math.max(0, i - SCAN_WINDOW) && indent > 0; j -= 1) {
     const text = lines[j].text;
-    if (isBlank(text) || isComment(text) || indentOf(text) >= indent) continue;
-    if (PERMISSIONS_KEY_RE.test(text)) return true;
+    if (isBlank(text) || isYamlComment(text) || indentOf(text) >= indent) continue;
+    if (PERMISSIONS_KEY_RE.test(text)) return 'under';
     indent = indentOf(text);
   }
-  return owningKeyTexts(lines, i).some((t) => PERMISSIONS_KEY_RE.test(t));
+  if (owningKeyTexts(lines, i, isYamlComment).some((t) => PERMISSIONS_KEY_RE.test(t))) return 'under';
+  if (indent === 0) return 'not-under';
+  // Ran out of context below a top-level key. git's heading can say `permissions:`, but it never CLEARS the line: it
+  // skips column-0 lines that do not start with a letter, `$` or `_` (a quoted `"permissions":`), so a different
+  // heading proves nothing.
+  return PERMISSIONS_KEY_RE.test(lines.heading ?? '') ? 'under' : 'unknown';
 }
 
 /** Does one line carry a `key: grant` pair for a key that is not free text (also inside a flow mapping)? */
@@ -234,25 +315,30 @@ function lineGrantsPermission(text) {
 function workflowLineChangesPermissions(lines, i) {
   const { text } = lines[i];
   if (PERMISSIONS_KEY_RE.test(text) || ALL_GRANT_RE.test(text)) return true;
-  if (underPermissionsKey(lines, i)) return true;
+  const chain = permissionsChain(lines, i);
+  if (chain === 'under') return true;
   if (lineGrantsPermission(text)) return true;
+  // The `permissions:` key may sit above the context: a spelling that only a grant map can take holds on its own.
+  if (chain === 'unknown' && (MERGE_KEY_RE.test(text) || (SCOPE_LIKE_EXPR_RE.test(text) && !FREE_TEXT_KEYS.has(SCOPE_LIKE_EXPR_RE.exec(text)[1])))) return true;
   // The value on a line of its own: `contents:` newline `  write`, in either order of which line changed.
-  if (BARE_GRANT_RE.test(text)) {
-    const key = EMPTY_KEY_RE.exec(previousCodeLine(lines, i) ?? '')?.[1];
+  // The value may also be an alias or an expression on its own line (`copilot-requests:` newline `${{ inputs.level }}`).
+  if (BARE_GRANT_RE.test(text) || BARE_OPAQUE_RE.test(text)) {
+    const key = EMPTY_KEY_RE.exec(previousCodeLine(lines, i, isYamlComment) ?? '')?.[1];
     return !(key && FREE_TEXT_KEYS.has(key));
   }
   const key = EMPTY_KEY_RE.exec(text)?.[1];
-  const below = nextCodeLine(lines, i);
-  return Boolean(key && !FREE_TEXT_KEYS.has(key) && below !== null && BARE_GRANT_RE.test(below));
+  const below = nextCodeLine(lines, i, isYamlComment);
+  return Boolean(key && !FREE_TEXT_KEYS.has(key) && below !== null && (BARE_GRANT_RE.test(below) || BARE_OPAQUE_RE.test(below)));
 }
 
 /** Does this workflow's diff change what its token may do? A section with no hunk (rename, empty new file) cannot say, so it does. */
 function touchesWorkflowPermissions(hunks) {
-  if (typeof hunks !== 'string' || !/^@@/m.test(hunks)) return true;
+  if (!hasHunkHeader(hunks)) return true;
   // Too large to read within bounds: hold rather than skim. A sandbox grant spelled in a workflow (an agent action's
   // `sandbox: danger-full-access`, `--dangerously-skip-permissions`) widens an automated actor the same way.
-  return parseHunks(hunks).some((lines) => lines.length > MAX_WORKFLOW_HUNK_LINES || lines.some(({ kind, text }, i) => kind !== ' '
-    && !isBlank(text) && !isComment(text)
+  return parseHunks(hunks).some((lines) => lines.length > MAX_WORKFLOW_HUNK_LINES
+    || lines.some((l) => l.text.length > MAX_WORKFLOW_LINE_CHARS) || lines.some(({ kind, text }, i) => kind !== ' '
+    && !isBlank(text) && !isYamlComment(text)
     && (text.length > MAX_WORKFLOW_LINE_CHARS || SANDBOX_TOKEN_RE.test(text) || workflowLineChangesPermissions(lines, i))));
 }
 
@@ -262,17 +348,24 @@ const isSandboxBearingPath = (p) => SANDBOX_CONFIG_RE.test(p)
 
 /** Does this file's change touch a sandbox grant - on the changed line itself, or by editing a list that one owns? */
 function touchesSandboxGrant(file, hunks) {
-  const codexConfig = /(^|\/)\.codex\//.test(file);
+  // Grant-bearing files (config that is nothing but grants, and every script that spells a sandbox token) cannot be
+  // cleared by a hunk that does not show the list's owner: such an entry fails closed.
+  const grantBearing = isSandboxBearingPath(file);
   for (const lines of parseHunks(hunks)) {
+    // Each changed line rescans up to SCAN_WINDOW lines above it, so both a long line and a big hunk are capped.
+    const wide = lines.some((l) => l.text.length > MAX_SANDBOX_LINE_CHARS)
+      || lines.reduce((n, l) => n + l.text.length, 0) > MAX_SANDBOX_HUNK_CHARS;
     for (let i = 0; i < lines.length; i += 1) {
       const { kind, text } = lines[i];
       if (kind === ' ' || isBlank(text) || isComment(text)) continue;
       if (SANDBOX_TOKEN_RE.test(text)) return true;
-      if (lines.length > MAX_OWNER_HUNK_LINES) continue; // bounded read: the token test above still covers every changed line
+      // Bounded read: the token test above covers every changed line; what it cannot read (an oversized hunk, or one
+      // with a very long line) it cannot clear, so a grant-bearing file holds.
+      if (lines.length > MAX_OWNER_HUNK_LINES || wide) { if (grantBearing) return true; continue; }
       const owners = owningKeyTexts(lines, i);
       if (owners.some((t) => !isComment(t) && SANDBOX_TOKEN_RE.test(t))) return true;
-      // A Codex config is nothing BUT grants: a list entry whose key is out of the hunk's reach fails closed.
-      if (codexConfig && !owners.length && LIST_ENTRY_RE.test(text)) return true;
+      if (sandboxTokenAbove(lines, i)) return true;
+      if (grantBearing && !owners.length && isUnownedElement(text)) return true;
     }
   }
   return false;
@@ -291,7 +384,7 @@ export function permissionChangeKind(file, hunks) {
   if (SANDBOX_FILE_RE.test(p) && !TEST_OR_DOC_RE.test(p)) {
     // Unreadable hunks (the net diff was not scored, no clone, a pure rename): a file that is nothing but grants, or
     // one on the sandbox-bearing list, fails closed; any other code file says nothing by its path alone.
-    if (typeof hunks !== 'string' || !/^@@/m.test(hunks)) return isSandboxBearingPath(p) ? 'sandbox-widening' : null;
+    if (!hasHunkHeader(hunks)) return isSandboxBearingPath(p) ? 'sandbox-widening' : null;
     return touchesSandboxGrant(p, hunks) ? 'sandbox-widening' : null;
   }
   return null;
