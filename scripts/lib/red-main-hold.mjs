@@ -83,13 +83,16 @@ export function redMainHoldReason(signal) {
 }
 
 /**
- * Per-PR decision. PURE. Only local-repo PRs are held (a red WE main does not block another repo's main; a
- * couple's impl half defers through the existing couple join when its WE carrier is held).
+ * Per-PR decision. PURE. A PUBLISHED red holds only local-repo PRs (a red WE main does not block another repo's
+ * main; a couple's impl half defers through the existing couple join when its WE carrier is held). A MANUAL freeze
+ * is the operator's stop-the-line, so it holds EVERY repo's PRs (as it did before the hold existed). The fix-PR
+ * exemption is for the local repo only: the published fix PR numbers are WE numbers, never another repo's.
  * @returns {{hold:boolean, reason?:string, fix?:boolean}}
  */
 export function decideRedMainHold({ num, isLocal = true, signal, setting = 'on' }) {
-  if (setting !== 'on' || !signal?.red || !isLocal) return { hold: false };
-  if (signal.fixPrs.includes(Number(num))) return { hold: false, fix: true };
+  if (setting !== 'on' || !signal?.red) return { hold: false };
+  if (!isLocal && !signal.sources?.includes('manual')) return { hold: false };
+  if (isLocal && signal.fixPrs.includes(Number(num))) return { hold: false, fix: true };
   return { hold: true, reason: redMainHoldReason(signal) };
 }
 

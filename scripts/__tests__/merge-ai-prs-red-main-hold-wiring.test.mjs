@@ -79,6 +79,9 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     const envMarker = join(dir, 'explicit-freeze.json');
     if (freeze === 'env') writeFileSync(envMarker, JSON.stringify(marker));
     if (freeze === 'legacy' || freeze === 'both') { mkdirSync(dirname(legacyMarker), { recursive: true }); writeFileSync(legacyMarker, JSON.stringify(marker)); }
+    // 'sibling': the freeze was raised from ANOTHER clone (the drain daemon's code clone), not the one running the pass.
+    const siblingMarker = join(dir, 'workspace', '.lanes', 'we-drain-daemon', 'code', '.conveyor', 'red-main-freeze.json');
+    if (freeze === 'sibling') { mkdirSync(dirname(siblingMarker), { recursive: true }); writeFileSync(siblingMarker, JSON.stringify(marker)); }
     if (freeze === 'both') writeFileSync(newMarker, JSON.stringify({ ...marker, reason: 'raised at the new path' }));
     if (priorityPrs) writeFileSync(join(coord, 'main-red-priority.json'), JSON.stringify({ repo: 'we', pr: priorityPrs[0], prs: priorityPrs, firstRedSha: 'abc1234567', expiresAt: FUTURE }));
     if (publishedRed) writeFileSync(join(coord, 'main-ci-red-state.json'), JSON.stringify({ red: true, firstRedSha: 'abc1234567', since: NOW - 60_000, setAt: NOW, expiresAt: FUTURE }));
@@ -88,14 +91,15 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     writeFileSync(mqSettings, JSON.stringify({ mergeQueue: { enabled: false }, mergeFreshness: { enabled: false } }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.RMH_HOME; syncBuiltinESMExports();");
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RMH_FIXTURE: fixture, RMH_HOME: dir, WE_COORDINATION_ROOT: coord,
-      WE_RED_MAIN_FREEZE_LEGACY: legacyMarker, WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings };
+      ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings };
+    if (freeze === 'sibling') delete env.WE_RED_MAIN_FREEZE_LEGACY;
     for (const k of ['VITEST', 'WE_UNDER_TEST', 'WE_MERGE_BREAK_GLASS', 'WE_RED_MAIN_FREEZE', 'WE_DRAIN_RED_MAIN_HOLD', 'WE_DRAIN_RED_MAIN_MODE']) delete env[k];
     if (freeze === 'env') env.WE_RED_MAIN_FREEZE = envMarker;
     // Pin the hold + mode: with VITEST cleared the live scripts/settings/red-main-hold.json would otherwise be read.
     env.WE_DRAIN_RED_MAIN_HOLD = holdSetting || 'on';
     env.WE_DRAIN_RED_MAIN_MODE = 'stop';
     if (unfreezeFirst) { // the operator lifts the freeze through the real remediation CLI BEFORE the drain pass
-      const u = spawnSync(process.execPath, [remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: 30000, env });
+      const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: 30000, env });
       expect(u.status, u.stderr).toBe(0);
     }
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
@@ -107,6 +111,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     return { status: r.status, result, stderr: r.stderr, attempts, newMarkerExists: existsSync(newMarker),
       legacyGone: !existsSync(legacyMarker),
       legacyAside: ['migrated', 'superseded', 'retired'].find((s) => existsSync(`${legacyMarker}.${s}`)) ?? null,
+      siblingAside: ['migrated', 'superseded', 'retired'].find((s) => existsSync(`${siblingMarker}.${s}`)) ?? null, siblingGone: !existsSync(siblingMarker),
       migratedFrom: existsSync(newMarker) ? JSON.parse(readFileSync(newMarker, 'utf8')).migratedFrom ?? null : null, legacyMarker };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -163,6 +168,22 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(stderr).toMatch(/red-main freeze marker migrated/);
     expect(attempts).toEqual([]); // frozen, no fix PR published → nothing lands (a fully held pass is a clean exit, not a stop)
     expect(status).toBe(0);
+  }, 30000);
+
+  it('rollout (PR #4624 review): a freeze raised from a SIBLING clone (the daemon code clone) is carried across and still holds the line', () => {
+    const { attempts, newMarkerExists, siblingGone, siblingAside, migratedFrom, stderr } = runCli({ freeze: 'sibling' });
+    expect(newMarkerExists, stderr).toBe(true);
+    expect(siblingGone).toBe(true);
+    expect(siblingAside).toBe('migrated');
+    expect(migratedFrom).toMatch(/we-drain-daemon\/code\/\.conveyor\/red-main-freeze\.json$/);
+    expect(attempts).toEqual([]);
+  }, 30000);
+
+  it('a sibling clone\'s freeze does not resurface after `unfreeze` through the real CLI', () => {
+    const { attempts, siblingAside, newMarkerExists } = runCli({ freeze: 'sibling', unfreezeFirst: true });
+    expect(siblingAside).toBe('retired');
+    expect(newMarkerExists).toBe(false);
+    expect(attempts.sort()).toEqual([FIX, OTHER]);
   }, 30000);
 
   it('an old marker can never resurface after `unfreeze`: legacy + new both present → unfreeze → both PRs land', () => {

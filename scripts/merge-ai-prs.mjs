@@ -167,7 +167,7 @@ import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
-import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
+import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
 // #2399 — the ONE remote-manifest `gh api` argv, shared with `/finish` (lane-resume) so the two readers never
 // drift. Re-exported to keep this file's public surface (and its tests' import site) stable.
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
@@ -192,7 +192,7 @@ import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
-import { decideQuarantineHold } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
+import { decideQuarantineHold, resolveFixFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
@@ -5390,19 +5390,22 @@ async function runCli() {
         let held = 0;
         // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
+        // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
         const mode = resolveRedMainMode();
+        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual');
         let qList = null;
         let filesOf = () => null;
-        if (mode.value === 'quarantine') {
+        if (quarantine) {
           const q = readQuarantine();
           qList = q.ok ? q.list : null;
           const localPrs = [...(openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map())].filter(([r]) => isLocalRepo(r)).flatMap(([, prs]) => prs || []);
           filesOf = (n) => { const p = localPrs.find((x) => Number(x?.number) === Number(n)); return Array.isArray(p?.files) ? p.files.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : null; };
         }
-        const fixFiles = mode.value === 'quarantine' ? (sig.fixPrs.length ? sig.fixPrs.flatMap((n) => filesOf(n) ?? []) : []) : null;
+        // Unknown fix-PR files stay `null` (decideQuarantineHold fails closed on it) — never coerced to "no files".
+        const fixFiles = quarantine ? resolveFixFiles({ fixPrs: sig.fixPrs, filesOf }) : null;
         for (const v of verdicts) {
           if (v.decision !== 'merge') continue;
-          const d = mode.value === 'quarantine' && isLocalRepo(v.repo)
+          const d = quarantine && isLocalRepo(v.repo)
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: holdSetting.value });
           if (d.hold) { v.decision = 'skip'; v.reason = d.reason; v.redMainHold = true; held++; }
@@ -6320,7 +6323,7 @@ async function runCli() {
         try { const at = Date.parse(readFreeze()?.at); if (Number.isFinite(at)) age = ` (raised ${Math.round((Date.now() - at) / 3_600_000)}h ago)`; } catch { /* age is informational */ }
         process.stderr.write(`merge-ai-prs · red-main freeze marker migrated ${mig.from} → ${mig.to}${age} — one source from now on\n`);
       } else if (mig.reason && !BENIGN.has(mig.reason)) {
-        process.stderr.write(`merge-ai-prs · WARNING: a legacy red-main freeze marker was NOT migrated (${mig.reason}) — it is being ignored; check ${resolveLegacyFreezeMarkerPath()}\n`);
+        process.stderr.write(`merge-ai-prs · WARNING: a legacy red-main freeze marker was NOT migrated (${mig.reason}) — it is being ignored; check ${pendingLegacyFreezeMarkers().join(', ') || resolveLegacyFreezeMarkerPath()}\n`);
       }
     }
     if (!isDispatchFrozen()) return null;

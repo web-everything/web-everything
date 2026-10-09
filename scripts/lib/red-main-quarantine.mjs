@@ -111,14 +111,47 @@ export function testsToSkip({ list, now, prNumber = null, fixPrs = [], onMain = 
   return [...new Set(activeEntries(list, { now }).map((e) => e.test))];
 }
 
+/** Is this entry a whole-file quarantine (no `::<test name>`)? Only those may stand for a whole file. PURE. */
+export const isWholeFileEntry = (testId) => !String(testId).includes('::');
+
+/**
+ * The vitest CLI args for the tests CI should skip. A whole-file entry becomes `--exclude=<file>`; a name-qualified
+ * `file::test name` entry NEVER does — an exclude is per file, so it would also skip every other test in that file,
+ * and a test name is free text that must not reach a shell. Those entries are returned in `unsupported` instead (CI
+ * runs them: the safe direction). PURE.
+ * @returns {{args:string[], unsupported:string[]}}
+ */
+export function vitestExcludeArgs(tests) {
+  const ids = [...new Set((tests ?? []).map(String))];
+  const files = [...new Set(ids.filter(isWholeFileEntry))];
+  return { args: files.map((f) => `--exclude=${f}`), unsupported: ids.filter((t) => !isWholeFileEntry(t)) };
+}
+
+/**
+ * The main-fix PR's files, for {@link decideQuarantineHold}. `null` (unknown — fail closed there) when ANY published
+ * fix PR's files cannot be read; `[]` only when no fix PR is published at all. PURE.
+ * @param {{fixPrs:number[], filesOf:(n:number)=>string[]|null}} o
+ */
+export function resolveFixFiles({ fixPrs, filesOf }) {
+  if (!fixPrs?.length) return [];
+  const all = [];
+  for (const n of fixPrs) {
+    const f = filesOf(n);
+    if (!Array.isArray(f)) return null;
+    all.push(...f);
+  }
+  return all;
+}
+
 /**
  * A red required check that failed ONLY on quarantined tests is routed to the existing re-run path (the next run
- * skips them). Unknown failing tests ⇒ not a quarantine case. PURE.
+ * skips them). Unknown failing tests ⇒ not a quarantine case. A name-qualified entry covers only that exact test,
+ * never the other tests of its file. PURE.
  */
 export function classifyQuarantinedFailure({ failedTests, list, now }) {
   if (!Array.isArray(failedTests) || !failedTests.length) return { rerun: false, why: 'failed tests unknown' };
   const q = activeEntries(list, { now });
-  const covered = (t) => q.some((e) => e.test === t || testFileOf(e.test) === testFileOf(t));
+  const covered = (t) => q.some((e) => e.test === t || (isWholeFileEntry(e.test) && testFileOf(e.test) === testFileOf(t)));
   const other = failedTests.filter((t) => !covered(t));
   return other.length ? { rerun: false, why: `non-quarantined failures: ${other.slice(0, 3).join(', ')}` } : { rerun: true, why: 'failed only on quarantined tests' };
 }

@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
-  validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine,
+  validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, vitestExcludeArgs,
 } from './red-main-quarantine.mjs';
 
 const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts });
@@ -86,7 +86,11 @@ function cli(argv) {
     const r = readQuarantine();
     const fixPrs = String(f['fix-prs'] ?? '').split(',').filter(Boolean).map(Number);
     const tests = r.ok ? testsToSkip({ list: r.list, now, prNumber: f.pr ?? null, fixPrs, onMain: !!f['on-main'] }) : [];
-    if (f.format === 'vitest') writeAllSync(1, tests.map((t) => `--exclude=${t.split('::')[0]}`).join(' ') + '\n');
+    if (f.format === 'vitest') {
+      const { args, unsupported } = vitestExcludeArgs(tests);
+      if (unsupported.length) process.stderr.write(`red-main-quarantine: ${unsupported.length} name-qualified entr${unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file; CI runs them): ${unsupported.slice(0, 3).join(' | ')}\n`);
+      writeAllSync(1, args.join(' ') + '\n');
+    }
     else writeAllSync(1, JSON.stringify({ ok: r.ok, ...(r.ok ? {} : { error: r.error }), skip: tests }) + '\n');
     return;
   }
