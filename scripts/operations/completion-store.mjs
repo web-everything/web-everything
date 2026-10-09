@@ -225,7 +225,13 @@ export function writeCompletion(record, dir = resolveCompletionsDir(), { expectP
       if (own) {
         const [count, since] = own;
         const prevStreak = positiveStreak(prev?.[count]);
-        toWrite = { ...rest, [count]: prevStreak + 1, [since]: prevStreak > 0 && prev?.[since] ? prev[since] : record.updatedAt };
+        // 117 S3b — a wrapped worker's agent reports `done` onto the launcher's v2 record (`source: legacy-completion`),
+        // then the wrapper writes the envelope for the SAME run with that same word: one occurrence, counted once.
+        const sameDone = prevStreak > 0 && prev?.v === 2 && record.v === 2 && prev.status === 'done' && prev.source === 'legacy-completion'
+          && prev.outcome === record.outcome && prev.startedAt === record.startedAt && prev.pid === record.pid;
+        toWrite = sameDone
+          ? { ...rest, [count]: prevStreak, [since]: prev[since] ?? record.updatedAt }
+          : { ...rest, [count]: prevStreak + 1, [since]: prevStreak > 0 && prev?.[since] ? prev[since] : record.updatedAt };
       }
     } else {
       const carried = {};

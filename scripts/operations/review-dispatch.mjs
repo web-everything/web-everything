@@ -129,7 +129,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  agentArgsFromEnv, assertNotALaneCheckout, buildAgentArgv, defaultSpawnAgent, parseBackgroundedId, REPO_ROOT,
+  agentArgsFromEnv, assertNotALaneCheckout, buildAgentArgv, defaultSpawnAgent, parseBackgroundedId, REPO_ROOT, workerSpawnEnv,
   resolveGhShimSettingsEnv,
   // #4174 — the SAME "never spawn into `root` itself" fix `dispatch-lane-io.mjs#createDispatchSinks` applies;
   // this function is its own independent spawn call site (see its own docblock), so it needs the same two
@@ -172,6 +172,7 @@ import { CODEX_MODEL } from '../lib/codex-model-routing.mjs';
 import { ANTIGRAVITY_MODEL } from '../lib/antigravity-judge-spawn.mjs';
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
+import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 
 // re-exported so nothing that already imports `reviewSessionSlug` from this file has to change (#3437) — the
 // slug itself now lives in `we:scripts/conveyor/review-session-slug.mjs`, a PURE module both this file and
@@ -451,6 +452,8 @@ const REVIEW_CODE_PATH_FILES = new Set([
   // review-extra-seats, jury-core, write-all-sync) are covered above.
   'scripts/lib/review-ci-gate-io.mjs', 'scripts/operations/completion-cli.mjs', 'scripts/operations/completion-store.mjs',
   'scripts/conveyor/run-rating.mjs', 'scripts/operations/telemetry-store.mjs', 'scripts/conveyor/reconcile-core.mjs',
+  // 117 S3b — the review session and the review job now launch / record through the unified worker wrapper.
+  'scripts/operations/worker-wrapper-launch.mjs', 'scripts/operations/worker-wrapper.mjs',
 ]);
 
 /** #4387 (PR #2916 review, round 2) — direct imports are not enough: the credential sandbox lives one level
@@ -568,6 +571,10 @@ export function dispatchReview({
   // and returns the `--settings` worktree patch). Before this, only dispatch-lane's sink applied it, so this
   // path's sessions hit Claude Code's "Call EnterWorktree first" guard on their first Edit.
   isolateSession = isolateDispatchSession,
+  // 117 S3b (D7 FINAL) — the review SESSION runs to completion through the detached worker wrapper (`claude -p` +
+  // `--json-schema`, a v2 completion record) instead of `claude --bg`. `false` keeps the old spawn byte for byte.
+  wrapReview = workerWrapperEnabledFor('review'),
+  launchWrapped = launchWrappedClaudeWorker,
 } = {}) {
   const planned = planReviewDispatch({ pr, repo, checkoutExists, home });
   assertNotALaneCheckout(root);
@@ -630,6 +637,16 @@ export function dispatchReview({
   // concluded no session had started — while the real session (findable by its `-n` slug) was running the
   // review to completion. `agentId` is the id that actually addresses it; `sessionId` is kept on the result
   // only so an existing caller reading that field still gets the old, documented shape.
+  if (wrapReview) {
+    const launched = launchWrapped({
+      role: 'review', session: planned.sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr,
+      model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
+    });
+    return {
+      sessionId, agentId: launched.handle, sessionSlug: planned.sessionSlug, pr: planned.pr, repo: planned.repo, repoKey: planned.repoKey, prompt,
+      unknownTokens, judgeProvider, wrapped: true,
+    };
+  }
   const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
   const agentId = parseBackgroundedId(stdout);
   return {
@@ -651,6 +668,12 @@ export function dispatchReview({
  */
 export function formatSessionDispatchResult(result) {
   if (result.skipped) return `dispatch-review: ${result.repo}#${result.pr} not started — ${result.skipped}\n`;
+  if (result.wrapped) {
+    return `dispatch-review: started wrapped worker ${result.agentId ?? '(pid unread)'} (slug ${result.sessionSlug}) reviewing `
+      + `${result.repo}#${result.pr} (judge provider: ${result.judgeProvider})\n`
+      + `watch it: node scripts/operations/completion-cli.mjs show --session=${result.sessionSlug} --envelope\n`
+      + (result.unknownTokens.length ? `note: unrecognized brief tokens (reported, not fatal): ${result.unknownTokens.join(', ')}\n` : '');
+  }
   return (result.agentId
     ? `dispatch-review: started agent ${result.agentId} (slug ${result.sessionSlug}) reviewing `
       + `${result.repo}#${result.pr} (judge provider: ${result.judgeProvider})\n`

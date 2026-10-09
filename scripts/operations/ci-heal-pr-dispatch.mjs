@@ -65,7 +65,7 @@ import { runReconcilePass } from '../conveyor/reconcile-pass.mjs';
 import { readUnsupported, recordUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { readPrsFromFile } from '../conveyor/open-pr-fetch.mjs';
 import {
-  acquireFixDispatchClaim, releaseFixDispatchClaim, fixDispatchClaimOwner,
+  acquireFixDispatchClaim, releaseFixDispatchClaim, fixDispatchClaimOwner, stampBorrowedRunnerPid,
 } from '../conveyor/fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
 import { codeqlBriefSection } from '../lib/codeql-gate.mjs';
@@ -154,6 +154,9 @@ export async function dispatchCiHeal(planned, {
   claimOwner = fixDispatchClaimOwner(),
   acquireClaim = acquireFixDispatchClaim,
   releaseClaim = releaseFixDispatchClaim,
+  // 117 S3b — a ci-heal run through the detached worker wrapper has no `claude agents` row: stamp the wrapper's pid on
+  // the claim so the claim's liveness is that process (`fix-dispatch-claim.mjs#refreshLiveFixDispatchClaims`).
+  stampRunner = stampBorrowedRunnerPid,
   claimRoot,
   // fix procedure — injectable live fix-claim read (`fix-procedure.mjs#readLiveFixClaim`); a test stubs it.
   readFixClaim = ({ repo: r, pr }) => readLiveFixClaim({ repo: r, pr, ...(claimRoot ? { lockRoot: claimRoot } : {}) }),
@@ -230,6 +233,9 @@ export async function dispatchCiHeal(planned, {
     }
     // #x0jphk5 — deliberately NOT released here: see `dispatchFix`'s own docblock (`reconcile-fix-dispatch.mjs`)
     // for why a claim on a successful spawn must outlive this call.
+    if (out?.dispatch?.wrapped && Number.isInteger(out.dispatch.runnerPid)) {
+      try { stampRunner({ repo, pr: planned.pr, kind: 'ci-heal', owner: claimOwner, pid: out.dispatch.runnerPid, ...(claimRoot ? { lockRoot: claimRoot } : {}) }); } catch { /* best effort: the plain TTL still applies */ }
+    }
     return { agentId: out?.handle ?? null, sessionSlug, pr: planned.pr, itemNum: planned.itemNum ?? null, lane: planned.lane, unknownTokens };
   } catch (e) {
     releaseOurClaim();

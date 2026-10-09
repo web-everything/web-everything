@@ -83,9 +83,10 @@ import {
   fixDispatchSessionName, listFixDispatchClaims,
 } from './fix-claim-store.mjs';
 import { defaultListAgents } from '../operations/dispatch-lane-io.mjs';
+import { listWrappedWorkerAgents } from '../operations/worker-wrapper-launch.mjs';
 import { startedAtMs } from './reconcile-core.mjs';
 import { readHungInfo, resolveHungThresholdMs } from './hung-session.mjs';
-import { isBorrowedRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
+import { isClaimRunnerDead, isPidAlive } from '../lib/dispatch-throttle.mjs';
 
 // The light store helpers live in `fix-claim-store.mjs` (no dispatch graph — see its header); re-exported here so
 // every existing importer of this module is unchanged.
@@ -254,7 +255,7 @@ export const MAX_FIX_DISPATCH_CLAIM_REFRESH_MS = 4 * 60 * 60 * 1000;
  */
 export function refreshLiveFixDispatchClaims({
   lockRoot = fixDispatchClaimRoot(),
-  listAgentsAll = () => defaultListAgents({ all: true }),
+  listAgentsAll = () => [...defaultListAgents({ all: true }), ...listWrappedWorkerAgents()],
   hungInfoFor = readHungInfo,
   awaitingVerifyFor = makeAwaitingVerifyResolver(),
   hungThresholdMs = resolveHungThresholdMs(),
@@ -282,14 +283,15 @@ export function refreshLiveFixDispatchClaims({
     if (kind === 'fixing') name = entry.meta.who ? String(entry.meta.who) : null;
     else { try { name = fixDispatchSessionName({ repo, pr, kind }); } catch { name = null; } }
     if (!name) continue;
-    // A BORROWED (non-Claude) fix has no `claude agents` row: its liveness is its runner pid. Dead -> release now,
-    // with a reason; alive -> heartbeat. (No pid stamped yet -> falls through to the plain TTL like any new claim.)
-    if (entry.meta.borrowed && Number.isInteger(entry.meta.runnerPid)) {
+    // A BORROWED (non-Claude) fix, or (117 S3b) a Claude fix / ci-heal run through the detached worker wrapper, has no
+    // `claude agents` row: its liveness is its runner pid. Dead -> release now, with a reason; alive -> heartbeat.
+    // (No pid stamped yet -> falls through to the plain TTL like any new claim.)
+    if (Number.isInteger(entry.meta.runnerPid)) {
       const cur = readLockEntry(lockRoot, fixDispatchResource({ repo, pr, kind }));
       if (!cur || cur.owner !== entry.owner) continue;
-      if (isBorrowedRunnerDead(cur, alive)) {
+      if (isClaimRunnerDead(cur, alive)) {
         const result = releaseFixDispatchClaim({ repo, pr, kind, owner: entry.owner, lockRoot });
-        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: `borrowed-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
+        if (result.released) released.push({ repo, pr, kind, owner: entry.owner, reason: `${entry.meta.borrowed ? 'borrowed' : 'wrapped'}-runner-dead (pid ${entry.meta.runnerPid} is gone)` });
       } else {
         heartbeat(lockRoot, fixDispatchResource({ repo, pr, kind }), cur.owner, nowIso(), cur.pid ?? null, cur.meta);
         refreshed.push({ repo, pr, kind, headSha, owner: entry.owner });
