@@ -90,10 +90,14 @@ export function isOperatorAnswerStandDownSuperseded(comments, index) {
   if (!Array.isArray(comments) || !isTerminal(comments[index])) return false;
   for (let i = index + 1; i < comments.length; i += 1) {
     const answer = parseOperatorAnswer(comments[i]);
-    if (answer && answerDisposition(answer) && comments.slice(0, i).some((c) => isTerminal(c) && c.id != null
-      && String(c.id) === answer.standDownId)) return true;
+    if (answer && answerDisposition(answer) && answersEarlierStandDown(comments, i, answer)) return true;
   }
   return false;
+}
+
+/** Does `answer` (at `comments[i]`) name a terminal comment that precedes it on this thread? */
+function answersEarlierStandDown(comments, i, answer) {
+  return comments.slice(0, i).some((c) => isTerminal(c) && c.id != null && String(c.id) === answer.standDownId);
 }
 
 export function latestUnresolvedStandDown(comments) {
@@ -110,8 +114,7 @@ export function latestOperatorAnswer(comments) {
   if (!Array.isArray(comments)) return null;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
     const answer = parseOperatorAnswer(comments[i]);
-    if (answer && comments.slice(0, i).some((c) => isTerminal(c) && c.id != null
-      && String(c.id) === answer.standDownId)) return answer;
+    if (answer && answersEarlierStandDown(comments, i, answer)) return answer;
   }
   return null;
 }
@@ -144,7 +147,7 @@ export function isCloseSupersededExecuted(comments) {
   let answerAt = -1;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
     const answer = parseOperatorAnswer(comments[i]);
-    if (answer && comments.slice(0, i).some((c) => isTerminal(c) && c.id != null && String(c.id) === answer.standDownId)) { answerAt = i; break; }
+    if (answer && answersEarlierStandDown(comments, i, answer)) { answerAt = i; break; }
   }
   if (answerAt < 0) return false;
   return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'

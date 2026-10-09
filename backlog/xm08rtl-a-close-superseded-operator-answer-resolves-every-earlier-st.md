@@ -13,24 +13,24 @@ Live #4522: two stand-downs (fixer 04:36Z, supersede-watch 05:38Z); the close-su
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/conveyor/__tests__/stand-down-disposition.test.mjs`: the `#4522` block fails on main (the live thread is refused `stood-down`) and passes after (planned `close-superseded`).
+- [A2] **Must refuse on error** — an answer that does not parse, names no earlier terminal comment, or comes from a login outside the operator/automation allow-list widens nothing; the earlier stand-down stays terminal (tested).
+- [A3] **Must keep every other input cautious** — only an answer carrying a DISPOSITION widens; an ordinary ruling still resolves only the stand-down it names, and a stand-down posted AFTER the answer stays terminal (tested). The change touches comment-thread reading only; no docs, config or data paths are involved.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+Hint: the endpoint hint does not apply — no receive or write endpoint is added.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not change the CLI (`we:scripts/conveyor/stand-down-answer.mjs`) or which stand-down it targets, and does not change the close executor (`we:scripts/operations/promote-draft-pr-dispatch.mjs`) or its card-on-main refusal.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the answer's power comes only from `parseOperatorAnswer`, which requires a trusted posting login and a byte-identical rebuilt body; forged markers parse to null (tested).
+2. **Truncated reads** — n/a: a missing comment can only drop an answer, which leaves the stand-down terminal (fail closed).
+3. **Shared state files** — n/a: pure reader over the PR's comment list.
+4. **Fail closed** — a non-array or unparseable thread returns false (stand-down stays terminal).
+5. **Identity scoping** — the answer must name a terminal comment that precedes it on THIS PR's thread.
+6. **State over time** — only stand-downs BEFORE the answer are resolved; a later stand-down is a new question and stays terminal; a live fix claim still blocks the close.
+7. **Who wrote it** — operator/automation logins only (`OPERATOR_LOGINS`/`AUTOMATION_LOGINS` via `parseOperatorAnswer`).
