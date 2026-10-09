@@ -85,8 +85,9 @@ export function resolveResourcePolicy({ standard = RESOURCE_POLICY_STANDARD, pla
   }
   return policy;
 }
-const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
-export function loadResourcePolicy({ env = process.env, repoRoot = REPO_ROOT, home = homedir() } = {}) {
+// Resolved lazily: some test harnesses load modules from a non-file URL, where a top-level fileURLToPath throws.
+const repoRootOf = () => fileURLToPath(new URL('../../', import.meta.url));
+export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(), home = homedir() } = {}) {
   const sources = { platform: null, tool: null };
   const readLayer = (source, path) => {
     try {

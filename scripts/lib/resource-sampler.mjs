@@ -13,7 +13,8 @@ import { admissionStatus, admissionLockRoot, resolveCap } from '../readiness/hea
 
 const round = n => Math.round(n * 10) / 10;
 const finite = n => Number.isFinite(n) ? n : null;
-const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
+// Resolved lazily (see we:scripts/lib/resource-admission.mjs#loadResourcePolicy for why).
+const repoRoot = () => fileURLToPath(new URL('../../', import.meta.url)).replace(/\/$/, '');
 
 export function cpuIdlePctFromTimes(prevCpus, nextCpus) {
   if (!Array.isArray(prevCpus) || !Array.isArray(nextCpus) || prevCpus.length !== nextCpus.length) return null;
@@ -79,11 +80,11 @@ export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, load
 function defaultHeavySlots() {
   // Reuse we:scripts/readiness/heavy-admission.mjs; heavy capacity excludes its separate fast lane.
   const cap = resolveCap();
-  const status = admissionStatus({ lockRoot: admissionLockRoot(REPO_ROOT), cap });
+  const status = admissionStatus({ lockRoot: admissionLockRoot(repoRoot()), cap });
   return { held: status.heldCount, cap };
 }
 function defaultCountLanes() {
-  const pool = join(workspaceFor(REPO_ROOT), '.lanes');
+  const pool = join(workspaceFor(repoRoot()), '.lanes');
   return readdirSync(pool, { withFileTypes: true }).filter(d => d.isDirectory()).reduce((sum, d) =>
     sum + readdirSync(join(pool, d.name), { withFileTypes: true }).filter(l => l.isDirectory() && l.name.startsWith('lane-')).length, 0);
 }
