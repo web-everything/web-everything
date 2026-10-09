@@ -20,6 +20,19 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2921@5264fae59e61a56c18c0c7f85c578b438fb5c900
 
+## Ruling (operator, 2026-10-09 ~13:20 ET)
+
+The open choice from the prepare run (threshold N, and when the per-item streak resets) is ruled:
+- **N = 3** consecutive orphan releases of the same item → hold. N is a setting (policy cascade: standard
+  default 3, platform preference, tool override), defaulting to `MAX_RESUME_ATTEMPTS`.
+- **Reset only on a real outcome** (the item's dispatch opens a PR or resolves the card). Hold expiry does NOT
+  reset the streak: one more orphan release after expiry re-holds at once.
+- **Operator addition: a hold must trigger a root-cause investigation, not just park the card.** Placing the
+  streak hold raises a health smell (one episode per item) that the health daemon's existing investigation
+  dispatch (#4078, `we:scripts/conveyor/health-investigate-plan.mjs`) picks up; when the investigation names a
+  product change, the existing filing path (#4079, `we:scripts/conveyor/health-file-request.mjs`) files it.
+  The hold reason links the episode, so the item is visibly "under investigation", never silently parked.
+
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
