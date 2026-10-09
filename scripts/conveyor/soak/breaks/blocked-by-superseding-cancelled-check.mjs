@@ -11,7 +11,7 @@ export default {
   id: 'blocked-by-superseding-cancelled-check',
   title: 'A queued PR GitHub holds BLOCKED on a required check whose newest-suite run is CANCELLED is never re-run',
   card: 'unstick PR #4651 (cancelled soak-replay-gate held BLOCKED, drain skips, nobody re-runs)',
-  fixedBy: { sha: null, where: 'lane/cancelled-check-rerun', paths: ['scripts/conveyor/infra-cancelled.mjs', 'scripts/conveyor/reconcile-pass.mjs', 'scripts/conveyor/reconcile-core.mjs'] },
+  fixedBy: { sha: '5f53e945bc9616f90942507d1fcbd62202af3986', where: 'lane/cancelled-check-rerun', paths: ['scripts/conveyor/infra-cancelled.mjs', 'scripts/conveyor/reconcile-pass.mjs', 'scripts/conveyor/reconcile-core.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/reconcile-core.mjs'), 'utf8').includes('BLOCKED_CANCELLED_RERUN_CAP'); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
