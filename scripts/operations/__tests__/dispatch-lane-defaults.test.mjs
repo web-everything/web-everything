@@ -456,12 +456,20 @@ describe('#4415 round 2 — every gh-touching default in this module is execFile
     const orig = process.env.PATH;
     process.env.PATH = env.PATH;
     process.env.WE_GH_THROTTLE_LOCK_ROOT = dir;
+    // Hermetic (card xcu4cqf): the default also fetches origin/main; it runs against a git overlay of this checkout
+    // whose `origin` is local (env restored after the test by vitest.setup.ts).
+    const { makeGitOverlay } = await import('../../lib/hermetic-git-overlay.mjs');
+    const { DEFAULT_REPO_ROOT } = await import('../../lib/hermetic-tests.mjs');
+    const overlay = makeGitOverlay(DEFAULT_REPO_ROOT);
+    Object.assign(process.env, overlay.env);
     try {
       const result = defaultCheckAlreadyDone('999999', {}); // NO `exec` key at all — the real production default
       expect(result).toEqual({ done: false, pr: null, checked: true });
     } finally {
       process.env.PATH = orig;
       delete process.env.WE_GH_THROTTLE_LOCK_ROOT;
+      delete process.env.GIT_DIR; delete process.env.GIT_WORK_TREE;
+      overlay.cleanup();
     }
     const logPath = ghThrottleLogPath(ghThrottleLockRoot(undefined, env));
     const lines = rf(logPath, 'utf8').trim().split('\n').filter(Boolean);

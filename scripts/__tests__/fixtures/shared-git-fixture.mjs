@@ -15,7 +15,8 @@
  * ref-based logic (branch containment, `ls-remote`, `cherry`, fetch), which is all these tests exercise.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
@@ -106,4 +107,21 @@ export function sharedRepos(root, repoDirs) {
     restore() { for (const s of snaps) restoreRepo(s); },
     dispose() { rmSync(root, { recursive: true, force: true }); },
   };
+}
+
+// Hermetic (xcu4cqf): `lane-pool.mjs` makes a best-effort `gh api …/pulls` call for its PR-terminal axis and
+// degrades that axis OFF when gh fails. The lane-pool tests don't exercise that axis, so a stub `gh` that always
+// exits 1 (the way an unavailable gh did) goes first on the child's PATH — deterministic, never reaches GitHub.
+let ghStubDir;
+function ensureGhStub() {
+  if (ghStubDir && existsSync(ghStubDir)) return ghStubDir;
+  ghStubDir = mkdtempSync(join(tmpdir(), 'lane-pool-ghstub-'));
+  writeFileSync(join(ghStubDir, 'gh'), '#!/bin/sh\necho "gh stub: unavailable in this test" >&2\nexit 1\n', { mode: 0o755 });
+  process.once('exit', () => { try { rmSync(ghStubDir, { recursive: true, force: true }); } catch { /* best effort */ } });
+  return ghStubDir;
+}
+
+/** Return `env` with the always-failing `gh` stub first on PATH. Use in every spawned lane-pool child's env. */
+export function withGhStub(env = process.env) {
+  return { ...env, PATH: `${ensureGhStub()}:${env.PATH || process.env.PATH}` };
 }

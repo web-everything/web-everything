@@ -8,7 +8,7 @@
  *   deliberately avoid the WE band names so no constellation-sibling clone is provisioned.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -29,7 +29,7 @@ function runPool(args) {
     // cwd = the reference checkout so resolveRepo can always derive an origin (release --all-pools needs none,
     // but resolveRepo still runs before dispatch); the private LANE_POOL_ROOT scopes every pool op.
     cwd: referenceDir,
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot },
+    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot }),
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }

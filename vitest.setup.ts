@@ -39,7 +39,10 @@ const ownedTmpDirs: string[] = [];
 const fixtureRootKeys: string[] = [];
 let addedPathPrefix: string | undefined;
 afterAll(() => {
-  if (fileTmpBase && existsSync(fileTmpBase)) rmSync(fileTmpBase, { recursive: true, force: true });
+  // Retries: a child the file spawned (e.g. a cache writer under the per-file fake HOME) can still be finishing.
+  if (fileTmpBase && existsSync(fileTmpBase)) {
+    try { rmSync(fileTmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* run-wide sweep in vitest.globalSetup.mjs */ }
+  }
   for (const key of ['WE_COORDINATION_ROOT', 'WE_GH_THROTTLE_LOCK_ROOT', 'WE_DAEMON_STATE_DIR', ...fixtureRootKeys.splice(0)]) {
     const v = process.env[key];
     if (fileTmpBase && v && v.startsWith(`${fileTmpBase}/`)) delete process.env[key];

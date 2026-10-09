@@ -40,6 +40,10 @@ import { findStdoutFlushViolations, scanStdoutFlush } from '../lib/stdout-flush-
 // capture-via-exec-file-sync.mjs's header for the fix (validate the shape of every attempt, retry on an
 // invalid one) and scripts/lib/__tests__/capture-via-exec-file-sync.test.mjs for its coverage.
 import { captureViaExecFileSync, isParseableJson } from '../lib/capture-via-exec-file-sync.mjs';
+// Hermetic (xcu4cqf): check-standards reads `origin/main` in the real checkout; run it over a git overlay whose
+// origin/main is pinned to HEAD instead of the live remote ref.
+import { makeGitOverlay } from '../lib/hermetic-git-overlay.mjs';
+import { DEFAULT_REPO_ROOT } from '../lib/hermetic-tests.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -49,9 +53,14 @@ const LANE_REVIEW = join(ROOT, 'scripts', 'lane-review.mjs');
 /** The macOS pipe-buffer floor an `execFileSync` consumer truncated at. Payloads must clear it comfortably. */
 const PIPE_FLOOR = 8192;
 
+let overlay;
+beforeAll(() => { overlay = makeGitOverlay(DEFAULT_REPO_ROOT); });
+afterAll(() => overlay?.cleanup());
+const overlayEnv = () => ({ ...process.env, ...overlay.env });
+
 describe('check-standards.mjs --json survives a capturing parent (#3061)', () => {
   let out;
-  beforeAll(() => { out = captureViaExecFileSync(CHECK_STANDARDS, ['--json'], { validate: isParseableJson }); }, 120_000);
+  beforeAll(() => { out = captureViaExecFileSync(CHECK_STANDARDS, ['--json'], { validate: isParseableJson, env: overlayEnv() }); }, 120_000);
 
   it('delivers far more than the pipe-buffer floor through execFileSync', () => {
     expect(Buffer.byteLength(out, 'utf8')).toBeGreaterThan(PIPE_FLOOR * 10);
@@ -86,7 +95,7 @@ describe('check-standards.mjs human mode survives a capturing parent (#3061)', (
   // — 337 131 bytes to a file vs 302 018 through a slow pipe on the broken code. Its LAST line is the summary,
   // so asserting the summary arrived is the exact tail-loss detector, and it does not depend on the race.
   it('delivers its final summary line, not just the first N KB of warnings', () => {
-    const out = captureViaExecFileSync(CHECK_STANDARDS, []);
+    const out = captureViaExecFileSync(CHECK_STANDARDS, [], { env: overlayEnv() });
     expect(Buffer.byteLength(out, 'utf8')).toBeGreaterThan(PIPE_FLOOR * 10);
     expect(out.trimEnd().split('\n').pop()).toMatch(/\d+ error\(s\).*\d+ warning\(s\)/);
   }, 120_000);

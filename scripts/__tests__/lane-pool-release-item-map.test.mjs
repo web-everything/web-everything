@@ -9,7 +9,7 @@
  *   real capacity indefinitely.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -26,7 +26,7 @@ function git(args, cwd) {
 // call and make two genuinely separate acquire/release invocations read as "the same session" via the durable
 // ownerSession fallback — exactly the confusion lane-pool-release-ownership.test.mjs isolates against.
 function runPool(args, extraEnv = {}, opts = {}) {
-  const env = { ...process.env, ...extraEnv };
+  const env = withGhStub({ ...process.env, ...extraEnv });
   delete env.LANE_SESSION;
   delete env.CLAUDE_CODE_SESSION_ID;
   const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env, ...opts });
