@@ -1,22 +1,22 @@
 ---
-bornAs: x6z3usv
+bornAs: x5pjzdl
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md"]
+scope: ["we:scripts/backlog.mjs", "we:scripts/__tests__/backlog.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that blocks moving a card from open to in-progress, or landing code ag… (from web-everything/web-everything#4659 review)
+# Prevention — Add a lint rule or review-lens note that frontmatter edits in we:scripts/backlog.mjs must go thro… (from web-everything/web-everything#4681 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md:24` — Add a check:standards rule that blocks moving a card from open to in-progress, or landing code against it, while it still contains `TODO:` placeholders in Acceptance or Edge cases. For scope paths that touch lock files, also require a concrete fail-closed line.
-2. `we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md:16` — Add a deterministic backlog readiness gate that rejects placeholder acceptance criteria and requires repository-qualified named tests with observable assertions before implementation begins.
+1. `we:scripts/backlog.mjs:861` — Add a lint rule or review-lens note that frontmatter edits in we:scripts/backlog.mjs must go through the we:frontmatter.mjs helpers (removeFrontmatterField, setFrontmatterField), with a test for the no-op case.
+2. `we:scripts/backlog.mjs:896` — Deduplicate normalized input with a Set and extend the named CLI test to assert one stored edge and one added entry for repeated new targets.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4659@4a4098945e70c66e7cdf5ab84fb1396dbd797aea
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4681@2fbf88932d47a6481f0bc44a6b403694f2daf195
 
 ## Acceptance
 

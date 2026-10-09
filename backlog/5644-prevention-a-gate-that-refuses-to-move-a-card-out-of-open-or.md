@@ -1,22 +1,22 @@
 ---
-bornAs: x6z3usv
+bornAs: xz1o2ux
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md"]
+scope: ["we:backlog/x5059uu-daemon-rebuild-keeps-the-adopted-overlay-set-and-parks-the-c.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that blocks moving a card from open to in-progress, or landing code ag… (from web-everything/web-everything#4659 review)
+# Prevention — A gate that refuses to move a card out of open (or into a build lane) while any 'TODO:' placehold… (from web-everything/web-everything#4682 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md:24` — Add a check:standards rule that blocks moving a card from open to in-progress, or landing code against it, while it still contains `TODO:` placeholders in Acceptance or Edge cases. For scope paths that touch lock files, also require a concrete fail-closed line.
-2. `we:backlog/5638-hold-route-lock-is-reclaimed-when-its-owner-process-is-dead.md:16` — Add a deterministic backlog readiness gate that rejects placeholder acceptance criteria and requires repository-qualified named tests with observable assertions before implementation begins.
+1. `we:backlog/x5059uu-daemon-rebuild-keeps-the-adopted-overlay-set-and-parks-the-c.md:30` — A gate that refuses to move a card out of open (or into a build lane) while any 'TODO:' placeholder remains in Acceptance, Non-goals or Edge cases, with the Untrusted text and Fail closed lines required to be non-n/a when the card posts externally derived text.
+2. `we:backlog/x5059uu-daemon-rebuild-keeps-the-adopted-overlay-set-and-parks-the-c.md:12` — Add planned cases in we:scripts/lib/__tests__/daemon-rebuild.test.mjs named 'parks changed earlier-registered overlay while preserving adopted overlays' and 'reports parked newcomer and any established-overlay removal'. Specify assertions for retained HEAD content, parked newcomer state, alert fields, and PR notification. A deterministic backlog gate should require named planned tests for behavioral guarantees before implementation begins.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4659@4a4098945e70c66e7cdf5ab84fb1396dbd797aea
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4682@fe5d2ffcd4d703faa0552056cbabc53f7b101436
 
 ## Acceptance
 
