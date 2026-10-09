@@ -12,7 +12,7 @@ import { DISPATCH_EFFECT } from '../../../scripts/operations/dispatch-lane.mjs';
 import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../../scripts/lib/planning-snapshot.mjs';
 import {
   cliListRunStoreInFlight, cliListSettledBuilds, readDispatchLaneRunRecords,
-  createRoundRoutePredictor, startPlanningRound, cliPlanTick, PLANNING_LANE_POOL_ARGS,
+  createRoundRoutePredictor, createRoundPlanTick, startPlanningRound, cliPlanTick, PLANNING_LANE_POOL_ARGS,
 } from '../build-dispatch-daemon.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -146,6 +146,27 @@ describe('the lane-pool read starts at the top of the round (#5322)', () => {
       expect(seenDir).toBe(dir);
       expect(existsSync(dir)).toBe(true);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the round planTick waits for the early read before planning, so the pool is scanned once per round', async () => {
+    const order = [];
+    let finish;
+    const round = startPlanningRound({ readLanePool: () => new Promise((r) => { finish = r; }) });
+    const plan = (payload, opts) => { order.push('plan'); return { payload, ...opts }; };
+    const planning = createRoundPlanTick(round, { plan })({ a: 1 }, { config: { c: 2 } }).then((r) => { order.push('planned'); return r; });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(order).toEqual([]);
+    finish(['/lanes/lane-3']);
+    expect(await planning).toEqual({ payload: { a: 1 }, config: { c: 2 }, snapshotDir: round.dir });
+    expect(order).toEqual(['plan', 'planned']);
+    await round.end();
+  });
+
+  it('the round planTick still plans when the early read failed (the plan reads for itself)', async () => {
+    const round = startPlanningRound({ readLanePool: async () => { throw new Error('scan timed out'); } });
+    const got = await createRoundPlanTick(round, { plan: () => 'planned' })({});
+    expect(got).toBe('planned');
+    await round.end();
   });
 
   it('cliPlanTick with no round snapshot still makes and removes its own, as before', () => {

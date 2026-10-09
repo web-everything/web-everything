@@ -1075,6 +1075,19 @@ export function startPlanningRound({ readLanePool = defaultReadLanePool } = {}) 
 }
 
 /**
+ * #5322 — the round's `planTick`: waits for the round's early lane-pool read, THEN plans inside the round snapshot.
+ * Without the wait, tick-core could start its own identical scan while the early one was still running (the
+ * snapshot has nothing yet), reading the pool twice in one round. The early read began at the top of the round, so
+ * it has overlapped the run-store and prepare reads; a failed read resolves to nothing and the plan reads for itself.
+ */
+export function createRoundPlanTick(round, { plan = cliPlanTick } = {}) {
+  return async (payload, { config } = {}) => {
+    await round.prefetch;
+    return plan(payload, { config, snapshotDir: round.dir });
+  };
+}
+
+/**
  * #5322 — the backlog and routing inputs `cliPredictRoute` reads, loaded once per round instead of once per
  * candidate (each backlog load parses every card: ~1.5-4 s, 8-9 candidates a tick). Same loaders, same values,
  * passed through `cliPredictRoute`'s existing seams. If loading fails, each call falls back to its own read, so
@@ -2123,7 +2136,7 @@ async function dryRun(flags) {
   const prepareEnabled = !flags['no-prepare'];
   // #5322 — the same round shape as a live tick: early lane-pool read, one run-store read, route inputs read once.
   const round = startPlanningRound();
-  effects.planTick = (payload, { config } = {}) => cliPlanTick(payload, { config, snapshotDir: round.dir });
+  effects.planTick = createRoundPlanTick(round);
   const predictRoute = createRoundRoutePredictor();
   effects.predictRoute = predictRoute;
   const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords());
@@ -2259,7 +2272,7 @@ async function live(flags) {
     const timer = createPhaseTimer();
     // #5322 — start the lane-pool read now (it overlaps the reads below), and read route inputs once per round.
     const round = startPlanningRound();
-    effects.planTick = (payload, { config } = {}) => cliPlanTick(payload, { config, snapshotDir: round.dir });
+    effects.planTick = createRoundPlanTick(round);
     effects.predictRoute = createRoundRoutePredictor();
     try {
       const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords()); // #5322 — one read for the three readers below
