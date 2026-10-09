@@ -54,20 +54,25 @@ const MARKER_LINE_RE = /^ {0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \t
 
 /** A fence line: up to 3 SPACES (a tab or no-break space is indented code / not a fence), a run of 3+ backticks or
  *  3+ tildes, then the rest of the line. */
-const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})([^]*)$/;
 /** A fence opened inside a list item (`- ```` / `1. ````, markers may nest on one line: `- - ````). CommonMark: the
- *  closer may be indented at most 3 columns past the item's content column (4+ is code content, not a closer). */
-const LIST_FENCE_LINE_RE = /^ {0,3}(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)+(`{3,}|~{3,})(.*)$/;
-const FENCE_RUN_RE = /^(`{3,}|~{3,})(.*)$/;
+ *  closer may be indented at most 3 columns past the item's content column (4+ is code content, not a closer), and a
+ *  line indented LESS than that column is not part of the item at all, so it cannot close the item's fence either.
+ *  `[^]` (not `.`) so U+2028/U+2029 in an info string do not stop a line being read as a fence. */
+const LIST_FENCE_LINE_RE = /^ {0,3}(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)+(`{3,}|~{3,})([^]*)$/;
+const FENCE_RUN_RE = /^(`{3,}|~{3,})([^]*)$/;
+/** After a closing run only spaces and tabs are allowed (not `trim()`, which also strips NBSP, BOM, U+2028). */
+const BLANK_RE = /^[ \t]*$/;
 /** Columns a string spans, tabs to the next multiple of 4. */
 const columnsOf = (s) => { let col = 0; for (const ch of s) col += ch === '\t' ? 4 - (col % 4) : 1; return col; };
-/** The content column of a list-item fence opener (where the fence run starts), or null when the gap after the marker
- *  is 5+ columns (then the text is indented code, not a fence). */
+/** The content column of a list-item fence opener (where the fence run starts), or null when ANY gap after a marker
+ *  is 5+ spaces (then the rest is indented code, not a fence). */
 const listFenceColumn = (line, open) => {
   const prefix = line.slice(0, line.length - open[1].length - open[2].length);
-  const col = columnsOf(prefix);
-  return col - columnsOf(prefix.trimEnd()) > 4 ? null : col;
+  return / {5,}/.test(prefix) ? null : columnsOf(prefix);
 };
+/** `line` without inline code spans, so a backticked `<!--` does not open a comment. */
+const withoutCodeSpans = (line) => line.replace(/(`+)[^]*?\1/g, '');
 
 /** Most PR numbers one body may declare; a body past it is not a list of real supersedes. */
 export const MAX_SUPERSEDE_TARGETS = 50;
@@ -83,12 +88,13 @@ export function parseSupersedes(body) {
   let fence = null; // { char, len, base } of the open fence, CommonMark rules: closes on the same char, at least as long,
   // indented 0-3 columns past `base` (0 for a top-level fence, the item's content column for a list-item fence)
   let inComment = false; // inside a multi-line `<!-- ... -->` (PR templates carry guidance there)
-  for (const line of body.split(/\r?\n/)) {
+  for (const line of body.split(/\r\n|\r|\n/)) { // CommonMark line endings: CRLF, lone CR, LF
     if (fence) {
       const lead = /^[ \t]*/.exec(line)[0];
       const close = FENCE_RUN_RE.exec(line.slice(lead.length));
-      if (close && columnsOf(lead) <= fence.base + 3 && close[1][0] === fence.char && close[1].length >= fence.len
-        && close[2].trim() === '') fence = null;
+      const indent = columnsOf(lead);
+      if (close && indent >= fence.base && indent <= fence.base + 3 && close[1][0] === fence.char
+        && close[1].length >= fence.len && BLANK_RE.test(close[2])) fence = null;
       continue;
     }
     if (inComment) { if (line.includes('-->')) inComment = false; continue; }
@@ -110,8 +116,9 @@ export function parseSupersedes(body) {
         if (out.length >= MAX_SUPERSEDE_TARGETS) return out;
       }
     }
-    const opened = line.lastIndexOf('<!--');
-    if (opened !== -1 && !line.includes('-->', opened)) inComment = true;
+    const bare = withoutCodeSpans(line);
+    const opened = bare.lastIndexOf('<!--');
+    if (opened !== -1 && !bare.includes('-->', opened)) inComment = true;
   }
   return out;
 }
