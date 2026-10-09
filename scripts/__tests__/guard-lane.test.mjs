@@ -470,6 +470,38 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
     expect(classifyOverlayRecord({ clone: fakeClone, overlays: [{ ref: 'a' }] }, ws).live).toBe(true);
   });
 
+  // 2026-10-09 live bug: the drain's CODE clone (`.lanes/we-drain-daemon/code`, the clone the drain daemon
+  // actually runs from) was read as "under the lane pool" and every overlay registered on it was pruned, so
+  // PR #4717 / #4715 could never load. Only a NUMBERED lane in a pool repo dir is a pool lane.
+  it('the drain CODE clone under .lanes/we-drain-daemon/code is a daemon clone (seeded) and is never pruned', () => {
+    const ws = path.join(root, 'ws-drain-code');
+    const code = path.join(ws, '.lanes', 'we-drain-daemon', 'code');
+    mkdirSync(code, { recursive: true });
+    expect(classifyOverlayRecord({ clone: code, overlays: [] }, ws).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: code, overlays: [{ ref: 'lane/drain-gh-enqueue', pr: 4717 }] }, ws).live).toBe(true);
+    expect(daemonCloneRoots(ws, { env: { WE_DAEMON_OVERLAY_DIR: path.join(root, 'none') } })).toContain(realpathSync(code));
+    const dir = path.join(root, 'prune-drain-code');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'd7132fe6223895b4.json'), JSON.stringify({ clone: code, overlays: [{ ref: 'lane/drain-gh-enqueue', pr: 4717 }] }));
+    expect(pruneStaleOverlayRecords(ws, { env: { WE_DAEMON_OVERLAY_DIR: dir }, log: () => {} })).toEqual([]);
+    expect(existsSync(path.join(dir, 'd7132fe6223895b4.json'))).toBe(true);
+  });
+
+  it('a non-lane dir under .lanes/ with overlays is live; a numbered pool lane (any pool repo, any depth) is still refused', () => {
+    const ws = path.join(root, 'ws-pool-shape');
+    const other = path.join(ws, '.lanes', 'some-daemon', 'code');
+    mkdirSync(other, { recursive: true });
+    expect(classifyOverlayRecord({ clone: other, overlays: [{ ref: 'a' }] }, ws).live).toBe(true);
+    expect(classifyOverlayRecord({ clone: other, overlays: [] }, ws).live).toBe(false); // empty list: still stale
+    for (const repo of ['web-everything', 'frontierui', 'plateau-app']) {
+      const lane = path.join(ws, '.lanes', repo, 'lane-12');
+      const c = classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws);
+      expect(c.live, repo).toBe(false);
+      expect(c.reason).toMatch(/pool lane/);
+      expect(classifyOverlayRecord({ clone: path.join(lane, 'sub'), overlays: [{ ref: 'a' }] }, ws).live).toBe(false);
+    }
+  });
+
   it('pruneStaleOverlayRecords drops stale records with a logged reason and keeps live ones', () => {
     const dir = path.join(root, 'prune-state');
     mkdirSync(dir, { recursive: true });

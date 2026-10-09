@@ -56,6 +56,9 @@ const SEP = path.sep;
  *   - `.lanes/we-drain-daemon/lane-1` — the WE drain's own dedicated clone (docs/agent/platform-decisions.md
  *     #resident-daemon-reload-lifecycle) — NOT a pool lane: never leased/refreshed like one, rebuilt the same
  *     way every other daemon clone is.
+ *   - `.lanes/we-drain-daemon/code` — the WE drain's CODE clone (the checkout the drain daemon runs its scripts
+ *     from, the drain lib's `weCodeClone`). Missing from this list until 2026-10-09, so the overlay CLI's prune
+ *     read it as "under the lane pool" and deleted every overlay registered on it (#4717/#4715 never loaded).
  */
 export const DAEMON_CLONE_SEED = [
   'wev-review-daemon',
@@ -66,7 +69,26 @@ export const DAEMON_CLONE_SEED = [
   'wev-host-sampler',
   'plateau-drain-daemon',
   `.lanes${SEP}we-drain-daemon${SEP}lane-1`,
+  `.lanes${SEP}we-drain-daemon${SEP}code`,
 ];
+
+/**
+ * PURE: is `real` a POOL LANE (or inside one)? A pool lane is ONLY a numbered lane directly inside a pool repo
+ * dir — `<workspace>/.lanes/<repo>/lane-<N>` (same `lane-\d+` shape `lane-pool-scan.mjs#laneIndicesIn` uses).
+ * Being anywhere under `.lanes/` is NOT enough: daemon clones (`we-drain-daemon/code`) and other non-pool
+ * checkouts live there too. Seed roots are checked BEFORE this, so the seeded `we-drain-daemon/lane-1` wins.
+ * @param {string} real  resolved path
+ * @param {string} workspace
+ * @returns {boolean}
+ */
+export function isPoolLaneRealpath(real, workspace) {
+  if (!real) return false;
+  const pool = path.join(realpathOrResolve(workspace), '.lanes');
+  const rel = path.relative(pool, String(real));
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return false;
+  const parts = rel.split(SEP);
+  return parts.length >= 2 && /^lane-\d+$/.test(parts[1]);
+}
 
 function realpathOrResolve(p) {
   try { return realpathSync(p); } catch { return path.resolve(p); }
@@ -83,8 +105,9 @@ function seedRoots(workspace) {
 
 /**
  * THE ONE PREDICATE (item 116). Does an overlay-state record make its `.clone` a daemon clone? Only when it is
- * a known daemon clone (a seed root) OR it carries a non-empty overlay list — AND it is not a path under the
- * lane pool (`<workspace>/.lanes/`, seed roots excepted: the drain's own clone lives there). A stale record
+ * a known daemon clone (a seed root) OR it carries a non-empty overlay list — AND it is not a numbered POOL LANE
+ * (`<workspace>/.lanes/<repo>/lane-<N>`, see `isPoolLaneRealpath`; seed roots excepted). Other dirs under `.lanes/`
+ * (the drain's clones) are not pool lanes. A stale record
  * (empty list, or a pool lane such as one leaked by an old overlay `add`) therefore NEVER protects its path,
  * so `guard-lane` cannot lock an ordinary leased lane out of its own edits.
  * PURE. Returns `{live:true}` or `{live:false, reason}`.
@@ -96,8 +119,7 @@ export function classifyOverlayRecord(record, workspace) {
   if (!record || typeof record.clone !== 'string' || !record.clone) return { live: false, reason: 'no clone path' };
   const real = realpathOrResolve(record.clone);
   if (isDaemonCloneRealpath(real, seedRoots(workspace))) return { live: true };
-  const pool = path.join(realpathOrResolve(workspace), '.lanes');
-  if (isDaemonCloneRealpath(real, [pool])) return { live: false, reason: `path is under the lane pool (${pool}); a pool lane is never a daemon clone` };
+  if (isPoolLaneRealpath(real, workspace)) return { live: false, reason: `path is a numbered lane in the lane pool (${path.join(realpathOrResolve(workspace), '.lanes')}/<repo>/lane-<N>); a pool lane is never a daemon clone` };
   if (!Array.isArray(record.overlays) || record.overlays.length === 0) return { live: false, reason: 'empty overlay list and not a known daemon clone' };
   return { live: true };
 }
