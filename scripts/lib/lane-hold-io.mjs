@@ -142,7 +142,7 @@ function laneOriginUrl(dir) {
   const gitDir = join(dir, '.git');
   if (!statSync(gitDir).isDirectory()) return null;
   const url = execFileSync('git', ['config', '--file', join(gitDir, 'config'), '--get', 'remote.origin.url'], {
-    cwd: tmpdir(), encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: laneGitHardeningEnv(process.env),
+    cwd: tmpdir(), encoding: 'utf8', timeout: 10_000, maxBuffer: 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], env: laneGitHardeningEnv(process.env),
   }).trim();
   if (!url || url.startsWith('-') || /[\0\n\r]/.test(url)) return null;
   return /^[a-z][a-z0-9+.-]*:|^[^/]+:/i.test(url) ? url : resolve(dir, url);
