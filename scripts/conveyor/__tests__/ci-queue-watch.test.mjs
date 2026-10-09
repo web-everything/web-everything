@@ -246,6 +246,38 @@ describe('withHistoryLock', () => {
     expect(readFileSync(held, 'utf8')).toBe(''); // the live holder's own lock file is untouched — never stolen or cleaned up
   });
 
+  it('required: a lock that cannot be taken returns LOCK_UNAVAILABLE without running fn', async () => {
+    const { LOCK_UNAVAILABLE } = await import('../ci-queue-watch.mjs');
+    writeFileSync(`${lockPath}.lock`, 'someone-else');
+    let ran = false;
+    const out = withHistoryLock(lockPath, () => { ran = true; }, { staleMs: 10_000, timeoutMs: 20, required: true });
+    expect(out).toBe(LOCK_UNAVAILABLE);
+    expect(ran).toBe(false);
+    expect(readFileSync(`${lockPath}.lock`, 'utf8')).toBe('someone-else');
+  });
+
+  it('touch() keeps a long holder from going stale, so a contender cannot steal the lock', async () => {
+    const { sleepSyncMs } = await import('../../readiness/drain-lock.mjs');
+    let contender;
+    withHistoryLock(lockPath, (touch) => {
+      for (let i = 0; i < 4; i += 1) {
+        sleepSyncMs(25);
+        expect(touch()).toBe(true); // refreshed between slow calls: never older than ~25 ms
+      }
+      contender = withHistoryLock(lockPath, () => 'stole-it', { staleMs: 60, timeoutMs: 20, required: true });
+    }, { staleMs: 60 });
+    expect(typeof contender).toBe('symbol'); // total hold time (>100 ms) exceeded staleMs, yet the lock was not stolen
+  });
+
+  it('a holder whose lock was taken over reports it via touch() and never deletes the new holder\'s lock', () => {
+    withHistoryLock(lockPath, (touch) => {
+      rmSync(`${lockPath}.lock`);
+      writeFileSync(`${lockPath}.lock`, 'new-holder-token'); // a stale-steal by another process
+      expect(touch()).toBe(false);
+    });
+    expect(readFileSync(`${lockPath}.lock`, 'utf8')).toBe('new-holder-token');
+  });
+
   it('two REAL concurrent sweep CLI invocations against the SAME sidecar never lose either sample', async () => {
     // The exact race the review finding names: a human running `sweep` by hand while another writer (here,
     // a second concurrent process standing in for the resident runner's tick) writes the same sidecar file.
@@ -349,7 +381,8 @@ describe('ci-queue-watch.mjs CLI — real subprocess, fake gh, real sidecar file
   it('--limit is threaded through to the real gh invocation argv', () => {
     const ghPath = join(binDir, 'gh');
     const argvFile = join(dir, 'gh-argv.json');
-    writeFileSync(ghPath, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
+    // `sweep` also lists PRs for the hung-job check (xncfkf2) — record only the `gh run list` call's argv.
+    writeFileSync(ghPath, `#!/usr/bin/env node\nif (process.argv[2] === 'run') require('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
     chmodSync(ghPath, 0o755);
     runCli(['sweep', '--json', '--limit=5']);
     const ghArgv = JSON.parse(readFileSync(argvFile, 'utf8'));
@@ -360,7 +393,8 @@ describe('ci-queue-watch.mjs CLI — real subprocess, fake gh, real sidecar file
   it('--repo is threaded through to the real gh invocation argv', () => {
     const ghPath = join(binDir, 'gh');
     const argvFile = join(dir, 'gh-argv-repo.json');
-    writeFileSync(ghPath, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
+    // `sweep` also lists PRs for the hung-job check (xncfkf2) — record only the `gh run list` call's argv.
+    writeFileSync(ghPath, `#!/usr/bin/env node\nif (process.argv[2] === 'run') require('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
     chmodSync(ghPath, 0o755);
     runCli(['sweep', '--json', '--repo=web-everything/web-everything']);
     const ghArgv = JSON.parse(readFileSync(argvFile, 'utf8'));
@@ -370,7 +404,8 @@ describe('ci-queue-watch.mjs CLI — real subprocess, fake gh, real sidecar file
   it('a bare valueless --limit (no "=N") falls back to the default limit, never Number(true) === 1', () => {
     const ghPath = join(binDir, 'gh');
     const argvFile = join(dir, 'gh-argv-bare.json');
-    writeFileSync(ghPath, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
+    // `sweep` also lists PRs for the hung-job check (xncfkf2) — record only the `gh run list` call's argv.
+    writeFileSync(ghPath, `#!/usr/bin/env node\nif (process.argv[2] === 'run') require('fs').writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)));\nprocess.stdout.write('[]');\n`);
     chmodSync(ghPath, 0o755);
     runCli(['sweep', '--json', '--limit']); // no "=value" — parseFlags sets this to the boolean `true`
     const ghArgv = JSON.parse(readFileSync(argvFile, 'utf8'));
@@ -430,4 +465,854 @@ it('keeps separate per-repo histories and preserves the WE filename', async () =
     else process.env.CONVEYOR_CI_QUEUE_FILE = previous;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── 4. hung CI jobs (we:backlog/xncfkf2) ────────────────────────────────────────────────────────────────────
+// Live shape, PR #4450 2026-10-08: GitHub reported the required `daemon-soak` job `in_progress` for 90+ min
+// although every step had finished and `completedAt`/`conclusion` were already set. Nothing noticed it.
+describe('hung CI jobs', () => {
+  const T0 = Date.parse('2026-10-08T15:02:41Z');
+  const MIN = 60_000;
+  const url = (run, job) => `https://github.com/web-everything/web-everything/actions/runs/${run}/job/${job}`;
+  const done = (name, job, sec) => ({
+    name, workflowName: 'CI', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: url(9, job),
+    startedAt: new Date(T0 - 3600_000).toISOString(), completedAt: new Date(T0 - 3600_000 + sec * 1000).toISOString(),
+  });
+  const phantom = (job = 113380540047, run = 37796107550) => ({
+    name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: 'SUCCESS', detailsUrl: url(run, job),
+    startedAt: new Date(T0).toISOString(), completedAt: new Date(T0 + 3000).toISOString(),
+  });
+  const pr = (checks, number = 4450, head = 'db9f116') => ({ number, headRefOid: head, statusCheckRollup: checks });
+
+  let dir;
+  let statePath;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ci-hung-')); statePath = join(dir, 'hung.json'); });
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  it('jobRefOf reads the run and job ids from an Actions details URL, null otherwise', async () => {
+    const { jobRefOf } = await import('../ci-queue-watch.mjs');
+    expect(jobRefOf({ detailsUrl: url(37796107550, 113380540047) })).toEqual({ runId: 37796107550, jobId: 113380540047 });
+    expect(jobRefOf({ detailsUrl: 'https://github.com/web-everything/web-everything/runs/113376158917' })).toBeNull();
+    expect(jobRefOf({})).toBeNull();
+  });
+
+  // The details URL is attacker-influenceable (any app with checks:write sets it), and its ids drive writes made
+  // with the App's actions:write token — so it must be this repo's own Actions job URL, exactly.
+  it.each([
+    ['another repo', 'https://github.com/evil/other/actions/runs/1/job/2'],
+    ['another host', 'https://evil.example/web-everything/web-everything/actions/runs/1/job/2'],
+    ['a look-alike host', 'https://github.com.evil.example/web-everything/web-everything/actions/runs/1/job/2'],
+    ['http', 'http://github.com/web-everything/web-everything/actions/runs/1/job/2'],
+    ['userinfo', 'https://x:y@github.com/web-everything/web-everything/actions/runs/1/job/2'],
+    ['a prefix before the path', 'https://github.com/evil/other/x/web-everything/web-everything/actions/runs/1/job/2'],
+    ['the path inside the query', 'https://github.com/evil/other?u=/web-everything/web-everything/actions/runs/1/job/2'],
+    ['a suffix after the job id', 'https://github.com/web-everything/web-everything/actions/runs/1/job/2/../../../x'],
+    ['a run id past the safe-integer range', 'https://github.com/web-everything/web-everything/actions/runs/123456789012345678901234567890/job/2'],
+    ['a job id past the safe-integer range', 'https://github.com/web-everything/web-everything/actions/runs/1/job/123456789012345678901234567890'],
+  ])('jobRefOf rejects %s', async (_label, detailsUrl) => {
+    const { jobRefOf } = await import('../ci-queue-watch.mjs');
+    expect(jobRefOf({ detailsUrl })).toBeNull();
+  });
+
+  it('jobRefOf accepts a query string and compares the repo case-insensitively; a sibling repo needs its own slug', async () => {
+    const { jobRefOf } = await import('../ci-queue-watch.mjs');
+    expect(jobRefOf({ detailsUrl: 'https://github.com/Web-Everything/web-everything/actions/runs/7/job/8?pr=4450' })).toEqual({ runId: 7, jobId: 8 });
+    expect(jobRefOf({ detailsUrl: 'https://github.com/web-everything/frontierui/actions/runs/7/job/8' })).toBeNull();
+    expect(jobRefOf({ detailsUrl: 'https://github.com/web-everything/frontierui/actions/runs/7/job/8' }, 'web-everything/frontierui')).toEqual({ runId: 7, jobId: 8 });
+  });
+
+  // A third-party app with checks:write sets its own name, times and details URL — but not `workflowName`, which only
+  // Actions check runs carry. A perfect-looking Actions URL on a non-Actions check must not teach or trigger anything.
+  it('a non-Actions check carrying a perfect Actions URL is neither learned nor flagged', async () => {
+    const { findHungChecks, learnDurations } = await import('../ci-queue-watch.mjs');
+    const strip = (c) => { const { workflowName: _w, ...rest } = c; return rest; };
+    const forgedSuccess = strip({ ...done('daemon-soak', 77, 36_000) }); // a fake 10-hour "success" under a real check name
+    expect(learnDurations({}, [pr([forgedSuccess])])).toEqual({});
+    expect(findHungChecks([pr([strip(phantom())])], {}, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+    expect(findHungChecks([pr([{ ...phantom(), workflowName: '  ' }])], {}, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+  });
+
+  it('a foreign-repo URL feeds neither the hung scan nor the learned durations', async () => {
+    const { findHungChecks, learnDurations } = await import('../ci-queue-watch.mjs');
+    const foreign = 'https://github.com/evil/other/actions/runs/37796107550/job/113380540047';
+    const prs = [pr([{ ...phantom(), detailsUrl: foreign }, { ...done('test', 1, 60), detailsUrl: foreign }])];
+    expect(findHungChecks(prs, {}, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+    expect(learnDurations({}, prs)).toEqual({});
+  });
+
+  it('percentile is nearest-rank; empty is null', async () => {
+    const { percentile } = await import('../ci-queue-watch.mjs');
+    expect(percentile([], 95)).toBeNull();
+    expect(percentile([5], 95)).toBe(5);
+    expect(percentile(Array.from({ length: 20 }, (_, i) => i + 1), 95)).toBe(19);
+  });
+
+  it('learnDurations keeps only successful completed jobs, dedups by job id, caps the window', async () => {
+    const { learnDurations } = await import('../ci-queue-watch.mjs');
+    const prs = [pr([done('test', 1, 60), done('test', 1, 60), done('test', 2, 90), phantom(),
+      { ...done('test', 3, 10), conclusion: 'FAILURE' }])];
+    const d = learnDurations({}, prs, { window: 50 });
+    expect(d.test.map((s) => s.jobId)).toEqual([1, 2]);
+    expect(d.test.map((s) => s.sec)).toEqual([60, 90]);
+    expect(d['daemon-soak']).toBeUndefined();
+    const capped = learnDurations(d, [pr([done('test', 4, 30), done('test', 5, 40)])], { window: 3 });
+    expect(capped.test.map((s) => s.jobId)).toEqual([2, 4, 5]);
+  });
+
+  it('hungThreshold is max(floor, k × p95)', async () => {
+    const { hungThreshold } = await import('../ci-queue-watch.mjs');
+    expect(hungThreshold([], { k: 3, floorSec: 1800 })).toMatchObject({ thresholdSec: 1800, p95Sec: null, samples: 0 });
+    const long = Array.from({ length: 10 }, (_, i) => ({ jobId: i, sec: 1200 }));
+    expect(hungThreshold(long, { k: 3, floorSec: 1800 })).toMatchObject({ thresholdSec: 3600, p95Sec: 1200, samples: 10 });
+  });
+
+  it('findHungChecks flags the live #4450 shape (in_progress past the threshold) and nothing under it', async () => {
+    const { findHungChecks } = await import('../ci-queue-watch.mjs');
+    const durations = { 'daemon-soak': [{ jobId: 1, sec: 3 }, { jobId: 2, sec: 4 }] };
+    const prs = [pr([phantom(), done('test', 7, 60)])];
+    const hung = findHungChecks(prs, durations, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 });
+    expect(hung).toHaveLength(1);
+    expect(hung[0]).toMatchObject({ pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: 37796107550, jobId: 113380540047, thresholdSec: 1800 });
+    expect(Math.round(hung[0].inProgressSec / 60)).toBe(95);
+    expect(findHungChecks(prs, durations, { now: T0 + 20 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+    // a check with no Actions job behind it (no rerun handle) is never flagged
+    const noJob = [pr([{ ...phantom(), detailsUrl: 'https://example.com/x' }])];
+    expect(findHungChecks(noJob, durations, { now: T0 + 95 * MIN, k: 3, floorSec: 1800 })).toEqual([]);
+  });
+
+  it('planHungActions: first hang recovers, the same job is not touched twice, a second hang on the head escalates', async () => {
+    const { planHungActions, hungKey } = await import('../ci-queue-watch.mjs');
+    const h = { pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: 1, jobId: 10 };
+    expect(planHungActions([h], {}, { maxReruns: 1 })[0].action).toBe('recover');
+    const ledger = { [hungKey(h)]: { jobIds: [10], reruns: 1, stage: 'rerun-requested' } };
+    expect(planHungActions([h], ledger, { maxReruns: 1 })[0].action).toBe('handled');
+    expect(planHungActions([{ ...h, jobId: 11 }], ledger, { maxReruns: 1 })[0].action).toBe('escalate');
+    // a different head is a fresh slate
+    expect(planHungActions([{ ...h, headSha: 'beef', jobId: 12 }], ledger, { maxReruns: 1 })[0].action).toBe('recover');
+  });
+
+  function fakes(runStatus = 'completed') {
+    const calls = [];
+    const lines = [];
+    return {
+      calls, lines,
+      getRun: ({ runId }) => { calls.push(['getRun', runId]); return { status: typeof runStatus === 'function' ? runStatus() : runStatus, head_sha: 'db9f116' }; },
+      getJob: ({ jobId }) => { calls.push(['getJob', jobId]); return { id: jobId, run_id: 37796107550, name: 'daemon-soak' }; },
+      cancelRun: ({ runId }) => { calls.push(['cancelRun', runId]); },
+      forceCancelRun: ({ runId }) => { calls.push(['forceCancelRun', runId]); },
+      rerunJob: ({ jobId }) => { calls.push(['rerunJob', jobId]); },
+      rerunRun: ({ runId }) => { calls.push(['rerunRun', runId]); },
+      log: (l) => lines.push(l),
+    };
+  }
+
+  it('sweepHungJobs re-runs a hung job whose run already completed (no cancel), records it, and never repeats it', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const prs = [pr([phantom()])];
+    const opts = { repo: 'web-everything/web-everything', listPrs: () => prs, statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
+    const r1 = sweepHungJobs({ ...opts, now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
+    expect(r1.actions).toEqual([expect.objectContaining({ action: 'rerun-job', jobId: 113380540047, ok: true })]);
+    const entry = Object.values(readHungState(statePath).hung)[0];
+    expect(entry).toMatchObject({ pr: 4450, headSha: 'db9f116', name: 'daemon-soak', reruns: 1, stage: 'rerun-requested', jobIds: [113380540047] });
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: RECOVER/);
+    // GitHub may keep reporting the old job in_progress — it is already handled, so nothing more happens.
+    f.calls.length = 0;
+    sweepHungJobs({ ...opts, now: () => T0 + 100 * MIN });
+    expect(f.calls).toEqual([]);
+  });
+
+  it('a second hang on the same head escalates (a logged [high] signal) instead of re-running again', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
+    sweepHungJobs({ ...base, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN });
+    f.calls.length = 0;
+    const second = { ...phantom(222, 333), startedAt: new Date(T0 + 100 * MIN).toISOString() };
+    const r = sweepHungJobs({ ...base, listPrs: () => [pr([phantom(), second])], now: () => T0 + 140 * MIN });
+    expect(f.calls.filter(([c]) => c.startsWith('rerun') || c.includes('ancel'))).toEqual([]);
+    expect(r.escalations).toEqual([expect.objectContaining({ pr: 4450, name: 'daemon-soak', jobId: 222 })]);
+    const esc = f.lines.find((l) => l.startsWith('ci-job-hung: ESCALATE '));
+    expect(esc).toBeTruthy();
+    expect(JSON.parse(esc.slice('ci-job-hung: ESCALATE '.length))).toMatchObject({ repo: 'web-everything/web-everything', pr: 4450, check: 'daemon-soak', jobId: 222 });
+    expect(Object.values(readHungState(statePath).hung)[0].escalatedAt).toBeTruthy();
+  });
+
+  it('a hung job whose run is still running is cancelled first, then re-run on a later sweep once the run completes', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    let status = 'in_progress';
+    const f = fakes(() => status);
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
+    sweepHungJobs({ ...base, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['cancelRun', 37796107550]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'cancel-requested', reruns: 0 });
+    // next sweep: the cancelled job no longer shows in_progress; the ledger drives the pending re-run
+    f.calls.length = 0;
+    status = 'completed';
+    sweepHungJobs({ ...base, listPrs: () => [pr([{ ...live, status: 'COMPLETED', conclusion: 'CANCELLED' }])], now: () => T0 + 97 * MIN });
+    // the run was cancelled WHOLE (healthy sibling jobs included), so the whole run is re-run — never just the hung job
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+  });
+
+  it('a cancel that does not take within the grace window is force-cancelled', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([live])], ...f };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 96 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550]]); // still inside the grace window: just wait
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 105 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['forceCancelRun', 37796107550]]);
+  });
+
+  it('a refused job re-run falls back to re-running the whole run; a double failure is recorded, never thrown', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.rerunJob = ({ jobId }) => { f.calls.push(['rerunJob', jobId]); throw new Error('HTTP 403'); };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
+    const r = sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047], ['rerunRun', 37796107550]]);
+    expect(r.actions.at(-1)).toMatchObject({ action: 'rerun-run', ok: true });
+    rmSync(statePath, { force: true });
+    f.calls.length = 0;
+    const r2 = sweepHungJobs({ ...base, rerunRun: () => { throw new Error('HTTP 403 run'); }, now: () => T0 + 95 * MIN });
+    expect(r2.actions.at(-1)).toMatchObject({ ok: false });
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ reruns: 0, stage: 'rerun-failed' });
+  });
+
+  // Live 2026-10-08 (first live run on #4450): gh-throttle was in a shared core-API rate-limit backoff, so the
+  // run-status read AND both re-run writes were refused WITHOUT being sent. That is not GitHub refusing the
+  // recovery: it must be retried on a later sweep, never escalated, and never acted on blind.
+  const THROTTLED = 'gh-throttle: GitHub core API rate limit exceeded for this identity — shared backoff until 2026-10-08T17:17:36.000Z, call not sent (#gh-graphql-budget)';
+
+  it('an unreadable run status defers the recovery (no blind re-run, no ledger entry) and a later sweep recovers', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
+    const r = sweepHungJobs({ ...base, getRun: () => { throw new Error(THROTTLED); }, now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([]);
+    expect(r.actions).toEqual([]);
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: DEFERRED/);
+    expect(readHungState(statePath).hung).toEqual({});
+    sweepHungJobs({ ...base, now: () => T0 + 100 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
+  });
+
+  it('a throttled (not-sent) re-run is deferred and retried next sweep — no run-rerun fallback, no escalation', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
+    sweepHungJobs({ ...base, rerunJob: ({ jobId }) => { f.calls.push(['rerunJob', jobId]); throw new Error(THROTTLED); }, now: () => T0 + 95 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-deferred', reruns: 0 });
+    f.calls.length = 0;
+    const r = sweepHungJobs({ ...base, now: () => T0 + 115 * MIN });
+    expect(r.escalations).toEqual([]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047], ['rerunJob', 113380540047]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+  });
+
+  it('a ledger left at rerun-failed by a transient (throttled) error is retried, not escalated', async () => {
+    const { planHungActions, hungKey } = await import('../ci-queue-watch.mjs');
+    const h = { pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: 1, jobId: 10 };
+    const transient = { [hungKey(h)]: { jobIds: [10], reruns: 0, stage: 'rerun-failed', actions: [{ action: 'rerun-run', ok: false, error: THROTTLED }] } };
+    expect(planHungActions([h], transient, { maxReruns: 1 })[0].action).toBe('recover');
+    const refused = { [hungKey(h)]: { jobIds: [10], reruns: 0, stage: 'rerun-failed', actions: [{ action: 'rerun-run', ok: false, error: 'HTTP 403: Resource not accessible by integration' }] } };
+    expect(planHungActions([h], refused, { maxReruns: 1 })[0].action).toBe('escalate');
+  });
+
+  // ── a recovery that started with a CANCEL keeps being driven from the ledger after the check leaves in_progress ──
+  // (review finding, impact "broken"): once the cancel lands, GitHub reports the check COMPLETED/CANCELLED, so
+  // `findHungChecks` never sees it again — the ledger is the only thing left that can finish or escalate it.
+  const cancelledSetup = async ({ rerunRun }) => {
+    const mod = await import('../ci-queue-watch.mjs');
+    let status = 'in_progress';
+    const f = fakes(() => status);
+    f.rerunRun = rerunRun(f);
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const cancelled = { ...live, status: 'COMPLETED', conclusion: 'CANCELLED' };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f };
+    mod.sweepHungJobs({ ...base, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN });
+    status = 'completed';
+    f.calls.length = 0;
+    f.lines.length = 0;
+    return { ...mod, f, base, cancelled, setStatus: (s) => { status = s; } };
+  };
+
+  it('retries a deferred rerun after cancellation completes', async () => {
+    let throttle = true;
+    const { sweepHungJobs, readHungState, f, base, cancelled } = await cancelledSetup({
+      rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); if (throttle) throw new Error(THROTTLED); },
+    });
+    const listPrs = () => [pr([cancelled])];
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 97 * MIN });
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-deferred', reruns: 0 });
+    // the cancelled check never returns to in_progress; only the ledger can retry the throttled re-run
+    throttle = false;
+    f.calls.length = 0;
+    const r = sweepHungJobs({ ...base, listPrs, now: () => T0 + 99 * MIN });
+    expect(r.escalations).toEqual([]);
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]); // the run is read before it is re-run
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+    // …and once re-run, nothing further happens
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 101 * MIN });
+    expect(f.calls).toEqual([]);
+  });
+
+  it('escalates a refused rerun after cancellation completes', async () => {
+    const { sweepHungJobs, readHungState, f, base, cancelled } = await cancelledSetup({
+      rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); throw new Error('HTTP 403: Resource not accessible by integration'); },
+    });
+    const listPrs = () => [pr([cancelled])];
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 97 * MIN });
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-failed', reruns: 0 });
+    f.calls.length = 0;
+    f.lines.length = 0;
+    const r1 = sweepHungJobs({ ...base, listPrs, now: () => T0 + 99 * MIN });
+    expect(f.calls.filter(([c]) => c !== 'getRun')).toEqual([]); // a real refusal is never retried (only the run is read)
+    expect(r1.escalations).toEqual([expect.objectContaining({ pr: 4450, name: 'daemon-soak' })]);
+    const esc = (lines) => lines.filter((l) => l.startsWith('ci-job-hung: ESCALATE '));
+    expect(esc(f.lines)).toHaveLength(1);
+    // logged on EVERY sweep while stranded, with a line that differs each time (the daemon log folds identical lines)
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 104 * MIN });
+    expect(esc(f.lines)).toHaveLength(1);
+    const body = (l) => JSON.parse(l.slice('ci-job-hung: ESCALATE '.length));
+    expect(body(esc(f.lines)[0]).inProgressMin).toBe(104);
+    expect(body(esc(f.lines)[0])).toMatchObject({ repo: 'web-everything/web-everything', pr: 4450, check: 'daemon-soak', runId: 37796107550, jobId: 113380540047, thresholdMin: 30, reruns: 0 });
+  });
+
+  it('the stranded-recovery ESCALATE line is accepted by the ci-job-hung smell (the two validators agree)', async () => {
+    const { default: ciJobHung } = await import('../health-smells/ci-job-hung.mjs');
+    const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({
+      rerunRun: () => () => { throw new Error('HTTP 403: Resource not accessible by integration'); },
+    });
+    const listPrs = () => [pr([cancelled])];
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 97 * MIN });
+    sweepHungJobs({ ...base, listPrs, now: () => T0 + 99 * MIN });
+    const out = ciJobHung.evaluate({ daemonLogs: [{ name: 'ci-queue-watch', text: f.lines.join('\n') }] });
+    expect(out).toEqual([expect.objectContaining({ subject: 'web-everything/web-everything#4450:daemon-soak', breach: true })]);
+  });
+
+  it('stops driving a cancelled recovery once its PR is gone, moved to a new head, or the check passed', async () => {
+    for (const next of [
+      [], // PR closed / merged
+      [pr([{ ...phantom(), status: 'COMPLETED', conclusion: 'CANCELLED' }], 4450, 'newhead')], // force-pushed
+    ]) {
+      rmSync(statePath, { force: true });
+      const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); throw new Error(THROTTLED); } });
+      sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 97 * MIN }); // defers
+      f.calls.length = 0;
+      f.lines.length = 0;
+      const r = sweepHungJobs({ ...base, listPrs: () => next, now: () => T0 + 99 * MIN });
+      expect(f.calls).toEqual([]);
+      expect(r.escalations).toEqual([]);
+    }
+    // a pending cancel-requested entry is not re-run for a PR that is gone either
+    rmSync(statePath, { force: true });
+    const { sweepHungJobs, f, base } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    // setup already cancelled; the run completed — but the PR is no longer open
+    sweepHungJobs({ ...base, listPrs: () => [], now: () => T0 + 97 * MIN });
+    expect(f.calls).toEqual([]);
+  });
+
+  // Review finding: the cancel kills the WHOLE run, so a later job-only re-run left cancelled siblings blocking the PR.
+  it('re-runs the whole run (not just the hung job) after cancelling a multi-job run', async () => {
+    const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    const sibling = { name: 'unit', workflowName: 'CI', status: 'COMPLETED', conclusion: 'CANCELLED', detailsUrl: url(37796107550, 555), startedAt: new Date(T0).toISOString() };
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled, sibling])], now: () => T0 + 97 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]);
+    expect(f.calls.some(([c]) => c === 'rerunJob')).toBe(false);
+  });
+
+  // Review finding (security): never write against a run or job the PR does not own.
+  it('refuses any write when the run belongs to a different head', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'in_progress', head_sha: 'someone-elses-release-sha' }; };
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550]]);
+    expect(r.actions).toEqual([]);
+    expect(readHungState(statePath).hung).toEqual({});
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: REFUSED/);
+  });
+
+  it('refuses a run read that carries no head_sha (fail closed)', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'completed' }; };
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550]]);
+    expect(r.actions).toEqual([]);
+  });
+
+  it('refuses a job re-run when the job id belongs to a different run than the details URL names', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.getJob = ({ jobId }) => { f.calls.push(['getJob', jobId]); return { id: jobId, run_id: 999, name: 'daemon-soak' }; }; // e.g. a deploy workflow's job
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047]]);
+    expect(r.actions).toEqual([]);
+    expect(readHungState(statePath).hung).toEqual({});
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: REFUSED/);
+  });
+
+  // Review (re-review of the repair): the CANCEL path writes by run id too, so the job must be tied to the run and to
+  // the check by name there as well — a third-party check may point its details URL at any real job of the same head.
+  it.each([
+    ['belongs to a different run', { run_id: 999, name: 'daemon-soak' }],
+    ['carries a different name than the check', { run_id: 37796107550, name: 'release-deploy' }],
+    ['has no name at all', { run_id: 37796107550 }],
+  ])('refuses to CANCEL a running run when the named job %s', async (_label, job) => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    f.getJob = ({ jobId }) => { f.calls.push(['getJob', jobId]); return { id: jobId, ...job }; };
+    const live = { ...phantom(), conclusion: null, completedAt: null };
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([live])], now: () => T0 + 95 * MIN, ...f });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['getJob', 113380540047]]);
+    expect(r.actions).toEqual([]);
+    expect(readHungState(statePath).hung).toEqual({});
+  });
+
+  // A check NAME is an attacker-chosen string used as a key: `constructor` / `__proto__` / `toString` resolved to
+  // Object's own members and made `list.some` throw at the top of the sweep, stopping recovery for the whole repo.
+  it.each(['constructor', '__proto__', 'toString', 'hasOwnProperty'])('a successful check named %s neither throws nor poisons the learned durations', async (name) => {
+    const { learnDurations, sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const prs = [pr([done(name, 1, 60), done('test', 2, 90)])];
+    const d = learnDurations({}, prs);
+    expect(Object.getOwnPropertyDescriptor(d, name)?.value).toEqual([{ jobId: 1, sec: 60 }]);
+    expect(d.test).toEqual([{ jobId: 2, sec: 90 }]);
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted')).toBe(false);
+    const f = fakes('completed');
+    expect(() => sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([done(name, 1, 60), phantom()])], now: () => T0 + 95 * MIN, ...f })).not.toThrow();
+    expect(f.calls.some(([c]) => c === 'rerunJob')).toBe(true); // recovery for the real hung job still ran
+    expect(Object.keys(readHungState(statePath).durations)).toContain(name);
+  });
+
+  it('caps how many distinct check names are learned', async () => {
+    const { learnDurations, MAX_DURATION_NAMES } = await import('../ci-queue-watch.mjs');
+    const checks = Array.from({ length: MAX_DURATION_NAMES + 25 }, (_, i) => done(`job-${i}`, 1000 + i, 60));
+    expect(Object.keys(learnDurations({}, [pr(checks)]))).toHaveLength(MAX_DURATION_NAMES);
+  });
+
+  it('canonicalises --repo (a key or a legacy form) before it anchors the details-URL check', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const r = sweepHungJobs({ repo: 'we', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(r.hung).toHaveLength(1);
+  });
+
+  // Truncated read: `gh pr list --limit 100` — a PR missing from a FULL page is unknown, not closed.
+  it('does not mistake a PR missing from a full 100-PR page for a closed one', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const { f, base } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    const fullPage = Array.from({ length: 100 }, (_, i) => pr([], 9000 + i, `${i}`.padStart(7, 'a')));
+    sweepHungJobs({ ...base, listPrs: () => fullPage, now: () => T0 + 97 * MIN });
+    expect(f.calls).toEqual([['getRun', 37796107550], ['rerunRun', 37796107550]]);
+  });
+
+  // A cancel the job outran must not re-run a run that FINISHED SUCCESSFULLY: the whole run is healthy.
+  it('does not re-run the whole run when the run in fact finished successfully after the cancel', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const { f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    const getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'completed', conclusion: 'success', head_sha: 'db9f116' }; };
+    sweepHungJobs({ ...base, getRun, listPrs: () => [pr([{ ...cancelled, conclusion: 'SUCCESS' }])], now: () => T0 + 97 * MIN });
+    expect(f.calls.filter(([c]) => c.startsWith('rerun'))).toEqual([]);
+    expect(Object.values(readHungState(statePath).hung)[0].stage).toBe('cancel-outran');
+  });
+
+  // Review finding (codex, CONFIRMED): the watched job being green says nothing about the siblings the whole-run
+  // cancel killed — only the RUN's own conclusion does.
+  it('restores cancelled siblings when the watched job finishes green', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const { f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); } });
+    const getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'completed', conclusion: 'cancelled', head_sha: 'db9f116' }; };
+    const sibling = { name: 'unit', workflowName: 'CI', status: 'COMPLETED', conclusion: 'CANCELLED', detailsUrl: url(37796107550, 555), startedAt: new Date(T0).toISOString() };
+    sweepHungJobs({ ...base, getRun, listPrs: () => [pr([{ ...cancelled, conclusion: 'SUCCESS' }, sibling])], now: () => T0 + 97 * MIN });
+    expect(f.calls.filter(([c]) => c.startsWith('rerun'))).toEqual([['rerunRun', 37796107550]]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+  });
+
+  it('retries a deferred whole-run re-run even though the watched job is green and only a sibling stays cancelled', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    let throttle = true;
+    const { f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); if (throttle) throw new Error(THROTTLED); } });
+    const getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'completed', conclusion: 'cancelled', head_sha: 'db9f116' }; };
+    const green = { ...cancelled, conclusion: 'SUCCESS' };
+    sweepHungJobs({ ...base, getRun, listPrs: () => [pr([green])], now: () => T0 + 97 * MIN });
+    expect(Object.values(readHungState(statePath).hung)[0].stage).toBe('rerun-deferred');
+    throttle = false;
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, getRun, listPrs: () => [pr([green])], now: () => T0 + 99 * MIN });
+    expect(f.calls.filter(([c]) => c.startsWith('rerun'))).toEqual([['rerunRun', 37796107550]]);
+  });
+
+  it('a deferred cancel-origin recovery that the lagging snapshot still shows in_progress is retried as a WHOLE-run re-run', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    let throttle = true;
+    const { f, base, cancelled } = await cancelledSetup({ rerunRun: (fk) => ({ runId }) => { fk.calls.push(['rerunRun', runId]); if (throttle) throw new Error(THROTTLED); } });
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 97 * MIN }); // → rerun-deferred
+    throttle = false;
+    f.calls.length = 0;
+    const stale = { ...cancelled, status: 'IN_PROGRESS', conclusion: null };
+    sweepHungJobs({ ...base, listPrs: () => [pr([stale])], now: () => T0 + 99 * MIN });
+    expect(f.calls.some(([c]) => c === 'rerunJob')).toBe(false);
+    expect(f.calls.some(([c]) => c === 'rerunRun')).toBe(true);
+  });
+
+  it('the stranded-recovery alert says the re-run was refused after a cancel, not that a job "hung again"', async () => {
+    const { default: ciJobHung } = await import('../health-smells/ci-job-hung.mjs');
+    const { sweepHungJobs, f, base, cancelled } = await cancelledSetup({ rerunRun: () => () => { throw new Error('HTTP 403: Resource not accessible by integration'); } });
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 97 * MIN });
+    sweepHungJobs({ ...base, listPrs: () => [pr([cancelled])], now: () => T0 + 99 * MIN });
+    const [alert] = ciJobHung.evaluate({ daemonLogs: [{ name: 'ci-queue-watch', text: f.lines.join('\n') }] });
+    expect(alert.summary).toMatch(/re-run was refused after it was cancelled/);
+    expect(alert.summary).not.toMatch(/hung again/);
+    expect(alert.recommendation).not.toMatch(/automatic re-run did not clear it/);
+  });
+
+  // ── force-cancel outcomes (review findings, codex + correctness) ──────────────────────────────────────────────
+  const escLines = (lines) => lines.filter((l) => l.startsWith('ci-job-hung: ESCALATE ')).map((l) => JSON.parse(l.slice('ci-job-hung: ESCALATE '.length)));
+  const writesOf = (calls) => calls.filter(([c]) => /^(cancelRun|forceCancelRun|rerunJob|rerunRun)$/.test(c)).map(([c]) => c);
+  const stuckRun = () => ({ ...phantom(), conclusion: null, completedAt: null });
+
+  it('escalates a permanent force-cancel refusal without retrying the write', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    f.forceCancelRun = ({ runId }) => { f.calls.push(['forceCancelRun', runId]); throw new Error('HTTP 403: Resource not accessible by integration'); };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], ...f };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    f.calls.length = 0;
+    f.lines.length = 0;
+    const r = sweepHungJobs({ ...base, now: () => T0 + 105 * MIN });
+    expect(writesOf(f.calls)).toEqual(['forceCancelRun']);
+    expect(escLines(f.lines)).toEqual([expect.objectContaining({ check: 'daemon-soak', reason: 'force-cancel-refused' })]); // exactly one
+    expect(r.escalations).toHaveLength(1);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'cancel-requested', forceCancelRefusedAt: expect.any(String) });
+    // every later sweep: no write is re-sent, and it escalates again (one line, minutes growing)
+    f.calls.length = 0;
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 110 * MIN });
+    expect(writesOf(f.calls)).toEqual([]);
+    const again = escLines(f.lines);
+    expect(again).toEqual([expect.objectContaining({ reason: 'force-cancel-refused' })]);
+    expect(again[0].inProgressMin).toBe(110);
+  });
+
+  it('retries a transient (throttled) force-cancel failure instead of escalating it', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    let throttle = true;
+    f.forceCancelRun = ({ runId }) => { f.calls.push(['forceCancelRun', runId]); if (throttle) throw new Error(THROTTLED); };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], ...f };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 105 * MIN });
+    expect(escLines(f.lines)).toEqual([]);
+    throttle = false;
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 106 * MIN });
+    expect(writesOf(f.calls)).toEqual(['forceCancelRun']);
+    expect(Object.values(readHungState(statePath).hung)[0].forceCancelledAt).toEqual(expect.any(String));
+  });
+
+  it('escalates a run that is still not complete a grace window after the force-cancel', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], ...f };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    sweepHungJobs({ ...base, now: () => T0 + 105 * MIN }); // force-cancel
+    f.calls.length = 0;
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 107 * MIN }); // inside the second grace window: just wait
+    expect(escLines(f.lines)).toEqual([]);
+    expect(writesOf(f.calls)).toEqual([]);
+    sweepHungJobs({ ...base, now: () => T0 + 111 * MIN });
+    expect(escLines(f.lines)).toEqual([expect.objectContaining({ reason: 'cancel-did-not-take', inProgressMin: 111 })]);
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 115 * MIN });
+    expect(escLines(f.lines)).toEqual([expect.objectContaining({ reason: 'cancel-did-not-take', inProgressMin: 115 })]);
+    expect(writesOf(f.calls)).toEqual([]);
+  });
+
+  it('names a refused initial cancel and a refused direct re-run in the escalation, not "hung again"', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const refuse = () => { throw new Error('HTTP 403: Resource not accessible by integration'); };
+    {
+      const f = fakes('in_progress');
+      f.cancelRun = ({ runId }) => { f.calls.push(['cancelRun', runId]); refuse(); };
+      const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], ...f };
+      sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+      f.lines.length = 0;
+      sweepHungJobs({ ...base, now: () => T0 + 100 * MIN });
+      expect(escLines(f.lines)).toEqual([expect.objectContaining({ reason: 'cancel-refused' })]);
+    }
+    rmSync(statePath, { force: true });
+    {
+      const f = fakes('completed');
+      f.rerunJob = ({ jobId }) => { f.calls.push(['rerunJob', jobId]); refuse(); };
+      f.rerunRun = ({ runId }) => { f.calls.push(['rerunRun', runId]); refuse(); };
+      const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], ...f };
+      sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+      f.lines.length = 0;
+      sweepHungJobs({ ...base, now: () => T0 + 100 * MIN });
+      expect(escLines(f.lines)).toEqual([expect.objectContaining({ reason: 'rerun-refused' })]);
+    }
+  });
+
+  // Self-review findings: the same defect class one step over.
+  it('an interrupted job→run re-run fallback leaves the ledger retryable, never "handled"', async () => {
+    const { sweepHungJobs, readHungState, planHungActions, hungKey } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.rerunJob = ({ jobId }) => { f.calls.push(['rerunJob', jobId]); throw new Error('HTTP 403: Resource not accessible by integration'); };
+    let onDisk;
+    f.rerunRun = ({ runId }) => { f.calls.push(['rerunRun', runId]); onDisk = Object.values(readHungState(statePath).hung)[0]; }; // the fallback, right after the refusal
+    sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    expect(onDisk).toMatchObject({ stage: 'rerun-job-refused', reruns: 0 });
+    const h = { pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: 1, jobId: 10 };
+    expect(planHungActions([h], { [hungKey(h)]: onDisk && { ...onDisk, jobIds: [10] } }, { maxReruns: 1 })[0].action).toBe('recover');
+  });
+
+  it('a force-cancel that lost the race to the run finishing is no refusal: nothing latched, nothing escalated', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    let status = 'in_progress';
+    const f = fakes(() => status);
+    f.forceCancelRun = ({ runId }) => { f.calls.push(['forceCancelRun', runId]); status = 'completed'; throw new Error('HTTP 409: Cannot cancel a workflow run that is completed.'); };
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], ...f };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 105 * MIN });
+    expect(escLines(f.lines)).toEqual([]);
+    expect(Object.values(readHungState(statePath).hung)[0].forceCancelRefusedAt).toBeUndefined();
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 106 * MIN }); // the run is completed now: the whole run is re-run
+    expect(writesOf(f.calls)).toEqual(['rerunRun']);
+  });
+
+  it('a run the ledger cannot read is never silent: permanent → ESCALATE run-unreadable, transient → DEFERRED and retried', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], ...f };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN }); // cancel
+    f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); throw new Error(THROTTLED); };
+    f.lines.length = 0;
+    sweepHungJobs({ ...base, getRun: f.getRun, now: () => T0 + 97 * MIN });
+    expect(escLines(f.lines)).toEqual([]);
+    expect(f.lines.join('\n')).toMatch(/ci-job-hung: DEFERRED .*run status unreadable/);
+    f.lines.length = 0;
+    const gone = ({ runId }) => { f.calls.push(['getRun', runId]); throw new Error('HTTP 404: Not Found'); };
+    const r = sweepHungJobs({ ...base, getRun: gone, now: () => T0 + 99 * MIN });
+    expect(escLines(f.lines)).toEqual([expect.objectContaining({ reason: 'run-unreadable' })]);
+    expect(r.escalations).toHaveLength(1);
+  });
+
+  it('a ledger that cannot be parsed is set aside loudly, not silently overwritten', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    writeFileSync(statePath, '{"durations": {"soak": [');
+    const f = fakes('completed');
+    sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, ...f });
+    const reset = f.lines.find((l) => l.startsWith('ci-job-hung: LEDGER-RESET '));
+    expect(reset).toBeTruthy();
+    const { aside } = JSON.parse(reset.slice('ci-job-hung: LEDGER-RESET '.length));
+    expect(readFileSync(aside, 'utf8')).toBe('{"durations": {"soak": [');
+  });
+
+  // The state machine, exhaustively: for every ledger stage the next sweep either ACTS (exactly these writes), WAITS
+  // (no write, no escalation) or ESCALATES (exactly one ESCALATE line, with its reason, and no write).
+  describe('ledger stage table', () => {
+    const iso = (min) => new Date(T0 + min * MIN).toISOString();
+    const entryAt = (over) => ({
+      pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: 37796107550, jobIds: [113380540047], reruns: 0,
+      startedAt: iso(0), detectedAt: iso(95), thresholdSec: 1800, updatedAt: iso(95), actions: [], ...over,
+    });
+    const lagging = () => stuckRun(); // GitHub still reports the check in_progress
+    const cancelled = () => ({ ...phantom(), status: 'COMPLETED', conclusion: 'CANCELLED' });
+    const rows = [
+      // [label, ledger entry, run, check, minute, expected writes, expected escalation reason | null]
+      ['cancel-requested, inside the grace window → waits', { stage: 'cancel-requested', cancelRequestedAt: iso(95) }, { status: 'in_progress' }, lagging, 97, [], null],
+      ['cancel-requested, grace window passed → force-cancels', { stage: 'cancel-requested', cancelRequestedAt: iso(95) }, { status: 'in_progress' }, lagging, 105, ['forceCancelRun'], null],
+      ['force-cancelled, inside the second grace window → waits', { stage: 'cancel-requested', cancelRequestedAt: iso(95), forceCancelledAt: iso(100) }, { status: 'in_progress' }, lagging, 103, [], null],
+      ['force-cancelled, second grace window passed → escalates', { stage: 'cancel-requested', cancelRequestedAt: iso(95), forceCancelledAt: iso(100) }, { status: 'in_progress' }, lagging, 106, [], 'cancel-did-not-take'],
+      ['force-cancel refused → escalates, never re-sent', { stage: 'cancel-requested', cancelRequestedAt: iso(95), forceCancelRefusedAt: iso(100) }, { status: 'in_progress' }, lagging, 106, [], 'force-cancel-refused'],
+      ['cancel-requested, run cancelled → re-runs the whole run', { stage: 'cancel-requested', cancelRequestedAt: iso(95) }, { status: 'completed', conclusion: 'cancelled' }, cancelled, 97, ['rerunRun'], null],
+      ['cancel-requested, run succeeded → resolved, no write', { stage: 'cancel-requested', cancelRequestedAt: iso(95) }, { status: 'completed', conclusion: 'success' }, cancelled, 97, [], null],
+      ['rerun-deferred, run still cancelled → retries the whole run', { stage: 'rerun-deferred', cancelRequestedAt: iso(95), actions: [{ ok: false, error: THROTTLED }] }, { status: 'completed', conclusion: 'cancelled' }, cancelled, 99, ['rerunRun'], null],
+      ['rerun-failed (refused), run still cancelled → escalates', { stage: 'rerun-failed', cancelRequestedAt: iso(95), actions: [{ ok: false, error: 'HTTP 403: nope' }] }, { status: 'completed', conclusion: 'cancelled' }, cancelled, 99, [], 'rerun-refused-after-cancel'],
+      ['rerun-failed (refused), snapshot still in_progress → escalates ONCE', { stage: 'rerun-failed', cancelRequestedAt: iso(95), actions: [{ ok: false, error: 'HTTP 403: nope' }] }, { status: 'completed', conclusion: 'cancelled' }, lagging, 99, [], 'rerun-refused-after-cancel'],
+      ['rerun-requested, run re-running → waits', { stage: 'rerun-requested', cancelRequestedAt: iso(95), reruns: 1 }, { status: 'in_progress' }, lagging, 99, [], null],
+      ['cancel-outran → nothing', { stage: 'cancel-outran', cancelRequestedAt: iso(95) }, { status: 'completed', conclusion: 'success' }, cancelled, 99, [], null],
+      ['cancel-failed (refused) → escalates (cancel-refused)', { stage: 'cancel-failed', actions: [{ ok: false, error: 'HTTP 403: nope' }] }, { status: 'in_progress' }, lagging, 99, [], 'cancel-refused'],
+      ['cancel-deferred (throttled) → cancels again', { stage: 'cancel-deferred', actions: [{ ok: false, error: THROTTLED }] }, { status: 'in_progress' }, lagging, 99, ['cancelRun'], null],
+    ];
+    it.each(rows)('%s', async (_label, over, run, check, minute, writes, reason) => {
+      const { sweepHungJobs, hungKey } = await import('../ci-queue-watch.mjs');
+      const e = entryAt(over);
+      writeFileSync(statePath, JSON.stringify({ durations: {}, hung: { [hungKey({ pr: e.pr, headSha: e.headSha, name: e.name })]: e } }));
+      const f = fakes(run.status);
+      f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { ...run, head_sha: 'db9f116' }; };
+      const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([check()])], now: () => T0 + minute * MIN, ...f });
+      expect(writesOf(f.calls)).toEqual(writes);
+      expect(escLines(f.lines).map((x) => x.reason)).toEqual(reason ? [reason] : []);
+      expect(r.escalations).toHaveLength(reason ? 1 : 0);
+    });
+  });
+
+  // ── the ledger lock (review finding): gh calls run inside it, so it must outlive a slow call and never be
+  //    shared with an overlapping sweep ───────────────────────────────────────────────────────────────────────
+  describe('the hung sweep ledger lock', () => {
+    it('skips (makes no write) while another sweep holds a live lock, instead of running unlocked', async () => {
+      const { sweepHungJobs, withHistoryLock } = await import('../ci-queue-watch.mjs');
+      const f = fakes('completed');
+      const opts = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, lock: { staleMs: 5000, timeoutMs: 30 }, ...f };
+      let inner;
+      withHistoryLock(statePath, () => { inner = sweepHungJobs(opts); }, { staleMs: 5000 });
+      expect(inner).toMatchObject({ skipped: 'lock-held', actions: [] });
+      expect(f.calls).toEqual([]);
+      expect(f.lines.join('\n')).toMatch(/ci-job-hung: SKIPPED/);
+    });
+
+    it('a sweep whose lock was taken over mid-sweep stops without writing, and the other sweep acts exactly once', async () => {
+      const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+      const { sleepSyncMs } = await import('../../readiness/drain-lock.mjs');
+      const lock = { staleMs: 40, timeoutMs: 400 };
+      const common = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, lock };
+      const fB = fakes('completed');
+      let resB;
+      const fA = fakes('completed');
+      // sweep A's first gh read outlives the lock's staleness window; sweep B (an operator's hand-run `hung`) starts then
+      fA.getRun = ({ runId }) => {
+        fA.calls.push(['getRun', runId]);
+        sleepSyncMs(120);
+        resB = sweepHungJobs({ ...common, ...fB });
+        return { status: 'completed', head_sha: 'db9f116' };
+      };
+      const rA = sweepHungJobs({ ...common, ...fA });
+      expect(resB.actions).toEqual([expect.objectContaining({ action: 'rerun-job', ok: true })]);
+      expect(rA).toMatchObject({ skipped: 'lock-lost', actions: [] });
+      expect(writesOf(fA.calls)).toEqual([]);
+      expect(fA.lines.join('\n')).toMatch(/ci-job-hung: ABORTED/);
+      expect(writesOf(fB.calls)).toEqual(['rerunJob']);
+      expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ reruns: 1, stage: 'rerun-requested' });
+    });
+
+    it('a cancel is in the ledger the moment it is sent, not only when the sweep ends', async () => {
+      const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+      const f = fakes('in_progress');
+      // what a process that died right after the cancel would leave on disk: read it back at the moment the cancel
+      // is logged, long before the sweep's own final write
+      let onDisk;
+      f.log = (l) => { f.lines.push(l); if (l.startsWith('ci-job-hung: RECOVER')) onDisk = Object.values(readHungState(statePath).hung)[0]; };
+      sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([stuckRun()])], now: () => T0 + 95 * MIN, ...f });
+      expect(writesOf(f.calls)).toEqual(['cancelRun']);
+      expect(onDisk).toMatchObject({ stage: 'cancel-requested', cancelRequestedAt: expect.any(String) });
+    });
+  });
+
+  it('apply:false reports the plan with no GitHub writes', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN, apply: false, ...f });
+    expect(r.hung).toEqual([expect.objectContaining({ jobId: 113380540047, action: 'recover' })]);
+    expect(f.calls.filter(([c]) => c !== 'getRun')).toEqual([]);
+  });
+
+  it('learns durations across sweeps into the persisted state', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    const base = { repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 60, maxReruns: 1, ...f };
+    sweepHungJobs({ ...base, listPrs: () => [pr(Array.from({ length: 10 }, (_, i) => done('soak', 100 + i, 600)))], now: () => T0 });
+    expect(readHungState(statePath).durations.soak).toHaveLength(10);
+    // 25 min in progress: past the 60 s floor but under 3 × p95 (30 min) — not hung
+    const running = { name: 'soak', workflowName: 'CI', status: 'IN_PROGRESS', detailsUrl: url(5, 500), startedAt: new Date(T0).toISOString() };
+    const r = sweepHungJobs({ ...base, listPrs: () => [pr([running])], now: () => T0 + 25 * MIN });
+    expect(r.hung).toEqual([]);
+  });
+});
+
+describe('hung CLI verb', () => {
+  it('`hung --dry-run --json` lists the hung job from gh pr list without acting', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-hung-cli-'));
+    try {
+      const bin = join(dir, 'bin');
+      mkdirSync(bin);
+      const started = new Date(Date.now() - 120 * 60_000).toISOString();
+      const prs = [{ number: 4450, headRefOid: 'db9f116', statusCheckRollup: [{ name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: 'SUCCESS', startedAt: started, detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/37796107550/job/113380540047' }] }];
+      writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(prs))});\n`);
+      chmodSync(join(bin, 'gh'), 0o755);
+      const out = JSON.parse(execFileSync('node', [CLI, 'hung', '--dry-run', '--json', '--repo=web-everything/web-everything'], {
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONVEYOR_CI_QUEUE_FILE: join(dir, 'history.json') },
+      }));
+      expect(out.hung).toEqual([expect.objectContaining({ pr: 4450, jobId: 113380540047, action: 'recover' })]);
+      expect(out.actions).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// Review finding: the `WE_CI_HUNG_ACTION=0` kill switch and the `sweep` → hung-sweep wiring had no test (the only CLI
+// test used `--dry-run`). A fake `gh` that answers per-argv and LOGS every write lets the CLI prove both for real.
+describe('hung sweep wiring through the real CLI (kill switch + sweep integration)', () => {
+  let dir, writeLog;
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ci-hung-wire-')); writeLog = join(dir, 'posts.log'); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function installGh() {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    const started = new Date(Date.now() - 120 * 60_000).toISOString();
+    const prs = [{ number: 4450, headRefOid: 'db9f116', statusCheckRollup: [{ name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: 'SUCCESS', startedAt: started, detailsUrl: 'https://github.com/web-everything/web-everything/actions/runs/37796107550/job/113380540047' }] }];
+    writeFileSync(join(bin, 'gh'), [
+      '#!/usr/bin/env node',
+      'const fs = require("fs");',
+      'const a = process.argv.slice(2);',
+      `if (a.includes("-X")) { fs.appendFileSync(${JSON.stringify(writeLog)}, a.join(" ") + "\\n"); process.stdout.write("{}"); process.exit(0); }`,
+      'if (a[0] === "run") process.stdout.write("[]");',
+      `else if (a[0] === "pr") process.stdout.write(${JSON.stringify(JSON.stringify(prs))});`,
+      'else if (a[0] === "api" && /actions\\/runs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ status: "completed", head_sha: "db9f116" }));',
+      'else if (a[0] === "api" && /actions\\/jobs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ id: 113380540047, run_id: 37796107550, name: "daemon-soak" }));',
+      'else process.stdout.write("{}");',
+    ].join('\n'));
+    chmodSync(join(bin, 'gh'), 0o755);
+    return bin;
+  }
+  const runCli = (args, extraEnv = {}) => {
+    const bin = installGh();
+    return JSON.parse(execFileSync('node', [CLI, ...args, '--json', '--repo=web-everything/web-everything'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env, PATH: `${bin}:${process.env.PATH}`, CONVEYOR_CI_QUEUE_FILE: join(dir, 'history.json'),
+        WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle'), ...extraEnv,
+      },
+    }));
+  };
+  const writes = () => (existsSync(writeLog) ? readFileSync(writeLog, 'utf8').trim().split('\n') : []);
+
+  it('sweep runs the hung pass, attaches result.hung, and performs the re-run when writes are on', () => {
+    const out = runCli(['sweep'], { WE_CI_HUNG_ACTION: '' });
+    expect(out.hung).toEqual({ count: 1, actions: 1, escalations: 0 });
+    expect(writes()).toEqual([expect.stringContaining('jobs/113380540047/rerun')]);
+  });
+
+  it('WE_CI_HUNG_ACTION=0 turns every hung-job write off on `sweep` — the hang is still detected', () => {
+    const out = runCli(['sweep'], { WE_CI_HUNG_ACTION: '0' });
+    expect(out.hung).toEqual({ count: 1, actions: 0, escalations: 0 });
+    expect(writes()).toEqual([]);
+  });
+
+  it('WE_CI_HUNG_ACTION=0 turns the writes off on the `hung` verb too', () => {
+    const out = runCli(['hung'], { WE_CI_HUNG_ACTION: '0' });
+    expect(out.hung).toEqual([expect.objectContaining({ pr: 4450, action: 'recover' })]);
+    expect(out.actions).toEqual([]);
+    expect(writes()).toEqual([]);
+  });
 });
