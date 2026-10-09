@@ -3,10 +3,11 @@ bornAs: x2gsr9p
 kind: story
 size: 3
 parent: "4075"
-status: active
+status: resolved
 scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper*.test.mjs"]
 dateOpened: "2026-09-28"
 dateStarted: "2026-10-09"
+dateResolved: "2026-10-09"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "6fc4b52158026e5e959559ecebc89de378665531"
 tags: []
