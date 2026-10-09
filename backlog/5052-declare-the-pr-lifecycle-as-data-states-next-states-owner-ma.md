@@ -6,7 +6,7 @@ parent: "3383"
 status: open
 blockedBy: ["4281"]
 relatedTo: ["4075", "4282", "4284", "3007"]
-scope: ["we:scripts/conveyor/pr-lifecycle.mjs", "we:scripts/conveyor/__tests__/pr-lifecycle.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
+
 dateOpened: "2026-10-04"
 tags: []
 ---
@@ -20,3 +20,12 @@ Epic 4075 (webhooks-not-polling) is moving PR state off GitHub: per-PR state is 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Findings (standalone worker, 2026-10-09)
+
+The build-dispatch daemon held #5052 with:
+
+> worker-declined: **could-not-prepare** — an ownership design choice remains. No files changed or stamped. Commit '2a786ea24' delivered the lifecycle table and ledger derivation, but 'HUMAN-HOLD-CI-RED' names one recovery watcher ('we:scripts/conveyor/pr-lifecycle.mjs:36') while reconcile supports CI healing, review-gate refusal, and exhausted-budget escalation ('we:scripts/conveyor/__tests__/reconcile-core.test.mjs:816'). The unresolved choice is whether to split that state by responsible owner or define 'owner' as an accountable coordinator distinct from the executor. Preparing the remaining contract would requ…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
