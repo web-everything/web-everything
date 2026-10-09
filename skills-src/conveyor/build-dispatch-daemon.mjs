@@ -83,7 +83,7 @@ import { readMainRedState, resolveFreezeMainRed } from '../../scripts/lib/main-r
 import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'; // card xu1nixv
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
@@ -333,7 +333,16 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       if (due.length) releaseOwnPrepareHolds({ nums: due, holds: effects.listHolds?.() ?? [], release: effects.releasePrepareHold });
       // Live 2026-10-09 — a held prepare whose worker reported already-done (with a commit) becomes an ordinary
       // dispatch hold the hold router lands as a resolve (graduatedTo that commit), exactly as the runner does.
-      for (const r of effects.takePrepareRouteHolds?.() ?? []) effects.placePrepareHold?.({ num: r.num, reason: r.reason });
+      // Each route is already stamped as handed out, so one failed placement must not drop the rest: it is un-stamped
+      // again and handed out on the next tick. (A crash between the stamp and the placement only lets the card be
+      // prepared again, which re-reports it.)
+      for (const r of effects.takePrepareRouteHolds?.() ?? []) {
+        try { effects.placePrepareHold?.({ num: r.num, reason: r.reason }); }
+        catch (e) {
+          console.error(`build-dispatch-daemon: already-done route hold for #${r.num} not placed: ${String(e?.message || e).split('\n')[0]}`);
+          try { effects.requeuePrepareRouteHold?.(r.num, r.reason); } catch { /* the next tick's re-prepare still routes it */ }
+        }
+      }
     } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
   }
   // A held ledger failure that carries its own reason (a could-not-prepare: `needs-you: …`) is held UNDER that reason,
@@ -347,8 +356,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const prepareIsLive = (r) => r.row?.entry?.live === true
     && !(r.row.entry.handle?.startsWith('pid:') && classifyClaimLiveness({ row: r.row,
       isPidAlive: effects.isPidAlive ?? defaultIsPidAlive }).status === 'dead');
-  // A ledger hold remapped to its `needs-you:` reason (`ledger: true`) is still the ledger's prepare hold: tracking,
-  // the stamped-on-main release and the unstamped-completion path must keep applying to it.
+  // `h.ledger`: a ledger hold remapped to its own `needs-you:` reason above is still the prepare-unstamped hold file
+  // underneath, so every prepare-hold check (tracking, stamped-on-main release, completion) must accept it too.
   const isPrepareHold = h => h.ledger === true || ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
   // The stamp a prepare's claim recorded at spawn, kept on its hold too: the claim is released when the attempt ends
   // unstamped, and a later tick must still tell the stamp being replaced from a result.
@@ -380,11 +389,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
       completedPrepares.add(num);
       if (live && holds.some(h => normNum(h.num) === num && isPrepareHold(h))) effects.releasePrepareHold?.({ num });
-      // Stamped on main: a needs-you hold resolved by hand is closed with it, else the CLI's synthetic hold for that
-      // record would bring the card back under a hold every tick.
-      // Only for a needs-you hold: a backed-off failure of a stale-stamped re-prepare must keep its ledger record (and
-      // its attempt count), or the card would be re-dispatched every tick.
-      if (live && ledgerHoldReason.has(num)) effects.completePrepareFailures?.(num);
+      // A ledger record that carries its own hold reason would otherwise stay held (and listed under `needsYou`)
+      // forever once the card is stamped on main by hand: the stamp is the observation that closes it.
+      if (live && holds.some(h => normNum(h.num) === num && h.ledger)) effects.completePrepareFailures?.(num);
     } catch (e) { prepareReadErrors.set(num, e); }
   }
   holds = holds.filter(h => !isPrepareHold(h) || !completedPrepares.has(normNum(h.num)));
@@ -403,7 +410,13 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   for (const failure of failureRecords) {
     if (releasedAttempt(releases, failure.num, failure.attempt)
       && !failureRecords.some(f => f.num === failure.num && f.held && !f.completed && !releasedAttempt(releases, f.num, f.attempt))
-      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) released.add(failure.num);
+      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) {
+      released.add(failure.num);
+      // A reviewed release of an EXHAUSTED retry hold (lane-busy / infra-transient: the hold text tells the operator to
+      // clear it with a release) starts a fresh budget: left uncompleted, its record would still count against the next
+      // failure, which would be exhausted at once and go straight back to needs-you.
+      if (live && failure.holdReason && ['lane-busy', 'infra-transient'].includes(failure.cause)) effects.completePrepareFailures?.(failure.num);
+    }
   }
   holds = holds.filter(h => {
     if (!released.has(normNum(h.num)) || !(h.reason?.startsWith('prepare-') || h.ledger)) return true;
@@ -609,8 +622,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
-  // A card stamped on main this tick (its hold just released above) is no longer waiting on anyone.
-  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num)) needsYou.push({ num, step: 'prepare', reason });
+  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num) && !released.has(normNum(num))) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
     const step = outcome?.stepRefused?.step ?? null;
@@ -746,7 +758,15 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     prepare.failures.push({ num, stage, reason, cause: failure.cause, retry: failure.retry, prevention: failure.prevention });
     if (live && failure.held) effects.placePrepareHold({ num, reason: 'prepare-unstamped', ...holdStamp(num) });
     // An already-done report: the resolve route hold (the ledger hands it out once, stamped at record time).
-    if (live && failure.routeHold) effects.placePrepareHold({ num, reason: failure.routeHold });
+    // (Stamped at record time, so a failed placement is un-stamped again and handed out on the next tick, exactly like
+    // the retry-release placement above; without that the stamp would leave the route lost.)
+    if (live && failure.routeHold) {
+      try { effects.placePrepareHold({ num, reason: failure.routeHold }); }
+      catch (e) {
+        console.error(`build-dispatch-daemon: already-done route hold for #${num} not placed: ${String(e?.message || e).split('\n')[0]}`);
+        try { effects.requeuePrepareRouteHold?.(num, failure.routeHold); } catch { /* the next tick's re-prepare still routes it */ }
+      }
+    }
     if (failure.held || failure.routeHold) heldNums.add(num);
     if (failure.holdReason) needsYou.push({ num: normNum(num), step: 'prepare', reason: failure.holdReason });
     return failure;
@@ -1999,6 +2019,7 @@ function cliEffects() {
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     takePrepareRouteHolds: () => takePrepareRouteHolds(),
+    requeuePrepareRouteHold: (num, reason) => requeuePrepareRouteHold(num, reason),
     killSwitch: cliKillSwitch,
     mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,

@@ -42,8 +42,7 @@ const SCOPE_DEFECT_RE = /\b(?:wrong|incorrect|stale|bad|invalid)\s+scope\b|\bsco
  */
 export function classifyPrepareReport(message) {
   const text = String(message ?? '');
-  // Redacted BEFORE the cut: a secret straddling the 280-char boundary would otherwise leave a prefix no pattern matches.
-  const summary = redactSpawnText(text.replace(/\s+/g, ' ').trim()).slice(0, 280);
+  const summary = text.replace(/\s+/g, ' ').trim().slice(0, 280);
   // A decline outranks an "already done" mention inside its own explanation.
   const decline = COULD_NOT_RE.exec(text);
   const done = ALREADY_DONE_RE.exec(text);
@@ -132,12 +131,13 @@ export function replaceCardScope(raw, scope) {
 export function needsYouReason(kind, detail) {
   // The hold router scans hold reasons for its own phrases (already-done / superseded / not buildable) and routes
   // lane work on them; a needs-you reason must never trigger that, so those phrases are defused.
-  // The detail is raw WORKER text and lands in the failure ledger, the findings ledger and the tick line, so a
-  // token-shaped string in it is redacted like the ledger's `evidence`. Redact the whole raw text BEFORE the
-  // truncation: a cut after it can never leave a partial secret that no pattern matches any more. (The strip below
-  // swaps a character for a SPACE, so it cannot join two halves into a new token-shaped string.)
-  const clean = redactSpawnText(detail).replace(/[\p{Cc}`<>]+/gu, ' ')
+  // Strip and collapse FIRST, then defuse: a phrase split by `<`, a backtick or a control character
+  // (`already <done on main`) would otherwise collapse into the very phrase the router matches.
+  // The detail is raw WORKER text that lands in a hold reason, the findings ledger and the tick line, so a token-shaped
+  // string in it is redacted here, in the one shared sink every caller (daemon, ledger, runner) goes through - and BEFORE
+  // the truncation, so the cut can never leave a partial secret no pattern matches any more.
+  const clean = redactSpawnText(String(detail ?? '')).replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
     .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue').replace(/already done on main/gi, 'done elsewhere')
-    .replace(/^\s*worker-declined/i, 'declined').replace(/\s+/g, ' ').trim().slice(0, 300);
+    .replace(/^\s*worker-declined/i, 'declined').trim().slice(0, 300);
   return `needs-you: prepare blocked (${kind}) - ${clean || 'no detail'}; re-scope the card by hand or close it`;
 }

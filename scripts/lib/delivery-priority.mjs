@@ -14,6 +14,9 @@
  *     P3 normal          — default.
  *     P4 housekeeping    — changes no code, or the operator said low.
  *
+ *   Operator overrides: urgent → P0, now → P1, low → P4. P1 via `now` is the operator's "build now"
+ *   (ruling 2026-10-09): next free slot, never interrupts running work (only P0 does, ruling Q4).
+ *
  *   Aging (Q1): waiting longer than `agingHours` moves an item up one class, never into P0.
  *   Score (Q2): `unblocks * unblockWeightMinutes + minutesWaited` — the fix-queue score in minutes.
  *   Cap: at most `maxLiveP0` derived P0 per ranked queue (oldest kept); the excess falls to P1. An operator
@@ -21,6 +24,7 @@
  */
 
 export const PRIORITY_CLASSES = Object.freeze(['P0', 'P1', 'P2', 'P3', 'P4']);
+export const PRIORITY_OVERRIDE_CLASSES = Object.freeze({ urgent: 'P0', now: 'P1', low: 'P4' });
 export const PRIORITY_MODES = Object.freeze(['off', 'shadow', 'enforce']);
 
 /** The off value of every setting: today's behaviour (every item P3, order unchanged). */
@@ -79,7 +83,7 @@ export function minutesWaited(waitingSince, now) {
  *   - `blockedItems`          number  — open items blocked by this one
  *   - `operatorRequested`     boolean — an operator answer or send-back waits on it
  *   - `changesCode`           boolean — false: records/docs only (P4). Absent counts as true.
- *   - `override`              {value:'urgent'|'low', byOperator:boolean}
+ *   - `override`              {value:'urgent'|'now'|'low', byOperator:boolean}
  *   - `waitingSince`          ISO string or epoch ms
  *
  * @param {object} facts
@@ -119,9 +123,9 @@ export function deliveryPriority(facts, settings, now) {
   }
 
   const ov = f.override;
-  if (ov && (ov.value === 'urgent' || ov.value === 'low')) {
+  if (ov && typeof ov.value === 'string' && Object.hasOwn(PRIORITY_OVERRIDE_CLASSES, ov.value)) {
     if (ov.byOperator === true) {
-      cls = ov.value === 'urgent' ? 'P0' : 'P4';
+      cls = PRIORITY_OVERRIDE_CLASSES[ov.value];
       reasons.push(`operator override ${ov.value}`);
       return { ...base, class: cls, derived, reasons, aged, override: ov.value, p0Kind: cls === 'P0' ? 'override' : null };
     }

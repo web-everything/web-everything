@@ -11,12 +11,14 @@ import { join } from 'node:path';
 import {
   buildOperatorRulingComment, mandatoryReferralReviewer, normalizeFinding, referralFindingKey, renderReferralRecord,
 } from '../../lib/jury-core.mjs';
-import { parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
+import { buildLedgerEvent, parseLedgerEvents, verdictLedgerPath } from '../../lib/verdict-ledger.mjs';
 import {
   openReferralFindings, planOperatorRuling, recordReferralRulingOperation,
   OPERATOR_RULING_FOLLOW_UP_EFFECT, OPERATOR_RULING_POST_EFFECT, RULING_NEEDED_LABEL,
 } from '../record-referral-ruling.mjs';
-import { createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
+import { appendLedgerEvents, createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
+import { ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
+import { registerLedgerStore } from '../../lib/verdict-ledger-store.mjs';
 
 const repo = 'o/r';
 const head = 'a'.repeat(40);
@@ -67,7 +69,7 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
       expect(results[1]).toMatchObject({ action: 'send-back', sentBack: true });
       const events = parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8'));
       expect(events.map((e) => e.type)).toEqual(['ruling', 'send-back']);
-      expect(events[0]).toMatchObject({ repo, pr: 7, findingKey: key, ruling: 'block', actor: { declared: 'chalbert', channel: 'chat' } });
+      expect(events[0]).toMatchObject({ repo, pr: 7, findingKey: ledgerFindingKey(key), ruling: 'block', actor: { declared: 'chalbert', channel: 'chat' } });
       expect(events[1]).toMatchObject({ cause: 'block-ruling' });
     } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
   });
@@ -88,10 +90,226 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     expect(posts).toEqual([]);
   });
 
+  it('a batch of CLEARING rulings stops at the first miss: later rows are not written, nothing is posted', async () => {
+    const posts = [];
+    const attempted = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => ({ headRefOid: head, comments: [] }), post: (_r, _p, b) => posts.push(b),
+      appendEvents: (list) => { attempted.push(...list.map((e) => e.findingKey)); throw new Error('transport down'); },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+      rulings: [{ key: 'k1', result: 'card' }, { key: 'k2', result: 'not-real' }] })).rejects.toThrow(/does not clear/);
+    expect(attempted).toEqual([ledgerFindingKey('k1')]);
+    expect(posts).toEqual([]);
+  });
+
+  it('wiring: a two-finding clearing batch whose SECOND append fails reverts both rows to a hold (the failed one may have landed), posts nothing, and a re-run finishes it', async () => {
+    const f2 = { ...f, summary: 'second gap', file: 'scripts/y.mjs' };
+    const key2 = referralFindingKey(seat, f2);
+    const rec2 = { ...rec, referrals: [...rec.referrals, { key: key2, seat, original: f2, finding: normalizeFinding(f2) }], rulings: [] };
+    const thread = { headRefOid: head, comments: [gh(renderReferralRecord(rec2))] };
+    const ctx = () => ({ head, ...openReferralFindings({ comments: thread.comments, repo, pr: 7, head, body: rec2.authorBody, cardReadable: () => true }),
+      card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
+    const written = [];
+    const posts = [];
+    let failOn = ledgerFindingKey(key2);
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => structuredClone(thread),
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
+      appendEvents: (list) => {
+        for (const e of list) {
+          if (e.findingKey === failOn && e.ruling !== 'block') throw new Error('transport down');
+          written.push(`${e.findingKey}:${e.ruling}`);
+        }
+      },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    const run = async () => {
+      const plan = planOperatorRuling(ctx(), input({ ruling: 'not-real' }));
+      const op = recordReferralRulingOperation({ readRulingContext: ctx });
+      const effects = op.steps.find((x) => x.name === 'write').step.effects({ verdict: plan, input: {} });
+      for (const e of effects) await sinks[e.type](e.payload);
+    };
+    const err = await run().then(() => null, (e) => e);
+    expect(err?.message).toMatch(/1 of 2 clearing rulings were recorded/);
+    expect(err.message).toContain(ledgerFindingKey(key));
+    expect(err.message).toContain(ledgerFindingKey(key2));
+    expect(err.message).toMatch(/reverted to a holding block ruling, so the finding is blocking/);
+    expect(err.message).not.toContain('LIVE');
+    expect(err.message).toMatch(/re-run the same ruling/);
+    // The first row landed, then the failure: the batch is compensated by a LATER holding row for each touched finding
+    // (the second too: a failed append can still have landed), so the append-order derive ends on `block` and no
+    // clearing row is left live without a comment.
+    expect(written).toEqual([`${ledgerFindingKey(key)}:not-real`, `${ledgerFindingKey(key)}:block`, `${ledgerFindingKey(key2)}:block`]);
+    expect(posts).toEqual([]);
+    // The re-run once the ledger is writable plans BOTH findings again (the plan reads only the thread), records
+    // both clearing rows (appended after the reverts, so they are the latest) and posts the one comment.
+    failOn = null;
+    await run();
+    expect(posts).toHaveLength(1);
+    expect(written.slice(3)).toEqual([ledgerFindingKey(key), ledgerFindingKey(key2)].map((k) => `${k}:not-real`));
+  });
+
+  it('wiring: a clearing row recorded and then a failed POST is reverted to a hold, so no clearing row stays live without a comment', async () => {
+    const written = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => ({ headRefOid: head, comments: [] }),
+      post: () => { throw new Error('gh: 502'); },
+      appendEvents: (list) => { written.push(...list.map((e) => `${e.findingKey}:${e.ruling}`)); },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    const err = await sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+      rulings: [{ key: 'k1', result: 'card' }] }).then(() => null, (e) => e);
+    expect(err?.message).toMatch(/gh: 502/);
+    expect(err.message).toMatch(/reverted to a holding block ruling/);
+    expect(written).toEqual([`${ledgerFindingKey('k1')}:card`, `${ledgerFindingKey('k1')}:block`]);
+  });
+
+  it('wiring: a failed post of a HOLDING-only batch changes nothing in the ledger (no revert row)', async () => {
+    const written = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => ({ headRefOid: head, comments: [] }),
+      post: () => { throw new Error('gh: 502'); },
+      appendEvents: (list) => { written.push(...list.map((e) => e.ruling)); },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+      rulings: [{ key: 'k1', result: 'block' }] })).rejects.toThrow(/gh: 502/);
+    expect(written).toEqual([]);
+  });
+
+  it('wiring: when the compensating row ALSO fails to record, the error names the clearing rows still live', async () => {
+    const f2 = { ...f, summary: 'second gap', file: 'scripts/y.mjs' };
+    const key2 = referralFindingKey(seat, f2);
+    const rec2 = { ...rec, referrals: [...rec.referrals, { key: key2, seat, original: f2, finding: normalizeFinding(f2) }], rulings: [] };
+    const thread = { headRefOid: head, comments: [gh(renderReferralRecord(rec2))] };
+    const ctx = () => ({ head, ...openReferralFindings({ comments: thread.comments, repo, pr: 7, head, body: rec2.authorBody, cardReadable: () => true }),
+      card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
+    const written = [];
+    const posts = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => structuredClone(thread),
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
+      appendEvents: (list) => {
+        for (const e of list) {
+          if (e.findingKey === ledgerFindingKey(key2) || e.ruling === 'block') throw new Error('transport down');
+          written.push(`${e.findingKey}:${e.ruling}`);
+        }
+      },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    const plan = planOperatorRuling(ctx(), input({ ruling: 'not-real' }));
+    const op = recordReferralRulingOperation({ readRulingContext: ctx });
+    const effects = op.steps.find((x) => x.name === 'write').step.effects({ verdict: plan, input: {} });
+    const err = await (async () => { for (const e of effects) await sinks[e.type](e.payload); })().then(() => null, (e) => e);
+    expect(err?.message).toMatch(/1 of 2 clearing rulings were recorded/);
+    expect(err.message).toContain(`${ledgerFindingKey(key)}, ${ledgerFindingKey(key2)} may each be LIVE`);
+    expect(err.message).toMatch(/revert to a holding block ruling was not recorded either/);
+    expect(written).toEqual([`${ledgerFindingKey(key)}:not-real`]);
+    expect(posts).toEqual([]);
+  });
+
   it('a clearing ruling is recorded BEFORE the comment is posted', async () => {
     const order = [];
     const posts = { push: (b) => order.push('post') };
     await drive({ ruling: 'not-real', appendEvents: (ev) => order.push(`ledger:${ev[0].ruling}`), posts }).catch(() => {});
     expect(order).toEqual(['ledger:not-real', 'post']);
+  });
+
+  it('the ruling row names the finding by the SAME hashed key the referral row uses, never the raw key', async () => {
+    const seen = [];
+    await drive({ ruling: 'block', appendEvents: (ev) => { seen.push(...ev); } });
+    const row = seen.find((e) => e.type === 'ruling');
+    expect(row.findingKey).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(row.findingKey).toBe(ledgerFindingKey(key));
+    expect(row.findingKey).not.toBe(key);
+  });
+});
+
+describe('the default writer reaches the shared git store (slice H shadow: no ruling rows on ops/review-requests)', () => {
+  let dir;
+  afterEach(() => { if (dir) rmSync(dir, { recursive: true, force: true }); dir = null; });
+  const rows = () => [
+    buildLedgerEvent({ type: 'ruling', repo, pr: 7, at: '2026-10-04T14:31:00Z', source: 'record-referral-ruling', declaredActor: 'chalbert', channel: 'chat', findingKey: ledgerFindingKey(key), ruling: 'not-real' }),
+    buildLedgerEvent({ type: 'send-back', repo, pr: 7, at: '2026-10-04T14:31:01Z', source: 'record-referral-ruling', declaredActor: 'chalbert', channel: 'chat', cause: 'block-ruling' }),
+  ];
+
+  it('every ruling and send-back event is appended to the git store AND the home file', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const git = [];
+      await appendLedgerEvents(rows(), { store: 'dual', board: dir, gitAppend: ({ records }) => { git.push(...records); return { rows: records.length, duplicates: 0 }; } });
+      expect(git.map((r) => r.type)).toEqual(['ruling', 'send-back']);
+      expect(git[0]).toMatchObject({ findingKey: ledgerFindingKey(key), ruling: 'not-real' });
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.type)).toEqual(['ruling', 'send-back']);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  it('a git miss throws, so the caller applies F4 (a clearing ruling then does not clear)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      await expect(appendLedgerEvents(rows().slice(0, 1), { store: 'dual', board: dir, warn: () => {},
+        gitAppend: () => { throw new Error('push rejected'); } })).rejects.toThrow(/push rejected|refused/);
+      await expect(appendLedgerEvents(rows().slice(1), { store: 'dual', board: dir, warn: () => {},
+        gitAppend: () => { throw new Error('push rejected'); } })).rejects.toThrow(/git store write missed/);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  const holdingRows = (n) => Array.from({ length: n }, (_, i) => buildLedgerEvent({ type: 'ruling', repo, pr: 7, at: `2026-10-04T14:31:0${i}Z`,
+    source: 'record-referral-ruling', declaredActor: 'chalbert', channel: 'chat', findingKey: ledgerFindingKey(`${key}-${i}`), ruling: 'block' }));
+
+  it('a git miss on the FIRST event of a batch still writes every other event (home rows kept), then throws one aggregate error', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const attempts = [];
+      let calls = 0;
+      await expect(appendLedgerEvents(holdingRows(3), { store: 'dual', board: dir, warn: () => {},
+        gitAppend: ({ records }) => { attempts.push(...records); if (calls++ === 0) throw new Error('push rejected'); return { rows: records.length, duplicates: 0 }; } }))
+        .rejects.toThrow(/1 of 3 ledger events failed.*push rejected/);
+      expect(attempts).toHaveLength(3);
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.findingKey))
+        .toEqual(holdingRows(3).map((e) => e.findingKey));
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  it('a refused row does not stop the rest of the batch either', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const [a, b] = holdingRows(2);
+      await expect(appendLedgerEvents([{ ...a, type: 'not-a-type' }, b], { store: 'home' })).rejects.toThrow(/1 of 2 ledger events failed.*refused/);
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.findingKey)).toEqual([b.findingKey]);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  it('writes through a registered ASYNC store (appendVerdict would refuse a plugged store)', async () => {
+    const stored = [];
+    registerLedgerStore({
+      name: 'async-ruling-store',
+      capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' },
+      append: async (r) => { stored.push(...r); return { ok: true, appended: r.length }; },
+      read: async () => ({ status: 'ok', rows: stored }),
+    });
+    await appendLedgerEvents(holdingRows(2), { store: 'async-ruling-store', env: {}, warn: () => {} });
+    expect(stored.map((r) => r.findingKey)).toEqual(holdingRows(2).map((e) => e.findingKey));
+  });
+
+  it('with NO store named, a ruling still reaches both the home file and the git store (the default is dual)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const git = [];
+      // `env: {}` is the production shape: no store named, not under test. Only the transport seams are injected.
+      await appendLedgerEvents(rows(), { env: {}, board: dir, warn: () => {},
+        gitAppend: ({ records }) => { git.push(...records); return { rows: records.length, duplicates: 0 }; } });
+      expect(git.map((r) => r.type)).toEqual(['ruling', 'send-back']);
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.type)).toEqual(['ruling', 'send-back']);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
   });
 });

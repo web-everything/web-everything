@@ -52,6 +52,17 @@ tags: []
   prescribe one (e.g. "poll the CLI's active account on an interval" vs. "stamp the account into the lease at
   acquire time" are both live options for ask 3).
 
+## Ruling (operator, 2026-10-09 ~13:05 ET)
+
+The open choice from the prepare run (how a resumed session learns which background workers were running) is
+ruled **(c) both**:
+- **Source of truth: a launch record.** A hook on the agent-launch tool writes each background worker's id,
+  purpose, lane and session to a durable record at launch. No caller discipline; the hook does it.
+- **Fallback: reconstruction at resume.** The resume command also walks lane leases and lane content-state and
+  lists any lane with no matching launch record, so workers started before the hook (or outside it) are not lost.
+- Unchanged and not in question: the lease reaper never reclaims a lane carrying unpreserved work (ask 1, safe
+  direction only).
+
 ## Done when
 
 1. **Executable** — TODO (no tier-1 command yet; each ask needs a design decision before a test can pin it).

@@ -2,6 +2,7 @@
 bornAs: xtl54o5
 kind: story
 size: 5
+priority: high
 parent: "4075"
 status: open
 blockedBy: ["4124"]

@@ -20,6 +20,15 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2947@4fbc20ca7ced68c23c28857df62a3ac6f25782ec
 
+## Ruling (operator, 2026-10-09 ~13:25 ET)
+
+The open choice from the prepare run (lint that requires a test citation for every absolute claim, vs a review
+lens) is ruled **(b) review lens**: reviewers flag absolute guarantees in comments ("never", "always", "ANY")
+and the author either cites the defending test or marks the claim `intentionally unguarded: <reason>`. No
+`check:standards` lint on the bare words (too noisy: the words are common in plain prose, and a forced citation
+invites rubber-stamping). Deciding whether prose is a real guarantee is judgment, so it lives in review. A narrow
+lint on an explicit marker may follow later only if the lens misses cases. Same ruling applies to #4411.
+
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.

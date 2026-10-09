@@ -1,0 +1,15 @@
+{
+  "mergeQueue": {
+    "enabled": true,
+    "batchSize": 1,
+    "classOrder": ["main-fix", "normal"],
+    "defaultClass": "normal",
+    "strategy": "drain-direct"
+  },
+  "mergeFreshness": {
+    "enabled": true,
+    "maxAgeMinutes": 30,
+    "allowDisjointMainMoves": true,
+    "nonCodePaths": ["backlog/", "docs/"]
+  }
+}

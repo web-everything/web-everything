@@ -2,8 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases, releaseDuePrepareRetries, takePrepareRouteHolds, preparedReportRoute } from '../prepare-failure-policy.mjs';
-import { needsYouReason } from '../prepare-outcome.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, validatePrepareRelease, releasedAttempt, readPrepareReleases, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold } from '../prepare-failure-policy.mjs';
 import { planScaffold, shapeScaffoldRead } from '../../operations/scaffold.mjs';
 import { writeFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -131,7 +130,7 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
   const orphanDone = { error: 'build-dispatch-orphan-adopt: dispatch retired (prepare-unstamped)', terminal: '#4444 prepare-item → already-done — 4e75771b7 (#487 single-kind-axis migration) plus the validateBacklogItem rules.', reason: 'prepare-unstamped' };
   const couldNot = { error: 'prepare requires a card-only diff; worker report: **could-not-prepare** — #4355 leaves a genuine policy choice unresolved: boost within the tier, or pin?', reason: 'prepare-unstamped' };
   it.each([
-    ['lane busy (a LIVE lease)', laneBusy, 'result', 'dispatch-transient'],
+    ['lane busy (a LIVE lease)', laneBusy, 'result', 'lane-busy'],
     ['orphan-adopt retirement', orphan, 'result', 'infra-transient'],
     ['raw git ref lock at the stamp stage', refLock, 'stamp', 'infra-transient'],
     ['workspace not trusted', untrusted, 'result', 'infra-transient'],
@@ -165,24 +164,23 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
       held('4392', 'result', 'result-lost', ownCard),
       held('4560', 'result', 'unknown', alreadyDone),
       held('4355', 'result', 'unknown', couldNot),
-      held('4423', 'result', 'no-session', laneBusy),
-      // #4433 already spent its immediate infra budget: it stays held.
-      held('4433', 'result', 'unknown', orphan),
-      ['4433:a:dispatch', { num: '4433', attempt: 'a', stage: 'dispatch', cause: 'infra-transient', evidence: {}, retry: true, held: false }],
-      ['4433:b:dispatch', { num: '4433', attempt: 'b', stage: 'dispatch', cause: 'infra-transient', evidence: {}, retry: true, held: false }],
+      held('4423', 'result', 'unknown', orphan),
+      // #4423 already spent its infra budget: it stays held.
+      ['4423:a:dispatch', { num: '4423', attempt: 'a', stage: 'dispatch', cause: 'infra-transient', evidence: {}, retry: true, held: false }],
+      ['4423:b:dispatch', { num: '4423', attempt: 'b', stage: 'dispatch', cause: 'infra-transient', evidence: {}, retry: true, held: false }],
       held('9999', 'result', 'unknown', { error: 'wrapper-failed' }),
     ]) }));
     const released = releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') });
-    expect(released.sort()).toEqual(['4341', '4392', '4414', '4423', '4425', '4426', '4560']);
+    expect(released.sort()).toEqual(['4341', '4392', '4414', '4425', '4426', '4560']);
     const f = readFailureState(path).failures;
     for (const n of ['4414', '4426', '4392']) expect(f[`${n}:run ${n}:result`]).toMatchObject({ cause: 'infra-transient', held: false, retry: true });
-    // Lane busy is backed off, not budgeted: the record is healed to `dispatch-transient` and released once due.
-    for (const n of ['4425', '4423']) expect(f[`${n}:run ${n}:result`]).toMatchObject({ cause: 'dispatch-transient', healedFrom: 'no-session', reasonCode: 'lane-busy', held: false, retry: true });
+    // Lane busy is not charged to the infra budget: it gets the backoff schedule (due once its first wait elapsed).
+    expect(f['4425:run 4425:result']).toMatchObject({ cause: 'lane-busy', healedFrom: 'no-session', held: false, retry: true, attempts: 1 });
     expect(f['4341:run 4341:stamp']).toMatchObject({ cause: 'infra-transient', held: false, retry: true, healedFrom: 'unknown' });
     expect(f['4560:run 4560:result']).toMatchObject({ cause: 'already-done', held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
     expect(f['4355:run 4355:result']).toMatchObject({ cause: 'needs-you', held: true, retry: false });
     expect(f['4355:run 4355:result'].holdReason).toMatch(/^needs-you: /);
-    expect(f['4433:run 4433:result']).toMatchObject({ held: true });
+    expect(f['4423:run 4423:result']).toMatchObject({ held: true });
     expect(f['9999:run 9999:result']).toMatchObject({ cause: 'unknown', held: true });
     expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
     expect(takePrepareRouteHolds({ path })).toEqual([]);
@@ -218,159 +216,148 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
     expect(releaseDuePrepareRetries({ path, now: Date.now(), cardChange: () => { throw new Error('git broke'); } })).toEqual([]);
     expect(readFailureState(path).failures['4354:r:result']).toMatchObject({ held: true });
   });
+  // PR #4643 review — the new infra patterns must not steal a DISPATCH-stage failure from its backoff schedule.
+  describe('new infra patterns at every stage (review of #4643)', () => {
+    const dispatchRefLock = { reason: "Command failed: git fetch -q origin main\nerror: cannot lock ref 'refs/remotes/origin/main': is at a04b734 but expected adde7a6\n" };
+    const dispatchUntrusted = { reason: 'Command failed: claude --bg -n x\nworkspace not trusted for /Users/x/workspace/.operations/dispatch/3fa49e22' };
+    const dispatchLaneBusy = { reason: 'Command failed: lane-pool.mjs acquire\ncould not acquire a lane: ✗ lane-10 is leased by review-4484 — a LIVE lease; --force does not override it' };
+    it.each([
+      ['ref lock', dispatchRefLock],
+      ['workspace not trusted', dispatchUntrusted],
+      ['lane busy', dispatchLaneBusy],
+    ])('a dispatch-stage `Command failed` that quotes %s keeps its backoff (dispatch-transient)', async (_, evidence) => {
+      expect(classifyPrepareFailure(evidence, 'dispatch')).toBe('dispatch-transient');
+      const f = await recordPrepareFailure({ num: '4700', attempt: 'a', stage: 'dispatch', evidence }, { path, fileCard: vi.fn(), now: Date.parse('2026-10-09T17:00:00Z') });
+      expect(f).toMatchObject({ cause: 'dispatch-transient', held: true, retry: false, reasonCode: 'dispatch-command-failed', exhausted: false });
+      expect(f.retryAfter).toBe('2026-10-09T17:05:00.000Z');
+    });
+    it('the SAME text at the stamp/result stage is still infra (ref lock, untrusted) or lane-busy', () => {
+      expect(classifyPrepareFailure(dispatchRefLock, 'stamp')).toBe('infra-transient');
+      expect(classifyPrepareFailure(dispatchUntrusted, 'result')).toBe('infra-transient');
+      expect(classifyPrepareFailure(dispatchLaneBusy, 'result')).toBe('lane-busy');
+    });
+    it('a healed dispatch-stage `unknown` ref-lock record gets the dispatch backoff, not an immediate release', () => {
+      writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4701:a:dispatch': { num: '4701', attempt: 'a', stage: 'dispatch', cause: 'unknown', evidence: dispatchRefLock, retry: false, held: true, recordedAt: '2026-10-09T16:59:00.000Z' } } }));
+      expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') })).toEqual([]);
+      expect(readFailureState(path).failures['4701:a:dispatch']).toMatchObject({ cause: 'dispatch-transient', held: true, healedFrom: 'unknown' });
+    });
+  });
+
+  // PR #4643 review — a lease that outlasts a couple of ticks must not burn the retry budget in two ticks.
+  describe('lane-busy retries back off (review of #4643)', () => {
+    const t0 = Date.parse('2026-10-09T17:00:00Z');
+    it('a lease that stays held for hours is retried on a growing schedule, then surfaced as needs-you — never silently held', async () => {
+      const fileCard = vi.fn();
+      let now = t0;
+      const seen = [];
+      for (let n = 1; n <= 8; n++) {
+        // The tick: release whatever is due, then (card still re-dispatched) the lane is busy again.
+        releaseDuePrepareRetries({ path, now });
+        const f = await recordPrepareFailure({ num: '4800', attempt: `run ${n}`, stage: 'result', evidence: laneBusy }, { path, fileCard, now });
+        seen.push(f);
+        if (f.exhausted) break;
+        expect(f).toMatchObject({ cause: 'lane-busy', held: true, retry: false });
+        now = Date.parse(f.retryAfter) + 1;
+      }
+      // Not a third failure in three minutes: each retry waits longer than the last, up to the backoff cap.
+      const waits = seen.filter(f => f.retryAfter).map(f => Date.parse(f.retryAfter) - Date.parse(f.recordedAt));
+      expect(waits[0]).toBe(5 * 60_000);
+      expect(waits[1]).toBeGreaterThan(waits[0]);
+      // Only after the whole window is the hold final, and it names the way out.
+      const last = seen.at(-1);
+      expect(last).toMatchObject({ cause: 'lane-busy', held: true, exhausted: true });
+      expect(last.holdReason).toMatch(/^needs-you: /);
+      expect(fileCard).not.toHaveBeenCalled();
+    });
+    it('lane-busy attempts do not spend the shared infra-transient budget', async () => {
+      for (let n = 1; n <= 3; n++) await recordPrepareFailure({ num: '4801', attempt: `run ${n}`, stage: 'result', evidence: laneBusy }, { path, fileCard: vi.fn(), now: t0 });
+      const f = await recordPrepareFailure({ num: '4801', attempt: 'run 9', stage: 'stamp', evidence: refLock }, { path, fileCard: vi.fn(), now: t0 });
+      expect(f).toMatchObject({ cause: 'infra-transient', retry: true, held: false });
+    });
+    it('an infra-transient card whose retry budget is spent is surfaced as needs-you, never held silently', async () => {
+      const fileCard = vi.fn();
+      const seen = [];
+      for (let n = 1; n <= 3; n++) seen.push(await recordPrepareFailure({ num: '4803', attempt: `run ${n}`, stage: 'stamp', evidence: refLock }, { path, fileCard, now: t0 }));
+      expect(seen.map(f => f.retry)).toEqual([true, true, false]);
+      expect(seen[0].holdReason).toBeUndefined();
+      expect(seen[2]).toMatchObject({ cause: 'infra-transient', held: true });
+      expect(seen[2].holdReason).toMatch(/^needs-you: /);
+    });
+    it('a worker report that merely MENTIONS an infra signal does not steer the classification', () => {
+      for (const text of ['rate limit exceeded', 'ECONNRESET', 'cannot lock ref \'refs/x\'', 'could not acquire a lane: lane-1 is a LIVE lease']) {
+        expect(classifyPrepareFailure({ error: `prepare requires a card-only diff; worker report: I changed the retry for ${text} in the doc` }, 'result')).toBe('unknown');
+      }
+      // The same text BEFORE the report is still the signal.
+      expect(classifyPrepareFailure({ error: 'HTTP 429 from the API; worker report: stopped' }, 'result')).toBe('infra-transient');
+    });
+    it('a reviewed release can clear an exhausted lane-busy hold', () => {
+      const entry = { target: '4800', attempt: 'run 8', cause: 'lane-busy', evidence: 'lanes freed', fixCommit: 'a'.repeat(40) };
+      expect(validatePrepareRelease(entry, () => true)).toEqual(entry);
+    });
+  });
+
+  // PR #4643 review — the could-not-prepare text is worker output: redact it like the evidence beside it.
+  it('a token quoted in a could-not-prepare report never reaches holdReason', async () => {
+    const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    const evidence = { error: `prepare requires a card-only diff; worker report: **could-not-prepare** — cannot clone with https://x:${token}@github.com/o/r and password=hunter2hunter2 failed`, reason: 'prepare-unstamped' };
+    const f = await recordPrepareFailure({ num: '4802', attempt: 'a', stage: 'result', evidence }, { path, fileCard: vi.fn() });
+    expect(f.holdReason).toMatch(/^needs-you: /);
+    expect(JSON.stringify(f)).not.toContain(token);
+    expect(JSON.stringify(f)).not.toContain('hunter2hunter2');
+    expect(JSON.stringify(readFailureState(path))).not.toContain(token);
+  });
+
+  // Self-review of the #4643 repair — same defect classes, next variants.
+  it('a token cut by the 280-char summary limit is still redacted (the whole report is redacted before parsing)', async () => {
+    const key = 'sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    const evidence = { error: `prepare requires a card-only diff; worker report: **could-not-prepare** — ${'x'.repeat(237 - 'could-not-prepare — '.length - 4)} ${key} tail`, reason: 'prepare-unstamped' };
+    const f = await recordPrepareFailure({ num: '4803', attempt: 'a', stage: 'result', evidence }, { path, fileCard: vi.fn() });
+    expect(f.holdReason).not.toMatch(/sk-/);
+    expect(f.holdReason).not.toContain('ABCDE');
+  });
+  it('worker text cannot re-form a hold-router phrase across a stripped character', async () => {
+    const evidence = { error: 'prepare requires a card-only diff; worker report: **could-not-prepare** — spec already <done on main: commit abcdef1234 and spec not `buildable', reason: 'prepare-unstamped' };
+    const f = await recordPrepareFailure({ num: '4804', attempt: 'a', stage: 'result', evidence }, { path, fileCard: vi.fn() });
+    expect(f.holdReason).not.toMatch(/already done on main|spec not buildable|spec superseded/i);
+  });
+  it('a lane-busy error on one huge line is classified in bounded time', () => {
+    const huge = { error: 'could not acquire a lane: '.repeat(40_000) };
+    const t = Date.now();
+    classifyPrepareFailure(huge, 'result');
+    expect(Date.now() - t).toBeLessThan(2000);
+  });
+  it.each(['ECONNRESET', 'HTTP 429 Too Many Requests', 'network error'])('a dispatch-stage `Command failed` quoting "%s" keeps its dispatch backoff', (quoted) => {
+    expect(classifyPrepareFailure({ reason: `Command failed: git fetch -q origin main\nfatal: ${quoted}` }, 'dispatch')).toBe('dispatch-transient');
+  });
+  // PR #4643 review — a crash between stamping routeHoldPlacedAt and placing the hold must recover on its own.
+  it('recovers an already-done route after a crash before hold placement', async () => {
+    const held = { num: '4560', attempt: 'run 4560', stage: 'result', cause: 'unknown', evidence: alreadyDone, retry: false, held: true, recordedAt: '2026-10-09T00:00:00.000Z' };
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4560:run 4560:result': held } }));
+    releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') });
+    // The daemon takes the route (stamps it) … and dies before placing the hold. Nothing hands it out again.
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
+    expect(takePrepareRouteHolds({ path })).toEqual([]);
+    // The card is not held (retry:true), so it is prepared again and the worker re-reports the same thing: the
+    // fresh record carries the route and the daemon places it right after recording.
+    const again = await recordPrepareFailure({ num: '4560', attempt: 'run again', stage: 'result', evidence: alreadyDone }, { path, fileCard: vi.fn() });
+    expect(again).toMatchObject({ cause: 'already-done', held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
+    expect(Object.values(readFailureState(path).failures).filter(f => f.num === '4560' && f.routeHold && !f.completed)).toHaveLength(2);
+    // The recovery is the fresh record's route, placed by the daemon right after recording; if THAT placement fails too,
+    // the requeue hands it out again - and only it, never the stale stamped one (review of #4643).
+    requeuePrepareRouteHold('4560', again.routeHold, path);
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
+    expect(takePrepareRouteHolds({ path })).toEqual([]);
+  });
+  it('requeuePrepareRouteHold un-stamps only the route that failed to place', () => {
+    const rec = (attempt, reason, at) => [`4560:${attempt}:result`, { num: '4560', attempt, stage: 'result', cause: 'already-done', retry: true, held: false, routeHold: reason, routeHoldPlacedAt: at }];
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: Object.fromEntries([
+      rec('a', 'spec already done on main: commit aaaaaaa', '2026-10-09T01:00:00.000Z'),
+      rec('b', 'spec already done on main: commit bbbbbbb', '2026-10-09T02:00:00.000Z')]) }));
+    requeuePrepareRouteHold('4560', 'spec already done on main: commit bbbbbbb', path);
+    expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: 'spec already done on main: commit bbbbbbb' }]);
+  });
   it('a needs-you hold is releasable by a reviewed, commit-cited release entry', () => {
     const entry = { target: '4355', attempt: 'run 4355', cause: 'needs-you', evidence: 'ruled in the card', fixCommit: 'a'.repeat(40) };
     expect(validatePrepareRelease(entry, () => true)).toEqual(entry);
-  });
-});
-
-// PR #4643 review (changes requested): the 2026-10-09 classes at EVERY stage, lane-busy over many ticks, a redacted
-// needs-you reason, and the crash-before-placement recovery of an already-done route.
-describe('review of #4643 — each new class at each stage, lane-busy backoff, redaction, route recovery', () => {
-  let dir, path;
-  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'prepare-review-4643-')); path = join(dir, 'prepare-failures.json'); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
-  const sha = '10fedba67afc9550fb9a6592282603117284c0c2';
-  const refLockText = "git fetch -q origin main\nerror: cannot lock ref 'refs/remotes/origin/main': is at a04b734 but expected adde7a6\n";
-  const laneBusyText = 'could not acquire a lane: ✗ lane-10 is leased by review-4484 (review-loop) — a LIVE lease; --force does not override it (#2337).';
-  const untrustedText = 'claude could not be started (workspace not trusted for /Users/x/workspace/.operations/dispatch/3fa49e22) — no agent exists';
-  // A dispatch-stage failure's reason is the `Command failed: …` the daemon recorded; every other stage carries the same
-  // text raw (`reason`) or as the agent's `error`.
-  const asDispatch = text => ({ reason: `Command failed: ${text}` });
-  it.each([
-    // [label, evidence, stage, expected]
-    ['ref lock — dispatch (a `Command failed:` reason keeps its backoff)', asDispatch(refLockText), 'dispatch', 'dispatch-transient'],
-    ['ref lock — stamp', { reason: `Command failed: ${refLockText}` }, 'stamp', 'infra-transient'],
-    ['ref lock — result', { error: refLockText }, 'result', 'infra-transient'],
-    ['ref lock — dispatch, bare stderr (the stage decides, not the wrapper)', { error: refLockText }, 'dispatch', 'dispatch-transient'],
-    ['untrusted — dispatch (a `Command failed:` reason keeps its backoff)', asDispatch(untrustedText), 'dispatch', 'dispatch-transient'],
-    ['untrusted — dispatch, bare error', { error: untrustedText }, 'dispatch', 'dispatch-transient'],
-    ['untrusted — result', { error: untrustedText }, 'result', 'infra-transient'],
-    ['lane busy — dispatch', asDispatch(laneBusyText), 'dispatch', 'dispatch-transient'],
-    ['lane busy — stamp', { error: laneBusyText }, 'stamp', 'dispatch-transient'],
-    ['lane busy — result', { error: laneBusyText, sessionAbsent: true }, 'result', 'dispatch-transient'],
-    // The pre-existing patterns keep their immediate budget at every stage.
-    ['429 — dispatch', asDispatch('HTTP 429 Too Many Requests'), 'dispatch', 'infra-transient'],
-  ])('%s', (_, evidence, stage, expected) => expect(classifyPrepareFailure(evidence, stage)).toBe(expected));
-  it.each([
-    ['a step-refused wrapper', { reason: `step-refused at \`dispatch-lane\`: Command failed: ${refLockText}` }],
-    ['a stopped wrapper', { reason: `stopped (step-failed) at \`dispatch-lane\`: ${refLockText}` }],
-    ['bare stderr (no `Command failed:` prefix)', { reason: `error: cannot lock ref 'refs/remotes/origin/main': is at a04b734 but expected adde7a6` }],
-    ['the retry helper token', { reason: `git-ref-lock-transient: ${refLockText}` }],
-    ['a lock-file variant', { reason: "Command failed: git fetch\nfatal: Unable to create '/x/.git/refs/remotes/origin/main.lock': File exists." }],
-  ])('a dispatch-stage ref lock under %s is never an immediate retry or a silent hold', (_, evidence) => {
-    // `git-ref-lock-transient` is a pre-existing infra-transient token (kept); every other shape backs off.
-    expect(classifyPrepareFailure(evidence, 'dispatch')).toBe(evidence.reason.startsWith('git-ref-lock-transient') ? 'infra-transient' : 'dispatch-transient');
-  });
-  it('a lock-file variant at the stamp stage is infra-transient, not an unknown hold', () => {
-    expect(classifyPrepareFailure({ error: "fatal: Unable to create '/x/.git/refs/remotes/origin/main.lock': File exists." }, 'stamp')).toBe('infra-transient');
-  });
-  it('an exhausted lane-busy hold can be re-armed by code (a lease that outlasts the whole backoff)', async () => {
-    const { rearmFalseHolds } = await import('../prepare-failure-policy.mjs');
-    writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4423:run a:result': { num: '4423', attempt: 'run a', stage: 'result', cause: 'dispatch-transient', reasonCode: 'lane-busy',
-      evidence: { error: laneBusyText, sessionAbsent: true }, held: true, exhausted: true, retryAfter: null, recordedAt: '2026-10-09T10:00:00.000Z' } } }));
-    expect(rearmFalseHolds({ path, codes: ['lane-busy'], before: '2026-10-09T12:00:00Z', now: Date.parse('2026-10-09T17:00:00Z') })).toEqual({ count: 1, nums: ['4423'] });
-    expect(readFailureState(path).failures['4423:run a:result']).toMatchObject({ held: false, retry: true });
-  });
-  it('a held dispatch-stage lane-busy record is healed with the same reason code a fresh one gets', () => {
-    writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4423:a:dispatch': { num: '4423', attempt: 'a', stage: 'dispatch', cause: 'unknown',
-      evidence: { reason: laneBusyText }, retry: false, held: true, recordedAt: '2026-10-09T10:00:00.000Z' } } }));
-    releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') });
-    expect(readFailureState(path).failures['4423:a:dispatch']).toMatchObject({ cause: 'dispatch-transient', reasonCode: 'lane-busy' });
-  });
-  it('a dispatch-stage ref lock is backed off (retryAfter set, counted per card), never retried at once', async () => {
-    const now = Date.parse('2026-10-09T17:00:00Z');
-    const f = await recordPrepareFailure({ num: '4341', attempt: 'a', stage: 'dispatch', evidence: asDispatch(refLockText) }, { path, now, fileCard: vi.fn() });
-    expect(f).toMatchObject({ cause: 'dispatch-transient', reasonCode: 'dispatch-command-failed', held: true, retry: false, attempts: 1, exhausted: false, retryAfter: new Date(now + 5 * 60_000).toISOString() });
-    // Not due yet: nothing is released.
-    expect(releaseDuePrepareRetries({ path, now: now + 60_000 })).toEqual([]);
-    expect(releaseDuePrepareRetries({ path, now: now + 5 * 60_000 })).toEqual(['4341']);
-  });
-  it('a held dispatch-stage `unknown` ref-lock record is healed to the backoff, not to an immediate retry', () => {
-    writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4341:a:dispatch': { num: '4341', attempt: 'a', stage: 'dispatch', cause: 'unknown',
-      evidence: asDispatch(refLockText), retry: false, held: true, recordedAt: '2026-10-09T17:00:00.000Z' } } }));
-    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:01:00Z') })).toEqual([]);
-    expect(readFailureState(path).failures['4341:a:dispatch']).toMatchObject({ cause: 'dispatch-transient', healedFrom: 'unknown', held: true, attempts: 1 });
-    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:06:00Z') })).toEqual(['4341']);
-  });
-  it('lane busy for hours is not spent in two ticks: every attempt is backed off, and only exhaustion ends the retries', async () => {
-    let now = Date.parse('2026-10-09T17:00:00Z');
-    const settings = { baseMs: 5 * 60_000, maxMs: 60 * 60_000, maxAttempts: 6 };
-    const lifecycle = [];
-    for (let i = 1; i <= 6; i++) {
-      const f = await recordPrepareFailure({ num: '4423', attempt: `run ${i}`, stage: 'result', evidence: { error: laneBusyText, sessionAbsent: true } }, { path, now, fileCard: vi.fn(), settings });
-      lifecycle.push({ i, cause: f.cause, held: f.held, exhausted: Boolean(f.exhausted), reasonCode: f.reasonCode });
-      // The very next tick (a minute later) must NOT retry while the backoff runs …
-      if (!f.exhausted) {
-        expect(releaseDuePrepareRetries({ path, now: now + 60_000, settings })).toEqual([]);
-        // … and the tick when it is due releases it, to try again.
-        now = Date.parse(f.retryAfter);
-        expect(releaseDuePrepareRetries({ path, now, settings })).toEqual(['4423']);
-      }
-    }
-    // Attempts 3, 4 and 5 (past the old immediate budget of 2) are still scheduled retries, not a permanent hold.
-    expect(lifecycle.slice(0, 5)).toEqual([1, 2, 3, 4, 5].map(i => ({ i, cause: 'dispatch-transient', held: true, exhausted: false, reasonCode: 'lane-busy' })));
-    // The sixth is the bounded end of the budget: exhausted, held, and visible as such.
-    expect(lifecycle[5]).toMatchObject({ cause: 'dispatch-transient', held: true, exhausted: true });
-  });
-  describe('a needs-you reason carries no secret from the worker report', () => {
-    const secrets = ['ghp_abcdefghijklmnopqrstuvwxyz0123456789', 'sk-abcdefghijklmnopqrstuvwxyz0123456789', 'Bearer abcdefghijklmnop.qrstuv', 'token=hunter2hunter2', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4eXoifQ.abcdefghij'];
-    it.each(secrets)('%s never reaches holdReason, in the ledger, or after a heal', async (secret) => {
-      const evidence = { error: `prepare requires a card-only diff; worker report: could-not-prepare — the deploy uses ${secret} and I cannot decide`, reason: 'prepare-unstamped' };
-      const fresh = await recordPrepareFailure({ num: '4355', attempt: 'run a', stage: 'result', evidence }, { path, fileCard: vi.fn() });
-      expect(fresh.holdReason).toMatch(/^needs-you: /);
-      expect(JSON.stringify(readFailureState(path))).not.toContain(secret.split(/[ =]/).pop());
-      // Healed from an older record: the same text through the other writer.
-      writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4356:run b:result': { num: '4356', attempt: 'run b', stage: 'result', cause: 'unknown', evidence, retry: false, held: true, recordedAt: '2026-10-09T00:00:00.000Z' } } }));
-      releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') });
-      const healed = readFailureState(path).failures['4356:run b:result'];
-      expect(healed.holdReason).toMatch(/^needs-you: /);
-      expect(healed.holdReason).not.toContain(secret.split(/[ =]/).pop());
-    });
-    it('a secret straddling the 280-char summary cut in the real route never leaves a prefix in holdReason', () => {
-      const report = `could-not-prepare — ${'x'.repeat(240)} ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4eXoifQ.abcdefghij`;
-      for (const pad of [225, 230, 235, 240, 245, 250]) {
-        const text = `could-not-prepare — ${'x'.repeat(pad)} ghp_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ`;
-        const route = preparedReportRoute({ error: `prepare requires a card-only diff; worker report: ${text}` });
-        expect(route.holdReason).not.toMatch(/ghp_|ZZZ/);
-      }
-      expect(preparedReportRoute({ error: `worker report: ${report}` }).holdReason).not.toMatch(/eyJ/);
-    });
-    it('a secret near the 300-char limit is redacted before the cut, so no partial of it is kept', () => {
-      const cut = needsYouReason('needs-ruling', `${'x'.repeat(285)} ghp_abcdefghijklmnopqrstuvwxyz0123456789`);
-      expect(cut).not.toMatch(/ghp_|abcdefghij/);
-      expect(needsYouReason('needs-ruling', `${'x'.repeat(250)} ghp_abcdefghijklmnopqrstuvwxyz0123456789`)).toContain('redacted-token');
-    });
-    it('a secret broken up by a control character or backtick is never joined back into a token', () => {
-      const split = needsYouReason('needs-ruling', 'uses ghp_abcdefgh\u0000ijklmnopqrstuvwx`yz0123456789 here');
-      expect(split).not.toMatch(/ghp_abcdefghijklmnopqrstuvwxyz0123456789/);
-    });
-  });
-  describe('an already-done route survives a crash between recording it and placing its hold', () => {
-    const alreadyDone = { error: `prepare requires a card-only diff; worker report: already-done — delivered by commit '${sha}'`, reason: 'prepare-unstamped' };
-    it('the stamped route is not handed out twice, the card is retried, and the next report is routed again', async () => {
-      const fileCard = vi.fn();
-      // Tick 1: recorded (and stamped as handed out); the daemon dies before `placePrepareHold` runs.
-      const first = await recordPrepareFailure({ num: '4560', attempt: 'run a', stage: 'result', evidence: alreadyDone }, { path, fileCard });
-      expect(first).toMatchObject({ held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
-      // Restart: persisted state is read fresh. The omitted route is deliberate (no double placement) …
-      expect(takePrepareRouteHolds({ path })).toEqual([]);
-      // … and the card stays retryable (not held), so it is prepared again and the worker re-reports.
-      expect(Object.values(readFailureState(path).failures).some(f => f.num === '4560' && f.held && !f.completed)).toBe(false);
-      const second = await recordPrepareFailure({ num: '4560', attempt: 'run b', stage: 'result', evidence: alreadyDone }, { path, fileCard });
-      expect(second).toMatchObject({ held: false, retry: true, routeHold: `spec already done on main: commit ${sha}` });
-      expect(second.attempt).not.toBe(first.attempt);
-    });
-    it('a healed route handed out by `takePrepareRouteHolds` but never placed is re-derived by the next report', async () => {
-      writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4560:run a:result': { num: '4560', attempt: 'run a', stage: 'result', cause: 'unknown', evidence: alreadyDone, retry: false, held: true, recordedAt: '2026-10-09T00:00:00.000Z' } } }));
-      expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') })).toEqual(['4560']);
-      expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
-      // Crash here: the daemon never placed it. The record is retryable, never held …
-      expect(readFailureState(path).failures['4560:run a:result']).toMatchObject({ held: false, retry: true });
-      expect(takePrepareRouteHolds({ path })).toEqual([]);
-      // … so the next prepare re-reports and is routed.
-      const again = await recordPrepareFailure({ num: '4560', attempt: 'run b', stage: 'result', evidence: alreadyDone }, { path, fileCard: vi.fn() });
-      expect(again.routeHold).toBe(`spec already done on main: commit ${sha}`);
-    });
   });
 });
