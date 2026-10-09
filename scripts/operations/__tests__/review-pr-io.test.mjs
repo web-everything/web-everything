@@ -15,7 +15,7 @@ import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
  * assertable without running it.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -211,9 +211,15 @@ describe('the ledger and notice sinks', () => {
 
     it('a #3988 replay: 3 runs on one head yield 3 review-run rows with posted:false', async () => {
       const sinks = createReviewPrSinks({ root });
-      for (let i = 0; i < 3; i += 1) {
-        await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
-      }
+      // A row's id hashes its content, `at` (millisecond) included, so two runs landing in the same ms are one
+      // row to the ledger. Real runs are seconds apart; pin the clock so each replay gets its own tick.
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        for (let i = 0; i < 3; i += 1) {
+          vi.setSystemTime(new Date(Date.UTC(2026, 9, 8, 12, 0, i)));
+          await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
+        }
+      } finally { vi.useRealTimers(); }
       const rows = readEvents().filter((r) => r.type === 'review-run');
       expect(rows).toHaveLength(3);
       for (const r of rows) expect(r).toMatchObject({ pr: 7, headSha: HEAD, phase: 'completed', posted: false, source: 'review-pr' });
