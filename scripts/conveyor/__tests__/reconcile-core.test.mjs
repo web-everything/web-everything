@@ -179,6 +179,25 @@ describe('case 1 — the dispatch, keyed by PR NUMBER (#3296)', () => {
     for (const r of plan.refusals) expect(REFUSAL_KINDS).toContain(r.kind);
     for (const d of plan.dispatch) expect(DISPATCH_KINDS).toContain(d.kind);
   });
+
+  // Review round 1 on PR #4527 (F1): `main-fix-combining` / `main-fix-owed-elsewhere` were emitted but never listed, so
+  // `formatReport` and land-advance's `reconcileHolds` (both keyed on REFUSAL_KINDS) silently dropped them. A fixture
+  // plan cannot reach every branch, so this reads the SOURCE: every literal kind the pass hands to `refuse(...)` or
+  // pushes onto `refusals` must be registered. (Dynamic kinds — `refuse(live.kind, …)` — are covered by the plan tests.)
+  it('every LITERAL refusal kind the source can emit is on the frozen REFUSAL_KINDS list (no unregistered refusal)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-core.mjs'), 'utf8');
+    const literal = new Set([...src.matchAll(/\brefuse\(\s*'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]));
+    for (const m of src.matchAll(/refusals\.push\(\{\s*(?:\.\.\.[A-Za-z]+,\s*)?kind:\s*'([a-z][a-z0-9-]*)'/g)) literal.add(m[1]);
+    expect(literal.size).toBeGreaterThan(15); // the scan really found the call sites
+    // `timeout-retry-ineligible` is deliberately NOT a refusal kind: it is pushed alongside the `ci-heal` dispatch the
+    // same PR still gets, as an informational row (registering it would make land-advance hold a PR that is being
+    // healed). Whether that row should be a note instead is filed as a card (see the PR #4527 round-1 evidence).
+    const INFORMATIONAL_ALONGSIDE_DISPATCH = ['timeout-retry-ineligible'];
+    expect([...literal].filter((k) => !REFUSAL_KINDS.includes(k) && !INFORMATIONAL_ALONGSIDE_DISPATCH.includes(k)).sort()).toEqual([]);
+  });
+  it('REFUSAL_KINDS has no duplicate entry', () => {
+    expect(new Set(REFUSAL_KINDS).size).toBe(REFUSAL_KINDS.length);
+  });
 });
 
 // ── CASE 2 — REFUSAL 1: `stood-down` IS TERMINAL ──────────────────────────────────────────────────────────────

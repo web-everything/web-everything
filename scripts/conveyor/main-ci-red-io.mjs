@@ -25,7 +25,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   mainCiRedSettings, mainRedState, findOwner, findOwnerPrs, isRedLongEnough, decideOwner, planCombinedFix, combineKey, buildCombineBrief, buildOwnerBrief, ownerSessionSlug, classifyRun,
-  planPriority,
+  planPriority, admitMainFixDispatch,
 } from './main-ci-red-core.mjs';
 import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priority.mjs';
 
@@ -33,6 +33,8 @@ import { writeMainRedPriority, writeMainRedState } from '../lib/main-red-priorit
 export const DEFAULT_REPO_SLUG = CONSTELLATION_REPOS.we.slug;
 const OPEN_PR_LIMIT = 300;
 const MAX_JOB_READS = 4;
+/** How many extra job reads the first-red-run check may spend stepping past infra-only runs at the front of the window. */
+const MAX_FIRST_RED_READS = 8;
 
 function ghJson(exec, argv) {
   const out = exec('gh', argv, {
@@ -43,12 +45,21 @@ function ghJson(exec, argv) {
   return JSON.parse(String(out || 'null'));
 }
 
-/** Failing jobs of one run: `{complete, jobs:[{id,name,conclusion}]}`; a job that was only cancelled is not failing. */
+/**
+ * Jobs of one run: `{complete, failed:[{id,name}], passed:[name]}`. A job that was only cancelled is not failing; and
+ * only a job whose conclusion is `success` is in `passed` — skipped, cancelled, neutral and not-yet-finished jobs are
+ * neither (review round 1, F5: they are not evidence that anything was fixed).
+ */
 export function readRunJobs(runId, { exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
   const page = ghJson(exec, ['api', `repos/${repoSlug}/actions/runs/${runId}/jobs?per_page=100`]);
   const jobs = Array.isArray(page?.jobs) ? page.jobs : [];
   const complete = Number.isInteger(page?.total_count) && page.total_count === jobs.length;
-  return { complete, failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: j.name })) };
+  return {
+    complete,
+    count: jobs.length,
+    failed: jobs.filter((j) => ['failure', 'timed_out'].includes(String(j.conclusion))).map((j) => ({ id: j.id, name: j.name })),
+    passed: jobs.filter((j) => String(j.conclusion) === 'success').map((j) => String(j.name)),
+  };
 }
 
 /** Failing test titles from one job's check-run annotations (CI output — untrusted text, quoted later). */
@@ -76,15 +87,27 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
   }
   const sorted = [...runs].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
   const failing = { jobs: [], tests: [] };
+  // One job read per run, however many passes below look at it. `null` = unreadable (stays red: never promoted on a blind read).
+  const jobsRead = new Map();
+  const jobsOf = (r) => {
+    if (!jobsRead.has(r.databaseId)) {
+      let jobs = null;
+      try { jobs = readRunJobs(r.databaseId, { exec, repoSlug }); } catch { jobs = null; }
+      jobsRead.set(r.databaseId, jobs);
+    }
+    return jobsRead.get(r.databaseId);
+  };
+  // A failure whose job list is complete, NON-EMPTY and holds no failed job (only cancelled / never ran) is infra, not
+  // code. An empty list is not infra: a `startup_failure` run (a broken workflow file) has zero jobs and IS the defect.
+  const markInfraOnly = (r, jobs) => { if (jobs && jobs.complete && jobs.count > 0 && jobs.failed.length === 0) { r.infraOnly = true; return true; } return false; };
   let reads = 0;
   for (const r of sorted) {
     const v = classifyRun(r);
     if (v === 'green') break; // only the current red window matters
     if (v !== 'red' || reads >= MAX_JOB_READS) continue;
     reads += 1;
-    let jobs = null;
-    try { jobs = readRunJobs(r.databaseId, { exec, repoSlug }); } catch { jobs = null; }
-    if (jobs && jobs.complete && jobs.failed.length === 0) { r.infraOnly = true; continue; }
+    const jobs = jobsOf(r);
+    if (markInfraOnly(r, jobs)) continue;
     if (jobs && !failing.jobs.length) {
       failing.jobs = jobs.failed.map((j) => j.name);
       for (const j of jobs.failed.slice(0, 2)) {
@@ -92,6 +115,18 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
       }
       failing.runId = r.databaseId;
     }
+  }
+  // Review round 1 (F2): the failing-job read above covers the NEWEST red runs, but `mainRedState` names the OLDEST red
+  // run after the last green one as the first red commit (the owner ledger key, the episode subject, the brief). If that
+  // run — or the next ones — failed only through cancelled jobs / runner loss it is not a code failure: check the
+  // candidate itself, step forward past every infra-only one, and stop at the first run that is genuinely red (or whose
+  // jobs cannot be read — that stays red, never promoted on a blind read). Bounded by MAX_FIRST_RED_READS.
+  for (let i = 0; i < MAX_FIRST_RED_READS; i += 1) {
+    const st = mainRedState(sorted);
+    if (st.status !== 'red') break;
+    const candidate = sorted.find((r) => r.databaseId === st.firstRed.runId);
+    if (!candidate || jobsRead.has(candidate.databaseId)) break; // already inspected: genuine, or unreadable
+    if (!markInfraOnly(candidate, jobsOf(candidate))) break;
   }
   return { runs: sorted, failing };
 }
@@ -108,16 +143,22 @@ export function readFixPrCi(pr, { exec = execFileSyncThrottled, repoSlug = DEFAU
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
     if (!done) return { status: 'pending', failedJobs: [] };
     if (pr.headRefOid && done.headSha !== pr.headRefOid) return { status: 'pending', failedJobs: [] };
-    if (classifyRun(done) === 'green') return { status: 'green', failedJobs: [] };
+    if (classifyRun(done) === 'green') {
+      // A green run can still have skipped jobs, so read the jobs: only the ones that SUCCEEDED prove a fix (F5). An
+      // unreadable job list leaves the PR green with no proof — it can then fix nothing, but it is not "unknown".
+      let passedJobs = [];
+      try { passedJobs = readRunJobs(done.databaseId, { exec, repoSlug }).passed; } catch { passedJobs = []; }
+      return { status: 'green', failedJobs: [], passedJobs };
+    }
     const jobs = readRunJobs(done.databaseId, { exec, repoSlug });
-    return jobs.complete ? { status: 'red', failedJobs: jobs.failed.map((j) => j.name) } : { status: 'unknown', failedJobs: [] };
+    return jobs.complete ? { status: 'red', failedJobs: jobs.failed.map((j) => j.name), passedJobs: jobs.passed } : { status: 'unknown', failedJobs: [] };
   } catch { return { status: 'unknown', failedJobs: [] }; }
 }
 
 /** Open PRs for the owner check, or `null` when unreadable or possibly cut off (= ownership unknown). */
 export function readOpenPrsForOwner({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG } = {}) {
   try {
-    const rows = ghJson(exec, ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,body,headRefName,headRefOid,createdAt,state']);
+    const rows = ghJson(exec, ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,body,headRefName,headRefOid,createdAt,state,author']);
     if (!Array.isArray(rows) || rows.length >= OPEN_PR_LIMIT) return null;
     return rows;
   } catch { return null; }
@@ -208,15 +249,29 @@ export async function probeAndOwnMainCi({
   }
   if (prs !== null && !dryRun) publishPriority(priority);
   base.priority = priority;
-  // A deadlock gets ONE combine session (ledger key per PR set; never a second one, never while one is reserved).
-  if (combine?.deadlock && !dryRun && settings.mainCiRedOwnerDispatch && !(await gates()).killed) {
+  // One read of the dispatch gates per tick, shared by the combine session and the owner.
+  let gateRead = null;
+  const readGates = async () => (gateRead ??= await gates());
+  // A deadlock gets ONE combine session (ledger key per PR set; never a second one, never while one is reserved), under
+  // the SAME admission rule as the owner (F6): the kill switch, host load, and the fixer cap (main-red work may go past
+  // a full cap only when `mainCiRedOwnerPriorityOverFixCap` is on). A refusal reserves nothing, so the next tick retries.
+  let combineAdmit = { admit: false };
+  if (combine?.deadlock && !dryRun && settings.mainCiRedOwnerDispatch) {
+    combineAdmit = admitMainFixDispatch({ ...(await readGates()), settings });
+    if (!combineAdmit.admit) base.combineHeld = { reason: combineAdmit.reason, ...(combineAdmit.why ? { why: combineAdmit.why } : {}) };
+  }
+  if (combineAdmit.admit) {
     const path = ledgerPathIn(dir);
     mkdirSync(dirname(path), { recursive: true });
     const key = combineKey(combine.deadlock);
     let owed = false;
     withFileLock(`${path}.lock`, () => {
       const l = readOwnerLedger(path);
-      if (l[key]) return;
+      // A reservation still `dispatching` after the priority TTL is a crash between reserve and settle (a live dispatch
+      // settles within seconds): reclaim it, or the fix PRs stay held `main-fix-combining` with no combine session ever
+      // coming. A `dispatched` entry (even with no handle — it may have started) is never reclaimed.
+      const stale = l[key]?.status === 'dispatching' && now - (Number(l[key].at) || 0) >= settings.mainCiRedPriorityTtlMs;
+      if (l[key] && !stale) return;
       l[key] = { at: now, status: 'dispatching', carrier: combine.deadlock.carrier };
       writeJsonAtomic(path, l);
       owed = true;
@@ -242,7 +297,7 @@ export async function probeAndOwnMainCi({
   }
   let agents = [];
   try { agents = await listAgents(); } catch { agents = []; }
-  const { killed, fixGate } = await gates();
+  const { killed, fixGate } = await readGates();
   const path = ledgerPathIn(dir);
   mkdirSync(dirname(path), { recursive: true });
   const sha = state.firstRed.sha;

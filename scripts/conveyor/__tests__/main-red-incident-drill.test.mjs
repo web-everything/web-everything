@@ -194,10 +194,34 @@ describe('INCIDENT DRILL — 2026-10-08, main red from two causes', () => {
     expect(published.at(-1)).toBeNull();
   });
 
+  it('review round 1 (F1): every hold kind a red-main fix PR can get is a REGISTERED refusal — printed in the report and held by land-advance', async () => {
+    const { REFUSAL_KINDS } = await import('../reconcile-core.mjs');
+    const { formatReport } = await import('../reconcile-pass.mjs');
+    const { reconcileHolds } = await import('../../operations/land-advance-items-io.mjs');
+    const [p4522, p4532] = TWO.fixPrs;
+    const now = T('2026-10-09T00:20:00Z');
+    const mainRedWindows = [{ start: '2026-10-08T17:04:20Z', end: null }];
+    const row = (p) => prRow({ number: p.number, headRefName: p.headRefName, statusCheckRollup: rollup('failure'), requiredCheckCompletedAt: '2026-10-09T00:13:07Z', aheadByOnMain: 3 });
+    const rec = (combine) => ({ repo: 'we', pr: 4532, prs: [4522, 4532], reason: 'owns the red-main fix', setAt: now, expiresAt: now + 30 * MIN, combine });
+    const deadlock = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs, fixPrs: TWO.fixPrs });
+    const owedOnly = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs, fixPrs: [{ ...p4522, ci: { status: 'green', failedJobs: [], passedJobs: TWO.mainFailingJobs } }, p4532] });
+    const seen = new Set();
+    for (const [record, pr, kind] of [[rec(deadlock), p4532, 'main-fix-combining'], [rec(owedOnly), p4532, 'main-fix-owed-elsewhere']]) {
+      const plan = planReconcile({ now, agents: [], mainRedWindows, mainRedPriority: record, prs: [row(pr)] });
+      const kinds = plan.refusals.map((r) => r.kind);
+      expect(kinds).toEqual([kind]);
+      for (const k of kinds) { expect(REFUSAL_KINDS).toContain(k); seen.add(k); }
+      expect(formatReport(plan)).toContain(`✗ ${kind} PR #${pr.number}`);
+      expect(Object.values(reconcileHolds(plan.refusals))).toEqual([expect.objectContaining({ kind, holds: ['review', 'fix'] })]);
+    }
+    // Every kind `mainFixHeldFor` can return was exercised above.
+    expect([...seen].sort()).toEqual(['main-fix-combining', 'main-fix-owed-elsewhere']);
+  });
+
   it('owed elsewhere, no deadlock: a fix PR red only on a cause another GREEN fix PR fixes waits for it', () => {
     const [p4522, p4532] = TWO.fixPrs;
     const plan = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs,
-      fixPrs: [{ ...p4522, ci: { status: 'green', failedJobs: [] } }, { ...p4532 }] });
+      fixPrs: [{ ...p4522, ci: { status: 'green', failedJobs: [], passedJobs: TWO.mainFailingJobs } }, { ...p4532 }] });
     expect(plan.deadlock).toBeNull();
     expect(plan.owedElsewhere).toEqual([{ pr: 4532, jobs: ['soak-shard (2)'], waitsOn: [4522] }]);
     expect(mainFixHeldFor(4532, { combine: plan })?.kind).toBe('main-fix-owed-elsewhere');
@@ -207,7 +231,7 @@ describe('INCIDENT DRILL — 2026-10-08, main red from two causes', () => {
   it('a fix PR failing on a job main does NOT fail is its own failure (never owed elsewhere); unknown CI is never acted on', () => {
     const [p4522, p4532] = TWO.fixPrs;
     // #4522 fails `lint` (its own failure → ordinary ci-heal); #4532 still waits on #4522's soak fix. No deadlock.
-    const own = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs, fixPrs: [{ ...p4522, ci: { status: 'red', failedJobs: ['lint'] } }, p4532] });
+    const own = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs, fixPrs: [{ ...p4522, ci: { status: 'red', failedJobs: ['lint'], passedJobs: ['soak-shard (2)'] } }, p4532] });
     expect(own.owedElsewhere.map((o) => o.pr)).toEqual([4532]);
     expect(own.deadlock).toBeNull();
     expect(planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs,

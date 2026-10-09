@@ -19,6 +19,20 @@
  * last-N-runs-across-all-workflows window (card xfrjlsi: busy other workflows push main's CI runs out of that window).
  */
 
+import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
+
+/**
+ * Is this PR's AUTHOR the conveyor or the operator? `gh pr list --json author` reports the conveyor's GitHub App as
+ * `{is_bot:true, login:"app/web-everything"}` (read live 2026-10-09 on #4522 / #4527 / #4532), while comments carry
+ * `web-everything` — so an `app/<slug>` login counts when `<slug>` is an automation login. The operator's login is
+ * NOT accepted in the `app/` form (anyone can register an app slug). No author = no trust. PURE.
+ */
+export function isTrustedPrAuthor(pr) {
+  const login = typeof pr?.author?.login === 'string' ? pr.author.login.trim().toLowerCase() : '';
+  if (login.startsWith('app/')) return AUTOMATION_LOGINS.includes(login.slice(4)) || AUTOMATION_LOGINS.includes(`${login.slice(4)}[bot]`);
+  return isTrustedMarkerAuthor({ author: { login } });
+}
+
 export const MINUTE = 60_000;
 
 /** Declared settings. Off values: `mainCiRedEnabled:false` (no breach), `mainCiRedOwnerDispatch:false` (no fixer). */
@@ -39,6 +53,10 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   mainCiRedOwnerPriorityOverFixCap: true,
   /** An open PR whose title matches this (case-insensitive) is taken as already fixing main. */
   mainCiRedOwnerTitlePattern: '\\b(?:fix(?:es|ing)?|heal(?:s|ing)?)\\b[^\\n]{0,24}\\b(?:red[- ]main|main[- ](?:red|ci))\\b|\\bred[- ]main fix\\b',
+  /** Review round 1 on PR #4527 (F4). On: a PR only counts as a red-main fix PR (priority, owner stand-down, combine)
+   *  when its AUTHOR is the conveyor or the operator (`isTrustedPrAuthor`, built on `marker-authorship.mjs`); a title or branch
+   *  that merely matches the patterns is not enough. Off = before this repair: title / branch / body alone. */
+  mainCiRedOwnerRequireTrustedAuthor: true,
   /** Off = before this card: fix PRs are never combined. On = when two fix PRs each fail CI on the OTHER's cause
    *  (live 2026-10-08: #4522 soak / #4532 ledger id), ONE combine session folds them into the newest PR. */
   mainCiRedCombineFixPrs: true,
@@ -133,8 +151,22 @@ export function runsAsOf(runs, t) {
   });
 }
 
+/** Only the hex digits of a commit sha, or '' — a sha that reaches a command line or a session name is never free text. PURE. */
+export function hexSha(sha) { const s = String(sha ?? ''); return /^[0-9a-f]{7,64}$/i.test(s) ? s : ''; }
+
+/**
+ * A git ref (a PR's head branch) that is safe to put on a command line: letters, digits, `.`, `_`, `/`, `-`, starting with a
+ * letter or digit, no `..`, no trailing `/` or `.lock`. Anything else — `$(…)`, a backtick, `;`, `&`, `|`, a quote, a newline,
+ * a leading `--` (an option) — returns null. A ref a PR author chose is DATA: it may name a branch, never reach a shell. PURE.
+ * @returns {string|null}
+ */
+export function safeRef(ref) {
+  const s = typeof ref === 'string' ? ref : '';
+  return s.length > 0 && s.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(s) && !s.includes('..') && !/[/.]$/.test(s) && !s.endsWith('.lock') ? s : null;
+}
+
 /** The session name the dispatched owner runs under (one per broken commit). PURE. */
-export function ownerSessionSlug(sha) { return `main-fix-${String(sha).slice(0, 9)}`; }
+export function ownerSessionSlug(sha) { return `main-fix-${String(sha).replace(/[^0-9A-Za-z]/g, '').slice(0, 9)}`; }
 
 /**
  * The OPEN PR that owns the fix for this broken commit, if any: created at or after the first red run, and naming the
@@ -163,6 +195,9 @@ export function findOwnerPrs({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAUL
   const out = [];
   for (const pr of prs || []) {
     if (!pr || (pr.state && String(pr.state).toUpperCase() !== 'OPEN')) continue;
+    // F4 (review round 1): a title or branch anyone can type is not provenance. Only the conveyor's own login or the
+    // operator's counts; no author information fails closed. (`author.login` is assigned by GitHub from the real identity.)
+    if (settings.mainCiRedOwnerRequireTrustedAuthor !== false && !isTrustedPrAuthor(pr)) continue;
     const created = ts(pr.createdAt);
     if (since !== null && created !== null && created < since) continue; // an older PR cannot be fixing a newer break
     const title = String(pr.title ?? '');
@@ -266,12 +301,27 @@ export function decideOwner({ state, now, settings = MAIN_CI_RED_DEFAULTS, owner
   if (!isRedLongEnough(state, { now, thresholdMs: settings.mainCiRedThresholdMs })) return { owed: false, reason: 'below-threshold' };
   if (prs === null) return { owed: false, reason: 'owner-unknown', why: 'open PRs unreadable' };
   if (owner) return { owed: false, reason: 'owned', why: `${owner.kind} ${owner.ref}` };
-  if (killed) return { owed: false, reason: 'fix-dispatch-killed' };
+  const adm = admitMainFixDispatch({ killed, fixGate, settings });
+  if (!adm.admit) return { owed: false, reason: adm.reason, ...(adm.why ? { why: adm.why } : {}) };
+  return adm.why ? { owed: true, reason: 'owed', why: adm.why } : { owed: true, reason: 'owed' };
+}
+
+/**
+ * THE ONE admission rule for every session the main-red path starts (the owner AND the combine session — review round 1
+ * on PR #4527, F6: the combine path used to read only `killed` and ignore host load and the fixer cap). PURE.
+ *   - the fix-dispatch kill switch holds everything;
+ *   - a refused gate holds (host load, ...), except a full fixer cap, which main-red work may go past when
+ *     `mainCiRedOwnerPriorityOverFixCap` is on (red main blocks every other PR).
+ * @param {{killed?:boolean, fixGate?:{admit:boolean, kind?:string, why?:string}|null, settings?:object}} o
+ * @returns {{admit:boolean, reason?:string, why?:string}}
+ */
+export function admitMainFixDispatch({ killed = false, fixGate = null, settings = MAIN_CI_RED_DEFAULTS } = {}) {
+  if (killed) return { admit: false, reason: 'fix-dispatch-killed' };
   if (fixGate && fixGate.admit === false) {
-    if (!(fixGate.kind === 'fix-cap' && settings.mainCiRedOwnerPriorityOverFixCap)) return { owed: false, reason: fixGate.kind || 'held', why: fixGate.why };
-    return { owed: true, reason: 'owed', why: `priority over fixer cap (${fixGate.why ?? 'fix-cap'})` };
+    if (!(fixGate.kind === 'fix-cap' && settings.mainCiRedOwnerPriorityOverFixCap)) return { admit: false, reason: fixGate.kind || 'held', ...(fixGate.why ? { why: fixGate.why } : {}) };
+    return { admit: true, why: `priority over fixer cap (${fixGate.why ?? 'fix-cap'})` };
   }
-  return { owed: true, reason: 'owed' };
+  return { admit: true };
 }
 
 /** Fence untrusted text (log/annotation excerpts) so it cannot close the fence or read as instructions. PURE. */
@@ -284,14 +334,19 @@ export function quoteData(text, max = 1500) {
  * @param {{state:object, failing?:{jobs?:string[], tests?:string[]}, weRoot:string, repoSlug:string, settings?:object}} o
  */
 export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, settings = MAIN_CI_RED_DEFAULTS }) {
-  const sha = state.firstRed.sha;
+  // Everything interpolated OUTSIDE the data fence is a validated token (a hex sha, a number) — never CI-supplied free
+  // text (review round 1, F3: same class as the combine brief's branch name). The raw values go in the fenced data below.
+  const rawSha = String(state.firstRed.sha ?? '');
+  const sha = hexSha(rawSha) || 'unknown';
   const sha9 = sha.slice(0, 9);
+  const lastGreenSha = hexSha(state.lastGreen?.sha);
+  const runId = Number(state.latestRed?.runId ?? state.firstRed.runId);
   const ref = `${settings.mainCiRedOwnerBranchPrefix}${sha9}`;
-  const range = state.lastGreen ? `${state.lastGreen.sha.slice(0, 9)}..${sha9}` : `(no green run in the read window; start from ${sha9})`;
+  const range = lastGreenSha ? `${lastGreenSha.slice(0, 9)}..${sha9}` : `(no green run in the read window; start from ${sha9})`;
   const data = [
-    `first red commit: ${sha}`,
+    `first red commit: ${rawSha}`,
     `last green commit: ${state.lastGreen?.sha ?? 'unknown'}`,
-    `latest red commit: ${state.latestRed?.sha ?? sha}`,
+    `latest red commit: ${state.latestRed?.sha ?? rawSha}`,
     `failing jobs: ${(failing.jobs || []).join(', ') || 'unknown'}`,
     ...(failing.tests || []).slice(0, 8).map((t) => `failing test: ${t}`),
   ].join('\n');
@@ -307,7 +362,7 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
     '',
     'Steps:',
     `1. Take a lane: \`node "${weRoot}/scripts/lane-pool.mjs" acquire --purpose=main-fix-${sha9} --adopt\`. Work only in the lane path it prints.`,
-    `2. Find the cause in the merged range ${range} (\`git log --oneline ${state.lastGreen ? range : sha9}\`) and the failing job logs (\`gh run view ${state.latestRed?.runId ?? state.firstRed.runId} --log-failed\`).`,
+    `2. Find the cause in the merged range ${range} (\`git log --oneline ${lastGreenSha ? range : sha9}\`) and the failing job logs (\`gh run view ${Number.isInteger(runId) ? runId : 0} --log-failed\`).`,
     '3. Main can have SEVERAL red causes on one commit (2026-10-08: a soak scenario AND a ledger-id test). You own them all, in ONE PR: fix every failing job listed above. If an open PR already fixes one cause, build ON its branch (`git merge origin/<its branch>` into yours) so your PR carries every fix, and name it in your PR body. Two PRs that each fix one cause DEADLOCK: each one\'s CI fails on the other\'s cause.',
     '4. Write or keep a failing test, then fix the ROOT CAUSE. Never delete, skip or loosen a test or a merge-gate guard to get green.',
     '5. Run the failing tests with `npm run test:unit -- <files>` and the gate with `node scripts/operations/run.mjs verify --checkout=<lane>`.',
@@ -329,17 +384,25 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
  * take in the others' branches, so one PR carries every fix.
  *
  * @param {{mainFailingJobs:string[], fixPrs:Array<{number:number, createdAt?:string, headRefName?:string,
- *   ci:{status:'green'|'red'|'pending'|'unknown', failedJobs?:string[]}}>}} o
+ *   ci:{status:'green'|'red'|'pending'|'unknown', failedJobs?:string[], passedJobs?:string[]}}>}} o
  *   `ci` is the PR's latest FINISHED CI run with a complete job list; anything else is `unknown` (never acted on).
+ *   `passedJobs` = the jobs whose conclusion was `success` (skipped / cancelled / absent are NOT in it): the only
+ *   evidence that this PR fixes a main cause.
  * @returns {{owedElsewhere:Array<{pr:number, jobs:string[], waitsOn:number[]}>,
  *   deadlock:null|{carrier:number, carrierRef:string|null, from:Array<{pr:number, ref:string|null}>, jobs:string[]}}}
  */
 export function planCombinedFix({ mainFailingJobs = [], fixPrs = [], summaryJobs = MAIN_CI_RED_DEFAULTS.mainCiRedSummaryJobs } = {}) {
   const summary = new Set((summaryJobs || []).map(String));
   const mainFail = new Set((mainFailingJobs || []).map(String).filter((j) => !summary.has(j)));
-  const known = (fixPrs || []).filter((p) => p && Number.isInteger(p.number) && ['green', 'red'].includes(p.ci?.status));
-  // Q fixes job j: main fails j, Q's finished CI does not.
-  const fixes = (q, j) => mainFail.has(j) && !(q.ci.failedJobs || []).includes(j);
+  // A PR whose branch name is not a safe ref is never planned with (F3: its name would end up in an agent's command
+  // line): unknown never acts. A PR with no branch name at all stays (its ref is simply unknown).
+  const hasUnsafeRef = (p) => (p.headRefName ?? '') !== '' && safeRef(p.headRefName) === null;
+  const known = (fixPrs || []).filter((p) => p && Number.isInteger(p.number) && ['green', 'red'].includes(p.ci?.status) && !hasUnsafeRef(p));
+  // Q fixes job j only on EVIDENCE: main fails j, Q's finished CI did not fail it, AND Q's finished CI shows j SUCCEEDED.
+  // A job that was skipped, cancelled, absent from the run or whose result is unknown proves nothing (F5): a conditional
+  // job or fail-fast cancellation would otherwise read as "fixed".
+  const passed = (q, j) => Array.isArray(q.ci.passedJobs) && q.ci.passedJobs.map(String).includes(j);
+  const fixes = (q, j) => mainFail.has(j) && !(q.ci.failedJobs || []).map(String).includes(j) && passed(q, j);
   const owedElsewhere = [];
   for (const p of known) {
     const failed = (p.ci.failedJobs || []).map(String).filter((j) => !summary.has(j));
@@ -362,8 +425,8 @@ export function planCombinedFix({ mainFailingJobs = [], fixPrs = [], summaryJobs
     const ordered = stuck.map((o) => byNum.get(o.pr)).sort((a, b) => (Date.parse(a.createdAt ?? '') || a.number) - (Date.parse(b.createdAt ?? '') || b.number));
     const carrier = ordered[ordered.length - 1];
     deadlock = {
-      carrier: carrier.number, carrierRef: carrier.headRefName ?? null,
-      from: ordered.slice(0, -1).map((p) => ({ pr: p.number, ref: p.headRefName ?? null })),
+      carrier: carrier.number, carrierRef: safeRef(carrier.headRefName),
+      from: ordered.slice(0, -1).map((p) => ({ pr: p.number, ref: safeRef(p.headRefName) })),
       jobs: [...new Set(stuck.flatMap((o) => o.jobs))].sort(),
     };
   }
@@ -377,14 +440,17 @@ export function combineKey(deadlock) {
 
 /** The brief for the ONE combine session (PR titles and CI names are fenced as data). PURE. */
 export function buildCombineBrief({ deadlock, weRoot, repoSlug, firstRedSha }) {
+  // A branch name is chosen by a PR author: it appears ONLY inside the data fence, and only when it is a safe ref (F3).
+  // Outside the fence the steps point at the data block ("the carrier branch above") and use PR NUMBERS (integers).
+  const carrier = Number(deadlock.carrier);
   const data = [
-    `carrier PR: #${deadlock.carrier} (branch ${deadlock.carrierRef ?? 'unknown'})`,
-    ...deadlock.from.map((f) => `fix PR to fold in: #${f.pr} (branch ${f.ref ?? 'unknown'})`),
+    `carrier PR: #${carrier} (branch ${safeRef(deadlock.carrierRef) ?? 'unknown'})`,
+    ...deadlock.from.map((f) => `fix PR to fold in: #${Number(f.pr)} (branch ${safeRef(f.ref) ?? 'unknown'})`),
     `jobs each PR fails only because of the other's cause: ${deadlock.jobs.join(', ')}`,
     `first red commit: ${firstRedSha ?? 'unknown'}`,
   ].join('\n');
   return [
-    `# Combine the red-main fix PRs into #${deadlock.carrier} (${repoSlug})`,
+    `# Combine the red-main fix PRs into #${carrier} (${repoSlug})`,
     '',
     'Main is red with several causes, and each fix PR fails CI on a cause another fix PR fixes, so none can land. Make ONE PR carry every fix.',
     '',
@@ -394,10 +460,10 @@ export function buildCombineBrief({ deadlock, weRoot, repoSlug, firstRedSha }) {
     '```',
     '',
     'Steps:',
-    `1. Take a lane: \`node "${weRoot}/scripts/lane-pool.mjs" acquire --purpose=main-fix-combine-${deadlock.carrier} --base=${deadlock.carrierRef ?? ''} --adopt\`. Work only in the lane path it prints.`,
+    `1. Take a lane: \`node "${weRoot}/scripts/lane-pool.mjs" acquire --purpose=main-fix-combine-${carrier} --base=<the carrier branch named in the data block> --adopt\`. Work only in the lane path it prints.`,
     `2. Check out the carrier branch and merge in each other fix branch (\`git fetch origin <branch> && git merge --no-edit origin/<branch>\`). Resolve conflicts by keeping BOTH fixes.`,
     '3. Run the jobs\' failing tests with `npm run test:unit -- <files>`, then `node scripts/operations/run.mjs verify --checkout=<lane>`.',
-    `4. Push to the carrier branch (no --force). Comment on each folded PR: "carried by #${deadlock.carrier}", then close it.`,
+    `4. Push to the carrier branch (no --force). Comment on each folded PR: "carried by #${carrier}", then close it.`,
     '5. Never delete, skip or loosen a test or a merge-gate guard. Release the lane.',
     '',
     'Report in at most 6 lines: what merged, the tests that pass, the carrier PR.',

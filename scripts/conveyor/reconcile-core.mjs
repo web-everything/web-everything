@@ -278,6 +278,9 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *                          apparent conflict by reverting the carrier PR's later work. This PR should be closed
  *                          and its backlog card resolved, never dispatched; see
  *                          `we:scripts/conveyor/already-landed-watch.mjs` for the pass that acts on it.
+ *   `main-fix-combining` / `main-fix-owed-elsewhere` — a red-main fix PR whose CI failure belongs to another fix
+ *                          PR's cause (xu1nixv, `main-ci-red-core.mjs#mainFixHeldFor`): no ci-heal, no rerun, it waits.
+ *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
@@ -302,6 +305,15 @@ export const REFUSAL_KINDS = Object.freeze([
   // because another author was pushing; NOT terminal — re-arms on the next head or after
   // {@link CONCURRENT_AUTHOR_QUIET_MS} of quiet.
   'fix-claimed', 'concurrent-author-paused',
+  // xu1nixv (review round 1 on PR #4527, F1) — a red-main fix PR whose CI failure is owed elsewhere: `main-fix-combining`
+  // (the fix PRs deadlock on each other's cause and ONE combine session folds them) and `main-fix-owed-elsewhere`
+  // (it fails only on a main cause another fix PR fixes). They come from `main-ci-red-core.mjs#mainFixHeldFor` as
+  // `refuse(fixHold.kind, …)`; unlisted, `formatReport` never printed them and land-advance's `reconcileHolds` dropped them.
+  'main-fix-combining', 'main-fix-owed-elsewhere',
+  // Same class, found by the source scan in `reconcile-core.test.mjs` (literal `refuse('…')` calls that were never listed):
+  // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
+  // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
+  'scope-bloat', 'ruling-dispute',
 ]);
 
 /**
