@@ -5,7 +5,12 @@
  *   instance". A fix / ci-heal session runs it on its evidence text BEFORE posting it:
  *
  *     node <WE_ROOT>/scripts/conveyor/class-sweep-check.mjs --evidence-file=<file> --kind=fix|ci-heal \
- *       --repo=<owner/name> --pr=<n> --session=<slug>
+ *       --repo=<owner/name> --pr=<n> --session=<slug> --checkout=<lane> --base=origin/<pr base branch>
+ *
+ *   THE SAME CLASS ANYWHERE IN THE PR (card 5536): the PR's changed files are read from the lane
+ *   (`git -C <lane> diff --name-only <base>...HEAD`, argv array, no shell, bounded buffer) or from
+ *   `--changed-files=<file>` (one path per line). Every finding's rows must name each of them; with neither flag, or an
+ *   unreadable list, the PR-wide check fails closed (`pr-files-unknown`).
  *
  *   It reads the ```class-sweep block (grammar: `../lib/class-sweep-rule.mjs`), prints one line, and RECORDS the
  *   structured sweep — the classes and every sibling path checked — under the coordination root:
@@ -19,6 +24,7 @@
  *
  * IMPURE: reads one file, writes the record. Every decision is in the pure rule.
  */
+import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -63,6 +69,25 @@ function readEvidence(path, read) {
   } catch { return null; }
 }
 
+const BASE_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,200}$/;
+
+/** The PR's changed files, or null when they cannot be read (→ `pr-files-unknown`, never `complete`). */
+export function readChangedFiles(flags, { read, git }) {
+  let text = null;
+  if (typeof flags['changed-files'] === 'string' && flags['changed-files']) {
+    try { text = read(flags['changed-files']); } catch { return null; }
+  } else if (typeof flags.checkout === 'string' && flags.checkout) {
+    const base = typeof flags.base === 'string' ? flags.base : 'origin/main';
+    if (!BASE_RE.test(base) || base.includes('..')) return null;
+    try { text = git(['-C', flags.checkout, 'diff', '--name-only', `${base}...HEAD`]); } catch { return null; }
+  }
+  // A list past the bound is never cut short (a cut list could read `complete`): it is unknown.
+  if (typeof text !== 'string' || text.length > MAX_EVIDENCE_BYTES) return null;
+  return text.split('\n').map((l) => l.trim()).filter(Boolean);
+}
+
+const defaultGit = (args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'] });
+
 /**
  * Run the check. Injectable IO for tests.
  * @returns {{exitCode: number, line: string, verdict: object, recorded: boolean}}
@@ -70,12 +95,13 @@ function readEvidence(path, read) {
 export function main(argv = process.argv.slice(2), {
   env = process.env, read = (p) => readFileSync(p, 'utf8'), now = () => new Date().toISOString(),
   root = resolveCoordinationRoot({ env }), write = writeFileSync, rename = renameSync, append = appendFileSync, mkdir = mkdirSync,
-  settingsPath = defaultPolicySettingsPath(), out = (s) => process.stdout.write(`${s}\n`),
+  settingsPath = defaultPolicySettingsPath(), out = (s) => process.stdout.write(`${s}\n`), git = defaultGit,
 } = {}) {
   const flags = parseFlags(argv);
   const { mode, source, since } = resolveClassSweepMode({ env, read, path: settingsPath });
   const kind = typeof flags.kind === 'string' ? flags.kind : 'fix';
-  const verdict = classSweepVerdict({ mode, changeKind: kind, evidence: readEvidence(flags['evidence-file'], read) });
+  const changedFiles = mode === 'off' ? undefined : readChangedFiles(flags, { read, git });
+  const verdict = classSweepVerdict({ mode, changeKind: kind, evidence: readEvidence(flags['evidence-file'], read), changedFiles });
   const line = formatClassSweep(verdict);
   let recorded = false;
   const session = typeof flags.session === 'string' && SESSION_RE.test(flags.session) ? flags.session : null;
@@ -84,7 +110,8 @@ export function main(argv = process.argv.slice(2), {
       v: 1, at: now(), session, kind, repo: typeof flags.repo === 'string' ? flags.repo.slice(0, 100) : null,
       pr: /^\d+$/.test(String(flags.pr ?? '')) ? Number(flags.pr) : null, modeSource: source, since,
       status: verdict.status, reason: verdict.reason, blocking: verdict.blocking, problems: verdict.problems.slice(0, 50),
-      classes: verdict.classes, sweep: verdict.sweep,
+      classes: verdict.classes, sweep: verdict.sweep, unswept: verdict.unswept,
+      prFiles: Array.isArray(changedFiles) ? changedFiles.length : null,
     };
     try {
       const dir = join(root, 'class-sweep');

@@ -2,6 +2,7 @@
  * Card xet6iu0 — the class-sweep check CLI, against a real temporary directory (the record it writes is the point).
  */
 import { afterEach, describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,10 +24,12 @@ const SWEEP = { v: 1, findings: [{ finding: 'F1', class: 'truncated read', sibli
 ] }] };
 const evidence = (sweep) => `## fix evidence\n\n\`\`\`class-sweep\n${JSON.stringify(sweep)}\n\`\`\`\n`;
 
-function run({ text, mode = 'warn', args = [], settings } = {}) {
+function run({ text, mode = 'warn', args = [], settings, changed = ['a.mjs', 'b.mjs'] } = {}) {
   const d = scratch();
   const file = join(d, 'evidence.md');
   if (text !== undefined) writeFileSync(file, text);
+  const changedFile = join(d, 'changed.txt');
+  if (changed) { writeFileSync(changedFile, `${changed.join('\n')}\n`); args = [`--changed-files=${changedFile}`, ...args]; }
   const settingsPath = join(d, 'settings.json');
   writeFileSync(settingsPath, JSON.stringify(settings ?? { classSweep: { mode, since: '2026-10-08' } }));
   const lines = [];
@@ -69,6 +72,32 @@ describe('class-sweep-check', () => {
     const r = run({ text: evidence(SWEEP), args: ['--session=../../etc/x'] });
     expect(existsSync(join(r.root, 'class-sweep', 'log.jsonl'))).toBe(true);
     expect(JSON.parse(readFileSync(join(r.root, 'class-sweep', 'log.jsonl'), 'utf8')).session).toBe(null);
+  });
+
+  it('card 5536: a changed file of the PR no row names is flagged in the same pass and recorded', () => {
+    const r = run({ text: evidence(SWEEP), changed: ['a.mjs', 'b.mjs', 'c.mjs', 'backlog/1-card.md'] });
+    expect(r.lines[0]).toBe('class-sweep (warn): incomplete — F1: pr-unswept-1; 1 finding(s); first problem F1: pr-unswept-1');
+    const record = JSON.parse(readFileSync(join(r.root, 'class-sweep', 'fix-4481.json'), 'utf8'));
+    expect(record).toMatchObject({ unswept: { F1: ['c.mjs'] }, prFiles: 4 });
+  });
+
+  it('card 5536: with no PR file list the PR-wide check fails closed; enforce exits 2', () => {
+    expect(run({ text: evidence(SWEEP), changed: null }).verdict).toMatchObject({ status: 'incomplete', reason: 'pr-files-unknown' });
+    expect(run({ text: evidence(SWEEP), changed: null, mode: 'enforce' }).exitCode).toBe(2);
+  });
+
+  it('card 5536: --checkout reads the PR files from the lane with git (base...HEAD); a bad base is unknown', () => {
+    const repo = scratch();
+    const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    g('init', '-q', '-b', 'main');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base');
+    g('branch', 'base');
+    for (const f of ['a.mjs', 'c.mjs']) writeFileSync(join(repo, f), 'x\n');
+    g('add', 'a.mjs', 'c.mjs');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'pr');
+    const r = run({ text: evidence(SWEEP), changed: null, args: [`--checkout=${repo}`, '--base=base'] });
+    expect(r.verdict.unswept).toEqual({ F1: ['c.mjs'] });
+    expect(run({ text: evidence(SWEEP), changed: null, args: [`--checkout=${repo}`, '--base=--output=/tmp/x'] }).verdict.reason).toBe('pr-files-unknown');
   });
 
   it('the mode is read from the RUNNING root\'s settings; env overrides; a bad value never loosens', () => {
