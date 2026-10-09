@@ -3,11 +3,13 @@ bornAs: xqh3tkh
 kind: story
 size: 3
 parent: "2405"
-status: active
+status: resolved
 scaffoldedBy: "ledger-slice-h"
 dateScaffolded: "2026-10-08"
 scope: ["we:scripts/conveyor/review-hold-ledger-shadow.mjs", "we:scripts/conveyor/__tests__/review-hold-ledger-shadow.test.mjs", "we:scripts/conveyor/reconcile-pass.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
+graduatedTo: a7cb69c6d6f196fb35af5e2b1fab3211fbc9e562
 tags: []
 ---
 

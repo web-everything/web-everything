@@ -1,6 +1,7 @@
 ---
 bornAs: x428kgj
 kind: task
+priority: high
 parent: "2405"
 relatedTo: ["3007"]
 status: open

@@ -1,7 +1,7 @@
 ---
 bornAs: x3x7182
 kind: epic
-size: 13
+priority: high
 parent: "5407"
 status: open
 scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/pr-state.mjs", "we:scripts/lib/verdict-ledger-store.mjs", "we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs"]
