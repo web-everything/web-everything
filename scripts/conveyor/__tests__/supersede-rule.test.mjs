@@ -159,13 +159,76 @@ describe('planSupersedeHolds', () => {
     const comment = { body: buildSupersededStandDownComment(hold), author: { login } };
     expect(plan({ openPrs: [{ ...fixture.open, comments: [...fixture.open.comments, comment] }] })).toEqual(expected);
   });
+  // PR #4560 advisory (security): a merged PR's body stays editable by its author, so only a trusted author's marker counts.
+  it.each([
+    ['the automation as gh prints a bot', { is_bot: true, login: 'app/web-everything' }, [hold]],
+    ['the automation as a REST bot', { login: 'web-everything[bot]' }, [hold]],
+    ['the automation, plain login in any case', { login: 'Web-Everything' }, [hold]],
+    ['the operator', { login: 'chalbert' }, [hold]],
+    ['an outside contributor', { login: 'rando' }, []],
+    ['a look-alike bot', { is_bot: true, login: 'app/rando' }, []],
+    ['an app/ login on a row that is not a bot', { login: 'app/web-everything' }, []],
+    ['an app/ login with is_bot false', { is_bot: false, login: 'app/web-everything' }, []],
+    ['the operator name under app/', { is_bot: true, login: 'app/chalbert' }, []],
+    ['an upper-case APP/ prefix', { is_bot: true, login: 'APP/web-everything' }, []],
+    ['a look-alike with a trusted suffix', { login: 'not-web-everything' }, []],
+    ['a double app/ prefix', { login: 'app/app/web-everything' }, []],
+    ['an empty login', { login: '' }, []],
+    ['a non-string login', { login: 7 }, []],
+  ])('merged-PR author trust: %s', (_name, author, expected) => {
+    const merged = [{ ...fixture.merged, author }];
+    expect(plan({ mergedPrs: merged })).toEqual(expected);
+    expect(supersedeCandidates({ mergedPrs: merged, openNumbers: [4522] })).toEqual(expected.length ? [4522] : []);
+  });
+  it.each([['no author field', undefined], ['a null author', null], ['a bare string author', 'web-everything']])(
+    'a merged PR with %s never holds (fail closed)', (_name, author) => {
+      const merged = [{ ...fixture.merged, author }];
+      expect(plan({ mergedPrs: merged })).toEqual([]);
+      expect(supersedeCandidates({ mergedPrs: merged, openNumbers: [4522] })).toEqual([]);
+    });
+  // The author gate alone leaves a trusted-author PR whose body someone else rewrites AFTER the merge.
+  it.each([
+    ['never edited', { lastEditedAt: null, editor: null }, [hold]],
+    ['no edit fields at all', {}, [hold]],
+    ['edited before the merge by the operator', { lastEditedAt: '2026-10-09T01:11:15Z', editor: { login: 'chalbert' } }, [hold]],
+    ['edited before the merge by an outsider', { lastEditedAt: '2026-10-09T01:11:15Z', editor: { login: 'rando' } }, [hold]],
+    ['edited at the merge instant by an outsider', { lastEditedAt: '2026-10-09T01:52:13Z', editor: { login: 'rando' } }, [hold]],
+    ['edited after the merge by the operator', { lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'chalbert' } }, [hold]],
+    ['edited after the merge by the automation', { lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'web-everything' } }, [hold]],
+    ['edited after the merge by an outsider', { lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'rando' } }, []],
+    ['edited after the merge by a look-alike app', { lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'app/rando' } }, []],
+    ['edited after the merge by nobody known', { lastEditedAt: '2026-10-09T02:00:00Z', editor: null }, []],
+    ['edited at an unreadable time', { lastEditedAt: 'soon', editor: { login: 'chalbert' } }, []],
+    ['an edit time that is a number', { lastEditedAt: 0, editor: { login: 'chalbert' } }, []],
+    ['an edit by an app/ editor login', { lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'app/web-everything' } }, []],
+    ['an edit read that failed', { bodyEditUnknown: true }, []],
+  ])('post-merge body edit: %s', (_name, edit, expected) => {
+    const merged = [{ ...fixture.merged, ...edit }];
+    expect(plan({ mergedPrs: merged })).toEqual(expected);
+    expect(supersedeCandidates({ mergedPrs: merged, openNumbers: [4522] })).toEqual(expected.length ? [4522] : []);
+  });
+  it('a merge time that cannot be read orders no edit before it, so an outsider edit is ignored', () => {
+    const merged = [{ ...fixture.merged, mergedAt: undefined, state: 'MERGED', lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'rando' } }];
+    expect(plan({ mergedPrs: merged })).toEqual([]);
+  });
+  it('an untrusted merged PR cannot hide or displace a trusted one', () => {
+    const forged = { ...fixture.merged, number: 4531, mergedAt: '2026-10-09T01:00:00Z', author: { login: 'rando' } };
+    expect(plan({ mergedPrs: [forged, fixture.merged] })).toEqual([hold]);
+  });
+  it('an untrusted merged PR naming many open PRs holds none of them', () => {
+    const body = Array.from({ length: 10 }, (_, i) => `Supersedes: #${100 + i}`).join('\n');
+    const merged = [{ number: 9, state: 'MERGED', mergedAt: '2026-10-09T01:00:00Z', body, author: { login: 'rando' } }];
+    const openPrs = Array.from({ length: 10 }, (_, i) => ({ number: 100 + i, comments: [] }));
+    expect(planSupersedeHolds({ mergedPrs: merged, openPrs, settings: { hold: true } })).toEqual([]);
+    expect(supersedeCandidates({ mergedPrs: merged, openNumbers: openPrs.map((p) => p.number) })).toEqual([]);
+  });
   it('chooses the earliest merged superseder once, regardless of input order', () => {
     const later = { ...fixture.merged, number: 4533, mergedAt: '2026-10-09T03:00:00Z' };
     expect(plan({ mergedPrs: [later, fixture.merged] })).toEqual([hold]);
   });
   it('reads only open candidate targets and deduplicates them', () => {
     expect(supersedeCandidates({ mergedPrs: [fixture.merged, fixture.merged], openNumbers: [4522, 1] })).toEqual([4522]);
-    expect(supersedeCandidates({ mergedPrs: [{ number: 1, state: 'MERGED', body: 'Supersedes #1 #2 #3' }], openNumbers: [1, 2] })).toEqual([2]);
+    expect(supersedeCandidates({ mergedPrs: [{ number: 1, state: 'MERGED', body: 'Supersedes #1 #2 #3', author: { login: 'web-everything' } }], openNumbers: [1, 2] })).toEqual([2]);
   });
 });
 

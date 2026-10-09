@@ -18,7 +18,8 @@ nowhere but here, and it is the one whose wrong version looks right.
 `Supersedes: #N, #M`). Write it as its own line of the PR body, not inside a sentence. Once your PR merges,
 the fix daemon's supersede watch (`we:scripts/conveyor/supersede-watch.mjs`) reads that line and stands #N
 down (a `superseded` stand-down plus label), so no fixer or reviewer is spent on work that already landed.
-It never closes #N: closing stays an operator decision. Prose such as "#N is superseded by this PR" is not
+It never closes #N: closing stays an operator decision. The line counts only on a PR authored by the
+automation or the operator; the same line on a PR from any other account is ignored. Prose such as "#N is superseded by this PR" is not
 read (live: #4532 merged with that prose and `fix-4522` still launched, card xiqtf7w).
 
 ## You drive it to merged. The human is not a step in this loop.

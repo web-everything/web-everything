@@ -27,7 +27,7 @@ Live 2026-10-09: #4532 (merged) says 'Supersedes #4522', yet the fix daemon laun
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — the marker is read only from a MERGED PR's body (written by a repo author) and only as a whole line; a hold comment counts only from a trusted login.
+1. **Untrusted text** — the marker is read only from a MERGED PR's body and only as a whole line, and only when that PR's author is trusted (the automation or the operator, `isTrustedSupersedeAuthor`; an `app/<slug>` login counts only on a bot row and only against the automation list; a missing author fails closed) and its body was not last edited after the merge by anyone else (`isBodyEditedAfterMergeByUntrusted`, GraphQL `lastEditedAt`/`editor`, read only for a PR with an open target; a failed read ignores that PR and is reported). A hold comment counts only from a trusted login. Residual (accepted): only the LAST editor is checked, and a trusted lane PR can still name any open PR (capped at `MAX_SUPERSEDE_TARGETS` per body); both need a trusted principal to write the marker.
 2. **Truncated reads** — `gh pr list` is capped at 200; a truncated merged list only misses older supersedes (newest first), never invents one.
 3. **Shared state files** — n/a: no local state file — the hold lives on the PR thread.
 4. **Fail closed** — setting missing/malformed/off = no hold; a failed read skips the repo this tick.

@@ -12,6 +12,8 @@
  * Examples that do not: `This supersedes #4522.` (mid-sentence), `supersedes #4522` (lower case), anything CommonMark
  * renders as code (a fenced or indented code block, a raw `<pre>`, a code span running across lines) or hides (an HTML
  * comment). `open-pr.mjs` and `docs/agent/delivery-loop.md` tell authors to write `Supersedes: #N`.
+ * The merged PR's AUTHOR must be trusted too (`isTrustedSupersedeAuthor`: the automation or the operator): a PR author can
+ * edit their own body after it merges, so an outside account could otherwise stand down any open PR.
  *
  * THE HOLD reuses the existing terminal hold — a stand-down (`stand-down.mjs`, reason `superseded`) — so
  * `reconcile-core.mjs` REFUSAL 1 stops fix, review and ci-heal for both daemons with no edit there. It never closes the
@@ -25,6 +27,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import MarkdownIt from 'markdown-it';
+import { isAutomationAuthored, isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { supersedeHoldsOn } from './stand-down.mjs';
 
 export const SUPERSEDE_HOLD_ENV = 'WE_SUPERSEDE_HOLD';
@@ -252,6 +255,52 @@ function readSupersedes(body) {
 
 const isMerged = (pr) => String(pr?.state ?? '').toUpperCase() === 'MERGED' || (typeof pr?.mergedAt === 'string' && pr.mergedAt !== '');
 
+const isTrustedLogin = (login) => typeof login === 'string' && isTrustedMarkerAuthor({ author: { login } });
+
+/**
+ * Is this merged PR's author a principal the repo trusts with a control marker? A PR author can edit the body of their
+ * own PR after it merges, so the `Supersedes` line is only as trustworthy as its author: an outside contributor (or a
+ * prompt-injected lane) could otherwise stand down up to `MAX_SUPERSEDE_TARGETS` unrelated open PRs, and with them fix,
+ * review and ci-heal. Same gate every other marker reader uses (`marker-authorship.mjs#isTrustedMarkerAuthor`: the
+ * automation or the operator). `gh pr list` prints a GitHub App as `app/<slug>` (with `is_bot: true`) where a comment
+ * author reads `<slug>`, so a lower-case `app/` login counts only on a bot row and only against the AUTOMATION list (an
+ * `app/chalbert` is never the operator; `app/rando`, `app/app/<slug>` and `APP/<slug>` stay untrusted). No author, or one
+ * that is not an object with a string login, is untrusted (fail closed: a missed hold costs one fixer run).
+ * @param {{author?:{login?:string, is_bot?:boolean}}|null|undefined} pr
+ * @returns {boolean}
+ */
+export function isTrustedSupersedeAuthor(pr) {
+  const login = pr?.author?.login;
+  if (typeof login !== 'string') return false;
+  // `app/<slug>` is only ever the automation: a bot row, compared against the automation list alone (never the operator's).
+  if (login.startsWith('app/')) return pr.author.is_bot === true && isAutomationAuthored({ author: { login: login.slice(4) } });
+  return isTrustedLogin(login);
+}
+
+/**
+ * Was the merged PR's body last edited AFTER it merged, by someone who is not trusted? The trusted-author gate alone
+ * leaves the original attack open for a trusted-author PR whose body is rewritten later by another account with write
+ * access to it. `supersede-watch.mjs` reads `lastEditedAt` and `editor` (GraphQL; `gh pr list` has no such field) for
+ * each PR that carries a marker and puts them on the row; `bodyEditUnknown: true` means that read failed. An edit before
+ * the merge, or after it by a trusted principal, is fine. An edit that cannot be ordered against the merge, or whose
+ * read failed, is treated as untrusted (fail closed). A row with no edit fields at all was never edited.
+ * @param {{mergedAt?:string, lastEditedAt?:?string, editor?:?{login?:string}, bodyEditUnknown?:boolean}} pr
+ * @returns {boolean}
+ */
+export function isBodyEditedAfterMergeByUntrusted(pr) {
+  if (pr?.bodyEditUnknown === true) return true;
+  if (pr?.lastEditedAt == null || pr.lastEditedAt === '') return false;
+  const edited = typeof pr.lastEditedAt === 'string' ? Date.parse(pr.lastEditedAt) : NaN;
+  if (!Number.isFinite(edited)) return true;
+  const merged = Date.parse(pr?.mergedAt ?? '');
+  if (Number.isFinite(merged) && edited <= merged) return false;
+  return !isTrustedLogin(pr?.editor?.login);
+}
+
+/** The merged PRs whose `Supersedes` marker may be read: merged, authored by a trusted principal, and not rewritten after the merge by an untrusted one. */
+const trustedMergedPrs = (mergedPrs) => (Array.isArray(mergedPrs) ? mergedPrs : []).filter(isMerged)
+  .filter(isTrustedSupersedeAuthor).filter((m) => !isBodyEditedAfterMergeByUntrusted(m));
+
 /**
  * The supersede holds owed now. For each OPEN PR a MERGED PR declares it supersedes (never itself, never by a PR
  * that is still open): `{ pr, by, mergedAt }`. Skips a PR whose thread already carries a trusted supersede hold
@@ -264,7 +313,7 @@ const isMerged = (pr) => String(pr?.state ?? '').toUpperCase() === 'MERGED' || (
 export function planSupersedeHolds({ mergedPrs = [], openPrs = [], settings = resolveSupersedeSettings() } = {}) {
   if (!settings?.hold) return [];
   const open = new Map((Array.isArray(openPrs) ? openPrs : []).map((p) => [Number(p?.number), p]));
-  const merged = (Array.isArray(mergedPrs) ? mergedPrs : []).filter(isMerged)
+  const merged = trustedMergedPrs(mergedPrs)
     .filter((m) => !open.has(Number(m.number)))
     .sort((a, b) => (Date.parse(a.mergedAt ?? '') || 0) - (Date.parse(b.mergedAt ?? '') || 0));
   const holds = new Map();
@@ -284,7 +333,7 @@ export function planSupersedeHolds({ mergedPrs = [], openPrs = [], settings = re
 export function supersedeCandidates({ mergedPrs = [], openNumbers = [] } = {}) {
   const open = new Set((Array.isArray(openNumbers) ? openNumbers : []).map(Number));
   const out = new Set();
-  for (const m of (Array.isArray(mergedPrs) ? mergedPrs : []).filter(isMerged)) {
+  for (const m of trustedMergedPrs(mergedPrs)) {
     for (const t of parseSupersedes(m.body)) if (t !== Number(m.number) && open.has(t)) out.add(t);
   }
   return [...out];

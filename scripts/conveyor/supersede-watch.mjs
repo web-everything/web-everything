@@ -16,7 +16,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
-import { planSupersedeHolds, resolveSupersedeSettings, supersedeCandidates } from './supersede-rule.mjs';
+import { isTrustedSupersedeAuthor, parseSupersedes, planSupersedeHolds, resolveSupersedeSettings, supersedeCandidates } from './supersede-rule.mjs';
 import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -30,14 +30,44 @@ const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
 }) || 'null'));
 
 /**
- * Merged PRs (number, body, state, mergedAt) merged within `lookbackDays` of `now`. `gh pr list` returns the newest
+ * Merged PRs (number, body, state, mergedAt, author) merged within `lookbackDays` of `now`. `gh pr list` returns the newest
  * first; the window is applied here on `mergedAt` (a search qualifier would hide behind GitHub's search index).
  */
 export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync }) {
   const since = now - lookbackDays * 86_400_000;
   return (ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'merged',
-    '--limit', String(LIST_LIMIT), '--json', 'number,body,state,mergedAt'], exec) ?? [])
+    '--limit', String(LIST_LIMIT), '--json', 'number,body,state,mergedAt,author'], exec) ?? [])
     .filter((p) => (Date.parse(p?.mergedAt ?? '') || 0) >= since);
+}
+
+/**
+ * When a merged PR's body was last edited and by whom (GraphQL: `gh pr list` has no such field). Read only for the few
+ * merged PRs that carry a marker. `{ lastEditedAt: null, editor: null }` = never edited.
+ */
+export function defaultReadBodyEdit({ repo, pr, exec = execFileSync }) {
+  const [owner, name] = slugOf(repo).split('/');
+  const out = ghJson(['api', 'graphql', '-f', 'query=query($o:String!,$n:String!,$p:Int!){repository(owner:$o,name:$n){pullRequest(number:$p){lastEditedAt editor{login}}}}',
+    '-f', `o=${owner}`, '-f', `n=${name}`, '-F', `p=${Number(pr)}`], exec);
+  const node = out?.data?.repository?.pullRequest;
+  if (!node) throw new Error(`no pull request #${pr} in ${slugOf(repo)}`);
+  return { lastEditedAt: node.lastEditedAt ?? null, editor: node.editor ? { login: node.editor.login } : null };
+}
+
+/**
+ * Put the body-edit facts on each merged PR whose marker could matter (trusted author, at least one target that is
+ * still OPEN, so a read costs a call only when a hold is actually possible). A failed read marks that one PR
+ * `bodyEditUnknown` (the rule then ignores it: a missed hold costs one fixer run, a false one stops an unrelated PR);
+ * it never throws and never blocks the others. Returns `{ rows, failures }` so a persistent failure (no GraphQL access,
+ * a rate limit) is reported instead of silently switching every hold off.
+ */
+export function withBodyEdits({ repo, mergedPrs, openNumbers, readBodyEdit = defaultReadBodyEdit }) {
+  const open = new Set(openNumbers.map(Number));
+  let failures = 0;
+  const rows = mergedPrs.map((m) => {
+    if (!isTrustedSupersedeAuthor(m) || !parseSupersedes(m.body).some((t) => open.has(t))) return m;
+    try { return { ...m, ...readBodyEdit({ repo, pr: m.number }) }; } catch { failures += 1; return { ...m, bodyEditUnknown: true }; }
+  });
+  return { rows, failures };
 }
 
 /** Open PR numbers only (cheap); comments are read just for the candidates. */
@@ -74,16 +104,19 @@ export function defaultPostHold({ repo, hold, exec = execFileSync }) {
 export function runSupersedeWatch({
   repo, apply = true, settings = resolveSupersedeSettings(), now = Date.now(),
   readMergedPrs = defaultReadMergedPrs, readOpenNumbers = defaultReadOpenNumbers, readPr = defaultReadPr, postHold = defaultPostHold,
+  readBodyEdit = defaultReadBodyEdit,
 } = {}) {
   if (!settings?.hold) return { repo, holds: [], applied: [], skipped: 'supersede hold is off' };
   try {
-    const mergedPrs = readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now });
-    const candidates = supersedeCandidates({ mergedPrs, openNumbers: readOpenNumbers({ repo }) });
+    const openNumbers = readOpenNumbers({ repo });
+    const { rows: mergedPrs, failures: bodyEditFailures } = withBodyEdits({
+      repo, mergedPrs: readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now }), openNumbers, readBodyEdit });
+    const candidates = supersedeCandidates({ mergedPrs, openNumbers });
     // Re-read each candidate: it must still be OPEN, and its own thread decides idempotency.
     const openPrs = candidates.map((pr) => readPr({ repo, pr })).filter((p) => String(p?.state ?? '').toUpperCase() === 'OPEN');
     const holds = planSupersedeHolds({ mergedPrs, openPrs, settings });
     const applied = apply ? holds.map((hold) => ({ ...hold, ...postHold({ repo, hold }) })) : [];
-    return { repo, holds, applied };
+    return { repo, holds, applied, ...(bodyEditFailures ? { bodyEditFailures } : {}) };
   } catch (e) {
     return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] };
   }
@@ -94,6 +127,7 @@ export function formatSupersedeLines(result) {
   const lines = [];
   for (const r of result?.repos ?? []) {
     if (r.error) lines.push(`supersede-watch ${r.repo} — read failed (non-fatal, retried next tick): ${r.error}`);
+    if (r.bodyEditFailures) lines.push(`supersede-watch ${r.repo} — ${r.bodyEditFailures} merged-PR body-edit read(s) failed; those PRs' Supersedes lines are ignored this tick (retried next tick)`);
     const applied = new Map((r.applied ?? []).map((a) => [a.pr, a]));
     for (const h of r.holds ?? []) {
       const a = applied.get(h.pr);

@@ -40,6 +40,15 @@ export default {
       '- <!-- describe the change\n-->\nSupersedes #4522']) {
       if (parseSupersedes(body).length) violations.push(`fenced example read as a supersede marker: ${JSON.stringify(body)}`);
     }
+    // PR #4560 advisory (security): a merged PR's body stays editable by its author, so an outside author's marker holds nothing.
+    for (const author of [{ login: 'rando' }, { is_bot: true, login: 'app/rando' }, undefined]) {
+      const forged = { ...fixture.merged, author };
+      if (planSupersedeHolds({ ...input, mergedPrs: [forged] }).length) violations.push(`merged PR by ${JSON.stringify(author)} planned a supersede hold`);
+    }
+    // ... and neither does a trusted-author PR whose body an outsider rewrote after the merge (or whose edit could not be read).
+    for (const edit of [{ lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'rando' } }, { bodyEditUnknown: true }]) {
+      if (planSupersedeHolds({ ...input, mergedPrs: [{ ...fixture.merged, ...edit }] }).length) violations.push(`post-merge body edit ${JSON.stringify(edit)} planned a supersede hold`);
+    }
     return { violations };
   },
   judge(report) { return report.violations; },
