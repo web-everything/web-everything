@@ -37,6 +37,7 @@
  * we:scripts/conveyor/__tests__/build-dispatch-policy.test.mjs.
  */
 
+import { OPEN_PR_CAP_SCOPE_DEFAULTS, readOpenPrCapScope, countOpenPrsForCap, formatOpenPrCap } from '../lib/open-pr-cap-scope.mjs';
 import { normNum } from './queue-store.mjs';
 import { parseScopeEntry, pathsOverlap, firstScopeOverlap, overlapsInFlight } from '../readiness/overlap-chain.mjs';
 
@@ -46,6 +47,8 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   maxConcurrentBuilds: 1, // --max-concurrent: Claude, including unknown legacy executors
   maxConcurrentExternalBuilds: 4, // Codex + Antigravity together
   maxOpenPrs: 12,
+  // Operator ruling 2026-10-09: accepted and card-only PRs do not consume the landing cap.
+  openPrCapScope: readOpenPrCapScope(),
   // #4353 — open items from build start until MERGE (durable in-flight ∪ delivered-by-open-PR), a tighter,
   // separate cap from `maxConcurrentBuilds` (which only bounds builds actually running right now). Unmeasured
   // starting point per the operator's own framing — see `planBuildDispatch`'s `wip-cap` rule below.
@@ -78,7 +81,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   rules: Object.freeze([
     { id: 'cap', text: 'at most maxConcurrentBuilds Claude and maxConcurrentExternalBuilds external builds in flight', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'wip-cap', text: 'at most maxOpenItems items open from build start until merge (durable in-flight ∪ delivered-by-open-PR)', enforcedBy: 'build-dispatch-policy.mjs' },
-    { id: 'landing-freeze', text: 'no new build while open PRs > maxOpenPrs or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
+    { id: 'landing-freeze', text: 'no new build while counted open PRs > maxOpenPrs (card-only and review:accepted PRs are not counted) or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'main-red', text: "no new build while main's CI is red (setting freeze.mainRed; prepares and the main-fix owner exempt)", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'scope-vs-open-prs', text: "a build whose scope overlaps an open PR's files waits for that PR", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'hot-file', text: 'no two in-flight builds on the same file', enforcedBy: 'build-dispatch-policy.mjs' },
@@ -199,6 +202,7 @@ function executorClass(executor) {
  *   default) keeps the OLD, unfiltered union — every existing caller/test that predates this card sees no
  *   change; the real daemon always passes its own set.
  * @returns {{freeze:{frozen:boolean, reasons:string[]}, slots:number, dispatch:Array<object>, hold:Array<object>,
+ *   openPrCap:{total:number, counted:number, cardOnly:number, accepted:number, countedPrs:string[], cardOnlyPrs:string[], acceptedPrs:string[], cap:number},
  *   openItems:{count:number, cap:number, nums:string[]}}} `openItems` is the PRE-TICK union
  *   (`{inFlight} ∪ {delivered-by-open-PR ∩ dispatchedByBuilder}`), #4353/xovjhwh — the value the `wip-cap` rule
  *   below checks and decrements.
@@ -218,7 +222,8 @@ export function planBuildDispatch({
   // tell an open-PR-count freeze (a build-WIP limit) from a kill switch or a freeze label (hold everything).
   const freezeKinds = new Set();
   if (killSwitch?.engaged) { freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`); freezeKinds.add('kill-switch'); }
-  if (openPrs.length > policy.maxOpenPrs) { freezeReasons.push(`${openPrs.length} open PRs > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
+  const openPrCap = countOpenPrsForCap(openPrs, policy.openPrCapScope ?? OPEN_PR_CAP_SCOPE_DEFAULTS);
+  if (openPrCap.counted > policy.maxOpenPrs) { freezeReasons.push(`${formatOpenPrCap(openPrCap)} > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
   // GLOBAL freeze set — `blocked:daemon-bug` only (#3383 continuation, live incident 2026-09-28). A per-PR
   // `*-stalled` label never reaches this set any more; it is still an ordinary open PR below, so the
   // `scope-vs-open-prs` loop still holds any candidate whose scope overlaps ITS files. Falls back to the full
@@ -330,6 +335,7 @@ export function planBuildDispatch({
     // the tick core passed in, visible to a dry-run/status line even though this cap no longer reads it.
     externalBuilding: Number(externalBuilding) || 0,
     mainRedFreeze: { frozen: mainRedFreeze?.frozen === true, ...(mainRedFreeze?.frozen ? { reason: mainRedFreeze.reason } : {}) }, // card xu1nixv
+    openPrCap: { ...openPrCap, cap: policy.maxOpenPrs },
     openItems: { count: openItemsInitial.size, cap: maxOpenItems, nums: [...openItemsInitial].sort() },
   };
 }
