@@ -617,6 +617,10 @@ export function planMainRedRebases({
   // xd3dkzx — `mainRuns` (main's own run list, annotated with `checkConclusions`) lets the "is main recovered?"
   // gate be judged per failing check. Omitted → `[]` → byte-identical to the old whole-workflow gate.
   mainRuns = [], recoveryScope = resolveMainRecoveryScope(),
+  // Card xu1nixv (incident 2026-10-08: #4522, the fix for red main, was refused `main-still-red` — the fix told to
+  // wait for main). PR numbers that own the red-main fix (the published priority record's `prs`): never refused
+  // `main-still-red`; every other check (attribution, ahead-by, the per-head cap) still applies. `[]` = before.
+  mainFixPrs = [],
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -661,7 +665,8 @@ export function planMainRedRebases({
     // every required check green on the PR itself, and the per-head cap below still bounds the attempts.
     const recoveredCheck = mainStillRed && recoveryScope === 'check'
       && isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns, failureCompletedAt: base.failureCompletedAt }) ? base.failingCheckName : null;
-    if (mainStillRed && !recoveredCheck) {
+    const isMainFix = (mainFixPrs || []).map(Number).includes(prNumber);
+    if (mainStillRed && !recoveredCheck && !isMainFix) {
       refusals.push({
         ...base, kind: 'main-still-red',
         why: `main's own CI is still red right now — refreshing PR #${prNumber} against it would not prove anything; wait for main to recover`,

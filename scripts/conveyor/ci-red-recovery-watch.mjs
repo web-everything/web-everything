@@ -86,6 +86,8 @@ import {
 import { rebaseDropManifest } from '../lib/rebase-drop-manifest.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
+import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 /** How many open PRs one sweep reads — mirrors `we:scripts/conveyor/reconcile-pass.mjs#PR_LIST_LIMIT`. */
 export const PR_LIST_LIMIT = 200;
@@ -215,6 +217,8 @@ export function sweepCiRedRecovery({
   maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // #2811 — injectable so a test can pin the restamp-first/rearm-fallback chain with no `gh`/child-process.
   reconcileAcceptance = reconcileAcceptanceAfterRebase,
+  // Card xu1nixv — the published red-main priority record (WE only); hermetic (null) inside a test run.
+  readPriority = () => readMainRedPriority(),
 } = {}) {
   const prs = readOpenPrs({ repo });
   // soak-main-red — judge every REQUIRED check (live branch-protection list when readable, else
@@ -272,7 +276,11 @@ export function sweepCiRedRecovery({
     return { ...withFacts, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha) };
   });
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
-  const plan = planMainRedRebases({ candidates, mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns });
+  // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
+  const prio = readPriority();
+  const isWe = repo == null || repo === 'we' || repo === CONSTELLATION_REPOS.we.slug;
+  const mainFixPrs = prio && prio.repo === 'we' && isWe ? (Array.isArray(prio.prs) ? prio.prs : [prio.pr]) : [];
+  const plan = planMainRedRebases({ candidates, mainRedWindows, mainLatestCheckRuns, maxRebaseRetriesPerSha, mainRuns, mainFixPrs });
 
   // x5uqim1 follow-up (#4075/#3383) part (c) — "check the owed-ci-rerun path for frontierui/plateau-app too":
   // `rebaseDropManifest` needs a REAL LOCAL checkout of the repo it rebases (this file's own header). Left at

@@ -179,6 +179,25 @@ describe('case 1 — the dispatch, keyed by PR NUMBER (#3296)', () => {
     for (const r of plan.refusals) expect(REFUSAL_KINDS).toContain(r.kind);
     for (const d of plan.dispatch) expect(DISPATCH_KINDS).toContain(d.kind);
   });
+
+  // Review round 1 on PR #4527 (F1): `main-fix-combining` / `main-fix-owed-elsewhere` were emitted but never listed, so
+  // `formatReport` and land-advance's `reconcileHolds` (both keyed on REFUSAL_KINDS) silently dropped them. A fixture
+  // plan cannot reach every branch, so this reads the SOURCE: every literal kind the pass hands to `refuse(...)` or
+  // pushes onto `refusals` must be registered. (Dynamic kinds — `refuse(live.kind, …)` — are covered by the plan tests.)
+  it('every LITERAL refusal kind the source can emit is on the frozen REFUSAL_KINDS list (no unregistered refusal)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-core.mjs'), 'utf8');
+    const literal = new Set([...src.matchAll(/\brefuse\(\s*'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]));
+    for (const m of src.matchAll(/refusals\.push\(\{\s*(?:\.\.\.[A-Za-z]+,\s*)?kind:\s*'([a-z][a-z0-9-]*)'/g)) literal.add(m[1]);
+    expect(literal.size).toBeGreaterThan(15); // the scan really found the call sites
+    // `timeout-retry-ineligible` is deliberately NOT a refusal kind: it is pushed alongside the `ci-heal` dispatch the
+    // same PR still gets, as an informational row (registering it would make land-advance hold a PR that is being
+    // healed). Whether that row should be a note instead is filed as a card (see the PR #4527 round-1 evidence).
+    const INFORMATIONAL_ALONGSIDE_DISPATCH = ['timeout-retry-ineligible'];
+    expect([...literal].filter((k) => !REFUSAL_KINDS.includes(k) && !INFORMATIONAL_ALONGSIDE_DISPATCH.includes(k)).sort()).toEqual([]);
+  });
+  it('REFUSAL_KINDS has no duplicate entry', () => {
+    expect(new Set(REFUSAL_KINDS).size).toBe(REFUSAL_KINDS.length);
+  });
 });
 
 // ── CASE 2 — REFUSAL 1: `stood-down` IS TERMINAL ──────────────────────────────────────────────────────────────
@@ -3747,5 +3766,45 @@ describe('held item 141: an older-head block the current-head reviewer ruled not
   ])('%s: no dispute and no "owed a fix" once the current-head reviewer ruled them; still fires while unruled', (_, file, beforeRulings) => {
     expect(disputeOrSendBack(replay(file))).toEqual([]);
     expect(disputeOrSendBack(replay(file, beforeRulings)).length).toBeGreaterThan(0);
+  });
+});
+
+// ── Card xu1nixv (incident 2026-10-08) — the red-main fix PR's fast lane ─────────────────────────────────────
+// #4522 (the fix for red main) sat as a draft ("still a draft"), then was refused `owed-ci-rerun` ("main is red")
+// while every other PR waited for main. With the published priority record, that one PR goes first, is promoted
+// from draft at once, and is never told to wait for main. `mainRedPriority: null` = before this card.
+describe('xu1nixv — the red-main fix PR is first, never a waiting draft, never owed-ci-rerun', () => {
+  const MAIN_RED_WINDOWS = [{ start: '2026-09-25T01:30:55Z', end: '2026-09-25T02:31:25Z' }];
+  const priority = (pr) => ({ repo: 'we', pr, firstRedSha: '7c731a95e', setAt: NOW, expiresAt: NOW + 30 * 60_000 });
+  const redOnMain = (over = {}) => pr1563({ number: 4522, labels: [], statusCheckRollup: redRollup, comments: [],
+    requiredCheckCompletedAt: '2026-09-25T01:57:47Z', aheadByOnMain: 33, ...over });
+
+  it('before this card the fix PR is refused owed-ci-rerun; with priority it is planned a ci-heal', () => {
+    const before = planReconcile({ prs: [redOnMain()], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS });
+    expect(before.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', prNumber: 4522 })]);
+    const after = planReconcile({ prs: [redOnMain()], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS, mainRedPriority: priority(4522) });
+    expect(after.refusals.some((r) => r.kind === 'owed-ci-rerun')).toBe(false);
+    expect(after.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 4522 })]);
+  });
+
+  it('other PRs keep waiting for main (only the owner is exempt)', () => {
+    const plan = planReconcile({ prs: [redOnMain({ number: 2635 })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS, mainRedPriority: priority(4522) });
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', prNumber: 2635 })]);
+  });
+
+  it('a draft fix PR is promoted at once, even before its checks are green', () => {
+    const draft = pr1563({ number: 4522, isDraft: true, labels: lbl('review:pending'), statusCheckRollup: pendingRollup, comments: [] });
+    expect(planReconcile({ prs: [draft], agents: [], now: NOW }).dispatch).toEqual([]);
+    expect(planReconcile({ prs: [draft], agents: [], now: NOW, mainRedPriority: priority(4522) }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'promote-draft', prNumber: 4522 })]);
+  });
+
+  it('the fix PR is planned first (review queue order); an expired record changes nothing', () => {
+    const a = pr1563({ number: 4600, labels: lbl('review:pending'), statusCheckRollup: greenRollup, comments: [] });
+    const fix = pr1563({ number: 4522, labels: lbl('review:pending'), statusCheckRollup: greenRollup, comments: [] });
+    const first = planReconcile({ prs: [a, fix], agents: [], now: NOW, mainRedPriority: priority(4522) }).dispatch.map((d) => d.prNumber);
+    expect(first).toEqual([4522, 4600]);
+    const expired = { ...priority(4522), expiresAt: NOW - 1 };
+    expect(planReconcile({ prs: [a, fix], agents: [], now: NOW, mainRedPriority: expired }).dispatch.map((d) => d.prNumber)).toEqual([4600, 4522]);
   });
 });

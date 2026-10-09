@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, unlabelledHandOffLabel } from '../pr-land.mjs';
+import { pushFailedDetail, mergeMethodFlag, buildCreateArgs, prCreateBodyGuard, buildMergeArgs, buildRenumberHealArgs, buildRegenArgs, buildAddLabelArgs, classifyChecks, planPrLand, pollVerdict, isPostLandTreeDirty, postLandSkips, postLandReport, scopeHealChangedPaths, resolveProducerReviewLabel, resolveRosterReconcile, resolveParkLabel, withAuthorStamp, composePrBody, PARK_LABELS, decideHoldReadyStrip, resolveDraft, isMainFixPr, unlabelledHandOffLabel } from '../pr-land.mjs';
 import { REVIEW_LABELS, REVIEW_LABEL_META, READY_TO_MERGE_LABEL, scoreEscalation } from '../lib/review-escalation.mjs';
 import { buildAuthorActorMarker, parseAuthorActorId } from '../lib/review-independence.mjs';
 import { PANEL_LENSES } from '../lib/review-core.mjs';
@@ -474,7 +474,7 @@ describe('pr-land.mjs source wiring — draft-first PRs applied at the park crea
   const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
   it('the create params carry `draft` computed via resolveDraft, threaded from PLAN.mode and the --no-draft flag', () => {
     expect(src).toMatch(/const DRAFT_OPT_OUT = !!flags\['no-draft'\];/);
-    expect(src).toMatch(/const DRAFT = resolveDraft\(\{ mode: PLAN\.mode, optOut: DRAFT_OPT_OUT \}\);/);
+    expect(src).toMatch(/const DRAFT = resolveDraft\(\{ mode: PLAN\.mode, optOut: DRAFT_OPT_OUT, ref: REF, title: sourceTitle \?\? '' \}\);/);
     expect(src).toMatch(/const createParams = \{ base: BASE, head: REF, body: CREATE_BODY, draft: DRAFT,/);
     expect(src).toMatch(/get title\(\) \{ return publicationTitle\(/);
     expect(src).toMatch(/if \(DRY_RUN\) \{\s+const createArgs = buildCreateArgs\(createParams\);/);
@@ -882,5 +882,16 @@ describe('E3 #3929 — pr-land records its holds in the verdict ledger (additive
     expect(body).toContain("declaredActor: 'producer', source: 'pr-land'");
     expect(body).toContain('catch');
     expect(body).not.toMatch(/throw |process\.exit|return false/);
+  });
+});
+
+describe('resolveDraft — a red-main fix PR always opens ready (card xu1nixv, incident 2026-10-08)', () => {
+  it('the main-fix owner branch and a fix-main title open ready even in park mode', () => {
+    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-fix-7c731a95e', title: 'x' })).toBe(false);
+    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-red-soak', title: 'WE #xh6ij2v: fix — fix red main — orphan-adopt soak' })).toBe(false);
+  });
+  it('any other parked PR stays draft-first (the card PR "a red main gets an owner" included)', () => {
+    expect(resolveDraft({ mode: 'park', optOut: false, ref: 'lane/main-red-owner-card', title: 'backlog: file xu1nixv — a red main gets an owner' })).toBe(true);
+    expect(isMainFixPr({ ref: 'lane/foo', title: 'fix(drain): main tip refresh' })).toBe(false);
   });
 });
