@@ -109,6 +109,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
+import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
@@ -1345,6 +1346,9 @@ export function runReconcileFixDispatch({
   tryResume = tryResumeFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
+  // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
+  // setting). Real git only with the real reconcile; an injected `reconcile` (every test) keeps its own fences.
+  netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
   resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
   // #xmtbdgs multi-repo slice 6 — the item-less diff read; UN-prefixed (see `planFixesFromReconcile`'s own
   // docblock for why this is a distinct binding from `resolveFallbackScope` above, which IS prefixed). #xcla4iv
@@ -1387,7 +1391,8 @@ export function runReconcileFixDispatch({
   // will, once fix dispatch is turned on for that repo, dispatch fixes) from code that had already been proven
   // stale. Run it for every repo.
   assertMainNotStale(root, checkStaleness);
-  const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  const reconciledRaw = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
+  const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
 
@@ -1544,6 +1549,7 @@ export function runReconcileFixDispatch({
         continue;
       }
       dispatched.push(borrowed ? { ...result, borrowed, reason: BORROW_REASON } : result);
+      if (entry.overlapExempt) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
     } catch (e) {
       refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
@@ -1851,8 +1857,16 @@ export function resolveScopeOverlapMaxWaitMinutes(env = process.env) {
   return n === 0 ? null : n;
 }
 
+// Card xd1tvd0 — one exempt stale-base rebase per PR head, remembered for the life of this process.
+const exemptRebaseHeads = new Set();
+/** The live exemption: the `rebaseExempt` setting, read per call, with this process's per-head memory. */
+export const defaultRebaseExempt = (entry) => rebaseOverlapExemption(entry, { on: resolveNetScopeSettings().rebaseExempt, used: exemptRebaseHeads });
+
 export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims = [], {
   now = Date.now(), maxWaitMinutes = resolveScopeOverlapMaxWaitMinutes(), urgentPrs = new Set(),
+  // Card xd1tvd0 — a stale-base rebase edits none of the PR's files: it is admitted past every overlap and blocks nobody.
+  // `null` = no exemption (the behaviour before the card).
+  rebaseExempt = defaultRebaseExempt,
 } = {}) {
   const accepted = [];
   const refusals = [];
@@ -1883,6 +1897,8 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   const orderedRanks = queue.map((entry, index) => ({ ...rankByPr.get(entry.pr), rank: index + 1 }));
   const ordinal = (n) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th')}`;
   for (const entry of queue) {
+    const exemption = rebaseExempt ? rebaseExempt(entry) : null;
+    if (exemption?.exempt) { accepted.push({ ...entry, overlapExempt: exemption.why }); continue; }
     const inFlight = [
       ...buildClaims
         .filter((c) => !(entry.itemNum != null && String(c.meta?.num) === String(entry.itemNum)))
