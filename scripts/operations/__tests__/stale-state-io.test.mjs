@@ -64,7 +64,9 @@ it('retains real corrupt/unreadable lease files alongside normal leases; real CL
     expect(result.gaps.some((g) => g.includes('enumeration failed'))).toBe(false);
     const stdout = execFileSync(process.execPath, [resolve(scripts, 'operations/run.mjs'), 'stale-state', '--json'], {
       cwd: clone, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-      env: { ...process.env, LANE_POOL_ROOT: pool, OPERATION_RUNS_DIR: runDir, OPERATION_CALLS_DIR: callsDir },
+      // WE_DAEMON_MANAGED_CLONE exempts the runner-freshness check, which would otherwise read origin/main of the real
+      // checkout that owns the symlinked scripts (hermetic tests forbid it; freshness is not what this test proves).
+      env: { ...process.env, LANE_POOL_ROOT: pool, OPERATION_RUNS_DIR: runDir, OPERATION_CALLS_DIR: callsDir, WE_DAEMON_MANAGED_CLONE: '1' },
     });
     const report = JSON.parse(stdout).verdict;
     expect(report.records.find((r) => r.kind === 'lane-lease')).toMatchObject({ verdict: 'live', hasUnsafeWork: false });

@@ -112,10 +112,12 @@ describe('xvr2o8r — runStrandedSweepStep: the drain\'s once-per-pass call to t
   });
 
   it('defaults sweepFn to the real autoStrandedSweepPass when none is injected (wiring is live, not vestigial)', () => {
-    // No sweepFn injected — this exercises the real default wiring against this checkout's OWN cwd/backlog.
+    // The REAL autoStrandedSweepPass is the sweepFn (the default wiring), with only its two readers faked: the
+    // default main-log reader runs `git fetch origin` / `git log origin/main`, which a hermetic test must not do.
     // We only assert it never throws and returns the expected report SHAPE; the actual matching behaviour is
     // backlog-stranded-sweep.test.mjs's job.
-    const result = runStrandedSweepStep({ dryRun: true, asJson: true });
+    const sweepFn = (o) => autoStrandedSweepPass({ ...o, readCardsFn: () => [], readMainLogFn: () => [] });
+    const result = runStrandedSweepStep({ dryRun: true, asJson: true, sweepFn });
     expect(result).toHaveProperty('ok');
     expect(result).toHaveProperty('autoResolvable');
     expect(result).toHaveProperty('applied');

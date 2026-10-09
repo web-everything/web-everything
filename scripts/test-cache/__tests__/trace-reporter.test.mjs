@@ -3,7 +3,7 @@
  * @description prepare-124 S3 — traces folded into the shadow decisions: auto-deny, the traced input list as a manifest
  * (a changed listed input is a key-miss, not a hit), and K-clean-runs admission. Uses synthetic trace files.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +12,17 @@ import { atomicWrite, readAdmission } from '../../lib/test-result-store.mjs';
 import { traceFileBase } from '../../lib/test-cache-trace.mjs';
 import { latestPerFile, summarize } from '../trace-report.mjs';
 import ShadowReporter from '../shadow-reporter.mjs';
+
+// The reporter records `git merge-base HEAD origin/main` as the run's base sha; hermetic tests may not read the real
+// checkout's remote refs. Answer that one probe with "no base" (the reporter already treats it as null); everything
+// else passes through.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    execFileSync: (cmd, args, ...rest) => (cmd === 'git' && args?.[0] === 'merge-base' ? '' : actual.execFileSync(cmd, args, ...rest)),
+  };
+});
 
 const dirs = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'trr-')); dirs.push(d); return d; };

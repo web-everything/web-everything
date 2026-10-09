@@ -5,7 +5,8 @@
  * through. See `we:scripts/lib/approval-prevention-notice.mjs`'s header for the decision this exercises, and
  * `we:scripts/review-set-label.mjs`'s own `runApprovalPreventionFiling` for the wiring.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterAll } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +21,26 @@ import {
 import { REPO_ROOT as REAL_REPO_ROOT } from '../operations/detached-dispatch.mjs';
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
+
+// HERMETIC (card xcu4cqf): an accept makes `runReviewLabelCli` read the PR's net diff (`git fetch origin …`,
+// `merge-base`/`diff` against `origin/...`) in the process's git repo — the real checkout when run from a lane, a live
+// remote read the hermetic git shim refuses. The wiring under test does not depend on the diff, so git is pinned (via
+// GIT_DIR, inherited by the CLI's git children) to a throwaway repo whose `origin` is itself and which has no `lane/x`
+// branch: the net-diff read degrades to "unscored", as it does on any clone lacking that remote branch.
+let netDiffFixtureDir = null;
+const netDiffGitDir = () => {
+  if (netDiffFixtureDir) return join(netDiffFixtureDir, '.git');
+  const dir = mkdtempSync(join(tmpdir(), 'approval-prevention-netdiff-'));
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_DIR: undefined } });
+  g('init', '-q', '-b', 'main');
+  writeFileSync(join(dir, 'f.txt'), 'base\n');
+  g('add', 'f.txt');
+  g('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--no-gpg-sign', '-m', 'base');
+  g('remote', 'add', 'origin', dir);
+  netDiffFixtureDir = dir;
+  return join(dir, '.git');
+};
+afterAll(() => { if (netDiffFixtureDir) { try { rmSync(netDiffFixtureDir, { recursive: true, force: true }); } catch { /* best-effort */ } netDiffFixtureDir = null; } });
 
 describe('derivePreventionParent — #4075 default, unless a finding names a better one', () => {
   it('defaults to 4075 when no finding names a parent', () => {
@@ -424,6 +445,8 @@ describe('runApprovalPreventionFiling wired end-to-end through runReviewLabelCli
     const realExit = process.exit.bind(process);
     process.exit = (code) => { const e = new Error('process.exit'); e.exitCode = code; throw e; };
     let exitCode = 0;
+    const prevGitDir = process.env.GIT_DIR;
+    process.env.GIT_DIR = netDiffGitDir();
     try {
       runReviewLabelCli({
         defaultActor: 'test',
@@ -437,7 +460,10 @@ describe('runApprovalPreventionFiling wired end-to-end through runReviewLabelCli
         provider, argv, ...config,
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; }
-    finally { process.exit = realExit; }
+    finally {
+      process.exit = realExit;
+      if (prevGitDir === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prevGitDir;
+    }
     return { exitCode, payload: JSON.parse(chunks.join('') || '{}') };
   };
 

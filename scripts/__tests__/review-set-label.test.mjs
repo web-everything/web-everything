@@ -17,7 +17,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   decideSetLabel, presentRemoveLabels, buildVerdictComment, neutralizeCommentMarkers, normalizeChannel,
-  runReviewLabelCli, projectVerdictCommentLength, REVIEW_LABEL_TARGETS, GH_COMMENT_MAX,
+  runReviewLabelCli as runReviewLabelCliRaw, projectVerdictCommentLength, REVIEW_LABEL_TARGETS, GH_COMMENT_MAX,
   checkBodyFileLocation, bodyFileRoots,
   // #x9krtkb — the restamp path's carried-human-clearance decision (bug 1) and its CLI wiring (bug 2's
   // `--new-head`, exercised through `runReviewLabelCli` below with a stub provider).
@@ -46,6 +46,34 @@ import {
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
+
+// HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
+// +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
+// is the real checkout when run from a lane — a live remote read the hermetic git shim refuses. These tests assert
+// the verdict wiring, not the diff, so they point git (via GIT_DIR, which the CLI's git children inherit) at a
+// throwaway repo whose `origin` is itself and which has no `lane/x` branch: the net-diff read resolves nothing and
+// degrades to "unscored", exactly as it does on a clone with no such remote branch.
+let netDiffFixtureDir = null;
+const netDiffFixtureGitDir = () => {
+  if (netDiffFixtureDir) return join(netDiffFixtureDir, '.git');
+  const dir = mkdtempSync(join(tmpdir(), 'review-label-netdiff-'));
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_DIR: undefined } });
+  g('init', '-q', '-b', 'main');
+  writeFileSync(join(dir, 'f.txt'), 'base\n');
+  g('add', 'f.txt');
+  g('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--no-gpg-sign', '-m', 'base');
+  g('remote', 'add', 'origin', dir);
+  netDiffFixtureDir = dir;
+  return join(dir, '.git');
+};
+const netDiffFixtureEnv = () => ({ GIT_DIR: netDiffFixtureGitDir() });
+afterAll(() => { if (netDiffFixtureDir) { try { rmSync(netDiffFixtureDir, { recursive: true, force: true }); } catch { /* best-effort */ } netDiffFixtureDir = null; } });
+/** `runReviewLabelCli` with git pinned to the throwaway repo for the duration of the call. */
+const runReviewLabelCli = (cfg) => {
+  const prev = process.env.GIT_DIR;
+  process.env.GIT_DIR = netDiffFixtureGitDir();
+  try { return runReviewLabelCliRaw(cfg); } finally { if (prev === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prev; }
+};
 
 const human = [{ name: REVIEW_LABELS.human }, { name: 'ready-to-merge' }];
 const pending = [{ name: REVIEW_LABELS.pending }, { name: 'ready-to-merge' }];
@@ -1779,6 +1807,7 @@ process.exit(0);
         GH_PR_LABELS: JSON.stringify(labels),
         GH_PR_CREATED_AT: createdAt,
         CLAUDE_CODE_SESSION_ID: sessionId,
+        ...netDiffFixtureEnv(), // hermetic: git reads a throwaway repo, never the real checkout's origin/*
       },
     },
   );
