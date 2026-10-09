@@ -36,7 +36,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (!Number.isInteger(intervalMs) || intervalMs <= 0 || intervalMs > 2147483647) throw new Error('--interval-ms must be a positive timer interval');
   const repoDir = fileURLToPath(new URL('../../', import.meta.url));
-  const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8', timeout: 10000 }).trim();
+  const codeSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoDir, encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 }).trim();
   // A proof root isolates both snapshots and job records; normal boot uses the runtime's shared jobs home.
   const dir = root ? daemonJobsDir('resource-sampler', { WE_DAEMON_JOBS_ROOT: join(root, 'daemon-jobs') }) : daemonJobsDir('resource-sampler');
   mkdirSync(dir, { recursive: true });

@@ -11,6 +11,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+import { isValidPolicyLayer, resolveResourcePolicy, decideAdmission } from './resource-policy.mjs';
+// The pure policy + decision live in we:scripts/lib/resource-policy.mjs so a read-only declaring module (the
+// resource-status operation) can import them without reaching fs.
+export { RESOURCE_POLICY_STANDARD, RESOURCE_POLICY_KINDS, resolveResourcePolicy, decideAdmission } from './resource-policy.mjs';
 
 // ── SNAPSHOT STORAGE. Lives HERE (the light reader every gate imports), not in the sampler: the sampler pulls in
 // we:scripts/readiness/heavy-admission.mjs for its slot count, and heavy-admission imports this file for its
@@ -42,49 +46,6 @@ export function readSnapshot({ root } = {}) {
   try { return JSON.parse(readFileSync(resourcePaths(root).snapshot, 'utf8')); } catch { return null; }
 }
 
-// maxDiskBusyPct defaults to null (record, never gate): on this NVMe host the disk reads 100% busy (several I/Os
-// in flight) on an ordinary afternoon with the CPU 45% idle, so a disk threshold needs calibrating from the shadow
-// log first (slice 2) — a tool override or platform preference can set one now.
-const kindPolicy = (cpu, cost = 'heavy') => Object.freeze({ class: cost, minCpuIdlePct: cpu,
-  maxMemPressureLevel: 2, maxDiskBusyPct: null, waitMinutes: 2 });
-// Fixes tolerate busier CPUs; timing-sensitive flake re-verification needs a quiet host.
-// Light preparation does no heavy local work; critical memory pressure still holds it.
-export const RESOURCE_POLICY_STANDARD = Object.freeze({
-  build: kindPolicy(15), prepare: kindPolicy(5, 'light'), fix: kindPolicy(8),
-  'ci-heal': kindPolicy(8), review: kindPolicy(10), 'rebuild-smoke': kindPolicy(5),
-  'load-flake-rearm': kindPolicy(20), light: kindPolicy(5, 'light'), staleGraceMs: 0,
-});
-const kinds = Object.keys(RESOURCE_POLICY_STANDARD).filter(k => k !== 'staleGraceMs');
-const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
-const nonnegative = v => Number.isFinite(v) && v >= 0;
-const percent = v => nonnegative(v) && v <= 100;
-const validators = {
-  class: v => v === 'heavy' || v === 'light', minCpuIdlePct: percent,
-  maxMemPressureLevel: v => [1, 2, 4].includes(v),
-  maxDiskBusyPct: v => v === null || percent(v),
-  maxHeavySlotsHeldPct: v => v === null || percent(v), waitMinutes: nonnegative,
-};
-function validLayer(layer) {
-  if (!object(layer)) return false;
-  return Object.entries(layer).every(([key, value]) => {
-    if (key === 'staleGraceMs') return nonnegative(value);
-    return kinds.includes(key) && object(value) &&
-      Object.entries(value).every(([field, v]) => Object.hasOwn(validators, field) && validators[field](v));
-  });
-}
-/** Pure merge; malformed layers are ignored as a whole, never partially applied. */
-export function resolveResourcePolicy({ standard = RESOURCE_POLICY_STANDARD, platform, tool } = {}) {
-  const policy = Object.fromEntries(kinds.map(k => [k, { ...RESOURCE_POLICY_STANDARD[k] }]));
-  policy.staleGraceMs = RESOURCE_POLICY_STANDARD.staleGraceMs;
-  for (const layer of [standard, platform, tool]) {
-    if (!validLayer(layer)) continue;
-    for (const [key, value] of Object.entries(layer)) {
-      if (key === 'staleGraceMs') policy[key] = value;
-      else Object.assign(policy[key], value);
-    }
-  }
-  return policy;
-}
 // Resolved lazily: some test harnesses load modules from a non-file URL, where a top-level fileURLToPath throws.
 const repoRootOf = () => fileURLToPath(new URL('../../', import.meta.url));
 export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(), home = homedir() } = {}) {
@@ -92,9 +53,9 @@ export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(),
   const readLayer = (source, path) => {
     try {
       const file = JSON.parse(readFileSync(path, 'utf8'));
-      if (!object(file)) throw Error('expected an object');
+      if (file === null || typeof file !== 'object' || Array.isArray(file)) throw Error('expected an object');
       if (!Object.hasOwn(file, 'resourceAdmission')) return undefined;
-      if (!validLayer(file.resourceAdmission)) throw Error('invalid resourceAdmission policy');
+      if (!isValidPolicyLayer(file.resourceAdmission)) throw Error('invalid resourceAdmission policy');
       sources[source] = path;
       return file.resourceAdmission;
     } catch (error) {
@@ -105,45 +66,6 @@ export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(),
   const platform = readLayer('platform', env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'));
   const tool = readLayer('tool', join(repoRoot, 'scripts', 'dispatch-settings.json'));
   return { policy: resolveResourcePolicy({ platform, tool }), sources };
-}
-const finite = v => Number.isFinite(v) ? v : null;
-/** Pure decision: loadAvg1 is comparison evidence ONLY, never a condition. */
-export function decideAdmission({ kind, snapshot, policy = RESOURCE_POLICY_STANDARD, nowMs } = {}) {
-  const resolved = resolveResourcePolicy({ tool: policy });
-  const rule = kinds.includes(kind) ? resolved[kind] : resolved.build;
-  // An unknown kind remains heavy even if a tool reclassifies build.
-  const cost = kinds.includes(kind) ? rule.class : 'heavy';
-  const inputs = { cpuIdlePct: finite(snapshot?.cpu?.idlePct), memPressureLevel: finite(snapshot?.memory?.pressureLevel),
-    diskBusyPct: finite(snapshot?.disk?.busyPct), loadAvg1: finite(snapshot?.cpu?.loadAvg?.[0]) };
-  const sampledAt = Date.parse(snapshot?.sampledAt);
-  const freshUntil = Date.parse(snapshot?.freshUntil);
-  const snapshotAge = Number.isFinite(sampledAt) ? Math.max(0, Math.round((nowMs - sampledAt) / 1000)) : null;
-  const unknownFields = [
-    inputs.cpuIdlePct === null ? 'cpu idle unknown' : null,
-    inputs.memPressureLevel === null ? 'memory pressure unknown' : null,
-    inputs.diskBusyPct === null ? 'disk busy unknown' : null,
-    inputs.loadAvg1 === null ? 'load average unknown (comparison only)' : null,
-  ].filter(Boolean);
-  const result = (verdict, reason, unknown = false) => ({ kind, verdict,
-    reason: unknown ? reason : [reason, ...unknownFields].join('; '),
-    projectedWaitMinutes: verdict === 'admit' ? 0 : rule.waitMinutes, snapshotAge, unknown, inputs });
-  if (!snapshot || !Number.isFinite(sampledAt) || !Number.isFinite(freshUntil)) return result(cost === 'heavy' ? 'hold' : 'admit', 'snapshot-missing', true);
-  if (nowMs > freshUntil + resolved.staleGraceMs) return result(cost === 'heavy' ? 'hold' : 'admit', 'snapshot-stale (age ' + snapshotAge + 's)', true);
-  if (inputs.memPressureLevel !== null && inputs.memPressureLevel > rule.maxMemPressureLevel)
-    return result('hold', 'memory pressure ' + inputs.memPressureLevel + ' > ' + rule.maxMemPressureLevel);
-  if (inputs.cpuIdlePct !== null && inputs.cpuIdlePct < rule.minCpuIdlePct)
-    return result('wait', 'cpu idle ' + inputs.cpuIdlePct + '% < ' + rule.minCpuIdlePct + '%');
-  if (inputs.diskBusyPct !== null && rule.maxDiskBusyPct !== null && inputs.diskBusyPct > rule.maxDiskBusyPct)
-    return result('wait', 'disk busy ' + inputs.diskBusyPct + '% > ' + rule.maxDiskBusyPct + '%');
-  const held = snapshot.heavySlots?.held; const cap = snapshot.heavySlots?.cap;
-  if (rule.maxHeavySlotsHeldPct != null) {
-    if (Number.isFinite(held) && Number.isFinite(cap) && cap > 0) {
-      const pct = held / cap * 100;
-      if (pct > rule.maxHeavySlotsHeldPct) return result('wait', 'heavy slots held ' + pct.toFixed(1) + '% > ' + rule.maxHeavySlotsHeldPct + '%');
-    } else unknownFields.push('heavy slots unknown');
-  }
-  return result('admit', inputs.cpuIdlePct === null ? 'admitted with unavailable probes' :
-    'cpu idle ' + inputs.cpuIdlePct + '% ≥ ' + rule.minCpuIdlePct + '%');
 }
 function audit(root, row) {
   try { appendResourceLog(resourcePaths(root).shadow, row); } catch { /* Observability must not change a gate. */ }

@@ -1,7 +1,7 @@
 /** Card xkuflno — read-only resource facts and the shared policy's per-kind shadow verdicts. */
 import { op } from './registry.mjs';
 import { compute } from './step-kinds.mjs';
-import { decideAdmission, RESOURCE_POLICY_STANDARD } from '../lib/resource-admission.mjs';
+import { decideAdmission, RESOURCE_POLICY_STANDARD } from '../lib/resource-policy.mjs';
 
 export const RESOURCE_STATUS_OP = 'resource-status';
 
