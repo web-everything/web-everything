@@ -632,7 +632,7 @@ export function hasStaleReviewPendingBesideAccept({ currentLabels = [] } = {}) {
  * let it throw so callers defer without changing labels. PR #3432 exceeded Node's default 1 MiB buffer.
  * Git reads must use the PR's own clone; an unavailable sibling clone cannot supply coverage proof.
  */
-export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText }) {
+export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText, carrySetting = null }) {
   const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
     '--json', 'headRefOid,headRefName,comments'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -649,9 +649,27 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     humanClearedSha: parseLatestHumanClearedSha(d.comments),
     headDiff: null, headContribution: null, headReadFailed: false,
   };
-  const { acceptedSha, headSha, acceptedDiff, acceptedContribution } = evidence;
-  const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha
-    && !headSha.startsWith(acceptedSha) && !acceptedSha.startsWith(headSha));
+  const headSha = evidence.headSha;
+  const moved = !!evidence.acceptedSha && !headSha.startsWith(evidence.acceptedSha) && !evidence.acceptedSha.startsWith(headSha);
+  // card xu7kxtt (#5472) — an accept stamped WITHOUT a diff fingerprint (live plateau-app #217: the clear-human ran
+  // from a checkout that could not read that repo's net diff, so only `reviewed-sha` was recorded). The accepted
+  // commit is immutable and named by a trusted marker, so its net diff vs its own merge-base can be re-derived from
+  // git here; the strict comparison below then carries the accept only on a byte-identical net diff. Unreadable →
+  // no fingerprint → today's SHA-identity behaviour (fail closed). Only the STRICT digest is derived, never the
+  // context-insensitive contribution digest.
+  if (moved && !evidence.acceptedDiff && !evidence.acceptedContribution && /^[0-9a-f]{40}$/i.test(evidence.acceptedSha)
+    && (local || cwd) && (carrySetting ?? resolveAcceptCarryForward().value) === 'on') {
+    try {
+      const old = netDiff({
+        exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
+        rev: evidence.acceptedSha, fetchExtraRefs: [evidence.acceptedSha],
+      });
+      const fp = old?.scored ? normalizeDiffFingerprint(old.text) : null;
+      if (fp) { evidence.acceptedDiff = fp; evidence.acceptedDiffDerived = true; }
+    } catch { /* unreadable accepted head → no derived fingerprint → SHA identity, as today */ }
+  }
+  const { acceptedSha, acceptedDiff, acceptedContribution } = evidence;
+  const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha && moved);
   if (liveDiffReadOwed && d.headRefName && (local || cwd)) {
     try {
       const net = netDiff({

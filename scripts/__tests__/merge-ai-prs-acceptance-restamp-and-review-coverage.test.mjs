@@ -388,8 +388,14 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
     const view = acceptanceView();
     view.comments = [{ viewerDidAuthor: true, body: `<!-- reviewed-sha: ${REVIEWED} -->` }];
     const netDiff = vi.fn();
-    expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff }).headReadFailed).toBe(false);
+    expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff, carrySetting: 'off' }).headReadFailed).toBe(false);
     expect(netDiff).not.toHaveBeenCalled();
+    // card xu7kxtt — with carry-forward on, the accepted commit's own net diff is derived first; an unreadable
+    // derivation still owes no live read and reports no read miss (SHA identity, as before).
+    const derive = vi.fn(() => ({ scored: false }));
+    expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff: derive, carrySetting: 'on' }).headReadFailed).toBe(false);
+    expect(derive).toHaveBeenCalledTimes(1);
+    expect(derive.mock.calls[0][0].rev).toBe(REVIEWED);
   });
 
   it('pins diff reads to the sibling clone', () => {

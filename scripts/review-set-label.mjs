@@ -1264,9 +1264,18 @@ export function runReviewLabelCli({
   // the operator's `clear-human`, and its strict reviewed-diff equals THIS head's net diff. Unscored diff → no proof
   // → refused (fail closed). The comment records both SHAs (the reason names the cleared one; the marker the new one).
   if (restampAcrossHold) {
+    let record = latestAcceptRecord(prComments);
+    // A clearance stamped without a diff fingerprint (cross-repo checkout, live plateau-app #217): re-derive the
+    // cleared commit's own net diff from git. Unreadable → no proof → refused.
+    if (record && !record.diff && diffScored) {
+      try {
+        const old = computeNetDiffText({ exec: execFileSyncThrottled, rev: record.sha, fetchExtraRefs: [record.sha] });
+        if (old?.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) };
+      } catch { /* no proof */ }
+    }
     const humanCarry = decideAcceptCarryForward({
       setting: resolveAcceptCarryForward().value,
-      record: latestAcceptRecord(prComments),
+      record,
       headSha,
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });

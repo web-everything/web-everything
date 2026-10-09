@@ -12,6 +12,8 @@ import {
   decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel } from '../../review-set-label.mjs';
+import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
+import { acceptanceCoversHead } from '../review-escalation.mjs';
 import { planAcceptCarry, sweepAcceptCarry, _resetAcceptCarryMemo } from '../../conveyor/accept-carry-sweep.mjs';
 
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/accept-carry-forward-4535.json'), 'utf8'));
@@ -132,5 +134,37 @@ describe('setting cascade (card x5wnfcg)', () => {
 
   it('the platform preference ships on', () => {
     expect(JSON.parse(readFileSync(ACCEPT_CARRY_FORWARD_SETTINGS_FILE, 'utf8')).acceptCarryForward).toBe('on');
+  });
+});
+
+describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (no diff marker), refreshed 808f0deb → 4339cf57', () => {
+  const OLD217 = '808f0deba4d8' + '0'.repeat(28);
+  const NEW217 = '4339cf573915' + '0'.repeat(28);
+  const DIFF = 'diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1 +1 @@\n-a\n+b\n';
+  const view = { headRefOid: NEW217, headRefName: 'lane/xadunn9-wip-deeplinks',
+    comments: [{ author: { login: 'web-everything[bot]' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
+  const exec = (cmd) => { if (cmd === 'gh') return JSON.stringify(view); throw new Error('unexpected'); };
+  const read = (texts, carrySetting = 'on') => readDrainAcceptance({ pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', exec, carrySetting,
+    netDiff: ({ rev }) => (texts[rev] == null ? { scored: false } : { scored: true, text: texts[rev] }) });
+
+  it('identical net diff on both heads: the accept covers the refreshed head (derived from git)', () => {
+    const ev = read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF });
+    expect(ev.acceptedDiffDerived).toBe(true);
+    expect(acceptanceCoversHead(ev).covers).toBe(true);
+  });
+
+  it('a changed net diff does not cover', () => {
+    const ev = read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF.replace('+b', '+c') });
+    expect(acceptanceCoversHead(ev).covers).toBe(false);
+  });
+
+  it('an unreadable accepted head leaves today\'s SHA identity (not covered)', () => {
+    const ev = read({ 'lane/xadunn9-wip-deeplinks': DIFF });
+    expect(ev.acceptedDiff).toBeNull();
+    expect(acceptanceCoversHead(ev).covers).toBe(false);
+  });
+
+  it('setting off = today', () => {
+    expect(acceptanceCoversHead(read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF }, 'off')).covers).toBe(false);
   });
 });
