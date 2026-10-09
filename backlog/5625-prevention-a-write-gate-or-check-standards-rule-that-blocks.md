@@ -1,9 +1,10 @@
 ---
+bornAs: xy2kgfz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xbld0p4-retries-carry-the-previous-attempt-failure-to-the-next-agent.md"]
+scope: ["we:backlog/5624-retries-carry-the-previous-attempt-failure-to-the-next-agent.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -12,8 +13,8 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xbld0p4-retries-carry-the-previous-attempt-failure-to-the-next-agent.md:11` — A write-gate or check:standards rule that blocks a card moving from open to ready or build while any edge-case row is still TODO, and requires 'Untrusted text' to be non-TODO when the card describes passing text into an agent prompt.
-2. `we:backlog/xbld0p4-retries-carry-the-previous-attempt-failure-to-the-next-agent.md:12` — Before implementation, require a claim-to-test review mapping each behavioral guarantee to a repository-qualified named test and observable assertion, including omitted-setting cases.
+1. `we:backlog/5624-retries-carry-the-previous-attempt-failure-to-the-next-agent.md:11` — A write-gate or check:standards rule that blocks a card moving from open to ready or build while any edge-case row is still TODO, and requires 'Untrusted text' to be non-TODO when the card describes passing text into an agent prompt.
+2. `we:backlog/5624-retries-carry-the-previous-attempt-failure-to-the-next-agent.md:12` — Before implementation, require a claim-to-test review mapping each behavioral guarantee to a repository-qualified named test and observable assertion, including omitted-setting cases.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4644@050b84b1172ce30bf8fd3d7837148d995812d3d9
 
