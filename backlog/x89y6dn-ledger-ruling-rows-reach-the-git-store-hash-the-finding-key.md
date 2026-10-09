@@ -8,7 +8,7 @@ tags: []
 
 # Ledger ruling rows: reach the git store + hash the finding key (slice H shadow fixes)
 
-Slice H shadow (PR #4495) found 7 block + 8 ordinary rulings missing from the git store on ops/review-requests (no ruling/send-back rows at all) and ruling rows storing the raw finding key while referral rows store sha256:<hex>, so rulings never close referrals. Fix both writers, make derive tolerant of old raw-key rows, backfill today's rulings on open PRs via the sanctioned writer.
+Slice H shadow (PR #4495) found 7 block + 8 ordinary rulings missing from the git store on ops/review-requests (no ruling/send-back rows at all) and ruling rows storing the raw finding key while referral rows store sha256:<hex>, so rulings never close referrals. Fix both writers, backfill today's rulings on open PRs via the sanctioned writer. Operator ruling 2026-10-09: the derive does NOT tolerate raw-key rows (only hashed `sha256:` keys close a referral); existing raw-key rows are migrated once by `ledger-backfill-rulings --migrate-raw` (appends hashed twins, idempotent, raw rows stay in history).
 
 ## Done when
 

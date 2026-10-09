@@ -47,13 +47,12 @@ export function deriveReferrals(events) {
         keys.set(key, { key, state: 'open', head: e.headSha, ruling: null, resolvedAtHead: null });
       }
     } else if (e.type === EVENT_TYPES.RULING) {
-      // A ruling row written before rulings were hashed names the RAW key; the referral it answers names the hash.
-      // Exact match first (rows of one form), then the hashed form, so old raw-key history still closes its referral.
-      const id = keys.has(e.findingKey) ? e.findingKey : ledgerFindingKey(e.findingKey);
-      const k = keys.get(id);
+      // Only a ruling that names the key exactly as the referral does (the hashed form) closes it. A legacy ruling row
+      // that names the RAW key closes nothing; `ledger-backfill-rulings --migrate-raw` appends its hashed equivalent.
+      const k = keys.get(e.findingKey);
       // Only the closed set of rulings moves a key; an unknown value (a forged or mis-cased row) changes nothing.
       const state = RULING_STATE.get(e.ruling);
-      if (k && state) keys.set(id, { ...k, state, ruling: e.ruling });
+      if (k && state) keys.set(e.findingKey, { ...k, state, ruling: e.ruling });
     } else if ((e.type === EVENT_TYPES.VERDICT || e.type === undefined) && verdictClears(e.verdict)) {
       const head = verdictHead(e);
       for (const [key, k] of keys) {

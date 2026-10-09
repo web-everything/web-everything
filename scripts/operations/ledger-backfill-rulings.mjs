@@ -8,6 +8,8 @@
  *   clearing verdict, or ruling for the same finding) is skipped as `out-of-order`, never reordered. A clearing
  *   ruling (`not-real` / `card`) is copied only when the PR thread carries a ruling comment for the same key and
  *   result; otherwise it is skipped as `unposted`. Dry-run by default; `--apply` appends through the git store contract.
+ *   `--migrate-raw` is the one-time migration for rows ALREADY on the git store that name a raw key: it appends a hashed
+ *   twin of each (see {@link planRawKeyMigration}); the derive reads only hashed keys.
  */
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -39,6 +41,53 @@ function headAt(rows) {
 }
 
 /**
+ * The hashed ledger key for a ruling row's `findingKey`, or `null` when the row holds a truncated raw key that no thread
+ * comment resolves. A hashed key is kept as is; a raw key is matched to its full form in the thread (the row builder
+ * collapses whitespace and caps the field at 200 characters) before it is hashed.
+ */
+function resolveRulingKey(fk, thread) {
+  if (hashed(fk)) return fk;
+  const matches = [...new Set(thread.map(t => t.key).filter(k => k === fk || oneLine200(k) === fk))];
+  if (matches.length === 1) return ledgerFindingKey(matches[0]);
+  return fk.endsWith('…') ? null : ledgerFindingKey(fk);
+}
+
+// A later row for the same finding replaces its state in the derive's append-order fold, so landing this one after it would undo it.
+const supersededByLaterRow = (history, at, findingKey) => history.some(other => Date.parse(other.at) > Date.parse(at) &&
+  ((other.type === 'referral' && other.findingKeys.some(k => ledgerFindingKey(k) === findingKey)) ||
+    (other.type === 'ruling' && ledgerFindingKey(other.findingKey) === findingKey) ||
+    (other.type === 'verdict' && verdictClears(other.verdict))));
+
+/**
+ * One-time migration (operator ruling 2026-10-09): the derive no longer reads a ruling that names the RAW finding key,
+ * so every raw-key ruling row already on the git store gets a hashed twin appended (same time, source, writer, actor and
+ * ruling; only `findingKey` differs). The raw rows stay in history, the derive ignores them. Idempotent: a twin already
+ * in the store (same PR, time, ruling and hashed key) is skipped as `already-in-git`, and the store's own event-id
+ * dedupe covers a re-run that races this one. Append order is never reordered, so a twin whose meaning would change by
+ * landing after a later referral, clearing verdict, or ruling for the same finding is skipped as `out-of-order`.
+ * No thread comment is needed to back a clearing ruling: the row is already authoritative history on the store.
+ */
+export function planRawKeyMigration({ gitRows, threadRulings = new Map() }) {
+  const append = [], skipped = [];
+  const raw = gitRows.filter(row => row.type === 'ruling' && !hashed(row.findingKey)).sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  for (const row of raw) {
+    const { pr, at } = row;
+    const skip = reason => skipped.push({ pr, type: 'ruling', at, reason });
+    const findingKey = resolveRulingKey(row.findingKey, threadRulings.get(pr) ?? []);
+    if (findingKey === null) { skip('key-truncated-unresolved'); continue; }
+    if ([...gitRows, ...append].some(other => other.type === 'ruling' && other.pr === pr && other.at === at &&
+      other.ruling === row.ruling && other.findingKey === findingKey)) { skip('already-in-git'); continue; }
+    if (supersededByLaterRow(gitRows.filter(other => other.pr === pr), at, findingKey)) { skip('out-of-order'); continue; }
+    append.push(buildLedgerEvent({
+      type: 'ruling', repo: row.repo, pr, at, source: row.source, writer: row.writer,
+      declaredActor: row.actor?.declared, session: row.actor?.session, channel: row.actor?.channel,
+      findingKey, ruling: row.ruling,
+    }));
+  }
+  return { append, skipped, candidates: raw.length };
+}
+
+/**
  * `threadRulings` maps a PR number to the rulings its public thread comments carry (`{ key, result }`, the raw key as
  * the comment states it). A clearing ruling is only copied when a comment backs that exact key AND result.
  */
@@ -51,14 +100,8 @@ export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadRu
     const thread = threadRulings.get(pr) ?? [];
     let findingKey;
     if (type === 'ruling') {
-      const fk = row.findingKey;
-      if (hashed(fk)) findingKey = fk;
-      else {
-        const matches = [...new Set(thread.map(t => t.key).filter(k => k === fk || oneLine200(k) === fk))];
-        if (matches.length === 1) findingKey = ledgerFindingKey(matches[0]);
-        else if (!fk.endsWith('…')) findingKey = ledgerFindingKey(fk);
-        else { skip('key-truncated-unresolved'); continue; }
-      }
+      findingKey = resolveRulingKey(row.findingKey, thread);
+      if (findingKey === null) { skip('key-truncated-unresolved'); continue; }
     }
     if ([...gitRows, ...append].some(other => other.type === type && other.pr === pr && other.at === at &&
       (type === 'ruling' ? ledgerFindingKey(other.findingKey) === findingKey : other.cause === row.cause))) {
@@ -73,11 +116,7 @@ export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadRu
     const history = gitRows.filter(other => other.pr === pr);
     let outOfOrder;
     if (type === 'ruling') {
-      // A later row for the same finding replaces its state in the derive's append-order fold, so landing this one after it would undo it.
-      outOfOrder = history.some(other => Date.parse(other.at) > Date.parse(at) &&
-        ((other.type === 'referral' && other.findingKeys.some(k => ledgerFindingKey(k) === findingKey)) ||
-          (other.type === 'ruling' && ledgerFindingKey(other.findingKey) === findingKey) ||
-          (other.type === 'verdict' && verdictClears(other.verdict))));
+      outOfOrder = supersededByLaterRow(history, at, findingKey);
     } else {
       const before = headAt(history.filter(other => Date.parse(other.at) <= Date.parse(at)));
       const current = headAt(history);
@@ -112,7 +151,7 @@ function readHome(repo) {
 }
 
 export async function main({
-  repos = Object.values(CONSTELLATION_REPOS).map(r => r.slug), since = newYorkMidnight(), apply = false,
+  repos = Object.values(CONSTELLATION_REPOS).map(r => r.slug), since = newYorkMidnight(), apply = false, migrateRaw = false,
   readHome: home = readHome,
   readGit = ctx => getLedgerStore('git').read(ctx),
   listOpenPrs = repo => ghJson(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '500', '--json', 'number']).map(pr => pr.number),
@@ -124,10 +163,9 @@ export async function main({
   const results = [];
   let exitCode = 0;
   for (const repo of repos) {
-    const result = { repo, mode: apply ? 'apply' : 'dry-run', candidates: 0, append: 0, skipped: {}, appended: 0 };
+    const result = { repo, mode: `${migrateRaw ? 'migrate-raw ' : ''}${apply ? 'apply' : 'dry-run'}`, candidates: 0, append: 0, skipped: {}, appended: 0 };
     results.push(result);
     try {
-      const homeRows = await home(repo);
       const board = await resolveBoard(repo);
       if (!board) { result.status = 'no-board'; continue; }
       const git = await readGit({ board, repo });
@@ -137,16 +175,26 @@ export async function main({
         exitCode = 1;
         continue;
       }
-      const openPrs = new Set(await listOpenPrs(repo));
-      const candidates = candidatesFor(homeRows, openPrs, since);
-      result.candidates = candidates.length;
-      // Raw keys need the thread to recover the full key; clearing rulings need it to prove a comment was posted.
       const threadRulings = new Map();
-      const needsThread = row => row.type === 'ruling' && (!hashed(row.findingKey) || CLEARING_RULINGS.has(row.ruling));
-      for (const pr of new Set(candidates.filter(needsThread).map(row => row.pr))) {
-        threadRulings.set(pr, await readThreadRulings(repo, pr));
+      let plan;
+      if (migrateRaw) {
+        // The raw key in a row may be a truncated or whitespace-collapsed form; the PR thread carries the full key.
+        const rawPrs = new Set(git.rows.filter(row => row.type === 'ruling' && !hashed(row.findingKey)).map(row => row.pr));
+        for (const pr of rawPrs) threadRulings.set(pr, await readThreadRulings(repo, pr));
+        plan = planRawKeyMigration({ gitRows: git.rows, threadRulings });
+        result.candidates = plan.candidates;
+      } else {
+        const homeRows = await home(repo);
+        const openPrs = new Set(await listOpenPrs(repo));
+        const candidates = candidatesFor(homeRows, openPrs, since);
+        result.candidates = candidates.length;
+        // Raw keys need the thread to recover the full key; clearing rulings need it to prove a comment was posted.
+        const needsThread = row => row.type === 'ruling' && (!hashed(row.findingKey) || CLEARING_RULINGS.has(row.ruling));
+        for (const pr of new Set(candidates.filter(needsThread).map(row => row.pr))) {
+          threadRulings.set(pr, await readThreadRulings(repo, pr));
+        }
+        plan = planRulingBackfill({ homeRows, gitRows: git.rows, openPrs, since, threadRulings });
       }
-      const plan = planRulingBackfill({ homeRows, gitRows: git.rows, openPrs, since, threadRulings });
       result.append = plan.append.length;
       for (const { reason } of plan.skipped) result.skipped[reason] = (result.skipped[reason] ?? 0) + 1;
       if (apply && plan.append.length) {
@@ -171,6 +219,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     let json = false;
     for (const arg of process.argv.slice(2)) {
       if (arg === '--apply') options.apply = true;
+      else if (arg === '--migrate-raw') options.migrateRaw = true;
       else if (arg === '--json') json = true;
       else if (arg.startsWith('--repo=')) options.repos = arg.slice(7).split(',');
       else if (arg.startsWith('--since=')) options.since = arg.slice(8);

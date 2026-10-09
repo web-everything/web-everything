@@ -3,9 +3,9 @@
  * @description Backfill key recovery, append-order safety, and injected IO tests.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { buildLedgerEvent, buildVerdictRecord, parseLedgerEvents } from '../../lib/verdict-ledger.mjs';
-import { ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
-import { main, newYorkMidnight, planRulingBackfill } from '../ledger-backfill-rulings.mjs';
+import { buildLedgerEvent, buildVerdictRecord, ledgerEventId, parseLedgerEvents } from '../../lib/verdict-ledger.mjs';
+import { deriveReferrals, ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
+import { main, newYorkMidnight, planRawKeyMigration, planRulingBackfill } from '../ledger-backfill-rulings.mjs';
 
 const repo = 'o/r';
 const since = '2026-10-08T04:00:00.000Z';
@@ -250,5 +250,92 @@ describe('New York midnight', () => {
     ['2026-10-08T02:00:00Z', '2026-10-07T04:00:00.000Z'],
   ])('resolves %s to %s', (now, expected) => {
     expect(newYorkMidnight(new Date(now))).toBe(expected);
+  });
+});
+
+describe('planRawKeyMigration (raw-key ruling rows already on the git store)', () => {
+  const twin = (row = ruling(), findingKey = ledgerFindingKey('raw key')) => ({ ...row, findingKey });
+  const migrate = (gitRows, threadRulings = new Map()) => planRawKeyMigration({ gitRows, threadRulings });
+
+  it('appends a hashed twin of a raw-key row: same time, source, writer, actor and ruling', () => {
+    const raw = ruling({ ruling: 'card' });
+    expect(migrate([raw])).toEqual({ append: [twin(raw)], skipped: [], candidates: 1 });
+  });
+
+  it('migrated twin closes the hashed referral; the raw row alone does not', () => {
+    const open = referral({ findingKeys: [ledgerFindingKey('raw key')], at: early });
+    const raw = ruling();
+    const rawOnly = deriveReferrals([open, raw]).get(ledgerFindingKey('raw key'));
+    const migrated = deriveReferrals([open, raw, ...migrate([open, raw]).append]).get(ledgerFindingKey('raw key'));
+    expect([rawOnly.state, migrated.state]).toEqual(['open', 'blocking']);
+  });
+
+  it('is idempotent: a second plan over the store with the twin appended adds nothing', () => {
+    const raw = ruling();
+    const first = migrate([raw]);
+    expect(migrate([raw, ...first.append])).toEqual({ append: [], skipped: skipped('already-in-git'), candidates: 1 });
+  });
+
+  it('gives the twin the same event id on every run (the store dedupes a racing re-run)', () => {
+    const a = migrate([ruling()]).append[0], b = migrate([ruling()]).append[0];
+    expect(ledgerEventId(a)).toBe(ledgerEventId(b));
+  });
+
+  it('leaves hashed rows and other row types alone', () => {
+    expect(migrate([ruling({ findingKey: ledgerFindingKey('k') }), sendBack(), review()])).toEqual({ append: [], skipped: [], candidates: 0 });
+  });
+
+  it('does not treat an equal-time twin with a different ruling as already migrated', () => {
+    expect(migrate([ruling(), twin(ruling({ ruling: 'not-real' }))]).append).toHaveLength(1);
+  });
+
+  it('recovers a truncated raw key from the thread, and skips it when the thread cannot resolve it', () => {
+    const key = `${'long '.repeat(60)}end`;
+    const raw = ruling({ findingKey: key });
+    expect(raw.findingKey.endsWith('…')).toBe(true);
+    expect(migrate([raw], new Map([[7, [{ key, result: 'block' }]]])).append[0].findingKey).toBe(ledgerFindingKey(key));
+    expect(migrate([raw])).toEqual({ append: [], skipped: skipped('key-truncated-unresolved'), candidates: 1 });
+  });
+
+  it.each([referral({ findingKeys: [ledgerFindingKey('raw key')], at: late }), verdict(), ruling({ ruling: 'not-real', at: late })])('skips a twin superseded by a later %#', later => {
+    expect(migrate([ruling(), later]).skipped).toEqual(skipped('out-of-order'));
+  });
+
+  it('copes with a clearing ruling without a thread comment (history is already authoritative)', () => {
+    expect(migrate([ruling({ ruling: 'not-real' })]).append).toHaveLength(1);
+  });
+
+  it('migrates each raw row of a finding ruled twice: only the latest, which is what the derive ends on', () => {
+    const result = migrate([ruling({ ruling: 'block' }), ruling({ ruling: 'not-real', at: late })]);
+    expect(result.append.map(r => [r.ruling, r.at])).toEqual([['not-real', late]]);
+    expect(result.skipped).toEqual(skipped('out-of-order'));
+  });
+});
+
+describe('main --migrate-raw', () => {
+  const migrateIo = (over = {}) => io({ migrateRaw: true, readGit: vi.fn(() => ({ status: 'ok', rows: [ruling()] })), ...over });
+
+  it('dry-runs with counts and appends nothing', async () => {
+    const options = migrateIo();
+    expect(await main(options)).toEqual({ exitCode: 0, results: [{ repo, mode: 'migrate-raw dry-run', candidates: 1, append: 1, skipped: {}, appended: 0 }] });
+    expect(options.appendGit).not.toHaveBeenCalled();
+    expect(options.readHome).not.toHaveBeenCalled();
+    expect(options.readThreadRulings).toHaveBeenCalledWith(repo, 7);
+  });
+
+  it('applies the twins in one append; a second run over the result is a no-op', async () => {
+    const rows = [ruling()];
+    const options = migrateIo({ apply: true, readGit: vi.fn(() => ({ status: 'ok', rows: [...rows] })) });
+    const first = await main(options);
+    expect(first.results[0]).toMatchObject({ mode: 'migrate-raw apply', append: 1, appended: 1 });
+    expect(options.appendGit).toHaveBeenCalledWith([{ ...ruling(), findingKey: ledgerFindingKey('raw key') }], { board: '/board', repo });
+    const again = migrateIo({ apply: true, readGit: vi.fn(() => ({ status: 'ok', rows: [...rows, ...options.appendGit.mock.calls[0][0]] })) });
+    expect((await main(again)).results[0]).toMatchObject({ append: 0, appended: 0, skipped: { 'already-in-git': 1 } });
+    expect(again.appendGit).not.toHaveBeenCalled();
+  });
+
+  it('reports an append failure with a non-zero exit', async () => {
+    const result = await main(migrateIo({ apply: true, appendGit: vi.fn(() => ({ ok: false, appended: 0, error: 'boom' })) }));
+    expect(result).toMatchObject({ exitCode: 1, results: [{ status: 'append-failed', error: 'boom' }] });
   });
 });

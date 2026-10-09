@@ -136,7 +136,7 @@ describe('referrals (#5083: a later accept on a new head closes them)', () => {
   });
 });
 
-describe('finding keys: a ruling closes the referral whichever form it names (slice H shadow, ruling-key-unhashed)', () => {
+describe('finding keys: only a hashed ruling closes a hashed referral (slice H shadow, ruling-key-unhashed)', () => {
   const raw = '["judgeCorrectnessAdvisory","scripts/x.mjs",12,"a finding"]';
   const hashed = ledgerFindingKey(raw);
   it('the ledger form is sha256:<hex> of the raw key, and hashing twice is a no-op', () => {
@@ -146,9 +146,15 @@ describe('finding keys: a ruling closes the referral whichever form it names (sl
   it('a hashed ruling closes a hashed referral', () => {
     expect(deriveReferrals([referral(1, H1, hashed), ruling(5, hashed, 'not-real')]).get(hashed).state).toBe('ruled');
   });
-  it('an OLD raw-key ruling row still closes the hashed referral it answers', () => {
-    expect(deriveReferrals([referral(1, H1, hashed), ruling(5, raw, 'block')]).get(hashed)).toMatchObject({ state: 'blocking', ruling: 'block' });
-    expect(state([referral(1, H1, hashed), ruling(5, raw, 'card')], facts()).holds.map(h => h.code)).not.toContain('referral-unruled');
+  it('a raw-key ruling row does not close the hashed referral it names (legacy rows are migrated, not tolerated)', () => {
+    expect(deriveReferrals([referral(1, H1, hashed), ruling(5, raw, 'block')]).get(hashed)).toMatchObject({ state: 'open', ruling: null });
+    expect(deriveReferrals([referral(1, H1, hashed), ruling(5, raw, 'not-real')]).get(hashed).state).toBe('open');
+    expect(state([referral(1, H1, hashed), ruling(5, raw, 'card')], facts()).holds.map(h => h.code)).toContain('referral-unruled');
+  });
+  it('a migrated hashed ruling (appended after the raw row) closes the referral', () => {
+    const events = [referral(1, H1, hashed), ruling(5, raw, 'block'), ruling(6, ledgerFindingKey(raw), 'block')];
+    expect(deriveReferrals(events).get(hashed)).toMatchObject({ state: 'blocking', ruling: 'block' });
+    expect(state([referral(1, H1, hashed), ruling(5, raw, 'card'), ruling(6, hashed, 'card')], facts()).holds.map(h => h.code)).not.toContain('referral-unruled');
   });
   it('a ruling for a different finding closes nothing', () => {
     expect(deriveReferrals([referral(1, H1, hashed), ruling(5, 'another', 'not-real')]).get(hashed).state).toBe('open');
