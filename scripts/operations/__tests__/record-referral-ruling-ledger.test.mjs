@@ -104,7 +104,7 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     expect(posts).toEqual([]);
   });
 
-  it('wiring: a two-finding clearing batch whose SECOND append fails names the live first row, posts nothing, and a re-run finishes it', async () => {
+  it('wiring: a two-finding clearing batch whose SECOND append fails reverts both rows to a hold (the failed one may have landed), posts nothing, and a re-run finishes it', async () => {
     const f2 = { ...f, summary: 'second gap', file: 'scripts/y.mjs' };
     const key2 = referralFindingKey(seat, f2);
     const rec2 = { ...rec, referrals: [...rec.referrals, { key: key2, seat, original: f2, finding: normalizeFinding(f2) }], rulings: [] };
@@ -120,7 +120,7 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
       readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
       appendEvents: (list) => {
         for (const e of list) {
-          if (e.findingKey === failOn) throw new Error('transport down');
+          if (e.findingKey === failOn && e.ruling !== 'block') throw new Error('transport down');
           written.push(`${e.findingKey}:${e.ruling}`);
         }
       },
@@ -134,17 +134,82 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     };
     const err = await run().then(() => null, (e) => e);
     expect(err?.message).toMatch(/1 of 2 clearing rulings were recorded/);
-    expect(err.message).toContain(`${ledgerFindingKey(key)} is ALREADY LIVE`);
-    expect(err.message).not.toContain(ledgerFindingKey(key2));
+    expect(err.message).toContain(ledgerFindingKey(key));
+    expect(err.message).toContain(ledgerFindingKey(key2));
+    expect(err.message).toMatch(/reverted to a holding block ruling, so the finding is blocking/);
+    expect(err.message).not.toContain('LIVE');
     expect(err.message).toMatch(/re-run the same ruling/);
-    expect(written).toEqual([`${ledgerFindingKey(key)}:not-real`]);
+    // The first row landed, then the failure: the batch is compensated by a LATER holding row for each touched finding
+    // (the second too: a failed append can still have landed), so the append-order derive ends on `block` and no
+    // clearing row is left live without a comment.
+    expect(written).toEqual([`${ledgerFindingKey(key)}:not-real`, `${ledgerFindingKey(key)}:block`, `${ledgerFindingKey(key2)}:block`]);
     expect(posts).toEqual([]);
     // The re-run once the ledger is writable plans BOTH findings again (the plan reads only the thread), records
-    // both (the live one a second time, same ruling) and posts the one comment.
+    // both clearing rows (appended after the reverts, so they are the latest) and posts the one comment.
     failOn = null;
     await run();
     expect(posts).toHaveLength(1);
-    expect(written).toEqual([ledgerFindingKey(key), ledgerFindingKey(key), ledgerFindingKey(key2)].map((k) => `${k}:not-real`));
+    expect(written.slice(3)).toEqual([ledgerFindingKey(key), ledgerFindingKey(key2)].map((k) => `${k}:not-real`));
+  });
+
+  it('wiring: a clearing row recorded and then a failed POST is reverted to a hold, so no clearing row stays live without a comment', async () => {
+    const written = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => ({ headRefOid: head, comments: [] }),
+      post: () => { throw new Error('gh: 502'); },
+      appendEvents: (list) => { written.push(...list.map((e) => `${e.findingKey}:${e.ruling}`)); },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    const err = await sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+      rulings: [{ key: 'k1', result: 'card' }] }).then(() => null, (e) => e);
+    expect(err?.message).toMatch(/gh: 502/);
+    expect(err.message).toMatch(/reverted to a holding block ruling/);
+    expect(written).toEqual([`${ledgerFindingKey('k1')}:card`, `${ledgerFindingKey('k1')}:block`]);
+  });
+
+  it('wiring: a failed post of a HOLDING-only batch changes nothing in the ledger (no revert row)', async () => {
+    const written = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => ({ headRefOid: head, comments: [] }),
+      post: () => { throw new Error('gh: 502'); },
+      appendEvents: (list) => { written.push(...list.map((e) => e.ruling)); },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+      rulings: [{ key: 'k1', result: 'block' }] })).rejects.toThrow(/gh: 502/);
+    expect(written).toEqual([]);
+  });
+
+  it('wiring: when the compensating row ALSO fails to record, the error names the clearing rows still live', async () => {
+    const f2 = { ...f, summary: 'second gap', file: 'scripts/y.mjs' };
+    const key2 = referralFindingKey(seat, f2);
+    const rec2 = { ...rec, referrals: [...rec.referrals, { key: key2, seat, original: f2, finding: normalizeFinding(f2) }], rulings: [] };
+    const thread = { headRefOid: head, comments: [gh(renderReferralRecord(rec2))] };
+    const ctx = () => ({ head, ...openReferralFindings({ comments: thread.comments, repo, pr: 7, head, body: rec2.authorBody, cardReadable: () => true }),
+      card: null, now: '2026-10-04T14:30:00Z', clearerId: 's' });
+    const written = [];
+    const posts = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => structuredClone(thread),
+      post: (_r, _p, body) => { posts.push(body); thread.comments.push(gh(body)); },
+      readPr: () => ({ headRefOid: head, labels: [] }), runSetLabel: () => '{"ok":true}', setLabels: () => {},
+      appendEvents: (list) => {
+        for (const e of list) {
+          if (e.findingKey === ledgerFindingKey(key2) || e.ruling === 'block') throw new Error('transport down');
+          written.push(`${e.findingKey}:${e.ruling}`);
+        }
+      },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    const plan = planOperatorRuling(ctx(), input({ ruling: 'not-real' }));
+    const op = recordReferralRulingOperation({ readRulingContext: ctx });
+    const effects = op.steps.find((x) => x.name === 'write').step.effects({ verdict: plan, input: {} });
+    const err = await (async () => { for (const e of effects) await sinks[e.type](e.payload); })().then(() => null, (e) => e);
+    expect(err?.message).toMatch(/1 of 2 clearing rulings were recorded/);
+    expect(err.message).toContain(`${ledgerFindingKey(key)}, ${ledgerFindingKey(key2)} may each be LIVE`);
+    expect(err.message).toMatch(/revert to a holding block ruling was not recorded either/);
+    expect(written).toEqual([`${ledgerFindingKey(key)}:not-real`]);
+    expect(posts).toEqual([]);
   });
 
   it('a clearing ruling is recorded BEFORE the comment is posted', async () => {

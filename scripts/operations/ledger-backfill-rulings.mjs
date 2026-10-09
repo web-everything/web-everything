@@ -59,7 +59,9 @@ const decidesFinding = (other, findingKey) =>
   (other.type === 'verdict' && verdictClears(other.verdict));
 
 // A later row for the same finding replaces its state in the derive's append-order fold, so landing this one after it would undo it.
-const supersededByLaterRow = (history, at, findingKey) => history.some(other => Date.parse(other.at) > Date.parse(at) &&
+// A row at the SAME time counts: the timestamps cannot say which came first, and this row would land last (the same tie
+// rule as `overwritesAtTie`). An equivalent ruling is `already-in-git` before this check runs.
+const supersededByLaterRow = (history, at, findingKey) => history.some(other => Date.parse(other.at) >= Date.parse(at) &&
   decidesFinding(other, findingKey));
 
 // A clearing ruling is live only when a public ruling comment names the same key and result. Every path that appends a
@@ -132,7 +134,9 @@ export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadRu
     if (type === 'ruling') {
       outOfOrder = supersededByLaterRow(history, at, findingKey);
     } else {
-      const before = headAt(history.filter(other => Date.parse(other.at) <= Date.parse(at)));
+      // Strictly earlier: a row at the same instant has no known order against this send-back, which lands last (the
+      // same tie rule as a ruling).
+      const before = headAt(history.filter(other => Date.parse(other.at) < Date.parse(at)));
       const current = headAt(history);
       outOfOrder = !(before === null && current === null) && !sameHead(before, current);
     }

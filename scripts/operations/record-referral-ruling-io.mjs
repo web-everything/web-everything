@@ -182,33 +182,60 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
       // F4: a CLEARING ruling (card / not-real) that cannot be recorded does not clear: nothing is posted, the
       // operation stays resumable. A HOLDING ruling (block) is still posted and raises ledger-write-miss.
       const clearing = events.filter((e) => clearsHold(e.ruling));
+      // A clearing row recorded without its comment is live and closes its referral. The ledger is append-only, so it is
+      // reverted by a LATER holding `block` row for the same finding: the derive folds in append order, so the finding
+      // ends `blocking` (a `ruled` key ignores a later referral, so no other row can reopen it for a ruling). Returns the
+      // keys whose revert could not be recorded either, which may still be live. The revert is unconditional: a row
+      // another writer appended for the same finding in between is overridden by the hold (the fail-safe side).
+      const RERUN = 're-run the same ruling once the ledger is writable to record the rest and post the comment';
+      const revertToHold = async (rows) => {
+        const stillLive = [];
+        for (const e of rows) {
+          const hold = buildLedgerEvent({ type: EVENT_TYPES.RULING, repo, pr, at: now(), source: 'record-referral-ruling',
+            declaredActor: actor, channel, findingKey: e.findingKey, ruling: 'block' });
+          if (await tryAppend([hold])) stillLive.push(e.findingKey);
+        }
+        return stillLive;
+      };
+      const revertNote = (rows, stillLive) => stillLive.length
+        ? `${stillLive.join(', ')} ${stillLive.length === 1 ? 'may be' : 'may each be'} LIVE in the ledger and clear${stillLive.length === 1 ? 's' : ''} without a comment (the revert to a holding block ruling was not recorded either)`
+        : `${rows.map((e) => e.findingKey).join(', ')} reverted to a holding block ruling, so the finding is blocking (not cleared) until the ruling is re-run`;
       if (clearing.length) {
         // One at a time, stopping at the first miss, so no further clearing row is written once the ledger is failing
         // (holding rulings below are the opposite: attempt them all). The ledger is append-only, so a row recorded
-        // BEFORE the miss is already live and closes its referral with no comment posted. That cannot be rolled back
-        // here, so it is reported by name and a re-run finishes the batch: the plan reads only the PR thread, so it
-        // plans every finding again, re-records the live rows (same ruling, so the latest row says what it said) and
-        // posts the comment.
-        let miss = null;
+        // BEFORE the miss is already live and closes its referral with no comment posted. It cannot be deleted, so it is
+        // reverted by a LATER holding `block` row for the same finding (the derive folds in append order, so the finding
+        // ends held again). If that revert cannot be recorded either, the rows still live are named in the error. Either
+        // way a re-run finishes the batch: the plan reads only the PR thread, so it plans every finding again, records
+        // the clearing rows after the revert (the latest row wins) and posts the comment.
+        let miss = null, missed = null;
         const recorded = [];
         for (const e of clearing) {
           miss = await tryAppend([e]);
-          if (miss) break;
-          recorded.push(e.findingKey);
+          if (miss) { missed = e; break; }
+          recorded.push(e);
         }
         if (miss && recorded.length) {
+          // The row that missed is reverted too: a failed append can still have landed (a push whose reply was lost).
+          const touched = [...recorded, missed];
           throw new Error(`ledger-write-miss: ${recorded.length} of ${clearing.length} clearing rulings were recorded before the ledger failed (${miss}); `
-            + `${recorded.join(', ')} ${recorded.length === 1 ? 'is' : 'are'} ALREADY LIVE in the ledger and clear${recorded.length === 1 ? 's' : ''} without a comment, and nothing was posted; `
-            + 're-run the same ruling once the ledger is writable to record the rest and post the comment');
+            + `${revertNote(touched, await revertToHold(touched))}, and nothing was posted; ${RERUN}`);
         }
         if (miss) throw new Error(`ledger-write-miss: the ruling was not recorded in the verdict ledger, so it does not clear and nothing was posted (${miss}); retry once the ledger is writable`);
       }
       const already = before.comments.some((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
-      if (!already) post(repo, pr, body);
-      const after = readPrThread(repo, pr, { readJson });
-      const seen = after.comments.filter((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
-      if (!seen.length || !readOperatorRulings(seen, { head }).rulings.length) {
-        throw new Error('the ruling comment is not readable by the gate after posting (untrusted author or altered body); the hold remains — inspect the thread before retrying');
+      let seen;
+      try {
+        if (!already) post(repo, pr, body);
+        const after = readPrThread(repo, pr, { readJson });
+        seen = after.comments.filter((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
+        if (!seen.length || !readOperatorRulings(seen, { head }).rulings.length) {
+          throw new Error('the ruling comment is not readable by the gate after posting (untrusted author or altered body); the hold remains — inspect the thread before retrying');
+        }
+      } catch (error) {
+        // Clearing rows are already recorded (the F4 order) but the comment did not land readable: they must not stay live.
+        if (!clearing.length) throw error;
+        throw new Error(`${String(error?.message ?? error)} [${revertNote(clearing, await revertToHold(clearing))}; ${RERUN}]`);
       }
       const holding = events.filter((e) => !clearsHold(e.ruling));
       const holdMiss = holding.length ? await tryAppend(holding) : null;

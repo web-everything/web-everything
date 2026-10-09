@@ -125,8 +125,28 @@ describe('planRulingBackfill', () => {
     expect(plan({ threadRulings: new Map() }).append).toHaveLength(1);
   });
 
-  it.each([review(), referral({ findingKeys: ['unrelated'] }), verdict({ verdict: 'changes' }), verdict({ pr: 8 }), referral({ at })])('allows unrelated or non-later rows: %j', row => {
+  it.each([review(), referral({ findingKeys: ['unrelated'] }), verdict({ verdict: 'changes' }), verdict({ pr: 8 }), referral({ at: early })])('allows unrelated or strictly earlier rows: %j', row => {
     expect(plan({ gitRows: [row] }).append).toHaveLength(1);
+  });
+
+  // An equal timestamp cannot establish append order, and the backfill appends the ruling LAST: a clearing ruling would
+  // close a referral that landed at the same instant. The migration already skips the same tie.
+  it.each([
+    ['a referral for the finding', referral({ at })],
+    ['a referral naming the hashed key', referral({ findingKeys: [ledgerFindingKey('raw key')], at })],
+    ['a clearing verdict', verdict({ at })],
+  ])('skips a clearing ruling that ties on time with %s (appending it last would overwrite that row)', (_name, other) => {
+    const row = ruling({ ruling: 'not-real' });
+    const result = plan({ homeRows: [row], gitRows: [other], threadRulings: posted(row) });
+    expect(result).toEqual({ append: [], skipped: skipped('out-of-order') });
+  });
+
+  it('a tied clearing ruling that is backfilled would close the referral; skipped, the derive still holds it', () => {
+    const tied = referral({ at, findingKeys: [ledgerFindingKey('raw key')] });
+    const row = ruling({ ruling: 'not-real' });
+    const { append } = plan({ homeRows: [row], gitRows: [tied], threadRulings: posted(row) });
+    const state = rows => deriveReferrals(rows).get(ledgerFindingKey('raw key')).state;
+    expect(state([tied, ...append])).toBe('open');
   });
 
   it('skips a send-back when a later row witnesses another head', () => {
@@ -143,6 +163,11 @@ describe('planRulingBackfill', () => {
     [{ ...verdict({ at: early }), coverage: undefined, headSha: head }, review()],
   ].map(rows => ({ rows })))('keeps send-backs with equal heads or no witnesses: $rows', ({ rows }) => {
     expect(plan({ homeRows: [sendBack()], gitRows: rows }).append).toEqual([sendBack()]);
+  });
+
+  it('skips a send-back that ties on time with a row witnessing another head (the order is unknown and it lands last)', () => {
+    expect(plan({ homeRows: [sendBack()], gitRows: [review({ at: early }), review({ headSha: nextHead, at })] }))
+      .toEqual({ append: [], skipped: [{ pr: 7, type: 'send-back', at, reason: 'out-of-order' }] });
   });
 
   it('treats a newly witnessed head as different from unknown', () => {
