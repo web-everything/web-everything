@@ -20,10 +20,11 @@
  * capture (any mechanism — a crash, a kill, plain truncation) instead of trusting it; see
  * capture-via-exec-file-sync.mjs's header for why signal-based detection alone was tried and disproven.
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { captureViaExecFileSync, isParseableJson } from '../lib/capture-via-exec-file-sync.mjs';
+import { makeGitOverlay } from '../lib/hermetic-git-overlay.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..');
@@ -31,8 +32,13 @@ const CHECK_STANDARDS = join(ROOT, 'scripts', 'check-standards.mjs');
 
 describe('check:standards — no duplicate (message, descriptor.file) finding pairs (#2863 durable guard)', () => {
   let findings;
+  // Hermetic (card xcu4cqf): the gate reads `origin/main`; it runs over the real tree through a git overlay whose
+  // `origin/main` is pinned to HEAD, so the result never drifts with what was pushed upstream.
+  let overlay;
+  afterAll(() => overlay?.cleanup());
   beforeAll(() => {
-    const out = captureViaExecFileSync(CHECK_STANDARDS, ['--json'], { validate: isParseableJson });
+    overlay = makeGitOverlay(ROOT);
+    const out = captureViaExecFileSync(CHECK_STANDARDS, ['--json'], { validate: isParseableJson, env: { ...process.env, ...overlay.env } });
     const parsed = JSON.parse(out);
     findings = [...parsed.errors, ...parsed.warnings];
   }, 120_000);

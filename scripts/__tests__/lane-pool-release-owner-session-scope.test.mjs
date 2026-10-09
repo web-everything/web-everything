@@ -14,7 +14,7 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -27,11 +27,19 @@ function git(args, cwd) {
 
 let base, originDir, referenceDir, poolRoot;
 
+// Hermetic (xcu4cqf): `lane-pool acquire/release/reap` asks `gh api …/pulls` for its best-effort PR-terminal axis and
+// degrades that axis OFF when gh fails. This suite does not exercise that axis, so a stub `gh` that always fails
+// (first on the child's PATH) stands in for the real/fake one — deterministic, never reaches GitHub.
+let ghStubDir;
+function withGhStub(env) {
+  return { ...env, PATH: `${ghStubDir}:${env.PATH || process.env.PATH}` };
+}
+
 function runPool(args, extraEnv = {}) {
   const r = spawnSync('node', [SCRIPT, ...args], {
     encoding: 'utf8',
     cwd: referenceDir,
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv },
+    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv }),
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
@@ -53,6 +61,9 @@ beforeAll(() => {
   git(['add', 'file.txt'], referenceDir);
   git(['-c', 'user.email=t@t.com', '-c', 'user.name=t', 'commit', '--quiet', '-m', 'v1'], referenceDir);
   git(['push', '--quiet', 'origin', 'main'], referenceDir);
+  ghStubDir = join(fixtureRoot, 'ghstub');
+  mkdirSync(ghStubDir, { recursive: true });
+  writeFileSync(join(ghStubDir, 'gh'), '#!/bin/sh\necho "gh stub: unavailable in this test" >&2\nexit 1\n', { mode: 0o755 });
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
 });
 

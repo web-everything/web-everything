@@ -915,13 +915,21 @@ describe('assertLaneCwd follows symlinks', () => {
   });
 
   it('sameDirectory answers by inode, so two names for one directory match', () => {
-    const here = realpathSync.native(process.cwd());
-    const alias = `/System/Volumes/Data${here}`;
-    expect(sameDirectory(here, here)).toBe(true);
-    expect(sameDirectory(here, join(here, '..'))).toBe(false);
-    if (existsSync(alias)) expect(sameDirectory(here, alias)).toBe(true);
-    // Unstattable paths answer false rather than throwing — the refusal above is the louder signal.
-    expect(sameDirectory(join(here, 'no-such-dir-xyz'), here)).toBe(false);
+    // A throwaway tree (hermetic: no stat of the real lane pool). The parent dir stands in for "another directory".
+    const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'same-dir-')));
+    try {
+      const here = join(root, 'here');
+      mkdirSync(here);
+      const link = join(root, 'link');
+      symlinkSync(here, link);
+      const alias = `/System/Volumes/Data${here}`;
+      expect(sameDirectory(here, here)).toBe(true);
+      expect(sameDirectory(here, link)).toBe(true);
+      expect(sameDirectory(here, join(here, '..'))).toBe(false);
+      if (existsSync(alias)) expect(sameDirectory(here, alias)).toBe(true);
+      // Unstattable paths answer false rather than throwing — the refusal above is the louder signal.
+      expect(sameDirectory(join(here, 'no-such-dir-xyz'), here)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   // `dev` IS LOAD-BEARING and had no test (PR #1188 round 3, finding 1). Inode numbers are unique per

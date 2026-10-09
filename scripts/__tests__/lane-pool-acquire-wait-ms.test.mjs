@@ -32,7 +32,7 @@
  * `pollCount >= 1` for the same load-independent proof that this is the retry path, not a lucky first read.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -55,7 +55,7 @@ function runPool(args) {
   // alone. A no-op for every command other than `acquire`'s auto-pick retry loop.
   const r = spawnSync('node', [SCRIPT, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_ACQUIRE_DEBUG: '1' },
+    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, LANE_POOL_ACQUIRE_DEBUG: '1' }),
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
@@ -109,7 +109,7 @@ const poolArgs = () => [`--origin=${originDir}`, `--reference=${referenceDir}`, 
 function scheduleRelease(delayMs) {
   const sleepSec = (delayMs / 1000).toFixed(3);
   spawn('sh', ['-c', `sleep ${sleepSec} && node "${SCRIPT}" release --pool=waitms --lane=1 --session=holder`], {
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot },
+    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot }),
     stdio: 'ignore',
     detached: true,
   }).unref();

@@ -4,6 +4,11 @@ import { TRUST_CHAIN_TIER_FILES } from './scripts/lib/trust-chain-tier.mjs';
 import { cacheEnabled as testCacheEnabled } from './scripts/lib/test-result-cache.mjs';
 import { traceEnabled as testTraceEnabled } from './scripts/lib/test-cache-trace.mjs';
 import ShadowReporter from './scripts/test-cache/shadow-reporter.mjs';
+import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tests.mjs';
+
+// Card xcu4cqf: the scheduled live suite's files (scripts/hermetic-tests.settings.json → liveSuite.tests) never run
+// in a blocking suite. They run only in vitest.live.config.ts, on a schedule, as a non-blocking health signal.
+const LIVE_SUITE = liveSuiteFiles(loadHermeticSettings());
 
 export default defineConfig({
   // Mirror vite.config.mts so .tsx files (the shared mapping fixtures + conformance suites)
@@ -35,7 +40,9 @@ export default defineConfig({
     globalSetup: ['./vitest.globalSetup.mjs'],
     // Isolate spawned git from host config and skip inert sample-hook copies in throwaway repos.
     // See vitest.shared.ts#hermeticGitEnv.
-    env: hermeticGitEnv(),
+    // WE_TEST_HERMETIC: hermetic by default (card xcu4cqf, see vitest.setup.ts) — written down so no config can
+    // drift to live by omission; only vitest.live.config.ts says '0'.
+    env: { ...hermeticGitEnv(), WE_TEST_HERMETIC: '1' },
     // #x1jcikc: cap this invocation's own worker count (see vitest.shared.ts#maxTestWorkers for the sizing
     // rationale) — otherwise the ~2000-file suite defaults to one thread per CPU core, which is how two
     // concurrently-admitted `test:unit` runs oversubscribe a 12-core host.
@@ -167,6 +174,7 @@ export default defineConfig({
     // See `vitest.integration.config.ts`'s header for the full file list and the pool assignment within it.
     exclude: [
       ...configDefaults.exclude,
+      ...LIVE_SUITE,
       // #3061 real-CLI regression proof (`check-standards.mjs`/`lane-review.mjs`, captured through a real
       // pipe — an in-process call can't reproduce the truncation bug this exists to catch). Measured at
       // 88.9s total, 2 of its tests alone at 48.4s/39.7s — the single most expensive file in the unit suite,

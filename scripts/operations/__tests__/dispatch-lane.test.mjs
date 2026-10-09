@@ -1995,6 +1995,10 @@ describe('the tick reader', () => {
     // that left this one real would shell `claude` whenever the ambient run store happened to hold an
     // in-flight dispatch.
     listAgents: () => [],
+    // #3457/#3460 + xykwe0h — readTick calls these lazily whenever a launch clears; left to their defaults they
+    // shell the real `gh` and read origin/main from the real checkout. Stubbed: nothing is already delivered.
+    checkAlreadyDone: () => ({ done: false, pr: null, checked: false }),
+    checkBuildDelivery: () => null,
   };
 
   it('selects this item\'s launch with the tick\'s OWN normalizer, so `#042` and `42` are one item', () => {
@@ -3169,6 +3173,7 @@ describe('readTick — the ground-truth check is LAZY: one gh call per dispatch 
     readText: () => BRIEF,
     loadItems: () => [{ num: '3037', slug: 'declare-dispatch', scope: ['we:scripts/operations/'] }],
     listAgents: () => [],
+    checkBuildDelivery: () => null,
   };
 
   it('calls checkAlreadyDone exactly once when a launch was cleared, and threads its verdict onto the read', () => {

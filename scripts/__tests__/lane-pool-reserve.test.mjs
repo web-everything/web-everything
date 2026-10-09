@@ -11,7 +11,7 @@
  *   no shared pool root); the pure tests exercise the lease-decision core directly.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -30,7 +30,7 @@ let base, originDir, referenceDir, poolRoot;
 function runPool(args) {
   const r = spawnSync('node', [SCRIPT, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot },
+    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot }),
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }

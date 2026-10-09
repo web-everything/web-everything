@@ -10,7 +10,7 @@
  *   one interactive session, driving `acquire` then `release` through separate Bash-tool invocations.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -83,7 +83,7 @@ let base, originDir, referenceDir, poolRoot;
 function runPool(args, ownerSessionId) {
   // LANE_POOL_ROOT MUST be this test's private tmp dir — without it every command falls back to the
   // real default pool root (~/workspace/.lanes), colliding with any other lane pool of the same --name.
-  const env = { ...process.env, LANE_POOL_ROOT: poolRoot };
+  const env = withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot });
   delete env.LANE_SESSION;
   if (ownerSessionId !== undefined) env.CLAUDE_CODE_SESSION_ID = ownerSessionId;
   else delete env.CLAUDE_CODE_SESSION_ID;

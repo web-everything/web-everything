@@ -134,6 +134,7 @@ describe('recordPrepVerdict — the race guard', () => {
       expectedContentHash: 'a-hash-that-will-never-match-the-live-file',
       exec: () => { calls.push('exec'); return ''; },
       runNode: () => { calls.push('runNode'); return '{}'; },
+      hasCredential: () => true, // hermetic: no live `gh auth status` probe
     });
     expect(result).toMatchObject({ recorded: false, aborted: true });
     expect(result.reason).toMatch(/changed since it was read/);
@@ -341,6 +342,7 @@ describe('recordPrepVerdict — the post-write verify (#3230)', () => {
         return args[0] === 'rev-parse' ? 'deadbeefcafe\n' : '';
       },
       runNode: (argv) => { landCalls.push(argv); return '{}'; },
+      hasCredential: () => true, // hermetic: no live `gh auth status` probe
       // the staged index still holds the card's PRE-write text — the write never landed there.
       readStagedContent: () => CARD_RAW,
     });
@@ -500,6 +502,7 @@ describe('recordPrepVerdict — failure classification', () => {
       expectedContentHash: contentHashOf(CARD_RAW),
       exec: () => { throw new Error('nothing to commit'); },
       runNode: () => { throw new Error('must not be reached'); },
+      hasCredential: () => true, // hermetic: no live `gh auth status` probe
     })).rejects.toMatchObject({ notApplied: true });
   });
 

@@ -11,6 +11,12 @@ vi.mock('node:child_process', async (importOriginal) => {
   const execFileSync = vi.fn(() => '[]');
   return { ...actual, execFileSync, default: { ...actual.default, execFileSync } };
 });
+// The queue reads `gh` through the throttle, whose `gh` path is `spawnSync` (not the mocked `execFileSync`), so the
+// mock above never caught it: stub the throttled entry point itself with an empty PR list per repo (hermetic).
+vi.mock('../../lib/gh-throttle.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, execFileSyncThrottled: vi.fn(() => '[]') };
+});
 import { main } from '../operator-queue.mjs';
 
 const saved = process.env.CONVEYOR_STATE_ROOT;

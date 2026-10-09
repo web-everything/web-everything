@@ -125,9 +125,11 @@ function countGitSpawnsDuring(fn) {
 }
 
 function runCollect(extraEnv) {
+  // cwd = the throwaway reference clone, NOT the real checkout: the collector probes `git rev-parse origin/main`
+  // in its own cwd, which hermetic tests forbid inside the real checkout.
   const r = spawnSync('node', [
     COLLECT_CLI, '--json', '--no-track-attempts', `--repo=${referenceDir}`, `--name=${POOL_NAME}`,
-  ], { encoding: 'utf8', env: poolEnv(extraEnv) });
+  ], { encoding: 'utf8', env: poolEnv(extraEnv), cwd: referenceDir });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 

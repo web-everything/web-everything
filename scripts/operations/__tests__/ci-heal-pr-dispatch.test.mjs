@@ -677,6 +677,7 @@ describe('xng7q1p retry reservation and restart soak', () => {
       lastPlan = planReconcile({ prs, requiredChecks: ['test'] });
       await runReconcileCiHealDispatch({ checkStaleness: FRESH, reconcile: () => lastPlan,
         flushOwed: () => ({}), flushTimeouts: async () => [], pickFreeLanes: () => [],
+        resolveWorkUnit: () => ({ itemNum: null, scope: [] }), // hermetic: no live `gh pr diff` for the work unit
         unsupportedPath: join(dir, 'unsupported'), retryTimeout: (entry) => dispatchTimeoutRetry(entry, opts),
         dispatch: () => { throw new Error('no lane available'); } });
     }

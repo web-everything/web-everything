@@ -5,7 +5,7 @@
  *   in-memory-store convention for `ensureSettingsFileEnv`/`ensureSettingsFilePermissions`.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, mkdirSync, readdirSync, copyFileSync, symlinkSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -165,16 +165,28 @@ describe('xl5reby dispatched worker effective settings include the repo guard ho
   });
 
   it('the guard runs from a dispatch-style cwd with an absolute path and denies a redirect write at a primary checkout', () => {
+    // HERMETIC (xcu4cqf): the guard derives the constellation primaries from ITS OWN location
+    // (`<workspace>/<repo>/scripts/guard-bash.mjs`). Build a throwaway workspace whose `webeverything/scripts/`
+    // holds a COPY of the guard beside symlinks to every other script, so the primary it protects is a tmp
+    // directory — not whatever sibling checkout (or lane pool) the machine running the suite happens to have.
     const cwd = mkdtempSync(join(tmpdir(), 'dispatch-guards-'));
+    // realpath'd: the guard's CLI check compares `process.argv[1]` with its realpath'd `import.meta.url`.
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), 'dispatch-guards-ws-')));
     try {
-      const primary = resolve(REPO, '..', 'webeverything');
-      const ev = JSON.stringify({ tool_name: 'Bash', cwd: primary, tool_input: { command: 'echo x > scratch-should-never-exist.txt' } });
-      const out = spawnSync('node', [join(REPO, 'scripts', 'guard-bash.mjs')], { cwd, input: ev, encoding: 'utf8' });
-      expect(out.status).toBe(0);
-      // Only meaningful when a sibling primary exists on this machine; elsewhere the guard has nothing to protect.
-      if (existsSync(primary) && resolve(REPO, '..') === dirname(primary)) {
-        expect(JSON.parse(out.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+      const primary = join(ws, 'webeverything');
+      const scripts = join(primary, 'scripts');
+      mkdirSync(scripts, { recursive: true });
+      for (const name of readdirSync(join(REPO, 'scripts'))) {
+        if (name === 'guard-bash.mjs') copyFileSync(join(REPO, 'scripts', name), join(scripts, name));
+        else symlinkSync(join(REPO, 'scripts', name), join(scripts, name));
       }
-    } finally { rmSync(cwd, { recursive: true, force: true }); }
+      const ev = JSON.stringify({ tool_name: 'Bash', cwd: primary, tool_input: { command: 'echo x > scratch-should-never-exist.txt' } });
+      const out = spawnSync('node', [join(scripts, 'guard-bash.mjs')], { cwd, input: ev, encoding: 'utf8' });
+      expect(out.status).toBe(0);
+      expect(JSON.parse(out.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(ws, { recursive: true, force: true });
+    }
   });
 });
