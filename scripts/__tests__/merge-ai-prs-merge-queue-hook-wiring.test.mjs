@@ -52,15 +52,16 @@ if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
 
-function runCli({ hookOn, seedRefreshed = null }) {
+function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
     mkdirSync(bin);
-    for (const [name, code] of [['gh', fakeGh], ['git', fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
+    // (the main-fix record names the WE repo by key, so that run's clone must read as WE: the couple shim's `origin`)
+    for (const [name, code] of [['gh', fakeGh], ['git', mainFixPr ? fakeGitCouple : fakeGit]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
     const fixture = join(dir, 'prs.json');
     // #3001: pass 5 min old (fresh). #3002: pass 120 min old (stale). Main moved only on a backlog card (non-code).
-    writeFileSync(fixture, JSON.stringify([[3001, 5], [3002, 120]].map(([number, age]) => ({
+    writeFileSync(fixture, JSON.stringify(ages.map(([number, age]) => ({
       number, title: `leaf ${number}`, body: 'A real summary.', headRefName: `lane/leaf-${number}`,
       baseRefName: 'main', headRefOid: `sha-${number}`, mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN',
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
@@ -76,13 +77,18 @@ function runCli({ hookOn, seedRefreshed = null }) {
     const coord = join(dir, 'coord');
     const statePath = join(coord, 'merge-queue-refreshed.json');
     if (seedRefreshed) { mkdirSync(coord, { recursive: true }); writeFileSync(statePath, JSON.stringify(seedRefreshed)); }
+    // A published main-red-priority record in the shape planPriority really writes (`repo` is the constellation KEY,
+    // `prs` every fix PR): PR `mainFixPr` owns the fix and must land first.
+    const mainFixFile = join(dir, 'main-red-priority.json');
+    if (mainFixPr) writeFileSync(mainFixFile, JSON.stringify({ repo: 'we', pr: mainFixPr, prs: [mainFixPr], firstRedSha: 'red', reason: 'owns the red-main fix', setAt: NOW, expiresAt: NOW + 3_600_000 }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: dir, encoding: 'utf8', timeout: 30000,
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
-        ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), WE_COORDINATION_ROOT: coord },
+        ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
+        WE_COORDINATION_ROOT: coord },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
@@ -108,16 +114,159 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(refreshed).toBeNull();
   }, 30000);
 
-  it('once per head: a head already refreshed waits — no second refresh, no merge', () => {
-    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
-    const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seed });
+  // The record a refresh writes: the head AND the pass it was requested against (the fixture's check-run id is 7 and
+  // its pass completed at `iso(120)`), plus when it was requested.
+  const seedFor = (over = {}) => Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k,
+    { head: 'sha-3002', checkRunId: 7, completedAtMs: Date.parse(iso(120)), atMs: NOW, ...over }]));
+
+  it('once per pass: a head refreshed against the pass still in force waits — no second refresh, no merge', () => {
+    const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seedFor() });
     expect(attempts).toEqual([3001]);
     expect(stderr).toMatch(/merge-queue: wait \(refresh-already-requested\)/);
   }, 30000);
+
+  it('a rerun that finished (a newer pass on the same head) does not strand the head: it is refreshed again', () => {
+    // Review of #4619: the record used to be head-only, so the head stayed `wait` after its rerun finished.
+    const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seedFor({ checkRunId: 6, completedAtMs: Date.parse(iso(300)) }) });
+    expect(attempts).toEqual([3001]);
+    expect(stderr).not.toMatch(/refresh-already-requested/);
+    expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
+  }, 30000);
+
+  it('a legacy head-only record (key → head) does not park the head either', () => {
+    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
+    const { stderr } = runCli({ hookOn: true, seedRefreshed: seed });
+    expect(stderr).not.toMatch(/refresh-already-requested/);
+    expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
+  }, 30000);
+
+  it('main-fix first (through the drain): the published main-fix PR lands before an older-numbered PR', () => {
+    const both = [[3001, 5], [3002, 5]]; // both merge-fresh, so only the ORDER differs
+    expect(runCli({ hookOn: true, ages: both }).attempts).toEqual([3001, 3002]); // control: no record → number order
+    expect(runCli({ hookOn: true, ages: both, mainFixPr: 3002 }).attempts).toEqual([3002, 3001]);
+  }, 60000);
 
   it('hook OFF (built-in default): both merge exactly as today, no freshness reads', () => {
     const { attempts, api } = runCli({ hookOn: false });
     expect(attempts.sort()).toEqual([3001, 3002]);
     expect(api.filter((p) => p.includes('check-runs?check_name=test&per_page=100'))).toEqual([]);
   }, 30000);
+});
+
+// ── Review of #4619 (correctness): the WE-carrier pre-check had no test. A couple = an impl half in a sibling repo
+// plus its WE carrier; the carrier lands AFTER the impl half, so its merge-freshness is judged at the impl half's turn
+// (a stale carrier holds the whole couple) and again at its own turn. Driven through the real CLI, two repos, hermetic
+// shims — the same harness shape as above, with a repo-aware `gh`.
+const LOCAL = 'web-everything/web-everything'; // the clone's own `origin`, so the drain treats it as the local repo
+const FUI = 'frontier-ui/frontierui';
+const PA = 'plateauapp/plateau-app';
+const fakeGitCouple = fakeGit.replace('git@github.com:fixture/drain-mq.git', `git@github.com:${LOCAL}.git`);
+const fakeGhCouple = `#!/usr/bin/env node
+const fs = require('node:fs');
+const a = process.argv.slice(2);
+const F = process.env.MQ_FIXTURE;
+const db = JSON.parse(fs.readFileSync(F, 'utf8'));
+const ri = a.indexOf('--repo');
+const slugOf = () => (ri >= 0 ? a[ri + 1] : db.local);
+const prsOf = (slug) => db.repos[slug] || [];
+const mark = (slug, n) => F + '.merged-' + slug.replace(/\\//g, '_') + '-' + n;
+const out = x => { process.stdout.write(JSON.stringify(x)); process.exit(0); };
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('main'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'list') { const s = slugOf(); out(prsOf(s).filter(p => !fs.existsSync(mark(s, p.number)))); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  const s = slugOf(); const p = prsOf(s).find(p => String(p.number) === a[2]);
+  if (!p) process.exit(1);
+  const landed = fs.existsSync(mark(s, p.number));
+  out({ ...p, state: landed ? 'MERGED' : 'OPEN', mergedAt: landed ? '2026-10-09T00:00:00Z' : null });
+}
+if (a[0] === 'pr' && a[1] === 'merge') { const s = slugOf(); fs.appendFileSync(F + '.attempts', s + '#' + a[2] + '\\n'); fs.writeFileSync(mark(s, a[2]), ''); process.exit(0); }
+if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
+if (a[0] === 'api') {
+  const path = a[1];
+  fs.appendFileSync(F + '.api', path + '\\n');
+  let m;
+  if ((m = /repos\\/(.+?)\\/commits\\/([0-9a-f]+)\\/check-runs/.exec(path))) {
+    const p = prsOf(m[1]).find(p => p.headRefOid === m[2]);
+    // the Nth read of this head's pass sees the Nth age in passAtSeq (the last one repeats): a pass that ages out mid-pass
+    const nf = F + '.reads-' + m[2]; const n = fs.existsSync(nf) ? Number(fs.readFileSync(nf, 'utf8')) : 0; fs.writeFileSync(nf, String(n + 1));
+    const at = p.passAtSeq[Math.min(n, p.passAtSeq.length - 1)];
+    out([{ check_runs: [{ id: 7, name: 'test', head_sha: m[2], status: 'completed', conclusion: 'success',
+      started_at: at, completed_at: at, details_url: 'https://github.com/o/r/actions/runs/99' + p.number + '/job/1' }] }]);
+  }
+  if (/\\/branches\\/main$/.test(path)) out({ sha: 'tip' });
+  if ((m = /compare\\/([0-9a-f]+)\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
+  if ((m = /pulls\\/(\\d+)\\/files/.exec(path))) out([[{ filename: 'backlog/leaf-' + m[1] + '.md' }]]);
+}
+process.exit(0);
+`;
+
+function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null }) {
+  const dir = mkdtempSync(join(tmpdir(), 'drain-mq-couple-'));
+  try {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    for (const [name, code] of [['gh', fakeGhCouple], ['git', fakeGitCouple]]) writeFileSync(join(bin, name), code, { mode: 0o755 });
+    const manifest = { item: 'xcarr01', repos: [{ repo: 'we', ref: 'lane/xcarr01-we' }, { repo: 'fui', ref: 'lane/xcarr01-fui' },
+      ...(secondImplPassAges ? [{ repo: 'plateau-app', ref: 'lane/xcarr01-pa' }] : [])], blockedBy: [], stackParents: [] };
+    const body = `A real summary.\n\n<!-- lane-manifest:begin -->\n\`\`\`json\n${JSON.stringify(manifest)}\n\`\`\`\n<!-- lane-manifest:end -->\n`;
+    const sha = (number) => String(number).padStart(12, 'a'); // a hex sha, so a reviewed-sha marker can name it
+    // A cross-repo couple is always escalated for review; the carrier carries the human clearance for ITS head
+    // (label + a trusted reviewed-sha marker), which is what the real drain requires before it will land it.
+    const accepted = (number) => ({ labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
+      comments: [{ body: `Reviewed.\n<!-- reviewed-sha: ${sha(number)} -->`, viewerDidAuthor: true, author: { login: 'web-everything' }, createdAt: iso(60) }] });
+    const pr = (number, headRefName, ages, extra = {}) => ({
+      number, title: `couple ${number}`, body: 'A real summary.', headRefName, baseRefName: 'main', headRefOid: sha(number),
+      mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
+      labels: [{ name: 'ready-to-merge' }], comments: [], passAtSeq: ages.map(iso),
+      commits: [{ oid: sha(number), authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
+      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0 }], ...extra,
+    });
+    const fixture = join(dir, 'prs.json');
+    writeFileSync(fixture, JSON.stringify({ local: LOCAL, repos: {
+      [LOCAL]: [pr(4001, 'lane/xcarr01-we', carrierPassAges, { body, ...accepted(4001) })],
+      [FUI]: [pr(501, 'lane/xcarr01-fui', implPassAges)],
+      ...(secondImplPassAges ? { [PA]: [pr(601, 'lane/xcarr01-pa', secondImplPassAges)] } : {}),
+    } }));
+    const settings = join(dir, 'merge-queue.json');
+    writeFileSync(settings, JSON.stringify({ mergeQueue: { enabled: true, batchSize: 1 }, mergeFreshness: { enabled: true, maxAgeMinutes: 30, allowDisjointMainMoves: true } }));
+    const coord = join(dir, 'coord');
+    const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
+    const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
+      '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
+      cwd: dir, encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord },
+    });
+    expect(r.error, r.stderr).toBeUndefined();
+    const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
+    return { stdout: r.stdout, stderr: r.stderr, attempts: read('.attempts'), api: read('.api') };
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+describe('review of #4619 — the WE-carrier pre-check keeps a couple together', () => {
+  it('a stale WE carrier holds the whole couple: the fresh impl half does not land alone, nothing reaches gh pr merge', () => {
+    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [120] });
+    // (--json: the drain prints its skip reasons, not the per-line `⛓` notes)
+    expect(stderr).toMatch(/"kind":"couple-held"[^\n]*its WE carrier is not merge-fresh \(merge-queue\)/);
+    expect(stderr).toMatch(/"num":4001[^\n]*merge-queue: refresh \(pass-too-old\)/);
+    expect(attempts).toEqual([]);
+  }, 90000);
+
+  it('both halves fresh: the impl half lands, then its carrier (control — the gate does not block a healthy couple)', () => {
+    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [5] });
+    expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
+  }, 90000);
+
+  it('the carrier pass ages out between the pre-check and its own turn: the couple still lands together, never split', () => {
+    // 25 min old when the pre-check reads it (fresh), 31 min old when the carrier is judged again after the impl merged.
+    const { attempts, stderr } = runCouple({ implPassAges: [5], carrierPassAges: [25, 31] });
+    expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
+    expect(stderr).not.toMatch(/COUPLE SPLIT/);
+  }, 90000);
+
+  it('a carrier with TWO impl halves: the second half\'s pre-check honours the first one\'s clearance, so neither lands alone', () => {
+    // Pre-check for the first half reads the carrier's pass at 25 min (fresh); by the second half's pre-check it is 31 min old.
+    const { attempts, stderr } = runCouple({ implPassAges: [5], secondImplPassAges: [5], carrierPassAges: [25, 31] });
+    expect(attempts).toEqual([`${FUI}#501`, `${PA}#601`, `${LOCAL}#4001`]);
+    expect(stderr).not.toMatch(/COUPLE SPLIT/);
+  }, 90000);
 });

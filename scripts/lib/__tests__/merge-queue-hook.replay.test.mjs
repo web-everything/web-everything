@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   loadMergeQueueSettings, hookEnabled, readMergeFreshnessFacts, decideMergeQueueAction, requiredCheckFact,
-  prioritizeMainFix, isNonCodePath, mainGainedCode, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
+  prioritizeMainFix, isNonCodePath, mainGainedCode, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
 } from '../merge-queue-hook.mjs';
 
 const SETTINGS_FILE = JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8'));
@@ -43,7 +43,7 @@ function fakeGh(s, num) {
   return (args) => {
     const path = args[1];
     if (path.includes('/check-runs')) {
-      return JSON.stringify([{ check_runs: [{ id: 1, name: 'test', head_sha: s.head, status: 'completed', conclusion: 'success',
+      return JSON.stringify([{ check_runs: [{ id: s.checkId ?? 1, name: 'test', head_sha: s.head, status: 'completed', conclusion: 'success',
         started_at: s.started, completed_at: s.completed, details_url: `https://github.com/${REPO}/actions/runs/${s.run}/job/1` }] }]);
     }
     if (path.endsWith('/branches/main')) return JSON.stringify({ sha: s.tip });
@@ -135,8 +135,66 @@ describe('replay 2026-10-09: #4453 then #4547 (main red 07:44 ET)', () => {
   it('once per head: a head already refreshed waits instead of refreshing again', () => {
     const s = SEQ[4547];
     const facts = readMergeFreshnessFacts({ repo: REPO, num: 4547, headSha: s.head, gh: fakeGh(s, 4547) });
-    const r = decideMergeQueueAction({ key: `${REPO}#4547`, num: 4547, facts, nowMs: Date.parse(s.mergedAt), refreshed: { [`${REPO}#4547`]: s.head }, settings: LIVE });
+    const key = `${REPO}#4547`;
+    const r = decideMergeQueueAction({ key, num: 4547, facts, nowMs: Date.parse(s.mergedAt), refreshed: passRecord(key, s.head, facts), settings: LIVE });
     expect(r).toEqual({ action: 'wait', reasons: ['refresh-already-requested'] });
+  });
+});
+
+/** The durable record `recordRefreshed` writes for a refresh requested against `facts`' pass (shape under test). */
+function passRecord(key, head, facts, atMs = Date.parse(SEQ[4547].mergedAt)) {
+  const dir = mkdtempSync(join(tmpdir(), 'mqh-rec-'));
+  const p = join(dir, 'refreshed.json');
+  recordRefreshed(p, key, head, { pass: facts.pr.requiredCheck, nowMs: atMs });
+  return readRefreshed(p);
+}
+
+// Review of #4619: a successful `gh run rerun` keeps the same head, and the old once-per-head record (key → head) then
+// answered `wait` for that head FOREVER — once the new pass aged out, or main gained code, the PR was skipped on every
+// pass and never refreshed again. The record now names the pass it was requested against and lapses when a newer pass
+// exists (or after the freshness window), so a rerun that completed can be followed by another refresh.
+describe('a rerun on an unchanged head does not strand it (review of #4619)', () => {
+  const key = `${REPO}#4547`;
+  const base = SEQ[4547];
+  const factsOf = (s) => readMergeFreshnessFacts({ repo: REPO, num: 4547, headSha: s.head, gh: fakeGh(s, 4547) });
+  const at = (s, minAfterPass) => Date.parse(s.completed) + minAfterPass * 60_000;
+  // P1: the stale pass the rerun was requested against; P2: the pass the rerun produced (new check-run id, same head, same run id).
+  const p1 = { ...base, checkId: 1 };
+  const p2 = { ...base, checkId: 2, completed: '2026-10-09T11:30:00Z', started: '2026-10-09T11:25:00Z' };
+
+  it('right after the rerun (the old pass is still the latest) the head waits — no second rerun', () => {
+    const record = passRecord(key, p1.head, factsOf(p1), at(p1, 130));
+    const r = decideMergeQueueAction({ key, num: 4547, facts: factsOf(p1), nowMs: at(p1, 131), refreshed: record, settings: LIVE });
+    expect(r).toEqual({ action: 'wait', reasons: ['refresh-already-requested'] });
+  });
+  it('the rerun finished and its new pass has since aged past the window → refresh again, not wait', () => {
+    const record = passRecord(key, p1.head, factsOf(p1), at(p1, 130));
+    const r = decideMergeQueueAction({ key, num: 4547, facts: factsOf(p2), nowMs: Date.parse(p2.completed) + 45 * 60_000, refreshed: record, settings: LIVE });
+    expect(r.action).toBe('refresh');
+    expect(r.reasons).toContain('pass-too-old');
+  });
+  it('the rerun finished, then main gained code before the PR landed → refresh again (rebase), not wait', () => {
+    const record = passRecord(key, p1.head, factsOf(p1), at(p1, 130));
+    const r = decideMergeQueueAction({ key, num: 4547, facts: factsOf(p2), nowMs: Date.parse(p2.completed) + 2 * 60_000, refreshed: record, settings: LIVE });
+    expect(r.action).toBe('refresh');
+    expect(r.reasons).toContain('main-gained-code');
+  });
+  it('a request whose rerun never produced a new pass lapses after the freshness window', () => {
+    const record = passRecord(key, p1.head, factsOf(p1), at(p1, 130));
+    const r = decideMergeQueueAction({ key, num: 4547, facts: factsOf(p1), nowMs: at(p1, 130 + LIVE.freshness.maxAgeMinutes + 1), refreshed: record, settings: LIVE });
+    expect(r.action).toBe('refresh');
+  });
+  it('a record for another head, or a legacy key → head string, never blocks a refresh', () => {
+    const facts = factsOf(p1);
+    const nowMs = at(p1, 131);
+    const other = passRecord(key, 'some-older-head', facts, at(p1, 130));
+    expect(decideMergeQueueAction({ key, num: 4547, facts, nowMs, refreshed: other, settings: LIVE }).action).toBe('refresh');
+    expect(decideMergeQueueAction({ key, num: 4547, facts, nowMs, refreshed: { [key]: p1.head }, settings: LIVE }).action).toBe('refresh');
+  });
+  it('the record carries the pass identity (head, check-run id, completion time) and the request time', () => {
+    const facts = factsOf(p1);
+    const record = passRecord(key, p1.head, facts, 1234);
+    expect(record[key]).toEqual({ head: p1.head, checkRunId: 1, completedAtMs: Date.parse(p1.completed), atMs: 1234 });
   });
 });
 
@@ -163,15 +221,93 @@ describe('fail closed on missing facts', () => {
   });
 });
 
+// Review of #4619 (security lens): the fail-closed guarantee was pinned only when ALL reads fail. Each fact is nulled out
+// on its own here, on a PR that WOULD merge when every read works (young pass, main moved only on backlog cards).
+describe('fail closed: no single missing fact can turn into a merge (review of #4619)', () => {
+  const s = SEQ[4453];
+  const ok = fakeGh(s, 4453);
+  const decide = (gh, partial = {}) => {
+    const facts = readMergeFreshnessFacts({ repo: REPO, num: 4453, headSha: s.head, gh });
+    Object.assign(facts.pr, partial.pr); Object.assign(facts.main, partial.main);
+    return decideMergeQueueAction({ key: 'k', num: 4453, facts, nowMs: Date.parse(s.mergedAt), settings: LIVE });
+  };
+  it('control: with every read working this PR merges', () => {
+    expect(decide(ok).action).toBe('merge');
+  });
+  it.each([
+    ['check-runs read fails', (args) => { if (args[1].includes('/check-runs')) throw new Error('boom'); return ok(args); }],
+    ['branch tip read fails', (args) => { if (args[1].endsWith('/branches/main')) throw new Error('boom'); return ok(args); }],
+    ['compare read fails', (args) => { if (args[1].includes('/compare/')) throw new Error('boom'); return ok(args); }],
+    ['PR files read fails', (args) => { if (args[1].includes('/pulls/')) throw new Error('boom'); return ok(args); }],
+    ['check-runs reply is empty', (args) => (args[1].includes('/check-runs') ? '' : ok(args))],
+    ['compare reply is not JSON', (args) => (args[1].includes('/compare/') ? 'not json' : ok(args))],
+  ])('%s → refuse, never merge', (_name, gh) => {
+    const r = decide(gh);
+    expect(r.action).toBe('refuse');
+    expect(r.reasons).toEqual(['facts-incomplete']);
+  });
+  it.each([
+    ['compare is capped (≥300 files)', { main: { complete: false } }],
+    ['the PR base is unknown', { pr: { baseSha: null } }],
+    ['the main tip is unknown', { main: { tipSha: null } }],
+    ['the PR file list is truncated', { pr: { filesComplete: false } }],
+    ['the pass has no completion time', { pr: { requiredCheck: { state: 'passed', headSha: s.head, completedAtMs: null, runId: '1', checkRunId: 1 } } }],
+  ])('%s → refuse, never merge', (_name, partial) => {
+    expect(decide(ok, partial).action).toBe('refuse');
+  });
+});
+
+describe('couple pin: a carrier the pre-check cleared is not split by its pass aging out (review of #4619)', () => {
+  const W = 30 * 60_000;
+  const pin = { head: 'H', tip: 'T', atMs: 1_000_000 };
+  const stale = { headSha: 'H', mainTip: 'T', action: 'refresh', reasons: ['pass-too-old'], nowMs: 1_000_000 + 60_000, windowMs: W };
+  it('same head, same main tip, only the pass aged out → the pre-check verdict stands', () => {
+    expect(couplePinExcuses(pin, stale)).toBe(true);
+  });
+  it('time-boxed: a long gap between the pre-check and the carrier\'s turn is not excused', () => {
+    expect(couplePinExcuses(pin, { ...stale, nowMs: pin.atMs + W })).toBe(true);
+    expect(couplePinExcuses(pin, { ...stale, nowMs: pin.atMs + W + 1 })).toBe(false);
+  });
+  it.each([
+    ['a pin stamped in the future (clock skew / tampered)', { ...pin, atMs: stale.nowMs + 1 }, stale],
+    ['a pin with no timestamp', { head: 'H', tip: 'T' }, stale],
+    ['no clock given', pin, { ...stale, nowMs: undefined }],
+    ['no pin (the carrier was never pre-checked)', null, stale],
+    ['the carrier head moved', pin, { ...stale, headSha: 'H2' }],
+    ['main moved (a WE merge landed in between)', pin, { ...stale, mainTip: 'T2' }],
+    ['main tip unreadable', pin, { ...stale, mainTip: null }],
+    ['main gained code as well', pin, { ...stale, reasons: ['main-gained-code', 'base-behind-main', 'pass-too-old'] }],
+    ['the pass is not on the head', pin, { ...stale, reasons: ['pass-not-on-head'] }],
+    ['the rule says wait/refuse, not refresh', pin, { ...stale, action: 'refuse', reasons: ['facts-incomplete'] }],
+    ['no reasons given', pin, { ...stale, reasons: [] }],
+  ])('%s → judged afresh, never excused', (_name, p, args) => {
+    expect(couplePinExcuses(p, args)).toBe(false);
+  });
+});
+
 describe('main-fix goes first; couple halves never move', () => {
   const list = [{ num: 1, repo: null }, { num: 2, repo: null }, { num: 3, repo: null }];
+  // The record main-ci-red-core.mjs#planPriority really publishes: the constellation KEY ('we'), not a slug, plus every fix PR.
+  const record = { repo: 'we', pr: 3, prs: [3], firstRedSha: 'abc', reason: 'owns the red-main fix', setAt: 1, expiresAt: 2 };
+  const keyOf = (c) => (c.repo == null ? 'we' : c.repo === 'frontier-ui/frontierui' ? 'fui' : c.repo); // the drain's repoKeyOfVerdict
   it('moves the published main-fix PR to the front, stable otherwise', () => {
-    expect(prioritizeMainFix(list, { mainFix: { pr: 3, repo: REPO }, queueSettings: LIVE.queue }).map((c) => c.num)).toEqual([3, 1, 2]);
+    expect(prioritizeMainFix(list, { mainFix: record, queueSettings: LIVE.queue }).map((c) => c.num)).toEqual([3, 1, 2]);
+  });
+  it('matches the real record against slug-repo candidates through the drain\'s repo key (review of #4619)', () => {
+    const mixed = [{ num: 1, repo: 'frontier-ui/frontierui' }, { num: 3, repo: 'frontier-ui/frontierui' }, { num: 3, repo: null }, { num: 2, repo: null }];
+    // PR 3 of the WE repo (null = the local clone) goes first; FUI's own #3 is a different PR and stays put.
+    expect(prioritizeMainFix(mixed, { mainFix: record, queueSettings: LIVE.queue, repoKeyOf: keyOf }).map((c) => `${c.repo ?? 'we'}#${c.num}`))
+      .toEqual(['we#3', 'frontier-ui/frontierui#1', 'frontier-ui/frontierui#3', 'we#2']);
+    // a record for another repo's PR 3 does not pull WE's #3 forward
+    expect(prioritizeMainFix(list, { mainFix: { ...record, repo: 'fui' }, queueSettings: LIVE.queue, repoKeyOf: keyOf }).map((c) => c.num)).toEqual([1, 2, 3]);
+  });
+  it('every PR in `prs` is a fix and goes first (the red window may have several), in their existing order', () => {
+    expect(prioritizeMainFix(list, { mainFix: { ...record, pr: 3, prs: [3, 2] }, queueSettings: LIVE.queue }).map((c) => c.num)).toEqual([2, 3, 1]);
   });
   it('off, no record, or a couple half → unchanged', () => {
     expect(prioritizeMainFix(list, { mainFix: { pr: 3 }, queueSettings: { enabled: false } })).toBe(list);
     expect(prioritizeMainFix(list, { mainFix: null, queueSettings: LIVE.queue })).toBe(list);
-    expect(prioritizeMainFix(list, { mainFix: { pr: 3 }, queueSettings: LIVE.queue, isCoupleHalf: (c) => c.num === 3 }).map((c) => c.num)).toEqual([1, 2, 3]);
+    expect(prioritizeMainFix(list, { mainFix: record, queueSettings: LIVE.queue, isCoupleHalf: (c) => c.num === 3 }).map((c) => c.num)).toEqual([1, 2, 3]);
   });
 });
 
@@ -202,8 +338,9 @@ describe('refresh path', () => {
   });
   it('the once-per-head record persists across processes (one drain process per pass)', () => {
     const p = join(mkdtempSync(join(tmpdir(), 'mqh-')), 'refreshed.json');
-    recordRefreshed(p, 'r#1', 'h1');
-    recordRefreshed(p, 'r#1', 'h2');
-    expect(readRefreshed(p)).toEqual({ 'r#1': 'h2' });
+    const pass = { checkRunId: 5, completedAtMs: 1000 };
+    recordRefreshed(p, 'r#1', 'h1', { pass, nowMs: 1 });
+    recordRefreshed(p, 'r#1', 'h2', { pass, nowMs: 2 });
+    expect(readRefreshed(p)).toEqual({ 'r#1': { head: 'h2', checkRunId: 5, completedAtMs: 1000, atMs: 2 } });
   });
 });
