@@ -851,7 +851,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         // from re-preparing; here it is only surfaced.
         handledOutcome = currentSettled && PREPARE_HANDLED_OUTCOMES.includes(settled.outcome) && !priorFailure ? settled.outcome : null;
         if (handledOutcome) {
-          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: String(settled.evidence?.error ?? 'prepare needs you').slice(0, 300) });
+          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: redactSpawnText(String(settled.evidence?.error ?? 'prepare needs you')).slice(0, 300) });
           prepare.handled.push({ num, outcome: handledOutcome });
           heldNums.add(num);
           why ??= handledOutcome;

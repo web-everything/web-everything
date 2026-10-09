@@ -2195,6 +2195,15 @@ describe('automatic item preparation', () => {
     if (outcome === 'prepare-needs-you') expect(tick.needsYou).toContainEqual(expect.objectContaining({ num: '4501', step: 'prepare', reason: expect.stringContaining('scope is wrong') }));
     else expect(tick.needsYou).toEqual([]);
   });
+  it('a token quoted in a handled needs-you outcome never reaches the tick needsYou line (review of #4643)', async () => {
+    const effects = fixture();
+    effects.listSettledPrepares = () => [{ num: '4501', source: 'run:handled', startedAt: '2026-09-29', outcome: 'prepare-needs-you', evidence: { error: 'needs-you: prepare blocked (spec-defect) - leaked ghp_abcdefghijklmnopqrstuvwxyz0123456789 here' } }];
+    effects.readPrepareStatus = () => ({ preparedDate: null });
+    const tick = await runBuildDispatchTick({ live: true, effects });
+    const line = tick.needsYou.find(n => n.num === '4501');
+    expect(line.reason).toContain('leaked');
+    expect(line.reason).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+  });
   // Live 2026-10-09: 28 prepares sat held after ONE attempt. The tick re-classifies the held ledger itself.
   describe('held prepare ledger is re-classified on the next tick (live 2026-10-09)', () => {
     const sha = '10fedba67afc9550fb9a6592282603117284c0c2';
