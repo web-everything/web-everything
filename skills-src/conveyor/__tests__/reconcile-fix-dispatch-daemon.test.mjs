@@ -1104,6 +1104,8 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick,
+      // No fixTick/ciHealTick here, so this is a "real" tick: inject the supersede half too, or it lists PRs via live gh.
+      supersedeTick: ({ repo }) => ({ repo, holds: [], applied: [] }),
       authGateOverride: () => ({ paused: true, reason: 'paused: Claude login expired' }),
     });
     expect(out.authPaused).toBe(true);
