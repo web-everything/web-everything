@@ -6,14 +6,17 @@
  *   on schedule with the background builder, swaps only between ticks and at most once per window.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   BUILT_IN_BACKGROUND_BUILD_SETTINGS, validateBackgroundBuildSettings, loadBackgroundBuildSettings,
-  resolveBackgroundBuild, decideBuilderStart, tickStarvedSmell, builderIsAlive,
+  resolveBackgroundBuild, decideBuilderStart, tickStarvedSmell, builderIsAlive, builderRunFinished,
+  spawnBuilder, readBuilderState, writeBuilderState,
 } from '../daemon-background-build.mjs';
-import { summarizeRebuildResult, parseBuilderArgs } from '../daemon-rebuild-builder.mjs';
+import { summarizeRebuildResult, parseBuilderArgs, writeBuilderStateIfOwner } from '../daemon-rebuild-builder.mjs';
 import { withSelfSync } from '../daemon-self-sync.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -61,16 +64,34 @@ describe('tickStarvedSmell — pure', () => {
 });
 
 describe('builder helpers', () => {
-  it('builderIsAlive: unfinished + same host + live pid', () => {
-    expect(builderIsAlive({ pid: 1, host: 'h' }, { host: 'h', isAlive: () => true })).toBe(true);
-    expect(builderIsAlive({ pid: 1, host: 'h', finishedAt: 'x' }, { host: 'h', isAlive: () => true })).toBe(false);
-    expect(builderIsAlive({ pid: 1, host: 'other' }, { host: 'h', isAlive: () => true })).toBe(false);
+  it('builderIsAlive: unfinished + same host + live pid + younger than the max age', () => {
+    const o = { host: 'h', isAlive: () => true, nowMs: 100 * MIN, maxAgeMs: 90 * MIN };
+    const startedAt = new Date(95 * MIN).toISOString();
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt }, o)).toBe(true);
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt, finishedAt: 'x' }, o)).toBe(false);
+    expect(builderIsAlive({ pid: 1, host: 'other', startedAt }, o)).toBe(false);
     expect(builderIsAlive(null)).toBe(false);
+  });
+  it('builderIsAlive: a stale unfinished record with a live-looking pid is NOT alive (pid reuse after SIGKILL / reboot)', () => {
+    const o = { host: 'h', isAlive: () => true, nowMs: 300 * MIN, maxAgeMs: 90 * MIN };
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt: new Date(100 * MIN).toISOString() }, o)).toBe(false);
+    // exactly at the bound is still alive; a record whose age cannot be read cannot be bounded, so it is not trusted
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt: new Date(210 * MIN).toISOString() }, o)).toBe(true);
+    expect(builderIsAlive({ pid: 1, host: 'h' }, o)).toBe(false);
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt: 'garbage' }, o)).toBe(false);
+  });
+  it('the age bound is a declared setting (built-in default, file/env override), not a magic number', () => {
+    expect(BUILT_IN_BACKGROUND_BUILD_SETTINGS.builderMaxAgeMs).toBeGreaterThan(30 * MIN);
+    expect(resolveBackgroundBuild({ entry: 'a.mjs', settings: { builderMaxAgeMs: 7 } }).builderMaxAgeMs).toBe(7);
+    expect(resolveBackgroundBuild({ entry: 'a.mjs', env: { WE_DAEMON_BACKGROUND_BUILD_MAX_AGE_MS: '9' } }).builderMaxAgeMs).toBe(9);
+    expect(loadBackgroundBuildSettings().builderMaxAgeMs).toBeGreaterThan(30 * MIN);
   });
   it('summarize + args', () => {
     expect(summarizeRebuildResult({ moved: true, adopted: true, head: 'abc', alerts: [1] })).toEqual({ moved: true, adopted: true, reason: 'adopted', head: 'abc' });
     expect(summarizeRebuildResult(null).reason).toBe('no-result');
-    expect(parseBuilderArgs(['--root=/c', '--entry=/c/a.mjs', '--main-only'])).toEqual({ root: '/c', entries: ['/c/a.mjs'], mainOnly: true });
+    expect(parseBuilderArgs(['--root=/c', '--entry=/c/a.mjs', '--main-only'])).toEqual({ root: '/c', entries: ['/c/a.mjs'], mainOnly: true, maxAgeMs: 0 });
+    expect(parseBuilderArgs(['--root=/c', '--max-age-ms=5400000']).maxAgeMs).toBe(5_400_000);
+    expect(parseBuilderArgs(['--root=/c', '--max-age-ms=junk']).maxAgeMs).toBe(0);
   });
 });
 
@@ -218,5 +239,205 @@ describe('simulation — withSelfSync, main moving every 3 min, tonight\'s smoke
     await w.tickOnce();
     expect(log.error.mock.calls.some(([m]) => /SMELL tick-starved — no completed tick for 40 min/.test(m))).toBe(true);
     expect(alert).toHaveBeenCalledWith('tick-starved', expect.objectContaining({ sinceTickMs: 40 * MIN, background: false }), 40 * MIN);
+  });
+});
+
+// ── review:changes round 1 (PR #4578) ────────────────────────────────────────────────────────────────────────────
+
+/** A background-mode `withSelfSync` over fakes; returns the wrapper plus the spies the repair tests assert on. */
+function bgDaemon({ tick = async () => ({ repos: [] }), readState = () => ({}), acquireRead, builderRead = () => null, cloneIdentity, cloneBornAt, readHead = () => 'h1', diffFiles, swapMinIntervalMs = 0 } = {}) {
+  const start = vi.fn(() => ({ pid: 7 }));
+  const onRestart = vi.fn(() => ({ restarted: true }));
+  const tickOnce = vi.fn(tick);
+  const w = withSelfSync({ tickOnce }, {
+    root: '/clone', env: {}, log: { error: () => {} }, versions: null, entries: ['/clone/a.mjs'], rebuild: vi.fn(),
+    readHead, acquireRead: acquireRead ?? (() => ({ ok: true })), releaseRead: vi.fn(), readState, now: () => 0, onRestart,
+    ...(cloneIdentity ? { cloneIdentity } : {}),
+    ...(cloneBornAt ? { cloneBornAt } : {}),
+    ...(diffFiles ? { diffFiles, importClosure: () => null } : {}),
+    background: { enabled: true, swapMinIntervalMs, buildMinIntervalMs: 0, tickStarvedSmellMs: 0 },
+    builder: { read: builderRead, alive: () => false, start }, tickProgress: null,
+  });
+  return { w, start, onRestart, tickOnce };
+}
+
+describe('F1 — every skip path still starts the builder (a quarantined clone must be able to heal)', () => {
+  it('quarantined clone: the tick is skipped AND the builder (whose rebuildClone clears the quarantine) starts', async () => {
+    const { w, start, tickOnce } = bgDaemon({ readState: () => ({ quarantine: { prevHead: 'p', reason: 'reset-rollback-failed' } }) });
+    const r = await w.tickOnce();
+    expect(r).toMatchObject({ skipped: true, reason: 'quarantine' });
+    expect(tickOnce).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('read lock refused: the builder still starts', async () => {
+    const { w, start, tickOnce } = bgDaemon({ acquireRead: () => ({ ok: false, reason: 'writer-active' }) });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'writer-active' });
+    expect(tickOnce).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('writer-priority yield: the builder still starts', async () => {
+    const { w, start } = bgDaemon({ acquireRead: () => ({ ok: false, reason: 'writer-priority' }) });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'writer-priority' });
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('a tick() that throws: the error still propagates and the builder still starts', async () => {
+    const { w, start } = bgDaemon({ tick: async () => { throw new Error('boom'); } });
+    await expect(w.tickOnce()).rejects.toThrow('boom');
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('a completed tick starts it exactly once (no double start from two exit points)', async () => {
+    const { w, start } = bgDaemon();
+    await w.tickOnce();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('a re-cloned skip starts it exactly once', async () => {
+    const { w, start } = bgDaemon({ builderRead: () => ({ recloned: true, finishedAt: null }) });
+    await w.tickOnce();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('a restart (the swap) starts no builder: the new process builds after its own first tick', async () => {
+    const { w, start, onRestart } = bgDaemon({ readHead: (() => { let n = 0; return () => (n++ === 0 ? 'h1' : 'h2'); })(), diffFiles: () => ['scripts/lib/daemon-self-sync.mjs'] });
+    await w.tickOnce();
+    expect(onRestart).toHaveBeenCalledTimes(1);
+    expect(start).not.toHaveBeenCalled();
+  });
+});
+
+describe('F2 — the re-clone fail-closed flag survives a respawn', () => {
+  const withState = (fn) => {
+    const dir = mkdtempSync(join(tmpdir(), 'bgb-'));
+    try { return fn({ root: dir, env: { WE_DAEMON_STATE_DIR: join(dir, 'state') } }); } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+  const fakeSpawn = () => () => Object.assign(new EventEmitter(), { pid: 4242, unref: () => {} });
+  it('a builder spawned after a recloned record keeps recloned until a builder run finishes on the fresh clone', () => withState(({ root, env }) => {
+    writeBuilderState(root, { pid: 1, host: 'h', startedAt: new Date(0).toISOString(), finishedAt: new Date(1).toISOString(), recloned: true, result: { reason: 'clone-recloned' } }, env);
+    const next = spawnBuilder({ root, env, spawnFn: fakeSpawn(), log: { error: () => {} } });
+    expect(next.recloned).toBe(true);
+    expect(readBuilderState(root, env)).toMatchObject({ pid: 4242, finishedAt: null, recloned: true });
+  }));
+  it('a normal respawn does not invent the flag', () => withState(({ root, env }) => {
+    writeBuilderState(root, { pid: 1, host: 'h', startedAt: new Date(0).toISOString(), finishedAt: new Date(1).toISOString(), recloned: false }, env);
+    expect(spawnBuilder({ root, env, spawnFn: fakeSpawn(), log: { error: () => {} } }).recloned).toBeUndefined();
+  }));
+});
+
+describe('F3 — an asynchronous spawn failure never crashes the daemon', () => {
+  it('a child that emits \'error\' (ENOENT/EAGAIN) is logged and recorded as a finished failed build', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bgb-'));
+    try {
+      const env = { WE_DAEMON_STATE_DIR: join(dir, 'state') };
+      const child = Object.assign(new EventEmitter(), { pid: undefined, unref: () => {} });
+      const log = { error: vi.fn() };
+      spawnBuilder({ root: dir, env, spawnFn: () => child, log });
+      const err = Object.assign(new Error('spawn node ENOENT'), { code: 'ENOENT' });
+      // an EventEmitter with no 'error' listener THROWS on emit — exactly the uncaught exception that killed the daemon
+      expect(() => child.emit('error', err)).not.toThrow();
+      expect(log.error.mock.calls.some(([m]) => /spawn node ENOENT/.test(m) && /next tick/.test(m))).toBe(true);
+      const st = readBuilderState(dir, env);
+      expect(st.finishedAt).toBeTruthy();
+      expect(st.result).toMatchObject({ moved: false, adopted: false });
+      expect(st.result.reason).toMatch(/^spawn-failed: spawn node ENOENT/);
+      expect(builderIsAlive(st)).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('F5 — a checkout re-cloned between the pre-lock check and the read lock runs no children', () => {
+  it('replaced checkout + builder not finished (its recloned record not yet written): skip under the read lock, builder starts', async () => {
+    const ids = ['inode-a', 'inode-a', 'inode-b']; // boot, the pre-lock check (not yet replaced), then under the read lock (replaced)
+    const { w, start, tickOnce } = bgDaemon({ cloneIdentity: () => ids.shift() ?? 'inode-b', builderRead: () => ({ pid: 5, finishedAt: null }) });
+    const r = await w.tickOnce();
+    expect(r).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(tickOnce).not.toHaveBeenCalled();
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it('replaced checkout + the builder\'s run on it has finished (not re-cloned again): ticks, and keeps ticking while a LATER build runs', async () => {
+    let rec = { pid: 5, finishedAt: new Date(1).toISOString(), recloned: false };
+    const identities = ['inode-a'];
+    const { w, tickOnce } = bgDaemon({ cloneIdentity: () => identities[0], builderRead: () => rec });
+    identities[0] = 'inode-b'; // the re-clone happened after boot
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+    rec = { pid: 6, finishedAt: null }; // the next build's smoke is running: the accepted checkout must not starve the ticks again
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(2);
+  });
+  it('the recloned flag is re-read UNDER the read lock (it can land between the pre-lock read and the lock)', async () => {
+    const reads = [{ pid: 5, finishedAt: null }, { pid: 5, finishedAt: null, recloned: true }];
+    const { w, tickOnce } = bgDaemon({ builderRead: () => reads.shift() ?? { pid: 5, finishedAt: null, recloned: true } });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+  it('an unchanged checkout is untouched: ticks with an unfinished builder running', async () => {
+    const { w, tickOnce } = bgDaemon({ cloneIdentity: () => 'inode-a', builderRead: () => ({ pid: 5, finishedAt: null }) });
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+  });
+  // D1 (self-review): a finished record from BEFORE the replacement (a sibling daemon's inline re-clone) proves nothing.
+  it('a finished record OLDER than the replaced checkout does not unblock it', async () => {
+    const identities = ['inode-a'];
+    const { w, tickOnce } = bgDaemon({
+      cloneIdentity: () => identities[0], cloneBornAt: () => 5000,
+      builderRead: () => ({ pid: 5, finishedAt: new Date(1000).toISOString(), recloned: false, result: { reason: 'up-to-date' } }),
+    });
+    identities[0] = 'inode-b';
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+  it('a finished record NEWER than the replaced checkout unblocks it', async () => {
+    const identities = ['inode-a'];
+    const { w, tickOnce } = bgDaemon({
+      cloneIdentity: () => identities[0], cloneBornAt: () => 5000,
+      builderRead: () => ({ pid: 5, finishedAt: new Date(9000).toISOString(), recloned: false, result: { reason: 'up-to-date' } }),
+    });
+    identities[0] = 'inode-b';
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+  });
+  // D2 (self-review): a spawn that never started, or a builder that hit its deadline, ran no rebuild on the fresh clone.
+  it.each([['spawn-failed: spawn node EAGAIN'], ['builder-deadline']])('a record finished as "%s" is not a completed run', async (reason) => {
+    const rec = { pid: 5, finishedAt: new Date(9000).toISOString(), result: { moved: false, adopted: false, reason } };
+    expect(builderRunFinished(rec)).toBe(false);
+    expect(builderRunFinished({ ...rec, result: { reason: 'up-to-date' } })).toBe(true);
+    const identities = ['inode-a'];
+    const { w, tickOnce } = bgDaemon({ cloneIdentity: () => identities[0], builderRead: () => rec });
+    identities[0] = 'inode-b';
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+});
+
+describe('self-review round — stale swapPending, record ownership, future-dated records', () => {
+  // D3: HEAD moves (swap deferred => swapPending), then HEAD returns to boot; the flag must not block builders forever.
+  it('swapPending is recomputed every tick: a deferred swap that no longer applies does not block the builder', async () => {
+    const heads = ['h1', 'h2', 'h1']; // boot, tick 1 (moved, deferred), tick 2 (moved back)
+    const { w, start } = bgDaemon({ readHead: () => heads.shift() ?? 'h1', diffFiles: () => ['scripts/lib/daemon-self-sync.mjs'], swapMinIntervalMs: 10 * MIN });
+    await w.tickOnce(); // deferred swap: no builder (swap-pending)
+    expect(start).not.toHaveBeenCalled();
+    await w.tickOnce(); // HEAD is back at boot: the stale flag must have cleared
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  // D4: a late finish from an expired builder must not mark its successor's record finished.
+  it('writeBuilderStateIfOwner refuses to write over a record another pid owns', () => {
+    const write = vi.fn();
+    expect(writeBuilderStateIfOwner('/c', { x: 1 }, { pid: 10, read: () => ({ pid: 11 }), write })).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+    expect(writeBuilderStateIfOwner('/c', { x: 1 }, { pid: 10, read: () => ({ pid: 10 }), write })).toBe(true);
+    expect(writeBuilderStateIfOwner('/c', { x: 2 }, { pid: 10, read: () => null, write })).toBe(true);
+    expect(write).toHaveBeenCalledTimes(2);
+  });
+  it('spawnBuilder hands the builder its own deadline (the daemon\'s trust bound)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bgb-'));
+    try {
+      const spawnFn = vi.fn(() => Object.assign(new EventEmitter(), { pid: 1, unref: () => {} }));
+      spawnBuilder({ root: dir, env: { WE_DAEMON_STATE_DIR: join(dir, 'state') }, spawnFn, log: { error: () => {} }, maxAgeMs: 5_400_000 });
+      expect(spawnFn.mock.calls[0][1]).toContain('--max-age-ms=5400000');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // D6: a clock jump back must not keep a stale record young forever.
+  it('a future-dated record (beyond clock skew) is not alive', () => {
+    const o = { host: 'h', isAlive: () => true, nowMs: 100 * MIN, maxAgeMs: 90 * MIN };
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt: new Date(1000 * MIN).toISOString() }, o)).toBe(false);
+    expect(builderIsAlive({ pid: 1, host: 'h', startedAt: new Date(101 * MIN).toISOString() }, o)).toBe(true); // small skew is fine
   });
 });

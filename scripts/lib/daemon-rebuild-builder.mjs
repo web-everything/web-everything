@@ -25,13 +25,27 @@ export function summarizeRebuildResult(r) {
 }
 
 export function parseBuilderArgs(argv) {
-  const out = { root: null, entries: [], mainOnly: false };
+  const out = { root: null, entries: [], mainOnly: false, maxAgeMs: 0 };
   for (const a of argv) {
     if (a.startsWith('--root=')) out.root = a.slice('--root='.length);
     else if (a.startsWith('--entry=')) out.entries.push(a.slice('--entry='.length));
     else if (a === '--main-only') out.mainOnly = true;
+    else if (a.startsWith('--max-age-ms=')) { const n = Number(a.slice('--max-age-ms='.length)); if (Number.isSafeInteger(n) && n > 0) out.maxAgeMs = n; }
   }
   return out;
+}
+
+/**
+ * Write the builder record ONLY while it is still ours (its pid is this process's). Once the daemon stops trusting an
+ * old record (the max-age bound) it may spawn a successor that owns the record; a late finish from the old builder
+ * must not mark the successor's record finished (last write wins would let a third builder start under a live one).
+ * @returns {boolean} whether the write happened
+ */
+export function writeBuilderStateIfOwner(root, state, { pid = process.pid, read = readBuilderState, write = writeBuilderState } = {}) {
+  const cur = read(root);
+  if (cur && cur.pid != null && cur.pid !== pid) return false;
+  write(root, state);
+  return true;
 }
 
 async function main() {
@@ -39,12 +53,21 @@ async function main() {
     const { installDaemonLog } = await import('../../skills-src/conveyor/daemon-log.mjs');
     installDaemonLog({ logPath: null, timers: false }); // stamp lines; the daemon owns rotation of the shared log
   } catch { /* unstamped lines are still lines */ }
-  const { root, entries, mainOnly } = parseBuilderArgs(process.argv.slice(2));
+  const { root, entries, mainOnly, maxAgeMs } = parseBuilderArgs(process.argv.slice(2));
   if (!root) { console.error('daemon-rebuild-builder: --root=<clone> is required'); process.exit(2); }
   const startedMs = Date.now();
   const prev = readBuilderState(root) || {};
   const base = { ...prev, pid: process.pid, host: hostname(), startedAt: prev.pid === process.pid && prev.startedAt ? prev.startedAt : new Date(startedMs).toISOString(), finishedAt: null, result: null };
   try { writeBuilderState(root, base); } catch { /* the spawner already wrote a record */ }
+  // Deadline = the age after which the daemon stops trusting this record. Past it a successor may own the record, so
+  // this process must not keep running (and writing) behind its back: record the timeout (if still ours) and exit.
+  if (maxAgeMs > 0) {
+    setTimeout(() => {
+      try { writeBuilderStateIfOwner(root, { ...base, recloned: base.recloned || false, finishedAt: new Date().toISOString(), result: { moved: false, adopted: false, reason: 'builder-deadline' } }); } catch { /* best-effort */ }
+      console.error(`daemon-rebuild-builder: exceeded its ${Math.round(maxAgeMs / 60_000)} min deadline — exiting (x44lnnt)`);
+      process.exit(1);
+    }, maxAgeMs).unref();
+  }
   console.error(`daemon-rebuild-builder: building the next version of ${root} off the tick path (pid ${process.pid}) (x44lnnt)`);
   let result;
   // A re-clone replaces the checkout with plain origin/main (never smoked): flag it so the daemon runs no children
@@ -58,12 +81,12 @@ async function main() {
     }
     if (result.reason !== 'clone-recloned') break;
     recloned = true;
-    try { writeBuilderState(root, { ...base, recloned }); } catch { /* best-effort */ }
+    try { writeBuilderStateIfOwner(root, { ...base, recloned }); } catch { /* best-effort */ }
   }
   // The rebuild ON the fresh clone has finished (whatever its verdict) — exactly when the inline path ticked again.
   recloned = result.reason === 'clone-recloned';
   const finishedMs = Date.now();
-  try { writeBuilderState(root, { ...base, recloned, finishedAt: new Date(finishedMs).toISOString(), ms: finishedMs - startedMs, result }); } catch { /* best-effort */ }
+  try { writeBuilderStateIfOwner(root, { ...base, recloned, finishedAt: new Date(finishedMs).toISOString(), ms: finishedMs - startedMs, result }); } catch { /* best-effort */ }
   console.error(`daemon-rebuild-builder: done in ${Math.round((finishedMs - startedMs) / 1000)}s — ${result.moved && result.adopted ? `adopted ${result.head}; the daemon swaps onto it between ticks` : `not adopted (${result.reason})`} (x44lnnt)`);
 }
 

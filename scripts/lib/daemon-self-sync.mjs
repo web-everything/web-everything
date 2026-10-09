@@ -123,7 +123,7 @@ import { repairCloneRefs } from './lane-repair.mjs';
 import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, decideBuilderStart, tickStarvedSmell,
   BUILT_IN_BACKGROUND_BUILD_SETTINGS,
-  makeBuilderApi, makeTickProgressStore,
+  makeBuilderApi, makeTickProgressStore, readCloneIdentity, readCloneBornAtMs, builderRunFinished,
 } from './daemon-background-build.mjs';
 
 /** Setting: how long a STARVED reader (see `daemon-clone-lock.mjs` "reader fairness") waits, within the same
@@ -529,7 +529,7 @@ export function withSelfSync(effects, {
   // resolves from daemon-background-build-settings.json by this daemon's entry name (default OFF = the inline
   // rebuild below, unchanged); an object overrides it. `builder` / `tickProgress` are the IO (injectable); they
   // default to the real files only when `rebuild` is the real one, so a test never writes real daemon state.
-  background, builder, tickProgress,
+  background, builder, tickProgress, cloneIdentity = readCloneIdentity, cloneBornAt = readCloneBornAtMs,
 }) {
   const tick = effects.tickOnce;
   const realIo = rebuildOpt === undefined;
@@ -540,7 +540,7 @@ export function withSelfSync(effects, {
     ? resolveBackgroundBuild({ entry: entries?.[0], settings: loadBackgroundBuildSettings(), env })
     : (background ? { ...BUILT_IN_BACKGROUND_BUILD_SETTINGS, ...background, enabled: !!background.enabled } : null);
   const bgOn = !!bg?.enabled;
-  const builderApi = builder ?? (realIo ? makeBuilderApi({ root, entries, env, mainOnly }) : null);
+  const builderApi = builder ?? (realIo ? makeBuilderApi({ root, entries, env, mainOnly, log, maxAgeMs: bg?.builderMaxAgeMs }) : null);
   const progress = tickProgress ?? (realIo ? makeTickProgressStore({ root, entry: entries?.[0], env }) : null);
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
@@ -661,8 +661,37 @@ export function withSelfSync(effects, {
   };
   const markTickDone = () => { try { progress?.markTickDone(now()); } catch { /* best-effort */ } };
 
+  // x44lnnt — the checkout's identity at boot. A re-clone (done by the builder, under the write lock) renames the old
+  // directory aside and clones into the vacated path, so the identity changes exactly when the checkout was replaced.
+  // Under a READ lock it is stable (a replacement needs the write lock), which is what closes the window between the
+  // pre-lock `recloned` read and the lock, and the one between the builder's re-clone and its record write.
+  let bootIdentity = bgOn ? cloneIdentity(root) : null;
+  /**
+   * Must this tick run no children because the checkout is an unsmoked re-clone? Reads the builder record fresh every
+   * call. The `recloned` flag says so outright; a replaced checkout (identity changed since boot) says so until the
+   * builder's run on it has FINISHED, whatever its verdict — as the inline path ticked again after its rebuild on the
+   * fresh clone. Once that finished record is seen the new identity is accepted as the baseline, so a LATER build's
+   * smoke never reads as "still re-cloned" and starves the ticks again.
+   */
+  const recloneBlocksTick = () => {
+    if (!bgOn || !builderApi) return false;
+    const bst = builderApi.read?.();
+    if (bst?.recloned) return true;
+    const idNow = cloneIdentity(root);
+    if (bootIdentity == null || idNow == null || idNow === bootIdentity) return false;
+    // A finished run counts only if it finished AFTER this checkout was created (where the filesystem says when): an
+    // older record — or a sibling daemon's inline re-clone — proves nothing about a build on THIS checkout. A spawn
+    // that never started is "finished" too but ran no rebuild (builderRunFinished).
+    const bornAt = cloneBornAt(root);
+    const finishedMs = Date.parse(bst?.finishedAt || '');
+    if (builderRunFinished(bst) && (bornAt == null || finishedMs >= bornAt)) { bootIdentity = idNow; return false; }
+    return true;
+  };
+
   // x44lnnt — start the builder BETWEEN ticks only (after the read lock is released), coalesced. Never throws.
   let swapPending = false;
+  let restarting = false;
+  const restart = (info) => { restarting = true; return onRestart(info); };
   const maybeStartBuilder = () => {
     if (!bgOn || !builderApi) return null;
     try {
@@ -682,7 +711,7 @@ export function withSelfSync(effects, {
     }
   };
 
-  return {
+  const synced = {
     ...effects,
     // Forwards whatever arguments the caller's own tickOnce takes (e.g. runner.mjs's per-tick bookkeeping
     // payload) straight through to the wrapped `tick` — this wrapper never needs to see them itself, and
@@ -721,14 +750,16 @@ export function withSelfSync(effects, {
       checkTickStarved();
       // x44lnnt — background mode: never rebuild on the tick path. A clone re-cloned by the builder (plain
       // origin/main, never smoked) runs no children until the builder's rebuild on it has finished, as inline.
-      if (bgOn) {
-        const bst = builderApi?.read?.();
-        if (bst?.recloned) {
-          maybeStartBuilder();
-          log.error?.('daemon-self-sync: the clone was re-cloned by the background build and nothing has been adopted on it yet — skipping this tick (x44lnnt)');
-          return skippedTick('clone-recloned');
-        }
-      }
+      // This is the cheap pre-lock check; the one that counts is re-run UNDER the read lock below.
+      restarting = false;
+      // Recomputed every tick: set only when this tick's HEAD check defers a swap. A stale `true` (HEAD moved back,
+      // or a skip path returned before the check) would otherwise block every builder start forever.
+      swapPending = false;
+      const recloneSkip = () => {
+        log.error?.('daemon-self-sync: the clone was re-cloned by the background build and nothing has been adopted on it yet — skipping this tick (x44lnnt)');
+        return skippedTick('clone-recloned');
+      };
+      if (recloneBlocksTick()) return recloneSkip();
 
       // 1. Rebuild (gated: takes the WRITE lock itself, runs the live smoke inside it). An adopted build
       //    restarts INSTEAD of ticking — the read lock below is never even acquired for this tick.
@@ -743,7 +774,7 @@ export function withSelfSync(effects, {
       if (rebuildResult && rebuildResult.moved && rebuildResult.adopted) {
         if (restartGate(rebuildResult.head).restart) {
           log.error?.(`daemon-self-sync: rebuilt the clone onto ${rebuildResult.head} — restarting onto the new code (#4044)`);
-          return onRestart(rebuildResult);
+          return restart(rebuildResult);
         }
       } else if (rebuildResult && rebuildResult.reason && rebuildResult.reason !== 'up-to-date') {
         log.error?.(`daemon-self-sync: rebuild did not move the clone (${rebuildResult.reason}) — ticking on the current code`);
@@ -801,6 +832,10 @@ export function withSelfSync(effects, {
 
         let tickResult;
         try {
+          // 2b. x44lnnt — under the read lock the checkout cannot be replaced, so this is the authoritative
+          //     re-clone check: the builder may have re-cloned (and not yet written its record) since the pre-lock one.
+          if (recloneBlocksTick()) { releaseOnce(); return recloneSkip(); }
+
           // 3. Under the read lock: a quarantined clone never runs children, never restarts onto it.
           const rebuildState = readState(root, env);
           if (rebuildState.quarantine) {
@@ -821,7 +856,7 @@ export function withSelfSync(effects, {
             if (d.restart) {
               releaseOnce();
               log.error?.(`daemon-self-sync: HEAD moved from ${bootSha} to ${headNow} since this process booted (an adopted rebuild) — restarting onto the new code (#4044)${bgOn ? ' — swap between ticks (x44lnnt)' : ''}`);
-              return onRestart({ merged: false, commits: 0, reason: 'head-moved', headSha: headNow });
+              return restart({ merged: false, commits: 0, reason: 'head-moved', headSha: headNow });
             }
             swapPending = d.reason === 'min-interval';
           }
@@ -833,12 +868,10 @@ export function withSelfSync(effects, {
           releaseOnce();
         }
 
-        // x44lnnt — between ticks: the read lock is released, so the builder's short locked prepare never waits
-        // on this process. Its smoke then runs while the next ticks run.
-        if (bgOn) {
-          maybeStartBuilder();
-          return tickResult;
-        }
+        // x44lnnt — background mode never re-discovers inline (the builder owns every rebuild). The builder itself
+        // starts from the single exit point wrapped around this whole function (`startBuilderOnExit`), so no
+        // return path — skip, throw or tick — can bypass it.
+        if (bgOn) return tickResult;
 
         // 5. #3383 bug 1 (unchanged in spirit) — this SAME tick's own result shows it hit the stale-main refusal
         //    (origin/main moved mid-tick). Rebuild IMMEDIATELY (never a raw merge) rather than wait out the rest
@@ -848,13 +881,32 @@ export function withSelfSync(effects, {
           if (r2 && r2.moved && r2.adopted) {
             if (restartGate(r2.head, { urgent: true }).restart) {
               log.error?.(`daemon-self-sync: tick hit the stale-main refusal — rebuild adopted ${r2.head} immediately, restarting onto the new code (#3383/#4044), instead of waiting the full interval to lose the same race again`);
-              return onRestart(r2);
+              return restart(r2);
             }
             log.error?.('daemon-self-sync: stale-main recovery adopted a build with no imported changes — retrying discovery once in this pass');
             continue;
           }
         }
         return tickResult;
+      }
+    },
+  };
+
+  // x44lnnt — the ONE exit point that starts the background builder. It runs after EVERY default-path tick however it
+  // ended: a completed tick, a skipped one (quarantine, read lock refused, writer priority, re-cloned clone) or a
+  // tick() that threw — the read lock is always released by then, so the builder's short locked prepare never waits
+  // on this process. A skip path that returned before reaching a start of its own is exactly how a quarantined clone
+  // could never heal: only `rebuildClone` (the builder) clears a quarantine. A restart (the swap) starts none — the
+  // new process builds after its own first tick. POC and versioned daemons never use background builds.
+  if (!bgOn || resolvedPocBranch || vctx) return synced;
+  const startBuilderOnExit = synced.tickOnce;
+  return {
+    ...synced,
+    tickOnce: async (...args) => {
+      try {
+        return await startBuilderOnExit(...args);
+      } finally {
+        if (!restarting) maybeStartBuilder();
       }
     },
   };

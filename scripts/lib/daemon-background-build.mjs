@@ -26,7 +26,7 @@
  * Pure rules ({@link decideBuilderStart}, {@link tickStarvedSmell}, {@link resolveBackgroundBuild}) are separate
  * from the IO shells below and replay-tested against tonight's log (fixtures/background-build/).
  */
-import { readFileSync, writeFileSync, mkdirSync, renameSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, appendFileSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { hostname } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -42,6 +42,9 @@ export const BUILT_IN_BACKGROUND_BUILD_SETTINGS = Object.freeze({
   swapMinIntervalMs: 10 * 60_000,
   buildMinIntervalMs: 5 * 60_000,
   tickStarvedSmellMs: 30 * 60_000,
+  // An unfinished builder record older than this is dead whatever its pid says (a SIGKILL / OOM / reboot leaves
+  // `finishedAt: null` behind and the pid is later reused). The smoke takes 10–24 min; this is ~4× the worst seen.
+  builderMaxAgeMs: 90 * 60_000,
 });
 
 /** Env: `1`/`true` forces background builds ON for this process, `0`/`false` forces OFF; unset → the file. */
@@ -50,6 +53,7 @@ const NUMBER_ENV = {
   swapMinIntervalMs: 'WE_DAEMON_BACKGROUND_BUILD_SWAP_MIN_INTERVAL_MS',
   buildMinIntervalMs: 'WE_DAEMON_BACKGROUND_BUILD_MIN_INTERVAL_MS',
   tickStarvedSmellMs: 'WE_DAEMON_TICK_STARVED_SMELL_MS',
+  builderMaxAgeMs: 'WE_DAEMON_BACKGROUND_BUILD_MAX_AGE_MS',
 };
 
 export function defaultBackgroundBuildSettingsPath() {
@@ -78,7 +82,7 @@ export function loadBackgroundBuildSettings(path = defaultBackgroundBuildSetting
 /**
  * PURE: the effective background-build config for one daemon entry (its script basename, e.g.
  * `reconcile-fix-dispatch-daemon.mjs`). Env beats file; a malformed env value keeps the file value.
- * @returns {{enabled:boolean, swapMinIntervalMs:number, buildMinIntervalMs:number, tickStarvedSmellMs:number, source:string}}
+ * @returns {{enabled:boolean, swapMinIntervalMs:number, buildMinIntervalMs:number, tickStarvedSmellMs:number, builderMaxAgeMs:number, source:string}}
  */
 export function resolveBackgroundBuild({ entry, settings = BUILT_IN_BACKGROUND_BUILD_SETTINGS, env = {} } = {}) {
   const s = validateBackgroundBuildSettings(settings);
@@ -158,36 +162,100 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return !(e && e.code === 'ESRCH'); }
 }
 
-/** Is the recorded builder still running? Unfinished + same host + live pid. Another host: never ours to wait on. */
-export function builderIsAlive(state, { isAlive = pidAlive, host = hostname() } = {}) {
+/**
+ * Is the recorded builder still running? Unfinished + same host + younger than `maxAgeMs` + live pid. Another host:
+ * never ours to wait on. The age bound is what stops a stale record (a SIGKILL / OOM / reboot left `finishedAt: null`)
+ * whose pid was later reused — by any unrelated process, or one that `kill(pid, 0)` merely reports EPERM for — from
+ * counting as a live builder forever and starving every later build. A record whose age cannot be read cannot be
+ * bounded, so it is not trusted either (the spawner always writes `startedAt`).
+ */
+export function builderIsAlive(state, {
+  isAlive = pidAlive, host = hostname(), nowMs = Date.now(), maxAgeMs = BUILT_IN_BACKGROUND_BUILD_SETTINGS.builderMaxAgeMs,
+} = {}) {
   if (!state || state.finishedAt) return false;
   if (state.host && state.host !== host) return false;
+  const startedMs = Date.parse(state.startedAt || '');
+  // Older than the bound — or dated in the future beyond clock skew (a clock jump back would otherwise keep a stale
+  // record "young" indefinitely).
+  if (!Number.isFinite(startedMs) || nowMs - startedMs > maxAgeMs || startedMs - nowMs > CLOCK_SKEW_MS) return false;
   return !!isAlive(state.pid);
+}
+
+const CLOCK_SKEW_MS = 5 * 60_000;
+
+/**
+ * Did a builder RUN finish (any verdict)? A spawn that never started is recorded finished too (so nothing waits on
+ * it), and a builder that hit its deadline is recorded finished so a successor can start — but no rebuild completed
+ * in either case: neither may count as "the builder's run on the fresh clone has finished".
+ */
+export function builderRunFinished(state) {
+  return !!state?.finishedAt && !/^(spawn-failed|builder-deadline)/.test(String(state?.result?.reason ?? ''));
 }
 
 /** The builder CLI, resolved next to THIS module (the daemon clone's own tree). */
 export const BUILDER_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-builder.mjs');
 
 /**
+ * The checkout's identity (`dev:ino` of the clone directory), or null when it cannot be read. A re-clone renames the
+ * old directory aside and clones into the vacated path, so the identity changes exactly when the checkout was
+ * replaced — and a replacement needs the clone's WRITE lock, so under a READ lock the value is stable.
+ */
+export function readCloneIdentity(root) {
+  try { const s = statSync(root); return `${s.dev}:${s.ino}`; } catch { return null; }
+}
+
+/** When the current checkout directory was created (ms), or null where the filesystem does not report it. */
+export function readCloneBornAtMs(root) {
+  try { const b = statSync(root).birthtimeMs; return b > 0 ? b : null; } catch { return null; }
+}
+
+/**
  * Spawn the detached builder. It inherits stdout/stderr (the daemon's launchd log), so its `daemon-rebuild:` lines
  * land in the same log as before; it is in its own process group, so a daemon restart (the swap) never kills a
  * smoke in flight. Records `{pid, host, startedAt}` before returning.
+ *
+ * Two things carry over / are handled here, both found in review:
+ *  - `recloned` is carried forward from the previous record. The builder that re-cloned the checkout may die or
+ *    finish still flagged; the NEXT builder's record must keep the fail-closed marker until that builder's own run
+ *    on the fresh clone has finished (the builder clears it itself, in `daemon-rebuild-builder.mjs`).
+ *  - `spawn` reports ENOENT / EAGAIN / EMFILE as an ASYNC 'error' event, not a throw — with no listener that is an
+ *    uncaught exception that kills the daemon. The listener logs it and records the build as finished + failed, so
+ *    nothing waits on a builder that never existed; the next tick retries once the coalesce window allows.
  */
-export function spawnBuilder({ root, entries = [], env = process.env, mainOnly = false, spawnFn = spawn, nowMs = Date.now() }) {
-  const args = [BUILDER_SCRIPT, `--root=${root}`, ...entries.filter(Boolean).map((e) => `--entry=${e}`), ...(mainOnly ? ['--main-only'] : [])];
+export function spawnBuilder({ root, entries = [], env = process.env, mainOnly = false, spawnFn = spawn, nowMs = Date.now(), log = console, maxAgeMs }) {
+  const args = [
+    BUILDER_SCRIPT, `--root=${root}`, ...entries.filter(Boolean).map((e) => `--entry=${e}`), ...(mainOnly ? ['--main-only'] : []),
+    // The builder's own deadline = the age after which the daemon stops trusting its record: it must not outlive it.
+    ...(maxAgeMs > 0 ? [`--max-age-ms=${maxAgeMs}`] : []),
+  ];
+  const prev = readBuilderState(root, env);
   const child = spawnFn(process.execPath, args, { cwd: root, env, detached: true, stdio: ['ignore', 'inherit', 'inherit'] });
+  child.on?.('error', (err) => {
+    try {
+      const why = String((err && err.message) || err).split('\n')[0];
+      log.error?.(`daemon-self-sync: the background build could not start (${why}) — ticking on, the next tick retries (x44lnnt)`);
+      const cur = readBuilderState(root, env);
+      // Only mark our own record: a later spawn may already have replaced it.
+      if (cur && cur.startedAt === state.startedAt && !cur.finishedAt) {
+        writeBuilderState(root, { ...cur, finishedAt: new Date().toISOString(), result: { moved: false, adopted: false, reason: `spawn-failed: ${why}` } }, env);
+      }
+    } catch { /* a failed spawn report never breaks the daemon */ }
+  });
   child.unref?.();
-  const state = { pid: child.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(), finishedAt: null, result: null, by: process.pid };
+  const state = {
+    pid: child.pid, host: hostname(), startedAt: new Date(nowMs).toISOString(), finishedAt: null, result: null, by: process.pid,
+    ...(prev?.recloned ? { recloned: true } : {}),
+  };
   writeBuilderState(root, state, env);
   return state;
 }
 
 /** The builder API `withSelfSync` uses (injectable in tests). */
-export function makeBuilderApi({ root, entries, env = process.env, mainOnly = false }) {
+export function makeBuilderApi({ root, entries, env = process.env, mainOnly = false, log = console, maxAgeMs }) {
   return {
     read: () => readBuilderState(root, env),
-    alive: (state) => builderIsAlive(state),
-    start: ({ nowMs } = {}) => spawnBuilder({ root, entries, env, mainOnly, ...(nowMs ? { nowMs } : {}) }),
+    alive: (state) => builderIsAlive(state, maxAgeMs > 0 ? { maxAgeMs } : {}),
+    start: ({ nowMs } = {}) => spawnBuilder({ root, entries, env, mainOnly, log, maxAgeMs, ...(nowMs ? { nowMs } : {}) }),
   };
 }
 
