@@ -1,4 +1,5 @@
 ---
+bornAs: x17044r
 kind: story
 size: 2
 status: open
