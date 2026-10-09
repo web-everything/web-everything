@@ -13,11 +13,9 @@ import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
-  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency,
+  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency, isRepeatAlert,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
-import { emptyHealthState, stepEpisodes, planActions } from '../health-watch-core.mjs';
-import preExistingRedOnMain from '../health-smells/pre-existing-red-on-main.mjs';
 
 
 // Keep the shell, persistence and real detector registry intact; supply deterministic probe results
@@ -1332,37 +1330,55 @@ describe('quietHours: the main-red health smell is tagged as a main-red emergenc
 
 // Operator ruling 2026-10-09 ("Add it", PR #4461): a red main is on the always-notify list, so in the default shadow mode
 // it produces a real alert, carries the main-red tag, breaks through quiet hours, and fires once per broken main commit.
-describe('quietHours: a red main is wired end to end (shadow mode → notify plan → delivery gate)', () => {
-  const at2am = Date.parse('2026-10-09T02:00:00-04:00');
-  const smell = preExistingRedOnMain;
+describe('quietHours: a red main is wired end to end (real tick, shadow mode → send → delivery gate)', () => {
+  const start = Date.parse('2026-10-09T02:00:00-04:00');
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockReset(); episodeReplay.send.mockImplementation(() => ({ ok: true })); });
   const marker = (baseSha) => ({
     status: 'red', redCause: 'pre-existing-on-main', head: 'h1', sha: 'h1', pool: 'p', lane: 1,
     redCauseEvidence: { baseSha, tests: [{ file: 'a.test.mjs', name: 'x' }] },
   });
-  const tickWith = (state, baseShas, now) => {
-    const results = smell.evaluate({ laneVerifyMarkers: baseShas.map(marker) });
-    const r = stepEpisodes(state, [{ smell, results }], now);
-    return { r, plan: planActions(r.transitions, { [smell.id]: smell }, { mode: 'shadow' }) };
+  const setup = () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    // `baseShas` empty → the lanes stopped showing the red sha (the episode closes after its clean streak).
+    const run = (offset, baseShas) => {
+      const now = start + offset * minute;
+      episodeReplay.probes = { prs: [], agents: [], operationRuns: [], leases: [], daemonLogs: [], laneVerifyMarkers: baseShas.map(marker) };
+      return tick({ ...flags, now: new Date(now).toISOString() });
+    };
+    const redCalls = () => episodeReplay.send.mock.calls.map(([n]) => n).filter((n) => /pre-existing-red-on-main/.test(n.title));
+    return { run, redCalls };
   };
 
-  it('is NOT suppressed in shadow mode, and its alert is delivered at 02:00 ET while a routine one is held', () => {
-    const { r, plan } = tickWith(emptyHealthState(), ['efd88abcc00'], 0);
-    const notify = plan.find((p) => p.kind === 'notify');
-    expect(notify.suppressed).toBeNull();
-    const ep = r.state.episodes[notify.key];
-    const alert = { title: `Health: ${ep.smell} — ${ep.subject}`, emergency: breakthroughEmergency(ep) };
-    expect(decideDelivery(alert, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
-    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+  it('alerts in shadow mode with the main-red tag; the gate delivers it at 02:00 ET while a routine alert is held', async () => {
+    const { run, redCalls } = setup();
+    await run(0, ['efd88abcc00']);
+    expect(redCalls()).toHaveLength(1);
+    expect(redCalls()[0].title).toBe('Health: pre-existing-red-on-main — main:efd88abcc');
+    expect(redCalls()[0].emergency).toEqual({ kind: 'main-red' });
+    expect(decideDelivery(redCalls()[0], { now: start, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: start, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
   });
 
-  it('alerts once per broken main commit: the same sha never re-alerts, a new sha does', () => {
-    const notifies = (p) => p.plan.filter((x) => x.kind === 'notify' && !x.suppressed);
-    const t1 = tickWith(emptyHealthState(), ['efd88abcc00'], 0);
-    const t2 = tickWith(t1.r.state, ['efd88abcc00'], 60_000);
-    const t3 = tickWith(t2.r.state, ['efd88abcc00', '0123456789ab'], 120_000);
-    expect(notifies(t1)).toHaveLength(1);
-    expect(notifies(t2)).toHaveLength(0);
-    expect(notifies(t3)).toHaveLength(1);
-    expect(notifies(t3)[0].key).toContain('main:012345678');
+  it('alerts once per broken main commit: no repeat on later ticks, past the 4 h reminder, or after a close and reopen', async () => {
+    const { run, redCalls } = setup();
+    await run(0, ['efd88abcc00']);
+    await run(1, ['efd88abcc00']);
+    await run(5 * 60, ['efd88abcc00']); // past reminderAfterMs (4 h): the reminder must not re-alert
+    expect(redCalls()).toHaveLength(1);
+    await run(5 * 60 + 1, []); await run(5 * 60 + 2, []); // lanes stop showing the sha → episode closes
+    await run(5 * 60 + 3, ['efd88abcc00']); // the same sha reappears → reopened, still no second alert
+    expect(redCalls()).toHaveLength(1);
+    await run(5 * 60 + 4, ['efd88abcc00', '0123456789ab']); // a NEW broken commit alerts
+    expect(redCalls()).toHaveLength(2);
+    expect(redCalls()[1].title).toBe('Health: pre-existing-red-on-main — main:012345678');
+  });
+
+  it('isRepeatAlert only affects the once-per-subject smells (main-ci-red keeps its reminder)', () => {
+    expect(isRepeatAlert({ reason: 'reminder' }, { smell: 'main-ci-red', subject: 'main:abc' }, [])).toBe(false);
+    expect(isRepeatAlert({ reason: 'reminder' }, { smell: 'pre-existing-red-on-main', subject: 'main:abc' }, [])).toBe(true);
+    expect(breakthroughEmergency({ smell: 'main-ci-red' })).toEqual({ kind: 'main-red' });
   });
 });

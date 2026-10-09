@@ -17,6 +17,7 @@
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
 
 /** The frontmatter keys the render/CLI layer actually reads. Extras in the file are ignored, not an error. */
 const FRONTMATTER_KEYS = ['bornAs', 'kind', 'parent', 'status', 'dateOpened', 'dateStarted', 'costSessions'];
@@ -29,7 +30,6 @@ const FRONTMATTER_KEYS = ['bornAs', 'kind', 'parent', 'status', 'dateOpened', 'd
 // their exact punctuation).
 const SESSION_HEADING_RE = /^## Session update \(([^)]*)\)\s*(?:—|-{1,2})\s*(.*)$/;
 const LEADING_DATE_RE = /^(\d{4}-\d{2}-\d{2})/;
-const DONE_WHEN_RE = /^## Done when\s*$/;
 const H1_RE = /^# (.+)$/m;
 const H2_RE = /^## /;
 
@@ -104,7 +104,8 @@ export function parseSessionUpdates(text) {
 }
 
 /**
- * The numbered "## Done when" checklist near the top of the card. PURE. Returns `[]` when the section is
+ * The numbered acceptance checklist near the top of the card — the `## Acceptance` section or its legacy alias,
+ * found by the shared task-agreement reader's heading rule (#5399 S7); items are `N. …` or `- [A#] …`. PURE. Returns `[]` when the section is
  * absent rather than throwing — a tracker missing that section is a content gap for the renderer to show
  * plainly, not a parse failure.
  * @param {string} text
@@ -112,14 +113,14 @@ export function parseSessionUpdates(text) {
  */
 export function parseDoneWhen(text) {
   const lines = String(text ?? '').split('\n');
-  const start = lines.findIndex((l) => DONE_WHEN_RE.test(l));
+  const start = lines.findIndex((l) => /^## /.test(l) && ACCEPTANCE_HEADING_RE.test(l.slice(3).trim()));
   if (start < 0) return [];
   const items = [];
   for (let i = start + 1; i < lines.length; i++) {
     if (H2_RE.test(lines[i])) break;
-    const m = /^\d+\.\s+(.*)$/.exec(lines[i]);
+    const m = /^(?:\d+\.|[-*+][ \t]+\[A\d+\])\s+(.*)$/i.exec(lines[i]);
     if (m) items.push(m[1].trim());
-    // A continuation line (no leading "N.") extends the previous item — the card wraps long "Done when"
+    // A continuation line (no leading "N.") extends the previous item — the card wraps long acceptance
     // entries across lines (verified against the live file's own item 1).
     else if (items.length && lines[i].trim() && !/^#/.test(lines[i])) items[items.length - 1] += ` ${lines[i].trim()}`;
   }

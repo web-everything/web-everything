@@ -55,7 +55,7 @@ import {
 import { DEFAULT_LEASE_TTL_MINUTES } from '../../lib/lane-lease.mjs';
 import { DISPATCH_GUARD_LISTING_GRACE_MINUTES } from '../../operations/dispatch-lane.mjs';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -850,6 +850,33 @@ describe('sessionPidAliveByName — #3383 real process-liveness per session, reu
   it('interactive rows are excluded, matching sessionStateByName\'s own guard', () => {
     const m = sessionPidAliveByName([{ kind: 'interactive', name: 'conveyor-1', pid: 111 }], { isPidAlive: () => true });
     expect(m.has('conveyor-1')).toBe(false);
+  });
+  // xbdixjc — live 2026-10-08 21:17Z/21:25Z: `fix-4461` and `fix-4433` each had older `done` rows (no pid, their
+  // session ids gone from ps) next to one live `working` row. When a done row came AFTER the live one, its `false`
+  // overwrote the live `true`, so sessionGoneForLease read a fixer mid-edit as gone and the reaper released lane-5
+  // and lane-20 with uncommitted work in them. A dead duplicate row must never mask a live (or unknown) reading.
+  describe('duplicate names (round-N reuse) — a dead row never masks a live or unknown reading', () => {
+    const live = { kind: 'background', name: 'fix-4461', pid: 81159, state: 'working' };
+    const done = { kind: 'background', name: 'fix-4461', sessionId: 'c198d004-f67f-4138-9018-63756d0bb8a3', state: 'done' };
+    const unknown = { kind: 'background', name: 'fix-4461', state: 'working' };
+    const opts = { psOutput: 'nothing matches', isPidAlive: (pid) => pid === 81159 };
+    it.each([
+      ['live then done', [live, done], true],
+      ['done then live', [done, live], true],
+      ['done, live, done', [done, live, done], true],
+      ['unknown then done', [unknown, done], null],
+      ['done then unknown', [done, unknown], null],
+      ['only done rows', [done, done], false],
+    ])('%s', (_label, rows, expected) => {
+      expect(sessionPidAliveByName(rows, opts).get('fix-4461')).toBe(expected);
+    });
+    it('end to end: a live fixer listed before its stale done row is NOT session-gone', () => {
+      const rows = [live, done];
+      const states = sessionStateByName(rows);
+      const pidAlive = sessionPidAliveByName(rows, opts).get('fix-4461');
+      const lease = { session: 'fix-4461', acquiredAt: '2026-10-08T20:00:00.000Z' };
+      expect(sessionGoneForLease(lease, states, { nowMs: Date.parse('2026-10-08T21:17:43.000Z'), pidAlive })).toBe(false);
+    });
   });
   it('malformed/empty input → empty map', () => {
     expect(sessionPidAliveByName([null, {}, { kind: 'background' }]).size).toBe(0);
@@ -1797,5 +1824,32 @@ describe('#xp4r23a — readDetachedWrapperPids reduces record-by-record (never r
   it('a record that throws on read is skipped, never fatal', () => {
     const store = { list: () => ['x', 'y'], read: (id) => { if (id === 'x') throw new Error('bad json'); return rec('y', 'conveyor-9', 9); } };
     expect([...readDetachedWrapperPids(store)]).toEqual([['conveyor-9', 9]]);
+  });
+});
+
+// xbdixjc review round — a lane's `.git/config` is agent-writable, so the reaper's own reads inside a lane must not
+// run a program the config names (`core.fsmonitor` runs on every `git status`).
+describe('lane reads in the reaper never run code named by the lane\'s own git config', () => {
+  it('a planted core.fsmonitor is not executed by the clean-tree read or the containment read', () => {
+    const outer = mkdtempSync(join(tmpdir(), 'we-lease-reaper-pins-'));
+    const dir = join(outer, 'lane');
+    mkdirSync(dir);
+    try {
+      const git = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      git(['init', '-q', '-b', 'main']);
+      git(['config', 'user.email', 't@t.com']);
+      git(['config', 'user.name', 't']);
+      writeFileSync(join(dir, 'f.txt'), 'v0\n');
+      git(['add', 'f.txt']);
+      git(['commit', '-q', '-m', 'C0']);
+      const sha = git(['rev-parse', 'HEAD']).trim();
+      const sentinel = join(outer, 'fsmonitor-ran');
+      const hook = join(outer, 'hook.sh');
+      writeFileSync(hook, `#!/bin/sh\necho ran > '${sentinel}'\nexit 0\n`, { mode: 0o755 });
+      git(['config', 'core.fsmonitor', hook]);
+      const old = new Date(NOW - DEFAULT_QUIET_MS - 3600_000).toISOString();
+      laneQuietSincePr(dir, { prMergedAt: old, leaseAcquiredAt: old, nowMs: NOW, prMergeSha: sha });
+      expect(existsSync(sentinel)).toBe(false);
+    } finally { rmSync(outer, { recursive: true, force: true }); }
   });
 });

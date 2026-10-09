@@ -52,8 +52,11 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   // Operator order, 2026-10-07 (builder-starved-2): the builder starved twice in one day while this smell sat
   // record-only in shadow mode (opened 18:16Z, nobody told) — a starving builder must reach the operator.
   'builder-starved',
-  // Operator ruling, 2026-10-09 ("Add it", PR #4461): a red main must reach the operator even during quiet hours
-  // (with a silent daemon it is the only alert that breaks through). One episode per main SHA — the smell's subject
-  // is `main:<sha>` — so this is one alert per broken main commit.
+  // Operator standing rule, 2026-10-08 (card xu1nixv): main was red ~5.5 h (17:04Z on) and nothing noticed. A red
+  // main must reach the operator, even in shadow mode and through quiet hours.
+  'main-ci-red',
+  // Operator ruling, 2026-10-09 ("Add it", PR #4461): the lane-verify view of a red main (`pre-existing-red-on-main`)
+  // also alerts through quiet hours. One alert per main SHA: the subject is `main:<sha>`, and health-watch sends it
+  // once (no reminder, no re-alert on a reopened episode).
   'pre-existing-red-on-main',
 ]);

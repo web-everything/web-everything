@@ -79,6 +79,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
     { id: 'cap', text: 'at most maxConcurrentBuilds Claude and maxConcurrentExternalBuilds external builds in flight', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'wip-cap', text: 'at most maxOpenItems items open from build start until merge (durable in-flight ∪ delivered-by-open-PR)', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'landing-freeze', text: 'no new build while open PRs > maxOpenPrs or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
+    { id: 'main-red', text: "no new build while main's CI is red (setting freeze.mainRed; prepares and the main-fix owner exempt)", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'scope-vs-open-prs', text: "a build whose scope overlaps an open PR's files waits for that PR", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'hot-file', text: 'no two in-flight builds on the same file', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'branch-name', text: 'a delivery branch never starts with a bare number', enforcedBy: 'build-dispatch-policy.mjs (checks the planned ref)' },
@@ -205,12 +206,19 @@ function executorClass(executor) {
 export function planBuildDispatch({
   candidates = [], inFlight = [], openPrs = [], externalBuilding = 0, killSwitch = { engaged: false }, policy = BUILD_DISPATCH_POLICY,
   dispatchedByBuilder = null, fixInFlight = [],
+  // Card xu1nixv — freeze kind `main-red` (next to `open-prs`): `{frozen, reason, exemptNums}` from
+  // `main-ci-red-core.mjs#mainRedBuildFreeze`. Holds BUILDS only — prepares (light) never come through here and the
+  // main-fix owner is dispatched by the health watch — so it is kept out of `freeze.frozen`. `null` = before this card.
+  mainRedFreeze = null,
 } = {}) {
   const hold = [];
   const dispatch = [];
   const freezeReasons = [];
-  if (killSwitch?.engaged) freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`);
-  if (openPrs.length > policy.maxOpenPrs) freezeReasons.push(`${openPrs.length} open PRs > maxOpenPrs ${policy.maxOpenPrs}`);
+  // Card x60i0ie — WHY the queue is frozen, as stable kinds (`kill-switch` | `open-prs` | `label`), so a caller can
+  // tell an open-PR-count freeze (a build-WIP limit) from a kill switch or a freeze label (hold everything).
+  const freezeKinds = new Set();
+  if (killSwitch?.engaged) { freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`); freezeKinds.add('kill-switch'); }
+  if (openPrs.length > policy.maxOpenPrs) { freezeReasons.push(`${openPrs.length} open PRs > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
   // GLOBAL freeze set — `blocked:daemon-bug` only (#3383 continuation, live incident 2026-09-28). A per-PR
   // `*-stalled` label never reaches this set any more; it is still an ordinary open PR below, so the
   // `scope-vs-open-prs` loop still holds any candidate whose scope overlaps ITS files. Falls back to the full
@@ -219,7 +227,7 @@ export function planBuildDispatch({
   const freezeSet = new Set(policy.globalFreezeLabels ?? policy.freezeLabels ?? []);
   for (const pr of openPrs) {
     const hit = pr.labels.find((l) => freezeSet.has(l));
-    if (hit) freezeReasons.push(`${pr.repo}#${pr.number} is labelled ${hit}`);
+    if (hit) { freezeReasons.push(`${pr.repo}#${pr.number} is labelled ${hit}`); freezeKinds.add('label'); }
   }
   const frozen = freezeReasons.length > 0;
 
@@ -269,6 +277,7 @@ export function planBuildDispatch({
     const num = normNum(c.num);
     const base = { num, lane: c.lane ?? null };
     if (frozen) { hold.push({ ...base, rule: 'landing-freeze', reason: freezeReasons.join('; ') }); continue; }
+    if (mainRedFreeze?.frozen && !(mainRedFreeze.exemptNums ?? []).map(normNum).includes(num)) { hold.push({ ...base, rule: 'main-red', reason: mainRedFreeze.reason }); continue; }
     if (inFlightByNum.has(num)) { hold.push({ ...base, rule: 'in-flight', reason: `already in flight (${inFlightByNum.get(num).source})` }); continue; }
     const deliveringPr = openPrs.find((pr) => prDeliversNum(pr, num));
     if (deliveringPr) { hold.push({ ...base, rule: 'in-flight', reason: `${deliveringPr.repo}#${deliveringPr.number} already delivers it` }); continue; }
@@ -316,10 +325,11 @@ export function planBuildDispatch({
     dispatch.push(pick);
   }
   return {
-    freeze: { frozen, reasons: freezeReasons }, inFlight: running, busy, slots: slotsByClass.claude, slotsByClass, dispatch, hold,
+    freeze: { frozen, reasons: freezeReasons, kinds: [...freezeKinds] }, inFlight: running, busy, slots: slotsByClass.claude, slotsByClass, dispatch, hold,
     // Card x3vs6tu — logged signal only (never gates `busy`/`slots` above): the machine-wide "building" count
     // the tick core passed in, visible to a dry-run/status line even though this cap no longer reads it.
     externalBuilding: Number(externalBuilding) || 0,
+    mainRedFreeze: { frozen: mainRedFreeze?.frozen === true, ...(mainRedFreeze?.frozen ? { reason: mainRedFreeze.reason } : {}) }, // card xu1nixv
     openItems: { count: openItemsInitial.size, cap: maxOpenItems, nums: [...openItemsInitial].sort() },
   };
 }

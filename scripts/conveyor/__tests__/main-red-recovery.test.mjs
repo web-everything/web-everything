@@ -327,6 +327,28 @@ describe('main-red-recovery — planMainRedRebases', () => {
     expect(plan.refusals).toEqual([expect.objectContaining({ prNumber: 9001, kind: 'main-still-red' })]);
   });
 
+  // Card xu1nixv (incident 2026-10-08 23:42Z: #4522, the fix for red main, refused `main-still-red`).
+  it('never refuses the red-main fix PR main-still-red; the other checks and every other PR are unchanged', () => {
+    const stillRedWindows = computeMainRedWindows(MAIN_RUNS_STILL_RED);
+    const plan = planMainRedRebases({
+      candidates: [
+        { prNumber: 4522, aheadBy: 5, failureCompletedAt: '2026-09-25T03:40:00Z' },
+        { prNumber: 9001, aheadBy: 5, failureCompletedAt: '2026-09-25T03:40:00Z' },
+        { prNumber: 4531, aheadBy: 0, failureCompletedAt: '2026-09-25T03:40:00Z' },
+      ],
+      mainRedWindows: stillRedWindows,
+      mainFixPrs: [4522, 4531],
+    });
+    expect(plan.dispatch).toEqual([expect.objectContaining({ prNumber: 4522, kind: 'rebase-onto-main' })]);
+    expect(plan.refusals).toEqual([
+      expect.objectContaining({ prNumber: 9001, kind: 'main-still-red' }),
+      expect.objectContaining({ prNumber: 4531, kind: 'already-current' }),
+    ]);
+    // Off value (no fix PRs published) = before this card.
+    expect(planMainRedRebases({ candidates: [{ prNumber: 4522, aheadBy: 5, failureCompletedAt: '2026-09-25T03:40:00Z' }], mainRedWindows: stillRedWindows })
+      .refusals).toEqual([expect.objectContaining({ prNumber: 4522, kind: 'main-still-red' })]);
+  });
+
   it('refuses unknown-ahead-by when the compare read could not be resolved', () => {
     const plan = planMainRedRebases({
       candidates: [{ prNumber: 9002, aheadBy: null, failureCompletedAt: '2026-09-25T02:02:29Z' }],

@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-scope: ["we:scripts/lib/quiet-hours.mjs", "we:scripts/lib/quiet-hours-io.mjs", "we:scripts/quiet-hours-settings.json", "we:scripts/conveyor/branch-sync.mjs", "we:scripts/operations/scheduled-sweep.mjs", "we:skills-src/conveyor/supervisor.mjs", "we:scripts/conveyor/driver-watchdog.mjs", "we:scripts/conveyor/health-watch.mjs"]
+scope: ["we:scripts/lib/quiet-hours.mjs", "we:scripts/lib/quiet-hours-io.mjs", "we:scripts/quiet-hours-settings.json", "we:scripts/conveyor/branch-sync.mjs", "we:scripts/operations/scheduled-sweep.mjs", "we:skills-src/conveyor/supervisor.mjs", "we:scripts/conveyor/driver-watchdog.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-smells-notify-list.mjs", "we:scripts/conveyor/health-smells/pre-existing-red-on-main.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---

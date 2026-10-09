@@ -43,6 +43,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync, readdirSync, mkdirSync, appendFileSync, renameSync, statSync } from 'node:fs';
 import os, { tmpdir, hostname, homedir } from 'node:os';
 import { gateHost } from '../../scripts/lib/dispatch-throttle.mjs';
+import { admitLaunch, costAdmissionOn, freezeHolds, lightCapFor, summarizeCostAdmission } from '../../scripts/lib/cost-admission.mjs';
+import { readCostAdmissionSettings, readCostFacts } from '../../scripts/lib/cost-admission-facts.mjs';
 import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
 import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
 import { dirname, join, resolve } from 'node:path';
@@ -77,6 +79,8 @@ import { settleDispatchEffect } from '../../scripts/operations/deliver-item-sett
 import { prepareCardStatus } from '../../scripts/conveyor/prepare-result.mjs';
 import { readField } from '../../scripts/backlog/frontmatter.mjs';
 import { CONSTELLATION_REPOS } from '../../scripts/lib/constellation-repos.mjs';
+import { readMainRedState, resolveFreezeMainRed } from '../../scripts/lib/main-red-priority.mjs'; // card xu1nixv
+import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'; // card xu1nixv
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
 import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
@@ -580,6 +584,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const plan = planBuildDispatch({
     candidates, inFlight, openPrs, externalBuilding, killSwitch: effects.killSwitch(), policy, dispatchedByBuilder,
     fixInFlight: effects.listFixClaims ? effects.listFixClaims() : [],
+    // Card xu1nixv — freeze kind `main-red` (setting freeze.mainRed); an effect that is absent or throws = no freeze.
+    mainRedFreeze: (() => { try { return effects.mainRedFreeze ? effects.mainRedFreeze() : null; } catch { return null; } })(),
   });
 
   const dispatched = [];
@@ -608,13 +614,35 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   let startedThisTick = 0;
   const launchSlotBusy = () => typeof effects.settleLaunches === 'function'
     && (pendingLaunch.build.size + pendingLaunch.prepare.size + startedThisTick) > 0;
+  // Card x60i0ie — cost-class admission (`we:scripts/lib/cost-admission.mjs`). `off` (the default) = today's gates.
+  // Every launch decision this tick (heavy and light) is recorded for the one report line.
+  const costSettings = policy?.costAdmission ?? null;
+  const costOn = costAdmissionOn(costSettings);
+  const costDecisions = [];
+  let costFacts = null;
+  const readFacts = () => {
+    if (costFacts) return costFacts;
+    try { costFacts = effects.costFacts?.() ?? {}; } catch { costFacts = {}; }
+    return costFacts;
+  };
   const loadGateFor = (kind, num) => {
     const gate = effects.hostLoadGate?.(kind) ?? { admit: true };
     if (!gate.admit) {
       loadHolds.push({ num: normNum(num), kind, reason: 'host-load', why: gate.why });
       console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (host-load): ${gate.why}`);
     } else if (gate.note) console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${gate.note}`);
+    costDecisions.push({ num: normNum(num), kind, ...admitLaunch({ kind: kind === 'prepare' ? 'prepare-item' : kind, settings: costSettings, legacy: gate }) });
     return gate;
+  };
+  // A LIGHT launch under the rule ON: its own budget / cap / CPU floor; the heavy host gate is not consulted.
+  const lightGateFor = (kind, num, lightInFlight) => {
+    const d = admitLaunch({ kind, settings: costSettings, facts: { ...readFacts(), lightInFlight } });
+    costDecisions.push({ num: normNum(num), kind, ...d });
+    if (!d.admit) {
+      loadHolds.push({ num: normNum(num), kind, reason: d.reason, why: d.why });
+      console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (${d.reason}): ${d.why}`);
+    } else console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${d.why}`);
+    return d;
   };
   if (live) {
     for (const pick of plan.dispatch) {
@@ -654,7 +682,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }));
   const configuredPrepare = resolveOperationRoute({ operation: 'prepare-item', taskType: 'prepare', policy: routingPolicy });
   const fallback = configuredPrepare ? configuredPrepare.provider === 'claude' : prepareRouteFallback(probationRecords, releases);
-  const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
+  const prepareCap = lightCapFor('prepare-item', costSettings, 2);
+  const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
@@ -835,15 +865,18 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   }
   for (const num of heldNums) prepareBusy.delete(num);
   prepare.inFlight = [...prepareBusy];
-  if (prepareEnabled && !plan.freeze.frozen) {
+  // Card x60i0ie — a light prepare skips an open-PR-count freeze (`lightOpenPrFreeze: skip`); a kill switch or a
+  // freeze label still holds it. Rule OFF: `freezeHolds` is exactly `plan.freeze.frozen` (today).
+  prepare.freezeHeld = freezeHolds('prepare-item', plan.freeze, costSettings);
+  if (prepareEnabled && !prepare.freezeHeld) {
     for (const pick of prepareSpawns) {
       const num = normNum(pick.num);
-      // tick-core's default cap is two; it may offer fewer after its own admission checks.
-      if (finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= 2) continue;
+      // tick-core's cap is two (the light cap with the rule ON); it may offer fewer after its own admission checks.
+      if (finishedPrepares.has(num) || heldNums.has(num) || prepareBusy.has(num) || prepareBusy.size >= prepareCap) continue;
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
-      if (!loadGateFor('prepare', num).admit) continue;
+      if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
       // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
       // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
       // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
@@ -907,6 +940,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     dispatched,
     // 78b/#4139 — launches deferred by the host-load gate, and the detached-launch settlement this tick did.
     loadHolds,
+    // Card x60i0ie — the one cost-class admission line for this tick (heavy vs light, admitted/refused and why).
+    costAdmission: { ...summarizeCostAdmission(costDecisions, { settings: costSettings, facts: costOn ? readFacts() : (costFacts ?? {}) }), decisions: costDecisions },
     launchSettlement,
     // Every cleared card not dispatched this tick, with the stage and reason that held it (queue-cap included).
     buildHolds: collectBuildHolds({
@@ -1271,6 +1306,11 @@ export function cliHostLoadGate(kind = 'build', opts = {}) {
   const { env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample } = opts;
   try { return gateHost({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); }
   catch { return { admit: true }; }
+}
+
+/** Card xu1nixv — the builder's `main-red` freeze from the health watch's published main-red record (TTL'd). */
+function cliMainRedFreeze() {
+  return mainRedBuildFreeze(readMainRedState(), { setting: resolveFreezeMainRed(), now: Date.now() });
 }
 
 function cliKillSwitch() {
@@ -1881,9 +1921,12 @@ function cliEffects() {
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
     killSwitch: cliKillSwitch,
+    mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,
     settleLaunches: (o) => cliSettleLaunches({ confirmed: cliLaunchConfirmed, ...o }),
     hostLoadGate: cliHostLoadGate,
+    // Card x60i0ie — the plain facts the cost-class rule reads (host sample + Claude spend today). Fails open.
+    costFacts: () => readCostFacts(),
     // #4348-open-pr-retry — only called by `runBuildDispatchTick` when `live` (never on a `--dry-run` tick).
     retryInfraBlocked: cliRetryInfraBlocked,
     // #4131/#4382 build-orphan-adopt — only called by `runBuildDispatchTick` when `live`, and BEFORE this same
@@ -1961,6 +2004,8 @@ export function policyFrom(flags, env = process.env) {
     // Card 80 — declared settings; `off` (or a negative value) disables the window / the staleness gate.
     prepareAheadWindow: offOr(flags['prepare-ahead-window'] ?? env.WE_BUILD_DAEMON_PREPARE_AHEAD_WINDOW, BUILD_DISPATCH_POLICY.prepareAheadWindow),
     preparedMaxAgeDays: offOr(flags['prepared-max-age-days'] ?? env.WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS, BUILD_DISPATCH_POLICY.preparedMaxAgeDays),
+    // Card x60i0ie — declared cost-class admission settings (env + dispatch-settings.json); built-in `off`.
+    costAdmission: readCostAdmissionSettings({ env }),
   };
 }
 
@@ -1980,7 +2025,8 @@ function offOr(v, d) {
  */
 export function tickCapacity(r) {
   const buildSlots = r?.plan?.slotsByClass ?? {};
-  const prepareSlots = Math.max(0, 2 - (Array.isArray(r?.prepare?.inFlight) ? r.prepare.inFlight.length : 0));
+  const prepareCap = Number.isFinite(r?.prepare?.cap) ? r.prepare.cap : 2; // card x60i0ie — the light cap when ON
+  const prepareSlots = Math.max(0, prepareCap - (Array.isArray(r?.prepare?.inFlight) ? r.prepare.inFlight.length : 0));
   return { buildSlots, prepareSlots, frozen: r?.plan?.freeze?.frozen === true,
     free: r?.plan?.freeze?.frozen !== true && (prepareSlots > 0 || Object.values(buildSlots).some((n) => Number(n) > 0)) };
 }
@@ -1994,6 +2040,7 @@ export function planConfigFrom(policy = BUILD_DISPATCH_POLICY) {
   const cfg = { launchKinds: BUILD_DAEMON_LAUNCH_KINDS };
   if (Number.isFinite(policy?.prepareAheadWindow)) cfg.prepareAheadWindow = policy.prepareAheadWindow;
   if (Number.isFinite(policy?.preparedMaxAgeDays)) cfg.preparedMaxAgeDays = policy.preparedMaxAgeDays;
+  if (costAdmissionOn(policy?.costAdmission)) cfg.costAdmission = policy.costAdmission; // card x60i0ie — only when ON
   return cfg;
 }
 
@@ -2037,7 +2084,7 @@ async function dryRun(flags) {
     const route = await cliPredictRoute(c.num, scope);
     reportCandidates.push({ num: c.num, lane: c.lane, scope, route, executor: route.executor });
   }
-  const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight() });
+  const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight(), mainRedFreeze: cliMainRedFreeze() });
   const focus = String(flags.focus || '').split(',').map(normNum).filter(Boolean);
   const rows = [];
   const holdByNum = new Map((tick.buildHolds || []).map((h) => [normNum(h.num), h]));
@@ -2164,7 +2211,8 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, launchSettlement: r.launchSettlement, capacity: tickCapacity(r) })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, capacity: tickCapacity(r) })}\n`);
+      if (r.costAdmission?.line) console.error(`build-dispatch-daemon: ${r.costAdmission.line}`);
     },
     onTickError: (e, _tick, loop) => {
       // Keep the health watcher's existing failure-line contract; timings are an additive JSON line.

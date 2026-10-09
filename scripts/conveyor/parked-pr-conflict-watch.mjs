@@ -169,6 +169,8 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // module's `CONFLICT_LABEL`/`CONFLICT_LABEL_META` (`reconcile-fix-dispatch.mjs`) needs no edit either. See that
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
+// Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
+import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
 
 export { CONFLICT_LABEL, CONFLICT_LABEL_META };
 
@@ -1510,6 +1512,10 @@ export function watchParkedPrConflicts({
   listAgents = defaultListAgents,
   now = Date.now(),
   queueScope = {},
+  // Card xkugvzd — the declared setting (`conflict-reassert-settings.json`, env `WE_CONFLICT_REASSERT_REVIEW_HUMAN`).
+  // The CLI (the daemon's own invocation) resolves it once per sweep; an in-process caller that passes nothing gets
+  // `off`, exactly the behaviour before this card.
+  conflictReassertSettings = CONFLICT_REASSERT_OFF,
 } = {}) {
   const listed = listPrs({ repo });
   if (isGhDeferred(listed)) return []; // throttle already logged the skipped pass
@@ -1570,12 +1576,10 @@ export function watchParkedPrConflicts({
       && !hasReviewLabel(pr?.labels, REVIEW_LABELS.changes);
     if (!plan.add && plan.remove.length === 0 && !graceDue && !recheckCandidate && !idleConflictBounce) continue;
     const entry = { num: pr?.number, isConflicting, ...plan, commented: false };
-    if (idleConflictBounce && !recheckCandidate && !graceDue) {
+    // The #2793 idle re-assert, shared with card xkugvzd's `review:human` case (`variant` only names the route).
+    // Same round cap, same once-per-round guard, same `postFinding` (which keeps `review:human`). Pushes `entry`.
+    const reassertIdleConflict = (comments, variant) => {
       try {
-        // Same lazy-read discipline as `recheckCandidate` just below — this narrow, otherwise-invisible
-        // population costs nothing extra on every OTHER tick.
-        let comments = [];
-        try { comments = listPrComments({ number: pr?.number, repo }); } catch { comments = []; }
         const conflictFixRoundsSpent = countConflictFixComments(comments);
         if (conflictFixRoundsSpent >= CONFLICT_FIX_ROUND_CAP) {
           // Never loop forever past the shared cap — surface it once via the same reconcile-notes channel the
@@ -1591,10 +1595,10 @@ export function watchParkedPrConflicts({
             postNoteComment({ repo: resolvedRepo, pr: pr?.number, body: notePlan.body });
             try { notifyDesktopChecked({ title: 'Conveyor: conflict-fix cap exhausted', body: note.text }); } catch { /* best-effort */ }
           }
-          entry.routedTo = 'cap-exhausted (conflict-fix, idle)';
+          entry.routedTo = `cap-exhausted (conflict-fix, idle${variant ? `, ${variant}` : ''})`;
           entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
           results.push(entry);
-          continue;
+          return;
         }
         // The episode boundary for THIS narrow population is the last completed conflict-fix round (if any) —
         // never the label-removal boundary `sinceMs` uses elsewhere in this file, because the label here has
@@ -1605,19 +1609,30 @@ export function watchParkedPrConflicts({
         const sinceMs = Number.isFinite(lastRearmAtMs) ? lastRearmAtMs : -Infinity;
         if (hasRecentConflictFindingComment(comments, { now, sinceMs })) {
           // Already re-asserted for this round within the retry window — avoid reposting every tick.
-          entry.routedTo = 'reconcile-finding (idle conflict-bounce, already re-asserted this round)';
+          entry.routedTo = `reconcile-finding (idle conflict-bounce${variant ? `, ${variant}` : ''}, already re-asserted this round)`;
           results.push(entry);
-          continue;
+          return;
         }
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         if (!dryRun) postFinding({ pr, repo: resolvedRepo });
-        entry.routedTo = 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
+        entry.routedTo = variant
+          ? `reconcile-finding (idle conflict-bounce re-asserted, ${variant} — xkugvzd)`
+          : 'reconcile-finding (idle conflict-bounce re-asserted — #2793)';
         entry.conflictFixRoundsSpent = conflictFixRoundsSpent;
         results.push(entry);
       } catch (e) {
         entry.error = String((e && e.message) || e).split('\n')[0];
         results.push(entry);
       }
+    };
+    if (idleConflictBounce && !recheckCandidate && !graceDue) {
+      // Same lazy-read discipline as `recheckCandidate` just below — this narrow, otherwise-invisible
+      // population costs nothing extra on every OTHER tick.
+      // Same fail-closed read as the review:human route below: an unreadable thread (throw / non-array) hides the
+      // spent round cap and the once-per-round finding, so re-asserting off `[]` would bypass both. Retry next sweep.
+      let comments = null;
+      try { const listed = listPrComments({ number: pr?.number, repo }); if (Array.isArray(listed)) comments = listed; } catch { comments = null; }
+      if (comments) reassertIdleConflict(comments, null);
       continue;
     }
     if (recheckCandidate && !graceDue) {
@@ -1627,9 +1642,30 @@ export function watchParkedPrConflicts({
         // below, and ONLY once a watcher marker is actually found, so the common "nothing to recheck" tick never
         // pays for it (mirrors this file's existing xoh8fkw discipline elsewhere in this loop).
         let comments = [];
-        try { comments = listPrComments({ number: pr?.number, repo }); } catch { comments = []; }
+        // `commentsRead` keeps "the read failed" distinct from "the thread is empty": the new review:human
+        // re-assert below decides from the thread's stand-downs and spent rounds, so an unreadable thread must
+        // never read as "no guard applies".
+        let commentsRead = false;
+        try {
+          const listed = listPrComments({ number: pr?.number, repo });
+          if (Array.isArray(listed)) { comments = listed; commentsRead = true; }
+        } catch { comments = []; }
         const watcherMarker = findWatcherStandDownComment(comments);
-        if (!watcherMarker) continue; // nothing this fork can change here — leave it exactly as today
+        if (!watcherMarker) {
+          // Card xkugvzd (live: #4481) — no watcher stand-down, so the statute recheck below has nothing to change.
+          // A `review:human` PR still conflicting with no live `review:changes` used to be skipped here forever (the
+          // #2793 idle path excludes `review:human`). The declared rule decides whether to re-assert the idle
+          // conflict finding; off, a live bounce, or any stand-down on the thread (a fix agent's own judgment call)
+          // leaves it exactly as before.
+          if (!commentsRead) continue; // unreadable thread → retry next sweep, post nothing
+          const decision = decideConflictReassert({
+            labels: pr?.labels, hasLiveWatcherMarker: false, hasStandDown: standDownComments(comments).length > 0,
+            settings: conflictReassertSettings,
+          });
+          if (!decision.reassert) continue;
+          reassertIdleConflict(comments, 'review-human');
+          continue;
+        }
         // Already superseded (and dispatched) on an earlier sweep — the supersede comment is the durable record,
         // so re-posting it and a fresh finding every tick is pure noise (live on #2549, 2026-09-24).
         if (isWatcherMarkerAlreadySuperseded(comments)) continue;
@@ -2165,6 +2201,7 @@ if (IS_CLI) {
     try {
       const results = watchParkedPrConflicts({
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        conflictReassertSettings: resolveConflictReassertSettings(),
       });
       for (const r of results) {
         const verb2 = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';

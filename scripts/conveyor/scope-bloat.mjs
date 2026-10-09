@@ -27,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { countRebaseOntoMainComments } from './main-red-recovery.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { coversFile } from '../readiness/scope-lease.mjs';
+import { readNetSets, resolveNetScopeSettings, scopeFilesFor } from './net-scope.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -195,7 +196,12 @@ export function readBaseSha({ base = 'main', root = ROOT, run = git } = {}) {
  * Only the Web Everything repo is read (the git root is this clone); other repos pass through.
  */
 export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'main', env = process.env, root = ROOT,
-  readNet = readNetFiles, readScope = readCardScope, readBaseSha: readBase = readBaseSha } = {}) {
+  readNet = readNetFiles, readScope = readCardScope, readBaseSha: readBase = readBaseSha,
+  // Card xd1tvd0 — judge the PR's git net diff (head vs its merge-base with `origin/main`), not GitHub's list, which
+  // still diffs against the PR's old base after a merge of `main` and stops at 100 files. Real git only when the
+  // other reads are real too (a test that injects `readNet` never shells out); `null` = GitHub's list (today).
+  readMergeBaseNet = readNet === readNetFiles ? ((pr) => readNetSets([pr], { dir: root }).get(pr.number)) : null,
+  netScope = resolveNetScopeSettings(env) } = {}) {
   if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);
   let baseSha = null; // read once per call, lazily: a pass over PRs that all fail the cheap checks never shells out
@@ -212,15 +218,18 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
       if (unreadable.has(headKey)) return pr;
       const key = `${headKey}:${baseTip()}`;
       if (!memo.has(key)) {
-        const lazy = scopeSignalOn(limits) && pr.files.length >= limits.minFiles;
+        let mergeBaseNet = null;
+        if (netScope?.scopeBloat && readMergeBaseNet) { try { mergeBaseNet = readMergeBaseNet(pr); } catch { mergeBaseNet = null; } }
+        const { files: prFiles } = scopeFilesFor({ net: mergeBaseNet, listed: pr.files, on: Boolean(netScope?.scopeBloat) });
+        const lazy = scopeSignalOn(limits) && prFiles.length >= limits.minFiles;
         // Stale-base needs the net diff for any PR big enough to hold that many files; the card scope only for big ones.
-        const needNet = lazy || (limits.alreadyOnMain > 0 && pr.files.length >= limits.alreadyOnMain);
+        const needNet = lazy || (limits.alreadyOnMain > 0 && prFiles.length >= limits.alreadyOnMain);
         // An unreadable diff is remembered as "no claim" too, so a PR whose head cannot be fetched costs one failed read, not one per tick.
         let net = null;
         try { net = needNet ? readNet({ headRefName: pr.headRefName, headRefOid: pr.headRefOid, base: defaultBranch, root }) : null; }
         catch { unreadable.add(headKey); if (unreadable.size > 500) unreadable.delete(unreadable.values().next().value); return pr; }
         const scope = lazy ? readScope({ title: pr.title ?? '', base: defaultBranch, root }) : null;
-        memo.set(key, assessScopeBloat({ prFiles: pr.files, netFiles: net, cardScope: scope, env }));
+        memo.set(key, assessScopeBloat({ prFiles, netFiles: net, cardScope: scope, env }));
         if (memo.size > 500) memo.delete(memo.keys().next().value);
       }
       const bloat = memo.get(key);

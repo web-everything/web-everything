@@ -79,6 +79,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
+import { probeAndOwnMainCi } from './main-ci-red-io.mjs';
 import { collectCredentialInventory, normalizeInventory } from './credential-inventory.mjs';
 import { readGithubAppStatus, defaultCachePath } from '../lib/github-app-auth-env.mjs';
 import { resolvePrLimit, readLimitState, isGlobalOffNow } from '../lib/pr-limit.mjs';
@@ -124,11 +125,25 @@ export function daemonDownEmergency(ep) {
 
 /**
  * Health smells whose episode IS a red main: their alert always breaks through quiet hours (`mainRed` breakthrough).
- * The tag only acts once the smell notifies at all: `pre-existing-red-on-main` is listed in `NOTIFY_EVEN_IN_SHADOW`
- * (the operator-owned list in `health-smells-notify-list.mjs`; operator ruling 2026-10-09), so a red main raises a
- * desktop alert in shadow mode, and this tag makes it break through quiet hours. One episode per main SHA = one alert.
+ * The tag only acts once the smell notifies at all: both are listed in `NOTIFY_EVEN_IN_SHADOW` (the operator-owned
+ * list in `health-smells-notify-list.mjs`; operator rulings 2026-10-08 and 2026-10-09), so a red main raises a desktop
+ * alert in shadow mode, and this tag makes it break through quiet hours.
  */
-export const MAIN_RED_SMELLS = new Set(['pre-existing-red-on-main']);
+export const MAIN_RED_SMELLS = new Set(['pre-existing-red-on-main', 'main-ci-red']);
+
+/**
+ * Smells that alert ONCE per subject (operator ruling 2026-10-09: one alert per broken main commit). Their subject is
+ * `main:<sha>`, so a second send for the same subject is suppressed: the 4-hour reminder, and a reopened episode for a
+ * sha whose earlier episode already closed (the smell reads lane verify markers, which come and go while main stays red).
+ */
+export const ALERT_ONCE_PER_SUBJECT = new Set(['pre-existing-red-on-main']);
+
+/** True when a plan entry would be a repeat alert for an ALERT_ONCE_PER_SUBJECT smell. PURE. */
+export function isRepeatAlert(p, ep, history = []) {
+  if (!ALERT_ONCE_PER_SUBJECT.has(ep?.smell)) return false;
+  if (p?.reason === 'reminder') return true;
+  return history.some((h) => h?.smell === ep.smell && h?.subject === ep.subject && h?.id !== ep.id);
+}
 
 /**
  * The quietHours breakthrough tag for a health episode's alert, or undefined for a routine one. The real red-main
@@ -1122,6 +1137,16 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       runsDir: process.env.OPERATION_RUNS_DIR || join(workspaceOf(REPO_ROOT), '.operations', 'coordination', 'build-dispatch-runs'),
       lanesRoot: process.env.LANE_POOL_ROOT || join(workspaceOf(REPO_ROOT), '.lanes'), nowMs: now }));
   }
+  // Card xu1nixv — main's own CI workflow runs (read by workflow, never across all workflows) and its ONE owner per
+  // broken commit, every tick (main red is the priority). The result is the `main-ci-red` smell's probe. A fixture
+  // (`--main-ci-runs-fixture=<file>`) replays recorded runs and never dispatches; other fixture ticks skip it.
+  if (flags['main-ci-runs-fixture'] || (!flags['no-gh'] && !flags['lock-root'] && !flags['state-root'])) {
+    const fixture = flags['main-ci-runs-fixture'];
+    probes.mainCiRuns = await attempt('mainCiRuns', () => probeAndOwnMainCi({
+      dir, now, config, weRoot: REPO_ROOT, dryRun: !!flags['dry-run'] || !!fixture,
+      ...(fixture ? { readRuns: () => JSON.parse(readFileSync(fixture, 'utf8')), readPrs: () => [], listAgents: async () => [], gates: async () => ({ killed: false, fixGate: null }) } : {}),
+    }));
+  }
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());
 
@@ -1275,6 +1300,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     // `--dry-run`/`--no-notify` both skip actually SENDING one (an OS-visible side effect, unlike the
     // read-only diagnoses above) — a dry-run reports what it would have sent via `result.plan` already.
     if (!ep || flags['no-notify'] || flags['dry-run']) continue;
+    if (isRepeatAlert(p, ep, state.history)) continue; // one alert per broken main commit
     const title = `Health: ${ep.smell} — ${ep.subject}`;
     const body = scrubText(ep.recommendation || ep.summary || 'See the health report.');
     let sent;

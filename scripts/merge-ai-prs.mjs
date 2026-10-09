@@ -187,6 +187,8 @@ import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './li
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
+import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
+import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -2790,6 +2792,8 @@ export function buildStackedBaseCloseReason({ headRef = 'its base branch' } = {}
 export const REVIEW_RECORD_HEADLINES = {
   restamp: '📌 review — acceptance re-stamped after a rebase (no new review)',
   'clear-human': '✅ review — `review:human` cleared via the sanctioned path',
+  // card x5f2daz — the light single-reviewer note on a card-only PREPARE PR. The heading is owned by prep-review.mjs.
+  'prep-advised': PREP_REVIEW_HEADLINE,
   accepted: '✅ review — accepted',
   changes: '🔁 review — changes requested',
 };
@@ -2905,6 +2909,19 @@ export const REVIEW_COVERAGE_GAP_META = {
 };
 
 /**
+ * card x5f2daz — the arguments `runCli` hands {@link reviewCoverageGaps} for one landing candidate `c`. The head ref and the
+ * head being landed (the listed head wins over the verdict's) MUST travel with the comments, or every prep note reads as
+ * "not covering the head" and the drain posts `no-recorded-review` on prepare PRs again. Extracted so a test can drive the
+ * real assembly instead of passing those two fields by hand.
+ */
+export function reviewCoverageGapArgs(c, comments) {
+  return {
+    comments, reliefWaived: c?.reliefWaived === true, reliefPassWide: c?.reliefPassWide === true,
+    headRef: c?.headRef ?? null, headSha: c?.listedHeadSha || c?.headSha || null,
+  };
+}
+
+/**
  * Which review-coverage gaps does this landing PR carry? Pure — the caller supplies the PR's own comments.
  * Returns `[{code, line}]`, EMPTY for a normally-reviewed PR, which is what keeps the announcement off every
  * PR.
@@ -2914,7 +2931,7 @@ export const REVIEW_COVERAGE_GAP_META = {
  * CLEAN — see the measurement in REVIEW_COVERAGE_GAP_META for why those two are expected rather than
  * degraded, and why they must STOP the analysis rather than fall through to the basis checks.
  */
-export function reviewCoverageGaps({ comments = [], reliefWaived = false, reliefPassWide = false } = {}) {
+export function reviewCoverageGaps({ comments = [], reliefWaived = false, reliefPassWide = false, headRef = null, headSha = null } = {}) {
   const codes = [];
   if (reliefWaived === true) codes.push('relief-waived');
   // #3308 (round-2 correctness fix) — the pass-wide waiver is its OWN gap, not a synonym of the scoped one. The
@@ -2922,10 +2939,17 @@ export function reviewCoverageGaps({ comments = [], reliefWaived = false, relief
   // which `passWide` switches off), so at most one of these two lines fires; the `else` is deliberately absent
   // rather than assumed, because a caller passing both should be told both rather than silently told one.
   if (reliefPassWide === true) codes.push('relief-waived-pass-wide');
-  const records = recordedReviewRecords(comments);
+  // card x5f2daz — a `prep-advised` note is a review record ONLY on a prepare PR (head ref `lane/<n>-prepare-item-...`),
+  // only from a trusted author, and only for the head being landed (its marker's head is `headSha`; no `headSha` to
+  // compare is "not covered"). On any other PR, from anyone else, or for an older head it is ignored, so a code PR can
+  // never satisfy this check with a forged heading, and a push that adds code after the note is not covered by it.
+  const prepPr = prepareItemFromRef(headRef) !== null;
+  const records = recordedReviewRecords((Array.isArray(comments) ? comments : [])
+    .filter((c) => !(typeof c !== 'string' && reviewRecordKind(c?.body) === 'prep-advised' && !(prepPr && prepNoteCoversHead(c, headSha)))
+      && !(typeof c === 'string' && reviewRecordKind(c) === 'prep-advised')));
   const latest = records[records.length - 1] || null;
   if (!latest) codes.push('no-recorded-review');
-  else if (latest.kind !== 'restamp' && latest.kind !== 'clear-human') {
+  else if (latest.kind !== 'restamp' && latest.kind !== 'clear-human' && latest.kind !== 'prep-advised') {
     const read = readReviewRecord(latest.body);
     if (read.lensRows.length && !read.lensRows.some((r) => r.weight === 'mandatory')) codes.push('unseated-mandatory-lens');
     if (!read.basis) codes.push('unstated-basis');
@@ -5608,7 +5632,7 @@ async function runCli() {
           // `--watch` loop that re-lands nothing re-posts nothing. It cannot affect the merge either — the post
           // swallows every `gh` error internally and returns a bool.
           if (preread.read) {
-            const gaps = reviewCoverageGaps({ comments: preread.comments, reliefWaived: c.reliefWaived === true, reliefPassWide: c.reliefPassWide === true });
+            const gaps = reviewCoverageGaps(reviewCoverageGapArgs(c, preread.comments));
             if (gaps.length) {
               const reason = buildReviewCoverageReason(gaps);
               const posted = postDrainReasonComment(c.repo, c.num, REVIEW_COVERAGE_KIND, reason, null, preread.comments);

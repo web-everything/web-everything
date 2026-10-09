@@ -39,16 +39,40 @@ export function readMainRedOwner({ env = process.env, now = Date.now(), read = r
 const isCodeFree = (path) => /^(backlog|docs)\//.test(path) || /\.md$/i.test(path);
 
 /**
+ * Who ACTUALLY waits on whom this pass. PURE. The fix queue's own `blocks` count is symmetric (any shared file,
+ * both directions), so on a busy queue every PR "blocks" ten others and all read P1 (live 2026-10-09 03:04Z).
+ * Here a PR's waiters are only the PRs that (a) were refused `scope-overlap` this pass, (b) rank BEHIND it, and
+ * (c) share a changed path with it — and a PR that is itself waiting on scope has none: raising it frees nobody
+ * until its own blocker finishes. So only the head of each wait chain (admitted this pass) unblocks others.
+ * @param {{planned:Array<{pr:number, overlapScope?:string[], scope?:string[]}>, ranks?:Array<{pr:number, rank:number}>, refusals?:Array<{pr?:number, kind:string}>}} pass
+ * @returns {Map<number, number>} pr → number of PRs actually waiting on it
+ */
+export function actualScopeWaiters({ planned = [], ranks = [], refusals = [] } = {}) {
+  const rankOf = new Map((ranks ?? []).map((r) => [r.pr, r.rank]));
+  const waiting = new Set((refusals ?? []).filter((r) => r?.kind === 'scope-overlap').map((r) => Number(r.pr ?? r.prNumber)));
+  const pathsOf = new Map((planned ?? []).map((e) => [e.pr, new Set(Array.isArray(e.overlapScope) ? e.overlapScope : (e.scope ?? []))]));
+  const out = new Map();
+  for (const head of planned ?? []) {
+    if (waiting.has(head.pr) || !rankOf.has(head.pr)) { out.set(head.pr, 0); continue; }
+    const mine = pathsOf.get(head.pr);
+    out.set(head.pr, (planned ?? []).filter((other) => other.pr !== head.pr && waiting.has(other.pr)
+      && (rankOf.get(other.pr) ?? 0) > rankOf.get(head.pr)
+      && [...pathsOf.get(other.pr)].some((p) => mine.has(p))).length);
+  }
+  return out;
+}
+
+/**
  * Plain facts for one planned fix/ci-heal entry. PURE.
  * @param {object} entry   a planned entry of `runReconcileFixDispatch` (pr, waitingSince, overlapScope, operatorAnswer…)
- * @param {{rank?:{blocks?:number}, owner?:{repo:string|null, pr:number}|null, repoKey?:string, labels?:string[]}} ctx
+ * @param {{waiters?:number, owner?:{repo:string|null, pr:number}|null, repoKey?:string, labels?:string[]}} ctx
  */
-export function fixEntryPriorityFacts(entry, { rank = null, owner = null, repoKey = 'we', labels = [] } = {}) {
+export function fixEntryPriorityFacts(entry, { waiters = 0, owner = null, repoKey = 'we', labels = [] } = {}) {
   const paths = Array.isArray(entry?.overlapScope) ? entry.overlapScope.map((p) => String(p).replace(/^[a-z-]+:/, '')) : null;
   const overrideLabel = (Array.isArray(labels) ? labels : []).find((l) => PRIORITY_OVERRIDE_LABELS[l]);
   return {
     incident: owner ? { open: true, owner: owner.pr === entry?.pr && (owner.repo == null || owner.repo === repoKey) } : { open: false },
-    scopeWaiters: Number(rank?.blocks) || 0,
+    scopeWaiters: Number(waiters) || 0,
     operatorRequested: Boolean(entry?.operatorAnswer || entry?.operatorSendBack),
     ...(paths && paths.length ? { changesCode: paths.some((p) => !isCodeFree(p)) } : {}),
     ...(overrideLabel ? { override: { value: PRIORITY_OVERRIDE_LABELS[overrideLabel], byOperator: false } } : {}),
@@ -60,12 +84,12 @@ export function fixEntryPriorityFacts(entry, { rank = null, owner = null, repoKe
  * Rank one fix pass in shadow. PURE.
  * @returns {{mode:string, ranked:Array<object>}}
  */
-export function shadowFixPassPriority({ planned = [], ranks = [], dispatchEntries = [], repoKey = 'we', settings, owner = null, now }) {
-  const rankByPr = new Map((ranks ?? []).map((r) => [r.pr, r]));
+export function shadowFixPassPriority({ planned = [], ranks = [], refusals = [], dispatchEntries = [], repoKey = 'we', settings, owner = null, now }) {
+  const waitersByPr = actualScopeWaiters({ planned, ranks, refusals });
   const labelsByPr = new Map((dispatchEntries ?? []).map((e) => [Number(e.prNumber), e.labels ?? []]));
   const items = (planned ?? []).map((entry) => ({
     id: entry.pr,
-    facts: fixEntryPriorityFacts(entry, { rank: rankByPr.get(entry.pr), owner, repoKey, labels: labelsByPr.get(entry.pr) }),
+    facts: fixEntryPriorityFacts(entry, { waiters: waitersByPr.get(entry.pr), owner, repoKey, labels: labelsByPr.get(entry.pr) }),
   }));
   return { mode: settings.mode, ranked: rankByDeliveryPriority(items, settings, now) };
 }
@@ -81,14 +105,14 @@ export function formatPriorityShadowLine(repoKey, { mode, ranked }) {
  * Mode `off`, or a pass with nothing owed, logs nothing. Returns the shadow result or null.
  */
 export function logFixPassPriorityShadow({
-  planned, ranks, dispatchEntries, repoKey = 'we', env = process.env, now = Date.now(), log = (line) => console.error(line),
+  planned, ranks, refusals = [], dispatchEntries, repoKey = 'we', env = process.env, now = Date.now(), log = (line) => console.error(line),
   readSettings = readDeliveryPrioritySettings, readOwner = () => readMainRedOwner({ env, now }),
 } = {}) {
   try {
     if (!Array.isArray(planned) || !planned.length) return null; // nothing owed this pass: nothing to class
     const settings = readSettings();
     if (settings.mode === 'off') return null;
-    const result = shadowFixPassPriority({ planned, ranks, dispatchEntries, repoKey, settings, owner: readOwner(), now });
+    const result = shadowFixPassPriority({ planned, ranks, refusals, dispatchEntries, repoKey, settings, owner: readOwner(), now });
     log(formatPriorityShadowLine(repoKey, result));
     return result;
   } catch (e) {

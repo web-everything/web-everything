@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:scripts/lib/verify-lane-gate.mjs", "we:scripts/lib/__tests__/verify-lane-gate.test.mjs", "we:scripts/check-standards-rules.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards-rules*.test.mjs", "we:scripts/__tests__/check-standards*.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-01"
-preparedAgainstSha: "95d2f9913e2b7510772f6410181c2c9fd82fde26"
+preparedDate: "2026-10-09"
+preparedAgainstSha: "0007875ad3f13546d089e71c49a89d50264feb15"
 tags: []
 ---
 
@@ -31,6 +31,8 @@ The existing overlap tests at `we:scripts/lib/__tests__/verify-lane-gate.test.mj
 The original follow-up premise implied that `resolveDefaultGate` exposes dependency reachability through its targets. Source evidence narrows that claim: at `we:scripts/lib/verify-lane-gate.mjs:169`, targets are the union of changed selection inputs and tests found by textual references; `testsNaming` at `we:scripts/lib/verify-lane-gate.mjs:385` uses `git grep`. The import walk happens later inside `vitest related`. Keep the accepted limitation documented at `we:scripts/lib/verify-lane-gate.mjs:307`, characterize it, and carry dependency-aware invalidation into a separate follow-up without choosing its policy here.
 
 The standards runner already separates pure rule logic from filesystem reads, as shown by its code-guard wiring at `we:scripts/check-standards.mjs:2648`. Extend that structure. Research here is source inspection; the real-Git regression and mutation proof below remain implementation deliverables, not claimed passing results.
+
+Re-prepare 2026-10-09 (stale `preparedAgainstSha`; premise re-checked against `origin/main` 0007875ad): still undelivered — the gate module has no `--no-renames` at the four set-membership sites. Citations drifted; current ones: `localChangedSet` at `we:scripts/lib/verify-lane-gate.mjs:438` (diffs at lines 443-444), `laneRelevantChangeSince` at `we:scripts/lib/verify-lane-gate.mjs:578` (diffs at lines 588 and 593), the upstream-only limitation documented in the doc comment at `we:scripts/lib/verify-lane-gate.mjs:552`, `resolveDefaultGate` at `we:scripts/lib/verify-lane-gate.mjs:313` with `testsNaming` at `we:scripts/lib/verify-lane-gate.mjs:628`. A fifth diff at `we:scripts/lib/verify-lane-gate.mjs:249` already carries `--no-renames`; the standards rule must accept it. Wiring precedent in the runner: `we:scripts/check-standards.mjs:3012`. Design, MVP, Test plan, Proof plan and Follow-ups are otherwise unchanged and still hold; read every "line 200/201/345/350/307/169/385" above as the current line named here.
 
 ## Design
 

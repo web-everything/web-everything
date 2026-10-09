@@ -3,7 +3,8 @@
  * @description Pure conflict and expiry contract tests, including the declared reader/assessor boundary.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, assessFreeScope, formatFreeScope, freeScopeOperation, parseExcludePr } from '../free-scope.mjs';
+import { qualifyFile, repoKeyFor, partitionRegistry, registerScope, releaseScope, assessFreeScope, formatFreeScope, freeScopeOperation, parseExcludePr,
+  choosePrFileSet, prHoldsFile, GH_LIST_FILE_CAP, GH_API_FILE_CAP } from '../free-scope.mjs';
 const startedAt = '2026-10-05T10:00:00.000Z';
 const nowMs = Date.parse(startedAt);
 const agent = { agent: 'build-x', purpose: 'build', files: ['we:scripts/lib/'], startedAt };
@@ -166,5 +167,58 @@ describe('new backlog cards never collide (live 2026-10-08)', () => {
     const filer = { agent: 'filer', purpose: 'card', files: ['we:backlog/'], startedAt };
     expect(assess({ files: ['we:backlog/'], agents: [filer] }).status).toBe('free');
     expect(assess({ files: ['we:backlog/x100-existing.md'], agents: [filer] }).status).toBe('occupied');
+  });
+});
+
+describe('a PR holds only the files git says it changes against current main (xl5oele, live 2026-10-08)', () => {
+  const WE = 'web-everything/web-everything';
+  const ok = (files, added = []) => ({ ok: true, files, added });
+  const many = (n) => Array.from({ length: n }, (_, i) => `scripts/f${i}.mjs`);
+  it('prefers git, then the paginated API, then an uncapped gh list', () => {
+    const net = ok(['a.mjs'], ['a.mjs']), paged = ok(['a.mjs', 'main-only.mjs']), listed = ok(['a.mjs', 'main-only.mjs']);
+    expect(choosePrFileSet({ net, paged, listed })).toEqual({ source: 'git', files: ['a.mjs'], added: ['a.mjs'] });
+    expect(choosePrFileSet({ net: { ok: false, reason: 'no head' }, paged, listed }).source).toBe('github-api');
+    expect(choosePrFileSet({ net: { ok: false, reason: 'no head' }, listed })).toMatchObject({ source: 'github-list', added: [] });
+  });
+  it('a gh list at its 100-file cap is unresolved only when neither git nor the API is readable', () => {
+    const capped = ok(many(GH_LIST_FILE_CAP));
+    expect(choosePrFileSet({ net: ok(many(150)), listed: capped })).toMatchObject({ source: 'git' });
+    expect(choosePrFileSet({ net: { ok: false, reason: 'x' }, paged: ok(many(150)), listed: capped }).files).toHaveLength(150);
+    const none = choosePrFileSet({ net: { ok: false, reason: 'no local checkout' }, paged: { ok: false, reason: 'HTTP 502' }, listed: capped });
+    expect(none.source).toBeNull();
+    expect(none.reason).toMatch(/git: no local checkout; github api: HTTP 502; lists 100 files \(the gh cap\)/);
+    expect(choosePrFileSet({ paged: ok(many(GH_API_FILE_CAP)) }).source).toBeNull();
+    expect(choosePrFileSet({}).reason).toBe('no file list was read');
+  });
+  it('answers "does PR P hold file F?" with the same rules as the assessor', () => {
+    const pr = { repo: WE, number: 1, files: ['scripts/lib/x.mjs', 'backlog/x1-new.md'], added: ['backlog/x1-new.md'] };
+    expect(prHoldsFile(pr, 'we:scripts/lib/x.mjs')).toBe(true);
+    expect(prHoldsFile(pr, 'we:scripts/lib/')).toBe(true);
+    expect(prHoldsFile(pr, 'scripts/lib/y.mjs')).toBe(false);
+    expect(prHoldsFile(pr, 'we:backlog/')).toBe(false);
+    expect(prHoldsFile(pr, 'we:backlog/x1-new.md')).toBe(true);
+    expect(prHoldsFile({ ...pr, repo: 'plateauapp/plateau-app' }, 'we:scripts/lib/x.mjs')).toBe(false);
+  });
+  // Replay of the live facts: gh's list for #4502/#4508/#4512 included main's own jury-core/review-pr/verdict-ledger
+  // changes, and #4461 listed 100 files. git's net sets (merge-base with current main) held none of the three.
+  it('replays the live case: git net sets clear the false holders and #4461 no longer forces UNKNOWN', () => {
+    const scope = ['we:scripts/lib/jury-core.mjs', 'we:scripts/operations/review-pr.mjs', 'we:scripts/lib/verdict-ledger.mjs'];
+    const stale = ['scripts/lib/jury-core.mjs', 'scripts/operations/review-pr.mjs', 'scripts/lib/verdict-ledger.mjs'];
+    const facts = [
+      { number: 4502, listed: ok([...stale, 'scripts/lib/ledger-git.mjs']), net: ok(['scripts/lib/ledger-git.mjs']) },
+      { number: 4508, listed: ok([...stale.slice(0, 2), 'scripts/lane-pool.mjs']), net: ok(['scripts/lane-pool.mjs']) },
+      { number: 4512, listed: ok([...stale.slice(0, 2), 'scripts/conveyor/admission.mjs']), net: ok(['scripts/conveyor/admission.mjs']) },
+      { number: 4461, listed: ok(many(GH_LIST_FILE_CAP)), net: ok(['scripts/conveyor/quiet-hours.mjs']) },
+      { number: 4524, listed: ok(stale), net: ok(stale) },
+    ];
+    const prs = facts.map(({ number, listed, net }) => ({ repo: WE, number, title: `PR ${number}`, url: 'u', ...choosePrFileSet({ net, listed }) }));
+    const after = assessFreeScope({ files: scope, prs, nowMs, unreadable: [] });
+    expect(after.status).toBe('occupied');
+    expect(after.files.map((r) => r.holders.map((h) => h.number))).toEqual([[4524], [4524], [4524]]);
+    expect(assessFreeScope({ files: scope, prs, nowMs, excludePr: 4524 }).status).toBe('free');
+    // Before (gh lists only): every PR that merged main "held" the files, and the capped #4461 made it UNKNOWN.
+    const before = facts.map(({ number, listed }) => ({ repo: WE, number, title: `PR ${number}`, url: 'u', files: listed.files }));
+    const old = assessFreeScope({ files: scope, prs: before, nowMs, excludePr: 4524, unreadable: [{ repo: WE, error: 'PR #4461 lists 100 files' }] });
+    expect(old.files[0].holders.map((h) => h.number)).toEqual([4502, 4508, 4512]);
   });
 });
