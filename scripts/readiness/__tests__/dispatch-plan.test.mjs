@@ -24,7 +24,9 @@ import {
   // we:xniq7xs — the open-PR backpressure limit's intake hold.
   PR_LIMIT_HINT, readPrLimitHeld,
   // #4347 — the capacity-cap operator gloss, naming the real active count and room.
-  capacityCapHint, prepareStaleness } from '../dispatch-plan.mjs';
+  capacityCapHint, prepareStaleness,
+  // The free-lane read fails soft: a failed `lane-pool list --acquirable` means no free lanes, not a crashed plan.
+  freeLaneIdsFromPaths, settleFreeLanes } from '../dispatch-plan.mjs';
 import { PAUSABLE_KINDS } from '../dispatch-pause.mjs';
 import { normNum, bornAsIndexFromItems, resolveBornAsRefs } from '../../conveyor/queue-store.mjs';
 
@@ -1424,5 +1426,27 @@ describe('card 80 (b) — prepare-stale: an old or drifted stamp is re-prepared 
   it('prepareStaleness fails open on an unknown age or unchecked drift', () => {
     expect(prepareStaleness({ preparedDate: 'bad' }, policy)).toBeNull();
     expect(prepareStaleness({ preparedDate: '2026-10-05' }, { maxAgeDays: 3 })).toBeNull();
+  });
+});
+
+describe('settleFreeLanes — a failed lane-pool read degrades to zero free lanes instead of crashing the plan', () => {
+  it('freeLaneIdsFromPaths keeps only lane dirs, as ascending ids', () => {
+    expect(freeLaneIdsFromPaths(['/x/lane-12', '/x/lane-3/', '/x/other', 7])).toEqual([3, 12]);
+    expect(freeLaneIdsFromPaths(null)).toEqual([]);
+  });
+  it('a successful read returns the sorted ids and no error', async () => {
+    expect(await settleFreeLanes(async () => ['/p/lane-9', '/p/lane-2'])).toEqual({ freeLanes: [2, 9], error: null });
+  });
+  it('a rejected read (the scan-budget timeout) returns no free lanes and the WHOLE reason on one line', async () => {
+    const r = await settleFreeLanes(async () => { throw new Error('took over a stale scan lock\n\n✗ scan exceeded its 120000ms budget'); });
+    expect(r).toEqual({ freeLanes: [], error: 'took over a stale scan lock | ✗ scan exceeded its 120000ms budget' });
+  });
+  it('caps a huge reason so it cannot flood the builder log', async () => {
+    const r = await settleFreeLanes(async () => { throw new Error('x'.repeat(5000)); });
+    expect(r.error.length).toBe(601);
+  });
+  it('a read that throws synchronously is also caught', async () => {
+    const r = await settleFreeLanes(() => { throw new Error('boom'); });
+    expect(r).toEqual({ freeLanes: [], error: 'boom' });
   });
 });

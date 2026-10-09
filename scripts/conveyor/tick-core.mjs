@@ -1951,6 +1951,24 @@ export function lanePoolListArgsForRepo(repoFlag, resolveProfile) {
   return [`--repo=${profile.lanePoolRepo}`];
 }
 
+/**
+ * When dispatch-plan's own free-lane read already FAILED this tick (it fails soft and reports
+ * `plan.lanePool = {freeLanes:'unavailable', error}`), the tick must not re-run the identical read: on a loaded host
+ * that read is the one that timed out (scan-lock wait + scan budget, minutes each), and failed reads are never
+ * cached in the planning snapshot, so a retry only doubles the tick's wall time to reach the same failure.
+ * Only the SAME pool is reused — `--repo` args name a different pool, which is a different read.
+ * PURE.
+ * @param {{lanePool?:{freeLanes?:string, error?:string}}|null|undefined} plan - the dispatch-plan.mjs read.
+ * @param {string[]} poolArgs - the extra args `lanePoolListArgsForRepo` returned for this tick's read.
+ * @returns {string|null} the reported error to reuse, or null to do the read.
+ */
+export function reuseFailedLanePoolRead(plan, poolArgs) {
+  if (Array.isArray(poolArgs) && poolArgs.length) return null;
+  const pool = plan?.lanePool;
+  if (pool?.freeLanes !== 'unavailable') return null;
+  return typeof pool.error === 'string' && pool.error ? pool.error : 'lane-pool list unavailable';
+}
+
 // ── IO SHELL (runs only as a CLI — owns all child_process; keeps the pure core import-clean) ──────────────────
 
 /** Read all of STDIN as a string (the SESSION-EPHEMERAL bookkeeping is piped in — never a committed repo store). */
@@ -1990,7 +2008,9 @@ async function main(argv) {
     try { return fn(); } finally { timings[label] = (timings[label] || 0) + Math.round(performance.now() - t0); }
   };
 
-  const runJson = (cmd, args, what) => planningRead(args, () => {
+  // `soft` reads THROW instead of exiting, so the caller can degrade (the free-lane read below).
+  const runJson = (cmd, args, what, { soft = false } = {}) => planningRead(args, () => {
+    const fail_ = soft ? (m) => { throw new Error(m); } : fail;
     let out;
     try {
       // #x5n4zn3 — was bare (no timeout): this is the tick's read of `conveyor-state.mjs`/`dispatch-plan.mjs`/
@@ -1998,10 +2018,10 @@ async function main(argv) {
       // (a hung `list --acquirable` burning the drain's whole 45-min pass cap).
       out = execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs() * 2, killSignal: 'SIGKILL' });
     } catch (e) {
-      fail(`${what} failed: ${childFailure(e)}`);
+      fail_(`${what} failed: ${childFailure(e)}`);
     }
     try { return JSON.parse(out); }
-    catch (e) { fail(`could not parse ${what} JSON: ${String(e.message || e).split('\n')[0]}`); }
+    catch (e) { fail_(`could not parse ${what} JSON: ${String(e.message || e).split('\n')[0]}`); }
   });
 
   // The SESSION-EPHEMERAL bookkeeping is piped in on STDIN (SKILL §5: no on-disk parallel state store). A first
@@ -2060,11 +2080,15 @@ async function main(argv) {
   // in this shell already threads `--repo=${flags.repo}` through (see `lanePoolListArgsForRepo`'s own docblock).
   const { repoProfile } = await import('../lib/repo-profile.mjs');
   const lanePoolListArgs = ['list', '--acquirable', '--json', ...lanePoolListArgsForRepo(flags.repo, repoProfile)];
-  const paths = time('lanePoolListMs', () => runJson('node', [LANE_POOL_CLI, ...lanePoolListArgs], 'lane-pool list'));
-  const freeLanes = (Array.isArray(paths) ? paths : [])
-    .map((p) => { const m = /lane-(\d+)\/?$/.exec(String(p)); return m ? Number(m[1]) : null; })
-    .filter((n) => n != null)
-    .sort((a, b) => a - b);
+  // FAIL SOFT, like dispatch-plan's own read: an unreadable pool is zero free lanes (nothing launches into a lane
+  // this tick) plus a reported reason — never a crashed tick that also drops every hold, note and watcher. A read
+  // dispatch-plan already watched fail is reused, not repeated (`reuseFailedLanePoolRead`).
+  const { settleFreeLanes } = await import('../readiness/dispatch-plan.mjs');
+  const reusedPoolError = reuseFailedLanePoolRead(plan, lanePoolListArgsForRepo(flags.repo, repoProfile));
+  const { freeLanes, error: lanePoolError } = reusedPoolError
+    ? { freeLanes: [], error: reusedPoolError }
+    : await settleFreeLanes(() => time('lanePoolListMs', () => runJson('node', [LANE_POOL_CLI, ...lanePoolListArgs], 'lane-pool list', { soft: true })));
+  if (lanePoolError) process.stderr.write(`⚠ free-lane read failed (${lanePoolError}) — 0 free lanes this tick\n`);
 
   // #3403 — DURABLE build-guard floor: the live `claude agents --json` listing, fed to `durableBuildNums` inside
   // `planTick`. Best-effort like the `gh` comment reads below — a failure (no `claude` on PATH, a timeout) leaves
@@ -2233,6 +2257,7 @@ async function main(argv) {
   const out = planTick({ state, plan, freeLanes, bookkeeping, signals, prRearmCounts, prCiHealCounts, prCiHealRefunds, admission, liveAgentSessions, config, now: Date.now(), lastOperatorTurn, dispatchPaused, dispatchPausedKinds, dispatchPausedReason, loadAdmission, queueAdmission, itemSizes });
   // Always expose the observed phase costs, including in the builder log; the pure decision is unchanged.
   out.decisions.timings = timings;
+  if (lanePoolError) out.decisions.lanePoolError = lanePoolError;
   writeAllSync(1, JSON.stringify(out, null, 2) + '\n');
   process.exit(0);
 }
