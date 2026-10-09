@@ -7,14 +7,15 @@
  * `objects/info/alternates`, nothing copied), a copy of the real index, and its OWN refs: `main` and `origin/main`
  * both pinned to the real `HEAD` commit. A child run with {@link GitOverlay.env} sees exactly the checkout's content,
  * but `origin/main` is a fixture that never moves when someone pushes — so its result cannot drift with live data.
- * The hermetic `git` shim sees `GIT_DIR` outside every real checkout and lets it through.
+ * Its `origin` remote is the overlay itself, so even a fetch stays local. The hermetic `git` shim sees `GIT_DIR`
+ * outside every real checkout and lets it through.
  *
  * Costs milliseconds and a ~1–2 MB index copy, unlike a clone or a tree copy (tens of thousands of files).
  */
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { readGit } from './proc-read.mjs';
 
 /**
  * @typedef {{gitDir: string, head: string, env: {GIT_DIR: string, GIT_WORK_TREE: string}, cleanup: () => void}} GitOverlay
@@ -26,7 +27,7 @@ import { isAbsolute, join, resolve } from 'node:path';
  * @returns {GitOverlay}
  */
 export function makeGitOverlay(root, { base = tmpdir() } = {}) {
-  const git = (args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = (args) => String(readGit(args, { cwd: root })).trim();
   const absGitDir = git(['rev-parse', '--absolute-git-dir']);
   const commonRaw = git(['rev-parse', '--git-common-dir']);
   const common = isAbsolute(commonRaw) ? commonRaw : resolve(root, commonRaw);
@@ -39,7 +40,10 @@ export function makeGitOverlay(root, { base = tmpdir() } = {}) {
   writeFileSync(join(dir, 'refs', 'heads', 'main'), `${head}\n`);
   writeFileSync(join(dir, 'refs', 'remotes', 'origin', 'main'), `${head}\n`);
   writeFileSync(join(dir, 'refs', 'remotes', 'origin', 'HEAD'), 'ref: refs/remotes/origin/main\n');
-  writeFileSync(join(dir, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n');
+  // `origin` is the overlay itself: a `git fetch origin +refs/heads/main:refs/remotes/origin/main` (the runner-freshness
+  // check does one) succeeds locally and changes nothing — there is no network remote to reach.
+  writeFileSync(join(dir, 'config'), '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = true\n'
+    + `[remote "origin"]\n\turl = ${dir}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n`);
   if (existsSync(join(absGitDir, 'index'))) copyFileSync(join(absGitDir, 'index'), join(dir, 'index'));
   if (existsSync(join(common, 'info', 'exclude'))) copyFileSync(join(common, 'info', 'exclude'), join(dir, 'info', 'exclude'));
 
