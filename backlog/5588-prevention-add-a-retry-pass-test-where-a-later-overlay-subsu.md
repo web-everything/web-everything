@@ -1,15 +1,21 @@
 ---
+bornAs: xd7paj2
 kind: story
 size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-version-migrate.mjs", "we:scripts/lib/__tests__/"]
+scope: ["we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/lib/daemon-rebuild/__tests__/plan.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Daemon migrate tool: fix plist rewrite anchor, atomic lock takeover, retry test — before first live migration
+# Prevention — Add a retry-pass test where a later overlay subsumes an earlier conflicting one. Resolve that dec… (from web-everything/web-everything#4563 review)
 
-Gated follow-up from #4433 (card 89 S6), operator approved 2026-10-09: must land BEFORE the first live migration. (1) we:scripts/lib/daemon-version-migrate.mjs versionedPlistText rewrites at the first /<name> segment, not the clone path — anchor on dirname(clone), test with the name in a parent dir. (2) acquireLock stale takeover is rmSync-then-wx (not atomic) and treats a same-process call as a dead owner — make takeover atomic and pin same-process behaviour with a test. (3) test the failed-smoke retry cleanup.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/lib/daemon-rebuild/plan.mjs:250` — Add a retry-pass test where a later overlay subsumes an earlier conflicting one. Resolve that decision to 'remove' (in-main) or 'apply'.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4563@a577b8fe50c29a3bb042baa6f752fe3a330e0126
 
 ## Acceptance
 
