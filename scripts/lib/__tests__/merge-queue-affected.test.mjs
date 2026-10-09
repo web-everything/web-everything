@@ -315,6 +315,24 @@ describe('decideAffected — shared unchanged importer (review round 2: the test
     const importsOf = (side, f) => (side === 'main' && f === 'scripts/z.mjs' ? ['scripts/a.mjs'] : []);
     expect(run({ importsOf, importersOf: () => { throw new Error('not asked'); } }).reasons).toEqual(['main-file-imports-pr-file:scripts/z.mjs->scripts/a.mjs']);
   });
+  describe('implicit test infrastructure (review round 2: vitest loads these for every test, no test imports them)', () => {
+    it('a PR file that vitest.setup.ts imports, against an unrelated main change → affected', () => {
+      const r = run({ prFiles: ['scripts/lib/hermetic-tests.mjs'], mainFiles: ['blocks/renderers/jsx/index.ts'], importersOf: importers({ 'scripts/lib/hermetic-tests.mjs': ['vitest.setup.ts'] }) });
+      expect(r).toMatchObject({ affected: true, reasons: ['test-infra-reached:vitest.setup.ts (pr:scripts/lib/hermetic-tests.mjs)'] });
+    });
+    it('a main-changed file that vitest.config.ts imports, against an unrelated PR → affected', () => {
+      const r = run({ prFiles: ['blocks/x.ts'], mainFiles: ['scripts/lib/trust-chain-tier.mjs'], importersOf: importers({ 'scripts/lib/trust-chain-tier.mjs': ['vitest.config.ts'] }) });
+      expect(r.reasons).toEqual(['test-infra-reached:vitest.config.ts (main:scripts/lib/trust-chain-tier.mjs)']);
+    });
+    it('reached through an unchanged hub, and for a suite config or global setup entry', () => {
+      const viaHub = run({ importersOf: importers({ 'scripts/a.mjs': ['scripts/hub.mjs'], 'scripts/hub.mjs': ['vitest.globalSetup.mjs'] }) });
+      expect(viaHub.reasons).toEqual(['test-infra-reached:vitest.globalSetup.mjs (pr:scripts/a.mjs)']);
+      expect(run({ importersOf: importers({ 'scripts/z.mjs': ['vitest.soak.config.ts'] }) }).affected).toBe(true);
+    });
+    it('a file merely named like the entry (not at the repo root) is not infrastructure', () => {
+      expect(run({ importersOf: importers({ 'scripts/a.mjs': ['docs/vitest.setup.ts'] }) }).affected).toBe(false);
+    });
+  });
 });
 
 describe('readAffectedFacts — shared unchanged importer through git (one batched read of the tip tree)', () => {
@@ -375,6 +393,12 @@ describe('readAffectedFacts — shared unchanged importer through git (one batch
   it('a file the PR adds that nothing names stays unaffected (the added-file rule is not a blanket refresh)', () => {
     const { git } = fakeGit(trees());
     expect(readAffectedFacts({ ...facts({ prFiles: ['scripts/brand-new.mjs'] }), git }).affected).toBe(false);
+  });
+  it('a tracked source path holding a newline would desync the batched read: fails closed under a named reason', () => {
+    const t = trees();
+    t[TIP]['scripts/evil\nname.mjs'] = '';
+    const { git } = fakeGit(t);
+    expect(readAffectedFacts({ ...facts(), git }).reasons).toEqual(['reverse-graph-unreadable:newline-in-path']);
   });
   it('a failed tip-graph read is remembered for that tip: the next PR of the pass does not re-spawn it', () => {
     const { git, calls } = fakeGit(trees(), { batchFails: true });

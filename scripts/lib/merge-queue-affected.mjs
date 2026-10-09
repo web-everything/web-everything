@@ -23,6 +23,8 @@
  *      the PR changed and a file main changed. The two forward walks of rule 4 cannot see it; CI running that file
  *      after the merge exercises both together. A file the PR adds counts as imported by every unchanged file that
  *      already names it by a specifier that resolved to nothing or to a lower-priority file;
+ *      Test infrastructure vitest loads for every test file (root `vitest.*.{ts,mjs}`: config, setup, global setup) has no
+ *      importing test, so a change on either side that those files reach re-tests, under reason `test-infra-reached`;
  *   6. an import list could not be read, the tip's reverse graph could not be read in full or has more than
  *      {@link MAX_REVERSE_FILES} sources, or a forward closure is larger than {@link MAX_CLOSURE_FILES} — fail closed.
  *   NOT covered, by design: data read through `fs` rather than imported (other than declared settings, rule 1), and
@@ -61,6 +63,9 @@ export const GATE_PATTERNS = Object.freeze([
   /^\.github\//,
   /^\.githooks\//,
 ]);
+
+/** Root-level vitest entry files (`vitest.config.ts`, `vitest.setup.ts`, `vitest.globalSetup.mjs`, `vitest.<suite>.config.ts`, …): loaded for every test file, imported by none. */
+const TEST_INFRA_ENTRY_RE = /^vitest\.[\w.-]+\.(?:ts|mts|js|mjs|cjs)$/;
 
 /** PURE. Is this path part of the merge gate or the test infrastructure? */
 export function isGateFile(path) {
@@ -143,6 +148,12 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   if (typeof fromPr === 'string') return done(true, [fromPr]);
   const fromMain = reach(mainSet);
   if (typeof fromMain === 'string') return done(true, [fromMain]);
+  // Test infrastructure vitest loads for EVERY test file (config, setup, global setup) has no importing test, so no
+  // edge shows it. A change on either side that those files reach (a helper `vitest.setup.ts` imports) runs under
+  // every test of the merged tree: re-test.
+  for (const [side, closure] of [['pr', fromPr], ['main', fromMain]]) {
+    for (const [file, root] of closure) if (TEST_INFRA_ENTRY_RE.test(file)) return done(true, [`test-infra-reached:${file} (${side}:${root})`]);
+  }
   for (const [file, prRoot] of fromPr) {
     // A meeting point is something CI executes: a test or spec file, or an entry point (nothing imports it: a script
     // CI runs directly, such as check:standards or a build).
@@ -166,6 +177,8 @@ function gitRunner(root) {
 function readTipGraph({ git, tipSha, maxFiles, tipFiles }) {
   const sources = tipFiles.filter(isGraphSourceFile);
   if (sources.length > maxFiles) return 'reverse-graph-too-large';
+  // `cat-file --batch` reads one object name per line: a path holding a newline would desync every answer after it.
+  if (sources.some((f) => /[\r\n]/.test(f))) return 'reverse-graph-unreadable:newline-in-path';
   const known = new Set(tipFiles);
   const reverse = new Map();
   const bases = new Map(); // relative specifier base → the files that name it, resolved or not (see specifierBasesResolvingTo)
