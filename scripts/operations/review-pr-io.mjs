@@ -38,7 +38,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -53,7 +53,12 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 // (`planAdvisoryLabels`) lives in the leaf, the writes go through the same provider port as the note above.
 import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels } from '../lib/advisory-labels.mjs';
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
-import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
+// Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
+import { resolveReviewSettings, SCOPED_REREVIEW_MODES } from '../lib/review-settings.mjs';
+import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
+  FINDING_STATUSES } from '../lib/review-round-rules.mjs';
+import { sharedRunsDir } from './run-store.mjs';
 import { notApplied } from './effect-executor.mjs';
 // #xgmzd0y — the DERIVED sibling table, so the subject checkout is computed rather than typed
 // (`we:docs/agent/vm-sessions.md`: derivable by the repo's own tooling → in the tooling). Importing
@@ -201,6 +206,8 @@ export function readPr({
   // #xgmzd0y — the checkouts the caller's subject resolution already tried, named in the refusal below so
   // an operator sees WHERE it looked rather than only that it failed. Message-only; decides nothing.
   probed = null,
+  // Card 5469 — the declared `scopedRereview` mode (we:scripts/review-settings.json); injectable for tests.
+  scopedRereview = null,
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
@@ -300,7 +307,107 @@ export function readPr({
     net: { ...netPaths, revSha },
     latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
     diff: netText,
+    // Card 5469 — carried only when the shadow is on, so an `off` read is byte-identical to before.
+    ...(resolveScopedRereviewMode(scopedRereview) === 'shadow' ? { scopedRereview: 'shadow' } : {}),
   };
+}
+
+/** Card 5469 — the append-only shadow journal (one JSON line per reviewed round), beside the ledger-shadow journal. */
+export function scopedRereviewJournalPath(env = process.env) {
+  const named = String(env?.WE_SCOPED_REREVIEW_JOURNAL ?? '').trim();
+  return named || join(dirname(sharedRunsDir(env)), 'ledger-shadow', 'scoped-rereview.jsonl');
+}
+
+/** Append one journal entry. Throws on a write failure; the caller reports it. */
+export function appendScopedRereviewJournal(entry, { env = process.env } = {}) {
+  const path = scopedRereviewJournalPath(env);
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, `${JSON.stringify(entry)}\n`);
+  return path;
+}
+
+/** A cited path safe to hand to `git show <head>:<path>`: repo-relative, no `..`, no leading `-` or `/`. */
+const SAFE_GIT_PATH = /^(?!-)(?!\/)[\w.@+\/-]+$/;
+
+/**
+ * Card 5469 — THE SCOPED RE-REVIEW SHADOW for one review run. The io half: reads the PR's ledger rows (last reviewed
+ * head, prior finding statuses), the fix range since that head, the cited files at the head (for each finding's
+ * symbol) and the card's Acceptance list; calls the pure rules (we:scripts/lib/review-round-rules.mjs); appends one
+ * `finding` ledger row per identity; journals the round. NEVER throws and never changes a verdict, a comment or a label:
+ * any failure is one loud `scoped-rereview-shadow-miss` line. An unreadable ledger runs the rules with no prior head,
+ * which is the full review (edge 4: fail closed).
+ * @returns {object|null} the round summary, or null on a miss.
+ */
+export function recordScopedRereviewShadow({ payload, exec, readLedgerRows, appendLedgerRow, appendJournal, out = () => {}, now = () => new Date().toISOString() }) {
+  const { repo, pr } = payload ?? {};
+  try {
+    const facts = payload.roundFacts;
+    const head = typeof facts?.head === 'string' ? facts.head.toLowerCase() : null;
+    if (!head) { out(`scoped-rereview-shadow-miss: ${repo}#${pr} no pinned head; nothing recorded`); return null; }
+    let rows = [];
+    let ledger = 'ok';
+    try { rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)); } catch { rows = []; ledger = 'unreadable'; }
+    // Reviewed heads, in append order: a completed run's review-run row, and the shadow's own finding rows (written at
+    // review time, so a round parked for a ruling is counted too).
+    const reviewRuns = rows.filter((r) => r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING);
+    const fromLedger = ledger === 'ok' ? lastReviewedHead(reviewRuns, head) : null;
+    // The ledger names the last reviewed head (edge 6). A PR whose earlier rounds predate the review-run rows falls
+    // back to the trusted `Net basis:` marker the latest-fix read already used; anything else is a full review.
+    const markerHead = ledger === 'ok' && typeof facts.latestFix?.priorHead === 'string' ? facts.latestFix.priorHead.toLowerCase() : null;
+    const priorHead = fromLedger ?? markerHead;
+    const priorHeadSource = fromLedger ? 'ledger' : markerHead ? 'net-basis-marker' : null;
+    const round = Math.max(reviewRoundOf(reviewRuns, head), priorHead ? 2 : 1);
+    const delta = !priorHead ? null
+      : facts.latestFix?.priorHead?.toLowerCase() === priorHead && facts.latestFix.files ? facts.latestFix
+        : readFixRange({ exec, priorHead, head });
+    const prior = ledger === 'ok' ? foldFindingStatuses(rows, { pr, head }) : new Map();
+    const sentBack = [...prior].filter(([, p]) => p.status === FINDING_STATUSES.RAISED && String(p.headSha ?? '').toLowerCase() === priorHead).map(([id]) => id);
+    const show = new Map();
+    const fileAt = (path) => {
+      if (!SAFE_GIT_PATH.test(path) || path.split('/').includes('..')) return null;
+      if (!show.has(path)) {
+        try { show.set(path, String(exec('git', ['show', '--end-of-options', `${head}:${path}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 }) ?? '')); }
+        catch { show.set(path, null); }
+      }
+      return show.get(path);
+    };
+    const acceptance = (Array.isArray(facts.cardPaths) ? facts.cardPaths : []).flatMap((p) => acceptanceIds(fileAt(p) ?? ''));
+    const findings = (Array.isArray(facts.findings) ? facts.findings : []).map((item) => {
+      const file = typeof item?.finding?.file === 'string' ? item.finding.file.trim().replace(/^\.\//, '').replace(/:\d+(?::\d+)?$/, '') : '';
+      const text = file && Number.isInteger(item.finding.line) ? fileAt(file) : null;
+      return { ...item, symbol: text == null ? '' : enclosingSymbol(text, item.finding.line, file) };
+    });
+    const scope = reviewScope({ priorHead, head, delta, sentBack, acceptance });
+    const result = shadowRound({ repo, pr: Number(pr), head, round, scope, findings, prior,
+      liveVerdict: facts.liveVerdict, humanRequired: facts.humanRequired === true });
+    const at = now();
+    const missed = [];
+    for (const row of result.rows) {
+      try {
+        const res = appendLedgerRow(buildLedgerEvent({ type: EVENT_TYPES.FINDING, repo, pr: Number(pr), at, source: 'review-pr',
+          channel: 'review-pr', session: currentActorId(), headSha: head, ...row }));
+        if (!res?.ok || res.ledgerWriteMiss) missed.push(row.findingId);
+      } catch { missed.push(row.findingId); }
+    }
+    const summary = { ...result.summary, priorHead, priorHeadSource, ledger, findingRows: result.rows.length, findingRowsMissed: missed.length };
+    appendJournal({ v: 1, kind: 'we.scoped-rereview-shadow', at, repo, pr: Number(pr), head, priorHead, priorHeadSource, round,
+      scope: { kind: scope.kind, reason: scope.reason, files: Object.keys(scope.files ?? {}).length, carried: scope.carried, acceptance: scope.acceptance },
+      summary, entries: result.entries });
+    const verdictWord = round < 2 ? 'round 1 (full review; identities recorded)'
+      : summary.shadowBlocked ? `would still block (${summary.blocked} blocking, ${summary.carded} carded)`
+        : summary.liveBlocked ? `would have ACCEPTED with ${summary.carded} card(s) — round avoided` : 'accepted live; nothing to scope';
+    out(`scoped-rereview-shadow: ${repo}#${pr} round ${round} on ${head.slice(0, 8)} (scope ${scope.kind}${priorHead ? ` since ${priorHead.slice(0, 8)}` : ''}): live ${summary.liveVerdict || 'n/a'} → ${verdictWord}${missed.length ? `; ${missed.length} finding row(s) not written` : ''}`);
+    return summary;
+  } catch (e) {
+    out(`scoped-rereview-shadow-miss: ${repo}#${pr} ${String(e?.message ?? e).split('\n')[0]}; the live review is unaffected`);
+    return null;
+  }
+}
+
+/** Card 5469 — the scoped re-review mode: an explicit value, else the declared setting. Any doubt is `off`. */
+export function resolveScopedRereviewMode(explicit = null, { settings = resolveReviewSettings } = {}) {
+  if (SCOPED_REREVIEW_MODES.includes(explicit)) return explicit;
+  try { return SCOPED_REREVIEW_MODES.includes(settings().scopedRereview) ? settings().scopedRereview : 'off'; } catch { return 'off'; }
 }
 
 /** #5135 — output cap for the latest-fix `git diff`; past it the read fails and the scope falls back to `all`. */
@@ -327,6 +434,23 @@ export function readLatestFixRange(options = {}) {
       }
     }
     if (!priorHead) return { priorHead: null };
+    return readFixRange({ exec, priorHead, head });
+  } catch {
+    return { priorHead, head, error: 'diff-unparseable' };
+  }
+}
+
+/**
+ * The changed new-side lines of `<priorHead>..<head>`, in {@link readLatestFixRange}'s shape. Shared by the latest-fix
+ * read (prior head from the last trusted `Net basis:` marker) and the scoped re-review shadow (card 5469, prior head
+ * from the ledger's review-run rows). Never throws.
+ * @param {{exec: Function, priorHead: string, head: string|null}} o
+ * @returns {{priorHead: string, head?: string, files?: object, error?: string}}
+ */
+export function readFixRange({ exec, priorHead, head } = {}) {
+  const current = typeof head === 'string' && /^[0-9a-f]+$/i.test(head) ? head.toLowerCase() : null;
+  try {
+    if (typeof priorHead !== 'string' || !/^[0-9a-f]+$/i.test(priorHead)) return { priorHead, head, error: 'prior-head-invalid' };
     if (!current) return { priorHead, error: 'head-unpinned' };
     let diff;
     try {
@@ -675,6 +799,11 @@ export function createReviewPrSinks({
   // mechanical-dispatcher — the `AWAITING_ADVISORY_CLEAR` sink's own two primitives (see the header note above).
   readLabels = createGhProvider().readLabels,
   setLabels = createGhProvider().setLabels,
+  // Card 5469 — the scoped re-review shadow's reads and writes, injectable so the sink is testable with no git/ledger.
+  shadowGitExec = execFileIn(root),
+  readLedgerRows = (repo) => parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')),
+  appendLedgerRow = (row) => appendVerdict(row),
+  appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
 } = {}) {
   return {
     [REVIEW_EFFECTS.MANDATORY_REFERRALS]: async (payload, ctx) => {
@@ -1175,6 +1304,13 @@ export function createReviewPrSinks({
       }
       if (missed.length) out(`ledger-write-miss: ${payload.repo}#${payload.pr} review events not fully recorded (${missed.join(' | ')}); comments, labels and decisions are unaffected`);
       return { written, missed };
+    },
+
+    // ── Card 5469 — THE SCOPED RE-REVIEW SHADOW: finding-identity ledger rows + the would-block / would-card journal.
+    // SHADOW ONLY: it changes no comment, label or verdict, and it never throws (a miss is one loud line).
+    [REVIEW_EFFECTS.SCOPED_REREVIEW_SHADOW]: async (payload) => {
+      const summary = recordScopedRereviewShadow({ payload, exec: shadowGitExec, readLedgerRows, appendLedgerRow, appendJournal: appendShadowJournal, out });
+      return { recorded: summary !== null, ...(summary ? { summary } : {}) };
     },
 
     // ── 3. THE EVENT: the operator notice, rendered by `renderReviewNotice` in the declaration. ──────────────

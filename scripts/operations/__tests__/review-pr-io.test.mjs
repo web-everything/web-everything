@@ -212,6 +212,9 @@ describe('the ledger and notice sinks', () => {
     it('a #3988 replay: 3 runs on one head yield 3 review-run rows with posted:false', async () => {
       const sinks = createReviewPrSinks({ root });
       for (let i = 0; i < 3; i += 1) {
+        // Three real visits never share a millisecond; rows identical down to `at` are one row by event id (#4498),
+        // so a same-millisecond loop made this test flaky (~1 in 4 on a busy host). Space the visits apart.
+        if (i) await new Promise((r) => setTimeout(r, 3));
         await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
       }
       const rows = readEvents().filter((r) => r.type === 'review-run');
@@ -2231,5 +2234,96 @@ describe('#5135 fix range read wiring', () => {
     expect(result.latestFix).toEqual({ priorHead, head, files: {} });
     expect(calls.filter(args => args.at(-1) === `${result.net.rev}^{commit}`)).toHaveLength(1);
     expect(calls).toContainEqual(['diff', '--no-ext-diff', '--no-color', '--no-renames', '--src-prefix=a/', '--dst-prefix=b/', '--unified=0', priorHead, head]);
+  });
+});
+
+// ── Card 5469 — the scoped re-review shadow sink (finding-identity ledger rows + would-block/would-card journal) ──────
+describe('card 5469: recordScopedRereviewShadow (shadow only, never a decision)', async () => {
+  const { recordScopedRereviewShadow, readFixRange, resolveScopedRereviewMode } = await import('../review-pr-io.mjs');
+  const { scopedRereviewFacts } = await import('../review-pr.mjs');
+  const P = 'a'.repeat(40);
+  const H = 'b'.repeat(40);
+  const REPO = 'o/r';
+  const fileText = ['export function run() {', '  const x = 1;', '  return x;', '}', '', 'export function other() {', '  return 2;', '}'].join('\n');
+  const exec = (cmd, args) => {
+    if (args[0] === 'show') return fileText;
+    throw new Error(`unexpected git ${args.join(' ')}`);
+  };
+  const facts = (over = {}) => ({
+    head: H, basisLenses: ['correctness', 'security'], liveVerdict: 'changes', humanRequired: false, cardPaths: [],
+    latestFix: { priorHead: P, head: H, files: { 'src/a.mjs': [7] } },
+    findings: [{ finding: { file: 'src/a.mjs', line: 3, category: 'correctness/fail-open', summary: 'late nit', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' }, heldVerdict: true, deferred: false }],
+    ...over,
+  });
+  const run = (payload, rows = [{ type: 'review-run', pr: 7, headSha: P }]) => {
+    const appended = []; const journal = []; const lines = [];
+    const summary = recordScopedRereviewShadow({ payload: { repo: REPO, pr: 7, roundFacts: payload }, exec,
+      readLedgerRows: () => rows, appendLedgerRow: (row) => { appended.push(row); return { ok: true }; },
+      appendJournal: (e) => journal.push(e), out: (l) => lines.push(l), now: () => '2026-10-08T22:00:00.000Z' });
+    return { summary, appended, journal, lines };
+  };
+
+  it('journals a late finding on unchanged code as would-card, with a finding row carrying its identity', () => {
+    const { summary, appended, journal, lines } = run(facts());
+    expect(summary).toMatchObject({ round: 2, scope: 'delta', liveBlocked: true, shadowBlocked: false, carded: 1, roundAvoided: true, priorHeadSource: 'ledger' });
+    expect(appended).toHaveLength(1);
+    expect(appended[0]).toMatchObject({ type: 'finding', headSha: H, path: 'src/a.mjs', symbol: 'run', defectClass: 'fail-open', status: 'raised', round: 2, lines: [3] });
+    expect(journal[0].entries[0]).toMatchObject({ decision: 'card', reason: 'late-on-unchanged-code', change: 'far' });
+    expect(lines[0]).toMatch(/^scoped-rereview-shadow: o\/r#7 round 2 .*would have ACCEPTED with 1 card/);
+  });
+
+  it('a confirmed-broken finding on unchanged code still blocks', () => {
+    const f = facts();
+    f.findings[0].finding = { ...f.findings[0].finding, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+    const { summary, journal } = run(f);
+    expect(summary).toMatchObject({ shadowBlocked: true, blocked: 1, roundAvoided: false });
+    expect(journal[0].entries[0]).toMatchObject({ decision: 'block', reason: 'confirmed-broken' });
+  });
+
+  it('an unreadable ledger is a full review: nothing turns into a card', () => {
+    const summary = recordScopedRereviewShadow({ payload: { repo: REPO, pr: 7, roundFacts: facts() }, exec,
+      readLedgerRows: () => { throw new Error('ledger gone'); }, appendLedgerRow: () => ({ ok: true }), appendJournal: () => {}, out: () => {} });
+    expect(summary).toMatchObject({ ledger: 'unreadable', scope: 'full', roundAvoided: false });
+  });
+
+  it('never throws: a journal failure is one loud miss line', () => {
+    const lines = [];
+    const summary = recordScopedRereviewShadow({ payload: { repo: REPO, pr: 7, roundFacts: facts() }, exec,
+      readLedgerRows: () => [], appendLedgerRow: () => ({ ok: true }), appendJournal: () => { throw new Error('disk full'); }, out: (l) => lines.push(l) });
+    expect(summary).toBeNull();
+    expect(lines.at(-1)).toMatch(/^scoped-rereview-shadow-miss: o\/r#7 disk full/);
+  });
+
+  it('readFixRange refuses an invalid prior head and an unpinned head without running git', () => {
+    expect(readFixRange({ exec, priorHead: '-x', head: H })).toMatchObject({ error: 'prior-head-invalid' });
+    expect(readFixRange({ exec, priorHead: P, head: null })).toMatchObject({ error: 'head-unpinned' });
+  });
+
+  it('off (the built-in) adds nothing to the read or the ledger-events payload', () => {
+    expect(resolveScopedRereviewMode(null, { settings: () => ({ scopedRereview: 'off' }) })).toBe('off');
+    expect(resolveScopedRereviewMode(null, { settings: () => { throw new Error('unreadable'); } })).toBe('off');
+    expect(resolveScopedRereviewMode('shadow')).toBe('shadow');
+    const out = scopedRereviewFacts({ netBasis: { rev: H }, body: 'Card: `we:backlog/5469-x.md`' },
+      { verdict: 'changes', admittedFindings: [facts().findings[0].finding], deferredAdvisory: [] }, { verdict: 'changes' });
+    expect(out).toMatchObject({ head: H, liveVerdict: 'changes', cardPaths: ['backlog/5469-x.md'] });
+    expect(out.findings[0]).toMatchObject({ heldVerdict: true, deferred: false });
+  });
+});
+
+describe('card 5469: the advise step declares the shadow effect only when the setting is shadow', async () => {
+  const { reviewPrOperation, REVIEW_EFFECTS: E } = await import('../review-pr.mjs');
+  const advise = reviewPrOperation({ readPr: () => ({}) }).steps.find((s) => s.name === 'advise').step;
+  const view = (read) => ({ input: { pr: 7, repo: 'o/r' }, findings: { read: { netBasis: { rev: 'b'.repeat(40) }, labels: [], ...read } },
+    verdict: { verdict: 'changes', admittedFindings: [], deferredAdvisory: [], findings: [] } });
+
+  it('off (no setting on the read): exactly today — no effect for a non-human PR', () => {
+    expect(advise.effects(view({}))).toEqual([]);
+  });
+
+  it('shadow: one idempotent shadow effect, after any advisory effects', () => {
+    const effects = advise.effects(view({ scopedRereview: 'shadow' }));
+    expect(effects).toHaveLength(1);
+    expect(effects[0]).toMatchObject({ type: E.SCOPED_REREVIEW_SHADOW, idempotent: true, payload: { pr: 7, repo: 'o/r' } });
+    expect(effects[0].payload.roundFacts).toMatchObject({ head: 'b'.repeat(40), liveVerdict: 'changes' });
   });
 });
