@@ -103,7 +103,13 @@ describe('missingDoneWhenProof — A1 (#2949)', () => {
     expect(missingDoneWhenProof(it_)).toEqual({ hit: false, reason: null });
   });
 
-  it('also recognizes the legacy `## Acceptance` heading', () => {
+  it('reads `## Acceptance` exactly as `## Done when` — the shared task-agreement heading rule (#5399 S7)', () => {
+    for (const items of ['1. Looks right on review.', '- [A1] `scripts/x.mjs` exists.', '- [A1] doc-only — prose.', ''])
+      expect(missingDoneWhenProof({ body: `# T\n\nd.\n\n## Acceptance\n\n${items}\n` }))
+        .toEqual(missingDoneWhenProof({ body: `# T\n\nd.\n\n## Done when\n\n${items}\n` }));
+  });
+
+  it('also recognizes `## Acceptance` and `## Acceptance criteria` headings', () => {
     const noToken = { body: '# Title\n\ndigest.\n\n## Acceptance\n\nLooks right on review.\n' };
     expect(missingDoneWhenProof(noToken)).toEqual({ hit: true, reason: 'no-executable-token' });
     const withToken = {

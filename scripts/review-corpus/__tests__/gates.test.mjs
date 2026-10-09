@@ -27,6 +27,31 @@ const REPLAY_SOURCE = readFileSync(resolve(HERE, '..', 'replay-gates.mjs'), 'utf
 
 const card = (body) => `---\nkind: story\nstatus: open\n---\n\n# A card\n\n${body}\n`;
 
+// #5399 S7 — the acceptance heading comes from the shared task-agreement reader, and `- [A#]` items are criteria.
+describe('gates read `## Acceptance` `[A#]` items exactly as `## Done when` numbered items', () => {
+  const legacyBody = [
+    '## Done when', '',
+    '1. **Executable** — grepping `we:skills-src/conveyor/SKILL.md` for `dispatch-lane`',
+    '   returns hits. It returns nothing today.',
+    '2. no new warnings against the 0-error / 1435-warning baseline.',
+    '3. a test in `we:skills-src/conveyor/__tests__/runner.test.mjs` asserts it.', '',
+    '## Later', '', 'x',
+  ].join('\n');
+  const canonicalBody = legacyBody.replace('## Done when', '## Acceptance').replace(/^(\d+)\. /gm, '- [A$1] ');
+  const ctx = { path: 'backlog/x.md', read: () => 'no dispatch-lane here', exists: () => false, list: () => [] };
+  it('same section, same criteria count and offsets', () => {
+    const a = doneWhenSection(card(legacyBody)), b = doneWhenSection(card(canonicalBody));
+    expect(b.startLine).toBe(a.startLine);
+    expect(doneWhenCriteria(b.body).map((c) => c.line)).toEqual(doneWhenCriteria(a.body).map((c) => c.line));
+    expect(doneWhenCriteria(b.body)).toHaveLength(3);
+  });
+  it('every registered gate fires identically', () => {
+    const run = (t) => runGates(t, ctx).map((f) => `${f.gate}@${f.line}:${f.subject}`);
+    expect(run(card(canonicalBody))).toEqual(run(card(legacyBody)));
+    expect(run(card(legacyBody)).length).toBeGreaterThan(0);
+  });
+});
+
 describe('doneWhenCriteria — criteria wrap across physical lines', () => {
   it('joins a criterion with its continuation lines', () => {
     const { body } = doneWhenSection(card('## Done when\n\n1. **Executable** — grepping `we:a/b.md`\n   for `needle` returns nothing.\n2. second\n'));

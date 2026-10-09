@@ -44,6 +44,8 @@ import {
   parseIdentifierSpan,
   codeSpans,
   PROVENANCE_ESCAPE_MARKERS,
+  PROVENANCE_ESCAPE_HEADINGS,
+  isProvenanceEscapeHeading,
   findHashPathCiteOutsideBacklog,
   findHashPathCitesInGrepLines,
   classifyHashPathCite,
@@ -721,6 +723,25 @@ describe('findUnresolvedIdentifiers — the escapes, and their limits', () => {
     const body = ['# Item', 'lede cites `ledeFake`', '## Done when', '- `doneWhenFake` exists',
       '### sub of done-when', '- `subFake` too', '## Provenance', 'cites `provenanceFake`'].join('\n');
     expect(tokens(body)).toEqual(['ledeFake', 'provenanceFake']);
+  });
+
+  // #5399 S7 — the task-agreement headings come from the shared reader, so `## Acceptance` (and `## Non-goals`)
+  // get exactly the escape the legacy `## Done when` heading gets, subsections included.
+  it.each(['Done when', 'Acceptance', 'Acceptance criteria', 'Non-goals'])('`## %s` is an escape zone, and its subsection inherits it', (heading) => {
+    const body = ['# Item', 'lede cites `ledeFake`', `## ${heading}`, '- [A1] `notYetWritten` exists',
+      '### sub', '- `subFake` too', '## Provenance', 'cites `provenanceFake`'].join('\n');
+    expect(tokens(body)).toEqual(['ledeFake', 'provenanceFake']);
+  });
+  it('an unresolved path under `## Acceptance` gets the same escape as under `## Done when` (A1)', () => {
+    const card = (h) => `# T\n\nlede \`ledeFake\`\n\n## ${h}\n\n1. \`we:scripts/not-yet.mjs\` exists.\n`;
+    expect(scan(card('Acceptance'))).toEqual(scan(card('Done when')));
+    expect(tokens(card('Acceptance'))).toEqual(['ledeFake']);
+  });
+  it('isProvenanceEscapeHeading reads the agreement headings through the shared reader; the list holds only the rest', () => {
+    expect(PROVENANCE_ESCAPE_HEADINGS).toEqual(['design']);
+    for (const t of ['Acceptance', '**Acceptance**', 'Done when', 'done when:', 'Non-goals', 'Design', 'design: shape'])
+      expect(isProvenanceEscapeHeading(t)).toBe(true);
+    for (const t of ['Where it is today', 'Designer notes', 'Provenance']) expect(isProvenanceEscapeHeading(t)).toBe(false);
   });
 
   it('a marker QUOTED in prose or in an inline code span does NOT open a region (the self-disarm defect)', () => {
