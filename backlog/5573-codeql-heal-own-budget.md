@@ -1,4 +1,5 @@
 ---
+bornAs: xijemc6
 kind: story
 size: 2
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # CodeQL-held PR is charged only CodeQL heals, not the shared ci-heal cap
 
-LIVE PR #4453 (2026-10-09): 2 red-ci heals + 1 CodeQL heal spent the shared 3-heal cap, so a NEW CodeQL alert (Bad HTML filtering regexp at we:scripts/conveyor/prep-review.mjs:127) was refused cap-exhausted though no heal was ever briefed with it. Not an App-permission gap: alerts already reach the brief via CodeQL check-run annotations (x8cnbii); the direct code-scanning alerts API would need App repo permission 'Code scanning alerts: Read' (security_events:read), operator decision. Fix: per-reason count for the CodeQL branch + setting WE_CI_HEAL_CODEQL_OWN_BUDGET (default on) + #4453 fixture.
+LIVE PR #4453 (2026-10-09): 2 red-ci heals + 1 CodeQL heal spent the shared 3-heal cap, so a NEW CodeQL alert (Bad HTML filtering regexp at we:scripts/conveyor/prep-review.mjs:127) was refused cap-exhausted though no heal was ever briefed with it. Not an App-permission gap: alerts already reach the brief via CodeQL check-run annotations (5333); the direct code-scanning alerts API would need App repo permission 'Code scanning alerts: Read' (security_events:read), operator decision. Fix: per-reason count for the CodeQL branch + setting WE_CI_HEAL_CODEQL_OWN_BUDGET (default on) + #4453 fixture.
 
 ## Acceptance
 
