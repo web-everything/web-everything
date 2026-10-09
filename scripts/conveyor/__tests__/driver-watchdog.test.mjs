@@ -33,6 +33,7 @@ import {
   driverModePath, WATCHDOG_REPO_ROOT,
   resolvePidAlive, defaultIsPidAlive, scanPsOutput,
 } from '../driver-watchdog.mjs';
+import { DEFAULT_RENAG_MS } from '../branch-sync.mjs';
 import { driverModeFor, parseDriverMode, readDriverMode, writeDriverMode, DRIVER_MODES } from '../driver-mode.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
 
@@ -907,6 +908,31 @@ describe('runWatchdogOnce — a DOWN driver now ALERTS, but is still never heale
     expect(seen.logs.map((l) => l[1]).join('\n')).toContain('watchdog[down]');
   });
 
+  // quietHours (card xmvc6oc): the DOWN alert says how long nothing has moved (the silence, not an episode age), so
+  // overnight it is held below 30 min and breaks through on the re-nag once the silence has grown past it.
+  it('tags the DOWN alert {kind:daemon-down, downForMs: the silence}; the re-nag carries the longer silence', () => {
+    const notices = [];
+    const alertStore = { value: null };
+    const run = (nowMs) => runWatchdogOnce({
+      checkout: '/drv',
+      readFacts: () => downFacts({ nowMs }),
+      readHeadFn: () => { throw new Error('must not read HEAD for `down`'); },
+      heal: () => { throw new Error('must not heal `down`'); },
+      notify: (n) => notices.push(n),
+      appendLog: () => {},
+      loadAlert: () => alertStore.value,
+      saveAlert: (p, v) => { alertStore.value = v; return p; },
+      now: () => nowMs,
+    });
+    const first = run(NOW);
+    expect(Number.isFinite(first.verdict.quietMs)).toBe(true);
+    expect(notices[0].emergency).toEqual({ kind: 'daemon-down', downForMs: first.verdict.quietMs });
+    const later = run(NOW + DEFAULT_RENAG_MS + MIN);
+    expect(later.alerted).toBe(true);
+    expect(notices[1].emergency.downForMs).toBe(first.verdict.quietMs + DEFAULT_RENAG_MS + MIN);
+    expect(notices[1].emergency.downForMs).toBeGreaterThanOrEqual(30 * MIN);
+  });
+
   it('DEDUPS exactly like `stale` — the SAME down cause does not re-notify inside the re-nag window', () => {
     const notices = [];
     const alertStore = { value: null };
@@ -1204,6 +1230,8 @@ describe('the watchdog shares NONE of the driver\'s own decision logic', () => {
       'infra-blocked.mjs',          // branch-sync's backoff primitives
       'pr-land-reasons.mjs',        // #4348-open-pr-retry — infra-blocked's refused/unrun split (leaf: no imports)
       'queue-store.mjs',            // the sidecar GRAMMAR — parseQueue / normNum
+      'quiet-hours-io.mjs',         // card xmvc6oc — branch-sync's notify goes through the quietHours gate
+      'quiet-hours.mjs',            // card xmvc6oc — its pure core (leaf: no imports)
       'resolve-runner-checkout.mjs',// lease pid → checkout
       'runner-lock.mjs',            // the singleton lease
       'under-test.mjs',             // #5187 — claude-agents-cache's runner-neutral test-isolation predicate
