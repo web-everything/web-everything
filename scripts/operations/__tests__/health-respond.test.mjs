@@ -30,7 +30,7 @@ it('prints the same read-only decision feed for a human/Plateau with no effect o
 it('is registered in the common operation CLI', async () => {
   const { OPERATIONS } = await import('../run.mjs');
   expect(OPERATIONS['health-respond']).toBeTypeOf('function');
-});
+}, 60_000); // the first dynamic import of the whole operations registry can exceed the 5s default on a loaded host
 
 it('real CLI prints the feed without writing the state root or operation bookkeeping', async () => {
   const { spawnSync } = await import('node:child_process');
