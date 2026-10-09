@@ -1,21 +1,24 @@
 ---
+bornAs: xk8zbz3
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/backlog.mjs", "we:scripts/__tests__/backlog.test.mjs"]
+scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/__tests__/reconcile-core.test.mjs", "we:scripts/conveyor/__tests__/infra-cancelled.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a lint rule or review-lens note that frontmatter edits in we:scripts/backlog.mjs must go thro… (from web-everything/web-everything#4681 review)
+# Prevention — Extract the pending-budget hold/escalate logic into one helper that both branches call, and add a… (from web-everything/web-everything#4669 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/backlog.mjs:861` — Add a lint rule or review-lens note that frontmatter edits in we:scripts/backlog.mjs must go through the we:frontmatter.mjs helpers (removeFrontmatterField, setFrontmatterField), with a test for the no-op case.
-2. `we:scripts/backlog.mjs:896` — Deduplicate normalized input with a Set and extend the named CLI test to assert one stored edge and one added entry for repeated new targets.
+1. `we:scripts/conveyor/reconcile-core.mjs:2062` — Extract the pending-budget hold/escalate logic into one helper that both branches call, and add a table test over (fresh, stale, unreadable) pending states for every ci-timeout-rerun entry point.
+2. `we:scripts/conveyor/reconcile-core.mjs:2058` — Require that at least one job in `timeoutRetry.jobs` maps to a name in `requiredChecks` (or filter the evidence to required names) in this branch, and add a negative test: BLOCKED, queued, cancelled check not in `requiredChecks`, expect `nothing-owed`.
+3. `we:scripts/conveyor/__tests__/reconcile-core.test.mjs:3855` — Add a review-lens checklist item: every conjunct of a safety guard needs its own negative test. A mutation-testing gate over `we:scripts/conveyor/reconcile-core.mjs` would also catch it.
+4. `we:scripts/conveyor/__tests__/infra-cancelled.test.mjs:203` — Add a deterministic unit test contrasting a missing suite ID with a populated suite ID and a lower check-run ID.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4681@2fbf88932d47a6481f0bc44a6b403694f2daf195
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4669@1622272596f493a13f9ef4b3a6e03e2b84204606
 
 ## Acceptance
 
