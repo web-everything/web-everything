@@ -61,6 +61,16 @@ describe('ensure one sampler job', () => {
     expect(next.record.id).not.toBe(first.record.id);
     expect(store.list().records).toHaveLength(2);
   });
+  it('retires a live job pinned to OLDER code and queues one on the current sha (live 2026-10-09: a fix never reached the running sampler)', () => {
+    const store = newStore(); const first = ensureSamplerJob({ store, ...args, codeSha: 'b'.repeat(40) });
+    const retired = [];
+    const next = ensureSamplerJob({ store, ...args, retire: (record) => retired.push(record.id) });
+    expect(retired).toEqual([first.record.id]);
+    expect(store.read(first.record.id).job).toMatchObject({ status: 'failed' });
+    expect(store.read(first.record.id).job.error).toMatch(/superseded by a{7}/);
+    expect(next).toMatchObject({ enqueued: true });
+    expect(next.record.job.codeSha).toBe(args.codeSha);
+  });
   it('refuses to infer absence from corrupt records', () => {
     expect(() => ensureSamplerJob({ ...args, store: { list: () => ({ records: [], corrupt: ['broken'] }) } })).toThrow(/corrupt/);
   });

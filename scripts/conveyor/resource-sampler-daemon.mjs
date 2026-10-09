@@ -5,8 +5,9 @@ import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../lib/atomic-json-file.mjs';
-import { createJobStore, enqueueJob, reattachTick, startJobLoop } from '../lib/daemon-jobs-runtime.mjs';
-import { defineJobKind, kindRegistry } from '../lib/daemon-jobs.mjs';
+import { createJobStore, enqueueJob, probeHandle, reattachTick, startJobLoop } from '../lib/daemon-jobs-runtime.mjs';
+import { parseJobHandle } from '../operations/job-record.mjs';
+import { defineJobKind, kindRegistry, markFailed } from '../lib/daemon-jobs.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
 import { daemonJobsDir } from '../operations/run-store.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -15,11 +16,21 @@ export const RESOURCE_SAMPLE_KIND = defineJobKind({ kind: 'resource-sample',
   entry: 'scripts/conveyor/resource-sampler-job.mjs', codeMode: 'readonly-tree', maxAttempts: 1000 });
 
 /** Caller serializes this read/enqueue transaction. Never infer absence from unreadable records. */
-export function ensureSamplerJob({ store, kindDef = RESOURCE_SAMPLE_KIND, codeSha, now = Date.now(), input = {} }) {
+/**
+ * The sampler job never finishes, so a job pinned to older code would sample with that code forever (live
+ * 2026-10-09: a lane-count fix never reached the running sampler — the dead job was requeued on its old sha).
+ * A live job on a different sha is therefore retired: `retire` stops its process (the supervisor passes a
+ * SIGTERM-by-handle), the record is marked failed "superseded", and a fresh job is queued on `codeSha`.
+ */
+export function ensureSamplerJob({ store, kindDef = RESOURCE_SAMPLE_KIND, codeSha, now = Date.now(), input = {}, retire = () => {} }) {
   const { records, corrupt } = store.list();
   if (corrupt.length) throw new Error(`resource-sampler: corrupt job records: ${corrupt.join(', ')}`);
   const live = records.find(r => r.job.kind === kindDef.kind && !TERMINAL_JOB_STATUSES.includes(r.job.status));
-  if (live) return { enqueued: false, record: live };
+  if (live && live.job.codeSha === codeSha) return { enqueued: false, record: live };
+  if (live) {
+    retire(live);
+    store.update(live.id, r => markFailed(r, { at: new Date(now).toISOString(), reason: `superseded by ${String(codeSha).slice(0, 9)}` }));
+  }
   const base = `resource-sample-${new Date(now).toISOString().replace(/[:.]/g, '-')}`;
   let id = base; let suffix = 0;
   while (store.read(id)) id = `${base}-${++suffix}`;
@@ -43,7 +54,14 @@ export async function main(argv = process.argv.slice(2)) {
   const store = createJobStore(dir);
   const log = message => console.log(`${new Date().toISOString()} resource-sampler ${message}`);
   const ensure = () => withFileLock(join(dir, 'ensure-sampler.lock'), () => {
-    const result = ensureSamplerJob({ store, codeSha, input: { intervalMs, root: root ?? resolveCoordinationRoot(), checkoutRoot: repoDir.replace(/\/$/, '') } });
+    const retire = (record) => {
+      const handle = record.job.handle;
+      if (handle && probeHandle(handle) === 'alive') {
+        try { process.kill(parseJobHandle(handle).pid, 'SIGTERM'); } catch { /* already gone */ }
+      }
+      log(`tick action ${JSON.stringify({ action: 'retire', id: record.id, codeSha: record.job.codeSha, for: codeSha })}`);
+    };
+    const result = ensureSamplerJob({ store, codeSha, retire, input: { intervalMs, root: root ?? resolveCoordinationRoot(), checkoutRoot: repoDir.replace(/\/$/, '') } });
     if (result.enqueued) log(`tick action ${JSON.stringify({ action: 'enqueue', id: result.record.id })}`);
     return result;
   });
