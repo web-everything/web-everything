@@ -15,15 +15,20 @@
  *
  *   A flusher claims the whole queue with ONE rename (`queue/` → `claim-<pid>-<ms>-<seq>/`), so two flushers never
  *   send the same alert. If anything fails before a confirmed send, each entry is renamed back into `queue/`; a
- *   per-file rename moves an entry at most once, so two recoveries cannot both restore it. A confirmed claim is renamed
- *   to `sent-…` before it is deleted, so no sweeper ever restores it.
+ *   per-file rename moves an entry at most once, so two recoveries cannot both restore it.
  *
- *   Delivery is AT LEAST ONCE: a flusher killed between a confirmed send and that rename leaves a claim the next flush
- *   restores and sends again (one duplicate digest). Nothing here ever deletes an alert that was not sent.
+ *   A claim is never deleted wholesale. A writer's rename resolves `queue/` before it takes effect, so an entry can
+ *   land inside a claim AFTER the flusher listed it. After a confirmed send the flusher deletes only the entries it
+ *   read, by name; anything else still in the claim goes back to the queue, and a claim that will not empty is left
+ *   for the stale-claim sweep. A file that cannot be read as an alert is kept in the queue (never deleted) and named in
+ *   the digest, so it never blocks the alerts held with it.
+ *
+ *   Delivery is AT LEAST ONCE: a flusher killed between a confirmed send and those deletes leaves a claim the next
+ *   flush restores and sends again (one duplicate digest). Nothing here ever deletes an alert that was not sent.
  *
  *   `WE_QUIET_HOURS=off` turns the gate off (every alert is delivered at once) and still drains what was held before.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -75,7 +80,6 @@ export const LIVE_OWNER_CLAIM_MS = 2 * 60 * 60_000;
 /** A staged entry (`tmp/<ms>-…`) this old belongs to a writer that died before committing it (its caller was never told "held"). */
 export const STALE_STAGED_MS = 24 * 60 * 60_000;
 const CLAIM_PREFIX = 'claim-';
-const SENT_PREFIX = 'sent-';
 
 /** Claims this process holds right now (a re-entrant flush must not sweep the outer call's claim). */
 const activeClaims = new Set();
@@ -125,31 +129,61 @@ function hasEntries(queue) {
   try { return readdirSync(queue).length > 0; } catch { return false; }
 }
 
-/** The entries of a claim, oldest first. A file that cannot be READ throws (the claim is restored); one that is not JSON is skipped. */
+/** A queue entry larger than this is not one the gate wrote (an alert is a short title and body): it is kept, not read. */
+export const MAX_ENTRY_BYTES = 256 * 1024;
+
+/**
+ * The alerts of a claim, oldest first, and `names`: the files they came from (the only files a confirmed send may
+ * delete). Every other file is KEPT and counted in `kept`: one that is not a plain file (a directory, a symlink, a
+ * pipe that would block the read), is too big, cannot be read right now (no permission, too many open files), or is
+ * not an alert (not JSON, no title). It goes back to the queue, so a passing error heals on a later flush and a
+ * lasting one never blocks the alerts held with it.
+ */
 function readEntries(claimDir) {
   const entries = [];
+  const names = [];
+  let kept = 0;
   for (const f of readdirSync(claimDir).sort()) {
-    const text = readFileSync(join(claimDir, f), 'utf8');
-    try { entries.push(JSON.parse(text)); } catch { /* not an alert — skip */ }
+    let entry = null;
+    try {
+      const st = lstatSync(join(claimDir, f));
+      if (st.isFile() && st.size <= MAX_ENTRY_BYTES) entry = JSON.parse(readFileSync(join(claimDir, f), 'utf8'));
+    } catch { /* kept: see above */ }
+    if (entry && typeof entry === 'object' && !Array.isArray(entry) && typeof entry.title === 'string') { entries.push(entry); names.push(f); }
+    else kept += 1;
   }
-  return entries;
+  return { entries, names, kept };
 }
 
-/** Move every entry of a claim back into the queue, then remove the claim. Never throws; false = some entries are still in the claim. */
+/**
+ * Move every entry of a claim back into the queue, then remove the claim. Never throws. Returns false when some entries
+ * could not be moved (they stay in the claim, which the stale-claim sweep restores later). A claim that will not
+ * empty because an entry landed in it meanwhile is left too, for the same sweep.
+ */
 function restoreClaim(claimDir, queue) {
   try {
     for (const f of readdirSync(claimDir)) moveIntoQueue(join(claimDir, f), queue, f);
   } catch { return false; }
-  try { rmdirSync(claimDir); } catch { /* an empty claim left behind is restored (as nothing) by the next sweep */ }
+  try { rmdirSync(claimDir); } catch { /* left for the stale-claim sweep */ }
   return true;
 }
 
-/** A claim whose entries were sent (or are not alerts): mark it sent, then delete it. Never throws. */
-function endClaim(claimDir, paths, now) {
-  let target = claimDir;
-  try { const sent = join(paths.dir, `${SENT_PREFIX}${uniqueId(now)}`); renameSync(claimDir, sent); target = sent; } catch { /* delete in place */ }
-  // A leftover `sent-*` is removed by the next sweep; a leftover claim (both steps failed) is at worst one duplicate digest.
-  try { rmSync(target, { recursive: true, force: true }); } catch { /* see above */ }
+/**
+ * A claim whose alerts (`names`) were sent, or held no alert at all: delete exactly those files, by name. Everything
+ * else in it goes back to the queue: the files `readEntries` kept, and any entry that landed after the claim was read
+ * (a writer whose rename resolved `queue/` just before the claim). A few passes absorb an entry landing during the
+ * cleanup itself; a claim that still will not empty stays a claim, and the stale-claim sweep restores it. If an
+ * unlink fails, that sent alert goes back too and is sent again (a duplicate, never a loss). Never throws.
+ */
+function endClaim(claimDir, paths, { names }) {
+  for (const f of names) { try { unlinkSync(join(claimDir, f)); } catch { /* already gone */ } }
+  for (let pass = 0; pass < 3; pass += 1) {
+    try {
+      for (const f of readdirSync(claimDir)) moveIntoQueue(join(claimDir, f), paths.queue, f);
+      rmdirSync(claimDir);
+      return;
+    } catch { if (!existsSync(claimDir)) return; }
+  }
 }
 
 /**
@@ -184,13 +218,8 @@ function recoverStaleClaims(paths, now) {
   }
 }
 
-/** Remove what is safe to remove: `sent-*` claims, and entries staged by a writer that died long ago. Never throws. */
+/** Remove entries staged by a writer that died long ago (never committed, so its caller was never told "held"). Never throws. */
 function sweepLeftovers(paths, now) {
-  try {
-    for (const name of readdirSync(paths.dir)) {
-      if (name.startsWith(SENT_PREFIX)) { try { rmSync(join(paths.dir, name), { recursive: true, force: true }); } catch { /* next time */ } }
-    }
-  } catch { /* no digest dir yet */ }
   try {
     for (const name of readdirSync(paths.tmp)) {
       // A writer this late finds its staged file gone, fails its commit, and so delivers the alert itself.
@@ -212,6 +241,7 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
   let claimId = null;
   let paths = null;
   let confirmed = false; // the sender reported success — from here the entries must NOT be restored
+  let handled = { names: [], kept: 0 }; // the alerts this flush read from its claim (only those are ever deleted)
   try {
     if (testBypassed(env)) return { flushed: false, reason: 'bypassed' };
     const { settings, state } = quietContext({ env, now });
@@ -226,11 +256,17 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
     claimDir = claim;
     claimId = basename(claim);
     activeClaims.add(claimId);
-    const entries = readEntries(claimDir);
+    const { entries, ...rest } = readEntries(claimDir);
+    handled = rest;
     // `digest.enabled=false` only stops NEW alerts being held (decideDelivery delivers them). Whatever was already
     // held is still owed to the operator, so it drains here, once, as a digest: never deleted, never stranded.
-    const plan = planDigest(entries, { ...settings, digest: { ...settings.digest, enabled: true } });
-    if (!plan) { endClaim(claimDir, paths, now); claimDir = null; return { flushed: false, reason: 'digest empty' }; } // no file in it is an alert
+    const base = planDigest(entries, { ...settings, digest: { ...settings.digest, enabled: true } });
+    // Nothing readable as an alert: the kept files go back to the queue untouched, and nothing is sent.
+    if (!base) { endClaim(claimDir, paths, handled); claimDir = null; return { flushed: false, reason: handled.kept ? `${handled.kept} held file(s) could not be read; kept in the queue` : 'digest empty' }; }
+    // Files the flush kept are named in the digest (first, so a shortened notification still shows it): a lasting read
+    // failure is seen, not silently carried forever.
+    const keptNote = handled.kept ? `${handled.kept} held file(s) could not be read; kept in the queue` : '';
+    const plan = keptNote ? { ...base, body: `[${keptNote}] ${base.body}`, markdown: `${base.markdown}\n_${keptNote}: ${paths.queue}._\n` } : base;
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
     const mdPath = join(paths.dir, `digest-${stamp}.md`);
     writeFileSync(mdPath, plan.markdown);
@@ -246,13 +282,13 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
       return { flushed: false, count: entries.length, mdPath, sent };
     }
     confirmed = true;
-    endClaim(claimDir, paths, now);
+    endClaim(claimDir, paths, handled);
     claimDir = null;
     return { flushed: true, count: entries.length, mdPath, sent };
   } catch (e) {
     // Already sent: never restore (that would send twice). Otherwise put the entries back; if even that fails, the
     // claim stays and the stale-claim sweep restores it later (this process: after STALE_CLAIM_MS; another: once we exit).
-    if (claimDir) { if (confirmed) endClaim(claimDir, paths, now); else restoreClaim(claimDir, paths.queue); }
+    if (claimDir) { if (confirmed) endClaim(claimDir, paths, handled); else restoreClaim(claimDir, paths.queue); }
     return { flushed: false, reason: `flush error: ${String(e?.message ?? e)}` };
   } finally {
     if (claimId) activeClaims.delete(claimId);

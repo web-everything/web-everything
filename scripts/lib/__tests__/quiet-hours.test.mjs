@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -433,6 +433,59 @@ describe('quietHours: findings the operator ruled on (PR 4461)', () => {
     const later = flushDigest({ send, env, now: ET('09:00') });
     const delivered = [...direct.map((n) => n.title), ...seen.map((n) => n.body)].join(' | ');
     expect({ r, later: later.reason ?? later.count, delivered }).toMatchObject({ delivered: expect.stringMatching(/late/) });
+  });
+
+  // A writer's rename resolves `queue/` by path BEFORE it takes effect: when the flusher renames `queue/` to its claim
+  // in between, the entry lands inside the claim, possibly after the flusher has listed it. The beforeSend seam plays
+  // that late arrival. The writer was told "held", so the entry must reach a later digest, never be deleted unsent.
+  it('F1/F9 (rung 3): an alert that lands in the claim after the flusher read it is not deleted with the claim', () => {
+    const { env, digest } = fixture(1);
+    const { seen, send } = collector();
+    const late = { at: new Date(ET('06:59')).toISOString(), title: 'late', body: 'late' };
+    const r = flushDigest({ send, env, now: ET('08:00'),
+      beforeSend: (claimDir) => writeFileSync(join(claimDir, `${String(ET('06:59')).padStart(15, '0')}-1-1-late.json`), JSON.stringify(late)) });
+    expect(r).toMatchObject({ flushed: true, count: 1 });
+    flushDigest({ send, env, now: ET('09:00') });
+    expect(seen.map((n) => n.body)).toEqual(['r1', 'late']);
+    expect(leftovers(digest)).toEqual([]);
+  });
+
+  // One entry that cannot be read made every flush throw after the claim and restore the whole queue, forever: every
+  // alert held with it was stranded. Now the rest are sent; the stray file is kept in the queue (never deleted), named
+  // in the digest, and sent itself once it can be read.
+  const STRAY = '000000000000000-1-1-stray.json';
+  it.each([
+    ['a directory', (p) => mkdirSync(p)],
+    ['a file with no read permission', (p) => { writeFileSync(p, '{"title":"x"}'); chmodSync(p, 0o000); }],
+    ['a symlink', (p, dir) => { writeFileSync(join(dir, 'outside.json'), '{"title":"outside"}'); symlinkSync(join(dir, 'outside.json'), p); }],
+    ['a file that is not JSON', (p) => writeFileSync(p, '{"title":"torn')],
+  ])('F2 (rung 3): %s in the queue does not strand the alerts held with it, flush after flush', (_, makeStray) => {
+    const { env, digest, dir } = fixture(2);
+    const stray = join(digest, 'queue', STRAY);
+    makeStray(stray, dir);
+    if (/permission/.test(_)) { try { readFileSync(stray); return; /* root reads anything: nothing to test */ } catch { /* unreadable, as intended */ } }
+    const { seen, send } = collector();
+    flushDigest({ send, env, now: ET('08:00') });
+    expect(flushDigest({ send, env, now: ET('09:00') }).reason).toMatch(/1 held file\(s\) could not be read; kept in the queue/);
+    expect(seen.map((n) => n.title)).toEqual(['Quiet-hours digest: 2 alert(s) held']);
+    expect(seen[0].body).toMatch(/1 held file\(s\) could not be read; kept in the queue\] r1 \| r2$/);
+    expect(readdirSync(join(digest, 'queue'))).toEqual([STRAY]); // kept, never deleted
+    expect(leftovers(digest)).toEqual([]);
+  });
+
+  it('F2 (rung 3): an alert that could not be read for a while is sent once it can be (a passing error is not a loss)', () => {
+    const { env, digest } = fixture(1);
+    const stray = join(digest, 'queue', STRAY);
+    writeFileSync(stray, JSON.stringify({ title: 'was unreadable', body: 'x' }));
+    chmodSync(stray, 0o000);
+    try { readFileSync(stray); return; /* root reads anything: nothing to test */ } catch { /* unreadable, as intended */ }
+    const { seen, send } = collector();
+    flushDigest({ send, env, now: ET('08:00') });
+    chmodSync(stray, 0o644);
+    flushDigest({ send, env, now: ET('09:00') });
+    expect(seen.map((n) => n.title)).toEqual(['Quiet-hours digest: 1 alert(s) held', 'Quiet-hours digest: 1 alert(s) held']);
+    expect(seen[1].body).toBe('was unreadable');
+    expect(queued(digest)).toEqual([]);
   });
 
   it('F4: switching quiet hours off (WE_QUIET_HOURS=off) still delivers what was already held', () => {
