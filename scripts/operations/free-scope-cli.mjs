@@ -8,7 +8,7 @@ import { pathToFileURL } from 'node:url';
 import { assessFreeScope, formatFreeScope, parseExcludePr, partitionRegistry, registerScope, releaseScope, DEFAULT_TTL_HOURS } from './free-scope.mjs';
 import { collectFreeScope, defaultRegistryPath, readRegistry, updateRegistry } from './free-scope-io.mjs';
 const usage = `Usage: free-scope [check|register|release|list] [options]
-  --files=a,b --card=<id> --exclude-agent=<name> [--exclude-owner=<token>] --exclude-pr=<n>|<repo>#<n> --json
+  --files=a,b --card=<id> --exclude-agent=<name> [--exclude-owner=<token>] --exclude-pr=<n>|<repo>#<n>[,…] (repeatable) --json
   register --agent=<name> [--owner=<token>] --purpose=<text> (--files=a,b | --card=<id>) [--ttl-hours=N]
   release --agent=<name> [--owner=<token>]
   list [--json]
@@ -33,7 +33,9 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
         if (!match || !names.includes(match[1])) throw new TypeError(`free-scope: unknown argument ${arg}`);
         const value = match[2] ?? argv[++i];
         if (value == null || value.startsWith('--')) throw new TypeError(`free-scope: missing value for ${match[1]}`);
-        options[match[1]] = value;
+        // A stacked PR's whole base chain holds its files: `--exclude-pr` repeats and takes a comma list.
+        if (match[1] === 'exclude-pr') (options['exclude-pr'] ??= []).push(...value.split(',').map((v) => v.trim()).filter(Boolean));
+        else options[match[1]] = value;
       }
     }
     const registry = defaultRegistryPath(env);
@@ -49,14 +51,16 @@ export function main(argv, { env = process.env, stdout = process.stdout, stderr 
       updateRegistry(registry, (entries) => { const result = releaseScope(entries, options.agent, options.owner); released = result.released; return result.entries; });
       print(`released ${released}`); return 0;
     }
-    const { repo: excludeRepo, number: excludePr } = parseExcludePr(options['exclude-pr']);
+    const excludedPrs = (options['exclude-pr'] ?? []).map(parseExcludePr);
     const ttlHours = Number(options['ttl-hours'] ?? DEFAULT_TTL_HOURS);
     if (command === 'register' && (!Number.isFinite(ttlHours) || ttlHours <= 0)) throw new TypeError('free-scope: --ttl-hours must be positive');
     const snapshot = collect({ files: options.files ?? '', card: options.card ?? '', env, now });
-    const assess = (agents) => assessFreeScope({ ...snapshot, agents,
+    // Every excluded PR is dropped from the snapshot here, so the core's single-PR exclusion stays unused.
+    const prs = (snapshot.prs ?? []).filter((pr) => !excludedPrs.some((x) => x.number === pr.number && x.repo === pr.repo));
+    const assess = (agents) => assessFreeScope({ ...snapshot, prs, agents,
       excludeAgent: command === 'register' ? options.agent : options['exclude-agent'] ?? '',
       // register ignores only its OWN entry; a check names its owner via --exclude-owner, else excludes every entry of that name
-      excludeOwner: command === 'register' ? options.owner ?? null : options['exclude-owner'], excludePr, excludeRepo });
+      excludeOwner: command === 'register' ? options.owner ?? null : options['exclude-owner'] });
     let check, registered;
     if (command === 'register') {
       updateRegistry(registry, (entries) => {

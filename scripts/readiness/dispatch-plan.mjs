@@ -786,6 +786,39 @@ export const FREE_LANES_ENV = 'WE_DISPATCH_FREE_LANES';
  * @param {string|boolean|undefined|null} raw
  * @returns {number[]|null}
  */
+/**
+ * The lane ids in a `lane-pool list --acquirable --json` result: the trailing `lane-<n>` of each path, ascending.
+ * Ascending order is a SHELL contract: the pure core assigns launches to freeLanes in the order given.
+ * @param {unknown} paths
+ * @returns {number[]}
+ */
+export function freeLaneIdsFromPaths(paths) {
+  return (Array.isArray(paths) ? paths : [])
+    .map((p) => { const m = /lane-(\d+)\/?$/.exec(String(p)); return m ? Number(m[1]) : null; })
+    .filter((n) => n != null)
+    .sort((a, b) => a - b);
+}
+
+/**
+ * Run the free-lane read and FAIL SOFT. `lane-pool list --acquirable` refuses to return a partial answer when its
+ * scan blows its budget (#xn432dz) — correct for the pool, but it used to crash this WHOLE plan, so a loaded host
+ * launched nothing at all: no builds, no prepares, no holds reported. An unreadable pool now means ZERO free lanes
+ * (the conservative answer — nothing launches into a lane we could not prove free) plus the reason, and every
+ * other part of the plan is still computed.
+ * @param {() => unknown} read - returns (or resolves to) the `list --acquirable --json` paths; may throw/reject.
+ * @returns {Promise<{freeLanes:number[], error:string|null}>} `error` is the whole reason on one line (capped).
+ */
+export async function settleFreeLanes(read) {
+  try {
+    return { freeLanes: freeLaneIdsFromPaths(await read()), error: null };
+  } catch (e) {
+    // One line, every part kept: the pool's stderr often leads with a lock-takeover notice, and the real cause
+    // (the scan-budget refusal) follows it.
+    const msg = String(e?.message || e).split('\n').map((l) => l.trim()).filter(Boolean).join(' | ');
+    return { freeLanes: [], error: msg.length > 600 ? `${msg.slice(0, 600)}…` : msg };
+  }
+}
+
 export function parseFreeLanes(raw) {
   if (raw == null || raw === false) return null;
   if (raw === true) return [];
@@ -824,15 +857,17 @@ async function main(argv) {
   // which left test-spawned runs scanning the real lane pool for an hour after vitest had died.
   installChildReaper({ log });
   const childTimeoutMs = resolveChildTimeoutMs(process.env);
-  const runJson = async (cmd, args, what) => planningRead(args, async () => {
+  // `soft` reads THROW instead of exiting, so the caller can degrade (the free-lane read, via settleFreeLanes).
+  const runJson = async (cmd, args, what, { soft = false } = {}) => planningRead(args, async () => {
+    const die = soft ? (m) => { throw new Error(m); } : fail;
     let out;
     try {
       out = await runBounded(cmd, args, { timeoutMs: childTimeoutMs });
     } catch (e) {
-      fail(`${what} failed: ${childFailure(e)}`);
+      die(`${what} failed: ${childFailure(e)}`);
     }
     try { return JSON.parse(out); }
-    catch (e) { fail(`could not parse ${what} JSON: ${String(e.message || e).split('\n')[0]}`); }
+    catch (e) { die(`could not parse ${what} JSON: ${String(e.message || e).split('\n')[0]}`); }
   });
 
   // #x7xv2xt — FIXTURE MODE never touches the real lane pool. `--backlog-dir` means "a synthetic corpus", so the
@@ -891,7 +926,7 @@ async function main(argv) {
   const scopePromise = fixtureMode ? null
     : startRead('scope-lease-collect', () => runJson('node', [SCOPE_COLLECT_CLI, '--json', '--no-track-attempts'], 'scope-lease-collect'));
   const poolPromise = (freeLanesOverride !== null || fixtureMode) ? null
-    : startRead('lane-pool-list', () => runJson('node', [LANE_POOL_CLI, 'list', '--acquirable', '--json'], 'lane-pool list'));
+    : startRead('lane-pool-list', () => settleFreeLanes(() => runJson('node', [LANE_POOL_CLI, 'list', '--acquirable', '--json'], 'lane-pool list', { soft: true })));
   const driftPromise = flags['no-drift-check'] ? null : startRead('drift-check', async () => {
     const DRIFT_CLI = join(HERE, '..', 'conveyor', 'branch-drift.mjs');
     const branch = typeof flags['drift-branch'] === 'string' ? flags['drift-branch'] : DEFAULT_DRIFT_BRANCH;
@@ -1027,17 +1062,13 @@ async function main(argv) {
   //    dirs; the lane id is the trailing `lane-<n>`. Their COUNT is the free-slot count. An explicit list, or
   //    fixture mode, replaces the pool read entirely (#x7xv2xt).
   let freeLanes;
+  let lanePoolError = null;
   if (freeLanesOverride !== null) freeLanes = freeLanesOverride;
   else if (fixtureMode) freeLanes = [];
   else {
-    const paths = await poolPromise;
-    freeLanes = (Array.isArray(paths) ? paths : [])
-      .map((p) => { const m = /lane-(\d+)\/?$/.exec(String(p)); return m ? Number(m[1]) : null; })
-      .filter((n) => n != null)
-      // Ascending lane order is a SHELL contract: the pure core assigns launches to freeLanes in the order
-      // given, so sorting here makes the plan's lane assignment deterministic regardless of how `lane-pool
-      // list --acquirable` happens to order its output (removes the dependency on the pool's listing stability).
-      .sort((a, b) => a - b);
+    // Fail soft (settleFreeLanes): an unreadable pool is zero free lanes plus a reported reason, never a crash.
+    ({ freeLanes, error: lanePoolError } = await poolPromise);
+    if (lanePoolError) log(`  ⚠ free-lane read failed (${lanePoolError}) — planning with 0 free lanes; nothing launches into a lane this tick`);
   }
 
   // 3.5 BRANCH-DRIFT CEILING (#3464) — read the latest `branch-drift.mjs check` verdict for the watched
@@ -1181,7 +1212,11 @@ async function main(argv) {
   }));
   // #x7xv2xt — say where the pool inputs came from whenever they did NOT come from the real pool, so a caller
   // (and the fixture harness test) can see it. Absent on a normal run, which keeps that output unchanged.
-  if (fixtureMode || freeLanesOverride !== null) {
+  if (lanePoolError) {
+    // The free-lane read failed: say so in the plan, so tick-core skips its own identical (slow) read and the
+    // builder log names the reason instead of a crashed tick.
+    plan.lanePool = { freeLanes: 'unavailable', error: lanePoolError, leases: 'lane-pool' };
+  } else if (fixtureMode || freeLanesOverride !== null) {
     plan.lanePool = {
       freeLanes: freeLanesOverride !== null ? 'explicit' : 'fixture-empty',
       leases: fixtureMode ? 'fixture-empty' : 'lane-pool',

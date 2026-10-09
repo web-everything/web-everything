@@ -24,7 +24,7 @@
  *   node scripts/lane-pool.mjs provision --count=N [--acquirable] [--no-install] [--force]   # ensure N lanes exist (clone missing) + refresh all + ensure deps + ensure the WE pool's FUI render-sibling (#2166); --acquirable grows PAST foreign-leased lanes so N ACQUIRABLE ones result (#2426)
  *   node scripts/lane-pool.mjs refresh           [--no-install] [--force]     # fetch + hard-reset existing lanes to origin/main (no creation)
  *   node scripts/lane-pool.mjs status  [--lane=N] [--json] [--leased-only] [--max-age-ms=N]     # per-lane: path / head / clean / behind origin/main / deps / lease. --lane=N probes only that provisioned lane (unknown lane: no rows). #4345: --leased-only reads only the lease marker (no git) for a lane with no LIVE lease, and runs the full git probe only for lanes that ARE leased — for a reader that only ever consumes leased rows (conveyor-state.mjs / scope-lease-collect.mjs); an unleased row's git-derived fields (head/branch/clean/behind) are simply absent. Keep plain `status` for operator use and for anything needing dirty-unleased info (lane-pool-health-watch.mjs's trim).
- *   node scripts/lane-pool.mjs list    [--json] [--acquirable [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N]]  # existing lane paths (for the orchestrator to dispatch into); --acquirable filters out foreign-leased / busy lanes (#2426); #xn432dz: lease-first (no git in a live-leased lane), SINGLE-FLIGHT + cached for --cache-ttl-ms (env LANE_POOL_LIST_CACHE_TTL_MS, default 30000; 0 disables) so concurrent callers share one scan, --no-cache forces a fresh one, --limit=N stops at N (never cached), and the scan fails cleanly past --scan-timeout-ms (env LANE_POOL_LIST_SCAN_TIMEOUT_MS, default 120000)
+ *   node scripts/lane-pool.mjs list    [--json] [--acquirable [--limit=N] [--no-cache] [--cache-ttl-ms=N] [--scan-timeout-ms=N] [--lane-clean-reuse-ms=N]]  # existing lane paths (for the orchestrator to dispatch into); --acquirable filters out foreign-leased / busy lanes (#2426); #xn432dz: lease-first (no git in a live-leased lane), SINGLE-FLIGHT + cached for --cache-ttl-ms (env LANE_POOL_LIST_CACHE_TTL_MS, default 30000; 0 disables) so concurrent callers share one scan, --no-cache forces a fresh one, --limit=N stops at N (never cached), and the scan fails cleanly past --scan-timeout-ms (env LANE_POOL_LIST_SCAN_TIMEOUT_MS, default 120000); xkv3p37: a cached-mode scan reuses each CLEAN lane's verdict while its cheap stat signals are unchanged, for up to --lane-clean-reuse-ms (env LANE_POOL_LIST_LANE_CLEAN_REUSE_MS, default 300000; 0 disables), and an overrun returns the lanes already proven acquirable (never cached) — it fails only when it proved none
  *   node scripts/lane-pool.mjs path    --lane=N                     # print one lane's absolute path
  *   node scripts/lane-pool.mjs acquire [--purpose=<slug>] [--session=<slug>] [--lane=N] [--item=NNN[,NNN…]] [--ttl-minutes=N] [--no-reset] [--no-reap] [--base=<ref>] [--scope=<repo:path,...>] [--reserve] [--wait-ms=N] [--no-free-list] [--free-list-max-age-ms=N] [--json]  # #2275 lease a free lane (exclusive) + reset to origin/main (or, with #2386 --base=<ref>, to a predecessor lane's pushed tip); stdout = its path. #4122: auto-pick tries `we:scripts/conveyor/lane-pool-health-watch.mjs`'s pre-computed free-lane list FIRST (near-zero git) when it exists and is fresh (< --free-list-max-age-ms / LANE_POOL_FREE_LIST_MAX_AGE_MS, default 10min) — every candidate is still atomically claimed + re-verified fresh before it's ever handed out, so a stale entry costs at most a lost race, never a clobbered lane; --no-free-list opts out. Falls back to today's shared, single-flight, cached full-pool scan (#xn432dz/#3383) unchanged, only when the list is missing, stale or exhausted. #x3jmao3: auto-pick (no --lane) OPT-IN bounded retry — --wait-ms=<total> polls (ACQUIRE_POLL_MS spacing, no busy-wait) for up to that many ms before the "no free lane" failure, instead of failing on the very first full-pool reading (omitted ⇒ today's instant-fail, unchanged); a genuinely-exhausted pool still fails with the identical message once the bound elapses. #2748: BEFORE selecting, a reaper backstop reclaims any PROVABLY-DEAD ghost lease in the pool (item resolved on main, or PR merged/closed) so a finished-but-unreleased lane never blocks a fresh dispatch — the pool ACTS on the ghost the board only flags; --no-reap opts out. #2413: --purpose=workflow-lane MARKS the lease (workflowLane:true) → the guard requires a sibling to assert its minted slug before a destructive op. #2560: --scope=<repo:path,...> declares this lane's ADVISORY predicted file-scope — persisted into the marker (the live scope-lease collector reads it) + warns on overlap, but NEVER gates the acquire (the whole-clone lease is the real lock). #2616: --item=NNN records this lane's item → lane in the lane-ports registry (same as `map`) so conveyor-state's health-stall scan can flag a genuinely stalled lane — the self-serve population a conveyor delivery agent needs (nothing else calls `map` for it). #2350: --reserve (requires --lane=N) mints a PERMANENT reserved lane — no TTL, never stale, off-limits to acquire/refresh/provision (even --force); dropped only by `release --release-reserved`. #2997: EVERY acquire now mints a per-holder `holder` slug into the lease and prints it (stderr + --json `holder`) — the one signal that separates this holder from a SIBLING agent of the same session, which `ownerSession` cannot; assert it as `--session=<slug>` (release) or `LANE_SESSION=<slug>` (a destructive git op) whenever a sibling of your session also holds a live lane. #2997 r2: --adopt also stamps YOU as the lane's OCCUPANT (`workerSession`) — pass it when the process running this acquire is the one that will work in the lane, omit it when you are leasing on someone else's behalf (they run `adopt` instead).
  *   node scripts/lane-pool.mjs adopt   --lane=N [--force] [--json]   # #2997 r2 the dispatcher → worker OCCUPANCY hand-off: declare the CALLING session the agent working in lane-N (stamps `workerSession`), which is what arms guard-lane.mjs's Edit/Write refusal against every OTHER session. `ownerSession` cannot do this job — it records whoever RAN `acquire`, which for a dispatched lane is the dispatcher, not the worker. Idempotent; a lane already declared-occupied by a different LIVE session needs --force (a deliberate takeover, which names who is displaced).
@@ -2853,6 +2853,7 @@ const freeListMaxAgeMs = () => numFlagOrEnv('free-list-max-age-ms', FREE_LANE_LI
 function invalidateListCache(repo) {
   try { rmSync(LIST_CACHE_FILE(repo), { force: true }); } catch { /* best-effort — the fingerprint still guards */ }
   try { rmSync(VERDICT_MEMO_FILE(repo), { force: true }); } catch { /* best-effort — each entry's fingerprint still guards */ }
+  try { rmSync(LANE_CLEAN_MEMO_FILE(repo), { force: true }); } catch { /* best-effort — each entry's fingerprint still guards */ }
 }
 
 // ── list --acquirable: per-lane "holds un-pushed work" memo ─────────────────────────────────────────
@@ -3061,6 +3062,100 @@ function writeVerdictMemo(repo, memo) {
     renameSync(tmp, file);
   } catch { try { rmSync(tmp, { force: true }); } catch { /* ignore */ } }
 }
+
+// ── list --acquirable: per-lane reuse of a CLEAN verdict (card xkv3p37) ─────────────────────────────
+// WHY (live 2026-10-09, load ~18-26, 90-101 lanes): the builder's dispatch-plan read overran its 120s budget,
+// planned with zero free lanes and launched nothing. Measured: ~70% of the scan was `git status --porcelain` in
+// each of ~64 CLEAN, unleased lanes (~100ms each idle, 3-4x that under a launchd-throttled daemon), redone from
+// scratch on EVERY scan. The whole-list cache rarely helps: its fingerprint covers every unleased lane's
+// `.git/index`, and agents run read-only git in unleased lanes all the time, so ANY one of them invalidates
+// all 90. This memo moves the same idea to per-lane granularity: a lane whose cheap signals are unchanged keeps
+// its clean verdict, so a re-scan probes only the lanes that actually changed.
+//
+// CHEAP SIGNALS, no git spawned: `laneVerdictFingerprint` (HEAD, branch tip, origin/<branch>, packed-refs,
+// `.git/index`, lease marker) + `shallowTreeSignature` (stat of the lane root and of every entry directly in
+// it). So a lease, a commit, a stage/reset, a new or deleted file at the root or one level down (its directory's
+// mtime moves), or an in-place edit of a root-level file all miss and re-probe. What it cannot see — an in-place
+// edit of a tracked file two or more levels deep, with nothing else changing — is bounded by the reuse window
+// (`--lane-clean-reuse-ms` / LANE_POOL_LIST_LANE_CLEAN_REUSE_MS, default 5 min, staggered per lane).
+//
+// SOUNDNESS. Same contract as the whole-list cache above: `list --acquirable` is a CAPACITY read, never a claim.
+// `acquire` never trusts it — the O_EXCL lease claim plus the fresh dirty/ahead re-verify right before the reset
+// (#2924/#3390) still run on every lane it hands out, so a stale "clean" costs at most a refused candidate, never
+// a clobbered lane. Only FULLY clean lanes are recorded (no lease marker, nothing uncommitted, nothing ahead, not
+// an "ahead but provably pushed" lane whose answer depends on the live remote, no failed probe). Off for
+// `--no-cache` and a list-cache TTL of 0 (the soak world): a caller that asked for a fresh scan gets one.
+const LANE_CLEAN_MEMO_FILE = (repo) => join(repo.poolDir, '.list-acquirable-clean-memo.json');
+const LANE_CLEAN_MEMO_VERSION = 1;
+const DEFAULT_LANE_CLEAN_REUSE_MS = 5 * 60_000;
+const SHALLOW_SIG_MAX_ENTRIES = 5_000;
+const laneCleanReuseMs = () => numFlagOrEnv('lane-clean-reuse-ms', 'LANE_POOL_LIST_LANE_CLEAN_REUSE_MS', DEFAULT_LANE_CLEAN_REUSE_MS);
+
+/**
+ * Stat signature of the lane root and every entry directly in it (`.git` excluded — the fingerprint covers it).
+ * `null` = no trustworthy signature (unreadable, too many entries, or — with `probeStartMs` — an entry changed
+ * at/after the probe start: git's "racily clean" rule, as in `treeSignature`).
+ */
+function shallowTreeSignature(dir, probeStartMs = null) {
+  let names;
+  try { names = readdirSync(dir).filter((name) => name !== '.git').sort(); } catch { return null; }
+  if (names.length > SHALLOW_SIG_MAX_ENTRIES) return null;
+  const h = createHash('sha1');
+  for (const name of ['.', ...names]) {
+    let sig = '-';
+    try {
+      const st = lstatSync(join(dir, name));
+      const newest = Math.max(st.mtimeMs, st.ctimeMs);
+      const margin = newest % 1000 === 0 ? DIRT_SIG_COARSE_MTIME_MARGIN_MS : 0;
+      if (probeStartMs !== null && newest >= probeStartMs - margin) return null;
+      sig = `${st.mtimeMs}:${st.ctimeMs}:${st.size}:${st.mode}:${st.ino}`;
+    } catch { /* gone — '-' */ }
+    h.update(`${name}\0${sig}\n`);
+  }
+  return h.digest('hex');
+}
+
+function readLaneCleanMemo(repo) {
+  let m = null;
+  try { m = JSON.parse(readFileSync(LANE_CLEAN_MEMO_FILE(repo), 'utf8')); } catch { /* none yet */ }
+  const lanes = m && m.v === LANE_CLEAN_MEMO_VERSION && m.branch === repo.branch && m.lanes && typeof m.lanes === 'object' ? m.lanes : {};
+  return { lanes, updates: new Map(), maxAgeMs: laneCleanReuseMs() };
+}
+
+/** Is lane `n`'s recorded clean verdict still usable? Every cheap signal must match, and it must be young enough. */
+function laneCleanReusable(cleanMemo, repo, n, nowMs) {
+  const e = cleanMemo?.lanes?.[n];
+  if (!e || typeof e.at !== 'number' || !e.fp || !e.tree) return false;
+  const maxAge = cleanMemo.maxAgeMs * (0.5 + ((n * 37) % 50) / 100); // staggered: 50%–99% of the window
+  if (nowMs - e.at >= maxAge || e.at > nowMs + 1000) return false;
+  const dir = laneDir(repo, n);
+  if (readLease(dir)) return false; // belt and braces: the fingerprint already covers the marker's stat
+  return e.fp === laneVerdictFingerprint(dir, repo.branch) && e.tree === shallowTreeSignature(dir);
+}
+
+function noteLaneClean(cleanMemo, n, fp, info, tree) {
+  if (!cleanMemo) return;
+  const doa = info?.dirtyOrAhead;
+  const fullyClean = !!doa && !!fp && !!tree && !doa.probeFailed && info.exists && !info.lease &&
+    !doa.dirty && doa.uncommitted === 0 && doa.ahead === 0 && !doa.aheadPushed;
+  cleanMemo.updates.set(n, fullyClean ? { fp, tree, at: Date.now() } : null);
+}
+
+function writeLaneCleanMemo(repo, cleanMemo) {
+  if (!cleanMemo || cleanMemo.updates.size === 0) return;
+  const file = LANE_CLEAN_MEMO_FILE(repo);
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    // Merge onto the LATEST file (a concurrent scan may have written other lanes meanwhile), then tmp+rename.
+    const lanes = { ...readLaneCleanMemo(repo).lanes };
+    for (const [n, e] of cleanMemo.updates) {
+      if (e) lanes[n] = e;
+      else delete lanes[n];
+    }
+    writeFileSync(tmp, JSON.stringify({ v: LANE_CLEAN_MEMO_VERSION, branch: repo.branch, lanes }) + '\n');
+    renameSync(tmp, file);
+  } catch { try { rmSync(tmp, { force: true }); } catch { /* ignore */ } }
+}
 // Stat-only fingerprint of the pool's lease state: which lanes exist + each marker's mtime (0 = no marker).
 //
 // soak-main-red (2026-09-26) — for an UNLEASED lane, also its `.git/index` stat. An unleased lane holding work
@@ -3163,14 +3258,30 @@ function takeOverStaleListLock(repo, staleOwner) {
 // The actual scan. `limit` stops at N acquirable lanes (a truncated answer — never cached). Fails the whole scan,
 // cleanly, if it overruns `scanTimeoutMs` (see `scanDeadlineMs`: a result produced past the deadline may rest on
 // a killed git probe, so it is discarded rather than returned).
+//
+// xkv3p37 — `reuseClean` turns on the per-lane clean-verdict reuse (`LANE_CLEAN_MEMO_FILE`); only cached-mode
+// callers pass it. `partialOnOverrun` (only `list --acquirable` itself, never `acquire`) makes an overrun return
+// the lanes ALREADY PROVEN acquirable instead of throwing, provided there is at least one: each of those lanes
+// finished its whole probe inside the deadline, so the answer is a sound LOWER bound on capacity — only the lane
+// in flight at the deadline (whose git may have been killed and read fail-open) is dropped. Live, the builder
+// read a thrown overrun as "zero free lanes" and launched nothing; 40 proven lanes are a far truer answer. Such
+// a result is flagged in `lastScanPartial` and never cached. Zero proven lanes still throws: then nothing is known.
 let lastScanFingerprint = null;
-function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
+let lastScanPartial = null;
+function scanAcquirable(repo, { limit = null, scanTimeoutMs, reuseClean = false, partialOnOverrun = false }) {
   const startedMs = Date.now();
   scanDeadlineMs = scanTimeoutMs > 0 ? startedMs + scanTimeoutMs : null;
+  lastScanPartial = null;
   const overrun = () => scanDeadlineMs !== null && Date.now() > scanDeadlineMs;
   let memo = null;
+  let cleanMemo = null;
+  const out = [];
   const overrunFail = (where) => {
     scanDeadlineMs = null;
+    if (partialOnOverrun && out.length > 0) {
+      lastScanPartial = { where, proven: out.length };
+      throw Object.assign(new Error('partial'), { partialScan: true });
+    }
     throw Object.assign(new Error(`list --acquirable scan exceeded its ${scanTimeoutMs}ms budget ${where} (pool "${repo.name}" under ${repo.poolDir}) — refusing to return a partial/unsound answer. Raise --scan-timeout-ms / LANE_POOL_LIST_SCAN_TIMEOUT_MS, or check for a hung git (#xn432dz)`), { scanTimeout: true });
   };
   try {
@@ -3189,15 +3300,18 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
     // not one per lane — keeps this a cheap, at-most-one-network-call read, same cost shape as `cmdAcquire`'s
     // own auto-pick.
     const remoteShasBox = { value: null };
-    const out = [];
     memo = readVerdictMemo(repo);
+    cleanMemo = reuseClean && laneCleanReuseMs() > 0 ? readLaneCleanMemo(repo) : null;
     for (const n of existingLanes(repo)) {
       let ok = false;
       const memoState = verdictMemoState(memo, repo, n, Date.now());
       if (memoState === 'clean') ok = true;
+      else if (memoState === null && laneCleanReusable(cleanMemo, repo, n, Date.now())) ok = true; // xkv3p37
       else if (memoState === null) {
-        const fp = memo ? laneVerdictFingerprint(laneDir(repo, n), repo.branch) : null;
+        const fp = memo || cleanMemo ? laneVerdictFingerprint(laneDir(repo, n), repo.branch) : null;
         const probeStartMs = Date.now();
+        // xkv3p37 — like `treeSig` below, read BEFORE the probe; skipped for a leased lane (never recorded clean).
+        const shallowSig = cleanMemo && !readLease(laneDir(repo, n)) ? shallowTreeSignature(laneDir(repo, n), probeStartMs) : null;
         // Taken BEFORE the probe (like `fp`): an edit landing after this stat changes the signature, so it can
         // only ever cost a re-probe, never a stale "clean".
         // Skipped for a live-leased lane: its probe returns at once and it is never recorded clean, so the walk
@@ -3208,6 +3322,7 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
         ok = isLaneAcquirable(info, nowMs, ttlMs);
         if (overrun()) overrunFail(`at lane-${n}`); // before noteVerdict: a past-deadline verdict may rest on a killed git
         noteVerdict(memo, n, fp, info, remoteShasBox, laneDir(repo, n), probeStartMs, treeSig);
+        noteLaneClean(cleanMemo, n, fp, info, shallowSig);
       }
       if (overrun()) overrunFail(`at lane-${n}`);
       if (ok) {
@@ -3216,11 +3331,15 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
       }
     }
     return out.map((n) => laneDir(repo, n));
+  } catch (e) {
+    if (e && e.partialScan) return out.map((n) => laneDir(repo, n)); // xkv3p37 — see `partialOnOverrun` above
+    throw e;
   } finally {
     scanDeadlineMs = null;
     // Also on an overrun: every verdict recorded so far finished inside the deadline, so the NEXT scan skips
     // those lanes and gets further — a scan that times out under load still makes the next one cheaper.
     writeVerdictMemo(repo, memo);
+    writeLaneCleanMemo(repo, cleanMemo);
   }
 }
 
@@ -3238,13 +3357,15 @@ function scanAcquirable(repo, { limit = null, scanTimeoutMs }) {
 // holder's scan actually finished or the lock's OWN (far larger) staleness grace elapsed — 3.4x its wait in the
 // worst observed case. `null` (the default, e.g. `list --acquirable`'s own direct callers) reproduces the
 // prior behavior exactly: no caller-side bound, only the scan/lock's own.
-function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null }) {
+function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDeadlineMs = null, partialOnOverrun = false }) {
   const slice = (paths) => (limit !== null ? paths.slice(0, limit) : paths);
   const hit = readListCache(repo, Date.now(), cacheTtlMs);
   if (hit) return slice(hit);
+  // xkv3p37 — cached-mode scans reuse per-lane clean verdicts (off when caching itself is off: TTL 0).
+  const scanOpts = { scanTimeoutMs, reuseClean: cacheTtlMs > 0, partialOnOverrun };
   // A --limit caller never scans on the cache's behalf (its answer is truncated); it takes a hit if there is
   // one, else runs its own short early-stopping scan uncached.
-  if (limit !== null) return scanAcquirable(repo, { limit, scanTimeoutMs });
+  if (limit !== null) return scanAcquirable(repo, { ...scanOpts, limit });
   const waitDeadline = Date.now() + (scanTimeoutMs > 0 ? scanTimeoutMs : DEFAULT_LIST_SCAN_TIMEOUT_MS) + LIST_LOCK_ORPHAN_GRACE_MS;
   for (;;) {
     let mine = tryTakeListLock(repo);
@@ -3257,8 +3378,8 @@ function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDe
         // Re-check under the lock: the previous holder may have just written a fresh result.
         const again = readListCache(repo, Date.now(), cacheTtlMs);
         if (again) return again;
-        const paths = scanAcquirable(repo, { limit: null, scanTimeoutMs });
-        writeListCache(repo, paths);
+        const paths = scanAcquirable(repo, { ...scanOpts, limit: null });
+        if (!lastScanPartial) writeListCache(repo, paths); // a partial answer is a lower bound — never cached
         return paths;
       } finally {
         releaseListLock(repo);
@@ -3281,7 +3402,7 @@ function acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, callerDe
     if (Date.now() > waitDeadline) {
       // Should be unreachable (the lock goes stale first), but never hang: scan ourselves, uncached.
       log(`  list --acquirable: gave up waiting for the scan lock after ${scanTimeoutMs}ms+grace — scanning uncached (#xn432dz)`);
-      return scanAcquirable(repo, { limit: null, scanTimeoutMs });
+      return scanAcquirable(repo, { ...scanOpts, limit: null });
     }
   }
 }
@@ -3306,10 +3427,14 @@ function cmdList(repo) {
       if (flags['no-cache'] || cacheTtlMs === 0) {
         // --no-cache forces a fresh scan (no read, no wait). A full fresh scan is still written back — it IS the
         // freshest answer — unless caching is disabled outright (TTL 0) or the answer is --limit-truncated.
-        paths = scanAcquirable(repo, { limit, scanTimeoutMs });
-        if (limit === null && cacheTtlMs > 0) writeListCache(repo, paths);
+        paths = scanAcquirable(repo, { limit, scanTimeoutMs, partialOnOverrun: true });
+        if (limit === null && cacheTtlMs > 0 && !lastScanPartial) writeListCache(repo, paths);
       } else {
-        paths = acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs });
+        paths = acquirableListCached(repo, { limit, scanTimeoutMs, cacheTtlMs, partialOnOverrun: true });
+      }
+      if (lastScanPartial) {
+        log(`  ⚠ list --acquirable: the scan ran out of its ${scanTimeoutMs}ms budget ${lastScanPartial.where} — returning the ` +
+          `${lastScanPartial.proven} lane(s) already proven acquirable (a lower bound on capacity; not cached) (xkv3p37)`);
       }
     } catch (e) {
       if (e && e.scanTimeout) fail(e.message);
@@ -4268,6 +4393,8 @@ const KNOWN_FLAGS = new Set([
   'limit', 'no-cache', 'cache-ttl-ms', 'scan-timeout-ms',
   // list --acquirable's per-lane "holds un-pushed work" memo (see VERDICT_MEMO_FILE).
   'no-verdict-memo', 'verdict-memo-max-age-ms', 'clean-verdict-memo-max-age-ms',
+  // xkv3p37 — list --acquirable's per-lane clean-verdict reuse window (see LANE_CLEAN_MEMO_FILE).
+  'lane-clean-reuse-ms',
   // #4025 — provision --acquirable's per-call new-lane cap, and trim's own cap/dry-run knobs.
   'max-new', 'max', 'dry-run',
   // #3383 — acquire's own growth-on-empty knobs: hard ceiling and per-call new-lane cap.
