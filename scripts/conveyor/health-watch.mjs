@@ -103,6 +103,7 @@ import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
+import { runGhProbeJobs, resolveHealthJobSwitches } from './health-watch-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -975,8 +976,8 @@ export function probeBgIsolationStalls(agents, { readInfo = readBgIsolationStall
  * other child call in this file.
  * @returns {{observedAt:string, records:Array<object>, gaps:string[]}}
  */
-export function probeStaleState({ exec = run, timeoutMs = 90_000 } = {}) {
-  const out = exec(process.execPath, [join(REPO_ROOT, 'scripts/operations/run.mjs'), 'stale-state', '--json'], { timeoutMs });
+export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT } = {}) {
+  const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], { timeoutMs, cwd: repoRoot });
   return JSON.parse(out).verdict;
 }
 
@@ -988,9 +989,57 @@ export function probeStaleState({ exec = run, timeoutMs = 90_000 } = {}) {
  * never a duplicate merged-PR fetch.
  * @returns {{cards:Array<{stem:string, body:string}>, prs:Array<object>}}
  */
-export function probeMergedPrs({ exec = run, limit = 800, timeoutMs = 60_000 } = {}) {
+export function probeMergedPrs({ exec = run, limit = 800, timeoutMs = 60_000, repoRoot = REPO_ROOT } = {}) {
   const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'merged', '--limit', String(limit), '--json', 'number,title,headRefName,body'], { timeoutMs }));
-  return { cards: readBacklogCards(REPO_ROOT), prs };
+  return { cards: readBacklogCards(repoRoot), prs };
+}
+
+/**
+ * #4131 — the gh-cadence probe group (every 15 min): open PRs, the agent listing and everything read off it,
+ * stale-state and merged PRs. The slow part of a tick (live 2026-10-09: ~130 s of a ~150 s tick). Run inline by
+ * the tick, or inside the `health-gh-probe` job's worker thread (we:scripts/conveyor/health-watch-job.mjs).
+ * Each probe's failure is captured in `errors` (scrubbed), never thrown, so one failing read never blocks the
+ * others. `sourceRoot` is the daemon clone: the job runs from a pinned code snapshot, so every read of the
+ * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
+ * @returns {{probes: object, errors: Record<string, string>}}
+ */
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false } = {}) {
+  const probes = {};
+  const errors = {};
+  const attempt = (name, fn) => {
+    try { return fn(); } catch (e) { errors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; }
+  };
+  const prs = attempt('prs', () => probePrs({ now }));
+  const agents = attempt('agents', () => probeAgents());
+  // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
+  // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
+  // only `prs` and must not sit blocked on a failing `agents` read too. `ghCache.at` still needs both, so a
+  // partial gh hiccup keeps `ghDue` true and retries sooner rather than waiting the full cadence.
+  if (prs) probes.prs = prs;
+  if (agents) probes.agents = agents;
+  // claude-auth-expired's own probe needs only `agents` (the exact same listing, same cadence) — independent
+  // of whether `prs` also succeeded this tick, same reasoning as stale-claim's two probes just below.
+  if (agents) probes.authExpired = attempt('authExpired', () => probeAuthExpiredSessions(agents));
+  // #x9fbg1x — same cadence/gating reasoning as `authExpired` just above: needs only the same `agents`
+  // listing, independent of whether `prs` also succeeded this tick.
+  if (agents) probes.bgIsolationStalls = attempt('bgIsolationStalls', () => probeBgIsolationStalls(agents));
+  // #4068 — same `agents` listing, same gating: what can hold a PR as `live-process` (review jobs + PR-bound
+  // sessions) and how long since each last did anything.
+  if (agents) {
+    probes.liveBindings = attempt('liveBindings', () => probeLiveBindings(agents, {
+      nowMs: now, roots: [sourceRoot, ...daemonCloneRoots(workspaceOf(sourceRoot))],
+    }));
+  }
+  // Build/prepare supervision (operator 2026-10-06) — same `agents` listing, bounded transcript tail reads.
+  if (agents && !skipBuildSessions) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
+  // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
+  // prs/agents pairing above — one failing never blocks the other.
+  const staleState = attempt('staleState', () => probeStaleState({ repoRoot: sourceRoot }));
+  if (staleState) probes.staleState = staleState;
+  const mergedPrs = attempt('mergedPrs', () => probeMergedPrs({ repoRoot: sourceRoot }));
+  if (mergedPrs) probes.mergedPrs = mergedPrs;
+  for (const k of Object.keys(probes)) if (probes[k] === undefined) delete probes[k];
+  return { probes, errors };
 }
 
 // ── the tick ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1019,7 +1068,7 @@ function archiveOptions(config, flags, now) {
 }
 
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
-export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun } = {}) {
+export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
   const dir = healthDir(flags['state-root']);
@@ -1163,6 +1212,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   probes.prLimit = attempt('prLimit', () => probePrLimit());
 
   const ghCache = prev.ghCache || {};
+  let jobsState = prev.jobs;
+  let ghJob = null;
   const ghDue = !flags['no-gh'] && (flags['force-gh'] || !ghCache.at || now - ghCache.at >= GH_CADENCE_MS);
   // Inventory has its own cadence stamp: unrelated GitHub failures cannot cause repeated log scans.
   const inventoryDue = !flags['no-gh'] && (flags['force-gh'] || !prev.credentialInventoryAt || now - prev.credentialInventoryAt >= GH_CADENCE_MS);
@@ -1176,33 +1227,30 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       if (errors.length) probeErrors.credentialInventory = errors.join('; ');
     } catch { probeErrors.credentialInventory = 'unavailable'; }
   }
-  if (ghDue) {
-    const prs = attempt('prs', () => probePrs({ now }));
-    const agents = attempt('agents', () => probeAgents());
-    // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
-    // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
-    // only `prs` and must not sit blocked on a failing `agents` read too. `ghCache.at` still needs both, so a
-    // partial gh hiccup keeps `ghDue` true and retries sooner rather than waiting the full cadence.
-    if (prs) probes.prs = prs;
-    if (agents) probes.agents = agents;
-    if (prs && agents) ghCache.at = now;
-    // claude-auth-expired's own probe needs only `agents` (the exact same listing, same cadence) — independent
-    // of whether `prs` also succeeded this tick, same reasoning as stale-claim's two probes just below.
-    if (agents) probes.authExpired = attempt('authExpired', () => probeAuthExpiredSessions(agents));
-    // #x9fbg1x — same cadence/gating reasoning as `authExpired` just above: needs only the same `agents`
-    // listing, independent of whether `prs` also succeeded this tick.
-    if (agents) probes.bgIsolationStalls = attempt('bgIsolationStalls', () => probeBgIsolationStalls(agents));
-    // #4068 — same `agents` listing, same gating: what can hold a PR as `live-process` (review jobs + PR-bound
-    // sessions) and how long since each last did anything.
-    if (agents) probes.liveBindings = attempt('liveBindings', () => probeLiveBindings(agents, { nowMs: now }));
-    // Build/prepare supervision (operator 2026-10-06) — same `agents` listing, bounded transcript tail reads.
-    if (agents && !flags['lock-root']) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
-    // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
-    // prs/agents pairing above — one failing never blocks the other.
-    const staleState = attempt('staleState', () => probeStaleState());
-    if (staleState) probes.staleState = staleState;
-    const mergedPrs = attempt('mergedPrs', () => probeMergedPrs());
-    if (mergedPrs) probes.mergedPrs = mergedPrs;
+  // #4131 — the gh-cadence group is the slow part of a tick (live: ~130 s of a ~150 s tick). With the
+  // `ghProbes` job switch on, it runs as a detached durable job (we:scripts/conveyor/health-watch-job.mjs) and
+  // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before.
+  const ghJobsOn = !!deps.ghJobs || (resolveHealthJobSwitches(config).ghProbes && !fixtureTick && !flags['dry-run']);
+  if (ghJobsOn && !flags['no-gh']) {
+    const out = await attempt('ghJob', () => runGhProbeJobs({
+      ...(deps.ghJobs || {}), now, due: ghDue, state: prev.jobs,
+      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'] },
+    }));
+    if (out) {
+      jobsState = out.state;
+      ghJob = out.summary;
+      if (out.result) {
+        Object.assign(probes, out.result.probes);
+        for (const [k, v] of Object.entries(out.result.errors || {})) probeErrors[k] = v;
+        if (out.result.probes.prs && out.result.probes.agents) ghCache.at = out.result.sampledAt;
+      }
+      if (out.failure) probeErrors.ghJob = scrubText(out.failure);
+    }
+  } else if (ghDue) {
+    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'] });
+    Object.assign(probes, got.probes);
+    Object.assign(probeErrors, got.errors);
+    if (got.probes.prs && got.probes.agents) ghCache.at = now;
   }
 
   // A tick the watchdog killed last time is the overrun smell's input.
@@ -1236,6 +1284,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   state.cursors = logs ? { ...(prev.cursors || {}), ...logs.cursors } : prev.cursors;
   state.builderCursors = builderLogs ? { ...(prev.builderCursors || {}), ...builderLogs.cursors } : prev.builderCursors;
   state.ghCache = { at: ghCache.at ?? null };
+  if (jobsState) state.jobs = jobsState;
   if (probes.credentialInventory) {
     state.credentialInventoryAt = now;
     state.credentialInventoryCache = probes.credentialInventory.ciFindings;
@@ -1393,7 +1442,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   }
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
-    now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs,
+    now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
