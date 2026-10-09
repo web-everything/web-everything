@@ -7,10 +7,6 @@
   "fixDispatch": {
     "borrowBuildSlots": "on",
     "borrowAfterMinutes": 15,
-    "borrowExecutor": "codex",
-    "awaitVerifyLoopSeconds": 15,
-    "parkedReleasesSlot": "on",
-    "parkedCapFactor": 2,
-    "releaseOnCompletion": "on"
+    "borrowExecutor": "codex"
   }
 }

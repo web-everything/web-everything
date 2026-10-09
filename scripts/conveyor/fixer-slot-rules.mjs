@@ -15,15 +15,15 @@
  *                            we:scripts/conveyor/await-verify-pass.mjs#classifyAwaitVerdict (pure, exact-sha, unchanged).
  *   R5 release-on-completion — a fix claim is released as soon as its session's completion record says `done`.
  *
- * THE SETTINGS (declared in we:scripts/dispatch-settings.json `fixDispatch`, each overridable by env; the BUILT-IN value
- * is today's behaviour, so removing the file entry turns the feature off):
+ * THE SETTINGS (declared in we:scripts/settings/push-on-green.json `fixDispatch`, merged with the other declared settings
+ * by we:scripts/lib/settings-files.mjs; each overridable by env; the BUILT-IN value is today's behaviour, so removing the
+ * file entry turns the feature off):
  *   awaitVerifyLoopSeconds  env WE_AWAIT_VERIFY_LOOP_SECONDS   built-in 0 (off: the pass runs once per fix tick)
  *   parkedReleasesSlot      env WE_FIX_PARKED_RELEASES_SLOT    built-in off (off: a parked session holds its slot)
  *   parkedCapFactor         env WE_FIX_PARKED_CAP_FACTOR       built-in 2 (live sessions incl. parked ≤ factor × cap)
  *   releaseOnCompletion     env WE_FIX_RELEASE_ON_COMPLETION   built-in off (off: release waits for the next claim sweep)
  */
-import { readFileSync } from 'node:fs';
-import { defaultDispatchSettingsPath } from '../lib/dispatch-throttle.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 
 export const FIXER_SLOT_SETTINGS_BUILT_IN = Object.freeze({
   awaitVerifyLoopSeconds: 0, parkedReleasesSlot: false, parkedCapFactor: 2, releaseOnCompletion: false,
@@ -59,7 +59,7 @@ const PARSE = { awaitVerifyLoopSeconds: seconds, parkedReleasesSlot: onOff, park
 /** Every setting: a valid env value wins, then a valid file value (`fixDispatch.<key>`), then the built-in. Never throws. */
 export function resolveFixerSlotSettings({ env = process.env, file } = {}) {
   let raw = file;
-  if (raw === undefined) { try { raw = JSON.parse(readFileSync(defaultDispatchSettingsPath(), 'utf8')); } catch { raw = null; } }
+  if (raw === undefined) raw = readSettings();
   const block = raw && typeof raw === 'object' && raw.fixDispatch && typeof raw.fixDispatch === 'object' ? raw.fixDispatch : {};
   const out = {};
   for (const key of Object.keys(FIXER_SLOT_SETTINGS_BUILT_IN)) {
