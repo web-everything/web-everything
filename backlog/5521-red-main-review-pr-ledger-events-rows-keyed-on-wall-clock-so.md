@@ -2,10 +2,11 @@
 bornAs: xrw21vx
 kind: story
 size: 2
-status: active
+status: resolved
 scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-08"
 dateStarted: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
