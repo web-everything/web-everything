@@ -1,7 +1,8 @@
 ---
+bornAs: xjddimd
 kind: story
 size: 3
-parent: "x8juafk"
+parent: "5522"
 status: active
 scaffoldedBy: "priority-class-s1"
 dateScaffolded: "2026-10-08"
@@ -13,9 +14,9 @@ tags: [conveyor, delivery-standard, priority]
 
 # Delivery priority class: pure rule, settings, incident replay, shadow log on the fix daemon
 
-Slice S1 of epic x8juafk (rulings Q1, Q2). A pure rule `deliveryPriority(facts, settings, now)` gives one PR or job a class P0-P4, the reasons, and an in-class score (unblocks x weight + minutes waited). `rankByDeliveryPriority` ranks a whole queue and applies the live-P0 cap. Settings are declared in we:scripts/lib/delivery-priority-settings.json; the off value makes every item P3 and keeps today's order.
+Slice S1 of epic 5522 (rulings Q1, Q2). A pure rule `deliveryPriority(facts, settings, now)` gives one PR or job a class P0-P4, the reasons, and an in-class score (unblocks x weight + minutes waited). `rankByDeliveryPriority` ranks a whole queue and applies the live-P0 cap. Settings are declared in we:scripts/lib/delivery-priority-settings.json; the off value makes every item P3 and keeps today's order.
 
-Shadow only: the fix daemon (we:scripts/conveyor/reconcile-fix-dispatch.mjs) logs the class each owed PR would get, through the adapter we:scripts/conveyor/delivery-priority-shadow.mjs. It changes no order, refusal or dispatch. Consumers are slice x3r5fzx.
+Shadow only: the fix daemon (we:scripts/conveyor/reconcile-fix-dispatch.mjs) logs the class each owed PR would get, through the adapter we:scripts/conveyor/delivery-priority-shadow.mjs. It changes no order, refusal or dispatch. Consumers are slice 5524.
 
 The P0 incident fact comes from the main-red owner record that card 5510 (PR #4527) publishes (the coordination-root main-red priority record, written by we:scripts/lib/main-red-priority.mjs once PR #4527 lands: the PR that owns the fix). Until that lands, nothing is P0 live, which is the honest shadow result.
 
@@ -30,10 +31,10 @@ The P0 incident fact comes from the main-red owner record that card 5510 (PR #45
 
 ## Non-goals
 
-- [N1] No queue sorts by class yet (slice x3r5fzx).
-- [N2] No reserve, interruption, incident freeze or speed setting (slices xoa99a8, xy6r60l, xp5c982).
-- [N3] No check of who set an override label on the forge: the shadow adapter treats every label as unverified. The writer check ships with x3r5fzx.
-- [N4] No merge-gate change (slice xy828sf).
+- [N1] No queue sorts by class yet (slice 5524).
+- [N2] No reserve, interruption, incident freeze or speed setting (slices 5525, 5527, 5526).
+- [N3] No check of who set an override label on the forge: the shadow adapter treats every label as unverified. The writer check ships with 5524.
+- [N4] No merge-gate change (slice 5528).
 
 ## Edge cases this change must handle
 

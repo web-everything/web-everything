@@ -1,9 +1,10 @@
 ---
+bornAs: xp5c982
 kind: story
 size: 3
-parent: "x8juafk"
+parent: "5522"
 status: open
-blockedBy: ["xjddimd"]
+blockedBy: ["5523"]
 scope: ["we:scripts/lib/delivery-priority-settings.json", "we:scripts/lib/dispatch-routing-policy.mjs", "we:scripts/conveyor/reconcile-core.mjs"]
 dateOpened: "2026-10-08"
 tags: [conveyor, priority, routing]
@@ -11,7 +12,7 @@ tags: [conveyor, priority, routing]
 
 # Speed per class: P0 may use Opus ultrafast and Codex fast, off by default, capped and logged
 
-Slice S3c of epic x8juafk (ruling Q6: "not to be overused, but useful"). A per-class setting picks model, speed mode and executor. P0 may use Opus ultrafast (about 8x output speed, about 6x cost) for diagnosis and Codex fast (through we:scripts/codex-direct-task.mjs) for the scoped edit. P1-P4 keep today's routing.
+Slice S3c of epic 5522 (ruling Q6: "not to be overused, but useful"). A per-class setting picks model, speed mode and executor. P0 may use Opus ultrafast (about 8x output speed, about 6x cost) for diagnosis and Codex fast (through we:scripts/codex-direct-task.mjs) for the scoped edit. P1-P4 keep today's routing.
 
 Prep estimate: ultrafast saves about 2% of today's incident wall time and about 16% of a P0 path once detection and queue waits are fixed. So it is off by default, P0 only, and measured on each use.
 

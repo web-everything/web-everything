@@ -1,9 +1,10 @@
 ---
+bornAs: xy828sf
 kind: story
 size: 5
-parent: "x8juafk"
+parent: "5522"
 status: open
-blockedBy: ["xjddimd", "x3r5fzx", "xoa99a8", "xy6r60l", "xp5c982"]
+blockedBy: ["5523", "5524", "5525", "5527", "5526"]
 relatedTo: ["5510", "5118"]
 scope: ["we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/main-red-recovery.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-08"
@@ -12,7 +13,7 @@ tags: [conveyor, priority, merge-gate]
 
 # P0 main-fix merge-gate exemption: judged only on checks main does not also fail
 
-Slice S4 of epic x8juafk (ruling Q5, merge-gate part). It ships LAST, after every other slice, behind its own fixture set and a red-team pass.
+Slice S4 of epic 5522 (ruling Q5, merge-gate part). It ships LAST, after every other slice, behind its own fixture set and a red-team pass.
 
 The incident's circular wait: the fix for red main was refused `owed-ci-rerun` and `main-still-red`, i.e. told to wait for main. For the P0 PR that owns the main-red fix only (the 5510 owner record): skip those two holds, and judge its CI only on the checks main does not also fail. Every check main passes must still pass on it. All other merge-gate guards stay.
 

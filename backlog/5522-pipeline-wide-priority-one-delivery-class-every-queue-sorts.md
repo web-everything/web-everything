@@ -1,4 +1,5 @@
 ---
+bornAs: x8juafk
 kind: epic
 parent: "5452"
 status: open
@@ -38,12 +39,12 @@ Parent is #5452 (event-driven daemons), not the fixer epic #5467: the class is c
 
 | Slice | Card | Size | Blocked by |
 |---|---|---|---|
-| S1 pure rule + settings + incident replay, shadow log on the fix daemon | xjddimd | 3 | - |
-| S2 queues sort by class (fix, ci-heal, review, drain, draft promote, heavy waiters) | x3r5fzx | 5 | S1 |
-| S3a capacity policy interrupt/reserve + interruption log | xoa99a8 | 5 | S1 (+ PR #4508) |
-| S3b incident mode: class-aware builder pause, drain lands P0 + proven green | xy6r60l | 3 | S1 (+ card 5510 / PR #4527, #5118) |
-| S3c speed per class, capped and logged | xp5c982 | 3 | S1 |
-| S4 P0 main-fix merge-gate exemption (LAST) | xy828sf | 5 | all of the above |
+| S1 pure rule + settings + incident replay, shadow log on the fix daemon | 5523 | 3 | - |
+| S2 queues sort by class (fix, ci-heal, review, drain, draft promote, heavy waiters) | 5524 | 5 | S1 |
+| S3a capacity policy interrupt/reserve + interruption log | 5525 | 5 | S1 (+ PR #4508) |
+| S3b incident mode: class-aware builder pause, drain lands P0 + proven green | 5527 | 3 | S1 (+ card 5510 / PR #4527, #5118) |
+| S3c speed per class, capped and logged | 5526 | 3 | S1 |
+| S4 P0 main-fix merge-gate exemption (LAST) | 5528 | 5 | all of the above |
 
 ## Rule for card 5468 (Review & fix policy protocol)
 
@@ -51,7 +52,7 @@ Row to add to 5468's rule table (5468 is held by open PRs #4508, #4502, #4461 at
 
 | Rule | Ruling | Off value (today) | Slice |
 |---|---|---|---|
-| delivery priority class: one class P0-P4 per PR/job, in-class score = unblocks x weight + minutes waited, operator override, aging +1 after 8 h never into P0 | Q1, Q2 (x8juafk) | mode off: every item P3, today's order | xjddimd |
+| delivery priority class: one class P0-P4 per PR/job, in-class score = unblocks x weight + minutes waited, operator override, aging +1 after 8 h never into P0 | Q1, Q2 (5522) | mode off: every item P3, today's order | 5523 |
 
 ## Acceptance
 

@@ -1,9 +1,10 @@
 ---
+bornAs: xy6r60l
 kind: story
 size: 3
-parent: "x8juafk"
+parent: "5522"
 status: open
-blockedBy: ["xjddimd"]
+blockedBy: ["5523"]
 relatedTo: ["5510", "5118"]
 scope: ["we:scripts/conveyor/build-dispatch-policy.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/lib/delivery-priority-settings.json"]
 dateOpened: "2026-10-08"
@@ -12,7 +13,7 @@ tags: [conveyor, priority, incident]
 
 # Incident mode: pause P3/P4 builds and land only P0 or proven-green PRs while main is red
 
-Slice S3b of epic x8juafk (ruling Q5, all but the merge-gate exemption). While a main-red episode is open: no new P3/P4 build or prepare starts; the drain lands only P0 and PRs proven green on the red main (#5118's halt design). Review and fix of P1-P3 continue (they do not touch main), behind P0 in every line.
+Slice S3b of epic 5522 (ruling Q5, all but the merge-gate exemption). While a main-red episode is open: no new P3/P4 build or prepare starts; the drain lands only P0 and PRs proven green on the red main (#5118's halt design). Review and fix of P1-P3 continue (they do not touch main), behind P0 in every line.
 
 The builder pause itself is being built in the main-red-owner work (card 5510, PR #4527). This slice makes that pause class-aware (P0-P2 builds still start) and adds the drain's class gate. It does not rebuild the pause or the main-red signal.
 
@@ -24,7 +25,7 @@ The builder pause itself is being built in the main-red-owner work (card 5510, P
 
 ## Non-goals
 
-- [N1] The P0 exemption from owed-ci-rerun / main-still-red (xy828sf, ships last).
+- [N1] The P0 exemption from owed-ci-rerun / main-still-red (5528, ships last).
 - [N2] Detecting red main or naming its owner (5510).
 
 ## Edge cases this change must handle
