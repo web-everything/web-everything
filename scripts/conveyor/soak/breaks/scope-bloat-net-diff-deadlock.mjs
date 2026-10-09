@@ -9,7 +9,7 @@ const FIXTURE = 'scripts/conveyor/__tests__/fixtures/net-scope/stuck-2026-10-09.
 export default {
   id: 'scope-bloat-net-diff-deadlock',
   title: '#4538 #4536 #4525 #4512 #4479 #4453 #4439: "98 of its 100 files are already on main" and the owed rebase "refused scope-overlap" for 80+ min',
-  card: 'xd1tvd0',
+  card: '5545',
   fixedBy: { sha: '38c6a4987', where: 'lane/scope-bloat-deadlock', paths: ['scripts/conveyor/net-scope.mjs', 'scripts/conveyor/scope-bloat.mjs', 'scripts/conveyor/reconcile-fix-dispatch.mjs'] },
   fixPresent(root) { return existsSync(join(root, 'scripts/conveyor/net-scope.mjs')); },
   async run() {
