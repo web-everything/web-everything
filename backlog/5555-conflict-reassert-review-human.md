@@ -2,9 +2,10 @@
 bornAs: xkugvzd
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/parked-pr-conflict-watch.mjs", "we:scripts/conveyor/conflict-reassert-rule.mjs", "we:scripts/conveyor/conflict-reassert-settings.json"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
