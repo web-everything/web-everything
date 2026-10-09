@@ -20,7 +20,10 @@
  *   build-dispatch daemon's own tick rows. If a `builder-starved` health smell lands on main, read that instead
  *   (see `assessBuilderStarvation`'s one call site).
  *
- *   Usage: node scripts/operations/scheduled-sweep.mjs run <pr-movement|coroner|opus> [--dry-run] [--json]
+ *   QUIET HOURS (card xmvc6oc): jobs listed in `we:scripts/quiet-hours-settings.json` `sweeps.skipDuringQuiet`
+ *   skip overnight; every run first flushes the held-alerts digest once quiet hours are over.
+ *
+ *   Usage: node scripts/operations/scheduled-sweep.mjs run <pr-movement|coroner|opus> [--dry-run] [--json] [--ignore-quiet]
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -31,6 +34,7 @@ import { createHash } from 'node:crypto';
 import { resolveCoordinationRoot } from './coordination-root.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { notifyDesktopChecked } from '../conveyor/branch-sync.mjs';
+import { flushDigest, sweepSkipNow } from '../lib/quiet-hours-io.mjs';
 
 const MIN = 60_000;
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -313,8 +317,16 @@ function post(report, { env = process.env } = {}) {
 
 export function main(argv = process.argv.slice(2)) {
   const [verb, job, ...rest] = argv;
-  if (verb !== 'run' || !job) { console.error('usage: scheduled-sweep.mjs run <pr-movement|coroner|opus> [--dry-run] [--json]'); return 2; }
+  if (verb !== 'run' || !job) { console.error('usage: scheduled-sweep.mjs run <pr-movement|coroner|opus> [--dry-run] [--json] [--ignore-quiet]'); return 2; }
   const dryRun = rest.includes('--dry-run');
+  // quietHours (card xmvc6oc): send the held-alerts digest once quiet ends, and skip the costly jobs overnight.
+  if (!dryRun) flushDigest({ send: (n) => notifyDesktopChecked(n, { quietGate: null }) });
+  const quiet = rest.includes('--ignore-quiet') ? { skip: false } : sweepSkipNow(job);
+  if (quiet.skip) {
+    if (rest.includes('--json')) console.log(JSON.stringify({ job, skipped: true, reason: quiet.reason }));
+    else console.log(`skipped: ${quiet.reason}`);
+    return 0;
+  }
   const report = runJob(job, { dryRun });
   const posted = dryRun ? null : post(report);
   if (rest.includes('--json')) console.log(JSON.stringify({ ...report, markdown: undefined, posted }));

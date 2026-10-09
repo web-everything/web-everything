@@ -581,3 +581,18 @@ describe('notifyDesktopChecked', () => {
     expect(notifyDesktopChecked({}, { platform: 'linux', spawnSyncFn })).toEqual({ ok: false, error: 'Desktop notifications unsupported on linux' });
   });
 });
+
+// quietHours (card xmvc6oc): the fire-and-forget sender acknowledges before osascript has run, so the held-alerts
+// digest must be flushed through the CHECKED sender or one failed delivery silently loses the whole night's alerts.
+describe('notifyDesktop hands the quiet-hours gate a checked digest sender', () => {
+  it('sendDigest confirms only a real exit zero (the plain send never does)', async () => {
+    const { notifyDesktop } = await import('../branch-sync.mjs');
+    let opts;
+    notifyDesktop({ title: 't', body: 'b' }, { quietGate: (_n, o) => { opts = o; }, platform: 'darwin', spawnSyncFn: () => ({ status: 1, stderr: 'denied' }) });
+    expect(typeof opts.sendDigest).toBe('function');
+    expect(opts.sendDigest({ title: 'd', body: 'd' })).toMatchObject({ ok: false, error: expect.stringContaining('denied') });
+    let ok;
+    notifyDesktop({ title: 't', body: 'b' }, { quietGate: (_n, o) => { ok = o; }, platform: 'darwin', spawnSyncFn: () => ({ status: 0 }) });
+    expect(ok.sendDigest({ title: 'd', body: 'd' })).toEqual({ ok: true });
+  });
+});

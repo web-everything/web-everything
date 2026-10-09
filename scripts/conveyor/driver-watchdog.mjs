@@ -779,7 +779,9 @@ export function runWatchdogOnce({
     });
     if (escalation.fire) {
       saveAlert(alertPath(root), { ...escalation.record, state: verdict.state, action: 'alert-only', reason: verdict.reason });
-      notify({ title: 'Conveyor driver DOWN', body: `${root}: ${verdict.reason}` });
+      notify({ title: 'Conveyor driver DOWN', body: `${root}: ${verdict.reason}`,
+        // quietHours breakthrough (card xmvc6oc): a daemon down long enough reaches the operator overnight.
+        emergency: { kind: 'daemon-down', downForMs: Number.isFinite(verdict.quietMs) ? verdict.quietMs : null } });
     }
     return { checkout: root, verdict, action: 'alert-only', rollback: null, heal: null, alerted: escalation.fire };
   }
