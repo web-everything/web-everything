@@ -1,9 +1,10 @@
 ---
+bornAs: x3r5fzx
 kind: story
 size: 5
-parent: "x8juafk"
+parent: "5522"
 status: open
-blockedBy: ["xjddimd"]
+blockedBy: ["5523"]
 relatedTo: ["5510", "5118"]
 scope: ["we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:skills-src/conveyor/review-daemon.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/operations/promote-draft-pr-dispatch.mjs", "we:scripts/lib/ci-heal-reserve.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/conveyor/delivery-priority-shadow.mjs"]
 dateOpened: "2026-10-08"
@@ -12,12 +13,12 @@ tags: [conveyor, priority]
 
 # Queues sort by delivery class: fix, ci-heal, review, drain, draft promote
 
-Slice S2 of epic x8juafk (rulings Q1, Q2). Each queue sorts by delivery class first, then by the fix-queue score in minutes (Q2: the same score in every queue). Off value (mode off) proven by fixture in every queue.
+Slice S2 of epic 5522 (rulings Q1, Q2). Each queue sorts by delivery class first, then by the fix-queue score in minutes (Q2: the same score in every queue). Off value (mode off) proven by fixture in every queue.
 
 | Queue | Change |
 |---|---|
 | Fix / ci-heal rank | sort key becomes (class, then today's key); the overlay-conflict `urgent` set becomes "class P0"; P0 skips scope-overlap waits as `urgent` does now |
-| ci-heal reserve | a P0 ci-heal takes the existing reserve first (no new reserve: Q3 default is interrupt, slice xoa99a8) |
+| ci-heal reserve | a P0 ci-heal takes the existing reserve first (no new reserve: Q3 default is interrupt, slice 5525) |
 | Review | sort owed reviews by class before the free-lane cut |
 | Drain | sort `ready` by class before item number; `blockedBy` stays a hard edge; a P0 that depends on a lower item lifts it to P0 (inheritance, depth-capped) |
 | Heavy test slots | the waiter marker carries its class; "oldest live waiter" becomes "oldest waiter in the highest waiting class" |
@@ -32,9 +33,9 @@ Slice S2 of epic x8juafk (rulings Q1, Q2). Each queue sorts by delivery class fi
 
 ## Non-goals
 
-- [N1] No pre-emption, reserve or interruption (xoa99a8).
-- [N2] No owed-ci-rerun or main-still-red exemption (xy828sf, ships last).
-- [N3] No build freeze (xy6r60l).
+- [N1] No pre-emption, reserve or interruption (5525).
+- [N2] No owed-ci-rerun or main-still-red exemption (5528, ships last).
+- [N3] No build freeze (5527).
 
 ## Edge cases this change must handle
 

@@ -1,9 +1,10 @@
 ---
+bornAs: xoa99a8
 kind: story
 size: 5
-parent: "x8juafk"
+parent: "5522"
 status: open
-blockedBy: ["xjddimd"]
+blockedBy: ["5523"]
 relatedTo: ["5461"]
 scope: ["we:scripts/lib/delivery-priority.mjs", "we:scripts/lib/delivery-priority-settings.json", "we:scripts/lib/dispatch-throttle.mjs", "we:scripts/lane-pool.mjs", "we:scripts/readiness/heavy-admission.mjs"]
 dateOpened: "2026-10-08"
@@ -12,7 +13,7 @@ tags: [conveyor, priority, admission]
 
 # Urgent-work capacity policy: interrupt (default) or reserve, with an interruption log
 
-Slice S3a of epic x8juafk (rulings Q3, Q4). Capacity for urgent work is a policy setting `capacity.policy: reserve | interrupt`, default `interrupt` (reserve size 0). When a P0 cannot start for lack of a fixer slot, lane or heavy seat, it takes, in order: queued work (not yet started), then a fixer parked on verify, then the lowest-class active fixer (parked so it can resume). A running test is never killed. Only P0 may interrupt (`capacity.interruptClasses`, default `[P0]`); P1 gets queue priority only.
+Slice S3a of epic 5522 (rulings Q3, Q4). Capacity for urgent work is a policy setting `capacity.policy: reserve | interrupt`, default `interrupt` (reserve size 0). When a P0 cannot start for lack of a fixer slot, lane or heavy seat, it takes, in order: queued work (not yet started), then a fixer parked on verify, then the lowest-class active fixer (parked so it can resume). A running test is never killed. Only P0 may interrupt (`capacity.interruptClasses`, default `[P0]`); P1 gets queue priority only.
 
 Every interruption appends one row to an interruption log: when, the P0 that needed room, what was parked (class, kind, PR), how long the P0 would have waited, and when the parked work resumed. That log is how reserve vs interrupt gets revisited (Q3).
 
@@ -27,7 +28,7 @@ Needs lane protection (PR #4508: verified unpushed work cannot be reaped) landed
 
 ## Non-goals
 
-- [N1] No change to how classes are derived (xjddimd) or how queues sort (x3r5fzx).
+- [N1] No change to how classes are derived (5523) or how queues sort (5524).
 - [N2] P1 interruption: ruled out (Q4) until the log shows a need.
 
 ## Edge cases this change must handle
