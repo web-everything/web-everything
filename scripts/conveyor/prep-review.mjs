@@ -281,11 +281,28 @@ export function priorPrepReviews(comments) {
 const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
 
 /**
+ * Does the stage's NEWEST trusted note record a hold? `{head, blocked}` for it, `null` when there is none. Only the newest
+ * counts: a later note without `blocked=1` is the stage releasing its hold (round two), so an older `blocked=1` is history,
+ * not ownership of whatever `review:changes` is on the PR now (a reviewer may have re-added it since).
+ */
+function newestNoteHold(prior) {
+  if (!prior.length) return null;
+  const head = prior[prior.length - 1].head;
+  return { head, blocked: prior.some((p) => p.head === head && p.blocked) };
+}
+
+/** Is the `review:changes` on the PR now the one this stage applied (its newest trusted note recorded the hold)? */
+export function stageOwnsHold({ names, prior }) {
+  return names.includes('review:changes') && newestNoteHold(prior)?.blocked === true;
+}
+
+/**
  * Is a `review:changes` hold this stage applied for an OLDER head still on the PR now that the head has moved? Ownership
- * is the trusted `blocked=1` marker: a hold the stage never applied (advise mode, or a reviewer's own) is never lifted.
+ * is the trusted `blocked=1` marker on the NEWEST note: a hold the stage never applied (advise mode, or a reviewer's own),
+ * or one it already released, is never lifted.
  */
 export function staleBlockHold({ names, prior, head }) {
-  return names.includes('review:changes') && prior.some((p) => p.blocked && p.head !== head) && !prior.some((p) => p.blocked && p.head === head);
+  return stageOwnsHold({ names, prior }) && newestNoteHold(prior).head !== head;
 }
 
 /**
@@ -367,6 +384,16 @@ export async function reviewPreparePr(pr, deps) {
   if (prior.some((p) => p.head === head) && names.some((n) => n.startsWith('review:')) && !staleBlockHold({ names, prior, head }) && !lostBlockHold({ mode, names, prior, head })) return { skipped: 'already-reviewed' };
   // Only a PR the repo's own automation or operator opened, from this repo's own branch, earns a model call and a trusted note.
   if (!(await trustedPrAuthor(pr, deps.readPrAuthor, repo))) return { skipped: 'untrusted-author' };
+  // Lift the hold the stage applied for an older head BEFORE anything is recorded: the lift is judged by the `blocked=1` note
+  // being the NEWEST one, so the round-two note (which releases the hold) may only land once the label is really gone. A
+  // lift that fails here throws with no note and no model spend, and the next tick still reads the hold as the stage's own.
+  let labels = pr.labels;
+  let lifted = false;
+  if (staleBlockHold({ names, prior, head }) && !dryRun) {
+    provider.setLabels(repo, pr.number, { add: undefined, remove: ['review:changes'] });
+    labels = (Array.isArray(pr.labels) ? pr.labels : []).filter((l) => (typeof l === 'string' ? l : l?.name) !== 'review:changes');
+    lifted = true;
+  }
   const raw = readCard(head, shape.cardPath, repo);
   if (typeof raw !== 'string' || !raw.trim()) throw new Error('prep-review: the card could not be read at the PR head');
   let alreadyDone = null;
@@ -386,9 +413,9 @@ export async function reviewPreparePr(pr, deps) {
     }
   }
   const result = buildPrepReviewResult({ deterministic, model });
-  const plan = planPrepReview({ mode, head, result, notChecked: deterministic.notChecked, modelNote, comments: pr.comments, labels: pr.labels });
+  const plan = planPrepReview({ mode, head, result, notChecked: deterministic.notChecked, modelNote, comments: pr.comments, labels });
   if (!plan) return { skipped: 'already-reviewed' };
-  const out = { reviewed: true, outcome: result.outcome, findings: result.findingsAddressed.map((f) => f.ref), addLabels: plan.addLabels, removeLabels: plan.removeLabels, posted: plan.body !== null, round: plan.round, body: plan.body ?? undefined };
+  const out = { reviewed: true, outcome: result.outcome, findings: result.findingsAddressed.map((f) => f.ref), addLabels: plan.addLabels, removeLabels: [...(lifted ? ['review:changes'] : []), ...plan.removeLabels], posted: plan.body !== null, round: plan.round, body: plan.body ?? undefined };
   if (dryRun) return out;
   // Comment first: a note with no label still records that a review looked at this head (the drain reads the note, not the
   // label), while a label with no note would hide the missing review.
@@ -467,7 +494,7 @@ export async function runPrepReviewTick({ repo, readPrs, deps, review = reviewPr
       if (await shouldStripPrepLabel(pr, repo, deps.readPrFiles)) {
         // The hold this stage applied (a trusted `blocked=1` note) goes with it: left behind, it would park the code PR
         // out of the normal review, in any mode. A `review:changes` the stage never applied is a reviewer's and stays.
-        const stageHold = labelNames(pr.labels).includes('review:changes') && priorPrepReviews(pr.comments).some((p) => p.blocked);
+        const stageHold = stageOwnsHold({ names: labelNames(pr.labels), prior: priorPrepReviews(pr.comments) });
         try { deps.provider.setLabels(repo, pr.number, { add: undefined, remove: stageHold ? [PREP_REVIEW_LABEL, 'review:changes'] : [PREP_REVIEW_LABEL] }); out.stripped.push({ prNumber: pr.number, ...(stageHold ? { liftedHold: true } : {}) }); }
         catch (e) { out.failed.push({ prNumber: pr.number, error: foldOneLine(String(e?.message ?? e).split('\n')[0], 300) }); }
       }

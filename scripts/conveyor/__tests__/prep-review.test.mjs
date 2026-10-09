@@ -453,15 +453,9 @@ describe('block mode: round two lifts the hold round one applied', () => {
     const r2 = await reviewPreparePr(prepPr({ headRefOid: headB, labels, comments: [note1] }), b.deps);
     expect(r2.removeLabels).toEqual(['review:changes']);
     expect(b.calls.labels.some((l) => l.remove?.includes('review:changes'))).toBe(true);
-    // removal lost (the label is still there on the next tick): same head, no second note, no second model spend
+    // a lost removal is retried too, but BEFORE the round-two note exists (see the reviewer-hold block at the end of this file):
+    // once that note is the newest, a `review:changes` on the PR is no longer provably the stage's own, so it is never touched
     const note2 = { ...bot, body: b.calls.comments[0].b };
-    const judge = vi.fn();
-    const c = mkDeps({ mode: 'block', readCard: bad, judge });
-    const r3 = await reviewPreparePr(prepPr({ headRefOid: headB, labels, comments: [note1, note2] }), c.deps);
-    expect(r3.posted).toBe(false);
-    expect(r3.removeLabels).toEqual(['review:changes']);
-    expect(judge).not.toHaveBeenCalled();
-    // once the label is gone, the head is simply reviewed
     const d = mkDeps({ mode: 'block', readCard: bad });
     expect(await reviewPreparePr(prepPr({ headRefOid: headB, labels: [{ name: 'review:prep' }], comments: [note1, note2] }), d.deps)).toEqual({ skipped: 'already-reviewed' });
   });
@@ -767,5 +761,77 @@ describe('review of the repair itself: the next variants of each defect', () => 
     const { deps, calls } = mkDeps({ mode: 'block' });
     await runPrepReviewTick({ repo: 'o/r', readPrs: () => [grown({ labels: [{ name: 'review:prep' }, { name: 'review:changes' }], comments: [] })], deps, review: vi.fn() });
     expect(calls.labels).toEqual([{ r: 'o/r', n: 21, add: undefined, remove: ['review:prep'] }]);
+  });
+});
+
+describe('a reviewer\'s hold applied after the stage released its own is never removed (finding: historical blocked marker taken as ownership)', () => {
+  const bad = () => card({ scope: '["we:scripts/nope.mjs"]' });
+  const headA = 'b'.repeat(40);
+  const headB = 'c'.repeat(40);
+  const headC = 'e'.repeat(40);
+  const held = [{ name: 'review:prep' }, { name: 'review:changes' }];
+  // round 1 (block, hold) then round 2 (the lift), run through the real orchestrator so the notes are the real ones
+  const lifecycle = async () => {
+    const a = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: headA }), a.deps);
+    const note1 = { ...bot, body: a.calls.comments[0].b };
+    const b = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: headB, labels: held, comments: [note1] }), b.deps);
+    return { note1, note2: { ...bot, body: b.calls.comments[0].b }, lift: b.calls.labels };
+  };
+  it('prereq: round two lifts the stage\'s own hold, and the lift is written BEFORE the round-two note', async () => {
+    const order = [];
+    const a = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: headA }), a.deps);
+    const note1 = { ...bot, body: a.calls.comments[0].b };
+    const b = mkDeps({ mode: 'block', readCard: bad, provider: {
+      postComment: () => order.push('note'), ensureLabel: () => {},
+      setLabels: (r, n, s) => order.push(s.remove?.includes('review:changes') ? 'lift' : 'add'),
+    } });
+    await reviewPreparePr(prepPr({ headRefOid: headB, labels: held, comments: [note1] }), b.deps);
+    expect(order.indexOf('lift')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('lift')).toBeLessThan(order.indexOf('note'));
+  });
+  it('a reviewer\'s review:changes on the same head is left alone, by the plan and by the shortcut', async () => {
+    const { note1, note2 } = await lifecycle();
+    expect(planPrepReview({ mode: 'block', head: headB, result: buildPrepReviewResult({ deterministic: { findings: [] }, model: { findings: [] } }), comments: [note1, note2], labels: held }))
+      .toBeNull();
+    for (const mode of ['block', 'advise']) {
+      const judge = vi.fn();
+      const r = mkDeps({ mode, readCard: bad, judge });
+      expect(await reviewPreparePr(prepPr({ headRefOid: headB, labels: held, comments: [note1, note2] }), r.deps)).toEqual({ skipped: 'already-reviewed' });
+      expect(r.calls.labels).toEqual([]);
+      expect(judge).not.toHaveBeenCalled();
+    }
+  });
+  it('a reviewer\'s hold survives a later push too: the newest note is not a hold, so nothing is the stage\'s to lift', async () => {
+    const { note1, note2 } = await lifecycle();
+    const r = mkDeps({ mode: 'block', readCard: bad });
+    const out = await reviewPreparePr(prepPr({ headRefOid: headC, labels: held, comments: [note1, note2] }), r.deps);
+    expect(out.removeLabels).toEqual([]);
+    expect(r.calls.labels.some((l) => l.remove?.includes('review:changes'))).toBe(false);
+  });
+  it('the strip path leaves it as well', async () => {
+    const { note1, note2 } = await lifecycle();
+    const grown = prepPr({ number: 22, files: [{ path: 'backlog/4382-some-card.md' }, { path: 'scripts/x.mjs' }], labels: held, comments: [note1, note2] });
+    const { deps, calls } = mkDeps({ mode: 'block' });
+    const out = await runPrepReviewTick({ repo: 'o/r', readPrs: () => [grown], deps, review: vi.fn() });
+    expect(out.stripped).toEqual([{ prNumber: 22 }]);
+    expect(calls.labels).toEqual([{ r: 'o/r', n: 22, add: undefined, remove: ['review:prep'] }]);
+  });
+  it('still lifts its own hold on a new head when the removal fails first: no note is posted until the lift lands', async () => {
+    const a = mkDeps({ mode: 'block', readCard: bad });
+    await reviewPreparePr(prepPr({ headRefOid: headA }), a.deps);
+    const note1 = { ...bot, body: a.calls.comments[0].b };
+    const posted = [];
+    const failing = mkDeps({ mode: 'block', readCard: bad, provider: {
+      postComment: (r, n, b) => posted.push(b), ensureLabel: () => {},
+      setLabels: (r, n, s) => { if (s.remove?.includes('review:changes')) throw new Error('gh 502'); },
+    } });
+    await expect(reviewPreparePr(prepPr({ headRefOid: headB, labels: held, comments: [note1] }), failing.deps)).rejects.toThrow(/502/);
+    expect(posted).toEqual([]); // nothing recorded, so the next tick still sees the stage's hold as its own and retries the lift
+    const retry = mkDeps({ mode: 'block', readCard: bad });
+    const out = await reviewPreparePr(prepPr({ headRefOid: headB, labels: held, comments: [note1] }), retry.deps);
+    expect(out.removeLabels).toEqual(['review:changes']);
   });
 });
