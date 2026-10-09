@@ -347,7 +347,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const prepareIsLive = (r) => r.row?.entry?.live === true
     && !(r.row.entry.handle?.startsWith('pid:') && classifyClaimLiveness({ row: r.row,
       isPidAlive: effects.isPidAlive ?? defaultIsPidAlive }).status === 'dead');
-  const isPrepareHold = h => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
+  // A ledger hold remapped to its `needs-you:` reason (`ledger: true`) is still the ledger's prepare hold: tracking,
+  // the stamped-on-main release and the unstamped-completion path must keep applying to it.
+  const isPrepareHold = h => h.ledger === true || ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
   // The stamp a prepare's claim recorded at spawn, kept on its hold too: the claim is released when the attempt ends
   // unstamped, and a later tick must still tell the stamp being replaced from a result.
   // `null` (the card was unstamped at spawn) is a recorded answer, distinct from `undefined` (nothing recorded).
@@ -378,6 +380,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
       completedPrepares.add(num);
       if (live && holds.some(h => normNum(h.num) === num && isPrepareHold(h))) effects.releasePrepareHold?.({ num });
+      // Stamped on main: a needs-you hold resolved by hand is closed with it, else the CLI's synthetic hold for that
+      // record would bring the card back under a hold every tick.
+      // Only for a needs-you hold: a backed-off failure of a stale-stamped re-prepare must keep its ledger record (and
+      // its attempt count), or the card would be re-dispatched every tick.
+      if (live && ledgerHoldReason.has(num)) effects.completePrepareFailures?.(num);
     } catch (e) { prepareReadErrors.set(num, e); }
   }
   holds = holds.filter(h => !isPrepareHold(h) || !completedPrepares.has(normNum(h.num)));
@@ -602,7 +609,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
-  for (const [num, reason] of ledgerHoldReason) needsYou.push({ num, step: 'prepare', reason });
+  // A card stamped on main this tick (its hold just released above) is no longer waiting on anyone.
+  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num)) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
     const step = outcome?.stepRefused?.step ?? null;
@@ -729,7 +737,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const inspectNums = new Set([...prepareClaims.map((c) => normNum(c.meta.num)),
     ...prepareBusy, ...prepareSpawns.map((s) => normNum(s.num)),
     ...(bookkeeping.prepareGuards ?? []).filter((g) => g.kind === 'prepare-item').map((g) => normNum(g.num)),
-    ...holds.filter((h) => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason)).map((h) => normNum(h.num))]);
+    ...holds.filter(isPrepareHold).map((h) => normNum(h.num))]);
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
@@ -747,7 +755,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // settled by its own branch below, so it must not also be read as an unstamped prepare.
     const currentSettled = settled && settled.outcome !== 'prepare-session-dead'
       && (!claim?.meta?.claimedAt || settled.startedAt >= claim.meta.claimedAt);
-    const wasHeld = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+    const wasHeld = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
     const tracked = Boolean(claim) || prepareBusy.has(num);
     // A bare candidate (no claim, no in-flight row, no hold, no current settled attempt) has no evidence of a
     // prepare attempt: skip it, so old PRs/rows never place a hold and the per-tick probe stays bounded.
@@ -792,7 +800,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         if (deadUntimed || (worker?.entry?.handle?.startsWith('pid:') && workerLiveness?.status === 'dead')
           || (!worker && liveness.status === 'dead')) why = 'dead prepare owner past heartbeat TTL';
       }
-      const wasUnstamped = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+      const wasUnstamped = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
       // Live 2026-10-09 (4435/4436/4648): 8 stamp spawns per tick, worker `already-stamped`, no PR.
       // Sections of the replaced stamp are not a result of this re-prepare attempt.
       const mainHasResult = Boolean(status?.hasSections) && !status?.replacedPreparedDate;
@@ -845,7 +853,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         // from re-preparing; here it is only surfaced.
         handledOutcome = currentSettled && PREPARE_HANDLED_OUTCOMES.includes(settled.outcome) && !priorFailure ? settled.outcome : null;
         if (handledOutcome) {
-          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: String(settled.evidence?.error ?? 'prepare needs you').slice(0, 300) });
+          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: redactSpawnText(String(settled.evidence?.error ?? 'prepare needs you')).slice(0, 300) });
           prepare.handled.push({ num, outcome: handledOutcome });
           heldNums.add(num);
           why ??= handledOutcome;
