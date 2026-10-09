@@ -10,6 +10,8 @@ import { latestUnresolvedStandDown, buildOperatorAnswer } from '../stand-down-an
 const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/supersede/pr4522-2026-10-09.json'), 'utf8'));
 const hold = { pr: 4522, by: 4532, mergedAt: '2026-10-09T01:52:13Z' };
 const plan = (overrides = {}) => planSupersedeHolds({ mergedPrs: [fixture.merged], openPrs: [fixture.open], settings: { hold: true }, ...overrides });
+// Built from its code point: a literal U+00A0 in source is forbidden by check:standards (#2866).
+const NBSP = String.fromCharCode(0xa0);
 
 describe('parseSupersedes', () => {
   it('reads the real #4532 marker without counting its prose', () => {
@@ -41,7 +43,7 @@ describe('parseSupersedes', () => {
     ['a multi-line HTML comment', '<!--\nSupersedes #4522\n-->'],
     ['a comment opened after other text', 'Note <!-- template\nSupersedes #4522\nend -->'],
     ['a tab-indented line (indented code)', '\tSupersedes #4522'],
-    ['a no-break-space-led marker', ' Supersedes #4522'],
+    ['a no-break-space-led marker', `${NBSP}Supersedes #4522`],
   ];
   it.each(fenceCases)('ignores a marker inside %s', (_name, body) => expect(parseSupersedes(body)).toEqual([]));
   it.each([
@@ -54,7 +56,7 @@ describe('parseSupersedes', () => {
     ['a marker after a closed HTML comment', '<!--\nx\n-->\nSupersedes #2', [2]],
     ['a one-line HTML comment before a marker', '<!-- hint -->\nSupersedes #2', [2]],
     ['a marker followed by an opening comment', 'Supersedes #2 <!--\nSupersedes #3\n-->', [2]],
-    ['a no-break-space-led backtick line (not a fence)', ' ```\nSupersedes #2', [2]],
+    ['a no-break-space-led backtick line (not a fence)', `${NBSP}\`\`\`\nSupersedes #2`, [2]],
   ])('still reads %s', (_name, body, expected) => expect(parseSupersedes(body)).toEqual(expected));
   it('caps the targets one body may declare', () => {
     const body = `Supersedes ${Array.from({ length: 3000 }, (_, i) => `#${i + 1}`).join(', ')}`;
