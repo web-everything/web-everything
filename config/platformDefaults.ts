@@ -73,13 +73,17 @@ export const PLATFORM_CROSS_PROVIDER_FALLBACK_WAIT_TIMEOUT_MS = 24 * 60 * 60 * 1
  * `store`: `dual` writes the machine-local file AND the `ops/review-requests` git transport (default). The git board
  * is the checkout whose `origin` is the record's own repo (no env or option needed); for a repo this checkout is not
  * the board of, the unconfigured default stays on `home`. `home` is the one-setting rollback (git untouched); `git`
- * writes the transport only, and is for the read-slice cut-over: readers still read home, so a git-only row is
- * invisible to the fold. A git write miss is loud and follows ratified F4: a CLEARING verdict is written to git
+ * writes the transport only. Report readers select `readStore` independently. A git write miss is loud and
+ * follows ratified F4: a CLEARING verdict is written to git
  * first, so a miss leaves no home row and returns `ok: false` (callers do not swap the label); a HOLDING verdict is
  * written home-first and still holds.
+ * `readStore`: any registered store name (env `WE_VERDICT_LEDGER_READ_STORE`). `git` reads the shared
+ * `ops/review-requests` branch (default); `home` is the offline/dev fallback and declares not-shared.
+ * A failed read is `unreadable`, never empty, and never silently falls back to home.
  */
 export const PLATFORM_VERDICT_LEDGER_DEFAULTS = {
   store: 'dual' as 'home' | 'dual' | 'git',
+  readStore: 'git' as string,
 } as const;
 
 /**

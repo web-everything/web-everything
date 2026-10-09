@@ -1023,7 +1023,6 @@ it('xxh4zw8 the 100-row boundary hydrates even with all names present and target
 it.each([
   ['transport', () => { throw new Error('HTTP 502'); }],
   ['malformed', () => ({ check_runs: [] })],
-  ['empty', () => []],
   ['bad ID', () => xxRuns().map(row => ({ ...row, id: '123' }))],
   ['unreadable', () => xxRuns().map(row => ({ ...row, conclusion: row.name === 'test' ? null : row.conclusion }))],
 ])('xxh4zw8 %s hydration refuses visibly, never heals unknown evidence, and allows unrelated progress', async (_, readChecks) => {
@@ -1037,6 +1036,21 @@ it.each([
   expect(plan.prs).toBe(2);
 });
 
+// Live incident: plateauapp/plateau-app #217 (and web-everything #4402/#4439) logged `check-read-failed: required-check
+// hydration refused` when the REST feed read fine but the required checks had simply never started. That is not a
+// read failure: the PR is owed a CI trigger (missing-run recovery performs it).
+it.each([
+  ['an empty feed', () => []],
+  ['only unrelated checks', () => [{ id: 9, name: 'admit', status: 'completed', conclusion: 'success', completed_at: '2026-10-08T10:05:31Z' }]],
+])('never-started required checks (%s) are owed a re-trigger, not a check-read-failed refusal', async (_, readChecks) => {
+  const { runReconcilePass, formatReport } = await import('../reconcile-pass.mjs');
+  const plan = runReconcilePass({ ...xxOptions(), readChecks, readPrs: () => [xxPr()] });
+  expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+  expect(plan.owedTriggers).toEqual([expect.objectContaining({ kind: 'ci-trigger-owed', prNumber: 3336 })]);
+  expect(formatReport(plan)).toContain('ci-trigger-owed PR #3336');
+  expect(formatReport(plan)).not.toContain('required-check hydration refused');
+});
+
 it('xxh4zw8 an authoritative cancelled check with absent required jobs still heals', async () => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const readChecks = () => xxRuns().filter(row => row.name === 'smoke');
@@ -1046,31 +1060,33 @@ it('xxh4zw8 an authoritative cancelled check with absent required jobs still hea
 });
 
 it.each([
-  ['absent evidence', () => xxRuns().filter(row => row.name === 'soak-replay-gate')],
-  ['unreadable read', () => { throw new Error('HTTP 502'); }],
-])('xxh4zw8 %s withholds CI evidence but keeps the PR in non-CI planning', async (_, readChecks) => {
+  ['absent evidence', () => xxRuns().filter(row => row.name === 'soak-replay-gate'), false],
+  ['unreadable read', () => { throw new Error('HTTP 502'); }, true],
+])('xxh4zw8 %s withholds CI evidence but keeps the PR in non-CI planning', async (_, readChecks, isReadFailure) => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const pr = { ...xxPr(), isDraft: false, labels: [{ name: 'review:changes' }],
     comments: [{ body: '🔁 review — changes requested\nPlease fix', author: { login: 'web-everything' }, createdAt: '2026-10-01T09:00:00Z' }] };
   const plan = runReconcilePass({ ...xxOptions(), readChecks, readPrs: () => [pr] });
   expect(plan.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'fix']]);
+  // Absent evidence = the checks never started: owed a trigger, NOT a failed read. A real read error still refuses.
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
-    .toEqual([expect.objectContaining({ prNumber: 3336 })]);
+    .toEqual(isReadFailure ? [expect.objectContaining({ prNumber: 3336 })] : []);
+  expect(plan.owedTriggers.map(t => t.prNumber)).toEqual(isReadFailure ? [] : [3336]);
 });
 
 // Known failing/pending evidence already in the snapshot must survive a refused hydration: a cancelled required
 // check seen in the truncated snapshot still schedules recovery on this tick, while the refusal stays visible.
 it.each([
-  ['unreadable read', () => { throw new Error('HTTP 502'); }],
-  ['absent evidence', () => xxRuns().filter(row => row.name === 'soak-replay-gate')],
-])('xxh4zw8 %s keeps the known cancelled snapshot so recovery is still scheduled', async (_, readChecks) => {
+  ['unreadable read', () => { throw new Error('HTTP 502'); }, true],
+  ['absent evidence', () => xxRuns().filter(row => row.name === 'soak-replay-gate'), false],
+])('xxh4zw8 %s keeps the known cancelled snapshot so recovery is still scheduled', async (_, readChecks, isReadFailure) => {
   const { runReconcilePass } = await import('../reconcile-pass.mjs');
   const pr = { ...xxPr(), statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED',
     completedAt: '2026-10-01T10:00:00Z' }] };
   const plan = runReconcilePass({ ...xxOptions(), readChecks, readPrs: () => [pr] });
   expect(plan.dispatch.map(d => [d.prNumber, d.kind])).toEqual([[3336, 'ci-heal']]);
   expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
-    .toEqual([expect.objectContaining({ prNumber: 3336 })]);
+    .toEqual(isReadFailure ? [expect.objectContaining({ prNumber: 3336 })] : []);
 });
 
 it('xxh4zw8 a refused hydration keeps known pending evidence but never promotes on a truncated green snapshot', async () => {
@@ -1151,15 +1167,15 @@ describe('conflicting head: missing required checks are expected (#3771)', () =>
     expect(readChecks).not.toHaveBeenCalled();
   });
 
-  it('a PR that is NOT conflicting still refuses on missing required checks, exactly as before', async () => {
+  it('a PR that is NOT conflicting and never started its required checks is owed a re-trigger (no read failure)', async () => {
     const { runReconcilePass } = await import('../reconcile-pass.mjs');
     const readChecks = vi.fn(() => []);
     const clean = await livePr({ mergeStateStatus: 'CLEAN',
       labels: [{ name: 'review:changes' }, { name: 'review:human' }] });
     const plan = runReconcilePass(opts(clean, readChecks));
     expect(readChecks).toHaveBeenCalledTimes(1);
-    expect(plan.refusals.filter(r => r.kind === 'check-read-failed'))
-      .toEqual([expect.objectContaining({ prNumber: 3771, why: expect.stringContaining('missing required checks') })]);
+    expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+    expect(plan.owedTriggers).toEqual([expect.objectContaining({ prNumber: 3771, why: expect.stringContaining('missing required checks') })]);
   });
 
   it('a conflicting PR with OBSERVED check evidence still reads, and a real read error still refuses', async () => {
@@ -1263,7 +1279,8 @@ describe('stacked PR required-check absence (#3915)', () => {
     try {
       const { plan, readChecks } = await run([pr]);
       expect(readChecks).toHaveBeenCalledOnce();
-      expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toHaveLength(1);
+      expect(plan.refusals.filter(r => r.kind === 'check-read-failed')).toEqual([]);
+      expect(plan.owedTriggers).toHaveLength(1);
     } finally { vi.unstubAllEnvs(); }
   });
   it('classifies against the configured default and reads the policy', async () => {
@@ -1385,4 +1402,21 @@ describe('item 69 resolveCheckOrigin', () => {
   it('names the check for a null URL', async () => {
     await expect(get(mk('mystery', null))).rejects.toThrow('unknown-check-origin:mystery:github-actions:null');
   });
+});
+
+// xd3dkzx — check-scoped recovery needs each red main run's per-check verdict. Annotated only from a COMPLETE job
+// inventory (absence then means "did not run"); an unreadable/truncated one leaves no map (never a guess).
+it('defaultReadMainRuns annotates a failure run with checkConclusions from a complete jobs page (xd3dkzx)', async () => {
+  const { defaultReadMainRuns } = await import('../reconcile-pass.mjs');
+  const list = JSON.stringify([{ databaseId: 37851000000, conclusion: 'failure', status: 'completed', workflowName: 'CI', updatedAt: '2026-10-08T22:05:45Z' }]);
+  const job = (name, conclusion) => ({ name, status: 'completed', conclusion, runner_name: 'r', steps: [] });
+  const jobs = [job('test', 'success'), job('smoke', 'success'), job('soak-shard (2)', 'failure'), job('daemon-soak', 'failure')];
+  const complete = JSON.stringify({ total_count: jobs.length, jobs });
+  const out = defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? complete : list) });
+  expect(out[0].checkConclusions).toEqual({ test: 'success', smoke: 'success', 'soak-shard (2)': 'failure', 'daemon-soak': 'failure' });
+  const dup = [job('test', 'failure'), job('test', 'success')];
+  const dupPage = JSON.stringify({ total_count: dup.length, jobs: dup });
+  expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? dupPage : list) })[0].checkConclusions).toEqual({ test: 'failure' });
+  const truncated = JSON.stringify({ total_count: 150, jobs });
+  expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? truncated : list) })[0].checkConclusions).toBeUndefined();
 });

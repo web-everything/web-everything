@@ -143,6 +143,61 @@ describe('planNoteComment — the whole pure decision, no network', () => {
     const comments = [{ body: `${NOTE_COMMENT_MARKER}\n<!-- conveyor-note-key: ${key} -->`, author: { login: 'web-everything' } }];
     expect(planNoteComment(note, comments).alreadyPosted).toBe(true);
   });
+
+  // xadixye — comment only when state changes or someone must act (`prComments.mode`).
+  it('a status-only note (nobody needs to act) is suppressed: treated as already handled, never posted', () => {
+    for (const note of [
+      { kind: 'review-label-missing', prNumber: 4381, text: 'open agent PR has no review:* label' },
+      { kind: 'stacked-awaiting-base', prNumber: 4462, text: 'PR #4462: stacked on lane/x (PR #4439)' },
+    ]) {
+      const plan = planNoteComment(note, [], { mode: 'on-change-or-action' });
+      expect(plan.alreadyPosted).toBe(true);
+      expect(plan.suppressed).toBe('status-only');
+    }
+  });
+
+  it('mode=all restores the old behaviour for status-only notes', () => {
+    const plan = planNoteComment({ kind: 'review-label-missing', prNumber: 4381, text: 'x' }, [], { mode: 'all' });
+    expect(plan.alreadyPosted).toBe(false);
+    expect(plan.suppressed).toBe(null);
+  });
+
+  // PR #4494 review: repeat suppression silenced a recurring escalation (same words, new episode). A note that
+  // asks a person to act must post again for every new episode, whatever its visible text.
+  it('a recurring escalation (new episode, identical visible text) still posts — never repeat-suppressed', () => {
+    const escalations = [
+      { kind: 'permission-blocked', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'fixer denied `rm`' },
+      { kind: 'infra-retry-exhausted', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'infra retry streak capped' },
+      { kind: 'liveness-wait-exhausted', prNumber: 7, since: '2026-10-08T01:00:00Z', text: 'liveness wait ran long' },
+    ];
+    for (const first of escalations) {
+      const second = { ...first, since: '2026-10-08T05:00:00Z' };
+      const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+      expect(noteEpisodeKey(first), first.kind).not.toBe(noteEpisodeKey(second));
+      expect(planNoteComment(second, comments, { mode: 'on-change-or-action' }), first.kind)
+        .toMatchObject({ alreadyPosted: false, suppressed: null });
+    }
+  });
+
+  it('every kind whose headline says "needs your decision" is never repeat-suppressed', () => {
+    const kinds = ['ci-heal-exhausted', 'awaiting-permission', 'round-cap-exhausted', 'permission-blocked',
+      'infra-retry-exhausted', 'session-overrun', 'liveness-wait-exhausted', 'ruling-dispute', 'brand-new-kind'];
+    for (const kind of kinds) {
+      // An unknown kind is keyed on its own text (same words = same episode, the existing dedup), so its second
+      // episode must carry different words; every known kind differs by its key fields alone.
+      const first = { kind, prNumber: 3, sessionId: 'a', since: '1', head: 'h1', attempts: 1, cap: 3, text: 'same words' };
+      const second = { ...first, sessionId: 'b', since: '2', head: 'h2', attempts: 2, ...(kind === 'brand-new-kind' ? { text: 'same words ' } : {}) };
+      expect(noteEpisodeKey(first), kind).not.toBe(noteEpisodeKey(second));
+      const comments = [{ body: buildNoteComment(first), author: { login: 'web-everything' } }];
+      expect(noteHeadline(first), kind).toMatch(/^needs your decision/);
+      expect(planNoteComment(second, comments, { mode: 'on-change-or-action' }).alreadyPosted, kind).toBe(false);
+    }
+  });
+
+  it('an escalation that needs a person still posts', () => {
+    const note = { kind: 'ci-heal-exhausted', prNumber: 9, attempts: 3, cap: 3, text: 'exhausted' };
+    expect(planNoteComment(note, [], { mode: 'on-change-or-action' })).toMatchObject({ alreadyPosted: false, suppressed: null });
+  });
 });
 
 describe('postNoteComment — the IO shell', () => {

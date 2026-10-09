@@ -12,7 +12,8 @@ import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { withPathLock } from '../readiness/with-lock.mjs';
-import { DEFAULT_REPOS, qualifyFile } from './free-scope.mjs';
+import { DEFAULT_REPOS, GH_LIST_FILE_CAP, choosePrFileSet, qualifyFile, repoKeyFor } from './free-scope.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 const matter = createRequire(import.meta.url)('gray-matter');
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 export function defaultRegistryPath(env = process.env) {
@@ -51,24 +52,98 @@ export function ghExec(env = process.env) {
 /** `gh pr list --limit` page size. A page this full may have been cut off, so it is never trusted as complete. */
 export const OPEN_PR_LIMIT = 200;
 /** `gh pr list --json files` lists at most this many files per PR; a PR at the cap may touch more than it shows. */
-export const PR_FILES_LIMIT = 100;
-export function readOpenPrs({ repos = DEFAULT_REPOS, exec }) {
+export const PR_FILES_LIMIT = GH_LIST_FILE_CAP;
+const SHA = /^[0-9a-f]{40}$/;
+/** One line naming why a subprocess failed: its own stderr when it wrote one, else the error message. */
+const firstLine = (error) => String(error?.stderr || '').trim().split(/\r?\n/)[0] || String(error?.message || error).split(/\r?\n/)[0];
+/** Run git in `dir`. Large PRs list thousands of paths, so the buffer is generous. */
+export function gitExec() {
+  return (dir, args) => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 64 * 1024 * 1024, timeout: 120e3 });
+}
+/** The local checkout whose `origin` is `repo`, or null. WE is the checkout running this script (`root`). */
+export function defaultGitDirFor(repo, { root = repoRoot, env = process.env } = {}) {
+  const key = repoKeyFor(repo);
+  if (key === 'we') return root;
+  const meta = CONSTELLATION_REPOS[key];
+  if (!meta?.path) return null;
+  const dir = meta.path.replace(/^\$HOME(?=\/|$)/, env.HOME || os.homedir());
+  return fs.existsSync(path.join(dir, '.git')) ? dir : null;
+}
+/**
+ * Each PR's NET file set from git (xl5oele): the head commit against its merge-base with current `<remote>/<base>`.
+ * One fetch brings `<base>` up to date plus every PR head not already present (by `refs/pull/<n>/head`, no ref or
+ * FETCH_HEAD written). A failed fetch is not fatal: heads already present are still diffed, and a stale base only
+ * widens a set (never narrows it). Returns Map(number → { ok, files, added } | { ok: false, reason }).
+ */
+export function readNetFileSets({ dir, rows, git, remote = 'origin', base = 'main' }) {
+  const out = new Map();
+  const fail = (row, reason) => out.set(row.number, { ok: false, reason });
+  if (!dir) { for (const row of rows) fail(row, 'no local checkout of this repo'); return out; }
+  const valid = rows.filter((row) => Number.isInteger(row.number) && row.number > 0 && SHA.test(String(row.headRefOid || '')));
+  for (const row of rows) if (!valid.includes(row)) fail(row, 'no usable head commit id');
+  if (!valid.length) return out;
+  const present = (sha) => { try { git(dir, ['cat-file', '-e', `${sha}^{commit}`]); return true; } catch { return false; } };
+  const missing = valid.filter((row) => !present(row.headRefOid));
+  try {
+    git(dir, ['fetch', '--quiet', '--no-write-fetch-head', '--end-of-options', remote,
+      `+refs/heads/${base}:refs/remotes/${remote}/${base}`, ...missing.map((row) => `refs/pull/${row.number}/head`)]);
+  } catch { /* offline or a head gone: diff whatever is present; the rest falls back below */ }
+  for (const row of valid) {
+    try {
+      const mergeBase = String(git(dir, ['merge-base', '--end-of-options', `${remote}/${base}`, row.headRefOid])).split('\n')[0].trim();
+      if (!SHA.test(mergeBase)) throw new Error('no merge-base with the base branch');
+      // --no-renames: a rename holds both its old and new path. -z: paths are NUL-separated, never quoted.
+      const raw = String(git(dir, ['diff', '--no-ext-diff', '--no-renames', '--name-status', '-z', '--end-of-options', mergeBase, row.headRefOid]));
+      const tokens = raw.split('\0').filter(Boolean);
+      const files = [], added = [];
+      for (let i = 0; i + 1 < tokens.length; i += 2) {
+        files.push(tokens[i + 1]);
+        if (tokens[i] === 'A') added.push(tokens[i + 1]);
+      }
+      out.set(row.number, { ok: true, files, added });
+    } catch (error) { fail(row, firstLine(error)); }
+  }
+  return out;
+}
+/** GitHub's paginated files API for one PR (up to GH_API_FILE_CAP files). A rename holds both paths. */
+export function readPagedFiles({ repo, number, exec }) {
+  try {
+    const raw = exec(['api', '--paginate', `repos/${repo}/pulls/${number}/files?per_page=100`,
+      '--jq', '.[] | {s: .status, f: .filename, p: .previous_filename}']);
+    const files = [], added = [];
+    for (const line of String(raw).split(/\r?\n/).filter((l) => l.trim())) {
+      const row = JSON.parse(line);
+      if (!row || typeof row.f !== 'string') throw new Error('unexpected files API row');
+      files.push(row.f);
+      if (typeof row.p === 'string' && row.p) files.push(row.p);
+      if (row.s === 'added') added.push(row.f);
+    }
+    return { ok: true, files, added };
+  } catch (error) { return { ok: false, reason: firstLine(error) }; }
+}
+export function readOpenPrs({ repos = DEFAULT_REPOS, exec, git = gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo) }) {
   const prs = [], unreadable = [];
   for (const repo of repos) {
     try {
-      const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,files']));
-      // `added` (only when non-empty): the files this PR creates. The assessor lets a brand-new backlog card through.
-      prs.push(...rows.map(({ number, title, url, files }) => {
-        const added = files.filter((f) => f.changeType === 'ADDED').map((f) => f.path);
-        return { repo, number, title, url, files: files.map((f) => f.path), ...(added.length ? { added } : {}) };
-      }));
-      // The rows read still count as holders, but the snapshot is incomplete: never let it answer "free".
+      const rows = JSON.parse(exec(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(OPEN_PR_LIMIT), '--json', 'number,title,url,headRefOid,files']));
+      const net = readNetFileSets({ dir: gitDirFor(repo), rows, git });
       const why = [];
       if (rows.length >= OPEN_PR_LIMIT) why.push(`open PR list hit the ${OPEN_PR_LIMIT}-row limit and may be truncated`);
-      const capped = rows.filter(({ files }) => files.length >= PR_FILES_LIMIT).map(({ number }) => `#${number}`);
-      if (capped.length) why.push(`PR ${capped.join(', ')} list${capped.length === 1 ? 's' : ''} ${PR_FILES_LIMIT} files (the gh cap) and may touch more`);
+      for (const { number, title, url, files: listedFiles = [] } of rows) {
+        const listed = { ok: true, files: listedFiles.map((f) => f.path), added: listedFiles.filter((f) => f.changeType === 'ADDED').map((f) => f.path) };
+        const netRead = net.get(number);
+        // The paginated API costs one call per PR, so only ask it when git failed AND the cheap list is capped.
+        const paged = !netRead?.ok && listed.files.length >= GH_LIST_FILE_CAP ? readPagedFiles({ repo, number, exec }) : undefined;
+        const choice = choosePrFileSet({ net: netRead, paged, listed });
+        // An unresolved PR still holds every file it listed, but the snapshot is incomplete: never "free".
+        const { files, added } = choice.source ? choice : listed;
+        if (!choice.source) why.push(`PR #${number} ${choice.reason}`);
+        // `added` (only when non-empty): the files this PR creates. The assessor lets a brand-new backlog card through.
+        prs.push({ repo, number, title, url, files, ...(added.length ? { added } : {}), source: choice.source || 'github-list-capped' });
+      }
       if (why.length) unreadable.push({ repo, error: why.join('; ') });
-    } catch (error) { unreadable.push({ repo, error: error.message.split(/\r?\n/)[0] }); }
+    } catch (error) { unreadable.push({ repo, error: firstLine(error) }); }
   }
   return { prs, unreadable };
 }
@@ -95,8 +170,9 @@ export function readCardScope(card, { root }) {
   return entries;
 }
 export function collectFreeScope({ files = '', card = '', root = repoRoot, repos = DEFAULT_REPOS,
-  env = process.env, now = Date.now, exec = ghExec(env), registryPath = defaultRegistryPath(env) } = {}) {
+  env = process.env, now = Date.now, exec = ghExec(env), registryPath = defaultRegistryPath(env),
+  git = gitExec(), gitDirFor = (repo) => defaultGitDirFor(repo, { root, env }) } = {}) {
   const scope = [...new Set([...files.split(','), ...(card ? readCardScope(card, { root }) : [])].map((f) => qualifyFile(f)).filter(Boolean))];
   if (!scope.length) throw new TypeError('free-scope: give --files=a,b or --card=<id>');
-  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec }), agents: readRegistry(registryPath) };
+  return { files: scope, nowMs: now(), ...readOpenPrs({ repos, exec, git, gitDirFor }), agents: readRegistry(registryPath) };
 }

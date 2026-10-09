@@ -27,7 +27,7 @@
  * so the tests run it against a fake child. The CLI at the bottom runs a JSON spec detached.
  */
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, mkdirSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -51,6 +51,33 @@ export function workerWrapperEnabled(env = process.env) {
 /** Default budget when a spec names none (the build path passes its own 60-minute budget). */
 export const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 export const MAX_AWAIT_RESUMES = 6;
+/** The most a codex `-o` result file may hold: the stdout channel has a max-buffer guard, this one needs its own cap. */
+export const RESULT_FILE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Read a result file the CHILD wrote: bounded and never through a symlink. `O_NOFOLLOW` makes the open itself refuse a link (no
+ * lstat-then-open race), the fstat refuses anything that is not a regular file or is over the cap, and the read is capped even if
+ * the file grows after the fstat. The error names only the refusal, never the file's contents.
+ * @param {string} file
+ * @param {number} [maxBytes]
+ * @returns {string}
+ */
+export function readBoundedResultFile(file, maxBytes = RESULT_FILE_MAX_BYTES) {
+  // O_NONBLOCK: opening a FIFO the child left at the path would otherwise block this (synchronous) call forever, past every timeout.
+  const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw Object.assign(new Error('result file is not a regular file'), { code: 'EWRAPPER_REFUSED' });
+    if (st.size > maxBytes) throw Object.assign(new Error(`result file is over ${maxBytes} bytes`), { code: 'EWRAPPER_REFUSED' });
+    const buf = Buffer.alloc(maxBytes + 1);
+    let n = 0;
+    for (let r; n < buf.length && (r = readSync(fd, buf, n, buf.length - n, null)) > 0;) n += r;
+    if (n > maxBytes) throw Object.assign(new Error(`result file is over ${maxBytes} bytes`), { code: 'EWRAPPER_REFUSED' });
+    return buf.toString('utf8', 0, n);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 // ── argv + prompt helpers (pure) ────────────────────────────────────────────────────────────────────────────────
 
@@ -183,7 +210,7 @@ const isOverflow = (failure) => /maxBuffer exceeded/.test(String(failure?.messag
  * @param {(f: string) => string} [io.readFile]
  * @param {() => string|null} [io.head]               HEAD probe for headBefore / headAfter
  * @param {() => (object|null)} [io.legacyRead]       the old report for a launcher still migrating
- * @param {(failure: Error) => boolean} [io.isOperatorStop]  true when the operator stopped the worker (D6: aborted, no job); default: this wrapper was sent TERM/INT/HUP during the run
+ * @param {(failure: Error|null) => boolean} [io.isOperatorStop]  true when the operator stopped the worker (D6: aborted, no job), whatever the child's exit (`failure` is null when it exited 0); default: this wrapper was sent TERM/INT/HUP during the run
  * @param {{on: Function, off: Function}} [io.stopSource]  where the stop signals arrive (default `process`); a test passes an EventEmitter
  * @param {(record: object, dir: string) => *} [io.writeRecord]
  * @param {(action: object, o: {dir: string}) => *} [io.writeDraft]
@@ -221,7 +248,7 @@ async function runWorkerOnce(spec, io, stop) {
   // legacy reader (section 5 order) and as the source of the agent's own outcome words (see `preserveLegacyWords`).
   const completionLegacyRead = spec.legacyFromCompletion ? () => { try { return tryReadCompletion(spec.session, dir); } catch { return null; } } : null;
   const {
-    spawnToCompletionFn = spawnToCompletion, spawnFn = spawn, now = () => new Date().toISOString(), readFile = (f) => readFileSync(f, 'utf8'),
+    spawnToCompletionFn = spawnToCompletion, spawnFn = spawn, now = () => new Date().toISOString(), readFile = readBoundedResultFile,
     head = () => null, legacyRead = completionLegacyRead, isOperatorStop = () => stop.requested, writeRecord = writeCompletion, writeDraft = writeProductFixDraft,
     selfPid = process.pid, pollMs = 15_000, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   } = io;
@@ -249,6 +276,9 @@ async function runWorkerOnce(spec, io, stop) {
   const spawnWithPid = (cmd, argv, opts) => {
     const child = spawnFn(cmd, argv, opts);
     // An operator stop is forwarded to the child; one that ignores it is SIGKILLed after a grace, so the wrapper still writes its record.
+    // The child's exit ends the window in which a stop can still have stopped it: a TERM that lands after a clean exit (before the spawn
+    // promise settles) must not turn a finished result into `aborted`.
+    child?.once?.('exit', () => { stop.live = false; });
     stop.forward = (sig) => {
       try { child.kill(sig); } catch { /* already gone */ }
       graceTimer ??= setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* already gone */ } }, STOP_GRACE_MS);
@@ -328,12 +358,21 @@ async function runWorkerOnce(spec, io, stop) {
   // 1. the channel for this launcher
   let extracted;
   if (spec.launcher === 'codex-exec') {
-    try { extracted = { text: readFile(resultFile), prose: tail(stdout) }; } catch { extracted = { reason: 'no-structured-output', prose: tail(stdout) }; }
+    try { extracted = { text: readFile(resultFile), prose: tail(stdout) }; } catch (e) {
+      // a file the wrapper REFUSED (link, not a regular file, over the cap) is a contract violation of the channel; anything else (missing, unreadable) is "wrote nothing".
+      // The evidence prose is capped at ~200 chars FROM THE HEAD (unparseableOutcome), so the refusal note goes first and only a short stdout tail follows it.
+      const refused = e?.code === 'EWRAPPER_REFUSED' || e?.code === 'ELOOP';
+      extracted = refused
+        ? { reason: 'schema-violation', prose: [`result file refused (${e.code === 'ELOOP' ? 'result file is a symlink' : e.message})`, tail(stdout).slice(-100)].filter(Boolean).join(' | ') }
+        : { reason: 'no-structured-output', prose: tail(stdout) };
+    }
   } else if (spec.launcher === 'agy') extracted = extractAgyResult(stdout);
   else extracted = extractClaudeResult(stdout);
 
   // 2. settle: the worker's result, else the legacy record (migration only), else fail closed
-  const aborted = failure && isOperatorStop(failure);
+  // An operator stop is decided by whether the wrapper was told to stop WHILE the child was live, not by how the child then died: a child
+  // that handles the forwarded TERM and exits 0 (a cooperative shutdown) is still stopped work, so `failure` may be null here.
+  const aborted = isOperatorStop(failure);
   let legacyRecord = null;
   let settled;
   // FAIL CLOSED: a child that timed out, was signalled or exited non-zero never yields a success envelope, even when

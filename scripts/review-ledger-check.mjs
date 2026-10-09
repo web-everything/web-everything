@@ -25,10 +25,10 @@
  *   1 — at least one `ledger-holds-label-clears`: the ledger records a HOLD while the label says the drain
  *       may merge. Under today's label authority that is a live "hold that didn't hold" (#2750/#2820/#2745/
  *       #2416) caught in the act, which is the one thing this checker must never report quietly.
- *   2 — usage / `gh` failure.
+ *   2 — usage / `gh` failure / unreadable ledger store.
  *
  * Usage:
- *   node scripts/review-ledger-check.mjs [--repo=<owner/name>] [--json] [--all] [--limit=<n>]
+ *   node scripts/review-ledger-check.mjs [--repo=<owner/name>] [--json] [--all] [--limit=<n>] [--store=<name>]
  *   `--all` includes PRs that agree; the default output lists only what needs attention plus the summary.
  */
 
@@ -37,7 +37,7 @@ import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
 import {
-  AGREEMENT, DISAGREE_DIRECTION, compareLedgerToLabels, foldRepo, labelVerdictOf, parseLedgerEvents,
+  AGREEMENT, DISAGREE_DIRECTION, compareLedgerToLabels, foldVerdictLedger, readLedgerEventsFromStore, labelVerdictOf, parseLedgerEvents,
   summarizeAgreement, verdictLedgerPath,
 } from './lib/verdict-ledger.mjs';
 import { derivePrState } from './lib/pr-state.mjs';
@@ -114,10 +114,11 @@ export function renderRow(row) {
 }
 
 /** The whole human-readable report. Pure — the CLI only prints what this returns. */
-export function renderReport({ repo, rows, summary, path, showAll = false }) {
+export function renderReport({ repo, rows, summary, path, store, showAll = false }) {
   const lines = [];
   lines.push(`#3007 Phase 1 — verdict ledger vs review labels · ${repo}`);
-  lines.push(`ledger: ${path}`);
+  if (store) lines.push(`ledger store: ${store.name} (${store.shared ? 'shared' : 'NOT shared - rows written on other machines are invisible here'})`);
+  if (path) lines.push(`ledger: ${path}`);
   lines.push('');
   const shown = showAll ? rows : rows.filter((r) => r.status !== AGREEMENT.AGREE);
   if (!shown.length) {
@@ -258,13 +259,19 @@ export function renderDerived(summary) {
   return lines.join('\n');
 }
 
-/** This PR set's ledger events. Absent file = no rows; any other read failure = `null` (unreadable, never empty). */
+/** This PR set's HOME-FILE-ONLY ledger events. Absent file = no rows; any other read failure = `null` (unreadable, never empty). */
 export function readRepoEvents(repo, { read = readFileSync, pathOf = verdictLedgerPath } = {}) {
   try {
     return parseLedgerEvents(read(pathOf(repo), 'utf8'));
   } catch (e) {
     return e?.code === 'ENOENT' ? [] : null;
   }
+}
+
+/** Configured-store convenience reader: unreadable is null, never an empty event array. */
+export async function readRepoEventsFromStore(repo, opts = {}) {
+  const result = await readLedgerEventsFromStore(repo, opts);
+  return result.status === 'ok' ? result.rows : null;
 }
 
 /**
@@ -309,43 +316,56 @@ function parseFlags(argv) {
   return flags;
 }
 
-function main(argv) {
+/** One store snapshot supplies both comparisons. An unreadable ledger produces no score or run record. */
+export async function runCheck({
+  repo = DEFAULT_REPO, store, limit = 200, json = false, showAll = false, noRecord = false,
+  readEvents = readLedgerEventsFromStore, listPrs = readOpenPrs,
+  readFacts = repo === DEFAULT_REPO ? undefined : () => null, appendRun = appendCheckRun,
+  stdout = (text) => writeAllSync(1, text), stderr = (text) => process.stderr.write(text),
+} = {}) {
+  const ledger = await readEvents(repo, { store });
+  if (ledger.status !== 'ok') {
+    const report = { repo, store: ledger.store, status: 'unreadable', reason: ledger.reason, error: ledger.error };
+    stderr(`review-ledger-check: ledger store ${ledger.store.name} unreadable (${ledger.reason}): ${ledger.error} - nothing scored\n`);
+    if (json) stdout(`${JSON.stringify(report, null, 2)}\n`);
+    return { ...report, exitCode: 2 };
+  }
+  let prs;
+  try {
+    prs = await listPrs({ repo, limit });
+  } catch (e) {
+    stderr(`review-ledger-check: gh pr list failed — ${String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop()}\n`);
+    return { exitCode: 2 };
+  }
+  const events = ledger.rows;
+  const verdicts = events.filter((r) => r.type === 'verdict').map(({ type: _type, ...record }) => record);
+  const rows = buildRows({ prs, folded: foldVerdictLedger(verdicts) });
+  const summary = summarizeAgreement(rows);
+  const derivedRows = buildDerivedRows({ repo, prs, events, readFacts });
+  const derived = summarizeDerived(derivedRows);
+  const run = noRecord ? { ok: false, skipped: true } : await appendRun({ repo, summary: derived, phase1: { total: summary.total, counts: summary.counts, phase2Safe: summary.phase2Safe } });
+  const report = { repo, store: ledger.store, ledgerRows: events.length, rows, summary, derived: { ...derived, rows: derivedRows }, run };
+  if (json) {
+    stdout(`${JSON.stringify(report, null, 2)}\n`);
+  } else {
+    stdout(`${renderReport({ repo, rows, summary, store: ledger.store, showAll })}${renderDerived(derived)}\n`);
+    if (!run.ok && !run.skipped) stderr(`review-ledger-check: run record not written — ${run.error}\n`);
+  }
+  return { ...report, exitCode: summary.dangerous.length ? 1 : 0 };
+}
+
+async function main(argv) {
   const flags = parseFlags(argv);
   const repo = typeof flags.repo === 'string' && flags.repo ? flags.repo : DEFAULT_REPO;
   if (!REPO_RE.test(repo)) {
     process.stderr.write('review-ledger-check: --repo must be <owner/name>\n');
-    process.exit(2);
+    return 2;
   }
   const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
-
-  let prs;
-  try {
-    prs = readOpenPrs({ repo, limit });
-  } catch (e) {
-    process.stderr.write(`review-ledger-check: gh pr list failed — ${String((e && (e.stderr || e.message)) || e).split('\n').filter(Boolean).pop()}\n`);
-    process.exit(2);
-  }
-
-  const folded = foldRepo(repo);
-  const rows = buildRows({ prs, folded });
-  const summary = summarizeAgreement(rows);
-  const path = verdictLedgerPath(repo);
-
-  // Slice F. The facts reader is bound to the default repo, so another repo's PRs are reported unreadable.
-  const events = readRepoEvents(repo);
-  const derivedRows = buildDerivedRows({ repo, prs, events, readFacts: repo === DEFAULT_REPO ? undefined : () => null });
-  const derived = summarizeDerived(derivedRows);
-  const run = flags['no-record'] === true ? { ok: false, skipped: true } : appendCheckRun({ repo, summary: derived, phase1: { total: summary.total, counts: summary.counts, phase2Safe: summary.phase2Safe } });
-
-  if (flags.json) {
-    writeAllSync(1, `${JSON.stringify({ repo, path, rows, summary, derived: { ...derived, rows: derivedRows }, run }, null, 2)}\n`);
-  } else {
-    writeAllSync(1, `${renderReport({ repo, rows, summary, path, showAll: flags.all === true })}${renderDerived(derived)}\n`);
-    if (!run.ok && !run.skipped) process.stderr.write(`review-ledger-check: run record not written — ${run.error}\n`);
-  }
-  process.exit(summary.dangerous.length ? 1 : 0);
+  const result = await runCheck({ repo, store: flags.store, limit, json: !!flags.json, showAll: flags.all === true, noRecord: flags['no-record'] === true });
+  return result.exitCode;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main(process.argv.slice(2));
+  process.exitCode = await main(process.argv.slice(2));
 }

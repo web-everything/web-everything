@@ -26,13 +26,13 @@ describe('planMirror', () => {
 });
 
 describe('runMirrorReport (fixture dry run)', () => {
-  it('derives from fixtures through slice F and plans only a diff', () => {
+  it('derives from fixtures through slice F and plans only a diff', async () => {
     const prs = [{ number: 7, labels: [{ name: 'review:pending' }, { name: 'bug' }] }, { number: 8, labels: [] }];
     const facts = { headSha: 'a'.repeat(40), labels: [], checks: [], requiredChecks: [], probeErrors: [] };
-    const plan = runMirrorReport({
+    const plan = await runMirrorReport({
       repo: 'web-everything/web-everything',
       listPrs: () => prs,
-      readEvents: () => [],
+      readEvents: async () => ({ status: 'ok', rows: [], store: { name: 'home', shared: false } }),
       buildRows: (o) => buildDerivedRows({ ...o, readFacts: (n) => (n === 8 ? null : facts) }),
     });
     expect(plan.writes).toBe(0);
@@ -48,5 +48,23 @@ describe('report only', () => {
     for (const bad of ['setLabels', 'ensureLabel', 'createGhProvider', '--add-label', '--remove-label', 'pr edit', 'pr comment', 'writeRun', 'execFileSync']) {
       expect(src).not.toContain(bad);
     }
+  });
+});
+
+
+describe('shared-store mirror reporting', () => {
+  it('unreadable ledger plans nothing and retains the store failure', async () => {
+    const store = { name: 'git', shared: true };
+    const plan = await runMirrorReport({ store: 'git',
+      listPrs: async () => [{ number: 7, labels: [{ name: 'review:pending' }] }],
+      readEvents: async (_repo, opts) => { expect(opts.store).toBe('git'); return { status: 'unreadable', store, reason: 'no-board', error: 'missing board' }; },
+      buildRows: (opts) => buildDerivedRows({ ...opts, readFacts: () => ({}) }) });
+    expect(plan).toMatchObject({ store, ledgerUnreadable: { reason: 'no-board', error: 'missing board' }, unreadable: 1, inSync: 0, changes: [], counts: { add: 0, remove: 0 } });
+    expect(renderPlan(plan)).toContain('ledger store: git (shared)');
+    expect(renderPlan(plan)).toContain('no-board');
+  });
+  it('home report explicitly declares that other machines are invisible', async () => {
+    const plan = await runMirrorReport({ listPrs: () => [], readEvents: async () => ({ status: 'ok', rows: [], store: { name: 'home', shared: false } }) });
+    expect(renderPlan(plan)).toContain('ledger store: home (NOT shared - rows written on other machines are invisible here)');
   });
 });

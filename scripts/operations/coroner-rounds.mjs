@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 import { isTrustedMarkerAuthor, isOperatorAuthored } from '../lib/marker-authorship.mjs';
 import { countEdgeCaseClasses } from '../backlog/edge-case-classes.mjs';
+import { ACCEPTANCE_HEADING_RE } from '../backlog/task-agreement.mjs';
 
 const stamp = (v) => typeof v === 'string' ? Date.parse(v) : NaN;
 const round1 = (n, d = 1) => Number(n.toFixed(d));
@@ -219,7 +220,11 @@ export function parseCard(text) {
   let scope = [];
   try { scope = JSON.parse(fm.scope ?? '[]'); } catch { scope = []; }
   const body = m[2];
-  const doneWhen = body.split(/^#{2,3}\s+(?:Done[ -]when|Acceptance|Definition of done)[^\n]*$/im)[1]?.split(/^#{1,3}\s/m)[0] ?? '';
+  // The acceptance section (h2/h3): the shared task-agreement reader's heading rule (#5399 S7), plus the
+  // hyphenated and "Definition of done" spellings this probe has always accepted.
+  const acc = [...body.matchAll(/^#{2,3}\s+([^\n]*)$/gm)]
+    .find((h) => ACCEPTANCE_HEADING_RE.test(h[1].trim()) || /^(?:done-when|definition of done)\b/i.test(h[1].trim()));
+  const doneWhen = acc ? body.slice(acc.index + acc[0].length).split(/^#{1,3}\s/m)[0] : '';
   return {
     kind: fm.kind ?? null, size: Number.isFinite(Number(fm.size)) && fm.size !== '' ? Number(fm.size) : null, tier: fm.tier ?? null,
     preparedDate: /^\d{4}-\d{2}-\d{2}/.test(fm.preparedDate ?? '') ? fm.preparedDate : null, bornAs: fm.bornAs ?? null,

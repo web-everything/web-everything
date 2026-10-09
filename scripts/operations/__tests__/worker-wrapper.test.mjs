@@ -15,7 +15,7 @@ import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
 import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
 import { listDraftKeys } from '../worker-result-router.mjs';
 import {
-  MAX_AWAIT_RESUMES, resumeArgvFrom, resumeRequestPath, STRUCTURED_OUTPUT_SUFFIX, extractAgyResult, extractClaudeResult, launchDetached, runWorker, withStructuredOutput, workerWrapperEnabled,
+  MAX_AWAIT_RESUMES, RESULT_FILE_MAX_BYTES, resumeArgvFrom, resumeRequestPath, STRUCTURED_OUTPUT_SUFFIX, extractAgyResult, extractClaudeResult, launchDetached, runWorker, withStructuredOutput, workerWrapperEnabled,
 } from '../worker-wrapper.mjs';
 
 const dirs = [];
@@ -218,6 +218,32 @@ describe('runWorker: the job record and the result channels', () => {
     }
   }, 60_000);
 
+  it('a COOPERATIVE operator stop (the child handles the forwarded SIGTERM and exits 0) is still aborted with no draft, with or without earlier valid output', async () => {
+    const stopSource = new EventEmitter();
+    const dir = tmp();
+    const ready = join(dir, 'ready');
+    // the child announces itself ONLY after its handler is installed, so the stop can never beat it (a default-action TERM would be a signal death)
+    const handler = `process.on('SIGTERM',()=>process.exit(0));require('fs').writeFileSync(${JSON.stringify(ready)},'1');setInterval(()=>{},1000)`;
+    const variants = {
+      'no output': ['-e', handler],
+      'earlier valid output': ['-e', `process.stdout.write(${JSON.stringify(claudeStdout(DONE))});${handler}`],
+    };
+    let i = 0;
+    for (const [name, argv] of Object.entries(variants)) {
+      rmSync(ready, { force: true });
+      const s = spec({ argv, session: `build-403${i++}` }, dir);
+      const run = runWorker(s, { stopSource });
+      for (let n = 0; n < 400 && !existsSync(ready); n++) await new Promise((r) => setTimeout(r, 25));
+      expect(existsSync(ready), name).toBe(true);
+      stopSource.emit('SIGTERM', 'SIGTERM');
+      const { envelope, failure } = await run;
+      expect(failure, name).toBeNull(); // the child really did exit 0: this is the path `failure && ...` missed
+      expect(envelope, name).toMatchObject({ outcome: 'aborted', action: { type: 'aborted' } });
+      expect(envelope.outcome, name).not.toBe('done');
+      expect(listDraftKeys(s.draftsDir), name).toEqual([]);
+    }
+  }, 60_000);
+
   it('the stop is not swallowed: once the envelope is written it is re-raised, and a stop that lands AFTER the child ended does not relabel a crash `aborted`', async () => {
     const dir = tmp();
     const reraise = [];
@@ -304,6 +330,36 @@ describe('runWorker: the job record and the result channels', () => {
     expect(envelope).toMatchObject({ launcher: 'codex-exec', outcome: 'blocked-on-permission', action: { type: 'product-fix-draft' }, result: { blocker: { kind: 'permission-wall' } } });
     const missing = await runWorker(spec({ launcher: 'codex-exec', argv: printing('x'), resultFile: join(dir, 'nope.json'), session: 'build-4009' }, dir));
     expect(missing.envelope.parse.reason).toBe('no-structured-output');
+  });
+
+  it('codex: the -o file is read bounded and never through a symlink; an oversized, linked or non-regular file is unparseable even when its contents are a valid result', async () => {
+    const dir = tmp();
+    // the target and the padded file are each a VALID done result: only the bound / the symlink refusal can make them unparseable
+    const target = join(dir, 'elsewhere.json');
+    writeFileSync(target, JSON.stringify(DONE));
+    const resultFile = join(dir, 'last.json');
+    const cases = {
+      oversized: `require('fs').writeFileSync(${JSON.stringify(resultFile)}, ' '.repeat(${RESULT_FILE_MAX_BYTES + 10}) + ${JSON.stringify(JSON.stringify(DONE))})`,
+      symlink: `require('fs').symlinkSync(${JSON.stringify(target)}, ${JSON.stringify(resultFile)})`,
+      directory: `require('fs').mkdirSync(${JSON.stringify(resultFile)})`,
+      // a FIFO would block a plain blocking open() forever, past every timeout: it must be refused, not hang the wrapper
+      fifo: `require('child_process').execFileSync('mkfifo',[${JSON.stringify(resultFile)}])`,
+    };
+    let i = 0;
+    for (const [name, script] of Object.entries(cases)) {
+      rmSync(resultFile, { recursive: true, force: true });
+      // chatty stdout: the refusal note must survive the evidence's 500-char prose tail
+      const chatty = `process.stdout.write('z'.repeat(2000));${script}`;
+      const { envelope } = await runWorker(spec({ launcher: 'codex-exec', resultFile, argv: ['-e', chatty], session: `build-405${i++}` }, dir));
+      expect(envelope, name).toMatchObject({ parse: { ok: false, reason: 'schema-violation' }, result: { outcome: 'unparseable' } });
+      expect(envelope.result.blocker.evidence.text, name).toMatch(/result file refused/);
+      expect(envelope.outcome, name).not.toBe('done');
+      expect(JSON.stringify(envelope).length, name).toBeLessThan(RESULT_FILE_MAX_BYTES / 2);
+    }
+    // a small regular file still works (the bound is on size, not on the channel)
+    rmSync(resultFile, { recursive: true, force: true });
+    const ok = await runWorker(spec({ launcher: 'codex-exec', resultFile, argv: ['-e', `require('fs').writeFileSync(${JSON.stringify(resultFile)}, ${JSON.stringify(JSON.stringify(DONE))})`], session: 'build-4058' }, dir));
+    expect(ok.envelope).toMatchObject({ outcome: 'done', parse: { ok: true } });
   });
 
   it('agy: reads the nested key; an ABSENT key is agy-key-absent', async () => {

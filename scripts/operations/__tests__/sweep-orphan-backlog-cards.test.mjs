@@ -72,6 +72,15 @@ describe('parseOrphanCard', () => {
     expect(c.sourceRef).toBe('web-everything/web-everything#2821');
   });
 
+  it('a card titled ## Acceptance hashes exactly as its ## Done when twin (#5399 S7 shared heading rule)', () => {
+    for (const make of [APPROVAL_CARD(2900, 'deadbeef'), LOOP_CARD(2821, 'cafef00d')]) {
+      const canonical = make.replace('## Done when\n\n1. ', '## Acceptance\n\n- [A1] ');
+      expect(canonical).toContain('## Acceptance');
+      const a = parseOrphanCard('backlog/xab12cd-x.md', make), b = parseOrphanCard('backlog/xab12cd-x.md', canonical);
+      expect(b.digestHash).toBe(a.digestHash);
+    }
+  });
+
   it('two cards for the SAME PR + SAME guard hash identically; a different guard hashes differently', () => {
     const a = parseOrphanCard('backlog/xaaaaaa-x.md', APPROVAL_CARD(100, 'sha1', 'Add test A.'));
     const b = parseOrphanCard('backlog/xbbbbbb-x.md', APPROVAL_CARD(100, 'sha2', 'Add test A.'));

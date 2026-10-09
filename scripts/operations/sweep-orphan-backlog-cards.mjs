@@ -89,6 +89,7 @@ import { fileURLToPath } from 'node:url';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
 import { readField } from '../backlog/frontmatter.mjs';
+import { ACCEPTANCE_HEADING_RE, findLevel2Headings } from '../backlog/task-agreement.mjs';
 import { NON_DISPATCHABLE_KINDS } from './file-item.mjs';
 import {
   readQueueFile, writeQueueFile, addToQueue, queueHas, resolveQueuePath,
@@ -133,7 +134,7 @@ const GUARD_LINE_RE = /^\d+\.\s+\S.*$/gm;
  * `digestHash` covers the numbered GUARD LINES only — never the frontmatter (`dateOpened`, `scope`, a landed
  * card's `bornAs`), the intro paragraph (the #2749 loop shape names its `reviewed head` sha there) or the
  * idempotency key (which pins a head) — so the same guard for the same PR hashes identically whatever day or
- * head it was filed at. The `## Done when` boilerplate is cut before the guard lines are read. A card with no
+ * head it was filed at. The acceptance-section boilerplate is cut before the guard lines are read. A card with no
  * numbered guard line at all falls back to its whole body minus frontmatter.
  * @param {string} rel - `backlog/x......-*.md`, as `git status` reported it.
  * @param {string} content
@@ -146,9 +147,11 @@ export function parseOrphanCard(rel, content) {
   const kind = readField(content, 'kind') ?? '';
   const titleRef = TITLE_SOURCE_RE.exec(content)?.[1] ?? null;
   const sourceRef = IDEMPOTENCY_KEY_RE.exec(content)?.[1] ?? titleRef;
-  const body = String(content)
-    .replace(/^---\n[\s\S]*?\n---\n/, '')
-    .split(/\n##\s+Done when[\s\S]*$/)[0];
+  const unframed = String(content).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, '');
+  // Cut at the first acceptance heading outside fences and comments, in every spelling the reader accepts (any case,
+  // `Acceptance criteria`, `Done when:`), with LF or CRLF line endings.
+  const acceptanceAt = findLevel2Headings(unframed).find((h) => ACCEPTANCE_HEADING_RE.test(h.title));
+  const body = acceptanceAt ? unframed.slice(0, acceptanceAt.index) : unframed;
   const guards = body.match(GUARD_LINE_RE) ?? [];
   const digestBody = guards.length ? guards.map((g) => g.trim()).join('\n') : body.trim();
   const digestHash = createHash('sha256').update(digestBody).digest('hex');

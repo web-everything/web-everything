@@ -1336,6 +1336,47 @@ export function isTrustRefusal(error) {
 }
 
 /**
+ * x87v3ed — RESERVE THE LANE BEFORE THE BUILD SESSION LAUNCHES. The tick plans a lane NUMBER from a free-lane read,
+ * and the brief's own `acquire --lane=N` runs minutes later, so another role (review-loop, ledger, prevention-card)
+ * could lease it in between: 3 of 7 Claude builds on 2026-10-07 ended "not started: lane already leased" and the card
+ * was relaunched again and again. The daemon's launch now takes the lease HERE, under the session slug the worker
+ * will use, so the worker's own `acquire --lane=N --session=<slug> --adopt` is a self-refresh of a lease it already
+ * holds. Returns `{reserved, lane, session}`. A lane that is leased by someone else makes this THROW `notApplied`
+ * before any process exists, so the failure is recorded against the card and the card backs off.
+ *
+ * ON ONLY WHEN `WE_DISPATCH_RESERVE_LANE=1` (the build daemon sets it on its `dispatch-lane` launches); every other
+ * caller (a hand dispatch, a test) keeps today's behaviour: the worker acquires its own lane.
+ *
+ * @param {object} payload - the dispatch effect payload (`launchKind`, `lane`, `sessionSlug`, `scope`, `num`).
+ * @param {{enabled?: boolean, run?: Function, root?: string, env?: object}} [o]
+ */
+export function reserveBuildLane(payload, { enabled = process.env.WE_DISPATCH_RESERVE_LANE === '1', run = execFileSync, root = REPO_ROOT, env = process.env } = {}) {
+  const lane = Number(payload?.lane);
+  const session = String(payload?.sessionSlug ?? '').trim();
+  if (!enabled || (payload?.launchKind ?? 'build') !== 'build' || !Number.isInteger(lane) || lane < 1 || !session) return { reserved: false, lane: null, session: null };
+  const scope = Array.isArray(payload?.scope) ? payload.scope.join(',') : '';
+  const argv = ['scripts/lane-pool.mjs', 'acquire', `--lane=${lane}`, '--purpose=conveyor-delivery', `--session=${session}`,
+    ...(scope ? [`--scope=${scope}`] : []), ...(payload?.num != null ? [`--item=${payload.num}`] : [])];
+  try {
+    run('node', argv, { cwd: root, env: { ...env, LANE_SESSION: session }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 });
+  } catch (e) {
+    const why = String(e?.stderr || e?.message || e).replace(/\s+/g, ' ').slice(0, 240);
+    throw notApplied(`lane-reserve-failed: lane-${lane} could not be reserved before launch for #${payload?.num ?? '?'} — ${why}`, { sessionId: session });
+  }
+  return { reserved: true, lane, session };
+}
+
+/** x87v3ed — hand a reserved lane back when the launch itself failed (no worker will ever use it). Best-effort. */
+export function releaseReservedLane(reservation, { run = execFileSync, root = REPO_ROOT, env = process.env } = {}) {
+  if (!reservation?.reserved) return false;
+  try {
+    run('node', ['scripts/lane-pool.mjs', 'release', `--lane=${reservation.lane}`, `--session=${reservation.session}`],
+      { cwd: root, env, encoding: 'utf8', stdio: 'ignore', timeout: 60_000 });
+    return true;
+  } catch { return false; }
+}
+
+/**
  * THE SINK — the one thing in this repo that starts a delivery agent.
  *
  * THE HANDLE IS THE ONE THE CLI PRINTS BACK — NOT A MINTED ONE. CORRECTED 2026-09-11 (#3331); this paragraph
@@ -1437,6 +1478,9 @@ export function createDispatchSinks({
   }),
   mintSessionId = () => randomUUID(),
   now = () => new Date(),
+  // x87v3ed — see {@link reserveBuildLane}. Injectable so a test can assert the order without a real lane pool.
+  reserveLane = (payload) => reserveBuildLane(payload, { root }),
+  releaseLane = (reservation) => releaseReservedLane(reservation, { root }),
   extraArgs = [],
   // #x8mpubm — resolved ONCE per dispatch, here at the sink (the one place real fs/env effects belong in this
   // file), never inside `defaultClaudeProvider`/`buildAgentArgv` themselves, both of which stay side-effect-free
@@ -1486,6 +1530,9 @@ export function createDispatchSinks({
       if (payload?.occupancyWarning) {
         console.error(`dispatch-lane: ${payload.occupancyWarning}`);
       }
+      // x87v3ed — take the lane lease BEFORE anything is spawned; a lane that went to another role in the meantime
+      // throws `notApplied` here, so no session is started just to say "lane already leased".
+      const reservation = reserveLane(payload) ?? { reserved: false };
       const sessionId = String(mintSessionId());
       // #4174 — THE FIX: the session's cwd is a scratch directory OUTSIDE this checkout, never `root` itself.
       // See `dispatchSessionCwd`'s own header for why this location and not, say, an `os.tmpdir()` mkdtemp.
@@ -1564,6 +1611,9 @@ export function createDispatchSinks({
           worktreeSettings,
         });
       } catch (e) {
+        // x87v3ed — a launch that definitely started nothing hands its reserved lane back; an INDETERMINATE one
+        // (below) keeps it, because a session may be running in it.
+        if (e && (e.notApplied || isPreSpawnRefusal(e) || isTrustRefusal(e))) releaseLane(reservation);
         // A validation failure `buildAgentArgv` already proved happened before any process existed (e.g. an
         // empty prompt) carries `.notApplied` — rethrow it as-is rather than reclassifying it as indeterminate.
         if (e && e.notApplied) throw e;
