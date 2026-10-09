@@ -16,7 +16,7 @@ import {
   resolveBackgroundBuild, decideBuilderStart, tickStarvedSmell, builderIsAlive, builderRunFinished,
   spawnBuilder, readBuilderState, writeBuilderState,
 } from '../daemon-background-build.mjs';
-import { summarizeRebuildResult, parseBuilderArgs, writeBuilderStateIfOwner } from '../daemon-rebuild-builder.mjs';
+import { summarizeRebuildResult, parseBuilderArgs, writeBuilderStateIfOwner, deadlineRecord } from '../daemon-rebuild-builder.mjs';
 import { withSelfSync } from '../daemon-self-sync.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -425,6 +425,20 @@ describe('self-review round — stale swapPending, record ownership, future-date
     expect(writeBuilderStateIfOwner('/c', { x: 1 }, { pid: 10, read: () => ({ pid: 10 }), write })).toBe(true);
     expect(writeBuilderStateIfOwner('/c', { x: 2 }, { pid: 10, read: () => null, write })).toBe(true);
     expect(write).toHaveBeenCalledTimes(2);
+  });
+  // Review round 2: the deadline can fire after the builder re-cloned and before its final write.
+  it('the deadline record keeps the recloned marker set so far (live local or carried in), never drops it', () => {
+    const base = { pid: 10, host: 'h', startedAt: 's', finishedAt: null, result: null };
+    expect(deadlineRecord(base, { recloned: true }).recloned).toBe(true);
+    expect(deadlineRecord({ ...base, recloned: true }, { recloned: false }).recloned).toBe(true);
+    expect(deadlineRecord(base, { recloned: false }).recloned).toBe(false);
+    const r = deadlineRecord(base, { recloned: true, nowMs: Date.UTC(2026, 9, 9) });
+    expect(r.finishedAt).toBe('2026-10-09T00:00:00.000Z');
+    expect(r.result.reason).toBe('builder-deadline');
+    expect(builderRunFinished(r)).toBe(false); // a deadline is not a finished run: the clone stays fail-closed
+  });
+  it('--max-age-ms is clamped to the largest setTimeout delay (above it Node fires after ~1 ms)', () => {
+    expect(parseBuilderArgs(['--root=/c', `--max-age-ms=${2 ** 40}`]).maxAgeMs).toBe(2 ** 31 - 1);
   });
   it('spawnBuilder hands the builder its own deadline (the daemon\'s trust bound)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'bgb-'));

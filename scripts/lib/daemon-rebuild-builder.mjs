@@ -30,9 +30,23 @@ export function parseBuilderArgs(argv) {
     if (a.startsWith('--root=')) out.root = a.slice('--root='.length);
     else if (a.startsWith('--entry=')) out.entries.push(a.slice('--entry='.length));
     else if (a === '--main-only') out.mainOnly = true;
-    else if (a.startsWith('--max-age-ms=')) { const n = Number(a.slice('--max-age-ms='.length)); if (Number.isSafeInteger(n) && n > 0) out.maxAgeMs = n; }
+    // Clamped to the largest delay `setTimeout` honours: above 2^31-1 ms Node fires it after ~1 ms, which would make
+    // every builder record `builder-deadline` and exit at once.
+    else if (a.startsWith('--max-age-ms=')) { const n = Number(a.slice('--max-age-ms='.length)); if (Number.isSafeInteger(n) && n > 0) out.maxAgeMs = Math.min(n, MAX_TIMER_MS); }
   }
   return out;
+}
+
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/**
+ * The record the deadline timer writes. It must keep the fail-closed `recloned` marker the run has set so far
+ * (`recloned` is the live local, `base.recloned` the one carried in): the deadline can fire after the re-clone and
+ * before the final write, and a record that dropped the flag would let a restarted daemon run children on the
+ * never-smoked re-cloned checkout.
+ */
+export function deadlineRecord(base, { recloned = false, nowMs = Date.now() } = {}) {
+  return { ...base, recloned: !!(recloned || base.recloned), finishedAt: new Date(nowMs).toISOString(), result: { moved: false, adopted: false, reason: 'builder-deadline' } };
 }
 
 /**
@@ -61,9 +75,10 @@ async function main() {
   try { writeBuilderState(root, base); } catch { /* the spawner already wrote a record */ }
   // Deadline = the age after which the daemon stops trusting this record. Past it a successor may own the record, so
   // this process must not keep running (and writing) behind its back: record the timeout (if still ours) and exit.
+  let recloned = false; // set below the moment a re-clone happens; the deadline record reads it live
   if (maxAgeMs > 0) {
     setTimeout(() => {
-      try { writeBuilderStateIfOwner(root, { ...base, recloned: base.recloned || false, finishedAt: new Date().toISOString(), result: { moved: false, adopted: false, reason: 'builder-deadline' } }); } catch { /* best-effort */ }
+      try { writeBuilderStateIfOwner(root, deadlineRecord(base, { recloned })); } catch { /* best-effort */ }
       console.error(`daemon-rebuild-builder: exceeded its ${Math.round(maxAgeMs / 60_000)} min deadline — exiting (x44lnnt)`);
       process.exit(1);
     }, maxAgeMs).unref();
@@ -72,7 +87,6 @@ async function main() {
   let result;
   // A re-clone replaces the checkout with plain origin/main (never smoked): flag it so the daemon runs no children
   // on it, and rebuild once more right away (the inline path's "the next tick rebuilds from the fresh clone").
-  let recloned = false;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       result = summarizeRebuildResult(await rebuildClone({ root, entries: entries.length ? entries : undefined, mainOnly }));
