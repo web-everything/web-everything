@@ -29,7 +29,7 @@ try {
 process.stdout.write(JSON.stringify(out));
 `;
 const git = (cwd, ...args) => execFileSync('git', args, {
-  cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
+  cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000, maxBuffer: 16 * 1024 * 1024,
 });
 
 export default {
@@ -37,7 +37,7 @@ export default {
   title: 'the fix pass refuses every repo while a just-adopted daemon clone lags main (live 2026-10-09 19:18:51Z, PR #4624)',
   card: 'live incident 2026-10-09: PR #4624 block-ruled fix delayed a pass',
   fixedBy: {
-    sha: 'working-tree', where: 'fix dispatch fresh-adoption grace',
+    sha: '439e628a9', where: 'lane/fix-pass-stale-isolation-and-pass-latency',
     paths: [
       'scripts/conveyor/reconcile-fix-dispatch.mjs',
       'scripts/lib/daemon-last-good.mjs',
@@ -90,7 +90,7 @@ export default {
       const childFile = join(dir, 'child.mjs');
       writeFileSync(childFile, CHILD);
       const out = JSON.parse(execFileSync(process.execPath, [childFile], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000,
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env, timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
       }));
       log?.(`reconciled: ${out.reconciled}; threw: ${out.threw}`);
       if (out.threw?.includes('STALE code from this checkout')) {
