@@ -3,10 +3,11 @@ bornAs: xqw7hb2
 kind: story
 size: 5
 parent: "4075"
-status: open
+status: resolved
 blockedBy: ["4125"]
 scope: ["we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-watch-job.mjs", "we:scripts/conveyor/__tests__/health-watch*.test.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
 dateOpened: "2026-09-24"
+dateResolved: "2026-10-09"
 preparedDate: "2026-10-08"
 preparedAgainstSha: "47d73d01f584ded51a3a021b444c2b7f25bd7349"
 tags: []
@@ -35,4 +36,6 @@ Prepared at size 8 for the whole adopter. It splits cleanly under the split-safe
 
 - **Built (2026-10-09).** Kinds, cap and switch in the manifest; the job module; `collectGhProbes` and the job branch in the tick. Real bug caught by the child test: a snapshot under a symlinked directory (macOS `/var` → `/private/var`) is spawned by its link path while `import.meta.url` is the resolved one, so the child's "am I the entry" check silently did nothing. It now compares real paths.
 - **Tests.** we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs (tick side: one job per due cadence and no duplicate in flight, result consumed once, failed job is a probe error and the cadence stays due, pruning, cross-process sleep rule, switch override, the tick never runs the group inline in job mode, inline when the switch is off); we:scripts/conveyor/__tests__/health-watch-job.test.mjs (a real detached child from a snapshot: heartbeat advances while its worker is blocked, result sidecar, consumed once; idempotent step; worker timeout); we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs (kind shape, entry exists, cap, switch). Red on main: both new test files fail to import the job module and the manifest test finds no kinds. All 271 tests across the eight health/manifest files pass after.
+- **Converge (2 rounds, elevated).** The fixes that came out of it: job mode only when the switch is on, never on a dry run or on a fixture tick without its own store; a rollback keeps reconciling and drains the records; stale results are never applied; a graceful stop kills the job's process group, with a test that goes red when the handler is removed; the proof probe blocks on a real subprocess.
+- **Rollout.** The manifest default stays `false` in this PR. The live health daemon is switched on through its own config file (`jobs.ghProbes: true`) for the live proof, which is recorded on the PR. Flipping the manifest default is a one-line follow-up once that proof is reviewed.
 - **Not in this slice** (see #xz5m67t): diagnoses, investigations and the other command-backed reads still run inline; the daemon-job-health smell does not exist yet; we:scripts/conveyor/health-watch-core.mjs is unchanged (the gh probes were already absent on off-cadence ticks, so no new missing-sample semantics were introduced).
