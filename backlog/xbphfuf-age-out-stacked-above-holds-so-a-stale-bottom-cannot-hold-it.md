@@ -4,7 +4,7 @@ size: 2
 status: active
 scaffoldedBy: "fix-4655"
 dateScaffolded: "2026-10-09"
-scope: ["["we:scripts/conveyor/pr-stack.mjs"", ""we:scripts/conveyor/__tests__/pr-stack.test.mjs"]"]
+scope: ["we:scripts/conveyor/pr-stack.mjs", "we:scripts/conveyor/__tests__/pr-stack.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---

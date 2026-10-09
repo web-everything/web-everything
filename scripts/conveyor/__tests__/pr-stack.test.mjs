@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
@@ -638,7 +638,7 @@ describe('an exhausted git budget never produces a wrong or lost stack', () => {
     const root = mkdtempSync(join(tmpdir(), 'pr-stack-atomic-'));
     try {
       writeRemembered(root, [{ top: 2, bottom: 1, bottomRef: 'lane/p1', bottomHead: sha('a'), containedHead: sha('a'), restackedFor: null, restackRounds: 0, restackTopHead: null }]);
-      expect(readdirSync(join(root, '.conveyor'))).toEqual(['pr-stacks.json']);
+      expect(existsSync(join(root, '.conveyor', `pr-stacks.json.${process.pid}.tmp`))).toBe(false);
       expect(readRemembered(root)).toHaveLength(1);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
