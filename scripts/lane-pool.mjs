@@ -174,6 +174,9 @@ import {
   resolveChildTimeoutMs, NPM_INSTALL_TIMEOUT_MS, NETWORK_GIT_TIMEOUT_MS as SHARED_NETWORK_GIT_TIMEOUT_MS,
 } from './lib/bounded-child.mjs';
 import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/lane-verify.mjs';
+// xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
+import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
+import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 
 // #2560 — `--scope=a,b,c` → a normalized, repo-qualified array (empty when the flag is absent/blank).
@@ -1048,12 +1051,19 @@ function otherRemoteHeadsPatchEquivalentBatched(dir, head, remoteShas, branch) {
   if (ourPatchIds.size === 0) return false;
   // `batchPatchIds` maps commitSha → patchId — the match test is on the PATCH ID (the value), never the
   // commit sha (the key). Compare the VALUE sets, not `Map#has` against a key.
-  const ourPatchIdValues = new Set(ourPatchIds.values());
-  const theirPatchIds = batchPatchIds(dir, others);
-  for (const id of theirPatchIds.values()) {
-    if (ourPatchIdValues.has(id)) return true;
+  const theirPatchIds = new Set(batchPatchIds(dir, others).values());
+  // xbdixjc — 'every' (the lane-hold setting `aheadEquivalence`): each ahead commit that is on NO remote must
+  // itself match. 'any' (the old rule) let one already-pushed PR commit vouch for a newer, unpushed fix commit
+  // on top of it — exactly how acquire reset lane-5 over verified 4b254297 on 2026-10-08.
+  if (resolveLaneHoldSettings({ env: process.env }).aheadEquivalence === 'any') {
+    for (const id of ourPatchIds.values()) if (theirPatchIds.has(id)) return true;
+    return false;
   }
-  return false;
+  const notOnRemote = tryGit(['rev-list', '--ignore-missing', 'HEAD', '--not', ...remoteShas], dir);
+  if (notOnRemote === null) return false;
+  const mustMatch = notOnRemote.split('\n').filter(Boolean);
+  if (!mustMatch.length) return true;
+  return mustMatch.every((sha) => ourPatchIds.has(sha) && theirPatchIds.has(ourPatchIds.get(sha)));
 }
 
 // A large-but-bounded buffer: this pipes a POTENTIALLY large batch of commit patches through in one call
@@ -1186,6 +1196,8 @@ function refreshLane(repo, n, { force = false } = {}) {
     log(`  lane-${n}: SKIPPED (${describeLease(lease)}) — ${escape}`);
     return { skipped: true, leased: true, dirty: false, uncommitted: 0, ahead: 0 };
   }
+  // xbdixjc — not even `refresh --force` resets a lane the hold rule protects (its own setting is the escape).
+  if (laneHoldRefuses(dir, 'reset')) return { skipped: true, held: true, dirty: false, uncommitted: 0, ahead: 0 };
   if (!force) {
     // #2267 — dirty/ahead is a property of the TREE (possibly abandoned residue from a dead session), which
     // `--force` exists to recycle. Skippable by `--force`, unlike the lease check above.
@@ -1576,6 +1588,8 @@ function tryClaimLane(dir, session, nowMs, ttlMs) {
     return holder;
   }
   if (isLeaseStale(existing, nowMs, ttlMs)) {
+    // xbdixjc — a stale lease over a lane the hold rule protects is not taken over (its fixer will resume there).
+    if (laneHoldRefuses(dir, 'take-over')) return null;
     // #x96v5hl — was `rmSync(file, {force:true})` then a `wx` create: unconditional unlink-then-create, which let
     // TWO concurrent stale-reclaimers both "win". Both see the same stale `existing`, both `rmSync` (always
     // succeeds, no matter what's currently there), then both `wx`-create — but `rmSync` doesn't check WHAT it is
@@ -1745,6 +1759,7 @@ function reapDeadLeasesInPool(repo, nowMs, ttlMs) {
       // check-then-act TOCTOU `cmdTrim` already closed for its own reap path). `takeMarkerIf` (below, shared
       // with `cmdTrim`) only lets this proceed if the marker still on disk, right now, is BY VALUE the exact
       // lease `deadLeasePlan` judged — anything else (including "already gone") is left untouched.
+      if (laneHoldRefuses(c.dir, 'release')) continue; // xbdixjc
       reapTestBarrier();
       if (!takeMarkerIf(c.dir, (moved) => sameLease(moved, c.lease), c.lane)) continue;
       // #3383 — record the reap in the lane-history ledger (best-effort, after the marker is confirmed ours to drop).
@@ -1775,6 +1790,25 @@ function clearForeignVerifyMarker(dir) {
     const head = git(['rev-parse', 'HEAD'], dir);
     if (!keepMarkerAfterReset(readVerifyMarker(gitDir), head)) rmSync(join(gitDir, VERIFY_FILENAME), { force: true });
   } catch { /* advisory */ }
+}
+
+/**
+ * xbdixjc — ask the lane hold rule whether `action` may run on this lane. Returns null when allowed, else the
+ * refusing verdict (already logged and journalled as `hold-refused`, once per unchanged state). A lane whose fixer
+ * is parked awaiting verify, whose verify is running, or that holds a verified unpushed commit is never released,
+ * reset, removed or reclaimed by anyone but its holder — not by the reaper, not by acquire, trim or reclaim.
+ */
+function laneHoldRefuses(dir, action, { byHolder = false, unpushed } = {}) {
+  const verdict = checkLaneHold(dir, { action, byHolder, unpushed });
+  if (verdict.allowed) return null;
+  const n = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
+  log(`  lane-${n}: ${action} REFUSED — ${verdict.reason}`);
+  if (action === 'release') log(`    (only the holder may release this lane: pass --session=<the lease's session or its minted holder slug>)`);
+  journalLaneEvent(dir, {
+    action: 'hold-refused', reason: `${action} refused — ${verdict.reason}`, loud: true,
+    ...laneHoldJournalFields(verdict),
+  }, { unlessRepeat: true });
+  return verdict;
 }
 
 /**
@@ -1897,6 +1931,10 @@ function provisionClaimedLane(repo, chosen, targetWasReserved) {
     // unconditionally reclaim a lane regardless of stray edits left by a prior crashed/interrupted session, so
     // `--force` restores that same never-refuses guarantee `reset --hard` always gave it.
     const before = laneStateSnapshot(dir, `origin/${repo.branch}`);
+    // xbdixjc — the hold rule, on the fresh pre-reset snapshot. THROWS like the containment re-check above, so
+    // auto-pick restores the claim and moves to the next lane; `--force` does not override it.
+    const held = laneHoldRefuses(dir, 'reset', { unpushed: before.unpushed ?? undefined });
+    if (held) throw new Error(`lane-${chosen} is held — ${held.reason}; not reset (pick another lane)`);
     acquireResetSnapshots.set(chosen, before);
     git(['checkout', '-B', repo.branch, baseRef, '--quiet', '--force'], dir);
     git(['clean', '-fd', '--quiet'], dir);
@@ -2673,6 +2711,14 @@ function cmdRelease(repo) {
     // litter, the other 2 clean-but-ahead — the whole pool read 0 of 48 acquirable at once). Any
     // non-allowlisted dirty state (real uncommitted work) is left completely untouched by this call.
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
+    // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
+    // drop a lane whose fixer is parked awaiting verify or that holds verifying / verified-unpushed work.
+    // "The holder" is a STRICT proof: the exact lease `session` or the minted holder slug. `owned` also counts the
+    // `ownerSession` fallback, which only says "same Claude session" — an orchestrator and the fixer subagent it
+    // spawned share that id, so it cannot tell the holder from a sibling (or from a reaper launched by the same
+    // session). Such a caller may still release an unparked lane; it may not drop a parked one.
+    const holderProven = leaseOwnedBy(lease, session) || (!!laneHolderSlug(lease) && !!session && laneHolderSlug(lease) === session);
+    if (laneHoldRefuses(dir, 'release', { byHolder: holderProven, unpushed: beforeLitter.unpushed ?? undefined })) continue;
     const litter = cleanLaneLitter(dir);
     if (litter?.removed?.length) {
       journalLaneEvent(dir, {
@@ -2693,6 +2739,14 @@ function cmdRelease(repo) {
       continue;
     }
     if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
+    // The holder is done with this lane, so the parked-fixer records IT wrote are dead: left behind they refuse every
+    // acquire / trim / reclaim of the lane for the whole hold window. Cleared only after the lease is confirmed
+    // dropped (above), only for the holder's own release, only for records that holder wrote, and never while the
+    // lane still holds unpushed work (the await-verify pass pushes the verified sha from the record).
+    if (holderProven && beforeLitter.unpushed === false) {
+      const clearedAwaits = clearLaneAwaitRecords(dir, { holders: [lease.session, laneHolderSlug(lease), lease.workerSession, session] });
+      if (clearedAwaits.length) log(`  lane-${n}: cleared ${clearedAwaits.length} await-verify record(s) of the released holder`);
+    }
     // #3383 — record the release in the lane-history ledger (best-effort; the marker is confirmed ours to drop).
     appendLaneHistory(dir, laneHistoryEntry({
       event: 'release', session, ownerSession: lease.ownerSession || null, workerSession: lease.workerSession || null,
@@ -3503,6 +3557,8 @@ function laneRemovalEligibility(repo, n, { remoteShasBox, nowMs, ttlMs, deadReas
     if (remoteShasBox.value === null) remoteShasBox.value = liveRemoteShas(dir);
     return remoteShasBox.value;
   };
+  const held = laneHoldRefuses(dir, 'remove'); // xbdixjc
+  if (held) return { eligible: false, kind: 'work', reason: held.reason };
   const { dirty, ahead } = effectiveDirtyOrAhead(dir, repo.branch, getRemoteShas);
   if (dirty) return { eligible: false, kind: 'work', reason: 'uncommitted changes beyond the scratch allowlist' };
   if (ahead > 0) return { eligible: false, kind: 'work', reason: `${ahead} commit(s) ahead of origin/${repo.branch}, not provably pushed` };
@@ -3853,6 +3909,12 @@ function cmdReclaim(repo) {
     fail(`lane-${n} is held (${describeLease(lease)}) — reclaim only ever touches an unleased (or provably-stale-leased) lane; a live lease means someone is using it right now.`);
   }
 
+  // xbdixjc — the hold rule runs before salvage, preservation proofs and `--override` alike.
+  const held = laneHoldRefuses(dir, 'reclaim');
+  if (held) {
+    if (flags.json) process.stdout.write(`${JSON.stringify({ lane: n, path: dir, dryRun, reclaimed: false, kept: true, keptReason: held.reason, hold: held.hold }, null, 2)}\n`);
+    return;
+  }
   const proof = laneReclaimPreservationProof(dir, repo.branch);
   // SNAPSHOT-THEN-RECLAIM (`--salvage`): content that is NOT provably on a remote ref is saved durably first
   // (bundle + patch + refs/salvage/*, indexed) and only then reset — see `we:scripts/lib/lane-salvage.mjs`.

@@ -155,6 +155,8 @@ import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead } from '../lib/advi
 // check failed only because `origin/main`'s own CI was red at that moment must never be handed to `ci-heal`,
 // which would "repair" code that was never broken. `isPrCiFailureOwedRerun` is the PURE leaf that decides this
 // (see its own docblock for the full incident and the two facts it needs); this file only calls it.
+// Card xu1nixv — the red-main fix PR's fast lane (pure rank over the published priority record).
+import { mainRedPriorityRank, mainFixHeldFor } from './main-ci-red-core.mjs';
 import {
   isPrCiFailureOwedRerun, classifyMainDefect, isMainFixedSignatureOwed, isMainGreenFixOwed, countRebaseOntoMainComments, DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   // landing-freeze fix (2026-09-27) — used only to word the `owed-ci-rerun` refusal's `why` accurately when
@@ -276,6 +278,9 @@ export const DISPATCH_KINDS = Object.freeze(['fix', 'review', 'ci-heal', 'ci-tim
  *                          apparent conflict by reverting the carrier PR's later work. This PR should be closed
  *                          and its backlog card resolved, never dispatched; see
  *                          `we:scripts/conveyor/already-landed-watch.mjs` for the pass that acts on it.
+ *   `main-fix-combining` / `main-fix-owed-elsewhere` — a red-main fix PR whose CI failure belongs to another fix
+ *                          PR's cause (xu1nixv, `main-ci-red-core.mjs#mainFixHeldFor`): no ci-heal, no rerun, it waits.
+ *   `scope-bloat` / `ruling-dispute` — see the comments on the list below.
  */
 export const REFUSAL_KINDS = Object.freeze([
   'review-ci', 'review-referrals-pending',
@@ -300,6 +305,15 @@ export const REFUSAL_KINDS = Object.freeze([
   // because another author was pushing; NOT terminal — re-arms on the next head or after
   // {@link CONCURRENT_AUTHOR_QUIET_MS} of quiet.
   'fix-claimed', 'concurrent-author-paused',
+  // xu1nixv (review round 1 on PR #4527, F1) — a red-main fix PR whose CI failure is owed elsewhere: `main-fix-combining`
+  // (the fix PRs deadlock on each other's cause and ONE combine session folds them) and `main-fix-owed-elsewhere`
+  // (it fails only on a main cause another fix PR fixes). They come from `main-ci-red-core.mjs#mainFixHeldFor` as
+  // `refuse(fixHold.kind, …)`; unlisted, `formatReport` never printed them and land-advance's `reconcileHolds` dropped them.
+  'main-fix-combining', 'main-fix-owed-elsewhere',
+  // Same class, found by the source scan in `reconcile-core.test.mjs` (literal `refuse('…')` calls that were never listed):
+  // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
+  // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
+  'scope-bloat', 'ruling-dispute',
 ]);
 
 /**
@@ -1568,15 +1582,24 @@ export function planReconcile({
   // #3902 — the review-label healer policy, see the `restore-review-label` STUCK variant below. A caller may pass
   // it; omitted, it is the one env read in this file (`WE_REVIEW_LABEL_HEAL`, via {@link resolveReviewLabelHealMode}).
   reviewLabelHeal = resolveReviewLabelHealMode(globalThis.process?.env ?? {}),
+  // Card xu1nixv (incident 2026-10-08) — the published red-main priority record (`we:scripts/lib/main-red-priority.mjs`,
+  // `{repo, pr, expiresAt}`), pure data in. While main is red, the PR that owns the fix is planned FIRST (so it heads
+  // every queue that consumes this plan in order), is promoted from draft at once, and is never told to wait for main
+  // (`owed-ci-rerun`) — it is the one PR main is waiting for. `null` (default) = before this card, byte-identical.
+  mainRedPriority = null,
 } = {}) {
+  const isMainFixPriority = (n) => mainRedPriorityRank(n, mainRedPriority, { now, repo }) === 0;
   const dispatch = [];
   const refusals = [];
   const notes = [];
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
 
-  for (const pr of Array.isArray(prs) ? prs : []) {
+  // Stable: only the red-main fix PR moves to the front; every other PR keeps its order.
+  const orderedPrs = (Array.isArray(prs) ? [...prs] : []).sort((a, b) => (isMainFixPriority(a?.number) ? 0 : 1) - (isMainFixPriority(b?.number) ? 0 : 1));
+  for (const pr of orderedPrs) {
     const prNumber = Number(pr?.number);
     if (!Number.isInteger(prNumber) || prNumber <= 0) continue; // not a PR record; nothing to key on.
+    const mainFixPriority = isMainFixPriority(prNumber);
 
     if (missingReviewLabel(pr) === true) notes.push({ kind: 'review-label-missing', prNumber, repo, text: 'open agent PR has no review:* label' });
 
@@ -1894,14 +1917,17 @@ export function planReconcile({
     // not exempt from CI healing — only from review), and a still-running draft owes nothing at all yet — both
     // of those are the existing branches below, unmodified. Only {@link dispatchReviewRow}'s own gate (not this
     // one) keeps a review from firing for either of those two cases.
-    if (pr?.isDraft && withPhase.check === 'green') {
+    // xu1nixv — the red-main fix PR is promoted at once (it must not sit as a draft while main is red).
+    if (pr?.isDraft && (withPhase.check === 'green' || mainFixPriority)) {
       if (labelNames(pr.labels).includes('review-status:draft-withdrawn')) {
         refuse('draft', { ...withPhase, why: 'draft PR is withdrawn — explicit release is required before promotion' });
         continue;
       }
       dispatch.push({
         ...base, ...withPhase, kind: 'promote-draft',
-        why: 'draft PR — every required check is green; promote it to ready for review (draft-first PRs, '
+        why: withPhase.check !== 'green' && mainFixPriority
+          ? 'draft PR that owns the fix for red main — promoted at once: every other PR is waiting for it (card xu1nixv)'
+          : 'draft PR — every required check is green; promote it to ready for review (draft-first PRs, '
           + 'operator-approved 2026-09-27) — nothing else is owed this PR until that happens',
       });
       continue;
@@ -2083,7 +2109,12 @@ export function planReconcile({
       // a PR already sitting `cap-exhausted` from burning its heal count on main's own now-fixed regression is
       // NOT re-capped or specially reset: the cap is simply never consulted on this path, so the very next tick
       // this fires it reads `owed-ci-rerun` instead, with no separate "re-arm" bookkeeping needed.
-      if (!mergeDirty && !rebaseCapExhausted && isPrCiFailureOwedRerun({
+      // xu1nixv — never tell the red-main fix PR to wait for main to recover: main is waiting for IT. EXCEPT
+      // (live 2026-10-08 ~00:10Z, #4522/#4532) a fix PR whose every failing job is a main cause ANOTHER fix PR fixes:
+      // that failure is not its own (no ci-heal); it waits for the other fix, or — when the fix PRs wait on each
+      // other — for the ONE combine session the health watch sends (`main-ci-red-core.mjs#planCombinedFix`).
+      const fixHold = mainFixPriority ? mainFixHeldFor(prNumber, mainRedPriority) : null;
+      if (fixHold || (!mainFixPriority && !mergeDirty && !rebaseCapExhausted && isPrCiFailureOwedRerun({
         comments: pr?.comments, headSha: pr?.headRefOid,
         requiredCheckCompletedAt: base.requiredCheckCompletedAt,
         aheadBy: base.aheadByOnMain,
@@ -2094,7 +2125,19 @@ export function planReconcile({
         mergeBaseCheckRuns: base.mergeBaseCheckRuns,
         mergeBaseRunConclusion: base.mergeBaseRunConclusion,
         mainFixedSignature: base.mainFixedSignature,
-      })) {
+      }))) {
+        if (fixHold) {
+          refuse(fixHold.kind, { ...withPhase, why: fixHold.why });
+          if (withPhase.labels.includes('review:pending')) {
+            const foldRefusal = foldReviewRefusalInto(refusals[refusals.length - 1], withPhase, 'owedCiRerun');
+            dispatchReviewRow({
+              pr, requiredChecks, withPhase, base, attempts: roundAttempts(), roundCap: effectiveRoundCap, now,
+              refuse: foldRefusal, refuseCapExhausted: capExhaustedVia(foldRefusal), dispatch,
+              extra: { owedCiRerun: true },
+            });
+          }
+          continue;
+        }
         // ONE shared classifier — `via` names why (same call the ci-red-recovery-watch makes).
         const viaClass = classifyMainDefect({
           comments: pr?.comments, headSha: pr?.headRefOid, requiredCheckCompletedAt: base.requiredCheckCompletedAt,

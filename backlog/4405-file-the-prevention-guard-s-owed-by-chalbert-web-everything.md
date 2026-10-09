@@ -7,7 +7,7 @@ status: open
 scope: ["we:scripts/lane-pool.mjs", "we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs", "we:scripts/conveyor/lease-reaper.mjs", "we:scripts/conveyor/__tests__/lease-reaper.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs", "we:scripts/conveyor/soak/breaks/fixtures/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.soak.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/lease-reaper-graphql-unattributed.test.mjs", "we:docs/agent/testing.md"]
 dateOpened: "2026-09-29"
 preparedDate: "2026-10-09"
-preparedAgainstSha: "1e6f1bfb6e735f41fe303285bc76b981a8d8860b"
+preparedAgainstSha: "669efb6dd4272c14806b7ee2ba58905497f47f52"
 tags: []
 ---
 
@@ -27,6 +27,7 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - Remaining gaps: we:scripts/conveyor/__tests__/lease-reaper.test.mjs:342 tests only the mapper with a hand-built partial REST object; the fetch test at line 1029 supplies GraphQL data to REST. In we:scripts/conveyor/soak/breaks/lease-reaper-graphql-unattributed.mjs:55–70 both fake commands return the same GraphQL body. Its child we:scripts/conveyor/soak/breaks/fixtures/lease-reaper-graphql-unattributed.mjs reports item count, not state. The acquire fake at we:scripts/__tests__/lane-pool-reap-on-acquire.test.mjs:49 returns the same body for every argv and records none.
 - Corrected scope: preserve production semantics, strengthen both consumer tests and the soak, and document the endpoint-fixture review convention in we:docs/agent/testing.md. Production files remain scope anchors for their matching regression tests and any misleading comments; no runtime API change is required. Size 3 remains a bounded guard-and-fixture change. No implementation, stamp, or independent-review verdict is claimed here; the runner owns checks and parked review.
 - Re-prepare (2026-10-09, main moved since a001796): premise re-verified on current main; REST mapper and reducer behave as described and no guard is delivered yet. Citations refreshed: mapper we:scripts/conveyor/lease-reaper.mjs:745, reduceDetails we:scripts/conveyor/lease-reaper.mjs:766, fetch we:scripts/conveyor/lease-reaper.mjs:1247, REST call we:scripts/lane-pool.mjs:1662, mapper test we:scripts/conveyor/__tests__/lease-reaper.test.mjs:342. Scope and size unchanged.
+- Re-prepare (2026-10-09, after #4581): production files shifted lines only (unrelated hardening edits); behavior unchanged, no guard delivered. Current citations: mapper we:scripts/conveyor/lease-reaper.mjs:759, reduceDetails we:scripts/conveyor/lease-reaper.mjs:780, fetch we:scripts/conveyor/lease-reaper.mjs:1288, REST call we:scripts/lane-pool.mjs:1676, mapper test we:scripts/conveyor/__tests__/lease-reaper.test.mjs:342 (unchanged). Scope and size unchanged.
 
 ## Design
 

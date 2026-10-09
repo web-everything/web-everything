@@ -79,6 +79,11 @@
  */
 
 import { readGit } from '../lib/proc-read.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+
+// A lane's `.git/config` is agent-writable, so every git this file runs INSIDE a lane runs with the lane-config pins
+// (`core.fsmonitor` would otherwise run on each `git status`). Read per call: the base env can change under test.
+const laneGitEnv = () => laneGitHardeningEnv(process.env);
 import { parseSessionSlug } from './session-slug.mjs';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -112,6 +117,9 @@ import { CONSTELLATION_REPOS, repoKeyForDir } from '../lib/constellation-repos.m
 import { isCherryOutputAllPatchEquivalent } from '../lib/git-patch-equivalence.mjs';
 import { LANE_JOURNAL_ACTOR_ENV } from '../lib/lane-history.mjs';
 import { timestampLines } from '../lib/log-timestamp.mjs';
+// xbdixjc — the lane hold rule: a lane whose fixer is parked awaiting verify, whose verify is running, or that holds
+// a verified unpushed commit is never reaped (the pure rule is `laneHoldVerdict`, we:scripts/lib/lane-lease.mjs).
+import { checkLaneHold } from '../lib/lane-hold-io.mjs';
 // #3383 (this incident, 2026-09-14) — REUSE, never reimplement, the real PID-liveness probe `driver-watchdog.mjs`
 // just built for the IDENTICAL gap in a different place: a `claude agents --json` row can be a PHANTOM — still
 // LISTED (present, in some non-terminal state like `working`/`blocked`), with NO backing OS process at all (that
@@ -328,6 +336,7 @@ function defaultGitSymbolicRef(dir) {
   try {
     return readGit(['symbolic-ref', '--short', 'HEAD'], {
       cwd: dir,
+      env: laneGitEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: resolveChildTimeoutMs(),
@@ -365,6 +374,7 @@ function defaultGitStatusPorcelain(dir) {
   try {
     return readGit(['status', '--porcelain'], {
       cwd: dir,
+      env: laneGitEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: resolveChildTimeoutMs(),
@@ -447,6 +457,7 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
     // API response, or any future caller feeding this untrusted input) can never be misread as a flag.
     exec('git', ['merge-base', '--is-ancestor', '--', 'HEAD', sha], {
       cwd: dir,
+      env: laneGitEnv(),
       stdio: ['ignore', 'ignore', 'ignore'],
       timeout: resolveChildTimeoutMs(),
       killSignal: 'SIGKILL',
@@ -463,6 +474,7 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
     try {
       const out = exec('git', ['cherry', '--', sha, 'HEAD'], {
         cwd: dir,
+        env: laneGitEnv(),
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: resolveChildTimeoutMs(),
@@ -489,6 +501,7 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
     // aggregate tier below must never accept a lane whose history carries an unaccounted-for merge commit.
     const gitRead = (args) => exec('git', args, {
       cwd: dir,
+      env: laneGitEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: resolveChildTimeoutMs(),
@@ -510,9 +523,10 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
       const base = gitRead(['merge-base', '--', 'HEAD', sha]).trim();
       if (!base) return null;
       const stablePatchId = (from, to) => {
-        const diff = gitRead(['diff', '--no-ext-diff', '--end-of-options', from, to, '--']);
+        const diff = gitRead(['diff', '--no-ext-diff', '--no-textconv', '--end-of-options', from, to, '--']);
         const id = exec('git', ['patch-id', '--stable'], {
           cwd: dir,
+          env: laneGitEnv(),
           input: diff,
           encoding: 'utf8',
           stdio: ['pipe', 'pipe', 'pipe'],
@@ -903,10 +917,17 @@ export function sessionStatesForReap(sessions) {
  *   neither probe could say).
  */
 export function sessionPidAliveByName(sessions, { psOutput = null, isPidAlive = defaultIsPidAlive } = {}) {
+  // xbdixjc — duplicate names (a fix-<PR> round N next to round N-1's stale `done` rows): the reading kept per name
+  // is the most-alive one, true > null > false, never "whichever row sorted last". Same asymmetry as
+  // {@link sessionStateByName}'s #x2psfwz guard; a bare `.set()` here let a dead round-1 row read a live fixer as
+  // gone (lane-5 fix-4461 at 21:17Z, lane-20 fix-4433 at 21:25Z on 2026-10-08, both mid-edit).
+  const rank = (v) => (v === true ? 2 : v === null ? 1 : 0);
   const byName = new Map();
   for (const s of Array.isArray(sessions) ? sessions : []) {
     if (!s || typeof s !== 'object' || s.kind !== 'background') continue;
-    if (typeof s.name === 'string' && s.name) byName.set(s.name, resolvePidAlive(s, { psOutput, isPidAlive }));
+    if (typeof s.name !== 'string' || !s.name) continue;
+    const alive = resolvePidAlive(s, { psOutput, isPidAlive });
+    if (!byName.has(s.name) || rank(alive) > rank(byName.get(s.name))) byName.set(s.name, alive);
   }
   return byName;
 }
@@ -1134,6 +1155,26 @@ export function reapPlan(candidates, { nowMs, ttlMs = DEFAULT_LEASE_TTL_MINUTES 
     else keep.push({ ...c, reason: verdict.reason });
   }
   return { reap, keep };
+}
+
+/**
+ * xbdixjc — move every reap candidate the lane hold rule protects into `keep` (reason `held:<hold>`). `check` is
+ * injectable; the default reads the lane's await-verify records, verify record and work state. The same rule
+ * also refuses inside `lane-pool.mjs release`, so a caller that skips this still cannot drop a held lane.
+ * @param {{reap:Array, keep:Array}} plan @param {{nowMs:number, check?:Function}} opts
+ */
+export function applyLaneHold({ reap, keep }, { nowMs, check = checkLaneHold } = {}) {
+  const stillReap = [];
+  const kept = [...keep];
+  for (const c of reap) {
+    const verdict = check(c.dir, { action: 'release', byHolder: false, nowMs });
+    if (verdict?.allowed === true) stillReap.push(c);
+    else {
+      kept.push({ ...c, reason: `held:${verdict?.hold ?? 'work-state-unknown'}`, wouldHaveBeen: c.reason });
+      log(`  kept ${c.pool}/lane-${c.lane} (${c.reason} but ${verdict?.reason ?? 'lane-hold: unknown'}; session ${c.lease?.session ?? 'unknown'})`);
+    }
+  }
+  return { reap: stillReap, keep: kept };
 }
 
 // ── IO SHELL (runs only as a CLI — owns POOL_ROOT walk / marker reads / gh / the release delegation) ──────────
@@ -1437,7 +1478,8 @@ function main(argv) {
   const prStatesByRepo = new Map(distinctRepoKeys.map((repoKey) => [repoKey, fetchPrStatesForRepo(repoKey, flags)]));
 
   const signalsFor = buildLeaseSignalsFor({ prStatesByRepo, sessionStates, sessionPidAlive, sessionAgents, wrapperPids, nowMs });
-  const { reap, keep } = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
+  const plan = reapPlan(candidates, { nowMs, ttlMs, signalsFor });
+  const { reap, keep } = applyLaneHold(plan, { nowMs });
 
   // Reclaim (unless dry-run). A single failed release is logged and skipped — the reaper is best-effort and one
   // stuck lane must not abort the whole sweep — but a failure count surfaces via a non-zero exit (below) so a
