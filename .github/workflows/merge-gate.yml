@@ -1,0 +1,92 @@
+# The `merge-gate` required check: every gate the drain (scripts/merge-ai-prs.mjs) applies right before its merge
+# write, evaluated in CI so GitHub's native merge queue can do the merging (merge-delivery strategy
+# `github-merge-queue`, scripts/lib/merge-delivery-policy.mjs). Decision logic: scripts/lib/merge-gate-ci.mjs
+# (reuses the drain's own pure functions). Gate list + where each gate lives: scripts/lib/merge-gate-inventory.mjs
+# (a test fails when the drain gains a gate this check does not account for).
+#
+# Runs on `pull_request` (so a PR can be added to the queue) and on `merge_group` (each PR in the group is
+# re-evaluated against the group's commit right before GitHub merges it). `workflow_dispatch` is the dry run.
+#
+# SCRIPTS COME FROM MAIN, NEVER FROM THE PR (same rule and reasoning as review-gate.yml): a PR cannot neuter its
+# own gate by editing these scripts in its diff. The PR's body, labels, comments and diff are read as data.
+# BOOTSTRAP: until this lands, main has no scripts/merge-gate-check.mjs, so the check reports clear (the same
+# bootstrap review-gate.yml documents); it is not required by the ruleset until the operator adds it.
+#
+# FAILS CLOSED: an input that is unreadable, or that has no shared source CI can reach yet, holds the PR.
+name: Merge gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited, ready_for_review]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: 'PR numbers to evaluate (comma-separated) — dry run'
+        required: false
+      merge_group_head_sha:
+        description: 'Dry-run a merge group: its head commit (with base sha)'
+        required: false
+      merge_group_base_sha:
+        description: 'Dry-run a merge group: its base commit'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: merge-gate-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  merge-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Evaluate the drain's merge gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha || inputs.merge_group_head_sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha || inputs.merge_group_base_sha }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          DISPATCH_PRS: ${{ inputs.prs }}
+        run: |
+          if [ ! -f scripts/merge-gate-check.mjs ]; then
+            echo "scripts/merge-gate-check.mjs not present on main yet — merge gate not bootstrapped; reporting clear."
+            exit 0
+          fi
+          git config user.name merge-gate && git config user.email merge-gate@users.noreply.github.com
+          if [ -n "$MG_HEAD_SHA" ]; then
+            git fetch origin "$MG_HEAD_SHA" "$MG_BASE_SHA"
+            GROUP_TREE="$RUNNER_TEMP/group-tree"
+            mkdir -p "$GROUP_TREE"
+            git archive "$MG_HEAD_SHA" backlog | tar -x -C "$GROUP_TREE"
+            node scripts/merge-gate-check.mjs --repo="$REPO" --merge-group --head-sha="$MG_HEAD_SHA" --base-sha="$MG_BASE_SHA" --head-ref="$MG_HEAD_REF" --group-tree="$GROUP_TREE"
+          elif [ -n "$PR_NUMBER" ]; then
+            node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$PR_NUMBER"
+          elif [ -n "$DISPATCH_PRS" ]; then
+            node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$DISPATCH_PRS"
+          else
+            echo "::error::merge-gate: no PR or merge group to evaluate (event $EVENT) — failing closed." >&2
+            exit 1
+          fi
