@@ -838,6 +838,45 @@ export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendi
 }
 
 /**
+ * Live 2026-10-09 (#4602 skipped 46+ min, #4578, #4591, …): every cascade merge moves `main`, and GitHub then
+ * resets each other open PR's `mergeable` to UNKNOWN while it recomputes in the background (a few seconds; the
+ * `gh pr view --json mergeable` read itself is what asks for it). The pre-merge re-read ran seconds after the
+ * previous merge, saw UNKNOWN, and refused the rest of the cascade — so a pass landed one or two PRs and a queue
+ * of N accepted PRs took N/2 passes. A transient UNKNOWN is now re-read a bounded number of times before the
+ * refusal stands. Pure: true only for the classifier's own UNKNOWN-mergeability refusal — a head move, a red or
+ * CodeQL check, a conflict or a missed read is never retried.
+ * @param {{decision?:string, reason?:string}|null} verdict
+ */
+export function isTransientUnknownMergeability(verdict) {
+  return !!verdict && verdict.decision !== 'merge' && /^not mergeable \(mergeable=UNKNOWN\)/.test(String(verdict.reason || ''));
+}
+
+/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 4 × 3 s). */
+export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 4, delayMs: 3000 });
+/** Env knob: an integer 0–10 overrides `retries` (0 = the old single read). Anything else keeps the default. */
+export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
+export function resolveUnknownMergeabilityRetry(env = {}) {
+  const raw = env?.[UNKNOWN_MERGEABILITY_RETRY_ENV];
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return UNKNOWN_MERGEABILITY_RETRY;
+  const n = Number(raw.trim());
+  return n <= 10 ? { ...UNKNOWN_MERGEABILITY_RETRY, retries: n } : UNKNOWN_MERGEABILITY_RETRY;
+}
+
+/**
+ * `revalidateForMerge` over a fresh read, re-reading while the ONLY refusal is a transient UNKNOWN mergeability.
+ * Fails closed exactly as before: an UNKNOWN that never resolves within the bound returns that same refusal.
+ * IO is injected (`read` → the fresh PR or null; `sleep(ms)`), so the bound is testable without GitHub.
+ */
+export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
+  let verdict = revalidateForMerge(await read(), opts);
+  for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
+    sleep(setting.delayMs);
+    verdict = revalidateForMerge(await read(), opts);
+  }
+  return verdict;
+}
+
+/**
  * Is this SKIPPED verdict a rebase-drop-manifest candidate (#2198)? Pure. A PR that is producer-certified and
  * required-check-green but not landable ONLY because it is BEHIND/DIRTY/CONFLICTING is (almost always) blocked
  * by the shared `.lane-manifest.json` on that one repo-root path — the classic "manifest lands then conflicts
@@ -4053,6 +4092,12 @@ async function runCli() {
       return data && data.number != null ? await resolveChecks(repo, data) : null;
     } catch { return null; }
   };
+  // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
+  // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
+  const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    read: () => fetchFreshPrForRevalidation(repo, num), opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
+  });
 
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
@@ -5529,7 +5574,7 @@ async function runCli() {
           const ck = `${c.coupleCarrier.repo || 'cwd'}::${c.coupleCarrier.num}`;
           const carrierMerged = merged.some((m) => candKey(m) === ck);
           const carrier = coupleStep.ordered.find((x) => candKey(x) === ck) || null;
-          const fresh = carrierMerged || !carrier ? null : revalidateForMerge(await fetchFreshPrForRevalidation(carrier.repo, carrier.num), {
+          const fresh = carrierMerged || !carrier ? null : await revalidateFresh(carrier.repo, carrier.num, {
             requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(carrier.num)) || (!!escalationRelief.passWide && !!label),
             defaultBranch: defaultBranchOf(carrier.repo), expectedHeadSha: carrier.listedHeadSha || carrier.headSha || null,
           });
@@ -5593,7 +5638,7 @@ async function runCli() {
           // (review gate included) actually judged; a push since then refuses the merge instead of landing an
           // unjudged head under a still-present `review:accepted` label. `revalidated.headSha` is that pinned SHA.
           const reliefAllowsPendingNow = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
-          const revalidated = revalidateForMerge(await fetchFreshPrForRevalidation(c.repo, c.num), {
+          const revalidated = await revalidateFresh(c.repo, c.num, {
             requiredCheck: REQUIRED, allowPendingReview: reliefAllowsPendingNow, defaultBranch: defaultBranchOf(c.repo),
             expectedHeadSha: c.listedHeadSha || c.headSha || null,
           });
