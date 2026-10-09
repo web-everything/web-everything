@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync, appendFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -256,18 +256,62 @@ describe('digest', () => {
     }
   });
 
-  it('IO: an alert written into the claim after the flusher read it (writer opened the queue before the rename) is re-queued, not deleted', () => {
+  // A writer that opened held.jsonl BEFORE the flusher renamed it keeps a handle on the same file, so its line lands in
+  // the claim at ANY later moment, even after the flusher's last read. Reading the claim once more before deleting it
+  // only narrows that window; the claim must outlive the flush and be swept later. (Real file handle, no mocks.)
+  const lateLine = JSON.stringify({ at: '2026-10-09T12:00:00Z', title: 'late', body: '' });
+  const LATE_GRACE = 3 * 60_000; // longer than RETIRED_GRACE_MS
+  const lateWriterSurvives = (name, setup, send) => it(`IO: a straggling writer's line is not lost when the flush ends ${name}`, () => {
+    const { env, digest } = setup();
+    const fd = openSync(join(digest, 'held.jsonl'), 'a'); // the writer opens the queue, then gets descheduled
+    const first = flushDigest({ send, env, now: ET('08:00') });
+    writeSync(fd, `\n${lateLine}\n`); // ...and writes AFTER the flusher has finished and removed its claim
+    closeSync(fd);
+    expect(first.flushed || first.reason === 'digest empty' || first.sent?.ok === false).toBe(true);
+    const seen = [];
+    flushDigest({ send: (n) => { seen.push(n.body); return { ok: true }; }, env, now: ET('08:00') + LATE_GRACE });
+    expect(seen.join(' | ')).toMatch(/late/);
+  });
+  lateWriterSurvives('after a confirmed send', () => heldFixture(1), () => ({ ok: true }));
+  lateWriterSurvives('after a failed send (entries restored)', () => heldFixture(1), () => ({ ok: false }));
+  lateWriterSurvives('on a queue of torn lines only', () => {
+    const f = heldFixture(0);
+    mkdirSync(f.digest, { recursive: true });
+    writeFileSync(join(f.digest, 'held.jsonl'), 'not json at all\n');
+    return f;
+  }, () => ({ ok: true }));
+
+  it('IO: a late line waits out a grace period before it is re-queued (a retired claim is not swept while its writer may still be about to write)', () => {
     const { env, digest } = heldFixture(1);
-    const late = JSON.stringify({ at: '2026-10-09T12:00:00Z', title: 'late', body: '' });
-    const send = () => { // during the send, a straggling writer's line lands in the claim file
-      const claim = readdirSync(digest).find((f) => f.includes('.flushing-'));
-      appendFileSync(join(digest, claim), `${late}\n`);
-      return { ok: true };
-    };
-    expect(flushDigest({ send, env, now: ET('08:00') })).toMatchObject({ flushed: true, count: 1 });
-    expect(readFileSync(join(digest, 'held.jsonl'), 'utf8')).toMatch(/"title":"late"/);
-    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
-    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1); // sent once, in the next digest
+    const fd = openSync(join(digest, 'held.jsonl'), 'a');
+    flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') });
+    writeSync(fd, `\n${lateLine}\n`); closeSync(fd);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') + 1000 }).flushed).toBe(false); // too soon: nothing re-queued yet
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') + LATE_GRACE }).count).toBe(1);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') + 2 * LATE_GRACE }).flushed).toBe(false); // and only once
+    expect(readdirSync(digest).filter((f) => f.startsWith('held.jsonl.'))).toEqual([]);
+  });
+
+  it('IO: a late multibyte line is re-queued intact (offsets are bytes, not string length)', () => {
+    const { env, digest } = heldFixture(1);
+    writeFileSync(join(digest, 'held.jsonl'), `${JSON.stringify({ at: 'x', title: 'héllo ✓ 日本語', body: '' })}\n`); // multibyte in the consumed part
+    const fd = openSync(join(digest, 'held.jsonl'), 'a');
+    flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') });
+    writeSync(fd, `\n${JSON.stringify({ at: 'y', title: 'late ✓', body: '' })}\n`); closeSync(fd);
+    const seen = [];
+    flushDigest({ send: (n) => { seen.push(n.body); return { ok: true }; }, env, now: ET('08:00') + LATE_GRACE });
+    expect(seen).toEqual(['late ✓']);
+  });
+
+  it('IO: a flusher whose claim a sweeper took while it was hung does not send the entries again', () => {
+    const { env, digest } = heldFixture(1);
+    const send = vi.fn(() => ({ ok: true }));
+    const r = flushDigest({
+      send, env, now: ET('08:00'),
+      beforeSend: (claim) => renameSync(claim, `${claim}.taken`), // a sweeper restored this claim while the flusher was stuck
+    });
+    expect(r).toMatchObject({ flushed: false, reason: expect.stringMatching(/taken/) });
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('IO: a claim a sweeper just took is young again, so a second sweeper cannot take it mid-restore (no double delivery)', () => {

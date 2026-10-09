@@ -63,34 +63,72 @@ function pidAlive(pid) {
 }
 
 /**
- * Put a claimed queue file back on the held queue, byte for byte (not re-parsed, so a torn line is kept too),
- * then remove the claim. Never throws: if the restore itself fails the claim file stays, and the stale-claim
- * sweep at the next flush retries it.
+ * A retired claim (`held.jsonl.retired-<pid>-<atMs>-<seq>-<consumedBytes>`) is a claim whose flush is over. It is NOT
+ * deleted: a writer that opened the queue before it was renamed away keeps a handle on this very file and may write
+ * its line into it at any later moment (`appendFileSync` opens, then writes), so no read-then-delete can be safe.
+ * Instead the file waits {@link RETIRED_GRACE_MS}; the next flush then puts everything past `consumedBytes` back on
+ * the queue and deletes it. The prefix differs from the claim prefix on purpose: a retired file must never be taken
+ * for a crashed flusher's claim (its entries were already sent or restored, and would go out twice).
  */
-function restoreClaim(claimed, held) {
+export const RETIRED_GRACE_MS = 2 * 60_000;
+const RETIRED_PREFIX = 'held.jsonl.retired-';
+
+let claimSeq = 0;
+
+/** Rename a finished claim to its retired name. `consumedBytes` = how much of it was already sent or restored. Never throws. */
+function retireClaim(claimed, consumedBytes, now) {
+  claimSeq += 1;
+  try { renameSync(claimed, join(dirname(claimed), `${RETIRED_PREFIX}${process.pid}-${now}-${claimSeq}-${consumedBytes}`)); return true; } catch { return false; }
+}
+
+/**
+ * Put a claimed queue file back on the held queue, byte for byte (not re-parsed, so a torn line is kept too),
+ * then retire the claim (so a line a straggling writer adds to it afterwards is still re-queued later). Never throws:
+ * if the restore itself fails the claim file stays, and the stale-claim sweep at the next flush retries it.
+ */
+function restoreClaim(claimed, held, now) {
+  let consumed = 0;
   try {
-    const text = readFileSync(claimed, 'utf8');
+    const buf = readFileSync(claimed);
+    consumed = buf.length;
+    const text = buf.toString('utf8');
     if (text) appendFileSync(held, `\n${text}${text.endsWith('\n') ? '' : '\n'}`); // leading \n: a torn tail on held must not glue onto the first restored line
   } catch { return false; }
+  if (retireClaim(claimed, consumed, now)) return true;
   try { unlinkSync(claimed); } catch { try { writeFileSync(claimed, ''); } catch { /* restored already; a leftover claim is only a duplicate */ } }
   return true;
 }
 
-/**
- * A writer that opened the queue just before it was renamed away can land its line in the CLAIM after we read it
- * (`appendFileSync` opens, then writes). Before the claim is deleted, put anything beyond what was read back on the
- * queue, so that alert is held for the next digest instead of lost. Never throws.
- */
-function requeueLateWrites(claimed, readText, held) {
-  try {
-    const now = readFileSync(claimed, 'utf8');
-    if (now.length <= readText.length || !now.startsWith(readText)) return;
-    const tail = now.slice(readText.length);
-    if (tail.trim()) appendFileSync(held, `\n${tail}${tail.endsWith('\n') ? '' : '\n'}`);
-  } catch { /* best-effort: the alert is only delayed or, at worst, lost as before */ }
+/** A claim whose entries were sent (or are unsendable): retire it, or delete it when it cannot be renamed. Never throws. */
+function endClaim(claimed, consumedBytes, now) {
+  if (retireClaim(claimed, consumedBytes, now)) return;
+  try { unlinkSync(claimed); } catch { try { writeFileSync(claimed, ''); } catch { /* a leftover claim is only a duplicate */ } }
 }
 
-let claimSeq = 0;
+/**
+ * Re-queue what straggling writers added to retired claims once they are past the grace period, then delete them.
+ * Each file is taken by an atomic rename to a fresh retired name first, so two sweepers cannot both re-queue it.
+ * Never throws.
+ */
+function sweepRetired(dir, held, now) {
+  let names = [];
+  try { names = readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith(RETIRED_PREFIX)) continue;
+    const m = /^(\d+)-(\d+)-(\d+)-(\d+)$/.exec(name.slice(RETIRED_PREFIX.length));
+    if (!m) continue;
+    const consumed = Number(m[4]);
+    if (Math.abs(now - Number(m[2])) <= RETIRED_GRACE_MS) continue; // a future stamp (clock skew) is swept like an old one
+    claimSeq += 1;
+    const mine = join(dir, `${RETIRED_PREFIX}${process.pid}-${now}-${claimSeq}-${consumed}`);
+    try { renameSync(join(dir, name), mine); } catch { continue; }
+    try {
+      const tail = readFileSync(mine).subarray(consumed).toString('utf8');
+      if (tail.trim()) appendFileSync(held, `\n${tail}${tail.endsWith('\n') ? '' : '\n'}`);
+      try { unlinkSync(mine); } catch { writeFileSync(mine, ''); } // appended already: never leave the tail to be appended again
+    } catch { /* it stays under a fresh stamp and is retried after the next grace period (at worst one duplicate line) */ }
+  }
+}
 
 /**
  * Recover claims left behind by a flusher that died after renaming the queue away. A young claim may belong to
@@ -122,7 +160,7 @@ function recoverStaleClaims(dir, held, now) {
     const mine = join(dir, swept);
     try { renameSync(join(dir, name), mine); } catch { continue; }
     activeClaims.add(swept);
-    try { restoreClaim(mine, held); } finally { activeClaims.delete(swept); }
+    try { restoreClaim(mine, held, now); } finally { activeClaims.delete(swept); }
   }
 }
 
@@ -132,10 +170,11 @@ function recoverStaleClaims(dir, held, now) {
  * a confirmed send (a throwing sender, a failed digest-file write, a returned `{ok:false}`) puts the entries back
  * on the queue; a flusher that dies outright leaves a claim the next flush recovers. Returns what happened; never throws.
  */
-export function flushDigest({ send, env = process.env, now = Date.now(), dryRun = false } = {}) {
+export function flushDigest({ send, env = process.env, now = Date.now(), dryRun = false, beforeSend } = {}) {
   let claimed = null;
   let held = null;
   let claimId = null;
+  let consumed = 0; // bytes of the claim that were read (and so sent or restored); anything past it arrived late
   let confirmed = false; // the sender reported success — from here the entries must NOT be restored
   try {
     if (bypassed(env)) return { flushed: false, reason: 'bypassed' };
@@ -143,7 +182,7 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
     if (state.quiet) return { flushed: false, reason: `still quiet (${state.reason})` };
     const { dir, held: heldPath } = digestPaths(settings, { env });
     held = heldPath;
-    if (!dryRun) recoverStaleClaims(dir, held, now);
+    if (!dryRun) { recoverStaleClaims(dir, held, now); sweepRetired(dir, held, now); }
     if (!existsSync(held)) return { flushed: false, reason: 'nothing held' };
     if (dryRun) return { flushed: false, reason: 'dry run' };
     claimSeq += 1;
@@ -153,7 +192,9 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
     claimId = basename(claim);
     activeClaims.add(claimId);
     const entries = [];
-    const raw = readFileSync(claimed, 'utf8');
+    const buf = readFileSync(claimed);
+    consumed = buf.length;
+    const raw = buf.toString('utf8');
     for (const line of raw.split('\n')) {
       if (!line.trim()) continue;
       try { entries.push(JSON.parse(line)); } catch { /* torn line — skip */ }
@@ -161,30 +202,33 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
     // `digest.enabled=false` only stops NEW alerts being held (decideDelivery delivers them). Whatever was already
     // held is still owed to the operator, so it drains here, once, as a digest: never deleted, never stranded.
     const plan = planDigest(entries, { ...settings, digest: { ...settings.digest, enabled: true } });
-    if (!plan) { requeueLateWrites(claimed, raw, held); unlinkSync(claimed); claimed = null; return { flushed: false, reason: 'digest empty' }; } // only torn/untitled lines: nothing sendable
+    if (!plan) { endClaim(claimed, consumed, now); claimed = null; return { flushed: false, reason: 'digest empty' }; } // only torn/untitled lines: nothing sendable
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
     const mdPath = join(dir, `digest-${stamp}.md`);
     writeFileSync(mdPath, plan.markdown);
     writeFileSync(join(dir, 'latest-digest.md'), plan.markdown);
+    beforeSend?.(claimed); // test seam: lets a test play the part of a sweeper that takes the claim while this flusher is stuck
+    // A flusher that hung past the live-owner limit has had its claim restored by a sweeper; sending now would deliver the
+    // same entries twice (the restored copy goes out in the next digest). The claim is no longer ours: leave it.
+    if (!existsSync(claimed)) { claimed = null; return { flushed: false, reason: 'claim taken by a sweeper' }; }
     const sent = send ? send({ title: plan.title, body: plan.body }) : { ok: false, error: 'no sender' };
     if (sent?.ok !== true) { // only an explicit success empties the queue: undefined/{}/null from a sloppy sender is NOT a confirmation
       // Delivery failed: put the claim's raw lines back (torn lines included) so the next flush retries.
-      const requeued = restoreClaim(claimed, held);
+      const requeued = restoreClaim(claimed, held, now);
       if (requeued) claimed = null;
       else throw new Error('could not re-queue the failed digest');
       return { flushed: false, count: entries.length, mdPath, sent };
     }
     confirmed = true; // the sender reported success — the entries must not be restored from here
-    requeueLateWrites(claimed, raw, held);
-    unlinkSync(claimed);
+    endClaim(claimed, consumed, now);
     claimed = null;
     return { flushed: true, count: entries.length, mdPath, sent };
   } catch (e) {
     if (claimed && held) {
       if (confirmed) {
-        // Already sent: never restore, that would send twice. Empty the claim so a sweep finds nothing.
-        try { writeFileSync(claimed, ''); } catch { /* nothing more to do */ }
-      } else restoreClaim(claimed, held);
+        // Already sent: never restore, that would send twice. Retire the claim (or, failing that, empty it) so a sweep finds nothing to restore.
+        if (!retireClaim(claimed, consumed, now)) { try { writeFileSync(claimed, ''); } catch { /* nothing more to do */ } }
+      } else restoreClaim(claimed, held, now);
     }
     return { flushed: false, reason: `flush error: ${String(e?.message ?? e)}` };
   } finally {
