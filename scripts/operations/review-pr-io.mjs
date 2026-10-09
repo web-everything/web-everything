@@ -55,7 +55,7 @@ import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
-import { resolveReviewSettings, SCOPED_REREVIEW_MODES } from '../lib/review-settings.mjs';
+import { resolveReviewSettings, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
 import { sharedRunsDir } from './run-store.mjs';
@@ -208,6 +208,9 @@ export function readPr({
   probed = null,
   // Card 5469 — the declared `scopedRereview` mode (we:scripts/review-settings.json); injectable for tests.
   scopedRereview = null,
+  // Card 5471 — the declared `roundBudget` K, and the ledger reader the round count comes from; injectable for tests.
+  roundBudget = null,
+  readLedgerRows = defaultReadLedgerRows,
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
@@ -276,6 +279,8 @@ export function readPr({
 
   const priorRounds = priorRoundsFor(repo, pr);
   const revSha = revParseCommit(gitExec, netPaths.rev);
+  const scopedMode = resolveScopedRereviewMode(scopedRereview);
+  const budget = resolveRoundBudget(roundBudget);
 
   return {
     priorRounds,
@@ -307,9 +312,43 @@ export function readPr({
     net: { ...netPaths, revSha },
     latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
     diff: netText,
-    // Card 5469 — carried only when the shadow is on, so an `off` read is byte-identical to before.
-    ...(resolveScopedRereviewMode(scopedRereview) === 'shadow' ? { scopedRereview: 'shadow' } : {}),
+    // Card 5469 — carried only when the shadow is on (or `on`, card 5470), so an `off` read is byte-identical to before.
+    ...(['shadow', 'on'].includes(scopedMode) ? { scopedRereview: scopedMode } : {}),
+    // Card 5471 — the round budget K and this PR's reviewed-head round from the ledger. Carried only when the budget is
+    // set, so an `off` read is byte-identical to before. An unknown round is `null`: the budget never acts on it.
+    ...(budget !== ROUND_BUDGET_OFF ? { roundBudget: budget, reviewRound: readReviewRound({ repo, pr, head: revSha, readLedgerRows }) } : {}),
   };
+}
+
+/** The repo's verdict-ledger rows (the default reader for the round count and the shadow). Throws when unreadable. */
+function defaultReadLedgerRows(repo) {
+  return parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8'));
+}
+
+/**
+ * Card 5471 — THIS PR'S REVIEW ROUND from the ledger (edge 5: per PR, from the ledger): 1 + the distinct heads it was
+ * reviewed on before `head` (review-run rows, and the scoped re-review's finding rows written at review time). The
+ * same count the scoped re-review shadow uses. An unreadable ledger or an unpinned head is `null` (edge 2: an unknown
+ * round never earns the budget).
+ * @param {{repo: string, pr: number, head: string|null, readLedgerRows?: Function}} o
+ * @returns {number|null}
+ */
+export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLedgerRows }) {
+  if (typeof head !== 'string' || !/^[0-9a-f]{40}$/i.test(head)) return null;
+  try {
+    const rows = (readLedgerRows(repo) ?? []).filter((r) => Number(r?.pr) === Number(pr)
+      && (r.type === EVENT_TYPES.REVIEW_RUN || r.type === EVENT_TYPES.FINDING));
+    return reviewRoundOf(rows, head);
+  } catch { return null; }
+}
+
+/** Card 5471 — the round budget: an explicit value, else the declared setting. Any doubt is `off`. */
+export function resolveRoundBudget(explicit = null, { settings = resolveReviewSettings } = {}) {
+  if (Number.isInteger(explicit) && explicit >= 1) return explicit;
+  try {
+    const k = settings().roundBudget;
+    return Number.isInteger(k) && k >= 1 ? k : ROUND_BUDGET_OFF;
+  } catch { return ROUND_BUDGET_OFF; }
 }
 
 /** Card 5469 — the append-only shadow journal (one JSON line per reviewed round), beside the ledger-shadow journal. */
@@ -801,7 +840,7 @@ export function createReviewPrSinks({
   setLabels = createGhProvider().setLabels,
   // Card 5469 — the scoped re-review shadow's reads and writes, injectable so the sink is testable with no git/ledger.
   shadowGitExec = execFileIn(root),
-  readLedgerRows = (repo) => parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')),
+  readLedgerRows = defaultReadLedgerRows,
   appendLedgerRow = (row) => appendVerdict(row),
   appendShadowJournal = (entry) => appendScopedRereviewJournal(entry, { env }),
 } = {}) {

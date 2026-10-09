@@ -641,3 +641,139 @@ describe('#4315 mandatory referral hold', () => {
     }
   });
 });
+
+// ── Cards 5471 / 5470 — later rounds that end in cards, not another fix round (replay fixtures) ──────────────────────
+describe('cards 5471 + 5470: round budget and binding prior round', async () => {
+  const {
+    roundBudgetDecision, bindingPriorRoundDecision, roundCardsDecision, isRoundCardsParked,
+    buildRoundCardsFilingInput, roundCardsAcceptReason, ROUND_CARD_RULES,
+  } = await import('../review-loop-policy.mjs');
+  const { REVIEW_EFFECTS } = await import('../../operations/review-pr.mjs');
+  const degraded = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness', summary: 'late degraded nit', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' };
+  const cosmetic = { file: 'scripts/b.mjs', line: 9, category: 'security/untrusted-text', summary: 'cosmetic `x` text', verdict: 'CONFIRMED', impactIfUnfixed: 'cosmetic' };
+  const confirmedBroken = { file: 'scripts/a.mjs', line: 12, category: 'correctness/correctness', summary: 'loses work', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
+  const verdictOf = (findings, over = {}) => ({ verdict: VERDICTS.CHANGES, admittedFindings: findings, findings, humanRequired: false, ...over });
+  const runOf = (verdict, read = {}, shadow = null) => ({
+    pending: agentPending, verdict,
+    findings: { read: { roundBudget: 3, reviewRound: 4, ...read },
+      ...(shadow ? { advise: { effects: [{ type: REVIEW_EFFECTS.SCOPED_REREVIEW_SHADOW, status: 'applied', result: { recorded: true, summary: shadow } }] } } : {}) },
+  });
+
+  describe('5471 [A1] round budget replay fixtures', () => {
+    it('(a) round K+1 with only non-broken findings: accept + every held finding carded', () => {
+      const d = roundBudgetDecision({ verdict: verdictOf([degraded, cosmetic]), round: 4, budget: 3 });
+      expect(d).toMatchObject({ rule: ROUND_CARD_RULES.ROUND_BUDGET, apply: true, reason: 'over-budget', round: 4, k: 3 });
+      expect(d.cards).toEqual([degraded, cosmetic]);
+    });
+    it('(b) a confirmed broken finding at round K+1 blocks', () => {
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded, confirmedBroken]), round: 4, budget: 3 }))
+        .toMatchObject({ apply: false, reason: 'confirmed-broken' });
+    });
+    it('(b) a plausible broken, or an impact not stated, blocks too (unknown severity = block)', () => {
+      expect(roundBudgetDecision({ verdict: verdictOf([{ ...degraded, impactIfUnfixed: 'broken' }]), round: 4, budget: 3 }))
+        .toMatchObject({ apply: false, reason: 'blocking-impact' });
+      const { impactIfUnfixed: _drop, ...noImpact } = degraded;
+      expect(roundBudgetDecision({ verdict: verdictOf([noImpact]), round: 4, budget: 3 }))
+        .toMatchObject({ apply: false, reason: 'blocking-impact' });
+    });
+    it('(c) rounds 1..K behave as today', () => {
+      for (const round of [1, 2, 3]) {
+        expect(roundBudgetDecision({ verdict: verdictOf([degraded]), round, budget: 3 })).toMatchObject({ apply: false, reason: 'within-budget' });
+      }
+    });
+    it('(d) at the round cap the budget does not act: the cap still escalates', () => {
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded]), round: 5, budget: 3 })).toMatchObject({ apply: false, reason: 'round-cap' });
+    });
+    it('off, an unknown round, a referral, a human gate or a non-changes verdict keep today', () => {
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded]), round: 4, budget: 'off' }).reason).toBe('off');
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded]), round: null, budget: 3 }).reason).toBe('round-unknown');
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded], { blockedReferrals: [{ key: 'k' }] }), round: 4, budget: 3 }).reason).toBe('referral-blocked');
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded], { pendingReferrals: ['k'] }), round: 4, budget: 3 }).reason).toBe('referral-pending');
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded], { humanRequired: true }), round: 4, budget: 3 }).reason).toBe('human-required');
+      expect(roundBudgetDecision({ verdict: verdictOf([degraded], { verdict: VERDICTS.NEEDS_HUMAN }), round: 4, budget: 3 }).reason).toBe('not-changes');
+      expect(roundBudgetDecision({ verdict: verdictOf([]), round: 4, budget: 3 }).reason).toBe('no-held-finding');
+    });
+  });
+
+  describe('5470 [A1] binding prior round replay fixtures (mode on)', () => {
+    const avoided = { round: 3, scope: 'delta', liveBlocked: true, shadowBlocked: false, roundAvoided: true, blocked: 0, carded: 1 };
+    it('(a) a round the shadow would have avoided (late/tolerated finding on unchanged code) becomes cards', () => {
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded]), mode: 'on', shadow: avoided }))
+        .toMatchObject({ rule: ROUND_CARD_RULES.BINDING_PRIOR_ROUND, apply: true, reason: 'unchanged-code', round: 3, cards: [degraded] });
+    });
+    it('(b) a broken + CONFIRMED finding on unchanged code still blocks', () => {
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded, confirmedBroken]), mode: 'on', shadow: avoided }))
+        .toMatchObject({ apply: false, reason: 'confirmed-broken' });
+    });
+    it('(c) a finding on changed code (the shadow still blocks) blocks as today', () => {
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded]), mode: 'on', shadow: { ...avoided, shadowBlocked: true, roundAvoided: false, blocked: 1 } }))
+        .toMatchObject({ apply: false, reason: 'still-blocks' });
+    });
+    it('(d) shadow and off change nothing; a missing summary or a full-review scope fails closed', () => {
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded]), mode: 'shadow', shadow: avoided })).toMatchObject({ apply: false, reason: 'shadow' });
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded]), mode: 'off', shadow: avoided })).toMatchObject({ apply: false, reason: 'off' });
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded]), mode: 'on', shadow: null })).toMatchObject({ apply: false, reason: 'shadow-unavailable' });
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded]), mode: 'on', shadow: { ...avoided, scope: 'full' } })).toMatchObject({ apply: false, reason: 'full-review' });
+    });
+  });
+
+  describe('the loop: decline at confirm, then file and accept', () => {
+    it('reviewLoopAutoConfirm declines (never bounces) a round the budget turns into cards', () => {
+      expect(reviewLoopAutoConfirm(agentPending, runOf(verdictOf([degraded])))).toBeNull();
+      expect(isRoundCardsParked({ stopped: 'confirm', run: runOf(verdictOf([degraded])) })).toBe(true);
+    });
+    it('within budget it still answers changes, exactly as today', () => {
+      expect(reviewLoopAutoConfirm(agentPending, runOf(verdictOf([degraded]), { reviewRound: 3 }))).toEqual({ value: 'changes' });
+      expect(reviewLoopAutoConfirm(agentPending, runOf(verdictOf([degraded]), { roundBudget: 'off' }))).toEqual({ value: 'changes' });
+    });
+    it('a human-addressed confirm is never parked for cards', () => {
+      expect(isRoundCardsParked({ stopped: 'confirm', run: { ...runOf(verdictOf([degraded])), pending: humanPending } })).toBe(false);
+    });
+    it('binding prior round on: a within-budget round the shadow avoided also parks for cards', () => {
+      const run = runOf(verdictOf([degraded]), { reviewRound: 2, scopedRereview: 'on' },
+        { round: 2, scope: 'delta', liveBlocked: true, shadowBlocked: false, roundAvoided: true, carded: 1 });
+      expect(roundCardsDecision(run)).toMatchObject({ rule: ROUND_CARD_RULES.BINDING_PRIOR_ROUND, apply: true });
+      expect(reviewLoopAutoConfirm(agentPending, run)).toBeNull();
+    });
+  });
+
+  describe('the filed card and the accept reason', () => {
+    const decision = roundBudgetDecision({ verdict: verdictOf([degraded, cosmetic]), round: 4, budget: 3 });
+    const input = buildRoundCardsFilingInput({ repo: 'o/r', pr: 7, head: 'c'.repeat(40), decision });
+    it('one card, one numbered line per finding, scope = the cited files with their locus', () => {
+      expect(input).toMatchObject({ kind: 'story', size: '2', queue: 'true', title: 'Review follow-ups (round-budget, round 4) from o/r#7' });
+      expect(input.scope).toBe('we:scripts/a.mjs,we:scripts/b.mjs');
+      expect(input.digest).toMatch(/^1\. `we:scripts\/a\.mjs:4` — correctness, PLAUSIBLE degraded: late degraded nit$/m);
+      expect(input.digest).toMatch(/^2\. `we:scripts\/b\.mjs:9` — security, CONFIRMED cosmetic: cosmetic 'x' text$/m);
+      expect(input.digest).toContain(`reviewed head \`${'c'.repeat(40)}\``);
+      expect(findUnmarkedLocusRefs(input.digest)).toEqual([]);
+      expect(() => assertPublishableContent('backlog/x-card.md', `# t\n\n${input.digest}\n`)).not.toThrow();
+    });
+    it('the accept reason names the rule and one line per carded finding', () => {
+      const reason = roundCardsAcceptReason({ decision, filed: 'backlog/x.md' });
+      expect(reason.split('\n')).toHaveLength(3);
+      expect(reason).toMatch(/^Round budget \(card 5471\): round 4 > K=3/);
+      expect(reason).toContain('2 finding(s) filed as a follow-up card (backlog/x.md)');
+    });
+  });
+});
+
+describe('card 5471 [A3]: the round-cards report (count + later fix rate)', async () => {
+  const { roundCardsReport } = await import('../review-loop-policy.mjs');
+  const card = (rule, status, n) => `---\nkind: story\nstatus: ${status}\n---\n\n# Review follow-ups (${rule}, round 4) from o/r#7\n\nFiled mechanically…\n\n`
+    + Array.from({ length: n }, (_, i) => `${i + 1}. \`we:x.mjs:${i + 1}\` — correctness, PLAUSIBLE degraded: f${i}`).join('\n');
+  it('counts cards and carded findings per rule, and the share of cards since resolved', () => {
+    const report = roundCardsReport([card('round-budget', 'open', 2), card('round-budget', 'resolved', 3),
+      card('binding-prior-round', 'open', 1), '# Some other card\n\n1. not counted']);
+    expect(report).toEqual({
+      cards: 3, findings: 6, resolvedCards: 1, fixRate: 1 / 3,
+      byRule: {
+        'round-budget': { cards: 2, findings: 5, resolvedCards: 1, fixRate: 0.5 },
+        'binding-prior-round': { cards: 1, findings: 1, resolvedCards: 0, fixRate: 0 },
+      },
+    });
+  });
+  it('no cards: zero, with a null rate (nothing to divide)', () => {
+    expect(roundCardsReport([])).toMatchObject({ cards: 0, findings: 0, fixRate: null });
+  });
+});

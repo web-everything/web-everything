@@ -66,8 +66,9 @@ const NET_PATHS = ['scripts/operations/review-pr.mjs'];
 const HEAD_A = 'a'.repeat(40);
 const HEAD_B = 'b'.repeat(40);
 
-function stubReader({ labels = ['review:pending'], rev = 'def456' } = {}) {
+function stubReader({ labels = ['review:pending'], rev = 'def456', extra = {} } = {}) {
   return ({ pr, repo }) => ({
+    ...extra,
     state: 'OPEN',
     clearerId: undefined,
     createdAt: '',
@@ -1132,5 +1133,73 @@ describe('descriptive prevention titles preserve filing identity', () => {
         expect(findFiledPreventionCard({ title }, { root, head: HEAD_B, findings: [finding] }).filed).toEqual([]);
       }
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+// ── Cards 5471 / 5470 — a later round the round rules turn into cards: file ONE card, then accept ───────────────────
+describe('runReviewLoopOnce — cards 5471/5470: a round past the budget files its findings as a card and accepts', () => {
+  const DEGRADED_ANSWER = {
+    summary: 'one late, non-broken finding',
+    findings: [{ summary: 'a retry message could name the PR', file: NET_PATHS[0], line: 3, disposition: 'blocker', impactIfUnfixed: 'degraded' }],
+  };
+  const BROKEN_ANSWER = {
+    summary: 'one late broken finding',
+    findings: [{ summary: 'drops queued work on retry', file: NET_PATHS[0], line: 3, disposition: 'blocker', impactIfUnfixed: 'broken' }],
+  };
+  const stubFileItem = (calls) => async (input) => { calls.push(input); return { code: 0, lines: [JSON.stringify({ verdict: { num: 7001, rel: 'backlog/7001-review-follow-ups.md' } })] }; };
+  const run = async ({ answer, round, budget = 3, json = false, fileItem }) => {
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: budget, reviewRound: round } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const seen = [];
+    const out = await runReviewLoopOnce({
+      declaration, registry, argv: [...BASE_ARGV, ...(json ? ['--json'] : [])], store: createMemoryRunStore(), sinks: recordingSinks(seen),
+      makeJudge: cannedJudge(answer), mintRunId: () => `r-budget-${round}`, fileItem,
+      findFiledRoundCards: () => null,
+    });
+    return { out, seen };
+  };
+
+  it('round 4 > K=3, only non-broken findings: one card filed, then the SAME run accepts with the reason on record', async () => {
+    const calls = [];
+    const { out, seen } = await run({ answer: DEGRADED_ANSWER, round: 4, fileItem: stubFileItem(calls) });
+    expect(out.code).toBe(0);
+    expect(out.stopped).toBe('complete');
+    expect(out.run.verdict.verdict).toBe('changes');
+    expect(out.run.findings.confirm).toBe('accept');
+    expect(out.run.input.reason).toMatch(/^Round budget \(card 5471\): round 4 > K=3/);
+    expect(seen.map((s) => s.type)).toContain(REVIEW_EFFECTS.LABEL);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].title).toBe('Review follow-ups (round-budget, round 4) from web-everything/web-everything#1234');
+    expect(calls[0].digest).toMatch(/a retry message could name the PR/);
+    expect(out.lines.join('\n')).toMatch(/round-cards: web-everything\/web-everything#1234 round 4 \(round-budget, K=3\): accepted; 2 finding\(s\) carded → backlog\/7001-review-follow-ups\.md/);
+  });
+
+  it('--json carries roundCardsFiled', async () => {
+    const { out } = await run({ answer: DEGRADED_ANSWER, round: 4, json: true, fileItem: stubFileItem([]) });
+    const payload = JSON.parse(out.lines[0]);
+    expect(payload.roundCardsFiled).toMatchObject({ rule: 'round-budget', round: 4, k: 3, count: 2, num: 7001, path: 'backlog/7001-review-follow-ups.md' });
+  });
+
+  it('round 3 (within K) still bounces with changes; no card is filed', async () => {
+    const calls = [];
+    const { out } = await run({ answer: DEGRADED_ANSWER, round: 3, fileItem: stubFileItem(calls) });
+    expect(out.run.findings.confirm).toBe('changes');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a broken finding at round 4 still bounces', async () => {
+    const calls = [];
+    const { out } = await run({ answer: BROKEN_ANSWER, round: 4, fileItem: stubFileItem(calls) });
+    expect(out.run.findings.confirm).toBe('changes');
+    expect(calls).toHaveLength(0);
+  });
+
+  it('a failed filing leaves the run parked, unaccepted, and says so loudly', async () => {
+    const { out } = await run({ answer: DEGRADED_ANSWER, round: 4, fileItem: async () => ({ code: 1, lines: ['lane pool exhausted'] }) });
+    expect(out.code).toBe(1);
+    expect(out.stopped).toBe('confirm');
+    expect(out.run.findings.confirm).toBeUndefined();
+    expect(out.lines.join('\n')).toMatch(/FAILED to file the round's follow-up card: file-item refused: lane pool exhausted/);
   });
 });

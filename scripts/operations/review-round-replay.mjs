@@ -9,6 +9,12 @@
  * Usage:
  *   node scripts/operations/review-round-replay.mjs [--day=2026-10-08] [--repo=we|<owner/name>]
  *     [--runs-dir=<dir>] [--cwd=<git checkout>] [--prs=4441,4433] [--emit-fixtures=<dir>] [--json]
+ *   node scripts/operations/review-round-replay.mjs --round-budget=3 [--day=…] [--prs=…] [--json]
+ *     Card 5471 [A1/A4]: replay every recorded round 2+ through the round budget at K and report which `changes`
+ *     rounds it would have accepted with cards, and why the others still block.
+ *   node scripts/operations/review-round-replay.mjs --round-cards [--cwd=<checkout>] [--json]
+ *     Card 5471 [A3]: the card debt the round budget / binding prior round created — round cards filed, findings they
+ *     carry, and the share since resolved, per rule (we:scripts/lib/review-loop-policy.mjs#roundCardsReport).
  *
  * WHAT A ROUND IS. One `review-pr` run that reduced a verdict, per distinct reviewed head (a same-head re-run keeps the
  * latest). A PR counts when at least one of its rounds ran on `--day` (America/New_York); its earlier recorded rounds
@@ -26,6 +32,7 @@ import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { normalizeFinding, MANDATORY_LENSES } from '../lib/jury-core.mjs';
 import { enclosingSymbol, findingHeldVerdict, replayPrRounds } from '../lib/review-round-rules.mjs';
+import { roundBudgetDecision, roundCardsReport } from '../lib/review-loop-policy.mjs';
 import { readFixRange } from './review-pr-io.mjs';
 import { sharedRunsDir } from './run-store.mjs';
 import { DEFAULT_REPO_KEY, ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -66,6 +73,8 @@ export function roundFactsFromRecord(record) {
     liveVerdict: verdictOf(F.referralVerdict?.verdict) || verdictOf(reduce.verdict),
     humanRequired: F.read?.humanRequired === true,
     latestFix: F.read?.latestFix ?? null,
+    // Card 5471 — the run's final verdict (after referrals), for the round-budget replay (`--round-budget=K`).
+    verdict: record.verdict ?? null,
     findings: [
       ...admitted.map((finding) => ({ finding, heldVerdict: findingHeldVerdict(finding, { basisLenses }), deferred: false })),
       ...deferred.map((finding) => ({ finding, heldVerdict: false, deferred: true })),
@@ -160,8 +169,43 @@ export function main(argv = process.argv.slice(2), { log = (s) => process.stdout
   const runsDir = resolve(args['runs-dir'] || sharedRunsDir());
   const cwd = resolve(args.cwd || REPO_ROOT);
   const only = args.prs ? new Set(String(args.prs).split(',').map(Number)) : null;
+  if (args['round-cards']) {
+    const dir = join(cwd, 'backlog');
+    const texts = readdirSync(dir).filter((n) => n.endsWith('.md')).map((n) => { try { return readFileSync(join(dir, n), 'utf8'); } catch { return ''; } });
+    const report = roundCardsReport(texts);
+    const pct = (r) => (r === null ? 'n/a' : `${Math.round(r * 100)}%`);
+    if (args.json) log(JSON.stringify(report, null, 1));
+    else {
+      log(`round cards: ${report.cards} card(s), ${report.findings} finding(s) carded, ${report.resolvedCards} card(s) resolved (fix rate ${pct(report.fixRate)})`);
+      for (const [rule, b] of Object.entries(report.byRule)) log(`  ${rule}: ${b.cards} card(s), ${b.findings} finding(s), fix rate ${pct(b.fixRate)}`);
+    }
+    return report;
+  }
   const exec = (cmd, a, opts) => execFileSync(cmd, a, { ...opts, cwd });
   const byPr = loadRounds({ runsDir, repo });
+  if (args['round-budget'] !== undefined) {
+    const k = Number(args['round-budget']);
+    const out = [];
+    for (const [pr, all] of [...byPr].sort((a, b) => a[0] - b[0])) {
+      if (only && !only.has(pr)) continue;
+      all.forEach((r, i) => {
+        if (i === 0 || etDay(r.at) !== day) return;
+        const d = roundBudgetDecision({ verdict: r.verdict, round: i + 1, budget: k });
+        out.push({ pr, round: i + 1, runId: r.runId, liveVerdict: r.liveVerdict, apply: d.apply, reason: d.reason, cards: d.cards.length });
+      });
+    }
+    const accepted = out.filter((x) => x.apply);
+    const changesPastK = out.filter((x) => x.round > k && x.liveVerdict === 'changes');
+    const total = { day, repo, k, laterRounds: out.length, changesRoundsPastK: changesPastK.length, acceptedWithCards: accepted.length,
+      stillBlocking: Object.entries(changesPastK.filter((x) => !x.apply).reduce((m, x) => ({ ...m, [x.reason]: (m[x.reason] ?? 0) + 1 }), {})) };
+    if (args.json) log(JSON.stringify({ total, rows: out }, null, 1));
+    else {
+      for (const x of out.filter((y) => y.round > k)) log(`#${x.pr} r${x.round} live ${x.liveVerdict || '-'} → ${x.apply ? `ACCEPT with ${x.cards} card(s)` : `as today (${x.reason})`}`);
+      log(`\n${day} ${repo} K=${k}: ${changesPastK.length} \`changes\` round(s) past K; ${accepted.length} would accept with cards; `
+        + `still blocking: ${total.stillBlocking.map(([r, n]) => `${r} ${n}`).join(', ') || 'none'}.`);
+    }
+    return { total, rows: out };
+  }
   const rows = [];
   let laterRounds = 0; let laterBlocked = 0; let wouldCard = 0; let avoided = 0; let whatIf = 0;
   for (const [pr, all] of [...byPr].sort((a, b) => a[0] - b[0])) {

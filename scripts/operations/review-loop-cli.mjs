@@ -71,6 +71,7 @@ import { appendEntry } from '../conveyor/learnings-drop.mjs';
 import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
+  buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsHeadMarker,
 } from '../lib/review-loop-policy.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
@@ -300,6 +301,28 @@ export function parseFiledPayload(lines = []) {
 }
 
 /** The step a ruled, parked review is rewound to: the one that reads the rulings off the thread and re-reduces. */
+/**
+ * Cards 5471 / 5470 — HAS THIS ROUND'S FOLLOW-UP CARD ALREADY BEEN FILED? A retry after an accept that failed part-way
+ * must not file a second card. A candidate is an open backlog card with the same `# <title>` heading (the title names
+ * the PR, the rule and the round) and, when the head is pinned, the same reviewed-head marker.
+ * @param {{title: string}} input - {@link module:review-loop-policy.buildRoundCardsFilingInput}'s output.
+ * @param {{root?: string, head?: string|null}} [o]
+ * @returns {{num: string, path: string}|null}
+ */
+export function findFiledRoundCardsCard({ title }, { root = SCAFFOLD_ROOT, head = null } = {}) {
+  let names;
+  try { names = readdirSync(join(root, 'backlog')).filter((n) => n.endsWith('.md')); } catch { return null; }
+  for (const name of names) {
+    let text;
+    try { text = readFileSync(join(root, 'backlog', name), 'utf8'); } catch { continue; }
+    if (/^# .+$/m.exec(text)?.[0] !== `# ${title}`) continue;
+    if (head && !text.includes(roundCardsHeadMarker(head))) continue;
+    if (/^status:\s*"?(?:resolved|closed|done|wontfix|superseded)\b/m.test(text)) continue;
+    return { num: name.replace(/-.*$/, '').replace(/\.md$/, ''), path: `backlog/${name}` };
+  }
+  return null;
+}
+
 export const RESUME_STEP = 'mandatoryReferrals';
 /** How many times one parked run is driven again after its resume failed part-way, before a fresh review is allowed. */
 export const RESUME_MAX_ATTEMPTS = 3;
@@ -357,6 +380,7 @@ export async function runReviewLoopOnce({
   declaration, registry, argv, store, sinks, makeJudge, mintRunId, autoConfirm = reviewLoopAutoConfirm,
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
+  findFiledRoundCards = findFiledRoundCardsCard,
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
   if (parsed.control.help) {
@@ -560,6 +584,69 @@ export async function runReviewLoopOnce({
       run: acceptedOutcome.run,
       stopped: acceptedOutcome.stopped,
     };
+  }
+
+  // ── CARDS 5471 / 5470 — A LATER ROUND THAT ENDS IN CARDS, NOT ANOTHER FIX ROUND ─────────────────────────────────────
+  // `reviewLoopAutoConfirm` DECLINES a round the round rules turn into cards (the round budget past K, or the binding
+  // prior round when `on`): filing is impure, so it happens here, exactly like the prevention branch above. ONE card
+  // carries every deferred finding; only once it is filed (or queued for landing) does THIS SAME run resume with
+  // `accept`, its `--reason` naming the rule and one line per carded finding (rendered in the PR comment). A failed
+  // filing leaves the run parked and unaccepted, and says so loudly — never an accept over findings that went unfiled.
+  if (isRoundCardsParked(outcome)) {
+    const decision = roundCardsDecision(outcome.run);
+    const { pr, repo } = outcome.run.input;
+    const head = outcome.run.findings?.read?.netBasis?.rev ?? null;
+    const filingInput = buildRoundCardsFilingInput({ repo, pr, head, decision });
+    let filedPayload = null;
+    let alreadyFiled = null;
+    let filingError = null;
+    try {
+      alreadyFiled = findFiledRoundCards(filingInput, { head }) ?? null;
+      if (!alreadyFiled) {
+        const filed = await fileItem(filingInput);
+        if (filed?.code !== 0) filingError = `file-item refused: ${(filed?.lines ?? []).join(' / ')}`;
+        else filedPayload = parseFiledPayload(filed.lines);
+      }
+    } catch (e) {
+      filingError = String(e?.message ?? e);
+    }
+    if (filingError) {
+      const rendered = renderOutcome({ outcome, json: parsed.control.json, declaration });
+      if (parsed.control.json) {
+        const payload = { ...JSON.parse(rendered.lines[0]), roundCardsFilingError: filingError };
+        return { code: 1, lines: [JSON.stringify(payload, null, 2)], run: outcome.run, stopped: outcome.stopped };
+      }
+      return {
+        code: 1,
+        lines: [...rendered.lines, '', `FAILED to file the round's follow-up card: ${filingError}`,
+          'The run stays parked — nothing was recorded, and these findings are never accepted unfiled.'],
+        run: outcome.run,
+        stopped: outcome.stopped,
+      };
+    }
+    const queued = !alreadyFiled && filedPayload?.queued === true;
+    const num = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
+    const path = alreadyFiled ? alreadyFiled.path : (filedPayload?.verdict?.rel ?? null);
+    const handle = queued ? (filedPayload?.handle ?? null) : null;
+    const where = path ?? (queued ? `queued for landing (${handle ?? 'untracked job'})` : '(no path)');
+    const accepting = { ...outcome.run, input: { ...outcome.run.input, reason: roundCardsAcceptReason({ decision, filed: where }) } };
+    store.write(accepting);
+    const acceptedOutcome = await driveRun({
+      run: accepting, registry, store, sinks, judge: activeJudge, resume: { step: outcome.run.pending.step, value: 'accept' },
+      autoConfirm, attemptedBy: 'agent',
+    });
+    const rendered = renderOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
+    const summaryLine = `round-cards: ${repo}#${pr} round ${decision.round ?? '?'} (${decision.rule}${decision.k ? `, K=${decision.k}` : ''}): `
+      + `accepted; ${decision.cards.length} finding(s) carded → ${where}${alreadyFiled ? ' (already filed)' : ''}`;
+    if (parsed.control.json) {
+      const payload = {
+        ...JSON.parse(rendered.lines[0]),
+        roundCardsFiled: { rule: decision.rule, round: decision.round, k: decision.k, count: decision.cards.length, num, path,
+          ...(alreadyFiled ? { alreadyFiled: true } : {}), ...(queued ? { queued: true, handle } : {}) },
+      };
+      return { code: rendered.code, lines: [JSON.stringify(payload, null, 2)], run: acceptedOutcome.run, stopped: acceptedOutcome.stopped };
+    }
+    return { code: rendered.code, lines: [...rendered.lines, '', summaryLine], run: acceptedOutcome.run, stopped: acceptedOutcome.stopped };
   }
 
   // ── THE QUEUED-ACCEPT BRANCH — the one behaviour `runOperationCli` does not have ──────────────────────────

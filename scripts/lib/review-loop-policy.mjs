@@ -77,8 +77,10 @@ import { preventionCardTitle } from '../operations/machine-pr-title.mjs';
  * `review-loop-cli.mjs` is the only place {@link buildAcceptQueueEntry}'s output is actually appended anywhere.
  */
 
-import { CONFIRM_ACTORS, CONFIRM_OPTIONS } from '../operations/review-pr.mjs';
-import { VERDICTS, hasUncapturedPrevention } from './jury-core.mjs';
+import { CONFIRM_ACTORS, CONFIRM_OPTIONS, REVIEW_EFFECTS } from '../operations/review-pr.mjs';
+import { VERDICTS, hasUncapturedPrevention, normalizeFinding, requiresMandatoryReferral, DEFAULT_ROUND_CAP,
+  MANDATORY_LENSES } from './jury-core.mjs';
+import { findingHeldVerdict } from './review-round-rules.mjs';
 import { FIELD_CAPS, KINDS } from '../conveyor/learnings-drop.mjs';
 // #883 — every code-path reference filed into a backlog card's `scope` or BODY prose must carry its `<repo>:`
 // locus prefix (the write-time `lint-locus-prefix.mjs` hook enforces this on every scaffold/file-item write,
@@ -149,6 +151,10 @@ const UNATTENDED_ANSWER = CONFIRM_OPTIONS.includes('changes') ? 'changes' : (() 
 export function reviewLoopAutoConfirm(pending, run) {
   if (run?.verdict?.pendingReferrals?.length) return null;
   if (!pending || pending.of !== CONFIRM_ACTORS.AGENT) return null;
+  // Cards 5471 / 5470 — a later round whose findings the round rules turn into cards DECLINES here, like
+  // prevention-outstanding: filing the cards is impure, so `review-loop-cli.mjs` files them (see
+  // {@link isRoundCardsParked}) and only then resumes this run with the accept. Never a `changes` bounce.
+  if (roundCardsDecision(run).apply) return null;
   if (run?.verdict?.verdict === VERDICTS.ACCEPT) return { value: 'accept' };
   // #2749 FIX — `prevention-outstanding` NEVER auto-answers `accept` (nor `changes`: no editor round can file a
   // guard). DECLINE, same as a human-addressed confirm, so the run stays parked for an operator to file the
@@ -321,6 +327,27 @@ export function buildPreventionFilingInput({ repo, pr, findings = [], parent = '
     + `${repo}#${pr}'s review${head ? ` (${preventionHeadMarker(head)})` : ''} to prevention-outstanding by `
     + 'naming a guard neither captured nor filed:\n\n'
     + digestLines.join('\n');
+  const digest = qualifyLocusRefs(digestRaw, files);
+  return {
+    title: preventionCardTitle({ repo, pr, digest }),
+    kind: 'story',
+    size: '3',
+    digest,
+    scope,
+    parent: parent || '',
+    queue: queue === 'false' || queue === false ? 'false' : 'true',
+  };
+}
+
+/**
+ * PREFIX EVERY BARE REPO PATH in card prose with the `we:` locus (#883), so the write-time locus scan never refuses a
+ * mechanically filed card. PURE. Shared by {@link buildPreventionFilingInput} and {@link buildRoundCardsFilingInput}.
+ *
+ * @param {string} text - the raw digest.
+ * @param {string[]} files - the clean repo paths the card cites (their bare basenames are qualified too).
+ * @returns {string}
+ */
+export function qualifyLocusRefs(text, files = []) {
   // #883 SAFETY NET — a juror's own `prevention` PROSE can casually re-mention a file this card already cites
   // by its bare basename with no locus prefix at all (live example: PR #2749's actual finding 3 text says
   // "…mirroring how guard-lane.mjs already receives a pre-realpath'd real from its caller" — no backticks, no
@@ -336,14 +363,14 @@ export function buildPreventionFilingInput({ repo, pr, findings = [], parent = '
     // `lane.mjs` used to splice a prefix into the middle of `guard-lane.mjs`. A `.` only ends the name when no
     // word follows it (PR #2766 advisory): `lane.mjs.bak` is a longer name, `…fix lane.mjs.` ends a sentence.
     return text.replace(new RegExp(`(?<!we:|fui:|plateau:)(?<![\\w/.-])${escaped}(?![\\w-]|\\.\\w)`, 'g'), `${IN_REPO_LOCUS}${f}`);
-  }, digestRaw);
+  }, String(text ?? ''));
   // PR #2766 advisory (codex-correctness, reproduced) — the basename pass above deliberately skips a name that
   // is already part of a longer `dir/basename` path, so a FULL bare path in juror prose (a test file, or a file
   // this card never cites at all) survived unprefixed and the write-time scan refused the whole card, leaving
   // the run parked. Second pass: prefix every token the real detector still flags. Longest first, and never
   // inside a longer token or after an existing `<repo>:` prefix (only a REPO prefix — any other colon, as in
   // `Files:scripts/z.mjs`, is still flagged by the detector, so it must still be prefixed).
-  const digest = findUnmarkedLocusRefs(basenamesQualified)
+  return findUnmarkedLocusRefs(basenamesQualified)
     .sort((a, b) => b.length - a.length)
     .reduce((text, ref) => {
       const escaped = ref.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -352,15 +379,6 @@ export function buildPreventionFilingInput({ repo, pr, findings = [], parent = '
         `${IN_REPO_LOCUS}${ref}`,
       );
     }, basenamesQualified);
-  return {
-    title: preventionCardTitle({ repo, pr, digest }),
-    kind: 'story',
-    size: '3',
-    digest,
-    scope,
-    parent: parent || '',
-    queue: queue === 'false' || queue === false ? 'false' : 'true',
-  };
 }
 
 /**
@@ -538,4 +556,219 @@ export function isPreventionOutstandingClear(outcome) {
     && outcome?.run?.verdict?.verdict === VERDICTS.PREVENTION_OUTSTANDING
     && Array.isArray(outcome?.run?.verdict?.findings)
     && outcome.run.verdict.findings.some(hasUncapturedPrevention);
+}
+
+// ── Cards 5471 + 5470 — LATER ROUNDS THAT END IN CARDS, NOT ANOTHER FIX ROUND ──────────────────────────────────────
+//
+// Fixer/review rulings P5 and P3 (operator 2026-10-08, card 5467). Two rules, one outcome: a later review round whose
+// blocking findings are all safe to defer is ACCEPTED, and those findings are filed as one follow-up backlog card,
+// instead of sending the PR back for another fix round.
+//
+//   round-budget (5471, P5)          — after round K (setting `roundBudget`, shipped K=3), a `changes` round whose
+//                                      held findings are all `cosmetic`/`degraded` is accepted with cards. A `broken`
+//                                      or `unrecoverable` finding (or one with no stated impact) still blocks, at any
+//                                      round. The round cap still stands: at round ≥ the cap the budget does not act.
+//   binding-prior-round (5470, P3)   — when `scopedRereview` is `on`, a later round the scoped re-review shadow says
+//                                      would not have blocked (every held finding sits on code unchanged since the
+//                                      last reviewed head, none is CONFIRMED + broken, none carries a sent-back
+//                                      finding) is accepted with cards. `shadow` only journals, as before.
+//
+// PURE: plain facts in, a decision out. The facts come from the run record: the verdict, the read (the resolved
+// settings and the ledger round, written by the io shell), and the advise step's shadow summary. No label, forge or
+// clock detail is inside a rule, so it can move into the delivery standard as-is (protocol card 5468).
+
+/** The two rules, by name (also the card title's and the journal's word for them). */
+export const ROUND_CARD_RULES = Object.freeze({ ROUND_BUDGET: 'round-budget', BINDING_PRIOR_ROUND: 'binding-prior-round' });
+
+/** The impacts a round may turn into cards. Anything else (`broken`, `unrecoverable`, or none stated) blocks. */
+const CARDABLE_IMPACTS = Object.freeze(['cosmetic', 'degraded']);
+
+/** The findings that held the live verdict (the same test the shadow uses). PURE. */
+export function heldRoundFindings(verdict) {
+  const basisLenses = Array.isArray(verdict?.basisLenses) && verdict.basisLenses.length ? verdict.basisLenses : MANDATORY_LENSES;
+  return (Array.isArray(verdict?.admittedFindings) ? verdict.admittedFindings : [])
+    .filter((f) => normalizeFinding(f) && findingHeldVerdict(f, { basisLenses }));
+}
+
+/** The guards both rules share, in order. `null` when the round is eligible. PURE. */
+function roundCardsRefusal(verdict) {
+  if (verdict?.verdict !== VERDICTS.CHANGES) return 'not-changes';
+  if (verdict.humanRequired === true) return 'human-required';
+  if (verdict.pendingReferrals?.length) return 'referral-pending';
+  if (verdict.blockedReferrals?.length) return 'referral-blocked';
+  const admitted = Array.isArray(verdict.admittedFindings) ? verdict.admittedFindings : [];
+  if (admitted.some(requiresMandatoryReferral)) return 'confirmed-broken';
+  return null;
+}
+
+/**
+ * Card 5471 — THE ROUND BUDGET (ruling P5). PURE. Accept with cards only on positive evidence: a `changes` verdict, a
+ * known round past K and below the cap, no referral open or block-ruled, no CONFIRMED broken finding, and every held
+ * finding `cosmetic` or `degraded`. Every doubt keeps today's bounce (edges 2 and 4).
+ *
+ * @param {{verdict?: object, round?: number|null, budget?: number|string, cap?: number}} facts - `round` is the ledger's
+ *   reviewed-head round for this PR (`read.reviewRound`); `budget` the resolved `roundBudget` setting.
+ * @returns {{rule: string, apply: boolean, reason: string, round: number|null, k: number|null, cards: Array<object>}}
+ */
+export function roundBudgetDecision({ verdict, round = null, budget = 'off', cap = DEFAULT_ROUND_CAP } = {}) {
+  const k = Number.isInteger(budget) && budget >= 1 ? budget : null;
+  const r = Number.isInteger(round) && round >= 1 ? round : null;
+  const out = (apply, reason, cards = []) => ({ rule: ROUND_CARD_RULES.ROUND_BUDGET, apply, reason, round: r, k, cards });
+  if (k === null) return out(false, 'off');
+  const refusal = roundCardsRefusal(verdict);
+  if (refusal) return out(false, refusal);
+  if (r === null) return out(false, 'round-unknown');
+  if (r <= k) return out(false, 'within-budget');
+  if (r >= cap) return out(false, 'round-cap');
+  const held = heldRoundFindings(verdict);
+  if (!held.length) return out(false, 'no-held-finding');
+  if (held.some((f) => !CARDABLE_IMPACTS.includes(normalizeFinding(f).impactIfUnfixed))) return out(false, 'blocking-impact');
+  return out(true, 'over-budget', held);
+}
+
+/**
+ * Card 5470 — THE BINDING PRIOR ROUND, `on` (ruling P3). PURE. Reads the scoped re-review shadow's own summary for
+ * this round (the advise step's `review.scoped-rereview-shadow` result): when it says the round would have been
+ * avoided, the held findings become cards. No summary, a full-review scope, or a shadow block keeps today's bounce.
+ *
+ * @param {{verdict?: object, mode?: string, shadow?: object|null}} facts - `mode` is `read.scopedRereview`; `shadow` the
+ *   shadow summary.
+ * @returns {{rule: string, apply: boolean, reason: string, round: number|null, k: null, cards: Array<object>}}
+ */
+export function bindingPriorRoundDecision({ verdict, mode = 'off', shadow = null } = {}) {
+  const round = Number.isInteger(shadow?.round) ? shadow.round : null;
+  const out = (apply, reason, cards = []) => ({ rule: ROUND_CARD_RULES.BINDING_PRIOR_ROUND, apply, reason, round, k: null, cards });
+  if (mode !== 'on') return out(false, mode === 'shadow' ? 'shadow' : 'off');
+  const refusal = roundCardsRefusal(verdict);
+  if (refusal) return out(false, refusal);
+  if (!shadow || typeof shadow !== 'object') return out(false, 'shadow-unavailable');
+  if (!(round > 1) || shadow.scope !== 'delta') return out(false, 'full-review');
+  if (shadow.shadowBlocked !== false || shadow.liveBlocked !== true || shadow.roundAvoided !== true) return out(false, 'still-blocks');
+  const held = heldRoundFindings(verdict);
+  if (!held.length) return out(false, 'no-held-finding');
+  return out(true, 'unchanged-code', held);
+}
+
+/** The shadow summary the advise step recorded on this run, or null. PURE. */
+export function adviseShadowSummary(run) {
+  const effects = Array.isArray(run?.findings?.advise?.effects) ? run.findings.advise.effects : [];
+  const hit = effects.find((e) => e?.type === REVIEW_EFFECTS.SCOPED_REREVIEW_SHADOW && e.status === 'applied');
+  return hit?.result?.summary && typeof hit.result.summary === 'object' ? hit.result.summary : null;
+}
+
+/**
+ * THE ONE DECISION the loop acts on: the round budget first, then the binding prior round. PURE. `apply: false` is
+ * today's behaviour.
+ * @param {object} run - a `review-pr` run record (or its in-flight form at the confirm stop).
+ * @returns {{rule: string, apply: boolean, reason: string, round: number|null, k: number|null, cards: Array<object>}}
+ */
+export function roundCardsDecision(run) {
+  const read = run?.findings?.read ?? {};
+  const budget = roundBudgetDecision({ verdict: run?.verdict, round: read.reviewRound ?? null, budget: read.roundBudget ?? 'off' });
+  if (budget.apply) return budget;
+  const binding = bindingPriorRoundDecision({ verdict: run?.verdict, mode: read.scopedRereview ?? 'off', shadow: adviseShadowSummary(run) });
+  return binding.apply ? binding : budget;
+}
+
+/**
+ * IS THIS STOP THE MOMENT TO FILE THE ROUND'S CARDS AND ACCEPT? PURE — mirrors {@link isPreventionOutstandingParked}:
+ * an agent-addressed confirm the policy declined because {@link roundCardsDecision} applies.
+ * @param {{stopped?: string, run?: object}} outcome - a `driveRun` outcome.
+ * @returns {boolean}
+ */
+export function isRoundCardsParked(outcome) {
+  return outcome?.stopped === 'confirm'
+    && outcome?.run?.pending?.of === CONFIRM_ACTORS.AGENT
+    && roundCardsDecision(outcome.run).apply === true;
+}
+
+/** One finding as one plain line: the cited place, the lens and severity, and the summary (data, never parsed). */
+function roundCardLine(f, i) {
+  const n = normalizeFinding(f) ?? { summary: '' };
+  const lens = String(n.category ?? '').split('/')[0] || 'review';
+  const sev = [n.verdict, n.impactIfUnfixed].filter(Boolean).join(' ') || 'severity not stated';
+  const summary = n.summary.replace(/\s+/g, ' ').replace(/`/g, "'").trim().slice(0, 300);
+  const anchor = cleanFindingFile(f) ? preventionGuardAnchor(f) : '`(no file cited)`';
+  return `${i + 1}. ${anchor} — ${lens}, ${sev}: ${summary}`;
+}
+
+/** The text a round card carries to name the head it was filed for (the retry key, like {@link preventionHeadMarker}). */
+export function roundCardsHeadMarker(head) {
+  return `reviewed head \`${head}\``;
+}
+
+/** The card title: stable per PR + rule + round, never built from juror prose. PURE. */
+export function roundCardsTitle({ repo, pr, rule, round }) {
+  return `Review follow-ups (${rule}, round ${round ?? '?'}) from ${repo}#${pr}`;
+}
+
+/**
+ * BUILD the `file-item` input for the ONE card that carries every finding a round turned into a card. PURE. One card
+ * per round, one numbered line per finding — the same shape as {@link buildPreventionFilingInput}, for the same reason:
+ * each filed card lands through its own lane and PR, so one card per finding would multiply that cost.
+ *
+ * @param {{repo: string, pr: number|string, head?: string|null, decision: object, queue?: string}} o
+ * @returns {{title: string, kind: string, size: string, digest: string, scope: string, parent: string, queue: string}}
+ */
+export function buildRoundCardsFilingInput({ repo, pr, head = null, decision, queue = 'true' } = {}) {
+  const cards = Array.isArray(decision?.cards) ? decision.cards : [];
+  const files = [...new Set(cards.map(cleanFindingFile).filter(Boolean))];
+  const why = decision?.rule === ROUND_CARD_RULES.ROUND_BUDGET
+    ? `round ${decision.round} is past the round budget K=${decision.k} and no finding is broken (card 5471)`
+    : `round ${decision?.round ?? '?'} raised these only on code unchanged since the last reviewed head (card 5470)`;
+  const digestRaw = `Filed mechanically by the unattended review loop: ${repo}#${pr}'s review${head ? ` (${roundCardsHeadMarker(head)})` : ''} `
+    + `was accepted because ${why}. Each finding below was deferred to this card instead of another fix round:\n\n`
+    + cards.map(roundCardLine).join('\n');
+  return {
+    title: roundCardsTitle({ repo, pr, rule: decision?.rule, round: decision?.round }),
+    kind: 'story',
+    size: '2',
+    digest: qualifyLocusRefs(digestRaw, files),
+    scope: files.map((f) => `${IN_REPO_LOCUS}${f}`).join(','),
+    parent: '',
+    queue: queue === 'false' || queue === false ? 'false' : 'true',
+  };
+}
+
+/**
+ * The `--reason` the accept is recorded with: the rule, and one line per carded finding, so the PR comment tells the
+ * operator what was deferred and where it went. PURE.
+ * @param {{decision: object, filed?: string|null}} o - `filed` names the card (path, number, or the landing handle).
+ * @returns {string}
+ */
+export function roundCardsAcceptReason({ decision, filed = null } = {}) {
+  const head = decision?.rule === ROUND_CARD_RULES.ROUND_BUDGET
+    ? `Round budget (card 5471): round ${decision.round} > K=${decision.k}, no finding is broken, so this round accepts.`
+    : `Binding prior round (card 5470): round ${decision?.round ?? '?'} found these only on code unchanged since the last reviewed head, so this round accepts.`;
+  const cards = Array.isArray(decision?.cards) ? decision.cards : [];
+  return [`${head} ${cards.length} finding(s) filed as a follow-up card${filed ? ` (${filed})` : ''}:`, ...cards.map(roundCardLine)].join('\n');
+}
+
+/**
+ * Card 5471 [A3] — THE CARD DEBT the round rules create, made visible: how many round cards were filed, how many
+ * findings they carry, and the share of those cards since resolved (the later fix rate), per rule. PURE: it reads card
+ * texts (the caller lists `backlog/`); a card is a round card only by its own `# Review follow-ups (<rule>, …` heading.
+ * @param {string[]} cardTexts
+ * @returns {{cards: number, findings: number, resolvedCards: number, fixRate: number|null,
+ *   byRule: Record<string, {cards: number, findings: number, resolvedCards: number, fixRate: number|null}>}}
+ */
+export function roundCardsReport(cardTexts = []) {
+  const blank = () => ({ cards: 0, findings: 0, resolvedCards: 0, fixRate: null });
+  const total = blank();
+  const byRule = {};
+  const rules = Object.values(ROUND_CARD_RULES).join('|');
+  for (const text of Array.isArray(cardTexts) ? cardTexts : []) {
+    const m = new RegExp(`^# Review follow-ups \\((${rules}), round [^)]*\\) from \\S+#\\d+$`, 'm').exec(String(text ?? ''));
+    if (!m) continue;
+    const body = String(text).slice(m.index);
+    const findings = (body.match(/^\d+\. /gm) ?? []).length;
+    const resolved = /^status:\s*"?resolved\b/m.test(String(text).slice(0, m.index));
+    for (const bucket of [total, (byRule[m[1]] ??= blank())]) {
+      bucket.cards += 1;
+      bucket.findings += findings;
+      if (resolved) bucket.resolvedCards += 1;
+    }
+  }
+  for (const bucket of [total, ...Object.values(byRule)]) bucket.fixRate = bucket.cards ? bucket.resolvedCards / bucket.cards : null;
+  return { ...total, byRule };
 }
