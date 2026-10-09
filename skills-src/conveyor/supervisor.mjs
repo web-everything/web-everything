@@ -426,8 +426,8 @@ export const ALERT_HISTORY_CAP = 200;
  *  own `q()`. */
 function q(s) { return `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`; }
 
-/** Best-effort desktop notification (#3398, mirrors #2493's drain-daemon precedent). macOS-only (`osascript`);
- *  a no-op elsewhere, and a spawn failure must never break the supervisor loop. */
+/** CHECKED desktop notification: `{ok:true}` only once osascript exited zero; a failure, a throw or a non-macOS host
+ *  returns `{ok:false}` (never throws). The quiet-hours digest is confirmed through this sender only. */
 export function sendDesktopChecked({ title, body }, { spawnSyncFn = spawnSync, platform = process.platform } = {}) {
   if (platform !== 'darwin') return { ok: false, error: `Desktop notifications unsupported on ${platform}` };
   try {
@@ -437,6 +437,8 @@ export function sendDesktopChecked({ title, body }, { spawnSyncFn = spawnSync, p
   } catch (e) { return { ok: false, error: String(e?.message ?? e) }; }
 }
 
+/** Best-effort desktop notification (#3398, mirrors #2493's drain-daemon precedent). macOS-only (`osascript`);
+ *  a no-op elsewhere, and a spawn failure must never break the supervisor loop. */
 export function notifyDesktop(notification, { quietGate = gateAlert, spawnSyncFn = spawnSync, platform = process.platform } = {}) {
   // quietHours (card xmvc6oc): held overnight unless it is an emergency; see we:scripts/lib/quiet-hours-io.mjs.
   const send = ({ title, body }) => {

@@ -21,8 +21,8 @@ Operator-approved 2026-10-08 (held item 134). Overnight desktop alerts and sched
 One line per class: either the handling, or `n/a: <why>`.
 
 1. **Untrusted text** — alert titles/bodies are only stored in the digest file and re-shown capped (first 5 titles); never evaluated.
-2. **Truncated reads** — a torn/garbage settings or toggle file falls back to the defaults / toggle off; a torn digest line is skipped.
-3. **Shared state files** — the digest is append-only JSONL; the flush renames it away first so two flushers cannot both send.
+2. **Truncated reads** — a torn/garbage settings or toggle file falls back to the defaults / toggle off; a held-alert file that is not JSON is skipped.
+3. **Shared state files** — the digest queue is one file per held alert (`queue/<id>.json`), staged in `tmp/` and committed with one rename, so no writer holds a handle a flush could rename or delete. A flush claims the whole `queue/` with one rename, so two flushers cannot both send; on failure each entry is renamed back. Delivery is at least once (a flusher killed after a confirmed send can cause one duplicate digest), never lossy.
 4. **Fail closed** — any error in the quiet gate DELIVERS the alert (never silently drops one) — failing loud is the safe side for alerts.
 5. **Identity scoping** — n/a: one operator, one machine; settings and toggle are host-wide.
 6. **State over time** — toggle `until` in the past means off; the window is computed in the configured time zone so DST shifts are handled by Intl.
