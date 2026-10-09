@@ -82,7 +82,11 @@ Crux: `file-item` takes only `title` and `digest` as prose (`we:scripts/operatio
 // Fork 2 (c) — we:scripts/conveyor/prepare-result.mjs, sketch. Today the function takes only `raw` (:35);
 // the policy becomes an optional second argument, injected by the IO callers, so the module stays pure.
 import { readTaskAgreement } from '../backlog/task-agreement.mjs';
-export function prepareCardStatus(raw, { taskAgreementPolicy = 'advise' } = {}) {
+const TASK_AGREEMENT_POLICIES = new Set(['off', 'advise', 'enforce']);
+export function prepareCardStatus(raw, { taskAgreementPolicy } = {}) {
+  // A missing or invalid policy reads as `enforce` (fail closed, per the ruling), never as a silent `advise`.
+  // `advise` is only ever the committed value in the policy file, not a code fallback; callers report the reason.
+  const policy = TASK_AGREEMENT_POLICIES.has(taskAgreementPolicy) ? taskAgreementPolicy : 'enforce';
   const stamp = readField(raw, 'preparedDate');
   const body = String(raw).replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '').replace(/<!--[^]*?-->/g, '');
   const sections = readSections(body);
@@ -91,7 +95,7 @@ export function prepareCardStatus(raw, { taskAgreementPolicy = 'advise' } = {}) 
   const agreed = agreement.acceptance.length > 0 && agreement.nonGoalsAnswered;
   return {
     preparedDate: /^\d{4}-\d{2}-\d{2}$/.test(stamp ?? '') ? stamp : null,
-    hasSections: hasPrepare && (taskAgreementPolicy !== 'enforce' || agreed),
+    hasSections: hasPrepare && (policy !== 'enforce' || agreed),
     agreement, // callers log `agreed === false` under `advise`
   };
 }

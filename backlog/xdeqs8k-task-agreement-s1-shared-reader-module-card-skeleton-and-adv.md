@@ -26,7 +26,7 @@ comment marker after comment stripping (prepareCardStatus path) draft = false
 
 - [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reports `draft: true` when the visible line `Draft: model-written, not yet confirmed.` is the first non-blank line under `## Acceptance` or under `## Non-goals`, and that line is not counted as an item (fails before: the reader only knows the comment, so the visible line reads `draft: false`).
 - [A2] **Executable** — the same test file passes a full card (frontmatter and HTML comments included) through the real `prepareCardStatus` comment-stripping path and asserts the draft flag is still reported, and asserts a card marked with the old `<!-- agreement: draft -->` comment is NOT read as draft, so the format cannot drift back to a comment unnoticed (fails before: the comment reads as draft on a direct read and disappears after stripping).
-- [A3] **Observable** — `AGREEMENT_DRAFT_MARKER` is the visible line, the test pins its exact text, and a `git grep "agreement: draft"` over `we:scripts/`, `we:docs/`, `we:skills-src/` and `we:backlog/` finds only the A2 negative case.
+- [A3] **Observable** — `AGREEMENT_DRAFT_MARKER` is the visible line, the test pins its exact text, and `git grep -n "agreement: draft" -- we:scripts we:skills-src` finds only the A2 negative case in `we:scripts/backlog/__tests__/task-agreement.test.mjs`. The grep is scoped to code paths on purpose: card text under `we:backlog/` (this card and #5399 explain the old comment marker) and `we:docs/` may name it, and those explanatory matches are allowed.
 
 ## Non-goals
 
@@ -44,5 +44,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 4. **Fail closed** — the marker survives comment stripping (A2), so a draft section never reads as agreed on the gate's read path. A marker line inside a code fence or above the heading is still not read as the section's marker, as `main` already tests.
 5. **Identity scoping** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
-6. **State over time** — no card carries the old comment marker: nothing writes it before S2, and A3 checks the backlog for it. Dropping it therefore turns no draft section into an agreed one.
+6. **State over time** — no card carries the old comment marker: nothing writes it before S2, and A3 checks the code paths for it (the explanatory text in card bodies is allowed). Dropping it therefore turns no draft section into an agreed one.
 7. **Who wrote it** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
