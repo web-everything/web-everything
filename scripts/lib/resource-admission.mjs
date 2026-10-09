@@ -7,11 +7,12 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeJsonAtomic, withFileLock } from './atomic-json-file.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { isValidPolicyLayer, resolveResourcePolicy, decideAdmission } from './resource-policy.mjs';
+import { readDeclaredSettings, LEGACY_SETTINGS_PATH } from './settings-files.mjs';
 // The pure policy + decision live in we:scripts/lib/resource-policy.mjs so a read-only declaring module (the
 // resource-status operation) can import them without reaching fs.
 export { RESOURCE_POLICY_STANDARD, RESOURCE_POLICY_KINDS, resolveResourcePolicy, decideAdmission } from './resource-policy.mjs';
@@ -64,7 +65,19 @@ export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(),
     }
   };
   const platform = readLayer('platform', env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'));
-  const tool = readLayer('tool', join(repoRoot, 'scripts', 'dispatch-settings.json'));
+  // The tool layer is the merged scripts/ settings (legacy shared file + scripts/settings/*.json), so a feature file can
+  // carry `resourceAdmission` too. The legacy file sits beside the settings dir, so it is derived from it, not named here.
+  const settingsDir = join(repoRoot, 'scripts', 'settings');
+  const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
+  const pathOf = (name) => (name.startsWith('settings/') ? join(settingsDir, name.slice('settings/'.length)) : join(dirname(settingsDir), name));
+  for (const { source, error } of declared.errors) (sources.errors ??= []).push({ source: 'tool', path: pathOf(source), error });
+  let tool;
+  if (Object.hasOwn(declared.settings, 'resourceAdmission')) {
+    const owners = [...new Set(Object.entries(declared.owners).filter(([leaf]) => leaf.startsWith('resourceAdmission')).map(([, o]) => o))];
+    const path = pathOf(owners[owners.length - 1] ?? basename(LEGACY_SETTINGS_PATH));
+    if (isValidPolicyLayer(declared.settings.resourceAdmission)) { sources.tool = path; tool = declared.settings.resourceAdmission; }
+    else (sources.errors ??= []).push({ source: 'tool', path, error: 'invalid resourceAdmission policy' });
+  }
   return { policy: resolveResourcePolicy({ platform, tool }), sources };
 }
 function audit(root, row) {
