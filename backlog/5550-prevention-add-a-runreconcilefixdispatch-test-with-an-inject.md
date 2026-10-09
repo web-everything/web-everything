@@ -1,4 +1,5 @@
 ---
+bornAs: x70vs6i
 kind: story
 size: 3
 parent: "4075"
