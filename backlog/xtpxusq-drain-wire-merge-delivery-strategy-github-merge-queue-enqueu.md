@@ -1,9 +1,10 @@
 ---
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/settings/merge-queue.json", "we:scripts/merge-gate-check.mjs"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
@@ -13,24 +14,24 @@ Modules + tests landed with the merge-gate PR (we:scripts/lib/merge-delivery-pol
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/drain-merge-strategy.test.mjs` fails before (no module, no hooks in we:scripts/merge-ai-prs.mjs) and passes after: drain-direct makes no enqueue and no extra `gh` call; github-merge-queue enqueues only local-repo PRs pinned to the judged head, stamps the clearance first, never calls the merge API; an enqueue failure throws (reported as a failed land, never a direct merge); a GitHub-merged PR joins `merged` + `landedThisPass` exactly once.
+- [A2] Every existing `we:scripts/__tests__/merge-ai-prs*.test.mjs` passes unchanged (drain-direct byte-identical apart from the one policy log line per pass).
+- [A3] Live: the drain logs `merge-delivery policy: strategy=… (source)` each pass; `WE_DRAIN_MERGE_STRATEGY=github-merge-queue node we:scripts/merge-ai-prs.mjs --label=ready-to-merge --dry-run` prints `would ENQUEUE …` and calls no merge API. The live strategy stays `drain-direct` until the operator flips it after enabling the ruleset.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+Delivered in we:scripts/lib/drain-merge-strategy.mjs (all logic) + seven hook lines in we:scripts/merge-ai-prs.mjs. Manifest strip needs no hook: the rebase-drop step already strips every landable manifest PR before the land cascade.
 
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+Deferred to follow-up cards (files held by other work): wiring `readEnqueueClearance` into we:scripts/merge-gate-check.mjs (held by the red-main-freeze-shared agent; its `facts.enqueueClearance = null` line sits next to their `facts.redMain` line) plus choosing the trusted author list; retiring/aliasing `mergeQueue.strategy` in we:scripts/settings/merge-queue.json (held by #4689).
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Does not flip the live strategy (operator does that after enabling the GitHub ruleset). Does not enqueue sibling-repo PRs (impl halves stay drain-direct: the tool layer is this repo's settings and a sibling may have no merge queue).
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
-
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the clearance reader counts only comments from a configured trusted author whose marker names the exact current head; an empty trust list covers nothing.
+2. **Truncated reads** — a failed follow-up `gh pr view` keeps the PR pending (retried next pass); an unread comment list re-stamps the clearance rather than skipping it.
+3. **Shared state files** — the follow-up list is written atomically (temp file + rename) under the coordination root; only the drain writes it.
+4. **Fail closed** — enqueue failure, missing pinned head, or dry run all throw before any merge; the PR stays `skip` and keeps blocking its dependents.
+5. **Identity scoping** — pending entries are keyed by repo + PR number.
+6. **State over time** — a queued PR stays blocking dependents until GitHub merges it; closed-without-merge entries are dropped; the followed-up list is capped at 500.
+7. **Who wrote it** — the clearance trust check reads the comment author login, never marker text alone.
