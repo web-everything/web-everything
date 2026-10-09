@@ -25,7 +25,7 @@ export default {
       now: Date.parse(fixture.capturedAt), dryRun: true,
       ...(fixPresent(root) ? { conflictReassertSettings: { reviewHuman: true } } : {}),
       provider: {
-        currentRepo: () => 'web-everything/web-everything',
+        currentRepo: () => 'example/repo',
         setLabels: (...args) => { labelCalls.push(args); unexpected(); },
         postComment: unexpected, ensureLabel: unexpected,
       },
