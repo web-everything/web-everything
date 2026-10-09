@@ -32,12 +32,16 @@ export const LEGACY_SETTINGS_PATH = resolve(HERE, '../dispatch-settings.json');
 /**
  * The leaves the legacy file may hold — frozen as of 2026-10-09. `freeze.mainRed` is listed because the in-flight
  * PR #4527 (card xu1nixv) adds it there; listing it lets that PR land unchanged. Any other new setting goes in
- * `scripts/settings/<feature>.json`.
+ * `scripts/settings/<feature>.json`. The existing keys are NOT moved here on purpose: moving them edits the legacy
+ * file, which conflicts with every open PR that still edits it (live 2026-10-09: #4527 was rebased onto these very
+ * keys). Move them in a later change, when no open PR touches the legacy file.
  */
 export const LEGACY_SETTINGS_LEAVES = Object.freeze([
   'heavyAdmissionCap', 'fixDispatchMaxConcurrent', 'maxLoadPerCore', 'memFreeMinPct',
   'cpuIdleMinPct.fix', 'cpuIdleMinPct.ci-heal', 'cpuIdleMinPct.build', 'cpuIdleMinPct.prepare', 'cpuIdleMinPct.review',
   'fixDispatch.borrowBuildSlots', 'fixDispatch.borrowAfterMinutes', 'fixDispatch.borrowExecutor',
+  'fixDispatch.awaitVerifyLoopSeconds', 'fixDispatch.parkedReleasesSlot', 'fixDispatch.parkedCapFactor',
+  'fixDispatch.releaseOnCompletion',
   'freeze.mainRed',
 ]);
 

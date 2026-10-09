@@ -2,7 +2,7 @@
  * @file scripts/lib/__tests__/settings-files.test.mjs
  * @description Held item 168 — per-feature settings files (we:scripts/lib/settings-files.mjs). The merge rule, the
  *   on-disk layout guard (the legacy we:scripts/dispatch-settings.json is frozen; a new key goes in
- *   we:scripts/settings/<feature>.json), and that moving the push-on-green keys out changed no resolved value.
+ *   we:scripts/settings/<feature>.json), and that the merged read resolves the same values.
  */
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readdirSync, readFileSync } from 'node:fs';
@@ -86,7 +86,7 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
     expect(extra, `new keys in scripts/dispatch-settings.json: ${extra.join(', ')} — put them in scripts/settings/<feature>.json instead (overlays conflict-drop on this one shared file)`).toEqual([]);
   });
 
-  it('moving the push-on-green keys out changed no resolved value', () => {
+  it('the merged read resolves the same values as the single-file read did', () => {
     expect(resolveFixerSlotSettings({ env: {} })).toEqual({
       awaitVerifyLoopSeconds: 15, parkedReleasesSlot: true, parkedCapFactor: 2, releaseOnCompletion: true,
     });

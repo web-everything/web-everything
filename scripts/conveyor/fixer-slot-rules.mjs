@@ -15,7 +15,7 @@
  *                            we:scripts/conveyor/await-verify-pass.mjs#classifyAwaitVerdict (pure, exact-sha, unchanged).
  *   R5 release-on-completion — a fix claim is released as soon as its session's completion record says `done`.
  *
- * THE SETTINGS (declared in we:scripts/settings/push-on-green.json `fixDispatch`, merged with the other declared settings
+ * THE SETTINGS (declared in we:scripts/dispatch-settings.json `fixDispatch`, merged with the other declared settings
  * by we:scripts/lib/settings-files.mjs; each overridable by env; the BUILT-IN value is today's behaviour, so removing the
  * file entry turns the feature off):
  *   awaitVerifyLoopSeconds  env WE_AWAIT_VERIFY_LOOP_SECONDS   built-in 0 (off: the pass runs once per fix tick)

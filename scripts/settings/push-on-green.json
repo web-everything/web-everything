@@ -1,8 +1,0 @@
-{
-  "fixDispatch": {
-    "awaitVerifyLoopSeconds": 15,
-    "parkedReleasesSlot": "on",
-    "parkedCapFactor": 2,
-    "releaseOnCompletion": "on"
-  }
-}
