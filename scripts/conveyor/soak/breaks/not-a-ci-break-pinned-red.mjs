@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export default {
   id: 'not-a-ci-break-pinned-red',
-  card: 'x9zznl9',
+  card: '5585',
   title: '#4535: not-a-ci-break recorded 25 s before required "test" went red pinned the head',
   fixedBy: { sha: '8509c022b', where: 'lane/fixd-supersede-verdict', paths: [
     'scripts/conveyor/ci-heal-verdict-recheck.mjs', 'scripts/conveyor/ci-heal-escalation-mark.mjs',

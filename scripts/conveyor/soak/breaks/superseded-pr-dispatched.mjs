@@ -5,7 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export default {
   id: 'superseded-pr-dispatched',
-  card: 'xiqtf7w',
+  card: '5586',
   title: '#4532 merged with "Supersedes #4522"; fix-4522 still launched at 04:34Z',
   fixedBy: { sha: '8509c022b', where: 'lane/fixd-supersede-verdict', paths: [
     'scripts/conveyor/supersede-rule.mjs', 'scripts/conveyor/supersede-watch.mjs',
