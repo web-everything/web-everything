@@ -2,9 +2,10 @@
 bornAs: xi3s5g7
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/lib/permission-change.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/lib/review-core.mjs", "we:scripts/lib/review-policy.contract.json", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
