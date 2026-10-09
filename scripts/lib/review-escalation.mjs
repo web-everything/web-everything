@@ -13,6 +13,7 @@
  * — start loose, tighten from data; they live here so a change is one edit + a test, never scattered.
  */
 import { createHash } from 'node:crypto';
+import { permissionChangeFiles } from './permission-change.mjs';
 import { isTrustChainPath, isPolicyCorePath, isPolicySpecPath, isPolicyDerivationPath, isEngineTierPath, basenameOf, STATUTE_PATHS, isStatutePath, isDeclarativeLeashPath, principleSurfaceTriggers, isPrincipleSurface, statuteAnchorEditKind } from './gate-config.mjs';
 // #2892 — the statute predicate and the leash-path term now live beside `isPrincipleSurface` in gate-config.mjs (the
 // composition needs them and this module imports IT); re-exported so every existing importer is unchanged.
@@ -778,6 +779,16 @@ export function scoreEscalation({
     humanForced = true;
     reasons.push(`worker disclosed a rule deviation: ${deviation}`);
     signals.deviation = deviation;
+  }
+
+  // PERMISSION-CHANGE HOLD (operator decision 2026-10-08, after PR #4318 widened a workflow token and merged on
+  // the automatic accept). A diff that changes workflow `permissions:`, a sandbox grant, or branch-protection-adjacent
+  // config ALWAYS forces `review:human`, whatever else it scores. Additive: it only ever adds a human park.
+  const permissionHits = permissionChangeFiles(gateBasis, fileHunksOf);
+  if (permissionHits.length) {
+    humanForced = true;
+    signals.permissionChange = permissionHits.map((x) => x.file);
+    reasons.push(`permission-change (${permissionHits.map((x) => `${x.file}: ${x.kind}`).join(', ')}) — token permissions / sandbox / branch-protection config changed, human review required`);
   }
 
   // The additive marker term cannot read a file it has no diff section for — the whole diff was not computed, or the
@@ -2840,7 +2851,7 @@ export function decideDurableEscalationRecord({ changed, verified, liveBody, rea
 export function decideReviewGate({
   escalate, humanRequired = false, labels = [], acceptedSha = null, headSha = null,
   acceptedDiff = null, headDiff = null, acceptedContribution = null, headContribution = null,
-  operatorClearance = null, headReadFailed = false, engineTier = false, deviation = null, humanClearedSha = null,
+  operatorClearance = null, headReadFailed = false, engineTier = false, deviation = null, humanClearedSha = null, permissionChange = false,
 } = {}) {
   // A reviewer verdict (whoever applied it — for a human-gated PR only a human can) always wins, and is checked
   // FIRST so it overrides even the sticky human gate below: review:accepted IS the human clearing the gate →
@@ -2954,6 +2965,17 @@ export function decideReviewGate({
       return {
         action: 'park',
         reason: `worker disclosed a rule deviation (${deviation}) — review:accepted without a recorded human clearance does not merge; re-parking review:human`,
+        applyLabel: REVIEW_LABELS.human,
+        humanRequired: true,
+      };
+    }
+    // PERMISSION-CHANGE HOLD (2026-10-08): same shape as the deviation hold above. A PR that changes workflow
+    // permissions / a sandbox grant / branch-protection config does not merge on a bare or automatic accept: it
+    // needs a RECORDED human clearance bound to the live head. Without one, re-park review:human.
+    if (permissionChange && !deviationCleared) {
+      return {
+        action: 'park',
+        reason: 'permission-change — review:accepted without a recorded human clearance does not merge; re-parking review:human',
         applyLabel: REVIEW_LABELS.human,
         humanRequired: true,
       };

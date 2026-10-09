@@ -568,6 +568,7 @@ describe('decorated-string conformance — the drain\'s real reason strings deri
     [REVIEW_REASONS.GATE_SELF]: 'gate-self (scripts/lib/gate-config.mjs) — declarative leash, human review required',
     [REVIEW_REASONS.GATE_DERIVATION]: 'gate-derivation (scripts/lib/review-escalation.mjs) — gate derivation code, independent committee review',
     [REVIEW_REASONS.STATUTE]: 'statute (docs/agent/platform-decisions.md) — human review required',
+    [REVIEW_REASONS.PERMISSION_CHANGE]: 'permission-change (.github/workflows/x.yml: workflow-permissions) — token permissions / sandbox / branch-protection config changed, human review required',
     [REVIEW_REASONS.BLAST_RADIUS]: 'blast-radius (scripts/foo.mjs, scripts/bar.mjs)',
     [REVIEW_REASONS.SIZE]: 'size (1080 ≥ 400 changed lines)',
     [REVIEW_REASONS.DISMISSED_FINDINGS]: 'dismissed-findings (2 pre-PR review finding(s) the lane dismissed)',

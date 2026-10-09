@@ -183,7 +183,7 @@ const KNOWN_CARE_LEVELS = ['none', 'low', 'elevated', 'high'];
 // The FULL escalation-reason token vocabulary — a literal mirroring `REVIEW_REASONS` in
 // we:scripts/lib/review-core.mjs (no import in the sandbox), pinned equal by the source-regression suite.
 const REASON_TOKENS = [
-  'gate-self', 'gate-derivation', 'statute', 'blast-radius', 'size', 'dismissed-findings', 'cross-repo',
+  'gate-self', 'gate-derivation', 'statute', 'permission-change', 'blast-radius', 'size', 'dismissed-findings', 'cross-repo',
   'non-convergence', 'mandate-conflict',
 ];
 // #2908 (PR #1106 review F1) — the ONLY reason tokens that can reach an editor-enabled band, and only ALONE.

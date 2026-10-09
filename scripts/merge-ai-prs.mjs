@@ -3795,6 +3795,34 @@ export function engineTierForCandidate(score) { // `score` names the real future
 }
 
 /**
+ * The permission-change hold's `decideReviewGate` input for one scored candidate: did `scoreEscalation` name any
+ * file that changes workflow permissions / a sandbox grant / branch-protection config? Pure. Extracted from the
+ * `runCli` call site so the score -> gate hand-off is itself a named, tested thing: with it inline, dropping the
+ * line or renaming `signals.permissionChange` left every test green while the drain went back to merging a bare
+ * accept on a permission-change PR (the #4318 failure) - PR #4446 review.
+ * @param {{signals?: {permissionChange?: string[]}}} [score] a `scoreEscalation` result
+ * @returns {boolean}
+ */
+export function permissionChangeForCandidate(score) {
+  const files = score?.signals?.permissionChange;
+  return Array.isArray(files) && files.length > 0;
+}
+
+/**
+ * The full input object `runCli` hands `decideDrainReviewGate` for one candidate. Pure. One named place for every
+ * score-derived gate input (`escalate`, `humanRequired`, `engineTier`, `permissionChange`) so a new signal cannot be
+ * scored yet silently never reach the gate, and a test can drive a real `scoreEscalation` result straight through.
+ * @param {{score: object, labels: any, deviation?: string|null}} candidate
+ */
+export function drainGateInputs({ score, labels, deviation = null }) {
+  return {
+    escalate: score.escalate, humanRequired: score.humanRequired, labels,
+    engineTier: engineTierForCandidate(score), deviation,
+    permissionChange: permissionChangeForCandidate(score),
+  };
+}
+
+/**
  * PURE: turn a failed `gh pr list` exec error into `{kind, text, hint}`. `gh`'s own STDERR is the reason; the
  * error's `message` is only "Command failed: gh pr list …". Live-caught 2026-09-27: four drain passes in a row
  * logged just that first line (the old `.split('\n')[0]`), so the real cause — installation GraphQL rate
@@ -5102,11 +5130,9 @@ async function runCli() {
       // `blockedBy` resolves. Flip `engineTierForCandidate` to delegate to `basisTouchesEngineTier(score)` once
       // `#2410` ships that writer — do not re-inline the computation here when that day comes, keep it in one
       // named, tested place.
-      const engineTier = engineTierForCandidate(score);
-      const gate = decideDrainReviewGate({
-        escalate: score.escalate, humanRequired: score.humanRequired, labels: v.prLabels,
-        engineTier, deviation: v.deviation,
-      }, { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
+      const gate = decideDrainReviewGate(
+        drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;

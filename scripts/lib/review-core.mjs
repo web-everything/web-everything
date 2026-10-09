@@ -544,6 +544,7 @@ export const REVIEW_REASONS = Object.freeze({
   GATE_SELF: 'gate-self',              // the DECLARATIVE LEASH (contract / roster / suites) — human (#2771/#2785)
   GATE_DERIVATION: 'gate-derivation',  // policy-tier derivation CODE — independent committee (#2771 Fork A)
   STATUTE: 'statute',
+  PERMISSION_CHANGE: 'permission-change', // workflow permissions / sandbox grant / branch-protection config - human (2026-10-08)
   BLAST_RADIUS: 'blast-radius',
   SIZE: 'size',
   DISMISSED_FINDINGS: 'dismissed-findings',
@@ -695,6 +696,7 @@ export function careLevelFromReasons(reasons) {
         signals.blastRadius = true; break;
       case REVIEW_REASONS.GATE_SELF:
       case REVIEW_REASONS.STATUTE:
+      case REVIEW_REASONS.PERMISSION_CHANGE:
       case REVIEW_REASONS.NON_CONVERGENCE:
       case REVIEW_REASONS.MANDATE_CONFLICT:
         humanRequired = true; break;                    // human-gated or deadlocked → maximum care

@@ -15,7 +15,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readDrainAcceptance, decideDrainReviewGate, reconcileDrainReviewPending, classifyPr, needsAcceptanceRestamp, restampAcceptance, computeNetDiffSignals, drainReasonMarker, buildDrainReasonComment, hasDrainReasonComment, LAND_REASON, applyEscalationRelief, REVIEW_COVERAGE_KIND, REVIEW_COVERAGE_GAP_META, reviewRecordKind, recordedReviewRecords, readReviewRecord, reviewCoverageGaps, buildReviewCoverageReason } from '../merge-ai-prs.mjs';
-import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, REVIEW_LABELS } from '../lib/review-escalation.mjs';
+import { drainGateInputs, permissionChangeForCandidate } from '../merge-ai-prs.mjs';
+import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, scoreEscalation, REVIEW_LABELS } from '../lib/review-escalation.mjs';
 
 
 /**
@@ -627,5 +628,55 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
     expect(src).toMatch(/const gate = decideDrainReviewGate\([\s\S]*?if \(gate.action === 'defer'\) \{\s*v.decision = 'skip';\s*v.reason = gate.reason;\s*process.stderr.write\([\s\S]*?continue;\s*\}/);
     expect(src).toContain('const out = reconcileDrainReviewPending({');
+  });
+});
+
+/**
+ * PR #4446 review: the permission-change hold's DRAIN hand-off. The unit tests called `decideReviewGate` with a
+ * hand-supplied `permissionChange: true`, so dropping the `score.signals.permissionChange` -> gate-input mapping at
+ * the drain call site left every test green while the real drain went back to merging a bare accept (#4318).
+ * These feed a REAL `scoreEscalation` result for the #4318 diff through the SAME mapping the call site uses
+ * (`drainGateInputs`) and the SAME seam it calls (`decideDrainReviewGate`).
+ */
+describe('PR #4446 — permission-change hold: score -> drain gate hand-off', () => {
+  const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+  const WF = '.github/workflows/apply-review-request.yml';
+  const diff4318 = readFileSync(join(FIXTURES, 'pr4318-workflow-permissions.diff'), 'utf8');
+  const scoreOf = (files, diffHunks) => scoreEscalation({ changedFiles: files, diffLines: 30, diffHunks });
+  const drain = (score, view, extra = {}) => decideDrainReviewGate(
+    drainGateInputs({ score, labels: [REVIEW_LABELS.accepted], ...extra }), acceptanceOptions(view));
+  const reviewedView = () => { const view = acceptanceView(); view.headRefOid = REVIEWED; return view; };
+
+  it('maps the #4318 score to a permissionChange gate input, and a plain score to none', () => {
+    expect(drainGateInputs({ score: scoreOf([WF], diff4318), labels: [] }).permissionChange).toBe(true);
+    expect(drainGateInputs({ score: scoreOf(['docs/README.md'], ''), labels: [] }).permissionChange).toBe(false);
+    expect(permissionChangeForCandidate(undefined)).toBe(false);
+    expect(permissionChangeForCandidate({ signals: { permissionChange: [] } })).toBe(false);
+  });
+
+  it('parks a bare or automatic accept on the #4318 replay as review:human', () => {
+    const gate = drain(scoreOf([WF], diff4318), reviewedView());
+    expect(gate.action).toBe('park');
+    expect(gate.applyLabel).toBe(REVIEW_LABELS.human);
+    expect(gate.reason).toMatch(/permission-change/);
+  });
+
+  it('merges once a trusted head-bound human clearance is recorded', () => {
+    const view = reviewedView();
+    view.comments[0].body += '\n<!-- cleared-human: operator -->';
+    expect(drain(scoreOf([WF], diff4318), view).action).toBe('merge');
+  });
+
+  it('a PR with no permission change still merges on its accept', () => {
+    expect(drain(scoreOf(['docs/README.md'], ''), reviewedView()).action).toBe('merge');
+  });
+
+  it('forwards the deviation input beside the permission input', () => {
+    expect(drainGateInputs({ score: scoreOf(['docs/README.md'], ''), labels: [], deviation: 'scope' }).deviation).toBe('scope');
+  });
+
+  it('the drain call site builds its gate input through drainGateInputs (not an inline copy)', () => {
+    const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
+    expect(src).toMatch(/const gate = decideDrainReviewGate\(\s*drainGateInputs\(\{\s*score,\s*labels: v\.prLabels,\s*deviation: v\.deviation\s*\}\),/);
   });
 });
