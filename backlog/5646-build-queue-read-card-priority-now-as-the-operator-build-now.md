@@ -1,4 +1,5 @@
 ---
+bornAs: xx38lr6
 kind: story
 size: 1
 status: resolved
