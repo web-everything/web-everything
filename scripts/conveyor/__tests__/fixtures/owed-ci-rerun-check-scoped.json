@@ -1,0 +1,195 @@
+{
+  "$comment": "Live replay, web-everything/web-everything, 2026-10-08 ~18:07 ET. main CI workflow red on daemon-soak only (test green on its latest decisive runs); PRs #4494/#4446/#4511 failed `test` inside that red window. checkConclusions = what defaultReadMainRuns annotates from the run jobs page. aheadBy is the shape only (each head predates main tip; real compare value not pinned).",
+  "mainRuns": [
+    {
+      "databaseId": 37850997967,
+      "workflowName": "CI",
+      "status": "in_progress",
+      "conclusion": "",
+      "createdAt": "2026-10-08T22:03:26Z",
+      "updatedAt": "2026-10-08T22:06:43Z",
+      "headSha": "34309ed9783e1c1fd02e63777d6fa9536f1e0796"
+    },
+    {
+      "databaseId": 37850958761,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T22:03:05Z",
+      "updatedAt": "2026-10-08T22:03:27Z",
+      "headSha": "2f43c0d698fb0c7ab50fc8c9e613e8b412774786"
+    },
+    {
+      "databaseId": 37850375180,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:57:53Z",
+      "updatedAt": "2026-10-08T22:03:07Z",
+      "headSha": "5979cf011d362487b30b40bebf5cd564b170ddc1"
+    },
+    {
+      "databaseId": 37850334147,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:57:30Z",
+      "updatedAt": "2026-10-08T21:57:54Z",
+      "headSha": "8a28e3b9e641fe2a6e9c4e3e1c41f8390111cd40"
+    },
+    {
+      "databaseId": 37849513397,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "createdAt": "2026-10-08T21:50:09Z",
+      "updatedAt": "2026-10-08T22:05:45Z",
+      "headSha": "8111a959bf9f40e8e947db231c9d7fb619f36563",
+      "checkConclusions": {
+        "smoke": "success",
+        "test": "success",
+        "daemon-soak": "failure"
+      }
+    },
+    {
+      "databaseId": 37849460175,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:49:40Z",
+      "updatedAt": "2026-10-08T21:50:10Z",
+      "headSha": "8a0fcc31d3385a9cc8dc0da313dce419dab144f5"
+    },
+    {
+      "databaseId": 37849185398,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:47:15Z",
+      "updatedAt": "2026-10-08T21:49:41Z",
+      "headSha": "881310ab24ee9ec98611541aecf98c79ec141607"
+    },
+    {
+      "databaseId": 37849131579,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "createdAt": "2026-10-08T21:46:47Z",
+      "updatedAt": "2026-10-08T21:56:16Z",
+      "headSha": "d2d415ce7f7f9187d38b94a1666c078e85fb6ecb",
+      "checkConclusions": {
+        "smoke": "success",
+        "test": "success",
+        "daemon-soak": "failure"
+      }
+    },
+    {
+      "databaseId": 37847258734,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "createdAt": "2026-10-08T21:30:27Z",
+      "updatedAt": "2026-10-08T21:42:04Z",
+      "headSha": "a6634d61c23e0a166f7a26e5b1ffa488a31c1444",
+      "checkConclusions": {
+        "smoke": "success",
+        "test": "failure",
+        "daemon-soak": "failure"
+      }
+    },
+    {
+      "databaseId": 37847212501,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:30:06Z",
+      "updatedAt": "2026-10-08T21:30:28Z",
+      "headSha": "22d292f7c8280e820db3a4f62865bbf861dfbbc3"
+    },
+    {
+      "databaseId": 37845372292,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "createdAt": "2026-10-08T21:14:34Z",
+      "updatedAt": "2026-10-08T21:32:32Z",
+      "headSha": "f36299c4cf66023e276feb30730d7dd9e6bea113",
+      "checkConclusions": {
+        "smoke": "success",
+        "test": "success",
+        "daemon-soak": "failure"
+      }
+    },
+    {
+      "databaseId": 37845307004,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:14:01Z",
+      "updatedAt": "2026-10-08T21:14:35Z",
+      "headSha": "d4c3637ef5a32a96a2467a508bee5bcda4f2a6b2"
+    },
+    {
+      "databaseId": 37845018884,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "createdAt": "2026-10-08T21:11:36Z",
+      "updatedAt": "2026-10-08T21:14:02Z",
+      "headSha": "4c5036bc21d7e9c1308c06e81d35baef8d96f860"
+    },
+    {
+      "databaseId": 37844985089,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "createdAt": "2026-10-08T21:11:18Z",
+      "updatedAt": "2026-10-08T21:22:23Z",
+      "headSha": "ca5b636d8b4b04b02971de67498ff72189bc0534",
+      "checkConclusions": {
+        "smoke": "success",
+        "daemon-soak": "failure",
+        "test": "success"
+      }
+    },
+    {
+      "databaseId": 37831979504,
+      "workflowName": "CI",
+      "status": "completed",
+      "conclusion": "failure",
+      "createdAt": "2026-10-08T19:26:36Z",
+      "updatedAt": "2026-10-08T19:35:00Z",
+      "checkConclusions": {
+        "smoke": "success",
+        "test": "success",
+        "daemon-soak": "failure"
+      }
+    }
+  ],
+  "candidates": [
+    {
+      "prNumber": 4494,
+      "headRefName": "lane/noop-pr-comments",
+      "headSha": "0e6529ec",
+      "aheadBy": 40,
+      "failureCompletedAt": "2026-10-08T20:59:14Z",
+      "failingCheckName": "test"
+    },
+    {
+      "prNumber": 4446,
+      "headRefName": "lane/xi3s5g7-permission-change-hold",
+      "headSha": "9a188ef3",
+      "aheadBy": 40,
+      "failureCompletedAt": "2026-10-08T20:57:43Z",
+      "failingCheckName": "test"
+    },
+    {
+      "prNumber": 4511,
+      "headRefName": "lane/agreement-s7",
+      "headSha": "cecdc6a9",
+      "aheadBy": 20,
+      "failureCompletedAt": "2026-10-08T21:24:43Z",
+      "failingCheckName": "test"
+    }
+  ]
+}
