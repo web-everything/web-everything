@@ -478,6 +478,8 @@ describe('wrapped verification waits', () => {
   const sid = '12345678-1234-4234-8234-123456789abc';
   const start = Date.parse('2026-10-08T10:00:00.000Z');
   const awaiting = { awaiting: true, record: { sha: 'a'.repeat(40), pr: 7, ref: 'lane/fix-7', requestedAt: new Date(start).toISOString() } };
+  // Each turn that asks to wait again writes a NEW await record (its own `requestedAt`); an identical one is a leftover of an answered wait.
+  const awaitingTurn = (turn) => ({ awaiting: true, record: { ...awaiting.record, requestedAt: new Date(start + turn).toISOString() } });
   const harness = () => {
     const s = spec({ sessionId: sid, specDir: tmp(), cwd: '/lane', argv: withStructuredOutput(['--session-id', sid, '--permission-mode', 'auto', '--model', 'sonnet', '--settings', '{}', 'first']) });
     const calls = [], writes = [], drafts = [], heads = [];
@@ -603,17 +605,33 @@ describe('wrapped verification waits', () => {
   });
   it('the cap-or-deadline look-again treats an expired record as an unfinished wait', async () => {
     const h = harness();
-    h.io.awaitingVerify = () => (h.calls.length <= MAX_AWAIT_RESUMES ? awaiting : { expired: true, record: { ...awaiting.record, requestedAt: new Date(start + 1).toISOString() } });
+    h.io.awaitingVerify = () => (h.calls.length <= MAX_AWAIT_RESUMES ? awaitingTurn(h.calls.length) : { expired: true, record: awaitingTurn(h.calls.length).record });
     const out = await runWorker(h.s, h.io);
     expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
     expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
   });
-  it('an expired leftover of a wait the last resume already answered is not a new obligation', async () => {
+  // Deliberate non-regression pins: the pass clears the record right after it writes the resume request, so a leftover copy only
+  // exists when that clear failed. The wait it described was answered, so it must not turn the finished resumed turn into a block.
+  it.each(['expired', 'live'])('a %s leftover of a wait the last resume already answered is not a new obligation', async (kind) => {
     const h = harness();
-    h.io.awaitingVerify = () => (h.calls.length === 1 ? awaiting : { expired: true, record: awaiting.record });
+    h.io.awaitingVerify = () => (h.calls.length === 1 ? awaiting : kind === 'live' ? awaiting : { expired: true, record: awaiting.record });
     const out = await runWorker(h.s, h.io);
     expect(h.calls).toHaveLength(2);
     expect(out.result).toMatchObject({ outcome: 'done', summary: 'turn 2' });
+  });
+  it('a NEW wait after a resume (different requestedAt) is still owed', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => (h.calls.length === 1 ? awaiting : { expired: true, record: awaitingTurn(h.calls.length).record });
+    expect((await runWorker(h.s, h.io)).result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
+  });
+  it('the unfinished-wait evidence redacts the fixer-typed sha and ref', async () => {
+    const h = harness();
+    const ref = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789 @octocat `x` <!-- y -->';
+    h.io.awaitingVerify = () => ({ expired: true, record: { ...awaiting.record, ref, sha: '@octocat-----' } });
+    const text = (await runWorker(h.s, h.io)).result.blocker.evidence.text;
+    expect(text).toContain('[redacted]');
+    for (const raw of ['ghp_abcdefghijklmnopqrstuvwxyz', '<!--', '`x`']) expect(text).not.toContain(raw);
+    expect(text).not.toMatch(/(^|[^​])@octocat/);
   });
   it('an intermediate turn that is not done is left as the worker said it', async () => {
     const h = harness();
@@ -637,7 +655,7 @@ describe('wrapped verification waits', () => {
   });
   it('bounds repeated verify resumes at six without resetting the wall deadline', async () => {
     const h = harness();
-    h.io.awaitingVerify = () => awaiting;
+    h.io.awaitingVerify = () => awaitingTurn(h.calls.length);
     const out = await runWorker(h.s, h.io);
     expect(MAX_AWAIT_RESUMES).toBe(6);
     expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
@@ -648,7 +666,7 @@ describe('wrapped verification waits', () => {
   });
   it('a last turn that is no longer awaiting is a normal done (the cap is not a block by itself)', async () => {
     const h = harness();
-    h.io.awaitingVerify = () => h.calls.length <= MAX_AWAIT_RESUMES ? awaiting : null;
+    h.io.awaitingVerify = () => h.calls.length <= MAX_AWAIT_RESUMES ? awaitingTurn(h.calls.length) : null;
     const out = await runWorker(h.s, h.io);
     expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
     expect(out.result).toMatchObject({ outcome: 'done', summary: `turn ${1 + MAX_AWAIT_RESUMES}` });

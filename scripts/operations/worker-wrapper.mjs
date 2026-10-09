@@ -342,13 +342,16 @@ async function runWorkerOnce(spec, io, stop) {
   if (spec.launcher === 'claude-p') {
     const requestPath = resumeRequestPath(spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs'), spec.session);
     let resumes = 0;
-    let servedAt = null; // the `requestedAt` of the await record the last resume answered: its leftover record is not a new obligation
-    const expiredWait = (w) => (w?.expired && w.record?.requestedAt !== servedAt ? { sha: w.record.sha, pr: w.record.pr, ref: w.record.ref } : null);
+    let servedAt = null; // the `requestedAt` of the await record the last resume answered: a leftover copy of it (the pass failed to clear it) is not a new obligation
+    // The wait a live OR expired record still owes, or null when none is owed (no record, or only the copy the last resume answered).
+    const owedWait = (w) => ((w?.awaiting || w?.expired) && w.record?.requestedAt !== servedAt ? { sha: w.record.sha, pr: w.record.pr, ref: w.record.ref } : null);
     while (!failure && !isOperatorStop() && clock() < deadlineMs && resumes < MAX_AWAIT_RESUMES) {
       let awaiting = await awaitingVerify(spec.sessionId);
       if (awaiting?.unreadable) { unfinishedVerify = {}; break; } // cannot tell whether a verdict is owed: not a finished run
+      const owed = owedWait(awaiting);
       // An already-expired record means the verdict can no longer be delivered (nothing resumes on it): the turn's `done` is unverified.
-      if (!awaiting?.awaiting) { unfinishedVerify = expiredWait(awaiting); break; }
+      if (!awaiting?.awaiting) { unfinishedVerify = owed; break; }
+      if (!owed) break;
       const { sha, pr, ref, requestedAt } = awaiting.record;
       unfinishedVerify = { sha, pr, ref };
       withCompletionLock(spec.session, () => writeRecord({
@@ -377,9 +380,8 @@ async function runWorkerOnce(spec, io, stop) {
     // The loop also ends on the resume cap or the deadline right after a turn that asked to wait again: look once more.
     if (!unfinishedVerify && !failure && !isOperatorStop() && (resumes >= MAX_AWAIT_RESUMES || clock() >= deadlineMs)) {
       const last = await awaitingVerify(spec.sessionId);
-      if (last?.awaiting) unfinishedVerify = { sha: last.record.sha, pr: last.record.pr, ref: last.record.ref };
-      else if (last?.unreadable) unfinishedVerify = {};
-      else unfinishedVerify = expiredWait(last);
+      if (last?.unreadable) unfinishedVerify = {};
+      else unfinishedVerify = owedWait(last);
     }
   }
   stop.live = false;
@@ -459,9 +461,11 @@ async function runWorkerOnce(spec, io, stop) {
  * @param {{sha?: string, pr?: *, ref?: string}} wait the await record the wrapper was waiting on
  */
 export function verifyUnfinishedResult(result, wait = {}) {
-  const sha = typeof wait.sha === 'string' ? wait.sha.slice(0, 12) : 'unknown';
+  // `sha` and `ref` were typed by the fixer into the await record, so they get the same redaction as any worker-chosen text.
+  const sha = typeof wait.sha === 'string' ? redactFreeText(wait.sha.slice(0, 12), 12) || 'unknown' : 'unknown';
+  const ref = typeof wait.ref === 'string' ? redactFreeText(wait.ref, 200) : '';
   // The wrapper cannot know whether the harness pushed (a verdict may land just as the wait ends): the retry re-reads the PR.
-  const text = `The turn ended awaiting harness verification of ${sha}${wait.ref ? ` for ${wait.ref}` : ''}, and no verdict was applied by the wrapper `
+  const text = `The turn ended awaiting harness verification of ${sha}${ref ? ` for ${ref}` : ''}, and no verdict was applied by the wrapper `
     + `before the wait ran out (record expired, cleared or unreadable, deadline, or resume cap). Last summary: ${result.summary}`;
   return {
     ...result,
