@@ -1,9 +1,10 @@
 ---
+bornAs: xqjri60
 kind: story
 size: 3
 parent: "5407"
 status: open
-relatedTo: ["5402", "5468", "2692", "2740", "xs1hdl7"]
+relatedTo: ["5402", "5468", "2692", "2740", "5541"]
 blockedBy: ["5402"]
 dateOpened: "2026-10-08"
 tags: [delivery-standard, merge-queue, integration-authority]
@@ -11,7 +12,7 @@ tags: [delivery-standard, merge-queue, integration-authority]
 
 # Integration Authority protocol: merge-queue text in the delivery standard
 
-Write the Integration Authority protocol text for the delivery standard (Ship Evermore, epic 5407): the merge queue. Ready changes form one ordered queue (ruled priority class, then in-class score). The head is tested on the current main tip and merges only on that fresh green; a stale head is refreshed once; after each merge the next head is re-judged. One writer. Settings off = today; batch size 1 (batching later); forge-native queue reserved. Pure rules with replay fixtures; reference implementation in card xs1hdl7.
+Write the Integration Authority protocol text for the delivery standard (Ship Evermore, epic 5407): the merge queue. Ready changes form one ordered queue (ruled priority class, then in-class score). The head is tested on the current main tip and merges only on that fresh green; a stale head is refreshed once; after each merge the next head is re-judged. One writer. Settings off = today; batch size 1 (batching later); forge-native queue reserved. Pure rules with replay fixtures; reference implementation in card 5541.
 
 Operator direction, 2026-10-08. No scope yet: the protocol home is unruled (5402: separate repo now, or incubate here); this card names the file once it is. Prior art: decision 2692 (event-driven merge queue, speculative merge commit, batching rider) and its tripwire 2740; the batching policy here should reuse 2692's ruling.
 
@@ -29,11 +30,11 @@ Same shape as the review/fix policy protocol (5468): facts in, verdict out, no f
   `batchSize` (1 only), `strategy` (`drain-direct` built; `forge-native-queue` reserved). Off = no queue.
 - **Authority.** Exactly one writer integrates into main. A refresh happens once per head. Incomplete facts refuse.
 - **Future policies.** Batching (test N heads together, bisect on failure); forge-native queue adapter.
-- **Conformance cases.** The replay fixtures of xs1hdl7 become the protocol's conformance cases.
+- **Conformance cases.** The replay fixtures of 5541 become the protocol's conformance cases.
 
 ## Done when
 
-1. **Executable** — the protocol home's conformance runner passes the xs1hdl7 replay cases against the reference
+1. **Executable** — the protocol home's conformance runner passes the 5541 replay cases against the reference
    implementation (we:scripts/lib/merge-queue.mjs); fails before the cases are added.
 
 ## Edge cases this change must handle
