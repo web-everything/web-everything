@@ -135,9 +135,22 @@ describe('job records — liveness by pid, without a transcript', () => {
   });
 
   it('listAgentsWithReviewJobs merges the listing with the job rows, and a job-read failure costs nothing', () => {
-    const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'fix-3' }], listJobs: () => [{ name: 'review-4' }] });
+    const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'fix-3' }], listJobs: () => [{ name: 'review-4' }], listWrapped: () => [] });
     expect(merged.map((a) => a.name)).toEqual(['fix-3', 'review-4']);
-    expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); } })).toEqual([{ name: 'x' }]);
+    expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] })).toEqual([{ name: 'x' }]);
+  });
+  // PR #4462 review: a wrapped fixer is a live-session population readers decide on by absence, so a failed listing of it
+  // aborts the read (like a failed `claude agents`) instead of showing "no fixer".
+  it('listAgentsWithReviewJobs does not read a failed wrapped listing as no wrapped workers', () => {
+    expect(() => listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [], listWrapped: () => { throw new Error('io'); } })).toThrow('io');
+  });
+  it('listAgentsWithReviewJobs carries the wrapped listing\'s incomplete marker across the merge', () => {
+    const gap = { reason: 'wrapped record fix-9 unreadable', session: 'fix-9' };
+    const wrapped = Object.defineProperty([{ name: 'fix-3' }], 'incomplete', { value: [gap] });
+    const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => [], listWrapped: () => wrapped });
+    expect(merged.map((a) => a.name)).toEqual(['x', 'fix-3']);
+    expect(merged.incomplete).toEqual([gap]);
+    expect(listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [], listWrapped: () => [] }).incomplete).toBeUndefined();
   });
 });
 
@@ -346,7 +359,7 @@ describe('the two readers that decide "is a review running" see job rows (x26lw6
   it('review-status-tag labels a PR with a live job as review-status:reviewing', () => {
     const edits = [];
     const provider = { readLabels: () => [], ensureLabel: () => {}, setLabels: (_r, _p, e) => edits.push(e) };
-    const out = tagReviewStatus({ pr: 10, repo: REPO, listAgents: () => listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [jobRow] }), provider });
+    const out = tagReviewStatus({ pr: 10, repo: REPO, listAgents: () => listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [jobRow], listWrapped: () => [] }), provider });
     expect(out).toMatchObject({ changed: true, label: 'review-status:reviewing' });
   });
 });

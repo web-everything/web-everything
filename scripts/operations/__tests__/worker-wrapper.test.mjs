@@ -7,14 +7,15 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { writeStoredAwaitVerify, clearStoredAwaitVerify, awaitVerifyStoreKey } from '../../conveyor/await-verify.mjs';
 import { validateCompletionRecord } from '../completion-record.mjs';
 import { tryReadCompletion, writeCompletion } from '../completion-store.mjs';
 import { WORKER_MARKER_ENV, WORKER_MARKER_VALUE } from '../session-role.mjs';
 import { listDraftKeys } from '../worker-result-router.mjs';
 import {
-  RESULT_FILE_MAX_BYTES, STRUCTURED_OUTPUT_SUFFIX, extractAgyResult, extractClaudeResult, launchDetached, runWorker, withStructuredOutput, workerWrapperEnabled,
+  MAX_AWAIT_RESUMES, RESULT_FILE_MAX_BYTES, resumeArgvFrom, resumeRequestPath, STRUCTURED_OUTPUT_SUFFIX, extractAgyResult, extractClaudeResult, launchDetached, runWorker, withStructuredOutput, workerWrapperEnabled,
 } from '../worker-wrapper.mjs';
 
 const dirs = [];
@@ -430,7 +431,7 @@ describe('detached launch', () => {
     expect(calls[0].opts).toMatchObject({ detached: true, stdio: 'ignore' });
     expect(calls[0].argv[1]).toBe(`--spec=${r.specFile}`);
     expect(calls).toContain('unref');
-    expect(JSON.parse(readFileSync(r.specFile, 'utf8')).session).toBe('build-4001');
+    expect(JSON.parse(readFileSync(r.specFile, 'utf8'))).toMatchObject({ session: 'build-4001', specDir });
   });
 
   it('the CLI runs a spec file to completion, leaves the v2 record and deletes the spec (a real child process)', () => {
@@ -470,4 +471,199 @@ describe('detached launch', () => {
       if (prev === undefined) delete process.env.WE_OPERATIONS_DIR; else process.env.WE_OPERATIONS_DIR = prev;
     }
   });
+});
+
+// 117 S3b regression 2026-10-08: the old wrapper finalized run 1 and never consumed a resume.
+describe('wrapped verification waits', () => {
+  const sid = '12345678-1234-4234-8234-123456789abc';
+  const start = Date.parse('2026-10-08T10:00:00.000Z');
+  const awaiting = { awaiting: true, record: { sha: 'a'.repeat(40), pr: 7, ref: 'lane/fix-7', requestedAt: new Date(start).toISOString() } };
+  const harness = () => {
+    const s = spec({ sessionId: sid, specDir: tmp(), cwd: '/lane', argv: withStructuredOutput(['--session-id', sid, '--permission-mode', 'auto', '--model', 'sonnet', '--settings', '{}', 'first']) });
+    const calls = [], writes = [], drafts = [], heads = [];
+    let ms = start;
+    const io = {
+      now: () => new Date(ms).toISOString(), selfPid: 9001, pollMs: 100,
+      head: () => { heads.push(1); return 'a'; },
+      writeRecord: (rec, dir) => { writes.push(structuredClone(rec)); writeCompletion(rec, dir); },
+      writeDraft: (...args) => drafts.push(args),
+      spawnFn: () => ({ pid: 1234 + calls.length }),
+      spawnToCompletionFn: async (command, argv, opts, { spawnFn }) => {
+        calls.push({ argv, opts }); spawnFn(command, argv, opts);
+        return { stdout: claudeStdout({ ...DONE, summary: `turn ${calls.length}` }), stderr: '' };
+      },
+      awaitingVerify: () => calls.length === 1 ? awaiting : null,
+      sleep: async (delay) => { ms += delay; writeFileSync(resumeRequestPath(s.specDir, s.session), JSON.stringify({ v: 1, sessionId: sid, prompt: 'verified', at: new Date(ms).toISOString() })); },
+    };
+    return { s, io, calls, writes, drafts, heads, advance: (delay) => { ms += delay; } };
+  };
+  it('keeps its own live pid while waiting, resumes the same session, and finalizes only the last output', async () => {
+    const h = harness();
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1].argv).toEqual(resumeArgvFrom(h.s.argv, { sessionId: sid, prompt: 'verified' }));
+    expect(h.calls[1].argv).not.toContain('--session-id');
+    expect(h.calls[1].opts.timeout).toBe(h.s.timeoutMs - 100);
+    expect(h.writes).toContainEqual(expect.objectContaining({ status: 'started', pid: 9001, cwd: '/lane', awaitingVerify: awaiting.record }));
+    expect(h.writes.filter((r) => r.status === 'done')).toHaveLength(1);
+    expect(h.writes.every((r) => r.cwd === '/lane' && r.startedAt === new Date(start).toISOString())).toBe(true);
+    expect(h.writes.at(-2)).not.toHaveProperty('awaitingVerify');
+    expect(out.envelope).toMatchObject({ v: 2, status: 'done', parse: { ok: true }, result: { summary: 'turn 2' } });
+    expect(out.envelope).not.toHaveProperty('awaitingVerify');
+    expect(existsSync(resumeRequestPath(h.s.specDir, h.s.session))).toBe(false);
+    expect(h.heads).toHaveLength(2);
+    expect(h.drafts).toHaveLength(0);
+  });
+  // PR #4462 review: a wait that ends with no verdict delivered used to finalize the awaiting turn's `done` as a success.
+  // The harness never pushed, so the work is unverified and unpushed: it is a retryable infra block, never `done`.
+  it.each(['expired', 'deadline', 'foreign'])('%s ends the wait as a retryable block, not as the first turn\'s done', async (mode) => {
+    const h = harness();
+    let polled = false;
+    h.io.awaitingVerify = () => polled && mode !== 'deadline' ? null : awaiting;
+    h.io.sleep = async () => {
+      polled = true;
+      h.advance(mode === 'deadline' ? h.s.timeoutMs : 100);
+      if (mode === 'foreign') writeFileSync(resumeRequestPath(h.s.specDir, h.s.session), JSON.stringify({ v: 1, sessionId: 'foreign', prompt: 'wrong' }));
+    };
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(1);
+    expect(out.envelope).toMatchObject({
+      status: 'done', outcome: 'blocked-on-infra', parse: { ok: true }, action: { type: 'retry-after-cooloff' },
+      result: { outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait', retryable: true } },
+    });
+    expect(out.envelope.result.blocker.evidence.text).toContain('turn 1'); // the awaiting turn's own summary stays as evidence
+    expect(out.envelope.result.blocker.evidence.text).toContain('a'.repeat(40).slice(0, 12));
+    expect(out.envelope).not.toHaveProperty('awaitingVerify');
+    expect(existsSync(resumeRequestPath(h.s.specDir, h.s.session))).toBe(false);
+  });
+  it('an unfinished wait overrides a stale self-reported done word from the legacy store', async () => {
+    const h = harness();
+    h.s.preserveLegacyWords = true;
+    h.io.legacyRead = () => ({ status: 'done', outcome: 'healed' });
+    h.io.awaitingVerify = () => awaiting;
+    h.io.sleep = async () => { h.advance(h.s.timeoutMs); };
+    const out = await runWorker(h.s, h.io);
+    expect(out.envelope.outcome).toBe('blocked-on-infra');
+  });
+  // An await record that EXISTS but cannot be read is an unknown, not "no wait owed": the first check must not finalize `done`.
+  it('a torn await record in the default store blocks the run; a missing one is a normal done', async () => {
+    const store = tmp();
+    vi.stubEnv('WE_AWAIT_VERIFY_STORE', store);
+    try {
+      const missing = harness();
+      delete missing.io.awaitingVerify;
+      expect((await runWorker(missing.s, missing.io)).result.outcome).toBe('done');
+      writeFileSync(join(store, `${sid}.json`), '{"v":1,"sessionId":');
+      const torn = harness();
+      delete torn.io.awaitingVerify;
+      const out = await runWorker(torn.s, torn.io);
+      expect(torn.calls).toHaveLength(1);
+      expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait' } });
+      expect(out.envelope.outcome).toBe('blocked-on-infra');
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('an injected unreadable await check blocks the run too', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => ({ unreadable: true });
+    expect((await runWorker(h.s, h.io)).result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
+  });
+  it('an intermediate turn that is not done is left as the worker said it', async () => {
+    const h = harness();
+    h.io.spawnToCompletionFn = async (command, argv, opts, { spawnFn }) => {
+      h.calls.push({ argv, opts }); spawnFn(command, argv, opts);
+      return { stdout: claudeStdout(BLOCKED('needs-ruling', { ruling: { question: 'q', options: ['a', 'b'], recommendation: 'a' } })), stderr: '' };
+    };
+    h.io.awaitingVerify = () => awaiting;
+    h.io.sleep = async () => { h.advance(h.s.timeoutMs); };
+    const out = await runWorker(h.s, h.io);
+    expect(out.envelope.result.blocker.kind).toBe('needs-ruling');
+  });
+  it('consumes a queued resume even after the pass clears the await record', async () => {
+    const h = harness();
+    const sleep = h.io.sleep;
+    let cleared = false;
+    const poll = h.io.awaitingVerify;
+    h.io.awaitingVerify = () => cleared ? null : poll();
+    h.io.sleep = async (ms) => { await sleep(ms); cleared = true; };
+    expect((await runWorker(h.s, h.io)).result.summary).toBe('turn 2');
+  });
+  it('bounds repeated verify resumes at six without resetting the wall deadline', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => awaiting;
+    const out = await runWorker(h.s, h.io);
+    expect(MAX_AWAIT_RESUMES).toBe(6);
+    expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
+    // the cap ran out while the last turn was STILL awaiting a verdict: that turn's `done` is not a completion
+    expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait' } });
+    expect(out.result.blocker.evidence.text).toContain(`turn ${1 + MAX_AWAIT_RESUMES}`);
+    expect(out.envelope.deadlineAt).toBe(new Date(start + h.s.timeoutMs).toISOString());
+  });
+  it('a last turn that is no longer awaiting is a normal done (the cap is not a block by itself)', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => h.calls.length <= MAX_AWAIT_RESUMES ? awaiting : null;
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
+    expect(out.result).toMatchObject({ outcome: 'done', summary: `turn ${1 + MAX_AWAIT_RESUMES}` });
+  });
+  it('reads the default host await store and consumes the request after that record is cleared', async () => {
+    const h = harness();
+    const store = tmp();
+    vi.stubEnv('WE_AWAIT_VERIFY_STORE', store);
+    try {
+      writeStoredAwaitVerify({ v: 1, sessionId: sid, who: h.s.session, ...awaiting.record }, { dir: store });
+      delete h.io.awaitingVerify;
+      const sleep = h.io.sleep;
+      h.io.sleep = async (ms) => {
+        await sleep(ms);
+        clearStoredAwaitVerify(awaitVerifyStoreKey({ sessionId: sid }), { dir: store });
+      };
+      expect((await runWorker(h.s, h.io)).result.summary).toBe('turn 2');
+      expect(h.writes.some((r) => r.awaitingVerify)).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('does not reuse an earlier StructuredOutput when the resumed turn omits one', async () => {
+    const h = harness();
+    const spawn = h.io.spawnToCompletionFn;
+    h.io.spawnToCompletionFn = async (...args) => {
+      const out = await spawn(...args);
+      return h.calls.length === 2 ? { stdout: claudeStdout(undefined), stderr: '' } : out;
+    };
+    expect((await runWorker(h.s, h.io)).envelope.parse).toMatchObject({ ok: false, reason: 'no-structured-output' });
+    expect(h.drafts).toHaveLength(1);
+  });
+  it.each(['failure', 'aborted', 'agy', 'codex-exec'])('does not wait after %s', async (mode) => {
+    const h = harness();
+    if (mode === 'failure') h.io.spawnToCompletionFn = async () => { throw new Error('failed'); };
+    else if (mode === 'aborted') h.io.isOperatorStop = () => true;
+    else h.s.launcher = mode;
+    h.io.awaitingVerify = () => { throw new Error('must not inspect await store'); };
+    await runWorker(h.s, h.io);
+  });
+});
+
+it('resumeArgvFrom preserves flags, replaces the identity and prompt, and leaves its input unchanged', () => {
+  const argv = withStructuredOutput(['-p', '--session-id', 'original', '--permission-mode', 'auto', '--model', 'sonnet', '--settings', '{}', 'old']);
+  const copy = [...argv];
+  const out = resumeArgvFrom(argv, { sessionId: 'same', prompt: 'next' });
+  expect(out).toEqual(['-p', '--resume', 'same', ...argv.slice(3, -1), `next${STRUCTURED_OUTPUT_SUFFIX}`]);
+  expect(argv).toEqual(copy);
+  expect(out[out.indexOf('--json-schema') + 1]).toContain('"maxLength":280');
+});
+
+it('replays the shortened real Claude results through the ci-heal wrapper', async () => {
+  const fixtures = JSON.parse(readFileSync(join(process.cwd(), 'scripts/operations/__tests__/fixtures/wrapped-worker-results-2026-10-08.json'), 'utf8'));
+  for (const { structuredOutput: value } of Object.values(fixtures)) {
+    const { envelope } = await runWorker(spec({ role: 'ci-heal' }), {
+      spawnToCompletionFn: async () => ({ stdout: claudeStdout({ ...value, summary: value.summary.slice(0, 280) }), stderr: '' }),
+    });
+    expect(envelope).toMatchObject({ v: 2, parse: { ok: true } });
+    expect(envelope.outcome).not.toBe('blocked');
+    expect(envelope.cwd).toBeNull();
+  }
+});
+
+it('tells non-interactive workers to keep work foreground and end every turn with a capped result', () => {
+  for (const text of ['280 characters', '300 characters', 'FOREGROUND', 'never use run_in_background', 'very last action', 'awaiting harness verify', 'outcome "done"', 'last StructuredOutput']) {
+    expect(STRUCTURED_OUTPUT_SUFFIX).toContain(text);
+  }
 });
