@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseSupersedes, planSupersedeHolds, supersedeCandidates, resolveSupersedeSettings } from '../supersede-rule.mjs';
+import { MAX_SUPERSEDE_TARGETS, parseSupersedes, planSupersedeHolds, supersedeCandidates, resolveSupersedeSettings } from '../supersede-rule.mjs';
 import { STAND_DOWN_MARKER, STAND_DOWN_REASONS, SUPERSEDED_LABEL, buildSupersededStandDownComment, supersedeHoldsOn } from '../stand-down.mjs';
 import { countUnresolvedStandDowns } from '../reconcile-core.mjs';
 import { latestUnresolvedStandDown, buildOperatorAnswer } from '../stand-down-answer-core.mjs';
@@ -25,6 +25,41 @@ describe('parseSupersedes', () => {
   ])('accepts %s', (body, expected) => expect(parseSupersedes(body)).toEqual(expected));
   it.each(['This supersedes #4522.', 'supersedes #4522', 'Supersedes PR #4522', 'Supersedes #12a',
     '```md\nSupersedes #4522\n```', '', null, undefined, 42, {}])('rejects %j', (body) => expect(parseSupersedes(body)).toEqual([]));
+
+  // Finding on PR #4560: a fence closes only on the same character at least as long as its opener (CommonMark).
+  const fenceCases = [
+    ['a four-backtick fence wrapping a three-backtick example', '````md\n```\nSupersedes #4522\n```\nSupersedes #4523\n````'],
+    ['a tilde fence wrapping a backtick line', '~~~\n```\nSupersedes #4522\n~~~'],
+    ['a backtick fence wrapping a tilde line', '```\n~~~\nSupersedes #4522\n```'],
+    ['a longer tilde fence wrapping a shorter one', '~~~~\n~~~\nSupersedes #4522\n~~~~'],
+    ['a closer carrying trailing text (not a closer)', '```\n``` md\nSupersedes #4522\n```'],
+    ['a fence that is never closed', '```\nSupersedes #4522'],
+    ['an opener with an info string', '```md title="x"\nSupersedes #4522\n```'],
+    ['a closer indented 3 spaces', '```\nSupersedes #4522\n   ```'],
+    ['a fence opened inside a list item', '- ```md\n  Supersedes #4522\n  ```'],
+    ['a fence opened inside a numbered list item', '1. ```\n  Supersedes #4522\n    ```'],
+    ['a multi-line HTML comment', '<!--\nSupersedes #4522\n-->'],
+    ['a comment opened after other text', 'Note <!-- template\nSupersedes #4522\nend -->'],
+    ['a tab-indented line (indented code)', '\tSupersedes #4522'],
+    ['a no-break-space-led marker', ' Supersedes #4522'],
+  ];
+  it.each(fenceCases)('ignores a marker inside %s', (_name, body) => expect(parseSupersedes(body)).toEqual([]));
+  it.each([
+    ['a marker after a closed four-backtick fence', '````\n```\nSupersedes #1\n````\nSupersedes #2', [2]],
+    ['a marker after a closed tilde fence', '~~~\nSupersedes #1\n~~~\nSupersedes #2', [2]],
+    ['a closer longer than its opener', '```\nSupersedes #1\n`````\nSupersedes #2', [2]],
+    ['inline triple backticks are not a fence', '```not a fence```\nSupersedes #2', [2]],
+    ['a marker between two fences', '```\nx\n```\nSupersedes #3\n~~~\nSupersedes #4\n~~~', [3]],
+    ['a marker after a closed list-item fence', '- ```\n  x\n  ```\nSupersedes #2', [2]],
+    ['a marker after a closed HTML comment', '<!--\nx\n-->\nSupersedes #2', [2]],
+    ['a one-line HTML comment before a marker', '<!-- hint -->\nSupersedes #2', [2]],
+    ['a marker followed by an opening comment', 'Supersedes #2 <!--\nSupersedes #3\n-->', [2]],
+    ['a no-break-space-led backtick line (not a fence)', ' ```\nSupersedes #2', [2]],
+  ])('still reads %s', (_name, body, expected) => expect(parseSupersedes(body)).toEqual(expected));
+  it('caps the targets one body may declare', () => {
+    const body = `Supersedes ${Array.from({ length: 3000 }, (_, i) => `#${i + 1}`).join(', ')}`;
+    expect(parseSupersedes(body)).toHaveLength(MAX_SUPERSEDE_TARGETS);
+  });
 });
 
 describe('planSupersedeHolds', () => {

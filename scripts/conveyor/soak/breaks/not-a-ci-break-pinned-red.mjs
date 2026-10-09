@@ -17,7 +17,7 @@ export default {
     const violations = [];
     if (!this.fixPresent(root)) return { violations: ['verdict recheck is absent; not-a-ci-break pins the red head'] };
     const { contradictingChecks } = await import(pathToFileURL(join(root, 'scripts/conveyor/ci-heal-verdict-recheck.mjs')).href);
-    const { buildCiHealVerdictVoidComment, latestCiHealEscalationForHead, notCiBreakRecordRefusal } = await import(pathToFileURL(join(root, 'scripts/conveyor/ci-heal-escalation-mark.mjs')).href);
+    const { buildCiHealEscalationComment, buildCiHealVerdictVoidComment, latestCiHealEscalationForHead, notCiBreakRecordRefusal } = await import(pathToFileURL(join(root, 'scripts/conveyor/ci-heal-escalation-mark.mjs')).href);
     const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../__tests__/fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
     const headSha = fixture.headRefOid;
     const red = contradictingChecks({ escalation: latestCiHealEscalationForHead(fixture.comments, headSha, { recheck: true }),
@@ -31,6 +31,15 @@ export default {
     if (notCiBreakRecordRefusal({ headSha, pr: { ...fixture, statusCheckRollup }, requiredChecks: fixture.requiredChecks }) === null) {
       violations.push('unfinished required checks allow recording not-a-ci-break');
     }
+    // PR #4560 review: a void is owed per VERDICT. A second contradicted verdict on a head that already has a void
+    // must still be voided, or it pins the head again.
+    const { planVerdictVoid } = await import(pathToFileURL(join(root, 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs')).href);
+    const verdict = { author: { login: 'web-everything' }, createdAt: '2026-10-09T06:00:00Z',
+      body: buildCiHealEscalationComment({ headSha, outcome: 'not-a-ci-break', reason: 'second verdict' }) };
+    const second = planVerdictVoid({ note: { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha, prNumber: 4535 },
+      pr: { ...fixture, comments: [...comments, verdict] }, repo: fixture.repo, verdictSettings: { recheckNotCiBreak: true },
+      readRequiredChecks: () => fixture.requiredChecks });
+    if (!second || second.alreadyPosted) violations.push('a later contradicted verdict on an already-voided head is never voided');
     return { violations };
   },
   judge(report) { return report.violations; },

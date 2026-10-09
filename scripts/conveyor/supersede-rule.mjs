@@ -50,7 +50,17 @@ export function resolveSupersedeSettings(env = process.env, { path = supersedeSe
 
 /** One marker line: heading, bold, `Supersedes`, optional `:` (bold may close either side of it), then the PR list.
  *  Text after the list (`Supersedes #4522 (lane/main-red-soak)`) is allowed; text before `Supersedes` is not. */
-const MARKER_LINE_RE = /^\s{0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \t]*:?[ \t]*(?:\*\*)?[ \t]*(#\d+(?:(?:[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]+)#\d+)*)(?!\w)/;
+const MARKER_LINE_RE = /^ {0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \t]*:?[ \t]*(?:\*\*)?[ \t]*(#\d+(?:(?:[ \t]*,[ \t]*|[ \t]+and[ \t]+|[ \t]+)#\d+)*)(?!\w)/;
+
+/** A fence line: up to 3 SPACES (a tab or no-break space is indented code / not a fence), a run of 3+ backticks or
+ *  3+ tildes, then the rest of the line. */
+const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+/** A fence opened inside a list item (`- ```` / `1. ````): its closer is indented to the item's content, any depth. */
+const LIST_FENCE_LINE_RE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+(`{3,}|~{3,})(.*)$/;
+const INDENTED_FENCE_LINE_RE = /^ *(`{3,}|~{3,})(.*)$/;
+
+/** Most PR numbers one body may declare; a body past it is not a list of real supersedes. */
+export const MAX_SUPERSEDE_TARGETS = 50;
 
 /**
  * The PR numbers a body declares it supersedes, in order, de-duplicated. PURE.
@@ -60,16 +70,31 @@ const MARKER_LINE_RE = /^\s{0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \
 export function parseSupersedes(body) {
   if (typeof body !== 'string' || !body) return [];
   const out = [];
-  let fenced = false;
+  let fence = null; // { char, len, inList } of the open fence, CommonMark rules: closes on the same char, at least as long
+  let inComment = false; // inside a multi-line `<!-- ... -->` (PR templates carry guidance there)
   for (const line of body.split(/\r?\n/)) {
-    if (/^\s{0,3}(```|~~~)/.test(line)) { fenced = !fenced; continue; }
-    if (fenced) continue;
-    const m = MARKER_LINE_RE.exec(line);
-    if (!m) continue;
-    for (const n of m[1].matchAll(/#(\d+)/g)) {
-      const num = Number(n[1]);
-      if (Number.isSafeInteger(num) && num > 0 && !out.includes(num)) out.push(num);
+    if (fence) {
+      const close = (fence.inList ? INDENTED_FENCE_LINE_RE : FENCE_LINE_RE).exec(line);
+      if (close && close[1][0] === fence.char && close[1].length >= fence.len && close[2].trim() === '') fence = null;
+      continue;
     }
+    if (inComment) { if (line.includes('-->')) inComment = false; continue; }
+    const open = FENCE_LINE_RE.exec(line) ?? LIST_FENCE_LINE_RE.exec(line);
+    // A backtick fence's info string cannot hold a backtick, so ```text``` on one line is inline code, not a fence.
+    if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
+      fence = { char: open[1][0], len: open[1].length, inList: !FENCE_LINE_RE.test(line) };
+      continue;
+    }
+    const m = MARKER_LINE_RE.exec(line);
+    if (m) {
+      for (const n of m[1].matchAll(/#(\d+)/g)) {
+        const num = Number(n[1]);
+        if (Number.isSafeInteger(num) && num > 0 && !out.includes(num)) out.push(num);
+        if (out.length >= MAX_SUPERSEDE_TARGETS) return out;
+      }
+    }
+    const opened = line.lastIndexOf('<!--');
+    if (opened !== -1 && !line.includes('-->', opened)) inComment = true;
   }
   return out;
 }

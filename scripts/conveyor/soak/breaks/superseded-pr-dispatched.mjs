@@ -16,7 +16,7 @@ export default {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
     const violations = [];
     if (!this.fixPresent(root)) return { violations: ['supersede hold rule is absent; #4522 remains dispatchable'] };
-    const { planSupersedeHolds } = await import(pathToFileURL(join(root, 'scripts/conveyor/supersede-rule.mjs')).href);
+    const { planSupersedeHolds, parseSupersedes } = await import(pathToFileURL(join(root, 'scripts/conveyor/supersede-rule.mjs')).href);
     const { buildSupersededStandDownComment } = await import(pathToFileURL(join(root, 'scripts/conveyor/stand-down.mjs')).href);
     const { countUnresolvedStandDowns } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
     const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../__tests__/fixtures/supersede/pr4522-2026-10-09.json'), 'utf8'));
@@ -27,6 +27,10 @@ export default {
       const comments = [...fixture.open.comments, { author: { login: 'web-everything' }, body: buildSupersededStandDownComment(hold) }];
       if (countUnresolvedStandDowns(comments) <= 0) violations.push('superseded stand-down does not block reconcile dispatch');
       if (planSupersedeHolds({ ...input, openPrs: [{ ...fixture.open, comments }] }).length) violations.push('supersede hold re-planned after trusted comment');
+    }
+    // PR #4560 review: a Supersedes line inside a nested/mixed fence is documentation, never a hold on an unrelated PR.
+    for (const body of ['````md\n```\nSupersedes #4522\n```\nSupersedes #4523\n````', '~~~\n```\nSupersedes #4522\n~~~']) {
+      if (parseSupersedes(body).length) violations.push(`fenced example read as a supersede marker: ${JSON.stringify(body)}`);
     }
     return { violations };
   },

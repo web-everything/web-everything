@@ -192,7 +192,8 @@ export const CI_HEAL_VERDICT_VOID_MARKER = '🚦 conveyor CI-heal — verdict vo
 /** Build the void comment. Pure. `red` = the required check names that completed failing. */
 export function buildCiHealVerdictVoidComment({ headSha, red = [] } = {}) {
   if (!headSha || typeof headSha !== 'string') throw new TypeError('ci-heal verdict void: headSha is required');
-  const names = (Array.isArray(red) ? red : []).map(String).filter(Boolean);
+  // One line each: a check name is untrusted text, and a newline in it must never add a field to the marker.
+  const names = (Array.isArray(red) ? red : []).map((n) => String(n).replace(/\s+/g, ' ').trim()).filter(Boolean);
   return [
     CI_HEAL_VERDICT_VOID_MARKER,
     '',
@@ -220,6 +221,23 @@ export function parseCiHealVerdictVoids(comments) {
     out.push({ headSha: headSha.toLowerCase(), red, createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null, index });
   });
   return out;
+}
+
+/**
+ * The latest trusted `not-a-ci-break` verdict on `headSha`, and whether a trusted void for that head comes AFTER it
+ * (the same thread-order rule {@link latestCiHealEscalationForHead} uses). A head can carry several verdicts (ci-heal
+ * records a new one after a re-run), so "this head has a void" is not "this verdict is voided". `verdictIndex` is
+ * `-1` when no such verdict is in `comments` (any void for the head then counts). Pure.
+ * `voidCount` is every trusted void on that head, so a caller can bound a verdict/void loop on a flaky check.
+ * @returns {{verdictIndex:number, voided:boolean, voidCount:number}}
+ */
+export function notCiBreakVerdictVoidState(comments, headSha) {
+  const sha = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
+  const verdictIndex = parseEscalationsIndexed(comments)
+    .filter(({ e }) => e.headSha === sha && e.outcome === 'not-a-ci-break')
+    .reduce((latest, { index }) => Math.max(latest, index), -1);
+  const voids = parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha);
+  return { verdictIndex, voided: voids.some((v) => v.index > verdictIndex), voidCount: voids.length };
 }
 
 /**

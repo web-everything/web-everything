@@ -74,7 +74,7 @@ import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
 import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
 import { contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
-import { buildCiHealVerdictVoidComment, parseCiHealVerdictVoids } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
+import { buildCiHealVerdictVoidComment, notCiBreakVerdictVoidState } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
 import { getRequiredStatusChecks } from '../../scripts/lib/required-status-checks.mjs'; // card x9zznl9
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
@@ -435,6 +435,9 @@ export function defaultReadRequiredChecks({ repo }) {
   return getRequiredStatusChecks({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo }).checks;
 }
 
+/** card x9zznl9 — most verdicts one head may have voided before the verdict stands for an operator to decide. */
+export const MAX_VERDICT_VOIDS_PER_HEAD = 3;
+
 /**
  * card x9zznl9 — should this note's `not-a-ci-break` verdict be voided? Returns the comment row to post (or already
  * posted for this head), or `null` to handle the note normally. Pure apart from the injected required-check read.
@@ -455,8 +458,13 @@ export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredC
   });
   if (!red.length) return null;
   const head = String(note.headSha).toLowerCase();
-  const row = { repo, prNumber: note.prNumber, kind: 'ci-heal-verdict-void', key: `ci-heal-verdict-void:${note.prNumber}:${head}` };
-  if (parseCiHealVerdictVoids(pr.comments).some((v) => v.headSha === head)) return { ...row, alreadyPosted: true };
+  // A head can carry several verdicts (ci-heal records a new one after a re-run): owed once per VERDICT, not per head.
+  const { verdictIndex, voided, voidCount } = notCiBreakVerdictVoidState(pr.comments, head);
+  const row = { repo, prNumber: note.prNumber, kind: 'ci-heal-verdict-void', key: `ci-heal-verdict-void:${note.prNumber}:${head}:${verdictIndex}` };
+  if (voided) return { ...row, alreadyPosted: true };
+  // A check that flips green/red forever would grow the thread by two comments a cycle: past the cap the verdict
+  // stands, and the ordinary note tells the operator this head needs a decision.
+  if (voidCount >= MAX_VERDICT_VOIDS_PER_HEAD) return null;
   return { ...row, alreadyPosted: false, body: buildCiHealVerdictVoidComment({ headSha: head, red }) };
 }
 

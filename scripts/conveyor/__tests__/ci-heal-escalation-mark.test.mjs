@@ -283,7 +283,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   const { vi } = await import('vitest');
   const { CI_HEAL_VERDICT_VOID_MARKER, buildCiHealVerdictVoidComment, parseCiHealVerdictVoids,
     notCiBreakRecordRefusal, checkNotCiBreakRecordable } = await import('../ci-heal-escalation-mark.mjs');
-  const { planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+  const { MAX_VERDICT_VOIDS_PER_HEAD, planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
   const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
   const head = fixture.headRefOid;
   const settings = { recheckNotCiBreak: true };
@@ -360,6 +360,53 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   it('plans a verdict void from the daemon note and deduplicates a trusted void', () => {
     expect(planVerdictVoid(planOptions())).toMatchObject({ kind: 'ci-heal-verdict-void', alreadyPosted: false, body: voidComment().body });
     expect(planVerdictVoid({ ...planOptions(), pr: { ...fixture, comments: [...fixture.comments, voidComment()] } })).toMatchObject({ alreadyPosted: true });
+  });
+  // Finding on PR #4560: a void is keyed by head only, so one earlier void hid every later contradicted verdict on the
+  // same head. A void owes nothing only when it comes AFTER the latest not-a-ci-break verdict.
+  describe('a second contradicted verdict on a head that already has a void', () => {
+    const verdict = (n) => ({ author: AUTOMATION, createdAt: `2026-10-09T0${n}:00:00Z`,
+      body: buildCiHealEscalationComment({ headSha: head, outcome: 'not-a-ci-break', reason: `verdict ${n}` }) });
+    const prWith = (comments) => ({ ...fixture, comments });
+    it('owes a fresh void for a later verdict', () => {
+      const comments = [verdict(1), voidComment(), verdict(2)];
+      expect(planVerdictVoid({ ...planOptions(), pr: prWith(comments) })).toMatchObject({ alreadyPosted: false, body: voidComment().body });
+    });
+    it('is satisfied once a void follows the later verdict', () => {
+      const comments = [verdict(1), voidComment(), verdict(2), voidComment()];
+      expect(planVerdictVoid({ ...planOptions(), pr: prWith(comments) })).toMatchObject({ alreadyPosted: true });
+    });
+    it('is satisfied by the single void after the single verdict', () => {
+      expect(planVerdictVoid({ ...planOptions(), pr: prWith([verdict(1), voidComment()]) })).toMatchObject({ alreadyPosted: true });
+    });
+    it('gives each verdict episode its own row key', () => {
+      const first = planVerdictVoid({ ...planOptions(), pr: prWith([verdict(1)]) });
+      const second = planVerdictVoid({ ...planOptions(), pr: prWith([verdict(1), voidComment(), verdict(2)]) });
+      expect(first.key).not.toBe(second.key);
+    });
+    it('ignores an untrusted void and a void for another head', () => {
+      const comments = [verdict(1), { ...voidComment(), author: { login: 'rando' } }, voidComment('abcdef0123456789')];
+      expect(planVerdictVoid({ ...planOptions(), pr: prWith(comments) })).toMatchObject({ alreadyPosted: false });
+    });
+    it('stops voiding a head after the cap so a flapping check cannot grow the thread forever', () => {
+      const cycles = Array.from({ length: MAX_VERDICT_VOIDS_PER_HEAD }, (_, i) => [verdict(i + 1), voidComment()]).flat();
+      expect(planVerdictVoid({ ...planOptions(), pr: prWith([...cycles, verdict(9)]) })).toBeNull();
+      const fewer = cycles.slice(2);
+      expect(planVerdictVoid({ ...planOptions(), pr: prWith([...fewer, verdict(9)]) })).toMatchObject({ alreadyPosted: false });
+    });
+    it('keeps a check name on one line of the void marker', () => {
+      const body = buildCiHealVerdictVoidComment({ headSha: head, red: ['test\nhead: deadbeefdeadbeef', 'lint'] });
+      expect(body.split('\n').filter((l) => l.startsWith('head:'))).toEqual([`head: ${head}`]);
+      expect(parseCiHealVerdictVoids([{ author: AUTOMATION, body }])).toEqual([
+        expect.objectContaining({ headSha: head, red: ['test head: deadbeefdeadbeef', 'lint'] })]);
+    });
+    it('the notes daemon posts the second void', () => {
+      const postComment = vi.fn(() => ({ ok: true }));
+      const result = runReconcileNotesAllRepos({ repos: [fixture.repo], verdictSettings: settings,
+        readRequiredChecks: () => fixture.requiredChecks, dryRun: false, postComment,
+        tick: () => ({ notes: [note], prsByNumber: new Map([[4535, prWith([verdict(1), voidComment(), verdict(2)])]]) }) });
+      expect(postComment).toHaveBeenCalledTimes(1);
+      expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', posted: true })]);
+    });
   });
   it('off avoids required-check reads', () => {
     const opts = { ...planOptions(), verdictSettings: { recheckNotCiBreak: false } };
