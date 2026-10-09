@@ -2,9 +2,11 @@
 bornAs: x4skfj3
 kind: task
 parent: "2405"
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
+graduatedTo: bb92b4743331031ce7cfe939091a9ace9e4ce6e9
 tags: []
 ---
 

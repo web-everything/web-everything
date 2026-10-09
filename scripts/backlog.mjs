@@ -19,7 +19,7 @@
  *   node scripts/backlog.mjs resolve-parent <childNNN> [--json]  # #2752 drain-side ON-LAND pass: if <childNNN>'s parent EPIC now has every parent:-edge child resolved AND no judgment marker, splice it resolved+graduatedTo=none (mechanizes /resolve-on-last-child); a blocked/untriaged tail ESCALATEs (never auto-closes); a standing program / open-children / non-epic is a no-op. EDIT-ONLY — the caller lands + publishes it
  *   node scripts/backlog.mjs release <NNN>                       # active|preparing → open (abandon/redirect; stamps untouched)
  *   node scripts/backlog.mjs unresolve <NNN> --reason=<why> --force  # resolved → open, dropping dateResolved/graduatedTo/codifiedIn (#2779-incident: correcting a resolve-on-land false positive — evidence failure, never a routine reopen; --force + --reason both required)
- *   node scripts/backlog.mjs retype  <NNN> [--to=<kind>] [--size=N] [--status=parked]  # SANCTIONED pack-phase flag-fix — retype a mis-flagged item / bump size / park it through the CLI instead of a raw primary-tree Edit (no LANE_GUARD_OFF). Frontmatter-only (#2123)
+ *   node scripts/backlog.mjs retype  <NNN> [--to=<kind>] [--size=N|none] [--status=parked]  # SANCTIONED pack-phase flag-fix — retype a mis-flagged item / bump size / park it through the CLI instead of a raw primary-tree Edit (no LANE_GUARD_OFF). Frontmatter-only (#2123)
  *   node scripts/backlog.mjs yield    <NNN-slug>                 # move a LOCAL-ONLY NNN collision to the next free number (the guard's "a new item takes the next free number; yield this one"). Refuses a git-tracked file — NNN is immutable
  *   node scripts/backlog.mjs scaffold --kind=story --size=3 --title="..." [--digest="..."] [--blocked-by=NNN,NNN] [--parent=NNN] [--session=<slug>]   # --kind ∈ story|epic|task|decision|feature (#466/#487/#2691). --session ⇒ born `active`+`scaffoldedBy` (owned until settle, #670); without it, born `open` (default)
  *   node scripts/backlog.mjs settle   <NNN>                         # born-active scaffold (--session) → open: publish it once digest+edges+body are authored (#670)
@@ -837,7 +837,7 @@ function calibrate() {
 }
 
 /**
- * retype <NNN> [--to=<kind>] [--size=N] [--status=<s>] — the SANCTIONED pack-phase flag-fix (#2123 escape
+ * retype <NNN> [--to=<kind>] [--size=N|none] [--status=<s>] — `--size=none` drops the field. The SANCTIONED pack-phase flag-fix (#2123 escape
  * that isn't `LANE_GUARD_OFF`). The batch skill tells the packer to "fix a mis-flagged item in place" — retype
  * a `story` the pre-flight found is really a `decision`, bump a `size` to 13 to drop it from the pool, park it
  * — but the lane guard blocks a raw primary-tree Edit of the item's `.md`, which pushed agents to override the
@@ -858,7 +858,13 @@ function retype() {
   if (curStatus === 'resolved' && !argv.includes('--force')) die(`#${idFromName(file)} is resolved — retyping a closed item is almost certainly a mistake; pass --force if deliberate`);
   const changes = [];
   if (toKind) { src = setFrontmatterField(src, 'kind', toKind, { after: [] }); changes.push(`kind→${toKind}`); }
-  if (toSize !== undefined) {
+  if (toSize === 'none') {
+    // Drop `size` (frontmatter only). The split flow's "sliced epic carries no size" step (workflow-invariants
+    // rule 1) had no sanctioned way to do this, so a split stalled on a hand-edit.
+    const m = src.match(/^(---\n)([\s\S]*?)(\n---)/);
+    if (m) src = m[1] + m[2].replace(/^size:[^\n]*\n?/m, '') + m[3] + src.slice(m[0].length);
+    changes.push('size dropped');
+  } else if (toSize !== undefined) {
     const n = Number(toSize);
     if (!Number.isFinite(n) || n < 0) die(`--size must be a non-negative number (got "${toSize}")`);
     src = setFrontmatterField(src, 'size', String(n), { after: ['kind'] }); changes.push(`size→${n}`);
@@ -1424,7 +1430,7 @@ switch (verb) {
       `  ${GRN}resolve-parent${RST} <childNNN>   #2752 on-land: auto-resolve the child's parent EPIC iff every parent:-edge child is resolved + no judgment marker (else escalate/no-op); EDIT-ONLY\n` +
       `  ${GRN}release${RST} <NNN>               active|preparing → open\n` +
       `  ${GRN}unresolve${RST} <NNN> --reason=<why> --force   resolved → open, dropping dateResolved/graduatedTo/codifiedIn (#2779-incident correction path — a resolve that should never have happened, never a routine reopen)\n` +
-      `  ${GRN}retype${RST} <NNN> [--to=story|epic|task|decision|feature] [--size=N] [--status=parked]   sanctioned pack-phase flag-fix (no LANE_GUARD_OFF); frontmatter-only\n` +
+      `  ${GRN}retype${RST} <NNN> [--to=story|epic|task|decision|feature] [--size=N|none] [--status=parked]   sanctioned pack-phase flag-fix (no LANE_GUARD_OFF); frontmatter-only\n` +
       `  ${GRN}prioritize${RST} <NNN> [--to=low|--clear]   set or clear the item's \`priority\` frontmatter (the field readiness/batch ranks by); frontmatter-only\n` +
       `  ${GRN}tier${RST} <NNN> --to=pinned|normal|someday|won't [--clear]   set the build-queue TIER (#2528, the coarse ordering bucket); frontmatter-only\n` +
       `  ${GRN}rank${RST} <NNN> --to=<key> | --after=<NNN> [--before=<NNN>]   set the build-queue LexoRank (#2528, manual drag-order within a tier)\n` +
