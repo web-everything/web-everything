@@ -13,8 +13,13 @@
  * A day where some expected repo has no run is `incomplete`; a day with no run at all is `missing`. Both break
  * a streak: "7 clean days" means 7 consecutive days with evidence, not 7 scattered ones.
  *
- * THE STREAK counts back from today. If today has no run yet it starts from yesterday, so the morning before
- * the first run does not reset a week of evidence.
+ * A run counts as complete only when its record says the PR list was not truncated by `--limit` (`scan.truncated
+ * === false`) and `unreadable` is a validated zero. Records without that evidence are unknown.
+ * Only runs for the QUERIED repos shape a day: another repo's run never starts, ends or resets the streak.
+ *
+ * THE STREAK counts back from today. If today has no run yet, or is still `incomplete` (some repo has not run
+ * yet), it starts from yesterday, so the morning before the runs finish does not reset a week of evidence. A
+ * `drift` or `unknown` today does count.
  *
  * Pure except `readCheckRuns`, whose IO is injectable.
  */
@@ -61,13 +66,20 @@ export function readCheckRuns({ dir = resolveRunsDir(), listIds = listRunIds, re
   return { runs, corrupt };
 }
 
-/** One run's per-family verdict: `clean` | `drift` | `unknown` (no per-family data, or unreadable PRs). Pure. */
+const isCount = (n) => Number.isInteger(n) && n >= 0;
+
+/**
+ * One run's per-family verdict: `clean` | `drift` | `unknown`. Pure. Clean needs POSITIVE evidence of a complete
+ * scan: a validated zero `unreadable`, and a `scan` that says the PR list was not cut off by `--limit`. A record
+ * that omits either (older, hand-built, or a partial scan) is unknown, never clean.
+ */
 export function runFamilyVerdict(run, family) {
   const derived = run?.findings?.derived;
   const fam = derived?.perFamily?.[family];
-  if (!fam || typeof fam.disagree !== 'number') return 'unknown';
+  if (!fam || !isCount(fam.disagree)) return 'unknown';
   if (fam.disagree > 0) return 'drift';
-  if ((derived.unreadable ?? 0) > 0) return 'unknown';
+  if (!isCount(derived.unreadable) || derived.unreadable > 0) return 'unknown';
+  if (run.findings.scan?.truncated !== false) return 'unknown';
   return 'clean';
 }
 
@@ -85,11 +97,13 @@ function familiesOf(runs, families = []) {
  */
 export function dailyFamilyStatus(runs = [], { repos = DEFAULT_REPOS, families = [] } = {}) {
   const fams = familiesOf(runs, families);
+  const wanted = new Set(repos.map((r) => r.toLowerCase()));
   const byDay = new Map();
   for (const r of runs) {
     const day = etDay(r?.input?.at);
     const repo = r?.input?.repo;
     if (!day || !repo) continue;
+    if (!wanted.has(String(repo).toLowerCase())) continue; // a repo outside the query never creates or shapes a day
     if (!byDay.has(day)) byDay.set(day, []);
     byDay.get(day).push(r);
   }
@@ -104,7 +118,9 @@ export function dailyFamilyStatus(runs = [], { repos = DEFAULT_REPOS, families =
         perRepo[repo] = verdicts.length ? verdicts.reduce((a, b) => (rank[b] > rank[a] ? b : a)) : 'missing';
       }
       const vals = Object.values(perRepo);
-      const status = vals.includes('drift') ? 'drift' : vals.includes('missing') ? 'incomplete' : vals.includes('unknown') ? 'unknown' : 'clean';
+      // unknown outranks missing: a repo that already ran with unreadable/truncated evidence breaks the streak even
+      // while another repo has not run yet (a merely `incomplete` day is treated as still in progress).
+      const status = vals.includes('drift') ? 'drift' : vals.includes('unknown') ? 'unknown' : vals.includes('missing') ? 'incomplete' : 'clean';
       days[day][family] = { status, repos: perRepo };
     }
   }
@@ -121,7 +137,10 @@ export function cleanDaysPerFamily(runs = [], { repos = DEFAULT_REPOS, families 
   const result = {};
   for (const family of fams) {
     const statusOn = (day) => days[day]?.[family]?.status ?? 'missing';
-    let cursor = days[today] ? today : dayBefore(today);
+    // Today is still being filled in while it is `incomplete` (a repo has not run yet) or absent, so the streak
+    // starts from yesterday. A `drift` or `unknown` today is real evidence against the streak and counts now.
+    const todayStatus = statusOn(today);
+    let cursor = todayStatus === 'incomplete' || todayStatus === 'missing' ? dayBefore(today) : today;
     let streak = 0;
     while (statusOn(cursor) === 'clean') { streak += 1; cursor = dayBefore(cursor); }
     const window = [];
@@ -139,7 +158,7 @@ export function renderCleanDays(q, { corrupt = 0, runCount = 0 } = {}) {
     lines.push(`  ${family.padEnd(15)} streak ${String(f.streak).padStart(2)}/${q.required} · clean in window ${f.cleanInWindow}/${f.window.length}`
       + `  [${f.window.map((w) => mark[w.status]).join('')}]${f.ready ? '  READY' : ''}`);
   }
-  if (!Object.keys(q.families).length) lines.push('  no run records yet — run `npm run review:ledger-check` first.');
+  if (!Object.keys(q.families).length || !runCount) lines.push('  no run records yet — run `npm run review:ledger-check` first.');
   lines.push('  legend: ✓ clean · x drift · ? unreadable PRs · ~ a repo has no run · · no run');
   if (corrupt) lines.push(`  ${corrupt} corrupt run record(s) skipped`);
   return lines.join('\n');

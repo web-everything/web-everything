@@ -19,11 +19,11 @@ const PA = 'plateauapp/plateau-app';
 let seq = 0;
 
 /** A run record as the checker writes it. `drift` names the families with a disagreement. */
-function run({ repo = WE, at, drift = [], unreadable = 0 }) {
+function run({ repo = WE, at, drift = [], unreadable = 0, scan = { limit: 200, listed: 3, truncated: false } }) {
   const summary = summarizeDerived([]);
   for (const f of drift) summary.perFamily[f] = { compared: 1, agree: 0, disagree: 1 };
   summary.unreadable = unreadable;
-  return buildCheckRunRecord({ id: `review-ledger-check-t${seq++}`, repo, at, summary, phase1: {} });
+  return buildCheckRunRecord({ id: `review-ledger-check-t${seq++}`, repo, at, summary, phase1: {}, scan });
 }
 /** One clean run per constellation repo at 15:00 UTC (11:00 ET) on `day`. */
 const cleanDay = (day, extra = {}) => DEFAULT_REPOS.map((repo) => run({ repo, at: `${day}T15:00:00Z`, ...extra[repo] }));
@@ -47,6 +47,26 @@ describe('runFamilyVerdict', () => {
     expect(runFamilyVerdict(run({ at: NOW.toISOString(), unreadable: 1 }), 'review')).toBe('unknown');
     expect(runFamilyVerdict(run({ at: NOW.toISOString() }), 'review')).toBe('clean');
     expect(runFamilyVerdict({ op: 'review-ledger-check', findings: {} }, 'review')).toBe('unknown');
+  });
+
+  it('a missing or non-numeric unreadable count is unknown; an explicit zero is clean', () => {
+    const clean = run({ at: NOW.toISOString() });
+    expect(runFamilyVerdict(clean, 'review')).toBe('clean');
+    for (const bad of [undefined, null, '0', -1, 1.5, Number.NaN]) {
+      const rec = structuredClone(clean);
+      if (bad === undefined) delete rec.findings.derived.unreadable; else rec.findings.derived.unreadable = bad;
+      expect(runFamilyVerdict(rec, 'review')).toBe('unknown');
+    }
+  });
+
+  it('a truncated scan, or a record with no scan evidence, is never clean (a partial --limit run proves nothing)', () => {
+    expect(runFamilyVerdict(run({ at: NOW.toISOString(), scan: { limit: 1, listed: 1, truncated: true } }), 'review')).toBe('unknown');
+    expect(runFamilyVerdict(run({ at: NOW.toISOString(), scan: null }), 'review')).toBe('unknown');
+    const noFlag = run({ at: NOW.toISOString() });
+    delete noFlag.findings.scan.truncated;
+    expect(runFamilyVerdict(noFlag, 'review')).toBe('unknown');
+    // drift is still drift on a truncated scan: the disagreement it did see is real.
+    expect(runFamilyVerdict(run({ at: NOW.toISOString(), drift: ['review'], scan: { limit: 1, listed: 1, truncated: true } }), 'review')).toBe('drift');
   });
 });
 
@@ -90,6 +110,49 @@ describe('cleanDaysPerFamily — THE QUERY', () => {
   it('counts from yesterday when today has no run yet', () => {
     const runs = week('2026-10-08', 7).flatMap((d) => cleanDay(d));
     expect(cleanDaysPerFamily(runs, { now: NOW }).families.review).toMatchObject({ streak: 7, ready: true });
+  });
+
+  it('a partially covered today is in progress: the clean week ending yesterday still counts', () => {
+    const runs = [...week('2026-10-08', 7).flatMap((d) => cleanDay(d)), run({ repo: WE, at: '2026-10-09T10:00:00Z' })];
+    expect(cleanDaysPerFamily(runs, { now: NOW }).families.review).toMatchObject({ streak: 7, ready: true });
+  });
+
+  it('a drifting or unknown today still breaks the streak, even when other repos have not run yet', () => {
+    const week7 = week('2026-10-08', 7).flatMap((d) => cleanDay(d));
+    const drifted = cleanDaysPerFamily([...week7, run({ repo: WE, at: '2026-10-09T10:00:00Z', drift: ['review'] })], { now: NOW });
+    expect(drifted.families.review).toMatchObject({ streak: 0, ready: false });
+    expect(drifted.families['ci-failed'].streak).toBe(7); // only the drifting family resets
+    const unknown = cleanDaysPerFamily([...week7, ...cleanDay('2026-10-09', { [FUI]: { unreadable: 1 } })], { now: NOW });
+    expect(unknown.families.review).toMatchObject({ streak: 0, ready: false });
+    // partly covered today: WE already ran with an unreadable PR, the other repos have not run yet
+    const partialUnknown = cleanDaysPerFamily([...week7, run({ repo: WE, at: '2026-10-09T10:00:00Z', unreadable: 1 })], { now: NOW });
+    expect(partialUnknown.families.review).toMatchObject({ streak: 0, ready: false });
+    const partialTruncated = cleanDaysPerFamily([...week7, run({ repo: WE, at: '2026-10-09T10:00:00Z', scan: { limit: 1, listed: 1, truncated: true } })], { now: NOW });
+    expect(partialTruncated.families.review).toMatchObject({ streak: 0, ready: false });
+  });
+
+  it('a scan with no truncated field is recorded truncated (the writer fails closed too)', () => {
+    const rec = run({ at: NOW.toISOString(), scan: { limit: 200, listed: 3 } });
+    expect(rec.findings.scan.truncated).toBe(true);
+    expect(runFamilyVerdict(rec, 'review')).toBe('unknown');
+  });
+
+  it('runs from unselected repos never shape a scoped query (cannot reset or extend the streak)', () => {
+    const wePast = week('2026-10-08', 7).map((d) => run({ repo: WE, at: `${d}T15:00:00Z` }));
+    const others = [run({ repo: FUI, at: '2026-10-09T10:00:00Z', drift: ['review'] }), run({ repo: 'someone/else', at: '2026-10-09T10:00:00Z' })];
+    expect(cleanDaysPerFamily([...wePast, ...others], { now: NOW, repos: [WE] }).families.review).toMatchObject({ streak: 7, ready: true });
+    // and an unselected repo's clean run cannot manufacture a day for the selected one
+    expect(cleanDaysPerFamily(week('2026-10-09', 7).map((d) => run({ repo: FUI, at: `${d}T15:00:00Z` })), { now: NOW, repos: [WE] }).families.review.streak).toBe(0);
+    expect(dailyFamilyStatus(others, { repos: [WE] }).days).toEqual({});
+  });
+
+  it('a pinned family set makes a family absent from the records unknown instead of omitting it', () => {
+    const runs = week('2026-10-09', 7).flatMap((d) => cleanDay(d));
+    for (const r of runs) delete r.findings.derived.perFamily['ci-failed'];
+    const q = cleanDaysPerFamily(runs, { now: NOW, families: ['review', 'ruling-needed', 'ready-to-merge', 'ci-failed'] });
+    expect(q.families['ci-failed']).toMatchObject({ streak: 0, ready: false });
+    expect(q.families.review.ready).toBe(true);
+    expect(Object.keys(cleanDaysPerFamily(runs, { now: NOW }).families)).not.toContain('ci-failed'); // unpinned: omitted
   });
 
   it('unreadable PRs never count as clean', () => {

@@ -886,14 +886,15 @@ function block() {
   const rel = `backlog/${file}`;
   const abs = join(DIR, file);
   let src = readFileSync(abs, 'utf8');
-  const on = (flag('on') || '').split(',').map((s) => s.trim()).filter(Boolean).map(normalizeId);
+  const on = [...new Set((flag('on') || '').split(',').map((s) => s.trim()).filter(Boolean).map(normalizeId).map((t) => idFromName(t) ?? t))]; // a repeated target is one edge, however its slug is spelled
   if (!on.length) die('block needs --on=<NNN>[,<NNN>…]');
   const self = idFromName(file);
   for (const t of on) { if (t === self) die(`#${self} cannot block on itself`); resolveFile(t); }
   const cur = readField(src, 'blockedBy');
   let list = [];
   if (cur) { try { list = JSON.parse(cur); } catch { die(`#${self} has a blockedBy line that is not a JSON array: ${cur}`); } }
-  const added = on.filter((t) => !list.includes(t));
+  const have = new Set(list.map((e) => idFromName(e) ?? e)); // an existing edge spelled `<id>-<slug>` is the same edge
+  const added = on.filter((t) => !have.has(t));
   if (!added.length) return ok({ verb: 'block', id: file.replace(/\.md$/, ''), file: rel, added: [] }, `#${self} already blocked by ${on.join(', ')}`);
   list = [...list, ...added];
   src = setFrontmatterField(src, 'blockedBy', `[${list.map((t) => JSON.stringify(t)).join(', ')}]`, { after: ['status', 'parent', 'size', 'kind'] });

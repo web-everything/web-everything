@@ -369,6 +369,25 @@ describe('backlog.mjs CLI — ephemeral-clone integration smoke (#2273/#2274)', 
     expect(read('9015-n.md')).toBe(before);
   });
 
+  it('block --on: a target repeated in ONE invocation becomes one edge (whitespace-padded repeats too)', () => {
+    write('9015-n.md', item({ kind: 'epic', status: 'open', blockedBy: '["9014"]', dateOpened: '"2026-07-01"' }));
+    write('9016-o.md', item({ kind: 'story', size: 2, status: 'open', dateOpened: '"2026-07-01"' }));
+    const res = run(['block', '9015', '--on=9016,9016, 9016 ,9016']);
+    expect(res.code).toBe(0);
+    expect(res.json.added).toEqual(['9016']);
+    expect(read('9015-n.md')).toContain('blockedBy: ["9014", "9016"]');
+  });
+
+  it('block --on: the same card spelled bare and as <id>-<slug> is one edge, and cannot dodge the self-block check', () => {
+    write('9015-n.md', item({ kind: 'epic', status: 'open', dateOpened: '"2026-07-01"' }));
+    write('9016-o.md', item({ kind: 'story', size: 2, status: 'open', dateOpened: '"2026-07-01"' }));
+    const res = run(['block', '9015', '--on=9016,9016-o']);
+    expect(res.code).toBe(0);
+    expect(res.json.added).toEqual(['9016']);
+    expect(read('9015-n.md')).toContain('blockedBy: ["9016"]');
+    expect(run(['block', '9015', '--on=9015-n']).code).toBe(1);
+  });
+
   it('prioritize --clear: removes the priority field, returning to the default', () => {
     write('9011-j.md', item({ kind: 'story', size: 3, status: 'open', priority: 'low', dateOpened: '"2026-07-01"' }));
     const res = run(['prioritize', '9011', '--clear']);
