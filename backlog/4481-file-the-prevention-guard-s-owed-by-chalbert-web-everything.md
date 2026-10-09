@@ -3,9 +3,11 @@ bornAs: x2w940a
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:docs/agent/backlog-workflow.md"]
 dateOpened: "2026-09-29"
+dateStarted: "2026-10-09"
+dateResolved: "2026-10-09"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "0007875ad3f13546d089e71c49a89d50264feb15"
 tags: []
