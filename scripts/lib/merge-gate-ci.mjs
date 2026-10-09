@@ -183,10 +183,16 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     else set(id, clearance ? 'pass' : 'fail-closed', clearance ? 'drain enqueue clearance covers this head' : `manifest couple/blockedBy needs the drain's enqueue clearance (${gateCard(id)})`);
   }
 
-  // ledger — mergeGate.reviewAuthority, default `labels` (the drain does not consult the ledger).
-  const authority = facts.ledger?.authority ?? DEFAULT_REVIEW_AUTHORITY;
-  const ledger = decideLedgerGate({ folded: facts.ledger?.folded ?? null, derived: facts.ledger?.derived ?? null, head: pr.headRefOid, labelsClear: !uncleared, authority });
-  set('ledger', ledger.clear ? 'pass' : ledger.defer ? 'fail-closed' : 'hold', `${ledger.authority}: ${ledger.reason}`);
+  // ledger — mergeGate.reviewAuthority, default `labels` (the drain does not consult the ledger). The CLI MUST
+  // gather `facts.ledger` (the configured authority, or an error reading the settings): a missing fact is a
+  // fail-closed, never a silent `labels` default — that default is what let a configured `ledger`/`both`
+  // authority go unread. `ledger`/`both` with no ledger evidence defer (fail closed) inside decideLedgerGate.
+  if (!facts.ledger) set('ledger', 'fail-closed', 'ledger facts not gathered (mergeGate.reviewAuthority unread)');
+  else if (facts.ledger.error) set('ledger', 'fail-closed', `mergeGate.reviewAuthority unreadable: ${facts.ledger.error}`);
+  else {
+    const ledger = decideLedgerGate({ folded: facts.ledger.folded ?? null, derived: facts.ledger.derived ?? null, head: pr.headRefOid, labelsClear: !uncleared, authority: facts.ledger.authority ?? DEFAULT_REVIEW_AUTHORITY });
+    set('ledger', ledger.clear ? 'pass' : ledger.defer ? 'fail-closed' : 'hold', `${ledger.authority}: ${ledger.reason}`);
+  }
 
   return finish(num, out, policy);
 }
@@ -208,10 +214,18 @@ function finish(num, out, policy) {
   return { num, ok: blocking.length === 0, results, blocking };
 }
 
-/** A merge group passes only when it names at least one PR and every PR passes. Pure. */
-export function evaluateGroup(prResults) {
+/**
+ * A merge group passes only when it names at least one PR, its membership is COMPLETE, and every PR passes.
+ * `membership` is `groupMembership(...)`'s verdict; a partial list (only the head ref's PR, a commit that maps to
+ * no PR) must never read as the whole group — the unlisted PRs would merge unevaluated. Pure.
+ */
+export function evaluateGroup(prResults, membership) {
   const prs = Array.isArray(prResults) ? prResults : [];
   if (!prs.length) return { ok: false, reason: 'merge group: no PR could be identified — fail closed', prs };
+  // Proven complete or nothing: an omitted / malformed membership verdict is NOT "complete".
+  if (membership?.complete !== true) {
+    return { ok: false, reason: `merge group membership incomplete — fail closed: ${(membership?.reasons || []).join('; ') || 'completeness not proven'}`, prs };
+  }
   const bad = prs.filter((p) => !p.ok);
   return { ok: bad.length === 0, reason: bad.length ? `held: ${bad.map((p) => `#${p.num}`).join(', ')}` : `all ${prs.length} PR(s) pass`, prs };
 }
@@ -227,10 +241,44 @@ export function groupPrNumbers({ headRef = '', headSha = '', entries = [], commi
   const mine = (entries || []).find((e) => e?.headCommit?.oid === headSha);
   if (mine) for (const e of entries) if (Number(e?.position) <= Number(mine.position) && e?.pullRequest?.number) nums.add(Number(e.pullRequest.number));
   for (const s of commitSubjects || []) {
-    const mm = String(s).match(/^Merge pull request #(\d+)\b/) || String(s).match(/\(#(\d+)\)\s*$/);
-    if (mm) nums.add(Number(mm[1]));
+    const n = prNumberOfSubject(s);
+    if (n) nums.add(n);
   }
   return [...nums].sort((a, b) => a - b);
+}
+
+/** The PR number a first-parent queue commit's subject names (`Merge pull request #N` / `… (#N)`), or null. Pure. */
+export function prNumberOfSubject(subject) {
+  const mm = String(subject).match(/^Merge pull request #(\d+)\b/) || String(subject).match(/\(#(\d+)\)\s*$/);
+  return mm ? Number(mm[1]) : null;
+}
+
+/**
+ * The merge group's PR numbers AND whether that list is provably the whole group. `groupPrNumbers` is a union of
+ * best-effort sources; this cross-checks it against the one source that enumerates the group completely: every
+ * first-parent commit in base..head must map to a PR (by its subject, else by `resolved[sha]` — the commit→PR
+ * API's answer). Incomplete (fail closed) when the history was unreadable, there is no commit to check, or any
+ * commit maps to no PR (squash/rebase subjects without a `(#N)`, a hand-made commit). Pure.
+ * @param {{headRef?:string, headSha?:string, entries?:object[], commits?:Array<{sha:string,subject:string}>,
+ *   commitsRead?:boolean, resolved?:Record<string, number[]>}} o
+ * @returns {{nums:number[], complete:boolean, reasons:string[]}}
+ */
+export function groupMembership({ headRef = '', headSha = '', entries = [], commits = [], commitsRead = true, resolved = {} } = {}) {
+  const reasons = [];
+  const extra = new Set();
+  if (!commitsRead) reasons.push('first-parent history unreadable (git log failed)');
+  else if (!commits.length) reasons.push('no first-parent commits between the group base and head to cross-check');
+  const subjects = [];
+  for (const c of commits || []) {
+    const n = prNumberOfSubject(c?.subject);
+    if (n) { subjects.push(c.subject); continue; }
+    const viaApi = (resolved?.[c?.sha] || []).map(Number).filter((x) => Number.isInteger(x) && x > 0);
+    if (viaApi.length) for (const x of viaApi) extra.add(x);
+    else reasons.push(`commit ${String(c?.sha).slice(0, 7)} maps to no PR`);
+  }
+  const nums = [...new Set([...groupPrNumbers({ headRef, headSha, entries, commitSubjects: subjects }), ...extra])].sort((a, b) => a - b);
+  if (!nums.length) reasons.push('no PR could be identified');
+  return { nums, complete: reasons.length === 0, reasons };
 }
 
 /** Human-readable check summary. */
