@@ -25,6 +25,7 @@ export const QUARANTINE_LIST_PATH = 'quarantine.json';
 export const QUARANTINE_EVENTS_PATH = 'events.jsonl';
 export const QUARANTINE_WRITERS = Object.freeze(['red-main-safety-net', 'operator']);
 export const QUARANTINE_DEFAULT_TTL_MS = 6 * 60 * 60 * 1000;
+export const QUARANTINE_MAX_TTL_MS = 24 * 60 * 60 * 1000; // an entry can never outlive a day, whatever `--ttl-min` says
 export const RED_MAIN_MODES = Object.freeze(['stop', 'quarantine']);
 
 const isStr = (v) => typeof v === 'string' && v.trim() !== '';
@@ -76,7 +77,7 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
   const events = [];
   for (const test of tests) {
     if (entries.some((e) => e.test === test && now < e.expiresAt)) continue;
-    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: now + ttlMs, ...(area ? { area } : {}) };
+    const e = { test, brokenSha, owner, reason, addedAt: now, expiresAt: now + Math.min(Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : QUARANTINE_DEFAULT_TTL_MS, QUARANTINE_MAX_TTL_MS), ...(area ? { area } : {}) };
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
   }
@@ -127,6 +128,18 @@ export function vitestExcludeArgs(tests) {
   return { args: files.map((f) => `--exclude=${f}`), unsupported: ids.filter((t) => !isWholeFileEntry(t)) };
 }
 
+/** `gh pr list --json files` returns at most this many files per PR (GraphQL `first:100`); a list this long may be cut off. */
+export const LISTED_FILES_CAP = 100;
+
+/**
+ * A PR's changed-file paths from its open-PR listing row, or `null` when they are not fully known: no list, or one at
+ * the listing cap (a larger PR is silently truncated, which would hide an overlap). PURE.
+ */
+export function listedPrFiles(pr) {
+  if (!Array.isArray(pr?.files) || pr.files.length >= LISTED_FILES_CAP) return null;
+  return pr.files.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean);
+}
+
 /**
  * The main-fix PR's files, for {@link decideQuarantineHold}. `null` (unknown — fail closed there) when ANY published
  * fix PR's files cannot be read; `[]` only when no fix PR is published at all. PURE.
@@ -145,13 +158,14 @@ export function resolveFixFiles({ fixPrs, filesOf }) {
 
 /**
  * A red required check that failed ONLY on quarantined tests is routed to the existing re-run path (the next run
- * skips them). Unknown failing tests ⇒ not a quarantine case. A name-qualified entry covers only that exact test,
- * never the other tests of its file. PURE.
+ * skips them). Unknown failing tests ⇒ not a quarantine case. A failure is covered ONLY if the next run will actually
+ * skip it: that is a whole-file entry ({@link vitestExcludeArgs}). A name-qualified entry is never skipped by the
+ * per-file exclude, so routing its failure to a re-run would just fail again (a re-run loop) and is not covered. PURE.
  */
 export function classifyQuarantinedFailure({ failedTests, list, now }) {
   if (!Array.isArray(failedTests) || !failedTests.length) return { rerun: false, why: 'failed tests unknown' };
   const q = activeEntries(list, { now });
-  const covered = (t) => q.some((e) => e.test === t || (isWholeFileEntry(e.test) && testFileOf(e.test) === testFileOf(t)));
+  const covered = (t) => q.some((e) => isWholeFileEntry(e.test) && testFileOf(e.test) === testFileOf(t));
   const other = failedTests.filter((t) => !covered(t));
   return other.length ? { rerun: false, why: `non-quarantined failures: ${other.slice(0, 3).join(', ')}` } : { rerun: true, why: 'failed only on quarantined tests' };
 }

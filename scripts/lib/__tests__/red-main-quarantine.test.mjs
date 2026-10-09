@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   QUARANTINE_REF, validateQuarantineList, canWriteQuarantine, addEntries, pruneOnGreen, testsToSkip,
-  classifyQuarantinedFailure, decideQuarantineHold, testArea, vitestExcludeArgs, resolveFixFiles,
+  classifyQuarantinedFailure, decideQuarantineHold, testArea, vitestExcludeArgs, resolveFixFiles, listedPrFiles, QUARANTINE_MAX_TTL_MS, QUARANTINE_DEFAULT_TTL_MS,
 } from '../red-main-quarantine.mjs';
 import { redMainSignal, resolveRedMainMode } from '../red-main-hold.mjs';
 import { assertPushRef } from '../git-transport-branch.mjs';
@@ -73,13 +73,36 @@ describe('quarantine — what CI skips', () => {
   });
   // PR #4624 review: a `file::test name` entry names ONE test, never the whole file.
   const NAMED = `${TEST}::dispatches the fix`;
-  it('a name-qualified entry covers only that exact test — another failure in the same file is not quarantined', () => {
+  it('a name-qualified entry is never "covered": the per-file exclude does not skip it, so a re-run would loop; a whole-file entry still covers its file', () => {
     const ln = listWith([NAMED]);
-    expect(classifyQuarantinedFailure({ failedTests: [NAMED], list: ln, now: NOW }).rerun).toBe(true);
+    expect(classifyQuarantinedFailure({ failedTests: [NAMED], list: ln, now: NOW }).rerun).toBe(false);
     expect(classifyQuarantinedFailure({ failedTests: [`${TEST}::some other test`], list: ln, now: NOW }).rerun).toBe(false);
     expect(classifyQuarantinedFailure({ failedTests: [TEST], list: ln, now: NOW }).rerun).toBe(false);
-    // a whole-file entry still covers the file's tests
     expect(classifyQuarantinedFailure({ failedTests: [NAMED], list: l, now: NOW }).rerun).toBe(true);
+  });
+  it('rerun routing and the CI skip agree: a failure routes to a re-run iff the next run\'s vitest args exclude its file', () => {
+    for (const entries of [[TEST], [NAMED], [TEST, NAMED], ['scripts/other.test.mjs']]) {
+      const list = listWith(entries);
+      const { args } = vitestExcludeArgs(testsToSkip({ list, now: NOW, prNumber: 1, fixPrs: [2] }));
+      for (const failed of [TEST, NAMED, `${TEST}::another`]) {
+        const rerun = classifyQuarantinedFailure({ failedTests: [failed], list, now: NOW }).rerun;
+        expect(rerun, `${entries} / ${failed}`).toBe(args.includes(`--exclude=${failed.split('::')[0]}`));
+      }
+    }
+  });
+  it('an entry TTL is capped at a day, and a bad TTL falls back to the default', () => {
+    const e = (ttlMs) => addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, ttlMs }).list.entries[0];
+    expect(e(1e15).expiresAt - NOW).toBe(QUARANTINE_MAX_TTL_MS);
+    expect(e(Infinity).expiresAt - NOW).toBe(QUARANTINE_DEFAULT_TTL_MS);
+    expect(e(-5).expiresAt - NOW).toBe(QUARANTINE_DEFAULT_TTL_MS);
+    expect(e(60_000).expiresAt - NOW).toBe(60_000);
+  });
+  it('listedPrFiles: null when absent or at the 100-file listing cap (it may be truncated), else the paths', () => {
+    expect(listedPrFiles(undefined)).toBeNull();
+    expect(listedPrFiles({ files: null })).toBeNull();
+    expect(listedPrFiles({ files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) })).toBeNull();
+    expect(listedPrFiles({ files: [{ path: 'a' }, 'b', {}] })).toEqual(['a', 'b']);
+    expect(listedPrFiles({ files: [] })).toEqual([]);
   });
   it('vitest format: a whole-file entry becomes --exclude; a name-qualified entry never excludes its file (and never reaches a shell)', () => {
     expect(vitestExcludeArgs([TEST])).toEqual({ args: [`--exclude=${TEST}`], unsupported: [] });

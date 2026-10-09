@@ -192,7 +192,7 @@ import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
-import { decideQuarantineHold, resolveFixFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
+import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
@@ -5399,7 +5399,7 @@ async function runCli() {
           const q = readQuarantine();
           qList = q.ok ? q.list : null;
           const localPrs = [...(openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map())].filter(([r]) => isLocalRepo(r)).flatMap(([, prs]) => prs || []);
-          filesOf = (n) => { const p = localPrs.find((x) => Number(x?.number) === Number(n)); return Array.isArray(p?.files) ? p.files.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : null; };
+          filesOf = (n) => listedPrFiles(localPrs.find((x) => Number(x?.number) === Number(n))); // null ⇒ unknown OR cut off at the listing cap (fail closed)
         }
         // Unknown fix-PR files stay `null` (decideQuarantineHold fails closed on it) — never coerced to "no files".
         const fixFiles = quarantine ? resolveFixFiles({ fixPrs: sig.fixPrs, filesOf }) : null;
