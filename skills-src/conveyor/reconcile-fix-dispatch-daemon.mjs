@@ -72,6 +72,10 @@ import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatc
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
 import { applyReviewStatus } from '../../scripts/conveyor/review-status-tag.mjs'; // #3383 follow-up — tag at dispatch, see runTickAllRepos
 import { planClaudeAuthDispatchGate } from '../../scripts/conveyor/claude-auth-health.mjs'; // card x5kagse
+import { runSupersedeWatch, formatSupersedeLines } from '../../scripts/conveyor/supersede-watch.mjs'; // card xiqtf7w
+import { contradictingChecks, resolveCiHealVerdictSettings } from '../../scripts/conveyor/ci-heal-verdict-recheck.mjs'; // card x9zznl9
+import { buildCiHealVerdictVoidComment, parseCiHealVerdictVoids } from '../../scripts/conveyor/ci-heal-escalation-mark.mjs'; // card x9zznl9
+import { getRequiredStatusChecks } from '../../scripts/lib/required-status-checks.mjs'; // card x9zznl9
 
 /** The checkout this daemon runs from — its heavy-admission root is the host-wide `<workspace>/.lanes` one. */
 const DAEMON_REPO_ROOT = resolve(fileURLToPath(import.meta.url), '..', '..', '..');
@@ -354,7 +358,8 @@ export function defaultParkToHuman({ repo, pr, addLabel, removeLabels, exec = ex
  */
 export function runReconcileNotesAllRepos({
   repos = FIX_DISPATCH_DAEMON_REPOS, tick = defaultReadNotesForRepo, postComment = postNoteComment, parkToHuman = defaultParkToHuman,
-  dryRun = defaultNoteCommentDryRun(), ...tickOpts
+  dryRun = defaultNoteCommentDryRun(), verdictSettings = resolveCiHealVerdictSettings(), readRequiredChecks = defaultReadRequiredChecks,
+  ...tickOpts
 } = {}) {
   const perRepo = forEachRepo(repos, (repo) => tick({ ...tickOpts, repo }));
   const notes = [];
@@ -371,6 +376,15 @@ export function runReconcileNotesAllRepos({
       const tagged = { ...n, repo };
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
+      // card x9zznl9 (live #4535) — a `not-a-ci-break` verdict a required check has since contradicted is voided
+      // (once per head) instead of telling the operator it needs a decision; the ordinary ci-heal path resumes.
+      const voidRow = planVerdictVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks });
+      if (voidRow) {
+        if (voidRow.alreadyPosted || dryRun) { comments.push({ ...voidRow, posted: false, dryRun }); continue; }
+        const outcome = postComment({ repo, pr: n.prNumber, body: voidRow.body });
+        comments.push({ ...voidRow, posted: !!outcome.ok, dryRun: false, ...(outcome.ok ? {} : { error: outcome.error }) });
+        continue;
+      }
       const plan = planNoteComment(tagged, pr?.comments);
       // Parking retries independently of the one-comment-per-episode dedup.
       const parking = n.parkToHuman ? { parked: false } : {};
@@ -414,6 +428,46 @@ export function runReconcileNotesAllRepos({
     }
   }
   return { repos: perRepo, notes, refusals, comments };
+}
+
+/** The repo's live required-check set (branch protection, cached) — the SAME reader `reconcile-pass.mjs` uses. */
+export function defaultReadRequiredChecks({ repo }) {
+  return getRequiredStatusChecks({ repo: CONSTELLATION_REPOS[repo]?.slug ?? repo }).checks;
+}
+
+/**
+ * card x9zznl9 — should this note's `not-a-ci-break` verdict be voided? Returns the comment row to post (or already
+ * posted for this head), or `null` to handle the note normally. Pure apart from the injected required-check read.
+ */
+export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredChecks }) {
+  if (!verdictSettings?.recheckNotCiBreak || note?.kind !== 'ci-heal-escalated' || note?.outcome !== 'not-a-ci-break' || !pr) return null;
+  // Cheap pre-filter first: with no failing run other than review-gate on the PR at all, nothing can contradict the
+  // verdict, so the required-check set is never read.
+  const anyRed = contradictingChecks({
+    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup,
+    requiredChecks: [...new Set((pr.statusCheckRollup ?? []).map((r) => r?.name ?? r?.context).filter(Boolean))],
+  });
+  if (!anyRed.length) return null;
+  let requiredChecks = [];
+  try { requiredChecks = readRequiredChecks({ repo }) ?? []; } catch { return null; }
+  const red = contradictingChecks({
+    escalation: { outcome: note.outcome, headSha: note.headSha }, headSha: pr.headRefOid, rollup: pr.statusCheckRollup, requiredChecks,
+  });
+  if (!red.length) return null;
+  const head = String(note.headSha).toLowerCase();
+  const row = { repo, prNumber: note.prNumber, kind: 'ci-heal-verdict-void', key: `ci-heal-verdict-void:${note.prNumber}:${head}` };
+  if (parseCiHealVerdictVoids(pr.comments).some((v) => v.headSha === head)) return { ...row, alreadyPosted: true };
+  return { ...row, alreadyPosted: false, body: buildCiHealVerdictVoidComment({ headSha: head, red }) };
+}
+
+/**
+ * card xiqtf7w — the supersede half: per repo, hold (stand down + label) every open PR a merged PR declares it
+ * supersedes. Runs BEFORE the fix/ci-heal halves so the hold is on the thread before they plan. Never throws.
+ */
+export function runSupersedeAllRepos({ repos = FIX_DISPATCH_DAEMON_REPOS, tick = runSupersedeWatch, ...tickOpts } = {}) {
+  return { repos: repos.map((repo) => {
+    try { return tick({ ...tickOpts, repo }); } catch (e) { return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] }; }
+  }) };
 }
 
 /**
@@ -607,6 +661,8 @@ export async function runTickAllRepos({
   // card xccgzu5 — the consumer of the session watchdog's fixer-stuck events (we:scripts/conveyor/fixer-stuck-reclaim.mjs).
   // Injectable like every other half; a test tick never runs the real one.
   stuckFixerTick,
+  // card xiqtf7w — the supersede-hold half. Injectable like every other half; a test tick never runs the real one.
+  supersedeTick,
   // #3383 follow-up (live-caught 2026-09-26, PR #2771) — apply this daemon's OWN `review-status:*` tag the
   // instant it dispatches a fix/ci-heal session, never waiting on the SEPARATE Review daemon's own tick to
   // notice (see `we:scripts/conveyor/review-status-tag.mjs#applyReviewStatus`'s own docblock for the full
@@ -641,6 +697,11 @@ export async function runTickAllRepos({
   // so THIS tick's ci-heal/fix halves see the PR unowned and re-dispatch it, and its reserved slot frees up.
   const stuckFixers = stuckFixerTick ? await stuckFixerTick()
     : (realTick ? await runFixerStuckReclaimPass() : { rows: [] });
+  // card xiqtf7w — THIRD, before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
+  // stand-down now, so this tick's fix/ci-heal halves (and the review daemon) already read it as stood down.
+  // No Claude session is spawned, so the auth gate never pauses it.
+  const supersede = supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
+    : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] });
   const pausedDispatchResult = () => ({
     repos: repos.map((repo) => ({ repo, result: { dispatched: [], refusals: [] } })),
     dispatched: [], refusals: [], reconcileRefusals: [],
@@ -719,6 +780,7 @@ export async function runTickAllRepos({
     statusTags, // #3383 follow-up — one row per dispatch-time `review-status:*` tag attempt this tick made
     awaitVerify, // #5137 — one row per recorded verify wait this tick read (wait / push / rerequest / resume)
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
+    supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
   };
 }
@@ -899,8 +961,10 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
     onTick: (result) => {
       const {
         repos = [], dispatched = [], refusals = [], reconcileRefusals = [], hungCi, mainRedRebase, missingRun, promoteDraft, notes = [], noteComments = [],
-        authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null, stuckFixers = null,
+        authPaused = false, authPauseReason = null, statusTags = [], awaitVerify = null, stuckFixers = null, supersede = null,
       } = result || {};
+      // card xiqtf7w — one line per supersede hold planned or posted.
+      for (const line of formatSupersedeLines(supersede)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // card xccgzu5 — one line per fixer-stuck event this tick reclaimed, held or acknowledged.
       for (const line of formatFixerStuckReclaimLines(stuckFixers)) log.error(`reconcile-fix-dispatch-daemon: ${line}`);
       // #5137 — one line per verify wait the harness acted on (pushed / re-requested / resumed), plus a waiting count.

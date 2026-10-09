@@ -1,0 +1,108 @@
+/**
+ * @file scripts/conveyor/supersede-watch.mjs — card xiqtf7w. The IO shell around `supersede-rule.mjs`.
+ *
+ * Per repo, per tick of the fix daemon (`reconcile-fix-dispatch-daemon.mjs#runTickAllRepos`, BEFORE its fix and
+ * ci-heal halves): read the PRs merged in the last `lookbackDays` (with bodies) and the open PR numbers, read the
+ * comments of only the open PRs a merged PR names in a `Supersedes` line, plan with `planSupersedeHolds`, and for each
+ * hold post the terminal stand-down through `stand-down.mjs` (`--reason=superseded`, which also adds the
+ * `review-status:stood-down` and `superseded` labels). It never closes a PR: that is an operator decision.
+ *
+ * Setting off (`supersede-settings.json` / `WE_SUPERSEDE_HOLD`) = no read, no write. Every read is bounded; a failed
+ * read skips the repo for this tick (reported, never thrown). Usage as a one-off: `node supersede-watch.mjs
+ * [--repo=<owner/name>] [--apply]` (dry run without `--apply`).
+ */
+import { execFileSync } from 'node:child_process';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { planSupersedeHolds, resolveSupersedeSettings, supersedeCandidates } from './supersede-rule.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const STAND_DOWN_CLI = join(HERE, 'stand-down.mjs');
+export const SUPERSEDE_WATCH_ACTOR = 'supersede-watch (card xiqtf7w)';
+const LIST_LIMIT = 200;
+
+const slugOf = (repo) => CONSTELLATION_REPOS[repo]?.slug ?? repo;
+const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
+  stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024,
+}) || 'null'));
+
+/** Merged PRs (number, body, state, mergedAt) since `now - lookbackDays`. */
+export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync }) {
+  const since = new Date(now - lookbackDays * 86_400_000).toISOString().slice(0, 10);
+  return ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'merged', '--search', `merged:>=${since}`,
+    '--limit', String(LIST_LIMIT), '--json', 'number,body,state,mergedAt'], exec) ?? [];
+}
+
+/** Open PR numbers only (cheap); comments are read just for the candidates. */
+export function defaultReadOpenNumbers({ repo, exec = execFileSync }) {
+  return (ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'open', '--limit', String(LIST_LIMIT), '--json', 'number'], exec) ?? [])
+    .map((p) => p.number);
+}
+
+/** One candidate's state + comments, read fresh. */
+export function defaultReadPr({ repo, pr, exec = execFileSync }) {
+  return ghJson(['pr', 'view', String(pr), '--repo', slugOf(repo), '--json', 'number,state,comments,labels'], exec);
+}
+
+/** Post the hold through the stand-down CLI (comment + `review-status:stood-down` + `superseded` labels). */
+export function defaultPostHold({ repo, hold, exec = execFileSync }) {
+  try {
+    const out = exec(process.execPath, [STAND_DOWN_CLI, String(hold.pr), `--repo=${slugOf(repo)}`, '--reason=superseded',
+      `--superseded-by=${hold.by}`, ...(hold.mergedAt ? [`--merged-at=${hold.mergedAt}`] : []), `--actor=${SUPERSEDE_WATCH_ACTOR}`], {
+      stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    const last = String(out || '').trim().split('\n').at(-1) || '{}';
+    const parsed = JSON.parse(last);
+    return { ok: !!parsed.ok, labeled: !!parsed.labeled };
+  } catch (e) {
+    return { ok: false, error: String(e?.stderr || e?.message || e).trim().split('\n')[0] };
+  }
+}
+
+/**
+ * One repo's pass. Never throws.
+ * @returns {{repo:string, holds:Array<object>, applied:Array<object>, skipped?:string, error?:string}}
+ */
+export function runSupersedeWatch({
+  repo, apply = true, settings = resolveSupersedeSettings(), now = Date.now(),
+  readMergedPrs = defaultReadMergedPrs, readOpenNumbers = defaultReadOpenNumbers, readPr = defaultReadPr, postHold = defaultPostHold,
+} = {}) {
+  if (!settings?.hold) return { repo, holds: [], applied: [], skipped: 'supersede hold is off' };
+  try {
+    const mergedPrs = readMergedPrs({ repo, lookbackDays: settings.lookbackDays, now });
+    const candidates = supersedeCandidates({ mergedPrs, openNumbers: readOpenNumbers({ repo }) });
+    // Re-read each candidate: it must still be OPEN, and its own thread decides idempotency.
+    const openPrs = candidates.map((pr) => readPr({ repo, pr })).filter((p) => String(p?.state ?? '').toUpperCase() === 'OPEN');
+    const holds = planSupersedeHolds({ mergedPrs, openPrs, settings });
+    const applied = apply ? holds.map((hold) => ({ ...hold, ...postHold({ repo, hold }) })) : [];
+    return { repo, holds, applied };
+  } catch (e) {
+    return { repo, holds: [], applied: [], error: String(e?.message || e).split('\n')[0] };
+  }
+}
+
+/** One printable line per hold this pass planned or posted. */
+export function formatSupersedeLines(result) {
+  const lines = [];
+  for (const r of result?.repos ?? []) {
+    if (r.error) lines.push(`supersede-watch ${r.repo} — read failed (non-fatal, retried next tick): ${r.error}`);
+    const applied = new Map((r.applied ?? []).map((a) => [a.pr, a]));
+    for (const h of r.holds ?? []) {
+      const a = applied.get(h.pr);
+      const outcome = !a ? 'planned (dry run)' : a.ok ? `stood down${a.labeled ? ', labelled superseded' : ' (label failed)'}` : `FAILED (${a.error ?? 'unknown'})`;
+      lines.push(`supersede-watch ${r.repo} PR #${h.pr} — superseded by merged #${h.by} — ${outcome}; closing needs an operator decision`);
+    }
+  }
+  return lines;
+}
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (IS_CLI) {
+  const flags = Object.fromEntries(process.argv.slice(2).map((a) => a.replace(/^--/, '').split('=')).map(([k, v]) => [k, v ?? true]));
+  const repos = typeof flags.repo === 'string' ? [flags.repo] : Object.values(CONSTELLATION_REPOS).map((r) => r.slug);
+  const result = { repos: repos.map((repo) => runSupersedeWatch({ repo, apply: flags.apply === true })) };
+  for (const line of formatSupersedeLines(result)) process.stderr.write(`${line}\n`);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
