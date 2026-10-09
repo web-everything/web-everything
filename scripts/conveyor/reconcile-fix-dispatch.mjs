@@ -110,7 +110,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
-import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
+import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -1373,6 +1373,8 @@ export function runReconcileFixDispatch({
   netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
   prStack = reconcile === runReconcilePass ? readStacksForPass : null,
   prStackSettings = resolvePrStackSettings(),
+  // Where the remembered stacks are saved: the real memory file with the real stack reader, nowhere for an injected one.
+  writeStacks = prStack === readStacksForPass ? writeRemembered : null,
   readPrForRestack = prStack === readStacksForPass ? (pr) => {
     try {
       const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
@@ -1490,7 +1492,9 @@ export function runReconcileFixDispatch({
   });
   const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
   const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
-  let restackMemoryChanged = false;
+  // A started stacked-above hold clock is memory too (written right after the idle pass below).
+  let restackMemoryChanged = stackOrder.holdChanged;
+  const heldTops = new Set(stackOrder.heldTops);
   let idleLaneTips;
   for (const { top } of planIdleRestacks(stacks, {
     planned: plannedAll, reconcileRefusals: reconciled.refusals, fixClaims: claims,
@@ -1507,11 +1511,18 @@ export function runReconcileFixDispatch({
       repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
     planRefusals.push(...idle.refusals);
     const ordered = applyStackOrder(idle.planned, stacks, { settings: prStackSettings, used: restackedHeads });
-    stackOrder.refusals.push(...ordered.refusals);
+    // An idle top is only ever dispatched for its restack, so a release to ordinary dispatch is not one: say nothing of it.
+    stackOrder.refusals.push(...ordered.refusals.filter(r => r.kind !== 'stacked-above-aged'));
+    if (ordered.holdChanged) restackMemoryChanged = true;
+    for (const top of ordered.heldTops) heldTops.add(top);
     for (const entry of ordered.planned) {
       if (entry.restack) stackOrder.planned.push({ ...entry, restack: { ...entry.restack, idle: true } });
     }
   }
+  // The hold clock counts a CONTINUOUS hold. Write it now, before any lane pop or spawn below can throw or time out the pass:
+  // a clock saved only at the end of the pass restarts on every pass that dies early, and the hold never ages out.
+  if (clearUnheldHolds(stacks, heldTops)) restackMemoryChanged = true;
+  if (restackMemoryChanged && writeStacks) { writeStacks(root, nextRemembered(stacks)); restackMemoryChanged = false; }
   // Serialize against live claims and higher-ranked waiters, including blocked ones.
   let urgentPrs = new Set();
   try { urgentPrs = new Set(readOverlayConflictWakes(process.env).keys()); } catch { /* best-effort wake */ }
@@ -1624,7 +1635,7 @@ export function runReconcileFixDispatch({
     }
   }
 
-  if (restackMemoryChanged && prStack === readStacksForPass) writeRemembered(root, nextRemembered(stacks));
+  if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
   return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
