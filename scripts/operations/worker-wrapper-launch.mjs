@@ -181,18 +181,26 @@ export function wrappedRecordToAgentRow(rec, { isAlive = defaultIsAlive, nowMs =
 }
 
 /**
- * Every wrapped worker, as listing rows. NEVER throws: an unreadable store answers `[]` (absence is not liveness).
+ * Every wrapped worker, as listing rows. A store that cannot be listed THROWS (a missing dir is just `[]`): absence from a
+ * failed listing is not "gone". A record that cannot be read is skipped, and the returned array's non-enumerable
+ * `incomplete` lists what could not be read (`{reason, session}`, the session being the unreadable record's slug), for
+ * callers that decide on a session's ABSENCE.
  * @returns {object[]}
  */
 export function listWrappedWorkerAgents({ dir = resolveCompletionsDir(), isAlive = defaultIsAlive, nowMs = Date.now(), list = listCompletionSessions, read = tryReadCompletion } = {}) {
-  let sessions;
-  try { sessions = list(dir) ?? []; } catch { return []; }
+  // A FAILED listing throws: a missing store dir is already `[]` inside `list`, so a throw here means "could not look", and
+  // absence from a failed look is not "gone" (PR #4462 review: the await-verify pass read it as session-gone and dropped its record).
+  const sessions = list(dir) ?? [];
   const rows = [];
+  const unreadable = [];
   for (const s of sessions) {
     let rec = null;
-    try { rec = read(s, dir); } catch { rec = null; }
+    // One torn record must not blind the whole listing, but its session may be one a caller is looking for: say so.
+    // Scoped by slug (= the row's `name`): a torn file of one session must only make THAT session's absence unknown.
+    try { rec = read(s, dir); } catch { unreadable.push({ reason: `wrapped record ${s} unreadable`, session: s }); continue; }
     const row = wrappedRecordToAgentRow(rec, { isAlive, nowMs });
     if (row) rows.push(row);
   }
+  if (unreadable.length) Object.defineProperty(rows, 'incomplete', { value: unreadable });
   return rows;
 }

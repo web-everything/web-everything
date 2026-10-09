@@ -256,7 +256,16 @@ async function runWorkerOnce(spec, io, stop) {
   const awaitingVerify = io.awaitingVerify ?? (async (sessionId) => {
     if (!sessionId) return null;
     const { readStoredAwaitVerify, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyTtlMs } = await import('../conveyor/await-verify.mjs');
-    const record = readStoredAwaitVerify(awaitVerifyStoreKey({ sessionId }));
+    // `readStoredAwaitVerify` answers null for a missing AND an unreadable/unparseable record. Only a missing one means "not
+    // awaiting"; a record that exists but cannot be read is an unknown, reported as `{unreadable}` (never as "finished").
+    let text = null;
+    let readError = null;
+    const record = readStoredAwaitVerify(awaitVerifyStoreKey({ sessionId }), {
+      readFileSyncFn: (path, enc) => {
+        try { text = readFileSync(path, enc); return text; } catch (e) { if (e?.code !== 'ENOENT') readError = e; throw e; }
+      },
+    });
+    if (!record && (readError || text !== null)) return { unreadable: true };
     const verdict = classifyAwaitVerify({ record, session: { sessionId, name: spec.session }, nowMs: clock(), ttlMs: resolveAwaitVerifyTtlMs() });
     return verdict.awaiting ? { awaiting: true, record } : null;
   });
@@ -322,13 +331,17 @@ async function runWorkerOnce(spec, io, stop) {
   await run(spec.argv ?? []);
 
   // 117 S3b regression 2026-10-08: an ended print-mode turn leaves the wrapper alive for harness verification.
+  // Set while the LAST turn ended awaiting a verdict that never reached this wrapper (see `verifyUnfinishedResult`).
+  let unfinishedVerify = null;
   if (spec.launcher === 'claude-p') {
     const requestPath = resumeRequestPath(spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs'), spec.session);
     let resumes = 0;
     while (!failure && !isOperatorStop() && clock() < deadlineMs && resumes < MAX_AWAIT_RESUMES) {
       let awaiting = await awaitingVerify(spec.sessionId);
+      if (awaiting?.unreadable) { unfinishedVerify = {}; break; } // cannot tell whether a verdict is owed: not a finished run
       if (!awaiting?.awaiting) break;
       const { sha, pr, ref, requestedAt } = awaiting.record;
+      unfinishedVerify = { sha, pr, ref };
       withCompletionLock(spec.session, () => writeRecord({
         ...started, pid: selfPid, updatedAt: now(), awaitingVerify: { sha, pr, ref, requestedAt },
       }, dir), { dir });
@@ -348,7 +361,14 @@ async function runWorkerOnce(spec, io, stop) {
       }
       if (!request || isOperatorStop() || clock() >= deadlineMs) break;
       resumes += 1;
+      unfinishedVerify = null; // a verdict arrived: the resumed turn is the one that settles it
       await run(resumeArgvFrom(spec.argv, { sessionId: spec.sessionId, prompt: request.prompt }));
+    }
+    // The loop also ends on the resume cap or the deadline right after a turn that asked to wait again: look once more.
+    if (!unfinishedVerify && !failure && !isOperatorStop() && (resumes >= MAX_AWAIT_RESUMES || clock() >= deadlineMs)) {
+      const last = await awaitingVerify(spec.sessionId);
+      if (last?.awaiting) unfinishedVerify = { sha: last.record.sha, pr: last.record.pr, ref: last.record.ref };
+      else if (last?.unreadable) unfinishedVerify = {};
     }
   }
   stop.live = false;
@@ -396,6 +416,11 @@ async function runWorkerOnce(spec, io, stop) {
     }
   }
 
+  // A wait that ended with no verdict delivered: the awaiting turn's `done` only promised to continue after the harness
+  // verified and pushed, and the harness never did. Not a completion (PR #4462 review): a retryable infra block.
+  const verifyUnfinished = !aborted && !failure && unfinishedVerify && settled.parse?.ok && settled.result?.outcome === 'done';
+  if (verifyUnfinished) settled = { ...settled, result: verifyUnfinishedResult(settled.result, unfinishedVerify), reroute: null };
+
   // 3. route, write, and make the draft
   const mode = spec.postmortemMode ?? resolvePostmortemMode({ env: process.env, operationsDir: spec.operationsDir ?? defaultOperationsDir() });
   const action = routeWorkerResult(settled.result, { role: spec.role, launcher: spec.launcher, session: spec.session, pr: spec.pr == null ? null : String(spec.pr), item: spec.item == null ? null : String(spec.item), postmortemMode: mode });
@@ -404,13 +429,38 @@ async function runWorkerOnce(spec, io, stop) {
     // The wrapper wrote this result itself even when it is a fail-closed or aborted one: `none` is only for a legacy record that never reported.
     headAfter: head(), source: settled.source ?? 'worker-result',
   }, now);
-  if (spec.preserveLegacyWords && !aborted && legacyRead) finished = preserveLegacyWords(finished, legacyRecord ?? (failure ? null : legacyRead()));
+  // (An unfinished wait keeps its own words: an earlier self-reported `done` in the store must not win over the block.)
+  if (spec.preserveLegacyWords && !aborted && !verifyUnfinished && legacyRead) finished = preserveLegacyWords(finished, legacyRecord ?? (failure ? null : legacyRead()));
   withCompletionLock(spec.session, () => writeRecord(finished, dir), { dir });
   if (action.type === 'product-fix-draft') {
     // the shared 114 drafts store unless the spec names another; mode `off` writes nothing (the router put the mode on the action)
     try { writeDraft(action, { dir: spec.draftsDir ?? defaultDraftsDir(), now }); } catch { /* the envelope is the record of truth; a draft failure must not lose it */ }
   }
   return { envelope: finished, result: settled.result, action, legacyRecord, stdout, stderr, failure, resourceUsage };
+}
+
+/**
+ * The result of a wrapped turn that ended awaiting harness verification when the wait itself then ran out (the await
+ * record expired or was cleared with no resume request, the wall deadline passed, or the resume cap was spent). The
+ * awaiting turn was told to end with outcome `done`, but nothing was verified or pushed, so it is `blocked` /
+ * `infra-transient` (retryable: reconcile re-dispatches after the cool-off). The turn's own summary stays as evidence. PURE.
+ * @param {object} result the validated worker result of the last turn
+ * @param {{sha?: string, pr?: *, ref?: string}} wait the await record the wrapper was waiting on
+ */
+export function verifyUnfinishedResult(result, wait = {}) {
+  const sha = typeof wait.sha === 'string' ? wait.sha.slice(0, 12) : 'unknown';
+  // The wrapper cannot know whether the harness pushed (a verdict may land just as the wait ends): the retry re-reads the PR.
+  const text = `The turn ended awaiting harness verification of ${sha}${wait.ref ? ` for ${wait.ref}` : ''}, and no verdict was applied by the wrapper `
+    + `before the wait ran out (record expired, cleared or unreadable, deadline, or resume cap). Last summary: ${result.summary}`;
+  return {
+    ...result,
+    outcome: 'blocked',
+    summary: 'Verification wait ended with no verdict applied (retryable).',
+    blocker: {
+      kind: 'infra-transient', component: 'verify-wait', evidence: { text: text.slice(0, 2000), refs: [] },
+      proposedFix: null, ruling: null, deniedCommand: null, retryable: true,
+    },
+  };
 }
 
 /** The v1 words a wrapped agent may have reported itself (its brief still says to), carried over verbatim. */

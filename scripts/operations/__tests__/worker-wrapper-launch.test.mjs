@@ -111,7 +111,7 @@ describe('wrapped worker agent rows', () => {
       expect(wrappedRecordToAgentRow(rec, { isAlive: () => true })).toBeNull();
     }
   });
-  it('lists only readable worker rows and tolerates an unreadable listing', () => {
+  it('lists only readable worker rows', () => {
     const dir = tmp();
     const rec = started();
     const list = vi.fn(() => ['fix-7', 'x']);
@@ -121,7 +121,18 @@ describe('wrapped worker agent rows', () => {
     expect(rows[0]).toMatchObject({ name: 'fix-7', state: 'working' });
     expect(list).toHaveBeenCalledWith(dir);
     expect(read).toHaveBeenCalledWith('fix-7', dir);
-    expect(listWrappedWorkerAgents({ dir, list: () => { throw new Error('unreadable'); } })).toEqual([]);
+  });
+  // PR #4462 review: absence from a FAILED listing is not "gone", so a listing failure is never an empty result.
+  it('lets a failed listing throw instead of reading it as no wrapped workers', () => {
+    expect(() => listWrappedWorkerAgents({ dir: tmp(), list: () => { throw new Error('unreadable'); } })).toThrow('unreadable');
+  });
+  it('flags the listing incomplete when a record cannot be read, and keeps the rows it could read', () => {
+    const rec = started();
+    const read = (s) => { if (s === 'fix-9') throw new Error('torn record'); return s === 'fix-7' ? rec : null; };
+    const rows = listWrappedWorkerAgents({ dir: tmp(), list: () => ['fix-7', 'fix-9'], read, isAlive: () => true });
+    expect(rows).toHaveLength(1);
+    expect(rows.incomplete).toEqual([{ reason: expect.stringContaining('fix-9'), session: 'fix-9' }]);
+    expect(listWrappedWorkerAgents({ dir: tmp(), list: () => ['fix-7'], read, isAlive: () => true }).incomplete).toBeUndefined();
   });
 });
 

@@ -514,7 +514,9 @@ describe('wrapped verification waits', () => {
     expect(h.heads).toHaveLength(2);
     expect(h.drafts).toHaveLength(0);
   });
-  it.each(['expired', 'deadline', 'foreign'])('%s finalizes with the first turn when no valid resume arrives', async (mode) => {
+  // PR #4462 review: a wait that ends with no verdict delivered used to finalize the awaiting turn's `done` as a success.
+  // The harness never pushed, so the work is unverified and unpushed: it is a retryable infra block, never `done`.
+  it.each(['expired', 'deadline', 'foreign'])('%s ends the wait as a retryable block, not as the first turn\'s done', async (mode) => {
     const h = harness();
     let polled = false;
     h.io.awaitingVerify = () => polled && mode !== 'deadline' ? null : awaiting;
@@ -525,9 +527,56 @@ describe('wrapped verification waits', () => {
     };
     const out = await runWorker(h.s, h.io);
     expect(h.calls).toHaveLength(1);
-    expect(out.envelope).toMatchObject({ status: 'done', parse: { ok: true }, result: { summary: 'turn 1' } });
+    expect(out.envelope).toMatchObject({
+      status: 'done', outcome: 'blocked-on-infra', parse: { ok: true }, action: { type: 'retry-after-cooloff' },
+      result: { outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait', retryable: true } },
+    });
+    expect(out.envelope.result.blocker.evidence.text).toContain('turn 1'); // the awaiting turn's own summary stays as evidence
+    expect(out.envelope.result.blocker.evidence.text).toContain('a'.repeat(40).slice(0, 12));
     expect(out.envelope).not.toHaveProperty('awaitingVerify');
     expect(existsSync(resumeRequestPath(h.s.specDir, h.s.session))).toBe(false);
+  });
+  it('an unfinished wait overrides a stale self-reported done word from the legacy store', async () => {
+    const h = harness();
+    h.s.preserveLegacyWords = true;
+    h.io.legacyRead = () => ({ status: 'done', outcome: 'healed' });
+    h.io.awaitingVerify = () => awaiting;
+    h.io.sleep = async () => { h.advance(h.s.timeoutMs); };
+    const out = await runWorker(h.s, h.io);
+    expect(out.envelope.outcome).toBe('blocked-on-infra');
+  });
+  // An await record that EXISTS but cannot be read is an unknown, not "no wait owed": the first check must not finalize `done`.
+  it('a torn await record in the default store blocks the run; a missing one is a normal done', async () => {
+    const store = tmp();
+    vi.stubEnv('WE_AWAIT_VERIFY_STORE', store);
+    try {
+      const missing = harness();
+      delete missing.io.awaitingVerify;
+      expect((await runWorker(missing.s, missing.io)).result.outcome).toBe('done');
+      writeFileSync(join(store, `${sid}.json`), '{"v":1,"sessionId":');
+      const torn = harness();
+      delete torn.io.awaitingVerify;
+      const out = await runWorker(torn.s, torn.io);
+      expect(torn.calls).toHaveLength(1);
+      expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait' } });
+      expect(out.envelope.outcome).toBe('blocked-on-infra');
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('an injected unreadable await check blocks the run too', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => ({ unreadable: true });
+    expect((await runWorker(h.s, h.io)).result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
+  });
+  it('an intermediate turn that is not done is left as the worker said it', async () => {
+    const h = harness();
+    h.io.spawnToCompletionFn = async (command, argv, opts, { spawnFn }) => {
+      h.calls.push({ argv, opts }); spawnFn(command, argv, opts);
+      return { stdout: claudeStdout(BLOCKED('needs-ruling', { ruling: { question: 'q', options: ['a', 'b'], recommendation: 'a' } })), stderr: '' };
+    };
+    h.io.awaitingVerify = () => awaiting;
+    h.io.sleep = async () => { h.advance(h.s.timeoutMs); };
+    const out = await runWorker(h.s, h.io);
+    expect(out.envelope.result.blocker.kind).toBe('needs-ruling');
   });
   it('consumes a queued resume even after the pass clears the await record', async () => {
     const h = harness();
@@ -544,8 +593,17 @@ describe('wrapped verification waits', () => {
     const out = await runWorker(h.s, h.io);
     expect(MAX_AWAIT_RESUMES).toBe(6);
     expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
-    expect(out.result.summary).toBe(`turn ${1 + MAX_AWAIT_RESUMES}`);
+    // the cap ran out while the last turn was STILL awaiting a verdict: that turn's `done` is not a completion
+    expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait' } });
+    expect(out.result.blocker.evidence.text).toContain(`turn ${1 + MAX_AWAIT_RESUMES}`);
     expect(out.envelope.deadlineAt).toBe(new Date(start + h.s.timeoutMs).toISOString());
+  });
+  it('a last turn that is no longer awaiting is a normal done (the cap is not a block by itself)', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => h.calls.length <= MAX_AWAIT_RESUMES ? awaiting : null;
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
+    expect(out.result).toMatchObject({ outcome: 'done', summary: `turn ${1 + MAX_AWAIT_RESUMES}` });
   });
   it('reads the default host await store and consumes the request after that record is cleared', async () => {
     const h = harness();

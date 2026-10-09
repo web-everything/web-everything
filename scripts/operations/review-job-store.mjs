@@ -132,7 +132,10 @@ export function listAgentsWithReviewJobs({
   const agents = Array.isArray(listed) ? listed : [];
   let jobs = [];
   try { jobs = listJobs() ?? []; } catch { jobs = []; }
-  let wrapped = [];
-  try { wrapped = listWrapped() ?? []; } catch { wrapped = []; }
-  return [...agents, ...jobs, ...wrapped];
+  // Not swallowed, unlike `jobs`: a wrapped fix / ci-heal / review is a live-session population readers decide on by its
+  // ABSENCE (no live fixer -> dispatch one), so a failed listing aborts the read exactly as a failed `claude agents` does.
+  const wrapped = listWrapped() ?? [];
+  const merged = [...agents, ...jobs, ...wrapped];
+  // A spread drops the wrapped listing's non-enumerable `incomplete` (records it could not read): carry it over.
+  return wrapped.incomplete?.length ? Object.defineProperty(merged, 'incomplete', { value: wrapped.incomplete }) : merged;
 }

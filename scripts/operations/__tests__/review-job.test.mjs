@@ -139,6 +139,19 @@ describe('job records — liveness by pid, without a transcript', () => {
     expect(merged.map((a) => a.name)).toEqual(['fix-3', 'review-4']);
     expect(listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => { throw new Error('io'); }, listWrapped: () => [] })).toEqual([{ name: 'x' }]);
   });
+  // PR #4462 review: a wrapped fixer is a live-session population readers decide on by absence, so a failed listing of it
+  // aborts the read (like a failed `claude agents`) instead of showing "no fixer".
+  it('listAgentsWithReviewJobs does not read a failed wrapped listing as no wrapped workers', () => {
+    expect(() => listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [], listWrapped: () => { throw new Error('io'); } })).toThrow('io');
+  });
+  it('listAgentsWithReviewJobs carries the wrapped listing\'s incomplete marker across the merge', () => {
+    const gap = { reason: 'wrapped record fix-9 unreadable', session: 'fix-9' };
+    const wrapped = Object.defineProperty([{ name: 'fix-3' }], 'incomplete', { value: [gap] });
+    const merged = listAgentsWithReviewJobs({ listAgents: () => [{ name: 'x' }], listJobs: () => [], listWrapped: () => wrapped });
+    expect(merged.map((a) => a.name)).toEqual(['x', 'fix-3']);
+    expect(merged.incomplete).toEqual([gap]);
+    expect(listAgentsWithReviewJobs({ listAgents: () => [], listJobs: () => [], listWrapped: () => [] }).incomplete).toBeUndefined();
+  });
 });
 
 /** A fake io recording every effect in order. */

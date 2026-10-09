@@ -191,6 +191,81 @@ describe('runAwaitVerifyPass', () => {
     expect(rows[0].result).toBe('pushed; session-gone');
     expect(h.store.size).toBe(0);
   });
+  // PR #4462 review: a FAILED listing is not an absent session. The pass must keep the await record and push nothing.
+  describe('an incomplete session listing fails closed', () => {
+    const incomplete = (rows, why = 'claude agents listing failed: timed out', session = null) => Object.defineProperty([...rows], 'incomplete', { value: [{ reason: why, session }] });
+    it('one unrelated torn wrapped record does not pin another session\'s record; its own torn record does', async () => {
+      const unrelated = harness({ session: null });
+      unrelated.state.marker = marker('green');
+      unrelated.io.listSessions = () => incomplete([], 'wrapped record fix-9 unreadable', 'fix-9');
+      expect((await runAwaitVerifyPass({ io: unrelated.io, nowMs: T0 + 60_000, ttlMs: TTL })).rows[0].result).toBe('session-gone; not pushed');
+      expect(unrelated.store.size).toBe(0); // genuinely gone: dropped, not stuck behind someone else's torn file
+      const own = harness({ session: null });
+      own.state.marker = marker('green');
+      own.io.listSessions = () => incomplete([], 'wrapped record fix-4115 unreadable', 'fix-4115');
+      expect((await runAwaitVerifyPass({ io: own.io, nowMs: T0 + 60_000, ttlMs: TTL })).rows[0].result).toMatch(/^error: session listing incomplete \(wrapped record fix-4115 unreadable\)/);
+      expect(own.store.size).toBe(1);
+    });
+    it('green + a missing session on an incomplete listing: no push, no resume, the record is kept for the next tick', async () => {
+      const h = harness();
+      h.state.marker = marker('green');
+      h.io.listSessions = () => incomplete([]);
+      const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      expect(rows[0].result).toMatch(/^error: session listing incomplete \(claude agents listing failed: timed out\)/);
+      expect(h.calls.push).toEqual([]);
+      expect(h.calls.resume).toEqual([]);
+      expect(h.store.size).toBe(1);
+    });
+    it('red + a missing session on an incomplete listing: the record is kept, not dropped as session-gone', async () => {
+      const h = harness();
+      h.state.marker = marker('red');
+      h.io.listSessions = () => incomplete([{ sessionId: 'someone-else', name: 'fix-1', cwd: '/s', state: 'done' }], 'wrapped worker listing failed: EACCES');
+      const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      expect(rows[0].result).toMatch(/^error: session listing incomplete/);
+      expect(rows[0].result).not.toMatch(/session-gone/);
+      expect(h.store.size).toBe(1);
+    });
+    it('the next tick, once the listing is whole again, pushes and resumes as normal', async () => {
+      const h = harness();
+      h.state.marker = marker('green');
+      let broken = true;
+      h.io.listSessions = () => broken ? incomplete([]) : [{ sessionId: rec().sessionId, name: 'fix-4115', cwd: '/s', state: 'done' }];
+      await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      broken = false;
+      const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 180_000, ttlMs: TTL });
+      expect(rows[0].result).toBe('pushed; resumed:green');
+      expect(h.calls.push).toHaveLength(1);
+      expect(h.store.size).toBe(0);
+    });
+    it('a session that IS in the partial listing is still served (one broken population does not stall the other)', async () => {
+      const h = harness();
+      h.state.marker = marker('green');
+      h.io.listSessions = () => incomplete([{ sessionId: rec().sessionId, name: 'fix-4115', cwd: '/s', state: 'done' }], 'wrapped worker listing failed: EACCES');
+      const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      expect(rows[0].result).toBe('pushed; resumed:green');
+    });
+    it('a record with no session id cannot be bound by name on an incomplete listing (the name could be a stale twin)', async () => {
+      const h = harness({ records: [rec({ sessionId: null })], session: null });
+      h.state.marker = marker('green');
+      h.io.listSessions = () => incomplete([{ sessionId: 'twin', name: 'fix-4115', cwd: '/s', state: 'done' }]);
+      const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      expect(rows[0].result).toMatch(/^error: session listing incomplete/);
+      expect(h.calls.push).toEqual([]);
+    });
+    it('end to end through the default IO: a throwing `claude agents` listing keeps the await record and pushes nothing', async () => {
+      const h = harness();
+      h.state.marker = marker('green');
+      const real = await defaultAwaitVerifyIo({
+        dispatchIo: { defaultListAgents: () => { throw new Error('claude agents timed out'); } },
+        listWrappedWorkers: () => [],
+      });
+      h.io.listSessions = real.listSessions;
+      const { rows } = await runAwaitVerifyPass({ io: h.io, nowMs: T0 + 60_000, ttlMs: TTL });
+      expect(rows[0].result).toMatch(/^error: session listing incomplete \(claude agents listing failed: claude agents timed out\)/);
+      expect(h.calls.push).toEqual([]);
+      expect(h.store.size).toBe(1);
+    });
+  });
   it('logs one line per action and a waiting count', async () => {
     expect(formatAwaitVerifyLines({ rows: [{ action: 'wait' }, { action: 'push', repo: 'r', pr: 1, sha: SHA, reason: 'green', result: 'pushed' }] }))
       .toEqual(['await-verify: r PR #1 @ 65a382e8 — push (green) → pushed', 'await-verify: 1 session(s) awaiting a verdict']);
@@ -979,13 +1054,21 @@ describe('default IO includes and resumes wrapped workers', () => {
     expect(io.resume({ session, prompt: 'verified' })).toEqual({ resumed: true });
     expect(calls).toEqual([{ session, prompt: 'verified' }]);
   });
-  it.each(['neither', 'claude', 'wrapped'])('preserves the other listing when %s fails', async (failure) => {
+  it.each(['neither', 'claude', 'wrapped'])('keeps the other listing when %s fails, and says the merged listing is incomplete', async (failure) => {
     const claude = { kind: 'background', name: 'fix-1' };
     const wrapped = { kind: 'wrapped-worker', name: 'fix-2' };
     const io = await defaultAwaitVerifyIo({
       dispatchIo: { defaultListAgents: () => { if (failure === 'claude') throw new Error('unreadable'); return [claude]; } },
       listWrappedWorkers: () => { if (failure === 'wrapped') throw new Error('unreadable'); return [wrapped]; },
     });
-    expect(io.listSessions()).toEqual(failure === 'claude' ? [wrapped] : failure === 'wrapped' ? [claude] : [claude, wrapped]);
+    const listed = io.listSessions();
+    expect([...listed]).toEqual(failure === 'claude' ? [wrapped] : failure === 'wrapped' ? [claude] : [claude, wrapped]);
+    expect(listed.incomplete ?? []).toHaveLength(failure === 'neither' ? 0 : 1);
+  });
+  it('carries a wrapped listing\'s own incompleteness (an unreadable record) into the merged listing', async () => {
+    const gap = { reason: 'wrapped record fix-9 unreadable', session: 'fix-9' };
+    const wrapped = Object.defineProperty([], 'incomplete', { value: [gap] });
+    const io = await defaultAwaitVerifyIo({ dispatchIo: { defaultListAgents: () => [] }, listWrappedWorkers: () => wrapped });
+    expect(io.listSessions().incomplete).toEqual([gap]);
   });
 });
