@@ -15,7 +15,8 @@ import { withBareOrigin, withNarrowClone } from './helpers/real-repo.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const TOP_FILES = ['package.json'];
-const TREES = ['scripts', 'skills-src'];
+// `schemas` is read by path at import by operations/worker-result.mjs (prep-review → review daemon).
+const TREES = ['scripts', 'skills-src', 'schemas'];
 
 /** Copy the parts of this repo the CLI imports into the fixture clone, commit on main and push. */
 function seedCheckout(ctx) {
