@@ -449,10 +449,15 @@ async function main(argv = process.argv.slice(2)) {
   let seconds = resolveFixerSlotSettings().awaitVerifyLoopSeconds;
   write(`await-verify-loop: started pid ${process.pid} (parent ${parentPid || 'none'}), every ${seconds}s`);
   let lastDeferred = '';
+  // Draft-first promotion rides this child for the same reason the push does: the fix tick can starve for an hour
+  // behind self-sync rebuilds (live 2026-10-09, #4567). Own setting + interval; see draft-promotion-rule.mjs.
+  const { runDraftPromotionIfDue } = await import('./draft-promotion-loop.mjs');
+  let promotion = { lastRunAtMs: null, lastSkipKey: '' };
   for (;;) {
     const it = await runLoopIteration({ parentPid, lastDeferred, formatLines: formatAwaitVerifyLines, write });
     if (it.exit) return;
     lastDeferred = it.lastDeferred;
+    promotion = runDraftPromotionIfDue({ ...promotion, write });
     seconds = it.seconds;
     await sleep(seconds * 1000);
   }

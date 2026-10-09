@@ -12,5 +12,6 @@
     "parkedReleasesSlot": "on",
     "parkedCapFactor": 2,
     "releaseOnCompletion": "on"
-  }
+  },
+  "freeze": { "mainRed": "on" }
 }
