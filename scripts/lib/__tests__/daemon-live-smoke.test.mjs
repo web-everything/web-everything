@@ -1124,8 +1124,7 @@ describe('DISPATCH_DRY_RUN_SCRIPT — real child, proves it catches the pre-fix 
     // copied, and the pass-level part (live `gh` reads) is skipped — this test needs no GitHub credential.
     const copyTree = () => {
       const dest = mkdtempSync(join(tmpdir(), 'dispatch-dry-run-'));
-      // `schemas` is read by path at import by operations/worker-result.mjs (prep-review → review daemon).
-      for (const rel of ['scripts', 'skills-src', 'src/_data', 'schemas', 'package.json', '.gitignore']) {
+      for (const rel of ['scripts', 'skills-src', 'schemas', 'src/_data', 'package.json', '.gitignore']) {
         cpSync(join(REPO_ROOT, rel), join(dest, rel), {
           recursive: true,
           filter: (src) => !src.includes(`${sep}node_modules`) && !src.includes(`${sep}.git${sep}`) && !src.endsWith(`${sep}.git`),

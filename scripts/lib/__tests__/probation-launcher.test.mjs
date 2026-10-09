@@ -54,6 +54,7 @@ describe('buildDocFixTask (#4291)', () => {
     const t = buildDocFixTask({ num: 4291, title: 'Probation launcher for doc-fix builds', spec: '## Done when\n\n1. it works.', scope: ['we:scripts/lib/a.mjs'] });
     expect(t).toContain('#4291: Probation launcher for doc-fix builds');
     expect(t).toContain('## Done when\n\n1. it works.');
+    expect(t).toContain('every item of its `## Acceptance` section');
     expect(t).toContain('at most 2 files');
     expect(t).toContain('about 100 changed lines');
     expect(t).toContain('we:scripts/lib/a.mjs');

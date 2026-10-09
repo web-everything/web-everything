@@ -1,0 +1,8 @@
+{
+  "deliveryPriority": {
+    "mode": "shadow",
+    "agingHours": 8,
+    "maxLiveP0": 2,
+    "unblockWeightMinutes": 60
+  }
+}

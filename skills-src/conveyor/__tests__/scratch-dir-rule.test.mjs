@@ -108,10 +108,10 @@ describe('delivery-agent-brief.md — resolve rides the PR, never runs before th
     expect(commitAt).toBeGreaterThan(resolveAt);
   });
 
-  it('states the doctrine it follows: claim and resolve both ride the PR, and only when every Done-when holds', () => {
+  it('states the doctrine it follows: claim and resolve both ride the PR, and only when every acceptance item holds', () => {
     const step8 = stepBody(8);
     expect(step8).toMatch(/resolve rides the SAME PR/);
-    expect(step8).toMatch(/only if every `## Done when` item/);
+    expect(step8).toMatch(/only if every `## Acceptance` item/);
   });
 
   it('the guardrails no longer place resolve after the daemon merge', () => {
