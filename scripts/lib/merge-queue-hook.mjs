@@ -22,6 +22,7 @@
  *   both off (emergency switch). Inside a test run (VITEST / WE_UNDER_TEST) the live file is not read.
  */
 import { readFileSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS } from './merge-queue.mjs';
 import { MERGE_FRESHNESS_DEFAULTS } from './merge-freshness.mjs';
@@ -151,6 +152,11 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
   return { pr, main, errors };
 }
 
+function defaultReadTip(laneRef, root) {
+  const out = execFileSync('git', ['ls-remote', 'origin', `refs/heads/${laneRef}`], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+  return String(out).trim().split(/\s+/)[0] || null;
+}
+
 function firstLine(e) { return String(e?.stderr || e?.message || e).split('\n')[0].slice(0, 200); }
 
 /**
@@ -187,8 +193,16 @@ export function recordRefreshed(path, key, headSha, { max = 500 } = {}) {
  * the required check's workflow run instead (`gh run rerun`, throttled), so a new pass is produced.
  * @returns {Promise<{ok: boolean, action: string, newCommit?: string|null, error?: string}>}
  */
-export async function refreshStalePr({ laneRef, root, repo = null, runId = null, refresh, rerun }) {
+export async function refreshStalePr({ laneRef, root, repo = null, runId = null, expectedHead = null, readTip, refresh, rerun }) {
   if (!laneRef) return { ok: false, action: 'error', error: 'no head ref' };
+  // Pin to the judged head: the refresh works on the branch NAME, so a push since the judgment would otherwise be
+  // rebuilt (and its acceptance re-stamped) unjudged. A moved or unreadable tip refuses; the next pass re-judges.
+  // (The rebuild itself pushes a fast-forward of the fetched tip, so a push racing the rebuild is rejected by git.)
+  if (expectedHead) {
+    let tip = null;
+    try { tip = (readTip ?? defaultReadTip)(laneRef, root); } catch { tip = null; }
+    if (tip !== expectedHead) return { ok: false, action: 'head-moved', error: `branch tip ${tip ? tip.slice(0, 9) : 'unreadable'} is not the judged head ${expectedHead.slice(0, 9)}` };
+  }
   const doRefresh = refresh ?? (await import('../conveyor/ci-red-recovery-watch.mjs')).refreshOntoMain;
   const r = doRefresh(laneRef, root ? { root } : {});
   if (!r?.ok) return { ok: false, action: r?.action ?? 'error', error: r?.error ?? 'refresh failed' };

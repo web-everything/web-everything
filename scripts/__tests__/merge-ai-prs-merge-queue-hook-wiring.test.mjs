@@ -81,7 +81,8 @@ function runCli({ hookOn, seedRefreshed = null }) {
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: dir, encoding: 'utf8', timeout: 30000,
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
-        WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord },
+        // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
+        ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), WE_COORDINATION_ROOT: coord },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
@@ -101,7 +102,7 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
   }, 30000);
 
   it('a refresh that did not go through is NOT recorded, so the next pass retries it', () => {
-    // The shim git cannot rebuild a branch, so the refresh fails here.
+    // The shim `git ls-remote` prints no tip, so the head pin refuses the refresh (unreadable tip ≠ judged head).
     const { stderr, refreshed } = runCli({ hookOn: true });
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\) → \S+ failed/);
     expect(refreshed).toBeNull();

@@ -5504,7 +5504,8 @@ async function runCli() {
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
    * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per head, through
    * `refreshOntoMain`, or a re-run of its required run when it is already on the main tip), or it waits / refuses;
-   * it has logged the reason and recorded it in `revalidationAborted`. The caller only skips.
+   * it has logged the reason and recorded it in `revalidationAborted`. The caller only skips. Never cached: a WE
+   * carrier judged at its impl half's pre-check is judged again at its own turn, since merges in between move main.
    */
   const mergeQueueGate = async (cand, headSha) => {
     if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
@@ -5528,7 +5529,7 @@ async function runCli() {
     let out;
     if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
     else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
-    else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null });
+    else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
     // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git error,
     // no clone) is retried next pass rather than parking the head as `wait` forever.
     if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, headSha);

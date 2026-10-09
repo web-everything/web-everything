@@ -167,6 +167,14 @@ describe('refresh path', () => {
     expect(reruns).toEqual(['42']);
     expect(out.action).toBe('rerun');
   });
+  it('pinned to the judged head: a branch that moved since the judgment is never rebuilt', async () => {
+    let called = false;
+    const out = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'pushed-since', refresh: () => { called = true; return { ok: true, action: 'rebased' }; } });
+    expect(called).toBe(false);
+    expect(out).toMatchObject({ ok: false, action: 'head-moved' });
+    const ok = await refreshStalePr({ laneRef: 'lane/x', expectedHead: 'judged', readTip: () => 'judged', refresh: () => ({ ok: true, action: 'rebased', newCommit: 'n' }) });
+    expect(ok.action).toBe('rebased');
+  });
   it('a refused rebase is reported, not thrown', async () => {
     const out = await refreshStalePr({ laneRef: 'lane/x', refresh: () => ({ ok: false, action: 'skip', error: 'real conflict' }) });
     expect(out).toEqual({ ok: false, action: 'skip', error: 'real conflict' });
