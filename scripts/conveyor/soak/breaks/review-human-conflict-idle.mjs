@@ -8,7 +8,7 @@ const fixPresent = (root) => existsSync(join(root, 'scripts/conveyor/conflict-re
 export default {
   id: 'review-human-conflict-idle',
   title: '#4481: review:human PR stayed merge-status:conflicting 6+ h, never re-routed to a conflict fix after its finding was rearmed',
-  card: 'xkugvzd',
+  card: '5555',
   fixedBy: {
     sha: '0d990face', where: 'lane/conflict-reassert-human',
     paths: ['scripts/conveyor/conflict-reassert-rule.mjs', 'scripts/conveyor/parked-pr-conflict-watch.mjs'],
