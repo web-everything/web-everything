@@ -22,7 +22,7 @@
  *   both off (emergency switch). Inside a test run (VITEST / WE_UNDER_TEST) the live file is not read.
  */
 import { readFileSync, mkdirSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { readGit } from './proc-read.mjs';
 import { dirname, join } from 'node:path';
 import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS } from './merge-queue.mjs';
 import { MERGE_FRESHNESS_DEFAULTS } from './merge-freshness.mjs';
@@ -153,7 +153,7 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
 }
 
 function defaultReadTip(laneRef, root) {
-  const out = execFileSync('git', ['ls-remote', 'origin', `refs/heads/${laneRef}`], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+  const out = readGit(['ls-remote', 'origin', `refs/heads/${laneRef}`], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
   return String(out).trim().split(/\s+/)[0] || null;
 }
 
