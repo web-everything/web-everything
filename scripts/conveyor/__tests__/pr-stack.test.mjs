@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
-import { PR_STACK_DEFAULTS, resolvePrStackSettings, detectStacks, bottomOf, abovePrs, applyStackOrder, restackKey, markRestackUsed, withRestackHint, nextRemembered, readStacksForPass } from '../pr-stack.mjs';
+import { planIdleRestacks, RESTACK_HAZARD_KINDS, readRemembered, writeRemembered, PR_STACK_DEFAULTS, resolvePrStackSettings, detectStacks, bottomOf, abovePrs, applyStackOrder, restackKey, markRestackUsed, withRestackHint, nextRemembered, readStacksForPass } from '../pr-stack.mjs';
 import { filterFixesByInFlightScope, runReconcileFixDispatch } from '../reconcile-fix-dispatch.mjs';
 
 const a = { pr: 4624, headRefName: 'lane/red-main-contain', headRefOid: '459ea6f4fe3c330df5b0640589635cee3f3d5561' };
@@ -13,7 +16,7 @@ const claim = pr => ({ meta: { repo: 'we', pr, scope } });
 
 describe('stack detection and memory', () => {
   it('detects the live content stack and its helpers', () => {
-    expect(live().pairs).toEqual([{ top: 4631, bottom: 4624, bottomRef: a.headRefName, bottomHead: a.headRefOid, topHead: b.headRefOid, bottomOpen: true, inSync: true }]);
+    expect(live().pairs).toEqual([{ top: 4631, bottom: 4624, bottomRef: a.headRefName, bottomHead: a.headRefOid, topHead: b.headRefOid, bottomOpen: true, inSync: true, restackedFor: null, restackRounds: 0 }]);
     expect(bottomOf(live(), 4631).bottom).toBe(4624);
     expect(abovePrs(live(), 4624)).toEqual(new Set([4631]));
   });
@@ -112,7 +115,7 @@ describe('settings and fail-open IO', () => {
     expect(resolvePrStackSettings({}, { read: () => ({ prStack: { restack: 'off' } }) }).restack).toBe(false);
     expect(resolvePrStackSettings({ WE_PR_STACK_RESTACK: 'yes' }, { read: () => ({ prStack: { restack: 'off' } }) }).restack).toBe(true);
     expect(resolvePrStackSettings({ WE_PR_STACK_RESTACK: 'bad' }, { read: () => ({ prStack: { restack: 'no' } }) }).restack).toBe(false);
-    expect(resolvePrStackSettings({ WE_PR_STACK_DETECT: '0' }, { read: () => { throw Error(); } })).toEqual({ detect: false, bottomFirst: false, restack: false });
+    expect(resolvePrStackSettings({ WE_PR_STACK_DETECT: '0' }, { read: () => { throw Error(); } })).toEqual({ detect: false, bottomFirst: false, restack: false, restackMaxRounds: 3 });
   });
   it('combines planned and open heads, remembers pairs and fails open', () => {
     const writeMem = vi.fn(); const readHeads = vi.fn(() => new Map([[b.pr, b.headRefOid]]));
@@ -126,5 +129,96 @@ describe('settings and fail-open IO', () => {
     writeMem.mockClear();
     for (const openPrFiles of [undefined, []]) expect(readStacksForPass({ ...options, openPrFiles })).toEqual({ pairs: [] });
     expect(writeMem).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('durable idle restacks', () => {
+  const moved = () => ({ pairs: [{ ...live().pairs[0], bottomHead: 'idle-bottom-v2', inSync: false }] });
+  const opts = { planned: [], reconcileRefusals: [{ kind: 'nothing-owed', prNumber: b.pr }], fixClaims: [], settings, used: new Set() };
+  const hazards = ['fix-claimed', 'live-process', 'stood-down', 'cap-exhausted', 'round-cap-exhausted',
+    'ci-heal-exhausted', 'ci-heal-escalated', 'permission-blocked', 'awaiting-permission', 'ruling-dispute',
+    'timeout-retry-needs-human', 'infra-retry-exhausted', 'session-overrun', 'close-superseded', 'system-fix-landed'];
+  it('plans the idle live shape and landed bottom', () => {
+    const stacks = moved();
+    expect(planIdleRestacks(stacks, opts)).toEqual([{ top: b.pr, pair: stacks.pairs[0] }]);
+    expect(applyStackOrder([entries[1]], stacks, { settings }).planned[0].restack.onto).toBe(a.headRefName);
+    stacks.pairs[0].bottomOpen = false;
+    expect(planIdleRestacks(stacks, opts)).toHaveLength(1);
+    expect(applyStackOrder([entries[1]], stacks, { settings }).planned[0].restack.onto).toBe('main');
+  });
+  it.each(hazards)('respects reconcile hazard %s', kind => {
+    expect(RESTACK_HAZARD_KINDS).toContain(kind);
+    expect(planIdleRestacks(moved(), { ...opts, reconcileRefusals: [{ kind, prNumber: b.pr }] })).toEqual([]);
+  });
+  it('holds claimed, planned, in-sync, remembered, capped and disabled tops', () => {
+    expect(planIdleRestacks(moved(), { ...opts, fixClaims: [claim(b.pr)] })).toEqual([]);
+    expect(planIdleRestacks(moved(), { ...opts, planned: [entries[1]] })).toEqual([]);
+    expect(planIdleRestacks(live(), opts)).toEqual([]);
+    for (const patch of [{ restackedFor: 'idle-bottom-v2' }, { restackRounds: 3 }]) {
+      const stacks = moved(); Object.assign(stacks.pairs[0], patch);
+      expect(planIdleRestacks(stacks, opts)).toEqual([]);
+    }
+    for (const key of ['detect', 'restack']) expect(planIdleRestacks(moved(), { ...opts, settings: { ...settings, [key]: false } })).toEqual([]);
+  });
+  it('keys retries to the bottom head, caps owed tops and holds them as peers', () => {
+    const stacks = moved(); const used = new Set();
+    const first = applyStackOrder([entries[1]], stacks, { settings }).planned[0];
+    expect(restackKey(first)).toBe('restack:4631:idle-bottom-v2');
+    markRestackUsed(first, used);
+    expect(planIdleRestacks(stacks, { ...opts, used })).toEqual([]);
+    stacks.pairs[0].bottomHead = 'idle-bottom-v3';
+    expect(planIdleRestacks(stacks, { ...opts, used })).toHaveLength(1);
+    stacks.pairs[0].restackRounds = 3;
+    const capped = applyStackOrder([entries[1]], stacks, { settings: { ...settings, bottomFirst: false }, used });
+    expect(capped.planned).toEqual([]);
+    expect(capped.refusals[0]).toMatchObject({ kind: 'restack-cap-exhausted', why: expect.stringContaining('3') });
+  });
+  it('round trips history through disk and fresh detection, resetting for a different bottom', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-stack-'));
+    try {
+      const stacks = live(); Object.assign(stacks.pairs[0], { restackedFor: a.headRefOid, restackRounds: 2 });
+      writeRemembered(root, nextRemembered(stacks));
+      const remembered = readRemembered(root);
+      expect(remembered[0]).toMatchObject({ restackedFor: a.headRefOid, restackRounds: 2 });
+      expect(detectStacks([a, b], { remembered, isAncestor: ancestor }).pairs[0]).toMatchObject({ restackedFor: a.headRefOid, restackRounds: 2 });
+      expect(detectStacks([a, b], { remembered: [{ ...remembered[0], bottom: 9 }], isAncestor: ancestor }).pairs[0]).toMatchObject({ restackedFor: null, restackRounds: 0 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('resolves round caps from defaults, file, env and malformed values', () => {
+    const read = () => ({ prStack: { restackMaxRounds: 5 } });
+    expect(resolvePrStackSettings({}, { read: () => ({}) }).restackMaxRounds).toBe(3);
+    expect(resolvePrStackSettings({}, { read }).restackMaxRounds).toBe(5);
+    expect(resolvePrStackSettings({ WE_PR_STACK_RESTACK_MAX_ROUNDS: '7' }, { read }).restackMaxRounds).toBe(7);
+    for (const value of ['bad', '0', '-1', 'Infinity', '']) {
+      expect(resolvePrStackSettings({ WE_PR_STACK_RESTACK_MAX_ROUNDS: value }, { read }).restackMaxRounds).toBe(3);
+      expect(resolvePrStackSettings({}, { read: () => ({ prStack: { restackMaxRounds: value } }) }).restackMaxRounds).toBe(3);
+    }
+  });
+  it('dispatches both bottom and idle top once, recording history only on success', () => {
+    const stacks = moved(); stacks.pairs[0].bottomHead = 'dispatch-idle-v2';
+    const readPrForRestack = vi.fn(() => ({ ...b, prNumber: b.pr, kind: 'fix', labels: ['review:pending'], body: '' }));
+    const dispatch = vi.fn(p => p);
+    const args = { root: '/repo', repo: 'we', checkStaleness: () => ({ stale: false }),
+      reconcile: () => ({ dispatch: [{ ...a, prNumber: a.pr, kind: 'fix', files: ['scripts/merge-ai-prs.mjs'] }], refusals: opts.reconcileRefusals }),
+      prStack: () => stacks, prStackSettings: settings, readPrForRestack,
+      findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1, 2], dispatch,
+      fetchItemlessDiffPaths: () => ['scripts/merge-ai-prs.mjs'], resolveFallbackScope: () => scope,
+      resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+      listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null };
+    const out = runReconcileFixDispatch(args);
+    expect(out.dispatched.map(p => p.pr)).toEqual([a.pr, b.pr]);
+    const top = out.dispatched[1];
+    expect(top.restack.onto).toBe(a.headRefName);
+    expect(withRestackHint('original', top.restack)).toContain('no review findings to address');
+    expect(stacks.pairs[0]).toMatchObject({ restackedFor: 'dispatch-idle-v2', restackRounds: 1 });
+    expect(runReconcileFixDispatch(args).dispatched.map(p => p.pr)).toEqual([a.pr]);
+    expect(readPrForRestack).toHaveBeenCalledTimes(1);
+    stacks.pairs[0].bottomHead = 'dispatch-idle-v3';
+    dispatch.mockImplementation(() => { throw Error('launch failed'); });
+    runReconcileFixDispatch(args);
+    expect(stacks.pairs[0]).toMatchObject({ restackedFor: 'dispatch-idle-v2', restackRounds: 1 });
+    readPrForRestack.mockImplementation(() => { throw Error('read failed'); });
+    expect(() => runReconcileFixDispatch(args)).not.toThrow();
   });
 });

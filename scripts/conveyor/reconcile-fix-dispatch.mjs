@@ -110,7 +110,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
-import { readStacksForPass, resolvePrStackSettings, applyStackOrder, markRestackUsed, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
+import { readStacksForPass, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -1373,6 +1373,16 @@ export function runReconcileFixDispatch({
   netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
   prStack = reconcile === runReconcilePass ? readStacksForPass : null,
   prStackSettings = resolvePrStackSettings(),
+  readPrForRestack = prStack === readStacksForPass ? (pr) => {
+    try {
+      const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
+      const data = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo',
+        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body'],
+      { cwd: root, encoding: 'utf8', timeout: 30e3 }));
+      return { kind: 'fix', prNumber: data.number, headRefName: data.headRefName,
+        headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body };
+    } catch { return null; }
+  } : null,
   resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
   // #xmtbdgs multi-repo slice 6 — the item-less diff read; UN-prefixed (see `planFixesFromReconcile`'s own
   // docblock for why this is a distinct binding from `resolveFallbackScope` above, which IS prefixed). #xcla4iv
@@ -1450,9 +1460,6 @@ export function runReconcileFixDispatch({
     recordUnsupported({ repo: repoKey, rows: [...reviews, ...ciHealRefusals], path: unsupportedPath });
   }
   const { planned: plannedAll, refusals: planRefusals } = planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, resolveFallbackScope, repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
-  const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
-  const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
-  const restackedClosedTops = new Set();
   // Refresh existing PR claims too: a prepare's old declared implementation scope must
   // not survive as ownership. Reuse the reconcile snapshot, then one read per missing PR.
   const prefix = profile.canonicalPrefix || repoKey;
@@ -1478,6 +1485,25 @@ export function runReconcileFixDispatch({
     const scope = actualScopes.get(pr);
     return scope ? { ...claim, meta: { ...claim.meta, scope } } : claim;
   });
+  const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
+  const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
+  let restackMemoryChanged = false;
+  for (const { top } of planIdleRestacks(stacks, {
+    planned: plannedAll, reconcileRefusals: reconciled.refusals, fixClaims: claims,
+    settings: prStackSettings, used: restackedHeads,
+  })) {
+    let synthetic;
+    try { synthetic = readPrForRestack?.(top); } catch { continue; }
+    if (!synthetic) continue;
+    const idle = planFixesFromReconcile([synthetic], findItemFn, loadItems, resolveFallbackScope,
+      repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
+    planRefusals.push(...idle.refusals);
+    const ordered = applyStackOrder(idle.planned, stacks, { settings: prStackSettings, used: restackedHeads });
+    stackOrder.refusals.push(...ordered.refusals);
+    for (const entry of ordered.planned) {
+      if (entry.restack) stackOrder.planned.push({ ...entry, restack: { ...entry.restack, idle: true } });
+    }
+  }
   // Serialize against live claims and higher-ranked waiters, including blocked ones.
   let urgentPrs = new Set();
   try { urgentPrs = new Set(readOverlayConflictWakes(process.env).keys()); } catch { /* best-effort wake */ }
@@ -1578,7 +1604,10 @@ export function runReconcileFixDispatch({
       dispatched.push(borrowed ? { ...result, borrowed, reason: BORROW_REASON } : result);
       if (entry.restack) {
         markRestackUsed(entry, restackedHeads);
-        if (entry.restack.onto === 'main') restackedClosedTops.add(entry.pr);
+        const pair = stacks.pairs.find(pair => pair.top === entry.pr);
+        pair.restackedFor = entry.restack.bottomHead ?? 'main';
+        pair.restackRounds = (pair.restackRounds ?? 0) + 1;
+        restackMemoryChanged = true;
       }
       if (entry.overlapExempt && !entry.restack) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
     } catch (e) {
@@ -1586,7 +1615,7 @@ export function runReconcileFixDispatch({
     }
   }
 
-  if (restackedClosedTops.size && prStack === readStacksForPass) writeRemembered(root, nextRemembered(stacks, { dropTops: restackedClosedTops }));
+  if (restackMemoryChanged && prStack === readStacksForPass) writeRemembered(root, nextRemembered(stacks));
   return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
