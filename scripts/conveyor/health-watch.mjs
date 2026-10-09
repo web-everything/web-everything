@@ -124,9 +124,9 @@ export function daemonDownEmergency(ep) {
 
 /**
  * Health smells whose episode IS a red main: their alert always breaks through quiet hours (`mainRed` breakthrough).
- * NOTE: the tag only acts once the smell notifies at all. `pre-existing-red-on-main` is medium severity and is not in
- * `NOTIFY_EVEN_IN_SHADOW`, which is an operator-owned list (see `health-smells-notify-list.mjs`), so today a red main
- * raises no desktop alert; adding it there is the operator's call, and this tag then makes it an overnight emergency.
+ * The tag only acts once the smell notifies at all: `pre-existing-red-on-main` is listed in `NOTIFY_EVEN_IN_SHADOW`
+ * (the operator-owned list in `health-smells-notify-list.mjs`; operator ruling 2026-10-09), so a red main raises a
+ * desktop alert in shadow mode, and this tag makes it break through quiet hours. One episode per main SHA = one alert.
  */
 export const MAIN_RED_SMELLS = new Set(['pre-existing-red-on-main']);
 

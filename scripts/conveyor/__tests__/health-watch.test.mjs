@@ -16,6 +16,8 @@ import {
   probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency,
 } from '../health-watch.mjs';
 import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
+import { emptyHealthState, stepEpisodes, planActions } from '../health-watch-core.mjs';
+import preExistingRedOnMain from '../health-smells/pre-existing-red-on-main.mjs';
 
 
 // Keep the shell, persistence and real detector registry intact; supply deterministic probe results
@@ -1325,5 +1327,42 @@ describe('quietHours: the main-red health smell is tagged as a main-red emergenc
     const tagged = { title, emergency: breakthroughEmergency(redMain) };
     expect(decideDelivery(tagged, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
     expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+  });
+});
+
+// Operator ruling 2026-10-09 ("Add it", PR #4461): a red main is on the always-notify list, so in the default shadow mode
+// it produces a real alert, carries the main-red tag, breaks through quiet hours, and fires once per broken main commit.
+describe('quietHours: a red main is wired end to end (shadow mode → notify plan → delivery gate)', () => {
+  const at2am = Date.parse('2026-10-09T02:00:00-04:00');
+  const smell = preExistingRedOnMain;
+  const marker = (baseSha) => ({
+    status: 'red', redCause: 'pre-existing-on-main', head: 'h1', sha: 'h1', pool: 'p', lane: 1,
+    redCauseEvidence: { baseSha, tests: [{ file: 'a.test.mjs', name: 'x' }] },
+  });
+  const tickWith = (state, baseShas, now) => {
+    const results = smell.evaluate({ laneVerifyMarkers: baseShas.map(marker) });
+    const r = stepEpisodes(state, [{ smell, results }], now);
+    return { r, plan: planActions(r.transitions, { [smell.id]: smell }, { mode: 'shadow' }) };
+  };
+
+  it('is NOT suppressed in shadow mode, and its alert is delivered at 02:00 ET while a routine one is held', () => {
+    const { r, plan } = tickWith(emptyHealthState(), ['efd88abcc00'], 0);
+    const notify = plan.find((p) => p.kind === 'notify');
+    expect(notify.suppressed).toBeNull();
+    const ep = r.state.episodes[notify.key];
+    const alert = { title: `Health: ${ep.smell} — ${ep.subject}`, emergency: breakthroughEmergency(ep) };
+    expect(decideDelivery(alert, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+  });
+
+  it('alerts once per broken main commit: the same sha never re-alerts, a new sha does', () => {
+    const notifies = (p) => p.plan.filter((x) => x.kind === 'notify' && !x.suppressed);
+    const t1 = tickWith(emptyHealthState(), ['efd88abcc00'], 0);
+    const t2 = tickWith(t1.r.state, ['efd88abcc00'], 60_000);
+    const t3 = tickWith(t2.r.state, ['efd88abcc00', '0123456789ab'], 120_000);
+    expect(notifies(t1)).toHaveLength(1);
+    expect(notifies(t2)).toHaveLength(0);
+    expect(notifies(t3)).toHaveLength(1);
+    expect(notifies(t3)[0].key).toContain('main:012345678');
   });
 });

@@ -11,7 +11,9 @@ export default {
   probes: ['laneVerifyMarkers'],
   openAfter: 1,
   closeAfter: 2,
-  severity: 'medium',
+  // 'high' so the episode opens with a notify plan entry (`planActions` only notifies on high severity); the sign is on the
+  // always-notify list (operator ruling 2026-10-09), so a red main alerts even in shadow mode and through quiet hours.
+  severity: 'high',
   action: 'file',
   knownFix: {
     title: 'Tests failing on main @ ${subject}',

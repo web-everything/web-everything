@@ -52,4 +52,8 @@ export const NOTIFY_EVEN_IN_SHADOW = new Set([
   // Operator order, 2026-10-07 (builder-starved-2): the builder starved twice in one day while this smell sat
   // record-only in shadow mode (opened 18:16Z, nobody told) — a starving builder must reach the operator.
   'builder-starved',
+  // Operator ruling, 2026-10-09 ("Add it", PR #4461): a red main must reach the operator even during quiet hours
+  // (with a silent daemon it is the only alert that breaks through). One episode per main SHA — the smell's subject
+  // is `main:<sha>` — so this is one alert per broken main commit.
+  'pre-existing-red-on-main',
 ]);
