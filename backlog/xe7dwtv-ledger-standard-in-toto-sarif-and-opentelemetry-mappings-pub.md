@@ -1,26 +1,29 @@
 ---
-bornAs: xbm2jo5
-kind: task
-parent: "2405"
-status: resolved
-scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/__tests__/review-ledger-check.test.mjs"]
-dateOpened: "2026-10-08"
-dateResolved: "2026-10-09"
-graduatedTo: 72020d9ac050c73b8c78a3995a4940f82d65a051
+kind: story
+size: 2
+parent: "5445"
+status: open
+blockedBy: ["xedhm8w"]
+scope: ["we:conformance-vectors/verdict-ledger-bindings.vectors.json", "we:conformance-vectors/verdict-ledger-bindings.vectors.ts"]
+dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger plan slice F (#3930): review-ledger-check v2 compares derived labels to live labels, appends a run record
+# Ledger standard: in-toto, SARIF and OpenTelemetry mappings published as bindings
 
-Slice F of the verdict-ledger plan. The checker runs derivePrState per open PR and compares its labels to the live labels for every mirrored family (review, ruling-needed, ready-to-merge, ci:failed). It appends one run record to the shared runs folder. Report only: it fixes no labels. Also folds in two #4311 leftovers: tests clear WE_VERDICT_LEDGER_BOARD, and an origin-probe timeout reports unreadable.
+Slice of #5445 (A5). Publish mappings from the ledger event schema to in-toto (verdict as an attestation predicate), SARIF (findings as results) and OpenTelemetry (review runs as spans). Mappings only, never the source format (N4). Done when binding vectors map sample ledger events to each target shape and a test checks every mapped output against the target format minimum fields.
 
-## Done when
+## Acceptance
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
 Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
 
 ## Edge cases this change must handle
 

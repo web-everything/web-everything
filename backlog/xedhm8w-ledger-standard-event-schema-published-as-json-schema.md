@@ -1,26 +1,28 @@
 ---
-bornAs: xbm2jo5
-kind: task
-parent: "2405"
-status: resolved
-scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/__tests__/review-ledger-check.test.mjs"]
-dateOpened: "2026-10-08"
-dateResolved: "2026-10-09"
-graduatedTo: 72020d9ac050c73b8c78a3995a4940f82d65a051
+kind: story
+size: 3
+parent: "5445"
+status: open
+scope: ["we:schemas/verdict-ledger-event.v1.json", "we:scripts/lib/__tests__/verdict-ledger-event-schema.test.mjs"]
+dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger plan slice F (#3930): review-ledger-check v2 compares derived labels to live labels, appends a run record
+# Ledger standard: event schema published as JSON Schema
 
-Slice F of the verdict-ledger plan. The checker runs derivePrState per open PR and compares its labels to the live labels for every mirrored family (review, ruling-needed, ready-to-merge, ci:failed). It appends one run record to the shared runs folder. Report only: it fixes no labels. Also folds in two #4311 leftovers: tests clear WE_VERDICT_LEDGER_BOARD, and an origin-probe timeout reports unreadable.
+Slice of #5445 (A2). Publish a JSON Schema for every event type in we:scripts/lib/verdict-ledger.mjs EVENT_TYPES (verdict, referral, ruling, review-run, hold, release, approval, send-back, author, label-input, finding). The schema names states (for example held-for-human), never GitHub label strings (D5). Done when a test validates every buildLedgerEvent/buildVerdictRecord fixture against the schema and proves the schema and validateLedgerEvent agree on accept and reject for the same cases.
 
-## Done when
+## Acceptance
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
 Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+
+## Non-goals
+
+- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
 
 ## Edge cases this change must handle
 
