@@ -567,6 +567,54 @@ describe('wrapped verification waits', () => {
     h.io.awaitingVerify = () => ({ unreadable: true });
     expect((await runWorker(h.s, h.io)).result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
   });
+  // PR #4462 review: the default adapter answered null for a record that was OURS but already past its TTL when the child
+  // exited, so the first post-exit check skipped the wait and published the awaiting turn's `done` unverified.
+  describe('the default await store at the first post-exit check', () => {
+    const ttl = 150 * 60 * 1000;
+    const iso = (ms) => new Date(ms).toISOString();
+    const withStore = async (record, assert) => {
+      const store = tmp();
+      vi.stubEnv('WE_AWAIT_VERIFY_STORE', store);
+      try {
+        const h = harness();
+        delete h.io.awaitingVerify;
+        if (record) writeFileSync(join(store, `${sid}.json`), `${JSON.stringify({ v: 1, sessionId: sid, who: h.s.session, ...awaiting.record, ...record })}\n`);
+        await assert(h, await runWorker(h.s, h.io));
+      } finally { vi.unstubAllEnvs(); }
+    };
+    const blocked = (h, out) => {
+      expect(h.calls).toHaveLength(1);
+      expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { kind: 'infra-transient', component: 'verify-wait', retryable: true } });
+      expect(out.envelope).toMatchObject({ status: 'done', outcome: 'blocked-on-infra', action: { type: 'retry-after-cooloff' } });
+    };
+    it('an already-expired record of this session is a retryable block, not a done', () => withStore({ requestedAt: iso(start - ttl - 1) }, (h, out) => {
+      blocked(h, out);
+      expect(out.result.blocker.evidence.text).toContain('a'.repeat(12));
+    }));
+    it.each([
+      ['future-dated beyond the skew allowance', { requestedAt: iso(start + 6 * 60 * 1000) }],
+      ['missing its pr', { pr: undefined }],
+      ['unparseable requestedAt', { requestedAt: 'not-a-date' }],
+    ])('a record that is %s is unknown, so it blocks too', (_name, record) => withStore(record, blocked));
+    it('a record that speaks for another session, or none at all, is no wait owed', async () => {
+      await withStore({ sessionId: 'other', who: 'other-session' }, (h, out) => { expect(out.result.outcome).toBe('done'); expect(h.calls).toHaveLength(1); });
+      await withStore(null, (h, out) => { expect(out.result.outcome).toBe('done'); });
+    });
+  });
+  it('the cap-or-deadline look-again treats an expired record as an unfinished wait', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => (h.calls.length <= MAX_AWAIT_RESUMES ? awaiting : { expired: true, record: { ...awaiting.record, requestedAt: new Date(start + 1).toISOString() } });
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(1 + MAX_AWAIT_RESUMES);
+    expect(out.result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
+  });
+  it('an expired leftover of a wait the last resume already answered is not a new obligation', async () => {
+    const h = harness();
+    h.io.awaitingVerify = () => (h.calls.length === 1 ? awaiting : { expired: true, record: awaiting.record });
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(2);
+    expect(out.result).toMatchObject({ outcome: 'done', summary: 'turn 2' });
+  });
   it('an intermediate turn that is not done is left as the worker said it', async () => {
     const h = harness();
     h.io.spawnToCompletionFn = async (command, argv, opts, { spawnFn }) => {

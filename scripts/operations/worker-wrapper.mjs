@@ -267,7 +267,13 @@ async function runWorkerOnce(spec, io, stop) {
     });
     if (!record && (readError || text !== null)) return { unreadable: true };
     const verdict = classifyAwaitVerify({ record, session: { sessionId, name: spec.session }, nowMs: clock(), ttlMs: resolveAwaitVerifyTtlMs() });
-    return verdict.awaiting ? { awaiting: true, record } : null;
+    if (verdict.awaiting) return { awaiting: true, record };
+    // PR #4462 review: a record that is OURS but past its TTL is a wait that ran out, not "no wait owed"; collapsing it to null let a
+    // turn that ended awaiting a verdict finish `done` unverified. A record the classifier cannot trust (torn shape, clock skew, no
+    // clock) is an unknown, exactly like an unreadable file. Only "no record" and a record that speaks for another session mean none.
+    if (verdict.reason === 'expired') return { expired: true, record };
+    if (['malformed', 'future-skew', 'no-signal'].includes(verdict.reason)) return { unreadable: true };
+    return null;
   });
   // The codex `-o` file is written by the CHILD, so a relative path means relative to the child's cwd — resolve it once and use it for
   // the pre-run cleanup AND the read. (completionsDir / draftsDir / operationsDir are the WRAPPER's own and stay wrapper-relative.)
@@ -336,10 +342,13 @@ async function runWorkerOnce(spec, io, stop) {
   if (spec.launcher === 'claude-p') {
     const requestPath = resumeRequestPath(spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs'), spec.session);
     let resumes = 0;
+    let servedAt = null; // the `requestedAt` of the await record the last resume answered: its leftover record is not a new obligation
+    const expiredWait = (w) => (w?.expired && w.record?.requestedAt !== servedAt ? { sha: w.record.sha, pr: w.record.pr, ref: w.record.ref } : null);
     while (!failure && !isOperatorStop() && clock() < deadlineMs && resumes < MAX_AWAIT_RESUMES) {
       let awaiting = await awaitingVerify(spec.sessionId);
       if (awaiting?.unreadable) { unfinishedVerify = {}; break; } // cannot tell whether a verdict is owed: not a finished run
-      if (!awaiting?.awaiting) break;
+      // An already-expired record means the verdict can no longer be delivered (nothing resumes on it): the turn's `done` is unverified.
+      if (!awaiting?.awaiting) { unfinishedVerify = expiredWait(awaiting); break; }
       const { sha, pr, ref, requestedAt } = awaiting.record;
       unfinishedVerify = { sha, pr, ref };
       withCompletionLock(spec.session, () => writeRecord({
@@ -361,6 +370,7 @@ async function runWorkerOnce(spec, io, stop) {
       }
       if (!request || isOperatorStop() || clock() >= deadlineMs) break;
       resumes += 1;
+      servedAt = requestedAt;
       unfinishedVerify = null; // a verdict arrived: the resumed turn is the one that settles it
       await run(resumeArgvFrom(spec.argv, { sessionId: spec.sessionId, prompt: request.prompt }));
     }
@@ -369,6 +379,7 @@ async function runWorkerOnce(spec, io, stop) {
       const last = await awaitingVerify(spec.sessionId);
       if (last?.awaiting) unfinishedVerify = { sha: last.record.sha, pr: last.record.pr, ref: last.record.ref };
       else if (last?.unreadable) unfinishedVerify = {};
+      else unfinishedVerify = expiredWait(last);
     }
   }
   stop.live = false;
