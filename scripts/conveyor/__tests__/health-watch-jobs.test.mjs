@@ -113,8 +113,10 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
 });
 
 describe('tick — the gh cadence as a job never blocks the tick', () => {
-  function setup(name) {
+  function setup(name, { ghProbes = true } = {}) {
     const stateRoot = join(dir, `${name}-state`); const hd = healthDir(stateRoot); mkdirSync(hd, { recursive: true });
+    // The switch is always explicit here, so these cases do not move when the manifest default flips.
+    writeFileSync(join(hd, 'config.json'), JSON.stringify({ jobs: { ghProbes } }));
     const lockRoot = join(dir, `${name}-locks`); mkdirSync(lockRoot);
     const empty = join(dir, 'empty.json'); writeFileSync(empty, '{}');
     const flags = {
@@ -169,13 +171,68 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(second.ghJob.enqueued).not.toBe(first.ghJob.enqueued);
   }, 30000);
 
-  it('with the switch off (a fixture tick, no job deps) the gh group still runs inline when due', async () => {
-    const { flags } = setup('inline');
-    let calls = 0;
-    const collectGh = () => { calls++; return { probes: { prs: [], agents: [] }, errors: {} }; };
-    const out = await tick({ ...flags, now: '2026-10-09T12:00:00Z' }, { collectGh });
-    expect(calls).toBe(1);
-    expect(out.ghSampled).toBe(true);
-    expect(out.ghJob).toBeNull();
+  const inlineSpy = () => {
+    const spy = { calls: 0 };
+    spy.fn = () => { spy.calls++; return { probes: { prs: [], agents: [] }, errors: {} }; };
+    return spy;
+  };
+
+  it('the switch, a dry run and a fixture tick each keep the group inline', async () => {
+    const off = setup('off', { ghProbes: false });
+    const spyOff = inlineSpy();
+    const store = createJobStore(join(dir, 'jobs-off'));
+    const a = await tick({ ...off.flags, now: '2026-10-09T12:00:00Z' }, { collectGh: spyOff.fn, ghJobs: { store, codeSha: 'x', reattach: fakeReattach(), evict: noEvict } });
+    expect(spyOff.calls).toBe(1);
+    expect(a.ghJob).toBeNull();
+    expect(store.list().records).toHaveLength(0);
+
+    const dry = setup('dry');
+    const spyDry = inlineSpy();
+    const b = await tick({ ...dry.flags, 'dry-run': true, now: '2026-10-09T12:00:00Z' }, { collectGh: spyDry.fn, ghJobs: { store, codeSha: 'x', reattach: fakeReattach(), evict: noEvict } });
+    expect(spyDry.calls).toBe(1);
+    expect(b.ghJob).toBeNull();
+    expect(store.list().records).toHaveLength(0);
+
+    // A fixture tick with the switch on but no job store of its own never reaches the host's job store.
+    const fx = setup('fixture');
+    const spyFx = inlineSpy();
+    const c = await tick({ ...fx.flags, now: '2026-10-09T12:00:00Z' }, { collectGh: spyFx.fn });
+    expect(spyFx.calls).toBe(1);
+    expect(c.ghJob).toBeNull();
+  }, 30000);
+
+  it('a job-runtime error is a probe error on a finished tick, never an aborted one', async () => {
+    const { flags } = setup('throws');
+    const store = createJobStore(join(dir, 'jobs-throws'));
+    const reattach = async () => { throw new Error('jobs dir unwritable'); };
+    const out = await tick({ ...flags, now: '2026-10-09T12:00:00Z' }, { collectGh: neverInline, ghJobs: { store, codeSha: 'x', reattach, evict: noEvict } });
+    expect(out.probeErrors.ghJob).toMatch(/jobs dir unwritable/);
+    expect(out.ghSampled).toBe(false);
+    expect(out.reports).toBeDefined();
+  }, 30000);
+
+  it('a rollback still reconciles the in-flight job; a result too old to be current is never applied', async () => {
+    const on = setup('rollback');
+    const store = createJobStore(join(dir, 'jobs-rollback'));
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    const jobs = { store, codeSha: 'x', reattach: fakeReattach(), evict: noEvict };
+    const first = await tick({ ...on.flags, now: iso(t0) }, { collectGh: neverInline, ghJobs: jobs });
+    const id = first.ghJob.enqueued;
+    // Switch off while the job is in flight: the group runs inline, the job is still reconciled, nothing new queued.
+    writeFileSync(join(on.hd, 'config.json'), JSON.stringify({ jobs: { ghProbes: false } }));
+    const spy = inlineSpy();
+    const second = await tick({ ...on.flags, now: iso(t0 + 300_000) }, { collectGh: spy.fn, ghJobs: jobs });
+    expect(spy.calls).toBe(1);
+    expect(second.ghJob.inFlight.id).toBe(id);
+    expect(second.ghJob.enqueued).toBeNull();
+    // The old job finishes long after: its result is consumed but never applied as the current sample.
+    finish(store, id, { at: t0 + 400_000 });
+    const late = await tick({ ...on.flags, now: iso(t0 + 400_000 + 31 * 60_000) }, { collectGh: spy.fn, ghJobs: jobs });
+    expect(late.ghJob.stale).toEqual([id]);
+    expect(late.ghJob.consumed).toBeNull();
+    expect(late.ghJob.remaining).toBe(0);
+    // Nothing left to reconcile: the job state is dropped and later ticks no longer touch the job store.
+    const after = await tick({ ...on.flags, now: iso(t0 + 400_000 + 60 * 60_000) }, { collectGh: spy.fn, ghJobs: jobs });
+    expect(after.ghJob).toBeNull();
   }, 30000);
 });

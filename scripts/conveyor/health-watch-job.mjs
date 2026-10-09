@@ -12,8 +12,10 @@
  *   2. JOB CHILD — this file run as a script (the kind's `entry`), detached, from a pinned code snapshot. It
  *      claims its record through `runJob` and heartbeats from its own event loop, while the synchronous probe
  *      bodies run in a WORKER THREAD beneath it: a 2-minute `execFileSync` read can never starve the heartbeat.
- *      The worker lives inside the job process, so a SIGKILLed job takes its worker with it; no orphan probe can
- *      overlap the retry.
+ *      The worker thread dies with the job process. The probes' own subprocesses (`gh`, the stale-state CLI) are
+ *      in the job's process group: a graceful stop (SIGTERM) kills the group; after a SIGKILL they may finish
+ *      their own bounded timeouts (≤ 90 s) beside the retry. They only read, so an overlap duplicates a read,
+ *      never a write.
  *   3. WORKER — runs `collectGhProbes` (we:scripts/conveyor/health-watch.mjs), scrubs the result and posts it.
  *
  *   A finished job's result is a sidecar `<jobsDir>/<id>.result` (JSON; not `.json`, so run-record readers never
@@ -47,6 +49,9 @@ export const GH_PROBE_TIMEOUT_MS = 10 * 60_000;
 /** Finished, consumed records older than this are pruned (record, log, result). */
 export const FINISHED_JOB_KEEP_MS = 24 * 60 * 60_000;
 export const RESULT_SUFFIX = '.result';
+/** A finished result sampled longer ago than this is consumed but never applied: after a rollback and a later
+ *  re-enable, an old job's result must not pass for the current observation (two gh cadences). */
+export const MAX_RESULT_AGE_MS = 30 * 60_000;
 
 const WORKER_MARK = 'health-gh-probe-worker';
 const iso = (ms) => new Date(ms).toISOString();
@@ -108,6 +113,8 @@ function removeJobFiles(dir, id) {
 
 /**
  * TICK SIDE. One pass of the gh-probe job lifecycle. Never waits on a job.
+ * `drain` (a rollback: the switch is off) prunes every consumed finished record at once, so reconciliation can
+ * end with no health job record left behind.
  * @param {{now: number, due: boolean, state?: {consumed?: string[], clock?: object}, input: {sourceRoot: string,
  *   skipBuildSessions?: boolean}, store?: object, kinds?: Map, maxConcurrent?: number, codeSha?: string,
  *   reattach?: Function, reattachOpts?: object, snapshot?: object, evict?: Function, wallNow?: Function,
@@ -120,6 +127,7 @@ export async function runGhProbeJobs({
   store = createJobStore(daemonJobsDir(HEALTH_WATCH_JOB_DAEMON)), kinds = HEALTH_WATCH_JOB_KINDS,
   maxConcurrent = HEALTH_WATCH_JOB_CAP, codeSha, reattach = reattachTick, reattachOpts = {},
   snapshot, evict = evictSnapshots, wallNow = Date.now, monoNow = hostMonotonicMs, log = () => {},
+  maxResultAgeMs = MAX_RESULT_AGE_MS, drain = false,
 }) {
   const kind = HEALTH_GH_PROBE_KIND.kind;
   mkdirSync(store.dir, { recursive: true });
@@ -129,6 +137,7 @@ export async function runGhProbeJobs({
   // 1. Consume every finished job not consumed yet — oldest first, so the NEWEST success is the one kept.
   let result = null;
   const failures = [];
+  const stale = [];
   const finished = mine().filter((r) => TERMINAL_JOB_STATUSES.includes(r.job.status) && !consumed.has(r.id))
     .sort((a, b) => Date.parse(a.job.finishedAt || 0) - Date.parse(b.job.finishedAt || 0));
   for (const r of finished) {
@@ -136,6 +145,7 @@ export async function runGhProbeJobs({
     if (r.job.status === 'failed') { failures.push(`job ${r.id} failed: ${r.job.error ?? 'unknown'}`); continue; }
     try {
       const res = readResult(store.dir, r.id);
+      if (!Number.isFinite(res.sampledAt) || now - res.sampledAt > maxResultAgeMs) { stale.push(r.id); continue; }
       result = { jobId: r.id, sampledAt: res.sampledAt, probes: res.probes || {}, errors: res.errors || {} };
     } catch (e) { failures.push(`job ${r.id} result unreadable: ${String(e?.message || e).split('\n')[0]}`); }
   }
@@ -162,17 +172,19 @@ export async function runGhProbeJobs({
   const pruned = [];
   for (const r of after) {
     if (r.job.kind !== kind || !TERMINAL_JOB_STATUSES.includes(r.job.status) || !consumed.has(r.id)) continue;
-    if (now - Date.parse(r.job.finishedAt || 0) < FINISHED_JOB_KEEP_MS) continue;
+    if (!drain && now - Date.parse(r.job.finishedAt || 0) < FINISHED_JOB_KEEP_MS) continue;
     try { removeJobFiles(store.dir, r.id); pruned.push(r.id); consumed.delete(r.id); } catch { /* next tick */ }
   }
-  const present = new Set(store.list().records.map((r) => r.id));
+  const left = store.list().records;
+  const present = new Set(left.map((r) => r.id));
   const current = inFlight ? store.read(inFlight.id) : null;
   return {
     state: { consumed: [...consumed].filter((id) => present.has(id)), clock: clock.clock },
     result,
     failure: failures.length ? failures.join('; ') : null,
     summary: {
-      consumed: result?.jobId ?? null, enqueued,
+      consumed: result?.jobId ?? null, enqueued, stale,
+      remaining: left.filter((r) => r.job.kind === kind).length,
       inFlight: current && !TERMINAL_JOB_STATUSES.includes(current.job.status)
         ? { id: current.id, status: current.job.status, attempt: current.job.attempts, handle: current.job.handle } : null,
       slept: pass?.slept ?? false, actions: pass?.actions ?? [], evicted, pruned,
@@ -216,8 +228,9 @@ export async function ghProbeStep({ jobId, input, dir = process.env.OPERATION_RU
 async function workerMain() {
   const { input } = workerData;
   if (input?.proofBlockMs) {
-    // Live proof: block THIS thread the way a synchronous `execFileSync` read does.
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(input.proofBlockMs));
+    // Live proof only (`enqueue-proof`): block THIS thread on a real synchronous subprocess, exactly the way a
+    // probe's `execFileSync('gh', …)` does — so the proof exercises heartbeat continuity and process-group teardown.
+    execFileSync('sleep', [String(Math.max(1, Math.round(Number(input.proofBlockMs) / 1000)))], { stdio: 'ignore' });
     parentPort.postMessage({ probes: {}, errors: {} });
     return;
   }
@@ -236,6 +249,9 @@ async function jobMain(argv) {
     console.log(JSON.stringify({ queued: rec.id, codeSha: rec.job.codeSha, dir: store.dir }));
     return 0;
   }
+  // A graceful stop (the runtime's SIGTERM to a stalled job) takes the whole process group with it: the
+  // detached spawn made this process its group leader, so the worker's `gh`/CLI children are in it too.
+  process.once('SIGTERM', () => { try { process.kill(-process.pid, 'SIGKILL'); } catch { process.exit(143); } });
   const out = await runJob({ steps: [{ name: 'gh-probes', run: (ctx) => ghProbeStep(ctx) }] });
   console.log(`${new Date().toISOString()} health-gh-probe pid=${process.pid} ${JSON.stringify(out)}`);
   return out.outcome === 'succeeded' ? 0 : 1;

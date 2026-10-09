@@ -209,8 +209,9 @@ export const DAEMON_MANIFEST = {
  *     PRs). Only reads, so it runs from a pinned code snapshot of the clone (`readonly-tree`) with the clone's
  *     own `node_modules` cloned into a lockfile-keyed store.
  * `HEALTH_WATCH_JOB_CAP` is the daemon's job cap (the runtime has no default: the adopter states it).
- * `HEALTH_WATCH_JOB_SWITCHES` is the per-kind rollout switch: `true` runs the group as a job, `false` keeps the
- * old inline path. A health `config.json` key `jobs: { ghProbes: false }` rolls back without a deploy.
+ * `HEALTH_WATCH_JOB_SWITCHES` is each kind's DEFAULT rollout switch: `true` runs the group as a job, `false` keeps
+ * the old inline path. The health config file's `jobs` block overrides it per kind without a deploy (for example
+ * `jobs: { ghProbes: true }` to turn it on before the default flips, or `false` to roll back after).
  */
 export const HEALTH_WATCH_JOB_DAEMON = 'health-watch';
 export const HEALTH_WATCH_JOB_CAP = 2;

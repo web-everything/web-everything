@@ -9,6 +9,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { cpSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -58,6 +59,29 @@ describe('health-gh-probe job child', () => {
     expect(again.result).toBeNull();
   }, 60000);
 
+  it('a graceful stop (SIGTERM) takes the job and its probe subprocess down together', async () => {
+    const store = createJobStore(join(dir, 'jobs-stop'));
+    mkdirSync(store.dir, { recursive: true });
+    const job = enqueueJob({ store, kindDef: HEALTH_GH_PROBE_KIND, codeSha: 'test-snapshot-stop', input: { sourceRoot: REPO, proofBlockMs: 30_000 } });
+    const opts = { store, codeSha: 'test-snapshot-stop', snapshot, input: { sourceRoot: REPO }, reattachOpts: { heartbeatIntervalMs: 200 } };
+    const group = (pgid) => { try { return execFileSync('pgrep', ['-g', String(pgid)], { encoding: 'utf8' }).split('\n').filter(Boolean).map(Number); } catch { return []; } };
+    let pid = null;
+    let members = [];
+    for (let i = 0; i < 80 && members.length < 2; i += 1) {
+      await runGhProbeJobs({ ...opts, now: Date.now(), due: false, state: {} });
+      pid = store.read(job.id)?.job.pid ?? null;
+      if (pid) members = group(pid);
+      await sleep(250);
+    }
+    expect(pid).toBeTruthy();
+    expect(members).toContain(pid); // the detached job leads its own process group…
+    expect(members.length).toBeGreaterThanOrEqual(2); // …and its blocked probe's subprocess is in it
+    process.kill(pid, 'SIGTERM');
+    let left = members;
+    for (let i = 0; i < 40 && left.length; i += 1) { await sleep(100); left = group(pid); }
+    expect(left).toEqual([]);
+  }, 60000);
+
   it('the step writes its sidecar atomically and is idempotent on a rerun', async () => {
     const d = mkdtempSync(join(dir, 'step-'));
     const runWorker = async ({ input }) => ({ probes: { prs: [{ number: input.now }] }, errors: {} });
@@ -71,7 +95,7 @@ describe('health-gh-probe job child', () => {
 
   it('a worker that does not answer in time is terminated and the step fails', async () => {
     const t0 = Date.now();
-    await expect(runProbeWorker({ input: { proofBlockMs: 10_000 }, timeoutMs: 500 })).rejects.toThrow(/timed out after 500ms/);
+    await expect(runProbeWorker({ input: { proofBlockMs: 3000 }, timeoutMs: 500 })).rejects.toThrow(/timed out after 500ms/);
     expect(Date.now() - t0).toBeLessThan(5000);
   }, 15000);
 });

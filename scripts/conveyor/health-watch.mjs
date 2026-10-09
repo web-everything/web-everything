@@ -1229,24 +1229,32 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   }
   // #4131 — the gh-cadence group is the slow part of a tick (live: ~130 s of a ~150 s tick). With the
   // `ghProbes` job switch on, it runs as a detached durable job (we:scripts/conveyor/health-watch-job.mjs) and
-  // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before.
-  const ghJobsOn = !!deps.ghJobs || (resolveHealthJobSwitches(config).ghProbes && !fixtureTick && !flags['dry-run']);
-  if (ghJobsOn && !flags['no-gh']) {
+  // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before. A dry run or a
+  // fixture tick never touches the host job store (a test supplies its own store through `deps.ghJobs`).
+  const jobsAllowed = (!fixtureTick || !!deps.ghJobs) && !flags['dry-run'] && !flags['no-gh'];
+  const ghJobsOn = jobsAllowed && resolveHealthJobSwitches(config).ghProbes;
+  // Switched off with job state left behind (a rollback): still reconcile — reattach, consume, never queue — so an
+  // in-flight job is never stranded; the group runs inline meanwhile. Stops once no health job record remains.
+  const reconcileOnly = jobsAllowed && !ghJobsOn && !!prev.jobs;
+  let ghFromJob = false;
+  if (ghJobsOn || reconcileOnly) {
     const out = await attempt('ghJob', () => runGhProbeJobs({
-      ...(deps.ghJobs || {}), now, due: ghDue, state: prev.jobs,
+      ...(deps.ghJobs || {}), now, due: ghJobsOn && ghDue, state: prev.jobs, drain: reconcileOnly,
       input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'] },
     }));
     if (out) {
-      jobsState = out.state;
+      jobsState = reconcileOnly && !out.summary.remaining ? undefined : out.state;
       ghJob = out.summary;
       if (out.result) {
+        ghFromJob = true;
         Object.assign(probes, out.result.probes);
         for (const [k, v] of Object.entries(out.result.errors || {})) probeErrors[k] = v;
         if (out.result.probes.prs && out.result.probes.agents) ghCache.at = out.result.sampledAt;
       }
       if (out.failure) probeErrors.ghJob = scrubText(out.failure);
     }
-  } else if (ghDue) {
+  }
+  if (!ghJobsOn && ghDue && !ghFromJob) {
     const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'] });
     Object.assign(probes, got.probes);
     Object.assign(probeErrors, got.errors);
@@ -1285,6 +1293,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   state.builderCursors = builderLogs ? { ...(prev.builderCursors || {}), ...builderLogs.cursors } : prev.builderCursors;
   state.ghCache = { at: ghCache.at ?? null };
   if (jobsState) state.jobs = jobsState;
+  else delete state.jobs;
   if (probes.credentialInventory) {
     state.credentialInventoryAt = now;
     state.credentialInventoryCache = probes.credentialInventory.ciFindings;
