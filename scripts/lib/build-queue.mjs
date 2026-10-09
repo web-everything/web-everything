@@ -18,6 +18,8 @@
  * pullable, nor block a ready one.
  */
 
+import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES } from './delivery-priority.mjs';
+
 // ── Tiers (fixed enum; the primary sort key AND the human override) ─────────────────────────────────
 export const TIERS = ['pinned', 'normal', 'someday', "won't"];
 export const DEFAULT_TIER = 'normal';
@@ -163,6 +165,39 @@ export function effectiveScore(item, config, now, ctx = {}) {
   return base + bonus;
 }
 
+// ── Delivery class (#4355, rulings Q1/Q2 of 2026-10-08) ─────────────────────────────────────────────
+// Priority is a CLASS (P0–P4) from ONE pure rule (we:scripts/lib/delivery-priority.mjs — reused, never
+// re-derived here). This adapter only turns a backlog card into that rule's plain facts:
+//   - `unblocks` (pending dependents)  → `blockedItems` (>= 2 → P1 "unblocks others");
+//   - card `priority: high`             → P2 (the `prioritize` verb is the operator asking for it), not a boost/pin;
+//   - card `priority: low`              → the operator's `low` override (P4);
+//   - `queuedAt` (the sidecar's clear stamp) → `waitingSince`: the time it has waited IN the build queue, which
+//     drives the in-class score and the +1-class aging after `agingHours` (never into P0 — the rule's own cap).
+// Any other priority value (medium/normal/absent) adds no fact → the normal class.
+const CARD_PRIORITY_REASON = Object.freeze({ operatorRequested: 'an operator answer waits on it', low: 'operator override low' });
+
+/** Plain delivery-priority facts for one backlog card. PURE. */
+export function buildQueuePriorityFacts(item, { unblocks = 0 } = {}) {
+  const p = String(item?.priority ?? '').trim().toLowerCase();
+  return {
+    blockedItems: unblocks,
+    ...(p === 'high' ? { operatorRequested: true } : {}),
+    ...(p === 'low' ? { override: { value: 'low', byOperator: true } } : {}),
+    ...(item?.queuedAt ? { waitingSince: item.queuedAt } : {}),
+  };
+}
+
+/** Class one card; the reasons name the card's own field instead of the rule's PR-shaped wording. PURE. */
+function cardPriority(item, unblocks, settings, now) {
+  const r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
+  const reasons = r.reasons.map((why) => (why === CARD_PRIORITY_REASON.operatorRequested ? 'card priority: high'
+    : why === CARD_PRIORITY_REASON.low ? 'card priority: low' : why));
+  // Q2's in-class score is the fix-queue score: unblocks × weight + minutes waited. Mode `off` scores 0 so the
+  // order stays exactly today's (tier → WSJF → rank → date → num).
+  const score = settings.mode === 'off' ? 0 : unblocks * settings.unblockWeightMinutes + r.minutesWaited;
+  return { priorityClass: r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged };
+}
+
 // ── Ordering ─────────────────────────────────────────────────────────────────────────────────────────
 function tierRank(item) {
   const idx = TIER_ORDER.get(item.tier ?? DEFAULT_TIER);
@@ -175,11 +210,14 @@ function tierRank(item) {
  * effective WSJF score, aging folded in), `unblocks` (dependents freed), and `rank` (the LexoRank override).
  * Exposed so a display surface (the console queue view #2529) and the builder (#2530) can show/act on WHY an
  * item ranks where it does WITHOUT recomputing the engine's math (one source of truth). {@link orderQueue}
- * is this mapped back to bare items. Sort keys, in order: tier (pinned first) → effectiveScore (desc) →
- * rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total-order guarantee).
+ * is this mapped back to bare items. Sort keys, in order: delivery class (P0 first, #4355) → tier (pinned
+ * first, the hand pin WITHIN a class) → fix-queue score (desc: unblocks + minutes waited, Q2) → effectiveScore
+ * (desc) → rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total order).
+ * `opts.priority` is the delivery-priority settings; omitted or mode `off` → every row P3, score 0 → today's order.
  */
-export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now()) {
+export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.now(), { priority } = {}) {
   const byId = indexItems(items);
+  const prioritySettings = resolvePrioritySettings(priority);
   const ready = items
     .filter((it) => isReady(it, byId))
     .map((it) => {
@@ -192,6 +230,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         tierOrder: tierRank(it),
         score: effectiveScore(it, config, now, { unblocks }),
         unblocks,
+        ...cardPriority(it, unblocks, prioritySettings, now),
         buildQueued: isBuildQueued(it), // the human's explicit clear-for-build (the manual gate #2530)
         rank: it.rank ?? '',
         opened: item_dateKey(it),
@@ -202,7 +241,9 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
     });
   ready.sort(
     (a, b) =>
+      PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
       a.tierOrder - b.tierOrder ||
+      b.priorityScore - a.priorityScore ||
       b.score - a.score ||
       cmp(a.rank, b.rank) ||
       cmp(a.opened, b.opened) ||
@@ -215,8 +256,8 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
  * The full ordered build queue: every READY item, in the deterministic order the builder would pull them.
  * Bare-item projection of {@link orderQueueDetailed} (same sort keys).
  */
-export function orderQueue(items, config = DEFAULT_CONFIG, now = Date.now()) {
-  return orderQueueDetailed(items, config, now).map((r) => r.item);
+export function orderQueue(items, config = DEFAULT_CONFIG, now = Date.now(), opts = {}) {
+  return orderQueueDetailed(items, config, now, opts).map((r) => r.item);
 }
 
 /**
@@ -226,8 +267,8 @@ export function orderQueue(items, config = DEFAULT_CONFIG, now = Date.now()) {
  * high-tier item is NOT auto-built until the human explicitly clears it. (The queue VIEW still shows every
  * ready item via {@link orderQueueDetailed}; only the builder's pick is clearance-gated.)
  */
-export function nextToBuild(items, config = DEFAULT_CONFIG, now = Date.now()) {
-  const cleared = orderQueueDetailed(items, config, now).filter((r) => r.buildQueued);
+export function nextToBuild(items, config = DEFAULT_CONFIG, now = Date.now(), opts = {}) {
+  const cleared = orderQueueDetailed(items, config, now, opts).filter((r) => r.buildQueued);
   return cleared.length ? cleared[0].item : null;
 }
 
