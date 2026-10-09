@@ -1,0 +1,67 @@
+{
+  "source": "live 2026-10-09 ~06:57Z — gh pr list --draft (web-everything/web-everything) + fresh per-sha required-check read; review-daemon log: owed a promote-draft, not a review; health-watch: draft-not-promoted; fix daemon tick idle since 05:53Z (self-sync rebuild/restart starvation)",
+  "repo": "web-everything/web-everything",
+  "drafts": [
+    {
+      "headRefName": "lane/4455-prepare-file-the-prevention-guard-s-owed-by-chalbert-web-everything",
+      "headRefOid": "95e2ae47407bc9a6a06f578727ed67302f8b995f",
+      "isDraft": true,
+      "labels": [
+        {
+          "name": "review:pending"
+        }
+      ],
+      "number": 4567,
+      "state": "OPEN"
+    },
+    {
+      "headRefName": "lane/overlay-pileup",
+      "headRefOid": "32efe42b3b67b414f0b2f42be0b8d11fd5c1bff6",
+      "isDraft": true,
+      "labels": [
+        {
+          "name": "review:pending"
+        },
+        {
+          "name": "review-status:healing-ci"
+        }
+      ],
+      "number": 4563,
+      "state": "OPEN"
+    },
+    {
+      "headRefName": "lane/revert-red-check",
+      "headRefOid": "265f0465c13dcbcd3c37e9c959f36ff1634fbfd1",
+      "isDraft": true,
+      "labels": [
+        {
+          "name": "review:pending"
+        },
+        {
+          "name": "review-status:fixing"
+        }
+      ],
+      "number": 4535,
+      "state": "OPEN"
+    }
+  ],
+  "checksBySha": {
+    "95e2ae47407bc9a6a06f578727ed67302f8b995f": {
+      "state": "green",
+      "why": "all 4 blocking check(s) succeeded"
+    },
+    "32efe42b3b67b414f0b2f42be0b8d11fd5c1bff6": {
+      "state": "green",
+      "why": "all 4 blocking check(s) succeeded"
+    },
+    "265f0465c13dcbcd3c37e9c959f36ff1634fbfd1": {
+      "state": "green",
+      "why": "all 4 blocking check(s) succeeded"
+    }
+  },
+  "expectPromoted": [
+    4567,
+    4563,
+    4535
+  ]
+}
