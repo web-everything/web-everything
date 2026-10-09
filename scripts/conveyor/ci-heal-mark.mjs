@@ -96,11 +96,55 @@ export function readAttributedWindows(comments) {
   });
 }
 
-/** Refund heals spent during attributed main bugs; #3794 live case, 2026-10-04. */
-export function countChargeableCiHealComments(comments, { restore = true } = {}) {
-  if (!restore) return countCiHealComments(comments);
+/**
+ * we:scripts/conveyor/ci-heal-mark.mjs#CI_HEAL_REASON_WHY — the per-reason "why" sentence of a completed heal comment.
+ * Single-sourced: {@link buildCiHealComment} writes it and {@link ciHealCommentReason} reads it back, so a heal posted
+ * before the explicit `reason:` line existed is still attributable to its reason.
+ */
+export const CI_HEAL_REASON_WHY = Object.freeze({
+  behind: 'the branch had fallen BEHIND `main`',
+  'red-ci': 'a required check had gone red after open',
+  codeql: 'the CodeQL check failed (new code-scanning alerts) and the drain refused to land it',
+});
+
+/**
+ * we:scripts/conveyor/ci-heal-mark.mjs#ciHealCommentReason — which repair a CI-heal marker comment recorded: the
+ * explicit `reason: <r>` line when present, else the reason whose {@link CI_HEAL_REASON_WHY} sentence the body
+ * carries, else `null` (unattributable — callers charge it conservatively). Pure.
+ * @param {unknown} body
+ * @returns {string|null}
+ */
+export function ciHealCommentReason(body) {
+  if (typeof body !== 'string') return null;
+  const explicit = /^reason: ([a-z-]+)$/m.exec(body)?.[1];
+  if (explicit) return explicit;
+  for (const [reason, why] of Object.entries(CI_HEAL_REASON_WHY)) if (body.includes(`${why};`)) return reason;
+  return null;
+}
+
+/**
+ * Setting `WE_CI_HEAL_CODEQL_OWN_BUDGET` (default ON) — LIVE PR #4453, 2026-10-09: two red-ci heals plus one CodeQL
+ * heal spent the shared 3-heal cap, so the NEW CodeQL alert left after them was refused as "exhausted" although no
+ * heal had ever been briefed with it. With this on, a CodeQL-held PR is charged only CodeQL (and unattributable)
+ * heals; `0`/`false` restores the shared count.
+ */
+export function resolveCodeqlOwnBudget(env = {}) {
+  return !['0', 'false'].includes(String(env.WE_CI_HEAL_CODEQL_OWN_BUDGET ?? '').trim().toLowerCase());
+}
+
+/**
+ * Refund heals spent during attributed main bugs; #3794 live case, 2026-10-04. `onlyReason` (#4453) charges only heals
+ * recorded for that reason; a heal whose reason cannot be read is still charged, so the cap never under-counts.
+ */
+export function countChargeableCiHealComments(comments, { restore = true, onlyReason = null } = {}) {
+  const list = (Array.isArray(comments) ? comments : []).filter((c) => {
+    if (!onlyReason) return true;
+    const reason = ciHealCommentReason(typeof c === 'string' ? c : c?.body);
+    return reason === null || reason === onlyReason;
+  });
+  if (!restore) return countCiHealComments(list);
   const windows = readAttributedWindows(comments);
-  return countCiHealComments((Array.isArray(comments) ? comments : []).filter((c) => {
+  return countCiHealComments(list.filter((c) => {
     const at = Date.parse(c?.createdAt);
     return !windows.some(({ from, to }) => Date.parse(from) <= at && at <= Date.parse(to));
   }));
@@ -162,15 +206,14 @@ export function redactSecrets(text) {
  * @returns {string}
  */
 export function buildCiHealComment({ actor = 'conveyor CI-heal agent', reason = '', headSha = '', attemptId = null, failed = false, detail = '' } = {}) {
-  const why = reason === 'behind' ? 'the branch had fallen BEHIND `main`'
-    : reason === 'red-ci' ? 'a required check had gone red after open'
-    : reason === 'codeql' ? 'the CodeQL check failed (new code-scanning alerts) and the drain refused to land it'
-    : 'a required check regressed after open';
+  const known = Object.hasOwn(CI_HEAL_REASON_WHY, reason);
+  const why = known ? CI_HEAL_REASON_WHY[reason] : 'a required check regressed after open';
   const head = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
   return [
     failed ? CI_HEAL_FAILURE_MARKER : CI_HEAL_COMMENT_MARKER,
     ...(attemptId ? [`attempt: ${attemptId}`] : []),
     ...(head ? [`head: ${head}`] : []),
+    ...(known ? [`reason: ${reason}`] : []),
     '',
     failed ? `The executor did not complete a repair. Diagnostics (untrusted, redacted, truncated):\n\n${sanitizeForPublicComment(detail)}\n\nExit/quota evidence is unknown unless explicitly recorded. CI remains unproven.` : `${why}; ${actor} rebased onto current \`main\`, repaired the failing check, and re-pushed HEAD.`,
     'This records the CI repair, not a review verdict. Existing `review:human` / `review:pending` holds stay in place; ' +

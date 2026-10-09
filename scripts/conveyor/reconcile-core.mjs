@@ -121,7 +121,7 @@ import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
+import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -1557,6 +1557,7 @@ export function missingReviewLabel(pr) {
 export function planReconcile({
   repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
   ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
+  codeqlOwnBudget = resolveCodeqlOwnBudget(process.env), // #4453 — a CodeQL hold is charged only CodeQL heals
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
   cardBatchExtract = CARD_BATCH_EXTRACT_WIRED,
   fixerLadder = DEFAULT_FIXER_LADDER,
@@ -2044,7 +2045,7 @@ export function planReconcile({
     // required check; every cap/escalation outcome is a logged refusal, never a silent skip.
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
       const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
-      const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
+      const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
         refuse('ci-heal-escalated', {
           ...withPhase, headSha: escalation.headSha,

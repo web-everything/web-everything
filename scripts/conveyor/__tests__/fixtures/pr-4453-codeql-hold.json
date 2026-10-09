@@ -1,0 +1,38 @@
+{
+  "_source": "LIVE PR web-everything/web-everything#4453, head e7c8e921f8594498d6b05373d87b0c3f4b1eeaa4, CodeQL check-run 113715656234 (read 2026-10-09). Heal markers are the PR's real trusted comments.",
+  "headRefOid": "e7c8e921f8594498d6b05373d87b0c3f4b1eeaa4",
+  "codeqlDetailsUrl": "https://github.com/web-everything/web-everything/runs/113715656234",
+  "annotations": [
+    {
+      "path": "scripts/conveyor/prep-review.mjs",
+      "start_line": 127,
+      "end_line": 127,
+      "annotation_level": "failure",
+      "title": "Bad HTML filtering regexp",
+      "message": "This regular expression only parses --> and not --!> as a HTML comment end tag."
+    }
+  ],
+  "healComments": [
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🩹 conveyor CI-heal — rebased & re-pushed\n\na required check had gone red after open; conveyor CI-heal agent rebased onto current `main`, repaired the failing check, and re-pushed HEAD.\nThis records the CI repair, not a review verdict. Existing `review:human` / `review:pending` holds stay in place; a live `review:accepted` may be re-armed separately for review. The drain lands it once green and reviewed.",
+      "createdAt": "2026-10-08T15:36:21Z"
+    },
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🩹 conveyor CI-heal — rebased & re-pushed\n\na required check had gone red after open; conveyor CI-heal agent rebased onto current `main`, repaired the failing check, and re-pushed HEAD.\nThis records the CI repair, not a review verdict. Existing `review:human` / `review:pending` holds stay in place; a live `review:accepted` may be re-armed separately for review. The drain lands it once green and reviewed.",
+      "createdAt": "2026-10-08T17:28:11Z"
+    },
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "body": "🩹 conveyor CI-heal — rebased & re-pushed\n\nthe CodeQL check failed (new code-scanning alerts) and the drain refused to land it; conveyor CI-heal agent rebased onto current `main`, repaired the failing check, and re-pushed HEAD.\nThis records the CI repair, not a review verdict. Existing `review:human` / `review:pending` holds stay in place; a live `review:accepted` may be re-armed separately for review. The drain lands it once green and reviewed.",
+      "createdAt": "2026-10-08T19:12:55Z"
+    }
+  ]
+}
