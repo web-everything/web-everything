@@ -333,7 +333,12 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       if (due.length) releaseOwnPrepareHolds({ nums: due, holds: effects.listHolds?.() ?? [], release: effects.releasePrepareHold });
       // Live 2026-10-09 — a held prepare whose worker reported already-done (with a commit) becomes an ordinary
       // dispatch hold the hold router lands as a resolve (graduatedTo that commit), exactly as the runner does.
-      for (const r of effects.takePrepareRouteHolds?.() ?? []) effects.placePrepareHold?.({ num: r.num, reason: r.reason });
+      // Each route is already stamped as handed out, so one failed placement must not drop the rest: a card whose
+      // hold was never placed is simply prepared again (not held), re-reports, and is routed by that fresh record.
+      for (const r of effects.takePrepareRouteHolds?.() ?? []) {
+        try { effects.placePrepareHold?.({ num: r.num, reason: r.reason }); }
+        catch (e) { console.error(`build-dispatch-daemon: already-done route hold for #${r.num} not placed: ${String(e?.message || e).split('\n')[0]}`); }
+      }
     } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
   }
   // A held ledger failure that carries its own reason (a could-not-prepare: `needs-you: …`) is held UNDER that reason,
@@ -347,7 +352,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const prepareIsLive = (r) => r.row?.entry?.live === true
     && !(r.row.entry.handle?.startsWith('pid:') && classifyClaimLiveness({ row: r.row,
       isPidAlive: effects.isPidAlive ?? defaultIsPidAlive }).status === 'dead');
-  const isPrepareHold = h => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
+  // `h.ledger`: a ledger hold remapped to its own `needs-you:` reason above is still the prepare-unstamped hold file
+  // underneath, so every prepare-hold check (tracking, stamped-on-main release, completion) must accept it too.
+  const isPrepareHold = h => h.ledger === true || ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
   // The stamp a prepare's claim recorded at spawn, kept on its hold too: the claim is released when the attempt ends
   // unstamped, and a later tick must still tell the stamp being replaced from a result.
   // `null` (the card was unstamped at spawn) is a recorded answer, distinct from `undefined` (nothing recorded).
@@ -378,6 +385,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
       completedPrepares.add(num);
       if (live && holds.some(h => normNum(h.num) === num && isPrepareHold(h))) effects.releasePrepareHold?.({ num });
+      // A ledger record that carries its own hold reason would otherwise stay held (and listed under `needsYou`)
+      // forever once the card is stamped on main by hand: the stamp is the observation that closes it.
+      if (live && holds.some(h => normNum(h.num) === num && h.ledger)) effects.completePrepareFailures?.(num);
     } catch (e) { prepareReadErrors.set(num, e); }
   }
   holds = holds.filter(h => !isPrepareHold(h) || !completedPrepares.has(normNum(h.num)));
@@ -602,7 +612,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
-  for (const [num, reason] of ledgerHoldReason) needsYou.push({ num, step: 'prepare', reason });
+  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num)) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
     const step = outcome?.stepRefused?.step ?? null;
@@ -724,7 +734,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const inspectNums = new Set([...prepareClaims.map((c) => normNum(c.meta.num)),
     ...prepareBusy, ...prepareSpawns.map((s) => normNum(s.num)),
     ...(bookkeeping.prepareGuards ?? []).filter((g) => g.kind === 'prepare-item').map((g) => normNum(g.num)),
-    ...holds.filter((h) => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason)).map((h) => normNum(h.num))]);
+    ...holds.filter(isPrepareHold).map((h) => normNum(h.num))]);
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
@@ -742,7 +752,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // settled by its own branch below, so it must not also be read as an unstamped prepare.
     const currentSettled = settled && settled.outcome !== 'prepare-session-dead'
       && (!claim?.meta?.claimedAt || settled.startedAt >= claim.meta.claimedAt);
-    const wasHeld = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+    const wasHeld = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
     const tracked = Boolean(claim) || prepareBusy.has(num);
     // A bare candidate (no claim, no in-flight row, no hold, no current settled attempt) has no evidence of a
     // prepare attempt: skip it, so old PRs/rows never place a hold and the per-tick probe stays bounded.
@@ -787,7 +797,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         if (deadUntimed || (worker?.entry?.handle?.startsWith('pid:') && workerLiveness?.status === 'dead')
           || (!worker && liveness.status === 'dead')) why = 'dead prepare owner past heartbeat TTL';
       }
-      const wasUnstamped = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+      const wasUnstamped = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
       // A dead session that left sections behind is a finished-but-unstamped run: route it to stamp recovery.
       const deadWithWork = why === 'prepare-session-dead' && status && !status.preparedDate
         && (status.hasSections || (awaitingPr && status.pr.hasSections));

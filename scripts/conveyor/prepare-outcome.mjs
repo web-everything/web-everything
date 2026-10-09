@@ -129,8 +129,10 @@ export function replaceCardScope(raw, scope) {
 export function needsYouReason(kind, detail) {
   // The hold router scans hold reasons for its own phrases (already-done / superseded / not buildable) and routes
   // lane work on them; a needs-you reason must never trigger that, so those phrases are defused.
-  const clean = String(detail ?? '').replace(/[\p{Cc}`<>]+/gu, ' ')
+  // Strip and collapse FIRST, then defuse: a phrase split by `<`, a backtick or a control character
+  // (`already <done on main`) would otherwise collapse into the very phrase the router matches.
+  const clean = String(detail ?? '').replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
     .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue').replace(/already done on main/gi, 'done elsewhere')
-    .replace(/^\s*worker-declined/i, 'declined').replace(/\s+/g, ' ').trim().slice(0, 300);
+    .replace(/^\s*worker-declined/i, 'declined').trim().slice(0, 300);
   return `needs-you: prepare blocked (${kind}) - ${clean || 'no detail'}; re-scope the card by hand or close it`;
 }
