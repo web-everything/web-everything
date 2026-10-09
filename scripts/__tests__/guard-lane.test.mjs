@@ -493,6 +493,11 @@ describe('#xpt9fvd — the guard-lane CLI protects a clone discovered via the da
     mkdirSync(other, { recursive: true });
     expect(classifyOverlayRecord({ clone: other, overlays: [{ ref: 'a' }] }, ws).live).toBe(true);
     expect(classifyOverlayRecord({ clone: other, overlays: [] }, ws).live).toBe(false); // empty list: still stale
+    for (const parent of [path.join(ws, '.lanes'), path.join(ws, '.lanes', 'web-everything')]) {
+      const c = classifyOverlayRecord({ clone: parent, overlays: [{ ref: 'a' }] }, ws);
+      expect(c.live, parent).toBe(false);
+      expect(c.reason).toMatch(/lane pool/);
+    }
     for (const repo of ['web-everything', 'frontierui', 'plateau-app']) {
       const lane = path.join(ws, '.lanes', repo, 'lane-12');
       const c = classifyOverlayRecord({ clone: lane, overlays: [{ ref: 'a' }] }, ws);
