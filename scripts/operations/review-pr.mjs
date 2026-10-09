@@ -263,6 +263,7 @@ import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
 // The `advisory:*` label pair's outcome vocabulary — a leaf, shared with the sink, the staleness sweep and
 // `operator-queue.mjs` so nobody restates it.
 import { ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { isValidRoundBudget } from '../lib/review-settings.mjs';
 
 /** The operation's stable id. Adapters resolve it by this name. */
 export const REVIEW_PR_OP = 'review-pr';
@@ -1130,7 +1131,7 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     ...(['shadow', 'on'].includes(raw?.scopedRereview) ? { scopedRereview: raw.scopedRereview } : {}),
     // Card 5471 — the round budget K and the ledger round, resolved by the io shell. Absent when the budget is off.
     // An unknown round stays `null` (the budget never acts on it). Read by we:scripts/lib/review-loop-policy.mjs.
-    ...(Number.isInteger(raw?.roundBudget) && raw.roundBudget >= 1
+    ...(isValidRoundBudget(raw?.roundBudget)
       ? { roundBudget: raw.roundBudget, reviewRound: Number.isInteger(raw.reviewRound) && raw.reviewRound >= 1 ? raw.reviewRound : null } : {}),
     pr: Number(detail.pr) || Number(pr) || 0,
     repo: String(detail.repo || repo || ''),

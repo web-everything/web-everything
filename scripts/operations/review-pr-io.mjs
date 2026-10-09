@@ -55,7 +55,7 @@ import { ADVISORY_LABEL_META, advisoryCoversHead, labelNames, planAdvisoryLabels
 // #3007 — the real verdict ledger, behind the reserved `verdict-ledger.append` seam. See the LEDGER sink.
 import { EVENT_TYPES, appendVerdict, buildLedgerEvent, buildVerdictRecord, foldRepo, parseLedgerEvents, verdictForLabelTarget, verdictLedgerPath } from '../lib/verdict-ledger.mjs';
 // Card 5469 — the scoped re-review shadow: the declared setting and the pure round rules.
-import { resolveReviewSettings, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
+import { isValidRoundBudget, resolveReviewSettings, SCOPED_REREVIEW_MODES, ROUND_BUDGET_OFF } from '../lib/review-settings.mjs';
 import { acceptanceIds, enclosingSymbol, foldFindingStatuses, lastReviewedHead, reviewRoundOf, reviewScope, shadowRound,
   FINDING_STATUSES } from '../lib/review-round-rules.mjs';
 import { sharedRunsDir } from './run-store.mjs';
@@ -344,10 +344,10 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
 
 /** Card 5471 — the round budget: an explicit value, else the declared setting. Any doubt is `off`. */
 export function resolveRoundBudget(explicit = null, { settings = resolveReviewSettings } = {}) {
-  if (Number.isInteger(explicit) && explicit >= 1) return explicit;
+  if (isValidRoundBudget(explicit)) return explicit;
   try {
     const k = settings().roundBudget;
-    return Number.isInteger(k) && k >= 1 ? k : ROUND_BUDGET_OFF;
+    return isValidRoundBudget(k) ? k : ROUND_BUDGET_OFF;
   } catch { return ROUND_BUDGET_OFF; }
 }
 

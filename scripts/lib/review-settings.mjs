@@ -25,6 +25,10 @@ export const SCOPED_REREVIEW_MODES = Object.freeze(['off', 'shadow', 'on']);
  * from the env; anything else keeps the lower layer's value (fail closed: an unreadable file means `off`).
  */
 export const ROUND_BUDGET_OFF = 'off';
+/** The largest K any layer accepts (the round cap is 5, so a bigger K never acts; one bound keeps the layers in step). */
+export const ROUND_BUDGET_MAX = 50;
+/** THE ONE PREDICATE for a usable K, shared by the file, the env and every consumer of the resolved value. */
+export const isValidRoundBudget = (v) => Number.isInteger(v) && v >= 1 && v <= ROUND_BUDGET_MAX;
 export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF });
 export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
   roundBudget: 'WE_REVIEW_ROUND_BUDGET' });
@@ -34,8 +38,8 @@ const PARSERS = Object.freeze({
   ...Object.fromEntries(Object.entries(ALLOWED).map(([key, allowed]) => [key, (v) => (allowed.includes(v) ? v : undefined)])),
   roundBudget: (v, { fromEnv = false } = {}) => {
     if (v === ROUND_BUDGET_OFF) return v;
-    if (fromEnv) return typeof v === 'string' && /^[1-9]\d{0,1}$/.test(v) ? Number(v) : undefined;
-    return Number.isInteger(v) && v >= 1 && v <= 50 ? v : undefined;
+    const k = fromEnv ? (typeof v === 'string' && /^[1-9]\d*$/.test(v) ? Number(v) : undefined) : v;
+    return isValidRoundBudget(k) ? k : undefined;
   },
 });
 /** The WE root RUNNING the daemon owns this file; a PR under review cannot weaken it. */

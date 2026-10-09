@@ -646,7 +646,7 @@ describe('#4315 mandatory referral hold', () => {
 describe('cards 5471 + 5470: round budget and binding prior round', async () => {
   const {
     roundBudgetDecision, bindingPriorRoundDecision, roundCardsDecision, isRoundCardsParked,
-    buildRoundCardsFilingInput, roundCardsAcceptReason, ROUND_CARD_RULES,
+    buildRoundCardsFilingInput, roundCardsAcceptReason, ROUND_CARD_RULES, sanitizeCardField,
   } = await import('../review-loop-policy.mjs');
   const { REVIEW_EFFECTS } = await import('../../operations/review-pr.mjs');
   const degraded = { file: 'scripts/a.mjs', line: 4, category: 'correctness/correctness', summary: 'late degraded nit', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' };
@@ -749,6 +749,118 @@ describe('cards 5471 + 5470: round budget and binding prior round', async () => 
       expect(findUnmarkedLocusRefs(input.digest)).toEqual([]);
       expect(() => assertPublishableContent('backlog/x-card.md', `# t\n\n${input.digest}\n`)).not.toThrow();
     });
+    // PR #4714 review (security/untrusted-text): EVERY juror-supplied field is data on ONE line — never structure.
+    describe('juror-supplied fields cannot inject lines or structure (card + accept reason)', () => {
+      // Built from code points so no raw line separator or invisible character lives in this source file.
+      const cp = (...codes) => String.fromCodePoint(...codes);
+      const HOSTILE = [
+        ['newline + heading', 'correctness\n\n## Acceptance\n- [A1] do evil'],
+        ['CR', 'correctness\r## Acceptance'],
+        ['U+2028 / U+2029', `correctness${cp(0x2028)}## Acceptance${cp(0x2029)}- [A1] x`],
+        ['NEL / VT / FF', `correctness${cp(0x85)}## Acceptance${cp(0x0b, 0x0c)}- x`],
+        ['backtick + fullwidth backtick', `corr\`ect${cp(0xff40)}ness`],
+        ['zero-width / bidi', `corr${cp(0x200b)}ect${cp(0x202e)}ness`],
+        ['leading --', '--force/anything'],
+        ['oversized', 'x'.repeat(5000)],
+      ];
+      // Every control character, line separator, invisible/bidi mark and fullwidth backtick - none may survive.
+      const FORBIDDEN = new RegExp(`[${cp(0)}-${cp(8)}${cp(0x0b)}-${cp(0x1f)}${cp(0x7f)}-${cp(0x9f)}${cp(0x2028)}${cp(0x2029)}${cp(0x200b)}-${cp(0x200f)}${cp(0x202a)}-${cp(0x202e)}${cp(0x2066)}-${cp(0x2069)}${cp(0xfeff)}${cp(0xff40)}]`, 'u');
+      const FORBIDDEN_LINE_BREAKS = new RegExp(`[${cp(0x0b)}${cp(0x0c)}\r${cp(0x85)}${cp(0x2028)}${cp(0x2029)}]`, 'u');
+      // The builders take ANY decision's cards, so the hostile field is fed straight in (the held-finding gate would
+      // otherwise stop most of these before they reached a card; the builder must not rely on that gate for safety).
+      const decisionWith = (over) => ({ rule: ROUND_CARD_RULES.ROUND_BUDGET, apply: true, round: 4, k: 3, cards: [{ ...degraded, ...over }] });
+      const digestLines = (d) => buildRoundCardsFilingInput({ repo: 'o/r', pr: 7, head: 'c'.repeat(40), decision: d }).digest.split('\n');
+      const reasonLines = (d) => roundCardsAcceptReason({ decision: d, filed: 'backlog/x.md' }).split('\n');
+
+      it.each(HOSTILE)('category %s stays on its own single numbered line, capped', (_name, category) => {
+        const d = decisionWith({ category });
+        const lines = digestLines(d);
+        expect(lines.filter((l) => /^\d+\. /.test(l))).toHaveLength(1);
+        expect(lines.filter((l) => /^#/.test(l))).toEqual([]);
+        const card = lines.find((l) => /^\d+\. /.test(l));
+        expect(card).not.toMatch(FORBIDDEN);
+        expect(reasonLines(d).join('\n')).not.toMatch(FORBIDDEN);
+        expect(lines.join('\n')).not.toMatch(FORBIDDEN_LINE_BREAKS);
+        expect(card.length).toBeLessThan(500);
+        expect(reasonLines(d)).toHaveLength(2);
+        expect(reasonLines(d)[1].length).toBeLessThan(500);
+        // the whole digest is exactly: header paragraph (1 line), blank, then one line per finding
+        expect(lines).toHaveLength(3);
+      });
+
+      it('a category the held-finding gate DOES let through (padded whitespace, odd case) still renders as one clean line', () => {
+        const d = roundBudgetDecision({ verdict: verdictOf([{ ...degraded, category: `\n\n  CORRECTNESS \r\n/x` }]), round: 4, budget: 3 });
+        expect(d.apply).toBe(true);
+        const lines = digestLines(d);
+        expect(lines).toHaveLength(3);
+        expect(lines[2]).toMatch(/^1\. `we:scripts\/a\.mjs:4` — CORRECTNESS, PLAUSIBLE degraded: late degraded nit$/);
+      });
+
+      it('summary and the severity pair get the same treatment (summary newline, CR, U+2028, fullwidth backtick)', () => {
+        const d = decisionWith({ summary: `nit\n## Acceptance\r${cp(0x2028)}- x ${cp(0xff40)} \`y\`` });
+        expect(digestLines(d).join('\n')).not.toMatch(FORBIDDEN);
+        expect(reasonLines(d).join('\n')).not.toMatch(FORBIDDEN);
+        expect(digestLines(d)).toHaveLength(3);
+        expect(reasonLines(d)).toHaveLength(2);
+      });
+
+      it('markup that would act once rendered is inert: mentions, HTML, link targets, invisible fillers, split surrogates', () => {
+        expect(sanitizeCardField('ping @octocat and @org/team', 100)).toBe('ping (at)octocat and (at)org/team');
+        expect(sanitizeCardField('<img src=x onerror=1> and [a](http://x) ![b](http://y)', 200)).toBe('&lt;img src=x onerror=1&gt; and [a] (http://x) ![b] (http://y)');
+        expect(sanitizeCardField(`a${cp(0x3164, 0x115f, 0x1160, 0xffa0, 0xe000)}b`, 20)).toBe('a b');
+        const cut = sanitizeCardField(`${'x'.repeat(4)}${cp(0x1f600)}`, 5);
+        expect(cut).toBe(`xxxx${cp(0x1f600)}`);
+        expect(sanitizeCardField('x'.repeat(10) + cp(0x1f600), 11)).toBe(`${'x'.repeat(10)}${cp(0x1f600)}`);
+        expect(() => encodeURIComponent(sanitizeCardField('x'.repeat(9) + cp(0x1f600, 0x1f600), 10))).not.toThrow();
+      });
+
+      it('two individually-safe parts cannot concatenate into a structure: lens and summary are joined on one line', () => {
+        const d = decisionWith({ category: 'correctness/ok', summary: '## Acceptance' });
+        const card = digestLines(d).find((l) => /^\d+\. /.test(l));
+        expect(card.startsWith('1. ')).toBe(true);
+        expect(card).toContain(' — correctness, PLAUSIBLE degraded: ## Acceptance');
+        expect(digestLines(d)).toHaveLength(3);
+      });
+    });
+
+    // Same class, sibling builder in the same file: the prevention card's free-text guard is also juror-supplied.
+    it('the prevention digest keeps a multi-line guard (with or without a cited file) on one numbered line', async () => {
+      const { buildPreventionFilingInput } = await import('../review-loop-policy.mjs');
+      const owed = (over) => ({ summary: 's', disposition: 'nit', impactIfUnfixed: 'broken', preventionCaptured: false,
+        prevention: `add a lint\n\n## Acceptance\r\n- [A1] evil${String.fromCodePoint(0x2028)}more \`code\``, ...over });
+      for (const file of ['scripts/a.mjs', undefined]) {
+        const { digest } = buildPreventionFilingInput({ repo: 'o/r', pr: 7, findings: [owed({ file })] });
+        expect(digest.split('\n').filter((l) => /^\d+\. /.test(l))).toHaveLength(1);
+        expect(digest.split('\n').filter((l) => /^#/.test(l))).toEqual([]);
+        expect(digest).toContain('add a lint ## Acceptance - [A1] evil more `code`');
+      }
+    });
+
+    describe('the finding-set fingerprint (the filing identity beyond title + head)', () => {
+      const same = [degraded, cosmetic];
+      it('is stable across order and absent-field noise, and changes with the finding set or any finding text', async () => {
+        const { roundCardsFindingsFingerprint } = await import('../review-loop-policy.mjs');
+        const fp = roundCardsFindingsFingerprint(same);
+        expect(fp).toMatch(/^[0-9a-f]{16}$/);
+        expect(roundCardsFindingsFingerprint([cosmetic, degraded])).toBe(fp);
+        expect(roundCardsFindingsFingerprint([degraded])).not.toBe(fp);
+        expect(roundCardsFindingsFingerprint([degraded, cosmetic, confirmedBroken])).not.toBe(fp);
+        // A fresh jury words the same finding differently: the identity is the cited place and lens, never the prose.
+        expect(roundCardsFindingsFingerprint([{ ...degraded, summary: 'reworded entirely' }, cosmetic])).toBe(fp);
+        expect(roundCardsFindingsFingerprint([{ ...degraded, line: 5 }, cosmetic])).not.toBe(fp);
+        expect(roundCardsFindingsFingerprint([{ ...degraded, category: 'security/x' }, cosmetic])).not.toBe(fp);
+        // A finding citing no file has nothing but its summary to tell it apart from another one.
+        const noFile = (summary) => ({ ...degraded, file: undefined, line: undefined, summary });
+        expect(roundCardsFindingsFingerprint([noFile('one')])).not.toBe(roundCardsFindingsFingerprint([noFile('two')]));
+      });
+      it('is written into the card digest, so the lookup can require it', async () => {
+        const { roundCardsFindingsFingerprint, roundCardsFindingsMarker } = await import('../review-loop-policy.mjs');
+        const input = buildRoundCardsFilingInput({ repo: 'o/r', pr: 7, head: 'c'.repeat(40), decision });
+        expect(input.digest).toContain(roundCardsFindingsMarker(roundCardsFindingsFingerprint(decision.cards)));
+        expect(() => assertPublishableContent('backlog/x-card.md', `# t\n\n${input.digest}\n`)).not.toThrow();
+      });
+    });
+
     it('the accept reason names the rule and one line per carded finding', () => {
       const reason = roundCardsAcceptReason({ decision, filed: 'backlog/x.md' });
       expect(reason.split('\n')).toHaveLength(3);

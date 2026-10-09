@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import { preventionCardTitle } from '../operations/machine-pr-title.mjs';
+import { isValidRoundBudget } from './review-settings.mjs';
 /**
  * @file scripts/lib/review-loop-policy.mjs
  * @description THE CONCRETE UNATTENDED-CONFIRM POLICY for `review-pr` (#3072's remaining slice) — and the pure
@@ -321,7 +323,7 @@ export function buildPreventionFilingInput({ repo, pr, findings = [], parent = '
   const scope = [...new Set([...files, ...files.map(testSiblingOf).filter(Boolean)])]
     .map((f) => `${IN_REPO_LOCUS}${f}`).join(',');
   const digestLines = owed.map((f, i) => (
-    `${i + 1}. ${cleanFindingFile(f) ? `${preventionGuardAnchor(f)} — ${f.prevention ?? '(no guard text recorded)'}` : preventionGuardAnchor(f)}`
+    `${i + 1}. ${cleanFindingFile(f) ? `${preventionGuardAnchor(f)} — ${guardText(f) || '(no guard text recorded)'}` : preventionGuardAnchor(f)}`
   ));
   const digestRaw = `Filed mechanically by the unattended review loop (#2749) — every finding below reduced `
     + `${repo}#${pr}'s review${head ? ` (${preventionHeadMarker(head)})` : ''} to prevention-outstanding by `
@@ -430,7 +432,7 @@ export function preventionGuardAnchor(f) {
   const file = cleanFindingFile(f);
   if (!file) {
     const marker = typeof f?.file === 'string' && f.file.trim() ? FILE_WITHHELD : NO_FILE_CITED;
-    return `${marker} — ${f?.prevention ?? '(no guard text recorded)'}`;
+    return `${marker} — ${guardText(f) || '(no guard text recorded)'}`;
   }
   // A juror citing `file: 'x.mjs:10'` with no `line` keeps its line (cleanFindingFile strips it off the path):
   // without it, two guards in one file would share one duplicate key and the second would never be filed.
@@ -611,7 +613,7 @@ function roundCardsRefusal(verdict) {
  * @returns {{rule: string, apply: boolean, reason: string, round: number|null, k: number|null, cards: Array<object>}}
  */
 export function roundBudgetDecision({ verdict, round = null, budget = 'off', cap = DEFAULT_ROUND_CAP } = {}) {
-  const k = Number.isInteger(budget) && budget >= 1 ? budget : null;
+  const k = isValidRoundBudget(budget) ? budget : null;
   const r = Number.isInteger(round) && round >= 1 ? round : null;
   const out = (apply, reason, cards = []) => ({ rule: ROUND_CARD_RULES.ROUND_BUDGET, apply, reason, round: r, k, cards });
   if (k === null) return out(false, 'off');
@@ -682,19 +684,83 @@ export function isRoundCardsParked(outcome) {
     && roundCardsDecision(outcome.run).apply === true;
 }
 
+/**
+ * Controls, format (zero-width, bidi, BOM), line/paragraph separators, private-use and surrogate code points, and the
+ * Hangul filler characters that render as blanks: nothing a one-line field may carry. The fillers are named by code
+ * point so no invisible character lives in this source file.
+ */
+const CARD_FIELD_UNSAFE = new RegExp(
+  `[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}\\p{Co}\\p{Cs}${[0x115f, 0x1160, 0x3164, 0xffa0].map((c) => String.fromCodePoint(c)).join('')}]+`, 'gu',
+);
+
+/**
+ * THE ONE SANITIZER for any juror- or job-derived text that lands on a card line or in the accept comment (PR #4714
+ * review, security/untrusted-text). PURE. A juror reads an attacker-controlled diff, so a field it returns is data,
+ * never structure: NFKC first (a fullwidth backtick or compatibility form becomes the plain char it imitates), then
+ * every control, line/paragraph separator and invisible mark becomes a space, runs of whitespace collapse, backticks
+ * become apostrophes, and the result is trimmed and capped. Applied to EVERY such field, not just the summary.
+ * @param {unknown} value
+ * @param {number} cap - the longest the field may be.
+ * @returns {string}
+ */
+export function sanitizeCardField(value, cap, { keepBackticks = false } = {}) {
+  // Markup that would act on the PR comment or the card once rendered is made inert too: an `@` (a mention would notify
+  // someone), angle brackets (HTML) and a link/image target `](`.
+  const line = String(value ?? '').normalize('NFKC').replace(CARD_FIELD_UNSAFE, ' ').replace(/\s+/g, ' ')
+    .replace(/@/g, '(at)').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\]\(/g, '] (');
+  // Cut on code points, never inside a surrogate pair.
+  return [...(keepBackticks ? line : line.replace(/`/g, "'")).trim()].slice(0, cap).join('').trim();
+}
+
+/** A prevention guard's free text as one line (same class as the round-card fields; backticks kept: guards cite code). */
+const guardText = (f) => sanitizeCardField(f?.prevention, 1000, { keepBackticks: true });
+
+/**
+ * One finding's parts, each sanitized: the cited place, the lens, the severity and the summary. `uncapped` keeps the
+ * summary whole (the fingerprint hashes it so two findings that differ only past the card's 300-char cap stay distinct).
+ */
+function roundCardParts(f, { uncapped = false } = {}) {
+  const n = normalizeFinding(f) ?? { summary: '' };
+  const lens = sanitizeCardField(String(n.category ?? '').split('/')[0], 40) || 'review';
+  const sev = sanitizeCardField([n.verdict, n.impactIfUnfixed].filter(Boolean).join(' '), 40) || 'severity not stated';
+  const summary = sanitizeCardField(n.summary, uncapped ? Infinity : 300);
+  const anchor = cleanFindingFile(f) ? preventionGuardAnchor(f) : '`(no file cited)`';
+  return { anchor, lens, sev, summary };
+}
+
 /** One finding as one plain line: the cited place, the lens and severity, and the summary (data, never parsed). */
 function roundCardLine(f, i) {
-  const n = normalizeFinding(f) ?? { summary: '' };
-  const lens = String(n.category ?? '').split('/')[0] || 'review';
-  const sev = [n.verdict, n.impactIfUnfixed].filter(Boolean).join(' ') || 'severity not stated';
-  const summary = n.summary.replace(/\s+/g, ' ').replace(/`/g, "'").trim().slice(0, 300);
-  const anchor = cleanFindingFile(f) ? preventionGuardAnchor(f) : '`(no file cited)`';
+  const { anchor, lens, sev, summary } = roundCardParts(f);
   return `${i + 1}. ${anchor} — ${lens}, ${sev}: ${summary}`;
 }
 
 /** The text a round card carries to name the head it was filed for (the retry key, like {@link preventionHeadMarker}). */
 export function roundCardsHeadMarker(head) {
   return `reviewed head \`${head}\``;
+}
+
+/**
+ * THE FINDING-SET FINGERPRINT (PR #4714 review): 16 hex of a hash over the sorted, sanitized identity of every carded
+ * finding. PURE. A card is the same filing only for the same PR, rule, round, head AND findings: a same-head rerun that
+ * raises a different or extra finding must not reuse a card that omits it. Order-independent, and independent of how a
+ * (fresh) jury words a finding: it hashes the cited place and lens, not the prose.
+ * @param {Array<object>} cards - the decision's held findings.
+ * @returns {string}
+ */
+export function roundCardsFindingsFingerprint(cards = []) {
+  // STABLE identity only: the retry after a failed accept is a FRESH jury that words the same finding differently, so the
+  // prose is not part of it. The cited place and lens identify a finding (as `cardCoversGuard` does for guards); only a
+  // finding that cites no file has nothing else to tell it apart, so its summary stands in.
+  const identities = (Array.isArray(cards) ? cards : []).map((f) => {
+    const { anchor, lens, summary } = roundCardParts(f, { uncapped: true });
+    return [anchor, lens, cleanFindingFile(f) ? '' : summary].join('\u001f');
+  }).sort();
+  return createHash('sha256').update(identities.join('\u001e')).digest('hex').slice(0, 16);
+}
+
+/** The text a round card carries to name the finding set it was filed for (the lookup requires it). */
+export function roundCardsFindingsMarker(fingerprint) {
+  return `finding set \`${fingerprint}\``;
 }
 
 /** The card title: stable per PR + rule + round, never built from juror prose. PURE. */
@@ -717,7 +783,7 @@ export function buildRoundCardsFilingInput({ repo, pr, head = null, decision, qu
     ? `round ${decision.round} is past the round budget K=${decision.k} and no finding is broken (card 5471)`
     : `round ${decision?.round ?? '?'} raised these only on code unchanged since the last reviewed head (card 5470)`;
   const digestRaw = `Filed mechanically by the unattended review loop: ${repo}#${pr}'s review${head ? ` (${roundCardsHeadMarker(head)})` : ''} `
-    + `was accepted because ${why}. Each finding below was deferred to this card instead of another fix round:\n\n`
+    + `(${roundCardsFindingsMarker(roundCardsFindingsFingerprint(cards))}) was accepted because ${why}. Each finding below was deferred to this card instead of another fix round:\n\n`
     + cards.map(roundCardLine).join('\n');
   return {
     title: roundCardsTitle({ repo, pr, rule: decision?.rule, round: decision?.round }),
@@ -741,7 +807,9 @@ export function roundCardsAcceptReason({ decision, filed = null } = {}) {
     ? `Round budget (card 5471): round ${decision.round} > K=${decision.k}, no finding is broken, so this round accepts.`
     : `Binding prior round (card 5470): round ${decision?.round ?? '?'} found these only on code unchanged since the last reviewed head, so this round accepts.`;
   const cards = Array.isArray(decision?.cards) ? decision.cards : [];
-  return [`${head} ${cards.length} finding(s) filed as a follow-up card${filed ? ` (${filed})` : ''}:`, ...cards.map(roundCardLine)].join('\n');
+  // `filed` is a path, a number or a landing handle read back from a job's stdout or a stored receipt: data, like the rest.
+  const where = sanitizeCardField(filed, 200);
+  return [`${head} ${cards.length} finding(s) filed as a follow-up card${where ? ` (${where})` : ''}:`, ...cards.map(roundCardLine)].join('\n');
 }
 
 /**

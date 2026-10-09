@@ -33,6 +33,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { normalizeFinding, MANDATORY_LENSES } from '../lib/jury-core.mjs';
 import { enclosingSymbol, findingHeldVerdict, replayPrRounds } from '../lib/review-round-rules.mjs';
 import { roundBudgetDecision, roundCardsReport } from '../lib/review-loop-policy.mjs';
+import { isValidRoundBudget, ROUND_BUDGET_MAX } from '../lib/review-settings.mjs';
 import { readFixRange } from './review-pr-io.mjs';
 import { sharedRunsDir } from './run-store.mjs';
 import { DEFAULT_REPO_KEY, ghRepoSlug } from '../lib/constellation-repos.mjs';
@@ -180,6 +181,12 @@ export function main(argv = process.argv.slice(2), { log = (s) => process.stdout
       for (const [rule, b] of Object.entries(report.byRule)) log(`  ${rule}: ${b.cards} card(s), ${b.findings} finding(s), fix rate ${pct(b.fixRate)}`);
     }
     return report;
+  }
+  // One predicate for K everywhere: an out-of-range value would silently replay as `off`, so refuse it loudly instead.
+  // A bare flag parses as `true` and `Number('0x3')` is 3: only plain decimal digits name a K.
+  const budgetArg = args['round-budget'];
+  if (budgetArg !== undefined && !(/^[1-9]\d*$/.test(String(budgetArg)) && typeof budgetArg === 'string' && isValidRoundBudget(Number(budgetArg)))) {
+    throw new Error(`--round-budget must be an integer from 1 to ${ROUND_BUDGET_MAX}, got ${JSON.stringify(args['round-budget'])}`);
   }
   const exec = (cmd, a, opts) => execFileSync(cmd, a, { ...opts, cwd });
   const byPr = loadRounds({ runsDir, repo });

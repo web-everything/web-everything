@@ -34,10 +34,11 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { judgeOutcome, parseOperationArgv } from '../cli-adapter.mjs';
 import { fileItemOperation } from '../file-item.mjs';
 import { REVIEW_EFFECTS, reviewPrOperation } from '../review-pr.mjs';
-import { buildPreventionFilingInput } from '../../lib/review-loop-policy.mjs';
+import { buildPreventionFilingInput, buildRoundCardsFilingInput, roundCardsFindingsFingerprint } from '../../lib/review-loop-policy.mjs';
 import {
   applyUnattendedActorDefault, buildFileItemArgv, fileItemForPrevention, fileItemForPreventionViaLandingJob,
-  findFiledPreventionCard, runReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
+  findFiledPreventionCard, findFiledRoundCardsCard, findRetainedRoundCardsReceipt, QUEUED_RECEIPT_TTL_MS, retainedRoundCardsReceipt,
+  runReviewLoopOnce, UNATTENDED_REVIEW_ACTOR,
 } from '../review-loop-cli.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { spawnPreventionLandingJob } from '../../lib/prevention-landing-job.mjs';
@@ -1201,5 +1202,194 @@ describe('runReviewLoopOnce — cards 5471/5470: a round past the budget files i
     expect(out.stopped).toBe('confirm');
     expect(out.run.findings.confirm).toBeUndefined();
     expect(out.lines.join('\n')).toMatch(/FAILED to file the round's follow-up card: file-item refused: lane pool exhausted/);
+  });
+});
+
+// ── PR #4714 review round 1 — the round-card filing identity and its retry guarantee, with the REAL lookup ─────────
+describe('findFiledRoundCardsCard — the real lookup against a temp backlog (PR #4714)', () => {
+  const finding = (summary, line = 3) => ({ file: NET_PATHS[0], line, summary, verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded', category: 'correctness/x' });
+  const decisionOf = (cards) => ({ rule: 'round-budget', apply: true, round: 4, k: 3, cards });
+  const inputOf = (cards, head = HEAD_A) => buildRoundCardsFilingInput({ repo: 'o/r', pr: 7, head, decision: decisionOf(cards) });
+  const lookup = (root, cards, head = HEAD_A) => findFiledRoundCardsCard(inputOf(cards, head),
+    { root, head, fingerprint: roundCardsFindingsFingerprint(cards) });
+  const withBacklog = (body, fn) => {
+    const root = mkdtempSync(join(tmpdir(), 'round-cards-'));
+    try { mkdirSync(join(root, 'backlog')); body(root); fn(root); } finally { rmSync(root, { recursive: true, force: true }); }
+  };
+  const write = (root, name, input, status = 'open') =>
+    writeFileSync(join(root, 'backlog', name), `---\nstatus: ${status}\n---\n\n# ${input.title}\n\n${input.digest}\n`);
+  const A = finding('first finding');
+  const B = finding('second finding', 9);
+
+  it('hits a card filed for the same title, head and finding set', () => {
+    withBacklog((root) => write(root, 'x1-card.md', inputOf([A, B])), (root) => {
+      expect(lookup(root, [A, B])).toEqual({ num: 'x1', path: 'backlog/x1-card.md' });
+      expect(lookup(root, [B, A])).toEqual({ num: 'x1', path: 'backlog/x1-card.md' });
+    });
+  });
+
+  it('misses on another head, on a resolved or closed card, and on a card without the head marker', () => {
+    withBacklog((root) => write(root, 'x1-card.md', inputOf([A, B])), (root) => {
+      expect(lookup(root, [A, B], HEAD_B)).toBeNull();
+    });
+    for (const status of ['resolved', 'closed', 'done', 'wontfix', 'superseded']) {
+      withBacklog((root) => write(root, 'x1-card.md', inputOf([A, B]), status), (root) => expect(lookup(root, [A, B])).toBeNull());
+    }
+    withBacklog((root) => write(root, 'x1-card.md', { title: inputOf([A, B]).title, digest: 'no marker here' }), (root) => {
+      expect(lookup(root, [A, B])).toBeNull();
+    });
+  });
+
+  it('still hits when a fresh jury re-words the same findings, and misses when a finding moves to another line', () => {
+    withBacklog((root) => write(root, 'x1-card.md', inputOf([A, B])), (root) => {
+      expect(lookup(root, [finding('reworded one'), finding('reworded two', 9)])).toEqual({ num: 'x1', path: 'backlog/x1-card.md' });
+      expect(lookup(root, [A, finding('second finding', 10)])).toBeNull();
+    });
+  });
+
+  it('rejects an existing same-head card that omits a current finding (a changed finding set is filed again)', () => {
+    withBacklog((root) => write(root, 'x1-card.md', inputOf([A])), (root) => {
+      expect(lookup(root, [A])).toEqual({ num: 'x1', path: 'backlog/x1-card.md' });
+      expect(lookup(root, [A, B])).toBeNull();
+      expect(lookup(root, [B])).toBeNull();
+    });
+  });
+});
+
+describe('runReviewLoopOnce — a retry after a queued round-card filing never files a second card (PR #4714)', () => {
+  const DEGRADED = {
+    summary: 'one late, non-broken finding',
+    findings: [{ summary: 'a retry message could name the PR', file: NET_PATHS[0], line: 3, disposition: 'blocker', impactIfUnfixed: 'degraded' }],
+  };
+  const CHANGED = {
+    summary: 'a changed late finding set',
+    findings: [...DEGRADED.findings, { summary: 'a second, new finding', file: NET_PATHS[0], line: 8, disposition: 'blocker', impactIfUnfixed: 'degraded' }],
+  };
+  const queuedFileItem = (calls) => async (input) => {
+    calls.push(input);
+    return { code: 0, lines: [JSON.stringify({ queued: true, handle: 'pid:4242' })] };
+  };
+  const throwingLabelSinks = () => ({
+    ...recordingSinks([]),
+    [REVIEW_EFFECTS.LABEL]: async () => { throw new Error('gh label edit failed: network error'); },
+  });
+  const drive = ({ answer, store, sinks, argv = BASE_ARGV, fileItem, id }) => {
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: 3, reviewRound: 4 } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    return runReviewLoopOnce({
+      declaration, registry, argv, store, sinks, makeJudge: cannedJudge(answer), mintRunId: () => id,
+      fileItem, findFiledRoundCards: () => null,
+    });
+  };
+
+  it('reuses the queued filing receipt after acceptance fails', async () => {
+    const calls = [];
+    const store = createMemoryRunStore();
+    const first = await drive({ answer: DEGRADED, store, sinks: throwingLabelSinks(), fileItem: queuedFileItem(calls), id: 'review-pr-queued' });
+    expect(first.stopped).toBe('effect-halted');
+    expect(calls).toHaveLength(1);
+    expect(store.read('review-pr-queued').input.roundCardsFiling).toMatchObject({ queued: true, handle: 'pid:4242' });
+    // The halted run cannot be resumed (its label swap is not idempotent): the real retry is a FRESH run, new id, same head.
+    const second = await drive({ answer: DEGRADED, store, sinks: recordingSinks([]), fileItem: queuedFileItem(calls), id: 'review-pr-queued-2' });
+    expect(calls).toHaveLength(1);
+    expect(second.code).toBe(0);
+    expect(second.stopped).toBe('complete');
+    expect(second.run.findings.confirm).toBe('accept');
+    expect(second.lines.join('\n')).toMatch(/queued for landing \(pid:4242\).*\(already filed\)/);
+    expect(second.run.input.reason).toMatch(/queued for landing \(pid:4242\)/);
+  });
+
+  it('a fresh jury that WORDS the same findings differently still reuses the receipt (identity is the cited place, not prose)', async () => {
+    const calls = [];
+    const store = createMemoryRunStore();
+    await drive({ answer: DEGRADED, store, sinks: throwingLabelSinks(), fileItem: queuedFileItem(calls), id: 'review-pr-w1' });
+    const reworded = { summary: 'other words', findings: [{ ...DEGRADED.findings[0], summary: 'the retry text should say which PR it concerns' }] };
+    const second = await drive({ answer: reworded, store, sinks: recordingSinks([]), fileItem: queuedFileItem(calls), id: 'review-pr-w2' });
+    expect(calls).toHaveLength(1);
+    expect(second.stopped).toBe('complete');
+  });
+
+  it('an expired queued receipt (the landing job never landed) is not trusted: the findings are filed again', async () => {
+    const calls = [];
+    const store = createMemoryRunStore();
+    await drive({ answer: DEGRADED, store, sinks: throwingLabelSinks(), fileItem: queuedFileItem(calls), id: 'review-pr-e1' });
+    const later = () => new Date(Date.now() + QUEUED_RECEIPT_TTL_MS + 60_000).toISOString();
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_A, extra: { roundBudget: 3, reviewRound: 4 } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store, sinks: recordingSinks([]), makeJudge: cannedJudge(DEGRADED),
+      mintRunId: () => 'review-pr-e2', fileItem: queuedFileItem(calls), findFiledRoundCards: () => null, now: later,
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a retry on a NEW head files its own card (the receipt is keyed by head)', async () => {
+    const calls = [];
+    const store = createMemoryRunStore();
+    await drive({ answer: DEGRADED, store, sinks: throwingLabelSinks(), fileItem: queuedFileItem(calls), id: 'review-pr-h1' });
+    const declaration = reviewPrOperation({ readPr: stubReader({ rev: HEAD_B, extra: { roundBudget: 3, reviewRound: 4 } }) });
+    const registry = createRegistry();
+    registry.register(declaration);
+    await runReviewLoopOnce({
+      declaration, registry, argv: BASE_ARGV, store, sinks: recordingSinks([]), makeJudge: cannedJudge(DEGRADED),
+      mintRunId: () => 'review-pr-h2', fileItem: queuedFileItem(calls), findFiledRoundCards: () => null,
+    });
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a retry whose finding set CHANGED files again instead of reusing the stale receipt', async () => {
+    const calls = [];
+    const store = createMemoryRunStore();
+    await drive({ answer: DEGRADED, store, sinks: throwingLabelSinks(), fileItem: queuedFileItem(calls), id: 'review-pr-q1' });
+    await drive({ answer: CHANGED, store, sinks: recordingSinks([]), fileItem: queuedFileItem(calls), id: 'review-pr-q2' });
+    expect(calls).toHaveLength(2);
+  });
+
+  describe('retainedRoundCardsReceipt — only a receipt for THIS head and finding set answers a retry', () => {
+    const NOW = Date.parse('2026-10-09T12:00:00.000Z');
+    const good = { head: HEAD_A, fingerprint: 'f'.repeat(16), num: null, path: null, queued: true, handle: 'pid:1', at: new Date(NOW - 60_000).toISOString() };
+    const want = { head: HEAD_A, fingerprint: 'f'.repeat(16), nowMs: NOW };
+    it('accepts a matching queued or landed receipt', () => {
+      expect(retainedRoundCardsReceipt(good, want)).toEqual({ num: null, path: null, queued: true, handle: 'pid:1', at: good.at });
+      expect(retainedRoundCardsReceipt({ ...good, queued: false, path: 'backlog/x.md', num: 'x1' }, want))
+        .toMatchObject({ path: 'backlog/x.md', num: 'x1', queued: false });
+    });
+    it.each([
+      ['another head', { ...good, head: HEAD_B }],
+      ['another finding set', { ...good, fingerprint: '0'.repeat(16) }],
+      ['nothing filed (not queued, no path)', { ...good, queued: false }],
+      ['a queued receipt past its TTL', { ...good, at: new Date(NOW - QUEUED_RECEIPT_TTL_MS - 1).toISOString() }],
+      ['a queued receipt with no timestamp', { ...good, at: undefined }],
+      ['a queued receipt dated in the future', { ...good, at: new Date(NOW + 60_000).toISOString() }],
+      ['null', null], ['an array', []], ['a string', 'x'],
+    ])('rejects %s', (_name, receipt) => {
+      expect(retainedRoundCardsReceipt(receipt, want)).toBeNull();
+    });
+    it('a head-less receipt matches only a head-less retry, and a missing fingerprint never matches', () => {
+      expect(retainedRoundCardsReceipt({ ...good, head: null }, { head: null, fingerprint: good.fingerprint, nowMs: NOW })).not.toBeNull();
+      expect(retainedRoundCardsReceipt({ ...good, head: null }, want)).toBeNull();
+      expect(retainedRoundCardsReceipt(good, { head: HEAD_A, fingerprint: '', nowMs: NOW })).toBeNull();
+    });
+    it('findRetainedRoundCardsReceipt skips other PRs, other ops, other id prefixes and unreadable records', () => {
+      const input = { repo: 'o/r', pr: 7, roundCardsFiling: good };
+      const reads = [];
+      const flaky = {
+        list: () => ['review-pr-a', 'review-pr-b', 'review-pr-c', 'review-pr-d', 'file-item-e', 'r-f'],
+        read: (id) => {
+          reads.push(id);
+          if (id === 'review-pr-a') throw new Error('corrupt');
+          return { 'review-pr-b': { op: 'review-pr', input: { ...input, pr: 8 } }, 'review-pr-c': { op: 'other', input },
+            'review-pr-d': { op: 'review-pr', input } }[id];
+        },
+      };
+      expect(findRetainedRoundCardsReceipt({ store: flaky, repo: 'o/r', pr: 7, ...want })).toMatchObject({ handle: 'pid:1' });
+      expect(reads).not.toContain('file-item-e');
+      expect(reads).not.toContain('r-f');
+      expect(findRetainedRoundCardsReceipt({ store: flaky, repo: 'o/r', pr: 7, ...want })).toMatchObject({ handle: 'pid:1' });
+      expect(findRetainedRoundCardsReceipt({ store: flaky, repo: 'o/r', pr: 9, ...want })).toBeNull();
+      expect(findRetainedRoundCardsReceipt({ store: { list: () => { throw new Error('x'); }, read: () => null }, repo: 'o/r', pr: 7, ...want })).toBeNull();
+    });
   });
 });

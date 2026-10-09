@@ -71,7 +71,8 @@ import { appendEntry } from '../conveyor/learnings-drop.mjs';
 import {
   acceptResumeCommand, buildAcceptQueueEntry, buildPreventionFilingInput, buildPreventionQueueEntry, preventionHeadMarker,
   cardCoversGuard, isPreventionOutstandingClear, isPreventionOutstandingParked, isQueuedAcceptStop, reviewLoopAutoConfirm,
-  buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsHeadMarker,
+  buildRoundCardsFilingInput, isRoundCardsParked, roundCardsAcceptReason, roundCardsDecision, roundCardsFindingsFingerprint,
+  roundCardsFindingsMarker, roundCardsHeadMarker,
 } from '../lib/review-loop-policy.mjs';
 import { hasUncapturedPrevention } from '../lib/jury-core.mjs';
 import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/review-referral-hold.mjs';
@@ -304,12 +305,14 @@ export function parseFiledPayload(lines = []) {
 /**
  * Cards 5471 / 5470 — HAS THIS ROUND'S FOLLOW-UP CARD ALREADY BEEN FILED? A retry after an accept that failed part-way
  * must not file a second card. A candidate is an open backlog card with the same `# <title>` heading (the title names
- * the PR, the rule and the round) and, when the head is pinned, the same reviewed-head marker.
+ * the PR, the rule and the round), when the head is pinned the same reviewed-head marker, and — PR #4714 review — when
+ * a fingerprint is given the same finding-set marker, so a same-head rerun that raises a different or extra finding
+ * never reuses a card that omits it.
  * @param {{title: string}} input - {@link module:review-loop-policy.buildRoundCardsFilingInput}'s output.
- * @param {{root?: string, head?: string|null}} [o]
+ * @param {{root?: string, head?: string|null, fingerprint?: string|null}} [o]
  * @returns {{num: string, path: string}|null}
  */
-export function findFiledRoundCardsCard({ title }, { root = SCAFFOLD_ROOT, head = null } = {}) {
+export function findFiledRoundCardsCard({ title }, { root = SCAFFOLD_ROOT, head = null, fingerprint = null } = {}) {
   let names;
   try { names = readdirSync(join(root, 'backlog')).filter((n) => n.endsWith('.md')); } catch { return null; }
   for (const name of names) {
@@ -317,8 +320,63 @@ export function findFiledRoundCardsCard({ title }, { root = SCAFFOLD_ROOT, head 
     try { text = readFileSync(join(root, 'backlog', name), 'utf8'); } catch { continue; }
     if (/^# .+$/m.exec(text)?.[0] !== `# ${title}`) continue;
     if (head && !text.includes(roundCardsHeadMarker(head))) continue;
+    if (fingerprint && !text.includes(roundCardsFindingsMarker(fingerprint))) continue;
     if (/^status:\s*"?(?:resolved|closed|done|wontfix|superseded)\b/m.test(text)) continue;
     return { num: name.replace(/-.*$/, '').replace(/\.md$/, ''), path: `backlog/${name}` };
+  }
+  return null;
+}
+
+/**
+ * PR #4714 review — THE FILING RECEIPT A RUN KEEPS, so a retry after an accept that failed part-way reuses the filing
+ * instead of enqueueing a second card. The backlog scan above cannot see a card still `queued` for landing, so the
+ * receipt is persisted on the run (`input.roundCardsFiling`) BEFORE the accept is driven. PURE. A receipt answers a
+ * retry only for the SAME reviewed head and finding set; anything else (absent, malformed, stale) is no receipt.
+ * A receipt for a card still QUEUED expires after {@link QUEUED_RECEIPT_TTL_MS}: nothing here can see whether the
+ * landing job died, so past the TTL the landed-card scan alone decides and a dead job's findings are filed again
+ * instead of being accepted with no card ever landing.
+ * @param {unknown} receipt - `run.input.roundCardsFiling`.
+ * @param {{head?: string|null, fingerprint: string, nowMs?: number}} o
+ * @returns {{num: string|null, path: string|null, queued: boolean, handle: string|null}|null}
+ */
+export function retainedRoundCardsReceipt(receipt, { head = null, fingerprint, nowMs = Date.now() } = {}) {
+  if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) return null;
+  if ((receipt.head ?? null) !== (head ?? null) || !fingerprint || receipt.fingerprint !== fingerprint) return null;
+  const text = (v) => (typeof v === 'string' || typeof v === 'number' ? String(v) : null);
+  const out = { num: text(receipt.num), path: text(receipt.path), queued: receipt.queued === true, handle: text(receipt.handle),
+    at: typeof receipt.at === 'string' ? receipt.at : null };
+  if (out.queued && !out.path) {
+    const age = nowMs - Date.parse(receipt.at);
+    if (!Number.isFinite(age) || age < 0 || age > QUEUED_RECEIPT_TTL_MS) return null;
+  }
+  return out.path || out.queued ? out : null;
+}
+
+/** How long a receipt for a still-queued card answers a retry (a landing job needs a lane and a PR to merge). */
+export const QUEUED_RECEIPT_TTL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * PR #4714 review — THE RECEIPT, FOUND ACROSS RUNS. The real retry after an accept that failed part-way is a FRESH run
+ * on the same head (the halted run cannot be resumed: its label swap is not idempotent), so it has a new id and none of
+ * the first run's input. Scan the run store for a prior `review-pr` run on this PR that kept a receipt for this head
+ * and finding set. The current run is in the store too, so one scan covers both. Runs only on the rare round-cards path,
+ * and only after the landed-card scan missed. An unreadable record is skipped, never fatal.
+ * Only records whose id starts `<op>-` are read (the id `newRunId(op)` mints, as `readReviewRunEvidence` assumes), so the
+ * shared runs directory's other operations are never parsed.
+ * @param {{store: {list(): string[], read(id: string): (object|null)}, repo: string, pr: number|string,
+ *   head?: string|null, fingerprint: string, op?: string, nowMs?: number}} o
+ * @returns {ReturnType<typeof retainedRoundCardsReceipt>}
+ */
+export function findRetainedRoundCardsReceipt({ store, repo, pr, head = null, fingerprint, op = 'review-pr', nowMs = Date.now() }) {
+  let ids;
+  try { ids = store.list(); } catch { return null; }
+  for (const id of ids) {
+    if (!id.startsWith(`${op}-`)) continue;
+    let prior;
+    try { prior = store.read(id); } catch { continue; }
+    if (prior?.op !== op || String(prior.input?.repo) !== String(repo) || String(prior.input?.pr) !== String(pr)) continue;
+    const hit = retainedRoundCardsReceipt(prior.input?.roundCardsFiling, { head, fingerprint, nowMs });
+    if (hit) return hit;
   }
   return null;
 }
@@ -597,11 +655,18 @@ export async function runReviewLoopOnce({
     const { pr, repo } = outcome.run.input;
     const head = outcome.run.findings?.read?.netBasis?.rev ?? null;
     const filingInput = buildRoundCardsFilingInput({ repo, pr, head, decision });
+    // The filing identity is title + head + the finding set. A card that landed answers a retry; so does the receipt this
+    // run kept for a card still queued for landing (PR #4714 review) — either way the filing is reused, never repeated.
+    const fingerprint = roundCardsFindingsFingerprint(decision.cards);
     let filedPayload = null;
     let alreadyFiled = null;
     let filingError = null;
     try {
-      alreadyFiled = findFiledRoundCards(filingInput, { head }) ?? null;
+      const landed = findFiledRoundCards(filingInput, { head, fingerprint }) ?? null;
+      alreadyFiled = landed
+        ? { num: landed.num, path: landed.path, queued: false, handle: null }
+        : (retainedRoundCardsReceipt(outcome.run.input?.roundCardsFiling, { head, fingerprint, nowMs: Date.parse(now()) })
+          ?? findRetainedRoundCardsReceipt({ store, repo, pr, head, fingerprint, op: declaration.name, nowMs: Date.parse(now()) }));
       if (!alreadyFiled) {
         const filed = await fileItem(filingInput);
         if (filed?.code !== 0) filingError = `file-item refused: ${(filed?.lines ?? []).join(' / ')}`;
@@ -624,12 +689,17 @@ export async function runReviewLoopOnce({
         stopped: outcome.stopped,
       };
     }
-    const queued = !alreadyFiled && filedPayload?.queued === true;
+    const queued = alreadyFiled ? alreadyFiled.queued : filedPayload?.queued === true;
     const num = alreadyFiled ? alreadyFiled.num : (filedPayload?.verdict?.num ?? null);
     const path = alreadyFiled ? alreadyFiled.path : (filedPayload?.verdict?.rel ?? null);
-    const handle = queued ? (filedPayload?.handle ?? null) : null;
+    const handle = queued ? ((alreadyFiled ? alreadyFiled.handle : filedPayload?.handle) ?? null) : null;
     const where = path ?? (queued ? `queued for landing (${handle ?? 'untracked job'})` : '(no path)');
-    const accepting = { ...outcome.run, input: { ...outcome.run.input, reason: roundCardsAcceptReason({ decision, filed: where }) } };
+    // The receipt is stored on the run BEFORE the accept is driven: if the accept fails part-way, the retry finds it.
+    const receipt = { head, fingerprint, num, path, queued, handle, at: alreadyFiled?.at ?? now() };
+    const accepting = {
+      ...outcome.run,
+      input: { ...outcome.run.input, reason: roundCardsAcceptReason({ decision, filed: where }), roundCardsFiling: receipt },
+    };
     store.write(accepting);
     const acceptedOutcome = await driveRun({
       run: accepting, registry, store, sinks, judge: activeJudge, resume: { step: outcome.run.pending.step, value: 'accept' },
