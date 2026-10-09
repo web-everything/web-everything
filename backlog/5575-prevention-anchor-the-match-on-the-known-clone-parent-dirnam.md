@@ -1,9 +1,10 @@
 ---
+bornAs: x8isjum
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-version-migrate.mjs", "we:backlog/xnvwh5a-card-89-s6-migrate-unmigrate-tool-versioned-plist-template-l.md", "we:scripts/lib/__tests__/daemon-version-migrate.test.mjs"]
+scope: ["we:scripts/lib/daemon-version-migrate.mjs", "we:backlog/5569-card-89-s6-migrate-unmigrate-tool-versioned-plist-template-l.md", "we:scripts/lib/__tests__/daemon-version-migrate.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -14,7 +15,7 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 
 1. `we:scripts/lib/daemon-version-migrate.mjs:330` — Anchor the match on the known clone parent (`dirname(clone)`) when a clone is supplied, and add a plist test where the name also appears in a parent directory.
 2. `we:scripts/lib/daemon-version-migrate.mjs:268` — Extend the failed-smoke test to a second migrate with a passing runSmoke on the same sha and assert 'migrated'.
-3. `we:backlog/xnvwh5a-card-89-s6-migrate-unmigrate-tool-versioned-plist-template-l.md:15` — A check:standards rule that rejects 'TODO:' placeholders in backlog cards that a PR flips to implemented or lands code for.
+3. `we:backlog/5569-card-89-s6-migrate-unmigrate-tool-versioned-plist-template-l.md:15` — A check:standards rule that rejects 'TODO:' placeholders in backlog cards that a PR flips to implemented or lands code for.
 4. `we:scripts/lib/daemon-version-migrate.mjs:148` — Use an atomic lock primitive: `mkdir` the lock directory, or take over by `rename`ing the stale lock to a unique name and re-checking it, then add a two-contender takeover test. A shared advisory-lock helper in scripts/lib that all daemon tools use would cover this class.
 5. `we:scripts/lib/daemon-version-migrate.mjs` — Add a deterministic concurrency regression test using a paused build and a second call in the same process; require refusal and unchanged intent/state.
 6. `we:scripts/lib/daemon-version-migrate.mjs` — Pass the exact clone path into the transformer and gate it with deterministic ancestor-name collision tests asserting complete rewritten paths.
