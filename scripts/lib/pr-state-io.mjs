@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { tailLines, PROJECTS_DIR } from '../../skills-src/inspect-agent-health/agent-health.mjs';
 import { redactCommandLine, REDACTED } from '../operations/command-redact.mjs';
 import { reduceCheckState } from '../operations/pr-status.mjs';
-import { FALLBACK_REQUIRED_STATUS_CHECKS } from './required-status-checks.mjs';
+import { DECLARED_REQUIRED_STATUS_CHECKS, FALLBACK_REQUIRED_STATUS_CHECKS } from './required-status-checks.mjs';
 import { collapseRollupToLatestPerName } from './rollup-collapse.mjs';
 import { readFixDispatchClaim, fixDispatchSessionName } from '../conveyor/fix-claim-store.mjs';
 import { tryReadCompletion, resolveCompletionsDir } from '../operations/completion-store.mjs';
@@ -21,7 +21,7 @@ import { readField } from '../backlog/frontmatter.mjs';
 import { latestAdvisory, trustedAdvisoryComments } from './advisory-labels.mjs';
 import { liveReferralState } from './referral-live-context.mjs';
 import { countGrantedRoundExtensions } from '../conveyor/round-extension-mark.mjs';
-import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+import { CONSTELLATION_REPOS, repoKeyForSlug } from './constellation-repos.mjs';
 import { derivePrState, settingsFromEnv } from './pr-state-core.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const REPO = CONSTELLATION_REPOS.we.slug;
@@ -70,18 +70,29 @@ function agents(exec) {
 function probeAgents(exec) {
   try { return { listing: agents(exec), error: null }; } catch { return { listing: [], error: 'claude agents unavailable' }; }
 }
-/** io may inject run(bin,argv), now(), env, home, root, and agents (a shared listing). */
+/**
+ * Resolve the repo a PR read is about (xhetzpl): any constellation slug or key; WE when none is given. An unknown
+ * value throws rather than silently reading web-everything (the #2830 M3 bug class).
+ */
+function repoOf(value) {
+  if (value == null || value === '') return { key: 'we', slug: REPO };
+  const key = repoKeyForSlug(value);
+  if (!key) throw new Error(`readPrFacts: unknown repo ${JSON.stringify(String(value)).slice(0, 80)}`);
+  return { key, slug: CONSTELLATION_REPOS[key].slug };
+}
+/** io may inject run(bin,argv), now(), env, home, root, agents (a shared listing), and repo (a constellation slug or key; default WE). */
 export function readPrFacts(pr, io = {}) {
+  const { key: repoKey, slug: repo } = repoOf(io.repo);
   const exec = io.run ?? run, env = io.env ?? process.env, home = io.home ?? homedir();
   const root = io.root ?? ROOT;
   const daemon = env.WE_STATE_DAEMON_ROOT || '/Users/nicolasgilbert/workspace/wev-review-daemon';
   const errors = [];
   const probe = (name, fn, fallback) => { try { return fn(); } catch { errors.push(`${name} unavailable`); return fallback; } };
   const gh = args => JSON.parse(exec('gh', args));
-  const p = probe('GitHub PR', () => gh(['pr', 'view', String(pr), '--repo', REPO, '--json',
+  const p = probe('GitHub PR', () => gh(['pr', 'view', String(pr), '--repo', repo, '--json',
     'number,state,isDraft,mergeStateStatus,labels,headRefOid,body,createdAt']), {});
   // GraphQL last:N bounds the SERVER response, unlike fetching an entire thread then slicing it.
-  const [owner, name] = REPO.split('/');
+  const [owner, name] = repo.split('/');
   const query = `query { repository(owner:"${owner}",name:"${name}") { pullRequest(number:${Number(pr)}) {
     comments(last:100) { pageInfo { hasPreviousPage startCursor } nodes { body createdAt author { login } } }
     timelineItems(last:30,itemTypes:[LABELED_EVENT]) { nodes { ... on LabeledEvent { createdAt label { name } } } }
@@ -94,9 +105,9 @@ export function readPrFacts(pr, io = {}) {
   const commit = tail?.commits?.nodes?.[0]?.commit;
   if (commit?.oid && p.headRefOid && commit.oid !== p.headRefOid) errors.push('head changed during probes; rerun');
   const required = probe('required-check policy (using declared fallback)', () => {
-    const value = gh(['api', `repos/${REPO}/branches/main/protection/required_status_checks`]);
+    const value = gh(['api', `repos/${repo}/branches/main/protection/required_status_checks`]);
     return [...new Set([...array(value.contexts), ...array(value.checks).map(c => c.context)])];
-  }, [...FALLBACK_REQUIRED_STATUS_CHECKS]);
+  }, [...(DECLARED_REQUIRED_STATUS_CHECKS[repo] ?? FALLBACK_REQUIRED_STATUS_CHECKS)]); // each repo's own declared policy
   if (!required.length) errors.push('required-check set empty; readiness unknown');
   if (commit?.statusCheckRollup?.contexts?.pageInfo?.hasNextPage) errors.push('check rollup truncated at 100');
   const rollup = collapseRollupToLatestPerName(array(commit?.statusCheckRollup?.contexts?.nodes).map(c => c.context
@@ -125,10 +136,14 @@ export function readPrFacts(pr, io = {}) {
   const headAt = Date.parse(commit?.committedDate || '') || 0;
   const noteAfterHead = trusted.filter(c => (Date.parse(c.createdAt) || 0) >= headAt);
   const advisory = latestAdvisory(trusted);
-  const referrals = probe('referrals', () => liveReferralState({ ...p, comments }, { repo: REPO, pr: Number(pr) }), {});
-  const names = ['fix', 'ci-heal', 'review'].map(kind => fixDispatchSessionName({ repo: 'we', pr: Number(pr), kind }));
-  const matches = a => !/^(?:fix|ci-heal|review)-(?:pa|fui)-/.test(a?.name || '') &&
-    (names.includes(a?.name) || array(a?.children).some(c => new RegExp(`(?:github.com/${REPO}/|^/?)pull/${pr}(?:$|[/?#])`).test(c.href || '')));
+  const referrals = probe('referrals', () => liveReferralState({ ...p, comments }, { repo, pr: Number(pr) }), {});
+  const names = ['fix', 'ci-heal', 'review'].map(kind => fixDispatchSessionName({ repo: repoKey, pr: Number(pr), kind }));
+  // A session for another repo's PR with the same number is never this PR's: WE excludes the tagged names, and a
+  // non-WE repo matches only its own minted names or an absolute link to its own slug (a bare /pull/N is WE's).
+  const matches = repoKey === 'we'
+    ? a => !/^(?:fix|ci-heal|review)-(?:pa|fui)-/.test(a?.name || '') &&
+      (names.includes(a?.name) || array(a?.children).some(c => new RegExp(`(?:github.com/${repo}/|^/?)pull/${pr}(?:$|[/?#])`).test(c.href || '')))
+    : a => names.includes(a?.name) || array(a?.children).some(c => new RegExp(`github.com/${repo}/pull/${pr}(?:$|[/?#])`).test(c.href || ''));
   let listing = io.agents;
   if (!listing) { const probed = probeAgents(exec); listing = probed.listing; if (probed.error) errors.push(probed.error); }
   else if (io.agentsError) errors.push(io.agentsError);
@@ -196,14 +211,18 @@ export function readPrFacts(pr, io = {}) {
   }
   let claim = null;
   for (const kind of ['fix', 'ci-heal']) {
-    const entry = probe(`${kind} claim`, () => (io.readClaim ?? readFixDispatchClaim)({ repo: 'we', pr: Number(pr), kind }), null);
-    if (entry) { claim = { held: true, owner: clean(entry.owner), kind, meta: { headSha: entry.meta?.headSha, sessionId: entry.meta?.sessionId, sessionName: fixDispatchSessionName({ repo: 'we', pr: Number(pr), kind }) } }; break; }
+    const entry = probe(`${kind} claim`, () => (io.readClaim ?? readFixDispatchClaim)({ repo: repoKey, pr: Number(pr), kind }), null);
+    if (entry) { claim = { held: true, owner: clean(entry.owner), kind, meta: { headSha: entry.meta?.headSha, sessionId: entry.meta?.sessionId, sessionName: fixDispatchSessionName({ repo: repoKey, pr: Number(pr), kind }) } }; break; }
   }
   // The claim records the head the owner started from: a head that differs now is a push, even one made mid-session.
   for (const s of sessions) { s.name = clean(s.name); s.state = clean(s.state); } // clean first: claim.owner is already clean
   for (const s of sessions) if (claim?.meta?.headSha && (s.name === claim.owner || (claim.meta.sessionId && s.sessionId === claim.meta.sessionId))) s.headAtStart = claim.meta.headSha;
   const mentions = new RegExp(`(?:^|[^0-9])${pr}(?:$|[^0-9])`);
-  const log = file => soft(() => tailLines(join(daemon, '.conveyor', file), 400, LIMIT).lines, []).filter(l => mentions.test(l));
+  // The daemon logs are shared by every repo: for a non-WE PR a line must also name that repo, or WE's PR with the
+  // same number would leak in. WE keeps its historical number-only match (its log lines rarely name the repo).
+  const repoNames = repoKey === 'we' ? [] : [CONSTELLATION_REPOS[repoKey].slug, ...CONSTELLATION_REPOS[repoKey].dirs];
+  const ownRepo = l => !repoNames.length || repoNames.some(n => l.includes(n));
+  const log = file => soft(() => tailLines(join(daemon, '.conveyor', file), 400, LIMIT).lines, []).filter(l => mentions.test(l) && ownRepo(l));
   const at = line => line.match(/\d{4}-\d\d-\d\dT[0-9:.]+Z/)?.[0] ?? null;
   const refusals = ['fix-dispatch-daemon.log', 'review-daemon.log'].flatMap(log)
     .filter(l => /refus|cap[- ]exhausted|needs.your.decision/i.test(l)).slice(-8).map(l => ({ at: at(l), text: clean(l) }));
@@ -219,7 +238,7 @@ export function readPrFacts(pr, io = {}) {
     referrals: { pending: referrals.pending ?? [], ruled: referrals.operatorRulings ?? [] },
     roundCapNote: noteAfterHead.some(c => /round[- ]cap|cap[- ]exhausted/i.test(c.body)),
     needsDecisionNote: noteAfterHead.some(c => /needs[ -]your[ -]decision/i.test(c.body)),
-    roundExtensions: countGrantedRoundExtensions(comments, { repo: REPO, pr: Number(pr) }),
+    roundExtensions: countGrantedRoundExtensions(comments, { repo, pr: Number(pr) }),
     sessions, claim, refusals, handoffs, drainDeferral: drainDeferral ? clean(drainDeferral) : null, probeErrors: errors };
 }
 /** Resolve a local backlog claim and the bounded PR→card join; each PR uses the same reducer. */

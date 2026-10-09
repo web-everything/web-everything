@@ -90,6 +90,46 @@ describe('readPrFacts probes', () => {
   });
 });
 
+describe('readPrFacts reads the repo it is given (xhetzpl)', () => {
+  /** Record every gh argv so the test can assert the slug each probe carried. */
+  const recording = () => { const calls = []; const inner = runner(); return { calls, run: (bin, args) => { calls.push([bin, ...args]); return inner(bin, args); } }; };
+  it('every gh probe carries the plateau-app slug when repo=plateauapp/plateau-app', () => {
+    const rec = recording();
+    const facts = readPrFacts(PR, { ...io(), run: rec.run, repo: 'plateauapp/plateau-app' });
+    const gh = rec.calls.filter(c => c[0] === 'gh');
+    expect(gh.find(c => c.includes('view'))).toEqual(expect.arrayContaining(['--repo', 'plateauapp/plateau-app']));
+    expect(gh.find(c => c.includes('graphql')).join(' ')).toContain('owner:"plateauapp",name:"plateau-app"');
+    expect(gh.find(c => c.some(a => /protection/.test(a))).join(' ')).toContain('repos/plateauapp/plateau-app/');
+    expect(gh.flat().join(' ')).not.toContain('web-everything/web-everything');
+    expect(facts.probeErrors).toEqual([]);
+  });
+  it('an unreadable protection probe falls back to that repo\'s declared policy, not WE\'s (plateau-app: test + e2e)', () => {
+    const facts = readPrFacts(PR, { ...io({ fail: ['protection'] }), repo: 'plateauapp/plateau-app' });
+    expect(facts.requiredChecks.map(c => c.name)).toEqual(['test', 'e2e']);
+    expect(facts.probeErrors).toContain('required-check policy (using declared fallback) unavailable');
+  });
+  it('accepts the internal key too (frontierui)', () => {
+    const rec = recording();
+    readPrFacts(PR, { ...io(), run: rec.run, repo: 'frontierui' });
+    expect(rec.calls.find(c => c.includes('view'))).toEqual(expect.arrayContaining(['--repo', 'frontier-ui/frontierui']));
+  });
+  it('defaults to web-everything when no repo is given', () => {
+    const rec = recording();
+    readPrFacts(PR, { ...io(), run: rec.run });
+    expect(rec.calls.find(c => c.includes('view'))).toEqual(expect.arrayContaining(['--repo', 'web-everything/web-everything']));
+  });
+  it('an unknown repo fails closed instead of reading web-everything', () => {
+    expect(() => readPrFacts(PR, { ...io(), repo: 'someone/else' })).toThrow(/unknown repo/);
+  });
+  it('a plateau-app fix session is matched by its own name, a WE session with the same number is not', () => {
+    const own = fixDispatchSessionName({ repo: 'plateau-app', pr: PR, kind: 'fix' });
+    const we = fixDispatchSessionName({ repo: 'we', pr: PR, kind: 'fix' });
+    const agents = JSON.stringify([{ name: own, status: 'busy', startedAt: HEAD_AT }, { name: we, status: 'busy', startedAt: HEAD_AT }]);
+    const facts = readPrFacts(PR, { ...io({ agents }), repo: 'plateauapp/plateau-app' });
+    expect(facts.sessions.map(s => s.name)).toEqual([own]);
+  });
+});
+
 describe('readCardFacts probes', () => {
   it('a failed `claude agents` probe is reported as unknown, not as no sessions', () => {
     const card = readCardFacts('card-none', io({ fail: ['agents'] }));
