@@ -109,16 +109,26 @@ export const CI_HEAL_REASON_WHY = Object.freeze({
 
 /**
  * we:scripts/conveyor/ci-heal-mark.mjs#ciHealCommentReason — which repair a CI-heal marker comment recorded: the
- * explicit `reason: <r>` line when present, else the reason whose {@link CI_HEAL_REASON_WHY} sentence the body
- * carries, else `null` (unattributable — callers charge it conservatively). Pure.
+ * explicit `reason: <r>` line in the HEADER block (the lines before the first blank line) when <r> is a key of
+ * {@link CI_HEAL_REASON_WHY}, else — for a completed heal only — the reason whose why-sentence OPENS the body, else
+ * `null` (unattributable — callers charge it conservatively). Nothing past the header of a failed-attempt marker is
+ * read: that part is untrusted executor diagnostics, and a `reason:` line or why-sentence in it must never move an
+ * attempt out of the CodeQL count (review of PR #4591). Pure.
  * @param {unknown} body
  * @returns {string|null}
  */
 export function ciHealCommentReason(body) {
   if (typeof body !== 'string') return null;
-  const explicit = /^reason: ([a-z-]+)$/m.exec(body)?.[1];
-  if (explicit) return explicit;
-  for (const [reason, why] of Object.entries(CI_HEAL_REASON_WHY)) if (body.includes(`${why};`)) return reason;
+  const lines = body.trimStart().split(/\r?\n/);
+  const blank = lines.findIndex((line) => line.trim() === '');
+  const header = blank === -1 ? lines : lines.slice(0, blank);
+  for (const line of header) {
+    const reason = /^reason: ([a-z-]+)$/.exec(line)?.[1];
+    if (reason && Object.hasOwn(CI_HEAL_REASON_WHY, reason)) return reason;
+  }
+  if (header[0] === CI_HEAL_FAILURE_MARKER || blank === -1) return null;
+  const opening = lines.slice(blank).join('\n').trimStart();
+  for (const [reason, why] of Object.entries(CI_HEAL_REASON_WHY)) if (opening.startsWith(`${why};`)) return reason;
   return null;
 }
 

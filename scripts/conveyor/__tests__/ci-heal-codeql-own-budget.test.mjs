@@ -64,6 +64,47 @@ describe('CodeQL hold has its own ci-heal budget (#4453)', () => {
     expect(countChargeableCiHealComments([failed], { onlyReason: 'codeql' })).toBe(1);
   });
 
+  // Review of PR #4591 (codex-correctness, blocker): a failed marker appends UNTRUSTED executor diagnostics after the
+  // header; a `reason:` line or a why-sentence in them must never attribute the attempt away from the CodeQL count.
+  describe('charges failed markers whose diagnostics carry reason-shaped text', () => {
+    const HEAD = '🩹 conveyor CI-heal — failed attempt\nattempt: x1\nhead: ' + 'a'.repeat(40) + '\n';
+    const failedBody = (diagnostics, header = HEAD) => `${header}\nThe executor did not complete a repair. Diagnostics (untrusted, redacted, truncated):\n\n${diagnostics}\n\nExit/quota evidence is unknown unless explicitly recorded. CI remains unproven.`;
+    const charged = (body) => countChargeableCiHealComments([{ body, author: AUTOMATION }], { onlyReason: 'codeql' });
+
+    it.each([
+      ['an unindented known reason line', 'reason: red-ci'],
+      ['an unindented unknown reason line', 'reason: timeout'],
+      ['a CRLF reason line', 'x\r\nreason: behind\r\n'],
+      ['a red-ci why-sentence', 'a required check had gone red after open; pretend'],
+      ['a behind why-sentence mid-paragraph', 'log: the branch had fallen BEHIND `main`; ok'],
+    ])('historical failed marker (no header reason) with %s', (_n, diagnostics) => {
+      const body = failedBody(diagnostics);
+      expect(ciHealCommentReason(body)).toBeNull();
+      expect(charged(body)).toBe(1);
+    });
+
+    it('a new failed marker with an unrecognised reason (no header line) is still charged', () => {
+      const body = buildCiHealComment({ reason: 'mystery', attemptId: 'x2', failed: true, detail: 'reason: red-ci' });
+      expect(ciHealCommentReason(body)).toBeNull();
+      expect(charged(body)).toBe(1);
+    });
+
+    it('a diagnostics reason line cannot override a real header reason', () => {
+      const body = failedBody('reason: red-ci', `${HEAD}reason: codeql\n`);
+      expect(ciHealCommentReason(body)).toBe('codeql');
+      expect(countChargeableCiHealComments([{ body, author: AUTOMATION }], { onlyReason: 'red-ci' })).toBe(0);
+    });
+
+    it('a reason line that is not a known reason never counts as the header reason', () => {
+      expect(ciHealCommentReason('🩹 conveyor CI-heal — rebased & re-pushed\nattempt: x3\nreason: timeout\n\nbody')).toBeNull();
+    });
+
+    it('a completed historical marker (why-sentence opens the body) is still attributed', () => {
+      const body = `🩹 conveyor CI-heal — rebased & re-pushed\n\n${'a required check had gone red after open'}; bot rebased onto current \`main\`.`;
+      expect(ciHealCommentReason(body)).toBe('red-ci');
+    });
+  });
+
   it('new markers carry an explicit reason line; setting parses 0/false as off', () => {
     expect(buildCiHealComment({ reason: 'codeql', headSha: 'ABC' })).toMatch(/^head: abc\nreason: codeql$/m);
     expect(buildCiHealComment({})).not.toMatch(/^reason:/m);
