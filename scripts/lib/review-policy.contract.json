@@ -33,6 +33,12 @@
       "description": "The diff edits the statute layer (platform-decisions.md / any statute doc) — a governance rule a human must ratify (#2412). Same disposition as gate-self: converge an advisory fix, never auto-land. UNCHANGED by the #2771/#2785 narrowing: every statute edit still fires this token and still forces a human."
     },
     {
+      "token": "permission-change",
+      "family": "sensitivity",
+      "clearance": "human",
+      "description": "The diff changes what an automated actor may do: a `permissions:` line or scope grant in .github/workflows/*, a sandbox grant (Codex writable roots, --add-dir, sandbox_mode, ...), or branch-protection-adjacent config (CODEOWNERS, rulesets, the required-checks roster). Operator decision 2026-10-08, after PR #4318 widened a workflow token to contents: write and merged on the automatic accept. Same disposition as gate-self: converge an advisory fix, never auto-land; the drain also refuses a bare review:accepted without a recorded human clearance bound to the live head (decideReviewGate)."
+    },
+    {
       "token": "blast-radius",
       "family": "sensitivity",
       "clearance": "agent",

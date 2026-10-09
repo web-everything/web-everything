@@ -25,8 +25,9 @@ describe('selectScanTests', () => {
     const { scoped, full, scopedFiles } = selectScanTests({ changedFiles: ['scripts/lib/new-thing.mjs'] });
     expect(scoped.map((e) => e.test)).toContain(MULTI);
     expect(scopedFiles).toEqual(['scripts/lib/new-thing.mjs']);
-    // review-policy.conformance cannot be scoped: it runs FULL, but only because a source file changed.
-    expect(full.map((e) => e.scope)).toEqual(['full']);
+    // review-policy.conformance and the permission-change sandbox-list pin cannot be scoped: they run FULL, but only
+    // because a source file changed.
+    expect(full.map((e) => e.scope)).toEqual(['full', 'full']);
   });
 
   it('a docs-only or backlog-only change runs no scanner (cost stays zero)', () => {
