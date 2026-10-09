@@ -56,6 +56,7 @@ const SEP = path.sep;
  *   - `.lanes/we-drain-daemon/lane-1` — the WE drain's own dedicated clone (docs/agent/platform-decisions.md
  *     #resident-daemon-reload-lifecycle) — NOT a pool lane: never leased/refreshed like one, rebuilt the same
  *     way every other daemon clone is.
+ *   - `.lanes/we-drain-daemon/code` — the WE drain's code clone (main + its overlay list).
  */
 export const DAEMON_CLONE_SEED = [
   'wev-review-daemon',
@@ -66,6 +67,9 @@ export const DAEMON_CLONE_SEED = [
   'wev-host-sampler',
   'plateau-drain-daemon',
   `.lanes${SEP}we-drain-daemon${SEP}lane-1`,
+  // The drain's CODE clone (the daemon's `weCodeClone`): it carries the overlay list. Unseeded, every overlay CLI
+  // call dropped its record as "a pool lane" (2026-10-09), so the list never held more than one overlay.
+  `.lanes${SEP}we-drain-daemon${SEP}code`,
 ];
 
 function realpathOrResolve(p) {
