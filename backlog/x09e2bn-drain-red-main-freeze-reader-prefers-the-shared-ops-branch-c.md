@@ -2,7 +2,6 @@
 kind: story
 size: 2
 status: open
-blockedBy: ["xx7ckd6"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/red-main-remediation.mjs"]
 dateOpened: "2026-10-09"
 tags: []
@@ -10,7 +9,7 @@ tags: []
 
 # drain: red-main freeze reader prefers the shared ops branch copy
 
-Follow-up to xyd06qo. The freeze is now published to the shared ops/red-main-freeze branch (mergeDelivery.redMainFreezeBranch) by we:scripts/readiness/red-main-remediation.mjs freeze/unfreeze, and CI's merge-gate reads it; the drain's own reader (isDispatchFrozen/readFreeze in we:scripts/merge-ai-prs.mjs) still reads only the local marker. Make the drain prefer the shared copy (readSharedFreeze in we:scripts/lib/red-main-freeze-shared.mjs), falling back to the local marker, and treat frozen-in-either as frozen (never fail open). Blocked on PR #4624 (card xx7ckd6), which holds both files and moves the local marker to the coordination root.
+Follow-up to xyd06qo. The freeze is now published to the shared ops/red-main-freeze branch (mergeDelivery.redMainFreezeBranch) by we:scripts/readiness/red-main-remediation.mjs freeze/unfreeze, and CI's merge-gate reads it; the drain's own reader (isDispatchFrozen/readFreeze in we:scripts/merge-ai-prs.mjs) still reads only the local marker. Make the drain prefer the shared copy (readSharedFreeze in we:scripts/lib/red-main-freeze-shared.mjs), falling back to the local marker, and treat frozen-in-either as frozen (never fail open). Blocked on PR #4624 (card xx7ckd6), which holds both files and moves the local marker to the coordination root. (No `blockedBy:` edge yet: card xx7ckd6 exists only on #4624's branch, and an edge to a card not on main fails the gate — add `blockedBy: ["xx7ckd6"]` once #4624 lands, or simply start after it.)
 
 ## Acceptance
 
