@@ -97,11 +97,16 @@ export function shapeQueue(buildQueue, clearedNums = null) {
       ? buildQueue.queue
       : [];
   const clearedSet = Array.isArray(clearedNums) ? new Set(clearedNums.map(normNum)) : null;
+  // Build-now (operator ruling 2026-10-09): the row's delivery class rides along ONLY when the build queue ENFORCES
+  // class order (`priorityMode: 'enforce'`). In `shadow` the class is logged, never acted on, so it is not passed.
+  const classEnforced = !Array.isArray(buildQueue) && buildQueue?.priorityMode === 'enforce';
   return rows.map((r) => ({
     num: r?.num != null ? String(r.num) : null,
     rank: r?.rank ?? null,
     // Card 80 — the build-queue tier (`pinned` first), read by the prepare-ahead window. Omitted when absent.
     ...(r?.tier != null ? { tier: r.tier } : {}),
+    // The delivery class (P0-P4), read by the prepare-ahead window so a build-now (P1) card is prepared first.
+    ...(classEnforced && r?.priorityClass != null ? { priorityClass: r.priorityClass } : {}),
     // buildQueued: sidecar membership when a cleared set is injected (#2613), else the committed frontmatter flag.
     buildQueued: clearedSet ? clearedSet.has(normNum(r?.num)) : r?.buildQueued === true,
     // openBlockers: explicit field if present, else the item's `blockedBy`, else [] (a ready row has none).
