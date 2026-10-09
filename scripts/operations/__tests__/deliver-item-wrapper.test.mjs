@@ -3238,9 +3238,13 @@ describe('stageDeliveryReportCliIntoLane (build-path-codex-isolation-locus)', ()
 // ================================================================================================
 describe('deliverItem (#3627 bug 13 — the success-path result string names the real PR field)', () => {
   let lane;
+  let previousRunsDir;
 
   beforeEach(() => {
     lane = mkdtempSync(join(tmpdir(), 'deliver-item-wrapper-deliveritem-'));
+    // This fixture supplies a run identity, so terminal settlement must never read an inherited host store.
+    previousRunsDir = process.env.OPERATION_RUNS_DIR;
+    process.env.OPERATION_RUNS_DIR = join(lane, 'runs');
     findItem.mockReturnValue({ num: '9999', slug: 'bug13-fix', specPath: 'backlog/9999-bug13-fix.md', scope: [] });
     tryReadDeliveryReport.mockReturnValue({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'], reason: 'did it' });
     execFileSync.mockImplementation((cmd, args = []) => {
@@ -3273,6 +3277,8 @@ describe('deliverItem (#3627 bug 13 — the success-path result string names the
   });
 
   afterEach(() => {
+    if (previousRunsDir === undefined) delete process.env.OPERATION_RUNS_DIR;
+    else process.env.OPERATION_RUNS_DIR = previousRunsDir;
     rmSync(lane, { recursive: true, force: true });
     // `mockClear()`, never `mockReset()` — `findItem` was created as `vi.fn(actual.findItem)` (see the file-top
     // mock block) so every OTHER describe block above that relies on real `findItem` behavior keeps working;

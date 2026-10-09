@@ -3,9 +3,10 @@ bornAs: x2gsr9p
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/operations/deliver-item-wrapper.mjs", "we:scripts/operations/__tests__/deliver-item-wrapper*.test.mjs"]
 dateOpened: "2026-09-28"
+dateStarted: "2026-10-09"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "6fc4b52158026e5e959559ecebc89de378665531"
 tags: []
@@ -18,6 +19,19 @@ Filed mechanically on approval: the independent review owed three prevention gua
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2855@a538d451018986910658228b551e5b2825fd4b3c
 
 ## Progress
+
+- Final validation (2026-10-09): 512 targeted tests passed across the final ordering suite (19), existing wrapper suite (253), settlement suite (8), and daemon suite (232). Final logs: `/tmp/4410-ordering-final.log`, `/tmp/4410-wrapper-final.log`; settlement/daemon successes are recorded in `/tmp/4410-tests-green.log` alongside the initial fixture failures subsequently corrected.
+- Successful persisted-prefix evidence for both not-ready and gate-red: after hold, one readable live hold + one claim + one in-flight row; after settlement, one live hold + one claim + the expected settled outcome; after release, one live hold + no claim + the settled outcome. Every copied snapshot produced zero redispatches; settlement snapshots retired one claim. The unheld/unclaimed control dispatched 9002. Saved snapshots were read through disposable working copies and removed after each test.
+- Required follow-up cards linked below: #xbk1pf8 (ordering-comment review checklist) and #xytdhg8 (per-attempt owner-token release). Their mechanisms remain outside this implementation.
+
+- The delivery brief reserves gate commands for the wrapper, so `check:standards` is left for its gate stage. All test invocations used `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run` with checkout-relative paths. No production daemon soak or real process-kill proof is claimed.
+
+- Validation found six existing success-path wrapper fixtures inheriting the host run-store directory; the hermetic guard rejected those reads. Scoped that fixture's run-store override to its existing disposable lane and restored the previous environment afterward. The new ordering suite itself passed all 19 cases; settlement (8) and daemon (232) suites passed. The full wrapper rerun passed after this fixture correction.
+
+- Red evidence (2026-10-09): the initial 12-case ordering suite against settlement-first code failed (11 failed, 1 passed). For both not-ready and gate-red, the after-settle snapshot contained a settled row, one claim, and no hold; the real live tick retired that claim and dispatched item 9001 once. Later snapshots dispatched zero. The order spy observed settle → hold → release; the eligible unheld control dispatched 9002. Log: `/tmp/4410-ordering-red.log` (local, disposable evidence).
+- Moved the existing hold block before settlement, retaining release last, the once-only latch, outcome merging, and best-effort handling. The comment limits exclusion to successful persistence within the hold lease.
+
+- Implementation sanity read (2026-10-09): settlement-first code remains present. Added a dedicated real-store snapshot/tick harness before changing production order. Edge cases cover both non-PR outcomes, missing/partial run identity, PR success, individual throws/refusals, and a later telemetry failure.
 
 - Premise rechecked against WE `6fc4b52158026e5e959559ecebc89de378665531` by source inspection. The goal is not already delivered: settlement still precedes hold persistence and claim release (we:scripts/operations/deliver-item-wrapper.mjs:351-370). This is not a runtime verification.
 - **Old premise → corrected premise:** the previous preparation cited daemon retirement at lines 524–553, hold exclusion at 563, and readers at 1054/1098. Current retirement is at we:skills-src/conveyor/build-dispatch-daemon.mjs:526-555, hold exclusion at we:skills-src/conveyor/build-dispatch-daemon.mjs:565, and readers at we:skills-src/conveyor/build-dispatch-daemon.mjs:1058 and we:skills-src/conveyor/build-dispatch-daemon.mjs:1102. The wrapper ordering remains at we:scripts/operations/deliver-item-wrapper.mjs:351-370. PR success still intentionally retains its claim (we:scripts/operations/deliver-item-wrapper.mjs:635; we:scripts/operations/__tests__/deliver-item-wrapper.test.mjs:3873).
@@ -57,6 +71,8 @@ Use a dedicated proposed suite, we:scripts/operations/__tests__/deliver-item-wra
 4. Confirm both owed follow-up identifiers are linked and represent the specific guards, not merely neighboring ownership/checklist work. No implementation, tests, or new cards are executed as part of this preparation; runner owns preparation validation and stamping.
 
 ## Follow-ups
+
+- Required guard cards filed after deduplication: [xbk1pf8](xbk1pf8-ordering-comments-need-order-spy-review-checklist.md) (ordering-comment review checklist) and [xytdhg8](xytdhg8-build-claim-release-requires-per-attempt-owner-token.md) (per-attempt owner-token release). Searches of order-spy, ordering-comment/checklist, releaseBuildDispatchClaim, and per-attempt owner-token terms found no matching guard card; neighboring lock/ownership work does not cover this dispatch-to-wrapper contract.
 
 - **Required filing — guard 1:** a review-lens checklist item requiring an order-spy test whenever a comment justifies an ordering/atomicity choice. Link the resulting card here and include the terminal ordering comment and new test as its motivating example (we:scripts/operations/deliver-item-wrapper.mjs:359). Deduplicate before filing; implementing the checklist change belongs to that follow-up.
 - **Required filing — guard 2:** require a per-attempt owner token by default for `releaseBuildDispatchClaim`, with resource-only release an explicit opt-out. The current unchecked deletion and threading gap are documented at we:scripts/conveyor/build-dispatch-claim.mjs:73-89. The follow-up must trace acquisition through daemon dispatch, CLI boundary and wrapper launch, test stale-attempt release against a newer claim, and consider an owner-less-call lint/write gate. Do not implement or choose its full ownership protocol here.

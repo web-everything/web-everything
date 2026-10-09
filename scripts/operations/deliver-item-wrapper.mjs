@@ -351,20 +351,19 @@ export async function deliverItem(launch, provider = CLAUDE_RESTRICTED_PROVIDER,
   const settleTerminal = (outcome, { result = null, error = null, releaseClaim = false, hold = null } = {}) => {
     if (settledOnce) return;
     settledOnce = true;
+    // Hold BEFORE settlement and release (#4410): the daemon can retire a still-present claim as soon
+    // as it sees a settled non-PR run. Only a successfully persisted, unexpired hold excludes the item
+    // across every subsequent completed write, even if this process stops before releasing its claim.
+    // Failed writes remain best-effort; hold replacement is not atomic and TTL expiry ends this guarantee.
+    // Real-store prefix/tick evidence lives in deliver-item-wrapper-ordering.test.mjs.
+    if (hold) {
+      try { placeBuildDispatchHold({ num: item, reason: hold }); } catch { /* best-effort */ }
+    }
     try {
       settleDispatchEffect({
         runId, key: effectKey, status: error ? 'failed' : 'applied', result: mergeSettleResult(outcome, result), error,
       });
     } catch { /* best-effort — never mask the real outcome */ }
-    // Hold BEFORE release (red-team, round 2): a hold is what actually excludes the item from the daemon's
-    // next-tick candidates (`build-dispatch-daemon.mjs`'s `heldNums` filter) — the claim's own absence is not
-    // itself a re-dispatch guard. Releasing first opened a window (a crash between the two calls, or simply
-    // the two calls straddling a tick) where the claim was gone and nothing yet excluded the item, so a tick
-    // landing in that gap could re-dispatch it. Placing the hold first closes that window: from the moment
-    // this line returns, the item is excluded even if the release below never runs.
-    if (hold) {
-      try { placeBuildDispatchHold({ num: item, reason: hold }); } catch { /* best-effort */ }
-    }
     if (releaseClaim) {
       try { releaseBuildDispatchClaim({ num: item }); } catch { /* best-effort */ }
     }
