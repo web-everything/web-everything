@@ -8,7 +8,17 @@
  * already overruled it; plateau-app #202). A non-clearing verdict, or an accept on the same head, never closes a
  * referral.
  */
+import { createHash } from 'node:crypto';
 import { EVENT_TYPES, verdictClears } from '../verdict-ledger.mjs';
+
+const HASHED_KEY = /^sha256:[0-9a-f]{64}$/;
+/**
+ * The ONE form a finding key takes in a ledger row: `sha256:<hex>` of the full raw key (what `review-pr-io` writes on a
+ * referral row). Hashing is what makes a ruling row and a referral row name the same finding; an already-hashed key is
+ * returned as is, so calling it twice is harmless. Hash the FULL key before the row is built: the row builder caps a
+ * string field at 200 characters, so a raw key stored in a row may be a truncated one whose hash matches nothing.
+ */
+export const ledgerFindingKey = k => (HASHED_KEY.test(String(k ?? '')) ? String(k) : `sha256:${createHash('sha256').update(String(k ?? '')).digest('hex')}`);
 
 const RULING_STATE = new Map([['block', 'blocking'], ['not-real', 'ruled'], ['card', 'ruled']]); // a Map: a raw name like 'toString' or '__proto__' must never resolve through the prototype chain
 const normSha = v => (typeof v === 'string' ? v.trim().toLowerCase() : '');
@@ -37,6 +47,8 @@ export function deriveReferrals(events) {
         keys.set(key, { key, state: 'open', head: e.headSha, ruling: null, resolvedAtHead: null });
       }
     } else if (e.type === EVENT_TYPES.RULING) {
+      // Only a ruling that names the key exactly as the referral does (the hashed form) closes it. A legacy ruling row
+      // that names the RAW key closes nothing; `ledger-backfill-rulings --migrate-raw` appends its hashed equivalent.
       const k = keys.get(e.findingKey);
       // Only the closed set of rulings moves a key; an unknown value (a forged or mis-cased row) changes nothing.
       const state = RULING_STATE.get(e.ruling);
