@@ -2,6 +2,7 @@
 bornAs: xtzqoyq
 kind: story
 size: 3
+priority: high
 parent: "5467"
 status: open
 blockedBy: ["5469"]
