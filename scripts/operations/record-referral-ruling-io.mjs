@@ -183,10 +183,24 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
       // operation stays resumable. A HOLDING ruling (block) is still posted and raises ledger-write-miss.
       const clearing = events.filter((e) => clearsHold(e.ruling));
       if (clearing.length) {
-        // One at a time, stopping at the first miss: a clearing row that reached git live with no comment posted would
-        // clear a hold nobody can see (holding rulings below are the opposite: attempt them all).
+        // One at a time, stopping at the first miss, so no further clearing row is written once the ledger is failing
+        // (holding rulings below are the opposite: attempt them all). The ledger is append-only, so a row recorded
+        // BEFORE the miss is already live and closes its referral with no comment posted. That cannot be rolled back
+        // here, so it is reported by name and a re-run finishes the batch: the plan reads only the PR thread, so it
+        // plans every finding again, re-records the live rows (same ruling, so the latest row says what it said) and
+        // posts the comment.
         let miss = null;
-        for (const e of clearing) { miss = await tryAppend([e]); if (miss) break; }
+        const recorded = [];
+        for (const e of clearing) {
+          miss = await tryAppend([e]);
+          if (miss) break;
+          recorded.push(e.findingKey);
+        }
+        if (miss && recorded.length) {
+          throw new Error(`ledger-write-miss: ${recorded.length} of ${clearing.length} clearing rulings were recorded before the ledger failed (${miss}); `
+            + `${recorded.join(', ')} ${recorded.length === 1 ? 'is' : 'are'} ALREADY LIVE in the ledger and clear${recorded.length === 1 ? 's' : ''} without a comment, and nothing was posted; `
+            + 're-run the same ruling once the ledger is writable to record the rest and post the comment');
+        }
         if (miss) throw new Error(`ledger-write-miss: the ruling was not recorded in the verdict ledger, so it does not clear and nothing was posted (${miss}); retry once the ledger is writable`);
       }
       const already = before.comments.some((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);
