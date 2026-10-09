@@ -4,10 +4,11 @@ kind: task
 priority: high
 parent: "2405"
 relatedTo: ["3007"]
-status: open
+status: resolved
 blockedBy: ["3929"]
-scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/lib/verdict-ledger.mjs"]
+scope: ["we:scripts/review-ledger-check.mjs", "we:scripts/lib/review-ledger-history.mjs"]
 dateOpened: "2026-09-23"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
@@ -17,4 +18,11 @@ From an Opus design review 2026-09-23 of #3007 Phase 2 readiness: we:scripts/rev
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/review-ledger-history.test.mjs we:scripts/__tests__/review-ledger-check.test.mjs` passes (the history module does not exist before this item). The tests pin: a clean day needs a run for EVERY constellation repo that ET day with zero disagreement and zero unreadable PRs for the family; a gap, a missing repo, or a drift resets that family's streak only; `--history` exits 0 only when every family has 7.
+2. **Live** — `node we:scripts/review-ledger-check.mjs` (no `--repo`) checks web-everything, frontierui and plateau-app and appends one run record each; `node we:scripts/review-ledger-check.mjs --history [--json]` prints per-family `streak N/7` from those records (2026-10-09: 4 records, all families streak 0 — drift on WE, plateau-app PR unreadable).
+
+## Delivered
+
+- New we:scripts/lib/review-ledger-history.mjs: reads the `review-ledger-check` run records and answers clean days per label family (ET days, consecutive streak, 7-day window, `ready`).
+- we:scripts/review-ledger-check.mjs: no `--repo` now runs every constellation repo (one run record each; `--json` prints one `{repos:[…]}` document); `--history` runs the query. we:scripts/lib/verdict-ledger.mjs needed no change.
+- Follow-ups: the schedule (generic pass-daemon manifest entry) and the WE-only `readPrFacts` that makes other repos' PRs unreadable are filed as separate cards.
