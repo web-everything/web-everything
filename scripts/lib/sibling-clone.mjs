@@ -20,7 +20,7 @@
  *   clone shares no object store with a checkout someone else may gc. A clone that exists is reused untouched (the
  *   rebuild path fetches what it needs). Never throws; a failed clone removes its partial directory.
  */
-import { execFileSync } from 'node:child_process';
+import { readGit } from './proc-read.mjs';
 import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 
@@ -61,7 +61,7 @@ const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n')
  */
 export function ensureSiblingClone({
   repo, name, cwd = process.cwd(),
-  git = (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 300_000, ...opts }),
+  git = (args, opts = {}) => readGit(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 300_000, ...opts }),
   exists = (p) => existsSync(p),
   readAlternates = (dir) => { try { return readFileSync(join(dir, '.git', 'objects', 'info', 'alternates'), 'utf8'); } catch { return ''; } },
   rm = (p) => rmSync(p, { recursive: true, force: true }),
