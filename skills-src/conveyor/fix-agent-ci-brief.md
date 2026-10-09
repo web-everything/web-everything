@@ -407,6 +407,18 @@ uses ([delivery-agent-brief.md](delivery-agent-brief.md) step 6). Confirm the re
 and introduces no new problem. Address every finding to convergence (fix it, or dismiss it with a one-line reason).
 A trivial, obviously-correct heal (a clean merge with no code change) may skip the subagent.
 
+**The class sweep (card xet6iu0).** When the heal changes code, treat each failing check you repaired as a finding:
+name its defect class and walk the four sibling paths (`family`, `callers`, `branches`, and `recovery` — the error
+and retry paths your heal itself added), each `fixed`, `checked` or `n/a` with a site and a reason. Write it to a
+file as one fenced `class-sweep` JSON block (the format is in
+[fix-agent-brief.md](fix-agent-brief.md) step 3) and record it:
+
+```bash
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<sweep-file> --kind=ci-heal --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}}
+```
+
+In `warn` mode it never blocks. A merge-only heal with no code change skips it.
+
 **Pre-PR review, when a heal is itself risky (same rule `open-pr` applies).** After you commit and BEFORE step 4's `request`
 (or while its verify runs), ask the risk check on your lane:
 
