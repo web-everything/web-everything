@@ -68,24 +68,11 @@ afterAll(() => {
 //      and `WE_TELEMETRY` blocks below so their own "was this already set?" checks see the sandboxed
 //      baseline, never a live daemon's real value.
 //
-// NOT DONE HERE, DELIBERATELY, after trying it and finding it BROKEN rather than just "not cheap" — a
-// throwaway `$HOME` (so `os.homedir()`-derived real-path defaults, `~/.claude/*` chief among them, redirect
-// tree-wide with no per-call-site change). Built it, then caught a live regression proving it does NOT work
-// under this repo's default vitest `threads` pool: `lane-pool-health-watch.test.mjs` started failing because
-// `resolveLanePoolRepoPath`'s `home = homedir()` kept returning the REAL home while the test's own
-// `process.env.HOME` correctly showed the sandboxed one. Root cause, confirmed with a minimal two-file
-// `worker_threads` repro: `os.homedir()`'s native binding does NOT consult a Worker thread's own (virtualized,
-// per-thread) `process.env` — only a `child_process` spawn's inherited env does, which is why the `PATH` trick
-// below still works fine. A real `$HOME` sandbox would need the heavier `forks` pool (real OS processes, where
-// `process.env` mutation IS process-wide) or a per-call-site change — worth knowing before the separate
-// detection-checks follow-up card picks a mechanism; it should not re-reach for this same "cheap" fix.
-//
-// ALSO NOT DONE HERE, same reason: a general guard that FAILS a test for touching the real `~/.claude`/real
-// lane folders. Checked empirically — mutating `node:fs`'s exported functions from this setup file does NOT
-// intercept a test file's own `import { readFileSync, writeFileSync, ... } from 'node:fs'` named-import calls
-// (confirmed with a minimal two-file repro: a patched `fs.writeFileSync` never fired for a sibling module's
-// named-import call to it), which is this codebase's dominant `fs` import style. A real interception guard
-// needs a loader/`vi.mock`-level hook, not a setup-file patch.
+// SUPERSEDED (card xcu4cqf): this block used to explain why a throwaway `$HOME` and an fs guard were "not done
+// here" — `os.homedir()` ignores a `threads` worker's virtualized `process.env`, and patching `node:fs` seemed not to
+// reach named imports. Both are now done, in the hermetic block below, via we:scripts/lib/hermetic-tests-vitest.mjs:
+// `os.homedir` is replaced by a function that reads `process.env.HOME`, and `syncBuiltinESMExports()` makes both
+// that and the fs patch reach `import { homedir } from 'node:os'` / `import { readFileSync } from 'node:fs'`.
 //
 // OPT OUT, per config, for the tier that means to prove REAL host/subprocess behavior on purpose
 // (`vitest.integration.config.ts`'s real-git/real-`gh` files, `vitest.soak.config.ts`'s real daemons) via
@@ -130,7 +117,7 @@ if (hermetic) {
   }
   addedPathPrefix = fakeGhDir;
   process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
-  setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic') });
+  setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home') });
 }
 
 process.env.WE_UNDER_TEST = '1';

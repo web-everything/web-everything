@@ -8,7 +8,7 @@ import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tes
 
 // Card xcu4cqf: the scheduled live suite's files (scripts/hermetic-tests.settings.json → liveSuite.tests) never run
 // in a blocking suite. They run only in vitest.live.config.ts, on a schedule, as a non-blocking health signal.
-const LIVE_SUITE = liveSuiteFiles(loadHermeticSettings(new URL('.', import.meta.url).pathname));
+const LIVE_SUITE = liveSuiteFiles(loadHermeticSettings());
 
 export default defineConfig({
   // Mirror vite.config.mts so .tsx files (the shared mapping fixtures + conformance suites)

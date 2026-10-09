@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   GH_FIXTURE_ENV, HERMETIC_ENV, HermeticAccessError, LIVE_ACCESS_MESSAGE, REAL_REPOS_ENV, TEST_ID_ENV, TEST_NAME_ENV,
   VIOLATIONS_DIR_ENV, VIOLATIONS_FILE, buildGuardContext, classifyFetchUrl, classifyFsPath, classifyGitArgs,
-  fakeGhScript, gitShimScript, gitTargetDir, hermeticMode, installHermeticGuards, isHermetic, liveSuiteFiles,
+  fakeGhScript, fakeHomeEnv, gitShimScript, gitTargetDir, urlToFsPath, hermeticMode, installHermeticGuards, isHermetic, liveSuiteFiles,
   loadHermeticSettings, parseHermeticSettings, parseViolationLog,
 } from '../hermetic-tests.mjs';
 
@@ -90,6 +90,31 @@ describe('git remote-read classification', () => {
     expect(gitTargetDir(['-C', 'sub', 'status'], '/r')).toBe('/r/sub');
     expect(gitTargetDir(['status'], '/r')).toBe('/r');
   });
+  it('a --git-dir / --work-tree throwaway repo is the target, whatever the cwd', () => {
+    expect(gitTargetDir(['--git-dir', '/tmp/a/.git', 'rev-parse', 'origin/main'], '/r')).toBe('/tmp/a/.git');
+    expect(gitTargetDir(['--git-dir=/tmp/b', '-c', 'x=y', 'log', 'origin/main'], '/r')).toBe('/tmp/b');
+    expect(gitTargetDir(['-C', 'sub', '--work-tree', 'w', 'status'], '/r')).toBe('/r/sub/w');
+  });
+});
+
+describe('fake home', () => {
+  const settings = { fakeHome: { toolEnv: { npm_config_cache: '~/.npm', CARGO_HOME: '~/.cargo' } } };
+  it('HOME moves to the fixture; present tool caches stay on the real home unless the caller set them', () => {
+    const env = fakeHomeEnv({ realHome: '/home/op', fakeHome: '/tmp/f/home', settings, env: { CARGO_HOME: '/opt/cargo' }, exists: (p) => p === '/home/op/.npm' });
+    expect(env).toEqual({ HOME: '/tmp/f/home', npm_config_cache: '/home/op/.npm' });
+  });
+  it('os.homedir() in this worker follows the per-file fake HOME, not the real home', async () => {
+    const { homedir } = await import('node:os');
+    expect(homedir()).toBe(process.env.HOME);
+    expect(process.env.HOME).toMatch(/\/home$/);
+  });
+});
+
+describe('module path', () => {
+  it('survives the vite /@fs file-URL form a config module can be handed', () => {
+    expect(urlToFsPath('file:///@fs/Users/x/repo/')).toBe('/Users/x/repo/');
+    expect(urlToFsPath('file:///Users/x/repo/')).toBe('/Users/x/repo/');
+  });
 });
 
 describe('fetch classification', () => {
@@ -126,6 +151,35 @@ describe('shims (real sh processes)', () => {
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('gh auth login');
       expect(existsSync(join(viol, VIOLATIONS_FILE))).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a multi-line gh argument is logged as ONE violation line', () => {
+    const dir = box();
+    try {
+      writeFileSync(join(dir, 'gh'), fakeGhScript()); chmodSync(join(dir, 'gh'), 0o755);
+      const viol = join(dir, 'v');
+      spawnSync(join(dir, 'gh'), ['api', 'graphql', '-f', 'query=query {\n  viewer\t{ login }\n}'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't2' } });
+      const rows = parseViolationLog(readFileSync(join(viol, VIOLATIONS_FILE), 'utf8'));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ testId: 't2', kind: 'gh' });
+      expect(rows[0].target).toContain('viewer');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('git shim: a --git-dir throwaway repo is not the real checkout, even when cwd is', () => {
+    const dir = box();
+    try {
+      const realGit = join(dir, 'real-git');
+      writeFileSync(realGit, '#!/bin/sh\necho PASSED-THROUGH\n'); chmodSync(realGit, 0o755);
+      writeFileSync(join(dir, 'git'), gitShimScript({ realGit })); chmodSync(join(dir, 'git'), 0o755);
+      const repo = join(dir, 'repo'); mkdirSync(repo);
+      const other = join(dir, 'other'); mkdirSync(other);
+      const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: repo, [VIOLATIONS_DIR_ENV]: join(dir, 'v') };
+      const r = spawnSync(join(dir, 'git'), ['--git-dir', other, 'rev-parse', 'origin/main'], { cwd: repo, encoding: 'utf8', env });
+      expect(r.stdout).toContain('PASSED-THROUGH');
+      const r2 = spawnSync(join(dir, 'git'), [`--git-dir=${repo}`, 'rev-parse', 'origin/main'], { cwd: other, encoding: 'utf8', env });
+      expect(r2.status).toBe(128);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

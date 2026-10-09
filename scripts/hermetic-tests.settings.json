@@ -21,6 +21,16 @@
     { "id": "primary-backlog", "path": "~/workspace/webeverything/backlog", "why": "the primary checkout's live backlog (exempt when the primary IS the checkout under test)" },
     { "id": "primary-queue", "path": "~/workspace/webeverything/.conveyor", "why": "the primary checkout's legacy queue" }
   ],
+  "fakeHome": {
+    "$comment": "Hermetic runs give every test file a private, empty HOME (env HOME + os.homedir()), so a default path built from the home (~/.claude/*, ~/workspace/.lanes, ~/workspace/.operations) resolves into a throwaway fixture instead of the operator's live state. Tool caches below stay pointed at the REAL home (only when unset and present) so npx/playwright/cargo do not re-download.",
+    "toolEnv": {
+      "npm_config_cache": "~/.npm",
+      "PLAYWRIGHT_BROWSERS_PATH": "~/Library/Caches/ms-playwright",
+      "CARGO_HOME": "~/.cargo",
+      "RUSTUP_HOME": "~/.rustup",
+      "BUN_INSTALL": "~/.bun"
+    }
+  },
   "ambientRootEnv": ["CONVEYOR_STATE_ROOT", "WE_DAEMON_STATE_DIR", "LANE_POOL_ROOT", "WE_COORDINATION_ROOT", "WE_GH_THROTTLE_LOCK_ROOT"],
   "siblingRepos": ["frontierui", "plateau-app"],
   "primaryCheckout": "~/workspace/webeverything",

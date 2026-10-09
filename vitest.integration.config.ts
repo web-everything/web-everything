@@ -4,7 +4,7 @@ import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tes
 
 // Card xcu4cqf: this tier is BLOCKING (CI's `integration` check), so it is hermetic too and never runs a file of the
 // scheduled live suite (scripts/hermetic-tests.settings.json → liveSuite.tests; run by vitest.live.config.ts).
-const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings(new URL('.', import.meta.url).pathname)));
+const LIVE_SUITE = new Set(liveSuiteFiles(loadHermeticSettings()));
 
 /**
  * The REAL-git / real-subprocess tier `vitest.config.ts` excludes (see that file's `test.exclude` comment

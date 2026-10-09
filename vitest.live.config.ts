@@ -11,7 +11,7 @@ import { liveSuiteFiles, loadHermeticSettings } from './scripts/lib/hermetic-tes
  * `liveSuite.schedule.cron`), and a failure opens/updates a `health-smell` issue instead of turning anything red.
  * Live data drifts on its own; that is a health signal about the outside world, not a defect in the tree.
  */
-const files = liveSuiteFiles(loadHermeticSettings(new URL('.', import.meta.url).pathname));
+const files = liveSuiteFiles(loadHermeticSettings());
 
 export default defineConfig({
   test: {

@@ -106,7 +106,20 @@ export function parseHermeticSettings(raw) {
   return s;
 }
 
-export function loadHermeticSettings(repoRoot) {
+/**
+ * A file URL → filesystem path that also survives vite's SSR transform, which can hand a config module an
+ * `import.meta.url` of the form `file:///@fs/<abs path>` (seen when a test imports `vitest.config.ts`).
+ */
+export function urlToFsPath(url) {
+  let p;
+  try { p = fileURLToPath(url); } catch { p = new URL(url).pathname; }
+  return p.replace(/^\/@fs(?=\/)/, '');
+}
+
+/** This checkout's root, derived from this module's own location (never from a caller's `import.meta.url`). */
+export const DEFAULT_REPO_ROOT = urlToFsPath(new URL('../../', import.meta.url));
+
+export function loadHermeticSettings(repoRoot = DEFAULT_REPO_ROOT) {
   return parseHermeticSettings(readFileSync(join(repoRoot, SETTINGS_PATH), 'utf8'));
 }
 
@@ -180,14 +193,25 @@ export function classifyGitArgs(args) {
   return hit ? { subcommand: sub, hit } : null;
 }
 
-/** The `-C <dir>` a git invocation runs in (last one wins, relative to cwd), else cwd. */
+/**
+ * The repository a git invocation acts on: `--git-dir`/`--work-tree` (a throwaway repo addressed from any cwd) win,
+ * else the `-C <dir>` (last one wins, relative to cwd), else cwd. Only global options before the subcommand count.
+ */
 export function gitTargetDir(args, cwd) {
-  let dir = cwd;
-  for (let i = 0; i < args.length - 1; i += 1) {
-    if (args[i] === '-C') dir = resolve(dir, String(args[i + 1]));
-    else if (!String(args[i]).startsWith('-')) break;
+  let dir = cwd; let explicit = null;
+  for (let i = 0; i < args.length; i += 1) {
+    const a = String(args[i]);
+    if ((a === '-C' || a === '--git-dir' || a === '--work-tree') && i + 1 < args.length) {
+      const next = resolve(dir, String(args[i + 1]));
+      if (a === '-C') dir = next; else explicit = next;
+      i += 1; continue;
+    }
+    const eq = /^--(?:git-dir|work-tree)=(.+)$/.exec(a);
+    if (eq) { explicit = resolve(dir, eq[1]); continue; }
+    if (a === '-c' || a === '--namespace') { i += 1; continue; }
+    if (!a.startsWith('-')) break;
   }
-  return dir;
+  return explicit || dir;
 }
 
 const GITHUB_HOST = /(^|\.)github\.com$|(^|\.)githubusercontent\.com$/i;
@@ -197,6 +221,22 @@ export function classifyFetchUrl(url) {
     const u = new URL(String(url));
     return GITHUB_HOST.test(u.hostname) ? { host: u.hostname } : null;
   } catch { return null; }
+}
+
+/**
+ * The env a hermetic test file runs with instead of the real home (pure). `HOME` → `fakeHome`; each declared tool
+ * cache (`fakeHome.toolEnv` in the settings) is pinned to the REAL home's copy when the caller has not set it and it
+ * exists, so a fake home never makes npx/playwright/cargo fetch from the network.
+ * @param {{realHome:string, fakeHome:string, settings:object, env?:Record<string,string|undefined>, exists?:(p:string)=>boolean}} o
+ */
+export function fakeHomeEnv({ realHome, fakeHome, settings, env = {}, exists = () => true }) {
+  const out = { HOME: fakeHome };
+  for (const [key, p] of Object.entries(settings?.fakeHome?.toolEnv || {})) {
+    if (env[key]) continue;
+    const abs = expandHome(p, realHome);
+    if (exists(abs)) out[key] = abs;
+  }
+  return out;
 }
 
 /** Parse the shims' TSV log into violations. Lines: `<testId>\t<kind>\t<target>`. */
@@ -214,7 +254,8 @@ const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const SH_RECORD = (kind) => `_we_record() {
   if [ -n "\${${VIOLATIONS_DIR_ENV}:-}" ]; then
     mkdir -p "\$${VIOLATIONS_DIR_ENV}" 2>/dev/null
-    printf '%s\\t%s\\t%s\\n' "\${${TEST_ID_ENV}:-unattributed}" ${shQuote(kind)} "\$1" >> "\$${VIOLATIONS_DIR_ENV}/${VIOLATIONS_FILE}" 2>/dev/null
+    _we_t=$(printf '%s' "\$1" | tr '\\n\\t\\r' '   ')
+    printf '%s\\t%s\\t%s\\n' "\${${TEST_ID_ENV}:-unattributed}" ${shQuote(kind)} "\$_we_t" >> "\$${VIOLATIONS_DIR_ENV}/${VIOLATIONS_FILE}" 2>/dev/null
   fi
   echo "${LIVE_ACCESS_MESSAGE} (hermetic mode): ${kind} \$1 — test: \${${TEST_NAME_ENV}:-unknown}. Fix: ${REMEDY}." >&2
 }`;
@@ -249,16 +290,21 @@ export function gitShimScript({ realGit }) {
 _we_real=${shQuote(realGit)}
 if [ "\${${HERMETIC_ENV}:-1}" = "0" ] || [ -z "\${${REAL_REPOS_ENV}:-}" ]; then exec "$_we_real" "$@"; fi
 ${SH_RECORD('git')}
-_we_sub=""; _we_hit=""; _we_dir="."; _we_next=""
+_we_sub=""; _we_hit=""; _we_dir="."; _we_next=""; _we_explicit="\${GIT_DIR:-}"
 for _we_a in "$@"; do
   if [ -n "$_we_next" ]; then
-    [ "$_we_next" = "C" ] && case "$_we_a" in /*) _we_dir="$_we_a";; *) _we_dir="$_we_dir/$_we_a";; esac
+    case "$_we_next" in
+      C) case "$_we_a" in /*) _we_dir="$_we_a";; *) _we_dir="$_we_dir/$_we_a";; esac;;
+      X) case "$_we_a" in /*) _we_explicit="$_we_a";; *) _we_explicit="$_we_dir/$_we_a";; esac;;
+    esac
     _we_next=""; continue
   fi
   if [ -z "$_we_sub" ]; then
     case "$_we_a" in
       -C) _we_next="C"; continue;;
-      -c|--git-dir|--work-tree|--namespace) _we_next="skip"; continue;;
+      --git-dir|--work-tree) _we_next="X"; continue;;
+      --git-dir=*|--work-tree=*) _we_v="\${_we_a#*=}"; case "$_we_v" in /*) _we_explicit="$_we_v";; *) _we_explicit="$_we_dir/$_we_v";; esac; continue;;
+      -c|--namespace) _we_next="skip"; continue;;
       -*) continue;;
       *) _we_sub="$_we_a"; continue;;
     esac
@@ -271,6 +317,7 @@ for _we_a in "$@"; do
 done
 case "$_we_sub" in fetch|pull|push|ls-remote) [ -z "$_we_hit" ] && _we_hit="$_we_sub";; esac
 if [ -n "$_we_hit" ]; then
+  [ -n "$_we_explicit" ] && _we_dir="$_we_explicit"
   _we_abs=$(cd "$_we_dir" 2>/dev/null && pwd -P)
   _we_ifs=$IFS; IFS=:
   for _we_r in $${REAL_REPOS_ENV}; do

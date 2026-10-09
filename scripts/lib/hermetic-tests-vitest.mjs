@@ -10,13 +10,34 @@
 import fs, { existsSync, readFileSync, realpathSync, appendFileSync, mkdirSync, rmSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
-import { homedir } from 'node:os';
+import os from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import {
   HERMETIC_MODE_ENV, LIVE_ACCESS_MESSAGE, LIVE_GITHUB_ENV_KEYS, REAL_REPOS_ENV, REPORT_FILE_ENV, TEST_ID_ENV, TEST_NAME_ENV,
   VIOLATIONS_DIR_ENV, VIOLATIONS_FILE, buildGuardContext, hermeticMessage, hermeticMode, installHermeticGuards,
-  loadHermeticSettings, parseViolationLog,
+  fakeHomeEnv, loadHermeticSettings, parseViolationLog,
 } from './hermetic-tests.mjs';
+
+const HOME_KEY = Symbol.for('we.hermetic.homedir');
+
+/** The REAL home, even after {@link installFakeHomedir} replaced `os.homedir`. */
+export function realHomedir() {
+  return (os[HOME_KEY] || os.homedir)();
+}
+
+/**
+ * Make `os.homedir()` follow `process.env.HOME`. Needed because vitest's default `threads` pool gives each worker a
+ * virtualized `process.env`, and the native `os.homedir()` never reads it — the reason an earlier fake-HOME attempt
+ * (see the note in vitest.setup.ts) silently kept returning the real home. `syncBuiltinESMExports()` makes the
+ * replacement reach `import { homedir } from 'node:os'` named imports too. Installed once per worker.
+ */
+export function installFakeHomedir() {
+  if (os[HOME_KEY]) return;
+  const orig = os.homedir;
+  Object.defineProperty(os, HOME_KEY, { value: orig, enumerable: false });
+  os.homedir = function homedir() { return process.env.HOME || orig.call(os); };
+  syncBuiltinESMExports();
+}
 
 const real = (p) => { try { return realpathSync(p); } catch { return p; } };
 const expandHome = (p, home) => (p && p.startsWith('~/') ? join(home, p.slice(2)) : p);
@@ -29,8 +50,8 @@ const expandHome = (p, home) => (p && p.startsWith('~/') ? join(home, p.slice(2)
  * @param {Record<string,string|undefined>} o.ambient the LAUNCHING env, captured before any sandbox strip
  * @param {string} o.violationsDir per-file dir the shims append to
  */
-export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot, ambient, violationsDir }) {
-  const home = homedir();
+export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot, ambient, violationsDir, fakeHome }) {
+  const home = realHomedir();
   const settings = loadHermeticSettings(repoRoot);
   const repo = real(repoRoot);
   const ctx = buildGuardContext({ home, repoRoot: repo, settings, ambient });
@@ -47,6 +68,14 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
   };
   installHermeticGuards({ fs, fsPromises, syncBuiltinESMExports, state });
 
+  // A private, empty HOME per test file: every home-derived default (~/.claude/*, ~/workspace/.lanes, …) lands in a
+  // throwaway fixture. The guard above still fails anything that reaches the REAL roots by another route.
+  if (fakeHome) {
+    mkdirSync(fakeHome, { recursive: true });
+    Object.assign(process.env, fakeHomeEnv({ realHome: home, fakeHome, settings, env: process.env, exists: existsSync }));
+    installFakeHomedir();
+  }
+
   for (const key of LIVE_GITHUB_ENV_KEYS) delete process.env[key];
   const primary = real(expandHome(settings.primaryCheckout, home) || '');
   process.env[REAL_REPOS_ENV] = [...new Set([repo, primary].filter(Boolean))].join(':');
@@ -55,6 +84,7 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
 
   let seq = 0;
   let current = null;
+  let fileLabel = 'this test file';
   let consumed = 0;
   const readNewLog = () => {
     if (!existsSync(logFile)) return [];
@@ -85,7 +115,9 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
   beforeEach(() => {
     const st = expect.getState();
     seq += 1;
-    const name = `${st.testPath ? relative(repo, real(st.testPath)) : '?'} > ${st.currentTestName ?? '?'}`;
+    const file = st.testPath ? relative(repo, real(st.testPath)) : '?';
+    fileLabel = file;
+    const name = `${file} > ${st.currentTestName ?? '?'}`;
     current = { id: `${process.pid}-${seq}`, name };
     process.env[TEST_ID_ENV] = current.id;
     process.env[TEST_NAME_ENV] = name;
@@ -109,7 +141,7 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
   afterAll(() => {
     const leftovers = [...inProcess.splice(0), ...late.splice(0), ...readNewLog()];
     try { rmSync(violationsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    settle('this test file (outside any single test, or a child that outlived its test)', leftovers);
+    settle(`${fileLabel} > (outside any single test, or a child that outlived its test)`, leftovers);
   });
 
   return state;
