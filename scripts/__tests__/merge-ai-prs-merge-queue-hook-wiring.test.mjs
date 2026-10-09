@@ -52,7 +52,7 @@ if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
 
-function runCli({ hookOn }) {
+function runCli({ hookOn, seedRefreshed = null }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
@@ -73,17 +73,21 @@ function runCli({ hookOn }) {
       mergeQueue: { enabled: hookOn, batchSize: 1 },
       mergeFreshness: { enabled: hookOn, maxAgeMinutes: 30, allowDisjointMainMoves: true },
     }));
+    const coord = join(dir, 'coord');
+    const statePath = join(coord, 'merge-queue-refreshed.json');
+    if (seedRefreshed) { mkdirSync(coord, { recursive: true }); writeFileSync(statePath, JSON.stringify(seedRefreshed)); }
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.MQ_HOME; syncBuiltinESMExports();");
     const r = spawnSync(process.execPath, ['--import', preload, script, '--this-repo', '--label=ready-to-merge',
       '--no-reconcile-labels', '--no-drain-lease', '--no-red-main-freeze', '--json'], {
       cwd: dir, encoding: 'utf8', timeout: 30000,
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
-        WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: join(dir, 'coord') },
+        WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
-    return { result, stderr: r.stderr, attempts: read('.attempts').map(Number), api: read('.api') };
+    const refreshed = existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : null;
+    return { result, stderr: r.stderr, attempts: read('.attempts').map(Number), api: read('.api'), refreshed };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -94,6 +98,20 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(result.merged.map((p) => p.num)).toEqual([3001]);
     expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
     expect(api.some((p) => p.includes('commits/sha-3002/check-runs'))).toBe(true);
+  }, 30000);
+
+  it('a refresh that did not go through is NOT recorded, so the next pass retries it', () => {
+    // The shim git cannot rebuild a branch, so the refresh fails here.
+    const { stderr, refreshed } = runCli({ hookOn: true });
+    expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\) → \S+ failed/);
+    expect(refreshed).toBeNull();
+  }, 30000);
+
+  it('once per head: a head already refreshed waits — no second refresh, no merge', () => {
+    const seed = Object.fromEntries(['fixture/drain-mq#3002', 'cwd#3002'].map((k) => [k, 'sha-3002']));
+    const { stderr, attempts } = runCli({ hookOn: true, seedRefreshed: seed });
+    expect(attempts).toEqual([3001]);
+    expect(stderr).toMatch(/merge-queue: wait \(refresh-already-requested\)/);
   }, 30000);
 
   it('hook OFF (built-in default): both merge exactly as today, no freshness reads', () => {

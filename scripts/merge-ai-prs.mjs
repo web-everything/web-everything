@@ -5500,6 +5500,46 @@ async function runCli() {
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainRedPriority() : null;
+  /**
+   * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
+   * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per head, through
+   * `refreshOntoMain`, or a re-run of its required run when it is already on the main tip), or it waits / refuses;
+   * it has logged the reason and recorded it in `revalidationAborted`. The caller only skips.
+   */
+  const mergeQueueGate = async (cand, headSha) => {
+    if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
+    const mqKey = `${cand.repo || localSlug || 'cwd'}#${cand.num}`;
+    const facts = readMergeFreshnessFacts({
+      repo: cand.repo, num: cand.num, headSha, requiredCheck: REQUIRED,
+      defaultBranch: defaultBranchOf(cand.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+    });
+    const mq = decideMergeQueueAction({ key: mqKey, num: cand.num, facts, nowMs: Date.now(), refreshed: readRefreshed(MERGE_QUEUE_STATE), settings: MERGE_QUEUE });
+    const why = `${mq.reasons.join(', ') || 'fresh'}${facts.errors.length ? `; read errors: ${facts.errors.join('; ')}` : ''}`;
+    if (mq.action === 'merge') {
+      if (!AS_JSON) process.stderr.write(`  ✓ merge-queue: PR ${repoTag(cand.repo)}${cand.num} merge-fresh (pass ${Math.round((Date.now() - (facts.pr.requiredCheck?.completedAtMs ?? Date.now())) / 60000)} min old, main +${facts.main.commitsSinceBase ?? '?'} since base)\n`);
+      return true;
+    }
+    if (mq.action !== 'refresh') {
+      revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: ${mq.action} (${why})` });
+      if (!AS_JSON) process.stderr.write(`  ⏸ merge-queue: ${mq.action} PR ${repoTag(cand.repo)}${cand.num} (${why}) — not merged this pass\n`);
+      return false;
+    }
+    const cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
+    let out;
+    if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
+    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
+    else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null });
+    // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git error,
+    // no clone) is retried next pass rather than parking the head as `wait` forever.
+    if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, headSha);
+    if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(cand, { action: 'rebased' })) {
+      const rs = restampAcceptance({ pr: cand.num, repo: cand.repo, newHead: out.newCommit, cwd: isLocalRepo(cand.repo) ? undefined : cloneDir });
+      if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(cand.repo)}${cand.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
+    }
+    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}` });
+    if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
+    return false;
+  };
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
@@ -5597,6 +5637,14 @@ async function runCli() {
             if (carrier) holdCouple(carrier, 'carrier', `its impl half ${repoTag(c.repo)}${c.num} was held (${pf.reason})`);
             continue;
           }
+          // card xs1hdl7 — the WE carrier lands AFTER its impl half, so its merge-freshness is judged HERE, before the
+          // impl merges: a stale carrier is refreshed and the couple is held together, never split by the gate.
+          if (carrier && fresh?.decision === 'merge' && !(await mergeQueueGate(carrier, fresh.headSha))) {
+            const why = 'its WE carrier is not merge-fresh (merge-queue) — refreshed/held; the couple lands together later';
+            holdCouple(c, 'impl', why);
+            holdCouple(carrier, 'carrier', `not merge-fresh (merge-queue); impl half ${repoTag(c.repo)}${c.num} held with it`);
+            continue;
+          }
         }
         // fix-couple-split — carrier: every impl half ordered ahead of it in this group must have merged.
         let carrierImplsLanded = null;
@@ -5686,40 +5734,10 @@ async function runCli() {
           // the main tip) and skip this pass. It only ADDS a requirement; with `mergeFreshness.enabled` off (the built-in
           // default) no freshness read happens and the merge proceeds exactly as before.
           // Live 2026-10-09: #4547 merged on a 128-min-old pass after #4453 landed; main went red at 07:44 ET.
-          if (mergeQueueHookEnabled(MERGE_QUEUE)) {
-            const mqKey = `${c.repo || localSlug || 'cwd'}#${c.num}`;
-            const facts = readMergeFreshnessFacts({
-              repo: c.repo, num: c.num, headSha: revalidated.headSha, requiredCheck: REQUIRED,
-              defaultBranch: defaultBranchOf(c.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
-            });
-            const refreshedState = readRefreshed(MERGE_QUEUE_STATE);
-            const mq = decideMergeQueueAction({ key: mqKey, num: c.num, facts, nowMs: Date.now(), refreshed: refreshedState, settings: MERGE_QUEUE });
-            const why = `${mq.reasons.join(', ') || 'fresh'}${facts.errors.length ? `; read errors: ${facts.errors.join('; ')}` : ''}`;
-            if (mq.action !== 'merge') {
-              const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // re-judged next pass
-              noteSplit(`merge-queue: ${mq.action} (${why})`);
-              if (mq.action === 'refresh') {
-                const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
-                let out;
-                if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
-                else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${c.repo} clone provisioned` };
-                else out = await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId: facts.pr.requiredCheck?.runId ?? null });
-                // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or
-                // git error, no clone) is retried next pass rather than parking the head as `wait` forever.
-                if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, revalidated.headSha);
-                if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(c, { action: 'rebased' })) {
-                  const rs = restampAcceptance({ pr: c.num, repo: c.repo, newHead: out.newCommit, cwd: isLocalRepo(c.repo) ? undefined : cloneDir });
-                  if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
-                }
-                revalidationAborted.push({ num: c.num, repo: c.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}` });
-                if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(c.repo)}${c.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
-              } else {
-                revalidationAborted.push({ num: c.num, repo: c.repo, reason: `merge-queue: ${mq.action} (${why})` });
-                if (!AS_JSON) process.stderr.write(`  ⏸ merge-queue: ${mq.action} PR ${repoTag(c.repo)}${c.num} (${why}) — not merged this pass\n`);
-              }
-              continue;
-            }
-            if (!AS_JSON) process.stderr.write(`  ✓ merge-queue: PR ${repoTag(c.repo)}${c.num} merge-fresh (pass ${Math.round((Date.now() - (facts.pr.requiredCheck?.completedAtMs ?? Date.now())) / 60000)} min old, main +${facts.main.commitsSinceBase ?? '?'} since base)\n`);
+          if (!(await mergeQueueGate(c, revalidated.headSha))) {
+            const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // re-judged next pass
+            noteSplit('merge-queue: not merge-fresh');
+            continue;
           }
           // xnsk54v follow-up (land-path tamper-evidence) — the park/skip comment paths only fire when the drain
           // does NOT merge, so they record NOTHING in the attack's SUCCESS state: `dismissedFindings` edited DOWN
