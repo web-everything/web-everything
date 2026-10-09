@@ -55,7 +55,7 @@ import { FAILING_CONCLUSIONS, NON_BLOCKING_CONCLUSIONS, reduceCheckState } from 
 import { checksArgv, parseJsonLines, GH_TIMEOUT_MS } from '../operations/pr-status-io.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { readTimeoutBudget } from './timeout-retry-state.mjs';
-import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS } from './infra-cancelled.mjs';
+import { isInfraCancelledOnlyRun, isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, resolveInfraCancelledMode, DEFAULT_INFRA_CANCELLED_MAX_RERUNS, authoritativeCheckRuns } from './infra-cancelled.mjs';
 import { createHash } from 'node:crypto';
 import { posix } from 'node:path';
 import { createRequire } from 'node:module';
@@ -1613,7 +1613,9 @@ export function readTimeoutEvidence(pr, { repo, exec = execFileSyncThrottled, ts
     // evidence) and the derived aggregate `test` job (red only because its shard needed-failed, no vitest summary
     // of its own), so the log reads blew the 15 s evidence deadline / the aggregate read as an "incomplete
     // inventory" and the PR could never be classified eligible for the re-run that does not spend heal budget.
-    const failed = checks.filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion))
+    // PR #4651 (2026-10-09): judge only the run GitHub's branch protection judges (newest check suite per name), so a
+    // cancelled run already superseded by a newer suite is never re-run, and a newest-suite cancel always is.
+    const failed = authoritativeCheckRuns(checks).filter((c) => !['success', 'skipped', 'neutral'].includes(c.conclusion))
       .filter((c) => !isDerivedTimeoutCheck(c, checks));
     const jobs = failed.map((c) => {
       const match = resolveCheckOrigin(c, { repo, api });

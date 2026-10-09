@@ -18,6 +18,7 @@ import {
   isGlobalOffNow, isBranchAllowedNow,
   fetchOpenPrs, fetchPrCommits, countOpenPrsForRepo,
   createAuthorshipCache, countOpenPrsForDispatch, DISPATCH_PR_COUNT_API_CAP, AUTHORSHIP_FAILURE_COOLDOWN_MS,
+  PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope,
 } from '../pr-limit.mjs';
 
 describe('resolvePrLimit', () => {
@@ -148,8 +149,8 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
   const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
   const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
 
-  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
-    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName'])); expect(args).not.toContain('commits'); return '[]'; };
+  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
+    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,files'])); expect(args).not.toContain('commits'); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
   });
 
@@ -181,7 +182,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2 });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, cardOnly: 0, cardOnlyPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -199,6 +200,63 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
   it('countOpenPrsForRepo is unavailable when the list call fails, and unknown for an unrecognized repo key', () => {
     expect(countOpenPrsForRepo('we', { exec: () => { throw new Error('boom'); }, env: {} }).unavailable).toBe(true);
     expect(countOpenPrsForRepo('not-a-repo', { env: {} })).toEqual({ repoKey: 'not-a-repo', slug: null, count: null, prNumbers: [], limit: Infinity, unavailable: true, unresolved: 0 });
+  });
+});
+
+describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
+  const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
+  const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
+  const card = (n) => ({ number: n, labels: [], files: [{ path: `backlog/${n}-card.md` }] });
+  const code = (n) => ({ number: n, labels: [], files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
+  const execFor = (rows, calls = []) => (args) => {
+    calls.push(args);
+    if (args[1] === 'list') return JSON.stringify(rows);
+    if (args[0] === 'api' && args[1] === 'graphql') return commitsPage([aiCommit]);
+    throw new Error(`unexpected call: ${JSON.stringify(args)}`);
+  };
+
+  it('defaults to excluding card-only PRs; the tool layer and env override it, in that order', () => {
+    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true });
+    expect(resolvePrLimitScope({})).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'default' } });
+    expect(resolvePrLimitScope({ tool: { excludeCardOnly: false } })).toMatchObject({ excludeCardOnly: false, source: { excludeCardOnly: 'tool' } });
+    expect(resolvePrLimitScope({ tool: { excludeCardOnly: 'no' } }).excludeCardOnly).toBe(true);
+    expect(resolvePrLimitScope({ tool: { excludeCardOnly: false }, env: { WE_PR_LIMIT_EXCLUDE_CARD_ONLY: 'true' } })).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'env' } });
+  });
+
+  it('the shipped settings file states the ruling (excludeCardOnly: true)', () => {
+    expect(readPrLimitScope({ env: {} })).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'tool' } });
+  });
+
+  it('fetchOpenPrs asks for files (the card-only test needs them)', () => {
+    const exec = (args) => { expect(args[args.indexOf('--json') + 1].split(',')).toContain('files'); return '[]'; };
+    expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
+  });
+
+  it('countOpenPrsForRepo excludes card-only PRs, never spends a commits read on them, and reports the split', () => {
+    const calls = [];
+    const rows = [card(1), card(2), code(3), { ...code(4), labels: [{ name: 'review:accepted' }] }];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows, calls), env: {} });
+    expect(r).toMatchObject({ count: 1, prNumbers: [3], cardOnly: 2, cardOnlyPrNumbers: [1, 2], accepted: 1, acceptedPrNumbers: [4] });
+    expect(calls.filter((a) => a[0] === 'api')).toHaveLength(1);
+  });
+
+  it('a PR with no file list is never card-only (fail-closed: it counts)', () => {
+    const r = countOpenPrsForRepo('we', { exec: execFor([{ number: 5, labels: [] }]), env: {} });
+    expect(r).toMatchObject({ count: 1, cardOnly: 0 });
+  });
+
+  it('the setting OFF counts card-only PRs again', () => {
+    const r = countOpenPrsForRepo('we', { exec: execFor([card(1), code(3)]), env: {}, scope: { excludeCardOnly: false } });
+    expect(r).toMatchObject({ count: 2, cardOnly: 0 });
+  });
+
+  it('the refusal reports "N counted (M card-only excluded, K accepted excluded)"', () => {
+    const d = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 15, cardOnlyExcluded: 6, acceptedExcluded: 2 });
+    expect(d.allowed).toBe(false);
+    expect(d.reason).toContain('15 counted (6 card-only excluded, 2 accepted excluded)');
+    const ok = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 9, cardOnlyExcluded: 6, acceptedExcluded: 0 });
+    expect(ok.allowed).toBe(true);
+    expect(ok.reason).toContain('9 counted (6 card-only excluded, 0 accepted excluded)');
   });
 });
 

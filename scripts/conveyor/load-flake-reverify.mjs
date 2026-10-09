@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runBounded } from '../lib/bounded-child.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
-import { loadFlakeResults, buildLoadFlakeResolvedComment } from './stand-down.mjs';
+import { loadFlakeResults, buildLoadFlakeResolvedComment, buildLoadFlakeRedispatchResolvedComment } from './stand-down.mjs';
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
@@ -57,21 +57,28 @@ function reverifyMode(env) {
 }
 
 export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}) }) {
-  if (config.mode !== 'ci' && (!(cores > 0) || load.length < 2 || load.slice(0, 2).some((n) => !Number.isFinite(n) || n / cores > config.maxLoadPerCore))) {
+  const quiet = cores > 0 && load.length >= 2 && load.slice(0, 2).every((n) => Number.isFinite(n) && n / cores <= config.maxLoadPerCore);
+  let loadDeferred = false;
+  if (config.mode !== 'ci' && !quiet) {
     return { deferred: 'host-load' };
   }
   const candidates = prs.flatMap((pr) => {
     const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
     if (!state.live) return [];
+    if (state.hold.redispatch) {
+      if (!quiet) { loadDeferred = true; return []; }
+      return [{ pr, ...state, attempts: loadFlakeResults(pr.comments).filter((r) => r.redispatch && r.result === 'redispatched').length }];
+    }
     const reds = loadFlakeResults(pr.comments).filter((r) => r.sha === state.hold.alt.sha && r.result === 'red-again');
     if (reds.length && now - Date.parse(reds.at(-1).createdAt) < config.cooloffMs) return [];
     return [{ pr, ...state, attempts: reds.length }];
   }).sort((a, b) => Date.parse(a.hold.createdAt) - Date.parse(b.hold.createdAt));
-  return candidates.length ? { candidate: candidates[0], candidates } : { deferred: 'no-candidate' };
+  return candidates.length ? { candidate: candidates[0], candidates } : { deferred: loadDeferred ? 'host-load' : 'no-candidate' };
 }
 
-/** The one repository the registered pass sweeps (the manifest entry has no --repo flag); see `LOAD_FLAKE_REVERIFY_REPOS`. */
+/** Programmatic default stays WE; the CLI sweeps the constellation when no repo is specified. */
 export const REVERIFY_DEFAULT_REPO = 'we';
+export const REVERIFY_SWEEP_REPOS = Object.keys(CONSTELLATION_REPOS);
 
 export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRun = false, config = reverifyConfig() } = {}, io = defaultReverifyIo(config)) {
   const now = io.now();
@@ -90,7 +97,7 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
     return { ...plan, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
       holds: prs.flatMap((pr) => {
         const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
-        return state.live ? [{ pr: pr.number, alt: state.hold.alt.branch, altSha: state.hold.alt.sha }] : [];
+        return state.live ? [{ pr: pr.number, alt: state.hold.alt.branch, altSha: state.hold.alt.sha, ...(state.hold.redispatch ? { redispatch: true } : {}) }] : [];
       }) };
   }
   if (!plan.candidate || dryRun) return { ...plan, dryRun };
@@ -99,16 +106,27 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   // is ended on the PR instead, so it stops being picked at all.
   let firstError = null;
   let lastDeferral = null;
-  for (const candidate of plan.candidates) {
+  const redispatched = [];
+  const finish = (out) => ({ ...out, ...(rearmed.length ? { rearmed } : {}), ...(redispatched.length ? { redispatched } : {}) });
+  // Cheap redispatches all run first; then the saved-fix path still stops after one progress outcome.
+  for (const candidate of plan.candidates.filter((c) => c.hold.redispatch)) {
+    try {
+      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores }, io) });
+    } catch (e) {
+      redispatched.push({ pr: candidate.pr.number, error: String(e?.message ?? e) });
+    }
+  }
+  for (const candidate of plan.candidates.filter((c) => !c.hold.redispatch)) {
     try {
       const out = await reverifyCandidate({ candidate, key, slug, config }, io);
-      if (!NON_PROGRESS.has(out.deferred)) return rearmed.length ? { ...out, rearmed } : out;
+      if (!NON_PROGRESS.has(out.deferred)) return finish(out);
       lastDeferral = out;
     } catch (e) {
       firstError ??= e;
     }
   }
-  if (lastDeferral) return rearmed.length ? { ...lastDeferral, rearmed } : lastDeferral;
+  if (lastDeferral) return finish(lastDeferral);
+  if (redispatched.length) return finish(firstError ? { error: String(firstError.message ?? firstError) } : {});
   throw firstError;
 }
 
@@ -138,9 +156,11 @@ export async function rearmPushedFixes({ prs = [], slug }, io) {
   return out;
 }
 
-async function reverifyCandidate({ candidate, key, slug, config }, io) {
+async function reverifyCandidate({ candidate, key, slug, config, load, cores }, io) {
   const { pr, hold, attempts } = candidate;
-  const post =(result, detail = '') => io.comment(slug, pr.number, buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
+  const post = (result, detail = '') => io.comment(slug, pr.number, hold.redispatch
+    ? buildLoadFlakeRedispatchResolvedComment({ result, detail })
+    : buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
   const check = async () => {
     const live = await io.readPr(slug, pr.number);
     if (live.state !== 'OPEN' || live.headRefName !== pr.headRefName || live.headRefOid !== pr.headRefOid) {
@@ -155,6 +175,12 @@ async function reverifyCandidate({ candidate, key, slug, config }, io) {
   };
   let refusal = await check();
   if (refusal) return refusal;
+  if (hold.redispatch) {
+    const result = attempts >= config.maxAttempts ? 'exhausted' : 'redispatched';
+    await post(result, result === 'redispatched'
+      ? `host load ${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores ≤ ${config.maxLoadPerCore}/core; the fix loop re-dispatches a fixer against the same review findings (attempt ${attempts + 1} of ${config.maxAttempts})` : '');
+    return { result, pr: pr.number };
+  }
   if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted' }; }
   // Legacy holds have no recorded head: the fresh discovery head is still required as an ancestor.
   try {
@@ -291,6 +317,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
   const config = reverifyConfig(process.env, flags['max-load-per-core']);
-  const result = await runLoadFlakeReverify({ repo: flags.repo ?? REVERIFY_DEFAULT_REPO, dryRun: !!flags['dry-run'], config });
-  process.stdout.write(`${JSON.stringify({ mode: config.mode, ...result })}\n`);
+  const repos = {};
+  for (const repo of flags.repo ? [flags.repo] : REVERIFY_SWEEP_REPOS) {
+    try { repos[repo] = await runLoadFlakeReverify({ repo, dryRun: !!flags['dry-run'], config }); }
+    catch (e) { repos[repo] = { repo, error: String(e?.message ?? e) }; }
+  }
+  process.stdout.write(`${JSON.stringify({ mode: config.mode, repos })}\n`);
 }
