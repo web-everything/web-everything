@@ -1,12 +1,13 @@
 /** @file hermetic-tests.test.mjs — the hermetic-tests decision, shims, guard and declared settings (card xcu4cqf). */
-import { describe, expect, it } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { realHomedir, setupHermeticTestFile } from '../hermetic-tests-vitest.mjs';
 import {
-  GH_FIXTURE_ENV, HERMETIC_ENV, HermeticAccessError, LIVE_ACCESS_MESSAGE, REAL_REPOS_ENV, TEST_ID_ENV, TEST_NAME_ENV,
+  DEBT_ENV, GH_FIXTURE_ENV, HERMETIC_ENV, HERMETIC_MODE_ENV, HermeticAccessError, LIVE_ACCESS_MESSAGE, LIVE_GITHUB_ENV_KEYS, REAL_REPOS_ENV, REPORT_FILE_ENV, TEST_ID_ENV, TEST_NAME_ENV,
   VIOLATIONS_DIR_ENV, VIOLATIONS_FILE, buildGuardContext, classifyFetchUrl, classifyFsPath, classifyGitArgs,
   fakeGhScript, fakeHomeEnv, hermeticDebtFiles, gitShimScript, gitTargetDir, urlToFsPath, hermeticMode, installHermeticGuards, isHermetic, liveSuiteFiles,
   loadHermeticSettings, parseHermeticSettings, parseViolationLog,
@@ -95,10 +96,20 @@ describe('git remote-read classification', () => {
     expect(gitTargetDir(['-C', 'sub', 'status'], '/r')).toBe('/r/sub');
     expect(gitTargetDir(['status'], '/r')).toBe('/r');
   });
-  it('a --git-dir / --work-tree throwaway repo is the target, whatever the cwd', () => {
+  it('a --git-dir throwaway repo is the target, whatever the cwd', () => {
     expect(gitTargetDir(['--git-dir', '/tmp/a/.git', 'rev-parse', 'origin/main'], '/r')).toBe('/tmp/a/.git');
     expect(gitTargetDir(['--git-dir=/tmp/b', '-c', 'x=y', 'log', 'origin/main'], '/r')).toBe('/tmp/b');
-    expect(gitTargetDir(['-C', 'sub', '--work-tree', 'w', 'status'], '/r')).toBe('/r/sub/w');
+    expect(gitTargetDir(['status'], '/r', { GIT_DIR: '/tmp/c' })).toBe('/tmp/c');
+  });
+  it('--work-tree never picks the repository: git still finds it from cwd / -C / --git-dir', () => {
+    expect(gitTargetDir(['-C', 'sub', '--work-tree', 'w', 'status'], '/r')).toBe('/r/sub');
+    expect(gitTargetDir(['--work-tree=/tmp/w', 'fetch', 'origin'], '/r')).toBe('/r');
+    expect(gitTargetDir(['--work-tree', '/tmp/w', '--git-dir', '/tmp/g', 'status'], '/r')).toBe('/tmp/g');
+  });
+  it('a relative --git-dir / GIT_DIR resolves after every -C, in either order (git applies -C first)', () => {
+    expect(gitTargetDir(['--git-dir=.git', '-C', '/real', 'status'], '/elsewhere')).toBe('/real/.git');
+    expect(gitTargetDir(['-C', '/real', '--git-dir', '.git', 'status'], '/elsewhere')).toBe('/real/.git');
+    expect(gitTargetDir(['-C', '/real', 'status'], '/elsewhere', { GIT_DIR: '.git' })).toBe('/real/.git');
   });
 });
 
@@ -188,6 +199,67 @@ describe('shims (real sh processes)', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  // `[label, build(repo, other) → {args, env}, cwd, refused?]` — ONE table drives the shim (real sh) AND the JS mirror
+  // (gitTargetDir): the repository a command acts on is the real checkout exactly when the command is refused.
+  const TARGET_CASES = [
+    ['--work-tree <other> in the real checkout', (repo, other) => ({ args: ['--work-tree', other, 'rev-parse', 'origin/main'] }), 'repo', true],
+    ['--work-tree=<other> in the real checkout', (repo, other) => ({ args: [`--work-tree=${other}`, 'fetch', 'origin'] }), 'repo', true],
+    ['-C <repo> --work-tree <other> from elsewhere', (repo, other) => ({ args: ['-C', repo, '--work-tree', other, 'fetch', 'origin'] }), 'other', true],
+    ['--work-tree=<repo> from elsewhere does not make the repo the target', (repo) => ({ args: [`--work-tree=${repo}`, 'rev-parse', 'origin/main'] }), 'other', false],
+    ['relative --git-dir then -C <repo>', (repo) => ({ args: ['--git-dir=.git', '-C', repo, 'rev-parse', 'origin/main'] }), 'other', true],
+    ['-C <repo> then relative --git-dir', (repo) => ({ args: ['-C', repo, '--git-dir', '.git', 'rev-parse', 'origin/main'] }), 'other', true],
+    ['absolute GIT_DIR=<other> in the real checkout (a throwaway repo)', (repo, other) => ({ args: ['rev-parse', 'origin/main'], env: { GIT_DIR: join(other, '.git') } }), 'repo', false],
+    ['absolute GIT_DIR=<repo> from elsewhere', (repo) => ({ args: ['rev-parse', 'origin/main'], env: { GIT_DIR: join(repo, '.git') } }), 'other', true],
+    ['relative GIT_DIR with -C <other> from the real checkout (a throwaway repo)', (repo, other) => ({ args: ['-C', other, 'rev-parse', 'origin/main'], env: { GIT_DIR: '.git' } }), 'repo', false],
+    ['relative GIT_DIR with -C <repo> from elsewhere', (repo) => ({ args: ['-C', repo, 'rev-parse', 'origin/main'], env: { GIT_DIR: '.git' } }), 'other', true],
+    ['--git-dir=<a gitfile inside the repo> (cannot be cd-ed into: judged by its directory, not failed open)', (repo) => ({ args: ['--git-dir', join(repo, 'link', '.git'), 'rev-parse', 'origin/main'] }), 'other', true],
+  ];
+  const targetBox = () => {
+    const dir = box();
+    const repo = join(dir, 'repo'); mkdirSync(join(repo, '.git'), { recursive: true });
+    mkdirSync(join(repo, 'link')); writeFileSync(join(repo, 'link', '.git'), `gitdir: ${join(repo, '.git')}\n`);
+    const other = join(dir, 'other'); mkdirSync(join(other, '.git'), { recursive: true });
+    return { dir, repo, other };
+  };
+  it.each(TARGET_CASES)('git shim target: %s', (_label, build, where, refused) => {
+    const { dir, repo, other } = targetBox();
+    try {
+      const realGit = join(dir, 'real-git');
+      writeFileSync(realGit, '#!/bin/sh\necho PASSED-THROUGH\n'); chmodSync(realGit, 0o755);
+      writeFileSync(join(dir, 'git'), gitShimScript({ realGit })); chmodSync(join(dir, 'git'), 0o755);
+      const { args, env: extra } = build(repo, other);
+      const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: repo, [VIOLATIONS_DIR_ENV]: join(dir, 'v'), [TEST_ID_ENV]: 't5', ...extra };
+      const r = spawnSync(join(dir, 'git'), args, { cwd: where === 'repo' ? repo : other, encoding: 'utf8', env });
+      if (refused) expect(r.status).toBe(128);
+      else expect(r.stdout).toContain('PASSED-THROUGH');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(TARGET_CASES)('gitTargetDir (the JS mirror) agrees with the shim: %s', (_label, build, where, refused) => {
+    const repo = '/box/repo'; const other = '/box/other';
+    const { args, env } = build(repo, other);
+    const target = gitTargetDir(args, where === 'repo' ? repo : other, env);
+    expect(target === repo || target.startsWith(`${repo}/`)).toBe(refused);
+  });
+
+  it.each([
+    ['DEBT_ENV=1 (a hermeticDebt file)', { [DEBT_ENV]: '1' }],
+    ['local report mode', { [HERMETIC_MODE_ENV]: 'report' }],
+  ])('git shim: %s records the remote read in the real checkout but lets it through', (_label, extra) => {
+    const dir = box();
+    try {
+      const realGit = join(dir, 'real-git');
+      writeFileSync(realGit, '#!/bin/sh\necho PASSED-THROUGH\n'); chmodSync(realGit, 0o755);
+      writeFileSync(join(dir, 'git'), gitShimScript({ realGit })); chmodSync(join(dir, 'git'), 0o755);
+      const repo = join(dir, 'repo'); mkdirSync(repo);
+      const viol = join(dir, 'v');
+      const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: repo, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't7', ...extra };
+      const r = spawnSync(join(dir, 'git'), ['fetch', 'origin'], { cwd: repo, encoding: 'utf8', env });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain('PASSED-THROUGH');
+      expect(parseViolationLog(readFileSync(join(viol, VIOLATIONS_FILE), 'utf8'))[0]).toMatchObject({ testId: 't7', kind: 'git' });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(GIT_CASES)('git shim agrees with classifyGitArgs inside a real checkout: %j', (args, hit) => {
     const dir = box();
     try {
@@ -245,6 +317,138 @@ describe('in-process guard', () => {
     expect(readFileSync.name).toBe('hermeticFs');
     expect(existsSync.name).toBe('existsSync');
     expect(String(existsSync)).toContain('check(');
+  });
+});
+
+// The per-file lifecycle (setupHermeticTestFile): drives the REAL function with captured hook callbacks, a stub fs (so
+// the worker's own guard is never re-pointed) and a throwaway checkout — see hermetic-tests-vitest.mjs#guardFs.
+describe('setupHermeticTestFile lifecycle (beforeEach / afterEach / afterAll)', () => {
+  const ENV_KEYS = [HERMETIC_MODE_ENV, DEBT_ENV, TEST_ID_ENV, TEST_NAME_ENV, REAL_REPOS_ENV, VIOLATIONS_DIR_ENV, 'CI', 'GITHUB_ACTIONS', ...LIVE_GITHUB_ENV_KEYS];
+  let saved; let box;
+  beforeEach(() => {
+    saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+    box = realpathSync(mkdtempSync(join(tmpdir(), 'hermetic-lifecycle-')));
+  });
+  afterEach(() => {
+    for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    rmSync(box, { recursive: true, force: true });
+  });
+
+  /** A throwaway checkout + a live root beside it; returns the driven hooks and the stub fs. */
+  function harness({ ambient = {}, testFile = 'a/some.test.mjs', debt = [] } = {}) {
+    const repo = join(box, 'repo'); const live = join(box, 'live'); const violationsDir = join(box, 'viol');
+    mkdirSync(join(repo, 'scripts'), { recursive: true }); mkdirSync(live, { recursive: true });
+    writeFileSync(join(repo, 'scripts', 'hermetic-tests.settings.json'), JSON.stringify({
+      liveSuite: { schedule: { cron: '0 * * * *', intervalHours: 1 }, tests: [] },
+      hermeticDebt: { files: debt.map((file) => ({ file, reason: 'declared debt for the lifecycle test' })) },
+      guardedRoots: [{ id: 'live-root', path: live }],
+      primaryCheckout: join(box, 'primary'),
+    }));
+    const hooks = { beforeEach: [], afterEach: [], afterAll: [] };
+    const fs = { readFileSync: () => 'bytes', existsSync: () => true };
+    setupHermeticTestFile({
+      beforeEach: (fn) => hooks.beforeEach.push(fn), afterEach: (fn) => hooks.afterEach.push(fn), afterAll: (fn) => hooks.afterAll.push(fn),
+      expect: { getState: () => ({ testPath: join(repo, testFile), currentTestName: 'case one' }) },
+      repoRoot: repo, ambient, violationsDir, guardFs: { fs, fsPromises: {}, fetchHost: null },
+    });
+    const run = (hook) => hooks[hook].forEach((fn) => fn());
+    const logRow = (testId, kind, target) => {
+      mkdirSync(violationsDir, { recursive: true });
+      appendFileSync(join(violationsDir, VIOLATIONS_FILE), `${testId}\t${kind}\t${target}\n`);
+    };
+    return { fs, live, repo, run, logRow, violationsDir };
+  }
+
+  it('a clean test passes, and a failing one does not poison the next', () => {
+    const h = harness();
+    h.run('beforeEach');
+    expect(() => h.run('afterEach')).not.toThrow();
+    h.run('beforeEach');
+    expect(() => h.fs.readFileSync(join(h.live, 'q.json'))).toThrow(HermeticAccessError);
+    expect(() => h.run('afterEach')).toThrow(LIVE_ACCESS_MESSAGE);
+    h.run('beforeEach');
+    expect(() => h.run('afterEach')).not.toThrow();
+    expect(() => h.run('afterAll')).not.toThrow();
+  });
+
+  it('a live read the code under test SWALLOWED still fails the test in afterEach', () => {
+    const h = harness();
+    h.run('beforeEach');
+    let swallowed = 'not-run';
+    try { h.fs.readFileSync(join(h.live, 'state.json')); } catch { swallowed = 'caught'; }
+    expect(swallowed).toBe('caught');
+    expect(() => h.run('afterEach')).toThrow(/fs\.readFileSync .*\(live-root\)/);
+  });
+
+  it('a child shim row for this test fails afterEach; an unattributed row is charged to the running test', () => {
+    const h = harness();
+    h.run('beforeEach');
+    h.logRow(process.env[TEST_ID_ENV], 'gh', 'gh pr list');
+    expect(() => h.run('afterEach')).toThrow(/gh gh pr list/);
+    h.run('beforeEach');
+    h.logRow('unattributed', 'git', 'git fetch origin (in /real)');
+    expect(() => h.run('afterEach')).toThrow(/git git fetch origin/);
+  });
+
+  it('a row from a child that outlived its test fails the FILE in afterAll, not an unrelated test', () => {
+    const h = harness();
+    h.run('beforeEach');
+    h.logRow('999-some-earlier-test', 'git', 'git fetch origin (in /real)');
+    expect(() => h.run('afterEach')).not.toThrow();
+    expect(() => h.run('afterAll')).toThrow(/outside any single test, or a child that outlived its test/);
+    expect(existsSync(h.violationsDir)).toBe(false); // afterAll removes the shim log dir even when it fails the file
+  });
+
+  it('an in-process access made after its test ended also fails in afterAll', () => {
+    const h = harness();
+    h.run('beforeEach'); h.run('afterEach');
+    expect(() => h.fs.readFileSync(join(h.live, 'late.json'))).toThrow(HermeticAccessError);
+    expect(() => h.run('afterAll')).toThrow(LIVE_ACCESS_MESSAGE);
+  });
+
+  it('debt mode (a file listed in hermeticDebt): recorded and printed, never failed, and the access is let through', () => {
+    const h = harness({ testFile: 'a/debt.test.mjs', debt: ['a/debt.test.mjs'] });
+    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      h.run('beforeEach');
+      expect(process.env[DEBT_ENV]).toBe('1');
+      expect(h.fs.readFileSync(join(h.live, 'q.json'))).toBe('bytes');
+      expect(() => h.run('afterEach')).not.toThrow();
+      expect(err.mock.calls.map((c) => String(c[0])).join('')).toMatch(/\[hermetic-debt\].*1 live access/);
+    } finally { err.mockRestore(); }
+  });
+
+  it('report mode (local only): appends JSON lines to the report file and does not fail', () => {
+    delete process.env.CI; delete process.env.GITHUB_ACTIONS;
+    const reportFile = join(box, 'out', 'report.jsonl');
+    const h = harness({ ambient: { [HERMETIC_MODE_ENV]: 'report', [REPORT_FILE_ENV]: reportFile } });
+    h.run('beforeEach');
+    expect(h.fs.readFileSync(join(h.live, 'q.json'))).toBe('bytes');
+    h.logRow(process.env[TEST_ID_ENV], 'gh', 'gh pr list');
+    expect(() => h.run('afterEach')).not.toThrow();
+    const rows = readFileSync(reportFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(rows.map((r) => r.kind)).toEqual(['fs.readFileSync', 'gh']);
+    expect(rows[0].test).toContain('case one');
+  });
+
+  it('CI always enforces, even if the launching env asked for report mode', () => {
+    process.env.CI = 'true';
+    const h = harness({ ambient: { [HERMETIC_MODE_ENV]: 'report' } });
+    h.run('beforeEach');
+    expect(() => h.fs.readFileSync(join(h.live, 'q.json'))).toThrow(HermeticAccessError);
+    expect(() => h.run('afterEach')).toThrow(LIVE_ACCESS_MESSAGE);
+  });
+
+  // Through the REAL vitest hooks (vitest.setup.ts registered the same function on this file): `it.fails` passes only
+  // when the test body OR its afterEach throws, and the bodies below swallow every error themselves, so these prove
+  // the wiring end to end — a swallowed in-process read and a child `gh` call each fail the test that made them.
+  // Skipped in a local `WE_HERMETIC_MODE=report` diagnostic run, where nothing is meant to throw.
+  const enforcing = process.env[HERMETIC_MODE_ENV] !== 'report';
+  it.skipIf(!enforcing).fails('real hooks: a swallowed in-process read of live state fails its own test (afterEach)', () => {
+    try { readFileSync(join(realHomedir(), '.claude', 'jobs', 'x.json'), 'utf8'); } catch { /* swallowed on purpose */ }
+  });
+  it.skipIf(!enforcing).fails('real hooks: a child gh call fails its own test (afterEach), the shim being first on PATH', () => {
+    spawnSync('gh', ['pr', 'list'], { encoding: 'utf8' });
   });
 });
 

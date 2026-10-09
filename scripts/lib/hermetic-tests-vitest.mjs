@@ -49,8 +49,13 @@ const expandHome = (p, home) => (p && p.startsWith('~/') ? join(home, p.slice(2)
  * @param {string} o.repoRoot the checkout under test
  * @param {Record<string,string|undefined>} o.ambient the LAUNCHING env, captured before any sandbox strip
  * @param {string} o.violationsDir per-file dir the shims append to
+ * @param {object} [o.guardFs] the `fs` / `fs/promises` / fetch host the in-process guard patches — the real ones by
+ *   default; a test of this function passes stubs so it never re-patches (or re-points the sink of) the worker's real guard
  */
-export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot, ambient, violationsDir, fakeHome }) {
+export function setupHermeticTestFile({
+  beforeEach, afterEach, afterAll, expect, repoRoot, ambient, violationsDir, fakeHome,
+  guardFs = { fs, fsPromises, fetchHost: globalThis },
+}) {
   const home = realHomedir();
   const settings = loadHermeticSettings(repoRoot);
   const repo = real(repoRoot);
@@ -67,7 +72,7 @@ export function setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect,
     testName: () => process.env[TEST_NAME_ENV],
   };
   // The guard object is shared per worker (installed once); this file's state is copied into it.
-  const guard = installHermeticGuards({ fs, fsPromises, syncBuiltinESMExports, state });
+  const guard = installHermeticGuards({ fs: guardFs.fs, fsPromises: guardFs.fsPromises, fetchHost: guardFs.fetchHost, syncBuiltinESMExports, state });
 
   // A private, empty HOME per test file: every home-derived default (~/.claude/*, ~/workspace/.lanes, …) lands in a
   // throwaway fixture. The guard above still fails anything that reaches the REAL roots by another route.

@@ -215,24 +215,28 @@ export function isLiveRemote(remote) {
 }
 
 /**
- * The repository a git invocation acts on: `--git-dir`/`--work-tree` (a throwaway repo addressed from any cwd) win,
- * else the `-C <dir>` (last one wins, relative to cwd), else cwd. Only global options before the subcommand count.
+ * The repository a git invocation acts on: `--git-dir` (or `GIT_DIR` in `env`; a throwaway repo addressed from any
+ * cwd) wins, else the `-C <dir>` (each relative to the one before, starting at cwd), else cwd. `--work-tree` NEVER
+ * picks the repository — git still discovers it from cwd/`-C` — so it only skips its value. A relative `--git-dir`
+ * resolves against the directory AFTER every `-C` (git applies them first), so it is resolved once, after the loop.
+ * Only global options before the subcommand count.
  */
-export function gitTargetDir(args, cwd) {
-  let dir = cwd; let explicit = null;
+export function gitTargetDir(args, cwd, env = {}) {
+  let dir = cwd; let explicit = env.GIT_DIR || null;
   for (let i = 0; i < args.length; i += 1) {
     const a = String(args[i]);
     if ((a === '-C' || a === '--git-dir' || a === '--work-tree') && i + 1 < args.length) {
-      const next = resolve(dir, String(args[i + 1]));
-      if (a === '-C') dir = next; else explicit = next;
+      const value = String(args[i + 1]);
+      if (a === '-C') dir = resolve(dir, value);
+      else if (a === '--git-dir') explicit = value;
       i += 1; continue;
     }
-    const eq = /^--(?:git-dir|work-tree)=(.+)$/.exec(a);
-    if (eq) { explicit = resolve(dir, eq[1]); continue; }
+    const eq = /^--(git-dir|work-tree)=(.+)$/.exec(a);
+    if (eq) { if (eq[1] === 'git-dir') explicit = eq[2]; continue; }
     if (a === '-c' || a === '--namespace') { i += 1; continue; }
     if (!a.startsWith('-')) break;
   }
-  return explicit || dir;
+  return explicit ? resolve(dir, explicit) : dir;
 }
 
 const GITHUB_HOST = /(^|\.)github\.com$|(^|\.)githubusercontent\.com$/i;
@@ -316,16 +320,17 @@ for _we_a in "$@"; do
   if [ -n "$_we_next" ]; then
     case "$_we_next" in
       C) case "$_we_a" in /*) _we_dir="$_we_a";; *) _we_dir="$_we_dir/$_we_a";; esac;;
-      X) case "$_we_a" in /*) _we_explicit="$_we_a";; *) _we_explicit="$_we_dir/$_we_a";; esac;;
+      X) _we_explicit="$_we_a";;
     esac
     _we_next=""; continue
   fi
   if [ -z "$_we_sub" ]; then
     case "$_we_a" in
       -C) _we_next="C"; continue;;
-      --git-dir|--work-tree) _we_next="X"; continue;;
-      --git-dir=*|--work-tree=*) _we_v="\${_we_a#*=}"; case "$_we_v" in /*) _we_explicit="$_we_v";; *) _we_explicit="$_we_dir/$_we_v";; esac; continue;;
-      -c|--namespace) _we_next="skip"; continue;;
+      --git-dir) _we_next="X"; continue;;
+      --git-dir=*) _we_explicit="\${_we_a#*=}"; continue;;
+      --work-tree|-c|--namespace) _we_next="skip"; continue;;
+      --work-tree=*) continue;;
       -*) continue;;
       *) _we_sub="$_we_a"; continue;;
     esac
@@ -345,7 +350,11 @@ case "$_we_sub" in fetch|pull|push|ls-remote)
   [ -n "$_we_live" ] && [ -z "$_we_hit" ] && _we_hit="$_we_sub";;
 esac
 if [ -n "$_we_hit" ]; then
-  [ -n "$_we_explicit" ] && _we_dir="$_we_explicit"
+  if [ -n "$_we_explicit" ]; then
+    case "$_we_explicit" in /*) _we_dir="$_we_explicit";; *) _we_dir="$_we_dir/$_we_explicit";; esac
+    # A gitfile (\`.git\` FILE, as in a linked worktree) cannot be cd'd into: judge its containing directory instead of failing open.
+    [ -f "$_we_dir" ] && _we_dir=$(dirname "$_we_dir")
+  fi
   _we_abs=$(cd "$_we_dir" 2>/dev/null && pwd -P)
   _we_ifs=$IFS; IFS=:
   for _we_r in $${REAL_REPOS_ENV}; do
