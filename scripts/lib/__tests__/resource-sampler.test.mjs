@@ -93,4 +93,13 @@ describe('resource sampler', () => {
     writeFileSync(paths.snapshot, '{');
     expect(readSnapshot({ root })).toBeNull();
   });
+  it('reads lanes and slots from the given checkout, not from its own (snapshot) location', () => {
+    const seen = [];
+    const sampler = createSampler({ checkoutRoot: '/ws/.lanes/web-everything/lane-1', exec: () => '', cpus: () => [],
+      readHeavySlots: undefined, countLanes: undefined });
+    expect(typeof sampler.sample).toBe('function');
+    const s = createSampler({ exec: () => '', cpus: () => [], countLanes: () => { seen.push('lanes'); return 3; }, readHeavySlots: () => ({ held: 1, cap: 2 }) }).sample();
+    expect(s.laneCount).toBe(3);
+    expect(s.heavySlots).toEqual({ held: 1, cap: 2 });
+  });
 });

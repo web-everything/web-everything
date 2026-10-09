@@ -43,7 +43,7 @@ export async function main(argv = process.argv.slice(2)) {
   const store = createJobStore(dir);
   const log = message => console.log(`${new Date().toISOString()} resource-sampler ${message}`);
   const ensure = () => withFileLock(join(dir, 'ensure-sampler.lock'), () => {
-    const result = ensureSamplerJob({ store, codeSha, input: { intervalMs, root: root ?? resolveCoordinationRoot() } });
+    const result = ensureSamplerJob({ store, codeSha, input: { intervalMs, root: root ?? resolveCoordinationRoot(), checkoutRoot: repoDir.replace(/\/$/, '') } });
     if (result.enqueued) log(`tick action ${JSON.stringify({ action: 'enqueue', id: result.record.id })}`);
     return result;
   });

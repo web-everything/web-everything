@@ -22,7 +22,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   // the dead handle and resumes it on the next tick, rather than declaring an infinite job completed.
   process.once('SIGTERM', () => process.exit(0));
   const result = await runJob({ steps: [{ name: 'sample-loop', run: ({ input }) => runSamplerLoop({
-    sampler: createSampler(), write: snapshot => writeSnapshot(snapshot, { root: input.root }),
+    sampler: createSampler(input.checkoutRoot ? { checkoutRoot: input.checkoutRoot } : {}), write: snapshot => writeSnapshot(snapshot, { root: input.root }),
     intervalMs: input.intervalMs ?? 10000,
   }) }] });
   if (result.outcome !== 'succeeded') console.error(`resource-sampler: ${JSON.stringify(result)}`);

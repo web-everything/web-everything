@@ -77,20 +77,23 @@ export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, load
     heavySlots: heavySlots ?? null,
     agentSessions: agentSessions ?? { claude: null, codex: null, total: null }, laneCount: finite(laneCount), errors };
 }
-function defaultHeavySlots() {
+// `checkoutRoot` is the REAL checkout (the daemon clone), never this module's own location: a job on the job model
+// runs from a pinned code snapshot outside the workspace, where neither the lane pool nor the slot locks live.
+function defaultHeavySlots(checkoutRoot = repoRoot()) {
   // Reuse we:scripts/readiness/heavy-admission.mjs; heavy capacity excludes its separate fast lane.
   const cap = resolveCap();
-  const status = admissionStatus({ lockRoot: admissionLockRoot(repoRoot()), cap });
+  const status = admissionStatus({ lockRoot: admissionLockRoot(checkoutRoot), cap });
   return { held: status.heldCount, cap };
 }
-function defaultCountLanes() {
-  const pool = join(workspaceFor(repoRoot()), '.lanes');
+function defaultCountLanes(checkoutRoot = repoRoot()) {
+  const pool = join(workspaceFor(checkoutRoot), '.lanes');
   return readdirSync(pool, { withFileTypes: true }).filter(d => d.isDirectory()).reduce((sum, d) =>
     sum + readdirSync(join(pool, d.name), { withFileTypes: true }).filter(l => l.isDirectory() && l.name.startsWith('lane-')).length, 0);
 }
 /** Initial delta is unknown; cadence defaults to 10s until two sampling times exist. */
 export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = os.loadavg, freemem = os.freemem,
-  totalmem = os.totalmem, readHeavySlots = defaultHeavySlots, countLanes = defaultCountLanes, now = Date.now } = {}) {
+  totalmem = os.totalmem, checkoutRoot = repoRoot(), readHeavySlots = () => defaultHeavySlots(checkoutRoot),
+  countLanes = () => defaultCountLanes(checkoutRoot), now = Date.now } = {}) {
   let previousCpus = null; let previousDisk = null; let previousTime = null;
   return { sample() {
     const errors = [];

@@ -28,7 +28,7 @@ export function renderResourceStatus({ snapshot: s, sources, freshness, snapshot
   const lines = [freshness === 'missing' ? 'resource snapshot missing (unknown)' :
     `resource snapshot${freshness === 'stale' ? ' stale (unknown)' : ''}  sampled ${easternTime(s.sampledAt, true)} (age ${value(snapshotAge)}s, fresh until ${easternTime(s.freshUntil)})`];
   if (s) {
-    lines.push(`  cpu idle ${value(s.cpu?.idlePct)}% (${value(s.cpu?.cores)} cores) · load avg ${(s.cpu?.loadAvg ?? [null, null, null]).map(value).join('/')} (comparison only)`,
+    lines.push(`  cpu idle ${value(s.cpu?.idlePct)}% (${value(s.cpu?.cores)} cores) · load avg ${(s.cpu?.loadAvg ?? [null, null, null]).map((n) => value(Number.isFinite(n) ? Math.round(n * 10) / 10 : n)).join('/')} (comparison only)`,
       `  memory pressure ${value(s.memory?.pressureLevel)} (${({ 1: 'normal', 2: 'warning', 4: 'critical' })[s.memory?.pressureLevel] ?? 'unknown'}) · disk busy ${value(s.disk?.busyPct)}% (io depth ${value(s.disk?.ioDepth)}, read ${value(s.disk?.readMBps)} MB/s, write ${value(s.disk?.writeMBps)} MB/s)`,
       `  fseventsd cpu ${value(s.fsevents?.fseventsdCpuPct)}% (backlog: ${value(s.fsevents?.backlog)}) · heavy slots ${value(s.heavySlots?.held)}/${value(s.heavySlots?.cap)} · agent sessions ${value(s.agentSessions?.total)} (claude ${value(s.agentSessions?.claude)}, codex ${value(s.agentSessions?.codex)}) · lanes ${value(s.laneCount)}`);
   }
