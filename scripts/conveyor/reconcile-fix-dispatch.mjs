@@ -133,6 +133,8 @@ import {
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
 import { readOverlayConflictWakes } from '../lib/overlay-conflict-wake.mjs';
+// Card xjddimd — delivery priority class, SHADOW only: logged per pass, never changes order or dispatch.
+import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
 
 /** The template `we:skills-src/conveyor/fix-agent-brief.md` — the SAME brief `dispatch-lane.mjs`'s own
  *  tick-core-driven fix dispatch fills, read fresh per dispatch so an edit takes effect with no restart. */
@@ -1354,6 +1356,8 @@ export function runReconcileFixDispatch({
   resolveProfile = repoProfile,
   checkStaleness,
   prsFile, unsupportedPath,
+  // Card xjddimd — the delivery-priority shadow logger; `null` turns it off (tests that do not opt in).
+  priorityShadow = logFixPassPriorityShadow,
   // Card xkyw1x4 — the heavy-test queue baseline (or a function returning it, called once per pass). Each new fix
   // is costed at its expected heavy-slot demand and dispatched only while the projected queue wait stays ≤ the
   // max (30 min default); the rest are refused `queue-cap` and retried next pass. `null` (the default, and what
@@ -1450,6 +1454,9 @@ export function runReconcileFixDispatch({
   );
   const planned = scopeFilter.planned;
   const refusals = [...ciHealRefusals, ...planRefusals, ...scopeFilter.refusals];
+  // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
+  const priorityShadowResult = priorityShadow
+    ? priorityShadow({ planned: plannedAll, ranks: scopeFilter.ranks, dispatchEntries, repoKey }) : null;
 
   // Lanes: THIS repo's own pool (`profile.lanePoolRepo` — `.` for WE, an absolute checkout path for a sibling
   // repo), never the WE pool for a non-WE repo (#x33jgwt).
@@ -1542,7 +1549,7 @@ export function runReconcileFixDispatch({
     }
   }
 
-  return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
+  return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
 /** Card xkyw1x4 — a `queueAdmission` option may be a queue BUDGET already (`createQueueBudget`'s object — the
