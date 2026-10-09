@@ -235,4 +235,29 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     const after = await tick({ ...on.flags, now: iso(t0 + 400_000 + 60 * 60_000) }, { collectGh: spy.fn, ghJobs: jobs });
     expect(after.ghJob).toBeNull();
   }, 30000);
+
+  it('runs an identical diagnosis once per tick and defers the rest past the budget, so the tick is never killed', async () => {
+    // Live 2026-10-09: nine stale-claim episodes opened at once, each ran the same 30 s sweep, the watchdog killed
+    // the tick at 180 s, nothing was saved, and the next tick reopened all nine.
+    const fake = (id, cmdArg) => ({
+      id, probes: ['machineLoad'], severity: 'medium', openAfter: 1, diagnose: { command: 'node', args: ['-e', cmdArg] },
+      evaluate: () => ['a', 'b', 'c'].map((x) => ({ subject: x, breach: true, measure: {}, summary: `${id} ${x}`, recommendation: 'r' })),
+    });
+    const { flags } = setup('diag', { ghProbes: false });
+    const calls = [];
+    const runDiagnosis = (cmd, args) => { calls.push(args.join(' ')); return 'ok'; };
+    const out = await tick({ ...flags, 'no-gh': true, 'no-diagnose': false, now: '2026-10-09T12:00:00Z' },
+      { smells: [fake('fake-one', 'one'), fake('fake-two', 'two')], runDiagnosis });
+    expect(calls.sort()).toEqual(['-e one', '-e two']);
+    expect(out.diagnoses).toHaveLength(6);
+    expect(out.probeErrors.diagnoseDeferred).toBeUndefined();
+
+    const late = setup('diag-late', { ghProbes: false });
+    const lateCalls = [];
+    const past = await tick({ ...late.flags, 'no-gh': true, 'no-diagnose': false, now: '2026-10-09T12:00:00Z' },
+      { smells: [fake('fake-one', 'one')], runDiagnosis: (c, a) => { lateCalls.push(a); return 'ok'; }, clock: () => Date.now() + 10 * 60_000 });
+    expect(lateCalls).toHaveLength(0);
+    expect(past.diagnoses).toHaveLength(0);
+    expect(past.probeErrors.diagnoseDeferred).toMatch(/^3 diagnosis\(es\) skipped past the tick budget/);
+  }, 30000);
 });

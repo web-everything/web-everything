@@ -1275,7 +1275,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const silences = readJson(join(dir, 'silences.json'), []).map((x) => ({ ...x, expiredNotified: notified.has(silenceSig(x)) }));
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
-  const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, SMELLS, now, { config, probeErrors, activeCards });
+  const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, deps.smells || SMELLS, now, { config, probeErrors, activeCards });
   // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
   if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
     probes.processes ? summarizeSample(findUngatedHeavyRuns(probes.processes), new Date(now).toISOString())
@@ -1300,18 +1300,31 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   }
 
   // Deterministic diagnoses (allowed in shadow mode) — hard timeout each.
+  // Live 2026-10-09 (#4131): nine stale-claim episodes opened in one tick, each running the SAME 30 s sweep, and
+  // the watchdog killed the tick at 180 s — so no state was saved, and the next tick reopened all nine. Two
+  // bounds: an identical command runs once per tick (its output is shared), and no new diagnosis starts once the
+  // tick has used 1.5x its budget (the rest are reported as deferred, never as a killed tick).
   const diagnoses = [];
+  const diagnosisRuns = new Map();
+  const diagnoseDeadline = started + (config.tickBudgetMs ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs) * 1.5;
+  const deferredDiagnoses = [];
   for (const p of result.plan.filter((x) => x.kind === 'diagnose')) {
     const ep = state.episodes[p.key];
     if (!ep || flags['no-diagnose']) continue;
     const { command, args = [], timeoutMs = CHILD_TIMEOUT_MS } = p.diagnose;
-    let d;
-    try { d = { command: [command, ...args].join(' '), code: 0, output: run(command, args, { timeoutMs }) }; }
-    catch (e) { d = { command: [command, ...args].join(' '), code: e?.status ?? null, timedOut: e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM', output: `${e?.stdout || ''}${e?.stderr || ''}` || String(e?.message || e) }; }
-    d.output = scrubText(summarizeDiagnosisOutput(d.output)); // scrubbed at capture: every persisted copy is redacted
-    ep.diagnosis = d;
+    const commandLine = [command, ...args].join(' ');
+    let d = diagnosisRuns.get(commandLine);
+    if (!d) {
+      if ((deps.clock || Date.now)() > diagnoseDeadline) { deferredDiagnoses.push(p.key); continue; }
+      try { d = { command: commandLine, code: 0, output: (deps.runDiagnosis || run)(command, args, { timeoutMs }) }; }
+      catch (e) { d = { command: commandLine, code: e?.status ?? null, timedOut: e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM', output: `${e?.stdout || ''}${e?.stderr || ''}` || String(e?.message || e) }; }
+      d.output = scrubText(summarizeDiagnosisOutput(d.output)); // scrubbed at capture: every persisted copy is redacted
+      diagnosisRuns.set(commandLine, d);
+    }
+    ep.diagnosis = { ...d };
     diagnoses.push({ key: p.key, command: d.command, code: d.code });
   }
+  if (deferredDiagnoses.length) probeErrors.diagnoseDeferred = `${deferredDiagnoses.length} diagnosis(es) skipped past the tick budget: ${deferredDiagnoses.slice(0, 5).join(', ')}`;
 
   // #4078 — the diagnose-only investigation agent: stop what is due, dispatch what the budget clears (nothing
   // unless config `investigateDispatch` is on), and put each episode's investigation status + findings on the
