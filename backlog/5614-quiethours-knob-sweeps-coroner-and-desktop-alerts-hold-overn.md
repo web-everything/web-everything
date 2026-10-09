@@ -1,4 +1,5 @@
 ---
+bornAs: xmvc6oc
 kind: story
 size: 5
 status: open
