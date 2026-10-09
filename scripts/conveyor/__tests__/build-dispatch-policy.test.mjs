@@ -431,6 +431,14 @@ describe('card 80 — prepare just in time', () => {
     expect([...prepareAheadNums({ queue, held, window: 2 })]).toEqual(['9', '7']);
   });
 
+  it.each([
+    [[{ num: '5', tier: 'pinned', priorityClass: 'P1' }, { num: '6', priorityClass: 'P1' }], '5'],
+    [[{ num: '9', priorityClass: 'P1' }, { num: '7', tier: 'pinned', priorityClass: 'P1' }], '9'],
+  ])('prepareAheadNums preserves queue order within classified queues: %j', (queue, first) => {
+    const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
+    expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual([first]);
+  });
+
   it('prepareAheadNums treats missing and unknown classes as P3 and orders all classes', () => {
     const queue = [
       { num: '4', priorityClass: 'P4', tier: 'pinned' },

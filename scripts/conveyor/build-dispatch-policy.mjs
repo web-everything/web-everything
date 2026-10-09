@@ -91,7 +91,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
     // this row is DOCUMENTATION PARITY (every operator rule visible here, per this file's own header) — no
     // logic in this planner changes for it.
     { id: 'needs-prepare', text: 'a candidate carrying no truthful preparedDate is never built — held for a prepare pass first', enforcedBy: 'readiness/dispatch-plan.mjs' },
-    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (highest delivery class first, then pinned) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
+    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (highest delivery class first, preserving classified queue order) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
     { id: 'prepare-stale', text: 'a stamp older than preparedMaxAgeDays, or whose scope files changed since preparedAgainstSha, is re-prepared before build', enforcedBy: 'readiness/dispatch-plan.mjs' },
   ]),
 });
@@ -353,7 +353,8 @@ const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps l
 
 /**
  * Card 80 (a) — the items within the next `window` to build: the cleared queue in build order (highest delivery
- * class first, then pinned tier, then queue order; missing or unknown classes count as P3), keeping only items
+ * class first, then queue order; pinned first only when either row has no class, preserving legacy queues;
+ * missing or unknown classes count as P3), keeping only items
  * that are launching now or held for a reason that
  * clears on its own (see {@link BUILD_BOUND_REASONS}). A prepare is spent only on these, so a card is prepared
  * shortly before its build — never days ahead, when its scope may drift. Pure.
@@ -374,9 +375,9 @@ export function prepareAheadNums({ queue = [], launch = [], held = [], window = 
   const rows = (Array.isArray(queue) ? queue : []).filter((r) => r && r.num != null)
     .map((r, i) => {
       const classIndex = ['P0', 'P1', 'P2', 'P3', 'P4'].indexOf(r.priorityClass);
-      return { num: normNum(r.num), priority: classIndex < 0 ? 3 : classIndex, pinned: r.tier === 'pinned', i };
+      return { num: normNum(r.num), priority: classIndex < 0 ? 3 : classIndex, hasClass: !!r.priorityClass, pinned: r.tier === 'pinned', i };
     })
-    .sort((a, b) => (a.priority - b.priority) || (b.pinned - a.pinned) || (a.i - b.i));
+    .sort((a, b) => (a.priority - b.priority) || ((!a.hasClass || !b.hasClass) ? b.pinned - a.pinned : 0) || (a.i - b.i));
   const out = new Set();
   for (const r of rows) {
     if (out.size >= window) break;

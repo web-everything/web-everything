@@ -35,6 +35,64 @@ describe('build queue priority settings cascade', () => {
   });
 });
 
+describe('operator requests (Q2 amendment 2026-10-09)', () => {
+  const pair = () => [
+    item(1, { priority: 'high', queuedAt: queuedAgo(100) }),
+    item(2, { priority: 'now', queuedAt: queuedAgo(0.1) }),
+  ];
+  it('adapts now to the verified operator override', () => {
+    expect(buildQueuePriorityFacts(item(1, { priority: 'now' })).override)
+      .toEqual({ value: 'now', byOperator: true });
+  });
+  it.each([true, false])('orders request versus aged P1 with requestsFirstInClass=%s', (enabled) => {
+    const priority = enabled ? ON : { ...ON, requestsFirstInClass: false };
+    const rows = orderQueueDetailed(pair(), DEFAULT_CONFIG, NOW, { priority });
+    expect(rows.map((r) => r.priorityClass)).toEqual(['P1', 'P1']);
+    expect(rows.map((r) => r.item.num)).toEqual(enabled ? ['2', '1'] : ['1', '2']);
+    expect(rows.find((r) => r.item.num === '2')).toMatchObject({
+      operatorRequest: true, priorityReasons: expect.arrayContaining(['card priority: now (operator request)']),
+    });
+    expect(rows.find((r) => r.item.num === '1').operatorRequest).toBe(false);
+    expect(rows.find((r) => r.item.num === '1').priorityScore)
+      .toBeGreaterThan(rows.find((r) => r.item.num === '2').priorityScore);
+  });
+  it('puts a request before pinned derived P1 and every P2/P3; cards cannot produce P0', () => {
+    const rows = enforce([
+      item(1, { tier: 'pinned' }), item(2, { priority: 'now' }),
+      item(3, { priority: 'high' }), item(4),
+      item(10, { blockedBy: ['1'] }), item(11, { blockedBy: ['1'] }),
+    ]);
+    expect(rows.map((r) => r.item.num)).toEqual(['2', '1', '3', '4']);
+    expect(rows.map((r) => r.priorityClass)).toEqual(['P1', 'P1', 'P2', 'P3']);
+  });
+  it('preserves off/shadow ordering and supports configurable classOrder previews', () => {
+    const rows = (mode) => orderQueueDetailed(pair(), DEFAULT_CONFIG, NOW, { priority: { ...ON, mode } });
+    const off = rows('off');
+    const shadow = rows('shadow');
+    expect(shadow.map((r) => r.item.num)).toEqual(off.map((r) => r.item.num));
+    expect(off.every((r) => r.operatorRequest === false)).toBe(true);
+    expect(classOrder(shadow).map((r) => r.item.num)).toEqual(['2', '1']);
+    expect(classOrder(shadow, { requestsFirstInClass: false }).map((r) => r.item.num)).toEqual(['1', '2']);
+    expect(shadow.map((r) => r.item.num)).toEqual(['1', '2']);
+    const p0 = { ...shadow[0], priorityClass: 'P0' };
+    expect(classOrder([shadow[1], p0])[0]).toBe(p0);
+  });
+  it.each([
+    [{}, true, 'default'],
+    [{ platform: { requestsFirstInClass: false } }, false, 'platform'],
+    [{ platform: { requestsFirstInClass: false }, tool: { requestsFirstInClass: true } }, true, 'tool'],
+    [{ tool: { requestsFirstInClass: true }, env: { WE_BUILD_QUEUE_REQUESTS_FIRST: '0' } }, false, 'env'],
+    [{ tool: { requestsFirstInClass: false }, env: { WE_BUILD_QUEUE_REQUESTS_FIRST: '1' } }, true, 'env'],
+    [{ platform: { requestsFirstInClass: false }, env: { WE_BUILD_QUEUE_REQUESTS_FIRST: 'x' } }, false, 'platform'],
+    [{ platform: { requestsFirstInClass: 'false' }, tool: { requestsFirstInClass: 0 } }, true, 'default'],
+    [{ platform: { requestsFirstInClass: false }, tool: { requestsFirstInClass: null } }, false, 'platform'],
+  ])('resolves the requests-first cascade %j', (input, value, source) => {
+    expect(resolveBuildQueuePrioritySettings(input)).toMatchObject({
+      requestsFirstInClass: value, requestsFirstSource: source,
+    });
+  });
+});
+
 describe('build queue shadow observations', () => {
   it('retains legacy order with real priority metadata and previews enforce order without mutation', () => {
     const items = [
@@ -174,6 +232,7 @@ describe('#4355 build-queue --json reads the cleared set through the queue-store
       const env = { ...process.env, CONVEYOR_STATE_ROOT: stateDir, WE_BUILD_QUEUE_CACHE: '0' };
       delete env.CONVEYOR_QUEUE_FILE;
       delete env.WE_BUILD_QUEUE_PRIORITY_MODE;
+      delete env.WE_BUILD_QUEUE_REQUESTS_FIRST;
       const out = JSON.parse(execFileSync('node', [BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`], { encoding: 'utf8', env }));
       expect(out).toMatchObject({ priorityMode: 'enforce', prioritySource: 'tool' });
       expect(out.cleared).toBe(2);
@@ -211,6 +270,22 @@ describe('#4355 build-queue --json reads the cleared set through the queue-store
           expect(result.stderr).not.toContain('priority-shadow');
         }
       }
+
+      card(dir, '9104-request.md', { ...base, priority: 'now' });
+      writeFileSync(queueFile, JSON.stringify([
+        { num: '9102', addedAt: new Date(Date.now() - 100 * 3600e3).toISOString() },
+        { num: '9104', addedAt: at },
+      ]));
+      const requests = run('enforce').payload.queue.filter((r) => r.buildQueued);
+      expect(requests.map((r) => String(r.num))).toEqual(['9104', '9102']);
+      expect(requests.map((r) => r.priorityClass)).toEqual(['P1', 'P1']);
+      expect(requests[0].priorityReasons).toContain('card priority: now (operator request)');
+      const disabled = JSON.parse(execFileSync('node', [
+        BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`,
+      ], { encoding: 'utf8', env: {
+        ...env, WE_BUILD_QUEUE_PRIORITY_MODE: 'enforce', WE_BUILD_QUEUE_REQUESTS_FIRST: '0',
+      } }));
+      expect(disabled.queue.filter((r) => r.buildQueued).map((r) => String(r.num))).toEqual(['9102', '9104']);
 
     } finally {
       rmSync(root, { recursive: true, force: true });

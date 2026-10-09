@@ -24,9 +24,15 @@ import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_M
 export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) {
   let merged = resolvePrioritySettings(undefined);
   let source = 'default';
+  let requestsFirstInClass = true;
+  let requestsFirstSource = 'default';
   for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
     if (!layer || typeof layer !== 'object' || Array.isArray(layer)) continue;
     merged = { ...merged, ...layer };
+    if (typeof layer.requestsFirstInClass === 'boolean') {
+      requestsFirstInClass = layer.requestsFirstInClass;
+      requestsFirstSource = name;
+    }
     if (Object.hasOwn(layer, 'mode')) source = name;
   }
   if (env && typeof env === 'object' && !Array.isArray(env) &&
@@ -34,7 +40,12 @@ export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) 
     merged.mode = env.WE_BUILD_QUEUE_PRIORITY_MODE;
     source = 'env';
   }
-  return { ...resolvePrioritySettings(merged), source };
+  if (env && typeof env === 'object' && !Array.isArray(env) &&
+      ['0', '1'].includes(env.WE_BUILD_QUEUE_REQUESTS_FIRST)) {
+    requestsFirstInClass = env.WE_BUILD_QUEUE_REQUESTS_FIRST === '1';
+    requestsFirstSource = 'env';
+  }
+  return { ...resolvePrioritySettings(merged), source, requestsFirstInClass, requestsFirstSource };
 }
 
 // ── Tiers (fixed enum; the primary sort key AND the human override) ─────────────────────────────────
@@ -187,11 +198,12 @@ export function effectiveScore(item, config, now, ctx = {}) {
 // re-derived here). This adapter only turns a backlog card into that rule's plain facts:
 //   - `unblocks` (pending dependents)  → `blockedItems` (>= 2 → P1 "unblocks others");
 //   - card `priority: high`             → P2 (the `prioritize` verb is the operator asking for it), not a boost/pin;
+//   - card `priority: now`              → the operator's build-now override (P1);
 //   - card `priority: low`              → the operator's `low` override (P4);
 //   - `queuedAt` (the sidecar's clear stamp) → `waitingSince`: the time it has waited IN the build queue, which
 //     drives the in-class score and the +1-class aging after `agingHours` (never into P0 — the rule's own cap).
 // Any other priority value (medium/normal/absent) adds no fact → the normal class.
-const CARD_PRIORITY_REASON = Object.freeze({ operatorRequested: 'an operator answer waits on it', low: 'operator override low' });
+const CARD_PRIORITY_REASON = Object.freeze({ operatorRequested: 'an operator answer waits on it', low: 'operator override low', now: 'operator override now' });
 
 /** Plain delivery-priority facts for one backlog card. PURE. */
 export function buildQueuePriorityFacts(item, { unblocks = 0 } = {}) {
@@ -199,7 +211,7 @@ export function buildQueuePriorityFacts(item, { unblocks = 0 } = {}) {
   return {
     blockedItems: unblocks,
     ...(p === 'high' ? { operatorRequested: true } : {}),
-    ...(p === 'low' ? { override: { value: 'low', byOperator: true } } : {}),
+    ...(['low', 'now'].includes(p) ? { override: { value: p, byOperator: true } } : {}),
     ...(item?.queuedAt ? { waitingSince: item.queuedAt } : {}),
   };
 }
@@ -208,11 +220,13 @@ export function buildQueuePriorityFacts(item, { unblocks = 0 } = {}) {
 function cardPriority(item, unblocks, settings, now) {
   const r = deliveryPriority(buildQueuePriorityFacts(item, { unblocks }), settings, now);
   const reasons = r.reasons.map((why) => (why === CARD_PRIORITY_REASON.operatorRequested ? 'card priority: high'
-    : why === CARD_PRIORITY_REASON.low ? 'card priority: low' : why));
+    : why === CARD_PRIORITY_REASON.low ? 'card priority: low'
+    : why === CARD_PRIORITY_REASON.now ? 'card priority: now (operator request)' : why));
   // Q2's in-class score is the fix-queue score: unblocks × weight + minutes waited. Mode `off` scores 0 so the
   // order stays exactly today's (tier → WSJF → rank → date → num).
   const score = settings.mode === 'off' ? 0 : unblocks * settings.unblockWeightMinutes + r.minutesWaited;
-  return { priorityClass: r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged };
+  return { priorityClass: r.class, priorityScore: score, priorityReasons: reasons, aged: r.aged,
+    operatorRequest: String(item?.priority ?? '').trim().toLowerCase() === 'now' && r.override === 'now' };
 }
 
 // ── Ordering ─────────────────────────────────────────────────────────────────────────────────────────
@@ -227,7 +241,8 @@ function tierRank(item) {
  * effective WSJF score, aging folded in), `unblocks` (dependents freed), and `rank` (the LexoRank override).
  * Exposed so a display surface (the console queue view #2529) and the builder (#2530) can show/act on WHY an
  * item ranks where it does WITHOUT recomputing the engine's math (one source of truth). {@link orderQueue}
- * is this mapped back to bare items. Enforce sort keys, in order: delivery class (P0 first, #4355) → tier (pinned
+ * is this mapped back to bare items. Enforce sort keys, in order: delivery class (P0 first, #4355) →
+ * operator request first (unless requestsFirstInClass=false; Q2 amendment 2026-10-09) → tier (pinned
  * first, the hand pin WITHIN a class) → fix-queue score (desc: unblocks + minutes waited, Q2) → effectiveScore
  * (desc) → rank (asc, the manual override) → dateOpened (asc, FIFO tie-break) → num (asc, total order).
  * `opts.priority` omitted or mode `off` → every row P3, priorityScore 0, legacy order.
@@ -258,7 +273,7 @@ export function orderQueueDetailed(items, config = DEFAULT_CONFIG, now = Date.no
         num: numOr(Number(it.num), Infinity),
       };
     });
-  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder : compareLegacyOrder);
+  ready.sort(prioritySettings.mode === 'enforce' ? compareClassOrder(priority?.requestsFirstInClass !== false) : compareLegacyOrder);
   return ready;
 }
 
@@ -270,14 +285,15 @@ function compareLegacyOrder(a, b) {
   return a.tierOrder - b.tierOrder || compareLegacyTail(a, b);
 }
 
-function compareClassOrder(a, b) {
-  return PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
+function compareClassOrder(requestsFirstInClass) {
+  return (a, b) => PRIORITY_CLASSES.indexOf(a.priorityClass) - PRIORITY_CLASSES.indexOf(b.priorityClass) ||
+    (requestsFirstInClass ? Number(b.operatorRequest === true) - Number(a.operatorRequest === true) : 0) ||
     a.tierOrder - b.tierOrder || b.priorityScore - a.priorityScore || compareLegacyTail(a, b);
 }
 
 /** PURE: a copy of enriched rows in enforce order; never mutates the input. */
-export function classOrder(rows) {
-  return [...rows].sort(compareClassOrder);
+export function classOrder(rows, { requestsFirstInClass } = {}) {
+  return [...rows].sort(compareClassOrder(requestsFirstInClass !== false));
 }
 
 /** PURE: bounded, single-line observation of class order without changing queue order. */
