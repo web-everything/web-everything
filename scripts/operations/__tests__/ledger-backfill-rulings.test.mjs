@@ -259,7 +259,7 @@ describe('planRawKeyMigration (raw-key ruling rows already on the git store)', (
 
   it('appends a hashed twin of a raw-key row: same time, source, writer, actor and ruling', () => {
     const raw = ruling({ ruling: 'card' });
-    expect(migrate([raw])).toEqual({ append: [twin(raw)], skipped: [], candidates: 1 });
+    expect(migrate([raw], posted(raw))).toEqual({ append: [twin(raw)], skipped: [], candidates: 1 });
   });
 
   it('migrated twin closes the hashed referral; the raw row alone does not', () => {
@@ -285,8 +285,8 @@ describe('planRawKeyMigration (raw-key ruling rows already on the git store)', (
     expect(migrate([ruling({ findingKey: ledgerFindingKey('k') }), sendBack(), review()])).toEqual({ append: [], skipped: [], candidates: 0 });
   });
 
-  it('does not treat an equal-time twin with a different ruling as already migrated', () => {
-    expect(migrate([ruling(), twin(ruling({ ruling: 'not-real' }))]).append).toHaveLength(1);
+  it('does not treat an equal-time hashed ruling with a different result as already migrated, and does not overwrite it', () => {
+    expect(migrate([ruling(), twin(ruling({ ruling: 'not-real' }))])).toEqual({ append: [], skipped: skipped('out-of-order'), candidates: 1 });
   });
 
   it('recovers a truncated raw key from the thread, and skips it when the thread cannot resolve it', () => {
@@ -298,15 +298,53 @@ describe('planRawKeyMigration (raw-key ruling rows already on the git store)', (
   });
 
   it.each([referral({ findingKeys: [ledgerFindingKey('raw key')], at: late }), verdict(), ruling({ ruling: 'not-real', at: late })])('skips a twin superseded by a later %#', later => {
-    expect(migrate([ruling(), later]).skipped).toEqual(skipped('out-of-order'));
+    expect(migrate([ruling(), later], posted(ruling({ ruling: 'not-real' }))).skipped).toEqual(skipped('out-of-order'));
   });
 
-  it('copes with a clearing ruling without a thread comment (history is already authoritative)', () => {
-    expect(migrate([ruling({ ruling: 'not-real' })]).append).toHaveLength(1);
+  it.each(['not-real', 'card'])('refuses an unbacked raw %s ruling (no thread comment): the raw row is inert, its twin would be live', result => {
+    const raw = ruling({ ruling: result });
+    expect(migrate([raw])).toEqual({ append: [], skipped: skipped('unposted'), candidates: 1 });
+    // A comment for another key, or another result, does not back it either.
+    expect(migrate([raw], new Map([[7, [{ key: 'other key', result }, { key: 'raw key', result: result === 'card' ? 'not-real' : 'card' }]]])).skipped).toEqual(skipped('unposted'));
+  });
+
+  it.each(['not-real', 'card'])('migrates a raw %s ruling that a thread comment backs (same key and result)', result => {
+    const raw = ruling({ ruling: result });
+    expect(migrate([raw], posted(raw)).append).toEqual([twin(raw)]);
+  });
+
+  it('migrates a raw block ruling without a comment (block only holds, so it is fail-safe)', () => {
+    expect(migrate([ruling()]).append).toHaveLength(1);
+  });
+
+  it.each([
+    ['a hashed ruling with a different result', () => ruling({ ruling: 'not-real', findingKey: ledgerFindingKey('raw key') })],
+    ['a later-listed raw ruling with a different result', () => ruling({ ruling: 'not-real' })],
+  ])('skips the twin when it ties on time with %s (appending it last would overwrite that ruling)', (_name, other) => {
+    const raw = ruling({ ruling: 'block' });
+    expect(migrate([raw, other()], posted(raw)).skipped).toContainEqual({ pr: 7, type: 'ruling', at, reason: 'out-of-order' });
+  });
+
+  it('preserves the final authoritative ruling when timestamps tie: derived state stays ruled', () => {
+    const open = referral({ findingKeys: [ledgerFindingKey('raw key')], at: early });
+    const authoritative = ruling({ ruling: 'not-real', findingKey: ledgerFindingKey('raw key') });
+    const rows = [open, ruling({ ruling: 'block' }), authoritative];
+    const before = deriveReferrals(rows).get(ledgerFindingKey('raw key')).state;
+    const after = deriveReferrals([...rows, ...migrate(rows).append]).get(ledgerFindingKey('raw key')).state;
+    expect([before, after]).toEqual(['ruled', 'ruled']);
+  });
+
+  it('skips a twin that ties on time with a referral or a clearing verdict for the finding', () => {
+    expect(migrate([ruling(), referral({ findingKeys: [ledgerFindingKey('raw key')], at })]).skipped).toEqual(skipped('out-of-order'));
+    expect(migrate([ruling(), verdict({ at })]).skipped).toEqual(skipped('out-of-order'));
+  });
+
+  it('still migrates when an equal-time row is for another finding', () => {
+    expect(migrate([ruling(), ruling({ findingKey: ledgerFindingKey('other') , ruling: 'not-real' })]).append).toHaveLength(1);
   });
 
   it('migrates each raw row of a finding ruled twice: only the latest, which is what the derive ends on', () => {
-    const result = migrate([ruling({ ruling: 'block' }), ruling({ ruling: 'not-real', at: late })]);
+    const result = migrate([ruling({ ruling: 'block' }), ruling({ ruling: 'not-real', at: late })], posted(ruling({ ruling: 'not-real' })));
     expect(result.append.map(r => [r.ruling, r.at])).toEqual([['not-real', late]]);
     expect(result.skipped).toEqual(skipped('out-of-order'));
   });

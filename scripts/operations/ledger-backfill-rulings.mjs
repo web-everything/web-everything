@@ -52,11 +52,26 @@ function resolveRulingKey(fk, thread) {
   return fk.endsWith('…') ? null : ledgerFindingKey(fk);
 }
 
+// A row that decides the finding's state in the derive's append-order fold: landing another row after it would undo it.
+const decidesFinding = (other, findingKey) =>
+  (other.type === 'referral' && other.findingKeys.some(k => ledgerFindingKey(k) === findingKey)) ||
+  (other.type === 'ruling' && ledgerFindingKey(other.findingKey) === findingKey) ||
+  (other.type === 'verdict' && verdictClears(other.verdict));
+
 // A later row for the same finding replaces its state in the derive's append-order fold, so landing this one after it would undo it.
 const supersededByLaterRow = (history, at, findingKey) => history.some(other => Date.parse(other.at) > Date.parse(at) &&
-  ((other.type === 'referral' && other.findingKeys.some(k => ledgerFindingKey(k) === findingKey)) ||
-    (other.type === 'ruling' && ledgerFindingKey(other.findingKey) === findingKey) ||
-    (other.type === 'verdict' && verdictClears(other.verdict))));
+  decidesFinding(other, findingKey));
+
+// A clearing ruling is live only when a public ruling comment names the same key and result. Every path that appends a
+// clearing ruling (the home backfill and the raw-key migration) goes through this one check.
+const clearingRulingBacked = (row, findingKey, thread) => !CLEARING_RULINGS.has(row.ruling) ||
+  thread.some(t => t.result === row.ruling && ledgerFindingKey(t.key) === findingKey);
+
+// The migration appends its twin LAST, so any other row for the finding at the same time or later (other than an
+// equivalent ruling, which is `already-in-git`) would be overwritten by it. A tie is ambiguous, so it counts.
+const overwritesAtTie = (history, row, findingKey) => history.some(other => other !== row &&
+  Date.parse(other.at) >= Date.parse(row.at) && decidesFinding(other, findingKey) &&
+  !(other.type === 'ruling' && Date.parse(other.at) === Date.parse(row.at) && other.ruling === row.ruling));
 
 /**
  * One-time migration (operator ruling 2026-10-09): the derive no longer reads a ruling that names the RAW finding key,
@@ -64,8 +79,9 @@ const supersededByLaterRow = (history, at, findingKey) => history.some(other => 
  * ruling; only `findingKey` differs). The raw rows stay in history, the derive ignores them. Idempotent: a twin already
  * in the store (same PR, time, ruling and hashed key) is skipped as `already-in-git`, and the store's own event-id
  * dedupe covers a re-run that races this one. Append order is never reordered, so a twin whose meaning would change by
- * landing after a later referral, clearing verdict, or ruling for the same finding is skipped as `out-of-order`.
- * No thread comment is needed to back a clearing ruling: the row is already authoritative history on the store.
+ * landing after a later (or same-time: the order is ambiguous) referral, clearing verdict, or ruling for the same
+ * finding is skipped as `out-of-order`. A raw-key CLEARING ruling is inert today and its twin would be live, so it needs
+ * the same backing the home backfill demands: a thread comment naming the same key and result, else `unposted`.
  */
 export function planRawKeyMigration({ gitRows, threadRulings = new Map() }) {
   const append = [], skipped = [];
@@ -77,7 +93,8 @@ export function planRawKeyMigration({ gitRows, threadRulings = new Map() }) {
     if (findingKey === null) { skip('key-truncated-unresolved'); continue; }
     if ([...gitRows, ...append].some(other => other.type === 'ruling' && other.pr === pr && other.at === at &&
       other.ruling === row.ruling && other.findingKey === findingKey)) { skip('already-in-git'); continue; }
-    if (supersededByLaterRow(gitRows.filter(other => other.pr === pr), at, findingKey)) { skip('out-of-order'); continue; }
+    if (!clearingRulingBacked(row, findingKey, threadRulings.get(pr) ?? [])) { skip('unposted'); continue; }
+    if (overwritesAtTie(gitRows.filter(other => other.pr === pr), row, findingKey)) { skip('out-of-order'); continue; }
     append.push(buildLedgerEvent({
       type: 'ruling', repo: row.repo, pr, at, source: row.source, writer: row.writer,
       declaredActor: row.actor?.declared, session: row.actor?.session, channel: row.actor?.channel,
@@ -109,10 +126,7 @@ export function planRulingBackfill({ homeRows, gitRows, openPrs, since, threadRu
     }
     // The live path writes the row before it posts the comment, so a clearing row can exist with no public ruling.
     // `block` is fail-safe (it only holds), so only the closed clearing set needs a comment naming the same key and result.
-    if (type === 'ruling' && CLEARING_RULINGS.has(row.ruling) &&
-      !thread.some(t => t.result === row.ruling && ledgerFindingKey(t.key) === findingKey)) {
-      skip('unposted'); continue;
-    }
+    if (type === 'ruling' && !clearingRulingBacked(row, findingKey, thread)) { skip('unposted'); continue; }
     const history = gitRows.filter(other => other.pr === pr);
     let outOfOrder;
     if (type === 'ruling') {

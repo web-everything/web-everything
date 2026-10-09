@@ -18,8 +18,8 @@ import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
 import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
-import { EVENT_TYPES, appendVerdict, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
-import '../lib/verdict-ledger-io.mjs'; // registers the `git` store `appendVerdict` writes to
+import { EVENT_TYPES, appendVerdictAsync, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
+import '../lib/verdict-ledger-io.mjs'; // registers the `git` store `appendVerdictAsync` writes to
 import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
 import { assertOperatorCliFresh } from '../lib/main-staleness.mjs';
 import { idFromName, normalizeId } from '../backlog/id.mjs';
@@ -93,20 +93,28 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
 const clearsHold = (result) => result !== 'block';
 
 /**
- * Default ledger writer for ruling / send-back events: the ONE sanctioned append, `appendVerdict`, with its default
+ * Default ledger writer for ruling / send-back events: the ONE sanctioned append, `appendVerdictAsync`, with its default
  * store (`dual`: the machine-local file AND the shared git store on `ops/review-requests`, in the F4 order for a
  * clearing vs a holding row). Before this, the default wrote the home file only, so no ruling or send-back row ever
  * reached the git store the shared readers fold (slice H shadow: 7 block + 8 ordinary rulings missing). Throws when
- * a row is refused or missed git, so the caller applies the F4 write-miss posture. `opts` is passed through to
- * `appendVerdict` (test seams: store, board, gitAppend, homeAppend). Awaits each append, so an async store contract
- * works unchanged.
+ * a row is refused or missed git, so the caller applies the F4 write-miss posture. Every event is attempted: one
+ * failure never skips the rest of the batch (each holding ruling keeps its home row), and the failures come back as
+ * ONE aggregate error. `opts` is passed through to `appendVerdictAsync`, which has the same F4 policy as the sync
+ * `appendVerdict` but also writes through a plugged async store (test seams: store, board, env, gitAppend, homeAppend).
  */
 export async function appendLedgerEvents(events, opts = {}) {
+  const misses = [];
   for (const e of events) {
-    const res = await appendVerdict(e, opts);
-    if (!res?.ok) throw new Error(`ledger append refused: ${(res?.errors ?? []).join('; ') || res?.git?.error || 'unknown'}`);
-    if (res.ledgerWriteMiss) throw new Error(`git store write missed (the home row stands): ${res.git?.error ?? 'unknown'}`);
+    try {
+      const res = await appendVerdictAsync(e, opts);
+      const detail = res?.git?.error || res?.error || (res?.errors ?? []).join('; ') || 'unknown';
+      if (res?.ledgerWriteMiss) misses.push(`git store write missed${res.ok ? ' (the home row stands)' : ''}: ${detail}`);
+      else if (!res?.ok) misses.push(`ledger append refused: ${detail}`);
+    } catch (error) {
+      misses.push(`ledger append failed: ${String(error?.message ?? error).split('\n')[0]}`);
+    }
   }
+  if (misses.length) throw new Error(events.length === 1 ? misses[0] : `${misses.length} of ${events.length} ledger events failed: ${misses.join('; ')}`);
 }
 
 export function createRecordReferralRulingSinks({ readJson = ghJson,
@@ -175,7 +183,10 @@ export function createRecordReferralRulingSinks({ readJson = ghJson,
       // operation stays resumable. A HOLDING ruling (block) is still posted and raises ledger-write-miss.
       const clearing = events.filter((e) => clearsHold(e.ruling));
       if (clearing.length) {
-        const miss = await tryAppend(clearing);
+        // One at a time, stopping at the first miss: a clearing row that reached git live with no comment posted would
+        // clear a hold nobody can see (holding rulings below are the opposite: attempt them all).
+        let miss = null;
+        for (const e of clearing) { miss = await tryAppend([e]); if (miss) break; }
         if (miss) throw new Error(`ledger-write-miss: the ruling was not recorded in the verdict ledger, so it does not clear and nothing was posted (${miss}); retry once the ledger is writable`);
       }
       const already = before.comments.some((c) => String(c?.body ?? '').replace(/\r\n/g, '\n').trimEnd() === body);

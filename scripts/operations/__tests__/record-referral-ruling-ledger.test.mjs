@@ -18,6 +18,7 @@ import {
 } from '../record-referral-ruling.mjs';
 import { appendLedgerEvents, createRecordReferralRulingSinks } from '../record-referral-ruling-io.mjs';
 import { ledgerFindingKey } from '../../lib/pr-state/referrals.mjs';
+import { registerLedgerStore } from '../../lib/verdict-ledger-store.mjs';
 
 const repo = 'o/r';
 const head = 'a'.repeat(40);
@@ -89,6 +90,20 @@ describe('ledger plan slice E1: ruling and send-back events', () => {
     expect(posts).toEqual([]);
   });
 
+  it('a batch of CLEARING rulings stops at the first miss: later rows are not written, nothing is posted', async () => {
+    const posts = [];
+    const attempted = [];
+    const sinks = createRecordReferralRulingSinks({
+      readJson: () => ({ headRefOid: head, comments: [] }), post: (_r, _p, b) => posts.push(b),
+      appendEvents: (list) => { attempted.push(...list.map((e) => e.findingKey)); throw new Error('transport down'); },
+      warn: () => {}, now: () => '2026-10-04T14:31:00Z',
+    });
+    await expect(sinks[OPERATOR_RULING_POST_EFFECT]({ repo, pr: 7, head, body: 'b', actor: 'a', channel: 'chat',
+      rulings: [{ key: 'k1', result: 'card' }, { key: 'k2', result: 'not-real' }] })).rejects.toThrow(/does not clear/);
+    expect(attempted).toEqual([ledgerFindingKey('k1')]);
+    expect(posts).toEqual([]);
+  });
+
   it('a clearing ruling is recorded BEFORE the comment is posted', async () => {
     const order = [];
     const posts = { push: (b) => order.push('post') };
@@ -134,6 +149,59 @@ describe('the default writer reaches the shared git store (slice H shadow: no ru
         gitAppend: () => { throw new Error('push rejected'); } })).rejects.toThrow(/push rejected|refused/);
       await expect(appendLedgerEvents(rows().slice(1), { store: 'dual', board: dir, warn: () => {},
         gitAppend: () => { throw new Error('push rejected'); } })).rejects.toThrow(/git store write missed/);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  const holdingRows = (n) => Array.from({ length: n }, (_, i) => buildLedgerEvent({ type: 'ruling', repo, pr: 7, at: `2026-10-04T14:31:0${i}Z`,
+    source: 'record-referral-ruling', declaredActor: 'chalbert', channel: 'chat', findingKey: ledgerFindingKey(`${key}-${i}`), ruling: 'block' }));
+
+  it('a git miss on the FIRST event of a batch still writes every other event (home rows kept), then throws one aggregate error', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const attempts = [];
+      let calls = 0;
+      await expect(appendLedgerEvents(holdingRows(3), { store: 'dual', board: dir, warn: () => {},
+        gitAppend: ({ records }) => { attempts.push(...records); if (calls++ === 0) throw new Error('push rejected'); return { rows: records.length, duplicates: 0 }; } }))
+        .rejects.toThrow(/1 of 3 ledger events failed.*push rejected/);
+      expect(attempts).toHaveLength(3);
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.findingKey))
+        .toEqual(holdingRows(3).map((e) => e.findingKey));
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  it('a refused row does not stop the rest of the batch either', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const [a, b] = holdingRows(2);
+      await expect(appendLedgerEvents([{ ...a, type: 'not-a-type' }, b], { store: 'home' })).rejects.toThrow(/1 of 2 ledger events failed.*refused/);
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.findingKey)).toEqual([b.findingKey]);
+    } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
+  });
+
+  it('writes through a registered ASYNC store (appendVerdict would refuse a plugged store)', async () => {
+    const stored = [];
+    registerLedgerStore({
+      name: 'async-ruling-store',
+      capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' },
+      append: async (r) => { stored.push(...r); return { ok: true, appended: r.length }; },
+      read: async () => ({ status: 'ok', rows: stored }),
+    });
+    await appendLedgerEvents(holdingRows(2), { store: 'async-ruling-store', env: {}, warn: () => {} });
+    expect(stored.map((r) => r.findingKey)).toEqual(holdingRows(2).map((e) => e.findingKey));
+  });
+
+  it('with NO store named, a ruling still reaches both the home file and the git store (the default is dual)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'e1-git-'));
+    process.env.WE_VERDICT_LEDGER_DIR = dir;
+    try {
+      const git = [];
+      // `env: {}` is the production shape: no store named, not under test. Only the transport seams are injected.
+      await appendLedgerEvents(rows(), { env: {}, board: dir, warn: () => {},
+        gitAppend: ({ records }) => { git.push(...records); return { rows: records.length, duplicates: 0 }; } });
+      expect(git.map((r) => r.type)).toEqual(['ruling', 'send-back']);
+      expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.type)).toEqual(['ruling', 'send-back']);
     } finally { delete process.env.WE_VERDICT_LEDGER_DIR; }
   });
 });
