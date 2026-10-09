@@ -3,9 +3,10 @@ bornAs: xkfzukn
 kind: story
 size: 5
 priority: high
-status: open
+status: resolved
 scope: ["we:scripts/backlog.mjs", "we:scripts/lib/build-queue.mjs", "we:scripts/conveyor/queue-store.mjs", "we:scripts/conveyor/queue.mjs"]
 dateOpened: "2026-09-28"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
