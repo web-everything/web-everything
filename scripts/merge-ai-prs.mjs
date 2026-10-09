@@ -189,6 +189,8 @@ import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overla
 import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
+import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
+import { readMainRedPriority } from './lib/main-red-priority.mjs';
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -835,6 +837,45 @@ export function revalidateForMerge(freshPr, { requiredCheck = 'test', allowPendi
   }
   const verdict = classifyPr(freshPr, { requiredCheck, allowPendingReview, defaultBranch });
   return expectedHeadSha !== undefined && verdict.decision === 'merge' ? { ...verdict, headSha: expectedHeadSha } : verdict;
+}
+
+/**
+ * Live 2026-10-09 (#4602 skipped 46+ min, #4578, #4591, …): every cascade merge moves `main`, and GitHub then
+ * resets each other open PR's `mergeable` to UNKNOWN while it recomputes in the background (a few seconds; the
+ * `gh pr view --json mergeable` read itself is what asks for it). The pre-merge re-read ran seconds after the
+ * previous merge, saw UNKNOWN, and refused the rest of the cascade — so a pass landed one or two PRs and a queue
+ * of N accepted PRs took N/2 passes. A transient UNKNOWN is now re-read a bounded number of times before the
+ * refusal stands. Pure: true only for the classifier's own UNKNOWN-mergeability refusal — a head move, a red or
+ * CodeQL check, a conflict or a missed read is never retried.
+ * @param {{decision?:string, reason?:string}|null} verdict
+ */
+export function isTransientUnknownMergeability(verdict) {
+  return !!verdict && verdict.decision !== 'merge' && /^not mergeable \(mergeable=UNKNOWN\)/.test(String(verdict.reason || ''));
+}
+
+/** Setting: how many extra re-reads a transient UNKNOWN gets, and the wait before each (bounded: ≤ 4 × 3 s). */
+export const UNKNOWN_MERGEABILITY_RETRY = Object.freeze({ retries: 4, delayMs: 3000 });
+/** Env knob: an integer 0–10 overrides `retries` (0 = the old single read). Anything else keeps the default. */
+export const UNKNOWN_MERGEABILITY_RETRY_ENV = 'WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES';
+export function resolveUnknownMergeabilityRetry(env = {}) {
+  const raw = env?.[UNKNOWN_MERGEABILITY_RETRY_ENV];
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return UNKNOWN_MERGEABILITY_RETRY;
+  const n = Number(raw.trim());
+  return n <= 10 ? { ...UNKNOWN_MERGEABILITY_RETRY, retries: n } : UNKNOWN_MERGEABILITY_RETRY;
+}
+
+/**
+ * `revalidateForMerge` over a fresh read, re-reading while the ONLY refusal is a transient UNKNOWN mergeability.
+ * Fails closed exactly as before: an UNKNOWN that never resolves within the bound returns that same refusal.
+ * IO is injected (`read` → the fresh PR or null; `sleep(ms)`), so the bound is testable without GitHub.
+ */
+export async function revalidateWithUnknownRetry({ read, opts, setting = UNKNOWN_MERGEABILITY_RETRY, sleep }) {
+  let verdict = revalidateForMerge(await read(), opts);
+  for (let attempt = 0; attempt < setting.retries && isTransientUnknownMergeability(verdict); attempt += 1) {
+    sleep(setting.delayMs);
+    verdict = revalidateForMerge(await read(), opts);
+  }
+  return verdict;
 }
 
 /**
@@ -4053,6 +4094,12 @@ async function runCli() {
       return data && data.number != null ? await resolveChecks(repo, data) : null;
     } catch { return null; }
   };
+  // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
+  // re-read a bounded number of times before the refusal stands; see `revalidateWithUnknownRetry`.
+  const UNKNOWN_RETRY = resolveUnknownMergeabilityRetry(process.env);
+  const revalidateFresh = (repo, num, opts) => revalidateWithUnknownRetry({
+    read: () => fetchFreshPrForRevalidation(repo, num), opts, setting: UNKNOWN_RETRY, sleep: sleepSync,
+  });
 
   const fail = (reason, detail, code) => {
     if (AS_JSON) writeAllSync(1, JSON.stringify({ ok: false, reason, detail }) + '\n');
@@ -5447,6 +5494,53 @@ async function runCli() {
   // left `skip` so it keeps blocking its dependents and is re-read fresh next pass.
   const revalidationAborted = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
+  // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
+  const MERGE_QUEUE = loadMergeQueueSettings();
+  if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
+  if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
+  const MERGE_QUEUE_STATE = refreshedStatePath();
+  const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainRedPriority() : null;
+  /**
+   * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
+   * hook is off): merge as before. false = not this pass: it refreshed the PR onto main (once per head, through
+   * `refreshOntoMain`, or a re-run of its required run when it is already on the main tip), or it waits / refuses;
+   * it has logged the reason and recorded it in `revalidationAborted`. The caller only skips. Never cached: a WE
+   * carrier judged at its impl half's pre-check is judged again at its own turn, since merges in between move main.
+   */
+  const mergeQueueGate = async (cand, headSha) => {
+    if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
+    const mqKey = `${cand.repo || localSlug || 'cwd'}#${cand.num}`;
+    const facts = readMergeFreshnessFacts({
+      repo: cand.repo, num: cand.num, headSha, requiredCheck: REQUIRED,
+      defaultBranch: defaultBranchOf(cand.repo) || 'main', gh: (args) => readGh(args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }),
+    });
+    const mq = decideMergeQueueAction({ key: mqKey, num: cand.num, facts, nowMs: Date.now(), refreshed: readRefreshed(MERGE_QUEUE_STATE), settings: MERGE_QUEUE });
+    const why = `${mq.reasons.join(', ') || 'fresh'}${facts.errors.length ? `; read errors: ${facts.errors.join('; ')}` : ''}`;
+    if (mq.action === 'merge') {
+      if (!AS_JSON) process.stderr.write(`  ✓ merge-queue: PR ${repoTag(cand.repo)}${cand.num} merge-fresh (pass ${Math.round((Date.now() - (facts.pr.requiredCheck?.completedAtMs ?? Date.now())) / 60000)} min old, main +${facts.main.commitsSinceBase ?? '?'} since base)\n`);
+      return true;
+    }
+    if (mq.action !== 'refresh') {
+      revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: ${mq.action} (${why})` });
+      if (!AS_JSON) process.stderr.write(`  ⏸ merge-queue: ${mq.action} PR ${repoTag(cand.repo)}${cand.num} (${why}) — not merged this pass\n`);
+      return false;
+    }
+    const cloneDir = isLocalRepo(cand.repo) ? process.cwd() : siblingCloneDir(cand.repo);
+    let out;
+    if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
+    else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${cand.repo} clone provisioned` };
+    else out = await refreshStalePr({ laneRef: cand.headRef, root: cloneDir, repo: cand.repo, runId: facts.pr.requiredCheck?.runId ?? null, expectedHead: headSha });
+    // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git error,
+    // no clone) is retried next pass rather than parking the head as `wait` forever.
+    if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, headSha);
+    if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(cand, { action: 'rebased' })) {
+      const rs = restampAcceptance({ pr: cand.num, repo: cand.repo, newHead: out.newCommit, cwd: isLocalRepo(cand.repo) ? undefined : cloneDir });
+      if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(cand.repo)}${cand.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
+    }
+    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}` });
+    if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
+    return false;
+  };
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
@@ -5522,6 +5616,11 @@ async function runCli() {
       staleLandedOpenItems = plan.staleLandedOpenItems || [];
       if (!plan.ready.length) break;
       let progressed = false;
+      // card xs1hdl7 — a P0 main-fix PR (the published main-red owner) goes first; it still has to be merge-fresh.
+      // Reorders in place (same members), so every `coupleStep.ordered` lookup below sees the same list.
+      coupleStep.ordered = prioritizeMainFix(coupleStep.ordered, {
+        mainFix: mainFixPriority, queueSettings: MERGE_QUEUE.queue, isCoupleHalf: (x) => isImplHalf(x) || isCoupleCarrier(x),
+      });
       for (const c of coupleStep.ordered) {
         if (heldThisIteration.has(candKey(c))) continue;
         // fix-couple-split — impl half: its carrier must still pass a FRESH pre-merge read right now, else hold both.
@@ -5529,7 +5628,7 @@ async function runCli() {
           const ck = `${c.coupleCarrier.repo || 'cwd'}::${c.coupleCarrier.num}`;
           const carrierMerged = merged.some((m) => candKey(m) === ck);
           const carrier = coupleStep.ordered.find((x) => candKey(x) === ck) || null;
-          const fresh = carrierMerged || !carrier ? null : revalidateForMerge(await fetchFreshPrForRevalidation(carrier.repo, carrier.num), {
+          const fresh = carrierMerged || !carrier ? null : await revalidateFresh(carrier.repo, carrier.num, {
             requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(carrier.num)) || (!!escalationRelief.passWide && !!label),
             defaultBranch: defaultBranchOf(carrier.repo), expectedHeadSha: carrier.listedHeadSha || carrier.headSha || null,
           });
@@ -5537,6 +5636,14 @@ async function runCli() {
           if (!pf.ok) {
             holdCouple(c, 'impl', pf.reason);
             if (carrier) holdCouple(carrier, 'carrier', `its impl half ${repoTag(c.repo)}${c.num} was held (${pf.reason})`);
+            continue;
+          }
+          // card xs1hdl7 — the WE carrier lands AFTER its impl half, so its merge-freshness is judged HERE, before the
+          // impl merges: a stale carrier is refreshed and the couple is held together, never split by the gate.
+          if (carrier && fresh?.decision === 'merge' && !(await mergeQueueGate(carrier, fresh.headSha))) {
+            const why = 'its WE carrier is not merge-fresh (merge-queue) — refreshed/held; the couple lands together later';
+            holdCouple(c, 'impl', why);
+            holdCouple(carrier, 'carrier', `not merge-fresh (merge-queue); impl half ${repoTag(c.repo)}${c.num} held with it`);
             continue;
           }
         }
@@ -5593,7 +5700,7 @@ async function runCli() {
           // (review gate included) actually judged; a push since then refuses the merge instead of landing an
           // unjudged head under a still-present `review:accepted` label. `revalidated.headSha` is that pinned SHA.
           const reliefAllowsPendingNow = (escalationRelief.prs || []).includes(Number(c.num)) || (!!escalationRelief.passWide && !!label);
-          const revalidated = revalidateForMerge(await fetchFreshPrForRevalidation(c.repo, c.num), {
+          const revalidated = await revalidateFresh(c.repo, c.num, {
             requiredCheck: REQUIRED, allowPendingReview: reliefAllowsPendingNow, defaultBranch: defaultBranchOf(c.repo),
             expectedHeadSha: c.listedHeadSha || c.headSha || null,
           });
@@ -5618,6 +5725,19 @@ async function runCli() {
             }
             revalidationAborted.push({ num: c.num, repo: c.repo, reason: revalidated.reason });
             if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} no longer safe to merge on a fresh re-read (${revalidated.reason}) — the pass-start decision is stale; refusing to merge this pass (xvzc4v4)\n`);
+            continue;
+          }
+          // card xs1hdl7 — THE MERGE-QUEUE FRESHNESS HOOK. Every existing gate above has passed; before any land-side
+          // stamp or the merge write, ask the freshness rule (we:scripts/lib/merge-freshness.mjs) whether the green
+          // pass still proves THIS merge: the pass is on the pinned head, main moved only on files this PR does not
+          // touch AND only on non-code paths (allowDisjointMainMoves + nonCodePaths, the middle-ground mode), and the pass is younger than maxAgeMinutes. Not fresh → refresh the PR onto
+          // main once per head through the sanctioned refreshOntoMain path (or re-run its check when it is already on
+          // the main tip) and skip this pass. It only ADDS a requirement; with `mergeFreshness.enabled` off (the built-in
+          // default) no freshness read happens and the merge proceeds exactly as before.
+          // Live 2026-10-09: #4547 merged on a 128-min-old pass after #4453 landed; main went red at 07:44 ET.
+          if (!(await mergeQueueGate(c, revalidated.headSha))) {
+            const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; // re-judged next pass
+            noteSplit('merge-queue: not merge-fresh');
             continue;
           }
           // xnsk54v follow-up (land-path tamper-evidence) — the park/skip comment paths only fire when the drain
