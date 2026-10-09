@@ -108,7 +108,7 @@ import {
   resetStaleVerifyMarker, runVerifyOperation, deliverItem,
   // build-path-codex-isolation-locus
   resolveDeliveryLocus, acquireImplLane, stageDeliveryReportCliIntoLane, DELIVERY_REPORT_CLI_REL_FILES,
-  mergeSettleResult,
+  mergeSettleResult, buildReportFromEnvelope, envelopeReportOrNull,
   // #4348-open-pr-retry
   classifyOpenPrFailure,
 } from '../deliver-item-wrapper.mjs';
@@ -1656,6 +1656,35 @@ describe('runGateWithOneRetry commits the build turn itself (#3565 — before th
     expect(commitTurn).toHaveBeenCalledTimes(2);
     expect(commitTurn.mock.calls[0][0].phase).toBe('build');
     expect(commitTurn.mock.calls[1][0].phase).toBe('gate-fix');
+  });
+
+  it('a wrapped resumed turn\'s own v2 envelope outranks the stale first-turn legacy report (blocked -> gate-blocked)', async () => {
+    const run = vi.fn((cmd, args) => {
+      if (args[0] === 'scripts/lane-pool.mjs') return JSON.stringify({ lanes: [{ lane: 3, path: '/real/pool/lane-3', exists: true }] });
+      if (args[0] === 'scripts/operations/run.mjs') {
+        return JSON.stringify({
+          verdict: {
+            ok: false, cwd: '/real/pool/lane-3', suite: 'run', passed: 1, failed: 1, unrun: 0,
+            checks: [{ name: 'test:unit', outcome: 'fail' }], blocking: [{ check: 'test:unit', why: 'failed', detail: 'x' }],
+          },
+        });
+      }
+      throw new Error(`unexpected: ${cmd} ${JSON.stringify(args)}`);
+    });
+    const commitTurn = vi.fn(() => ({ committed: true, paths: [] }));
+    const envelope = {
+      v: 2, status: 'done', item: '3371', startedAt: '2026-10-08T10:00:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z',
+      result: { v: 1, outcome: 'blocked', findingsAddressed: [], filesTouched: [], learning: null, summary: 'cannot fix', blocker: { kind: 'tooling-defect', evidence: { text: 'the gate itself is broken' } } },
+    };
+    const provider = { name: 'claude-restricted', spawn: vi.fn(async () => ({ envelope })) };
+    const staleFirstTurn = { v: 1, session: 'conveyor-3371', item: '3371', status: 'done', outcome: 'done', reason: null, filesTouched: ['a.mjs'] };
+    const result = await runGateWithOneRetry({ lane: 3, item: '3371', sessionSlug: 'conveyor-3371', provider }, { run, commitTurn, readReport: () => staleFirstTurn });
+    expect(result.status).toBe('gate-blocked');
+    expect(result.reason).toMatch(/gate itself is broken/);
+    // an envelope that holds no usable result (unparseable) never falls back to that stale legacy report
+    const unusable = { name: 'claude-restricted', spawn: vi.fn(async () => ({ envelope: { v: 2, status: 'done', result: { outcome: 'unparseable' } } })) };
+    const again = await runGateWithOneRetry({ lane: 3, item: '3371', sessionSlug: 'conveyor-3371', provider: unusable }, { run, commitTurn, readReport: () => staleFirstTurn });
+    expect(again).toMatchObject({ status: 'red', retryReport: null });
   });
 });
 
@@ -4068,5 +4097,229 @@ describe('deliverItem (#4349 — settles its run-store effect + releases/holds t
     expect(listBuildDispatchHolds()[0].meta.reason).toBe('wrapper-threw');
     expect(readFileSync(lease, 'utf8')).toBe(foreign);
     expect(execFileSync.mock.calls.some(([, args]) => args?.[1] === 'release')).toBe(false);
+  });
+});
+
+// ================================================================================================
+// 117 S3a (D7 FINAL) — the build path on the unified detached worker wrapper, behind `WE_WORKER_WRAPPER`.
+// OFF is byte-identical to before; ON hands the child to `runWorker` with the schema on the argv and reads the
+// build report back from the v2 envelope.
+// ================================================================================================
+describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', () => {
+  const REQUEST = { sessionId: '77777777-7777-4777-8777-777777777777', prompt: 'build item #4001', lane: 3, sessionSlug: 'conveyor-4001', item: '4001', attemptTag: '' };
+  const fakeIo = (over = {}) => ({
+    ensureSettingsFile: vi.fn(() => '/fake/.operations/delivery-agent-hooks-settings.json'),
+    spawnAgent: vi.fn(async () => ({ stdout: '', stderr: '' })),
+    resolveLane: vi.fn(() => '/fake/pool/lane-3'),
+    resolveReportsDir: vi.fn(() => '/fake/pool/lane-3/.operations/delivery-reports'),
+    ...over,
+  });
+  const DONE = { v: 1, outcome: 'done', summary: 'built it', blocker: null, findingsAddressed: [], filesTouched: ['a.mjs'], learning: null };
+
+  it('knob OFF: no schema flags, the old spawn runs, and nothing is returned (byte-identical)', async () => {
+    const io = fakeIo({ workerWrapper: false, runWorkerFn: vi.fn() });
+    const out = await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+    expect(out).toBeUndefined();
+    expect(io.runWorkerFn).not.toHaveBeenCalled();
+    const [argv] = io.spawnAgent.mock.calls[0];
+    expect(argv).not.toContain('--json-schema');
+    expect(argv.at(-1)).toBe('build item #4001');
+  });
+
+  it('knob ON: runWorker gets role build, launcher claude-p, the 60-minute budget, the delivery env and a schema argv', async () => {
+    const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
+    const io = fakeIo({ workerWrapper: true, runWorkerFn });
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+    expect(io.spawnAgent).not.toHaveBeenCalled(); // the wrapper owns the process
+    const [spec, wio] = runWorkerFn.mock.calls[0];
+    expect(spec).toMatchObject({ role: 'build', launcher: 'claude-p', session: 'conveyor-4001', command: 'claude', cwd: '/fake/pool/lane-3', timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, item: '4001' });
+    expect(spec.env.WE_DISPATCH_KIND).toBe('delivery');
+    expect(spec.argv).toContain('-p');
+    expect(spec.argv[spec.argv.indexOf('--output-format') + 1]).toBe('json');
+    expect(JSON.parse(spec.argv[spec.argv.indexOf('--json-schema') + 1]).$id).toBe('we.worker-result/v1');
+    expect(spec.argv.at(-1)).toContain('build item #4001');
+    expect(spec.argv.at(-1)).toContain('StructuredOutput');
+    expect(typeof wio.legacyRead).toBe('function');
+  });
+
+  it('knob ON: the child goes through io.spawnAgent (so GH_TOKEN stripping and the worker marker still apply) and gets the pid-capturing spawn hook', async () => {
+    const stdout = JSON.stringify({ type: 'result', structured_output: DONE });
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prev = process.env.OPERATION_COMPLETIONS_DIR;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    try {
+      const io = fakeIo({ workerWrapper: true, spawnAgent: vi.fn(async () => ({ stdout, stderr: '' })) });
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, io);
+      expect(io.spawnAgent).toHaveBeenCalledTimes(1);
+      const [, opts, spawnIo] = io.spawnAgent.mock.calls[0];
+      expect(opts.env.WE_DISPATCH_KIND).toBe('delivery');
+      expect(opts.stdio).toEqual(['ignore', 'pipe', 'pipe']); // stdin closed
+      expect(typeof spawnIo.spawnFn).toBe('function'); // the wrapper's pid hook rides through the adapter
+    } finally {
+      if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resume reads a finished v2 envelope ONLY when the knob is on (the resume path is unchanged when off)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prevDir = process.env.OPERATION_COMPLETIONS_DIR;
+    const prevKnob = process.env.WE_WORKER_WRAPPER;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    try {
+      writeFileSync(join(dir, 'conveyor-1234.json'), JSON.stringify({
+        v: 2, session: 'conveyor-1234', kind: 'build', role: 'build', launcher: 'claude-p', model: null, pr: null, item: '1234', status: 'done', outcome: 'done',
+        verdict: null, label: null, runId: null, sessionId: null, headBefore: null, headAfter: null, pid: 1, timeoutMs: 1000, deadlineAt: null, parse: { ok: true, reason: null },
+        result: DONE, action: { type: 'done' }, reroute: null, source: 'worker-result', startedAt: '2026-10-08T10:00:00.000Z', endedAt: '2026-10-08T10:01:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z',
+      }));
+      const args = [
+        { item: '1234', sessionSlug: 'conveyor-1234', lane: 7, attemptTag: '', provider: { spawn: vi.fn() }, claudeSessionId: 'x', resume: true },
+        { readReport: () => null, resolveLane: () => '/fake/pool/lane-7', isLaneCommitAhead: () => true },
+      ];
+      delete process.env.WE_WORKER_WRAPPER;
+      await expect(runAgentToCompletion(...args)).rejects.toThrow(/nothing to resume from/);
+      process.env.WE_WORKER_WRAPPER = 'on';
+      await expect(runAgentToCompletion(...args)).resolves.toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
+    } finally {
+      if (prevDir === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prevDir;
+      if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resume prefers the finished v2 envelope over started or stale legacy reports (knob on)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prevDir = process.env.OPERATION_COMPLETIONS_DIR;
+    const prevKnob = process.env.WE_WORKER_WRAPPER;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    process.env.WE_WORKER_WRAPPER = 'on';
+    try {
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({
+        v: 2, session: 'conveyor-1235', kind: 'build', role: 'build', launcher: 'claude-p', model: null, pr: null, item: '1235', status: 'done', outcome: 'done',
+        verdict: null, label: null, runId: null, sessionId: null, headBefore: null, headAfter: null, pid: 1, timeoutMs: 1000, deadlineAt: null, parse: { ok: true, reason: null },
+        result: DONE, action: { type: 'done' }, reroute: null, source: 'worker-result', startedAt: '2026-10-08T10:00:00.000Z', endedAt: '2026-10-08T10:01:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z',
+      }));
+      const resume = (legacy) => runAgentToCompletion(
+        { item: '1235', sessionSlug: 'conveyor-1235', lane: 7, attemptTag: '', provider: { spawn: vi.fn() }, claudeSessionId: 'x', resume: true },
+        { readReport: () => legacy, resolveLane: () => '/fake/pool/lane-7', isLaneCommitAhead: () => true },
+      );
+      // a started legacy report must not block the completion fast path
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'started', outcome: null, filesTouched: [] })).resolves.toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
+      // a contradictory stale done legacy report must not win over the authoritative envelope
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'blocked', reason: 'stale', filesTouched: ['old.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).resolves.toMatchObject({ outcome: 'done', filesTouched: ['a.mjs'] });
+      // ...but a legacy report written AFTER the envelope (a later attempt with the knob off) is the newer truth
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['newer.mjs'], updatedAt: '2026-10-08T12:00:00.000Z' })).resolves.toMatchObject({ filesTouched: ['newer.mjs'] });
+      // a FINISHED envelope with no usable result (the child timed out) never falls back to a legacy `done`
+      const rec = JSON.parse(readFileSync(join(dir, 'conveyor-1235.json'), 'utf8'));
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({ ...rec, outcome: 'blocked', parse: { ok: false, reason: 'timeout' }, result: { v: 1, outcome: 'unparseable', summary: 'x', blocker: null, findingsAddressed: [], filesTouched: [], learning: null } }));
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['a.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).rejects.toThrow(/nothing to resume from/);
+      // a still-`started` envelope (wrapper died mid-run) may still fall back to the legacy report
+      writeFileSync(join(dir, 'conveyor-1235.json'), JSON.stringify({ ...rec, status: 'started', result: null, endedAt: null }));
+      await expect(resume({ v: 1, session: 'conveyor-1235', status: 'done', outcome: 'done', filesTouched: ['a.mjs'], updatedAt: '2026-10-08T09:00:00.000Z' })).resolves.toMatchObject({ filesTouched: ['a.mjs'] });
+    } finally {
+      if (prevDir === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prevDir;
+      if (prevKnob === undefined) delete process.env.WE_WORKER_WRAPPER; else process.env.WE_WORKER_WRAPPER = prevKnob;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('knob ON, resumed turn: only a legacy report written since the turn started counts (a stale first-turn one is not read)', async () => {
+    const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
+    const stale = { v: 1, session: 'conveyor-4001', status: 'done', outcome: 'done', updatedAt: '2020-01-01T00:00:00.000Z', filesTouched: ['a.mjs'] };
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    const [, io] = runWorkerFn.mock.calls[0];
+    expect(io.legacyRead()).toBeNull();
+    const fresh = { ...stale, updatedAt: new Date(Date.now() + 60_000).toISOString() };
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(fresh);
+    expect(io.legacyRead()).toBe(fresh);
+    // a FRESH (non-resume) spawn keeps reading whatever report is there, as before
+    vi.mocked(tryReadDeliveryReport).mockReturnValue(stale);
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, fakeIo({ workerWrapper: true, runWorkerFn }));
+    expect(runWorkerFn.mock.calls[1][1].legacyRead()).toBe(stale);
+    vi.mocked(tryReadDeliveryReport).mockReset();
+  });
+
+  it('knob ON, resumed turn: --resume is kept and the schema is on it too (D7: resume with the schema)', async () => {
+    const runWorkerFn = vi.fn(async () => ({ envelope: { v: 2 } }));
+    await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, resumeSessionId: 'abc-resume' }, fakeIo({ workerWrapper: true, runWorkerFn }));
+    const [spec] = runWorkerFn.mock.calls[0];
+    expect(spec.argv).toContain('--resume');
+    expect(spec.argv).toContain('-p');
+    expect(spec.argv).toContain('--json-schema');
+  });
+
+  it('knob ON, end to end with the REAL runWorker: the stdout structured_output becomes the build report and a v2 record', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prev = process.env.OPERATION_COMPLETIONS_DIR;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    try {
+      const stdout = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', structured_output: DONE });
+      const provider = { ...DELIVERY_AGENT_PROVIDERS['claude-restricted'], spawn: (req) => DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(req, fakeIo({ workerWrapper: true, spawnAgent: vi.fn(async () => ({ stdout, stderr: '' })) })) };
+      const readReport = vi.fn(() => { throw new Error('the delivery report must not be read in wrapped mode'); });
+      const report = await runAgentToCompletion(
+        { item: '4001', sessionSlug: 'conveyor-4001', lane: 3, attemptTag: '', provider, claudeSessionId: REQUEST.sessionId },
+        { readBrief: () => 'Read backlog/{{ITEM_SPEC_PATH_BASENAME}}.', readReport, loadItems: () => [{ num: '4001', slug: 'x', scope: [] }], resolveLane: () => '/fake/pool/lane-3' },
+      );
+      expect(report).toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
+      expect(JSON.parse(readFileSync(join(dir, 'conveyor-4001.json'), 'utf8'))).toMatchObject({ v: 2, kind: 'build', status: 'done', outcome: 'done', source: 'worker-result' });
+    } finally {
+      if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('knob ON parity: the post-spawn side effects of the old path still run (CPU telemetry on success AND on a failed turn, the failure capture on a failed turn)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prev = process.env.OPERATION_COMPLETIONS_DIR;
+    const prevOps = process.env.WE_OPERATIONS_DIR;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    process.env.WE_OPERATIONS_DIR = dir; // a failed turn files a draft: keep it out of the operator's real drafts store
+    try {
+      const usage = { userCPUTime: 7, systemCPUTime: 3 };
+      const stdout = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', structured_output: DONE });
+      const ok = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => ({ stdout, stderr: '', resourceUsage: usage })) });
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, ok);
+      expect(ok.recordCpu).toHaveBeenCalledWith(usage);
+      expect(ok.persistFailure).not.toHaveBeenCalled();
+
+      const boom = Object.assign(new Error('Command failed'), { status: 3, stdout: 'out', stderr: 'err', resourceUsage: usage });
+      const bad = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => { throw boom; }) });
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, sessionSlug: 'conveyor-4002' }, bad);
+      expect(bad.recordCpu).toHaveBeenCalledWith(usage);
+      expect(bad.persistFailure).toHaveBeenCalledWith('conveyor-4002', boom, { resumeSessionId: null });
+
+      // runWorker itself rejecting (a record it could not write) is also a failed turn: same telemetry + capture, then the error propagates
+      const fault = Object.assign(new Error('lock timeout'), { resourceUsage: usage });
+      const rej = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), runWorkerFn: vi.fn(async () => { throw fault; }) });
+      await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, rej)).rejects.toBe(fault);
+      expect(rej.recordCpu).toHaveBeenCalledWith(usage);
+      expect(rej.persistFailure).toHaveBeenCalledWith('conveyor-4001', fault, { resumeSessionId: null });
+    } finally {
+      if (prevOps === undefined) delete process.env.WE_OPERATIONS_DIR; else process.env.WE_OPERATIONS_DIR = prevOps;
+      if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  describe('buildReportFromEnvelope (same shape as the delivery report it replaces)', () => {
+    const env = (result, over = {}) => ({ v: 2, status: 'done', item: '4001', startedAt: '2026-10-08T10:00:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z', result, ...over });
+    const blocked = (kind, files = []) => ({ ...DONE, outcome: 'blocked', filesTouched: files, summary: 'stuck', blocker: { kind, component: 'c', evidence: { text: 'why', refs: [] }, proposedFix: null, ruling: null, deniedCommand: null, retryable: false } });
+    it('done / needs-ruling / other blocked / no-change map to the three build outcomes', () => {
+      expect(buildReportFromEnvelope({ envelope: env(DONE) }, 's')).toMatchObject({ status: 'done', outcome: 'done', filesTouched: ['a.mjs'] });
+      expect(buildReportFromEnvelope({ envelope: env(blocked('needs-ruling')) }, 's')).toMatchObject({ outcome: 'needs-human-judgment', filesTouched: [] });
+      expect(buildReportFromEnvelope({ envelope: env(blocked('gate-red', ['b.mjs'])) }, 's')).toMatchObject({ outcome: 'blocked', filesTouched: ['b.mjs'] });
+      expect(buildReportFromEnvelope({ envelope: env({ ...DONE, outcome: 'no-change', filesTouched: [] }) }, 's')).toMatchObject({ outcome: 'blocked', filesTouched: [] });
+    });
+    it('the old delivery report comes through untouched when the wrapper fell back to it', () => {
+      const legacy = { status: 'done', outcome: 'done', filesTouched: ['z.mjs'], learning: { kind: 'friction' } };
+      expect(buildReportFromEnvelope({ envelope: env(DONE), legacyRecord: legacy }, 's')).toBe(legacy);
+    });
+    it('unparseable, aborted and not-done throw the same crash error a missing report always did', () => {
+      for (const e of [env({ outcome: 'unparseable' }, { parse: { ok: false, reason: 'timeout' } }), env({ outcome: 'aborted' }), env(null, { status: 'started' })]) {
+        expect(() => buildReportFromEnvelope({ envelope: e }, 'conveyor-4001')).toThrow(/exited with no done report/);
+      }
+      expect(envelopeReportOrNull(null, 's')).toBeNull();
+    });
   });
 });

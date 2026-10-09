@@ -576,6 +576,14 @@ describe('#4448 scope-vs-body guards + deferredBlockedBy', () => {
     const body = '## MVP\n\nEdit `we:scripts/x.mjs`.\n\n## Done when\n\n1. `we:docs/y.md` and `we:docs/y.md`\n';
     expect(bodyDeliverablesMissingFromScope(open(['we:scripts/z.mjs']), body)).toEqual(['we:scripts/x.mjs', 'we:docs/y.md']);
   });
+  it('bodyDeliverablesMissingFromScope reads ## Acceptance exactly as ## Done when (#5399 S7)', () => {
+    for (const items of ['1. `we:docs/y.md` exists.', '- [A1] `we:docs/y.md` and `we:scripts/z.mjs`', '- [A1] `we:scripts/z.mjs` only']) {
+      const [legacy, canonical] = ['Done when', 'Acceptance'].map((h) => `## MVP\n\nEdit \`we:scripts/x.mjs\`.\n\n## ${h}\n\n${items}\n`);
+      expect(bodyDeliverablesMissingFromScope(open(['we:scripts/z.mjs']), canonical))
+        .toEqual(bodyDeliverablesMissingFromScope(open(['we:scripts/z.mjs']), legacy));
+    }
+    expect(bodyDeliverablesMissingFromScope(open(['we:scripts/z.mjs']), '## Acceptance\n\n- [A1] `we:docs/y.md`\n')).toEqual(['we:docs/y.md']);
+  });
   it('bodyDeliverablesMissingFromScope is silent when covered, read-only sections, or non-files', () => {
     const body = '## Design\n\nSee `we:scripts/readiness/scope-lease.mjs`.\n\n## MVP\n\n`we:scripts/x.mjs` `we:docs` `we:a/*.md`\n\n## Follow-ups\n\n`we:q.mjs`\n';
     expect(bodyDeliverablesMissingFromScope(open(['we:scripts/x.mjs']), body)).toEqual([]);

@@ -206,7 +206,7 @@ function renderFork(fork) {
 }
 
 function renderDoneWhen(doneWhen) {
-  if (!doneWhen.length) return 'See the item\'s own <code>## Done when</code> section.';
+  if (!doneWhen.length) return 'See the item\'s own <code>## Acceptance</code> section.';
   return renderMarkdownBlocks(doneWhen[0]).trim();
 }
 

@@ -6,6 +6,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { nextNum, pad3, slugify, normalizeScope, renderItem, GUARD_RELAXATION_HINT } from '../scaffold.mjs';
+import { readTaskAgreement } from '../task-agreement.mjs';
 
 describe('nextNum — random free-in-range allocation (#2292)', () => {
   it('picks a GAP below max, not max+1 (cuts the two-lanes-same-NNN collision)', () => {
@@ -68,14 +69,22 @@ describe('renderItem — predicted scope: frontmatter (#2619)', () => {
   });
 });
 
-describe('renderItem — `## Done when` skeleton (#2949)', () => {
+describe('renderItem — task-agreement skeleton (#2949, #5399 S7)', () => {
   const base = { kind: 'story', size: 3, slug: 'x', title: 'X', today: '2026-07-27' };
-  it('appends a `## Done when` heading with an `**Executable**` TODO line after the digest', () => {
+  it('appends `## Acceptance` with an `[A1]` **Executable** TODO line, then `## Non-goals` with an `[N1]` TODO line', () => {
     const out = renderItem(base);
-    expect(out).toContain('## Done when');
-    expect(out).toMatch(/\*\*Executable\*\*/);
-    // digest paragraph comes before the heading, not after
-    expect(out.indexOf('TODO digest')).toBeLessThan(out.indexOf('## Done when'));
+    expect(out).toMatch(/^## Acceptance\n\n- \[A1\] \*\*Executable\*\* — TODO: a command that fails before this item lands and passes after\.$/m);
+    expect(out).toMatch(/^## Non-goals\n\n- \[N1\] TODO: /m);
+    expect(out).not.toMatch(/Done when/);
+    // digest paragraph comes before the heading, not after; Acceptance before Non-goals before Edge cases
+    expect(out.indexOf('TODO digest')).toBeLessThan(out.indexOf('## Acceptance'));
+    expect(out.indexOf('## Acceptance')).toBeLessThan(out.indexOf('## Non-goals'));
+    expect(out.indexOf('## Non-goals')).toBeLessThan(out.indexOf('## Edge cases'));
+  });
+  it('the shared reader reads the skeleton: A1 and N1 are both TODO, so both sections report empty', () => {
+    const a = readTaskAgreement(renderItem(base));
+    expect(a.legacy).toBe(false);
+    expect(a.problems.map((p) => p.code)).toEqual(expect.arrayContaining(['acceptance-todo', 'non-goals-todo']));
   });
 });
 
@@ -83,7 +92,8 @@ describe('renderItem — guard-relaxation hint (#4409)', () => {
   it('#4409 scaffold skeleton carries the pinned hint verbatim', () => {
     const out = renderItem({ kind: 'story', size: 3, slug: 'x', title: 'X', today: '2026-07-27' });
     expect(out).toContain(GUARD_RELAXATION_HINT);
-    expect(out.indexOf('## Done when')).toBeLessThan(out.indexOf(GUARD_RELAXATION_HINT));
+    expect(out.indexOf('## Acceptance')).toBeLessThan(out.indexOf(GUARD_RELAXATION_HINT));
+    expect(out.indexOf(GUARD_RELAXATION_HINT)).toBeLessThan(out.indexOf('## Non-goals'));
   });
 });
 
@@ -110,8 +120,8 @@ describe('renderItem — conditional endpoint-security guidance (#4704)', () => 
       'dateOpened: "2026-10-06"', 'tags: []', '---',
     ].join('\n');
     expect(out.split('\n\n# ')[0]).toBe(metadata);
-    expect(out).toContain('# Example\n\nExample digest.\n\n## Done when\n\n');
-    expect(out).toContain('1. **Executable** — TODO: a command that fails before this item lands and passes after.');
+    expect(out).toContain('# Example\n\nExample digest.\n\n## Acceptance\n\n');
+    expect(out).toContain('- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.');
     const guardHint = 'Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.';
     expect(out).toContain(guardHint);
 
@@ -122,7 +132,8 @@ describe('renderItem — conditional endpoint-security guidance (#4704)', () => 
       'protection against abuse of state-resetting triggers',
       'mirror each in the port test plan, or explain why it does not apply',
     ]) expect(securityHint).toContain(obligation);
-    expect(out.indexOf('## Done when')).toBeLessThan(out.indexOf(securityHint));
+    expect(out.indexOf('## Acceptance')).toBeLessThan(out.indexOf(securityHint));
+    expect(out.indexOf(securityHint)).toBeLessThan(out.indexOf('## Non-goals'));
     expect(out).toContain(`${guardHint}\n\n${securityHint}\n`);
   });
 });

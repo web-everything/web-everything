@@ -118,6 +118,10 @@ import { sanitizeSpawnEnv } from '../lib/gh-app-shim.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { fillBrief } from './dispatch-lane.mjs';
 import { tryReadDeliveryReport, resolveDeliveryReportsDir } from './delivery-report-store.mjs';
+import { tryReadCompletion } from './completion-store.mjs';
+import {
+  STRUCTURED_OUTPUT_SUFFIX, runWorker, withStructuredOutput, workerWrapperEnabled,
+} from './worker-wrapper.mjs';
 import { isPolicyCorePath } from '../lib/gate-config.mjs';
 import { isStatutePath, scoreEscalation, producerReviewLabel } from '../lib/review-escalation.mjs';
 import { isAllowlistedLitterPath } from '../lib/lane-litter.mjs';
@@ -1083,6 +1087,10 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       resolveReportsDir = resolveDeliveryReportsDir,
       recordCpu = recordChildResourceUsage,
       stageDeliveryReportCli = stageDeliveryReportCliIntoLane,
+      // 117 S3a (D7 FINAL) — the unified detached worker wrapper. OFF unless `WE_WORKER_WRAPPER=on` (or a test says
+      // so): off is byte-identical to before this seam existed. See `worker-wrapper.mjs` for what on does.
+      workerWrapper = workerWrapperEnabled(),
+      runWorkerFn = runWorker,
     } = {},
   ) {
     const settingsFile = ensureSettingsFile();
@@ -1102,9 +1110,12 @@ const CLAUDE_RESTRICTED_PROVIDER = {
     // `$LANE` plus an `--add-dir` grant (`--restricted` confines file tools to the working directories).
     const weLanePath = resolveLane(lane, { run: runFn });
     const lanePath = lanePathOverride || weLanePath;
-    const argv = buildRestrictedProviderArgv({
-      sessionId, prompt, resumeSessionId, settingsFile, model, effort, addDirs: lanePathOverride ? [weLanePath] : [],
+    const baseArgv = buildRestrictedProviderArgv({
+      sessionId, prompt: workerWrapper ? `${prompt}${STRUCTURED_OUTPUT_SUFFIX}` : prompt, resumeSessionId, settingsFile, model, effort,
+      addDirs: lanePathOverride ? [weLanePath] : [],
     });
+    // 117 S3a — wrapped: `-p --output-format json --json-schema` on fresh AND resumed turns (the schema survives resume).
+    const argv = workerWrapper ? withStructuredOutput(baseArgv) : baseArgv;
     // build-path-codex-isolation-locus — a foreign-repo lane never carried `delivery-report-cli.mjs` (it is a
     // plain clone of THAT repo, not WE) — stage it at its real repo-relative path before the agent's first
     // `report --status=started` call needs it. See `stageDeliveryReportCliIntoLane`'s own docblock for why the
@@ -1136,6 +1147,39 @@ const CLAUDE_RESTRICTED_PROVIDER = {
     const deliveryEnv = buildDeliveryAgentEnv({
       sessionSlug, item, lanePath: weLanePath, attemptTag, reportsDir, implLane: lanePathOverride,
     });
+    if (workerWrapper) {
+      const turnStartedAt = Date.now();
+      // The wrapper owns the process, the timeout and the record; it never rejects on a worker failure (the v2
+      // envelope IS the failure report) and returns the envelope for `runAgentToCompletion` to read the build
+      // report from. `legacyRead` keeps the old delivery report working while the brief still asks for it.
+      let ran;
+      try {
+        ran = await runWorkerFn({
+          role: 'build', launcher: 'claude-p', session: sessionSlug, command: 'claude', argv, cwd: lanePath,
+          env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId,
+        }, {
+          // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
+          spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
+          // On a RESUMED turn the report on disk is the first turn's unless the agent rewrote it: only one written since
+          // this turn started counts, or a resume that ended with no result would read as the stale `done`.
+          legacyRead: () => {
+            const report = tryReadDeliveryReport(sessionSlug, reportsDir);
+            return resumeSessionId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
+          },
+        });
+      } catch (e) {
+        // runWorker rejects only on a bad spec or a record it could not write: the old path still recorded the turn's CPU and
+        // captured the failure on its way out, so do the same before rethrowing.
+        recordCpu(e && e.resourceUsage);
+        persistFailure(sessionSlug, e, { resumeSessionId });
+        throw e;
+      }
+      // The same post-spawn side effects as the unwrapped path below (the wrapper returns before reaching them): the turn's CPU
+      // telemetry on success and failure alike, and the capture of what a failed child said.
+      recordCpu(ran?.resourceUsage);
+      if (ran?.failure) persistFailure(sessionSlug, ran.failure, { resumeSessionId });
+      return ran;
+    }
     try {
       // #3627 bug 6 — explicit `timeout` override, distinct from (and far larger than) dispatch-lane-io.mjs's
       // `SPAWN_TIMEOUT_MS` (60s, correct only for that file's fire-and-forget `claude --bg` caller). Without
@@ -1358,6 +1402,45 @@ export function resolveDeliveryAgentProvider(name = DEFAULT_DELIVERY_AGENT_PROVI
 }
 
 /**
+ * 117 S3a — derive the BUILD report (the exact shape `tryReadDeliveryReport` returns, which every branch of
+ * `deliverItem` reads) from a worker-wrapper run. Behaviour-identical downstream; only the record format moved.
+ *  - the OLD delivery report, when the wrapper had to fall back to it, is returned untouched (full fidelity);
+ *  - `done` -> `done`; `blocked` + `needs-ruling` -> `needs-human-judgment`; any other `blocked` -> `blocked`;
+ *  - `no-change` / `not-applicable` -> `blocked` with no files (the "not ready" branch), because a build that
+ *    changed nothing has nothing to park;
+ *  - `unparseable` / `aborted` throw the same "exited with no done report" error a crash always did.
+ * @param {{envelope: object, legacyRecord?: object|null}} spawned
+ * @param {string} sessionSlug
+ */
+export function buildReportFromEnvelope(spawned, sessionSlug) {
+  const { envelope, legacyRecord } = spawned;
+  if (legacyRecord && legacyRecord.status === 'done') return legacyRecord;
+  const report = envelopeReportOrNull(envelope, sessionSlug);
+  if (!report) {
+    const why = envelope?.parse?.reason ?? envelope?.result?.outcome ?? 'no result';
+    throw new Error(`deliver-item-wrapper: agent for ${sessionSlug} exited with no done report (crash or refused effect) — worker-result envelope: ${why}`);
+  }
+  return report;
+}
+
+/** The report for a finished v2 envelope, or `null` when it holds no usable result (not done, unparseable, aborted). */
+export function envelopeReportOrNull(envelope, sessionSlug) {
+  if (!envelope || envelope.v !== 2 || envelope.status !== 'done' || !envelope.result) return null;
+  const r = envelope.result;
+  const base = { v: 1, session: sessionSlug, item: envelope.item, status: 'done', learning: r.learning ?? null, startedAt: envelope.startedAt, updatedAt: envelope.updatedAt };
+  const files = Array.isArray(r.filesTouched) ? r.filesTouched : [];
+  const reason = [r.summary, r.blocker?.evidence?.text].filter(Boolean).join(' — ').slice(0, 2000);
+  switch (r.outcome) {
+    case 'done': return { ...base, outcome: 'done', reason: null, filesTouched: files };
+    case 'no-change': case 'not-applicable':
+      return { ...base, outcome: 'blocked', reason: `worker reported ${r.outcome}: ${r.summary}`, filesTouched: [] };
+    case 'blocked':
+      return { ...base, outcome: r.blocker?.kind === 'needs-ruling' ? 'needs-human-judgment' : 'blocked', reason: reason || 'blocked', filesTouched: files };
+    default: return null; // unparseable / aborted: the caller treats it as a crash
+  }
+}
+
+/**
  * SKETCH. Spawns the minimal-brief agent through the given provider and BLOCKS until it exits — no separate
  * wait step, because there is nothing left to wait for once the blocking call itself returns. This is the
  * wrapper side of true push (FIRM REQUIREMENT 4): the AGENT never polls anything — it runs once, reports
@@ -1404,6 +1487,8 @@ export async function runAgentToCompletion(
     run: runFn = run,
     loadItems,
     isLaneCommitAhead = laneHasCommitAhead,
+    // off unless the knob is on, so the resume path is unchanged when it is off
+    readEnvelopeRecord = (session) => { if (!workerWrapperEnabled()) return null; try { return tryReadCompletion(session); } catch { return null; } },
   } = {},
 ) {
   // #3383 mechanical-dispatcher fix — read back from the SAME lane-scoped directory the provider itself just
@@ -1417,7 +1502,16 @@ export async function runAgentToCompletion(
   const reportsDir = resolveReportsDir(lanePath);
 
   if (resume) {
-    const existing = readReport(sessionSlug, reportsDir);
+    // 117 S3a — a wrapped attempt left a v2 envelope instead of (or beside) the delivery report; read either.
+    // A finished v2 envelope is authoritative: a started or stale legacy report must not shadow it. Three guards:
+    //  - a FINISHED envelope with no usable result (timeout / unparseable / aborted) never falls back to a legacy `done`
+    //    (that would turn a failed child into success); only a missing or still-`started` envelope may;
+    //  - a legacy report written AFTER the envelope (a later attempt that ran with the knob off) is the newer truth.
+    const envelope = readEnvelopeRecord(sessionSlug);
+    const legacy = readReport(sessionSlug, reportsDir);
+    const legacyIsNewer = !!legacy && !!envelope && Date.parse(legacy.updatedAt) > Date.parse(envelope.updatedAt);
+    const fromEnvelope = legacyIsNewer ? null : envelopeReportOrNull(envelope, sessionSlug);
+    const existing = fromEnvelope ?? (envelope?.status === 'done' && !legacyIsNewer ? null : legacy);
     if (existing && existing.status === 'done' && isLaneCommitAhead({ lane: lanePath, run: runFn })) {
       return existing;
     }
@@ -1433,9 +1527,13 @@ export async function runAgentToCompletion(
   // #3627 bug 7 — `lane`/`sessionSlug`/`item`/`attemptTag` threaded through so the provider can resolve the
   // real lane path (`cwd`) and mint the real env vars the brief needs (`buildDeliveryAgentEnv`) — see
   // `CLAUDE_RESTRICTED_PROVIDER.spawn`'s own docblock.
-  await provider.spawn({
+  const spawned = await provider.spawn({
     sessionId: claudeSessionId, prompt, lane, sessionSlug, item, attemptTag, lanePathOverride,
   }); // AWAITS — see DeliveryAgentProvider's own docblock.
+
+  // 117 S3a — a provider that ran through the unified worker wrapper hands back its v2 envelope: the report the
+  // rest of this file acts on is derived from THAT (same shape as the delivery report it replaces).
+  if (spawned && spawned.envelope) return buildReportFromEnvelope(spawned, sessionSlug);
 
   const report = readReport(sessionSlug, reportsDir);
   if (!report || report.status !== 'done') {
@@ -1544,14 +1642,18 @@ export async function runGateWithOneRetry(
   // #3627 attempt-5 finding — `gateOutcome` threaded through so the resume prompt itself can stop telling an
   // agent "your gate failed, fix it" when the true outcome is `unrun` (nothing in its diff to fix) — see
   // `resumeAgentWithGateFailure` below.
-  await resumeAgentWithGateFailure({
+  const resumed = await resumeAgentWithGateFailure({
     sessionSlug, lane, item, attemptTag, failureOutput: first.detail, gateOutcome: first.outcome, provider,
     claudeSessionId, lanePathOverride,
   }); // SKETCH — see below
   // #3383 mechanical-dispatcher fix — read back from the SAME lane-scoped directory the resume just used
   // (see `runAgentToCompletion`'s own comment for the full root-cause account), never the wrapper's own
   // script-location default.
-  const retryReport = readReport(sessionSlug, resolveReportsDir(lanePath)); // agent's fresh report after the resume — 'done' (fixed) or 'blocked' (couldn't)
+  // 117 S3a — a wrapped resumed turn's own v2 envelope outranks the legacy report, which on that path is the stale first-turn one.
+  // With an envelope present but unusable (unparseable / aborted) there is NO retry report: never fall back to that stale one.
+  const retryReport = resumed?.envelope
+    ? (resumed.legacyRecord?.status === 'done' ? resumed.legacyRecord : envelopeReportOrNull(resumed.envelope, sessionSlug))
+    : readReport(sessionSlug, resolveReportsDir(lanePath)); // agent's fresh report after the resume — 'done' (fixed) or 'blocked' (couldn't)
   // #3565 — commit whatever the resumed turn changed, same wrapper-owned reasoning as the build commit above,
   // BEFORE the second verify reads the lane. A `blocked` retry that touched nothing no-ops harmlessly here.
   commitTurn({ lane: lanePath, item, provider, phase: 'gate-fix' }, { run: runFn });
@@ -1606,10 +1708,10 @@ async function resumeAgentWithGateFailure({
   // #3627 bug 7 — this prompt says `$LANE` above, same as the fresh brief, so this resume needs the SAME real
   // cwd/env treatment (`lane`/`sessionSlug`/`item`/`attemptTag` threaded through to the provider) or a resumed
   // agent hits the identical "no real $LANE to cd into" failure the fresh spawn did.
-  await provider.spawn({
+  return provider.spawn({
     sessionId: claudeSessionId, prompt, resumeSessionId: claudeSessionId, lane, sessionSlug, item, attemptTag,
     lanePathOverride,
-  }); // AWAITS.
+  }); // AWAITS. Returned (not dropped): a wrapped provider hands back its v2 envelope for the resumed turn.
 }
 
 // #xu2pp2m — `resolveLanePath` EXTRACTED to `./minimal-context-provider.mjs` (imported above), unchanged: the

@@ -2415,6 +2415,7 @@ describe('the write arc and its #2964 ordering', () => {
           'scripts/lib/poc-branches.mjs',
           'scripts/lib/constellation-repos.mjs',
           'scripts/lib/prototype-tracker-data.mjs',
+          'scripts/backlog/task-agreement.mjs',
           'scripts/lib/local-date.mjs',
         ];
         for (const file of hookFiles) {

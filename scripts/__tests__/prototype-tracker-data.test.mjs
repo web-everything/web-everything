@@ -86,7 +86,12 @@ describe('parseDoneWhen', () => {
     expect(items).toHaveLength(3);
     expect(items[1]).toBe('A blocked case reaches a person via explicit notification. Still part of item 2, wrapped onto a second line.');
   });
-  it('returns [] when there is no "## Done when" section', () => {
+  it('reads `## Acceptance` `[A#]` items exactly as `## Done when` numbered items (#5399 S7)', () => {
+    const canonical = FIXTURE.replace('## Done when', '## Acceptance').replace(/^(\d+)\. /gm, '- [A$1] ');
+    expect(canonical).not.toContain('## Done when');
+    expect(parseDoneWhen(canonical)).toEqual(parseDoneWhen(FIXTURE));
+  });
+  it('returns [] when there is no acceptance section', () => {
     expect(parseDoneWhen('# Title\n\nno such section\n')).toEqual([]);
   });
 });

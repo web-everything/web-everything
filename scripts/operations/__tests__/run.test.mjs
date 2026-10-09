@@ -16,7 +16,9 @@ import { DEFAULT_REPO_ROOT } from '../../lib/hermetic-tests.mjs';
 import { withBareOrigin, withNarrowClone } from './helpers/real-repo.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
-const TOP_FILES = ['package.json'];
+// `schemas/worker-result.v1.json` is read by path when `scripts/operations/worker-result.mjs` is imported
+// (via `completion-store.mjs`), so the fixture clone needs it beside `scripts/`.
+const TOP_FILES = ['package.json', 'schemas/worker-result.v1.json'];
 const TREES = ['scripts', 'skills-src'];
 
 /** Copy the parts of this repo the CLI imports into the fixture clone, commit on main and push. */
