@@ -1,0 +1,70 @@
+{
+ "capturedFrom": "plateau-app/.drain-daemon/daemon.log skip-reasons, 2026-10-09 (UTC)",
+ "revalidationAborted": [
+  {
+   "num": 4602,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4605,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4607,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4446,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4547,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4595,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4578,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  },
+  {
+   "num": 4591,
+   "repo": "web-everything/web-everything",
+   "kind": "unknown-mergeability",
+   "reason": "not mergeable (mergeable=UNKNOWN)",
+   "source": "revalidationAborted"
+  }
+ ],
+ "otherKinds": [
+  {
+   "num": 4453,
+   "repo": "web-everything/web-everything",
+   "kind": "codeql-failed",
+   "reason": "CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)",
+   "source": "skipped"
+  }
+ ]
+}
