@@ -3,11 +3,12 @@ bornAs: x5d9nso
 kind: story
 size: 5
 parent: "5467"
-status: open
+status: resolved
 relatedTo: ["5468"]
 blockedBy: ["5534"]
 scope: ["we:scripts/operations/verify.mjs", "we:scripts/operations/mutation-check.mjs", "we:scripts/lib/verify-settings.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
 tags: [verify, fixer]
 ---
 
