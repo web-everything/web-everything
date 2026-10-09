@@ -91,6 +91,12 @@ describe('the checks the code decides', () => {
     expect(executableCommands('<!<!-- a --><!-- b -->-- `node hidden.mjs` -->')).toEqual([]);
     expect(executableCommands('<!-- stray `node a.mjs`')).toEqual(['node a.mjs']);
   });
+  it('a comment closed by `--!>` is a comment too — its command stays hidden', () => {
+    expect(executableCommands('<!-- `node hidden.mjs` --!>`node real.mjs`')).toEqual(['node real.mjs']);
+    expect(executableCommands('<!<!-- x --!>-- `node hidden.mjs` --!>`node real.mjs`')).toEqual(['node real.mjs']);
+    // a stray `--!>` is dropped, not left in the command scan
+    expect(executableCommands('x --!> `node a.mjs`')).toEqual(['node a.mjs']);
+  });
   it('work already on main is a finding; an unreadable history is "not checked", never "clear"', () => {
     const done = deterministicChecks({ raw: card(), exists, alreadyDone: { done: true, pr: { number: 4100 }, checked: true } });
     expect(done.findings.map((f) => f.ref)).toEqual(['already-on-main']);

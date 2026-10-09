@@ -115,6 +115,7 @@ const COMMAND_RE = /^(?:[A-Z_][A-Z0-9_]*=\S*\s+)*(?:node|npm|npx|pnpm|yarn|bun|v
 export function executableCommands(section) {
   // Strip to a fixpoint: one pass over `<!<!-- x -->-->` leaves a fresh `<!-- … -->` behind (incomplete multi-character
   // sanitization). A stray unterminated `<!--` / `-->` token is dropped too, so none survives into the command scan.
+  // An HTML comment ends at `-->` or at `--!>` (the spec's "incorrectly closed comment"), so both close one here.
   // Bounded first: each unterminated `<!--` makes the lazy match scan to the end, so the work grows with the square of the input.
   let text = String(section ?? '').slice(0, 20_000);
   for (let prev = null; prev !== text;) {
@@ -122,9 +123,9 @@ export function executableCommands(section) {
     // Whole comments first, to a fixpoint — a stray `-->` must not be eaten while a comment it closes is still forming.
     for (let before = null; before !== text;) {
       before = text;
-      text = text.replace(/<!--[^]*?-->/g, '');
+      text = text.replace(/<!--[^]*?--!?>/g, '');
     }
-    text = text.replace(/<!--|-->/g, '');
+    text = text.replace(/<!--|--!?>/g, '');
   }
   // Backtick and tilde fences alike (`readDoneWhen` treats both as fences); `\r\n` reads as `\n`.
   text = text.replace(/\r\n?/g, '\n');
