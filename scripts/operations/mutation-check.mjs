@@ -257,3 +257,61 @@ export function mutationCheckOperation() {
     }),
   });
 }
+
+/**
+ * #5466 — THE REVERT-RED CHECK, as a sibling declaration of `mutation-check` over the same transaction shape: put a
+ * fix's SOURCE changes back out (its tests stay), run only the tests it added or changed, and report which of them do
+ * not go red. A test that passes with the fix reverted does not discriminate — the same vacuous-guard defect this
+ * file's header names, found mechanically instead of by a juror.
+ *
+ * Inside the fixer's verify it runs from `we:scripts/verify-lane.mjs` (mode from the declared verify settings); this
+ * declaration is the replay / by-hand path: `node scripts/operations/run.mjs revert-red-check --checkout=<dir>
+ * --base=<pre-fix sha>`. An EFFECT for the same reason `probe` above is: it writes to source files.
+ */
+export const REVERT_RED_CHECK_OP = 'revert-red-check';
+export const REVERT_RED_PROBE_EFFECT = 'revert-red-check.probe';
+
+export function revertRedCheckOperation() {
+  return op(REVERT_RED_CHECK_OP, {
+    input: {
+      // Required, never defaulted to `process.cwd()` — same reason as `mutation-check`'s own `checkout`.
+      checkout: { type: 'string', required: true },
+      // The pre-fix commit. The range base..head is the fix.
+      base: { type: 'string', required: true },
+      head: { type: 'string', required: false, default: 'HEAD' },
+      // The replay caller asks for a verdict, so the default is `warn` (report, never block); `enforce` makes a
+      // non-discriminating test a blocking verdict.
+      mode: { type: 'string', required: false, default: 'warn', enum: ['warn', 'enforce'] },
+      maxFiles: { type: 'number', required: false, default: 40 },
+    },
+    verdictFrom: 'assess',
+
+    probe: effectStep({
+      reads: ['input.checkout', 'input.base', 'input.head', 'input.mode', 'input.maxFiles'],
+      effects: (view) => [{
+        type: REVERT_RED_PROBE_EFFECT,
+        payload: {
+          checkout: view.input.checkout,
+          base: view.input.base,
+          head: view.input.head,
+          mode: view.input.mode,
+          maxFiles: view.input.maxFiles,
+        },
+      }],
+    }),
+
+    assess: compute({
+      reads: ['findings.probe'],
+      fn: (view) => {
+        const entry = (view.findings.probe?.effects ?? [])[0];
+        if (!entry || entry.status !== 'applied' || !entry.result) {
+          throw new Error(
+            'revert-red-check.assess: the probe effect did not complete, so there is no result to judge. '
+            + `status=${entry?.status ?? 'missing'}${entry?.error ? ` error=${entry.error}` : ''}`,
+          );
+        }
+        return entry.result;
+      },
+    }),
+  });
+}

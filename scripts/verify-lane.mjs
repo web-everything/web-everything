@@ -79,6 +79,10 @@ import { laneGitHardeningEnv, hardenLaneGitArgs } from './lib/lane-git-hardening
 import { classifyRedCause, reachesChanged } from './lib/red-cause.mjs';
 import { baseRerunCandidate, measureBaseFailures, classifyPreExisting, runVitestOnBase } from './lib/verify-base-rerun.mjs';
 import { alwaysRunPlan, alwaysRunInventory,matchRequestedDefaultGate, verifySetting, phaseAdmissionKind, verifyPhaseAdmissionEnabled,buildPhaseOutcome, buildVerifyPhases, formatVerifyPhases, resolveDefaultGate, explicitGateRefusal, describeGate, scaledTimeoutFlags, laneRelevantChangeSinceForRecord, computeWorkingTreeHash, stableTreeHash, localChangedSet } from './lib/verify-lane-gate.mjs';
+import { readAwaitVerifyRecord } from './conveyor/await-verify.mjs';
+import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRedToVerdict } from './lib/verify-revert-red.mjs';
+import { createRevertProbe } from './operations/mutation-check-io.mjs';
+import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
@@ -148,6 +152,14 @@ function markerPhases(record) {
     ? { phases: record.phases } : {};
 }
 
+// #5466 — the revert-red result rides along on `check` (the fixer pastes its `line` into the evidence comment). Only for a
+// marker that belongs to THIS head, like the red cause below.
+function markerRevertRed(record) {
+  return record && typeof record === 'object' && !record.corrupt && record.sha === headSha
+    && record.revertRed && typeof record.revertRed === 'object' && !Array.isArray(record.revertRed)
+    ? { revertRed: record.revertRed } : {};
+}
+
 // Item 99 — the recorded red cause rides along on `check` and cached output, so a reader of the marker sees it.
 // Only for a marker that belongs to THIS head: a red cause for another commit would describe the wrong code.
 function markerRedCause(record) {
@@ -172,6 +184,14 @@ function emit(result, exitCode) {
 
 const headSha = tryGit(['rev-parse', 'HEAD']);
 if (!headSha) emit({ sha: null, status: 'error', reason: 'no-head', detail: `could not resolve HEAD in ${REPO} — is this a git checkout?` }, 3);
+
+// #5466 — a revert-red run that was killed mid-revert left a journal: put the fixed content back from git BEFORE this run
+// hashes or tests the tree, whatever the current revert-red mode. If it cannot be put back, refuse to verify that tree.
+if (MODE === 'verify' || MODE === 'run') {
+  const recovery = recoverRevertRed({ checkout: REPO });
+  if (recovery.pending) process.stderr.write(`revert-red: restored a revert a killed run left behind (${recovery.restored.length} file(s))${recovery.ok ? '' : ` — FAILED: ${recovery.detail}`}\n`);
+  if (!recovery.ok) emit({ sha: headSha, status: 'error', reason: 'revert-red-unrecovered', detail: `a revert-red run left reverted files in ${REPO} and they could not be restored (${recovery.detail}); the tree is not the commit being verified.` }, 3);
+}
 
 // ── `check` — READ-ONLY: report the finish-guard verdict for HEAD, run nothing. This is exactly the gate
 //    pr-land applies, exposed so a delivery step can pre-flight it (and so it is directly testable end-to-end).
@@ -206,14 +226,14 @@ if (MODE === 'check') {
       resolveLaneRelevantChangeSince: (record) => laneRelevantChangeSinceForRecord({ record, headSha, base: 'origin/main', runGit: git }),
     });
     const settled = readMarker();
-    emit({ ...result, ...markerPhases(settled), ...markerRedCause(settled) }, result.ok ? 0 : 2);
+    emit({ ...result, ...markerPhases(settled), ...markerRedCause(settled), ...markerRevertRed(settled) }, result.ok ? 0 : 2);
   }
   const bareCheckRecord = readMarker();
   const v = verifyGateDecision({
     record: bareCheckRecord, headSha, breakGlass: VERIFY_BREAK_GLASS, requireVerified: REQUIRE_VERIFIED,
     laneRelevantChangeSince: laneRelevantChangeSinceForRecord({ record: bareCheckRecord, headSha, base: 'origin/main', runGit: git }),
   });
-  emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord), ...markerRedCause(bareCheckRecord) }, v.ok ? 0 : 2);
+  emit({ sha: headSha, ...v, ...markerPhases(bareCheckRecord), ...markerRedCause(bareCheckRecord), ...markerRevertRed(bareCheckRecord) }, v.ok ? 0 : 2);
 }
 
 // #3378 review (rounds 2-4) — `isConfirmedOwnLease` itself now refuses an `ownerSession` match that is either
@@ -707,6 +727,39 @@ try {
   if ((!phaseAdmission && admission.ok) || firstPhaseAdmission?.ok) releaseOwnedSlot({ lockRoot: ADMISSION_LOCK_ROOT, cap: ADMISSION_CAP, owner: REPO });
 }
 
+// #5466 — the revert-red check, inside the fixer's own verify: on a GREEN gate for a fix push (the fix role's own await
+// record names exactly this head), revert the fix's source changes, run only the tests it added or changed, and record
+// which of them stay green. AFTER the gate and BEFORE the marker, so the harness's exact-sha / clean-tree push check
+// never sees the reverted tree (the transaction restores and re-reads every file; a failed restore leaves the tree
+// changed, the tree hash below unstable, and nothing is pushed). `off` (built-in) runs nothing; `warn` records only;
+// `enforce` turns a flagged or execution-unproven result red (a structural unproven is recorded, never blocking). Its
+// vitest runs queue on the heavy pool like every gate phase; their ceiling starts only once a slot is granted.
+let revertRed = null;
+if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, signal }) && headSha && MODE !== 'check') {
+  const revertRedMode = verifySetting('revertRed', process.env);
+  if (revertRedMode !== 'off') {
+    const started = performance.now();
+    try {
+      revertRed = await revertRedForVerify({
+        repo: REPO, headSha, record: readAwaitVerifyRecord(REPO),
+        settings: { mode: revertRedMode, maxFiles: verifySetting('revertRedMaxFiles', process.env) },
+        probe: createRevertProbe(),
+      });
+    } catch (error) {
+      revertRed = { mode: revertRedMode, status: 'unproven', reason: `check-crashed: ${String(error?.message ?? error).slice(0, 200)}`,
+        blocking: revertRedMode === 'enforce', discriminating: [], nonDiscriminating: [], unproven: [], reverted: [], keptNew: [] };
+      revertRed.line = `revert-red (${revertRedMode}): unproven — ${revertRed.reason}`;
+    }
+    revertRed = { ...revertRed, since: verifySetting('revertRedSince', process.env) ?? null, ms: Math.round(performance.now() - started) };
+    if (revertRed.status !== 'skipped' || revertRed.reason !== 'not-a-fix-push') process.stderr.write(`${revertRed.line}\n`);
+    if (revertRed.status !== 'skipped' || !['not-a-fix-push', 'mode-off'].includes(revertRed.reason)) {
+      appendRevertRedLog({ at: new Date().toISOString(), repo: REPO, sha: headSha, ...revertRed }, { root: resolveCoordinationRoot() });
+    }
+    // The verdict effect is decided in ONE pure place: warn never changes it, except a failed restore (red in every mode).
+    ({ exitCode, failureDetails } = applyRevertRedToVerdict({ exitCode, failureDetails, revertRed }));
+  }
+}
+
 const builtPhases = buildVerifyPhases({ admission: { mode: phaseAdmission ? 'phase' : 'gate', phases: admissionPhases }, admissionWaitMs: admission.waitedMs, ...phaseMs, gateMs, decision: resolvedGate?.decision, outcomes,
   alwaysRun: alwaysRun.declared.length ? alwaysRun : null });
 const phases = admissionFallback ? { ...builtPhases, admissionFallback } : builtPhases;
@@ -727,7 +780,7 @@ Object.assign(redCauseFields, classifyPreExisting({ cause: redCauseFields, candi
 if (MODE === 'run') process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (MODE === 'run' && infrastructure) emit({ sha: headSha, status: 'infrastructure-failure', reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 if (MODE === 'run') {
-  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...diagnostic, ...redCauseFields, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
+  emit({ sha: headSha, status: exitCode === 0 ? 'green' : 'red', reason: 'run', exitCode, ...(revertRed ? { revertRed } : {}), ...diagnostic, ...redCauseFields, phases, detail: exitCode === 0 ? 'gate passed (run mode — no marker recorded).' + retryDetail : `gate FAILED (exit ${exitCode}) — run mode, no marker recorded.${retryDetail}` }, exitCode === 0 ? 0 : 2);
 }
 
 // 4. Rewrite the marker to its terminal green/red form — for the sha THIS run actually verified.
@@ -763,11 +816,11 @@ const finished = verifyFinishBody(startBody, {
   suites: GATE,
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
-writeMarker({ ...finished, ...redCauseFields, phases });
+writeMarker({ ...finished, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 
 emit(
-  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, ...redCauseFields, phases, detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
+  { sha: headSha, status: finished.status, reason: finished.status, exitCode, ...diagnostic, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}), detail: (finished.status === 'green' ? `suites passed — recorded green for ${headSha.slice(0, 8)} (delivery may proceed).` : `suites FAILED (exit ${exitCode}) — recorded red for ${headSha.slice(0, 8)}; the finish-guard will refuse to land until this is green.`) + retryDetail },
   finished.status === 'green' ? 0 : 2,
 );
