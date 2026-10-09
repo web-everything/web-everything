@@ -64,7 +64,7 @@ export const HEALTH_INVESTIGATE_READ_OPERATIONS = Object.freeze(['runner-activit
  *  operation's io into the health tick); `health-investigate-dispatch.test.mjs` asserts it covers every id in
  *  `run.mjs#OPERATIONS`, so a new operation cannot silently become reachable. */
 export const NON_READ_OPERATIONS = Object.freeze([
-  'review-pr', 'review-prep', 'record-verdict', 'verify', 'mutation-check', 'gap-sweep-status', 'clear-stuck-session',
+  'review-pr', 'review-prep', 'record-verdict', 'verify', 'mutation-check', 'revert-red-check', 'gap-sweep-status', 'clear-stuck-session',
   'resolve', 'scaffold', 'file-item', 'suggest-next', 'pr-status', 'land-advance', 'pr-reconcile', 'pr-ownership',
   'agent-activity', 'item-activity', 'daemon-status', 'heavy-queue', 'review-seat-caps', 'gate-health', 'telemetry-summary',
   'graduation-progress-report', 'route-pr-outcome', 'dispatch-lane', 'claim', 'open-pr', 'explore', 'stage-pr-view',

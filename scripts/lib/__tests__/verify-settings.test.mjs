@@ -10,7 +10,8 @@ import { verifyRelatedMode, verifyTestTimeoutFactor, verifyStandardsPolicy, veri
 
 const allSources = source => Object.fromEntries(Object.keys(BUILT_IN_VERIFY_SETTINGS).map(key => [key, source]));
 const custom = { relatedMode: 'import-only', testTimeoutFactor: 4, standards: 'ci-only', phaseAdmission: false, fastTargets: 2,
-  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false };
+  matchRequestVariants: false, supersede: 'never', restartInFlight: 'kill', runAllPhases: false, isolatedRetry: 'off', relatedMaxTests: 12, relatedDepth: 3, alwaysRunTests: ['a/b.test.mjs'], skipLocalForCardOnly: false,
+  revertRed: 'enforce', revertRedSince: '2026-01-01', revertRedMaxFiles: 10 };
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 function file(contents) {
@@ -29,7 +30,7 @@ describe('verify settings', () => {
     for (const f of shippedAlwaysRun) expect(existsSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../..', f)), f).toBe(true);
     expect(defaultVerifySettingsPath()).toBe(resolve(dirname(fileURLToPath(import.meta.url)), '../../verify-settings.json'));
     expect(resolveVerifySettings({ fileConfig: loadVerifySettingsFile(defaultVerifySettingsPath()), env: {} }))
-      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true }, sources: allSources('file') });
+      .toEqual({ values: { ...BUILT_IN_VERIFY_SETTINGS, relatedMode: 'import-only', standards: 'auto', relatedMaxTests: 40, relatedDepth: 2, alwaysRunTests: shippedAlwaysRun, skipLocalForCardOnly: true, revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 40 }, sources: allSources('file') });
     expect(verifyRelatedMode({})).toBe('import-only');
   });
 
@@ -54,9 +55,11 @@ describe('verify settings', () => {
     const env = { WE_VERIFY_RELATED: 'all', WE_VERIFY_TEST_TIMEOUT_FACTOR: '2.5', WE_VERIFY_STANDARDS: 'auto',
       WE_VERIFY_PHASE_ADMISSION: '1', WE_VERIFY_FAST_TARGETS: '0', WE_VERIFY_MATCH_REQUEST_VARIANTS: '1',
       WE_VERIFY_SUPERSEDE: 'any', WE_VERIFY_RESTART_IN_FLIGHT: 'adopt', WE_VERIFY_RUN_ALL_PHASES: '1',
-      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1' };
+      WE_VERIFY_ISOLATED_RETRY: 'timeouts', WE_VERIFY_RELATED_MAX_TESTS: '5', WE_VERIFY_RELATED_DEPTH: '1', WE_VERIFY_ALWAYS_RUN_TESTS: 'x/y.test.mjs, z.test.mjs', WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY: '1',
+      WE_VERIFY_REVERT_RED: 'warn', WE_VERIFY_REVERT_RED_SINCE: '2026-10-08', WE_VERIFY_REVERT_RED_MAX_FILES: '7' };
     const values = { relatedMode: 'all', testTimeoutFactor: 2.5, standards: 'auto', phaseAdmission: true, fastTargets: 0,
-      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true };
+      matchRequestVariants: true, supersede: 'any', restartInFlight: 'adopt', runAllPhases: true, isolatedRetry: 'timeouts', relatedMaxTests: 5, relatedDepth: 1, alwaysRunTests: ['x/y.test.mjs', 'z.test.mjs'], skipLocalForCardOnly: true,
+      revertRed: 'warn', revertRedSince: '2026-10-08', revertRedMaxFiles: 7 };
     expect(resolveVerifySettings({ fileConfig: custom, env })).toEqual({ values, sources: allSources('env') });
     expect(resolveVerifySettings({ fileConfig: custom, env: { WE_VERIFY_RELATED: 'all' } }))
       .toEqual({ values: { ...custom, relatedMode: 'all' }, sources: { ...allSources('file'), relatedMode: 'env' } });
@@ -181,5 +184,22 @@ describe('alwaysRunTests setting (#99)', () => {
     }
     expect(resolveVerifySettings({ fileConfig: {}, env: { WE_VERIFY_ALWAYS_RUN_TESTS: './a/b.test.ts,c/d.test.cjs' } }).values.alwaysRunTests).toEqual(['./a/b.test.ts', 'c/d.test.cjs']);
     expect(resolveVerifySettings({ fileConfig: { alwaysRunTests: ['a.test.mjs'] }, env: { WE_VERIFY_ALWAYS_RUN_TESTS: '' } }).values.alwaysRunTests).toEqual([]);
+  });
+});
+
+// #5466 — the revert-red check mode is a declared setting; off (today's behaviour) is the built-in value.
+describe('revert-red settings (#5466)', () => {
+  it('is off by built-in and warn in the shipped file, with the warn window start recorded', () => {
+    expect(BUILT_IN_VERIFY_SETTINGS).toMatchObject({ revertRed: 'off', revertRedSince: null, revertRedMaxFiles: 40 });
+    expect(loadVerifySettingsFile(defaultVerifySettingsPath())).toMatchObject({ revertRed: 'warn', revertRedSince: '2026-10-08' });
+  });
+
+  it('an unknown or malformed value falls back to the built-in (off), never to a looser one', () => {
+    for (const bad of ['on', 'Warn', true, 1, null]) {
+      expect(validateVerifySettings({ revertRed: bad }).revertRed).toBe('off');
+      expect(resolveVerifySettings({ fileConfig: { revertRed: 'enforce' }, env: { WE_VERIFY_REVERT_RED: String(bad) } }).values.revertRed).toBe('enforce');
+    }
+    for (const bad of ['2026-13-40', 'yesterday', 20261008]) expect(validateVerifySettings({ revertRedSince: bad }).revertRedSince).toBe(null);
+    for (const bad of [0, -1, 1.5, 201, '9']) expect(validateVerifySettings({ revertRedMaxFiles: bad }).revertRedMaxFiles).toBe(40);
   });
 });
