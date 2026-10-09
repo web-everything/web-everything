@@ -1456,7 +1456,7 @@ export function runReconcileFixDispatch({
   const refusals = [...ciHealRefusals, ...planRefusals, ...scopeFilter.refusals];
   // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
   const priorityShadowResult = priorityShadow
-    ? priorityShadow({ planned: plannedAll, ranks: scopeFilter.ranks, dispatchEntries, repoKey }) : null;
+    ? priorityShadow({ planned: plannedAll, ranks: scopeFilter.ranks, refusals: scopeFilter.refusals, dispatchEntries, repoKey }) : null;
 
   // Lanes: THIS repo's own pool (`profile.lanePoolRepo` — `.` for WE, an absolute checkout path for a sibling
   // repo), never the WE pool for a non-WE repo (#x33jgwt).
