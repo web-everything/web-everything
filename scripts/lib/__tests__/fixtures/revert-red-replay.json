@@ -1,0 +1,1289 @@
+[
+  {
+    "name": "replay-4441-warn",
+    "source": "PR 4441 fix commit 66223b910 replayed 2026-10-08",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "backlog/xq1xbsl-review-a-ruling-on-an-unchanged-head-resumes-the-paused-revi.md"
+        },
+        {
+          "status": "M",
+          "path": "scripts/conveyor/__tests__/review-referral-hold.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/conveyor/review-referral-hold.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/lib/jury-core.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/__tests__/review-ruling-resume.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/review-loop-cli.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/review-pr.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/conveyor/__tests__/review-referral-hold.test.mjs": [
+          "still reads as the parked run it was, and is resumed again by the same ruling",
+          "a re-arm that arrived meanwhile still owes a fresh review",
+          "once the resumed pass has run `advise`, the ruling it answered no longer wakes it",
+          "a pass that died after its own verdict but before `advise` is still unfinished and resumable"
+        ],
+        "scripts/operations/__tests__/review-ruling-resume.test.mjs": [
+          "an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block",
+          "a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it",
+          "a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review",
+          "a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)",
+          "after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion",
+          "with no advisory seat seated, a nearby edit sets nothing aside",
+          "an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory",
+          "demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)"
+        ]
+      },
+      "probe": {
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > still reads as the parked run it was, and is resumed again by the same ruling",
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > a re-arm that arrived meanwhile still owes a fresh review",
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > a pass that died after its own verdict but before `advise` is still unfinished and resumable",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"correctness\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"security\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a undefined-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > with no advisory seat seated, a nearby edit sets nothing aside",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed > never demotes a correctness-lens re-raise, whatever the edit near the cited line",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed > never demotes a security-lens re-raise, whatever the edit near the cited line"
+        ],
+        "failuresTruncated": false,
+        "applied": true,
+        "occurrences": 4,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "flagged",
+      "reason": "tests-pass-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": [
+        {
+          "file": "scripts/conveyor/__tests__/review-referral-hold.test.mjs",
+          "test": "once the resumed pass has run `advise`, the ruling it answered no longer wakes it"
+        },
+        {
+          "file": "scripts/operations/__tests__/review-ruling-resume.test.mjs",
+          "test": "demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)"
+        }
+      ]
+    }
+  },
+  {
+    "name": "replay-4481-warn",
+    "source": "PR 4481 fix commit 5a7ba97cd replayed 2026-10-08",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "backlog/xkhtg2a-overlay-dispatch-smoke.md"
+        },
+        {
+          "status": "M",
+          "path": "scripts/lib/__tests__/daemon-load-overlay.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/lib/daemon-load-overlay.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/lib/__tests__/daemon-load-overlay.test.mjs": [
+          "no --wait → queues the request, launches NOTHING, and says loudly that no smoke ran",
+          "--wait + adopted + the overlay IS in THAT version → smoke it; a failure removes ONLY this overlay and rolls the VERSION back (never a no-op re-request)",
+          "the smoke targets the version in the RESULT, not whatever `current` points at now",
+          "a version rollback that does NOT switch is reported as such (never \"recovered\")",
+          "a worker launch that THROWS is a failed smoke → rolled back, not an unhandled rejection with the overlay left registered",
+          "a throw while recovering still returns the rolled-back result and its evidence",
+          "--wait + adopted + a passing smoke keeps the overlay",
+          "--wait + adopted but the overlay is NOT in the version (the updater builds origin/main only) → no worker, a loud warning, no rollback",
+          "--wait but the request was not adopted (timeout / smoke-failed) → nothing launched, and a loud warning that the overlay stays unsmoked",
+          "dispatchSmoke=off → the versioned path adds no warning and launches nothing",
+          "pins OPERATION_COMPLETIONS_DIR to a fresh scratch dir in the child env AND in the prompt's own report command, and leaves a real store untouched",
+          "a launch that exits non-zero fails the smoke with launch-failed, without waiting for a record",
+          "rebuild rejected / lock busy (overlay not in the live tree) → no worker, a warning",
+          "the post-adopt smoke THROWING rolls back instead of rejecting with the overlay left registered"
+        ]
+      },
+      "probe": {
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > no --wait → queues the request, launches NOTHING, and says loudly that no smoke ran",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > --wait + adopted + the overlay IS in THAT version → smoke it; a failure removes ONLY this overlay and rolls the VERSION back (never a no-op re-request)",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > the smoke targets the version in the RESULT, not whatever `current` points at now",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > a version rollback that does NOT switch is reported as such (never \"recovered\")",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > a worker launch that THROWS is a failed smoke → rolled back, not an unhandled rejection with the overlay left registered",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > a throw while recovering still returns the rolled-back result and its evidence",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > --wait + adopted + a passing smoke keeps the overlay",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > --wait + adopted but the overlay is NOT in the version (the updater builds origin/main only) → no worker, a loud warning, no rollback",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — versioned clone (the in-tick updater builds; this CLI smokes what --wait reports adopted) > --wait but the request was not adopted (timeout / smoke-failed) → nothing launched, and a loud warning that the overlay stays unsmoked",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — a non-versioned load whose overlay never reached the tree is not silently \"registered\" > rebuild rejected / lock busy (overlay not in the live tree) → no worker, a warning",
+          "scripts/lib/__tests__/daemon-load-overlay.test.mjs > runDaemonLoadOverlay — a non-versioned load whose overlay never reached the tree is not silently \"registered\" > the post-adopt smoke THROWING rolls back instead of rejecting with the overlay left registered"
+        ],
+        "failuresTruncated": false,
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "flagged",
+      "reason": "tests-pass-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": [
+        {
+          "file": "scripts/lib/__tests__/daemon-load-overlay.test.mjs",
+          "test": "dispatchSmoke=off → the versioned path adds no warning and launches nothing"
+        },
+        {
+          "file": "scripts/lib/__tests__/daemon-load-overlay.test.mjs",
+          "test": "pins OPERATION_COMPLETIONS_DIR to a fresh scratch dir in the child env AND in the prompt's own report command, and leaves a real store untouched"
+        },
+        {
+          "file": "scripts/lib/__tests__/daemon-load-overlay.test.mjs",
+          "test": "a launch that exits non-zero fails the smoke with launch-failed, without waiting for a record"
+        }
+      ]
+    }
+  },
+  {
+    "name": "replay-4441-off-is-today",
+    "source": "PR 4441 fix commit 66223b910 replayed 2026-10-08 — mode off (today): nothing runs",
+    "facts": {
+      "mode": "off",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "backlog/xq1xbsl-review-a-ruling-on-an-unchanged-head-resumes-the-paused-revi.md"
+        },
+        {
+          "status": "M",
+          "path": "scripts/conveyor/__tests__/review-referral-hold.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/conveyor/review-referral-hold.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/lib/jury-core.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/__tests__/review-ruling-resume.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/review-loop-cli.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/review-pr.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/conveyor/__tests__/review-referral-hold.test.mjs": [
+          "still reads as the parked run it was, and is resumed again by the same ruling",
+          "a re-arm that arrived meanwhile still owes a fresh review",
+          "once the resumed pass has run `advise`, the ruling it answered no longer wakes it",
+          "a pass that died after its own verdict but before `advise` is still unfinished and resumable"
+        ],
+        "scripts/operations/__tests__/review-ruling-resume.test.mjs": [
+          "an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block",
+          "a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it",
+          "a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review",
+          "a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)",
+          "after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion",
+          "with no advisory seat seated, a nearby edit sets nothing aside",
+          "an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory",
+          "demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)"
+        ]
+      },
+      "probe": {
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > still reads as the parked run it was, and is resumed again by the same ruling",
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > a re-arm that arrived meanwhile still owes a fresh review",
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > a pass that died after its own verdict but before `advise` is still unfinished and resumable",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"correctness\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"security\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a undefined-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > with no advisory seat seated, a nearby edit sets nothing aside",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed > never demotes a correctness-lens re-raise, whatever the edit near the cited line",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed > never demotes a security-lens re-raise, whatever the edit near the cited line"
+        ],
+        "failuresTruncated": false,
+        "applied": true,
+        "occurrences": 4,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "mode-off",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "replay-4441-enforce-blocks",
+    "source": "PR 4441 fix commit 66223b910 replayed 2026-10-08 — mode enforce",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "backlog/xq1xbsl-review-a-ruling-on-an-unchanged-head-resumes-the-paused-revi.md"
+        },
+        {
+          "status": "M",
+          "path": "scripts/conveyor/__tests__/review-referral-hold.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/conveyor/review-referral-hold.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/lib/jury-core.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/__tests__/review-ruling-resume.test.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/review-loop-cli.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/operations/review-pr.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/conveyor/__tests__/review-referral-hold.test.mjs": [
+          "still reads as the parked run it was, and is resumed again by the same ruling",
+          "a re-arm that arrived meanwhile still owes a fresh review",
+          "once the resumed pass has run `advise`, the ruling it answered no longer wakes it",
+          "a pass that died after its own verdict but before `advise` is still unfinished and resumable"
+        ],
+        "scripts/operations/__tests__/review-ruling-resume.test.mjs": [
+          "an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block",
+          "a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it",
+          "a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review",
+          "a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)",
+          "after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion",
+          "with no advisory seat seated, a nearby edit sets nothing aside",
+          "an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory",
+          "demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)"
+        ]
+      },
+      "probe": {
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > still reads as the parked run it was, and is resumed again by the same ruling",
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > a re-arm that arrived meanwhile still owes a fresh review",
+          "scripts/conveyor/__tests__/review-referral-hold.test.mjs > a ruling on an unchanged head resumes the parked run (replay of #4361) > a resume that never finished > a pass that died after its own verdict but before `advise` is still unfinished and resumable",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"correctness\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"security\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a undefined-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > a \"\"-lens block-ruled re-raise stays mandatory after a nearby (even exact-line) edit",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — referrals follow the later-round scoping rule (#3999) > an OPERATOR block ruling counts as blocked for an advisory-lens re-raise, like a reviewer block",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume whose referral step fails part-way leaves a run that is still parked and resumable, and the next pass finishes it",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume that keeps failing is retried RESUME_MAX_ATTEMPTS times in all, then the round falls back to a fresh review",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > runReviewLoopOnce — a ruling on an unchanged head resumes the paused review (replay of #4361) > a resume that finished and re-parked, then failed on the NEXT ruling, keeps the LATEST parked pass (not the first)",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > after a nearby edit the gate seats stay mandatory and only the advisory seat is set aside as a card suggestion",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > with no advisory seat seated, a nearby edit sets nothing aside",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > review-pr reduce — a later panel on an unchanged head adds no mandatory referral (replay of #4361) > a block-ruled finding re-raised after a fix push > an operator block ruling in the thread is read: the advisory seat is set aside, the gate seats stay mandatory",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed > never demotes a correctness-lens re-raise, whatever the edit near the cited line",
+          "scripts/operations/__tests__/review-ruling-resume.test.mjs > classifyReferralsByRound — a block-ruled re-raise is demoted only on positive evidence the cited lines were fixed > never demotes a security-lens re-raise, whatever the edit near the cited line"
+        ],
+        "failuresTruncated": false,
+        "applied": true,
+        "occurrences": 4,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "flagged",
+      "reason": "tests-pass-with-fix-reverted",
+      "blocking": true,
+      "nonDiscriminating": [
+        {
+          "file": "scripts/conveyor/__tests__/review-referral-hold.test.mjs",
+          "test": "once the resumed pass has run `advise`, the ruling it answered no longer wakes it"
+        },
+        {
+          "file": "scripts/operations/__tests__/review-ruling-resume.test.mjs",
+          "test": "demotes an advisory seat when a source file changed within LATER_ROUND_CHANGE_WINDOW of the cited line (edges included)"
+        }
+      ]
+    }
+  },
+  {
+    "name": "clean-new-test-goes-red",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "clean",
+      "reason": "all-new-tests-red-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "clean-in-enforce-does-not-block",
+    "source": "synthetic",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "clean",
+      "reason": "all-new-tests-red-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "unknown-mode-reads-as-off",
+    "source": "synthetic",
+    "facts": {
+      "mode": "strict",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "mode-off",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "not-a-fix-push",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "delivery",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "not-a-fix-push",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "missing-fix-record",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": null,
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "not-a-fix-push",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "fix-record-for-another-head",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": false,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "fix-record-not-for-this-head",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "no-test-changed",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "no-test-changed",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "test-only-change",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "no-source-to-revert",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "baseline-red-is-unproven-and-blocks-in-enforce",
+    "source": "synthetic",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": false,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": false,
+        "mutantRan": false,
+        "mutantGreen": false,
+        "killedBy": [],
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "unproven",
+      "reason": "baseline-red",
+      "blocking": true,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "runner-collected-nothing-is-unproven",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": false,
+        "occurrences": 1,
+        "baselineRan": false,
+        "baselineGreen": false,
+        "mutantRan": false,
+        "mutantGreen": false,
+        "killedBy": [],
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "unproven",
+      "reason": "baseline-unrun",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "restore-failed-outranks-everything",
+    "source": "synthetic",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "restored": false
+      }
+    },
+    "expect": {
+      "status": "unproven",
+      "reason": "not-restored",
+      "blocking": true,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "load-error-with-fix-reverted-is-not-red",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs"
+        ],
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "unproven",
+      "reason": "load-error-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "truncated-failure-list-is-unproven",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > other"
+        ],
+        "failuresTruncated": true,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "unproven",
+      "reason": "failure-list-truncated",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "changed-assertion-without-new-title-is-file-level",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": []
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": true,
+        "killedBy": [],
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "flagged",
+      "reason": "tests-pass-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": [
+        {
+          "file": "scripts/x/__tests__/guard.test.mjs",
+          "test": null
+        }
+      ]
+    }
+  },
+  {
+    "name": "title-text-is-data-not-structure",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/guard.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "a > b `${x}` --force"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > a > b `${x}` --force"
+        ],
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "clean",
+      "reason": "all-new-tests-red-with-fix-reverted",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "too-large",
+    "source": "synthetic",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        {
+          "status": "M",
+          "path": "scripts/x/f0.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f1.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f2.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f3.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f4.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f5.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f6.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f7.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f8.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f9.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f10.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f11.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f12.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f13.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f14.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f15.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f16.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f17.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f18.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f19.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f20.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f21.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f22.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f23.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f24.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f25.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f26.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f27.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f28.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f29.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f30.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f31.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f32.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f33.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f34.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f35.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f36.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f37.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f38.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f39.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/f40.mjs"
+        },
+        {
+          "status": "M",
+          "path": "scripts/x/__tests__/guard.test.mjs"
+        }
+      ],
+      "titles": {
+        "scripts/x/__tests__/guard.test.mjs": [
+          "refuses a dot name"
+        ]
+      },
+      "probe": {
+        "applied": true,
+        "occurrences": 1,
+        "baselineRan": true,
+        "baselineGreen": true,
+        "mutantRan": true,
+        "mutantGreen": false,
+        "killedBy": [
+          "scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"
+        ],
+        "failuresTruncated": false,
+        "restored": true
+      }
+    },
+    "expect": {
+      "status": "skipped",
+      "reason": "too-large",
+      "blocking": false,
+      "nonDiscriminating": []
+    }
+  },
+  {
+    "name": "new-source-kept-is-recorded-and-does-not-block-in-enforce",
+    "source": "synthetic — PR 4535 review: a fix modifies a.mjs, adds helper b.mjs and a test of b.mjs; the test legitimately stays green with a.mjs reverted, and the fixer has nothing to change",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/a.mjs" },
+        { "status": "A", "path": "scripts/x/b.mjs" },
+        { "status": "A", "path": "scripts/x/__tests__/b.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/b.test.mjs": ["b does the thing"] },
+      "probe": {
+        "applied": true, "occurrences": 1, "baselineRan": true, "baselineGreen": true,
+        "mutantRan": true, "mutantGreen": true, "killedBy": [], "failuresTruncated": false, "restored": true
+      }
+    },
+    "expect": { "status": "unproven", "reason": "new-source-kept", "blocking": false, "nonDiscriminating": [] }
+  },
+  {
+    "name": "load-error-with-fix-reverted-does-not-block-in-enforce",
+    "source": "synthetic — the commonest new-test shape: it imports an export the fix added to a modified file, so it cannot load without the fix",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/guard.mjs" },
+        { "status": "M", "path": "scripts/x/__tests__/guard.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/guard.test.mjs": ["refuses a dot name"] },
+      "probe": {
+        "applied": true, "occurrences": 1, "baselineRan": true, "baselineGreen": true,
+        "mutantRan": true, "mutantGreen": false,
+        "killedBy": ["scripts/x/__tests__/guard.test.mjs [ scripts/x/__tests__/guard.test.mjs ]"],
+        "failuresTruncated": false, "restored": true
+      }
+    },
+    "expect": { "status": "unproven", "reason": "load-error-with-fix-reverted", "blocking": false, "nonDiscriminating": [] }
+  },
+  {
+    "name": "changed-existing-test-next-to-a-new-one-is-flagged",
+    "source": "synthetic — PR 4535 review: a fix adds one discriminating test AND tightens an existing test that stays green with the fix reverted",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/guard.mjs" },
+        { "status": "M", "path": "scripts/x/__tests__/guard.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/guard.test.mjs": ["refuses a dot name"] },
+      "changedExisting": { "scripts/x/__tests__/guard.test.mjs": true },
+      "probe": {
+        "applied": true, "occurrences": 1, "baselineRan": true, "baselineGreen": true,
+        "mutantRan": true, "mutantGreen": false,
+        "killedBy": ["scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"],
+        "failuresTruncated": false, "restored": true
+      }
+    },
+    "expect": { "status": "flagged", "reason": "tests-pass-with-fix-reverted", "blocking": false, "nonDiscriminating": [{ "file": "scripts/x/__tests__/guard.test.mjs", "test": null }] }
+  },
+  {
+    "name": "execution-timeouts-block-in-enforce",
+    "source": "synthetic — PR 4535 review: a run that hit its own ceiling is named, not folded into baseline-unrun, and fails closed",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/guard.mjs" },
+        { "status": "M", "path": "scripts/x/__tests__/guard.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/guard.test.mjs": ["refuses a dot name"] },
+      "probe": {
+        "applied": false, "occurrences": 1, "baselineRan": false, "baselineGreen": false, "baselineTimedOut": true,
+        "mutantRan": false, "mutantGreen": false, "killedBy": [], "restored": true
+      }
+    },
+    "expect": { "status": "unproven", "reason": "baseline-timeout", "blocking": true, "nonDiscriminating": [] }
+  }
+]

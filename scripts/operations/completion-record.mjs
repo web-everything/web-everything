@@ -194,7 +194,9 @@ export const COMPLETION_READ_VERSIONS = Object.freeze([COMPLETION_RECORD_VERSION
 /** v2 `role` (= `kind`). Kept equal to `worker-result.mjs#ROLES` by a test (this file may not import it: cycle). */
 export const ENVELOPE_ROLES = Object.freeze(['review', 'fix', 'ci-heal', 'inspect', 'build', 'prepare', 'investigate']);
 /** v2 `launcher`: which run-to-completion pattern produced the result (D7 FINAL: all of them go through the detached wrapper). */
-export const ENVELOPE_LAUNCHERS = Object.freeze(['claude-bg', 'claude-p', 'codex-exec', 'agy']);
+// `node-job` (117 S3b): a deterministic detached node worker (the review job) — run to completion, its own pid and
+// timeout, a result built by code and checked by the same validator.
+export const ENVELOPE_LAUNCHERS = Object.freeze(['claude-bg', 'claude-p', 'codex-exec', 'agy', 'node-job']);
 /** v2 `source`: where `result` came from. The three legacy sources are the folded stores (D2). */
 export const ENVELOPE_SOURCES = Object.freeze(['worker-result', 'legacy-completion', 'legacy-delivery-report', 'legacy-fix-report', 'none']);
 
@@ -237,7 +239,7 @@ function validateEnvelopeFields(r) {
  */
 export function newEnvelopeRecord({
   session, role, launcher, model = null, pr = null, item = null, sessionId = null, headBefore = null,
-  pid = null, timeoutMs = null, now = () => new Date().toISOString(),
+  pid = null, timeoutMs = null, cwd = null, awaitingVerify, now = () => new Date().toISOString(),
 } = {}) {
   if (!isValidSessionSlug(session)) throw new TypeError(`operations: invalid completion session slug ${JSON.stringify(session)}`);
   if (!ENVELOPE_ROLES.includes(role)) throw new TypeError(`operations: envelope role must be one of ${ENVELOPE_ROLES.join('/')}, got ${JSON.stringify(role)}`);
@@ -262,6 +264,8 @@ export function newEnvelopeRecord({
     headBefore: str(headBefore),
     headAfter: null,
     pid: pid ?? null,
+    cwd,
+    ...(awaitingVerify === undefined ? {} : { awaitingVerify }),
     timeoutMs: timeoutMs ?? null,
     deadlineAt: pid != null && timeoutMs != null ? new Date(Date.parse(ts) + timeoutMs).toISOString() : null,
     parse: null,
@@ -283,8 +287,9 @@ export function newEnvelopeRecord({
  */
 export function finishEnvelopeRecord(record, fin, now = () => new Date().toISOString()) {
   const ts = now();
+  const { awaitingVerify: _awaitingVerify, ...finished } = record;
   return {
-    ...record,
+    ...finished,
     status: 'done',
     outcome: fin.outcome,
     result: fin.result,

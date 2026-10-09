@@ -55,6 +55,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { backoffMs, retryDecision } from './infra-blocked.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { ensureFullHistory } from '../lib/git-run.mjs';
+import { gateAlert } from '../lib/quiet-hours-io.mjs';
 
 // ── TUNING (exported so a caller/test can override) ────────────────────────────────────────────────────────
 
@@ -158,7 +159,14 @@ export function osascriptNotifyArgs({ title, body }) {
 }
 
 /** Checked delivery: unsupported platforms and stderr must not disappear as success. */
-export function notifyDesktopChecked(notification, { spawnSyncFn = spawnSync, platform = process.platform } = {}) {
+export function notifyDesktopChecked(notification, { spawnSyncFn = spawnSync, platform = process.platform, quietGate } = {}) {
+  // quietHours (card xmvc6oc): real deliveries go through the shared gate; an injected `spawnSyncFn` (a test)
+  // skips it unless the caller passes `quietGate` explicitly.
+  const gate = quietGate === undefined ? (spawnSyncFn === spawnSync ? gateAlert : null) : quietGate;
+  if (gate) {
+    const send = (n) => notifyDesktopChecked(n, { spawnSyncFn, platform, quietGate: null });
+    return gate(notification, { send, sendDigest: send });
+  }
   if (platform !== 'darwin') return { ok: false, error: `Desktop notifications unsupported on ${platform}` };
   try {
     const result = spawnSyncFn('osascript', osascriptNotifyArgs(notification), { encoding: 'utf8', timeout: 10_000 });
@@ -171,10 +179,16 @@ export function notifyDesktopChecked(notification, { spawnSyncFn = spawnSync, pl
 
 /** Best-effort desktop notification (mirrors `supervisor.mjs`'s own `notifyDesktop`, #3398). macOS-only; a
  *  no-op elsewhere, and a spawn failure must never break the sync loop. */
-export function notifyDesktop({ title, body }) {
-  if (process.platform !== 'darwin') return;
-  try { spawn('osascript', osascriptNotifyArgs({ title, body }), { stdio: 'ignore', detached: true }).unref(); }
-  catch { /* best-effort */ }
+export function notifyDesktop(notification, { quietGate = gateAlert, spawnSyncFn = spawnSync, platform = process.platform } = {}) {
+  const send = ({ title, body }) => {
+    if (process.platform !== 'darwin') return { ok: false };
+    try { spawn('osascript', osascriptNotifyArgs({ title, body }), { stdio: 'ignore', detached: true }).unref(); return { ok: true }; }
+    catch { return { ok: false }; /* best-effort */ }
+  };
+  // This `send` acknowledges before osascript has run, so it must never confirm a held-alerts DIGEST (the queue is
+  // emptied on that confirmation): the digest goes through the checked sender and stays queued if it fails.
+  const sendDigest = (n) => notifyDesktopChecked(n, { spawnSyncFn, platform, quietGate: null });
+  try { quietGate ? quietGate(notification, { send, sendDigest }) : send(notification); } catch { /* best-effort */ }
 }
 
 /** Best-effort refresh of the `branch-drift.mjs` git-notes report the moment a real conflict is found here —

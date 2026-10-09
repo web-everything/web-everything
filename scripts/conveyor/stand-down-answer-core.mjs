@@ -78,8 +78,26 @@ export function operatorAnswerForStandDown(comments, index) {
   return null;
 }
 
+/**
+ * A stand-down is resolved by an operator answer that names it — or (#4522, live 2026-10-09) by a LATER answer
+ * carrying a DISPOSITION, which rules the whole PR, not one question. #4522 had two stand-downs (a fixer's, then
+ * supersede-watch's); the `close-superseded` answer named the latest, the earlier one stayed "unresolved", and
+ * REFUSAL 1 (`stood-down`) fired before the disposition branch every tick, so the PR never closed. Only a
+ * disposition widens; a stand-down posted AFTER the answer is untouched.
+ */
 export function isOperatorAnswerStandDownSuperseded(comments, index) {
-  return operatorAnswerForStandDown(comments, index) !== null;
+  if (operatorAnswerForStandDown(comments, index) !== null) return true;
+  if (!Array.isArray(comments) || !isTerminal(comments[index])) return false;
+  for (let i = index + 1; i < comments.length; i += 1) {
+    const answer = parseOperatorAnswer(comments[i]);
+    if (answer && answerDisposition(answer) && answersEarlierStandDown(comments, i, answer)) return true;
+  }
+  return false;
+}
+
+/** Does `answer` (at `comments[i]`) name a terminal comment that precedes it on this thread? */
+function answersEarlierStandDown(comments, i, answer) {
+  return comments.slice(0, i).some((c) => isTerminal(c) && c.id != null && String(c.id) === answer.standDownId);
 }
 
 export function latestUnresolvedStandDown(comments) {
@@ -96,8 +114,7 @@ export function latestOperatorAnswer(comments) {
   if (!Array.isArray(comments)) return null;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
     const answer = parseOperatorAnswer(comments[i]);
-    if (answer && comments.slice(0, i).some((c) => isTerminal(c) && c.id != null
-      && String(c.id) === answer.standDownId)) return answer;
+    if (answer && answersEarlierStandDown(comments, i, answer)) return answer;
   }
   return null;
 }
@@ -130,7 +147,7 @@ export function isCloseSupersededExecuted(comments) {
   let answerAt = -1;
   for (let i = comments.length - 1; i >= 0; i -= 1) {
     const answer = parseOperatorAnswer(comments[i]);
-    if (answer && comments.slice(0, i).some((c) => isTerminal(c) && c.id != null && String(c.id) === answer.standDownId)) { answerAt = i; break; }
+    if (answer && answersEarlierStandDown(comments, i, answer)) { answerAt = i; break; }
   }
   if (answerAt < 0) return false;
   return comments.slice(answerAt + 1).some((c) => isTrustedMarkerAuthor(c) && typeof c?.body === 'string'

@@ -144,6 +144,7 @@ import {
 // narration went for the observer's `unresolved` message. See {@link isDispatchHandleLive}.
 import { DETACHED_HANDLE_PREFIX, defaultIsPidAlive, deliveryDispatchLogPath, detachedHandlePid } from './detached-dispatch.mjs';
 import { describeDispatchFailure } from '../lib/describe-spawn-failure.mjs';
+import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 
 /**
  * The three native Claude model ids {@link ../lib/dispatch-contracts.mjs#CLAUDE_NATIVE_MODEL_BY_TIER} maps to
@@ -1556,10 +1557,13 @@ export function createDispatchSinks({
       let reportedModel = null;
       let reportedEffort = null;
       let attemptId = null;
+      let wrappedPid = null;
       let handle;
       try {
         handle = await provider({
           reportAttempt: (id) => { attemptId = id; },
+          // 117 S3b — the provider ran this launch through the detached worker wrapper (its pid is the runner).
+          reportWrapped: (pid) => { wrappedPid = Number.isInteger(pid) ? pid : null; },
           headRefOid: payload?.headRefOid,
           claimOwner: payload?.claimOwner,
           claimRoot: payload?.claimRoot,
@@ -1660,6 +1664,7 @@ export function createDispatchSinks({
         // could not tell which one ran). The recommendation survives as `criteriaRecommendation`, named as one.
         dispatch: {
           ...(attemptId ? { attemptId } : {}),
+          ...(wrappedPid ? { wrapped: true, runnerPid: wrappedPid } : {}),
           launchKind: payload?.launchKind ?? 'build',
           route,
           executor,
@@ -1827,7 +1832,13 @@ export function routeDispatchProvider(request, {
  * @param {{spawnAgent?: Function}} [io]
  * @returns {string}
  */
-export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts) } = {}) {
+export function defaultClaudeProvider(request, {
+  spawnAgent = (argv, opts) => defaultSpawnAgent(argv, opts),
+  // 117 S3b (D7 FINAL) — a fix / ci-heal launched here runs to completion through the detached worker wrapper instead
+  // of `claude --bg` (same argv, `-p` + `--json-schema`, a v2 completion record). `false` keeps the old spawn exactly.
+  wrapKind = (kind) => WRAPPABLE_LAUNCH_KINDS.includes(kind) && workerWrapperEnabledFor(kind),
+  launchWrapped = launchWrappedClaudeWorker,
+} = {}) {
   // #x2psfwz — a PR_KIND session name (`review-`/`fix-`/`ci-heal-`/`inspect-<PR>`) carries NO attempt suffix
   // (session-slug.mjs's `mintSessionSlug` forbids one for these kinds), so a round-2 dispatch for the SAME PR
   // reuses the EXACT name round 1 used. Round 1's own agent brief wrote a completion record under that name
@@ -1880,9 +1891,22 @@ export function defaultClaudeProvider(request, { spawnAgent = (argv, opts) => de
   try { if (request.policyRoute) reportedModel = resolvePolicyModel('claude', launchedModel); } catch { /* Explicit reasoned pins may name models outside the policy catalogue. */ }
   request.reportModel?.(reportedModel);
   request.reportEffort?.(argv.find(arg => arg.startsWith('--effort='))?.slice(9) ?? argv[argv.indexOf('--effort') + 1]);
+  const kind = String(request.launchKind || 'build');
+  if (wrapKind(kind)) {
+    const launched = launchWrapped({
+      role: kind, session: request.sessionSlug, bgArgv: argv, cwd: request.cwd, env: workerSpawnEnv(), pr: request.pr ?? null,
+      item: request.num ?? null, model: launchedModel, sessionId: request.sessionId,
+    });
+    request.reportWrapped?.(launched.wrapperPid);
+    // `pid:<wrapper>` is the detached-handle shape the run store and liveness already read (route `detached`).
+    return launched.handle || request.sessionId;
+  }
   const stdout = String(spawnAgent(argv, { cwd: request.cwd }) ?? '');
   return parseBackgroundedId(stdout) || request.sessionId;
 }
+
+/** 117 S3b — the launch kinds this provider can run through the detached worker wrapper (review has its own call site). */
+export const WRAPPABLE_LAUNCH_KINDS = Object.freeze(['fix', 'ci-heal']);
 
 /**
  * The default `claude --bg` spawner — named and exported for the same reason as {@link defaultRunNode}: the
@@ -1932,6 +1956,16 @@ export function defaultSpawnAgent(argv, opts = {}, { exec = execFileSync, grantT
     try { grantTrust(opts.cwd); } catch { /* grantDispatchTrust itself never throws; belt-and-suspenders */ }
     return exec('claude', argv, execOpts);
   }
+}
+
+/**
+ * 117 S3b — the env a spawned worker gets: `GH_TOKEN` stripped (`sanitizeSpawnEnv`, PR #2600) and the worker marker
+ * set (`markWorkerEnv`, #3383). The SAME composition {@link defaultSpawnAgent} applies, exported so the detached
+ * worker wrapper launch hands its `claude -p` child exactly the env the `--bg` launch had.
+ * @param {object} [env]
+ */
+export function workerSpawnEnv(env = process.env) {
+  return markWorkerEnv(sanitizeSpawnEnv(env));
 }
 
 /**

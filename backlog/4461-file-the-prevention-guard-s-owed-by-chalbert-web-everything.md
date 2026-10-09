@@ -3,9 +3,10 @@ bornAs: x89vi71
 kind: story
 size: 5
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/conveyor/health-smells/dispatch-refused-stale-clone.mjs", "we:scripts/conveyor/health-smells/__tests__/dispatch-refused-stale-clone.test.mjs", "we:scripts/conveyor/health-smells/pr-stage-stall.mjs", "we:scripts/conveyor/health-smells/github-app-token.mjs", "we:scripts/conveyor/health-smells/github-rest-budget.mjs", "we:scripts/conveyor/health-watch.mjs", "we:scripts/conveyor/health-investigate-plan.mjs", "we:scripts/conveyor/health-smells/__tests__/pr-stage-stall.test.mjs", "we:scripts/conveyor/health-smells/__tests__/github-app-token.test.mjs", "we:scripts/conveyor/health-smells/__tests__/github-rest-budget.test.mjs", "we:scripts/conveyor/health-smells/__tests__/host-smells.test.mjs", "we:scripts/conveyor/health-smells/__tests__/slice-4-probes.test.mjs", "we:scripts/conveyor/health-smells/__tests__/probe-wiring.test.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/conveyor/__tests__/health-investigate-dispatch.test.mjs", "we:scripts/conveyor/__tests__/health-investigate-plan.test.mjs"]
 dateOpened: "2026-09-29"
+dateResolved: "2026-10-09"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "17469e55bc0bd7c2cb28364b533360d130d724ed"
 tags: []

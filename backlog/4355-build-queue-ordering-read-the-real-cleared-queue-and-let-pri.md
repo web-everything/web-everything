@@ -17,6 +17,13 @@ Separately, and compounding it: the ordering itself never looks at `priority`. `
 
 **Recommended default: make `priority: high` count as an in-tier boost (or, cheaper, auto-pin any card the priority verb marks high) rather than requiring a human to hand-run `tier`/`rank` every time, and fix the read path to the real state home first** — the read-path bug is the more urgent of the two since it makes the queue's `cleared` count actively lie on every checkout, not just mis-order within the truth. As a secondary, low-cost win: have the builder's `--dry-run` print the full pick order with the reason for each position (which criterion/tier/rank decided it), so a human auditing "why is X above Y" doesn't have to re-derive `orderQueueDetailed` by hand — this session had to read `we:scripts/lib/build-queue.mjs` source directly to explain the current order.
 
+## Ruling (already settled: priority rulings Q1/Q2, operator 2026-10-08)
+
+The prepare run reported an open choice ("boost within tier, or auto-pin?"). It is already ruled: priority is a
+**class** (P0–P4) derived from facts by a pure rule plus an operator override label (Q1); queues order by class
+first, then within a class by the fix-queue score (unblocks + time waited) (Q2). So `priority: high` maps to a
+class, not a score boost or a pin. Aging moves an item up one class after 8 h, never into P0. Build to that.
+
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.

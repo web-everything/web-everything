@@ -15,6 +15,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defaultListAgents } from './dispatch-lane-io.mjs';
+import { listWrappedWorkerAgents } from './worker-wrapper-launch.mjs';
 
 /** The checkout this module lives in — the same root `dispatch-lane-io.mjs#REPO_ROOT` resolves. */
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -119,11 +120,22 @@ export function listReviewJobAgents({ dir = reviewJobsDir(), isAlive = pidAlive 
   return rows;
 }
 
-/** `claude agents --json` + the live review jobs — the ONE merged listing reconcile and review-status-tag read. */
-export function listAgentsWithReviewJobs({ listAgents = () => defaultListAgents(), listJobs = () => listReviewJobAgents() } = {}) {
+/**
+ * `claude agents --json` + the live review jobs + (117 S3b) the wrapped run-to-completion workers — the ONE merged
+ * listing reconcile and review-status-tag read. A wrapped fix / ci-heal / review has no `claude agents` row; its v2
+ * completion record stands in for one (`worker-wrapper-launch.mjs#listWrappedWorkerAgents`).
+ */
+export function listAgentsWithReviewJobs({
+  listAgents = () => defaultListAgents(), listJobs = () => listReviewJobAgents(), listWrapped = () => listWrappedWorkerAgents(),
+} = {}) {
   const listed = listAgents();
   const agents = Array.isArray(listed) ? listed : [];
   let jobs = [];
   try { jobs = listJobs() ?? []; } catch { jobs = []; }
-  return [...agents, ...jobs];
+  // Not swallowed, unlike `jobs`: a wrapped fix / ci-heal / review is a live-session population readers decide on by its
+  // ABSENCE (no live fixer -> dispatch one), so a failed listing aborts the read exactly as a failed `claude agents` does.
+  const wrapped = listWrapped() ?? [];
+  const merged = [...agents, ...jobs, ...wrapped];
+  // A spread drops the wrapped listing's non-enumerable `incomplete` (records it could not read): carry it over.
+  return wrapped.incomplete?.length ? Object.defineProperty(merged, 'incomplete', { value: wrapped.incomplete }) : merged;
 }

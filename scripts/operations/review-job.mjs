@@ -86,6 +86,8 @@ import {
 } from './review-job-store.mjs';
 import { assertMainNotStale, dispatchReview, isReviewCodePath, planReviewDispatch } from './review-dispatch.mjs';
 import { runReport } from './completion-cli.mjs';
+import { writeReviewJobDone, writeReviewJobStarted } from './review-job-envelope.mjs';
+import { workerWrapperEnabledFor } from './worker-wrapper-launch.mjs';
 import { tryReadCompletion } from './completion-store.mjs';
 import { rateAndRecordReviewJob } from '../conveyor/run-rating.mjs';
 import { recorderFor, setActiveRecorder } from './telemetry-store.mjs';
@@ -248,7 +250,16 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
     now: () => Date.now(),
     newActorId: () => randomUUID(),
     readPrevCompletion: (slug) => { try { return tryReadCompletion(slug); } catch { return null; } },
-    report: (flags) => runReport(flags),
+    // 117 S3b — the job writes its record as the v2 envelope (launcher `node-job`): its own pid/timeout on `started`,
+    // a schema-checked result + action on `done`, the v1 words unchanged. `WE_WORKER_WRAPPER=off` keeps the v1 report.
+    report: (flags) => {
+      if (!workerWrapperEnabledFor('review', env)) return runReport(flags);
+      if (flags.status === 'started') return writeReviewJobStarted({ session: flags.session, pr: flags.pr, timeoutMs: flags.timeoutMs ?? null });
+      return writeReviewJobDone({
+        session: flags.session, pr: flags.pr ?? null, repo: flags.repo ?? null,
+        classified: { outcome: flags.outcome, loopOutcome: flags.verdict ?? null, runId: flags.runId ?? null, label: flags.label ?? null },
+      });
+    },
     claim: (slug, record) => {
       const verdict = decideJobClaim(readJobRecord(slug, dir), record.pid, pidAlive);
       if (verdict.ok) writeJobRecord(record, dir);
@@ -446,7 +457,7 @@ function runReviewArc({
   let lanePath = null;
   try {
     const prev = io.readPrevCompletion(slug);
-    io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started' });
+    io.report({ session: slug, kind: 'review', pr: String(planned.pr), repo: planned.repo, status: 'started', timeoutMs: loopTimeoutMs });
 
     // NO pre-release of this slug's lease. The job slot above proves no live JOB owns the slug, but not that no
     // live SESSION does (the `--mode=session` path, or a session dispatched just before a switch-over and not yet
@@ -513,7 +524,7 @@ function runReviewArc({
     const done = classified ?? { outcome: BLOCKED_ON_INFRA, label: 'review-job exited without an outcome' };
     try {
       io.report({
-        session: slug, status: 'done', outcome: done.outcome,
+        session: slug, pr: String(planned.pr), repo: planned.repo, status: 'done', outcome: done.outcome,
         ...(done.loopOutcome ? { verdict: done.loopOutcome } : {}),
         ...(done.runId ? { runId: done.runId } : {}),
         ...(done.label ? { label: String(done.label).slice(0, 500) } : {}),

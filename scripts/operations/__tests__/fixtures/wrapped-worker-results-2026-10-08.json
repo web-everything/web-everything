@@ -1,0 +1,41 @@
+{
+  "ci-heal-4479": {
+    "sessionId": "7701bacd-48ed-4a91-be7c-eaa728d54876",
+    "at": "2026-10-08T17:24:50.932Z",
+    "structuredOutput": {
+      "v": 1,
+      "outcome": "done",
+      "summary": "Healed PR #4479: merged the live main into the lane, and fixed the only real break, test-shard (2) failing health-responder-core \"covers every registered descriptor\". The PR's new `ci-job-hung` health smell had no responder catalogue entry, so I added it to OBSERVATION_ONLY in scripts/conveyor/health-responder-core.mjs. The two affected test files pass locally (63 tests). Committed as ddd62325, then ran `verify-lane request` and `await-verify mark` (attempt 1) and ended the turn. The harness owns the verdict, the push to lane/hung-ci-job, and the resume. Still owed on resume: the ci-heal-mark comment, the completion report, fix-end, and the learnings drop. The fix claim is held, and the review labels were not touched. I skipped the converge pre-PR review because the heal is a single catalogue line.",
+      "blocker": null,
+      "findingsAddressed": [],
+      "filesTouched": [
+        "scripts/conveyor/health-responder-core.mjs"
+      ],
+      "learning": null
+    }
+  },
+  "fix-4398": {
+    "sessionId": "a9091509-148a-4b36-919e-98a184324d9a",
+    "at": "2026-10-08T17:17:50.005Z",
+    "structuredOutput": {
+      "v": 1,
+      "outcome": "done",
+      "summary": "Merged current origin/main into lane/lane-reserve with no conflicts (a merge, not a rebase, so the harness can push without a force-push). The diff against origin/main is now the 7 files of this card's own change. Verify is requested and marked for 284f6062, attempt 1. The harness pushes on green. Review labels untouched, nothing else edited. Nothing is pushed yet and the fix claim is still held, so the rearm/fix-end step and the fix-4398 completion record come after the verdict.",
+      "blocker": null,
+      "findingsAddressed": [
+        {
+          "ref": "scope-bloat: 11 of 18 files already on main (stale base)",
+          "disposition": "fixed",
+          "note": "Merged origin/main (7c731a95e..) into lane/lane-reserve; diff vs origin/main is 7 files."
+        }
+      ],
+      "filesTouched": [],
+      "learning": {
+        "kind": "friction",
+        "summary": "The assigned lane id can be leased by another session between dispatch and acquire, which made the first acquire fail.",
+        "area": "fix dispatch / lane acquire",
+        "suggestion": "Let the fix brief fall back to auto-pick acquire when the assigned lane is taken."
+      }
+    }
+  }
+}

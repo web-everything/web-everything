@@ -26,7 +26,10 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { applyCompletionUpdate, newCompletionRecord, readEnvelope, tryReadCompletion, withCompletionLock, writeCompletion } from './completion-store.mjs';
+import {
+  COMPLETION_RECORD_V2, COMPLETION_RECORD_VERSION, applyCompletionUpdate, newCompletionRecord, readEnvelope, tryReadCompletion, withCompletionLock, writeCompletion,
+} from './completion-store.mjs';
+import { envelopeFromLegacy } from './worker-result-router.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 
 /** The SAME two grammars `dispatch-lane.mjs#sessionSlugFor` (fix) and `review-dispatch.mjs` (review) mint. */
@@ -44,7 +47,14 @@ export function sessionSlugForCompletion({ kind, pr, repo = 'we' }) {
  */
 export function planDoneReport({ existing, session, kind, pr, item, patch, now }) {
   const base = existing ?? newCompletionRecord({ session, kind, pr, item, now });
-  return applyCompletionUpdate(base, { status: 'done', ...patch }, now);
+  const next = applyCompletionUpdate(base, { status: 'done', ...patch }, now);
+  if (base.v !== COMPLETION_RECORD_V2) return next;
+  // 117 S3b — the agent of a WRAPPED launch (its brief still says to report) is writing `done` onto the launcher's v2
+  // record. Keep the record v2 (its pid / deadline / launcher stay, so the liveness row survives) and give it the
+  // result the legacy word maps to (section 4 table), as `source: legacy-completion`. The wrapper's own done write,
+  // when the worker exits, replaces it with the schema-checked worker result and keeps these words.
+  const mapped = envelopeFromLegacy({ ...next, v: COMPLETION_RECORD_VERSION, kind: base.kind }, 'legacy-completion', { role: base.role, launcher: base.launcher });
+  return { ...next, result: mapped.result, parse: mapped.parse, action: mapped.action, source: 'legacy-completion' };
 }
 
 /**
