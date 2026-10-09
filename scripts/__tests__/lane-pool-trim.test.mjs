@@ -12,7 +12,7 @@
  *   (see that file's exclude list in `vitest.config.ts`).
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
@@ -27,7 +27,7 @@ function git(args, cwd) {
 let base, originDir, referenceDir, poolRoot;
 
 function runPool(args, extraEnv = {}) {
-  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: { ...process.env, ...extraEnv } });
+  const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL', env: withGhStub({ ...process.env, ...extraEnv }) });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }
 
@@ -112,7 +112,7 @@ describe('lane-pool trim (#4025) — TOCTOU: a lane acquired between evaluation 
   async function trimWithMidRunAcquire(args, lane, { dirty = true, acquire = true, at = 'evaluated', during } = {}) {
     const barrier = join(base, 'trim-barrier');
     const child = spawn('node', [SCRIPT, 'trim', ...REPO(), '--json', ...args], {
-      env: { ...process.env, ...ENV(), LANE_POOL_TRIM_TEST_BARRIER: barrier, LANE_POOL_TRIM_TEST_BARRIER_AT: at },
+      env: withGhStub({ ...process.env, ...ENV(), LANE_POOL_TRIM_TEST_BARRIER: barrier, LANE_POOL_TRIM_TEST_BARRIER_AT: at }),
     });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });

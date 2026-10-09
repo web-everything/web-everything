@@ -8,6 +8,8 @@
  */
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
@@ -731,7 +733,17 @@ describe('CLI --json flush — the full payload round-trips through an execFileS
   it('emits complete, parseable JSON with every top-level section present', () => {
     // `--no-lane-pool` (#x7xv2xt): the payload size comes from the build queue, not the lanes, so there is no
     // reason for a unit test to scan every real lane (`lane-pool status` + a per-lane git walk).
-    const out = execFileSync('node', [CLI, '--json', '--no-lane-pool'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] });
+    // Hermetic (xcu4cqf): the PR collector shells `gh pr list`; a stub `gh` first on the child's PATH answers an
+    // empty PR list so the read never reaches GitHub (the payload size under test comes from the build queue).
+    const ghDir = mkdtempSync(join(tmpdir(), 'conveyor-state-gh-'));
+    let out;
+    try {
+      writeFileSync(join(ghDir, 'gh'), '#!/bin/sh\necho "[]"\n', { mode: 0o755 });
+      out = execFileSync('node', [CLI, '--json', '--no-lane-pool'], {
+        encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, PATH: `${ghDir}:${process.env.PATH}` },
+      });
+    } finally { rmSync(ghDir, { recursive: true, force: true }); }
     // The whole payload arrived (a truncated tail would make this throw — the bug this pins).
     const state = JSON.parse(out);
     for (const key of ['queue', 'clearedNotReady', 'unshaped', 'lanes', 'freeSlots', 'prs', 'daemon', 'idle', 'health']) {

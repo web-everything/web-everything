@@ -23,7 +23,7 @@
  *   root, no mocking of `lane-pool.mjs` itself.
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync, rmSync, mkdirSync, chmodSync } from 'node:fs';
 import { resolve, join, basename } from 'node:path';
@@ -42,7 +42,7 @@ function runPool(args, extraEnv = {}) {
     encoding: 'utf8',
     timeout: 30_000,
     killSignal: 'SIGKILL',
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv },
+    env: withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv }),
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }

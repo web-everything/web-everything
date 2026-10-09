@@ -21,7 +21,9 @@ const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).
 let base, poolRoot, storeDir, originDir, referenceDir, fixtureRoot, sharedFixture;
 
 function runPool(args, extraEnv = {}) {
-  const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_AWAIT_VERIFY_STORE: storeDir, CLAUDE_CODE_SESSION_ID: 'sess-test', ...extraEnv };
+  // `acquire --force` reaps dead leases through a best-effort `gh` PR read that degrades to "off" when gh fails;
+  // declare the logged-out gh fixture so the hermetic guard does not count that read as live GitHub access.
+  const env = { ...process.env, LANE_POOL_ROOT: poolRoot, WE_AWAIT_VERIFY_STORE: storeDir, CLAUDE_CODE_SESSION_ID: 'sess-test', WE_HERMETIC_GH: 'unauthenticated', ...extraEnv };
   delete env.LANE_SESSION;
   for (const k of ['WE_LANE_HOLD', 'WE_LANE_HOLD_MINUTES', 'WE_LANE_AHEAD_EQUIVALENCE']) if (!(k in extraEnv)) delete env[k];
   const r = spawnSync('node', [SCRIPT, ...args], { encoding: 'utf8', env });

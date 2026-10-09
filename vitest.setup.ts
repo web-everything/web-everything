@@ -1,8 +1,18 @@
-import { beforeEach, afterEach, afterAll } from 'vitest';
+import { beforeEach, afterEach, afterAll, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { FAKE_GH_DIR_ENV, lazyTmpPath, writeFakeGhShim } from './scripts/lib/test-tmp-root.mjs';
+import { HERMETIC_ENV, isHermetic } from './scripts/lib/hermetic-tests.mjs';
+import { setupHermeticTestFile } from './scripts/lib/hermetic-tests-vitest.mjs';
+
+const REPO_ROOT = dirname(fileURLToPath(import.meta.url));
+// Captured BEFORE the sandbox strip below, so the hermetic guard also covers a state root the LAUNCHING shell
+// pinned (an operator's CONVEYOR_STATE_ROOT, a daemon's WE_DAEMON_STATE_DIR).
+const ambientEnv = { ...process.env };
+// Decided by the CONFIG (`test.env.WE_TEST_HERMETIC`), read before the strip removes every WE_* key.
+const hermetic = isHermetic(process.env);
 
 // tmp-leak fix (2026-10-04): this file runs once per test FILE, and every temp dir it makes used to be left
 // behind — ~1.15M dirs in the operator's `$TMPDIR` (2m39s to list). Each dir this file creates is removed in
@@ -26,10 +36,16 @@ function lazyRoot(name: string): string {
   return join(fileTmpBase, name);
 }
 const ownedTmpDirs: string[] = [];
+const fixtureRootKeys: string[] = [];
 let addedPathPrefix: string | undefined;
-afterAll(() => {
-  if (fileTmpBase && existsSync(fileTmpBase)) rmSync(fileTmpBase, { recursive: true, force: true });
-  for (const key of ['WE_COORDINATION_ROOT', 'WE_GH_THROTTLE_LOCK_ROOT', 'WE_DAEMON_STATE_DIR']) {
+// Registered as its own afterAll only when hermetic mode is off; otherwise it runs from the hermetic afterAll (below),
+// after that hook has read the shim log that lives under `fileTmpBase`.
+function cleanupFileTmp() {
+  // Retries: a child the file spawned (e.g. a cache writer under the per-file fake HOME) can still be finishing.
+  if (fileTmpBase && existsSync(fileTmpBase)) {
+    try { rmSync(fileTmpBase, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* run-wide sweep in vitest.globalSetup.mjs */ }
+  }
+  for (const key of ['WE_COORDINATION_ROOT', 'WE_GH_THROTTLE_LOCK_ROOT', 'WE_DAEMON_STATE_DIR', ...fixtureRootKeys.splice(0)]) {
     const v = process.env[key];
     if (fileTmpBase && v && v.startsWith(`${fileTmpBase}/`)) delete process.env[key];
   }
@@ -37,7 +53,8 @@ afterAll(() => {
   if (addedPathPrefix && process.env.PATH?.startsWith(`${addedPathPrefix}:`)) {
     process.env.PATH = process.env.PATH.slice(addedPathPrefix.length + 1);
   }
-});
+}
+if (!hermetic) afterAll(cleanupFileTmp);
 
 // #xpc3krl (ci-heal-2684, 2026-09-25; extended by operator-approved follow-up the same day) — SANDBOX BY
 // DEFAULT, FIRST, before anything below reads `process.env`. Live-caught on this Mac: 6 tests across
@@ -58,24 +75,11 @@ afterAll(() => {
 //      and `WE_TELEMETRY` blocks below so their own "was this already set?" checks see the sandboxed
 //      baseline, never a live daemon's real value.
 //
-// NOT DONE HERE, DELIBERATELY, after trying it and finding it BROKEN rather than just "not cheap" — a
-// throwaway `$HOME` (so `os.homedir()`-derived real-path defaults, `~/.claude/*` chief among them, redirect
-// tree-wide with no per-call-site change). Built it, then caught a live regression proving it does NOT work
-// under this repo's default vitest `threads` pool: `lane-pool-health-watch.test.mjs` started failing because
-// `resolveLanePoolRepoPath`'s `home = homedir()` kept returning the REAL home while the test's own
-// `process.env.HOME` correctly showed the sandboxed one. Root cause, confirmed with a minimal two-file
-// `worker_threads` repro: `os.homedir()`'s native binding does NOT consult a Worker thread's own (virtualized,
-// per-thread) `process.env` — only a `child_process` spawn's inherited env does, which is why the `PATH` trick
-// below still works fine. A real `$HOME` sandbox would need the heavier `forks` pool (real OS processes, where
-// `process.env` mutation IS process-wide) or a per-call-site change — worth knowing before the separate
-// detection-checks follow-up card picks a mechanism; it should not re-reach for this same "cheap" fix.
-//
-// ALSO NOT DONE HERE, same reason: a general guard that FAILS a test for touching the real `~/.claude`/real
-// lane folders. Checked empirically — mutating `node:fs`'s exported functions from this setup file does NOT
-// intercept a test file's own `import { readFileSync, writeFileSync, ... } from 'node:fs'` named-import calls
-// (confirmed with a minimal two-file repro: a patched `fs.writeFileSync` never fired for a sibling module's
-// named-import call to it), which is this codebase's dominant `fs` import style. A real interception guard
-// needs a loader/`vi.mock`-level hook, not a setup-file patch.
+// SUPERSEDED (card xcu4cqf): this block used to explain why a throwaway `$HOME` and an fs guard were "not done
+// here" — `os.homedir()` ignores a `threads` worker's virtualized `process.env`, and patching `node:fs` seemed not to
+// reach named imports. Both are now done, in the hermetic block below, via we:scripts/lib/hermetic-tests-vitest.mjs:
+// `os.homedir` is replaced by a function that reads `process.env.HOME`, and `syncBuiltinESMExports()` makes both
+// that and the fs patch reach `import { homedir } from 'node:os'` / `import { readFileSync } from 'node:fs'`.
 //
 // OPT OUT, per config, for the tier that means to prove REAL host/subprocess behavior on purpose
 // (`vitest.integration.config.ts`'s real-git/real-`gh` files, `vitest.soak.config.ts`'s real daemons) via
@@ -89,20 +93,6 @@ afterAll(() => {
 // A test that means to exercise the CONFIGURED path (a real env var, a real `gh`) sets it itself, inside its
 // own test body — that always wins over this file, since it runs after.
 if (process.env.WE_TEST_SANDBOX !== '0') {
-  try {
-    let fakeGhDir = process.env[FAKE_GH_DIR_ENV];
-    if (!fakeGhDir || !existsSync(join(fakeGhDir, 'gh'))) {
-      fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));
-      ownedTmpDirs.push(fakeGhDir);
-      writeFakeGhShim(fakeGhDir);
-    }
-    addedPathPrefix = fakeGhDir;
-    process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
-  } catch {
-    // Best-effort — a host where this fails (e.g. no writable temp dir) is no worse off than before this
-    // existed; a test that genuinely needs `gh` unavailable still sees whatever the real PATH gives it.
-  }
-
   const ENV_STRIP_PREFIXES = ['WE_', 'CONVEYOR_', 'GH_', 'CLAUDE_'];
   const ENV_STRIP_ALLOWLIST = new Set([
     'WE_TELEMETRY', // an operator's own explicit local opt-in, handled below — never ambient daemon state.
@@ -110,6 +100,36 @@ if (process.env.WE_TEST_SANDBOX !== '0') {
   for (const key of Object.keys(process.env)) {
     if (ENV_STRIP_ALLOWLIST.has(key)) continue;
     if (ENV_STRIP_PREFIXES.some((p) => key.startsWith(p))) delete process.env[key];
+  }
+}
+
+// HERMETIC BY DEFAULT (card xcu4cqf — main was red ~5.5 h on 2026-10-08 because a soak scenario read live GitHub
+// and the live origin/main backlog). Independent of the sandbox above: the integration and soak tiers keep their
+// real env but are hermetic too. Only `vitest.live.config.ts` (the scheduled, non-blocking live suite) turns it off.
+//   1. the hermetic shims first on PATH: a fake `gh` that never reaches GitHub, a `git` that refuses remote reads in
+//      the real checkout — both RECORD the access against the running test (we:scripts/lib/hermetic-tests.mjs);
+//   2. an in-process fs + fetch guard over the declared live roots (conveyor state, jobs, lane pool, primary
+//      backlog — we:scripts/hermetic-tests.settings.json). This CORRECTS the old note above: patching `node:fs`
+//      does reach `import { readFileSync } from 'node:fs'` named imports once `syncBuiltinESMExports()` runs;
+//   3. `afterEach` fails a test that made any live access with `live GitHub/backlog access in test`, even when the
+//      code under test swallowed the error.
+// Not wrapped in a try: a guard that silently failed to install would be a gate that fails open.
+if (hermetic) {
+  process.env[HERMETIC_ENV] = '1';
+  let fakeGhDir = process.env[FAKE_GH_DIR_ENV];
+  if (!fakeGhDir || !existsSync(join(fakeGhDir, 'gh')) || !existsSync(join(fakeGhDir, 'git'))) {
+    fakeGhDir = mkdtempSync(join(tmpdir(), 'we-fake-gh-'));
+    ownedTmpDirs.push(fakeGhDir);
+    writeFakeGhShim(fakeGhDir);
+  }
+  addedPathPrefix = fakeGhDir;
+  process.env.PATH = `${fakeGhDir}:${process.env.PATH || ''}`;
+  const hermeticSettings = setupHermeticTestFile({ beforeEach, afterEach, afterAll, expect, repoRoot: REPO_ROOT, ambient: ambientEnv, violationsDir: lazyRoot('hermetic'), fakeHome: lazyRoot('home'), afterSettle: cleanupFileTmp }).settings;
+  // Roots found from the checkout's location rather than the home (lane pool, telemetry): a private per-file dir.
+  for (const [key, name] of Object.entries(hermeticSettings.fixtureRootEnv || {})) {
+    if (key.startsWith('$') || process.env[key] !== undefined) continue;
+    process.env[key] = lazyRoot(String(name));
+    fixtureRootKeys.push(key);
   }
 }
 

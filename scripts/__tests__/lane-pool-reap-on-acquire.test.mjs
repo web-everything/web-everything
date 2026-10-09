@@ -8,7 +8,7 @@
  *   throwaway origin + reference under a private POOL_ROOT (no network, no shared pool root).
  */
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
-import { sharedRepos } from './fixtures/shared-git-fixture.mjs';
+import { sharedRepos, withGhStub } from './fixtures/shared-git-fixture.mjs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
@@ -28,7 +28,7 @@ function runPool(args, extraEnv = {}) {
   const r = spawnSync('node', [SCRIPT, ...args], {
     encoding: 'utf8',
     cwd: referenceDir,
-    env: { ...process.env, LANE_POOL_ROOT: poolRoot, ...extraEnv },
+    env: { ...withGhStub({ ...process.env, LANE_POOL_ROOT: poolRoot }), ...extraEnv },
   });
   return { code: r.status ?? 1, out: String(r.stdout || ''), err: String(r.stderr || '') };
 }

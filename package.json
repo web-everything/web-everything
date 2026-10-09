@@ -29,6 +29,7 @@
     "test:bun:scripts": "npx --yes bun@1.4.2 test --isolate --preload ./bun-test.preload.ts scripts/__tests__",
     "test:unit": "node scripts/readiness/heavy-admission.mjs run -- vitest run",
     "test:integration:vitest": "node scripts/readiness/heavy-admission.mjs run -- vitest run --config vitest.integration.config.ts",
+    "test:live": "node scripts/readiness/heavy-admission.mjs run -- vitest run --config vitest.live.config.ts",
     "test:soak": "node scripts/readiness/heavy-admission.mjs run -- vitest run --config vitest.soak.config.ts",
     "test:soak:shard": "node scripts/readiness/heavy-admission.mjs run -- node scripts/conveyor/soak/run-shard.mjs",
     "test:integration": "node scripts/readiness/heavy-admission.mjs run -- playwright test",

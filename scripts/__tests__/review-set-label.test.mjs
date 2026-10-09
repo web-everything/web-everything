@@ -11,12 +11,13 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import {
   mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, readdirSync, existsSync, realpathSync, symlinkSync, copyFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
+const OUTSIDE_EVERY_ROOT = '/etc';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   decideSetLabel, presentRemoveLabels, buildVerdictComment, neutralizeCommentMarkers, normalizeChannel,
-  runReviewLabelCli, projectVerdictCommentLength, REVIEW_LABEL_TARGETS, GH_COMMENT_MAX,
+  runReviewLabelCli as runReviewLabelCliRaw, projectVerdictCommentLength, REVIEW_LABEL_TARGETS, GH_COMMENT_MAX,
   checkBodyFileLocation, bodyFileRoots,
   // #x9krtkb — the restamp path's carried-human-clearance decision (bug 1) and its CLI wiring (bug 2's
   // `--new-head`, exercised through `runReviewLabelCli` below with a stub provider).
@@ -45,6 +46,34 @@ import {
 import { parseClearerActorId, parseAuthorActorId, readAuthorActorStamps } from '../lib/review-independence.mjs';
 import { REVIEW_LABELS, READY_TO_MERGE_LABEL } from '../lib/review-escalation.mjs';
 import { ADVISORY_LABELS } from '../lib/advisory-labels.mjs';
+
+// HERMETIC (card xcu4cqf): on an accept/clear-human/restamp the CLI reads the PR's net diff with `git fetch origin
+// +main:refs/remotes/origin/main <head>` + `merge-base`/`diff` against `origin/...` in the PROCESS's git repo, which
+// is the real checkout when run from a lane — a live remote read the hermetic git shim refuses. These tests assert
+// the verdict wiring, not the diff, so they point git (via GIT_DIR, which the CLI's git children inherit) at a
+// throwaway repo whose `origin` is itself and which has no `lane/x` branch: the net-diff read resolves nothing and
+// degrades to "unscored", exactly as it does on a clone with no such remote branch.
+let netDiffFixtureDir = null;
+const netDiffFixtureGitDir = () => {
+  if (netDiffFixtureDir) return join(netDiffFixtureDir, '.git');
+  const dir = mkdtempSync(join(tmpdir(), 'review-label-netdiff-'));
+  const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_DIR: undefined } });
+  g('init', '-q', '-b', 'main');
+  writeFileSync(join(dir, 'f.txt'), 'base\n');
+  g('add', 'f.txt');
+  g('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--no-gpg-sign', '-m', 'base');
+  g('remote', 'add', 'origin', dir);
+  netDiffFixtureDir = dir;
+  return join(dir, '.git');
+};
+const netDiffFixtureEnv = () => ({ GIT_DIR: netDiffFixtureGitDir() });
+afterAll(() => { if (netDiffFixtureDir) { try { rmSync(netDiffFixtureDir, { recursive: true, force: true }); } catch { /* best-effort */ } netDiffFixtureDir = null; } });
+/** `runReviewLabelCli` with git pinned to the throwaway repo for the duration of the call. */
+const runReviewLabelCli = (cfg) => {
+  const prev = process.env.GIT_DIR;
+  process.env.GIT_DIR = netDiffFixtureGitDir();
+  try { return runReviewLabelCliRaw(cfg); } finally { if (prev === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = prev; }
+};
 
 const human = [{ name: REVIEW_LABELS.human }, { name: 'ready-to-merge' }];
 const pending = [{ name: REVIEW_LABELS.pending }, { name: 'ready-to-merge' }];
@@ -1778,6 +1807,7 @@ process.exit(0);
         GH_PR_LABELS: JSON.stringify(labels),
         GH_PR_CREATED_AT: createdAt,
         CLAUDE_CODE_SESSION_ID: sessionId,
+        ...netDiffFixtureEnv(), // hermetic: git reads a throwaway repo, never the real checkout's origin/*
       },
     },
   );
@@ -3041,8 +3071,10 @@ describe('checkBodyFileLocation (#2897)', () => {
 
   // THE GUARD IS INTACT. This is the direction that matters: the check exists to stop the CLI publishing
   // whatever a stale shell variable happened to point at.
+  // `/etc` stands in for "a real directory outside every root" (the home used to, but hermetic test runs give each
+  // file a private HOME under the temp dir, which IS a root — card xcu4cqf).
   it('still refuses a path outside every root', () => {
-    for (const p of [join(homedir(), '.ssh', 'config'), '/etc/passwd', join(homedir(), 'notes.md')]) {
+    for (const p of [join(OUTSIDE_EVERY_ROOT, '.ssh', 'config'), '/etc/passwd', join(OUTSIDE_EVERY_ROOT, 'notes.md')]) {
       expect(checkBodyFileLocation(p, bodyFileRoots()).ok).toBe(false);
     }
   });
@@ -3056,8 +3088,8 @@ describe('checkBodyFileLocation (#2897)', () => {
       expect(checkBodyFileLocation(join(link, 'v.md'), bodyFileRoots()).ok).toBe(true);
       // …and a symlink pointing OUT of the allowlist is still refused, which is the half that matters.
       const escape = join(TMP, `bodyfile-escape-${process.pid}`);
-      symlinkSync(homedir(), escape);
-      expect(checkBodyFileLocation(join(escape, '.ssh', 'config'), bodyFileRoots()).ok).toBe(false);
+      symlinkSync(OUTSIDE_EVERY_ROOT, escape);
+      expect(checkBodyFileLocation(join(escape, 'passwd'), bodyFileRoots()).ok).toBe(false);
       rmSync(escape, { force: true });
     } finally {
       rmSync(link, { force: true });
@@ -3100,7 +3132,7 @@ describe('checkBodyFileLocation (#2897)', () => {
 
   it('still refuses a nonexistent path OUTSIDE every root — resolving the ancestor is not a loophole', () => {
     expect(checkBodyFileLocation('/nowhere/at/all/verdict.md', bodyFileRoots()).ok).toBe(false);
-    expect(checkBodyFileLocation(join(homedir(), 'no-such-dir', 'v.md'), bodyFileRoots()).ok).toBe(false);
+    expect(checkBodyFileLocation(join(OUTSIDE_EVERY_ROOT, 'no-such-dir', 'v.md'), bodyFileRoots()).ok).toBe(false);
   });
 
   // A root that does not resolve is dropped rather than compared as written, so a platform without `/tmp`

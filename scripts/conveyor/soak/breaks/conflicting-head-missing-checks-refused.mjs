@@ -42,6 +42,7 @@ export default {
       readRequiredChecks: () => ({ checks: REQUIRED }), readChecks,
       enrichMainRed: (prs) => ({ prs, mainRedWindows: [] }), enrichAlreadyLanded: (p) => p, enrichBaseRef: (p) => p,
       enrichSystemFix: (p) => p, enrichFixClaims: (p) => p, enrichTimeouts: (p) => p, enrichReferralHolds: (p) => p,
+      enrichScopeBloat: (p) => p, // its default runs `git rev-parse`/`git diff` against origin/main in the real checkout
       resolveMainSha: () => null, now: Date.parse('2026-10-03T23:00:00Z'),
     });
     const refused = (plan) => plan.refusals.filter((r) => r.kind === 'check-read-failed');

@@ -115,6 +115,7 @@ import {
 import { runDeliverItemCli } from '../deliver-item-run.mjs';
 import { REPO_ROOT } from '../minimal-context-provider.mjs';
 import { repoProfile } from '../../lib/repo-profile.mjs';
+import { admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 // #4349 — real (never mocked) run-store + build-dispatch-claim reads, driven through a temp `OPERATION_RUNS_DIR`
 // / `WE_COORDINATION_ROOT` in the new describe block below.
 import { createFileRunStore, newRunRecord } from '../run-store.mjs';
@@ -707,6 +708,8 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
   // A lane number no real pool uses: the default deny map covers the checkout this suite RUNS from, so a real
   // lane path (e.g. lane-7) here makes these tests fail whenever the suite runs inside that very lane.
   const L7 = `${HOME}/workspace/.lanes/web-everything/lane-4348`;
+  // The pool root is hermetic (`LANE_POOL_ROOT` -> a per-file tmp dir), so the lock folder is derived, not a fixed `.lanes/...` path.
+  const ADMISSION_LOCK = admissionLockRoot(L7);
   const P2 = `${HOME}/workspace/.lanes/plateau-app/lane-2`;
   const REQ = {
     sessionId: '43484348-4348-4348-8348-434843484348', prompt: 'BUILD #2720', lane: 7, sessionSlug: 'conveyor-2720',
@@ -783,7 +786,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
       const argv = o.spawnAgent.mock.calls[0][0];
       const perms = permissionsOf(argv);
       const writes = [...perms.matchAll(/"([^"]+)"="write"/g)].map((m) => m[1]);
-      const lock = writes.filter((w) => w.endsWith('/.lanes/.admission/heavy'));
+      const lock = writes.filter((w) => w === ADMISSION_LOCK);
       expect(lock).toHaveLength(1);
       // nothing broader: no HOME, no workspace root, no .lanes root, no wildcard; the only other write grant is the WE lane.
       for (const w of writes) {
@@ -831,7 +834,7 @@ describe('cross-locus delivery reaches BOTH lanes (#4348)', () => {
     expect(Object.hasOwn(xOpts.env, 'IMPL_LANE')).toBe(false);
     // the heavy-admission lock folder is the one write grant a we-locus spawn carries (operator ruling 2026-10-07).
     expect([...permissionsOf(xArgv).matchAll(/"([^"]+)"="write"/g)].map((m) => m[1]))
-      .toEqual([expect.stringMatching(/\/\.lanes\/\.admission\/heavy$/)]);
+      .toEqual([ADMISSION_LOCK]);
     expect(permissionsOf(xArgv)).not.toContain(`${HOME}/workspace/plateau-app`);
   });
 });

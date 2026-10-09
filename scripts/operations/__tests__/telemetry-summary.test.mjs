@@ -6,10 +6,10 @@
  * directory this suite creates and removes itself — it never reads the real `.operations/claude-otel` or
  * `.operations/telemetry` stores, the same discipline `claim-io.test.mjs` uses for `backlog/`.
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, openSync, writeSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createRegistry } from '../registry.mjs';
@@ -28,6 +28,18 @@ import {
   scanFileForRecordsByName, readDeliveryTelemetryRecords, DELIVERY_METRIC_NAMES_FOR_DAEMON_REPORT,
 } from '../telemetry-summary-io.mjs';
 import { PLAN_WEEK_RENEWAL } from '../../lib/telemetry-summary.mjs';
+
+// HERMETIC (xcu4cqf): `createTelemetrySummaryReader` resolves the shared host-sampler root from the checkout's own
+// workspace (`resolveHostRoot()` takes no argument), so its `existsSync` would read the REAL
+// `<workspace>/.operations/telemetry`. Answer "no such directory" for exactly that path: the host root is then
+// deterministically MISSING (what these tests already assumed), whatever the machine holds. Every other path,
+// including the collector/host fixtures under tmp, goes to the real fs.
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal();
+  const realHostRoot = (p) => typeof p === 'string' && p.endsWith(`${sep}.operations${sep}telemetry`);
+  const mocked = { ...actual, existsSync: (p) => (realHostRoot(p) ? false : actual.existsSync(p)) };
+  return { ...mocked, default: mocked };
+});
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 

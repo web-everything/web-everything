@@ -183,19 +183,20 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
   });
 
   it.each([
-    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs'],
+    // `readCommits` stubbed: its default (`fetchPrCommits`) runs a real `git fetch origin` per unlabelled PR.
+    ['../../conveyor/reconcile-pass.mjs', 'defaultReadPrs', { readCommits: () => [] }],
     ['../../conveyor/advisory-label-sweep.mjs', 'defaultListPrs'],
     ['../../conveyor/ci-red-recovery-watch.mjs', 'defaultReadOpenPrs'],
     ['../../conveyor/parked-pr-conflict-watch.mjs', 'defaultListParkedPrs'],
     ['../../conveyor/stuck-pr-watch.mjs', 'defaultListOpenPrs'],
     ['../../conveyor/duplicate-pr-watch.mjs', 'defaultListOpenPrs'],
     ['../../conveyor/parked-pr-progress-watch.mjs', 'defaultListParkedPrs'],
-  ])('%s#%s', async (mod, fn) => {
+  ])('%s#%s', async (mod, fn, extra = {}) => {
     const m = await import(mod);
-    const got = m[fn]({ repo: REPO });
+    const got = m[fn]({ repo: REPO, ...extra });
     expect(got).toHaveLength(14);
     expect(got[0].number).toBe(100);
-  });
+  }, 60_000); // the first dynamic import of a heavy conveyor module can exceed the 5s default on a loaded host
 
   it('pr-limit#fetchOpenPrs', async () => {
     const { fetchOpenPrs } = await import('../pr-limit.mjs');

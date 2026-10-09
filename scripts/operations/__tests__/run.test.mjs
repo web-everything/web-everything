@@ -10,7 +10,9 @@ import { spawnSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { makeGitOverlay } from '../../lib/hermetic-git-overlay.mjs';
+import { DEFAULT_REPO_ROOT } from '../../lib/hermetic-tests.mjs';
 import { withBareOrigin, withNarrowClone } from './helpers/real-repo.mjs';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -94,6 +96,10 @@ import { createMemoryRunStore } from '../run-store.mjs';
 import { runOperationCli } from '../cli-adapter.mjs';
 
 describe('item-activity CLI', () => {
+  // The CLI runs from the real checkout; pin its origin/main to HEAD so the runner-freshness check stays local.
+  let overlay;
+  beforeAll(() => { overlay = makeGitOverlay(DEFAULT_REPO_ROOT); });
+  afterAll(() => overlay?.cleanup());
   it('is registered without effect sinks', () => {
     const { declaration, sinks } = resolveOperation('item-activity');
     expect(declaration.name).toBe('item-activity');
@@ -103,7 +109,7 @@ describe('item-activity CLI', () => {
   it('the real CLI can query read-only evidence stores without writing a cursor', () => {
     const result = spawnSync(process.execPath, [join(REPO, 'scripts/operations/run.mjs'), 'item-activity', '--pr=0', '--json'], {
       cwd: REPO, encoding: 'utf8', timeout: 30_000,
-      env: { ...process.env, OPERATION_RUNS_DIR: '/dev/null/item-activity-forbidden', OPERATION_CALLS_DIR: '/dev/null/item-activity-forbidden' },
+      env: { ...process.env, ...overlay.env, OPERATION_RUNS_DIR: '/dev/null/item-activity-forbidden', OPERATION_CALLS_DIR: '/dev/null/item-activity-forbidden' },
     });
     expect(result.status).not.toBe(0);
     expect(result.stdout).toContain('pr must be a positive integer');

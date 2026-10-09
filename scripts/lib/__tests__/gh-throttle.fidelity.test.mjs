@@ -33,11 +33,17 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const WRAPPER = join(HERE, '..', 'gh-throttle.mjs');
 
 function ghAvailable() {
+  // This probe's whole intent is "is gh logged in?" — under the hermetic harness (xcu4cqf) the fake gh answers it
+  // with the declared `unauthenticated` fixture (the real-binary half then skips), recording no live access.
+  const prior = process.env.WE_HERMETIC_GH;
+  process.env.WE_HERMETIC_GH = 'unauthenticated';
   try {
     execFileSync('gh', ['auth', 'status'], { stdio: 'ignore' });
     return true;
   } catch {
     return false;
+  } finally {
+    if (prior === undefined) delete process.env.WE_HERMETIC_GH; else process.env.WE_HERMETIC_GH = prior;
   }
 }
 

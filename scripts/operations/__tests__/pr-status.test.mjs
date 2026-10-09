@@ -7,7 +7,9 @@
  * suite as green, reading a superseded commit's marks — turns that stall back into something that looks
  * normal. So the tests below are mostly about refusing to be reassured.
  */
-import { describe, it, expect, afterAll } from 'vitest';
+import { describe, it, expect, afterAll, beforeAll } from 'vitest';
+import { makeGitOverlay } from '../../lib/hermetic-git-overlay.mjs';
+import { DEFAULT_REPO_ROOT } from '../../lib/hermetic-tests.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -416,13 +418,16 @@ describe('run.mjs pr-status --json — the real CLI, end to end (#3555, no gh ne
     'fi',
   ].join('\n'));
   chmodSync(ghPath, 0o755);
-  afterAll(() => rmSync(binDir, { recursive: true, force: true }));
+  // Pin origin/main to HEAD so the CLI's runner-freshness check stays local (fake gh stays the only gh).
+  let overlay;
+  beforeAll(() => { overlay = makeGitOverlay(DEFAULT_REPO_ROOT); });
+  afterAll(() => { overlay?.cleanup(); rmSync(binDir, { recursive: true, force: true }); });
 
   it('accepts --repo=/--pr=/--json exactly as the reduce prompt invokes it, and prints .verdict.prs[0].state', () => {
     const stdout = execFileSync(
       process.execPath,
       [RUN_MJS, 'pr-status', '--repo=o/r', '--pr=42', '--json'],
-      { encoding: 'utf8', env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+      { encoding: 'utf8', env: { ...process.env, ...overlay.env, PATH: `${binDir}:${process.env.PATH}` } },
     );
     const result = JSON.parse(stdout);
     expect(result.verdict.prs[0].state).toBe('green');
@@ -435,7 +440,7 @@ describe('run.mjs pr-status --json — the real CLI, end to end (#3555, no gh ne
     const stdout = execFileSync(
       process.execPath,
       [RUN_MJS, 'pr-status', '--repo=o/r', '--pr=777', '--json'],
-      { encoding: 'utf8', env: { ...process.env, PATH: `${binDir}:${process.env.PATH}` } },
+      { encoding: 'utf8', env: { ...process.env, ...overlay.env, PATH: `${binDir}:${process.env.PATH}` } },
     );
     const result = JSON.parse(stdout);
     expect(result.verdict.prs).toHaveLength(1);

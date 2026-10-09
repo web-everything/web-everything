@@ -144,7 +144,7 @@ describe('IO shell fails soft', () => {
   });
   it('a throwing reader is unknown, never delivered', () => {
     const boom = () => { throw new Error('gh down'); };
-    expect(readBuildDelivery('4388', { listPrs: boom, readCardStatus: boom })).toBeNull();
+    expect(readBuildDelivery('4388', { listPrs: boom, readCardStatus: boom, readCardOpened: () => null })).toBeNull();
   });
   it('defaultListBuildPrs asks gh for ALL states by branch prefix and parses rows; a gh failure is null', () => {
     let argv;

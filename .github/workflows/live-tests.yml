@@ -1,0 +1,64 @@
+# THE SCHEDULED LIVE SUITE (card xcu4cqf) — the only tests allowed to touch live GitHub / remote refs / host state.
+#
+# Why a separate, scheduled, NON-BLOCKING job: on 2026-10-08 main was red for ~5.5 h with no code change, because a
+# soak scenario read live GitHub + origin/main backlog and the real cards moved. Blocking suites (unit, integration,
+# soak) are now hermetic by default (we:scripts/lib/hermetic-tests.mjs). Tests that genuinely need live data are
+# listed in `liveSuite.tests` of we:scripts/hermetic-tests.settings.json and run ONLY here.
+#
+# Never a PR gate: no `pull_request` trigger, and it is not (and must not be made) a required check. A failure opens
+# or updates ONE issue labelled `health-smell` — live data drifting is a health signal, not a broken tree.
+# The cron below must equal `liveSuite.schedule.cron` (pinned by we:scripts/lib/__tests__/hermetic-tests.test.mjs).
+name: Live tests (scheduled, non-blocking)
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: live-tests
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Live suite
+        id: live
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: npm run test:live -- --reporter=default 2>&1 | tee live-tests.log; exit ${PIPESTATUS[0]}
+
+      - name: Report a failure as a health smell (never fails the workflow)
+        if: steps.live.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="health-smell: scheduled live test suite failing"
+          body=$(printf 'The scheduled live suite (tests listed in `scripts/hermetic-tests.settings.json` → `liveSuite.tests`) failed.\n\nRun: %s\n\nThis never gates a PR or main. Last lines:\n\n```\n%s\n```\n' "$RUN_URL" "$(tail -n 60 live-tests.log)")
+          gh label create health-smell --repo "$GITHUB_REPOSITORY" --color B60205 --description "Health signal from a scheduled check" 2>/dev/null || true
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --label health-smell --limit 100 --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n 1)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label health-smell --body "$body"
+          fi
