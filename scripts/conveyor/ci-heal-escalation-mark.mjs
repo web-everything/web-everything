@@ -49,10 +49,13 @@
  * read by any decision: it only makes sure the PR-thread record eventually exists.
  */
 import { resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { collectCiAuthDiagnosis, renderCiAuthDiagnosis } from './ci-auth-diagnosis.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { isBudgetRefusal, postPrComment, recordOwedWrite, resolveOwedRepo } from './ci-heal-owed.mjs';
+import { resolveCiHealVerdictSettings, unsettledRequiredChecks } from './ci-heal-verdict-recheck.mjs';
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_ESCALATION_MARKER — the stable FIRST LINE of the
@@ -123,9 +126,14 @@ export function buildCiHealEscalationComment({ headSha, outcome, reason = '', sy
  * @returns {Array<{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), createdAt:(string|null)}>}
  */
 export function parseCiHealEscalations(comments) {
+  return parseEscalationsIndexed(comments).map(({ e }) => e);
+}
+
+/** {@link parseCiHealEscalations} with each record's position in the thread. Pure. */
+function parseEscalationsIndexed(comments) {
   if (!Array.isArray(comments)) return [];
   const out = [];
-  for (const c of comments) {
+  for (const [index, c] of comments.entries()) {
     const body = typeof c === 'string' ? c : c?.body;
     if (typeof body !== 'string' || !body.trimStart().startsWith(CI_HEAL_ESCALATION_MARKER)) continue;
     if (!isTrustedMarkerAuthor(c)) continue;
@@ -135,10 +143,10 @@ export function parseCiHealEscalations(comments) {
     const reason = (/^reason:\s*(.+)$/m.exec(body) || [])[1] ?? '';
     const cause = (/^cause:\s*(\S+)/m.exec(body) || [])[1] ?? null;
     if (!outcome || !headSha) continue; // malformed/foreign — never half-parse a marker into a false match
-    out.push({
+    out.push({ index, e: {
       headSha: headSha.toLowerCase(), outcome, reason, systemFixRef, cause,
       createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null,
-    });
+    } });
   }
   return out;
 }
@@ -160,11 +168,98 @@ export function isUnverifiedLaneEscalation(e) {
  * @param {string|null|undefined} headSha
  * @returns {{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), createdAt:(string|null)}|null}
  */
-export function latestCiHealEscalationForHead(comments, headSha) {
+export function latestCiHealEscalationForHead(comments, headSha, { recheck } = {}) {
   const sha = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
   if (!sha) return null;
-  const matches = parseCiHealEscalations(comments).filter((e) => e.headSha === sha && !isUnverifiedLaneEscalation(e));
-  return matches.length ? matches[matches.length - 1] : null;
+  // card x9zznl9 — a `not-a-ci-break` verdict a LATER trusted void comment names (same head) is not the word on
+  // this head any more; only when the declared setting is on (`ci-heal-verdict-settings.json`).
+  const on = recheck ?? resolveCiHealVerdictSettings().recheckNotCiBreak;
+  const voids = on ? parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha) : [];
+  const matches = parseEscalationsIndexed(comments)
+    .filter(({ e }) => e.headSha === sha && !isUnverifiedLaneEscalation(e))
+    .filter(({ e, index }) => !(e.outcome === 'not-a-ci-break' && voids.some((v) => v.index > index)));
+  return matches.length ? matches[matches.length - 1].e : null;
+}
+
+/**
+ * we:scripts/conveyor/ci-heal-escalation-mark.mjs#CI_HEAL_VERDICT_VOID_MARKER — card x9zznl9 (live PR #4535). The
+ * stable FIRST LINE of the comment the fix daemon posts when a `not-a-ci-break` verdict on a head is contradicted by
+ * a required check that completed red AFTER it (`ci-heal-verdict-recheck.mjs#contradictingChecks`). Deliberately NOT
+ * {@link CI_HEAL_ESCALATION_MARKER}'s line, so it is never read as an escalation itself. Treat as fixed.
+ */
+export const CI_HEAL_VERDICT_VOID_MARKER = '🚦 conveyor CI-heal — verdict void';
+
+/** Build the void comment. Pure. `red` = the required check names that completed failing. */
+export function buildCiHealVerdictVoidComment({ headSha, red = [] } = {}) {
+  if (!headSha || typeof headSha !== 'string') throw new TypeError('ci-heal verdict void: headSha is required');
+  // One line each: a check name is untrusted text, and a newline in it must never add a field to the marker.
+  const names = (Array.isArray(red) ? red : []).map((n) => String(n).replace(/\s+/g, ' ').trim()).filter(Boolean);
+  return [
+    CI_HEAL_VERDICT_VOID_MARKER,
+    '',
+    'voids: not-a-ci-break',
+    `head: ${headSha.trim().toLowerCase()}`,
+    `red: ${names.join(', ') || '(unnamed)'}`,
+    '',
+    'The earlier `not-a-ci-break` verdict on this exact head is no longer true: the required check(s) above completed '
+      + 'FAILED after it was recorded. The verdict is void, so the ordinary CI-heal path (with its usual attempt cap) '
+      + 'owns this head again. No person is needed for this step.',
+  ].join('\n');
+}
+
+/** Every trusted void comment, `{ headSha, red, createdAt, index }`, in thread order. Pure. */
+export function parseCiHealVerdictVoids(comments) {
+  if (!Array.isArray(comments)) return [];
+  const out = [];
+  comments.forEach((c, index) => {
+    const body = typeof c === 'string' ? c : c?.body;
+    if (typeof body !== 'string' || !body.trimStart().startsWith(CI_HEAL_VERDICT_VOID_MARKER)) return;
+    if (!isTrustedMarkerAuthor(c)) return;
+    const headSha = (/^head:\s*([0-9a-fA-F]{7,40})\s*$/m.exec(body) || [])[1];
+    if (!headSha || !/^voids:\s*not-a-ci-break\s*$/m.test(body)) return;
+    const red = ((/^red:\s*(.+)$/m.exec(body) || [])[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    out.push({ headSha: headSha.toLowerCase(), red, createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null, index });
+  });
+  return out;
+}
+
+/**
+ * The latest trusted `not-a-ci-break` verdict on `headSha`, and whether a trusted void for that head comes AFTER it
+ * (the same thread-order rule {@link latestCiHealEscalationForHead} uses). A head can carry several verdicts (ci-heal
+ * records a new one after a re-run), so "this head has a void" is not "this verdict is voided". `verdictIndex` is
+ * `-1` when no such verdict is in `comments` (any void for the head then counts). Pure.
+ * `voidCount` is every trusted void on that head, so a caller can bound a verdict/void loop on a flaky check.
+ * @returns {{verdictIndex:number, voided:boolean, voidCount:number}}
+ */
+export function notCiBreakVerdictVoidState(comments, headSha) {
+  const sha = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
+  const verdictIndex = parseEscalationsIndexed(comments)
+    .filter(({ e }) => e.headSha === sha && e.outcome === 'not-a-ci-break')
+    .reduce((latest, { index }) => Math.max(latest, index), -1);
+  const voids = parseCiHealVerdictVoids(comments).filter((v) => v.headSha === sha);
+  return { verdictIndex, voided: voids.some((v) => v.index > verdictIndex), voidCount: voids.length };
+}
+
+/**
+ * card x9zznl9 — prevention at the source. Why the CLI must NOT record `not-a-ci-break` on this head yet, or `null`
+ * when it may. The verdict claims every required check (bar `review-gate`) is green, so a pending, missing or red
+ * one refuses it. `pr` is `{ headRefOid, statusCheckRollup }` for the PR now. A different head is not judged here
+ * (the rollup describes another commit). Pure.
+ */
+export function notCiBreakRecordRefusal({ headSha, pr, requiredChecks }) {
+  const head = String(headSha ?? '').trim().toLowerCase();
+  const prHead = String(pr?.headRefOid ?? '').trim().toLowerCase();
+  if (!head || !prHead || !(prHead.startsWith(head) || head.startsWith(prHead))) return null;
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return null;
+  const u = unsettledRequiredChecks({ rollup: pr?.statusCheckRollup, requiredChecks });
+  const parts = [];
+  if (u.pending.length) parts.push(`still running: ${u.pending.join(', ')}`);
+  if (u.missing.length) parts.push(`not started: ${u.missing.join(', ')}`);
+  if (u.red.length) parts.push(`red: ${u.red.join(', ')}`);
+  if (!parts.length) return null;
+  return `not-a-ci-break needs every required check except review-gate finished green on this head — ${parts.join('; ')}. `
+    + (u.red.length ? 'A required check is red, so this IS a CI break: heal it or escalate needs-human.'
+      : 'Wait for the checks to finish, then decide.');
 }
 
 /**
@@ -218,6 +313,38 @@ export function postOrOweCiHealEscalation({ pr, body, headSha, repo, post = post
   }
 }
 
+/**
+ * card x9zznl9 — the CLI's IO for {@link notCiBreakRecordRefusal}: read the PR's head + check rollup and the repo's
+ * required-check set, then judge. Returns `{ refusal: string|null, warning?: string }`. A failed read never blocks the
+ * escalation (`refusal: null` plus a warning) — the daemon-side void still catches a verdict that turns out wrong.
+ * Off (`ci-heal-verdict-settings.json`) or any other outcome → `{ refusal: null }` with no read at all.
+ */
+export async function checkNotCiBreakRecordable({ pr, repo, headSha, outcome, settings = resolveCiHealVerdictSettings(),
+  readPr = defaultReadPrChecks, readRequired = defaultReadRequiredChecks } = {}) {
+  if (outcome !== 'not-a-ci-break' || !settings?.recheckNotCiBreak) return { refusal: null };
+  try {
+    const facts = readPr({ pr, repo });
+    const { checks } = await readRequired({ repo: repo ?? facts?.slug ?? null });
+    return { refusal: notCiBreakRecordRefusal({ headSha, pr: facts, requiredChecks: checks }) };
+  } catch (e) {
+    return { refusal: null, warning: `could not re-check required checks before recording not-a-ci-break: ${String(e?.message || e).split('\n')[0]}` };
+  }
+}
+
+function defaultReadPrChecks({ pr, repo }) {
+  const args = ['pr', 'view', String(pr), '--json', 'headRefOid,statusCheckRollup,url'];
+  if (repo) args.push(`--repo=${repo}`);
+  const raw = execFileSync('gh', args, { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024 });
+  const parsed = JSON.parse(String(raw || '{}'));
+  const slug = /^https:\/\/github\.com\/([^/]+\/[^/]+)\//.exec(parsed.url ?? '')?.[1] ?? null;
+  return { ...parsed, slug };
+}
+
+async function defaultReadRequiredChecks({ repo }) {
+  const { getRequiredStatusChecks } = await import('../lib/required-status-checks.mjs');
+  return getRequiredStatusChecks({ repo });
+}
+
 /** Shared CLI composition seam: enrichment failure must never suppress an escalation. */
 export function composeCiHealEscalation(flags, { collect = collectCiAuthDiagnosis } = {}) {
   const original = { headSha: flags.head, outcome: flags.outcome,
@@ -268,6 +395,11 @@ async function main() {
     fail(String(e.message || e));
   }
   const repo = typeof flags.repo === 'string' ? flags.repo : undefined;
+  // card x9zznl9 — never record `not-a-ci-break` while a required check is still running, missing, or red (live
+  // PR #4535: recorded 25 s before `test` completed FAILED, then pinned that head for hours).
+  const recordable = await checkNotCiBreakRecordable({ pr, repo, headSha: flags.head, outcome: flags.outcome });
+  if (recordable.warning) process.stderr.write(`⚠ ${recordable.warning}\n`);
+  if (recordable.refusal) fail(`refusing to record not-a-ci-break on PR #${pr}: ${recordable.refusal}`);
   let posted;
   try {
     posted = postOrOweCiHealEscalation({

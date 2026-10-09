@@ -61,8 +61,9 @@ export const STAND_DOWN_LABEL = 'review-status:stood-down';
  * named once so the brief's two call sites and this file's comment body cannot drift apart. Keyed by the flag
  * value the brief passes; the value is the clause that goes in the durable comment.
  *
- * These four are the brief's REAL exits, read off it rather than imagined: the ambiguous-finding exit
+ * The fix-agent entries are the brief's REAL exits, read off it rather than imagined: the ambiguous-finding exit
  * (`fix-agent-brief.md` §2), the red-gate exit (§4), and the two `not-applicable` / conflict stops (§1, §3).
+ * `superseded` is the one non-agent entry: the supersede watch posts it (card xiqtf7w).
  */
 export const STAND_DOWN_REASONS = Object.freeze({
   'needs-judgment': 'the reviewer\'s finding needs a judgment the fix agent could not safely make, so it did NOT guess',
@@ -74,7 +75,58 @@ export const STAND_DOWN_REASONS = Object.freeze({
   // reason instead of a stand-down. Even a comment built through {@link buildStandDownComment} with it is read
   // as a pause by {@link isConcurrentAuthorStandDownBody}, via the comment's machine trailer.
   'concurrent-author': 'a concurrent author pushed to this PR\'s lane mid-repair; this is a re-armable pause, not a judgment call',
+  // card xiqtf7w (live #4522, 2026-10-09) — NOT a fix-agent exit: `supersede-watch.mjs` posts it when a MERGED PR
+  // declares `Supersedes #N` for this open PR. Terminal like any stand-down; see {@link buildSupersededStandDownComment}.
+  superseded: 'a merged PR declares that it supersedes this one, so more fix, review or CI-heal work here would be wasted',
 });
+
+/** card xiqtf7w — the visible label a supersede hold adds beside {@link STAND_DOWN_LABEL}. Informative only. */
+export const SUPERSEDED_LABEL = 'superseded';
+
+/** Machine line on a supersede hold: `<!-- supersede-hold by=<merged PR> -->`, written just before the trailer. */
+const SUPERSEDE_HOLD_RE = /<!--\s*supersede-hold by=(\d+)\s*-->/;
+
+/**
+ * card xiqtf7w — the stand-down body for a PR a MERGED PR declares it supersedes. Leads with {@link STAND_DOWN_MARKER}
+ * and ends with the `reason=superseded` trailer, so `reconcile-core.mjs#countUnresolvedStandDowns` (REFUSAL 1) stops
+ * fix, review and ci-heal for it exactly as for any other stand-down. Pure.
+ * @param {{pr:number, by:number, mergedAt?:?string, repo?:?string, actor?:string}} o
+ */
+export function buildSupersededStandDownComment({ pr, by, mergedAt = null, repo = null, actor = 'supersede-watch' } = {}) {
+  if (!Number.isInteger(Number(by)) || Number(by) <= 0) throw new TypeError('superseded stand-down: `by` (the merged PR) is required');
+  const repoArg = repo ? ` --repo=${repo}` : ' --repo=<owner/name>';
+  return [
+    STAND_DOWN_MARKER,
+    '',
+    `${actor} stopped rather than guessing: ${STAND_DOWN_REASONS.superseded}. Merged PR #${by}${mergedAt ? ` (merged ${mergedAt})` : ''} carries the line \`Supersedes #${pr ?? '?'}\`.`,
+    '',
+    '**Closing this PR needs an operator decision.** Nothing closes it automatically: the supersede line is the merged '
+      + 'PR author\'s claim, not a proof that every change here landed.',
+    '',
+    '**To hand it back to the fix loop instead** (the claim is wrong, or this PR still carries unique work), record an '
+      + `operator answer: \`node scripts/conveyor/stand-down-answer.mjs ${pr ?? '<pr>'}${repoArg} --reason="<why>" --actor=<you> --channel=<where>\`.`,
+    `<!-- supersede-hold by=${Number(by)} -->`,
+    '<!-- stand-down reason=superseded -->',
+  ].join('\n');
+}
+
+/**
+ * card xiqtf7w — the merged PR numbers this PR already carries a trusted supersede hold for (read back from the
+ * thread, so the watch posts each hold once). Pure.
+ * @returns {number[]}
+ */
+export function supersedeHoldsOn(comments) {
+  if (!Array.isArray(comments)) return [];
+  const out = [];
+  for (const c of comments) {
+    const body = typeof c === 'string' ? c : c?.body;
+    if (typeof body !== 'string' || !body.trimStart().startsWith(STAND_DOWN_MARKER) || !isTrustedMarkerAuthor(c)) continue;
+    if (STAND_DOWN_TRAILER_RE.exec(body)?.[1] !== 'superseded') continue;
+    const by = Number(SUPERSEDE_HOLD_RE.exec(body)?.[1]);
+    if (Number.isInteger(by) && by > 0) out.push(by);
+  }
+  return out;
+}
 
 /**
  * we:scripts/conveyor/stand-down.mjs#CONCURRENT_AUTHOR_PAUSE_MARKER — fix procedure (operator-approved
@@ -536,7 +588,7 @@ if (IS_CLI) {
   };
   const pr = Number(positionals[0]);
   if (!Number.isInteger(pr) || pr <= 0) {
-    fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--who=<session slug>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>]  (pr must be a positive integer)`);
+    fail(`usage: stand-down.mjs <pr> [--repo=<owner/name>] [--reason=<${Object.keys(STAND_DOWN_REASONS).join('|')}>] [--who=<session slug>] [--actor=<name>] [--detail=<text>] [--head=<sha> --alt=<lane/…-alt> --alt-sha=<sha>] [--superseded-by=<n> --merged-at=<iso>]  (pr must be a positive integer)`);
   }
   const actor = typeof flags.actor === 'string' ? flags.actor : undefined;
   const detail = typeof flags.detail === 'string' ? flags.detail : undefined;
@@ -548,7 +600,10 @@ if (IS_CLI) {
   if (flags.reason === 'load-flake' && !loadHold) {
     process.stderr.write('⚠ stand-down: no load-flake reverify worker serves this repo (or --alt/--alt-sha is missing); recording a terminal gate-red stand-down instead\n');
   }
-  const body = loadHold ? buildLoadFlakeHoldComment({ head: flags.head, alt: flags.alt, altSha: flags['alt-sha'], detail }) : concurrent
+  const supersededBy = flags.reason === 'superseded' && typeof flags['superseded-by'] === 'string' ? Number(flags['superseded-by']) : null;
+  if (flags.reason === 'superseded' && !(Number.isInteger(supersededBy) && supersededBy > 0)) fail('--reason=superseded needs --superseded-by=<merged PR number>');
+  const body = supersededBy ? buildSupersededStandDownComment({ pr, by: supersededBy, mergedAt: typeof flags['merged-at'] === 'string' ? flags['merged-at'] : null, repo: typeof flags.repo === 'string' ? flags.repo : null, actor })
+    : loadHold ? buildLoadFlakeHoldComment({ head: flags.head, alt: flags.alt, altSha: flags['alt-sha'], detail }) : concurrent
     ? buildConcurrentAuthorPauseComment({
       actor, detail,
       head: typeof flags.head === 'string' ? flags.head : null,
@@ -579,7 +634,8 @@ if (IS_CLI) {
   if (!concurrent && !loadHold) {
     try {
       gh(['label', 'create', STAND_DOWN_LABEL, ...repoArgs, '--color', 'b60205', '--description', 'a fixer stood down; a person is the next step (auto-managed)', '--force']);
-      gh(['pr', 'edit', String(pr), ...repoArgs, '--add-label', STAND_DOWN_LABEL]);
+      if (supersededBy) gh(['label', 'create', SUPERSEDED_LABEL, ...repoArgs, '--color', '6e7781', '--description', 'a merged PR declares it supersedes this one; closing needs an operator decision (auto-managed)', '--force']);
+      gh(['pr', 'edit', String(pr), ...repoArgs, '--add-label', supersededBy ? `${STAND_DOWN_LABEL},${SUPERSEDED_LABEL}` : STAND_DOWN_LABEL]);
       labeled = true;
     } catch (e) {
       process.stderr.write(`⚠ stand-down: comment posted but the ${STAND_DOWN_LABEL} label failed: ${String(e.message || e).split('\n')[0]}\n`);

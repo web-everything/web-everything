@@ -1,0 +1,322 @@
+{
+  "source": "gh pr view 4535 --repo web-everything/web-everything --json headRefOid,comments,statusCheckRollup, read 2026-10-09T04:42Z (card x9zznl9). requiredChecks = getRequiredStatusChecks live read the same minute.",
+  "repo": "web-everything/web-everything",
+  "number": 4535,
+  "headRefOid": "8443f3b68859605d033c4ea62d5a6abdb808505d",
+  "requiredChecks": [
+    "test",
+    "smoke",
+    "daemon-soak",
+    "soak-replay-gate"
+  ],
+  "escalationAt": "2026-10-09T02:29:18Z",
+  "comments": [
+    {
+      "author": {
+        "login": "chalbert"
+      },
+      "createdAt": "2026-10-09T02:21:28Z",
+      "body": "🔀 conveyor rebase-onto-main\n\nbranch: lane/revert-red-check\nsha: 2bde56ad95d1623df4a86f26a25c933970c37099\nconveyor rebase-onto-main refreshed this branch onto main's current tip."
+    },
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "createdAt": "2026-10-09T02:28:28Z",
+      "body": "🔒 conveyor fix-begin — fix claim held\n\n**Who:** `ci-heal-4535`\n**Why:** conveyor ci-heal: red-ci\n**Branch:** `lane/revert-red-check` at `8443f3b68`\n\nThe PR stays **ready for review** — a normal repair loop never drafts it; the fix claim itself is the lock, so no review/fix/ci-heal races it and no push from anyone else lands while it is live.\n\nWhile this claim is live (20-minute TTL, heartbeat-refreshed while the fixer runs): no review or advisory is dispatched, no other fixer starts, and pushes to this branch by anyone but the holder are refused. See we:docs/agent/platform-decisions.md#fix-claim-draft-only-on-withdrawal.\n<!-- fix-claim who=ci-heal-4535 -->"
+    },
+    {
+      "author": {
+        "login": "chalbert"
+      },
+      "createdAt": "2026-10-09T02:29:16Z",
+      "body": "🔓 conveyor fix-end — fix claim released\n\n`ci-heal-4535` released the fix claim at `8443f3b68`. The PR was never drafted for this claim — it stays ready; nothing further is owed here, and dispatch (review/ci-heal) resumes normally on the next tick."
+    },
+    {
+      "author": {
+        "login": "chalbert"
+      },
+      "createdAt": "2026-10-09T02:29:18Z",
+      "body": "🚦 conveyor CI-heal — escalated\n\noutcome: not-a-ci-break\nhead: 8443f3b68859605d033c4ea62d5a6abdb808505d\nreason: not a CI break — no required check is red (passing or still running); only review-gate is red, held by review:pending\n\nEvery required check is green on this exact head — the only red is the review gate itself, held by the review label (this is BY DESIGN, not a defect). This PR did nothing wrong and owes NO further ci-heal; it is owed its ordinary review, dispatched normally alongside this escalation."
+    },
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "createdAt": "2026-10-09T02:31:38Z",
+      "body": "🔔 conveyor — needs your decision\n\nneeds your decision: ci-heal-escalated\n\nPR #4535: ci-heal confirmed head `8443f3b68859605d033c4ea62d5a6abdb808505d` is not a CI break (review gate only) — no further heal owed; review waits for complete successful required checks\n\n<!-- conveyor-note-key: ci-heal-escalated:4535:PR #4535: ci-heal confirmed head `8443f3b68859605d033c4ea62d5a6abdb808505d` is not a CI break (review gate only) — no further heal owed; review waits for complete successful required checks -->"
+    }
+  ],
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:22:11Z",
+      "completedAt": "2026-10-09T02:22:33Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:28:31Z",
+      "completedAt": "2026-10-09T02:28:33Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:29:20Z",
+      "completedAt": "2026-10-09T02:29:22Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:29:25Z",
+      "completedAt": "2026-10-09T02:29:31Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:32:05Z",
+      "completedAt": "2026-10-09T02:32:07Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:39:33Z",
+      "completedAt": "2026-10-09T02:39:37Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "review-gate",
+      "status": "COMPLETED",
+      "conclusion": "CANCELLED",
+      "startedAt": "2026-10-09T02:39:29Z",
+      "completedAt": "2026-10-09T02:39:30Z",
+      "workflowName": "Review gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "changes",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:35Z",
+      "completedAt": "2026-10-09T02:21:57Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "Analyze (actions)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:34Z",
+      "completedAt": "2026-10-09T02:22:12Z",
+      "workflowName": "CodeQL"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "soak-replay-gate",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:35Z",
+      "completedAt": "2026-10-09T02:21:58Z",
+      "workflowName": "Soak replay gate"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "Analyze (javascript-typescript)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:34Z",
+      "completedAt": "2026-10-09T02:25:50Z",
+      "workflowName": "CodeQL"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "Analyze (python)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:34Z",
+      "completedAt": "2026-10-09T02:22:17Z",
+      "workflowName": "CodeQL"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "Analyze (rust)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:34Z",
+      "completedAt": "2026-10-09T02:23:40Z",
+      "workflowName": "CodeQL"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "daemon-soak-scope",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:35Z",
+      "completedAt": "2026-10-09T02:21:54Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test-selection-measure",
+      "status": "COMPLETED",
+      "conclusion": "SKIPPED",
+      "startedAt": "2026-10-09T02:21:34Z",
+      "completedAt": "2026-10-09T02:21:33Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "visual",
+      "status": "COMPLETED",
+      "conclusion": "SKIPPED",
+      "startedAt": "2026-10-09T02:21:34Z",
+      "completedAt": "2026-10-09T02:21:33Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test-shard (1)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:58Z",
+      "completedAt": "2026-10-09T02:27:16Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test-shard (2)",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:21:59Z",
+      "completedAt": "2026-10-09T02:29:15Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test-shard (3)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:59Z",
+      "completedAt": "2026-10-09T02:28:00Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test-shard (4)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:59Z",
+      "completedAt": "2026-10-09T02:28:33Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test-shard (5)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:59Z",
+      "completedAt": "2026-10-09T02:24:42Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "integration",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:59Z",
+      "completedAt": "2026-10-09T02:29:36Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "smoke",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:59Z",
+      "completedAt": "2026-10-09T02:24:53Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "soak-shard (1)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:22:32Z",
+      "completedAt": "2026-10-09T02:30:43Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "soak-shard (2)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:56Z",
+      "completedAt": "2026-10-09T02:29:31Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "soak-shard (3)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:56Z",
+      "completedAt": "2026-10-09T02:31:31Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "soak-shard (4)",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:21:56Z",
+      "completedAt": "2026-10-09T02:30:02Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "test",
+      "status": "COMPLETED",
+      "conclusion": "FAILURE",
+      "startedAt": "2026-10-09T02:29:38Z",
+      "completedAt": "2026-10-09T02:29:43Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "daemon-soak",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:31:33Z",
+      "completedAt": "2026-10-09T02:31:36Z",
+      "workflowName": "CI"
+    },
+    {
+      "__typename": "CheckRun",
+      "name": "CodeQL",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "startedAt": "2026-10-09T02:22:02Z",
+      "completedAt": "2026-10-09T02:22:06Z",
+      "workflowName": ""
+    }
+  ]
+}

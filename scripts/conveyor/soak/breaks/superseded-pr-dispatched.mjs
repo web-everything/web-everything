@@ -1,0 +1,55 @@
+/** Live #4522: a merged superseder must stop fresh dispatch and remain idempotent. */
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+export default {
+  id: 'superseded-pr-dispatched',
+  card: 'xiqtf7w',
+  title: '#4532 merged with "Supersedes #4522"; fix-4522 still launched at 04:34Z',
+  fixedBy: { sha: '8509c022b', where: 'lane/fixd-supersede-verdict', paths: [
+    'scripts/conveyor/supersede-rule.mjs', 'scripts/conveyor/supersede-watch.mjs',
+    'scripts/conveyor/stand-down.mjs', 'skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs',
+  ] },
+  fixPresent(root) { return existsSync(join(root, 'scripts/conveyor/supersede-rule.mjs')); },
+  async run() {
+    const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
+    const violations = [];
+    if (!this.fixPresent(root)) return { violations: ['supersede hold rule is absent; #4522 remains dispatchable'] };
+    const { planSupersedeHolds, parseSupersedes } = await import(pathToFileURL(join(root, 'scripts/conveyor/supersede-rule.mjs')).href);
+    const { buildSupersededStandDownComment } = await import(pathToFileURL(join(root, 'scripts/conveyor/stand-down.mjs')).href);
+    const { countUnresolvedStandDowns } = await import(pathToFileURL(join(root, 'scripts/conveyor/reconcile-core.mjs')).href);
+    const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../__tests__/fixtures/supersede/pr4522-2026-10-09.json'), 'utf8'));
+    const input = { mergedPrs: [fixture.merged], openPrs: [fixture.open], settings: { hold: true } };
+    const hold = planSupersedeHolds(input).find((h) => h.pr === 4522 && h.by === 4532);
+    if (!hold) violations.push('no hold for #4522 superseded by merged #4532');
+    else {
+      const comments = [...fixture.open.comments, { author: { login: 'web-everything' }, body: buildSupersededStandDownComment(hold) }];
+      if (countUnresolvedStandDowns(comments) <= 0) violations.push('superseded stand-down does not block reconcile dispatch');
+      if (planSupersedeHolds({ ...input, openPrs: [{ ...fixture.open, comments }] }).length) violations.push('supersede hold re-planned after trusted comment');
+    }
+    // PR #4560 review: a Supersedes line inside a nested/mixed fence is documentation, never a hold on an unrelated PR.
+    // Round 3: a list-item fence's closer sits at most 3 columns past the item's content, so a deeper fence line is code.
+    for (const body of ['````md\n```\nSupersedes #4522\n```\nSupersedes #4523\n````', '~~~\n```\nSupersedes #4522\n~~~',
+      '- ```md\n          ```\n  Supersedes #4522\n  ```', '1. ```md\n   Supersedes #4521\n       ```\n   Supersedes #4522\n   ```',
+      '- ```\n  x\n```\nSupersedes #4522\n```', '```md\rx\nSupersedes #4522\n```', `\`\`\`md\nx\n\`\`\`${String.fromCharCode(0xa0)}\nSupersedes #4522\n\`\`\``,
+      // Round 4: a line left of a list item's content column ends the item's fence and opens a new one.
+      '- ```\n  code\n~~~\nSupersedes #4521\n  ```\nSupersedes #4522\n~~~', '- item\n\n  ```\n  code\n```\nSupersedes #4522\n```',
+      'Write `x\nSupersedes #4522` in the body.', '<pre>\nSupersedes #4522\n</pre>',
+      'Use <code>x\nSupersedes #4522</code> as an example.', 'See [doc](https://x/`a) `b\nSupersedes #4522` end',
+      '- <!-- describe the change\n-->\nSupersedes #4522']) {
+      if (parseSupersedes(body).length) violations.push(`fenced example read as a supersede marker: ${JSON.stringify(body)}`);
+    }
+    // PR #4560 advisory (security): a merged PR's body stays editable by its author, so an outside author's marker holds nothing.
+    for (const author of [{ login: 'rando' }, { is_bot: true, login: 'app/rando' }, undefined]) {
+      const forged = { ...fixture.merged, author };
+      if (planSupersedeHolds({ ...input, mergedPrs: [forged] }).length) violations.push(`merged PR by ${JSON.stringify(author)} planned a supersede hold`);
+    }
+    // ... and neither does a trusted-author PR whose body an outsider rewrote after the merge (or whose edit could not be read).
+    for (const edit of [{ lastEditedAt: '2026-10-09T02:00:00Z', editor: { login: 'rando' } }, { bodyEditUnknown: true }]) {
+      if (planSupersedeHolds({ ...input, mergedPrs: [{ ...fixture.merged, ...edit }] }).length) violations.push(`post-merge body edit ${JSON.stringify(edit)} planned a supersede hold`);
+    }
+    return { violations };
+  },
+  judge(report) { return report.violations; },
+};
