@@ -37,7 +37,7 @@ export { referralSeatDisabled } from './review-seat-policy.mjs';
  */
 
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1284,7 +1284,14 @@ export function createReviewPrSinks({
     // ADDITIVE: it changes no comment, label or decision. Both events are NON-CLEARING (holding), so the
     // statute write-miss posture (#verdict-ledger-pr-state-store rule 4) is: a failed append never blocks or
     // throws; it prints a loud `ledger-write-miss` line and the run goes on with its label hold unchanged.
-    [REVIEW_EFFECTS.LEDGER_EVENTS]: async (payload) => {
+    [REVIEW_EFFECTS.LEDGER_EVENTS]: async (payload, ctx) => {
+      // #xrw21vx — each row's identity is THIS EFFECT (ctx.key) plus the row type, never the row's own bytes.
+      // `ledgerEventId` otherwise hashes the whole row, `at` included: two distinct runs in one millisecond then
+      // collide into one row, and a replay of one effect gets a new `at` and counts twice. No key (a direct call
+      // outside the executor) has no replay identity to honour, so it gets a fresh random id: never merged.
+      const rowId = (type) => (ctx?.key
+        ? `review-pr:${createHash('sha256').update(`${ctx.key}\n${type}`).digest('hex')}`
+        : `review-pr:rand:${randomUUID()}`);
       const base = { repo: payload.repo, pr: payload.pr, source: 'review-pr', session: currentActorId(), channel: 'review-pr' };
       const rows = [];
       const keys = Array.isArray(payload.referralKeys) ? payload.referralKeys : [];
@@ -1298,7 +1305,7 @@ export function createReviewPrSinks({
       const written = []; const missed = [];
       for (const row of rows) {
         try {
-          const res = appendVerdict(buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }));
+          const res = appendVerdict({ ...buildLedgerEvent({ ...base, ...row, at: new Date().toISOString() }), id: rowId(row.type) });
           if (res.ok && !res.ledgerWriteMiss) written.push(row.type); else missed.push(`${row.type}: ${(res.errors ?? []).join('; ') || 'git write miss'}`);
         } catch (e) { missed.push(`${row.type}: ${String(e?.message ?? e).split('\n')[0]}`); }
       }
