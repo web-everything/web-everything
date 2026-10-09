@@ -1,22 +1,23 @@
 ---
+bornAs: xl8x1xu
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-watch.mjs", "we:scripts/lib/quiet-hours-io.mjs", "we:scripts/conveyor/__tests__/health-watch.test.mjs", "we:scripts/lib/__tests__/quiet-hours-io.test.mjs"]
+scope: ["we:src/wip/glance/glance-mount.ts", "we:src/wip/glance/glance-deeplink.test.ts", "we:src/wip/glance/__tests__/glance-mount.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — In the re-send block, require isQuiet(now, settings, toggle).quiet before re-sending, and clear h… (from web-everything/web-everything#4461 review)
+# Prevention — Add a mount test that starts in fallback sample mode, then delivers a live snapshot with the card in a no… (from plateauapp/plateau-app#217 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/health-watch.mjs:1355` — In the re-send block, require `isQuiet(now, settings, toggle).quiet` before re-sending, and clear `heldByQuietHours` once a flush has run outside quiet hours. Add a test that crosses 07:00 with a held episode.
-2. `we:scripts/lib/quiet-hours-io.mjs:261` — Write the timestamped digest file only after a confirmed send, and overwrite only `we:latest-digest.md` beforehand. Optionally prune old digests.
-3. `we:scripts/lib/quiet-hours-io.mjs` — Add a deterministic producer/consumer boundary test at and above MAX_ENTRY_BYTES, and reject oversized holds so the existing direct-delivery fallback runs.
+1. `we:src/wip/glance/glance-mount.ts:104` — Add a mount test that starts in fallback sample mode, then delivers a live snapshot with the card in a non-default scope and the agent present, and asserts both the scope switch and the panel open.
+2. `we:src/wip/glance/glance-deeplink.test.ts:32` — Assert `toBe(1)` after forcing a second paint in the same test. A review lens on 'once' guards would also catch this.
+3. `we:src/wip/glance/glance-deeplink.test.ts:29` — Add a boundary-value case, for example 128 versus 129 characters, to the deepLinkFromSearch unit test. A review lens that asks for a named test for each stated input limit would catch the same gap in other places.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4461@c58d31e07e4d46ae86a7ccfb99c132b38bb0774f
+Idempotency key (do not edit): approval-prevention-key:plateauapp/plateau-app#217@4339cf5739155de8dca27e46ebb26c658f6b3a7d
 
 ## Acceptance
 
