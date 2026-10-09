@@ -2,7 +2,7 @@
 kind: story
 size: 5
 status: open
-relatedTo: ["xqjri60", "5407"]
+relatedTo: ["xqjri60", "5407", "2692", "2740"]
 scope: ["we:scripts/lib/merge-freshness.mjs", "we:scripts/lib/merge-queue.mjs", "we:scripts/lib/__tests__/merge-queue.replay.test.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-08"
 tags: [merge-queue, integration-authority, drain]
@@ -10,7 +10,7 @@ tags: [merge-queue, integration-authority, drain]
 
 # Merge queue: the drain merges the queue head only on a fresh green against current main
 
-Ready PRs form one ordered queue (ruled priority class, then in-class score). The drain acts on the head only: it merges only when the head's required checks passed on its current head, on a base that is the current main tip (or main moved only on files the PR doesn't touch, a setting), and younger than a max-age setting. A stale head is refreshed once per head through the existing rebase-onto-main path and the queue waits for the new run; after each merge the next head is re-judged on the new main. Batch size is a setting fixed at 1. Off by default (today's behaviour). The drain stays the single writer. Replay fixtures: #4361 and the 2026-10-08 red-main window.
+Ready PRs form one ordered queue (ruled priority class, then in-class score). The drain acts on the head only and merges it only when its required checks passed on its current head, on a base at the current main tip (or main moved only on files it doesn't touch, a setting), within a max age. A stale head is refreshed once through the existing rebase-onto-main path, then waited on. Batch size 1. Off by default. The drain stays the single writer. Replay fixtures: #4361 and the 2026-10-08 red-main window.
 
 Operator "Ok", 2026-10-08 (held item 158), widened the same day to a real merge queue defined as the Integration
 Authority protocol of the delivery standard (epic 5407; protocol text card xqjri60). Incident: the 2026-10-08
@@ -33,7 +33,7 @@ disjoint mode.
 
 Finding: strict mode with batch size 1 serialises every merge behind one CI run (about 10 to 15 min), so it caps
 throughput near 4 to 6 merges an hour against today's ~8. Disjoint mode keeps most of today's flow and still
-catches #4361. Batching (a later policy) is what restores throughput for strict mode.
+catches #4361. Batching (a later policy; decision 2692's batching rider, tripwire 2740) is what restores throughput for strict mode.
 
 ## Design
 

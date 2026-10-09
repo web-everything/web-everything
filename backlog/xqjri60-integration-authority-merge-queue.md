@@ -3,18 +3,17 @@ kind: story
 size: 3
 parent: "5407"
 status: open
-relatedTo: ["5402", "5468"]
+relatedTo: ["5402", "5468", "2692", "2740", "xs1hdl7"]
 blockedBy: ["5402"]
-scope: []
 dateOpened: "2026-10-08"
 tags: [delivery-standard, merge-queue, integration-authority]
 ---
 
 # Integration Authority protocol: merge-queue text in the delivery standard
 
-Write the Integration Authority protocol text for the delivery standard (Ship Evermore, epic 5407): the merge queue. Ready changes enter one ordered queue (ruled priority class, then in-class score). The head is tested on the current main tip and merges only on that fresh green; stale heads are refreshed once per head; after each merge the next head is re-judged on the new main. One single writer. Declared settings with off = today; batch size fixed at 1 (batching = later policy); forge-native merge queue = reserved strategy adapter. Rules are pure over plain facts, with replay fixtures (#4361 and the 2026-10-08 red-main window). Reference implementation: card xs1hdl7 (we:scripts/lib/merge-queue.mjs, we:scripts/lib/merge-freshness.mjs).
+Write the Integration Authority protocol text for the delivery standard (Ship Evermore, epic 5407): the merge queue. Ready changes form one ordered queue (ruled priority class, then in-class score). The head is tested on the current main tip and merges only on that fresh green; a stale head is refreshed once; after each merge the next head is re-judged. One writer. Settings off = today; batch size 1 (batching later); forge-native queue reserved. Pure rules with replay fixtures; reference implementation in card xs1hdl7.
 
-Operator direction, 2026-10-08. Scope is empty until the protocol home is ruled (5402: separate repo now, or incubate here); this card then names the file.
+Operator direction, 2026-10-08. No scope yet: the protocol home is unruled (5402: separate repo now, or incubate here); this card names the file once it is. Prior art: decision 2692 (event-driven merge queue, speculative merge commit, batching rider) and its tripwire 2740; the batching policy here should reuse 2692's ruling.
 
 ## What the protocol text must define
 
