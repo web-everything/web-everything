@@ -16,7 +16,9 @@ import { writeRun } from '../operations/run-store.mjs';
 import {
   runCheck, readRepoEventsFromStore, buildRows, renderReport, renderRow, readOpenPrs, LABEL_FAMILIES, unfamilied, labelsByFamily, compareDerivedLabels,
   deriveRow, summarizeDerived, renderDerived, readRepoEvents, buildCheckRunRecord, appendCheckRun, buildDerivedRows,
+  runAllRepos, runHistory,
 } from '../review-ledger-check.mjs';
+import { DEFAULT_REPOS } from '../lib/review-ledger-history.mjs';
 import {
   VERDICTS, AGREEMENT, DISAGREE_DIRECTION, buildVerdictRecord, foldVerdictLedger, summarizeAgreement,
 } from '../lib/verdict-ledger.mjs';
@@ -291,6 +293,13 @@ describe('configured store check run', () => {
     if (json) expect(JSON.parse(out)).toEqual({ repo: REPO, store, status: 'unreadable', reason: 'no-board', error: 'no board configured' });
   });
 
+  it('passes the repo to the facts reader so another repo\'s PRs are readable (xhetzpl)', () => {
+    const seen = [];
+    buildDerivedRows({ repo: 'plateauapp/plateau-app', prs: [{ number: 3, labels: [] }], events: [],
+      readFacts: (pr, o) => { seen.push([pr, o]); return null; } });
+    expect(seen).toEqual([[3, { repo: 'plateauapp/plateau-app' }]]);
+  });
+
   it('reads once and uses the same verdict/event snapshot for both comparisons', async () => {
     let reads = 0;
     let output = '';
@@ -318,5 +327,38 @@ describe('configured store check run', () => {
 
   it('the async event convenience reader returns null on an unreadable store', async () => {
     expect(await readRepoEventsFromStore(REPO, { store: 'missing-store' })).toBeNull();
+  });
+});
+
+
+describe('#3930 — every constellation repo, and the run history as a query', () => {
+  it('runAllRepos checks each constellation repo once and returns the worst exit code', async () => {
+    const seen = [];
+    const res = await runAllRepos({ stdout: () => {}, run: async ({ repo }) => { seen.push(repo); return { exitCode: repo === DEFAULT_REPOS[1] ? 1 : 0 }; } });
+    expect(seen).toEqual([...DEFAULT_REPOS]);
+    expect(res.exitCode).toBe(1);
+  });
+
+  it('runAllRepos --json prints ONE document holding every repo report', async () => {
+    let out = '';
+    await runAllRepos({ json: true, stdout: (t) => { out += t; },
+      run: async ({ repo, stdout }) => { stdout(`${JSON.stringify({ repo, ok: true })}\n`); return { exitCode: 0 }; } });
+    expect(JSON.parse(out).repos.map((r) => r.repo)).toEqual([...DEFAULT_REPOS]);
+  });
+
+  it('runHistory answers clean days per family from run records and exits 0 only when every family is ready', () => {
+    const now = new Date('2026-10-09T18:00:00Z');
+    const runs = [];
+    for (let i = 0; i < 7; i += 1) {
+      const day = new Date(Date.UTC(2026, 9, 9 - i, 15)).toISOString();
+      for (const repo of DEFAULT_REPOS) runs.push(buildCheckRunRecord({ id: `review-ledger-check-h${i}${repo.length}`, repo, at: day, summary: summarizeDerived([]), phase1: {} }));
+    }
+    let out = '';
+    const ok = runHistory({ now, read: () => ({ runs, corrupt: 0 }), stdout: (t) => { out += t; } });
+    expect(ok).toMatchObject({ ready: true, exitCode: 0, runCount: 21 });
+    expect(out).toContain('ALL FAMILIES READY');
+    const short = runHistory({ now, read: () => ({ runs: runs.slice(3), corrupt: 0 }), json: true, stdout: () => {} });
+    expect(short).toMatchObject({ ready: false, exitCode: 1 });
+    expect(runHistory({ now, read: () => ({ runs: [], corrupt: 0 }), stdout: () => {} }).exitCode).toBe(1);
   });
 });
