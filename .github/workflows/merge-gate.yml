@@ -7,10 +7,16 @@
 # Runs on `pull_request` (so a PR can be added to the queue) and on `merge_group` (each PR in the group is
 # re-evaluated against the group's commit right before GitHub merges it). `workflow_dispatch` is the dry run.
 #
-# SCRIPTS COME FROM MAIN, NEVER FROM THE PR (same rule and reasoning as review-gate.yml): a PR cannot neuter its
-# own gate by editing these scripts in its diff. The PR's body, labels, comments and diff are read as data.
-# BOOTSTRAP: until this lands, main has no scripts/merge-gate-check.mjs, so the check reports clear (the same
-# bootstrap review-gate.yml documents); it is not required by the ruleset until the operator adds it.
+# SCRIPTS COME FROM MAIN, NEVER FROM THE PR (same rule and reasoning as review-gate.yml): a PR cannot neuter the
+# gate's SCRIPTS by editing them in its diff. The PR's body, labels, comments and diff are read as data.
+# WHAT IS NOT PINNED: this workflow YAML. GitHub reads the workflow file from the PR's merge ref for
+# `pull_request`, and from the group commit for `merge_group`, so a PR that edits this file (e.g. makes the job
+# `exit 0`) changes what the required check does. The defence for that is review escalation of any
+# .github/workflows/* diff (the blast-radius signal, pinned by merge-gate-ci.test.mjs), not this file.
+# BOOTSTRAP (true bootstrap only): until this lands, main has neither scripts/merge-gate-check.mjs nor this
+# workflow, so the check reports clear (the same bootstrap review-gate.yml documents); it is not required by the
+# ruleset until the operator adds it. The moment main has this workflow, a missing script FAILS CLOSED — a later
+# rename or removal of the script can never turn the required check green (pinned by merge-gate-ci.test.mjs).
 #
 # FAILS CLOSED: an input that is unreadable, or that has no shared source CI can reach yet, holds the PR.
 name: Merge gate
@@ -72,7 +78,11 @@ jobs:
           DISPATCH_PRS: ${{ inputs.prs }}
         run: |
           if [ ! -f scripts/merge-gate-check.mjs ]; then
-            echo "scripts/merge-gate-check.mjs not present on main yet — merge gate not bootstrapped; reporting clear."
+            if [ -f .github/workflows/merge-gate.yml ]; then
+              echo "::error::scripts/merge-gate-check.mjs is missing from main although .github/workflows/merge-gate.yml is there (renamed or removed?) — failing closed." >&2
+              exit 1
+            fi
+            echo "::warning::neither scripts/merge-gate-check.mjs nor .github/workflows/merge-gate.yml is on main yet — merge gate not bootstrapped; reporting clear."
             exit 0
           fi
           git config user.name merge-gate && git config user.email merge-gate@users.noreply.github.com
