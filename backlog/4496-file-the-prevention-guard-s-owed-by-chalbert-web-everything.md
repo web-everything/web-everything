@@ -6,8 +6,8 @@ parent: "4075"
 status: open
 scope: ["we:docs/agent/backlog-workflow.md", "we:skills-src/conveyor/prepare-item-worker-brief.md", "we:skills-src/conveyor/prepare-item-agent-brief.md", "we:skills-src/conveyor/__tests__/prepare-brief-contract.test.mjs"]
 dateOpened: "2026-09-29"
-preparedDate: "2026-10-01"
-preparedAgainstSha: "c6e39f4de578937f54deaa98fa8f0367aa3f1e7e"
+preparedDate: "2026-10-09"
+preparedAgainstSha: "8ae482c6090044de9bc190a88c6bfaa96bb7e317"
 tags: []
 ---
 
@@ -25,9 +25,11 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 - **Schema correction:** `we:scripts/check-standards-rules.mjs`'s `validateBacklogItem` already requires `kind` and validates it against `BACKLOG_KINDS`; `we:scripts/backlog/migrate-kind.mjs` explicitly migrates away from `type`/`workItem`. Requiring `workItem` or rejecting `kind` would reverse the current schema. No schema change is owed here.
 - **Corrected scope:** the remaining deliverable is reusable authoring/prepare guidance in `we:docs/agent/backlog-workflow.md` and both current probation briefs, `we:skills-src/conveyor/prepare-item-worker-brief.md` and `we:skills-src/conveyor/prepare-item-agent-brief.md`. Their matching existing test home is `we:skills-src/conveyor/__tests__/prepare-brief-contract.test.mjs`; extend it to cover the shared guidance contract. Runtime files and the resolved #4494 card are evidence only. This preserves the prevention goal without changing the accepted failure policy.
 
+- **Re-prepare 2026-10-09 (stale stamp):** the prior stamp (`c6e39f4de`) predates edits to `we:skills-src/conveyor/prepare-item-agent-brief.md` (now six sections incl. a required `## Edge cases this change must handle`, plus a commit-first gate flow), `we:skills-src/conveyor/prepare-item-worker-brief.md` (`size:` / `## Proposed blockedBy changes` paragraph), and `we:skills-src/conveyor/__tests__/prepare-brief-contract.test.mjs` (new #4670 case). Premise re-checked on `main`: no attribution/failure-default checklist exists in any of the four scoped files, so the goal is undelivered. Goal and scope unchanged. Insertion point in `we:docs/agent/backlog-workflow.md`: directly after the "Story-kind extension — `preparedDate` + `preparedAgainstSha` (#3108)" paragraph (~line 616), which is where story/task preparation readiness is defined; there is no separate "build-item Definition of Ready" heading, so the new checklist is a sibling paragraph there. The agent brief's Edge-cases class 4 (fail closed) and class 7 (who wrote it) overlap the new checklist; the checklist must cross-reference them rather than restate them. Builders must also touch the existing `Only edit that card's body…` worker-brief line only by appending, not rewording.
+
 ## Design
 
-Add a named attribution-and-failure-default checklist to the build-item preparation guidance in `we:docs/agent/backlog-workflow.md`. Both probation briefs must invoke the same checklist explicitly, since the worker brief declares itself the entire task.
+Add a named attribution-and-failure-default checklist to the build-item preparation guidance in `we:docs/agent/backlog-workflow.md` (new paragraph after the #3108 story-kind paragraph). Both probation briefs must invoke the same checklist explicitly, since the worker brief declares itself the entire task.
 
 For a design attributing X to actor Y through store Z, require the concrete persisted field, accepted value, reader/filter, and writer evidence that distinguish Y from other writers. If no actor field exists, say so explicitly and substantiate any exclusive-producer assumption; a store name or run-ID prefix alone is not proof of actor ownership. Require a fixture containing a non-Y record that reaches the relevant reader boundary, alongside the Y record, with expected inclusion/exclusion. If the current representation cannot distinguish them, expose that gap for a decision rather than inventing a discriminator.
 
@@ -37,9 +39,9 @@ This is a semantic author/reviewer checklist. A deterministic text check can ens
 
 ## MVP
 
-1. Add the checklist at the build-item Definition of Ready in `we:docs/agent/backlog-workflow.md`, with #4494 as a worked caution: producer provenance is not an actor field, and empty-on-error differs from omitted-input fallback.
+1. Add the checklist as a new paragraph right after the #3108 story-kind paragraph in `we:docs/agent/backlog-workflow.md` (not a decision-prep "Definition of Ready" heading), with #4494 as a worked caution: producer provenance is not an actor field, and empty-on-error differs from omitted-input fallback.
 2. Add concise instructions to both scoped probation briefs to apply the checklist when relevant, citing the canonical guidance and retaining the existing no-policy-choice stop boundary.
-3. Extend `we:skills-src/conveyor/__tests__/prepare-brief-contract.test.mjs` to read the canonical checklist and verify both brief variants require ownership evidence, a non-owner fixture, and explicit failure-default evidence. Preserve existing authorization and stop-boundary assertions.
+3. Extend `we:skills-src/conveyor/__tests__/prepare-brief-contract.test.mjs` to read the canonical checklist and read the canonical doc (a new `readFileSync`) and verify both brief variants require ownership/writer evidence, a non-owner fixture, and explicit failure-default evidence. Preserve existing authorization and stop-boundary assertions.
 4. Do not modify builder counting, run-store schema, the accepted fail-open default, or backlog kind validation.
 
 ## Test plan
@@ -53,8 +55,18 @@ This is a semantic author/reviewer checklist. A deterministic text check can ens
 ## Proof plan
 
 - During implementation, add the contract cases first and run `npx vitest run we:skills-src/conveyor/__tests__/prepare-brief-contract.test.mjs` (strip the repository prefix when executing from WE). Capture the missing-instruction failures, then the passing result after updating guidance and briefs.
-- Perform the three sample reviews above using the actual resulting brief text; record the missing evidence or satisfied obligations. A green text-contract test alone does not prove semantic review quality.
+- Perform the three sample reviews above using the actual resulting brief text; record the missing evidence or satisfied obligations in the PR body. A green text-contract test alone does not prove semantic review quality.
 - Run `npm run check:standards` and inspect the diff for repository-prefixed references and unchanged worker authority/stop boundaries. This preparation pass leaves execution of these implementation checks to the runner and eventual builder.
+
+## Edge cases this change must handle
+
+1. **Untrusted text** — n/a: the change adds static guidance text and contract assertions; no card/PR/LLM text reaches a shell, argv or regex (tests read repo files only).
+2. **Truncated reads** — n/a: tests read three local files with `readFileSync`; no `gh`/`git` read.
+3. **Shared state files** — n/a: no state file is written.
+4. **Fail closed** — the contract test must throw (not skip) if a brief or the canonical doc is missing or the checklist anchor is not found; a missing file is never an empty string that passes a negative assertion.
+5. **Identity scoping** — n/a: no keys; the checklist itself tells authors to name the persisted actor field (the guidance subject, not a runtime key).
+6. **State over time** — assertions are anchored to stable phrases, not line numbers, so later edits to the briefs (they changed three times since the last stamp) don't break them spuriously.
+7. **Who wrote it** — the checklist text itself requires writer evidence for ownership claims; the test asserts that obligation is present in all three files.
 
 ## Follow-ups
 
