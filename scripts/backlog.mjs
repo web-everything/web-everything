@@ -1079,7 +1079,10 @@ function overlapYieldConfig() {
  * rank) come straight off the loader (`...data`), which is authoritative for them.
  */
 function buildQueue() {
-  const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=') || arg.startsWith('--backlog-dir=')) &&
+  // A `--backlog-dir=` fixture run is uncached unless the caller opts in with WE_BUILD_QUEUE_CACHE=1 (the cache-key
+  // regression test does, so it can exercise the cache on a small corpus instead of the live 5k-card backlog).
+  const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=')) &&
+    (!argv.some(arg => arg.startsWith('--backlog-dir=')) || process.env.WE_BUILD_QUEUE_CACHE === '1') &&
     process.env.WE_BUILD_QUEUE_CACHE !== '0' &&
     !(isUnderTest() && process.env.WE_BUILD_QUEUE_CACHE === undefined);
   const at = Date.now();
@@ -1092,7 +1095,10 @@ function buildQueue() {
     next: argv.includes('--next') }) : null;
   const key = baseKey === null ? null
     : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH),
-      mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE]);
+      mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
+      // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
+      // set it too: key on the merged value itself, not only on the one file's mtime.
+      JSON.stringify(readSettings().buildQueuePriority ?? null)]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
