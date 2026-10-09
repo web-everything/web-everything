@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 
 import {
-  WORKER_RESULT_SCHEMA, BLOCKER_KINDS, validateWorkerResult, parseWorkerResult, validateAgainstSchema, strictModeProblems,
+  WORKER_RESULT_SCHEMA, CAPS, claudeWorkerResultSchema, BLOCKER_KINDS, validateWorkerResult, parseWorkerResult, validateAgainstSchema, strictModeProblems,
   mapLegacyOutcome, guardBlockerKind, unparseableOutcome, abortedOutcome,
 } from '../worker-result.mjs';
 
@@ -216,5 +216,51 @@ describe('(c) legacy outcome mapping is total over the briefs', () => {
     expect(mapLegacyOutcome('unreported')).toBeNull();
     expect(mapLegacyOutcome(undefined)).toBeNull();
     expect(mapLegacyOutcome('constructor')).toBeNull();
+  });
+});
+
+// 117 S3b regression 2026-10-08: the old Claude schema accepted both overlong transcript results.
+describe('Claude capped schema and real transcript replay', () => {
+  const fixtures = JSON.parse(readFileSync(join(ROOT, 'scripts/operations/__tests__/fixtures/wrapped-worker-results-2026-10-08.json'), 'utf8'));
+  it.each(Object.entries(fixtures))('%s rejects the original summary in both validators, accepts the shortened result', (_name, { structuredOutput: value }) => {
+    expect(validateWorkerResult(value)).toMatchObject({ ok: false, problems: expect.arrayContaining([`summary: ${value.summary.length} chars exceeds 280`]) });
+    expect(validateAgainstSchema(claudeWorkerResultSchema(), value)).toContain(`$.summary: ${value.summary.length} chars exceeds maxLength 280`);
+    const short = { ...value, summary: value.summary.slice(0, 280) };
+    expect(validateWorkerResult(short).ok).toBe(true);
+    expect(validateAgainstSchema(claudeWorkerResultSchema(), short)).toEqual([]);
+  });
+  it('adds only cap keywords, keeps strict mode, and never mutates the file schema or another copy', () => {
+    const original = JSON.stringify(WORKER_RESULT_SCHEMA);
+    const schema = claudeWorkerResultSchema();
+    expect(strictModeProblems(schema)).toEqual([]);
+    const caps = [];
+    const strip = (node) => {
+      if (!node || typeof node !== 'object') return;
+      for (const key of Object.keys(node)) {
+        if (key === 'maxLength' || key === 'maxItems') { caps.push(node[key]); delete node[key]; }
+        else strip(node[key]);
+      }
+    };
+    strip(schema);
+    expect(caps.sort((a, b) => a - b)).toEqual(Object.values(CAPS).sort((a, b) => a - b));
+    expect(schema).toEqual(WORKER_RESULT_SCHEMA);
+    expect(JSON.stringify(WORKER_RESULT_SCHEMA)).toBe(original);
+    expect(JSON.parse(readFileSync(join(ROOT, 'schemas/worker-result.v1.json'), 'utf8'))).toEqual(schema);
+    expect(claudeWorkerResultSchema().properties.summary.maxLength).toBe(280);
+  });
+  it('enforces every nested cap and ignores string caps on null', () => {
+    const check = (schema, path = '$') => {
+      if (schema.maxLength !== undefined) {
+        expect(validateAgainstSchema(schema, 'x'.repeat(schema.maxLength + 1), path)).toContain(`${path}: ${schema.maxLength + 1} chars exceeds maxLength ${schema.maxLength}`);
+        if ([].concat(schema.type).includes('null')) expect(validateAgainstSchema(schema, null, path)).toEqual([]);
+      }
+      if (schema.maxItems !== undefined) {
+        expect(validateAgainstSchema(schema, Array(schema.maxItems + 1).fill(null), path)).toContain(`${path}: ${schema.maxItems + 1} items exceeds maxItems ${schema.maxItems}`);
+      }
+      for (const [key, sub] of Object.entries(schema.properties ?? {})) check(sub, `${path}.${key}`);
+      if (schema.items) check(schema.items, `${path}[]`);
+    };
+    check(claudeWorkerResultSchema());
+    expect(validateAgainstSchema({ type: 'array', maxItems: 0 }, [1])).toEqual(['$: 1 items exceeds maxItems 0']);
   });
 });

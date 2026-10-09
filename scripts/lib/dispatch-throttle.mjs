@@ -143,10 +143,18 @@ export function isBorrowedRunnerDead(claim, alive = isPidAlive) {
   return Boolean(claim?.meta?.borrowed) && Number.isInteger(pid) && pid > 0 && !alive(pid);
 }
 
-/** Count LIVE fix/ci-heal claims (`fixing` is not a session). A borrowed claim whose runner pid is dead is not live:
+/** 117 S3b — ANY claim whose stamped runner process is gone: a borrowed fix, or a Claude fix / ci-heal launched through
+ *  the detached worker wrapper (neither has a `claude agents` row; the runner pid IS its liveness). No pid stamped
+ *  yet -> not dead (only the plain TTL can end it). Pure given `alive`. */
+export function isClaimRunnerDead(claim, alive = isPidAlive) {
+  const pid = claim?.meta?.runnerPid;
+  return Number.isInteger(pid) && pid > 0 && !alive(pid);
+}
+
+/** Count LIVE fix/ci-heal claims (`fixing` is not a session). A claim whose runner pid is dead is not live:
  *  it must not hold a cap slot while it waits out its TTL. */
 export function countLiveFixSessions(claims = [], { alive = isPidAlive } = {}) {
-  return claims.filter((c) => (c?.meta?.kind === 'fix' || c?.meta?.kind === 'ci-heal') && !isBorrowedRunnerDead(c, alive)).length;
+  return claims.filter((c) => (c?.meta?.kind === 'fix' || c?.meta?.kind === 'ci-heal') && !isClaimRunnerDead(c, alive)).length;
 }
 
 /**
