@@ -109,6 +109,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
+import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
@@ -133,7 +134,6 @@ import {
 // build-path-codex-isolation — the ONE shared bg-isolation helper every dispatch path calls.
 import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
 import { readOverlayConflictWakes } from '../lib/overlay-conflict-wake.mjs';
-import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 
 /** The template `we:skills-src/conveyor/fix-agent-brief.md` — the SAME brief `dispatch-lane.mjs`'s own
  *  tick-core-driven fix dispatch fills, read fresh per dispatch so an edit takes effect with no restart. */
