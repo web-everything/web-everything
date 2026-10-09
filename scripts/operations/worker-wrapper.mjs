@@ -255,17 +255,21 @@ async function runWorkerOnce(spec, io, stop) {
   const clock = io.nowMs ?? (() => Date.parse(now()));
   const awaitingVerify = io.awaitingVerify ?? (async (sessionId) => {
     if (!sessionId) return null;
-    const { readStoredAwaitVerify, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyTtlMs } = await import('../conveyor/await-verify.mjs');
+    const { readStoredAwaitVerify, awaitVerifyStoreKey, classifyAwaitVerify, resolveAwaitVerifyTtlMs, readAwaitVerifyRecordForSession } = await import('../conveyor/await-verify.mjs');
     // `readStoredAwaitVerify` answers null for a missing AND an unreadable/unparseable record. Only a missing one means "not
     // awaiting"; a record that exists but cannot be read is an unknown, reported as `{unreadable}` (never as "finished").
     let text = null;
     let readError = null;
-    const record = readStoredAwaitVerify(awaitVerifyStoreKey({ sessionId }), {
+    let record = readStoredAwaitVerify(awaitVerifyStoreKey({ sessionId }), {
       readFileSyncFn: (path, enc) => {
         try { text = readFileSync(path, enc); return text; } catch (e) { if (e?.code !== 'ENOENT') readError = e; throw e; }
       },
     });
     if (!record && (readError || text !== null)) return { unreadable: true };
+    // The reaper and the pass find a session's record lane-local, then by id, then by NAME (`readAwaitVerifyRecordForSession`): a
+    // `mark` without `--ref` writes only the lane-local file. Look where they look, or a wait they can see reads as "none owed" here.
+    // (Binding still goes through classifyAwaitVerify, so another session's record never counts.)
+    record ??= readAwaitVerifyRecordForSession(spec.cwd, { sessionId, name: spec.session });
     const verdict = classifyAwaitVerify({ record, session: { sessionId, name: spec.session }, nowMs: clock(), ttlMs: resolveAwaitVerifyTtlMs() });
     if (verdict.awaiting) return { awaiting: true, record };
     // PR #4462 review: a record that is OURS but past its TTL is a wait that ran out, not "no wait owed"; collapsing it to null let a
@@ -342,14 +346,16 @@ async function runWorkerOnce(spec, io, stop) {
   if (spec.launcher === 'claude-p') {
     const requestPath = resumeRequestPath(spec.specDir ?? join(dirname(dir), 'worker-wrapper-specs'), spec.session);
     let resumes = 0;
-    let servedAt = null; // the `requestedAt` of the await record the last resume answered: a leftover copy of it (the pass failed to clear it) is not a new obligation
-    // The wait a live OR expired record still owes, or null when none is owed (no record, or only the copy the last resume answered).
-    const owedWait = (w) => ((w?.awaiting || w?.expired) && w.record?.requestedAt !== servedAt ? { sha: w.record.sha, pr: w.record.pr, ref: w.record.ref } : null);
+    // Every `requestedAt` of the await record(s) a resume answered. The pass re-stamps a waiting record (`rerequest`) while we poll, so
+    // the copy a failed clear leaves behind can carry a LATER stamp than the one the wait began with: collect every stamp seen in the wait.
+    const served = new Set();
+    // The wait a live OR expired record still owes, or null when none is owed (no record, or only a copy a resume already answered).
+    const owedWait = (w) => ((w?.awaiting || w?.expired) && !served.has(w.record?.requestedAt) ? { sha: w.record.sha, pr: w.record.pr, ref: w.record.ref } : null);
     while (!failure && !isOperatorStop() && clock() < deadlineMs && resumes < MAX_AWAIT_RESUMES) {
       let awaiting = await awaitingVerify(spec.sessionId);
       if (awaiting?.unreadable) { unfinishedVerify = {}; break; } // cannot tell whether a verdict is owed: not a finished run
       const owed = owedWait(awaiting);
-      // An already-expired record means the verdict can no longer be delivered (nothing resumes on it): the turn's `done` is unverified.
+      // An already-expired record is a wait that ran out before this check: no verdict reached the wrapper, so the turn's `done` is unverified.
       if (!awaiting?.awaiting) { unfinishedVerify = owed; break; }
       if (!owed) break;
       const { sha, pr, ref, requestedAt } = awaiting.record;
@@ -358,8 +364,10 @@ async function runWorkerOnce(spec, io, stop) {
         ...started, pid: selfPid, updatedAt: now(), awaitingVerify: { sha, pr, ref, requestedAt },
       }, dir), { dir });
       let request = null;
+      const stamps = new Set([requestedAt]);
       while (!failure && !isOperatorStop() && clock() < deadlineMs) {
         awaiting = await awaitingVerify(spec.sessionId);
+        if (awaiting?.record?.requestedAt) stamps.add(awaiting.record.requestedAt);
         try {
           request = JSON.parse(readFile(requestPath));
           rmSync(requestPath, { force: true });
@@ -373,7 +381,7 @@ async function runWorkerOnce(spec, io, stop) {
       }
       if (!request || isOperatorStop() || clock() >= deadlineMs) break;
       resumes += 1;
-      servedAt = requestedAt;
+      for (const stamp of stamps) served.add(stamp);
       unfinishedVerify = null; // a verdict arrived: the resumed turn is the one that settles it
       await run(resumeArgvFrom(spec.argv, { sessionId: spec.sessionId, prompt: request.prompt }));
     }

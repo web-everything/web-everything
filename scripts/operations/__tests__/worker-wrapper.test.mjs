@@ -619,6 +619,25 @@ describe('wrapped verification waits', () => {
     expect(h.calls).toHaveLength(2);
     expect(out.result).toMatchObject({ outcome: 'done', summary: 'turn 2' });
   });
+  it('a leftover re-stamped by the pass DURING the wait (later requestedAt) is the same answered wait', async () => {
+    const h = harness();
+    let polls = 0;
+    h.io.awaitingVerify = () => (++polls === 1 ? awaiting : awaitingTurn(99)); // the pass `rerequest`s the record while the wrapper polls
+    const out = await runWorker(h.s, h.io);
+    expect(h.calls).toHaveLength(2);
+    expect(out.result).toMatchObject({ outcome: 'done', summary: 'turn 2' });
+  });
+  // The reaper and the pass find a record lane-local / by id / by NAME. A `mark` without `--ref` leaves only a name-keyed or lane-local one.
+  it('an expired record found only by the session NAME is an unfinished wait too', async () => {
+    const store = tmp();
+    vi.stubEnv('WE_AWAIT_VERIFY_STORE', store);
+    try {
+      const h = harness();
+      delete h.io.awaitingVerify;
+      writeFileSync(join(store, `${h.s.session}.json`), `${JSON.stringify({ v: 1, who: h.s.session, ...awaiting.record, requestedAt: new Date(start - 150 * 60 * 1000 - 1).toISOString() })}\n`);
+      expect((await runWorker(h.s, h.io)).result).toMatchObject({ outcome: 'blocked', blocker: { component: 'verify-wait' } });
+    } finally { vi.unstubAllEnvs(); }
+  });
   it('a NEW wait after a resume (different requestedAt) is still owed', async () => {
     const h = harness();
     h.io.awaitingVerify = () => (h.calls.length === 1 ? awaiting : { expired: true, record: awaitingTurn(h.calls.length).record });
