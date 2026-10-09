@@ -3,9 +3,10 @@ bornAs: xbsa9by
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/operations/dispatch-lane-io.mjs", "we:scripts/operations/__tests__/dispatch-lane-defaults.test.mjs", "we:scripts/conveyor/soak/breaks/already-done-burst-unattributed.mjs", "we:scripts/operations/__tests__/dispatch-lane-io.test.mjs", "we:scripts/conveyor/soak/breaks/__tests__/already-done-burst-unattributed.test.mjs"]
 dateOpened: "2026-09-29"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
