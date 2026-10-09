@@ -22,11 +22,16 @@ beforeEach(() => {
 const args = process.argv.slice(2);
 const repo = args[args.indexOf('--repo') + 1];
 if (repo === 'bad/repo') { process.stderr.write('unavailable\\n'); process.exit(1); }
+if (args[0] === 'api') {
+  if (!args[2].startsWith('repos/paged/repo/pulls/7/files')) { process.stderr.write('HTTP 502\\n'); process.exit(1); }
+  for (let i = 0; i < 150; i++) console.log(JSON.stringify({ s: i === 0 ? 'added' : i === 1 ? 'renamed' : 'modified', f: 'c' + i + '.mjs', p: i === 1 ? 'old1.mjs' : null }));
+  process.exit(0);
+}
 const full = Array.from({length: Number(args[args.indexOf('--limit') + 1])}, (_, i) => ({number: i + 1, title: 'P', url: 'u', files: [{path: 'f' + i + '.mjs'}]}));
 const twin = [{number: 12, title: 'Twin ' + repo, url: 'u', files: [{path: 'twin.mjs'}]}];
 const fixture = [{number: 12, title: 'Fixture', url: 'https://example.test/12', files: [{path: 'held.mjs'}]}];
 const capped = [{number: 7, title: 'Capped', url: 'u', files: Array.from({length: 100}, (_, i) => ({path: 'c' + i + '.mjs'}))}];
-console.log(JSON.stringify(repo === 'full/repo' ? full : repo === 'capped/repo' ? capped : require('node:fs').existsSync(__filename + '.twins') ? twin : repo === 'fixture/repo' ? fixture : []));
+console.log(JSON.stringify(repo === 'full/repo' ? full : ['capped/repo', 'paged/repo'].includes(repo) ? capped : require('node:fs').existsSync(__filename + '.twins') ? twin : repo === 'fixture/repo' ? fixture : []));
 `, { mode: 0o755 });
   env = { WE_AGENT_SCOPES_PATH: registry, WE_FREE_SCOPE_GH_BIN: gh };
   fs.mkdirSync(path.join(root, 'backlog'));
@@ -64,7 +69,7 @@ it('updates under a lock, reclaims an abandoned lock and cleans up on callback f
 });
 it('reads real fake-gh subprocess output and retains failures per repo', () => {
   const result = readOpenPrs({ repos: ['bad/repo', 'fixture/repo'], exec: ghExec(env) });
-  expect(result.prs).toEqual([{ repo: 'fixture/repo', number: 12, title: 'Fixture', url: 'https://example.test/12', files: ['held.mjs'] }]);
+  expect(result.prs).toEqual([{ repo: 'fixture/repo', number: 12, title: 'Fixture', url: 'https://example.test/12', files: ['held.mjs'], source: 'github-list' }]);
   expect(result.unreadable).toHaveLength(1);
   expect(result.unreadable[0].repo).toBe('bad/repo');
   expect(result.unreadable[0].error).not.toContain('\n');
@@ -99,6 +104,16 @@ it('treats a PR whose file list is at the gh cap as unreadable, so its unlisted 
   expect(text.out).not.toMatch(/\bFREE\b/);
   expect(JSON.parse(cli(['--files=repo:c3.mjs', '--json'], { collect }).out).status).toBe('occupied');
   expect(readOpenPrs({ repos: ['fixture/repo'], exec: ghExec(env) }).unreadable).toEqual([]);
+});
+it('completes a capped gh list from the paginated files API when git cannot read the PR (xl5oele)', () => {
+  const result = readOpenPrs({ repos: ['paged/repo'], exec: ghExec(env) });
+  expect(result.unreadable).toEqual([]);
+  expect(result.prs[0]).toMatchObject({ number: 7, source: 'github-api', added: ['c0.mjs'] });
+  expect(result.prs[0].files).toHaveLength(151);
+  expect(result.prs[0].files).toEqual(expect.arrayContaining(['c149.mjs', 'old1.mjs']));
+  const collect = (options) => collectFreeScope({ ...options, repos: ['paged/repo'] });
+  expect(JSON.parse(cli(['--files=repo:c120.mjs', '--json'], { collect }).out).status).toBe('occupied');
+  expect(cli(['--files=repo:elsewhere.mjs'], { collect }).code).toBe(0);
 });
 it('qualifies --exclude-pr by repo through the CLI', () => {
   // Both default repos report an open PR #12 touching the same file.
