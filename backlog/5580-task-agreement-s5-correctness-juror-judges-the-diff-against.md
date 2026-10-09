@@ -1,9 +1,10 @@
 ---
+bornAs: x6f9vwo
 kind: story
 size: 5
 parent: "5399"
 status: open
-blockedBy: ["xdeqs8k"]
+blockedBy: ["5578"]
 scope: ["we:scripts/lib/review-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/converge-cli.mjs", "we:scripts/operations/review-prep.mjs", "we:skills-src/converge/SKILL.md", "we:scripts/lib/__tests__/review-core.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs", "we:scripts/operations/__tests__/review-prep.test.mjs", "we:scripts/__tests__/converge-cli.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []

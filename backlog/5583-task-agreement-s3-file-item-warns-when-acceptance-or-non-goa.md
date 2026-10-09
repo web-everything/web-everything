@@ -1,9 +1,10 @@
 ---
+bornAs: xk8lm2t
 kind: story
 size: 2
 parent: "5399"
 status: open
-blockedBy: ["xdeqs8k"]
+blockedBy: ["5578"]
 scope: ["we:scripts/operations/file-item.mjs", "we:scripts/operations/scaffold.mjs", "we:skills-src/file-item/SKILL.md", "we:scripts/operations/__tests__/file-item.test.mjs", "we:scripts/operations/__tests__/scaffold.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []

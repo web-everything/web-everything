@@ -1,9 +1,10 @@
 ---
+bornAs: xbb6fgj
 kind: story
 size: 5
 parent: "5399"
 status: open
-blockedBy: ["xdeqs8k", "x251p1l"]
+blockedBy: ["5578", "5579"]
 scope: ["we:scripts/backlog/", "we:backlog/"]
 scopeRationale: "the refresh rewrites many open backlog cards (about 50 per PR) and adds a new runner under scripts/backlog whose file name is not fixed yet"
 dateOpened: "2026-10-08"

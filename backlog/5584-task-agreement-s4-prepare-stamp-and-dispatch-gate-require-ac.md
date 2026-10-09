@@ -1,9 +1,10 @@
 ---
+bornAs: xphujml
 kind: story
 size: 5
 parent: "5399"
 status: open
-blockedBy: ["xdeqs8k", "x251p1l"]
+blockedBy: ["5578", "5579"]
 scope: ["we:scripts/conveyor/prepare-result.mjs", "we:scripts/readiness/dispatch-plan.mjs", "we:scripts/backlog.mjs", "we:skills-src/conveyor/prepare-item-agent-brief.md", "we:scripts/readiness/__tests__/dispatch-plan.test.mjs", "we:scripts/conveyor/__tests__/prepare-result.test.mjs", "we:scripts/__tests__/backlog-prepare-stamp-status.test.mjs"]
 scopeRationale: "we:scripts/lib/task-agreement-policy.json is named in [A5] only as the committed policy file the real loader READS; this slice never writes it (the test points the loader at a fixture policy file, and flipping the setting is a separate change per [N1]), so it is deliberately not in scope."
 dateOpened: "2026-10-08"

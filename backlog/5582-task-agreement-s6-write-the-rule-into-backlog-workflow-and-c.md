@@ -1,9 +1,10 @@
 ---
+bornAs: xdg7er2
 kind: story
 size: 3
 parent: "5399"
 status: open
-blockedBy: ["xdeqs8k"]
+blockedBy: ["5578"]
 scope: ["we:docs/agent/backlog-workflow.md", "we:scripts/audit-backlog-health.mjs", "we:scripts/__tests__/audit-backlog-health.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
