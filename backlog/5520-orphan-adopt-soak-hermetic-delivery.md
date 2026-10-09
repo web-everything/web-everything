@@ -2,11 +2,12 @@
 bornAs: xh6ij2v
 kind: story
 size: 1
-status: active
+status: resolved
 scaffoldedBy: "main-red-soak"
 dateScaffolded: "2026-10-08"
 scope: ["we:scripts/conveyor/soak/breaks/build-dispatch-orphan-adopt.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: []
 ---
 
