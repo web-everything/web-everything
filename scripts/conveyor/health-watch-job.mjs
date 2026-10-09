@@ -251,7 +251,9 @@ async function jobMain(argv) {
   }
   // A graceful stop (the runtime's SIGTERM to a stalled job) takes the whole process group with it: the
   // detached spawn made this process its group leader, so the worker's `gh`/CLI children are in it too.
-  process.once('SIGTERM', () => { try { process.kill(-process.pid, 'SIGKILL'); } catch { process.exit(143); } });
+  process.once('SIGTERM', () => {
+    try { process.kill(-process.pid, 'SIGKILL'); } catch { process.kill(process.pid, 'SIGKILL'); } // not a group leader: at least this process
+  });
   const out = await runJob({ steps: [{ name: 'gh-probes', run: (ctx) => ghProbeStep(ctx) }] });
   console.log(`${new Date().toISOString()} health-gh-probe pid=${process.pid} ${JSON.stringify(out)}`);
   return out.outcome === 'succeeded' ? 0 : 1;
