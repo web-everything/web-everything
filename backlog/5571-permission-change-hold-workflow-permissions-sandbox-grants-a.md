@@ -1,4 +1,5 @@
 ---
+bornAs: xi3s5g7
 kind: story
 size: 5
 status: open
