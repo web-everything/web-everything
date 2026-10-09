@@ -17,6 +17,7 @@
  *   node scripts/lib/red-main-quarantine-io.mjs show
  */
 import { execFileSync } from 'node:child_process';
+import { writeAllSync } from './write-all-sync.mjs'; // a CLI's stdout must be drained before any process.exit
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from './git-transport-branch.mjs';
@@ -25,7 +26,7 @@ import {
   validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine,
 } from './red-main-quarantine.mjs';
 
-const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts });
 
 /**
  * Read the current list. `{ok:true, list}` (an absent branch/file = an empty list is NOT assumed: absent file on a
@@ -85,11 +86,11 @@ function cli(argv) {
     const r = readQuarantine();
     const fixPrs = String(f['fix-prs'] ?? '').split(',').filter(Boolean).map(Number);
     const tests = r.ok ? testsToSkip({ list: r.list, now, prNumber: f.pr ?? null, fixPrs, onMain: !!f['on-main'] }) : [];
-    if (f.format === 'vitest') process.stdout.write(tests.map((t) => `--exclude=${t.split('::')[0]}`).join(' ') + '\n');
-    else process.stdout.write(JSON.stringify({ ok: r.ok, ...(r.ok ? {} : { error: r.error }), skip: tests }) + '\n');
+    if (f.format === 'vitest') writeAllSync(1, tests.map((t) => `--exclude=${t.split('::')[0]}`).join(' ') + '\n');
+    else writeAllSync(1, JSON.stringify({ ok: r.ok, ...(r.ok ? {} : { error: r.error }), skip: tests }) + '\n');
     return;
   }
-  if (cmd === 'show') { process.stdout.write(JSON.stringify(readQuarantine(), null, 2) + '\n'); return; }
+  if (cmd === 'show') { writeAllSync(1, JSON.stringify(readQuarantine(), null, 2) + '\n'); return; }
   if (cmd === 'add') {
     const tests = String(f.tests ?? '').split(',').filter(Boolean);
     const ttlMs = f['ttl-min'] ? Number(f['ttl-min']) * 60_000 : undefined;
@@ -97,13 +98,13 @@ function cli(argv) {
       actor: f.actor, message: `quarantine: add ${tests.join(', ')} (broken ${String(f['broken-sha']).slice(0, 9)}, by ${f.actor})`,
       change: (cur) => addEntries(cur, { tests, brokenSha: f['broken-sha'], owner: f.owner, reason: f.reason, actor: f.actor, now, ...(ttlMs ? { ttlMs } : {}), area: f.area ?? null }),
     });
-    process.stdout.write(JSON.stringify(out) + '\n');
+    writeAllSync(1, JSON.stringify(out) + '\n');
     return;
   }
   if (cmd === 'prune') {
     const mg = f['main-green'] === 'true' ? true : f['main-green'] === 'false' ? false : null;
     const out = writeQuarantineChange({ actor: f.actor, message: `quarantine: prune (main green: ${mg})`, change: (cur) => pruneOnGreen(cur, { mainGreen: mg, now, actor: f.actor }) });
-    process.stdout.write(JSON.stringify(out) + '\n');
+    writeAllSync(1, JSON.stringify(out) + '\n');
     return;
   }
   process.stderr.write('usage: red-main-quarantine-io.mjs <skip|show|add|prune> [--flags]\n');
