@@ -203,7 +203,7 @@ export async function probeAndOwnMainCi({
   if (priority && settings.mainCiRedCombineFixPrs && ownerPrs.length >= 2) {
     const full = new Map((prs || []).map((p) => [Number(p.number), p]));
     const fixPrs = ownerPrs.map((o) => { const p = full.get(o.number) ?? o; return { number: o.number, createdAt: p.createdAt, headRefName: p.headRefName ?? null, ci: readPrCi(p) }; });
-    combine = planCombinedFix({ mainFailingJobs: probe.failing?.jobs ?? [], fixPrs });
+    combine = planCombinedFix({ mainFailingJobs: probe.failing?.jobs ?? [], fixPrs, summaryJobs: settings.mainCiRedSummaryJobs });
     if (combine.owedElsewhere.length || combine.deadlock) priority.combine = combine;
   }
   if (prs !== null && !dryRun) publishPriority(priority);

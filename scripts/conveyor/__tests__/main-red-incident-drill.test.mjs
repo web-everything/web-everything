@@ -103,7 +103,7 @@ describe('INCIDENT DRILL — 2026-10-08, main red from two causes', () => {
     // (2) Exactly ONE owner, sent on the alert tick, for the whole red window; its brief demands ONE PR for every cause.
     expect(dispatched.map((d) => [d.at, d.sessionSlug])).toEqual([['2026-10-08T17:20:00.000Z', 'main-fix-7c731a95e']]);
     expect(dispatched[0].prompt).toMatch(/You own them all, in ONE PR/);
-    expect(dispatched[0].prompt).toMatch(/soak-shard \(3\), test-shard \(2\)/);
+    expect(dispatched[0].prompt).toMatch(/test-shard \(2\), soak-shard \(2\)/);
     // (6) Builder frozen for ordinary (P3) builds from the alert on; nothing frozen before.
     const stateAt = (t) => stateByT.get(t) ?? null;
     expect(mainRedBuildFreeze(stateAt(T('2026-10-08T17:15:00Z')), { now: T('2026-10-08T17:15:00Z') }).frozen).toBe(false);
@@ -199,7 +199,7 @@ describe('INCIDENT DRILL — 2026-10-08, main red from two causes', () => {
     const plan = planCombinedFix({ mainFailingJobs: TWO.mainFailingJobs,
       fixPrs: [{ ...p4522, ci: { status: 'green', failedJobs: [] } }, { ...p4532 }] });
     expect(plan.deadlock).toBeNull();
-    expect(plan.owedElsewhere).toEqual([{ pr: 4532, jobs: ['soak-shard (3)'], waitsOn: [4522] }]);
+    expect(plan.owedElsewhere).toEqual([{ pr: 4532, jobs: ['soak-shard (2)'], waitsOn: [4522] }]);
     expect(mainFixHeldFor(4532, { combine: plan })?.kind).toBe('main-fix-owed-elsewhere');
     expect(mainFixHeldFor(4522, { combine: plan })).toBeNull();
   });

@@ -42,6 +42,9 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   /** Off = before this card: fix PRs are never combined. On = when two fix PRs each fail CI on the OTHER's cause
    *  (live 2026-10-08: #4522 soak / #4532 ledger id), ONE combine session folds them into the newest PR. */
   mainCiRedCombineFixPrs: true,
+  /** ci.yml jobs that only gate on other jobs' results (`test` ← test shards, `daemon-soak` ← soak shards): never a
+   *  red cause of their own, so the combine rule ignores them. */
+  mainCiRedSummaryJobs: Object.freeze(['test', 'daemon-soak']),
   /** Incident-drill target: from the alert to the fix landing on main, in the simulated timeline (0 = no target). */
   mainCiRedLandTargetMs: 30 * MINUTE,
   /** The branch prefix the dispatched owner opens its PR from. */
@@ -163,9 +166,12 @@ export function findOwnerPrs({ firstRed, prs = [], settings = MAIN_CI_RED_DEFAUL
     const created = ts(pr.createdAt);
     if (since !== null && created !== null && created < since) continue; // an older PR cannot be fixing a newer break
     const title = String(pr.title ?? '');
-    const text = `${title}\n${pr.body ?? ''}`;
+    // The commit named in the TITLE, or in the body right after a fix verb ("fixes 7c731a9"). A body that only
+    // mentions the commit (live 2026-10-09: the card PR #4527 describing the incident) does not own the fix.
+    const body = String(pr.body ?? '');
+    const bodyNames = short.length === 7 && new RegExp(`(?:^|\\s)(?:fix(?:es|ed|ing)?|heal(?:s|ed|ing)?)\\b[^\\n]{0,40}${short}`, 'i').test(body);
     const branch = String(pr.headRefName ?? '');
-    if ((short.length === 7 && text.includes(short)) || branch.startsWith(settings.mainCiRedOwnerBranchPrefix)
+    if ((short.length === 7 && title.includes(short)) || bodyNames || branch.startsWith(settings.mainCiRedOwnerBranchPrefix)
       || (branchRe && branchRe.test(branch)) || (re && re.test(title))) {
       out.push({ number: Number(pr.number), title: title.slice(0, 100) });
     }
@@ -328,14 +334,15 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
  * @returns {{owedElsewhere:Array<{pr:number, jobs:string[], waitsOn:number[]}>,
  *   deadlock:null|{carrier:number, carrierRef:string|null, from:Array<{pr:number, ref:string|null}>, jobs:string[]}}}
  */
-export function planCombinedFix({ mainFailingJobs = [], fixPrs = [] } = {}) {
-  const mainFail = new Set((mainFailingJobs || []).map(String));
+export function planCombinedFix({ mainFailingJobs = [], fixPrs = [], summaryJobs = MAIN_CI_RED_DEFAULTS.mainCiRedSummaryJobs } = {}) {
+  const summary = new Set((summaryJobs || []).map(String));
+  const mainFail = new Set((mainFailingJobs || []).map(String).filter((j) => !summary.has(j)));
   const known = (fixPrs || []).filter((p) => p && Number.isInteger(p.number) && ['green', 'red'].includes(p.ci?.status));
   // Q fixes job j: main fails j, Q's finished CI does not.
   const fixes = (q, j) => mainFail.has(j) && !(q.ci.failedJobs || []).includes(j);
   const owedElsewhere = [];
   for (const p of known) {
-    const failed = (p.ci.failedJobs || []).map(String);
+    const failed = (p.ci.failedJobs || []).map(String).filter((j) => !summary.has(j));
     if (p.ci.status !== 'red' || !failed.length) continue;
     const waitsOn = new Set();
     let allOwed = true;
