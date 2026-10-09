@@ -1,4 +1,5 @@
 ---
+bornAs: xbf7be9
 kind: story
 size: 3
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Review daemon first pass after a restart takes ~10 min — now the whole promote-to-review wait
 
-After card xemxk3h a promoted draft's review goes out in the same review-daemon pass, so the remaining wait is pass length. Live 2026-10-09: steady pass 2-5 min (pr-events wake 20:22:12Z -> session-reap 20:24:21Z), but after the self-sync restart at 20:33:41Z the first pass only finished at 20:43:27Z (~10 min), so #4683/#4680 (promoted 20:26:43Z) waited 16.7 min. Card 4218 owns the rebuild smoke starving ticks (smoke-slow 305 s at 20:33:39Z); this card owns the cold first pass (ledger-shadow store pending, pr-facts warm, reconcile over all repos) — measure per-step timing on the first pass (see 4129) and cut it below one steady pass.
+After card 5658 a promoted draft's review goes out in the same review-daemon pass, so the remaining wait is pass length. Live 2026-10-09: steady pass 2-5 min (pr-events wake 20:22:12Z -> session-reap 20:24:21Z), but after the self-sync restart at 20:33:41Z the first pass only finished at 20:43:27Z (~10 min), so #4683/#4680 (promoted 20:26:43Z) waited 16.7 min. Card 4218 owns the rebuild smoke starving ticks (smoke-slow 305 s at 20:33:39Z); this card owns the cold first pass (ledger-shadow store pending, pr-facts warm, reconcile over all repos) — measure per-step timing on the first pass (see 4129) and cut it below one steady pass.
 
 ## Acceptance
 
