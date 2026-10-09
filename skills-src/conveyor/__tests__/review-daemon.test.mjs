@@ -41,6 +41,10 @@ import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mj
 import { REPO_ROOT as SESSION_REAPER_REPO_ROOT, DEFAULT_IDLE_REAP_THRESHOLD_MS } from '../../../scripts/conveyor/session-reaper.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
 
+// card x5f2daz — the prep-review stage is ON by default and reads a live `gh pr list`; every `tickOnce` test injects
+// this stub so none reaches GitHub (the hermetic guard fails the test otherwise).
+const noPrepReview = () => null;
+
 // #3383 bug 1 — wired into withSelfSync's `hasStaleRefusal` option in main(); tested here in isolation
 // (pure, no IO) against the exact shapes `runReviewTickAllRepos` returns (`failed[]` per-PR, `repos[].error`
 // whole-repo).
@@ -986,7 +990,7 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
     delete process.env.REVIEW_DAEMON_CONVERT_ADVISORY;
     try {
       const runConvertAdvisories = vi.fn(async () => ({ posted: [] }));
-      const effects = buildCliDaemonEffects({ owner: 'x', reapSessions: () => null, runReview: fakeReview, runConvertAdvisories });
+      const effects = buildCliDaemonEffects({ owner: 'x', reapSessions: () => null, runReview: fakeReview, runConvertAdvisories, runPrepReview: noPrepReview });
       const result = await effects.tickOnce();
       expect(runConvertAdvisories).not.toHaveBeenCalled();
       expect(result.convertAdvisory).toBeNull();
@@ -1003,7 +1007,7 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
       for (const [value, expected] of [['1', 1], ['0', 0], ['true', 0], ['', 0]]) {
         process.env.REVIEW_DAEMON_CONVERT_ADVISORY = value;
         const runConvertAdvisories = vi.fn(async () => ({ posted: [] }));
-        await buildCliDaemonEffects({ owner: 'x', reapSessions: () => null, runReview: fakeReview, runConvertAdvisories }).tickOnce();
+        await buildCliDaemonEffects({ owner: 'x', reapSessions: () => null, runReview: fakeReview, runConvertAdvisories, runPrepReview: noPrepReview }).tickOnce();
         expect(runConvertAdvisories).toHaveBeenCalledTimes(expected);
       }
     } finally {
@@ -1017,6 +1021,7 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
     const effects = buildCliDaemonEffects({
       owner: 'x',
       convertAdvisoryEnabled: true,
+      runPrepReview: noPrepReview,
       reapSessions: () => null,
       runReview: () => { order.push('review'); return fakeReview(); },
       runConvertAdvisories: async () => { order.push('convert-advisory'); return { convertAdvisoriesOwed: 1, posted: [{ prNumber: 2766, outcome: 'accept', repo: 'web-everything/web-everything' }], skipped: [], failed: [] }; },
@@ -1031,7 +1036,7 @@ describe('buildCliDaemonEffects.tickOnce — folds the convert-advisory stage on
   it('a convert-advisory tick failure is swallowed (logged, non-fatal) — never breaks the review tick', async () => {
     const log = { error: vi.fn() };
     const effects = buildCliDaemonEffects({
-      owner: 'x', log, reapSessions: () => null, runReview: fakeReview, convertAdvisoryEnabled: true,
+      owner: 'x', log, reapSessions: () => null, runReview: fakeReview, convertAdvisoryEnabled: true, runPrepReview: noPrepReview,
       runConvertAdvisories: () => { throw new Error('gh unreadable'); },
     });
     const result = await effects.tickOnce();
@@ -1106,7 +1111,7 @@ describe('buildCliDaemonEffects.tickOnce — now also runs a session-reap pass e
 
   it('folds the injected reapSessions() result onto the review tick result, under `sessionReap`', async () => {
     const reapSessions = vi.fn(() => ({ scanned: 3, stopped: 1, alreadyGone: 0, failures: 0, anomalies: 0, kept: 2 }));
-    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview: fakeReview, runConvertAdvisories: fakeConvertAdvisories });
+    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview: fakeReview, runConvertAdvisories: fakeConvertAdvisories, runPrepReview: noPrepReview });
     const result = await effects.tickOnce();
     expect(reapSessions).toHaveBeenCalledTimes(1);
     expect(result.sessionReap).toEqual({ scanned: 3, stopped: 1, alreadyGone: 0, failures: 0, anomalies: 0, kept: 2 });
@@ -1118,7 +1123,7 @@ describe('buildCliDaemonEffects.tickOnce — now also runs a session-reap pass e
   it('a session-reap failure is swallowed (logged, non-fatal) — never breaks the review tick', async () => {
     const reapSessions = () => { throw new Error('claude agents unreadable'); };
     const log = { error: vi.fn() };
-    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview: fakeReview, runConvertAdvisories: fakeConvertAdvisories, log });
+    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview: fakeReview, runConvertAdvisories: fakeConvertAdvisories, runPrepReview: noPrepReview, log });
     const result = await effects.tickOnce();
     expect(result.sessionReap).toBeNull();
     expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/session-reap failed \(non-fatal\)/));
@@ -1217,7 +1222,7 @@ describe('buildCliDaemonEffects.tickOnce — carries liveProcessPrs into the NEX
         : { repos: [], reviewsOwed: 0, dispatched: [], failed: [], liveProcessPrs: [] };
     };
     const reapSessions = vi.fn(() => ({ scanned: 0, stopped: 0, alreadyGone: 0, failures: 0, anomalies: 0, kept: 0 }));
-    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview });
+    const effects = buildCliDaemonEffects({ owner: 'x', reapSessions, runReview, runPrepReview: noPrepReview });
     await effects.tickOnce();
     expect(reapSessions).toHaveBeenNthCalledWith(1, { priorityNames: new Set() });
     await effects.tickOnce();
@@ -1385,6 +1390,7 @@ describe('review:pending PRs the tick did not dispatch — the daemon prints why
       runReview: () => { order.push('review'); return { repos: [], reviewsOwed: 0, dispatched: [], failed: [] }; },
       // #xconv1 — never the real `runConvertAdvisoryTickAllRepos` (real gh/judge IO) in a unit test.
       runConvertAdvisories: () => null,
+      runPrepReview: noPrepReview,
     });
     await fx.tickOnce();
     expect(order).toEqual(['reap', 'review']);
