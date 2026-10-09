@@ -347,6 +347,16 @@ describe('backlog.mjs CLI — ephemeral-clone integration smoke (#2273/#2274)', 
     expect(after).toContain('# Title'); // body untouched
   });
 
+  it('retype --size=none: drops the size field (a sliced epic carries no size), body untouched', () => {
+    write('9014-m.md', item({ kind: 'epic', size: 13, status: 'open', dateOpened: '"2026-07-01"' }));
+    const res = run(['retype', '9014', '--size=none']);
+    expect(res.code).toBe(0);
+    const after = read('9014-m.md');
+    expect(after).not.toMatch(/^size:/m);
+    expect(after).toContain('kind: epic');
+    expect(after).toContain('# Title');
+  });
+
   it('prioritize --clear: removes the priority field, returning to the default', () => {
     write('9011-j.md', item({ kind: 'story', size: 3, status: 'open', priority: 'low', dateOpened: '"2026-07-01"' }));
     const res = run(['prioritize', '9011', '--clear']);
