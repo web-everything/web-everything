@@ -237,6 +237,32 @@ export async function planRebuild({
     if (resolution?.ok) alerts.push({ kind: 'overlay-conflict-resolved', detail: { ref, pr, via: resolution.via, ...edge } });
   }
 
+  // 7. retry pass (held item 168, live 2026-10-09) — an overlay conflict-dropped (or a pinned one skipped) above may
+  //    merge cleanly once a LATER overlay in the list has applied: e.g. the later one moved shared settings keys out
+  //    of the file both edited. List order is only registration order, so without this the fixing overlay can never
+  //    help the one it fixes until it reaches main. One plain retry each, in list order, on the final tip; a still-
+  //    conflicting overlay stays dropped. Deterministic: same inputs → same tips, same order.
+  for (const d of decisions) {
+    const retriable = (d.action === 'drop' && d.reason === 'conflict')
+      || (d.action === 'skip' && d.reason === 'pinned-overlay-conflict-skipped');
+    if (!retriable || !d.sha) continue;
+    const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, d.sha]);
+    const tree = String(mt.stdout ?? '').split('\n')[0].trim();
+    if (mt.status !== 0 || !tree) continue;
+    if (tree === verifyRev(git, `${cur}^{tree}`)) continue;
+    const ct = git(['commit-tree', tree, '-p', cur, '-p', d.sha, '-m',
+      `daemon-rebuild: merge overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} onto ${cur} (retried after later overlays)`], {
+      env: rebuildCommitEnv(git, cur, d.sha),
+    });
+    const newSha = String(ct.stdout ?? '').trim();
+    if (ct.status !== 0 || !newSha) continue;
+    cur = newSha;
+    applied.push({ ref: d.ref, pr: d.pr, sha: d.sha });
+    d.action = 'apply';
+    d.reason = 'applied-retry';
+    alerts.push({ kind: 'overlay-conflict-retried', detail: { ref: d.ref, pr: d.pr, sha: d.sha } });
+  }
+
   const inputsKey = createHash('sha256')
     .update(JSON.stringify({ main: mainSha, overlays: applied.map((a) => a.resolvedVia
       ? [a.ref, a.sha, a.resolvedVia, a.edgeSha ?? null] : [a.ref, a.sha]) }))
