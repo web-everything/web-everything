@@ -32,7 +32,7 @@
  *   add --json to any verb for machine-readable output.
  */
 import { isUnderTest } from './lib/under-test.mjs';
-import { readdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs';
+import { readdirSync, readFileSync, writeFileSync, unlinkSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -58,10 +58,13 @@ import { fitAffineCost, budgetFromFit, impliedCapacity, isKnownStopReason, KNOWN
 import { BACKLOG_KINDS } from './check-standards-rules.mjs';
 import { numberPendingHashes, landedNumberFor } from './lane-drain.mjs';
 import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
-import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed } from './lib/build-queue.mjs';
+import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, resolveBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
 import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
+import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
+import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
+import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
 import { writeAllSync, writeLineSync } from './lib/write-all-sync.mjs';
 import { writeBacklogMd as writeBacklogMdCore, writeBacklogMdUnguarded as writeBacklogMdUnguardedCore } from './backlog/guarded-write.mjs';
 // #3034 — `claim` runs through this declared operation, not a second hand-rolled implementation. See
@@ -1076,12 +1079,26 @@ function overlapYieldConfig() {
  * rank) come straight off the loader (`...data`), which is authoritative for them.
  */
 function buildQueue() {
-  const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=') || arg.startsWith('--backlog-dir=')) &&
+  // A `--backlog-dir=` fixture run is uncached unless the caller opts in with WE_BUILD_QUEUE_CACHE=1 (the cache-key
+  // regression test does, so it can exercise the cache on a small corpus instead of the live 5k-card backlog).
+  const cacheEnabled = JSON_MODE && !argv.some(arg => arg.startsWith('--config=')) &&
+    (!argv.some(arg => arg.startsWith('--backlog-dir=')) || process.env.WE_BUILD_QUEUE_CACHE === '1') &&
     process.env.WE_BUILD_QUEUE_CACHE !== '0' &&
     !(isUnderTest() && process.env.WE_BUILD_QUEUE_CACHE === undefined);
   const at = Date.now();
-  const key = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
+  // #4355 — the cleared set and the priority settings are inputs too: fold their files' mtimes into the key, so a
+  // `queue.mjs add/remove` or a settings edit is never answered from a stale cached read.
+  const queueFilePath = resolveQueuePath();
+  const queueSrc = resolveQueueSource(queueFilePath);
+  const mtimeOf = (p) => { try { return statSync(p).mtimeMs; } catch { return 'none'; } };
+  const baseKey = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;
+  const key = baseKey === null ? null
+    : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH),
+      mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
+      // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
+      // set it too: key on the merged value itself, not only on the one file's mtime.
+      JSON.stringify(readSettings().buildQueuePriority ?? null)]);
   const file = cacheEnabled ? buildQueueCacheFile(DIR) : null;
   const configuredAge = Number(process.env.WE_BUILD_QUEUE_CACHE_MAX_AGE_MS ?? 60_000);
   const maxAgeMs = Number.isFinite(configuredAge) && configuredAge >= 0 ? configuredAge : 60_000;
@@ -1111,16 +1128,35 @@ function buildQueue() {
     config = loadBuildQueueConfig();
   }
   const loaded = requireCjs(join(ROOT, 'src/_data/backlog.js'))();
+  // #4355 — CLEARED = membership of the conveyor sidecar, read through queue-store's state-home resolver (the same
+  // read `queue.mjs list`, dispatch-plan and conveyor-state use; #2613/#4075), NOT committed `buildQueued`
+  // frontmatter (which reported `cleared: 0` from every checkout once the sidecar moved to the state home). A
+  // JIT-numbered card cleared under its pre-number hash still matches (bornAs resolve-at-read-time). The entry's
+  // `addedAt` is when the card started waiting in the build queue — the delivery class's wait (aging + score).
+  const sidecar = resolveBornAsRefs(readQueueFile(queueFilePath), bornAsIndexFromItems(loaded));
+  const clearedAt = new Map(sidecar.map((e) => [normNum(e.num), e.addedAt ?? null]));
   const items = loaded.map((it) => {
     if (it.status !== 'open') return it; // only the open set is ordered; skip the re-read for the rest
+    const k = normNum(it.num);
+    const queue = { buildQueued: clearedAt.has(k), queuedAt: clearedAt.get(k) ?? undefined };
     // Recover the raw build-queue tier (the loader clobbers `tier` with the A/B/C leverage tier). A missing
     // file (e.g. fixture-mode dir divergence) falls back to undefined → the engine treats it as `normal`.
     let rawTier;
     try { rawTier = readField(readFileSync(join(DIR, `${it.id}.md`), 'utf8'), 'tier') || undefined; }
     catch { rawTier = undefined; }
-    return { ...it, tier: rawTier };
+    return { ...it, tier: rawTier, ...queue };
   });
-  const detailed = orderQueueDetailed(items, config);
+  // Keep platform preferences raw so the tool and environment override only their declared keys.
+  let platform;
+  try { platform = JSON.parse(readFileSync(DELIVERY_PRIORITY_SETTINGS_PATH, 'utf8')).deliveryPriority; }
+  catch { platform = undefined; }
+  const priority = resolveBuildQueuePrioritySettings({
+    platform, tool: readSettings().buildQueuePriority, env: process.env,
+  });
+  const detailed = orderQueueDetailed(items, config, Date.now(), { priority });
+  const shadow = priority.mode === 'shadow'
+    ? { shadowClassOrder: classOrder(detailed).map((r) => r.item.num) } : {};
+  if (priority.mode === 'shadow') console.error(formatBuildQueuePriorityShadowLine(detailed, priority.mode));
   const rows = detailed.map((r) => ({
     num: r.item.num,
     id: r.item.id,
@@ -1131,20 +1167,25 @@ function buildQueue() {
     rank: r.rank || null,
     size: r.item.size ?? null,
     dateOpened: r.item.dateOpened ?? null,
-    buildQueued: r.buildQueued, // the human's clear-for-build gate (#2530)
+    buildQueued: r.buildQueued, // cleared for build: membership of the conveyor sidecar (#2613, #4355)
+    queuedAt: r.item.queuedAt ?? null,
+    priorityClass: r.priorityClass,
+    priorityScore: r.priorityScore,
+    priorityReasons: r.priorityReasons,
   }));
   if (argv.includes('--next')) {
     // The builder's ACTUAL next = the top-ordered item the human has CLEARED for build (#2530), not merely the
     // top ready one. A ready, high-tier item that hasn't been cleared is never auto-built.
     const head = rows.find((r) => r.buildQueued) ?? null;
-    return emit({ verb: 'build-queue', next: head, config },
-      head ? `${GRN}next → #${head.num}${RST} ${DIM}[${head.tier} · ${head.score.toFixed(2)}] ${head.title}${RST}`
+    return emit({ verb: 'build-queue', next: head, config, priorityMode: priority.mode, prioritySource: priority.source, ...shadow },
+      head ? `${GRN}next → #${head.num}${RST} ${DIM}[${head.priorityClass} · ${head.tier} · ${head.score.toFixed(2)}] ${head.title}${RST}`
            : `${DIM}build queue empty (no items cleared for build)${RST}`);
   }
   const clearedCount = rows.filter((r) => r.buildQueued).length;
-  return emit({ verb: 'build-queue', count: rows.length, cleared: clearedCount, queue: rows, config },
-    `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build · next-to-build order)${RST}\n` +
-    rows.slice(0, 25).map((r, i) => `  ${String(i + 1).padStart(2)}. ${r.buildQueued ? `${GRN}✓${RST}` : ' '} ${BLD}#${r.num}${RST} ${DIM}[${r.tier} · ${r.score.toFixed(2)}]${RST} ${r.title}`).join('\n') +
+  const sidecarInfo = { path: queueSrc.path, source: queueSrc.source, entries: sidecar.length };
+  return emit({ verb: 'build-queue', count: rows.length, cleared: clearedCount, sidecar: sidecarInfo, priorityMode: priority.mode, prioritySource: priority.source, ...shadow, queue: rows, config },
+    `${BLD}build queue${RST} ${DIM}(${rows.length} ready · ${clearedCount} cleared for build (${sidecar.length} in ${queueSrc.path}) · ${priority.mode === 'enforce' ? 'class-first order' : 'next-to-build order'}, priority ${priority.mode})${RST}\n` +
+    rows.slice(0, 25).map((r, i) => `  ${String(i + 1).padStart(2)}. ${r.buildQueued ? `${GRN}✓${RST}` : ' '} ${BLD}#${r.num}${RST} ${DIM}[${r.priorityClass} · ${r.tier} · ${r.score.toFixed(2)}] ${r.priorityReasons.join('; ')}${RST} ${r.title}`).join('\n') +
     (rows.length > 25 ? `\n  ${DIM}… +${rows.length - 25} more${RST}` : ''));
 }
 
