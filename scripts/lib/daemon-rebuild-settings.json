@@ -1,1 +1,1 @@
-{ "daemonRebuild": { "skipUnrelated": true } }
+{ "daemonRebuild": { "skipUnrelated": true }, "wrongBranchHeal": { "branches": ["ops/review-requests"], "pathPrefixes": ["verdict-ledger/"] } }

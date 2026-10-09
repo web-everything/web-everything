@@ -25,6 +25,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "clone-stale": "Existing gated self-sync owns clone repair; never clean/reset/rebase a daemon clone.",
   "clone-behind-main": "A clone that trails main is repaired by its owning daemon refresh path; never clean/reset/rebase a daemon clone.",
   "credential-inventory-stale": "Secret age is a review heuristic, not expiry proof; no automatic rotation.",
+  "daemon-clone-wrong-branch": "A daemon clone on a store branch is healed only by the allowlisted daemon-rebuild path; the responder never checks out, resets or cleans a daemon clone.",
   "daemon-held-on-last-good": "Last-good is an intentional safety hold; no forced adoption or smoke bypass.",
   "daemon-owed-no-dispatch": "Aggregate refusal is not a uniquely actionable PR; use linked specific episodes only.",
   "daemon-silent": "Dead/hung/not-ticking are distinct; supervisor owns lifecycle. No kill/restart/lease theft.",

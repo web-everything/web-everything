@@ -1101,12 +1101,18 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
 
   it('is UNPAUSED by the Claude-auth-broken gate — no Claude session is ever spawned by this half', async () => {
     const promoteDraftTick = vi.fn(({ repo }) => (repo === 'repo-a' ? { dispatched: [{ pr: 2813, kind: 'promote-draft' }], refusals: [] } : { dispatched: [], refusals: [] }));
+    // fixTick/ciHealTick are injected (and asserted un-called below) so the tick is not a "real tick": without them
+    // the supersede half and the stuck-fixer reclaim fall through to live GitHub reads.
+    const fixTick = vi.fn(() => ({ dispatched: [], refusals: [] }));
+    const ciHealTick = vi.fn(async () => ({ dispatched: [], refusals: [] }));
     const out = await runTickAllRepos({
-      repos: ['repo-a', 'repo-b'], hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
+      repos: ['repo-a', 'repo-b'], fixTick, ciHealTick, hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
       missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick,
       authGateOverride: () => ({ paused: true, reason: 'paused: Claude login expired' }),
     });
     expect(out.authPaused).toBe(true);
+    expect(fixTick).not.toHaveBeenCalled();
+    expect(ciHealTick).not.toHaveBeenCalled();
     expect(promoteDraftTick).toHaveBeenCalledTimes(2); // NOT skipped, unlike fix/ci-heal
     expect(out.dispatched).toEqual(expect.arrayContaining([{ pr: 2813, kind: 'promote-draft', repo: 'repo-a' }]));
   });

@@ -35,6 +35,23 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /**
+ * The env every git call INSIDE the transport worktree runs with (live 2026-10-09 06:52 ET: the review daemon's
+ * own clone ended up checked out on `ops/review-requests`, its tree replaced by the ledger branch, and the daemon
+ * died on MODULE_NOT_FOUND). The worktree lives INSIDE the board (`<board>/.operations/transport/wt-*`), so any
+ * call that does not resolve to the worktree itself — its `.git` file gone, or an inherited `GIT_DIR` /
+ * `GIT_WORK_TREE` — silently walks up and runs `checkout -B` on the BOARD. Two guards make that impossible:
+ *   · the inherited repo-selecting variables are dropped, so cwd decides the repo;
+ *   · `GIT_CEILING_DIRECTORIES` is the worktree's parent, so discovery may never climb out of the worktree:
+ *     a broken worktree now fails loudly ("not a git repository") instead of writing the caller's tree.
+ */
+export function worktreeGitEnv(wt, base = process.env) {
+  const env = { ...base };
+  for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY']) delete env[k];
+  env.GIT_CEILING_DIRECTORIES = dirname(wt);
+  return env;
+}
+
+/**
  * Write files onto `branch` in `board`'s checkout and push them.
  *
  * @param {object} o
@@ -113,6 +130,9 @@ export function stageOnTransportBranch({
 
   const wt = join(board, '.operations', 'transport', `wt-${now()}`);
   mkdir(dirname(wt), { recursive: true });
+  // EVERY call with `cwd: wt` goes through this: it can only ever act on the worktree, never the board above it.
+  const wtEnv = worktreeGitEnv(wt);
+  const runWt = (args, opts = {}) => run(args, { ...opts, cwd: wt, env: { ...wtEnv, ...(opts.env || {}) } });
   const created = createIfAbsent
     && !run(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], { cwd: board }).trim();
   try {
@@ -124,9 +144,9 @@ export function stageOnTransportBranch({
       // earlier run would become the new commit's parent.
       try { run(['update-ref', '-d', `refs/heads/${branch}`], { cwd: board }); } catch { /* none */ }
       run(['worktree', 'add', '--force', '--no-checkout', '--detach', wt, 'HEAD'], { cwd: board });
-      run(['symbolic-ref', 'HEAD', `refs/heads/${branch}`], { cwd: wt });
-      run(['read-tree', '--empty'], { cwd: wt });
-      return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
+      runWt(['symbolic-ref', 'HEAD', `refs/heads/${branch}`]);
+      runWt(['read-tree', '--empty']);
+      return writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
     }
     // AN EXPLICIT REFSPEC, never a bare `fetch origin <branch>` (#3264). The bare form writes `FETCH_HEAD` and
     // creates `refs/remotes/origin/<branch>` only when the CLONE'S CONFIGURED refspec covers it — true of a full
@@ -138,9 +158,9 @@ export function stageOnTransportBranch({
     // `--force` on the worktree add is about the DIRECTORY, not the branch: a leftover registration from a
     // killed run must not stop this one. The branch itself is taken from the freshly fetched remote tip.
     run(['worktree', 'add', '--force', '--detach', wt, `origin/${branch}`], { cwd: board });
-    run(['checkout', '-B', branch, `origin/${branch}`], { cwd: wt });
+    runWt(['checkout', '-B', branch, `origin/${branch}`]);
 
-    return writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
+    return writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
   } finally {
     // ALWAYS, and in this order: remove the directory, then prune the registration. Dropping either one leaves
     // the next run on this branch wedged.
@@ -152,8 +172,10 @@ export function stageOnTransportBranch({
 }
 
 /** The tail both starts share: the caller's check, the writes, and the commit + push (never a force). */
-function writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef }) {
-  if (assertReady) assertReady({ run, wt, board, branch, created });
+function writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef }) {
+  // The caller's check gets a runner that keeps the worktree guard on its `cwd: wt` calls (and leaves others alone).
+  const guarded = (args, opts = {}) => (opts.cwd === wt ? runWt(args, opts) : run(args, opts));
+  if (assertReady) assertReady({ run: guarded, wt, board, branch, created });
 
   for (const file of files) {
     const abs = join(wt, file.path);
@@ -162,15 +184,15 @@ function writeCommitPush({ run, mkdir, write, read, wt, files, message, branch, 
     // an APPEND is only correct if it is computed against the tip the push will race, so it must be computed
     // here, inside the worktree, and again on every retry (#3255).
     write(abs, typeof file.content === 'function' ? file.content({ existing: read(abs) }) : file.content);
-    run(['add', '--', file.path], { cwd: wt });
+    runWt(['add', '--', file.path]);
   }
 
-  const staged = run(['diff', '--cached', '--name-only'], { cwd: wt }).trim();
+  const staged = runWt(['diff', '--cached', '--name-only']).trim();
   if (!staged) return { paths: files.map((f) => f.path), pushed: false, reason: 'identical content already staged' };
 
-  run(['commit', '--quiet', '-m', message], { cwd: wt });
+  runWt(['commit', '--quiet', '-m', message]);
   // A FULL refname: on a created branch the remote has no `<branch>` for a short name to resolve against.
-  run(['push', '--quiet', 'origin', created || allowRef ? `HEAD:refs/heads/${branch}` : `HEAD:${branch}`], { cwd: wt });
+  runWt(['push', '--quiet', 'origin', created || allowRef ? `HEAD:refs/heads/${branch}` : `HEAD:${branch}`]);
   return { paths: files.map((f) => f.path), pushed: true, ...(created ? { created: true } : {}) };
 }
 

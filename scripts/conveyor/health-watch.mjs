@@ -77,6 +77,7 @@ import { readVerifyMarker } from '../lib/lane-verify.mjs';
 // #4317 — the same "which paths are DAEMON clones" registry `guard-lane.mjs`/`guard-bash.mjs` already use, so
 // this probe's notion of "a daemon clone" can never drift from the guards'.
 import { daemonCloneRoots } from '../lib/daemon-clone-registry.mjs';
+import { probeDaemonCloneBranches } from '../lib/daemon-clone-branch-probe.mjs';
 import { workspaceOf } from '../lib/automation-home.mjs';
 import { probeBuildSessions, probeExternalRuns } from './build-supervision.mjs';
 import { probeAndOwnMainCi } from './main-ci-red-io.mjs';
@@ -1003,6 +1004,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     : (attempt('daemonStatus', () => probeDaemonStatus()) ?? attempt('leases', leaseScan));
   probes.selfSync = attempt('selfSync', () => probeSelfSync(flags['self-sync-dir'] || defaultSelfSyncDir()));
   probes.cloneLag = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('cloneLag', () => probeCloneLag());
+  probes.daemonCloneBranches = (flags['logs-dir'] || flags['lock-root'] || flags['state-root']) ? undefined : attempt('daemonCloneBranches', () => probeDaemonCloneBranches({ workspace: workspaceOf(REPO_ROOT) }));
   probes.lanePools = attempt('lanePools', () => probeLanePools(logsDir));
   // #4370 — fs-only, every tick. A fixture tick (any of the fixture-dir flags) reads only an explicit
   // `--lane-pool-root`, never the host's real pool.
