@@ -152,6 +152,7 @@ import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewG
   // single-label-home doctrine (#2644); the decision itself lives beside `shouldReparkForTestTampering`, the
   // predicate that already proves this target's own precondition (see `decideParkToHuman`'s own docstring).
   decideParkToHuman,
+  normalizeDiffFingerprint, // card xu7kxtt — strict net-diff identity for carrying a clearance
 } from './lib/review-escalation.mjs';
 import { emptyBaselineState, parseBaselineState, serializeBaselineState, getBaseline, recordBaseline, diffBaseline } from './lib/review-baseline-state.mjs';
 import { mergePr, hasNonEmptyBody, scanTestTampering, retargetStackedPrs, describeStackedTestGamingOrigin } from './lib/pr-merge-gate.mjs';
@@ -192,6 +193,7 @@ import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -5100,6 +5102,19 @@ async function runCli() {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
           tamperHeadSha = typeof cd.headRefOid === 'string' ? cd.headRefOid : null;
           humanClearedSha = parseLatestHumanClearedSha(cd.comments || []);
+          // card xu7kxtt (#5472) — the clearance names an OLDER head (the merge queue / rebase-drop moved it), but the
+          // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
+          // 143107a87, reviewed-diff b945d333… on both) was re-parked here and waited for a second approval.
+          if (humanClearedSha && tamperHeadSha && humanClearedSha !== tamperHeadSha) {
+            const carry = decideAcceptCarryForward({
+              setting: resolveAcceptCarryForward().value, record: latestAcceptRecord(cd.comments || []),
+              headSha: tamperHeadSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
+            });
+            if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
+              humanClearedSha = tamperHeadSha;
+              if (!AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carry.reason}\n`);
+            }
+          }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }
       if (shouldReparkForTestTampering({ tampered: gaming.tampered, netDiffScored: netDiffText.scored, humanClearedSha, headSha: tamperHeadSha })) {
@@ -5573,11 +5588,16 @@ async function runCli() {
     // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or git error,
     // no clone) is retried next pass rather than parking the head as `wait` forever.
     if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, headSha);
+    let restampNote = '';
     if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(cand, { action: 'rebased' })) {
       const rs = restampAcceptance({ pr: cand.num, repo: cand.repo, newHead: out.newCommit, cwd: isLocalRepo(cand.repo) ? undefined : cloneDir });
+      // card xu7kxtt — a failed re-stamp was invisible in the daemon's --json runs (#4535 re-parked with no trace of
+      // why its clearance did not travel). It rides the skip reason now; the anti-test-gaming gate and the review
+      // daemon's hold sweep still carry the clearance on an identical net diff.
+      if (!rs.ok) restampNote = `; acceptance re-stamp failed: ${String(rs.reason).slice(0, 200)}`;
       if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(cand.repo)}${cand.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
     }
-    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}` });
+    revalidationAborted.push({ num: cand.num, repo: cand.repo, reason: `merge-queue: refresh (${why}) → ${out.action}${out.ok ? '' : ` failed: ${out.error}`}${restampNote}` });
     if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
     return false;
   };

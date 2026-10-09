@@ -92,6 +92,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 import { referralLiveContext } from './lib/referral-live-context.mjs';
@@ -254,7 +255,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -424,10 +425,32 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // THE REFUSALS ARE THE WHOLE GUARD. A `restamp` that could CREATE an acceptance would be a strictly worse
   // `accepted`: one that skips INVARIANT 2, skips #2844's independence check, and claims a review nobody ran.
   if (to === 'restamp') {
+    // card xu7kxtt (#5472, ruling P4) — the ONE way a re-stamp crosses a live `review:human`: the operator already
+    // cleared this exact net diff (`humanCarry`, the caller's proof from `decideAcceptCarryForward`: a trusted
+    // `clear-human` record whose strict reviewed-diff equals the live head's), and a mechanical pass re-held it only
+    // because the head SHA moved (live #4535: merge-queue refresh fcc29ce1 → 143107a87, re-parked 14:36Z). It
+    // completes nothing new: the human verdict it carries was given for these exact bytes. Any other shape — no
+    // proof, an agent accept, a changed diff — stays refused, exactly as before.
+    if (isHuman && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes)
+      && humanCarry && humanCarry.action === 'carry' && humanCarry.human === true) {
+      return {
+        allowed: true,
+        addLabel: REVIEW_LABELS.accepted,
+        // The same superset `clear-human` drops (see its comment): the hold, any parked/advisory state riding on it.
+        removeLabels: [
+          REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.redteamAccepted, REVIEW_LABELS.awaitingAdvisory,
+          ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
+        ],
+        keepsHuman: false,
+        humanCarried: true,
+        reason: `re-stamped — the operator's clearance carried across a mechanical re-hold (${humanCarry.reason}); no review was re-run`,
+      };
+    }
     if (isHuman) {
       return {
         allowed: false, addLabel: '', removeLabels: [], keepsHuman: true,
-        reason: 'gate-self: review:human is uncleared — a re-stamp carries an acceptance, it cannot complete one',
+        reason: 'gate-self: review:human is uncleared — a re-stamp carries an acceptance, it cannot complete one'
+          + (humanCarry?.reason ? ` (carry-forward: ${humanCarry.action} — ${humanCarry.reason})` : ''),
       };
     }
     if (!hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)) {
@@ -1170,14 +1193,17 @@ export function runReviewLabelCli({
   // reason (`we:scripts/operations/review-pr-io.mjs`'s label sink) renders it into the body and passes no
   // `--reason` flag at all — see `bounceEvidenceFromWriteUp`.
   const bounceEvidence = bounceEvidenceFromWriteUp(verdictBody);
-  const decision = decideSetLabel({
+  // card xu7kxtt — a re-stamp on a `review:human` PR is decided AFTER the net diff is read (below): its only
+  // allowed shape needs the live fingerprint as proof. Every other refusal still exits here, before any read.
+  const restampAcrossHold = to === 'restamp' && !guardedRestamp && hasReviewLabel(currentLabels, REVIEW_LABELS.human);
+  let decision = decideSetLabel({
     to,
     currentLabels,
     findingCount: bounceEvidence.findingCount,
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
   });
-  if (!decision.allowed) {
+  if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
     process.exit(1);
   }
@@ -1232,6 +1258,24 @@ export function runReviewLabelCli({
       diffScored = !!net?.scored && (!guardedRestamp || net.rev === expectedHead);
       reviewedDiff = diffScored ? net.text : '';
     } catch { reviewedDiff = ''; /* miss → no marker → SHA-identity fallback (the stricter path) */ }
+  }
+
+  // card xu7kxtt (#5472) — the proof a re-stamp needs to cross a `review:human` re-hold: the latest trusted accept is
+  // the operator's `clear-human`, and its strict reviewed-diff equals THIS head's net diff. Unscored diff → no proof
+  // → refused (fail closed). The comment records both SHAs (the reason names the cleared one; the marker the new one).
+  if (restampAcrossHold) {
+    const humanCarry = decideAcceptCarryForward({
+      setting: resolveAcceptCarryForward().value,
+      record: latestAcceptRecord(prComments),
+      headSha,
+      headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
+    });
+    decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
+    if (!decision.allowed) {
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
+      process.exit(1);
+    }
+    clearReason = `carried from ${humanCarry.from} to ${humanCarry.to}: ${humanCarry.reason}. ${clearReason}`.trim();
   }
 
   const carryEvidence = (comments) => {

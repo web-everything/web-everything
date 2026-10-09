@@ -65,6 +65,7 @@ import { defaultListPrs } from './advisory-label-sweep.mjs';
 import { sweepRulingNeededLabels } from './ruling-needed-sweep.mjs';
 import { sweepAutoBlock } from './referral-auto-block.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
+import { sweepAcceptCarry } from './accept-carry-sweep.mjs';
 
 /** Plain label names off a `gh --json labels` array (`[{name}]`) or a bare-string array. Pure. */
 function labelNames(labels) {
@@ -133,7 +134,7 @@ export function needsReviewHoldCleanup(pr) {
  *   needed (or would need) a change, was healed, or carries a contradiction this sweep could not resolve.
  */
 export function sweepReviewHoldLabels({
-  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling,
+  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false, settings, runRuling, acceptCarry,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
@@ -192,6 +193,15 @@ export function sweepReviewHoldLabels({
     }
     results.push(entry);
   }
+  // card xu7kxtt (#5472) — an operator clearance a mechanical pass re-held after the head moved (merge queue / rebase)
+  // is carried by the sanctioned re-stamp when the net diff is byte-identical. Same listing, own entry shape (`carry`).
+  try {
+    for (const r of sweepAcceptCarry({ prs, repo, dryRun, ...(acceptCarry ? { runRestamp: acceptCarry } : {}) })) {
+      results.push({ num: r.num, carry: r.carry, detail: r.detail });
+    }
+  } catch (e) {
+    results.push({ num: 0, carry: 'sweep-failed', error: String((e && e.message) || e).split('\n')[0] });
+  }
   // `advisory:ruling-needed` — a derived label (a parked review whose confirmed findings await the operator's
   // ruling on the current head), added and removed from the SAME listing this sweep already read. Its own entry
   // shape (`ruling`), so the three existing fields above keep their meaning. A failure here never costs the sweep.
@@ -243,6 +253,7 @@ if (IS_CLI) {
           writeLineSync(2, `  🩹 PR #${r.num}: ${did} — removed ${r.healed.join(',')} (no genuine human clearance found for the live head)${r.commentPosted ? ', comment posted' : ''}${r.error ? ` (${r.error})` : ''}`);
         }
         if (r.autoBlock) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : ''}${r.autoBlock} ${r.findings ?? 0} confirmed referral(s) as auto-policy${r.operatorKept ? ` (${r.operatorKept} left for the operator)` : ''}${r.error ? ` (FAILED: ${r.error})` : ''}`);
+        if (r.carry) writeLineSync(2, `  PR #${r.num}: accept carry-forward ${r.carry}${r.detail ? ` — ${r.detail}` : ''}${r.error ? ` (${r.error})` : ''}`);
         if (r.ruling) writeLineSync(2, `  PR #${r.num}: ${dryRun ? 'would ' : ''}${r.ruling} advisory:ruling-needed${r.error ? ` (FAILED: ${r.error})` : ''}`);
         if (r.flagged?.length) {
           writeLineSync(2, `  🚩 PR #${r.num}: carries contradictory review:* verdict labels (${r.flagged.join(',')}) — #2766/#2767 shape; not auto-resolved (${r.flagReason || 'unresolved'}${r.fetchError ? `, fetch error: ${r.fetchError}` : ''}). Resolve via review-set-label.mjs --to=clear-human or --to=changes.`);
