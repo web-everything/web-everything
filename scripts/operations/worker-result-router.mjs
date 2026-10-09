@@ -79,9 +79,13 @@ export function redactResultText(result) {
 export function settleWorkerResult({ role, launcher, value, text, reason, aborted = false, transcriptPath = null, prose = '' }) {
   if (aborted) return { result: abortedOutcome({ role, launcher }), parse: { ok: false, reason: 'aborted' }, reroute: null };
   const missing = value === undefined && (typeof text !== 'string' || text.trim() === '');
+  // EVERY fail-closed outcome below goes through the same redactor as a valid result: the validator's `problems` quote worker-chosen key
+  // names, echoed values and JSON.parse snippets, and `transcriptPath` comes from the launcher (`prose` is redacted by unparseableOutcome
+  // itself). Redact each piece BEFORE it is composed into evidence.text, so the one-line-per-field shape of the evidence survives.
+  const safeTranscript = transcriptPath == null ? null : cleanPath(transcriptPath);
   if (missing) {
     return {
-      result: unparseableOutcome({ role, launcher, reason: reason || 'no-structured-output', transcriptPath, prose }),
+      result: unparseableOutcome({ role, launcher, reason: reason || 'no-structured-output', transcriptPath: safeTranscript, prose }),
       parse: { ok: false, reason: reason || 'no-structured-output' }, reroute: null,
     };
   }
@@ -89,7 +93,10 @@ export function settleWorkerResult({ role, launcher, value, text, reason, aborte
   if (!checked.ok) {
     const why = value === undefined && checked.problems?.[0]?.includes('not valid JSON') ? 'invalid-json' : 'schema-violation';
     return {
-      result: unparseableOutcome({ role, launcher, reason: why, transcriptPath, prose, problems: checked.problems }),
+      result: unparseableOutcome({
+        role, launcher, reason: why, transcriptPath: safeTranscript, prose,
+        problems: (checked.problems ?? []).map((p) => redactFreeText(p, 300)),
+      }),
       parse: { ok: false, reason: why }, reroute: null,
     };
   }
@@ -171,7 +178,7 @@ export function routeWorkerResult(result, ctx = {}) {
     case 'unparseable': return draftAction(result, ctx, CONTRACT_VIOLATION_KIND, { hold: 'cool-off', releaseClaim: true });
     case 'blocked': break;
     default:
-      return routeWorkerResult(unparseableOutcome({ role: ctx.role, launcher: ctx.launcher, reason: 'schema-violation', problems: [`unknown outcome ${JSON.stringify(result.outcome)}`] }), ctx);
+      return routeWorkerResult(unparseableOutcome({ role: ctx.role, launcher: ctx.launcher, reason: 'schema-violation', problems: [redactFreeText(`unknown outcome ${JSON.stringify(result.outcome)}`, 300)] }), ctx);
   }
   const b = result.blocker;
   if (!b || !BLOCKER_KINDS.includes(b.kind)) {

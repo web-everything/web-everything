@@ -12,7 +12,7 @@ tags: []
 
 # Worker result contract S2: completion record v2 envelope (folds three stores) and the blocker-to-action router
 
-117 S2 (D2 + D3): completion record v2 is the ONE envelope the launcher writes (role, launcher, model, pid, timeout, heads, parse, result, action) and the one store the three old stores fold into: v1 completion, delivery-report and fix-report records read back through it. A pure router maps blocker.kind to an action: tooling-defect, permission-wall and contract-violation make a 114 draft card under postmortem.mode (off|draft|file, draft by default), needs-ruling goes to the operator, and it is the only route there. Spec: prepare-117 sections 3-5, 8 (S2).
+117 S2 (D2 + D3): completion record v2 is the ONE envelope the launcher writes (role, launcher, model, pid, timeout, heads, parse, result, action) and the one store the three old stores fold into: v1 completion, delivery-report and fix-report records read back through it. A pure router maps blocker.kind to an action: tooling-defect, permission-wall and contract-violation make a 114 draft card under postmortem.mode (off|draft|file, OFF by default: with no WE_POSTMORTEM_MODE set and no postmortem config file, no draft is written), needs-ruling goes to the operator, and it is the only route there. Spec: prepare-117 sections 3-5, 8 (S2).
 
 ## Done when
 

@@ -176,6 +176,50 @@ describe('redaction covers every free-text field, not just the ones the card nam
   });
 });
 
+describe('every fail-closed outcome is redacted too, not only the valid-result path', () => {
+  const TOKEN = 'ghp_abcdefghijklmnop12345';
+  const leaves = (v, out = []) => { if (typeof v === 'string') out.push(v); else if (v && typeof v === 'object') Object.values(v).forEach((x) => leaves(x, out)); return out; };
+  const hostile = [TOKEN, '@someone', '<!-- x -->', '`tick`'];
+  const hasHostile = (result) => leaves(result).filter((s) => s.includes(TOKEN) || /@(?!​)\w/.test(s) || s.includes('<!--') || s.includes('`'));
+
+  it('a worker-chosen KEY or VALUE in a schema violation never reaches evidence.text unredacted (value path)', () => {
+    for (const bad of hostile) {
+      const s = settleWorkerResult({ role: 'fix', launcher: 'claude-p', value: { ...done(), [bad]: 1 } });
+      expect(s.result.outcome, bad).toBe('unparseable');
+      expect(hasHostile(s.result), bad).toEqual([]);
+      const v = settleWorkerResult({ role: 'fix', launcher: 'claude-p', value: { ...done(), outcome: bad } });
+      expect(hasHostile(v.result), `value ${bad}`).toEqual([]);
+    }
+  });
+
+  it('the text path (a Codex -o file): hostile keys, values and the JSON.parse error snippet are redacted too, and a hostile transcriptPath', () => {
+    for (const bad of hostile) {
+      const obj = settleWorkerResult({ role: 'fix', launcher: 'codex-exec', text: JSON.stringify({ ...done(), [bad]: 1 }), transcriptPath: `t-${bad}.jsonl` }); // (cleanPath restores an npm-scope `/@x`, so the hostile bit is not placed right after a slash)
+      expect(obj.result.outcome, bad).toBe('unparseable');
+      expect(hasHostile(obj.result), bad).toEqual([]);
+      const broken = settleWorkerResult({ role: 'fix', launcher: 'codex-exec', text: `{"a": ${bad}` });
+      expect(broken.parse.reason, bad).toBe('invalid-json');
+      expect(hasHostile(broken.result), `invalid ${bad}`).toEqual([]);
+    }
+  });
+
+  it('the missing-output branch redacts a hostile transcriptPath, and an unknown outcome reaching the router is redacted', () => {
+    for (const bad of hostile) {
+      const m = settleWorkerResult({ role: 'fix', launcher: 'agy', transcriptPath: `t-${bad}.jsonl` });
+      expect(m.result.outcome, bad).toBe('unparseable');
+      expect(hasHostile(m.result), bad).toEqual([]);
+      const routed = route({ ...done(), outcome: bad });
+      expect(hasHostile(routed.draft ?? routed), `route ${bad}`).toEqual([]);
+    }
+  });
+
+  it('the redaction keeps the useful part: the reason and the shape of the problem survive', () => {
+    const s = settleWorkerResult({ role: 'fix', launcher: 'claude-p', value: { ...done(), nope: 1 } });
+    expect(s.result.blocker.evidence.text).toMatch(/reason: schema-violation/);
+    expect(s.result.blocker.evidence.text).toMatch(/nope/);
+  });
+});
+
 describe('legacyOutcomeWord only speaks the briefs own vocabulary', () => {
   it('every word it can return is a LEGACY_OUTCOME_MAP key, a bare blocked, or a success/stop word', () => {
     const allowed = new Set([...Object.keys(LEGACY_OUTCOME_MAP), 'blocked', 'aborted']);
