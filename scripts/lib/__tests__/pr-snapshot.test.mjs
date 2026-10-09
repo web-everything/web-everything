@@ -196,7 +196,7 @@ describe('the pass readers are wired to the snapshot (a seeded fresh snapshot is
     const got = m[fn]({ repo: REPO, ...extra });
     expect(got).toHaveLength(14);
     expect(got[0].number).toBe(100);
-  });
+  }, 60_000); // the first dynamic import of a heavy conveyor module can exceed the 5s default on a loaded host
 
   it('pr-limit#fetchOpenPrs', async () => {
     const { fetchOpenPrs } = await import('../pr-limit.mjs');
