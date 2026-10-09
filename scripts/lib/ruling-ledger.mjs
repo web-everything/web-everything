@@ -284,7 +284,12 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
       // Already settled on this head by the operator: any structured ruling of theirs here (block included — they
       // looked at it), or a not-real/card one carried forward from an earlier head whose operator backing is still in
       // the thread. A carried `block` settles nothing: the cited lines are unchanged, which is exactly an ignored ruling.
-      if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key)
+      // An `auto-policy` block on this head is NOT the operator looking: no person saw that the finding came back, so it
+      // settles nothing. Counting it as settled hid the came-back from the ladder (live 2026-10-09, plateau-app #217:
+      // auto-block on 166d067, the same finding re-raised on the fix head dfa0b5c and auto-blocked again; the fixer
+      // found it already fixed, ended without a push, and was re-dispatched ~25 times with no escalation).
+      if (operatorRulings.some((o) => o.head === head && o.runId === record.runId && o.key === f.key
+        && String(o.actor ?? '').toLowerCase() !== AUTO_POLICY_ACTOR)
         || (record.carried ?? []).some((c) => c.key === f.key && c.result !== 'block'
           && carriedBackingHolds(c, { repo: record.repo, pr: record.pr, operatorRulings }))) continue;
       // The standing ruling is the LATEST matching block: a fresh re-ruling restarts the count, so the ladder gives
