@@ -64,7 +64,7 @@ export function runDraftPromotionStep({
         rows.push({ repo, pr: n, action: 'skip', why: 'draft was withdrawn since the list read' });
         continue;
       }
-      try { ready(repo, n); } catch (e) { rows.push({ repo, pr: n, action: 'error', why: `gh pr ready: ${oneLine(e)}` }); continue; }
+      try { ready(repo, n); } catch (e) { rows.push({ repo, pr: n, action: 'error', why: `ready write failed: ${oneLine(e)}` }); continue; }
       try { clearAwaiting(repo, n); } catch { /* best effort; the review-status sweep corrects it */ }
       rows.push({ repo, pr: n, action: 'promoted', why: decision.why });
     }
