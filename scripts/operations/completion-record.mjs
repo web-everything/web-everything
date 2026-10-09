@@ -223,6 +223,7 @@ function validateEnvelopeFields(r) {
   }
   if (r.source !== undefined && !ENVELOPE_SOURCES.includes(r.source)) errors.push(`\`source\` must be one of ${ENVELOPE_SOURCES.join('/')}`);
   if (r.status === 'done' && r.result == null && r.source !== 'none') errors.push('a done v2 record needs a `result` (use source "none" only for a legacy record that never reported)');
+  if (r.source === 'none' && r.result != null) errors.push('source "none" means a legacy record that never reported, so it cannot carry a `result` (a launcher-written fail-closed result is source "worker-result")');
   return errors;
 }
 

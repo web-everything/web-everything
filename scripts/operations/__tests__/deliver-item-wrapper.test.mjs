@@ -4266,6 +4266,39 @@ describe('117 S3a: CLAUDE_RESTRICTED_PROVIDER on the unified worker wrapper', ()
     }
   });
 
+  it('knob ON parity: the post-spawn side effects of the old path still run (CPU telemetry on success AND on a failed turn, the failure capture on a failed turn)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 's3a-'));
+    const prev = process.env.OPERATION_COMPLETIONS_DIR;
+    const prevOps = process.env.WE_OPERATIONS_DIR;
+    process.env.OPERATION_COMPLETIONS_DIR = dir;
+    process.env.WE_OPERATIONS_DIR = dir; // a failed turn files a draft: keep it out of the operator's real drafts store
+    try {
+      const usage = { userCPUTime: 7, systemCPUTime: 3 };
+      const stdout = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', structured_output: DONE });
+      const ok = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => ({ stdout, stderr: '', resourceUsage: usage })) });
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, ok);
+      expect(ok.recordCpu).toHaveBeenCalledWith(usage);
+      expect(ok.persistFailure).not.toHaveBeenCalled();
+
+      const boom = Object.assign(new Error('Command failed'), { status: 3, stdout: 'out', stderr: 'err', resourceUsage: usage });
+      const bad = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), spawnAgent: vi.fn(async () => { throw boom; }) });
+      await DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn({ ...REQUEST, sessionSlug: 'conveyor-4002' }, bad);
+      expect(bad.recordCpu).toHaveBeenCalledWith(usage);
+      expect(bad.persistFailure).toHaveBeenCalledWith('conveyor-4002', boom, { resumeSessionId: null });
+
+      // runWorker itself rejecting (a record it could not write) is also a failed turn: same telemetry + capture, then the error propagates
+      const fault = Object.assign(new Error('lock timeout'), { resourceUsage: usage });
+      const rej = fakeIo({ workerWrapper: true, recordCpu: vi.fn(), persistFailure: vi.fn(), runWorkerFn: vi.fn(async () => { throw fault; }) });
+      await expect(DELIVERY_AGENT_PROVIDERS['claude-restricted'].spawn(REQUEST, rej)).rejects.toBe(fault);
+      expect(rej.recordCpu).toHaveBeenCalledWith(usage);
+      expect(rej.persistFailure).toHaveBeenCalledWith('conveyor-4001', fault, { resumeSessionId: null });
+    } finally {
+      if (prevOps === undefined) delete process.env.WE_OPERATIONS_DIR; else process.env.WE_OPERATIONS_DIR = prevOps;
+      if (prev === undefined) delete process.env.OPERATION_COMPLETIONS_DIR; else process.env.OPERATION_COMPLETIONS_DIR = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   describe('buildReportFromEnvelope (same shape as the delivery report it replaces)', () => {
     const env = (result, over = {}) => ({ v: 2, status: 'done', item: '4001', startedAt: '2026-10-08T10:00:00.000Z', updatedAt: '2026-10-08T10:01:00.000Z', result, ...over });
     const blocked = (kind, files = []) => ({ ...DONE, outcome: 'blocked', filesTouched: files, summary: 'stuck', blocker: { kind, component: 'c', evidence: { text: 'why', refs: [] }, proposedFix: null, ruling: null, deniedCommand: null, retryable: false } });

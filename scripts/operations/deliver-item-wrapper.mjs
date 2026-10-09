@@ -1152,19 +1152,33 @@ const CLAUDE_RESTRICTED_PROVIDER = {
       // The wrapper owns the process, the timeout and the record; it never rejects on a worker failure (the v2
       // envelope IS the failure report) and returns the envelope for `runAgentToCompletion` to read the build
       // report from. `legacyRead` keeps the old delivery report working while the brief still asks for it.
-      return runWorkerFn({
-        role: 'build', launcher: 'claude-p', session: sessionSlug, command: 'claude', argv, cwd: lanePath,
-        env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId,
-      }, {
-        // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
-        spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
-        // On a RESUMED turn the report on disk is the first turn's unless the agent rewrote it: only one written since
-        // this turn started counts, or a resume that ended with no result would read as the stale `done`.
-        legacyRead: () => {
-          const report = tryReadDeliveryReport(sessionSlug, reportsDir);
-          return resumeSessionId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
-        },
-      });
+      let ran;
+      try {
+        ran = await runWorkerFn({
+          role: 'build', launcher: 'claude-p', session: sessionSlug, command: 'claude', argv, cwd: lanePath,
+          env: { ...process.env, ...deliveryEnv }, timeoutMs: DELIVERY_AGENT_SPAWN_TIMEOUT_MS, model, item, sessionId,
+        }, {
+          // keep the SAME env hygiene as the old path (GH_TOKEN stripped, worker marker) via the existing spawn primitive
+          spawnToCompletionFn: (_cmd, a, opts, spawnIo) => spawnAgent(a, opts, spawnIo),
+          // On a RESUMED turn the report on disk is the first turn's unless the agent rewrote it: only one written since
+          // this turn started counts, or a resume that ended with no result would read as the stale `done`.
+          legacyRead: () => {
+            const report = tryReadDeliveryReport(sessionSlug, reportsDir);
+            return resumeSessionId && !(Date.parse(report?.updatedAt) >= turnStartedAt) ? null : report;
+          },
+        });
+      } catch (e) {
+        // runWorker rejects only on a bad spec or a record it could not write: the old path still recorded the turn's CPU and
+        // captured the failure on its way out, so do the same before rethrowing.
+        recordCpu(e && e.resourceUsage);
+        persistFailure(sessionSlug, e, { resumeSessionId });
+        throw e;
+      }
+      // The same post-spawn side effects as the unwrapped path below (the wrapper returns before reaching them): the turn's CPU
+      // telemetry on success and failure alike, and the capture of what a failed child said.
+      recordCpu(ran?.resourceUsage);
+      if (ran?.failure) persistFailure(sessionSlug, ran.failure, { resumeSessionId });
+      return ran;
     }
     try {
       // #3627 bug 6 — explicit `timeout` override, distinct from (and far larger than) dispatch-lane-io.mjs's
