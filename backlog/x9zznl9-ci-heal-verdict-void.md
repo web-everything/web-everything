@@ -32,5 +32,5 @@ One line per class: either the handling, or `n/a: <why>`.
 3. **Shared state files** — n/a: no local state; the void lives on the PR thread.
 4. **Fail closed** — setting off = today; a failed required-check read in the CLI warns and records as before; the daemon skips the void on a read error.
 5. **Identity scoping** — head-scoped: a void for another head never applies.
-6. **State over time** — posted once per head (dedup by reading voids back); a new push re-arms as before.
+6. **State over time** — posted once per verdict (dedup by reading voids back: a void counts only when it comes after the head's latest `not-a-ci-break` verdict, so an earlier void never hides a later contradicted verdict); at most `MAX_VERDICT_VOIDS_PER_HEAD` (3) voids per head, then the verdict stands for an operator; a new push re-arms as before.
 7. **Who wrote it** — `isTrustedMarkerAuthor` for both the escalation and the void.

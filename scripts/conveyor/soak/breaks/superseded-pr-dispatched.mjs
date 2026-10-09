@@ -32,7 +32,12 @@ export default {
     // Round 3: a list-item fence's closer sits at most 3 columns past the item's content, so a deeper fence line is code.
     for (const body of ['````md\n```\nSupersedes #4522\n```\nSupersedes #4523\n````', '~~~\n```\nSupersedes #4522\n~~~',
       '- ```md\n          ```\n  Supersedes #4522\n  ```', '1. ```md\n   Supersedes #4521\n       ```\n   Supersedes #4522\n   ```',
-      '- ```\n  x\n```\nSupersedes #4522\n```', '```md\rx\nSupersedes #4522\n```', `\`\`\`md\nx\n\`\`\`${String.fromCharCode(0xa0)}\nSupersedes #4522\n\`\`\``]) {
+      '- ```\n  x\n```\nSupersedes #4522\n```', '```md\rx\nSupersedes #4522\n```', `\`\`\`md\nx\n\`\`\`${String.fromCharCode(0xa0)}\nSupersedes #4522\n\`\`\``,
+      // Round 4: a line left of a list item's content column ends the item's fence and opens a new one.
+      '- ```\n  code\n~~~\nSupersedes #4521\n  ```\nSupersedes #4522\n~~~', '- item\n\n  ```\n  code\n```\nSupersedes #4522\n```',
+      'Write `x\nSupersedes #4522` in the body.', '<pre>\nSupersedes #4522\n</pre>',
+      'Use <code>x\nSupersedes #4522</code> as an example.', 'See [doc](https://x/`a) `b\nSupersedes #4522` end',
+      '- <!-- describe the change\n-->\nSupersedes #4522']) {
       if (parseSupersedes(body).length) violations.push(`fenced example read as a supersede marker: ${JSON.stringify(body)}`);
     }
     return { violations };

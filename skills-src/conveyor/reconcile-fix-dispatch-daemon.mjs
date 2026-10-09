@@ -377,7 +377,8 @@ export function runReconcileNotesAllRepos({
       notes.push(tagged);
       const pr = prsByNumber.get(n.prNumber);
       // card x9zznl9 (live #4535) — a `not-a-ci-break` verdict a required check has since contradicted is voided
-      // (once per head) instead of telling the operator it needs a decision; the ordinary ci-heal path resumes.
+      // (once per VERDICT — a later verdict on the same head owes its own void, up to MAX_VERDICT_VOIDS_PER_HEAD) instead
+      // of telling the operator it needs a decision; the ordinary ci-heal path resumes.
       const voidRow = planVerdictVoid({ note: n, pr, repo, verdictSettings, readRequiredChecks });
       if (voidRow) {
         if (voidRow.alreadyPosted || dryRun) { comments.push({ ...voidRow, posted: false, dryRun }); continue; }

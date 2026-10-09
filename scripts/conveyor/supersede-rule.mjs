@@ -9,8 +9,9 @@
  * optional markdown heading (`#` to `######` plus a space) and optional `**` bold, starts with the word `Supersedes`
  * (case-sensitive), an optional `:`, then one or more `#N` separated by `,`, `and`, or spaces. Examples that count:
  *   `Supersedes: #4522`   `### Supersedes #4522`   `**Supersedes:** #12, #13 and #14`
- * Examples that do not: `This supersedes #4522.` (mid-sentence), `supersedes #4522` (lower case), anything inside a
- * fenced code block. `open-pr.mjs` and `docs/agent/delivery-loop.md` tell authors to write `Supersedes: #N`.
+ * Examples that do not: `This supersedes #4522.` (mid-sentence), `supersedes #4522` (lower case), anything CommonMark
+ * renders as code (a fenced or indented code block, a raw `<pre>`, a code span running across lines) or hides (an HTML
+ * comment). `open-pr.mjs` and `docs/agent/delivery-loop.md` tell authors to write `Supersedes: #N`.
  *
  * THE HOLD reuses the existing terminal hold — a stand-down (`stand-down.mjs`, reason `superseded`) — so
  * `reconcile-core.mjs` REFUSAL 1 stops fix, review and ci-heal for both daemons with no edit there. It never closes the
@@ -23,6 +24,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import MarkdownIt from 'markdown-it';
 import { supersedeHoldsOn } from './stand-down.mjs';
 
 export const SUPERSEDE_HOLD_ENV = 'WE_SUPERSEDE_HOLD';
@@ -55,10 +57,9 @@ const MARKER_LINE_RE = /^ {0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \t
 /** A fence line: up to 3 SPACES (a tab or no-break space is indented code / not a fence), a run of 3+ backticks or
  *  3+ tildes, then the rest of the line. */
 const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})([^]*)$/;
-/** A fence opened inside a list item (`- ```` / `1. ````, markers may nest on one line: `- - ````). CommonMark: the
- *  closer may be indented at most 3 columns past the item's content column (4+ is code content, not a closer), and a
- *  line indented LESS than that column is not part of the item at all, so it cannot close the item's fence either.
- *  `[^]` (not `.`) so U+2028/U+2029 in an info string do not stop a line being read as a fence. */
+/** A fence opened inside a list item (`- ```` / `1. ````, markers may nest on one line: `- - ````). The closer may be
+ *  indented at most 3 columns past the item's content column (4+ is code content, not a closer). `[^]` (not `.`) so
+ *  U+2028/U+2029 in an info string do not stop a line being read as a fence. */
 const LIST_FENCE_LINE_RE = /^ {0,3}(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)+(`{3,}|~{3,})([^]*)$/;
 const FENCE_RUN_RE = /^(`{3,}|~{3,})([^]*)$/;
 /** After a closing run only spaces and tabs are allowed (not `trim()`, which also strips NBSP, BOM, U+2028). */
@@ -74,6 +75,118 @@ const listFenceColumn = (line, open) => {
 /** `line` without inline code spans, so a backticked `<!--` does not open a comment. */
 const withoutCodeSpans = (line) => line.replace(/(`+)[^]*?\1/g, '');
 
+/** PR #4560, round 4: what is code and what is prose is CommonMark's call. Three rounds of fixes to the line tracker
+ *  above each missed a container rule (a line left of a list item's content column ends the item AND its fence, and
+ *  may open a new fence), so the block AND inline structure now come from markdown-it, a CommonMark parser already
+ *  used at runtime by `scripts/lib/review-escalation.mjs`. `html: true`, as GitHub renders PR bodies.
+ *  The tracker stays as a SECOND reading: a line is a marker only when markdown-it reads it as prose AND the tracker
+ *  does not read it as fenced. Where they disagree it is a sloppily indented example (`1. ```` then a line left of the
+ *  item's column): GitHub shows it as text, but the author meant code, and a missed hold costs one wasted fixer run
+ *  while a false hold stops an unrelated PR until an operator answers. So the tracker can only hide lines, never add. */
+const md = new MarkdownIt({ html: true }).disable('reference'); // `reference` is quadratic in markdown-it 13 (3 s on a
+// 64 KB body of definitions); without it a definition parses as a paragraph, which `REF_DEF_START_RE` skips.
+
+/** Raw HTML elements whose text a reader sees as code or struck out, or never sees. Counted across the whole body:
+ *  a browser carries one left open into the next paragraph. */
+const HIDING_TAGS = 'code|pre|kbd|samp|tt|var|textarea|script|style|del|strike|s';
+const HIDING_TAG_RE = new RegExp(`<(/?)(?:${HIDING_TAGS})(?=[\\s/>])`, 'gi');
+/** `s` without its complete `<!-- ... -->` comments (linear: one forward scan; an unclosed one is cut to the end). */
+const withoutComments = (s) => {
+  let out = '';
+  for (let at = 0; ;) {
+    const open = s.indexOf('<!--', at);
+    if (open === -1) return out + s.slice(at);
+    out += s.slice(at, open);
+    const close = s.indexOf('-->', open + 4);
+    if (close === -1) return out;
+    at = close + 3;
+  }
+};
+/** Open hiding tags after raw HTML `s`, starting from `depth`. A comment's text is not markup. */
+const hidingDepthAfter = (s, depth) => {
+  for (const m of withoutComments(s).matchAll(HIDING_TAG_RE)) depth = m[1] ? Math.max(0, depth - 1) : depth + 1;
+  return depth;
+};
+/** A paragraph that starts like a link reference definition (`[a]: /url`, `[a\]b]: /url`): the `reference` rule is
+ *  off (below), so such a definition — and a title running across lines after it — would read as prose. Never read it. */
+const REF_DEF_START_RE = /^\[(?:[^\]\\]|\\[^])*\]:/;
+/** A private-use character the body does not hold: inserting it at a line start changes no inline structure (it is
+ *  neither punctuation nor space), and a body cannot spell it to mark a hidden line visible. */
+const sentinelChar = (body) => {
+  const used = new Set(body);
+  for (let cp = 0xe000; ; cp++) {
+    if (cp === 0xf900) cp = 0xf0000; // BMP private use ends; plane 15 holds 65534 more than a body can use up
+    const ch = String.fromCodePoint(cp);
+    if (!used.has(ch)) return ch;
+  }
+};
+/** Does raw HTML `s` leave a comment, processing instruction or CDATA section open? A browser then hides everything
+ *  after it (a `-->` markdown-it renders as text is escaped, so it closes nothing). */
+const leavesRawOpen = (s) => [['<!--', '-->'], ['<?', '?>'], ['<![CDATA[', ']]>']]
+  .some(([o, c]) => { const at = s.lastIndexOf(o); return at !== -1 && !s.includes(c, at + o.length); });
+
+/** Which of `marked` (line numbers of one paragraph or heading, from `from`) does a reader see as plain text? ONE
+ *  inline parse, every marked line prefixed with its own sentinel: a line counts only when its sentinel lands in a
+ *  `text` token outside raw code-ish HTML and outside `~~strike~~`. That rejects a line that starts inside a code
+ *  span, an inline comment, a tag's attribute, a link title or an image's alt text, with CommonMark's own precedence.
+ *  `depth` is the hiding tags already open; returns the lines seen and the depth after this block. */
+function visibleLines(inline, from, marked, ch, depth) {
+  const lines = inline.content.split('\n');
+  for (const i of marked) lines[i - from] = `${ch}${i}${ch}${lines[i - from]}`;
+  const sentinelRe = new RegExp(`${ch}(\\d+)${ch}`, 'gu');
+  const [parsed] = md.parseInline(lines.join('\n'), {});
+  const seen = new Set();
+  let strike = 0;
+  for (const c of parsed?.children ?? []) {
+    if (c.type === 'html_inline') { depth = hidingDepthAfter(c.content, depth); continue; }
+    if (c.type === 's_open') strike++;
+    else if (c.type === 's_close') strike = Math.max(0, strike - 1);
+    if (c.type !== 'text' || depth || strike) continue;
+    for (const m of c.content.matchAll(sentinelRe)) seen.add(Number(m[1]));
+  }
+  return { seen, depth };
+}
+
+/** The line numbers of `body` that a reader sees as plain text AND that look like a marker (`candidates`): inside a
+ *  paragraph or a heading, never in a code block, raw HTML, inside a code-ish or struck-out HTML element left open,
+ *  or after a raw comment that is never closed. */
+function proseMarkerLines(body, candidates) {
+  const out = new Set();
+  const ch = sentinelChar(body);
+  let hiddenFrom = Infinity;
+  let depth = 0;
+  const tokens = md.parse(body, {});
+  for (let t = 0; t < tokens.length; t++) {
+    const tok = tokens[t];
+    if (!tok.map || tok.map[0] >= hiddenFrom) continue;
+    if (tok.type === 'html_block') {
+      if (leavesRawOpen(tok.content || '')) hiddenFrom = Math.min(hiddenFrom, tok.map[1]);
+      depth = hidingDepthAfter(tok.content || '', depth);
+      continue;
+    }
+    if (tok.type !== 'paragraph_open' && tok.type !== 'heading_open') continue;
+    const inline = tokens[t + 1];
+    if (inline?.type !== 'inline') continue;
+    const [from, to] = tok.map;
+    if (tok.type === 'paragraph_open' && REF_DEF_START_RE.test(inline.content)) continue;
+    // markdown-it `trim()`s a block's text, which also drops a first or last line of only NBSP / U+2028 / \v. Then
+    // the text's lines no longer line up with the body's: read nothing in that block rather than the wrong line.
+    const setext = tok.type === 'heading_open' && (tok.markup === '=' || tok.markup === '-');
+    const aligned = inline.content.split('\n').length === to - from - (setext ? 1 : 0);
+    const marked = [];
+    for (let i = from; i < to; i++) if (candidates.has(i)) marked.push(i);
+    const r = visibleLines(inline, from, aligned ? marked : [], ch, depth);
+    depth = r.depth;
+    for (const i of r.seen) out.add(i);
+  }
+  for (const i of out) if (i >= hiddenFrom) out.delete(i);
+  return out;
+}
+
+/** The last few bodies' results: `supersedeCandidates` and `planSupersedeHolds` read the same bodies each tick. */
+const parsedBodies = new Map();
+const PARSED_BODIES_CAP = 256;
+
 /** Most PR numbers one body may declare; a body past it is not a list of real supersedes. */
 export const MAX_SUPERSEDE_TARGETS = 50;
 
@@ -84,11 +197,24 @@ export const MAX_SUPERSEDE_TARGETS = 50;
  */
 export function parseSupersedes(body) {
   if (typeof body !== 'string' || !body) return [];
+  if (!parsedBodies.has(body)) {
+    if (parsedBodies.size >= PARSED_BODIES_CAP) parsedBodies.delete(parsedBodies.keys().next().value);
+    parsedBodies.set(body, readSupersedes(body));
+  }
+  return [...parsedBodies.get(body)];
+}
+
+function readSupersedes(body) {
   const out = [];
-  let fence = null; // { char, len, base } of the open fence, CommonMark rules: closes on the same char, at least as long,
+  const lines = body.split(/\r\n|\r|\n/); // CommonMark line endings: CRLF, lone CR, LF (markdown-it splits the same way)
+  const candidates = new Set();
+  lines.forEach((line, i) => { if (MARKER_LINE_RE.test(line)) candidates.add(i); });
+  if (!candidates.size) return out; // most bodies: no markdown parse at all
+  const prose = proseMarkerLines(body, candidates);
+  let fence = null; // the tracker's open fence { char, len, base }: closes on the same char, at least as long,
   // indented 0-3 columns past `base` (0 for a top-level fence, the item's content column for a list-item fence)
   let inComment = false; // inside a multi-line `<!-- ... -->` (PR templates carry guidance there)
-  for (const line of body.split(/\r\n|\r|\n/)) { // CommonMark line endings: CRLF, lone CR, LF
+  for (const [index, line] of lines.entries()) {
     if (fence) {
       const lead = /^[ \t]*/.exec(line)[0];
       const close = FENCE_RUN_RE.exec(line.slice(lead.length));
@@ -108,7 +234,7 @@ export function parseSupersedes(body) {
         continue;
       }
     }
-    const m = MARKER_LINE_RE.exec(line);
+    const m = prose.has(index) ? MARKER_LINE_RE.exec(line) : null;
     if (m) {
       for (const n of m[1].matchAll(/#(\d+)/g)) {
         const num = Number(n[1]);
@@ -116,7 +242,8 @@ export function parseSupersedes(body) {
         if (out.length >= MAX_SUPERSEDE_TARGETS) return out;
       }
     }
-    const bare = withoutCodeSpans(line);
+    // The lazy code-span regex is quadratic on a long backtick line: past 4 KB keep the line whole (hides more, never less).
+    const bare = line.includes('<!--') && line.length <= 4096 ? withoutCodeSpans(line) : line;
     const opened = bare.lastIndexOf('<!--');
     if (opened !== -1 && !bare.includes('-->', opened)) inComment = true;
   }

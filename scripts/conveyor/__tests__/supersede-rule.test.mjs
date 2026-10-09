@@ -57,6 +57,47 @@ describe('parseSupersedes', () => {
     ['a comment opened after other text', 'Note <!-- template\nSupersedes #4522\nend -->'],
     ['a tab-indented line (indented code)', '\tSupersedes #4522'],
     ['a no-break-space-led marker', `${NBSP}Supersedes #4522`],
+    // Round 4 (ruling not addressed, rung 2): a non-blank line left of a list item's content column ENDS the item, and
+    // with it the item's fence; a fence line there opens a NEW fence. A tracker that only knows the old fence closes it
+    // on a line that is really content of the new one.
+    ['a new fence opened left of a list fence, holding a line like the list closer',
+      '- ```\n  code\n~~~\nSupersedes #4521\n  ```\nSupersedes #4522\n~~~'],
+    ['a list item fence on its own line, then a top-level fence', '- item\n\n  ```\n  code\n```\nSupersedes #4522\n```'],
+    ['a numbered item fence on its own line, then a top-level fence', '1. item\n\n   ```\n   code\n```\nSupersedes #4522\n```'],
+    ['a list item fence on its own line, then a tilde fence', '- item\n\n  ```\n  code\n~~~\nSupersedes #4521\n  ```\nSupersedes #4522\n~~~'],
+    // Code that is not a fence: an inline code span across lines, and a raw <pre> block.
+    ['an inline code span that spans lines', 'Write `x\nSupersedes #4522` in the body.'],
+    ['a double-backtick code span that spans lines', 'Write ``x`\nSupersedes #4522`` in the body.'],
+    ['a raw <pre> block', '<pre>\nSupersedes #4522\n</pre>'],
+    // Round 4 self-review: inline constructs that run across lines, with CommonMark's own precedence.
+    ['an inline <code> element across lines', 'Use <code>x\nSupersedes #4522</code> as an example.'],
+    ['an inline <kbd> element across lines', 'Press <kbd>x\nSupersedes #4522</kbd>'],
+    ['a tag attribute across lines', 'See <a title="\nSupersedes #4522\n">link</a>'],
+    ['a processing instruction across lines', 'Note <?\nSupersedes #4522\n?>'],
+    ['a CDATA section across lines', 'Note <![CDATA[\nSupersedes #4522\n]]>'],
+    ['a code span after a backtick inside a link destination', 'See [doc](https://x/`a) `b\nSupersedes #4522` end'],
+    ['a code span after a backtick inside an autolink', 'See <http://a`b> `x\nSupersedes #4522` end'],
+    ['a code span after a backtick inside a tag attribute', '<span title="`">ok</span> `x\nSupersedes #4522` end'],
+    ['a link title across lines', 'See [doc](/u "\nSupersedes #4522\n")'],
+    ['an image alt text across lines', 'See ![x\nSupersedes #4522](/i.png)'],
+    ['a list-item comment never closed in raw HTML', '- <!-- describe the change\n-->\nSupersedes #4522'],
+    ['a blockquote comment never closed in raw HTML', '> <!-- note\n-->\nSupersedes #4522'],
+    ['a comment reopened on its closing line', '<!--\na --> b <!--\nSupersedes #4522\n-->'],
+    ['a comment after a code span of another length', 'x `a <!-- ``\nSupersedes #4522\n-->'],
+    ['a link reference definition title across lines', '[a]: /u "\nSupersedes #4522\n"'],
+    // Round 4, second self-review.
+    ['a code span after a paragraph whose first line is a no-break space', `${NBSP}\na \`x\nSupersedes: #4522 \`\nplain`],
+    ['a code span after a paragraph whose first line is U+2028', `${String.fromCharCode(0x2028)}\na \`x\nSupersedes: #4522 \`\nplain`],
+    ['a setext heading after a vertical-tab line', '\u000b\na `x\nSupersedes: #4522 `\nplain\n==='],
+    ['a link definition whose label escapes a bracket', "[a\\]b]: /url '\nSupersedes: #4522\n'"],
+    ['a struck-through marker', '~~Supersedes: #4521\nSupersedes: #4522~~'],
+    ['a <del> marker', '<del>Supersedes: #4521\nSupersedes: #4522</del>'],
+    ['an <s> marker', '<s>Supersedes: #4521\nSupersedes: #4522</s>'],
+    ['an inline <code> left open into the next paragraph', 'Intro <code>\n\nSupersedes: #4522'],
+    ['an inline <pre> left open into the next paragraph', 'see <pre>\n\nSupersedes: #4522'],
+    ['a <pre> inside an HTML block, open across paragraphs', '<div><pre>\n\nSupersedes: #4522\n\n</pre></div>'],
+    ['a <code> HTML block open across paragraphs', '<code>\n\nSupersedes: #4522\n\n</code>'],
+    ['a body that holds the first private-use sentinel', `${String.fromCharCode(0xe000)}0${String.fromCharCode(0xe000)} \`x\nSupersedes #4522\``],
   ];
   it.each(fenceCases)('ignores a marker inside %s', (_name, body) => expect(parseSupersedes(body)).toEqual([]));
   it.each([
@@ -78,7 +119,29 @@ describe('parseSupersedes', () => {
     ['a one-line HTML comment before a marker', '<!-- hint -->\nSupersedes #2', [2]],
     ['a marker followed by an opening comment', 'Supersedes #2 <!--\nSupersedes #3\n-->', [2]],
     ['a no-break-space-led backtick line (not a fence)', `${NBSP}\`\`\`\nSupersedes #2`, [2]],
+    // Round 4: a marker CommonMark renders as text still counts.
+    ['a marker after a closed code span on the line before', 'Write `x` here\nSupersedes #2', [2]],
+    ['a marker after an escaped backtick', 'Write \\`x\nSupersedes #2', [2]],
+    ['a marker after an unmatched backtick run', 'Write ``x`\nSupersedes #2', [2]],
+    ['a marker after a link whose destination holds a backtick', 'See [doc](https://x/`a) and\nSupersedes: #2 `b`', [2]],
+    ['a marker after a closed inline <code> element', 'Use <code>x</code> here\nSupersedes #2', [2]],
+    ['a marker after a closed inline comment', 'Note <!-- x -->\nSupersedes #2', [2]],
+    ['a bold marker in a paragraph', 'Some text\n**Supersedes:** #2', [2]],
+    ['a marker in a setext heading', 'Supersedes #2\n===', [2]],
+    ['a marker after a closed <code> HTML block', '<code>\nx\n</code>\n\nSupersedes #2', [2]],
+    ['a marker after a closed strike-through', '~~old~~\nSupersedes #2', [2]],
+    ['a marker after a <span> (not a hiding tag)', '<span>x\n\nSupersedes #2', [2]],
+    ['a marker after a code tag named in a comment', '<!-- <code> -->\n\nSupersedes #2', [2]],
   ])('still reads %s', (_name, body, expected) => expect(parseSupersedes(body)).toEqual(expected));
+  // Round 4 self-review: the markdown parse must stay linear on a 64 KB body (markdown-it's `reference` rule is not).
+  it.each([['link reference definitions', '[a]: /u\n'], ['code spans', '`a`\n'], ['lone backticks', '`\n'], ['marker lines', 'Supersedes #1\n'],
+    ['a sentinel-like run', `qqsupersedesmark${'q'.repeat(40000)} `], ['comment openers', '<!--'], ['a backtick line', '`'.repeat(64) + '<!--']])(
+    'reads a 64 KB body of %s quickly', (_name, unit) => {
+      const body = `${unit.repeat(Math.ceil(65536 / unit.length))}\nSupersedes #2`;
+      const started = performance.now();
+      parseSupersedes(body);
+      expect(performance.now() - started).toBeLessThan(1500);
+    });
   it('caps the targets one body may declare', () => {
     const body = `Supersedes ${Array.from({ length: 3000 }, (_, i) => `#${i + 1}`).join(', ')}`;
     expect(parseSupersedes(body)).toHaveLength(MAX_SUPERSEDE_TARGETS);
