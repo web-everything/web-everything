@@ -1,4 +1,5 @@
 ---
+bornAs: xloy1no
 kind: story
 size: 3
 status: open

@@ -1,21 +1,23 @@
 ---
+bornAs: xlje75x
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/4354-survive-a-claude-account-switch-mid-session-without-losing-w.md", "we:backlog/4355-build-queue-ordering-read-the-real-cleared-queue-and-let-pri.md"]
+scope: ["we:backlog/5623-ledger-ruling-migration-writer-fixes-gate-before-running-the.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add named planned tests launchPersistsWorkerWithoutCallerBookkeeping and resumeIncludesLaneWithou… (from web-everything/web-everything#4641 review)
+# Prevention — Add a check:standards rule that a card quoting file paths and defects is re-verified against main… (from web-everything/web-everything#4639 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/4354-survive-a-claude-account-switch-mid-session-without-losing-w.md:59` — Add named planned tests `launchPersistsWorkerWithoutCallerBookkeeping` and `resumeIncludesLaneWithoutLaunchRecord`; require behavioral rulings to reference concrete test assertions before implementation preparation completes.
-2. `we:backlog/4355-build-queue-ordering-read-the-real-cleared-queue-and-let-pri.md:25` — Specify planned tests `classPrecedesScore` and `agingNeverPromotesIntoP0`, asserting conflicting class/score ordering and promotion behavior immediately before and at eight hours, including P1 remaining outside P0; require concrete test mappings during preparation.
+1. `we:backlog/5623-ledger-ruling-migration-writer-fixes-gate-before-running-the.md:11` — Add a check:standards rule that a card quoting file paths and defects is re-verified against main before it is filed (or at status:open). Short of that, require the card to cite the commit it was observed at.
+2. `we:backlog/5623-ledger-ruling-migration-writer-fixes-gate-before-running-the.md:15` — Add a lint that rejects `status: open` cards whose A1 still contains the template `TODO:` text. If it exists, make sure it also applies to gate cards.
+3. `we:backlog/5623-ledger-ruling-migration-writer-fixes-gate-before-running-the.md:24` — Add a check:standards rule that rejects a backlog card with an unfilled `TODO:` in Acceptance or Edge cases once it is gating another action. Better, make the migration script refuse to run unless this card's status is done.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4641@0a62c90e108736d48864b11ed89a998a6ef6506e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4639@17eb1a2a6f85443ca8955d1940820582c479e47a
 
 ## Acceptance
 
