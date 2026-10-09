@@ -25,7 +25,8 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
 
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
-import { planRevert, newTestTitles, revertRedVerdict, revertRedGate, formatRevertRed } from './revert-red-rule.mjs';
+import { DEFAULT_ADMISSION_CEILING_MS } from '../readiness/heavy-admission.mjs';
+import { planRevert, newTestTitles, changedOutsideNewTests, revertRedVerdict, revertRedGate, formatRevertRed } from './revert-red-rule.mjs';
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -56,8 +57,10 @@ export function textOrNull(bytes) {
  * puts the fixed content back from git before it does anything else ({@link recoverRevertRed}).
  */
 export const REVERT_JOURNAL = '.revert-red-pending.json';
-/** Two reverted-run ceilings (baseline + reverted run) plus slack: a journal older than this has no live writer. */
-export const REVERT_MAX_AGE_MS = 25 * 60 * 1000;
+/** Two runs, each of which may queue for a heavy-pool slot (up to the admission ceiling) before its own 10-minute run
+ *  ceiling starts, plus slack: a journal older than this has no live writer. (The run ceiling no longer covers the queue
+ *  wait, so the old 25-minute bound would have let a second verify restore the fix under a live, queued run.) */
+export const REVERT_MAX_AGE_MS = 2 * (DEFAULT_ADMISSION_CEILING_MS + 10 * 60 * 1000) + 5 * 60 * 1000;
 const journalPath = (run) => join(run(['rev-parse', '--absolute-git-dir']).trim(), REVERT_JOURNAL);
 
 /**
@@ -225,11 +228,15 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
   if (early.status === 'skipped') return finish(early);
 
   const titles = {};
+  const changedExisting = {};
   const targets = [];
   const unrevertable = [];
   try {
     for (const file of plan.tests) {
-      titles[file] = newTestTitles(addedLines(run(['diff', '-U0', baseSha.value, headSha.value, '--', file])));
+      const diffText = run(['diff', '-U0', baseSha.value, headSha.value, '--', file]);
+      titles[file] = newTestTitles(addedLines(diffText));
+      // Existing tests changed next to the new ones: their titles are not in `titles`, so the verdict must hear of them.
+      changedExisting[file] = changedOutsideNewTests(diffText);
     }
     for (const target of plan.revert) {
       // Text only (binary bytes would not survive a string round trip) and only a real file inside the checkout.
@@ -259,12 +266,20 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
   try {
     result = await probe({ cwd: checkout, targets, suite: plan.tests.map((f) => `./${f}`) });
   } catch (error) {
-    // The probe restores in its own `finally`; an error escaping it still never reads as a pass.
-    result = { applied: true, restored: false, detail: String(error?.message ?? error) };
+    // The probe restores in its own `finally`; an error escaping it still never reads as a pass. WHETHER the files are
+    // back is read off the disk, not assumed from the throw: a probe that died before (or after) touching anything left
+    // the fixed content in place, and calling that "not restored" turns a warn-mode result red for no reason.
+    const isIntact = () => targets.every((t) => { try { return fs.readFileSync(join(checkout, t.target), 'utf8') === t.fixed; } catch { return false; } });
+    let intact = isIntact();
+    // Not back: put the fixed content back from git now (the journal names exactly these files), rather than leaving the
+    // reverted tree for the next verify to find.
+    if (!intact && recoverRevertRed({ checkout, git: run, fs }).ok) intact = isIntact();
+    result = { applied: true, restored: intact, baselineRan: true, baselineGreen: true, mutantRan: false, mutantGreen: false, killedBy: [],
+      detail: String(error?.message ?? error) };
   }
   // The journal goes only once the restore is VERIFIED; otherwise the next verify of this lane restores from git.
   if (result?.restored === true || result?.applied === false) { try { fs.unlinkSync(journal); } catch { /* already gone */ } }
-  return { ...finish(revertRedVerdict({ ...facts, plan: runPlan, titles, probe: result })), unrevertable, probeDetail: String(result?.detail ?? '') };
+  return { ...finish(revertRedVerdict({ ...facts, plan: runPlan, titles, changedExisting, probe: result })), unrevertable, probeDetail: String(result?.detail ?? '') };
 }
 
 /**

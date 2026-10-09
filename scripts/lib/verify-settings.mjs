@@ -32,7 +32,7 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   skipLocalForCardOnly: false,
   // #5466 — the revert-red check on a fix push (ruling P6): revert the fix's source changes, keep its tests, and require
   // the tests it added or changed to go red. 'off' (today's behaviour) runs nothing; 'warn' records the result on the
-  // marker and the log and does not change the verdict; 'enforce' turns a non-discriminating or unproven result red.
+  // marker and the log and does not change the verdict; 'enforce' turns a non-discriminating or execution-unproven result red (a structural unproven — new source kept, partial revert, test that cannot load without the fix — is recorded only).
   // In every mode a revert whose restore fails is red: the tree is no longer the verified commit.
   revertRed: 'off',
   // RECORDED ONLY (nothing branches on it): when the current mode started (YYYY-MM-DD), stamped on every result so the

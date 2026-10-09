@@ -732,7 +732,8 @@ try {
 // which of them stay green. AFTER the gate and BEFORE the marker, so the harness's exact-sha / clean-tree push check
 // never sees the reverted tree (the transaction restores and re-reads every file; a failed restore leaves the tree
 // changed, the tree hash below unstable, and nothing is pushed). `off` (built-in) runs nothing; `warn` records only;
-// `enforce` turns a flagged or unproven result red. Its vitest runs queue on the heavy pool like every gate phase.
+// `enforce` turns a flagged or execution-unproven result red (a structural unproven is recorded, never blocking). Its
+// vitest runs queue on the heavy pool like every gate phase; their ceiling starts only once a slot is granted.
 let revertRed = null;
 if (exitCode === 0 && !signal && !verificationInfrastructureFailure({ exitCode, signal }) && headSha && MODE !== 'check') {
   const revertRedMode = verifySetting('revertRed', process.env);

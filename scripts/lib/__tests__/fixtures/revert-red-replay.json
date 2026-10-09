@@ -1203,5 +1203,87 @@
       "blocking": false,
       "nonDiscriminating": []
     }
+  },
+  {
+    "name": "new-source-kept-is-recorded-and-does-not-block-in-enforce",
+    "source": "synthetic — PR 4535 review: a fix modifies a.mjs, adds helper b.mjs and a test of b.mjs; the test legitimately stays green with a.mjs reverted, and the fixer has nothing to change",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/a.mjs" },
+        { "status": "A", "path": "scripts/x/b.mjs" },
+        { "status": "A", "path": "scripts/x/__tests__/b.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/b.test.mjs": ["b does the thing"] },
+      "probe": {
+        "applied": true, "occurrences": 1, "baselineRan": true, "baselineGreen": true,
+        "mutantRan": true, "mutantGreen": true, "killedBy": [], "failuresTruncated": false, "restored": true
+      }
+    },
+    "expect": { "status": "unproven", "reason": "new-source-kept", "blocking": false, "nonDiscriminating": [] }
+  },
+  {
+    "name": "load-error-with-fix-reverted-does-not-block-in-enforce",
+    "source": "synthetic — the commonest new-test shape: it imports an export the fix added to a modified file, so it cannot load without the fix",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/guard.mjs" },
+        { "status": "M", "path": "scripts/x/__tests__/guard.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/guard.test.mjs": ["refuses a dot name"] },
+      "probe": {
+        "applied": true, "occurrences": 1, "baselineRan": true, "baselineGreen": true,
+        "mutantRan": true, "mutantGreen": false,
+        "killedBy": ["scripts/x/__tests__/guard.test.mjs [ scripts/x/__tests__/guard.test.mjs ]"],
+        "failuresTruncated": false, "restored": true
+      }
+    },
+    "expect": { "status": "unproven", "reason": "load-error-with-fix-reverted", "blocking": false, "nonDiscriminating": [] }
+  },
+  {
+    "name": "changed-existing-test-next-to-a-new-one-is-flagged",
+    "source": "synthetic — PR 4535 review: a fix adds one discriminating test AND tightens an existing test that stays green with the fix reverted",
+    "facts": {
+      "mode": "warn",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/guard.mjs" },
+        { "status": "M", "path": "scripts/x/__tests__/guard.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/guard.test.mjs": ["refuses a dot name"] },
+      "changedExisting": { "scripts/x/__tests__/guard.test.mjs": true },
+      "probe": {
+        "applied": true, "occurrences": 1, "baselineRan": true, "baselineGreen": true,
+        "mutantRan": true, "mutantGreen": false,
+        "killedBy": ["scripts/x/__tests__/guard.test.mjs > guard > refuses a dot name"],
+        "failuresTruncated": false, "restored": true
+      }
+    },
+    "expect": { "status": "flagged", "reason": "tests-pass-with-fix-reverted", "blocking": false, "nonDiscriminating": [{ "file": "scripts/x/__tests__/guard.test.mjs", "test": null }] }
+  },
+  {
+    "name": "execution-timeouts-block-in-enforce",
+    "source": "synthetic — PR 4535 review: a run that hit its own ceiling is named, not folded into baseline-unrun, and fails closed",
+    "facts": {
+      "mode": "enforce",
+      "changeKind": "fix",
+      "recordMatchesHead": true,
+      "changes": [
+        { "status": "M", "path": "scripts/x/guard.mjs" },
+        { "status": "M", "path": "scripts/x/__tests__/guard.test.mjs" }
+      ],
+      "titles": { "scripts/x/__tests__/guard.test.mjs": ["refuses a dot name"] },
+      "probe": {
+        "applied": false, "occurrences": 1, "baselineRan": false, "baselineGreen": false, "baselineTimedOut": true,
+        "mutantRan": false, "mutantGreen": false, "killedBy": [], "restored": true
+      }
+    },
+    "expect": { "status": "unproven", "reason": "baseline-timeout", "blocking": true, "nonDiscriminating": [] }
   }
 ]

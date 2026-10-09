@@ -19,7 +19,10 @@
  *
  * `unproven` IS NOT `clean`. A run that could not execute, a baseline that was already red, a test file that failed to
  * load with the fix reverted, a restore that did not verify — none of these is evidence the tests discriminate. They are
- * reported as `unproven` and, in `enforce`, block exactly like `flagged` (the card's fail-closed rule). Same discipline as
+ * reported as `unproven`. An EXECUTION failure (the run did not happen, hung, changed the tree, lost part of its failure
+ * list) blocks in `enforce` exactly like `flagged` (the card's fail-closed rule). A STRUCTURAL one (the diff's own shape:
+ * a new source file kept, a binary left fixed, a test that cannot load without the fix — see `isStructuralUnproven`) is
+ * recorded and never blocks, because the fixer has nothing to change. Same discipline as
  * `we:scripts/operations/mutation-check.mjs#assessMutant`, whose transaction this rule judges.
  */
 
@@ -109,6 +112,49 @@ export function parseFailureLine(line) {
 const sameFile = (a, b) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
 
 /**
+ * `unproven` reasons that are a STRUCTURAL fact about the fix's diff: the fixer cannot clear them by changing a test, and
+ * the check cannot tell a weak test from a sound one under them. They are recorded (the line, the log, the evidence
+ * comment) but never block, even in `enforce`. Every other `unproven` reason is an EXECUTION failure (the run did not
+ * happen, hung, left the tree changed, or lost part of its failure list): fail closed, blocking in `enforce`.
+ *  - `new-source-kept`  the fix added a source file; reverting it would only turn a green test into one that fails to load.
+ *  - `partial-revert`   a changed source file is binary or symlinked and was left fixed.
+ *  - `load-error-with-fix-reverted`  the test cannot load without the fix (typically it imports an export the fix added):
+ *    the file is red, but a real red and an unrelated breakage look identical, so it proves nothing either way.
+ */
+const STRUCTURAL_UNPROVEN = Object.freeze(['new-source-kept', 'partial-revert', 'load-error-with-fix-reverted']);
+export const isStructuralUnproven = (why) => STRUCTURAL_UNPROVEN.includes(why);
+
+/** A line that decides whether a test passes: an assertion, or a test/suite declaration. Imports, blanks, comments do not. */
+const ASSERTION_LINE_RE = /\b(?:expect|assert|should)\b|\.(?:to[A-Z]\w*|resolves|rejects)\b|(?<![.\w$])(?:it|test|describe)(?:\.\w+)?\s*\(/;
+
+/**
+ * Did the fix change an EXISTING test in this test file, next to whatever new tests it added? PURE over the file's
+ * `git diff -U0` text. A hunk is attributed to the new tests only when it removes nothing and adds a test declaration;
+ * any other hunk that adds or removes an assertion or a declaration is a change to an existing test, which the new
+ * tests' titles cannot account for. Import lines, blanks and comments are not tests.
+ * @param {string} diffText
+ * @returns {boolean}
+ */
+export function changedOutsideNewTests(diffText = '') {
+  const hunks = [];
+  for (const line of String(diffText ?? '').split('\n')) {
+    const header = /^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/.exec(line);
+    if (header) { hunks.push({ removed: [], added: [], oldCount: header[2] === undefined ? 1 : Number(header[2]) }); continue; }
+    const hunk = hunks.at(-1);
+    if (!hunk || line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) hunk.added.push(line.slice(1));
+    else if (line.startsWith('-')) hunk.removed.push(line.slice(1));
+  }
+  const isComment = (l) => /^\s*(?:\/\/|\/\*|\*)/.test(l);
+  return hunks.some((h) => {
+    const attributed = h.oldCount === 0 && h.removed.length === 0 && newTestTitles(h.added).length > 0;
+    // Only what the fix WROTE can be a changed test: a removal-only hunk deleted a test, and a deleted test can never go
+    // red, so counting it would leave the fixer something it cannot clear.
+    return !attributed && h.added.some((l) => !isComment(l) && ASSERTION_LINE_RE.test(l));
+  });
+}
+
+/**
  * Does the check apply at all? PURE. Returns the skip reason, or `null` when it applies. Asked first, before any git
  * read, so `off` (today) costs nothing.
  * @param {{mode: string, changeKind: string|null, recordMatchesHead: boolean}} facts
@@ -136,12 +182,17 @@ export function revertRedGate({ mode, changeKind = null, recordMatchesHead = fal
  *   discriminating: Array<{file:string,test:string|null}>, nonDiscriminating: Array<{file:string,test:string|null}>,
  *   unproven: Array<{file:string,test:string|null,why:string}>, reverted: string[], keptNew: string[]}}
  */
-export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = false, plan = null, titles = {}, probe = null, skipReason = '' } = {}) {
+export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = false, plan = null, titles = {}, changedExisting = {}, probe = null, skipReason = '' } = {}) {
   const m = REVERT_RED_MODES.includes(mode) ? mode : 'off';
   const base = { mode: m, discriminating: [], nonDiscriminating: [], unproven: [], reverted: plan?.revert ?? [], keptNew: plan?.keptNew ?? [] };
   const skipped = (reason) => ({ ...base, status: 'skipped', blocking: false, reason });
-  // Blocking only ever in enforce; warn records, off never runs.
-  const result = (status, reason, lists) => ({ ...base, ...lists, status, reason, blocking: m === 'enforce' && status !== 'clean' });
+  // Blocking only ever in enforce; warn records, off never runs. A result whose ONLY open question is structural (see
+  // STRUCTURAL_UNPROVEN) is recorded and never blocks: the fixer has nothing to change.
+  const result = (status, reason, lists) => {
+    const open = Array.isArray(lists?.unproven) ? lists.unproven : [];
+    const structuralOnly = status === 'unproven' && open.length > 0 && open.every((u) => isStructuralUnproven(u.why));
+    return { ...base, ...lists, status, reason, blocking: m === 'enforce' && status !== 'clean' && !structuralOnly };
+  };
 
   const gate = revertRedGate({ mode: m, changeKind, recordMatchesHead });
   if (gate) return skipped(gate);
@@ -156,9 +207,14 @@ export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = 
   if (!probe || typeof probe !== 'object') return unrun('no-probe-result');
   // THE RESTORE FIRST — a tree still holding the revert outranks every other answer.
   if (probe.applied && !probe.restored) return unrun('not-restored');
+  // Said by name, not folded into "unrun": a file edited while the baseline ran, or a run that hit its own ceiling, are
+  // different problems from a runner that never started.
+  if (probe.driftedDuringBaseline) return unrun('target-changed-during-baseline');
+  if (probe.baselineTimedOut) return unrun('baseline-timeout');
   if (!probe.baselineRan) return unrun('baseline-unrun');
   if (!probe.baselineGreen) return unrun('baseline-red');
   if (!probe.applied) return unrun('not-applied');
+  if (probe.mutantTimedOut) return unrun('reverted-run-timeout');
   if (!probe.mutantRan) return unrun('reverted-run-unrun');
 
   const failures = (Array.isArray(probe.killedBy) ? probe.killedBy : []).map(parseFailureLine);
@@ -183,6 +239,13 @@ export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = 
       else if (truncated) unproven.push({ file, test, why: 'failure-list-truncated' });
       else nonDiscriminating.push({ file, test });
     }
+    // The fix ALSO changed an existing test in this file, which the new titles above cannot account for: it must have
+    // some failure of its own, or the new tests going red would hide a changed test that stays green (same rule as a
+    // file with no parseable title, applied to the part the titles do not cover).
+    if (changedExisting?.[file] === true && !inFile.some((f) => !named.some((t) => f.raw.endsWith(` > ${t}`)))) {
+      if (truncated) unproven.push({ file, test: null, why: 'failure-list-truncated' });
+      else nonDiscriminating.push({ file, test: null });
+    }
   }
   // A PARTIAL revert (some changed sources could not be reverted: binary, symlinked) cannot prove a green test weak —
   // it may guard exactly the file that stayed fixed. Such a test is unproven, never flagged.
@@ -196,7 +259,8 @@ export function revertRedVerdict({ mode, changeKind = null, recordMatchesHead = 
   }
   const lists = { discriminating, nonDiscriminating, unproven };
   if (nonDiscriminating.length) return result('flagged', 'tests-pass-with-fix-reverted', lists);
-  if (unproven.length) return result('unproven', unproven[0].why, lists);
+  // The reason names the first thing the fixer could act on; the structural ones only when nothing else is open.
+  if (unproven.length) return result('unproven', (unproven.find((u) => !isStructuralUnproven(u.why)) ?? unproven[0]).why, lists);
   return result('clean', 'all-new-tests-red-with-fix-reverted', lists);
 }
 

@@ -13,8 +13,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { withRealRepo } from '../../operations/__tests__/helpers/real-repo.mjs';
-import { createRevertProbe, runSuite } from '../../operations/mutation-check-io.mjs';
-import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ, recoverRevertRed, textOrNull, REVERT_JOURNAL, applyRevertRedToVerdict } from '../verify-revert-red.mjs';
+import { execFileSync } from 'node:child_process';
+import { createMutationProbe, createRevertProbe, runSuite, BOUNDED_RUN_SHIM } from '../../operations/mutation-check-io.mjs';
+import { runRevertRedCheck, revertRedForVerify, appendRevertRedLog, parseNameStatusZ, recoverRevertRed, textOrNull, REVERT_JOURNAL, REVERT_MAX_AGE_MS, applyRevertRedToVerdict } from '../verify-revert-red.mjs';
 
 const SRC = 'scripts/x/guard.mjs';
 const TEST = 'scripts/x/__tests__/guard.test.mjs';
@@ -89,6 +90,76 @@ describe('revert-red check on a real checkout', () => {
       const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: createRevertProbe({ run: runner(ctx.root, []) }) });
       expect(v).toMatchObject({ status: 'unproven', reason: 'baseline-unrun' });
       expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe('edited\n');
+    });
+  });
+
+  it('preserves target edits made during the baseline run: the edit survives and the revert is refused', async () => {
+    await withFix(async (ctx) => {
+      const seen = [];
+      const base = runner(ctx.root, seen);
+      let first = true;
+      const run = (...a) => {
+        if (first) { first = false; writeFileSync(join(ctx.root, SRC), `${FIXED}// edited while the baseline ran\n`); }
+        return base(...a);
+      };
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'enforce', probe: createRevertProbe({ run }) });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'target-changed-during-baseline', blocking: true });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(`${FIXED}// edited while the baseline ran\n`);
+      expect(seen).toHaveLength(1); // the reverted run never happened
+    });
+  });
+
+  it('an edit made while the reverted run executes is left alone, and the tree is reported not restored', async () => {
+    await withFix(async (ctx) => {
+      let calls = 0;
+      const run = (...a) => {
+        calls += 1;
+        if (calls === 2) writeFileSync(join(ctx.root, SRC), 'someone else was here\n');
+        return runner(ctx.root, [])(...a);
+      };
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: createRevertProbe({ run }) });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'not-restored' });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe('someone else was here\n');
+    });
+  });
+
+  it('a revert write that throws part-way is NOT a failed restore: the files are back, the run is simply unrun', async () => {
+    await withRealRepo(async (ctx) => {
+      // Two source files are reverted; the second revert write throws after the first has landed.
+      const SRC2 = 'scripts/x/guard2.mjs';
+      ctx.commit({ [SRC]: BUGGY, [SRC2]: 'old2\n', [TEST]: OLD_TEST }, 'base');
+      const base = ctx.head();
+      ctx.commit({ [SRC]: FIXED, [SRC2]: 'new2\n', [TEST]: NEW_TEST }, 'fix');
+      let reverts = 0;
+      const write = (p, text) => {
+        if (text === 'old2\n') { reverts += 1; throw Object.assign(new Error('EIO'), { code: 'EIO' }); }
+        realFs.writeFileSync(p, text);
+      };
+      const v = await runRevertRedCheck({ checkout: ctx.root, base, mode: 'warn', probe: createRevertProbe({ write, run: runner(ctx.root, []) }) });
+      expect(reverts).toBe(1);
+      expect(v).toMatchObject({ status: 'unproven', reason: 'reverted-run-unrun' });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED); // the first revert landed, then was put back
+      expect(ctx.git(['status', '--porcelain']).trim()).toBe('');
+      expect(existsSync(join(ctx.git(['rev-parse', '--absolute-git-dir']).trim(), REVERT_JOURNAL))).toBe(false);
+    });
+  });
+
+  it('a probe that throws still reads the tree back: files intact is unrun, not not-restored', async () => {
+    await withFix(async (ctx) => {
+      const probe = async () => { throw new Error('probe blew up before touching anything'); };
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'reverted-run-unrun' });
+      expect(ctx.porcelain()).toBe('');
+    });
+  });
+
+  it('a probe that dies with the revert still on disk is put back from git right away, not left for the next verify', async () => {
+    await withFix(async (ctx) => {
+      const probe = async () => { writeFileSync(join(ctx.root, SRC), BUGGY); throw new Error('killed mid-run'); };
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'reverted-run-unrun' });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED);
+      expect(ctx.porcelain()).toBe('');
     });
   });
 
@@ -286,19 +357,84 @@ describe('parts', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('the reverted run carries its ceiling to the runner, and a run killed by it is unproven', () => {
+  // The ceiling rides INSIDE the admitted command (the shim), so it starts when the heavy pool grants the slot — never
+  // on the wrapper process, whose lifetime also covers the queue wait.
+  const ceilingOf = (args) => JSON.parse(args.at(-1)).ms;
+
+  it('the reverted run carries its ceiling inside the admitted command, never as a timeout on the wrapper', () => {
     const seen = [];
-    const run = (_f, _a, opts) => { seen.push(opts.timeout); throw Object.assign(new Error('ETIMEDOUT'), { signal: 'SIGTERM', stdout: ' RUN v1\n', stderr: '' }); };
-    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run, timeoutMs: 1234 })).toMatchObject({ ran: false, green: false });
-    expect(seen).toEqual([1234]);
-    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); return 'Test Files  1 passed (1)\n'; } }).ran).toBe(true);
+    const run = (_f, args, opts) => {
+      seen.push({ wrapperTimeout: opts.timeout, ceiling: ceilingOf(args) });
+      throw Object.assign(new Error('exit 124'), { status: 124, stdout: ' RUN v1\n', stderr: 'revert-red-timeout: run exceeded 1234ms and was killed\n' });
+    };
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run, timeoutMs: 1234 })).toMatchObject({ ran: false, green: false, timedOut: true });
+    expect(seen).toEqual([{ wrapperTimeout: undefined, ceiling: 1234 }]);
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, opts) => { expect(opts.timeout).toBeUndefined(); return 'Test Files  1 passed (1)\n'; } })).toMatchObject({ ran: true, timedOut: false });
+  });
+
+  it('the shim bounds only the command it wraps: it kills the whole process group when the ceiling passes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'revert-red-shim-'));
+    try {
+      const pidFile = join(dir, 'pid');
+      const payload = JSON.stringify({ argv: ['sh', '-c', `sleep 30 & echo $! > ${pidFile}; wait`], ms: 400 });
+      const started = Date.now();
+      let caught;
+      try { execFileSync(process.execPath, ['-e', BOUNDED_RUN_SHIM, payload], { encoding: 'utf8', stdio: 'pipe', timeout: 20_000 }); } catch (e) { caught = e; }
+      expect(Date.now() - started).toBeLessThan(15_000);
+      expect(caught?.status).toBe(124);
+      expect(String(caught?.stderr)).toContain('revert-red-timeout');
+      const grandchild = Number(readFileSync(pidFile, 'utf8'));
+      expect(() => process.kill(grandchild, 0)).toThrow(); // the grandchild is gone, not orphaned against a restored tree
+      // A command that finishes in time keeps its own exit code and output.
+      const ok = execFileSync(process.execPath, ['-e', BOUNDED_RUN_SHIM, JSON.stringify({ argv: [process.execPath, '-e', 'console.log("fine")'], ms: 20_000 })], { encoding: 'utf8' });
+      expect(ok.trim()).toBe('fine');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a failure list past the output buffer is said to be cut, and the marker text alone is not a timeout', () => {
+    const big = Object.assign(new Error('spawnSync ENOBUFS'), { code: 'ENOBUFS', stdout: 'Test Files  1 failed (1)\n Tests  9 failed (9)\n', stderr: ' FAIL  a.test.mjs > t1\n' });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw big; } })).toMatchObject({ ran: true, failuresTruncated: true });
+    let seenBuffer;
+    runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: (_f, _a, o) => { seenBuffer = o.maxBuffer; return 'Test Files  1 passed (1)\n'; } });
+    expect(seenBuffer).toBeGreaterThan(1024 * 1024);
+    // A failing assertion that merely PRINTS the marker, exiting 1, is a red run, not a hung one.
+    const spoof = Object.assign(new Error('x'), { status: 1, stdout: 'Test Files  1 failed (1)\n Tests  1 failed (1)\n', stderr: ' FAIL  a.test.mjs > revert-red-timeout: run exceeded\n' });
+    expect(runSuite({ cwd: '.', suite: ['./a.test.mjs'], run: () => { throw spoof; }, timeoutMs: 1000 })).toMatchObject({ ran: true, timedOut: false });
+  });
+
+  it('a journal is trusted as live for as long as two QUEUED runs can take, not just two run ceilings', () => {
+    expect(REVERT_MAX_AGE_MS).toBeGreaterThan(2 * 120 * 60 * 1000);
+  });
+
+  it('a timed-out run is its own reason, not a generic unrun (baseline and reverted run)', async () => {
+    await withFix(async (ctx) => {
+      const timedOut = () => { throw Object.assign(new Error('exit 124'), { status: 124, stdout: '', stderr: 'revert-red-timeout: run exceeded 1ms and was killed\n' }); };
+      const baseline = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'enforce', probe: createRevertProbe({ run: timedOut, timeoutMs: 1 }) });
+      expect(baseline).toMatchObject({ status: 'unproven', reason: 'baseline-timeout', blocking: true });
+      let calls = 0;
+      const second = () => { calls += 1; if (calls === 1) return 'Test Files  1 passed (1)\n'; return timedOut(); };
+      const reverted = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'enforce', probe: createRevertProbe({ run: second, timeoutMs: 1 }) });
+      expect(reverted).toMatchObject({ status: 'unproven', reason: 'reverted-run-timeout', blocking: true });
+      expect(ctx.porcelain()).toBe('');
+    });
   });
 
   it('the revert probe bounds BOTH of its runs with a 10-minute ceiling by default', () => {
     const seen = [];
-    const probe = createRevertProbe({ read: () => 'fixed', write: () => {}, run: (_f, _a, opts) => { seen.push(opts.timeout); return 'Test Files  1 passed (1)\n'; } });
+    const probe = createRevertProbe({ read: () => 'fixed', write: () => {}, run: (_f, args) => { seen.push(ceilingOf(args)); return 'Test Files  1 passed (1)\n'; } });
     probe({ cwd: '.', targets: [{ target: 'a.mjs', fixed: 'fixed', revert: 'old' }], suite: ['./a.test.mjs'] });
     expect(seen).toEqual([600000, 600000]);
+  });
+
+  it('the single-file mutation probe also refuses to write over an edit made during its baseline run', () => {
+    const files = new Map([['/w/a.mjs', 'const a = 1;\n']]);
+    let calls = 0;
+    const run = () => { calls += 1; if (calls === 1) files.set('/w/a.mjs', 'const a = 1; // edited meanwhile\n'); return 'Test Files  1 passed (1)\n'; };
+    const probe = createMutationProbe({ read: (p) => files.get(p), write: (p, s) => files.set(p, s), run });
+    const r = probe({ cwd: '/w', target: 'a.mjs', find: 'const a = 1;', replace: 'const a = 2;', suite: './a.test.mjs' });
+    expect(r).toMatchObject({ applied: false, restored: true });
+    expect(files.get('/w/a.mjs')).toBe('const a = 1; // edited meanwhile\n');
+    expect(calls).toBe(1);
   });
 
   it('runSuite runs several files in one call and says when the failure list was cut', () => {
