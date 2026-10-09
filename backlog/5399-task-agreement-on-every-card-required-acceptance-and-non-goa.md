@@ -174,7 +174,7 @@ Screen: clear — whether a diff with a regression can land once it meets the li
 
 | slice | size | touch-set | blocked by |
 |---|---|---|---|
-| S1 — reader module + `## Non-goals` skeleton section (skeleton stays on `## Done when` until S7) + setting (in build 2026-10-08) | 3 | `we:scripts/backlog/task-agreement.mjs`, `we:scripts/backlog/scaffold.mjs`, `we:scripts/lib/task-agreement-policy.json`, `we:scripts/backlog/__tests__/` | — |
+| S1 — reader module, skeleton `## Non-goals` section and setting: **built on `main`** (e0da013e4, PR 4484, card xj67z1d). What stays open as #xdeqs8k: switch the reader's draft marker from the HTML comment `<!-- agreement: draft -->` to the visible line `Draft: model-written, not yet confirmed.` | 2 | `we:scripts/backlog/task-agreement.mjs`, `we:scripts/backlog/__tests__/task-agreement.test.mjs` | — |
 | S2 — one-off refresh of open stories (Fork 1 ruling) | 5 | a new refresh runner under `we:scripts/backlog/` with its test, then the open `backlog/*.md` stories it rewrites, about 50 cards per PR | S1, S7 |
 | S3 — file-item warns | 2 | `we:scripts/operations/file-item.mjs`, `we:scripts/operations/scaffold.mjs`, `we:skills-src/file-item/SKILL.md`, `we:scripts/operations/__tests__/` | S1 |
 | S4 — prepare + dispatch gate | 5 | `we:scripts/conveyor/prepare-result.mjs`, `we:scripts/readiness/dispatch-plan.mjs`, `we:scripts/backlog.mjs`, `we:skills-src/conveyor/prepare-item-agent-brief.md`, `we:scripts/readiness/__tests__/` | S1, S7 |
@@ -192,13 +192,15 @@ Screen: clear — whether a diff with a regression can land once it meets the li
 - About 50 cards per PR, each PR through `open-pr` and the normal review.
 - S2 waits for S7, so a card that switches to `## Acceptance` does not lose the provenance escape or the Must-cite check.
 
-**Filed 2026-10-08:** S1 #xdeqs8k (3), S2 #xbb6fgj (5, blocked by S1 and S7), S3 #xk8lm2t (2), S4 #xphujml (5, blocked by S1 and S7), S5 #x6f9vwo (5), S6 #xdg7er2 (3), S7 #x251p1l (3); S3–S7 are each blocked by S1.
+**Already on `main` when this card was reviewed:** the S1 reader, the numbered format and the setting (e0da013e4), and the S7 reader move with the skeleton switch to `## Acceptance` (cecdc6a92). The landed reader uses an HTML-comment draft marker, which this epic rejects; #xdeqs8k is now only that correction, and S2 and S4 wait on it.
+
+**Filed 2026-10-08:** S1 #xdeqs8k (now 2: the marker correction only), S2 #xbb6fgj (5, blocked by S1 and S7), S3 #xk8lm2t (2), S4 #xphujml (5, blocked by S1 and S7), S5 #x6f9vwo (5), S6 #xdg7er2 (3), S7 #x251p1l (3); S3–S7 are each blocked by S1.
 
 S4 also waits for S7: the prepare brief writes `## Acceptance`, so the readers that still key on `## Done when` must move first or prepared cards would lose the Must-cite, TODO-placeholder and provenance checks. S3, S5, S6 and S7 have disjoint touch-sets and can run in parallel after S1; S4 follows S7. The setting flip from `advise` to `enforce` is a one-line config change after S4, on the trigger above.
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reads `## Acceptance` and its legacy alias `## Done when`, reads `## Non-goals`, returns each `[A#]`/`[N#]` id with its line, drops TODO lines, treats `n/a: <why>` as answered, and reports a draft marker (fails before S1: the module does not exist).
+- [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reads `## Acceptance` and its legacy alias `## Done when`, reads `## Non-goals`, returns each `[A#]`/`[N#]` id with its line, drops TODO lines, treats `n/a: <why>` as answered, and reports a draft marker, which is the visible line `Draft: model-written, not yet confirmed.`, never an HTML comment (the module landed in e0da013e4; the visible-line marker fails before #xdeqs8k).
 - [A2] **Executable** — a `dispatch-plan` test holds a stamped story with no `## Non-goals`, or with a draft-marked section, as `needs-task-agreement` under `enforce`, and dispatches it under `advise`.
 - [A3] **Executable** — a `review-pr` mandate test shows a PR whose card has `[A#]` lines carries those lines, with their ids, inside the correctness juror's fenced goal block and not in any other lens's; a PR with no resolvable card keeps the title-only goal.
 - [A4] **Executable** — a `citation-check` test shows an unresolved path under `## Acceptance` gets the same provenance escape as one under `## Done when` (S7).

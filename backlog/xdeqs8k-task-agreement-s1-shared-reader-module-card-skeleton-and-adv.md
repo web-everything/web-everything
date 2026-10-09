@@ -1,31 +1,39 @@
 ---
 kind: story
-size: 3
+size: 2
 parent: "5399"
 status: open
-scope: ["we:scripts/backlog/task-agreement.mjs", "we:scripts/backlog/scaffold.mjs", "we:scripts/lib/task-agreement-policy.json", "we:scripts/backlog/__tests__/task-agreement.test.mjs", "we:scripts/backlog/__tests__/scaffold.test.mjs"]
+scope: ["we:scripts/backlog/task-agreement.mjs", "we:scripts/backlog/__tests__/task-agreement.test.mjs"]
 dateOpened: "2026-10-08"
 tags: []
 ---
 
-# Task agreement S1: shared reader module, card skeleton and advise/enforce setting
+# Task agreement S1 follow-up: the landed reader's draft marker becomes a visible line, not an HTML comment
 
-Slice S1 of #5399 (ruled 2026-10-08, Fork 3): one pure reader, `readTaskAgreement`, for `## Acceptance` (legacy alias `## Done when`) and `## Non-goals`; the card skeleton gains a `## Non-goals` section next to the existing `## Done when`; and the advise/enforce setting. The skeleton keeps emitting `## Done when` until S7 moves the hard-coded readers, so a card filed between S1 and S7 never loses the provenance escape, the Must-cite check or the TODO-placeholder guard. Ruled by the operator on 2026-10-08 (see `## Ruling` on #5399).
+What is left of slice S1 of #5399 (ruled 2026-10-08, Fork 3). The rest of S1 is already built on `main`: commit e0da013e4 (PR 4484, card xj67z1d) landed `readTaskAgreement`, the `## Acceptance` / legacy `## Done when` / `## Non-goals` reading, the numbered `[A#]` / `[N#]` ids, the fail-closed problems list and the setting file `we:scripts/lib/task-agreement-policy.json`; commit cecdc6a92 (S7) moved the other readers onto it and switched the card skeleton to `## Acceptance` plus `## Non-goals`. This card does not rebuild any of that.
+
+One thing landed wrong. The reader's draft marker is the HTML comment `<!-- agreement: draft -->` (`AGREEMENT_DRAFT_MARKER`), but the epic and S2, S3, S4 all rule the marker is a visible line, `Draft: model-written, not yet confirmed.`, as the first non-blank line under the heading. `prepareCardStatus` strips `<!--…-->` comments before it reads sections, so a comment marker is invisible to the S4 gate and fails open: a draft section would read as agreed. This card moves the marker to the visible line. S2 (the refresh writes the line) and S4 (the gate holds a draft) both depend on it.
+
+Measured on `main` @ e0da013e4 (the reader copied out of that tree and run on a card with the ruled marker):
+
+```
+visible line (ruled format) draft = false
+comment marker, direct read draft = true
+comment marker after comment stripping (prepareCardStatus path) draft = false
+```
 
 ## Acceptance
 
-- [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reads `## Acceptance` and its legacy alias `## Done when`, reads `## Non-goals`, returns each `[A#]`/`[N#]` id with its line, drops TODO lines, treats `n/a: <why>` as answered, and reports a draft marker (fails before: the module does not exist). The draft marker is the visible line `Draft: model-written, not yet confirmed.` as the first non-blank line under the heading, never an HTML comment; the same test also passes a full card (frontmatter and HTML comments included) through the real `prepareCardStatus` comment-stripping path and asserts the draft flag is still reported, and that a card marked with an HTML-comment marker is NOT read as draft-marked (so the format cannot drift back to a comment unnoticed).
-- [A2] **Executable** — a scaffold test shows a new story body still carries its `## Done when` TODO line and now also carries `## Non-goals` with an `[N1]` TODO line, and no `## Acceptance` (the heading switch is S7's).
-- [A5] **Executable** — a scaffold test passes a newly scaffolded story body through the existing TODO-placeholder guard and the Must-cite check and shows both still see its `## Done when` section (the TODO line is still flagged; a Must is still cited by number), so the S1-to-S7 window loses no check.
-- [A3] **Observable** — `we:scripts/lib/task-agreement-policy.json` holds `taskAgreementPolicy: "advise"`, and its validator rejects any value outside `off | advise | enforce`.
-- [A4] **Executable** — the same test file shows an unparseable section (a malformed id, an unclosed fence, a heading with no body) reads as empty and not agreed, never as agreed.
+- [A1] **Executable** — `node --test we:scripts/backlog/__tests__/task-agreement.test.mjs` passes: `readTaskAgreement` reports `draft: true` when the visible line `Draft: model-written, not yet confirmed.` is the first non-blank line under `## Acceptance` or under `## Non-goals`, and that line is not counted as an item (fails before: the reader only knows the comment, so the visible line reads `draft: false`).
+- [A2] **Executable** — the same test file passes a full card (frontmatter and HTML comments included) through the real `prepareCardStatus` comment-stripping path and asserts the draft flag is still reported, and asserts a card marked with the old `<!-- agreement: draft -->` comment is NOT read as draft, so the format cannot drift back to a comment unnoticed (fails before: the comment reads as draft on a direct read and disappears after stripping).
+- [A3] **Observable** — `AGREEMENT_DRAFT_MARKER` is the visible line, the test pins its exact text, and a `git grep "agreement: draft"` over `we:scripts/`, `we:docs/`, `we:skills-src/` and `we:backlog/` finds only the A2 negative case.
 
 ## Non-goals
 
-- [N1] Any gate or warning that reads the setting (S3, S4).
-- [N2] Moving the existing hard-coded `## Done when` readers to the new module (S7).
-- [N3] Rewriting existing cards (S2).
-- [N4] Switching the scaffold's acceptance heading from `## Done when` to `## Acceptance`. It waits for S7, which moves the readers that key on the old heading.
+- [N1] Rebuilding the reader, the skeleton or the setting file, which are on `main` (e0da013e4, cecdc6a92).
+- [N2] Changing the setting's shape (`mode`, `advise | enforce`) or any gate that reads it (S3, S4).
+- [N3] Writing the marker into any card (S2) or confirming a draft section (S4).
+- [N4] Moving the other `## Done when` readers (done by S7 on `main`).
 
 ## Edge cases this change must handle
 
@@ -34,7 +42,7 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — n/a: the reader parses card text into data and never executes it.
 2. **Truncated reads** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
 3. **Shared state files** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
-4. **Fail closed** — an unparseable section reads as empty (not agreed), never as agreed.
+4. **Fail closed** — the marker survives comment stripping (A2), so a draft section never reads as agreed on the gate's read path. A marker line inside a code fence or above the heading is still not read as the section's marker, as `main` already tests.
 5. **Identity scoping** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
-6. **State over time** — the window between S1 and S7: the skeleton keeps `## Done when` (A2) and A5 proves the existing guards still see it, so a card filed in the window loses no check.
+6. **State over time** — no card carries the old comment marker: nothing writes it before S2, and A3 checks the backlog for it. Dropping it therefore turns no draft section into an agreed one.
 7. **Who wrote it** — n/a: this slice opens no new case of this class; its inputs are committed card text and code.
