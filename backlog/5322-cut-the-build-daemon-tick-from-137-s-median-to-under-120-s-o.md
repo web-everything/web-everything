@@ -2,6 +2,7 @@
 bornAs: xwn53th
 kind: story
 size: 3
+priority: high
 status: open
 scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/lane-pool.mjs"]
 dateOpened: "2026-10-07"
