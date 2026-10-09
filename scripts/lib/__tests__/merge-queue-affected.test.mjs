@@ -7,7 +7,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { decideAffected, readAffectedFacts, isGateFile, DEFAULT_RETEST_MODE } from '../merge-queue-affected.mjs';
+import { decideAffected, readAffectedFacts, isGateFile, DEFAULT_RETEST_MODE, MAX_GRAPH_FILES, MAX_CLOSURE_FILES } from '../merge-queue-affected.mjs';
 import { resolvedImportsOf } from '../related-test-selection.mjs';
 import {
   loadMergeQueueSettings, decideMergeQueueAction, readRetestFacts, classifyMergeQueueSkip, MERGE_QUEUE_RETEST_MODE_ENV,
@@ -44,6 +44,7 @@ describe('decideAffected (pure)', () => {
   });
   it.each([
     'scripts/merge-ai-prs.mjs', 'scripts/lib/merge-queue-hook.mjs', 'scripts/lib/merge-freshness.mjs', '.github/workflows/ci.yml',
+    'scripts/settings/merge-queue.json', 'scripts/settings/anything-else.json',
     'package.json', 'package-lock.json', 'vitest.config.ts', 'tsconfig.json', 'scripts/__tests__/fixtures/shared-git-fixture.mjs', 'scripts/ci/shard-assign.mjs',
   ])('the gate itself (%s) on EITHER side always re-tests', (gate) => {
     expect(isGateFile(gate)).toBe(true);
@@ -58,11 +59,56 @@ describe('decideAffected (pure)', () => {
   });
 });
 
+/** A fake import graph: `{ pr: {file: [imports]}, main: {...} }`; a file absent from a side imports nothing there. */
+const graph = (g) => (side, f) => g[side]?.[f] ?? [];
+
+describe('decideAffected — transitive reachability (review round 1: the unchanged middle module)', () => {
+  it('transitive main dependency forces refresh: PR file A → unchanged B → main-changed C', () => {
+    const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/c.mjs'], importsOf: graph({ pr: { 'scripts/a.mjs': ['scripts/b.mjs'], 'scripts/b.mjs': ['scripts/c.mjs'] } }) });
+    expect(r).toMatchObject({ affected: true, reasons: ['pr-file-imports-main-file:scripts/a.mjs->scripts/b.mjs->scripts/c.mjs'] });
+  });
+  it('transitive PR dependency forces refresh: main-changed C → unchanged B → PR file A (read at the main tip)', () => {
+    const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/c.mjs'], importsOf: graph({ main: { 'scripts/c.mjs': ['scripts/b.mjs'], 'scripts/b.mjs': ['scripts/a.mjs'] } }) });
+    expect(r).toMatchObject({ affected: true, reasons: ['main-file-imports-pr-file:scripts/c.mjs->scripts/b.mjs->scripts/a.mjs'] });
+  });
+  it('a long chain (4 hops) is still followed', () => {
+    const chain = { 'scripts/a.mjs': ['scripts/b.mjs'], 'scripts/b.mjs': ['scripts/c.mjs'], 'scripts/c.mjs': ['scripts/d.mjs'], 'scripts/d.mjs': ['scripts/z.mjs'] };
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], importsOf: graph({ pr: chain }) }).affected).toBe(true);
+  });
+  it('an import cycle terminates, and a closure that never meets the other side is not affected', () => {
+    const cyc = { 'scripts/a.mjs': ['scripts/b.mjs'], 'scripts/b.mjs': ['scripts/a.mjs', 'scripts/c.mjs'], 'scripts/c.mjs': ['scripts/b.mjs'] };
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], importsOf: graph({ pr: cyc, main: cyc }) })).toMatchObject({ affected: false, reasons: ['main-delta-unaffected'] });
+  });
+  it('the intermediate file is read on the right side: the PR side at the PR head, the main side at the tip', () => {
+    // B imports C only at the main tip (main added the edge): the PR head's closure does not see it, the main closure from C does not reach A.
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/b2.mjs'], importsOf: graph({ pr: { 'scripts/a.mjs': ['scripts/b.mjs'] }, main: { 'scripts/b.mjs': ['scripts/b2.mjs'] } }) }).affected).toBe(false);
+  });
+  it('a closure larger than MAX_CLOSURE_FILES fails closed', () => {
+    const wide = { 'scripts/a.mjs': Array.from({ length: MAX_CLOSURE_FILES + 5 }, (_, i) => `scripts/lib/dep${i}.mjs`) };
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], importsOf: graph({ pr: wide }) }).reasons).toEqual(['closure-too-large:pr']);
+  });
+  it('an unreadable import list on the PR side (even mid-chain) fails closed', () => {
+    const importsOf = (side, f) => (f === 'scripts/b.mjs' ? null : side === 'pr' && f === 'scripts/a.mjs' ? ['scripts/b.mjs'] : []);
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], importsOf }).reasons).toEqual(['imports-unreadable:pr:scripts/b.mjs']);
+  });
+  it('too many changed files on either side fails closed, without walking', () => {
+    const many = Array.from({ length: MAX_GRAPH_FILES + 1 }, (_, i) => `scripts/lib/f${i}.mjs`);
+    const boom = () => { throw new Error('no walk expected'); };
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: many, importsOf: boom }).reasons).toEqual(['too-many-files']);
+    expect(decideAffected({ prFiles: many, mainFiles: ['scripts/z.mjs'], importsOf: boom }).reasons).toEqual(['too-many-files']);
+  });
+});
+
 describe('resolvedImportsOf (the shared import parser, forward direction)', () => {
   it('resolves relative imports against the file set, ignores bare specifiers', () => {
     const files = new Set(['scripts/lib/a.mjs', 'scripts/lib/b.mjs', 'scripts/c.mjs']);
     const text = "import x from './b.mjs';\nimport y from '../c.mjs';\nimport 'node:fs';\nawait import('./missing.mjs');";
     expect(resolvedImportsOf('scripts/lib/a.mjs', text, files).sort()).toEqual(['scripts/c.mjs', 'scripts/lib/b.mjs']);
+  });
+  it('resolves a template-literal dynamic import by its static prefix (cache-busting `?v=${n}` loads)', () => {
+    const files = new Set(['scripts/lib/a.mjs', 'scripts/pr-land.mjs']);
+    expect(resolvedImportsOf('scripts/lib/a.mjs', 'await import(`../pr-land.mjs?fresh=${++n}`);', files)).toEqual(['scripts/pr-land.mjs']);
+    expect(resolvedImportsOf('scripts/lib/a.mjs', 'await import(`../pr-land.mjs`);', files)).toEqual(['scripts/pr-land.mjs']);
   });
 });
 
@@ -81,7 +127,7 @@ function fakeGit(trees, { fetchable = true } = {}) {
     }
     if (cmd === 'fetch') { if (fetchable) for (const s of Object.keys(trees)) present.add(s); return ''; }
     if (cmd === 'ls-tree') return Object.keys(trees[args[3]]).join('\n');
-    if (cmd === 'show') { const [sha, path] = args[1].split(/:(.*)/s); if (!(path in (trees[sha] ?? {}))) throw new Error('no path'); return trees[sha][path]; }
+    if (cmd === 'show') { const [sha, path] = args[1].split(/:(.*)/s); if (!(path in (trees[sha] ?? {}))) throw new Error(`fatal: path '${path}' does not exist in '${sha}'`); return trees[sha][path]; }
     throw new Error(`unexpected git ${args.join(' ')}`);
   };
   return { git, calls };
@@ -115,6 +161,77 @@ describe('readAffectedFacts (IO, injected git)', () => {
     const { git } = fakeGit({ [HEAD]: {}, [TIP]: {} }, { fetchable: false });
     const g = (args) => { if (args[0] === 'cat-file') throw new Error('missing'); return git(args); };
     expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git: g }).reasons[0]).toMatch(/^commits-unavailable:/);
+  });
+  it('transitive through git: PR file → unchanged middle module → file main changed → affected', () => {
+    const { git } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': "import './mid.mjs';", 'scripts/mid.mjs': "import './c.mjs';", 'scripts/c.mjs': '' },
+      [TIP]: { 'scripts/a.mjs': '', 'scripts/mid.mjs': "import './c.mjs';", 'scripts/c.mjs': 'export const x = 2;' },
+    });
+    const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/c.mjs'], git });
+    expect(r).toMatchObject({ affected: true, reasons: ['pr-file-imports-main-file:scripts/a.mjs->scripts/mid.mjs->scripts/c.mjs'] });
+  });
+  it('transitive through git, the other way: main file → unchanged middle module → PR file → affected', () => {
+    const { git } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': '', 'scripts/mid.mjs': "import './a.mjs';", 'scripts/c.mjs': '' },
+      [TIP]: { 'scripts/a.mjs': '', 'scripts/mid.mjs': "import './a.mjs';", 'scripts/c.mjs': "import './mid.mjs';" },
+    });
+    const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/c.mjs'], git });
+    expect(r.reasons).toEqual(['main-file-imports-pr-file:scripts/c.mjs->scripts/mid.mjs->scripts/a.mjs']);
+  });
+  it('a shared module reached by several paths is read once per side', () => {
+    const { git, calls } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': "import './m1.mjs'; import './m2.mjs';", 'scripts/m1.mjs': "import './shared.mjs';", 'scripts/m2.mjs': "import './shared.mjs';", 'scripts/shared.mjs': '' },
+      [TIP]: { 'scripts/a.mjs': '', 'scripts/m1.mjs': '', 'scripts/m2.mjs': '', 'scripts/shared.mjs': '', 'scripts/z.mjs': '' },
+    });
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git }).affected).toBe(false);
+    expect(calls.filter((c) => c === `show ${HEAD}:scripts/shared.mjs`)).toHaveLength(1);
+  });
+  it('the PR side cannot read an import list (path exists but will not show) → imports-unreadable:pr, affected', () => {
+    const { git } = fakeGit({ [HEAD]: { 'scripts/a.mjs': '' }, [TIP]: { 'scripts/a.mjs': '', 'scripts/z.mjs': '' } });
+    const g = (args) => { if (args[0] === 'show' && args[1] === `${HEAD}:scripts/a.mjs`) throw new Error('corrupt object'); return git(args); };
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git: g }).reasons)
+      .toEqual(['imports-unreadable:pr:scripts/a.mjs']);
+  });
+  it('a transient git failure reading an intermediate (not git\'s "no such path") fails closed, never "imports nothing"', () => {
+    const { git } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': "import './mid.mjs';", 'scripts/mid.mjs': "import './c.mjs';", 'scripts/c.mjs': '' },
+      [TIP]: { 'scripts/a.mjs': '', 'scripts/mid.mjs': '', 'scripts/c.mjs': '', 'scripts/z.mjs': '' },
+    });
+    // both `show` and any follow-up probe fail with a non-"absent" error (EAGAIN-style)
+    const g = (args) => { if (args[0] === 'show' && args[1] === `${HEAD}:scripts/mid.mjs`) throw new Error('spawnSync git EAGAIN'); return git(args); };
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git: g }).reasons)
+      .toEqual(['imports-unreadable:pr:scripts/mid.mjs']);
+  });
+  it('a closure walk past the wall-clock budget fails closed (graph-budget-exceeded)', () => {
+    const { git } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': "import './m.mjs';", 'scripts/m.mjs': '' },
+      [TIP]: { 'scripts/a.mjs': '', 'scripts/m.mjs': '', 'scripts/z.mjs': '' },
+    });
+    const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git, budgetMs: -1 });
+    expect(r).toMatchObject({ affected: true });
+    expect(r.reasons).toEqual(['graph-read-failed:graph-budget-exceeded']);
+  });
+  it('a PR file that imports a docs/ file main changed is coupled (non-code skips roots, not targets)', () => {
+    const importsOf = (side, f) => (side === 'pr' && f === 'scripts/a.mjs' ? ['docs/data.json'] : []);
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['docs/data.json', 'scripts/z.mjs'], importsOf }).reasons)
+      .toEqual(['pr-file-imports-main-file:scripts/a.mjs->docs/data.json']);
+  });
+  it('missing shas fail closed without any git IO (shas-unknown)', () => {
+    const git = () => { throw new Error('no IO expected'); };
+    expect(readAffectedFacts({ headSha: '', tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git }).reasons).toEqual(['shas-unknown']);
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: undefined, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git }).reasons).toEqual(['shas-unknown']);
+  });
+  it('a git failure while reading the tree fails closed (graph-read-failed), never unaffected', () => {
+    const { git } = fakeGit({ [HEAD]: { 'scripts/a.mjs': '' }, [TIP]: { 'scripts/a.mjs': '', 'scripts/z.mjs': '' } });
+    const g = (args) => { if (args[0] === 'ls-tree') throw new Error('fatal: bad tree object\nsecond line'); return git(args); };
+    const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], git: g });
+    expect(r).toMatchObject({ affected: true });
+    expect(r.reasons).toEqual(['graph-read-failed:fatal: bad tree object']);
+  });
+  it('too many changed files fails closed before any git IO (too-many-files)', () => {
+    const git = () => { throw new Error('no IO expected'); };
+    const many = Array.from({ length: MAX_GRAPH_FILES + 1 }, (_, i) => `scripts/lib/f${i}.mjs`);
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: many, mainFiles: ['scripts/z.mjs'], git }).reasons).toEqual(['too-many-files']);
   });
   it('no git IO at all when main gained no code or the gate is touched', () => {
     const git = () => { throw new Error('no IO expected'); };

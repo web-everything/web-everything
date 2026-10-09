@@ -25,7 +25,7 @@
 
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
-const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]/g;
+const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
@@ -76,7 +76,8 @@ export function resolveSpecifier(fromFile, spec, fileSet) {
 export function resolvedImportsOf(fromFile, text, fileSet) {
   const out = new Set();
   for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
-    const target = resolveSpecifier(fromFile, m[1] ?? m[2] ?? m[3] ?? m[4], fileSet);
+    // m[5]: a template-literal dynamic import (`import(\`../x.mjs?v=${n}\`)`): the static prefix up to `${` is the path.
+    const target = resolveSpecifier(fromFile, m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5], fileSet);
     if (target && target !== fromFile) out.add(target);
   }
   return [...out];
