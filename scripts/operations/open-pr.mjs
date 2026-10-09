@@ -34,6 +34,17 @@ import { DECLARED_HOMES } from './declared-homes.mjs';
 import { compute, effect } from './step-kinds.mjs';
 import { HOME_REASONS } from './pr-land-reasons.mjs';
 
+/**
+ * card xiqtf7w — the ONE way a PR says it replaces another open PR. A PR that folds in another open PR's fix must
+ * carry a line of its own reading `Supersedes: #N` (several: `Supersedes: #N, #M`). The fix daemon's supersede watch
+ * (`we:scripts/conveyor/supersede-watch.mjs`) reads exactly that line once this PR MERGES and stands the old PR
+ * down, so no fixer is spent on it (live: #4532 merged with `### Supersedes #4522`, and `fix-4522` still launched).
+ * Prose like "#4522 is superseded by this PR" is not read. This module imports nothing external (its own
+ * import-graph test), so the line is checked where it is read — `supersede-rule.mjs#parseSupersedes` — not here.
+ */
+export const SUPERSEDES_LINE_GUIDANCE = 'A PR that folds in another open PR\'s fix must carry its own line `Supersedes: #N` '
+  + '(the fix daemon stands #N down once this PR merges; prose such as "is superseded by this PR" is not read).';
+
 export const OPEN_PR_OP = 'open-pr';
 
 /** The one effect: hand the planned argv to the home. */
@@ -113,7 +124,7 @@ export function planOpen({ ref, base, title, bodyFile, mode, parkLabel, sha = ''
   // operation stricter than the home for the one call that touches nothing — which is why `pr/SKILL.md`'s
   // rehearsal step could not name it.
   if (!dryRun && (typeof bodyFile !== 'string' || !bodyFile.trim())) {
-    problems.push('`bodyFile` must name a file holding a non-empty body — the drain gate rejects a bodyless PR at land, which stalls the queue (not required with `dryRun`, which opens nothing)');
+    problems.push('`bodyFile` must name a file holding a non-empty body — the drain gate rejects a bodyless PR at land, which stalls the queue (not required with `dryRun`, which opens nothing). ' + SUPERSEDES_LINE_GUIDANCE);
   }
   if (!OPEN_MODES.includes(mode)) problems.push(`\`mode\` must be one of ${OPEN_MODES.join('|')}`);
   if (mode === 'park' && !parkLabel) problems.push('`parkLabel` is required in `park` mode — that is what parking means');
@@ -221,7 +232,8 @@ export function openPrOperation({ parkLabels, deriveRef = () => '' } = {}) {
       // Optional — see `planOpen`. Empty means "the home derives it from the commit subject".
       title: { type: 'string', required: false, default: '' },
       // A PATH, not the body: a PR body is multi-line prose and an argv-borne one gets mangled, which is why
-      // the home prefers `--body-file` too (#2170).
+      // the home prefers `--body-file` too (#2170). A PR that replaces another open PR carries a `Supersedes: #N`
+      // line in this body ({@link SUPERSEDES_LINE_GUIDANCE}).
       // OPTIONAL IN THE SCHEMA, ENFORCED IN `planOpen` — and the split is deliberate rather than sloppy. The
       // requirement is CONDITIONAL (#x6ry8mf: a `dryRun` opens nothing, so it needs no body), and the input
       // schema has no way to say "required unless another field is set". Leaving it `required: true` here

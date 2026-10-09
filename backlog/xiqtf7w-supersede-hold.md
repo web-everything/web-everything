@@ -15,24 +15,22 @@ Live 2026-10-09: #4532 (merged) says 'Supersedes #4522', yet the fix daemon laun
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/conveyor/__tests__/supersede-rule.test.mjs we:scripts/conveyor/__tests__/supersede-watch.test.mjs we:scripts/conveyor/soak/breaks/superseded-pr-dispatched.soak.test.mjs` passes; the soak break is expected-fail on a tree without `we:scripts/conveyor/supersede-rule.mjs`.
+- [A2] **Live** — after the overlay loads on the fix daemon, #4522 carries a `superseded` stand-down + labels and its log shows `reconcile-refused stood-down … PR #4522`.
+- [A3] Must: a mid-sentence or lower-case mention, a fenced block, or an untrusted stand-down never counts; a still-open superseder never holds anything.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Never closes the superseded PR — closing on an author's claim is an operator decision (no sanctioned auto-close exists for this signal).
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the marker is read only from a MERGED PR's body (written by a repo author) and only as a whole line; a hold comment counts only from a trusted login.
+2. **Truncated reads** — `gh pr list` is capped at 200; a truncated merged list only misses older supersedes (newest first), never invents one.
+3. **Shared state files** — n/a: no local state file — the hold lives on the PR thread.
+4. **Fail closed** — setting missing/malformed/off = no hold; a failed read skips the repo this tick.
+5. **Identity scoping** — per repo; the `#N` is resolved inside the same repo as the merged PR.
+6. **State over time** — idempotent: an existing trusted supersede hold is read back from the thread; the operator answer ceremony resumes it (`we:scripts/conveyor/stand-down-answer.mjs`).
+7. **Who wrote it** — only automation/operator-authored stand-downs count (`isTrustedMarkerAuthor`).

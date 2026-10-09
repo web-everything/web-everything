@@ -278,3 +278,101 @@ it('#4545 malformed enrichment cannot prevent the original escalation', () => {
   expect(body).not.toContain('CANARY_SECRET_VALUE');
   expect(latestCiHealEscalationForHead([{ body, author: AUTOMATION }], HEAD)?.outcome).toBe('needs-human');
 });
+
+describe('not-a-ci-break verdict invalidation — live #4535', async () => {
+  const { vi } = await import('vitest');
+  const { CI_HEAL_VERDICT_VOID_MARKER, buildCiHealVerdictVoidComment, parseCiHealVerdictVoids,
+    notCiBreakRecordRefusal, checkNotCiBreakRecordable } = await import('../ci-heal-escalation-mark.mjs');
+  const { planVerdictVoid, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+  const fixture = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/ci-heal-verdict/pr4535-2026-10-09.json'), 'utf8'));
+  const head = fixture.headRefOid;
+  const settings = { recheckNotCiBreak: true };
+  const voidComment = (headSha = head) => ({ author: AUTOMATION, createdAt: '2026-10-09T05:00:00Z',
+    body: buildCiHealVerdictVoidComment({ headSha, red: ['test'] }) });
+  const latest = (comments, recheck = true) => latestCiHealEscalationForHead(comments, head, { recheck });
+  const escalation = latest(fixture.comments);
+  const asOf = fixture.statusCheckRollup.filter((r) => r.startedAt <= fixture.escalationAt)
+    .map((r) => r.completedAt > fixture.escalationAt ? { ...r, status: 'IN_PROGRESS', conclusion: null } : r);
+  const refusal = (overrides = {}) => notCiBreakRecordRefusal({ headSha: head, pr: fixture, requiredChecks: fixture.requiredChecks, ...overrides });
+
+  it('finds the real escalation and voids it only with rechecking enabled', () => {
+    expect(escalation).toMatchObject({ outcome: 'not-a-ci-break', headSha: head, createdAt: fixture.escalationAt });
+    const comments = [...fixture.comments, voidComment()];
+    expect(latest(comments)).toBeNull();
+    expect(latest(comments, false)).toEqual(escalation);
+  });
+  it('ignores untrusted voids', () => expect(latest([...fixture.comments, { ...voidComment(), author: { login: 'rando' } }])).toEqual(escalation));
+  it('ignores voids for another head', () => expect(latest([...fixture.comments, voidComment('abcdef0123456789')])).toEqual(escalation));
+  it('thread order prevents an earlier void from hiding a later escalation', () => expect(latest([voidComment(), ...fixture.comments])).toEqual(escalation));
+  it('a voided verdict does not hide a later needs-human escalation', () => {
+    const human = { author: AUTOMATION, body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human', reason: 'Needs judgment' }) };
+    expect(latest([...fixture.comments, voidComment(), human])).toMatchObject({ outcome: 'needs-human' });
+  });
+  it('a void never hides needs-human even when posted after it', () => {
+    const human = { author: AUTOMATION, body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) };
+    expect(latest([human, voidComment()])).toMatchObject({ outcome: 'needs-human' });
+  });
+  it('round-trips lowercase heads and check names without confusing marker types', () => {
+    const c = { author: AUTOMATION, body: buildCiHealVerdictVoidComment({ headSha: head.toUpperCase(), red: ['test', 'daemon-soak'] }) };
+    expect(c.body.startsWith(CI_HEAL_VERDICT_VOID_MARKER)).toBe(true);
+    expect(parseCiHealVerdictVoids([c])).toEqual([{ headSha: head, red: ['test', 'daemon-soak'], createdAt: null, index: 0 }]);
+    expect(parseCiHealVerdictVoids(fixture.comments)).toEqual([]);
+    expect(parseCiHealEscalations([c])).toEqual([]);
+  });
+  it('refuses the unfinished snapshot', () => expect(refusal({ pr: { ...fixture, statusCheckRollup: asOf } })).toContain('test'));
+  it('refuses the final red snapshot as a CI break', () => {
+    expect(refusal()).toContain('red: test');
+    expect(refusal()).toContain('IS a CI break');
+  });
+  it('accepts all required checks green', () => {
+    const statusCheckRollup = fixture.requiredChecks.map((name) => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS' }));
+    expect(refusal({ pr: { ...fixture, statusCheckRollup } })).toBeNull();
+  });
+  it('does not judge a different head or unknown required set', () => {
+    expect(refusal({ headSha: 'abcdef0123456789' })).toBeNull();
+    expect(refusal({ requiredChecks: [] })).toBeNull();
+  });
+
+  const recordOptions = () => ({ pr: 4535, repo: fixture.repo, headSha: head, outcome: 'not-a-ci-break', settings,
+    readPr: vi.fn(() => fixture), readRequired: vi.fn(async () => ({ checks: fixture.requiredChecks })) });
+  it.each([{ outcome: 'needs-human' }, { settings: { recheckNotCiBreak: false } }])('skips reads for %j', async (overrides) => {
+    const opts = { ...recordOptions(), ...overrides };
+    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: null });
+    expect(opts.readPr).not.toHaveBeenCalled();
+    expect(opts.readRequired).not.toHaveBeenCalled();
+  });
+  it('reports a read warning without refusing on missing evidence', async () => {
+    const opts = recordOptions();
+    opts.readPr.mockImplementation(() => { throw new Error('offline'); });
+    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: null, warning: expect.stringContaining('offline') });
+    expect(opts.readRequired).not.toHaveBeenCalled();
+  });
+  it('refuses with injected PR and asynchronous required-check readers', async () => {
+    const opts = recordOptions();
+    expect(await checkNotCiBreakRecordable(opts)).toEqual({ refusal: expect.stringContaining('red: test') });
+    expect(opts.readPr).toHaveBeenCalledWith({ pr: 4535, repo: fixture.repo });
+    expect(opts.readRequired).toHaveBeenCalledWith({ repo: fixture.repo });
+  });
+
+  const note = { kind: 'ci-heal-escalated', outcome: 'not-a-ci-break', headSha: head, prNumber: 4535 };
+  const planOptions = () => ({ note, pr: fixture, repo: fixture.repo, verdictSettings: settings,
+    readRequiredChecks: vi.fn(() => fixture.requiredChecks) });
+  it('plans a verdict void from the daemon note and deduplicates a trusted void', () => {
+    expect(planVerdictVoid(planOptions())).toMatchObject({ kind: 'ci-heal-verdict-void', alreadyPosted: false, body: voidComment().body });
+    expect(planVerdictVoid({ ...planOptions(), pr: { ...fixture, comments: [...fixture.comments, voidComment()] } })).toMatchObject({ alreadyPosted: true });
+  });
+  it('off avoids required-check reads', () => {
+    const opts = { ...planOptions(), verdictSettings: { recheckNotCiBreak: false } };
+    expect(planVerdictVoid(opts)).toBeNull();
+    expect(opts.readRequiredChecks).not.toHaveBeenCalled();
+  });
+  it.each([true, false])('notes daemon plans/posts the void with dryRun=%s', (dryRun) => {
+    const postComment = vi.fn(() => ({ ok: true }));
+    const result = runReconcileNotesAllRepos({ repos: [fixture.repo], verdictSettings: settings,
+      readRequiredChecks: () => fixture.requiredChecks, dryRun, postComment,
+      tick: () => ({ notes: [note], prsByNumber: new Map([[4535, fixture]]) }) });
+    expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', body: voidComment().body, posted: !dryRun, dryRun })]);
+    expect(postComment).toHaveBeenCalledTimes(dryRun ? 0 : 1);
+    if (!dryRun) expect(postComment).toHaveBeenCalledWith({ repo: fixture.repo, pr: 4535, body: voidComment().body });
+  });
+});

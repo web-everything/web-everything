@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { planSupersedeHolds, resolveSupersedeSettings, supersedeCandidates } from './supersede-rule.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const STAND_DOWN_CLI = join(HERE, 'stand-down.mjs');
@@ -28,11 +29,15 @@ const ghJson = (args, exec) => JSON.parse(String(exec('gh', args, {
   stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 64 * 1024 * 1024,
 }) || 'null'));
 
-/** Merged PRs (number, body, state, mergedAt) since `now - lookbackDays`. */
+/**
+ * Merged PRs (number, body, state, mergedAt) merged within `lookbackDays` of `now`. `gh pr list` returns the newest
+ * first; the window is applied here on `mergedAt` (a search qualifier would hide behind GitHub's search index).
+ */
 export function defaultReadMergedPrs({ repo, lookbackDays, now = Date.now(), exec = execFileSync }) {
-  const since = new Date(now - lookbackDays * 86_400_000).toISOString().slice(0, 10);
-  return ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'merged', '--search', `merged:>=${since}`,
-    '--limit', String(LIST_LIMIT), '--json', 'number,body,state,mergedAt'], exec) ?? [];
+  const since = now - lookbackDays * 86_400_000;
+  return (ghJson(['pr', 'list', '--repo', slugOf(repo), '--state', 'merged',
+    '--limit', String(LIST_LIMIT), '--json', 'number,body,state,mergedAt'], exec) ?? [])
+    .filter((p) => (Date.parse(p?.mergedAt ?? '') || 0) >= since);
 }
 
 /** Open PR numbers only (cheap); comments are read just for the candidates. */
@@ -41,9 +46,10 @@ export function defaultReadOpenNumbers({ repo, exec = execFileSync }) {
     .map((p) => p.number);
 }
 
-/** One candidate's state + comments, read fresh. */
-export function defaultReadPr({ repo, pr, exec = execFileSync }) {
-  return ghJson(['pr', 'view', String(pr), '--repo', slugOf(repo), '--json', 'number,state,comments,labels'], exec);
+/** One candidate's state, read fresh, with its COMPLETE comment thread (paginated — a hold past comment 100 still counts). */
+export function defaultReadPr({ repo, pr, exec = execFileSync, readComments = readCompletePrComments }) {
+  const view = ghJson(['pr', 'view', String(pr), '--repo', slugOf(repo), '--json', 'number,state,labels'], exec);
+  return { ...view, comments: readComments(pr, { repo: slugOf(repo) }) };
 }
 
 /** Post the hold through the stand-down CLI (comment + `review-status:stood-down` + `superseded` labels). */
