@@ -1,4 +1,4 @@
 {
-  "$comment": "Platform preference (card x5wnfcg cascade) for card xu7kxtt (#5472, ruling P4). acceptCarryForward on|off: on = when a PR's head moves (merge/rebase of main) and its net diff vs merge-base is byte-identical to the accepted head's (strict reviewed-diff), the accept — including the operator's clear-human — carries to the new head, recorded with both SHAs; anything else owes a review as today. off = today. Tool override env WE_ACCEPT_CARRY_FORWARD. See scripts/lib/accept-carry-forward.mjs.",
+  "$commentAcceptCarryForward": "Platform preference (card x5wnfcg cascade) for card xu7kxtt (#5472, ruling P4). acceptCarryForward on|off: on = when a PR's head moves (merge/rebase of main) and its net diff vs merge-base is byte-identical to the accepted head's (strict reviewed-diff), the accept — including the operator's clear-human — carries to the new head, recorded with both SHAs; anything else owes a review as today. off = today. Tool override env WE_ACCEPT_CARRY_FORWARD. See scripts/lib/accept-carry-forward.mjs.",
   "acceptCarryForward": "on"
 }
