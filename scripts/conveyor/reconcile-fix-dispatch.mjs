@@ -110,7 +110,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
-import { readStacksForPass, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
+import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -1377,12 +1377,15 @@ export function runReconcileFixDispatch({
     try {
       const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
       const data = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo',
-        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body'],
+        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body,isCrossRepository'],
       { cwd: root, encoding: 'utf8', timeout: 30e3 }));
       return { kind: 'fix', prNumber: data.number, headRefName: data.headRefName,
-        headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body };
+        headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body,
+        isCrossRepository: data.isCrossRepository !== false };
     } catch { return null; }
   } : null,
+  // Origin's lane/* tips, to verify an idle restack target at dispatch time (the push-capable step).
+  readLaneTips = readOriginLaneTips,
   resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
   // #xmtbdgs multi-repo slice 6 — the item-less diff read; UN-prefixed (see `planFixesFromReconcile`'s own
   // docblock for why this is a distinct binding from `resolveFallbackScope` above, which IS prefixed). #xcla4iv
@@ -1488,6 +1491,7 @@ export function runReconcileFixDispatch({
   const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
   const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
   let restackMemoryChanged = false;
+  let idleLaneTips;
   for (const { top } of planIdleRestacks(stacks, {
     planned: plannedAll, reconcileRefusals: reconciled.refusals, fixClaims: claims,
     settings: prStackSettings, used: restackedHeads,
@@ -1495,6 +1499,10 @@ export function runReconcileFixDispatch({
     let synthetic;
     try { synthetic = readPrForRestack?.(top); } catch { continue; }
     if (!synthetic) continue;
+    // The agent pushes to this branch: only a same-repo PR whose head is the tip of its origin lane/* branch qualifies.
+    if (synthetic.isCrossRepository !== false || !/^lane\//.test(synthetic.headRefName ?? '')) continue;
+    idleLaneTips ??= readLaneTips(root);
+    if (!idleLaneTips || idleLaneTips.get(synthetic.headRefName) !== synthetic.headRefOid) continue;
     const idle = planFixesFromReconcile([synthetic], findItemFn, loadItems, resolveFallbackScope,
       repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
     planRefusals.push(...idle.refusals);

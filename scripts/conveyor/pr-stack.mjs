@@ -9,7 +9,6 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
-import { readPrHeads } from './net-scope.mjs';
 
 export const PR_STACK_DEFAULTS = Object.freeze({ detect: true, bottomFirst: true, restack: true, restackMaxRounds: 3 });
 export const PR_STACK_ENV = Object.freeze({ detect: 'WE_PR_STACK_DETECT', bottomFirst: 'WE_PR_STACK_BOTTOM_FIRST', restack: 'WE_PR_STACK_RESTACK', restackMaxRounds: 'WE_PR_STACK_RESTACK_MAX_ROUNDS' });
@@ -38,27 +37,48 @@ export function resolvePrStackSettings(env = process.env, { read = readSettings 
 export function detectStacks(prs, { isAncestor, onMain = () => false, remembered = [] }) {
   const open = new Map(prs.map(p => [p.pr, p]));
   const pairs = new Map();
+  // The round count is per bottom head: a bottom that moved starts a fresh count, so the cap never outlives the head it bounded.
   const pair = (top, bottom, old) => ({
-    restackedFor: old?.restackedFor ?? null, restackRounds: old?.restackRounds ?? 0,
+    restackedFor: old?.restackedFor ?? null,
+    restackRounds: bottom?.headRefOid && old?.bottomHead && old.bottomHead !== bottom.headRefOid ? 0 : old?.restackRounds ?? 0,
     top: top.pr, bottom: bottom?.pr ?? old.bottom,
     bottomRef: bottom ? bottom.headRefName ?? old?.bottomRef ?? null : 'main',
     bottomHead: bottom?.headRefOid ?? old?.bottomHead ?? null,
     topHead: top.headRefOid, bottomOpen: Boolean(bottom),
-    inSync: Boolean(bottom?.headRefOid && top.headRefOid && isAncestor(bottom.headRefOid, top.headRefOid) === true),
+    inSync: syncState(bottom, top),
   });
+  // true / false only on a real answer; null when a head or the ancestry read is unknown (a failed read owes nothing).
+  const syncState = (bottom, top) => {
+    if (!bottom) return false;
+    if (!bottom.headRefOid || !top.headRefOid) return null;
+    const answer = isAncestor(bottom.headRefOid, top.headRefOid);
+    return answer === true ? true : answer === false ? false : null;
+  };
   for (const old of remembered) {
     const top = open.get(old.top);
     const bottom = open.get(old.bottom);
     // A bottom that left the open list counts as landed only on proof (its last head is on main); else forget it.
     if (top && (bottom || (old.bottomHead && onMain(old.bottomHead)))) pairs.set(top.pr, pair(top, bottom, old));
   }
+  // `untrusted` PRs (head not the tip of an origin lane branch) may sit in a remembered pair but never form a new one.
   for (const top of prs) {
-    const below = prs.filter(bottom => bottom.headRefOid && top.headRefOid
+    if (top.untrusted) continue;
+    const below = prs.filter(bottom => !bottom.untrusted && bottom.headRefOid && top.headRefOid
       && bottom.headRefOid !== top.headRefOid && !onMain(bottom.headRefOid)
       && isAncestor(bottom.headRefOid, top.headRefOid) === true);
     const nearest = below.find(candidate => below.every(other => other === candidate
       || isAncestor(other.headRefOid, candidate.headRefOid) === true));
-    if (nearest) pairs.set(top.pr, pair(top, nearest, remembered.find(old => old.top === top.pr && old.bottom === nearest.pr)));
+    if (!nearest) continue;
+    // A remembered open bottom stays the immediate bottom while the top still contains the head it last had (so the
+    // top has not yet been restacked) and that bottom still sits above the fresh nearest ancestor. After it advances,
+    // the top no longer contains its new head, so ancestry alone would drop to an older PR. A top that no longer
+    // contains the old head was rebased off that bottom: fresh ancestry wins.
+    const prior = pairs.get(top.pr);
+    const lastHead = remembered.find(old => old.top === top.pr && old.bottom === prior?.bottom)?.bottomHead;
+    const held = prior?.bottomOpen && prior.bottom !== nearest.pr
+      && isAncestor(nearest.headRefOid, open.get(prior.bottom)?.headRefOid) === true
+      && Boolean(lastHead) && isAncestor(lastHead, top.headRefOid) === true;
+    if (!held) pairs.set(top.pr, pair(top, nearest, remembered.find(old => old.top === top.pr && old.bottom === nearest.pr)));
   }
   return { pairs: [...pairs.values()] };
 }
@@ -78,21 +98,24 @@ const bottomKey = pair => pair.bottomOpen ? pair.bottomHead ?? 'main' : 'main';
 export const restackKey = entry => entry.restack
   ? `restack:${entry.pr}:${entry.restack.bottomHead ?? 'main'}`
   : `restack:${entry.top}:${bottomKey(entry)}`;
-const restackOwed = pair => !pair.bottomOpen || !pair.inSync;
+const restackOwed = pair => !pair.bottomOpen || pair.inSync === false;
 const restackUsed = (pair, used) => pair.restackedFor === bottomKey(pair) || used.has(restackKey(pair));
-export const RESTACK_HAZARD_KINDS = Object.freeze([
-  'fix-claimed', 'live-process', 'stood-down', 'cap-exhausted', 'round-cap-exhausted',
-  'ci-heal-exhausted', 'ci-heal-escalated', 'permission-blocked', 'awaiting-permission', 'ruling-dispute',
-  'timeout-retry-needs-human', 'infra-retry-exhausted', 'session-overrun', 'close-superseded', 'system-fix-landed',
-]);
+// An idle top is pushed to only when reconcile itself judged it settled. Every other verdict (and no verdict) holds it.
+export const RESTACK_IDLE_KIND = 'nothing-owed';
+const reconcileSettled = (rows, pr) => {
+  const own = rows.filter(row => Number(row?.prNumber) === pr);
+  return own.length > 0 && own.every(row => row.kind === RESTACK_IDLE_KIND);
+};
+// The round cap bounds an OPEN bottom's head only; a landed bottom has a single restack onto main, guarded by restackedFor.
+const capReached = (pair, settings) => pair.bottomOpen && (pair.restackRounds ?? 0) >= positiveRounds(settings.restackMaxRounds);
 export function planIdleRestacks(stacks, { planned = [], reconcileRefusals = [], fixClaims = [], settings, used = new Set() }) {
   if (!settings.detect || !settings.restack) return [];
   return stacks.pairs.filter(pair => restackOwed(pair) && !restackUsed(pair, used)
-    && (pair.restackRounds ?? 0) < positiveRounds(settings.restackMaxRounds)
+    && !capReached(pair, settings)
     && (!pair.bottomOpen || pair.bottomRef)
     && !planned.some(entry => entry.pr === pair.top)
     && !fixClaims.some(claim => Number(claim.meta?.pr) === pair.top)
-    && !reconcileRefusals.some(row => row.prNumber === pair.top && RESTACK_HAZARD_KINDS.includes(row.kind)))
+    && reconcileSettled(reconcileRefusals, pair.top))
     .map(pair => ({ top: pair.top, pair }));
 }
 export function markRestackUsed(entry, used) {
@@ -105,8 +128,7 @@ export function applyStackOrder(planned, stacks, { settings, used = new Set() })
   if (settings.bottomFirst) for (const p of stacks.pairs) out.stackAbove.set(p.bottom, abovePrs(stacks, p.bottom));
   for (const entry of planned) {
     const pair = bottomOf(stacks, entry.pr);
-    if (pair && settings.restack && restackOwed(pair)
-      && (pair.restackRounds ?? 0) >= positiveRounds(settings.restackMaxRounds)) {
+    if (pair && settings.restack && restackOwed(pair) && capReached(pair, settings)) {
       out.refusals.push({ pr: entry.pr, kind: 'restack-cap-exhausted',
         why: `PR #${entry.pr} exhausted the restack round cap of ${positiveRounds(settings.restackMaxRounds)} for bottom #${pair.bottom}` });
       continue;
@@ -152,24 +174,64 @@ export const gitOnMain = dir => sha => gitIsAncestor(dir)(sha, 'origin/main') ==
 export function readRemembered(root) {
   try {
     const pairs = JSON.parse(readFileSync(join(root, '.conveyor/pr-stacks.json'), 'utf8')).pairs;
-    return Array.isArray(pairs) && pairs.every(p => p && Number.isInteger(p.top) && Number.isInteger(p.bottom)
-      && (p.bottomRef === null || typeof p.bottomRef === 'string') && (p.bottomHead === null || typeof p.bottomHead === 'string')) ? pairs : [];
+    return Array.isArray(pairs) && pairs.every(validRemembered) ? pairs : [];
   } catch { return []; }
 }
+// The file feeds git arguments and agent-prompt ref names, so every field is shape-checked, not just typed.
+const SHA = /^[0-9a-f]{40}$/;
+const LANE_REF = /^lane\/[A-Za-z0-9._\/-]{1,200}$/;
+const validRemembered = p => Boolean(p) && Number.isInteger(p.top) && Number.isInteger(p.bottom)
+  && (p.bottomRef == null || p.bottomRef === 'main' || (typeof p.bottomRef === 'string' && LANE_REF.test(p.bottomRef) && !p.bottomRef.includes('..')))
+  && (p.bottomHead == null || (typeof p.bottomHead === 'string' && SHA.test(p.bottomHead)))
+  && (p.restackedFor == null || p.restackedFor === 'main' || (typeof p.restackedFor === 'string' && SHA.test(p.restackedFor)))
+  && (p.restackRounds == null || (Number.isInteger(p.restackRounds) && p.restackRounds >= 0 && p.restackRounds < 1000));
 export function writeRemembered(root, pairs) {
   try { mkdirSync(join(root, '.conveyor'), { recursive: true }); writeFileSync(join(root, '.conveyor/pr-stacks.json'), JSON.stringify({ pairs }, null, 2) + '\n'); } catch { /* fail open */ }
 }
+// Origin's lane branches and their tips (name -> sha), or null when origin cannot be listed.
+export function readOriginLaneTips(dir, { run = args => execFileSync('git', ['-C', dir, ...args], { encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
+  try {
+    const tips = new Map();
+    for (const line of String(run(['ls-remote', '--end-of-options', 'origin', 'refs/heads/lane/*'])).split('\n')) {
+      const m = /^([0-9a-f]{40})\trefs\/heads\/(lane\/.+)$/.exec(line.trim());
+      if (m) tips.set(m[2], m[1]);
+    }
+    return tips;
+  } catch { return null; }
+}
+// What GitHub reports for the open PRs (branch name, head, fork or not), keyed by number; an empty Map when it cannot be read.
+export function readOpenPrRefs(dir, { run = args => execFileSync('gh', args, { cwd: dir, encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
+  const refs = new Map();
+  try {
+    for (const row of JSON.parse(run(['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,isCrossRepository']))) {
+      if (Number.isInteger(row?.number)) refs.set(row.number, { headRefName: row.headRefName ?? null, headRefOid: row.headRefOid ?? null, isCrossRepository: row.isCrossRepository !== false });
+    }
+  } catch { /* unreadable: the PRs stay unverified */ }
+  return refs;
+}
+// Branch names come from GitHub and are only VERIFIED against origin's tips, never inferred from a sha.
 export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], settings,
-  readHeads = readPrHeads, isAncestor = gitIsAncestor(root), onMain = gitOnMain(root), readMem = readRemembered, writeMem = writeRemembered }) {
+  readRefs = readOpenPrRefs, isAncestor = gitIsAncestor(root), onMain = gitOnMain(root), readMem = readRemembered, writeMem = writeRemembered,
+  readLanes = readOriginLaneTips }) {
   try {
     if (repoKey !== 'we' || !settings.detect) return { pairs: [] };
     // No open-PR list (a deferred or failed read) proves nothing: keep the memory untouched and detect nothing.
     if (!Array.isArray(openPrFiles) || !openPrFiles.length) return { pairs: [] };
+    // Trust boundary: a PR may take part in a NEW stack only if it is not a fork PR and its head is the tip of the
+    // origin lane/* branch GitHub names for it (write access to origin). A non-lane branch, a same-named branch with
+    // other content, an unreadable PR: left out. If origin cannot be listed nothing is detected, memory untouched.
+    const tips = readLanes(root);
+    if (!tips) return { pairs: [] };
     const prs = new Map(planned.map(p => [p.pr, { pr: p.pr, headRefName: p.laneRef, headRefOid: p.headRefOid }]));
     const missing = [...new Set(openPrFiles.map(p => Number(p.pr)))].filter(pr => !prs.has(pr));
-    const heads = readHeads(root, missing);
-    for (const pr of missing) prs.set(pr, { pr, headRefName: null, headRefOid: heads.get(pr) ?? null });
-    const stacks = detectStacks([...prs.values()], { isAncestor, onMain, remembered: readMem(root) });
+    const refs = missing.length ? readRefs(root, missing) : new Map();
+    for (const pr of missing) {
+      const ref = refs.get(pr);
+      prs.set(pr, { pr, headRefName: ref?.headRefName ?? null, headRefOid: ref?.headRefOid ?? null, fork: ref ? ref.isCrossRepository !== false : true });
+    }
+    const flagged = [...prs.values()].map(p => ({ ...p,
+      untrusted: Boolean(p.fork) || !(p.headRefOid && p.headRefName && tips.get(p.headRefName) === p.headRefOid) }));
+    const stacks = detectStacks(flagged, { isAncestor, onMain, remembered: readMem(root) });
     writeMem(root, nextRemembered(stacks));
     return stacks;
   } catch { return { pairs: [] }; }
