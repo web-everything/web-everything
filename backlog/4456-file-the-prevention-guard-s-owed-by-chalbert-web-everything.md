@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules*.test.mjs", "we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs"]
+scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules*.test.mjs", "we:scripts/__tests__/check-standards-frontmatter-parse.test.mjs", "we:scripts/check-standards.mjs", "we:scripts/__tests__/check-standards.test.mjs", "we:scripts/__tests__/check-standards-backlog-schema.test.mjs"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-10-08"
 preparedAgainstSha: "873a1869f903e11c1581cb21e74d0619136c7adb"
