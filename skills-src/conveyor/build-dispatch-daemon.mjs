@@ -83,7 +83,7 @@ import { readMainRedState, resolveFreezeMainRed } from '../../scripts/lib/main-r
 import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'; // card xu1nixv
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
@@ -331,9 +331,17 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const due = effects.releaseDuePrepareRetries() ?? [];
       // Holds are keyed by card: only lift the PREPARE hold this ledger placed, never another hold on the card.
       if (due.length) releaseOwnPrepareHolds({ nums: due, holds: effects.listHolds?.() ?? [], release: effects.releasePrepareHold });
+      // Live 2026-10-09 — a held prepare whose worker reported already-done (with a commit) becomes an ordinary
+      // dispatch hold the hold router lands as a resolve (graduatedTo that commit), exactly as the runner does.
+      for (const r of effects.takePrepareRouteHolds?.() ?? []) effects.placePrepareHold?.({ num: r.num, reason: r.reason });
     } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
   }
-  let holds = effects.listHolds?.() ?? [];
+  // A held ledger failure that carries its own reason (a could-not-prepare: `needs-you: …`) is held UNDER that reason,
+  // never as a silent `prepare-unstamped`: the hold router records it and the tick lists it under `needsYou`.
+  const ledgerFailures = effects.listPrepareFailures?.() ?? [];
+  const ledgerHoldReason = new Map(ledgerFailures.filter(f => f.held && !f.completed && f.holdReason).map(f => [normNum(f.num), f.holdReason]));
+  let holds = (effects.listHolds?.() ?? []).map(h => (h.reason === LEDGER_HOLD_REASON && ledgerHoldReason.has(normNum(h.num))
+    ? { ...h, reason: ledgerHoldReason.get(normNum(h.num)), ledger: true } : h));
   const prepareRows = effects.listPrepareInFlight?.() ?? [];
   const prepareClaims = effects.listPrepareClaims?.() ?? [];
   const prepareIsLive = (r) => r.row?.entry?.live === true
@@ -377,7 +385,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(g => g.kind !== 'prepare-item' || !completedPrepares.has(normNum(g.num))) };
   const releases = effects.listPrepareReleases?.() ?? [];
   const allSettledPrepares = await effects.listSettledPrepares?.() ?? [];
-  const failureRecords = effects.listPrepareFailures?.() ?? [];
+  const failureRecords = ledgerFailures;
   const released = new Set();
   for (const row of allSettledPrepares) {
     if (releasedAttempt(releases, row.num, row.source)
@@ -391,7 +399,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) released.add(failure.num);
   }
   holds = holds.filter(h => {
-    if (!released.has(normNum(h.num)) || !h.reason?.startsWith('prepare-')) return true;
+    if (!released.has(normNum(h.num)) || !(h.reason?.startsWith('prepare-') || h.ledger)) return true;
     if (live) effects.releasePrepareHold({ num: normNum(h.num) });
     return false;
   });
@@ -594,6 +602,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
+  for (const [num, reason] of ledgerHoldReason) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
     const step = outcome?.stepRefused?.step ?? null;
@@ -644,7 +653,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     } else console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${d.why}`);
     return d;
   };
-  if (live) {
+  const launchBuilds = async () => {
     for (const pick of plan.dispatch) {
       if (launchSlotBusy()) continue;
       const gate = loadGateFor('build', pick.num);
@@ -662,7 +671,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
       }
     }
-  }
+  };
+  // Live 2026-10-09 16:47–18:28Z: prepare.planned stayed non-empty with 6 free slots for 13 ticks
+  // while every slot went to a build; the slot alternates when both kinds want it.
+  const preparesFirst = launchSettlement.settled.length > 0 && launchSettlement.settled.every((s) => s.kind !== 'prepare-item');
+  if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
   const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
@@ -685,6 +698,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
@@ -706,7 +720,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       : { ...input, cause: classifyPrepareFailure(evidence, stage), retry: false, held: true };
     prepare.failures.push({ num, stage, reason, cause: failure.cause, retry: failure.retry, prevention: failure.prevention });
     if (live && failure.held) effects.placePrepareHold({ num, reason: 'prepare-unstamped', ...holdStamp(num) });
-    if (failure.held) heldNums.add(num);
+    // An already-done report: the resolve route hold (the ledger hands it out once, stamped at record time).
+    if (live && failure.routeHold) effects.placePrepareHold({ num, reason: failure.routeHold });
+    if (failure.held || failure.routeHold) heldNums.add(num);
+    if (failure.holdReason) needsYou.push({ num: normNum(num), step: 'prepare', reason: failure.holdReason });
     return failure;
   };
   const inspectNums = new Set([...prepareClaims.map((c) => normNum(c.meta.num)),
@@ -776,16 +793,19 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
           || (!worker && liveness.status === 'dead')) why = 'dead prepare owner past heartbeat TTL';
       }
       const wasUnstamped = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+      // Live 2026-10-09 (4435/4436/4648): 8 stamp spawns per tick, worker `already-stamped`, no PR.
+      // Sections of the replaced stamp are not a result of this re-prepare attempt.
+      const mainHasResult = Boolean(status?.hasSections) && !status?.replacedPreparedDate;
       // A dead session that left sections behind is a finished-but-unstamped run: route it to stamp recovery.
       const deadWithWork = why === 'prepare-session-dead' && status && !status.preparedDate
-        && (status.hasSections || (awaitingPr && status.pr.hasSections));
+        && (mainHasResult || (awaitingPr && status.pr.hasSections));
       const ended = prDone || why === 'dead prepare owner past heartbeat TTL' || wasUnstamped || deadWithWork
         || (currentSettled && !prepareBusy.has(num));
       // An open, stamped PR is a valid finished agent run awaiting landing; main is not stamped yet.
       let unstamped = status && !status.preparedDate && ended && !(awaitingPr && status.pr.preparedDate);
       const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
       const failureHeld = Boolean(priorFailure);
-      const recoverable = !failureHeld && unstamped && (status.hasSections || (awaitingPr && status.pr.hasSections));
+      const recoverable = !failureHeld && unstamped && (mainHasResult || (awaitingPr && status.pr.hasSections));
       if (recoverable) {
         // Mechanical completion is separate from agent capacity; failures use the same evidence policy.
         if (live) effects.placePrepareHold({ num, reason: 'prepare-stamp-pending', ...holdStamp(num) });
@@ -832,7 +852,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         } else {
           const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped', evidence, attempt);
           if (priorFailure) prepare.failures.push({ ...priorFailure, reason: priorFailure.evidence?.reason ?? 'prepare-unstamped' });
-          if (failure.held) prepare.held.push({ num, reason: 'prepare-unstamped' });
+          if (failure.held) prepare.held.push({ num, reason: failure.holdReason ?? 'prepare-unstamped' });
           why ??= 'prepare-unstamped';
         }
       }
@@ -911,6 +931,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
     }
   }
+  if (live && preparesFirst) await launchBuilds();
   // #4348-open-pr-retry — ONE resume pass per LIVE tick, reusing #2659's own backoff/attempt-cap state machine
   // (`scripts/conveyor/infra-blocked.mjs retry`) wholesale rather than re-deriving it here: a `blocked-on-infra`
   // PR-open (the lane ref is already pushed; `deliver-item-wrapper.mjs` now settles this as `open-pending`,
@@ -1920,6 +1941,7 @@ function cliEffects() {
     listSettledBuilds: () => [],
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
+    takePrepareRouteHolds: () => takePrepareRouteHolds(),
     killSwitch: cliKillSwitch,
     mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,
