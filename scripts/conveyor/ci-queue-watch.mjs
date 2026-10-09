@@ -198,6 +198,21 @@ export const HUNG_K_ENV = 'WE_CI_HUNG_K';
  *  `WE_CI_HUNG_FLOOR_SEC` / `--hung-floor-sec=`. 30 min: every real job here finishes well inside it. */
 export const DEFAULT_HUNG_FLOOR_SEC = 30 * 60;
 export const HUNG_FLOOR_ENV = 'WE_CI_HUNG_FLOOR_SEC';
+/** The most `k × p95` may raise a threshold: one very long success sample (a forged or a freak run) must not push
+ *  the threshold past what a real hang looks like and silently disable detection for that check. 90 min = 3 × the
+ *  floor. Never below the floor. Env/flag: `WE_CI_HUNG_CEILING_SEC` / `--hung-ceiling-sec=`. */
+export const DEFAULT_HUNG_CEILING_SEC = 90 * 60;
+export const HUNG_CEILING_ENV = 'WE_CI_HUNG_CEILING_SEC';
+/** The smallest floor / k the CLI accepts. A floor of 0 (or an env var set but empty) would call EVERY running check
+ *  on EVERY open PR hung and cancel its whole run, so a smaller value falls back to the default instead. */
+export const MIN_HUNG_FLOOR_SEC = 300;
+export const MIN_HUNG_K = 1;
+/** The only run events the sweep recovers: a CI run for a pull request. A deploy, release or other push / dispatch /
+ *  workflow_run workflow whose check also shows on the PR head is never cancelled. */
+export const HUNG_ALLOWED_EVENTS = Object.freeze(['pull_request']);
+/** Optional comma-separated workflow file names (e.g. `ci.yml,review-gate.yml`); when set, only runs of those
+ *  workflows are recovered. Unset = any workflow file that ran on `pull_request`. */
+export const HUNG_WORKFLOWS_ENV = 'WE_CI_HUNG_WORKFLOWS';
 /** How many automatic re-runs one (PR, head, check) gets before a further hang escalates instead. */
 export const DEFAULT_HUNG_MAX_RERUNS = 1;
 /** Rolling window of successful durations kept per check name. */
@@ -278,6 +293,9 @@ export function learnDurations(durations, prs, { window = DEFAULT_DURATION_WINDO
   const out = Object.create(null);
   for (const [name, list] of Object.entries(durations || {})) out[name] = Array.isArray(list) ? [...list] : [];
   for (const p of Array.isArray(prs) ? prs : []) {
+    // A fork PR's workflow files are written by its author: its "successes" (and their durations) are not evidence of
+    // how long the base repo's own check takes.
+    if (p?.isCrossRepository === true) continue;
     for (const c of p?.statusCheckRollup || []) {
       const sec = successDurationSec(c);
       const ref = jobRefOf(c, repo);
@@ -293,17 +311,17 @@ export function learnDurations(durations, prs, { window = DEFAULT_DURATION_WINDO
   return out;
 }
 
-/** `max(floor, k × p95)` over one check's duration samples. PURE. */
-export function hungThreshold(samples, { k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC } = {}) {
+/** `max(floor, min(ceiling, k × p95))` over one check's duration samples; the ceiling never sits below the floor. PURE. */
+export function hungThreshold(samples, { k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, ceilingSec = DEFAULT_HUNG_CEILING_SEC } = {}) {
   const secs = (Array.isArray(samples) ? samples : []).map((s) => s?.sec);
   const p95Sec = percentile(secs, 95);
-  const thresholdSec = Math.max(floorSec, p95Sec === null ? 0 : k * p95Sec);
+  const thresholdSec = Math.max(floorSec, Math.min(ceilingSec, p95Sec === null ? 0 : k * p95Sec));
   return { thresholdSec, p95Sec, samples: secs.filter(Number.isFinite).length };
 }
 
 /** Every `in_progress` check (with an Actions job behind it) running longer than its threshold. PURE.
  *  `now` is epoch ms. */
-export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, repo = WE_SLUG } = {}) {
+export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, ceilingSec = DEFAULT_HUNG_CEILING_SEC, repo = WE_SLUG } = {}) {
   const out = [];
   for (const p of Array.isArray(prs) ? prs : []) {
     for (const c of p?.statusCheckRollup || []) {
@@ -312,7 +330,7 @@ export function findHungChecks(prs, durations, { now, k = DEFAULT_HUNG_K, floorS
       const started = Date.parse(c.startedAt);
       if (!ref || !c.name || !isActionsCheck(c) || !Number.isFinite(started)) continue;
       const inProgressSec = (now - started) / 1000;
-      const t = hungThreshold(durations?.[c.name], { k, floorSec });
+      const t = hungThreshold(durations?.[c.name], { k, floorSec, ceilingSec });
       if (inProgressSec <= t.thresholdSec) continue;
       out.push({ pr: p.number, headSha: p.headRefOid, name: c.name, ...ref, startedAt: c.startedAt, inProgressSec, ...t });
     }
@@ -344,6 +362,9 @@ export function planHungActions(hung, ledger, { maxReruns = DEFAULT_HUNG_MAX_RER
     // The job re-run was refused but the whole-run fallback has not been tried yet (a crash or lost lock between the
     // two attempts): the recovery is unfinished, never "handled".
     if (e && stage === 'rerun-job-refused') return { ...h, key, action: 'recover' };
+    // `-deferred` means "retry next sweep", whatever error was recorded with it (a refusal whose aftermath could not be
+    // read is deferred under the refusal's own message, which does not look transient).
+    if (e && /-deferred$/.test(stage)) return { ...h, key, action: 'recover' };
     // A recovery that never reached GitHub (throttle backoff, timeout, 5xx) is retried. One GitHub actually
     // refused (cancel/re-run failed for real) is not retried every sweep — it escalates instead.
     if (e && /-(failed|deferred)$/.test(stage) && last && !last.ok && isTransientGhError(last.error)) action = 'recover';
@@ -523,7 +544,7 @@ export const PR_LIST_LIMIT = 100;
 
 /** Open PRs with their check rollups (one `gh pr list` call). */
 export function defaultListPrs({ exec = execFileSyncThrottled, repo = WE_SLUG } = {}) {
-  const parsed = ghJson(exec, ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,headRefOid,statusCheckRollup']);
+  const parsed = ghJson(exec, ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(PR_LIST_LIMIT), '--json', 'number,headRefOid,isCrossRepository,statusCheckRollup']);
   return Array.isArray(parsed) ? parsed : [];
 }
 export function defaultGetRun({ exec = execFileSyncThrottled, repo = WE_SLUG, runId }) {
@@ -575,7 +596,8 @@ const errText = (e) => String(e?.stderr || e?.message || e).trim().split('\n')[0
  */
 export function sweepHungJobs({
   repo = null, statePath = resolveHungStatePath(repo), now = () => Date.now(),
-  k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, maxReruns = DEFAULT_HUNG_MAX_RERUNS, apply = true,
+  k = DEFAULT_HUNG_K, floorSec = DEFAULT_HUNG_FLOOR_SEC, ceilingSec = DEFAULT_HUNG_CEILING_SEC, maxReruns = DEFAULT_HUNG_MAX_RERUNS, apply = true,
+  events = HUNG_ALLOWED_EVENTS, workflows = null, // which runs may be recovered: their event, and (optionally) their workflow file names
   listPrs = defaultListPrs, getRun = defaultGetRun, getJob = defaultGetJob, cancelRun = defaultCancelRun, forceCancelRun = defaultForceCancelRun,
   rerunJob = defaultRerunJob, rerunRun = defaultRerunRun, log = (l) => writeLineSync(2, l),
   lock = {}, // `{staleMs, timeoutMs}` overrides for the ledger lock (tests only)
@@ -633,13 +655,21 @@ export function sweepHungJobs({
     // `viaCancel`: this recovery began by cancelling the WHOLE run, so the whole run is re-run (a job-only re-run
     // would leave the cancelled healthy siblings cancelled and the PR blocked) — and a refusal is never papered
     // over with a partial job re-run.
-    const rerun = (entry, h, { viaCancel = false } = {}) => {
-      const attempts = viaCancel
+    // `wholeRun`: re-run the whole run in one call (several hung checks share it, so a job re-run each would have the
+    // second refused — the first already put the run back in flight).
+    const rerun = (entry, h, { viaCancel = false, wholeRun = false } = {}) => {
+      const attempts = viaCancel || wholeRun
         ? [['rerun-run', () => rerunRun({ repo: slug, runId: h.runId })]]
         : [['rerun-job', () => rerunJob({ repo: slug, runId: h.runId, jobId: h.jobId })], ['rerun-run', () => rerunRun({ repo: slug, runId: h.runId })]];
       for (const [i, [action, send]] of attempts.entries()) {
         held();
-        try { send(); entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested'; record(entry, action, h, true); return; }
+        try {
+          send();
+          entry.reruns = (entry.reruns ?? 0) + 1; entry.stage = 'rerun-requested';
+          if (action === 'rerun-run') markWholeRun(entry);
+          record(entry, action, h, true);
+          return;
+        }
         catch (e) {
           const msg = errText(e);
           const transient = isTransientGhError(msg);
@@ -658,14 +688,58 @@ export function sweepHungJobs({
       try {
         const run = getRun({ repo: slug, runId: h.runId });
         const status = String(run?.status || '');
-        return status ? { status, headSha: String(run?.head_sha || ''), conclusion: String(run?.conclusion || '').toLowerCase() } : { error: 'empty' };
+        return status
+          ? {
+            status, headSha: String(run?.head_sha || ''), conclusion: String(run?.conclusion || '').toLowerCase(),
+            event: String(run?.event || ''), path: String(run?.path || ''), attempt: Number(run?.run_attempt),
+          }
+          : { error: 'empty' };
       } catch (e) { return { error: errText(e) }; }
     };
+    // After a refused write: is the run `completed` (the write lost a race to the run finishing — no refusal at
+    // all), verifiably still `running` (a real refusal), or `unknown` (unreadable — never guessed, so the caller
+    // retries instead of latching a refusal)? GitHub's own "cannot cancel a run that is completed" answer settles
+    // it without a second read, which can itself fail or lag.
+    const COMPLETED_REFUSAL_RE = /cannot cancel a workflow run that is completed|run (?:is )?already (?:completed|finished)/i;
+    const refusalAftermath = (msg, h) => {
+      if (COMPLETED_REFUSAL_RE.test(msg)) return 'completed';
+      const again = readRun(h);
+      if (again.error) return 'unknown';
+      return again.status === 'completed' ? 'completed' : 'running';
+    };
+    // ONE recovery per RUN: a cancel or a whole-run re-run acts on every job of the run, so a second hung check of
+    // the same run (same PR head, its job started before that whole-run action) rides on the first one's recovery
+    // instead of cancelling — or force-cancelling — the other's work. The follower is ledgered (`coveredBy`) so its
+    // own re-run budget is spent when the owner's whole-run re-run lands, and a later hang of ITS new job escalates.
+    const entryKey = (e) => hungKey({ pr: e.pr, headSha: e.headSha, name: e.name });
+    // The owner's re-run budget is spent on behalf of every follower once the run has been re-run — by the owner, or by
+    // anyone else (the attempt guard): a follower that hangs again in the new attempt then escalates, not re-recovers.
+    const budgetFollowers = (owner) => {
+      const ownerKey = entryKey(owner);
+      for (const e of Object.values(state.hung)) {
+        if (e.coveredBy !== ownerKey || e.runId !== owner.runId || e.coveredRerunAt) continue;
+        e.reruns = (e.reruns ?? 0) + 1; e.coveredRerunAt = at; e.updatedAt = at;
+      }
+    };
+    // A cancel or whole-run re-run was sent for attempt `owner.runAttempt` of the run: every job of THAT attempt (and
+    // only those) is covered by it.
+    const markWholeRun = (owner) => {
+      owner.wholeRunAt = at;
+      owner.wholeRunAttempt = Number.isFinite(owner.runAttempt) ? owner.runAttempt : undefined;
+      budgetFollowers(owner);
+    };
+    // Covered = the job belongs to an attempt the owner's whole-run action took down. Attempt numbers decide when both
+    // are known (a clock is no judge of which attempt a job is in); otherwise the job having started before the action.
+    const recoveringSibling = (h, job) => Object.entries(state.hung).find(([key, e]) => key !== h.key && !e.coveredBy
+      && e.pr === h.pr && e.headSha === h.headSha && e.runId === h.runId && e.wholeRunAt
+      && (Number.isFinite(job.attempt) && Number.isFinite(e.wholeRunAttempt)
+        ? job.attempt <= e.wholeRunAttempt
+        : Date.parse(h.startedAt) <= Date.parse(e.wholeRunAt)));
     const readJob = (h) => {
       held();
       try {
         const job = getJob({ repo: slug, jobId: h.jobId });
-        return { runId: Number(job?.run_id), name: String(job?.name || '') };
+        return { runId: Number(job?.run_id), name: String(job?.name || ''), attempt: Number(job?.run_attempt) };
       } catch (e) { return { error: errText(e) }; }
     };
     const prByNumber = new Map(prs.map((p) => [p.number, p]));
@@ -718,6 +792,15 @@ export function sweepHungJobs({
         owned.add(key);
         const run = readRun(h);
         if (run.error) { unreadable(entry, h, run.error); continue; }
+        // The run is on a NEWER attempt than the one this entry cancelled: it was re-run (by a person, or by this very
+        // recovery) and what is running now is the RECOVERY, not the hung attempt. Never cancel it again; its own hangs
+        // are step 2's, against the spent re-run budget.
+        if (Number.isFinite(run.attempt) && Number.isFinite(entry.runAttempt) && run.attempt > entry.runAttempt) {
+          entry.stage = 'rerun-requested'; entry.reruns = Math.max(1, entry.reruns ?? 0); entry.updatedAt = at;
+          budgetFollowers(entry); // the run was re-run (not by this sweep, or its write was lost): the followers' budget is spent too
+          log(`ci-job-hung: RESOLVED ${JSON.stringify({ repo: slug, pr: entry.pr, check: entry.name, runId: entry.runId, reason: `the run is on attempt ${run.attempt}: it was re-run after the cancel` })}`);
+          continue;
+        }
         if (run.status === 'completed') {
           // Only a run that finished SUCCESSFULLY has nothing to restore (the job outran the cancel). The watched job
           // being green proves nothing about its siblings: if the cancel landed on them, the whole run is re-run.
@@ -734,7 +817,7 @@ export function sweepHungJobs({
               const msg = errText(e);
               // Latch a refusal only when it is real: not transient, and the run is verifiably STILL running (a
               // force-cancel that lost the race to the run finishing is refused with a 409 and is no refusal at all).
-              if (!isTransientGhError(msg)) { const again = readRun(h); if (!again.error && again.status !== 'completed') entry.forceCancelRefusedAt = at; }
+              if (!isTransientGhError(msg) && refusalAftermath(msg, h) === 'running') entry.forceCancelRefusedAt = at;
               record(entry, 'force-cancel', h, false, msg);
               if (entry.forceCancelRefusedAt) escalateEntry(entry, h, 'force-cancel-refused');
             }
@@ -759,7 +842,11 @@ export function sweepHungJobs({
     }
 
     // 2. Newly detected hangs.
-    const hung = planHungActions(findHungChecks(prs, state.durations, { now: nowMs, k, floorSec, repo: slug }), state.hung, { maxReruns });
+    const hung = planHungActions(findHungChecks(prs, state.durations, { now: nowMs, k, floorSec, ceilingSec, repo: slug }), state.hung, { maxReruns });
+    // How many first-hang checks share each run: several in one COMPLETED run are recovered by ONE whole-run re-run.
+    const recoverPerRun = new Map();
+    for (const h of hung) if (h.action === 'recover' && !owned.has(h.key)) recoverPerRun.set(h.runId, (recoverPerRun.get(h.runId) ?? 0) + 1);
+    const allowedWorkflows = (Array.isArray(workflows) ? workflows : []).map((w) => String(w).trim()).filter(Boolean);
     for (const h of hung) {
       const view = { repo: slug, pr: h.pr, headSha: h.headSha, check: h.name, runId: h.runId, jobId: h.jobId, inProgressMin: Math.round(h.inProgressSec / 60), thresholdMin: Math.round(h.thresholdSec / 60) };
       if (h.action === 'handled' || owned.has(h.key)) continue;
@@ -788,6 +875,14 @@ export function sweepHungJobs({
         log(`ci-job-hung: REFUSED ${JSON.stringify({ ...view, reason: 'run does not belong to the PR head commit' })}`);
         continue;
       }
+      // Only a CI run for a pull request is ever recovered: a deploy / release / push / dispatch workflow whose check
+      // also shows on the PR head is legitimately long and must not be cancelled (or re-run) by a hang heuristic.
+      // An unknown event fails closed, like an unknown head.
+      const workflowFile = run.path.replace(/@.*$/, '').split('/').pop();
+      if (!events.includes(run.event) || (allowedWorkflows.length && !allowedWorkflows.includes(workflowFile))) {
+        log(`ci-job-hung: REFUSED ${JSON.stringify({ ...view, reason: `run is a "${run.event || 'unknown'}" run of "${workflowFile || 'unknown'}", not a ${events.join('/')} run${allowedWorkflows.length ? ` of ${allowedWorkflows.join(', ')}` : ''}` })}`);
+        continue;
+      }
       // The job id is a second untrusted number (a third-party check can name ANY real job of this repo): it must
       // belong to that same run AND be this check's own job — before a cancel as much as before a job re-run.
       const job = readJob(h);
@@ -799,21 +894,52 @@ export function sweepHungJobs({
         log(`ci-job-hung: REFUSED ${JSON.stringify({ ...view, reason: 'job does not belong to the run and the check' })}`);
         continue;
       }
-      const status = run.status;
       const entry = state.hung[h.key] || (state.hung[h.key] = { pr: h.pr, headSha: h.headSha, name: h.name, reruns: 0, jobIds: [] });
       entry.jobIds = [...new Set([...(entry.jobIds || []), h.jobId])];
       entry.runId = h.runId;
       entry.detectedAt = at;
       entry.startedAt = h.startedAt;
       entry.thresholdSec = h.thresholdSec;
-      if (status !== 'completed') {
+      entry.runAttempt = Number.isFinite(run.attempt) ? run.attempt : undefined; // the attempt this recovery acts on
+      // Another hung check of THIS run is already being recovered (its cancel or whole-run re-run took this job down
+      // with it): no second cancel, no force-cancel of the recovery. This check is a follower of that recovery.
+      const sibling = recoveringSibling(h, job);
+      if (sibling) {
+        const [siblingKey, owner] = sibling;
+        entry.stage = 'covered-by-sibling'; entry.coveredBy = siblingKey; entry.updatedAt = at;
+        delete entry.coveredRerunAt;
+        if (owner.stage === 'rerun-requested') { entry.reruns = Math.max(entry.reruns ?? 0, 1); entry.coveredRerunAt = at; } // the whole-run re-run already happened
+        log(`ci-job-hung: COVERED ${JSON.stringify({ ...view, by: owner.name, reason: 'its run is already being recovered through a hung sibling check' })}`);
+        continue;
+      }
+      // This check takes over the recovery of its run (a stale follower marker would hide it from later siblings).
+      delete entry.coveredBy; delete entry.coveredRerunAt;
+      let runCompleted = run.status === 'completed';
+      if (!runCompleted) {
         held();
-        try { cancelRun({ repo: slug, runId: h.runId }); entry.stage = 'cancel-requested'; entry.cancelRequestedAt = at; record(entry, 'cancel', h, true); }
-        catch (e) { const msg = errText(e); entry.stage = isTransientGhError(msg) ? 'cancel-deferred' : 'cancel-failed'; record(entry, 'cancel', h, false, msg); }
-      } else {
+        try {
+          cancelRun({ repo: slug, runId: h.runId });
+          entry.stage = 'cancel-requested'; entry.cancelRequestedAt = at; markWholeRun(entry);
+          record(entry, 'cancel', h, true);
+        } catch (e) {
+          const msg = errText(e);
+          // A cancel that lost the race to the run finishing is refused with a 409 and is no refusal at all (the same
+          // rule as the force-cancel's): the run is complete now, so it is re-run below, in this same sweep. A refusal
+          // whose aftermath cannot be read is retried (deferred), never latched as a permanent refusal.
+          const aftermath = isTransientGhError(msg) ? 'transient' : refusalAftermath(msg, h);
+          if (aftermath === 'completed') {
+            runCompleted = true;
+            log(`ci-job-hung: DETECTED ${JSON.stringify({ ...view, reason: 'the run finished before the cancel landed' })}`);
+          } else {
+            entry.stage = aftermath === 'running' ? 'cancel-failed' : 'cancel-deferred';
+            record(entry, 'cancel', h, false, msg);
+          }
+        }
+      }
+      if (runCompleted) {
         // A recovery that began with a cancel killed the WHOLE run: finish it as one even if a lagging snapshot
-        // still shows the cancelled job in_progress.
-        rerun(entry, h, { viaCancel: !!entry.cancelRequestedAt });
+        // still shows the cancelled job in_progress. Several hung checks in one completed run: one whole-run re-run.
+        rerun(entry, h, { viaCancel: !!entry.cancelRequestedAt, wholeRun: (recoverPerRun.get(h.runId) ?? 0) > 1 });
       }
     }
     held();
@@ -846,8 +972,26 @@ function numFlag(flags, name, envName, fallback) {
   // malformed/valueless flag must never silently read as the number 1 (found by this item's own convergence
   // red-team), so a boolean raw value is treated the same as absent.
   const raw = flags[name] ?? (envName ? process.env[envName] : undefined);
-  const n = typeof raw === 'boolean' ? NaN : Number(raw);
+  // An empty / whitespace-only value (`--x=`, an env var set but empty) is "nothing set" — `Number('')` is 0, which
+  // would otherwise read as an explicit zero.
+  const n = typeof raw === 'boolean' || String(raw ?? '').trim() === '' ? NaN : Number(raw);
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+/** The hung sweep's tuning from flags + env. Unlike {@link numFlag}, an explicit `0` is NOT honored: a floor of 0 would
+ *  call every running check on every open PR hung, so the floor needs >= {@link MIN_HUNG_FLOOR_SEC} and k >= 1 —
+ *  anything smaller, empty or non-numeric falls back to the default. The ceiling is never below the floor. */
+export function resolveHungSettings(flags = {}, env = process.env) {
+  const pick = (flag, envName, fallback, min) => {
+    // A malformed flag never falls through to the env var: the flag wins if it was given at all.
+    const raw = flags[flag] !== undefined ? flags[flag] : env[envName];
+    const n = typeof raw === 'boolean' || String(raw ?? '').trim() === '' ? NaN : Number(raw);
+    return Number.isFinite(n) && n >= min ? n : fallback;
+  };
+  const k = pick('hung-k', HUNG_K_ENV, DEFAULT_HUNG_K, MIN_HUNG_K);
+  const floorSec = pick('hung-floor-sec', HUNG_FLOOR_ENV, DEFAULT_HUNG_FLOOR_SEC, MIN_HUNG_FLOOR_SEC);
+  const ceilingSec = Math.max(floorSec, pick('hung-ceiling-sec', HUNG_CEILING_ENV, DEFAULT_HUNG_CEILING_SEC, MIN_HUNG_FLOOR_SEC));
+  return { k, floorSec, ceilingSec };
 }
 
 async function main(argv) {
@@ -868,7 +1012,7 @@ async function main(argv) {
   }
 
   if (verb !== 'sweep' && verb !== 'hung') {
-    writeLineSync(2, 'usage: ci-queue-watch.mjs [sweep|check|hung] [--repo=<owner/name>] [--limit=<n>] [--hung-k=<k>] [--hung-floor-sec=<s>] [--dry-run] [--json]');
+    writeLineSync(2, 'usage: ci-queue-watch.mjs [sweep|check|hung] [--repo=<owner/name>] [--limit=<n>] [--hung-k=<k>] [--hung-floor-sec=<s>] [--hung-ceiling-sec=<s>] [--hung-workflows=<a.yml,b.yml>] [--dry-run] [--json]');
     process.exitCode = 2;
     return;
   }
@@ -878,8 +1022,8 @@ async function main(argv) {
   const hungOpts = {
     repo,
     statePath: historyPath.replace(/(\.json)?$/, '.hung-jobs.json'),
-    k: numFlag(flags, 'hung-k', HUNG_K_ENV, DEFAULT_HUNG_K),
-    floorSec: numFlag(flags, 'hung-floor-sec', HUNG_FLOOR_ENV, DEFAULT_HUNG_FLOOR_SEC),
+    ...resolveHungSettings(flags),
+    workflows: String(flags['hung-workflows'] ?? process.env[HUNG_WORKFLOWS_ENV] ?? '').split(',').map((w) => w.trim()).filter(Boolean),
     apply: !flags['dry-run'] && process.env[HUNG_ACTION_ENV] !== '0',
   };
   const runHung = () => {

@@ -596,7 +596,8 @@ describe('hung CI jobs', () => {
     const lines = [];
     return {
       calls, lines,
-      getRun: ({ runId }) => { calls.push(['getRun', runId]); return { status: typeof runStatus === 'function' ? runStatus() : runStatus, head_sha: 'db9f116' }; },
+      // The run object GitHub returns: a pull_request run of the CI workflow (the only kind the sweep acts on).
+      getRun: ({ runId }) => { calls.push(['getRun', runId]); return { status: typeof runStatus === 'function' ? runStatus() : runStatus, head_sha: 'db9f116', event: 'pull_request', path: '.github/workflows/ci.yml', run_attempt: 1 }; },
       getJob: ({ jobId }) => { calls.push(['getJob', jobId]); return { id: jobId, run_id: 37796107550, name: 'daemon-soak' }; },
       cancelRun: ({ runId }) => { calls.push(['cancelRun', runId]); },
       forceCancelRun: ({ runId }) => { calls.push(['forceCancelRun', runId]); },
@@ -1157,7 +1158,7 @@ describe('hung CI jobs', () => {
       const e = entryAt(over);
       writeFileSync(statePath, JSON.stringify({ durations: {}, hung: { [hungKey({ pr: e.pr, headSha: e.headSha, name: e.name })]: e } }));
       const f = fakes(run.status);
-      f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { ...run, head_sha: 'db9f116' }; };
+      f.getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { event: 'pull_request', path: '.github/workflows/ci.yml', run_attempt: 1, ...run, head_sha: 'db9f116' }; };
       const r = sweepHungJobs({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, listPrs: () => [pr([check()])], now: () => T0 + minute * MIN, ...f });
       expect(writesOf(f.calls)).toEqual(writes);
       expect(escLines(f.lines).map((x) => x.reason)).toEqual(reason ? [reason] : []);
@@ -1235,6 +1236,267 @@ describe('hung CI jobs', () => {
     const r = sweepHungJobs({ ...base, listPrs: () => [pr([running])], now: () => T0 + 25 * MIN });
     expect(r.hung).toEqual([]);
   });
+
+  // ── review round 3 (fix-4479): five findings ────────────────────────────────────────────────────────────
+  const RUN = 37796107550;
+  const siblingCheck = () => ({ ...stuckRun(), name: 'test', detailsUrl: url(RUN, 113380540048) });
+  const jobsOf = ({ jobId }) => ({ id: jobId, run_id: RUN, name: jobId === 113380540047 ? 'daemon-soak' : 'test' });
+  /** A run whose status / conclusion / attempt the test drives; every call is logged on `f.calls`. */
+  const drivenRun = (f, state, extra = {}) => ({ runId }) => {
+    f.calls.push(['getRun', runId]);
+    return { status: state.status, conclusion: state.conclusion, head_sha: 'db9f116', event: 'pull_request', path: '.github/workflows/ci.yml', run_attempt: state.attempt ?? 1, ...extra };
+  };
+  const sharedBase = (f) => ({ repo: 'web-everything/web-everything', statePath, k: 3, floorSec: 1800, maxReruns: 1, ...f });
+
+  it('recovers two hung checks sharing one run without cancelling the recovery', async () => {
+    const { sweepHungJobs, readHungState, CANCEL_GRACE_MS } = await import('../ci-queue-watch.mjs');
+    const state = { status: 'in_progress', conclusion: null, attempt: 1 };
+    const f = fakes();
+    f.getRun = drivenRun(f, state);
+    f.getJob = jobsOf;
+    const base = sharedBase(f);
+    // sweep 1: BOTH checks are past their threshold in the same run → ONE cancel for the run, the second rides on it
+    sweepHungJobs({ ...base, listPrs: () => [pr([stuckRun(), siblingCheck()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(f.calls)).toEqual(['cancelRun']);
+    // the cancel lands: the run completed cancelled → ONE whole-run re-run
+    f.calls.length = 0;
+    state.status = 'completed'; state.conclusion = 'cancelled';
+    const cancelled = [{ ...stuckRun(), status: 'COMPLETED', conclusion: 'CANCELLED' }, { ...siblingCheck(), status: 'COMPLETED', conclusion: 'CANCELLED' }];
+    sweepHungJobs({ ...base, listPrs: () => [pr(cancelled)], now: () => T0 + 97 * MIN });
+    expect(writesOf(f.calls)).toEqual(['rerunRun']);
+    // the re-run attempt is still running past the cancel grace window: it must NOT be force-cancelled or re-run
+    f.calls.length = 0;
+    state.status = 'in_progress'; state.conclusion = null; state.attempt = 2;
+    const rerunning = [{ ...stuckRun(), startedAt: new Date(T0 + 97 * MIN).toISOString() }, { ...siblingCheck(), startedAt: new Date(T0 + 97 * MIN).toISOString() }]
+      .map((c, i) => ({ ...c, detailsUrl: url(RUN, 113380540100 + i) }));
+    for (const minute of [98, 98 + CANCEL_GRACE_MS / MIN + 1, 98 + 2 * CANCEL_GRACE_MS / MIN + 2]) {
+      sweepHungJobs({ ...base, listPrs: () => [pr(rerunning)], now: () => T0 + minute * MIN });
+    }
+    expect(writesOf(f.calls)).toEqual([]);
+    expect(escLines(f.lines)).toEqual([]);
+    // both checks spent their one re-run on that single whole-run re-run
+    expect(Object.values(readHungState(statePath).hung).map((e) => e.reruns)).toEqual([1, 1]);
+  });
+
+  it('a hung check that crosses its threshold a sweep AFTER its sibling cancelled the run rides on that cancel', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const state = { status: 'in_progress', conclusion: null };
+    const f = fakes();
+    f.getRun = drivenRun(f, state);
+    f.getJob = jobsOf;
+    const base = sharedBase(f);
+    const late = () => ({ ...siblingCheck(), startedAt: new Date(T0 + 80 * MIN).toISOString() });
+    sweepHungJobs({ ...base, listPrs: () => [pr([stuckRun(), late()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(f.calls)).toEqual(['cancelRun']); // the sibling is only 15 min in: not hung yet
+    f.calls.length = 0;
+    // 32 min in now → hung, but its run is already being recovered: no second cancel (the owner's cancel has not
+    // taken in all that time, so the OWNER is force-cancelled — that is its own, unchanged, recovery)
+    sweepHungJobs({ ...base, listPrs: () => [pr([stuckRun(), late()])], now: () => T0 + 112 * MIN });
+    expect(writesOf(f.calls)).not.toContain('cancelRun');
+    expect(Object.values(readHungState(statePath).hung).find((e) => e.name === 'test')).toMatchObject({ stage: 'covered-by-sibling' });
+  });
+
+  it('two hung checks of one run that already COMPLETED are recovered by one whole-run re-run, not a job re-run each', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const f = fakes('completed');
+    f.getJob = jobsOf;
+    sweepHungJobs({ ...sharedBase(f), listPrs: () => [pr([phantom(), { ...phantom(113380540048), name: 'test' }])], now: () => T0 + 95 * MIN });
+    expect(writesOf(f.calls)).toEqual(['rerunRun']);
+  });
+
+  it('never force-cancels a run that has a NEWER attempt than the one it cancelled (someone re-ran it)', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    const state = { status: 'in_progress', conclusion: null, attempt: 1 };
+    const f = fakes();
+    f.getRun = drivenRun(f, state);
+    const base = { ...sharedBase(f), listPrs: () => [pr([stuckRun()])] };
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    expect(writesOf(f.calls)).toEqual(['cancelRun']);
+    f.calls.length = 0;
+    state.attempt = 2; // a person re-ran the cancelled run; it is running again, past the grace window
+    sweepHungJobs({ ...base, now: () => T0 + 110 * MIN });
+    expect(writesOf(f.calls)).toEqual([]);
+  });
+
+  it('a first cancel that lost the race to the run finishing (409) is no refusal: the completed run is re-run, nothing escalates', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    let status = 'in_progress';
+    const f = fakes(() => status);
+    f.cancelRun = ({ runId }) => { f.calls.push(['cancelRun', runId]); status = 'completed'; throw new Error('HTTP 409: Cannot cancel a workflow run that is completed.'); };
+    sweepHungJobs({ ...sharedBase(f), listPrs: () => [pr([stuckRun()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(f.calls)).toEqual(['cancelRun', 'rerunJob']);
+    expect(escLines(f.lines)).toEqual([]);
+    expect(Object.values(readHungState(statePath).hung)[0]).toMatchObject({ stage: 'rerun-requested', reruns: 1 });
+    // a refusal while the run really IS still running stays a refusal
+    status = 'in_progress';
+    const g = fakes(() => status);
+    g.cancelRun = ({ runId }) => { g.calls.push(['cancelRun', runId]); throw new Error('HTTP 403: Resource not accessible by integration'); };
+    const other = { ...stuckRun(), name: 'daemon-soak', detailsUrl: url(RUN, 113380540047) };
+    sweepHungJobs({ ...sharedBase(g), statePath: `${statePath}.b`, listPrs: () => [pr([other], 4451)], now: () => T0 + 95 * MIN });
+    expect(Object.values(readHungState(`${statePath}.b`).hung)[0].stage).toBe('cancel-failed');
+  });
+
+  // Adversarial self-review of the repair (round 3): the four holes it found.
+  it('a 409 on the first cancel whose run cannot be re-read is DEFERRED (retried), never latched as a permanent refusal', async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    let readable = true;
+    const state = { status: 'in_progress', conclusion: null };
+    const f = fakes();
+    const read = drivenRun(f, state);
+    f.getRun = (a) => { const r = read(a); if (!readable && f.calls.filter(([c]) => c === 'cancelRun').length) throw new Error('HTTP 503: Service Unavailable'); return r; };
+    f.cancelRun = ({ runId }) => { f.calls.push(['cancelRun', runId]); throw new Error('HTTP 409: Conflict'); };
+    const base = { ...sharedBase(f), listPrs: () => [pr([stuckRun()])] };
+    readable = false;
+    sweepHungJobs({ ...base, now: () => T0 + 95 * MIN });
+    expect(Object.values(readHungState(statePath).hung)[0].stage).toBe('cancel-deferred');
+    expect(escLines(f.lines)).toEqual([]);
+    // next sweep: the run reads fine and is still running → the cancel is tried again (not 'handled' forever)
+    readable = true;
+    f.calls.length = 0;
+    sweepHungJobs({ ...base, now: () => T0 + 96 * MIN });
+    expect(writesOf(f.calls)).toEqual(['cancelRun']);
+  });
+
+  it("GitHub's own 'cannot cancel a run that is completed' settles a lost race even when the re-read still looks in progress", async () => {
+    const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+    const f = fakes('in_progress'); // a stale / lagging read: the run still reads in_progress
+    f.cancelRun = ({ runId }) => { f.calls.push(['cancelRun', runId]); throw new Error('HTTP 409: Cannot cancel a workflow run that is completed.'); };
+    sweepHungJobs({ ...sharedBase(f), listPrs: () => [pr([stuckRun()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(f.calls)).toEqual(['cancelRun', 'rerunJob']);
+    expect(Object.values(readHungState(statePath).hung)[0].stage).toBe('rerun-requested');
+  });
+
+  describe('a run re-run by someone else, and attempt-based coverage', () => {
+    const ownerKey = '4450@db9f116:daemon-soak';
+    const followerKey = '4450@db9f116:test';
+    const seed = (extra = {}) => writeFileSync(statePath, JSON.stringify({ durations: {}, hung: {
+      [ownerKey]: { pr: 4450, headSha: 'db9f116', name: 'daemon-soak', runId: RUN, reruns: 0, jobIds: [1], stage: 'cancel-outran', runAttempt: 1, wholeRunAt: new Date(T0 + 94 * MIN).toISOString(), wholeRunAttempt: 1, updatedAt: new Date(T0 + 94 * MIN).toISOString(), ...extra },
+      [followerKey]: { pr: 4450, headSha: 'db9f116', name: 'test', runId: RUN, reruns: 0, jobIds: [2], stage: 'covered-by-sibling', coveredBy: ownerKey, updatedAt: new Date(T0 + 94 * MIN).toISOString() },
+    } }));
+    const attempt2Jobs = ({ jobId }) => ({ id: jobId, run_id: RUN, name: jobId === 113380540047 ? 'daemon-soak' : jobId === 113380540048 ? 'test' : 'lint', run_attempt: 2 });
+    const hungInAttempt2 = (name, job) => ({ ...stuckRun(), name, detailsUrl: url(RUN, job), startedAt: new Date(T0 + 60 * MIN).toISOString() });
+
+    it('a run re-run by a person budgets the followers too: their new hang escalates, it does not cancel the recovery', async () => {
+      const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+      const state = { status: 'in_progress', conclusion: null, attempt: 2 };
+      const f = fakes();
+      f.getRun = drivenRun(f, state);
+      f.getJob = attempt2Jobs;
+      // both checks were cancelled by one recovery (owner stage cancel-requested); a person re-ran the run → attempt 2
+      seed({ stage: 'cancel-requested', cancelRequestedAt: new Date(T0 + 94 * MIN).toISOString() });
+      const live = [stuckRun(), { ...siblingCheck(), status: 'COMPLETED', conclusion: 'CANCELLED' }];
+      sweepHungJobs({ ...sharedBase(f), listPrs: () => [pr(live)], now: () => T0 + 100 * MIN });
+      expect(readHungState(statePath).hung[followerKey]).toMatchObject({ reruns: 1 });
+      // attempt 2's job of the follower hangs: escalates (budget spent), never cancels the running recovery
+      f.calls.length = 0;
+      sweepHungJobs({ ...sharedBase(f), listPrs: () => [pr([{ ...hungInAttempt2('test', 113380540100) }])], now: () => T0 + 135 * MIN });
+      expect(writesOf(f.calls)).toEqual([]);
+      expect(escLines(f.lines).map((e) => e.check)).toContain('test');
+    });
+
+    it('a follower that takes over recovery in a later attempt owns it (no stale coveredBy), and a third check rides on IT; attempt, not the clock, decides', async () => {
+      const { sweepHungJobs, readHungState } = await import('../ci-queue-watch.mjs');
+      const state = { status: 'in_progress', conclusion: null, attempt: 2 };
+      const f = fakes();
+      f.getRun = drivenRun(f, state);
+      f.getJob = attempt2Jobs;
+      seed(); // the owner's wholeRunAt (T0+94) is AFTER the attempt-2 jobs started (T0+60): a clock rule would wrongly cover them
+      const checks = [hungInAttempt2('test', 113380540048), hungInAttempt2('lint', 113380540049)];
+      sweepHungJobs({ ...sharedBase(f), listPrs: () => [pr(checks)], now: () => T0 + 135 * MIN });
+      expect(writesOf(f.calls)).toEqual(['cancelRun']); // 'test' recovers attempt 2; 'lint' rides on it — one cancel, not two
+      const hung = readHungState(statePath).hung;
+      expect(hung[followerKey].coveredBy).toBeUndefined();
+      expect(hung[followerKey]).toMatchObject({ stage: 'cancel-requested', wholeRunAttempt: 2 });
+      expect(hung['4450@db9f116:lint']).toMatchObject({ stage: 'covered-by-sibling', coveredBy: followerKey });
+    });
+  });
+
+  it('resolveHungSettings: an empty, zero or too-small floor / k falls back to the default, never to 0', async () => {
+    const { resolveHungSettings, DEFAULT_HUNG_FLOOR_SEC, DEFAULT_HUNG_K, MIN_HUNG_FLOOR_SEC } = await import('../ci-queue-watch.mjs');
+    for (const bad of ['', ' ', '0', '-5', 'abc', String(MIN_HUNG_FLOOR_SEC - 1), true]) {
+      expect(resolveHungSettings({ 'hung-floor-sec': bad }, {}).floorSec).toBe(DEFAULT_HUNG_FLOOR_SEC);
+      expect(resolveHungSettings({}, { WE_CI_HUNG_FLOOR_SEC: bad === true ? 'x' : bad }).floorSec).toBe(DEFAULT_HUNG_FLOOR_SEC);
+    }
+    for (const bad of ['', '0', '0.5', 'abc', true]) expect(resolveHungSettings({ 'hung-k': bad }, {}).k).toBe(DEFAULT_HUNG_K);
+    expect(resolveHungSettings({ 'hung-floor-sec': String(MIN_HUNG_FLOOR_SEC), 'hung-k': '2' }, {})).toMatchObject({ floorSec: MIN_HUNG_FLOOR_SEC, k: 2 });
+    expect(resolveHungSettings({}, { WE_CI_HUNG_FLOOR_SEC: '3600', WE_CI_HUNG_K: '4' })).toMatchObject({ floorSec: 3600, k: 4 });
+  });
+
+  it('one very long (forged or real) success sample cannot push the hang threshold past the ceiling', async () => {
+    const { hungThreshold, findHungChecks, DEFAULT_HUNG_CEILING_SEC } = await import('../ci-queue-watch.mjs');
+    const forged = [{ jobId: 1, sec: 5 * 3600 }];
+    expect(hungThreshold(forged, { k: 3, floorSec: 1800 }).thresholdSec).toBe(DEFAULT_HUNG_CEILING_SEC);
+    // the reviewer's case: a 5 h success sample, then a 2 h in_progress check is still flagged
+    const hung = findHungChecks([pr([stuckRun()])], { 'daemon-soak': forged }, { now: T0 + 120 * MIN, k: 3, floorSec: 1800 });
+    expect(hung).toHaveLength(1);
+    // the ceiling never drops below the floor
+    expect(hungThreshold(forged, { k: 3, floorSec: 7200, ceilingSec: 3600 }).thresholdSec).toBe(7200);
+    // and a normal history is untouched
+    expect(hungThreshold([{ jobId: 1, sec: 1200 }], { k: 3, floorSec: 1800 }).thresholdSec).toBe(3600);
+  });
+
+  it('durations are not learned from a fork PR (its workflows are written by its author)', async () => {
+    const { learnDurations } = await import('../ci-queue-watch.mjs');
+    const fork = { ...pr([done('daemon-soak', 7, 5 * 3600)], 4460), isCrossRepository: true };
+    const own = { ...pr([done('daemon-soak', 8, 600)], 4461), isCrossRepository: false };
+    expect(learnDurations({}, [fork, own])['daemon-soak']).toEqual([{ jobId: 8, sec: 600 }]);
+  });
+
+  it('acts only on a pull_request run of an allowed workflow; a deploy / push / unknown run is REFUSED with no write', async () => {
+    const { sweepHungJobs } = await import('../ci-queue-watch.mjs');
+    for (const run of [
+      { event: 'push', path: '.github/workflows/ci.yml' },
+      { event: 'workflow_run', path: '.github/workflows/deploy.yml' },
+      { event: 'workflow_dispatch', path: '.github/workflows/deploy.yml' },
+      { path: '.github/workflows/ci.yml' }, // no event at all: fail closed
+    ]) {
+      const f = fakes('in_progress');
+      const getRun = ({ runId }) => { f.calls.push(['getRun', runId]); return { status: 'in_progress', head_sha: 'db9f116', run_attempt: 1, ...run }; };
+      sweepHungJobs({ ...sharedBase(f), statePath: join(dir, `refuse-${run.event}-${run.path.length}.json`), getRun, listPrs: () => [pr([stuckRun()])], now: () => T0 + 95 * MIN });
+      expect(f.calls.filter(([c]) => c !== 'getRun')).toEqual([]);
+      expect(f.lines.join('\n')).toMatch(/ci-job-hung: REFUSED .*pull_request/);
+    }
+    // a pull_request run is acted on; with an explicit workflow allow-list only the listed files are
+    const ok = fakes('completed');
+    sweepHungJobs({ ...sharedBase(ok), workflows: ['ci.yml'], listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(ok.calls)).toEqual(['rerunJob']);
+    const notListed = fakes('completed');
+    notListed.getRun = ({ runId }) => { notListed.calls.push(['getRun', runId]); return { status: 'completed', head_sha: 'db9f116', event: 'pull_request', path: '.github/workflows/deploy.yml@refs/pull/4450/merge', run_attempt: 1 }; };
+    sweepHungJobs({ ...sharedBase(notListed), statePath: join(dir, 'notlisted.json'), workflows: ['ci.yml'], listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(notListed.calls)).toEqual([]);
+    const withRef = fakes('completed');
+    withRef.getRun = ({ runId }) => { withRef.calls.push(['getRun', runId]); return { status: 'completed', head_sha: 'db9f116', event: 'pull_request', path: '.github/workflows/ci.yml@refs/pull/4450/merge', run_attempt: 1 }; };
+    sweepHungJobs({ ...sharedBase(withRef), statePath: join(dir, 'withref.json'), workflows: ['ci.yml'], listPrs: () => [pr([phantom()])], now: () => T0 + 95 * MIN });
+    expect(writesOf(withRef.calls)).toEqual(['rerunJob']);
+  });
+
+  it('the PR list asks for isCrossRepository, which the duration learner depends on', async () => {
+    const { defaultListPrs } = await import('../ci-queue-watch.mjs');
+    let argv;
+    defaultListPrs({ repo: 'web-everything/web-everything', exec: (_bin, a) => { argv = a; return '[]'; } });
+    expect(argv[argv.indexOf('--json') + 1].split(',')).toContain('isCrossRepository');
+  });
+
+  it('`hung` with an EMPTY WE_CI_HUNG_FLOOR_SEC does not treat a 10-minute-old check as hung', () => {
+    const cdir = mkdtempSync(join(tmpdir(), 'ci-hung-floor-'));
+    try {
+      const bin = join(cdir, 'bin');
+      mkdirSync(bin);
+      const started = new Date(Date.now() - 10 * 60_000).toISOString();
+      const prs = [{ number: 4450, headRefOid: 'db9f116', statusCheckRollup: [{ name: 'daemon-soak', workflowName: 'CI', status: 'IN_PROGRESS', conclusion: null, startedAt: started, detailsUrl: url(RUN, 113380540047) }] }];
+      writeFileSync(join(bin, 'gh'), `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(prs))});\n`);
+      chmodSync(join(bin, 'gh'), 0o755);
+      for (const floor of ['', '0']) {
+        const out = JSON.parse(execFileSync('node', [CLI, 'hung', '--dry-run', '--json', '--repo=web-everything/web-everything'], {
+          encoding: 'utf8',
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CONVEYOR_CI_QUEUE_FILE: join(cdir, 'history.json'), WE_CI_HUNG_FLOOR_SEC: floor },
+        }));
+        expect(out.hung).toEqual([]);
+      }
+    } finally {
+      rmSync(cdir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('hung CLI verb', () => {
@@ -1278,7 +1540,7 @@ describe('hung sweep wiring through the real CLI (kill switch + sweep integratio
       `if (a.includes("-X")) { fs.appendFileSync(${JSON.stringify(writeLog)}, a.join(" ") + "\\n"); process.stdout.write("{}"); process.exit(0); }`,
       'if (a[0] === "run") process.stdout.write("[]");',
       `else if (a[0] === "pr") process.stdout.write(${JSON.stringify(JSON.stringify(prs))});`,
-      'else if (a[0] === "api" && /actions\\/runs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ status: "completed", head_sha: "db9f116" }));',
+      'else if (a[0] === "api" && /actions\\/runs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ status: "completed", head_sha: "db9f116", event: "pull_request", path: ".github/workflows/ci.yml", run_attempt: 1 }));',
       'else if (a[0] === "api" && /actions\\/jobs\\/\\d+$/.test(a[1])) process.stdout.write(JSON.stringify({ id: 113380540047, run_id: 37796107550, name: "daemon-soak" }));',
       'else process.stdout.write("{}");',
     ].join('\n'));
