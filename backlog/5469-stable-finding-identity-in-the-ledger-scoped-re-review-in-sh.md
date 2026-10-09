@@ -3,10 +3,11 @@ bornAs: xm1mi56
 kind: story
 size: 5
 parent: "5467"
-status: open
+status: resolved
 relatedTo: ["5468", "3363", "3024"]
 scope: ["we:scripts/lib/verdict-ledger.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/jury-core.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-08"
 tags: [review, ledger]
 ---
 
