@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/check-standards.mjs", "we:scripts/lib/citation-check.mjs", "we:scripts/lib/git-grep-gate.mjs", "we:scripts/lib/git-grep-gate.test.mjs", "we:scripts/__tests__/citation-check.test.mjs"]
+scope: ["we:scripts/check-standards.mjs", "we:scripts/lib/citation-check.mjs", "we:scripts/lib/git-grep-gate.mjs", "we:scripts/lib/git-grep-gate.test.mjs", "we:scripts/__tests__/citation-check.test.mjs", "we:scripts/__tests__/check-standards.test.mjs"]
 dateOpened: "2026-09-29"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "d94901c295a89f3bc92cc2377a7211bc9cf1f3c0"
