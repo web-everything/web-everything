@@ -437,7 +437,7 @@ export function sendDesktopChecked({ title, body }, { spawnSyncFn = spawnSync, p
   } catch (e) { return { ok: false, error: String(e?.message ?? e) }; }
 }
 
-function notifyDesktop(notification) {
+export function notifyDesktop(notification, { quietGate = gateAlert, spawnSyncFn = spawnSync, platform = process.platform } = {}) {
   // quietHours (card xmvc6oc): held overnight unless it is an emergency; see we:scripts/lib/quiet-hours-io.mjs.
   const send = ({ title, body }) => {
     if (process.platform !== 'darwin') return { ok: false };
@@ -445,7 +445,7 @@ function notifyDesktop(notification) {
     catch { return { ok: false }; /* best-effort — never let a notification failure break the supervisor */ }
   };
   // `send` acknowledges before osascript has run; a held-alerts digest is confirmed by the checked sender only.
-  try { gateAlert(notification, { send, sendDigest: (n) => sendDesktopChecked(n) }); } catch { /* best-effort */ }
+  try { quietGate(notification, { send, sendDigest: (n) => sendDesktopChecked(n, { spawnSyncFn, platform }) }); } catch { /* best-effort */ }
 }
 
 /** Build the `maybeAlert` IO-shell glue: re-detect anomalies over the in-memory ring, decide whether to fire

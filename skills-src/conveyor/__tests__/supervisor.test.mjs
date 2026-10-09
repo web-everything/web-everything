@@ -606,4 +606,13 @@ describe('sendDesktopChecked — confirms only a real exit zero', () => {
     expect(sendDesktopChecked(n, { platform: 'darwin', spawnSyncFn: () => { throw new Error('boom'); } })).toMatchObject({ ok: false });
     expect(sendDesktopChecked(n, { platform: 'linux', spawnSyncFn: () => ({ status: 0 }) })).toMatchObject({ ok: false });
   });
+
+  it('notifyDesktop hands the quiet-hours gate the CHECKED sender for the digest (a failed osascript is not a confirmation)', async () => {
+    const { notifyDesktop } = await import('../supervisor.mjs');
+    let opts = null;
+    notifyDesktop({ title: 't', body: 'b' }, { quietGate: (_n, o) => { opts = o; }, platform: 'darwin', spawnSyncFn: () => ({ status: 1, stderr: 'denied' }) });
+    expect(opts.sendDigest({ title: 'd', body: 'd' })).toMatchObject({ ok: false });
+    notifyDesktop({ title: 't', body: 'b' }, { quietGate: (_n, o) => { opts = o; }, platform: 'darwin', spawnSyncFn: () => ({ status: 0 }) });
+    expect(opts.sendDigest({ title: 'd', body: 'd' })).toEqual({ ok: true });
+  });
 });

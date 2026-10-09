@@ -32,7 +32,7 @@ export async function main(argv = process.argv.slice(2)) {
   const settings = loadQuietSettings(); const toggle = readToggle(settings);
   let out;
   if (verb === 'status') {
-    out = { now: new Date().toISOString(), state: isQuiet(Date.now(), settings, toggle), toggle, window: `${settings.start}-${settings.end} ${settings.timeZone}`, held: digestPaths(settings).held };
+    out = { now: new Date().toISOString(), state: isQuiet(Date.now(), settings, toggle), toggle, window: `${settings.start}-${settings.end} ${settings.timeZone}`, held: digestPaths(settings).queue };
   } else if (verb === 'simulate') {
     const now = f.at ? Date.parse(f.at) : Date.now();
     if (!Number.isFinite(now)) { console.error(`bad --at "${f.at}"`); return 2; }

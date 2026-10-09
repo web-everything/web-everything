@@ -3,13 +3,28 @@
  * @description The quietHours knob (card xmvc6oc) — the IO shell around the pure `we:scripts/lib/quiet-hours.mjs`.
  *
  *   Reads the settings file (`we:scripts/quiet-hours-settings.json`, or `WE_QUIET_HOURS_SETTINGS`), the operator
- *   toggle file, and owns the digest queue (`<digestDir>/held.jsonl`). Every notify path routes through
- *   {@link gateAlert}: deliver now, or append to the digest. Any error inside the gate DELIVERS the alert — the
- *   gate may delay an alert, it must never lose one.
+ *   toggle file, and owns the digest queue. Every notify path routes through {@link gateAlert}: deliver now, or hold
+ *   for the digest. Any error inside the gate DELIVERS the alert — the gate may delay an alert, it must never lose one.
  *
- *   `WE_QUIET_HOURS=off` bypasses the gate entirely (deliver everything, flush nothing).
+ *   THE QUEUE IS ONE FILE PER HELD ALERT (`<digestDir>/queue/<id>.json`). A writer stages its alert in
+ *   `<digestDir>/tmp/` and commits it with ONE rename into `queue/`. Nobody appends to a shared file, so no writer
+ *   holds a handle that a flush could rename or delete under it: a rename is resolved by path at the instant it runs,
+ *   so the alert lands either in the queue a flusher is about to claim (and is sent with it) or in a fresh queue (and
+ *   is sent by the next digest). A single shared file cannot give that: a writer that opened it before a flush can
+ *   write into it after any cleanup, however late.
+ *
+ *   A flusher claims the whole queue with ONE rename (`queue/` → `claim-<pid>-<ms>-<seq>/`), so two flushers never
+ *   send the same alert. If anything fails before a confirmed send, each entry is renamed back into `queue/`; a
+ *   per-file rename moves an entry at most once, so two recoveries cannot both restore it. A confirmed claim is renamed
+ *   to `sent-…` before it is deleted, so no sweeper ever restores it.
+ *
+ *   Delivery is AT LEAST ONCE: a flusher killed between a confirmed send and that rename leaves a claim the next flush
+ *   restores and sends again (one duplicate digest). Nothing here ever deletes an alert that was not sent.
+ *
+ *   `WE_QUIET_HOURS=off` turns the gate off (every alert is delivered at once) and still drains what was held before.
  */
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -18,8 +33,12 @@ import { decideDelivery, isQuiet, mergeSettings, planDigest, sweepSkip } from '.
 
 export const SETTINGS_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../quiet-hours-settings.json');
 
-/** Off switch: `WE_QUIET_HOURS=off`, and inside vitest unless `WE_QUIET_HOURS=on` (tests, per the shared `isUnderTest`, never touch the real digest). */
-export const bypassed = (env) => env.WE_QUIET_HOURS === 'off' || (isUnderTest(env) && env.WE_QUIET_HOURS !== 'on');
+/** The operator's off switch: deliver everything now (what was already held still drains). */
+const offSwitch = (env) => env.WE_QUIET_HOURS === 'off';
+/** Inside vitest, unless `WE_QUIET_HOURS=on` (tests, per the shared `isUnderTest`, never touch the real digest). */
+const testBypassed = (env) => isUnderTest(env) && env.WE_QUIET_HOURS !== 'on';
+/** The gate is off: the off switch, or a test. */
+export const bypassed = (env) => offSwitch(env) || testBypassed(env);
 
 export const expandHome = (p) => (typeof p === 'string' && p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
 
@@ -39,7 +58,7 @@ export function readToggle(settings, { env = process.env } = {}) {
 
 export const digestPaths = (settings, { env = process.env } = {}) => {
   const dir = expandHome(env.WE_QUIET_DIGEST_DIR || settings.digestDir);
-  return { dir, held: join(dir, 'held.jsonl') };
+  return { dir, queue: join(dir, 'queue'), tmp: join(dir, 'tmp') };
 };
 
 /** Everything needed to decide, read once. */
@@ -49,96 +68,98 @@ export function quietContext({ env = process.env, now = Date.now() } = {}) {
   return { settings, toggle, now, state: isQuiet(now, settings, toggle) };
 }
 
-/** A claim (`held.jsonl.flushing-<pid>-<claimedAtMs>-<seq>`) older than this MAY belong to a flusher that crashed. */
+/** A claim (`claim-<pid>-<claimedAtMs>-<seq>`) older than this MAY belong to a flusher that crashed. */
 export const STALE_CLAIM_MS = 10 * 60_000;
 /** ...but one whose owner process is still alive is only taken after this much longer (hung, or the pid was reused). */
 export const LIVE_OWNER_CLAIM_MS = 2 * 60 * 60_000;
-const CLAIM_PREFIX = 'held.jsonl.flushing-';
+/** A staged entry (`tmp/<ms>-…`) this old belongs to a writer that died before committing it (its caller was never told "held"). */
+export const STALE_STAGED_MS = 24 * 60 * 60_000;
+const CLAIM_PREFIX = 'claim-';
+const SENT_PREFIX = 'sent-';
 
 /** Claims this process holds right now (a re-entrant flush must not sweep the outer call's claim). */
 const activeClaims = new Set();
+
+let seq = 0;
+/** A name no other writer or flusher can pick: time first, so a directory listing sorts in arrival order. */
+function uniqueId(now) {
+  seq += 1;
+  return `${String(Math.trunc(Number(now) || 0)).padStart(15, '0')}-${process.pid}-${seq}-${randomBytes(4).toString('hex')}`;
+}
 
 function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
 }
 
 /**
- * A retired claim (`held.jsonl.retired-<pid>-<atMs>-<seq>-<consumedBytes>`) is a claim whose flush is over. It is NOT
- * deleted: a writer that opened the queue before it was renamed away keeps a handle on this very file and may write
- * its line into it at any later moment (`appendFileSync` opens, then writes), so no read-then-delete can be safe.
- * Instead the file waits {@link RETIRED_GRACE_MS}; the next flush then puts everything past `consumedBytes` back on
- * the queue and deletes it. The prefix differs from the claim prefix on purpose: a retired file must never be taken
- * for a crashed flusher's claim (its entries were already sent or restored, and would go out twice).
+ * Rename `src` into the queue as `name`. The queue directory may be claimed (renamed away) by a flusher at any moment,
+ * including between our mkdir and our rename: that is ENOENT on the target, so make the queue again and retry. Throws
+ * when `src` itself is gone or the retries run out.
  */
-export const RETIRED_GRACE_MS = 2 * 60_000;
-const RETIRED_PREFIX = 'held.jsonl.retired-';
-
-let claimSeq = 0;
-
-/** Rename a finished claim to its retired name. `consumedBytes` = how much of it was already sent or restored. Never throws. */
-function retireClaim(claimed, consumedBytes, now) {
-  claimSeq += 1;
-  try { renameSync(claimed, join(dirname(claimed), `${RETIRED_PREFIX}${process.pid}-${now}-${claimSeq}-${consumedBytes}`)); return true; } catch { return false; }
-}
-
-/**
- * Put a claimed queue file back on the held queue, byte for byte (not re-parsed, so a torn line is kept too),
- * then retire the claim (so a line a straggling writer adds to it afterwards is still re-queued later). Never throws:
- * if the restore itself fails the claim file stays, and the stale-claim sweep at the next flush retries it.
- */
-function restoreClaim(claimed, held, now) {
-  let consumed = 0;
-  try {
-    const buf = readFileSync(claimed);
-    consumed = buf.length;
-    const text = buf.toString('utf8');
-    if (text) appendFileSync(held, `\n${text}${text.endsWith('\n') ? '' : '\n'}`); // leading \n: a torn tail on held must not glue onto the first restored line
-  } catch { return false; }
-  if (retireClaim(claimed, consumed, now)) return true;
-  try { unlinkSync(claimed); } catch { try { writeFileSync(claimed, ''); } catch { /* restored already; a leftover claim is only a duplicate */ } }
-  return true;
-}
-
-/** A claim whose entries were sent (or are unsendable): retire it, or delete it when it cannot be renamed. Never throws. */
-function endClaim(claimed, consumedBytes, now) {
-  if (retireClaim(claimed, consumedBytes, now)) return;
-  try { unlinkSync(claimed); } catch { try { writeFileSync(claimed, ''); } catch { /* a leftover claim is only a duplicate */ } }
-}
-
-/**
- * Re-queue what straggling writers added to retired claims once they are past the grace period, then delete them.
- * Each file is taken by an atomic rename to a fresh retired name first, so two sweepers cannot both re-queue it.
- * Never throws.
- */
-function sweepRetired(dir, held, now) {
-  let names = [];
-  try { names = readdirSync(dir); } catch { return; }
-  for (const name of names) {
-    if (!name.startsWith(RETIRED_PREFIX)) continue;
-    const m = /^(\d+)-(\d+)-(\d+)-(\d+)$/.exec(name.slice(RETIRED_PREFIX.length));
-    if (!m) continue;
-    const consumed = Number(m[4]);
-    if (Math.abs(now - Number(m[2])) <= RETIRED_GRACE_MS) continue; // a future stamp (clock skew) is swept like an old one
-    claimSeq += 1;
-    const mine = join(dir, `${RETIRED_PREFIX}${process.pid}-${now}-${claimSeq}-${consumed}`);
-    try { renameSync(join(dir, name), mine); } catch { continue; }
-    try {
-      const tail = readFileSync(mine).subarray(consumed).toString('utf8');
-      if (tail.trim()) appendFileSync(held, `\n${tail}${tail.endsWith('\n') ? '' : '\n'}`);
-      try { unlinkSync(mine); } catch { writeFileSync(mine, ''); } // appended already: never leave the tail to be appended again
-    } catch { /* it stays under a fresh stamp and is retried after the next grace period (at worst one duplicate line) */ }
+function moveIntoQueue(src, queue, name) {
+  for (let attempt = 0; ; attempt += 1) {
+    mkdirSync(queue, { recursive: true });
+    try { renameSync(src, join(queue, name)); return; } catch (e) {
+      if (e?.code !== 'ENOENT' || attempt >= 4 || !existsSync(src)) throw e;
+    }
   }
 }
 
+/** Stage, then commit one held alert. Throws on any failure (the gate then delivers it instead). */
+function commitEntry(paths, entry, now, beforeCommit) {
+  mkdirSync(paths.tmp, { recursive: true });
+  const name = `${uniqueId(now)}.json`;
+  const staged = join(paths.tmp, name);
+  writeFileSync(staged, `${JSON.stringify(entry)}\n`);
+  try {
+    beforeCommit?.(); // test seam: the writer is descheduled here while flushes run
+    moveIntoQueue(staged, paths.queue, name);
+  } catch (e) {
+    try { unlinkSync(staged); } catch { /* already gone */ }
+    throw e;
+  }
+}
+
+/** Has anything been committed to the queue? */
+function hasEntries(queue) {
+  try { return readdirSync(queue).length > 0; } catch { return false; }
+}
+
+/** The entries of a claim, oldest first. A file that cannot be READ throws (the claim is restored); one that is not JSON is skipped. */
+function readEntries(claimDir) {
+  const entries = [];
+  for (const f of readdirSync(claimDir).sort()) {
+    const text = readFileSync(join(claimDir, f), 'utf8');
+    try { entries.push(JSON.parse(text)); } catch { /* not an alert — skip */ }
+  }
+  return entries;
+}
+
+/** Move every entry of a claim back into the queue, then remove the claim. Never throws; false = some entries are still in the claim. */
+function restoreClaim(claimDir, queue) {
+  try {
+    for (const f of readdirSync(claimDir)) moveIntoQueue(join(claimDir, f), queue, f);
+  } catch { return false; }
+  try { rmdirSync(claimDir); } catch { /* an empty claim left behind is restored (as nothing) by the next sweep */ }
+  return true;
+}
+
+/** A claim whose entries were sent (or are not alerts): mark it sent, then delete it. Never throws. */
+function endClaim(claimDir, paths, now) {
+  let target = claimDir;
+  try { const sent = join(paths.dir, `${SENT_PREFIX}${uniqueId(now)}`); renameSync(claimDir, sent); target = sent; } catch { /* delete in place */ }
+  // A leftover `sent-*` is removed by the next sweep; a leftover claim (both steps failed) is at worst one duplicate digest.
+  try { rmSync(target, { recursive: true, force: true }); } catch { /* see above */ }
+}
+
 /**
- * Recover claims left behind by a flusher that died after renaming the queue away. A young claim may belong to
- * a live flusher, so only claims older than {@link STALE_CLAIM_MS} (by the timestamp in the name — the queue
- * file's own mtime is the last ALERT time, not the claim time) are taken. Each is renamed to a unique name
- * first, so two sweepers cannot both restore the same claim. Never throws.
+ * Recover claims left behind by a flusher that died after claiming the queue. A young claim may belong to a live
+ * flusher, so only claims older than {@link STALE_CLAIM_MS} (by the stamp in the name) are taken. Each is renamed
+ * to a fresh name first, so only one sweeper takes it. Never throws.
  */
-function recoverStaleClaims(dir, held, now) {
+function recoverStaleClaims(paths, now) {
   let names = [];
-  try { names = readdirSync(dir); } catch { return; }
+  try { names = readdirSync(paths.dir); } catch { return; }
   for (const name of names) {
     if (!name.startsWith(CLAIM_PREFIX)) continue;
     const m = /^(\d+)-(\d+)/.exec(name.slice(CLAIM_PREFIX.length));
@@ -151,85 +172,87 @@ function recoverStaleClaims(dir, held, now) {
     // not active is a failed restore.
     const owner = Number(m[1]);
     if (owner !== process.pid && Math.abs(now - claimedAt) <= LIVE_OWNER_CLAIM_MS && pidAlive(owner)) continue;
-    // Take it under a NEW name stamped with this sweep (our pid, `now`). The rename is atomic, so only one sweeper wins;
-    // and the new stamp makes the claim young again, so a second sweeper cannot take it while we are still restoring it
-    // (with the old stamp it would look hours old and, being "owned" by a live pid past the hard limit, be taken, and
-    // its entries restored and sent twice). A crash mid-restore just leaves a claim that goes stale again in 10 minutes.
-    claimSeq += 1;
-    const swept = `${CLAIM_PREFIX}${process.pid}-${now}-${claimSeq}`;
-    const mine = join(dir, swept);
-    try { renameSync(join(dir, name), mine); } catch { continue; }
+    // Take it under a NEW name stamped with this sweep (our pid, `now`). The rename is atomic, so only one sweeper wins,
+    // and the new stamp makes the claim young again, so a second sweeper cannot take it while we are still restoring it.
+    // Even if two did, each entry is moved back by its own rename, so it can be restored only once.
+    seq += 1;
+    const swept = `${CLAIM_PREFIX}${process.pid}-${now}-${seq}`;
+    const mine = join(paths.dir, swept);
+    try { renameSync(join(paths.dir, name), mine); } catch { continue; }
     activeClaims.add(swept);
-    try { restoreClaim(mine, held, now); } finally { activeClaims.delete(swept); }
+    try { restoreClaim(mine, paths.queue); } finally { activeClaims.delete(swept); }
   }
 }
 
+/** Remove what is safe to remove: `sent-*` claims, and entries staged by a writer that died long ago. Never throws. */
+function sweepLeftovers(paths, now) {
+  try {
+    for (const name of readdirSync(paths.dir)) {
+      if (name.startsWith(SENT_PREFIX)) { try { rmSync(join(paths.dir, name), { recursive: true, force: true }); } catch { /* next time */ } }
+    }
+  } catch { /* no digest dir yet */ }
+  try {
+    for (const name of readdirSync(paths.tmp)) {
+      // A writer this late finds its staged file gone, fails its commit, and so delivers the alert itself.
+      const at = Number(/^(\d+)-/.exec(name)?.[1]);
+      if (Number.isFinite(at) && Math.abs(now - at) > STALE_STAGED_MS) { try { unlinkSync(join(paths.tmp, name)); } catch { /* next time */ } }
+    }
+  } catch { /* no tmp dir */ }
+}
+
 /**
- * Send the ONE held-alerts digest if quiet hours are over and something is held. The held file is renamed away
- * before reading, so two concurrent flushers cannot both send it. Anything that goes wrong between the claim and
- * a confirmed send (a throwing sender, a failed digest-file write, a returned `{ok:false}`) puts the entries back
- * on the queue; a flusher that dies outright leaves a claim the next flush recovers. Returns what happened; never throws.
+ * Send the ONE held-alerts digest if quiet hours are over (or switched off) and something is held. The queue is
+ * claimed by one rename before reading, so two concurrent flushers cannot both send it. Anything that goes wrong
+ * between the claim and a confirmed send (a throwing sender, a failed digest-file write, a returned `{ok:false}`)
+ * puts the entries back on the queue; a flusher that dies outright leaves a claim the next flush recovers. Returns
+ * what happened; never throws.
  */
 export function flushDigest({ send, env = process.env, now = Date.now(), dryRun = false, beforeSend } = {}) {
-  let claimed = null;
-  let held = null;
+  let claimDir = null;
   let claimId = null;
-  let consumed = 0; // bytes of the claim that were read (and so sent or restored); anything past it arrived late
+  let paths = null;
   let confirmed = false; // the sender reported success — from here the entries must NOT be restored
   try {
-    if (bypassed(env)) return { flushed: false, reason: 'bypassed' };
+    if (testBypassed(env)) return { flushed: false, reason: 'bypassed' };
     const { settings, state } = quietContext({ env, now });
-    if (state.quiet) return { flushed: false, reason: `still quiet (${state.reason})` };
-    const { dir, held: heldPath } = digestPaths(settings, { env });
-    held = heldPath;
-    if (!dryRun) { recoverStaleClaims(dir, held, now); sweepRetired(dir, held, now); }
-    if (!existsSync(held)) return { flushed: false, reason: 'nothing held' };
+    if (state.quiet && !offSwitch(env)) return { flushed: false, reason: `still quiet (${state.reason})` };
+    paths = digestPaths(settings, { env });
+    if (!dryRun) { recoverStaleClaims(paths, now); sweepLeftovers(paths, now); }
+    if (!hasEntries(paths.queue)) return { flushed: false, reason: 'nothing held' };
     if (dryRun) return { flushed: false, reason: 'dry run' };
-    claimSeq += 1;
-    const claim = `${held}.flushing-${process.pid}-${now}-${claimSeq}`; // unique per call: a rename must never overwrite a surviving claim
-    try { renameSync(held, claim); } catch { return { flushed: false, reason: 'another flusher claimed it' }; }
-    claimed = claim;
+    seq += 1;
+    const claim = join(paths.dir, `${CLAIM_PREFIX}${process.pid}-${now}-${seq}`); // unique per call
+    try { renameSync(paths.queue, claim); } catch { return { flushed: false, reason: 'another flusher claimed it' }; }
+    claimDir = claim;
     claimId = basename(claim);
     activeClaims.add(claimId);
-    const entries = [];
-    const buf = readFileSync(claimed);
-    consumed = buf.length;
-    const raw = buf.toString('utf8');
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue;
-      try { entries.push(JSON.parse(line)); } catch { /* torn line — skip */ }
-    }
+    const entries = readEntries(claimDir);
     // `digest.enabled=false` only stops NEW alerts being held (decideDelivery delivers them). Whatever was already
     // held is still owed to the operator, so it drains here, once, as a digest: never deleted, never stranded.
     const plan = planDigest(entries, { ...settings, digest: { ...settings.digest, enabled: true } });
-    if (!plan) { endClaim(claimed, consumed, now); claimed = null; return { flushed: false, reason: 'digest empty' }; } // only torn/untitled lines: nothing sendable
+    if (!plan) { endClaim(claimDir, paths, now); claimDir = null; return { flushed: false, reason: 'digest empty' }; } // no file in it is an alert
     const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
-    const mdPath = join(dir, `digest-${stamp}.md`);
+    const mdPath = join(paths.dir, `digest-${stamp}.md`);
     writeFileSync(mdPath, plan.markdown);
-    writeFileSync(join(dir, 'latest-digest.md'), plan.markdown);
-    beforeSend?.(claimed); // test seam: lets a test play the part of a sweeper that takes the claim while this flusher is stuck
+    writeFileSync(join(paths.dir, 'latest-digest.md'), plan.markdown);
+    beforeSend?.(claimDir); // test seam: lets a test play the part of a sweeper that takes the claim while this flusher is stuck
     // A flusher that hung past the live-owner limit has had its claim restored by a sweeper; sending now would deliver the
     // same entries twice (the restored copy goes out in the next digest). The claim is no longer ours: leave it.
-    if (!existsSync(claimed)) { claimed = null; return { flushed: false, reason: 'claim taken by a sweeper' }; }
+    if (!existsSync(claimDir)) { claimDir = null; return { flushed: false, reason: 'claim taken by a sweeper' }; }
     const sent = send ? send({ title: plan.title, body: plan.body }) : { ok: false, error: 'no sender' };
     if (sent?.ok !== true) { // only an explicit success empties the queue: undefined/{}/null from a sloppy sender is NOT a confirmation
-      // Delivery failed: put the claim's raw lines back (torn lines included) so the next flush retries.
-      const requeued = restoreClaim(claimed, held, now);
-      if (requeued) claimed = null;
-      else throw new Error('could not re-queue the failed digest');
+      if (!restoreClaim(claimDir, paths.queue)) throw new Error('could not re-queue the failed digest');
+      claimDir = null;
       return { flushed: false, count: entries.length, mdPath, sent };
     }
-    confirmed = true; // the sender reported success — the entries must not be restored from here
-    endClaim(claimed, consumed, now);
-    claimed = null;
+    confirmed = true;
+    endClaim(claimDir, paths, now);
+    claimDir = null;
     return { flushed: true, count: entries.length, mdPath, sent };
   } catch (e) {
-    if (claimed && held) {
-      if (confirmed) {
-        // Already sent: never restore, that would send twice. Retire the claim (or, failing that, empty it) so a sweep finds nothing to restore.
-        if (!retireClaim(claimed, consumed, now)) { try { writeFileSync(claimed, ''); } catch { /* nothing more to do */ } }
-      } else restoreClaim(claimed, held, now);
-    }
+    // Already sent: never restore (that would send twice). Otherwise put the entries back; if even that fails, the
+    // claim stays and the stale-claim sweep restores it later (this process: after STALE_CLAIM_MS; another: once we exit).
+    if (claimDir) { if (confirmed) endClaim(claimDir, paths, now); else restoreClaim(claimDir, paths.queue); }
     return { flushed: false, reason: `flush error: ${String(e?.message ?? e)}` };
   } finally {
     if (claimId) activeClaims.delete(claimId);
@@ -245,18 +268,19 @@ export function flushDigest({ send, env = process.env, now = Date.now(), dryRun 
  * before the OS call has run) is therefore not used for it; without a `sendDigest` this call does not flush (the
  * periodic `flushDigest` callers do).
  */
-export function gateAlert(notification, { send, sendDigest, env = process.env, now = Date.now() } = {}) {
-  if (bypassed(env)) return send(notification);
-  let decision;
+export function gateAlert(notification, { send, sendDigest, env = process.env, now = Date.now(), beforeCommit } = {}) {
+  if (bypassed(env)) {
+    // The off switch delivers every new alert at once; what was held before it was flipped is still owed, so drain it.
+    if (offSwitch(env) && sendDigest) { try { flushDigest({ send: sendDigest, env, now }); } catch { /* best-effort */ } }
+    return send(notification);
+  }
   try {
     if (sendDigest) flushDigest({ send: sendDigest, env, now });
     const { settings, toggle } = quietContext({ env, now });
-    decision = decideDelivery(notification, { now, settings, toggle });
+    const decision = decideDelivery(notification, { now, settings, toggle });
     if (!decision.deliver) {
-      const { dir, held } = digestPaths(settings, { env });
-      mkdirSync(dir, { recursive: true });
-      // Leading \n: if a writer died mid-line, the torn tail must not swallow this alert (the reader skips blank lines).
-      appendFileSync(held, '\n' + JSON.stringify({ at: new Date(now).toISOString(), title: String(notification?.title ?? ''), body: String(notification?.body ?? ''), reason: decision.reason }) + '\n');
+      const entry = { at: new Date(now).toISOString(), title: String(notification?.title ?? ''), body: String(notification?.body ?? ''), reason: decision.reason };
+      commitEntry(digestPaths(settings, { env }), entry, now, beforeCommit);
       return { ok: true, suppressed: true, reason: decision.reason };
     }
   } catch { /* the gate must never lose an alert — deliver */ }

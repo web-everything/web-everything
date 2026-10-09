@@ -1,11 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync, appendFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, readdirSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   isQuiet, breaksThrough, decideDelivery, sweepSkip, planDigest, mergeSettings, inWindow, toggleActive, DEFAULT_QUIET_SETTINGS,
 } from '../quiet-hours.mjs';
-import { gateAlert, flushDigest, SETTINGS_PATH } from '../quiet-hours-io.mjs';
+import { gateAlert, flushDigest, SETTINGS_PATH, STALE_STAGED_MS } from '../quiet-hours-io.mjs';
 import { spawnSync } from 'node:child_process';
 
 // A pid that is certain to be dead: a child that has already exited (a hard-coded pid could belong to a live process).
@@ -89,6 +89,14 @@ describe('breakthrough rule', () => {
   });
 });
 
+// The queue is one file per held alert under `<digestDir>/queue/`; a flusher claims it as `claim-<pid>-<ms>-<seq>/`.
+const queued = (digest) => {
+  try { return readdirSync(join(digest, 'queue')).map((f) => JSON.parse(readFileSync(join(digest, 'queue', f), 'utf8'))); } catch { return []; }
+};
+const claimsIn = (digest) => readdirSync(digest).filter((f) => f.startsWith('claim-'));
+const leftovers = (digest) => readdirSync(digest).filter((f) => /^(claim-|sent-)/.test(f))
+  .concat(existsSync(join(digest, 'tmp')) ? readdirSync(join(digest, 'tmp')).map((f) => `tmp/${f}`) : []);
+
 describe('digest', () => {
   it('plans one notification, grouping repeats', () => {
     const d = planDigest([{ title: 'A', body: '1' }, { title: 'A', body: '2' }, { title: 'B' }, 'junk'], S);
@@ -116,24 +124,14 @@ describe('digest', () => {
     expect(sent.at(-1).title).toBe('Quiet-hours digest: 2 alert(s) held');
     expect(flushDigest({ send, env, now: ET('07:35') }).flushed).toBe(false); // only once
     expect(existsSync(join(dir, 'digest', 'latest-digest.md'))).toBe(true);
-    expect(readFileSync(join(dir, 'digest', 'latest-digest.md'), 'utf8')).toMatch(/routine 2/);
+    expect(readFileSync(join(dir, 'digest', 'latest-digest.md'), 'utf8')).toMatch(/routine 1[\s\S]*routine 2/); // in arrival order
+    expect(leftovers(join(dir, 'digest'))).toEqual([]);
 
     // A daytime alert is delivered directly.
     expect(gateAlert({ title: 'day' }, { send, env, now: ET('12:00') })).toEqual({ ok: true });
   });
 
-  it('IO: a failed digest send keeps the entries for the next flush', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'quiet-'));
-    const settingsPath = join(dir, 'settings.json');
-    writeFileSync(settingsPath, JSON.stringify({ digestDir: join(dir, 'digest'), toggleFile: join(dir, 'none.json') }));
-    const env = { WE_QUIET_HOURS_SETTINGS: settingsPath };
-    gateAlert({ title: 'r' }, { send: () => ({ ok: true }), env, now: ET('01:00') });
-    expect(flushDigest({ send: () => ({ ok: false }), env, now: ET('08:00') }).flushed).toBe(false);
-    expect(readdirSync(join(dir, 'digest'))).toContain('held.jsonl');
-    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1);
-  });
-
-  // Variants of "the queue was claimed (renamed away), then something went wrong before delivery was confirmed".
+  // Variants of "the queue was claimed, then something went wrong before delivery was confirmed".
   const heldFixture = (n = 2) => {
     const dir = mkdtempSync(join(tmpdir(), 'quiet-'));
     const settingsPath = join(dir, 'settings.json');
@@ -143,11 +141,19 @@ describe('digest', () => {
     return { dir, env, digest: join(dir, 'digest') };
   };
 
+  it('IO: a failed digest send keeps the entries for the next flush', () => {
+    const { env, digest } = heldFixture(1);
+    expect(flushDigest({ send: () => ({ ok: false }), env, now: ET('08:00') }).flushed).toBe(false);
+    expect(queued(digest).map((e) => e.title)).toEqual(['r1']);
+    expect(claimsIn(digest)).toEqual([]);
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1);
+  });
+
   it('IO: a throwing sender restores claimed entries for retry', () => {
     const { env, digest } = heldFixture();
     const r = flushDigest({ send: () => { throw new Error('boom'); }, env, now: ET('08:00') });
     expect(r.flushed).toBe(false);
-    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    expect(claimsIn(digest)).toEqual([]);
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(2);
   });
 
@@ -157,43 +163,73 @@ describe('digest', () => {
     const send = vi.fn(() => ({ ok: true }));
     expect(flushDigest({ send, env, now: ET('08:00') }).flushed).toBe(false);
     expect(send).not.toHaveBeenCalled();
-    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    expect(claimsIn(digest)).toEqual([]);
     rmSync(join(digest, 'latest-digest.md'), { recursive: true });
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(2);
   });
 
+  it('IO: an exception after the claim whose restore ALSO fails leaves a claim the next flushes recover (never stranded)', () => {
+    const { env, digest } = heldFixture();
+    // The sender throws, and the queue path is blocked by a stray file, so putting the entries back fails twice.
+    const r = flushDigest({ send: () => { writeFileSync(join(digest, 'queue'), 'blocker'); throw new Error('boom'); }, env, now: ET('08:00') });
+    expect(r).toMatchObject({ flushed: false, reason: expect.stringMatching(/boom/) });
+    expect(claimsIn(digest)).toHaveLength(1); // the entries are still on disk, in our claim
+    rmSync(join(digest, 'queue')); // the fault clears
+    const ok = vi.fn(() => ({ ok: true }));
+    expect(flushDigest({ send: ok, env, now: ET('08:05') }).flushed).toBe(false); // young: maybe still a live flusher
+    expect(flushDigest({ send: ok, env, now: ET('08:15') }).count).toBe(2); // our own orphan, past the stale window
+    expect(ok).toHaveBeenCalledTimes(1);
+    expect(leftovers(digest)).toEqual([]);
+    // ...and the same orphan in a process that has since exited is recovered by any other process.
+    const f = heldFixture(1);
+    renameSync(join(f.digest, 'queue'), join(f.digest, `claim-${DEAD}-${ET('08:00')}-1`));
+    expect(flushDigest({ send: ok, env: f.env, now: ET('08:15') }).count).toBe(1);
+  });
+
   it('IO: a stale claim left by a crashed flusher is recovered by the next flush', () => {
     const { env, digest } = heldFixture();
-    renameSync(join(digest, 'held.jsonl'), join(digest, `held.jsonl.flushing-${DEAD}-${ET('08:00')}`)); // crash right after the claim
-    expect(existsSync(join(digest, 'held.jsonl'))).toBe(false);
+    renameSync(join(digest, 'queue'), join(digest, `claim-${DEAD}-${ET('08:00')}-1`)); // crash right after the claim
+    expect(queued(digest)).toEqual([]);
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:05') }).flushed).toBe(false); // claim is young — maybe a live flusher
-    expect(readdirSync(digest).some((f) => f.includes(`.flushing-${DEAD}-`))).toBe(true);
+    expect(claimsIn(digest).some((f) => f.startsWith(`claim-${DEAD}-`))).toBe(true);
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('09:00') }).count).toBe(2); // an hour old — recovered and sent
-    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
+    expect(claimsIn(digest)).toEqual([]);
   });
 
   it('IO: a stale claim merges with entries held since (nothing lost, one digest)', () => {
     const { env, digest } = heldFixture(1);
-    renameSync(join(digest, 'held.jsonl'), join(digest, `held.jsonl.flushing-${DEAD}-${ET('07:00')}`));
+    renameSync(join(digest, 'queue'), join(digest, `claim-${DEAD}-${ET('07:00')}-1`));
     gateAlert({ title: 'later' }, { send: () => ({ ok: true }), env, now: ET('22:30', '2026-10-09') }); // held again, next night
     const sent = [];
     expect(flushDigest({ send: (n) => { sent.push(n); return { ok: true }; }, env, now: ET('08:00', '2026-10-10') }).count).toBe(2);
     expect(sent).toHaveLength(1);
   });
 
-  it('IO: a torn tail on the queue does not swallow the next held alert', () => {
+  it('IO: a file in the queue that is not an alert does not swallow the others', () => {
     const { env, digest } = heldFixture(1);
-    appendFileSync(join(digest, 'held.jsonl'), '{"at":"2026-10-09T02:00:00Z","title":"torn'); // a writer died mid-line, no newline
-    gateAlert({ title: 'after-tear' }, { send: () => ({ ok: true }), env, now: ET('03:00') });
-    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') }).count).toBe(2); // r1 + after-tear; only the torn line is lost
+    writeFileSync(join(digest, 'queue', 'garbage.json'), '{"at":"2026-10-09T02:00:00Z","title":"torn'); // not JSON
+    gateAlert({ title: 'after' }, { send: () => ({ ok: true }), env, now: ET('03:00') });
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') }).count).toBe(2); // r1 + after
   });
 
-  it('IO: a claim stamped in the future is swept too, and a failed send re-queues the raw lines', () => {
+  it('IO: a writer that died after staging leaves nothing in the queue, and its staged file is cleared after a day', () => {
     const { env, digest } = heldFixture(1);
-    renameSync(join(digest, 'held.jsonl'), join(digest, `held.jsonl.flushing-${DEAD}-${ET('08:00') + 24 * 3600_000}`));
+    mkdirSync(join(digest, 'tmp'), { recursive: true });
+    const staged = `${String(ET('01:00')).padStart(15, '0')}-${DEAD}-1-dead.json`;
+    writeFileSync(join(digest, 'tmp', staged), JSON.stringify({ title: 'never committed' }));
+    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') }).count).toBe(1); // only r1: staged is not queued
+    expect(existsSync(join(digest, 'tmp', staged))).toBe(true); // young: its writer may still commit it
+    expect(ET('08:00', '2026-10-10') - ET('01:00')).toBeGreaterThan(STALE_STAGED_MS);
+    flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00', '2026-10-10') }); // the next morning (not quiet)
+    expect(existsSync(join(digest, 'tmp', staged))).toBe(false);
+  });
+
+  it('IO: a claim stamped in the future is swept too, and a failed send re-queues the entries', () => {
+    const { env, digest } = heldFixture(1);
+    renameSync(join(digest, 'queue'), join(digest, `claim-${DEAD}-${ET('08:00') + 24 * 3600_000}-1`));
     expect(flushDigest({ send: () => ({ ok: false }), env, now: ET('08:00') }).flushed).toBe(false);
-    expect(readdirSync(digest).filter((f) => f.includes('.flushing-'))).toEqual([]);
-    expect(readFileSync(join(digest, 'held.jsonl'), 'utf8')).toMatch(/"title":"r1"/);
+    expect(claimsIn(digest)).toEqual([]);
+    expect(queued(digest).map((e) => e.title)).toEqual(['r1']);
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1);
   });
 
@@ -207,104 +243,103 @@ describe('digest', () => {
     const r = flushDigest({ send, env, now: ET('08:00') });
     expect(r).toMatchObject({ flushed: true, count: 2 }); // the two held before the switch are not lost
     expect(sent.at(-1).title).toBe('Quiet-hours digest: 2 alert(s) held');
-    expect(existsSync(join(digest, 'held.jsonl'))).toBe(false);
+    expect(queued(digest)).toEqual([]);
   });
 
   it.each([[undefined], [null], [{}], [{ ok: 'yes' }], [{ ok: false }]])('IO: a sender returning %j is not a confirmation — the digest stays queued', (ret) => {
     const { env, digest } = heldFixture(1);
     expect(flushDigest({ send: () => ret, env, now: ET('08:00') }).flushed).toBe(false);
-    expect(readFileSync(join(digest, 'held.jsonl'), 'utf8')).toMatch(/"title":"r1"/);
+    expect(queued(digest).map((e) => e.title)).toEqual(['r1']);
     expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:30') }).count).toBe(1);
   });
 
   it('IO: gateAlert flushes the digest only through an explicit sendDigest, and an unconfirmed digest stays held', () => {
     const { env, digest } = heldFixture(1);
-    const held = join(digest, 'held.jsonl');
     const sent = [];
     const send = (n) => { sent.push(n); return { ok: true }; }; // fire-and-forget: acknowledges before delivery is known
     gateAlert({ title: 'day 1' }, { send, env, now: ET('12:00') });
-    expect(existsSync(held)).toBe(true); // an unchecked sender must never be allowed to empty the queue
+    expect(queued(digest)).toHaveLength(1); // an unchecked sender must never be allowed to empty the queue
     expect(sent.map((n) => n.title)).toEqual(['day 1']);
     gateAlert({ title: 'day 2' }, { send, env, now: ET('12:05'), sendDigest: () => ({ ok: false }) });
-    expect(readFileSync(held, 'utf8')).toMatch(/"title":"r1"/);
+    expect(queued(digest).map((e) => e.title)).toEqual(['r1']);
     const digests = [];
     gateAlert({ title: 'day 3' }, { send, env, now: ET('12:10'), sendDigest: (n) => { digests.push(n); return { ok: true }; } });
     expect(digests).toHaveLength(1);
-    expect(existsSync(held)).toBe(false);
+    expect(queued(digest)).toEqual([]);
   });
 
   it('IO: a claim owned by a LIVE other process is left alone until the hard limit; our own orphan and a dead sweeper are swept', () => {
     const live = process.ppid; // alive, and not us
-    const claim = (digest, pid, extra = '') => join(digest, `held.jsonl.flushing-${pid}-${ET('08:00')}-1${extra}`);
+    const claim = (digest, pid) => join(digest, `claim-${pid}-${ET('08:00')}-1`);
     const ok = () => ({ ok: true });
     {
       const { env, digest } = heldFixture(1);
-      renameSync(join(digest, 'held.jsonl'), claim(digest, live));
+      renameSync(join(digest, 'queue'), claim(digest, live));
       expect(flushDigest({ send: ok, env, now: ET('08:30') }).flushed).toBe(false); // 30 min old but its owner is alive: do not steal it
       expect(existsSync(claim(digest, live))).toBe(true);
       expect(flushDigest({ send: ok, env, now: ET('08:00') + 3 * 3600_000 }).count).toBe(1); // 3 h: hung or the pid was reused
     }
     {
       const { env, digest } = heldFixture(1);
-      renameSync(join(digest, 'held.jsonl'), claim(digest, process.pid)); // a failed restore in THIS (long-lived) process
+      renameSync(join(digest, 'queue'), claim(digest, process.pid)); // a failed restore in THIS (long-lived) process
       expect(flushDigest({ send: ok, env, now: ET('08:30') }).count).toBe(1);
     }
     {
       const { env, digest } = heldFixture(1);
-      renameSync(join(digest, 'held.jsonl'), claim(digest, DEAD)); // a sweeper that took it, then died (a swept claim carries the SWEEPER's pid)
+      renameSync(join(digest, 'queue'), claim(digest, DEAD)); // a sweeper that took it, then died (a swept claim carries the SWEEPER's pid)
       expect(flushDigest({ send: ok, env, now: ET('08:30') }).count).toBe(1);
     }
   });
 
-  // A writer that opened held.jsonl BEFORE the flusher renamed it keeps a handle on the same file, so its line lands in
-  // the claim at ANY later moment, even after the flusher's last read. Reading the claim once more before deleting it
-  // only narrows that window; the claim must outlive the flush and be swept later. (Real file handle, no mocks.)
-  const lateLine = JSON.stringify({ at: '2026-10-09T12:00:00Z', title: 'late', body: '' });
-  const LATE_GRACE = 3 * 60_000; // longer than RETIRED_GRACE_MS
-  const lateWriterSurvives = (name, setup, send) => it(`IO: a straggling writer's line is not lost when the flush ends ${name}`, () => {
+  // A writer can be descheduled between staging its alert and committing it, for any length of time. Whatever the
+  // flushers do meanwhile — claim, send, fail, clean up, many times — its alert must reach a later digest.
+  const pausedWriterSurvives = (name, setup, send) => it(`IO: a writer paused mid-commit is not lost when the flush ends ${name}`, () => {
     const { env, digest } = setup();
-    const fd = openSync(join(digest, 'held.jsonl'), 'a'); // the writer opens the queue, then gets descheduled
-    const first = flushDigest({ send, env, now: ET('08:00') });
-    writeSync(fd, `\n${lateLine}\n`); // ...and writes AFTER the flusher has finished and removed its claim
-    closeSync(fd);
-    expect(first.flushed || first.reason === 'digest empty' || first.sent?.ok === false).toBe(true);
+    const r = gateAlert({ title: 'late', body: '' }, {
+      send: () => { throw new Error('the alert was held, not delivered'); }, env, now: ET('06:59'),
+      beforeCommit: () => {
+        flushDigest({ send, env, now: ET('08:00') });
+        flushDigest({ send, env, now: ET('08:00') + 3 * 60_000 });
+        flushDigest({ send, env, now: ET('08:00') + 3 * 3600_000 });
+      },
+    });
+    expect(r).toMatchObject({ suppressed: true });
     const seen = [];
-    flushDigest({ send: (n) => { seen.push(n.body); return { ok: true }; }, env, now: ET('08:00') + LATE_GRACE });
+    flushDigest({ send: (n) => { seen.push(n.body); return { ok: true }; }, env, now: ET('12:00') });
     expect(seen.join(' | ')).toMatch(/late/);
+    expect(leftovers(digest)).toEqual([]);
   });
-  lateWriterSurvives('after a confirmed send', () => heldFixture(1), () => ({ ok: true }));
-  lateWriterSurvives('after a failed send (entries restored)', () => heldFixture(1), () => ({ ok: false }));
-  lateWriterSurvives('on a queue of torn lines only', () => {
+  pausedWriterSurvives('after a confirmed send', () => heldFixture(1), () => ({ ok: true }));
+  pausedWriterSurvives('after a failed send (entries restored)', () => heldFixture(1), () => ({ ok: false }));
+  pausedWriterSurvives('on a queue with no alert in it', () => {
     const f = heldFixture(0);
-    mkdirSync(f.digest, { recursive: true });
-    writeFileSync(join(f.digest, 'held.jsonl'), 'not json at all\n');
+    mkdirSync(join(f.digest, 'queue'), { recursive: true });
+    writeFileSync(join(f.digest, 'queue', 'junk.json'), 'not json at all\n');
     return f;
   }, () => ({ ok: true }));
 
-  it('IO: a late line waits out a grace period before it is re-queued (a retired claim is not swept while its writer may still be about to write)', () => {
-    const { env, digest } = heldFixture(1);
-    const fd = openSync(join(digest, 'held.jsonl'), 'a');
-    flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') });
-    writeSync(fd, `\n${lateLine}\n`); closeSync(fd);
-    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') + 1000 }).flushed).toBe(false); // too soon: nothing re-queued yet
-    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') + LATE_GRACE }).count).toBe(1);
-    expect(flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') + 2 * LATE_GRACE }).flushed).toBe(false); // and only once
-    expect(readdirSync(digest).filter((f) => f.startsWith('held.jsonl.'))).toEqual([]);
+  it('IO: a paused writer whose queue is claimed between its mkdir and its rename still commits (the queue is made again)', () => {
+    const { env, digest } = heldFixture(0);
+    let claimed = false;
+    const r = gateAlert({ title: 'raced' }, {
+      send: () => { throw new Error('held, not delivered'); }, env, now: ET('02:00'),
+      beforeCommit: () => { mkdirSync(join(digest, 'queue'), { recursive: true }); renameSync(join(digest, 'queue'), join(digest, 'elsewhere')); claimed = true; },
+    });
+    expect(claimed).toBe(true);
+    expect(r).toMatchObject({ suppressed: true });
+    expect(queued(digest).map((e) => e.title)).toEqual(['raced']);
   });
 
-  it('IO: a late multibyte line is re-queued intact (offsets are bytes, not string length)', () => {
-    const { env, digest } = heldFixture(1);
-    writeFileSync(join(digest, 'held.jsonl'), `${JSON.stringify({ at: 'x', title: 'héllo ✓ 日本語', body: '' })}\n`); // multibyte in the consumed part
-    const fd = openSync(join(digest, 'held.jsonl'), 'a');
-    flushDigest({ send: () => ({ ok: true }), env, now: ET('08:00') });
-    writeSync(fd, `\n${JSON.stringify({ at: 'y', title: 'late ✓', body: '' })}\n`); closeSync(fd);
+  it('IO: a multibyte title round-trips intact', () => {
+    const { env } = heldFixture(0);
+    gateAlert({ title: 'héllo ✓ 日本語', body: '' }, { send: () => ({ ok: true }), env, now: ET('02:00') });
     const seen = [];
-    flushDigest({ send: (n) => { seen.push(n.body); return { ok: true }; }, env, now: ET('08:00') + LATE_GRACE });
-    expect(seen).toEqual(['late ✓']);
+    flushDigest({ send: (n) => { seen.push(n.body); return { ok: true }; }, env, now: ET('08:00') });
+    expect(seen).toEqual(['héllo ✓ 日本語']);
   });
 
   it('IO: a flusher whose claim a sweeper took while it was hung does not send the entries again', () => {
-    const { env, digest } = heldFixture(1);
+    const { env } = heldFixture(1);
     const send = vi.fn(() => ({ ok: true }));
     const r = flushDigest({
       send, env, now: ET('08:00'),
@@ -316,28 +351,27 @@ describe('digest', () => {
 
   it('IO: a claim a sweeper just took is young again, so a second sweeper cannot take it mid-restore (no double delivery)', () => {
     const { env, digest } = heldFixture(1);
-    const claims = () => readdirSync(digest).filter((f) => f.includes('.flushing-'));
     const ok = vi.fn(() => ({ ok: true }));
     // A flusher died 7 h ago, right after claiming the queue.
-    const original = join(digest, `held.jsonl.flushing-${DEAD}-${ET('01:00')}-1`);
-    renameSync(join(digest, 'held.jsonl'), original);
-    const entries = readFileSync(original, 'utf8');
-    // Sweeper S takes that claim, but its restore dies half way (the claim cannot be read: a directory stands in for
-    // the fault), so the claim stays on disk, owned by S.
-    rmSync(original); mkdirSync(original);
+    renameSync(join(digest, 'queue'), join(digest, `claim-${DEAD}-${ET('01:00')}-1`));
+    // Sweeper S takes that claim, but its restore fails (a stray file blocks the queue path), so the claim stays on
+    // disk, owned by S.
+    writeFileSync(join(digest, 'queue'), 'blocker');
     expect(flushDigest({ send: ok, env, now: ET('08:00') }).flushed).toBe(false);
-    const left = claims();
+    const left = claimsIn(digest);
     expect(left).toHaveLength(1);
+    expect(left[0]).not.toMatch(new RegExp(`^claim-${DEAD}-`));
     // The claim's ORIGINAL age is 7 h, but S took it a moment ago. A second sweeper a minute later must see a young
     // claim and leave it alone; recovering it now would restore and send the same alerts S is about to restore.
+    rmSync(join(digest, 'queue'));
     expect(flushDigest({ send: ok, env, now: ET('08:01') }).flushed).toBe(false);
     expect(ok).not.toHaveBeenCalled();
-    expect(claims()).toEqual(left);
-    // Once it has gone quiet for the normal stale window it is recovered (the fault cleared), and sent exactly once.
-    rmSync(join(digest, left[0]), { recursive: true }); writeFileSync(join(digest, left[0]), entries);
+    expect(claimsIn(digest)).toEqual(left);
+    // Once it has gone quiet for the normal stale window it is recovered, and sent exactly once.
     expect(flushDigest({ send: ok, env, now: ET('08:30') }).count).toBe(1);
+    expect(flushDigest({ send: ok, env, now: ET('09:30') }).flushed).toBe(false);
     expect(ok).toHaveBeenCalledTimes(1);
-    expect(claims()).toEqual([]);
+    expect(leftovers(digest)).toEqual([]);
   });
 
   it('IO: the toggle file forces quiet by day; VITEST bypass and off switch deliver', () => {
@@ -356,5 +390,60 @@ describe('digest', () => {
     const p = join(dir, 's.json'); writeFileSync(p, '{torn');
     // torn settings → defaults; at noon that is not quiet → delivered.
     expect(gateAlert({ title: 'x' }, { send: () => ({ ok: true }), env: { WE_QUIET_HOURS_SETTINGS: p, WE_QUIET_DIGEST_DIR: join(dir, 'd'), WE_QUIET_MODE_FILE: join(dir, 'none') }, now: ET('12:00') })).toEqual({ ok: true });
+  });
+
+  it('IO: a hold that cannot be written during quiet hours delivers the alert at once, exactly once', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'quiet-'));
+    writeFileSync(join(dir, 'd'), 'a file where the digest dir should be'); // every write under it fails
+    const send = vi.fn(() => ({ ok: true }));
+    const env = { WE_QUIET_DIGEST_DIR: join(dir, 'd'), WE_QUIET_MODE_FILE: join(dir, 'none'), WE_QUIET_HOURS_SETTINGS: join(dir, 'none.json') };
+    expect(gateAlert({ title: 'x' }, { send, env, now: ET('02:00') })).toEqual({ ok: true });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith({ title: 'x' });
+  });
+});
+
+// PR 4461 rung 2 ("ruling not addressed"): each test below is named for the finding it pins.
+describe('quietHours: findings the operator ruled on (PR 4461)', () => {
+  const fixture = (n = 1) => {
+    const dir = mkdtempSync(join(tmpdir(), 'quiet-'));
+    const settingsPath = join(dir, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify({ digestDir: join(dir, 'digest'), toggleFile: join(dir, 'none.json') }));
+    const env = { WE_QUIET_HOURS_SETTINGS: settingsPath };
+    for (let i = 1; i <= n; i += 1) gateAlert({ title: `r${i}` }, { send: () => ({ ok: true }), env, now: ET('01:00') });
+    return { dir, env, digest: join(dir, 'digest') };
+  };
+  const collector = () => { const seen = []; return { seen, send: (n) => { seen.push(n); return { ok: true }; } }; };
+  const GRACE = 3 * 60_000; // longer than any grace period the flusher may wait before cleaning up
+
+  it('F1/F9: a writer paused mid-commit across a whole flush and cleanup cycle still has its alert delivered', () => {
+    const { env } = fixture(1);
+    const { seen, send } = collector();
+    const direct = [];
+    const r = gateAlert({ title: 'late', body: 'late' }, {
+      send: (n) => { direct.push(n); return { ok: true }; }, env, now: ET('06:59'),
+      // The writer is descheduled between choosing where to write and writing; meanwhile quiet hours end and every
+      // flush and cleanup step runs to completion, more than once.
+      beforeCommit: () => {
+        flushDigest({ send, env, now: ET('08:00') });
+        flushDigest({ send, env, now: ET('08:00') + GRACE });
+        flushDigest({ send, env, now: ET('08:00') + 2 * GRACE });
+      },
+    });
+    const later = flushDigest({ send, env, now: ET('09:00') });
+    const delivered = [...direct.map((n) => n.title), ...seen.map((n) => n.body)].join(' | ');
+    expect({ r, later: later.reason ?? later.count, delivered }).toMatchObject({ delivered: expect.stringMatching(/late/) });
+  });
+
+  it('F4: switching quiet hours off (WE_QUIET_HOURS=off) still delivers what was already held', () => {
+    const { env } = fixture(2);
+    const { seen, send } = collector();
+    expect(flushDigest({ send, env: { ...env, WE_QUIET_HOURS: 'off' }, now: ET('02:00') })).toMatchObject({ flushed: true, count: 2 });
+    expect(seen.map((n) => n.title)).toEqual(['Quiet-hours digest: 2 alert(s) held']);
+    // ...and a gated alert with the switch off flushes the backlog through its checked digest sender too.
+    const f = fixture(1);
+    const g = collector();
+    expect(gateAlert({ title: 'now' }, { send: () => ({ ok: true }), sendDigest: g.send, env: { ...f.env, WE_QUIET_HOURS: 'off' }, now: ET('02:00') })).toEqual({ ok: true });
+    expect(g.seen.map((n) => n.title)).toEqual(['Quiet-hours digest: 1 alert(s) held']);
   });
 });
