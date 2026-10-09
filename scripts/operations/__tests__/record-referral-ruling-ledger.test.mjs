@@ -119,7 +119,7 @@ describe('the default writer reaches the shared git store (slice H shadow: no ru
     process.env.WE_VERDICT_LEDGER_DIR = dir;
     try {
       const git = [];
-      await appendLedgerEvents(rows(), { store: 'dual', board: dir, gitAppend: ({ records }) => { git.push(...records); } });
+      await appendLedgerEvents(rows(), { store: 'dual', board: dir, gitAppend: ({ records }) => { git.push(...records); return { rows: records.length, duplicates: 0 }; } });
       expect(git.map((r) => r.type)).toEqual(['ruling', 'send-back']);
       expect(git[0]).toMatchObject({ findingKey: ledgerFindingKey(key), ruling: 'not-real' });
       expect(parseLedgerEvents(readFileSync(verdictLedgerPath(repo), 'utf8')).map((e) => e.type)).toEqual(['ruling', 'send-back']);
