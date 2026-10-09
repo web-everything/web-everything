@@ -1,4 +1,5 @@
 ---
+bornAs: xc9m7mh
 kind: story
 size: 3
 parent: "4075"
@@ -10,7 +11,7 @@ tags: []
 
 # Daemon builds its next version off the tick path — the fix daemon's tick no longer starves behind a 10-24 min rebuild smoke
 
-Starvation half of x44lnnt (PR #4575). Live 2026-10-09: the fix daemon's `withSelfSync` (we:scripts/lib/daemon-self-sync.mjs) awaited the gated rebuild at the start of every tick. With a 10-24 min live smoke, and an adopted rebuild restarting instead of ticking, no tick completed 06:03Z-07:11Z — no fix / ci-heal dispatches, green drafts unpromoted. Ruled design E5 ("a separate builder process", "restart only between handlers").
+Starvation half of 5561 (PR #4575). Live 2026-10-09: the fix daemon's `withSelfSync` (we:scripts/lib/daemon-self-sync.mjs) awaited the gated rebuild at the start of every tick. With a 10-24 min live smoke, and an adopted rebuild restarting instead of ticking, no tick completed 06:03Z-07:11Z — no fix / ci-heal dispatches, green drafts unpromoted. Ruled design E5 ("a separate builder process", "restart only between handlers").
 
 Fix: a detached builder process (we:scripts/lib/daemon-rebuild-builder.mjs) runs the SAME gated `rebuildClone` (same lease, unlocked candidate smoke, locked finalize) while the daemon keeps ticking on its current code. It is started only between ticks. The swap stays the existing HEAD-moved restart at a tick boundary, at most once per `swapMinIntervalMs`. Builder starts are coalesced (`buildMinIntervalMs`, none while a swap is pending). A `tick-starved` smell (no completed tick for `tickStarvedSmellMs` while rebuilds adopt) runs for every daemon, logged and appended to the clone's alerts.jsonl. Pure rules and settings: we:scripts/lib/daemon-background-build.mjs, we:scripts/lib/daemon-background-build-settings.json — off = today; on for the fix daemon only. The review daemon shares the code; turning it on is one settings line after the fix-daemon proof.
 
