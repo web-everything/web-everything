@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { writeRun } from '../operations/run-store.mjs';
 
 import {
-  buildRows, renderReport, renderRow, readOpenPrs, LABEL_FAMILIES, unfamilied, labelsByFamily, compareDerivedLabels,
+  runCheck, readRepoEventsFromStore, buildRows, renderReport, renderRow, readOpenPrs, LABEL_FAMILIES, unfamilied, labelsByFamily, compareDerivedLabels,
   deriveRow, summarizeDerived, renderDerived, readRepoEvents, buildCheckRunRecord, appendCheckRun, buildDerivedRows,
 } from '../review-ledger-check.mjs';
 import {
@@ -270,5 +270,53 @@ describe('slice F — derived vs live labels', () => {
         if (prior === undefined) delete process.env.OPERATION_RUNS_DIR; else process.env.OPERATION_RUNS_DIR = prior;
       }
     });
+  });
+});
+
+
+describe('configured store check run', () => {
+  const store = { name: 'git', shared: true, durable: true, ordering: 'total', singleWriter: 'push-race-retry' };
+  it.each([false, true])('unreadable exits 2, scores nothing and appends no record (json=%s)', async (json) => {
+    let writes = 0;
+    let out = '';
+    let err = '';
+    const result = await runCheck({ repo: REPO, store: 'git', json,
+      readEvents: async () => ({ status: 'unreadable', store, reason: 'no-board', error: 'no board configured' }),
+      listPrs: () => [{ number: 1, labels: L('review:accepted') }],
+      appendRun: () => { writes += 1; }, stdout: (s) => { out += s; }, stderr: (s) => { err += s; } });
+    expect(result.exitCode).toBe(2);
+    expect(writes).toBe(0);
+    expect(out).not.toContain('agree');
+    expect(err).toContain('review-ledger-check: ledger store git unreadable (no-board): no board configured - nothing scored');
+    if (json) expect(JSON.parse(out)).toEqual({ repo: REPO, store, status: 'unreadable', reason: 'no-board', error: 'no board configured' });
+  });
+
+  it('reads once and uses the same verdict/event snapshot for both comparisons', async () => {
+    let reads = 0;
+    let output = '';
+    let recorded;
+    const rows = [{ ...rec(), type: 'verdict' }, { type: 'ruling', repo: REPO, pr: 1, ruling: 'block', findingKey: 'f1' }];
+    const result = await runCheck({ repo: REPO, store: 'git', json: true,
+      readEvents: async (repo, opts) => { reads += 1; expect([repo, opts]).toEqual([REPO, { store: 'git' }]); return { status: 'ok', rows, store }; },
+      listPrs: async () => [{ number: 1, labels: L('review:accepted') }],
+      readFacts: () => ({ headSha: 'a'.repeat(40), labels: [], checks: [], requiredChecks: [], probeErrors: [] }),
+      appendRun: (r) => { recorded = r; return { ok: true }; }, stdout: (s) => { output += s; } });
+    expect(reads).toBe(1);
+    expect(result.exitCode).toBe(0);
+    const report = JSON.parse(output);
+    expect(report).toMatchObject({ store, ledgerRows: 2, summary: { total: 1 } });
+    expect(report.rows[0].ledgerVerdict).toBe('accepted');
+    expect(report.derived.rows).toEqual(buildDerivedRows({ repo: REPO, prs: [{ number: 1, labels: L('review:accepted') }], events: rows,
+      readFacts: () => ({ headSha: 'a'.repeat(40), labels: [], checks: [], requiredChecks: [], probeErrors: [] }) }));
+    expect(recorded).toBeDefined();
+  });
+
+  it.each([true, false])('report names the store and shared=%s', (shared) => {
+    const text = renderReport({ repo: REPO, rows: [], summary: summarizeAgreement([]), store: { ...store, name: shared ? 'git' : 'home', shared } });
+    expect(text).toContain(shared ? 'ledger store: git (shared)' : 'ledger store: home (NOT shared - rows written on other machines are invisible here)');
+  });
+
+  it('the async event convenience reader returns null on an unreadable store', async () => {
+    expect(await readRepoEventsFromStore(REPO, { store: 'missing-store' })).toBeNull();
   });
 });

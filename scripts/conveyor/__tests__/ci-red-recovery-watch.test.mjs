@@ -994,6 +994,69 @@ describe('ci-red-recovery-watch — sweepMissingRunRecovery (PR #2729 fixture: z
     expect(result.dispatch).toEqual([]);
   });
 
+  // Live incident, plateauapp/plateau-app#217 (2026-10-08): stacked on #216, so two missing-run attempts were refused
+  // "stacked" and BOTH counted against the per-sha cap. Once #216 landed and the drain retargeted #217 to main (same
+  // head sha), the cap was already spent and the PR sat with no test/e2e forever. A stacked refusal is bound to the
+  // base it was posted under: after the retarget it is stale and must not count.
+  const PR_217 = {
+    number: 217, headRefName: 'lane/xadunn9-wip-deeplinks', baseRefName: 'main',
+    headRefOid: '8f8d2d05af6251de0688d219815f89b6179b8b13', mergeable: 'MERGEABLE', labels: [{ name: 'checking' }],
+    statusCheckRollup: [{ __typename: 'CheckRun', name: 'admit', status: 'COMPLETED', conclusion: 'SUCCESS', workflowName: 'Deploy alpha (temporary)' }],
+  };
+  const STACKED_217 = (n) => ({
+    body: `🚦 conveyor missing-run-recovery\n\nbranch: lane/xadunn9-wip-deeplinks\nsha: ${PR_217.headRefOid}\n\nconveyor missing-run-recovery attempted to trigger CI (pull-request-push) and it FAILED: PR is stacked or from a fork (base lane/xwtnr2y-sessions-page, head repo plateauapp/plateau-app); missing-run push recovery only handles same-repo PRs on main (attempt ${n})`,
+    author: { login: 'web-everything' },
+  });
+  it('plateau-app #217: stacked-refusal markers from the OLD base do not burn the cap after the retarget to main', () => {
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push', newHeadSha: 'c'.repeat(40) }));
+    const result = sweepMissingRunRecovery({
+      apply: true, repo: 'plateauapp/plateau-app', readOpenPrs: () => [PR_217], readRequiredContexts: () => null,
+      readDeclaredContexts: () => ['test', 'e2e'], readHeadCommittedAt: () => '2026-10-08T09:27:50Z',
+      readComments: () => [STACKED_217(1), STACKED_217(2)], trigger, postComment: vi.fn(), clearLabel: vi.fn(() => true),
+      now: Date.parse('2026-10-08T12:30:00Z'),
+    });
+    expect(result.refusals.filter((r) => r.kind === 'missing-run-cap-exhausted')).toEqual([]);
+    expect(result.dispatch.map((d) => d.prNumber)).toEqual([217]);
+    expect(trigger).toHaveBeenCalledTimes(1);
+  });
+  it('plateau-app #217: while it is STILL stacked on the same base, the markers still count (cap unchanged)', () => {
+    const trigger = vi.fn();
+    const result = sweepMissingRunRecovery({
+      apply: true, repo: 'plateauapp/plateau-app', readOpenPrs: () => [{ ...PR_217, baseRefName: 'lane/xwtnr2y-sessions-page' }],
+      readRequiredContexts: () => null, readDeclaredContexts: () => ['test', 'e2e'], readHeadCommittedAt: () => '2026-10-08T09:27:50Z',
+      readComments: () => [STACKED_217(1), STACKED_217(2)], trigger, now: Date.parse('2026-10-08T12:30:00Z'),
+    });
+    expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 217, kind: 'missing-run-cap-exhausted' })]);
+    expect(trigger).not.toHaveBeenCalled();
+  });
+  // PR #4447 review (security/cap-bypass): the stale-marker test must compare the base EXACTLY, never parse it back out
+  // of prose. Git ref names may hold `,` and `)`, so a parsed base is truncated and a still-stacked refusal reads as
+  // stale (cap bypassed: one trigger attempt + comment per sweep, forever). Also a PREFIX of a longer base must not match.
+  it.each([
+    ['comma in the base, still stacked on it', 'lane/a,b', 'lane/a,b', true],
+    ['close paren in the base, still stacked on it', 'lane/a)b', 'lane/a)b', true],
+    ['current base is a PREFIX of the marker base (lane/a vs lane/a,b)', 'lane/a', 'lane/a,b', false],
+    ['marker base is a PREFIX of the current base (lane/a,b vs lane/a)', 'lane/a,b', 'lane/a', false],
+    ['marker base unknown (`?`) cannot be proven stale', 'main', '?', true],
+    ['current base unknown (null) cannot prove staleness', null, 'lane/old-base', true],
+    ['retargeted to main after the old base landed', 'main', 'lane/old-base', false],
+  ])('stacked-refusal marker: %s', (_name, currentBase, markerBase, counts) => {
+    const marker = (n) => ({
+      body: `🚦 conveyor missing-run-recovery\n\nbranch: ${PR_217.headRefName}\nsha: ${PR_217.headRefOid}\n\nconveyor missing-run-recovery attempted to trigger CI (pull-request-push) and it FAILED: PR is stacked or from a fork (base ${markerBase}, head repo plateauapp/plateau-app); missing-run push recovery only handles same-repo PRs on main (attempt ${n})`,
+      author: { login: 'web-everything' },
+    });
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push', newHeadSha: 'c'.repeat(40) }));
+    const result = sweepMissingRunRecovery({
+      apply: true, repo: 'plateauapp/plateau-app', readOpenPrs: () => [{ ...PR_217, baseRefName: currentBase }],
+      readRequiredContexts: () => null, readDeclaredContexts: () => ['test', 'e2e'], readHeadCommittedAt: () => '2026-10-08T09:27:50Z',
+      readComments: () => [marker(1), marker(2)], trigger, postComment: vi.fn(), clearLabel: vi.fn(() => true),
+      now: Date.parse('2026-10-08T12:30:00Z'),
+    });
+    const capped = result.refusals.some((r) => r.prNumber === 217 && r.kind === 'missing-run-cap-exhausted');
+    expect(capped).toBe(counts);
+    expect(trigger).toHaveBeenCalledTimes(counts ? 0 : 1);
+  });
+
   // Live incident, web-everything/web-everything#2793 (landing freeze, 2026-09-27) — real `gh pr view` shape: base
   // `main`, `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY`, empty rollup, head sha
   // 8be3bce0e51990837b7f9c016b407ec0f1657a1c already carrying 2 prior missing-run trigger-attempt comments.
@@ -1091,4 +1154,42 @@ it('sweeps a main-fixed signature and posts durable refund evidence', () => {
   readMainFixedSignatureFacts.mockClear();
   sweepCiRedRecovery({ ...options, readAheadBy: () => 0 });
   expect(readMainFixedSignatureFacts).not.toHaveBeenCalled();
+});
+
+// xd3dkzx — live replay 2026-10-08: main's CI workflow red on `daemon-soak` only; PRs failed `test` in that window.
+describe('ci-red-recovery-watch — check-scoped recovery (xd3dkzx live replay)', async () => {
+  const { readFileSync } = await import('node:fs');
+  const fixture = JSON.parse(readFileSync(`${process.cwd()}/scripts/conveyor/__tests__/fixtures/owed-ci-rerun-check-scoped.json`, 'utf8'));
+  const prs = fixture.candidates.map((c) => ({
+    number: c.prNumber, headRefName: c.headRefName, headRefOid: c.headSha,
+    statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: c.failureCompletedAt }],
+  }));
+  const commonReaders = {
+    readOpenPrs: () => prs, readMainRuns: () => fixture.mainRuns, readAheadBy: () => 7,
+    readRequiredContexts: () => ['test', 'smoke', 'daemon-soak'], readMainLatestCheckRuns: () => [],
+  };
+
+  it('applies one refresh per head and records it (the marker comment), instead of main-still-red forever', () => {
+    const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'n' }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({
+      ...commonReaders, apply: true, readComments: () => [], refresh, postComment, reconcileAcceptance: () => ({}),
+    });
+    expect(result.refusals).toEqual([]);
+    expect(refresh.mock.calls.map((c) => c[0])).toEqual(fixture.candidates.map((c) => c.headRefName));
+    expect(postComment.mock.calls.map((c) => [c[0], c[1].headSha])).toEqual(fixture.candidates.map((c) => [c.prNumber, c.headSha]));
+  });
+
+  it('a head that already used its recorded attempts (marker comments for that sha) is not refreshed again', async () => {
+    const { buildRebaseOntoMainComment, DEFAULT_MAX_REBASE_RETRIES_PER_SHA } = await import('../main-red-recovery.mjs');
+    const readComments = (n) => {
+      const c = fixture.candidates.find((x) => x.prNumber === n);
+      const body = buildRebaseOntoMainComment({ headRefName: c.headRefName, headSha: c.headSha, ok: false, action: 'error', error: 'push failed' });
+      return Array.from({ length: DEFAULT_MAX_REBASE_RETRIES_PER_SHA }, () => ({ body, viewerDidAuthor: true }));
+    };
+    const refresh = vi.fn();
+    const result = sweepCiRedRecovery({ ...commonReaders, apply: true, readComments, refresh, postComment: vi.fn() });
+    expect(refresh).not.toHaveBeenCalled();
+    expect(result.refusals.map((r) => r.kind)).toEqual(['rebase-cap-exhausted', 'rebase-cap-exhausted', 'rebase-cap-exhausted']);
+  });
 });

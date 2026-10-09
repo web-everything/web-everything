@@ -18,7 +18,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync, renameSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, cpSync, renameSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -149,6 +149,52 @@ describe('backlog.mjs CLI — ephemeral-clone integration smoke (#2273/#2274)', 
     expect(res.code).toBe(0);
     expect(res.json.background).toBe(true);
     expect(res.json.stop).toBe(false);
+  });
+
+  // #x0h3pe4 — the real `scaffold` subprocess never silently drops (or invents) a `--size`. The cards it writes
+  // land in the throwaway clone's `backlog/`, so count/inspect that directory.
+  describe('scaffold --size (#x0h3pe4)', () => {
+    const cards = () => readdirSync(join(clone, 'backlog')).filter((f) => f.endsWith('.md'));
+    const scaffoldOne = (args) => {
+      mkdirSync(join(clone, 'backlog'), { recursive: true });
+      const before = new Set(cards());
+      const res = run(['scaffold', ...args]);
+      const added = cards().filter((f) => !before.has(f));
+      return { res, added, text: added[0] ? readFileSync(join(clone, 'backlog', added[0]), 'utf8') : '' };
+    };
+
+    it('a sized task is REFUSED: non-zero exit, no card written', () => {
+      const { res, added } = scaffoldOne(['--kind=task', '--size=2', '--title=sized task']);
+      expect(res.code).not.toBe(0);
+      expect(res.json?.error).toMatch(/never sized/); // the refusal itself, not an unrelated crash
+      expect(added).toEqual([]);
+    });
+
+    it('a non-numeric size is REFUSED: non-zero exit, no card written', () => {
+      const { res, added } = scaffoldOne(['--kind=decision', '--size=big', '--title=bad size decision']);
+      expect(res.code).not.toBe(0);
+      expect(res.json?.error).toMatch(/must be a number/);
+      expect(added).toEqual([]);
+    });
+
+    it('a whitespace-only size is absent for a decision (never `size: 0`)', () => {
+      const { res, text } = scaffoldOne(['--kind=decision', '--size= ', '--title=blank size decision']);
+      expect(res.code).toBe(0);
+      expect(text).not.toMatch(/^size:/m);
+    });
+
+    it('a sized decision keeps its size', () => {
+      const { res, text } = scaffoldOne(['--kind=decision', '--size=3', '--title=sized decision']);
+      expect(res.code).toBe(0);
+      expect(text).toMatch(/^size: 3$/m);
+    });
+
+    it('an EMPTY --size= is absent for a decision: card written with no size line (never `size: 0`)', () => {
+      const { res, text } = scaffoldOne(['--kind=decision', '--size=', '--title=empty size decision']);
+      expect(res.code).toBe(0);
+      expect(text).toMatch(/^kind: decision$/m);
+      expect(text).not.toMatch(/^size:/m);
+    });
   });
 
   it('claim: the JSON payload reports stop=true only when it was asked for (#xd0hvsg)', () => {

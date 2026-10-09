@@ -145,6 +145,69 @@ export function isMainCurrentlyRed(windows) {
 }
 
 /**
+ * we:scripts/conveyor/main-red-recovery.mjs#mainCheckGreenSince — xd3dkzx (live 2026-10-08): since when has `main`
+ * been green again for ONE check, even while its workflow as a whole is still red? PURE. `main`'s CI stayed red for
+ * hours on `daemon-soak` alone while its `test` job passed; PRs #4494/#4446/#4511 had failed `test` inside that
+ * window, and the whole-workflow gate ({@link isMainCurrentlyRed}) refused their owed refresh every tick, forever.
+ *
+ * Returns the `updatedAt` of the OLDEST run in main's current green streak for `checkName` — the moment main proved
+ * that check healthy again — or `null` when there is no such proof. Runs that prove nothing are skipped (in flight,
+ * `cancelled`/`skipped`/`neutral`, `infraCancelledOnly`). A decisive run is green for the check when it concluded
+ * `success`, or concluded red with `checkConclusions[checkName] === 'success'` (annotated by
+ * `reconcile-pass.mjs#defaultReadMainRuns` off a COMPLETE job list). A red run whose map lacks the check did not run
+ * it and is skipped. `null` (never a guess) when: no check name; the newest decisive run has the check red; a red
+ * run has NO map (jobs unread) before any green-for-check run; or no red-for-check run exists in the history at all
+ * (nothing shows main's own copy of the check was ever red, so nothing proves a recovery).
+ * `mainRuns` must ALREADY be narrowed to one workflow (same contract as {@link computeMainRedWindows}; the IO
+ * shell's `defaultReadMainRuns` does it).
+ *
+ * KNOWN TRADEOFF: the PR's failure is still attributed to main by the WORKFLOW-level red window
+ * ({@link classifyCiFailureAttribution}), not by a red window of main's own copy of this check. So a PR whose own
+ * code broke the check inside a long red-on-another-check window gets ONE refresh (it then fails after the green
+ * streak began, and this path never admits it again). One bounded extra CI run beats the old outcome: waiting
+ * forever. The merge gate is untouched.
+ * @param {{checkName?:(string|null), mainRuns?:Array<object>}} [o]
+ * @returns {string|null}
+ */
+export function mainCheckGreenSince({ checkName = null, mainRuns = [] } = {}) {
+  if (!checkName) return null;
+  const decisive = (Array.isArray(mainRuns) ? mainRuns : [])
+    .filter((r) => r && String(r.status).toLowerCase() === 'completed' && r.updatedAt && r.infraCancelledOnly !== true)
+    .filter((r) => { const c = String(r.conclusion || '').toLowerCase(); return c === 'success' || MAIN_RED_CONCLUSIONS.includes(c); })
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  let since = null;
+  for (const run of decisive) {
+    let verdict; // 'green' | 'red' | 'unknown' | 'not-run'
+    if (String(run.conclusion).toLowerCase() === 'success') verdict = 'green';
+    else if (!run.checkConclusions || typeof run.checkConclusions !== 'object') verdict = 'unknown';
+    else if (!Object.hasOwn(run.checkConclusions, checkName)) verdict = 'not-run';
+    else verdict = String(run.checkConclusions[checkName]).toLowerCase() === 'success' ? 'green' : 'red';
+    if (verdict === 'not-run') continue;
+    if (verdict === 'green') { since = run.updatedAt; continue; }
+    // A red (or unreadable) run ends the streak: only a streak that began after a real red-for-check run counts.
+    return verdict === 'red' ? since : null;
+  }
+  return null;
+}
+
+/** xd3dkzx — is a PR's failure of `checkName` (completed at `failureCompletedAt`) one main has since recovered from?
+ *  True only when the failure completed BEFORE main's current green streak for that check began
+ *  ({@link mainCheckGreenSince}). A failure after that moment is not main's (main's check was already green), so a
+ *  refreshed PR that fails again is never refreshed again by this path — it waits, as before. PURE. */
+export function isMainRecoveredForCheck({ checkName = null, mainRuns = [], failureCompletedAt = null } = {}) {
+  const since = mainCheckGreenSince({ checkName, mainRuns });
+  const failedAt = Date.parse(failureCompletedAt);
+  return since != null && Number.isFinite(failedAt) && failedAt < Date.parse(since);
+}
+
+/** xd3dkzx — env setting `WE_MAIN_RECOVERY_SCOPE` (same in-module pattern as `WE_MAIN_DEFECT_REBASES_PER_SHA` / `WE_PR_SCOPED_CHECKS`; this repo has no central env registry): `check` (default — main counts as recovered for a PR once
+ *  the PR's own failing check is green on main, see {@link isMainRecoveredForCheck}) or `workflow` (the old gate:
+ *  wait until main's whole CI workflow is green). Anything else reads as the default. PURE over `env`. */
+export function resolveMainRecoveryScope(env = process.env) {
+  return env?.WE_MAIN_RECOVERY_SCOPE === 'workflow' ? 'workflow' : 'check';
+}
+
+/**
  * we:scripts/conveyor/main-red-recovery.mjs#classifyCiFailureAttribution — is a PR's own required-check
  * failure explained by `main` having been red at the moment it concluded? PURE.
  * @param {{failureCompletedAt?:(string|null), mainRedWindows?:Array<object>}} o
@@ -551,6 +614,9 @@ export function classifierNeedsComments({ failingCheckName = null, mainLatestChe
 export function planMainRedRebases({
   candidates = [], mainRedWindows = [], mainLatestCheckRuns = [], maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
   prScopedChecks = resolvePrScopedChecks(), mainDefectRebaseCap = resolveMainDefectRebaseCap(),
+  // xd3dkzx — `mainRuns` (main's own run list, annotated with `checkConclusions`) lets the "is main recovered?"
+  // gate be judged per failing check. Omitted → `[]` → byte-identical to the old whole-workflow gate.
+  mainRuns = [], recoveryScope = resolveMainRecoveryScope(),
 } = {}) {
   const dispatch = [];
   const refusals = [];
@@ -590,7 +656,12 @@ export function planMainRedRebases({
       });
       continue;
     }
-    if (mainStillRed) {
+    // xd3dkzx — main's WORKFLOW may stay red on a different check (live 2026-10-08: `daemon-soak` only) while the
+    // PR's own failing check is green on main again. Then the refresh is owed now: the merge gate still demands
+    // every required check green on the PR itself, and the per-head cap below still bounds the attempts.
+    const recoveredCheck = mainStillRed && recoveryScope === 'check'
+      && isMainRecoveredForCheck({ checkName: base.failingCheckName, mainRuns, failureCompletedAt: base.failureCompletedAt }) ? base.failingCheckName : null;
+    if (mainStillRed && !recoveredCheck) {
       refusals.push({
         ...base, kind: 'main-still-red',
         why: `main's own CI is still red right now — refreshing PR #${prNumber} against it would not prove anything; wait for main to recover`,
@@ -627,6 +698,7 @@ export function planMainRedRebases({
     }
     dispatch.push({
       ...base, attempts: rebaseAttempts, kind: 'rebase-onto-main',
+      ...(recoveredCheck ? { recoveredCheck } : {}),
       ...(mainFixed ? { attribution: 'main-fixed-signature', attributedWindow: {
         from: c.mainFixedSignature.bugIntroducedAt, to: c.mainFixedSignature.fixedAt,
       } } : {}),
@@ -634,6 +706,8 @@ export function planMainRedRebases({
         ? `PR #${prNumber}'s error signatures were fixed on main by ${[...new Set(c.mainFixedSignature.signatures.flatMap((s) => s.fixCommits))].map((sha) => sha.slice(0, 9)).join(', ')} — refreshing onto main`
         : mainGreenForCheck
         ? `PR #${prNumber}'s \`${base.failingCheckName}\` check failed at ${base.failureCompletedAt}, but is passing on main's own latest completed run and this head is ${base.aheadBy} commit(s) behind it — main has since fixed this, refreshing onto it`
+        : recoveredCheck
+        ? `PR #${prNumber}'s \`${recoveredCheck}\` check failed at ${base.failureCompletedAt}, inside a window where main's own CI was red; main's CI is still red on another check, but \`${recoveredCheck}\` is green on main again and this head is ${base.aheadBy} commit(s) behind it — refreshing onto main`
         : `PR #${prNumber}'s required check failed at ${base.failureCompletedAt}, inside a window where main's own CI was red; main has recovered and this head is ${base.aheadBy} commit(s) behind it — refreshing onto main`,
     });
   }
@@ -1215,6 +1289,9 @@ function missingRunBodyHasExactLine(body, line) {
   return body.split('\n').some((l) => l === line);
 }
 
+/** Leading text of the "stacked" refusal `missing-run-push.mjs` writes: `…(base <ref>, head repo <repo>); …`. */
+const MISSING_RUN_STACKED_REFUSAL_PREFIX = 'PR is stacked or from a fork (base ';
+
 /**
  * we:scripts/conveyor/main-red-recovery.mjs#countMissingRunComments — the DURABLE, restart-surviving
  * missing-run trigger-attempt count for ONE head sha, mirroring {@link countRebaseOntoMainComments}/
@@ -1222,9 +1299,10 @@ function missingRunBodyHasExactLine(body, line) {
  * EVERY attempt marker regardless of outcome — a permanently-failing trigger must still trip the cap. PURE.
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @param {string|null} [headSha]
+ * @param {{baseRefName?:(string|null)}} [o] - the PR's CURRENT base; stacked-refusal markers from another base are stale
  * @returns {number}
  */
-export function countMissingRunComments(comments, headSha = null) {
+export function countMissingRunComments(comments, headSha = null, { baseRefName = null } = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (const c of comments) {
@@ -1236,6 +1314,16 @@ export function countMissingRunComments(comments, headSha = null) {
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
     // xgq539z — legacy wrong-owner credential refusals (see MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL) are not counted.
     if (body.includes(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL)) continue;
+    // A "stacked" refusal is bound to the base it was posted under. Once the drain retargets the PR (base changed,
+    // head sha unchanged), that refusal is stale: it said nothing about whether a push can start CI on the NEW
+    // base. Counting it burned the cap before the PR could ever be recovered (plateau-app #217, 2026-10-08).
+    // Compare the base EXACTLY — never parse it back out of prose: git ref names may hold `,` and `)`, so a parsed
+    // base is truncated and a still-stacked refusal would read as stale (cap bypass). `, head repo ` terminates the
+    // writer's base (`missing-run-push.mjs`) unambiguously because a ref name cannot contain a space. A refusal that
+    // recorded no base (`base ?`) cannot be proven stale, so it still counts.
+    if (baseRefName && body.includes(MISSING_RUN_STACKED_REFUSAL_PREFIX)
+      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}?, head repo `)
+      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${baseRefName}, head repo `)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
     n += 1;
   }

@@ -85,6 +85,11 @@ export const DEFAULT_HEALTH_CONFIG = Object.freeze({
   fileDispatch: false,
   fileMaxPerDay: 3,
   fileWindowMs: 24 * HOUR,
+  // xkqia1h `pass-failing-repeatedly`: N consecutive failed passes, OR failing with no successful pass for X. A
+  // failure-free stretch of `recoverAfterMs` (floor; stretched to 4 pass intervals) means the passes recovered.
+  passFailingMinStreak: 3,
+  passFailingNoSuccessMs: 30 * MINUTE,
+  passFailingRecoverAfterMs: 15 * MINUTE,
 });
 
 // ── 1. Daemon log parsing ────────────────────────────────────────────────────────────────────────────────────
@@ -204,6 +209,52 @@ export function parseDaemonLog(text) {
   return out;
 }
 
+// xkqia1h — the pass-failure record. `pass-daemon.mjs` writes one of these lines for EVERY failed run of the
+// pass it supervises (non-zero exit, killed by a signal, or a spawn failure) and nothing on success, so these lines
+// are the only generic per-pass outcome a log carries. Live 2026-10-08: the lease reaper OOM-crashed on every pass
+// 08:37Z-15:57Z, each crash an UNSTAMPED V8 dump plus `pass-daemon: … exited on SIGABRT`, and nothing read them.
+const PASS_FAILED = /^pass-daemon: (?:\S+ exited (?:with code \d+|on SIG\w+)|failed to spawn \S+)/;
+const ISO_PREFIX = /^(\d{4}-\d\d-\d\dT[\d:.]+Z) /;
+// A line that states an error (the "why" an alert names) — never a native/JS stack frame or GC trace line.
+const ERRORISH = /\b(?:FATAL|[A-Z]\w*Error|error|failed|denied|refused|exception|E[A-Z]{3,}|out of memory|cannot|unable)\b/i;
+const NOT_A_REASON = /^\s*(?:\d+: 0x|at |\[\d+:0x|-{3,}|<-{2,})|DeprecationWarning|trace-deprecation/;
+
+/**
+ * PURE: the failed passes in an appended chunk of a pass-daemon log, in order. `why` is the last error-looking line
+ * of that run (else the exit line itself), capped at 200 chars; `stampMs` is the exit line's own ISO stamp, or null
+ * when the line is unstamped (the fold then times it by the health tick that read it).
+ * @param {string} text
+ * @returns {Array<{stampMs:number|null, why:string}>}
+ */
+export function parsePassFailures(text) {
+  const out = [];
+  let lastErr = null;
+  for (const raw of String(text ?? '').split('\n')) {
+    const trimmed = raw.trimEnd();
+    const stamp = ISO_PREFIX.exec(trimmed);
+    const line = stripLogTimestamp(trimmed);
+    if (!line.trim()) continue;
+    if (PASS_FAILED.test(line)) {
+      out.push({ stampMs: stamp ? Date.parse(stamp[1]) : null, why: (lastErr ?? line).slice(0, 200) });
+      lastErr = null;
+      continue;
+    }
+    if (ERRORISH.test(line) && !NOT_A_REASON.test(line)) lastErr = line.trim();
+  }
+  return out;
+}
+
+/** PURE: fold a sample's failed passes into the remembered list (last 6 h, at most 200). On a bootstrap read the
+ *  tail is history of unknown age, so an unstamped failure there is dropped (stamping it "now" would invent a
+ *  streak); a stamped one keeps its own time. */
+export function foldPassFailures(prev, sample, now) {
+  const at = Math.min(now, sample.mtimeMs ?? now);
+  const fresh = parsePassFailures(sample.text)
+    .filter((f) => !sample.bootstrap || f.stampMs != null)
+    .map((f) => ({ at: f.stampMs != null && f.stampMs <= now ? f.stampMs : at, why: f.why }));
+  return [...(prev || []), ...fresh].filter((f) => f.at >= now - 6 * HOUR).slice(-200);
+}
+
 // ── 1b. `ps` output parsing (machine-overload's own input) ──────────────────────────────────────────────────────
 
 const PS_ROW = /^\s*(\d+)\s+(\d+)\s+([\d.]+)\s+(\S+)\s+(.*)$/;
@@ -269,6 +320,7 @@ export function foldDaemonMemory(prev, sample, now) {
   mem.intervalMs = parsed.intervalMs ?? mem.intervalMs ?? sample.defaultIntervalMs ?? 120_000;
   mem.prAttempts = foldPrAttempts(prev?.prAttempts, sample, now, mem.intervalMs);
   mem.restarts += parsed.restarts;
+  mem.passFailures = foldPassFailures(prev?.passFailures, sample, now);
   if (sample.sizeBytes !== mem.lastSize || !prev) mem.lastGrowthAt = Math.min(sample.mtimeMs, now);
   mem.lastSize = sample.sizeBytes;
   mem.bootstrapEstimated = !!sample.bootstrap;

@@ -1202,7 +1202,7 @@ function prepareDispatchLaunch({ num, bookkeeping, launchKind = 'build', prepare
     }), { mode: 0o600 });
     argv.push(`--tickFile=${tickFile}`);
   }
-  const env = { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
+  const env = { ...process.env, ...routingPolicyEnv(), ...(launchKind === 'prepare-item' && prepareFallback ? { WE_PROBATION_LAUNCH: 'off' } : {}), [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, WE_DISPATCH_RESERVE_LANE: '1' /* x87v3ed: lease the lane before the session launches */, WE_BUILD_DISPATCH_MODE: process.env.WE_BUILD_DISPATCH_MODE || 'mechanical' };
   return { argv, env };
 }
 

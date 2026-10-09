@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
-import { createTickReader } from '../dispatch-lane-io.mjs';
+import { createTickReader, createDispatchSinks, reserveBuildLane } from '../dispatch-lane-io.mjs';
+import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 
 describe('the tick reader handoff', () => {
   const at = '2026-10-06T12:00:00.000Z';
@@ -111,5 +112,59 @@ describe('the tick reader handoff', () => {
     expect(read({ all: true })).toEqual([]);
     expect(runNode).toHaveBeenCalledTimes(1);
     expect(readText.mock.calls.some(([path]) => path === '/tmp/tick.json')).toBe(false);
+  });
+});
+
+// x87v3ed — reserve the lane BEFORE the build session launches.
+describe('x87v3ed — the build launch reserves its lane first', () => {
+  const payload = { num: '5189', launchKind: 'build', lane: 2, sessionSlug: 'conveyor-5189', scope: ['we:scripts/a.mjs'], prompt: 'brief' };
+  const baseSinks = (extra) => createDispatchSinks({
+    root: '/Users/op/workspace/webeverything', mintSessionId: () => 'sess-1', now: () => new Date('2026-10-08T00:00:00Z'),
+    sessionCwdFor: () => '/tmp/scratch', ensureSessionCwd: (d) => d, resolveSettingsEnv: () => ({}),
+    resolveLaneGrant: () => ({}), grantLanePermission: () => {}, ensureWorktreeIsolation: () => {},
+    ...extra,
+  });
+  it('reserves lane N under the worker\'s own session slug', () => {
+    const calls = [];
+    const r = reserveBuildLane(payload, { enabled: true, run: (cmd, argv, o) => { calls.push({ cmd, argv, env: o.env }); return ''; }, root: '/r' });
+    expect(r).toEqual({ reserved: true, lane: 2, session: 'conveyor-5189' });
+    expect(calls[0].argv).toEqual(expect.arrayContaining(['scripts/lane-pool.mjs', 'acquire', '--lane=2', '--session=conveyor-5189', '--item=5189']));
+  });
+  it('refuses with notApplied, before any process, when the lane is already leased', () => {
+    const run = () => { throw Object.assign(new Error('x'), { stderr: 'lane-2 is leased by review-4306 — a LIVE lease' }); };
+    let err; try { reserveBuildLane(payload, { enabled: true, run }); } catch (e) { err = e; }
+    expect(err?.notApplied).toBe(true);
+    expect(err.message).toMatch(/lane-reserve-failed.*LIVE lease/);
+  });
+  it('is off for non-build kinds and when not enabled', () => {
+    const run = () => { throw new Error('must not run'); };
+    expect(reserveBuildLane({ ...payload, launchKind: 'prepare' }, { enabled: true, run }).reserved).toBe(false);
+    expect(reserveBuildLane(payload, { enabled: false, run }).reserved).toBe(false);
+  });
+  it('the sink reserves BEFORE the provider spawns, and never spawns when the reservation fails', async () => {
+    const order = [];
+    const sinks = baseSinks({
+      reserveLane: () => { order.push('reserve'); return { reserved: true, lane: 2, session: 'conveyor-5189' }; },
+      provider: async () => { order.push('spawn'); return 'handle-1'; },
+    });
+    await sinks[DISPATCH_EFFECT](payload, {});
+    expect(order).toEqual(['reserve', 'spawn']);
+    let spawned = false;
+    const refusing = baseSinks({
+      reserveLane: () => { throw Object.assign(new Error('lane-reserve-failed'), { notApplied: true }); },
+      provider: async () => { spawned = true; return 'h'; },
+    });
+    await expect(refusing[DISPATCH_EFFECT](payload, {})).rejects.toThrow(/lane-reserve-failed/);
+    expect(spawned).toBe(false);
+  });
+  it('hands the reserved lane back when the launch definitely started nothing', async () => {
+    const released = [];
+    const sinks = baseSinks({
+      reserveLane: () => ({ reserved: true, lane: 2, session: 'conveyor-5189' }),
+      releaseLane: (r) => released.push(r),
+      provider: async () => { throw Object.assign(new Error('bad'), { notApplied: true }); },
+    });
+    await expect(sinks[DISPATCH_EFFECT](payload, {})).rejects.toThrow();
+    expect(released).toEqual([{ reserved: true, lane: 2, session: 'conveyor-5189' }]);
   });
 });

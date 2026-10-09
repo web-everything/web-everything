@@ -8,10 +8,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runLedgerStoreConformance } from './verdict-ledger-store-conformance.mjs';
 import {
-  validateLedgerStore, registerLedgerStore, getLedgerStore, ledgerStoreNames,
+  describeLedgerStore, validateLedgerStore, registerLedgerStore, getLedgerStore, ledgerStoreNames,
 } from '../verdict-ledger-store.mjs';
 import {
-  homeLedgerStore, verdictLedgerPath, appendVerdict, resolveLedgerStoreChoice, buildVerdictRecord, readVerdictLedger,
+  homeLedgerStore, verdictLedgerPath, appendVerdictAsync, resolveLedgerStoreChoice, buildVerdictRecord, readVerdictLedger,
 } from '../verdict-ledger.mjs';
 import { LEDGER_TRANSPORT_BRANCH } from '../verdict-ledger-io.mjs';
 import { withBareOrigin, git } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -75,8 +75,8 @@ runLedgerStoreConformance('git', gitHarness);
 
 describe('capabilities differ as declared', () => {
   it('home is local, git is shared with a total order', () => {
-    expect(getLedgerStore('home').capabilities).toEqual({ durable: true, shared: false, ordering: 'append' });
-    expect(getLedgerStore('git').capabilities).toEqual({ durable: true, shared: true, ordering: 'total' });
+    expect(getLedgerStore('home').capabilities).toEqual({ durable: true, shared: false, ordering: 'append', singleWriter: 'file-lock' });
+    expect(getLedgerStore('git').capabilities).toEqual({ durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' });
   });
 });
 
@@ -90,37 +90,46 @@ describe('registry', () => {
     expect(getLedgerStore('nope')).toBeNull();
   });
 
+  it('requires an explicit writer guarantee and reports every capability', () => {
+    const store = getLedgerStore('home');
+    expect(describeLedgerStore(store)).toEqual({ name: 'home', ...store.capabilities });
+    for (const singleWriter of [undefined, 'magic']) {
+      expect(validateLedgerStore({ ...store, capabilities: { ...store.capabilities, singleWriter } }).ok).toBe(false);
+    }
+    expect(validateLedgerStore({ ...store, capabilities: { ...store.capabilities, shared: undefined } }).ok).toBe(false);
+  });
+
   it('refuses a store that breaks the contract', () => {
     expect(validateLedgerStore({ name: 'x' }).ok).toBe(false);
-    expect(() => registerLedgerStore({ name: 'Bad Name', append() {}, read() {}, capabilities: { durable: true, shared: true, ordering: 'total' } })).toThrow(/invalid store/);
+    expect(() => registerLedgerStore({ name: 'Bad Name', append() {}, read() {}, capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' } })).toThrow(/invalid store/);
     expect(() => registerLedgerStore({ name: 'x', append() {}, read() {}, capabilities: { durable: true, shared: true, ordering: 'sideways' } })).toThrow(/ordering/);
   });
 
-  it('a plugged store is selectable by name through verdictLedger.store with no caller change', () => {
+  it('a plugged store is selectable by name through verdictLedger.store with no caller change', async () => {
     const rows = [];
     names.push('fake-product');
     registerLedgerStore({
       name: 'fake-product',
-      capabilities: { durable: true, shared: true, ordering: 'total' },
-      append: (r) => { rows.push(...r); return { ok: true, appended: r.length }; },
-      read: () => ({ status: 'ok', rows }),
+      capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' },
+      append: async (r) => { rows.push(...r); return { ok: true, appended: r.length }; },
+      read: async () => ({ status: 'ok', rows }),
     });
     expect(resolveLedgerStoreChoice('fake-product', {})).toEqual({ store: 'fake-product', named: true });
     const rec = buildVerdictRecord({ repo: REPO, pr: 9, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test' });
-    const r = appendVerdict(rec, { store: 'fake-product', env: {} });
+    const r = await appendVerdictAsync(rec, { store: 'fake-product', env: {} });
     expect(r).toMatchObject({ ok: true, store: 'fake-product' });
     expect(rows).toHaveLength(1);
   });
 
-  it('a plugged store that misses follows the F4 posture: a clearing verdict does not clear', () => {
+  it('a plugged store that misses follows the F4 posture: a clearing verdict does not clear', async () => {
     registerLedgerStore({
       name: 'down-product',
-      capabilities: { durable: true, shared: true, ordering: 'total' },
-      append: () => ({ ok: false, appended: 0, error: 'unreachable' }),
-      read: () => ({ status: 'unreadable', reason: 'down', error: 'unreachable' }),
+      capabilities: { durable: true, shared: true, ordering: 'total', singleWriter: 'push-race-retry' },
+      append: async () => ({ ok: false, appended: 0, error: 'unreachable' }),
+      read: async () => ({ status: 'unreadable', reason: 'down', error: 'unreachable' }),
     });
     const rec = buildVerdictRecord({ repo: REPO, pr: 9, verdict: 'accepted', at: '2026-10-07T12:00:00.000Z', source: 'test' });
-    const r = appendVerdict(rec, { store: 'down-product', env: {}, warn: () => {} });
+    const r = await appendVerdictAsync(rec, { store: 'down-product', env: {}, warn: () => {} });
     expect(r).toMatchObject({ ok: false, ledgerWriteMiss: true });
     expect(readVerdictLedger(REPO).some((x) => x.pr === 9)).toBe(false);
   });
