@@ -1,0 +1,4 @@
+{
+  "$comment": "#5399 task agreement (Acceptance + Non-goals) gate mode. advise = file-item and the prepare/dispatch gate only warn; enforce = the prepare/dispatch gate holds a card whose agreement is missing. Flip is a one-line change here. Read by scripts/backlog/task-agreement.mjs validateTaskAgreementPolicy.",
+  "mode": "advise"
+}

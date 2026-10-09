@@ -73,9 +73,11 @@
 
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { readGit } from '../lib/proc-read.mjs';
 import { readBuildDelivery } from './build-delivery-evidence.mjs';
+import { recordBuildFailure } from './build-dispatch-failures.mjs';
 import { makeAwaitingVerifyResolver } from './await-verify.mjs';
 import { normNum } from './queue-store.mjs';
 import { DISPATCH_EFFECT } from '../operations/dispatch-lane.mjs';
@@ -521,6 +523,11 @@ export async function adoptOrphanedBuildClaims({
   readDelivery = (num) => readBuildDelivery(num),
   settleDelivered = (o) => settleDeliveredRow(o),
   sessionLivenessFor = (o) => defaultSessionLiveness(o),
+  // x87v3ed — a build that ended with NO delivery is a failed start: charge it to the card's backoff so the next tick
+  // does not relaunch it at once (14 of 25 launches on 2026-10-07 repeated a card), and hand back a lane lease the
+  // dispatch reserved for a worker that never used it. Both best-effort.
+  recordFailure = (o) => recordBuildFailure(o),
+  releaseLaneLease = (o) => releaseReservedLaneLease(o),
 } = {}) {
   let runsCache = null;
   const runs = () => (runsCache ??= listRuns());
@@ -587,6 +594,8 @@ export async function adoptOrphanedBuildClaims({
         releaseClaim({ num });
         clearMarker(num);
         settleRow({ runId: row?.runId, key: row?.entry?.key, outcome: exhausted ? 'orphan-resume-exhausted' : 'orphan-released' });
+        try { recordFailure({ num, reason: `build-not-started: the dispatched build ended with no PR and no resolved card (${exhausted ? 'resume attempts exhausted' : 'orphan-released'}); backing the card off` }); } catch { /* the release above already happened */ }
+        if (payload.lane != null && payload.sessionSlug) { try { releaseLaneLease({ lane: payload.lane, sessionSlug: payload.sessionSlug }); } catch { /* best-effort */ } }
         results.push({ num, action: decision.action, reason: exhausted ? decision.reason : `${decision.reason} (${resumability.reason})` });
       }
     } catch (e) {
@@ -594,4 +603,9 @@ export async function adoptOrphanedBuildClaims({
     }
   }
   return results;
+}
+
+/** x87v3ed — release the lane lease the dispatch reserved, by SESSION SLUG only (never forced: a lease that now belongs to another session is refused, so this cannot take someone else's lane). */
+export function releaseReservedLaneLease({ lane, sessionSlug }, { exec = execFileSync, cwd = REPO_ROOT } = {}) {
+  exec('node', ['scripts/lane-pool.mjs', 'release', `--lane=${lane}`, `--session=${sessionSlug}`], { cwd, stdio: 'ignore', timeout: 60_000 });
 }

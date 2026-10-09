@@ -58,8 +58,10 @@ export default {
     if (reads) violations.push({ invariant: 'no-pointless-read', detail: `the REST check feed was read ${reads}x for a head that can never have checks` });
 
     const clean = pass({ ...real, mergeStateStatus: 'CLEAN', labels: real.labels.filter((l) => l.name !== 'merge-status:conflicting') }, () => []);
-    if (!refused(clean).length) {
-      violations.push({ invariant: 'other-paths-still-refuse', detail: 'a NON-conflicting PR with missing required checks was no longer refused' });
+    // A readable feed with no entry for a required name means the check never started: the PR is owed a CI
+    // re-trigger (missing-run recovery), surfaced via `owedTriggers`, and is not mislabelled a read failure.
+    if (!clean.owedTriggers.some((t) => t.prNumber === real.number) || refused(clean).length) {
+      violations.push({ invariant: 'other-paths-still-owed-trigger', detail: 'a NON-conflicting PR with missing required checks was not surfaced as owed a CI re-trigger' });
     }
 
     const observed = { ...real, statusCheckRollup: [{ name: 'smoke', status: 'COMPLETED', conclusion: 'CANCELLED' }] };
