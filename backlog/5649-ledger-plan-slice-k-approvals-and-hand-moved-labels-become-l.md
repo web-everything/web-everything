@@ -1,15 +1,19 @@
 ---
+bornAs: x72nwuy
 kind: story
 size: 2
+priority: high
+parent: "3007"
 status: open
-scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs"]
+blockedBy: ["5355"]
+scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Diagnose unknown prepare result failure (7cb52f88aee316b6)
+# Ledger plan slice K: approvals and hand-moved labels become ledger events (tighten-only)
 
-Prepare #4426 is held. Cause is unknown. Evidence is retained in the coordination-root prepare failure ledger under cause key 7cb52f88aee316b6 and item 4426; inspect the recorded terminal output before making a diagnosis. Recover the terminal evidence, fix the cause and add a regression. Release requires a reviewed fix commit. Cause key: 7cb52f88aee316b6.
+Slice K of the verdict-ledger plan (#3007), D5 ruling. Clearing ceremonies in we:scripts/review-set-label.mjs and the judge append an approval event (with delegation); the label mirror we:scripts/conveyor/pr-label-mirror.mjs records a hand-moved label as a label-input event that only counts if it tightens. Use the judge block planned by #5072/#5074, not a second shape. Done when an operator removing review:human by hand is restored by the mirror with a label-input row, and a judge clear writes an approval row. Depends on G1 (#5355) and the v2 event types (slice B), both delivered.
 
 ## Acceptance
 

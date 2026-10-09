@@ -1,4 +1,5 @@
 ---
+bornAs: xhetzpl
 kind: task
 parent: "2405"
 status: resolved
@@ -14,12 +15,12 @@ Found building #3930 on 2026-10-09: we:scripts/lib/pr-state-io.mjs hard-codes RE
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/pr-state-io.test.mjs we:scripts/__tests__/review-ledger-check.test.mjs`: the "reads the repo it is given (xhetzpl)" tests fail before (the gh argv carried web-everything; the checker passed no repo) and pass after.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/pr-state-io.test.mjs we:scripts/__tests__/review-ledger-check.test.mjs`: the "reads the repo it is given (5660)" tests fail before (the gh argv carried web-everything; the checker passed no repo) and pass after.
 - [A2] **Live** — `node we:scripts/review-ledger-check.mjs --repo=plateauapp/plateau-app --json` reported `unreadable: 1` for plateau-app PR 220 before, and `unreadable: 0` after, with plateau-app's own required checks (test, e2e) read green.
 
 ## Non-goals
 
-- [N1] Scheduling the checker (that is xlixxlj). `readCardFacts` stays WE-only: nothing asked it to cross repos.
+- [N1] Scheduling the checker (that is 5663). `readCardFacts` stays WE-only: nothing asked it to cross repos.
 
 ## Edge cases this change must handle
 

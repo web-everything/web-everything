@@ -1,9 +1,10 @@
 ---
+bornAs: x4y74wj
 kind: story
 size: 3
 parent: "4124"
 status: open
-blockedBy: ["xuy5acn"]
+blockedBy: ["5670"]
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/drain-followup-job.mjs"]
 dateOpened: "2026-10-09"
 tags: []
@@ -11,7 +12,7 @@ tags: []
 
 # Drain follow-up job, wiring + live proof: merge-ai-prs records one drain-followup job per pass and returns
 
-Slice 2 of 4124, after xuy5acn (the drain-followup kind). Waits on PRs 4624 and 4631 landing (they hold we:scripts/merge-ai-prs.mjs), or on card x5zjv3l's per-feature drain hook modules, whichever comes first — keep the merge-ai-prs edit to one call into a hook module. Behind a per-kind switch defaulting to inline (4120 adoption rule): replace the inline numbering/resolve-on-land/push/derived-regen block with buildFollowupInput (landedThisPass, landedCarriers, liveOpenHeadRefs) + enqueueJob into the drain's jobs dir (daemonJobsDir), and run reattachTick for the drain-followup kind at pass start so a dead job is resumed after a daemon restart; the worktree comes from makeFollowupWorktreePreparer off the drain clone. Also pin the numbering hash ledger to the state root (4120 Fork 2 note) and confirm releaseAndExit no longer kills the detached job. Done when: LIVE proof on the drain — a pass that merges 3 WE PRs ends within 90 s of its last merge, and the job record shows numbering and push done once (timestamps in the PR); before = inline jitNumbering ~11s, derivedRegen ~14s, postMergeSync ~7s in ~/workspace/plateau-app/.drain-daemon/daemon.log.
+Slice 2 of 4124, after 5670 (the drain-followup kind). Waits on PRs 4624 and 4631 landing (they hold we:scripts/merge-ai-prs.mjs), or on card x5zjv3l's per-feature drain hook modules, whichever comes first — keep the merge-ai-prs edit to one call into a hook module. Behind a per-kind switch defaulting to inline (4120 adoption rule): replace the inline numbering/resolve-on-land/push/derived-regen block with buildFollowupInput (landedThisPass, landedCarriers, liveOpenHeadRefs) + enqueueJob into the drain's jobs dir (daemonJobsDir), and run reattachTick for the drain-followup kind at pass start so a dead job is resumed after a daemon restart; the worktree comes from makeFollowupWorktreePreparer off the drain clone. Also pin the numbering hash ledger to the state root (4120 Fork 2 note) and confirm releaseAndExit no longer kills the detached job. Done when: LIVE proof on the drain — a pass that merges 3 WE PRs ends within 90 s of its last merge, and the job record shows numbering and push done once (timestamps in the PR); before = inline jitNumbering ~11s, derivedRegen ~14s, postMergeSync ~7s in ~/workspace/plateau-app/.drain-daemon/daemon.log.
 
 ## Acceptance
 

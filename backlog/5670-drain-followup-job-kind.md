@@ -1,4 +1,5 @@
 ---
+bornAs: xuy5acn
 kind: story
 size: 3
 parent: "4124"
@@ -11,7 +12,7 @@ tags: []
 
 # Drain follow-up job kind: the drain-followup job (own worktree, numbering lock, resumable steps) on the 4125 runtime
 
-Slice 1 of 4124 (decision 4120). Defines the drain-followup job kind on the 4125 job model without wiring it into the drain: mutates-tree + serial, runs in its own linked worktree of main (never the daemon clone; refuses to reset a primary clone), each write-to-main step holds the numbering lock with no unlocked fallback and heartbeats it, each step first resets its worktree to origin/main so a crash leaving an unpushed commit is safe to retry, and the record input carries the pass's landed ids, carriers and open head refs that resolve-on-land cannot re-derive. Child entry we:scripts/drain-followup-job.mjs. Wiring into we:scripts/merge-ai-prs.mjs plus the live drain proof is the next slice (x4y74wj).
+Slice 1 of 4124 (decision 4120). Defines the drain-followup job kind on the 4125 job model without wiring it into the drain: mutates-tree + serial, runs in its own linked worktree of main (never the daemon clone; refuses to reset a primary clone), each write-to-main step holds the numbering lock with no unlocked fallback and heartbeats it, each step first resets its worktree to origin/main so a crash leaving an unpushed commit is safe to retry, and the record input carries the pass's landed ids, carriers and open head refs that resolve-on-land cannot re-derive. Child entry we:scripts/drain-followup-job.mjs. Wiring into we:scripts/merge-ai-prs.mjs plus the live drain proof is the next slice (5671).
 
 ## Acceptance
 
@@ -19,7 +20,7 @@ Slice 1 of 4124 (decision 4120). Defines the drain-followup job kind on the 4125
 
 ## Non-goals
 
-- [N1] Wiring the job into we:scripts/merge-ai-prs.mjs, the per-kind switch and the live drain proof — slice x4y74wj (that file is held by open PRs 4624/4631).
+- [N1] Wiring the job into we:scripts/merge-ai-prs.mjs, the per-kind switch and the live drain proof — slice 5671 (that file is held by open PRs 4624/4631).
 
 ## Edge cases this change must handle
 

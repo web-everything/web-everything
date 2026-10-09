@@ -1,16 +1,18 @@
 ---
+bornAs: xovpj4v
 kind: story
-size: 3
+size: 2
 parent: "5445"
 status: open
-scope: ["we:conformance-vectors/verdict-ledger-derive.vectors.json", "we:conformance-vectors/verdict-ledger-derive.vectors.ts", "we:scripts/lib/pr-state/__tests__/"]
+blockedBy: ["5655", "5656", "5664"]
+scope: ["we:scripts/verdict-ledger-conformance.mjs", "we:scripts/__tests__/verdict-ledger-conformance.test.mjs", "we:package.json"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger standard: derive rules as replay conformance vectors
+# Ledger standard: one conformance runner over schema, derive and store vectors
 
-Slice of #5445 (A3, derive half of A1). Write the derive rules (when a hold applies, carry-forward of rulings, what clears a PR to merge) as language-neutral replay vectors: ledger events in, expected derived state and can-merge out. Seed from the existing replays in we:scripts/lib/pr-state/__tests__/pr-state.test.mjs (plateau-app #202, #3964) plus the #3771 and #3988 same-head cases. Done when a runner feeds every vector through derivePrState in we:scripts/lib/pr-state.mjs and all pass, and a mutated rule (for example dropping ruling carry-forward) fails at least one vector.
+Slice of #5445 (A1). One command runs the event-schema, derive-rule and store-contract vector sets against the open-core implementation (home and git store adapters, derivePrState) and prints a pass/fail per set. Done when the runner passes on main and fails on a deliberately broken adapter and on a deliberately broken derive rule.
 
 ## Acceptance
 

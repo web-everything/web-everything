@@ -1,9 +1,10 @@
 ---
+bornAs: xe7dwtv
 kind: story
 size: 2
 parent: "5445"
 status: open
-blockedBy: ["xedhm8w"]
+blockedBy: ["5656"]
 scope: ["we:conformance-vectors/verdict-ledger-bindings.vectors.json", "we:conformance-vectors/verdict-ledger-bindings.vectors.ts"]
 dateOpened: "2026-10-09"
 tags: []

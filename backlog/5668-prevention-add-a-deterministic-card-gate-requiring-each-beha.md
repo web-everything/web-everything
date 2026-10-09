@@ -1,9 +1,10 @@
 ---
+bornAs: xt4tbi5
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xemxk3h-review-daemon-promotes-a-green-draft-and-dispatches-its-revi.md", "we:backlog/xbxx07q-health-smell-when-an-operator-only-hold-on-a-pr-passes-an-ag.md", "we:backlog/xi7nyx1-coroner-reads-each-daemon-s-live-log-not-the-dead-fix-daemon.md", "we:backlog/xyaugbj-lane-pool-acquirable-scan-takes-100-s-inside-the-builder-vs.md"]
+scope: ["we:backlog/5658-review-daemon-promotes-a-green-draft-and-dispatches-its-revi.md", "we:backlog/5653-health-smell-when-an-operator-only-hold-on-a-pr-passes-an-ag.md", "we:backlog/5661-coroner-reads-each-daemon-s-live-log-not-the-dead-fix-daemon.md", "we:backlog/5672-lane-pool-acquirable-scan-takes-100-s-inside-the-builder-vs.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -12,10 +13,10 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xemxk3h-review-daemon-promotes-a-green-draft-and-dispatches-its-revi.md` — Add a deterministic card gate requiring each behavioral constraint to reference a repository-qualified planned test, case name, and observable assertion.
-2. `we:backlog/xbxx07q-health-smell-when-an-operator-only-hold-on-a-pr-passes-an-ag.md` — Gate cards on explicit constraint-to-test mappings, including separate omitted, malformed, and explicit setting cases whenever default behavior is specified.
-3. `we:backlog/xi7nyx1-coroner-reads-each-daemon-s-live-log-not-the-dead-fix-daemon.md` — Require a machine-checkable constraint-to-planned-test table for backlog cards, including test path, case name, and observable assertion.
-4. `we:backlog/xyaugbj-lane-pool-acquirable-scan-takes-100-s-inside-the-builder-vs.md` — Gate behavioral constraints on named planned tests and assertions, requiring invalidation and concurrent-state-change cases for shared-cache cards.
+1. `we:backlog/5658-review-daemon-promotes-a-green-draft-and-dispatches-its-revi.md` — Add a deterministic card gate requiring each behavioral constraint to reference a repository-qualified planned test, case name, and observable assertion.
+2. `we:backlog/5653-health-smell-when-an-operator-only-hold-on-a-pr-passes-an-ag.md` — Gate cards on explicit constraint-to-test mappings, including separate omitted, malformed, and explicit setting cases whenever default behavior is specified.
+3. `we:backlog/5661-coroner-reads-each-daemon-s-live-log-not-the-dead-fix-daemon.md` — Require a machine-checkable constraint-to-planned-test table for backlog cards, including test path, case name, and observable assertion.
+4. `we:backlog/5672-lane-pool-acquirable-scan-takes-100-s-inside-the-builder-vs.md` — Gate behavioral constraints on named planned tests and assertions, requiring invalidation and concurrent-state-change cases for shared-cache cards.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4683@4db30ba5980cdbec68f8743238d4d3898340b3f6
 

@@ -1,22 +1,22 @@
 ---
+bornAs: xt5s7iz
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/pr-limit.mjs", "we:scripts/lib/__tests__/pr-limit.test.mjs"]
+scope: ["we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/conveyor/__tests__/stand-down.test.mjs", "we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — In isCardOnlyPr, treat a list of 100 or more entries as unknown (not card-only). Add a unit test… (from web-everything/web-everything#4713 review)
+# Prevention — Add a test that runs a redispatched PR through the health smells (stood-down-prs, review-label-co… (from web-everything/web-everything#4700 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/pr-limit.mjs:78` — In isCardOnlyPr, treat a list of 100 or more entries as unknown (not card-only). Add a unit test for a 100-entry all-backlog list.
-2. `we:scripts/lib/pr-limit.mjs:78` — In isCardOnlyPr, treat a files list with length >= 100 (gh's cap) as not card-only. Add a unit test for the cap boundary. Longer term, have a check:standards rule require callers of isCardOnlyDiff to document the input's completeness.
-3. `we:scripts/lib/pr-limit.mjs:94` — Add the deterministic throwing-reader test to the test suite, asserting the returned default policy rather than merely that parsing succeeds.
+1. `we:scripts/conveyor/stand-down.mjs:278` — Add a test that runs a redispatched PR through the health smells (stood-down-prs, review-label-conflict). Better, have the quiet-host pass remove the stood-down label when it posts `redispatched`.
+2. `we:scripts/conveyor/load-flake-reverify.mjs:320` — After the sweep loop, exit non-zero (after printing the JSON) if any repo recorded an `error`. Add a CLI test asserting a non-zero status for the failing-repo fixture.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4713@3ed1abd87dcec51a4a1f6781c4782ca1703e862d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4700@858dca891598c271d4d2cea51bf14c1e3cacb149
 
 ## Acceptance
 

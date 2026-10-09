@@ -1,14 +1,17 @@
 ---
-kind: task
+bornAs: xedhm8w
+kind: story
+size: 3
+parent: "5445"
 status: open
-scope: ["we:scripts/operations/free-scope-cli.mjs", "we:scripts/operations/free-scope.mjs"]
+scope: ["we:schemas/verdict-ledger-event.v1.json", "we:scripts/lib/__tests__/verdict-ledger-event-schema.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# free-scope treats a frontmatter-only card change (priority/blockedBy) in an open PR as occupying the card, blocking real work on it
+# Ledger standard: event schema published as JSON Schema
 
-Seen 2026-10-09 on #3930: PR #4681 only added priority: high to backlog/3930-*.md, yet free-scope marked the card OCCUPIED and the worker brief stopped the build; the coordinator had to hand-pass --exclude-pr=4681 and stack the branch. Fix idea: a PR whose diff to a card touches only frontmatter keys like priority/blockedBy/relatedTo/tags does not occupy it (or such edits compose automatically, e.g. the drain rebases them). Done when: a free-scope test with a PR diff that only changes priority on a card reports the card FREE, and a body edit still reports OCCUPIED.
+Slice of #5445 (A2). Publish a JSON Schema for every event type in we:scripts/lib/verdict-ledger.mjs EVENT_TYPES (verdict, referral, ruling, review-run, hold, release, approval, send-back, author, label-input, finding). The schema names states (for example held-for-human), never GitHub label strings (D5). Done when a test validates every buildLedgerEvent/buildVerdictRecord fixture against the schema and proves the schema and validateLedgerEvent agree on accept and reject for the same cases.
 
 ## Acceptance
 

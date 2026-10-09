@@ -1,18 +1,18 @@
 ---
+bornAs: xdt06rk
 kind: story
-size: 2
+size: 3
 priority: high
-parent: "3007"
+parent: "5445"
 status: open
-blockedBy: ["5355"]
-scope: ["we:scripts/review-set-label.mjs", "we:scripts/__tests__/review-set-label.test.mjs", "we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs"]
+scope: ["we:conformance-vectors/verdict-ledger-store.vectors.json", "we:conformance-vectors/verdict-ledger-store.vectors.ts", "we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs", "we:scripts/lib/__tests__/verdict-ledger-store.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger plan slice K: approvals and hand-moved labels become ledger events (tighten-only)
+# Ledger standard: store contract as language-neutral conformance vectors
 
-Slice K of the verdict-ledger plan (#3007), D5 ruling. Clearing ceremonies in we:scripts/review-set-label.mjs and the judge append an approval event (with delegation); the label mirror we:scripts/conveyor/pr-label-mirror.mjs records a hand-moved label as a label-input event that only counts if it tightens. Use the judge block planned by #5072/#5074, not a second shape. Done when an operator removing review:human by hand is restored by the mirror with a label-input row, and a judge clear writes an approval row. Depends on G1 (#5355) and the v2 event types (slice B), both delivered.
+Slice of #5445 (A4, store half of A1). Publish the verdict-ledger store contract that #5462 already implemented in we:scripts/lib/verdict-ledger-store.mjs (async append/read, idempotent append by event id, unreadable never empty, invalid row refuses the batch, append order, singleWriter and shared declared) as language-neutral conformance vectors in we:conformance-vectors/, and drive the existing JS suite we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs from them. Done when the vectors run against the home and git adapters and a deliberately broken adapter (non-idempotent append, empty-on-failure read) fails. No adapter code changes.
 
 ## Acceptance
 

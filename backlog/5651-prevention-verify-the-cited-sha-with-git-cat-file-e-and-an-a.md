@@ -1,4 +1,5 @@
 ---
+bornAs: x99af0g
 kind: story
 size: 3
 status: open

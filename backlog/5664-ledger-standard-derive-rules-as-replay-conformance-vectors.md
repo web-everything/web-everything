@@ -1,15 +1,17 @@
 ---
-kind: task
-parent: "2405"
+bornAs: xmeeqj3
+kind: story
+size: 3
+parent: "5445"
 status: open
-scope: ["we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/com.we.conveyor-pass-daemon.review-ledger-check.plist.example"]
+scope: ["we:conformance-vectors/verdict-ledger-derive.vectors.json", "we:conformance-vectors/verdict-ledger-derive.vectors.ts", "we:scripts/lib/pr-state/__tests__/"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# run review-ledger-check on a schedule via the generic pass-daemon so the 7-clean-days history fills itself
+# Ledger standard: derive rules as replay conformance vectors
 
-Follow-up of #3930. The checker now appends one run record per constellation repo per run, and 'node we:scripts/review-ledger-check.mjs --history' answers clean days per label family, but a clean day needs at least one run per repo per ET day and nothing runs it. Add a we:skills-src/conveyor/daemon-manifest.mjs entry 'review-ledger-check' (script we:scripts/review-ledger-check.mjs, no args, interval about 6h) plus a plist example, so we:skills-src/conveyor/pass-daemon.mjs runs it. Done when: a daemon-manifest test resolves the review-ledger-check pass with that script, and after one live daemon tick the --history output shows a run for today in every repo.
+Slice of #5445 (A3, derive half of A1). Write the derive rules (when a hold applies, carry-forward of rulings, what clears a PR to merge) as language-neutral replay vectors: ledger events in, expected derived state and can-merge out. Seed from the existing replays in we:scripts/lib/pr-state/__tests__/pr-state.test.mjs (plateau-app #202, #3964) plus the #3771 and #3988 same-head cases. Done when a runner feeds every vector through derivePrState in we:scripts/lib/pr-state.mjs and all pass, and a mutated rule (for example dropping ruling carry-forward) fails at least one vector.
 
 ## Acceptance
 

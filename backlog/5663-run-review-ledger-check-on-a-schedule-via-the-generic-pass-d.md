@@ -1,18 +1,16 @@
 ---
-kind: story
-size: 2
-priority: high
-parent: "3007"
+bornAs: xlixxlj
+kind: task
+parent: "2405"
 status: open
-blockedBy: ["5355", "5371"]
-scope: ["we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/operations/record-referral-ruling-io.mjs"]
+scope: ["we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/com.we.conveyor-pass-daemon.review-ledger-check.plist.example"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger plan slice G2: the label mirror is the one writer of advisory:ruling-needed
+# run review-ledger-check on a schedule via the generic pass-daemon so the 7-clean-days history fills itself
 
-Slice G2 of the verdict-ledger plan (#3007), D5 ruling: labels are the GitHub rendering of derived state and the mirror is their one writer. we:scripts/conveyor/pr-label-mirror.mjs moves from report mode (G1) to writing advisory:ruling-needed from derivePrState; we:scripts/conveyor/ruling-needed-sweep.mjs, we:scripts/conveyor/review-hold-reconcile.mjs and we:scripts/operations/record-referral-ruling-io.mjs stop writing it in the same PR. Done when a grep test shows no file but the mirror passes RULING_NEEDED_LABEL to setLabels, and the plateau-app #202 replay converges in one mirror pass. Depends on G1 (#5355), E1 and E2 (#5371), all delivered.
+Follow-up of #3930. The checker now appends one run record per constellation repo per run, and 'node we:scripts/review-ledger-check.mjs --history' answers clean days per label family, but a clean day needs at least one run per repo per ET day and nothing runs it. Add a we:skills-src/conveyor/daemon-manifest.mjs entry 'review-ledger-check' (script we:scripts/review-ledger-check.mjs, no args, interval about 6h) plus a plist example, so we:skills-src/conveyor/pass-daemon.mjs runs it. Done when: a daemon-manifest test resolves the review-ledger-check pass with that script, and after one live daemon tick the --history output shows a run for today in every repo.
 
 ## Acceptance
 

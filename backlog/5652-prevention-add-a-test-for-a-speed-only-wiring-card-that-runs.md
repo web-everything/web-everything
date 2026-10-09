@@ -1,21 +1,22 @@
 ---
+bornAs: xa36vxs
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/stand-down.mjs", "we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/conveyor/__tests__/stand-down.test.mjs", "we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs", "we:skills-src/conveyor/__tests__/build-dispatch-daemon.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a test that runs a redispatched PR through the health smells (stood-down-prs, review-label-co… (from web-everything/web-everything#4700 review)
+# Prevention — Add a test for a speed-only wiring card that runs one round through an injected effects object an… (from web-everything/web-everything#4677 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/stand-down.mjs:278` — Add a test that runs a redispatched PR through the health smells (stood-down-prs, review-label-conflict). Better, have the quiet-host pass remove the stood-down label when it posts `redispatched`.
-2. `we:scripts/conveyor/load-flake-reverify.mjs:320` — After the sweep loop, exit non-zero (after printing the JSON) if any repo recorded an `error`. Add a CLI test asserting a non-zero status for the failing-repo fixture.
+1. `we:skills-src/conveyor/build-dispatch-daemon.mjs` — Add a test for a speed-only wiring card that runs one round through an injected effects object and asserts the round-scoped effects are installed (planTick receives the round snapshotDir, run-store listed once). Filing this as a backlog test card is the cheapest guard.
+2. `we:skills-src/conveyor/__tests__/build-dispatch-tick-speed.test.mjs:74` — Add a deterministic fixture-based equivalence test using loadRouteInputs and cliPredictRoute, and run it in the existing test gate.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4700@858dca891598c271d4d2cea51bf14c1e3cacb149
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4677@fd00c6ccea525211df9307b245a971ba2508ad78
 
 ## Acceptance
 

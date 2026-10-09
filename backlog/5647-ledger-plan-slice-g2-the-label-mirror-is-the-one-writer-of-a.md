@@ -1,17 +1,19 @@
 ---
+bornAs: x3mls27
 kind: story
-size: 3
+size: 2
 priority: high
-parent: "5445"
+parent: "3007"
 status: open
-scope: ["we:conformance-vectors/verdict-ledger-store.vectors.json", "we:conformance-vectors/verdict-ledger-store.vectors.ts", "we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs", "we:scripts/lib/__tests__/verdict-ledger-store.test.mjs"]
+blockedBy: ["5355", "5371"]
+scope: ["we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/operations/record-referral-ruling-io.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger standard: store contract as language-neutral conformance vectors
+# Ledger plan slice G2: the label mirror is the one writer of advisory:ruling-needed
 
-Slice of #5445 (A4, store half of A1). Publish the verdict-ledger store contract that #5462 already implemented in we:scripts/lib/verdict-ledger-store.mjs (async append/read, idempotent append by event id, unreadable never empty, invalid row refuses the batch, append order, singleWriter and shared declared) as language-neutral conformance vectors in we:conformance-vectors/, and drive the existing JS suite we:scripts/lib/__tests__/verdict-ledger-store-conformance.mjs from them. Done when the vectors run against the home and git adapters and a deliberately broken adapter (non-idempotent append, empty-on-failure read) fails. No adapter code changes.
+Slice G2 of the verdict-ledger plan (#3007), D5 ruling: labels are the GitHub rendering of derived state and the mirror is their one writer. we:scripts/conveyor/pr-label-mirror.mjs moves from report mode (G1) to writing advisory:ruling-needed from derivePrState; we:scripts/conveyor/ruling-needed-sweep.mjs, we:scripts/conveyor/review-hold-reconcile.mjs and we:scripts/operations/record-referral-ruling-io.mjs stop writing it in the same PR. Done when a grep test shows no file but the mirror passes RULING_NEEDED_LABEL to setLabels, and the plateau-app #202 replay converges in one mirror pass. Depends on G1 (#5355), E1 and E2 (#5371), all delivered.
 
 ## Acceptance
 

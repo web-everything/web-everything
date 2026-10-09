@@ -1,17 +1,16 @@
 ---
+bornAs: xoadbhg
 kind: story
 size: 2
-parent: "5445"
 status: open
-blockedBy: ["xdt06rk", "xedhm8w", "xmeeqj3"]
-scope: ["we:scripts/verdict-ledger-conformance.mjs", "we:scripts/__tests__/verdict-ledger-conformance.test.mjs", "we:package.json"]
+scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Ledger standard: one conformance runner over schema, derive and store vectors
+# Diagnose unknown prepare result failure (7cb52f88aee316b6)
 
-Slice of #5445 (A1). One command runs the event-schema, derive-rule and store-contract vector sets against the open-core implementation (home and git store adapters, derivePrState) and prints a pass/fail per set. Done when the runner passes on main and fails on a deliberately broken adapter and on a deliberately broken derive rule.
+Prepare #4426 is held. Cause is unknown. Evidence is retained in the coordination-root prepare failure ledger under cause key 7cb52f88aee316b6 and item 4426; inspect the recorded terminal output before making a diagnosis. Recover the terminal evidence, fix the cause and add a regression. Release requires a reviewed fix commit. Cause key: 7cb52f88aee316b6.
 
 ## Acceptance
 
