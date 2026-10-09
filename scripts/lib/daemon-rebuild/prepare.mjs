@@ -22,6 +22,7 @@ import {
 import { readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
+import { healWrongBranch } from './wrong-branch-heal.mjs';
 import { repairCloneRefs, holdsCloneWriteLock } from '../lane-repair.mjs';
 import {
   markOverlayConflictWake, readOverlayConflictWakes, clearOverlayConflictWake,
@@ -168,8 +169,18 @@ export async function prepareRebuild({
   }
 
   // ── Step 1: must be on main, and the local tree must be safe to move ────────────────────────────────────
-  const headRef = git(['symbolic-ref', '--short', 'HEAD']);
-  const onMain = headRef.status === 0 ? String(headRef.stdout ?? '').trim() === 'main' : null;
+  let headRef = git(['symbolic-ref', '--short', 'HEAD']);
+  let onMain = headRef.status === 0 ? String(headRef.stdout ?? '').trim() === 'main' : null;
+  if (!onMain) {
+    // A store writer that checked its branch out in THIS clone (live 2026-10-09) is healed back to main when the
+    // branch is allowlisted and only store files changed; anything else still refuses (wrong-branch-heal.mjs).
+    const heal = healWrongBranch({ git, now: nowMs });
+    alert(heal.healed ? 'wrong-branch-healed' : 'wrong-branch-heal-refused', heal);
+    if (heal.healed) {
+      headRef = git(['symbolic-ref', '--short', 'HEAD']);
+      onMain = headRef.status === 0 ? String(headRef.stdout ?? '').trim() === 'main' : null;
+    }
+  }
   if (!onMain) {
     alert('not-on-main', { onMain });
     return terminal({ moved: false, reason: 'not-on-main' });
