@@ -23,8 +23,8 @@
  *
  * RE-TEST MODE (`mergeFreshness.retestMode`, operator go 2026-10-09 16:35 ET): `any-code` = the middle ground (any
  *   code main gained since the PR's base forces a refresh); `affected` (default) = only code that can reach the PR
- *   does (we:scripts/lib/merge-queue-affected.mjs: same files, direct imports either way, the gate itself, CI and
- *   test infra). Layers: built-in default → the settings file → env `WE_MERGE_QUEUE_RETEST_MODE` (tool override).
+ *   does (we:scripts/lib/merge-queue-affected.mjs: same files, imports followed transitively either way, an unchanged
+ *   test that reaches both sides, the gate itself, CI and test infra). Layers: built-in default → the settings file → env `WE_MERGE_QUEUE_RETEST_MODE` (tool override).
  *   Each judged PR logs one `merge-queue · retest: {...}` line (stderr, so it reaches the daemon log under --json).
  */
 import { readFileSync, mkdirSync } from 'node:fs';

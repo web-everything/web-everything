@@ -84,6 +84,33 @@ export function resolvedImportsOf(fromFile, text, fileSet) {
 }
 
 /**
+ * The path BASES of the relative specifiers in `text` (before suffix resolution: `./x` → `scripts/lib/x`), resolved or
+ * not. A specifier that resolves to nothing today still names a file that a later change can add; the drain's
+ * `affected` rule pairs these with {@link specifierBasesResolvingTo}. Pure.
+ * @returns {string[]}
+ */
+export function relativeSpecifierBases(fromFile, text) {
+  const out = new Set();
+  for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
+    const spec = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
+    if (!spec || !(spec.startsWith('./') || spec.startsWith('../'))) continue;
+    const base = normalizeJoin(fromFile, spec.split('?')[0]);
+    if (base != null) out.add(base);
+  }
+  return [...out];
+}
+
+/** Every specifier base that {@link resolveSpecifier} would resolve to `path` once `path` exists (itself, a stripped suffix, a `.js`-for-`.ts` swap). Pure. */
+export function specifierBasesResolvingTo(path) {
+  const p = String(path);
+  const bases = new Set([p]);
+  for (const suffix of RESOLVE_SUFFIXES) if (suffix && p.endsWith(suffix)) bases.add(p.slice(0, -suffix.length));
+  const ts = /^(.*)\.(ts|tsx|mts|cts)$/.exec(p);
+  if (ts) for (const ext of { ts: ['.js'], tsx: ['.js'], mts: ['.mjs'], cts: ['.cjs'] }[ts[2]]) bases.add(ts[1] + ext);
+  return [...bases];
+}
+
+/**
  * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files (a tracked file deleted in the
  * working tree, whose imports are gone with it) are skipped. Only source files are READ for imports, but any tracked
  * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.

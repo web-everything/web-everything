@@ -17,18 +17,26 @@
  *   4. a file main changed reaches a file the PR changed (imports followed transitively, through unchanged modules,
  *      read at the main tip), or a file the PR changed reaches a file main changed (read at the PR head). Through the
  *      repo's own import parser (we:scripts/lib/related-test-selection.mjs, the same one the local gate's test
- *      selection uses). NOT covered, by design: a third unchanged file that imports both sides (shared importer) and
- *      data read through `fs` rather than imported (other than declared settings, rule 1) — filed as card x0e6tik;
- *   5. an import list could not be read, or a closure is larger than {@link MAX_CLOSURE_FILES} — fail closed.
+ *      selection uses);
+ *   5. a shared importer: an UNCHANGED test, spec or entry-point file (one nothing imports, such as check:standards
+ *      or a build script) reaches (reverse imports, through any unchanged modules, read at the main tip) both a file
+ *      the PR changed and a file main changed. The two forward walks of rule 4 cannot see it; CI running that file
+ *      after the merge exercises both together. A file the PR adds counts as imported by every unchanged file that
+ *      already names it by a specifier that resolved to nothing or to a lower-priority file;
+ *   6. an import list could not be read, the tip's reverse graph could not be read in full or has more than
+ *      {@link MAX_REVERSE_FILES} sources, or a forward closure is larger than {@link MAX_CLOSURE_FILES} — fail closed.
+ *   NOT covered, by design: data read through `fs` rather than imported (other than declared settings, rule 1), and
+ *   files loaded through a computed path — card x0e6tik (its shared-importer part is rule 5).
  *   Main changes under `nonCodePaths` (docs, backlog cards) never count, as in `any-code`.
  *
  * IO ({@link readAffectedFacts}): reads file contents with `git show <sha>:<path>` in the drain's own clone,
- *   fetching the two commits from `origin` when absent. A clone that cannot produce them (another repo, offline)
+ *   fetching the two commits from `origin` when absent. Rule 5 reads the whole tip tree in ONE `git cat-file --batch`
+ *   spawn, once per tip sha (shared by every PR judged against that tip), and only when rules 1-4 left the PR open. A clone that cannot produce them (another repo, offline)
  *   fails closed: affected.
  */
 import { execFileSync } from 'node:child_process';
-import { isGraphSourceFile, resolvedImportsOf } from './related-test-selection.mjs';
-import { hitsGlobEdge, isLocalFullSuiteTrigger } from '../readiness/test-selection.mjs';
+import { isGraphSourceFile, relativeSpecifierBases, resolvedImportsOf, specifierBasesResolvingTo } from './related-test-selection.mjs';
+import { hitsGlobEdge, isLocalFullSuiteTrigger, isTestFile } from '../readiness/test-selection.mjs';
 
 /** `any-code`: today's middle ground — any main code change re-tests. `affected`: only a change that can reach the PR. */
 export const RETEST_MODES = Object.freeze(['any-code', 'affected']);
@@ -39,6 +47,8 @@ export const MAX_GRAPH_FILES = 400;
 export const MAX_CLOSURE_FILES = 1500;
 /** Wall-clock budget for one PR's graph reads (one `git show` spawn per file, ~20 ms each); past it, re-test. */
 export const MAX_GRAPH_MS = 25_000;
+/** More graph source files than this at the main tip ⇒ the reverse graph is not built; re-test (bounded IO, fail closed). The repo has ~3000 today. */
+export const MAX_REVERSE_FILES = 8000;
 
 /** The gate itself: a change here always re-tests (operator constraint). Repo-relative path patterns. */
 export const GATE_PATTERNS = Object.freeze([
@@ -71,7 +81,7 @@ const isNonCode = (file, patterns) => patterns.some((p) => (p.endsWith('/') ? fi
  *   side (`[]` = deleted there / imports nothing; `null` = could not read → fail closed)
  * @returns {{affected: boolean, reasons: string[], mainCodeFiles: number}}
  */
-export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['backlog/', 'docs/'], importsOf }) {
+export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['backlog/', 'docs/'], importsOf, importersOf }) {
   const pr = [...new Set(prFiles.filter(Boolean))];
   const prSet = new Set(pr);
   const mainCode = [...new Set(mainFiles.filter(Boolean))].filter((f) => !isNonCode(f, nonCodePaths));
@@ -110,12 +120,85 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   };
   const edge = walk('main', mainCode, prSet) ?? walk('pr', pr, mainSet);
   if (edge) return done(true, [edge]);
+  // Shared importer: an UNCHANGED file that CI executes and that reaches a PR file and a file main changed runs both
+  // together after the merge, which neither forward walk sees (it starts at a changed file and never meets the other
+  // side). What CI executes is a test or spec file, or an entry point (a file nothing imports: check:standards, a
+  // build). A middle module importing both is not a meeting point itself; whatever runs it, further up, is.
+  if (typeof importersOf !== 'function') return done(true, ['importers-unavailable']);
+  // Reverse closure at the main tip. The PR's own new edges need no overlay: every one starts at a PR-changed file,
+  // which the forward PR walk above already followed to the end (a PR-ADDED file that an unchanged file already names
+  // is the one exception, and `importersOf` supplies those importers).
+  const reach = (roots) => {
+    const origin = new Map(); // file → the root it was reached from
+    const queue = [];
+    for (const r of roots) { origin.set(r, r); queue.push(r); }
+    for (let i = 0; i < queue.length; i++) {
+      const importers = importersOf(queue[i]);
+      if (!Array.isArray(importers)) return `importers-unreadable:${queue[i]}`;
+      for (const t of importers) if (!origin.has(t)) { origin.set(t, origin.get(queue[i])); queue.push(t); }
+    }
+    return origin;
+  };
+  const fromPr = reach(pr);
+  if (typeof fromPr === 'string') return done(true, [fromPr]);
+  const fromMain = reach(mainSet);
+  if (typeof fromMain === 'string') return done(true, [fromMain]);
+  for (const [file, prRoot] of fromPr) {
+    // A meeting point is something CI executes: a test or spec file, or an entry point (nothing imports it: a script
+    // CI runs directly, such as check:standards or a build).
+    if (prSet.has(file) || mainSet.has(file)) continue; // the meeting point is an UNCHANGED file (a changed one is rules 3-4)
+    if (fromMain.has(file) && (isTestFile(file) || importersOf(file)?.length === 0)) return done(true, [`shared-importer:${file} (pr:${prRoot}, main:${fromMain.get(file)})`]);
+  }
   return done(false, ['main-delta-unaffected']);
 }
+
 
 function gitRunner(root) {
   return (args, opts = {}) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 60_000, ...opts });
 }
+
+/**
+ * IO. The reverse-import graph of the whole tree at `tipSha` (`Map<imported file, importing files>`), read with ONE
+ * `git cat-file --batch` spawn (a `git show` per file would be ~60 s for ~3000 sources). Returns the graph, or a
+ * named failure reason: `reverse-graph-too-large` (more source files than `maxFiles`) / `reverse-graph-unreadable:<why>`
+ * (a failed spawn, a missing or non-blob object, a short or malformed answer). Never a partial graph.
+ */
+function readTipGraph({ git, tipSha, maxFiles, tipFiles }) {
+  const sources = tipFiles.filter(isGraphSourceFile);
+  if (sources.length > maxFiles) return 'reverse-graph-too-large';
+  const known = new Set(tipFiles);
+  const reverse = new Map();
+  const bases = new Map(); // relative specifier base → the files that name it, resolved or not (see specifierBasesResolvingTo)
+  if (!sources.length) return { reverse, bases };
+  let buf;
+  try {
+    buf = Buffer.from(git(['cat-file', '--batch'], { input: Buffer.from(`${sources.map((f) => `${tipSha}:${f}`).join('\n')}\n`), encoding: 'buffer', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 512 * 1024 * 1024, timeout: 45_000 }));
+  } catch (e) {
+    return `reverse-graph-unreadable:${e?.code ?? String(e?.message ?? e).split('\n')[0].slice(0, 80)}`;
+  }
+  let pos = 0;
+  for (const file of sources) {
+    const nl = buf.indexOf(0x0a, pos);
+    const header = nl < 0 ? '' : buf.toString('latin1', pos, nl);
+    const m = /^[0-9a-f]{40,64} blob (\d+)$/.exec(header);
+    if (!m || nl + 1 + Number(m[1]) > buf.length) return `reverse-graph-unreadable:${header.slice(-60) || 'short-answer'}`;
+    const end = nl + 1 + Number(m[1]);
+    const text = buf.toString('utf8', nl + 1, end);
+    for (const target of resolvedImportsOf(file, text, known)) {
+      if (!reverse.has(target)) reverse.set(target, []);
+      reverse.get(target).push(file);
+    }
+    for (const base of relativeSpecifierBases(file, text)) {
+      if (!bases.has(base)) bases.set(base, []);
+      bases.get(base).push(file);
+    }
+    pos = end + 1; // the answer's own newline after the content
+  }
+  return { reverse, bases };
+}
+
+/** Tip graphs shared by the PRs of one drain pass, keyed by `<checkout>\0<tip sha>`: a sha names one immutable tree, so an entry can never go stale. */
+const SHARED_TIP_GRAPHS = new Map();
 
 /** git's wording when a path is not in the commit: `path 'x' does not exist in '<sha>'` / `exists on disk, but not in '<sha>'`. */
 const PATH_ABSENT_RE = /does not exist in |exists on disk, but not in /;
@@ -129,11 +212,14 @@ const hasCommit = (git, sha) => { try { git(['cat-file', '-e', `${sha}^{commit}`
  *   nonCodePaths?: string[], git?: Function, budgetMs?: number}} a
  * @returns {{affected: boolean, reasons: string[], mainCodeFiles: number, ms: number}}
  */
-export function readAffectedFacts({ root = process.cwd(), num = null, headSha, tipSha, prFiles, mainFiles, nonCodePaths, git = gitRunner(root), budgetMs = MAX_GRAPH_MS }) {
+export function readAffectedFacts({ root = process.cwd(), num = null, headSha, tipSha, prFiles, mainFiles, nonCodePaths, git: injectedGit, budgetMs = MAX_GRAPH_MS, maxReverseFiles = MAX_REVERSE_FILES, tipGraphCache }) {
+  const git = injectedGit ?? gitRunner(root);
+  // The real runner shares tip graphs across PRs of one drain pass; an injected git (a test's fake tree) never does.
+  const cache = tipGraphCache ?? (injectedGit ? new Map() : SHARED_TIP_GRAPHS);
   const t0 = Date.now();
   const out = (r) => ({ ...r, ms: Date.now() - t0 });
   // Cheap first: no IO when the pure rule already answers without the graph.
-  const pre = decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf: () => [] });
+  const pre = decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf: () => [], importersOf: () => [] });
   if (pre.affected || pre.reasons[0] === 'main-gained-no-code') return out(pre);
   if (!headSha || !tipSha) return out({ ...pre, affected: true, reasons: ['shas-unknown'] });
   try {
@@ -144,7 +230,9 @@ export function readAffectedFacts({ root = process.cwd(), num = null, headSha, t
       const still = [headSha, tipSha].filter((s) => !hasCommit(git, s));
       if (still.length) return out({ ...pre, affected: true, reasons: [`commits-unavailable:${still.map((s) => s.slice(0, 9)).join(',')}`] });
     }
-    const fileSet = new Set(String(git(['ls-tree', '-r', '--name-only', tipSha])).split('\n').filter(Boolean));
+    // `-z`: without it git quotes a path with a non-ASCII character (`"caf\303\251.test.mjs"`) and the test is invisible.
+    const tipTree = new Set(String(git(['ls-tree', '-r', '-z', '--name-only', tipSha])).split('\0').filter(Boolean));
+    const fileSet = new Set(tipTree);
     for (const f of [...prFiles, ...mainFiles]) if (f) fileSet.add(f);
     const memo = new Map(); // a closure walk reads a shared module once per side, not once per path that reaches it
     const importsOf = (side, file) => {
@@ -164,7 +252,30 @@ export function readAffectedFacts({ root = process.cwd(), num = null, headSha, t
       }
       return resolvedImportsOf(file, text, fileSet);
     };
-    return out(decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf }));
+    // The importers of a file at the main tip: the whole tip tree is read once, and only when the forward walks left
+    // the question open. A graph that cannot be read in full is `null` here and named in the verdict below.
+    let graphFailure = null;
+    // A file the PR ADDS has no importer at the tip, but an unchanged file may already name it by a specifier that
+    // resolved to nothing (a guarded dynamic import) or to a lower-priority file (`./x` → x.js, and the PR adds x.mjs).
+    // Those files become its importers. (Every other new edge starts at a PR-changed file, which rule 4 already walks.)
+    const prAdded = new Set(prFiles.filter((f) => f && !tipTree.has(f)));
+    const importersOf = (file) => {
+      const key = `${root}\0${tipSha}`;
+      let graph = cache.get(key);
+      if (graph === undefined) {
+        // A build that failed is remembered for this tip too: every PR of the pass would otherwise re-spawn it (up to its timeout).
+        if (Date.now() > deadline) { graphFailure = 'graph-budget-exceeded'; return null; } // this PR's budget, not a fact about the tip: not cached
+        graph = readTipGraph({ git, tipSha, maxFiles: maxReverseFiles, tipFiles: [...tipTree] });
+        for (const k of [...cache.keys()].slice(0, Math.max(0, cache.size - 1))) cache.delete(k); // this pass's tip and one before it
+        cache.set(key, graph);
+      }
+      if (typeof graph === 'string') { graphFailure = graph; return null; }
+      const real = graph.reverse.get(file) ?? [];
+      if (!prAdded.has(file)) return real;
+      return [...new Set([...real, ...specifierBasesResolvingTo(file).flatMap((b) => graph.bases.get(b) ?? [])])].filter((f) => f !== file);
+    };
+    const verdict = decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf, importersOf });
+    return out(graphFailure ? { ...verdict, affected: true, reasons: [graphFailure] } : verdict);
   } catch (e) {
     return out({ ...pre, affected: true, reasons: [`graph-read-failed:${String(e?.message ?? e).split('\n')[0].slice(0, 120)}`] });
   }
