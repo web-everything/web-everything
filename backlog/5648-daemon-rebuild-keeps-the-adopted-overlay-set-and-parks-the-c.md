@@ -2,9 +2,10 @@
 bornAs: x5059uu
 kind: story
 size: 5
-status: open
+status: resolved
 scope: ["we:scripts/lib/daemon-rebuild/plan.mjs", "we:scripts/lib/daemon-rebuild/prepare.mjs", "we:scripts/lib/daemon-overlays.mjs", "we:scripts/lib/__tests__/daemon-rebuild.test.mjs"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
