@@ -53,14 +53,17 @@ export function resolveConflictReassertSettings(env = process.env, { path = conf
 /**
  * PURE. Decide whether to re-assert the idle conflict finding on an already-labelled, still-conflicting, parked
  * `review:human` PR. The caller has already established "parked + still conflicting + label already applied".
- * @param {{labels?:Array, hasLiveWatcherMarker?:boolean, settings?:{reviewHuman?:boolean}}} [o]
+ * `hasStandDown`: the thread carries ANY trusted stand-down (a fix agent's own judgment call, or a watcher marker
+ * already superseded) — never re-asserted over; a person or the statute recheck owns it.
+ * @param {{labels?:Array, hasLiveWatcherMarker?:boolean, hasStandDown?:boolean, settings?:{reviewHuman?:boolean}}} [o]
  * @returns {{reassert:boolean, why:string}}
  */
-export function decideConflictReassert({ labels = [], hasLiveWatcherMarker = false, settings = CONFLICT_REASSERT_OFF } = {}) {
+export function decideConflictReassert({ labels = [], hasLiveWatcherMarker = false, hasStandDown = false, settings = CONFLICT_REASSERT_OFF } = {}) {
   if (!hasReviewLabel(labels, REVIEW_LABELS.human)) return { reassert: false, why: 'not review:human (the #2793 idle path owns it)' };
   if (!hasReviewLabel(labels, CONFLICT_LABEL)) return { reassert: false, why: `no ${CONFLICT_LABEL} label yet (fresh detection owns it)` };
   if (hasReviewLabel(labels, REVIEW_LABELS.changes)) return { reassert: false, why: 'a review:changes bounce is already live' };
   if (hasLiveWatcherMarker) return { reassert: false, why: "the watch's own stand-down marker stands (statute recheck owns it)" };
+  if (hasStandDown) return { reassert: false, why: 'a stand-down is on the thread (a person owns it)' };
   if (settings?.reviewHuman !== true) return { reassert: false, why: 'conflictReassert.reviewHuman is off' };
   return { reassert: true, why: 'review:human PR still conflicting with no live review:changes and no watcher stand-down — re-assert the conflict finding' };
 }

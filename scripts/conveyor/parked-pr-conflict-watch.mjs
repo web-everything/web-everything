@@ -170,7 +170,7 @@ import { operatorAnswerForStandDown } from './stand-down-answer-core.mjs';
 // leaf's own header for the full reasoning and the original docblock this text used to carry.
 import { CONFLICT_LABEL, CONFLICT_LABEL_META } from './conflict-label.mjs';
 // Card xkugvzd — the idle re-assert for an already-labelled, still-conflicting `review:human` PR (live: #4481).
-import { decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
+import { CONFLICT_REASSERT_OFF, decideConflictReassert, resolveConflictReassertSettings } from './conflict-reassert-rule.mjs';
 
 export { CONFLICT_LABEL, CONFLICT_LABEL_META };
 
@@ -1512,9 +1512,10 @@ export function watchParkedPrConflicts({
   listAgents = defaultListAgents,
   now = Date.now(),
   queueScope = {},
-  // Card xkugvzd — declared setting (`conflict-reassert-settings.json`, env `WE_CONFLICT_REASSERT_REVIEW_HUMAN`);
-  // missing/malformed/`off` = the behaviour before this card. Resolved once per sweep.
-  conflictReassertSettings = resolveConflictReassertSettings(),
+  // Card xkugvzd — the declared setting (`conflict-reassert-settings.json`, env `WE_CONFLICT_REASSERT_REVIEW_HUMAN`).
+  // The CLI (the daemon's own invocation) resolves it once per sweep; an in-process caller that passes nothing gets
+  // `off`, exactly the behaviour before this card.
+  conflictReassertSettings = CONFLICT_REASSERT_OFF,
 } = {}) {
   const listed = listPrs({ repo });
   if (isGhDeferred(listed)) return []; // throttle already logged the skipped pass
@@ -1641,21 +1642,23 @@ export function watchParkedPrConflicts({
         let comments = [];
         try { comments = listPrComments({ number: pr?.number, repo }); } catch { comments = []; }
         const watcherMarker = findWatcherStandDownComment(comments);
-        // Already superseded (and dispatched) on an earlier sweep — the supersede comment is the durable record,
-        // so re-posting it and a fresh finding every tick is pure noise (live on #2549, 2026-09-24).
-        const liveWatcherMarker = Boolean(watcherMarker) && !isWatcherMarkerAlreadySuperseded(comments);
-        if (!liveWatcherMarker) {
-          // Card xkugvzd (live: #4481) — no live watcher stand-down, so the statute recheck below has nothing to
-          // change. A `review:human` PR still conflicting with no live `review:changes` used to be skipped here
-          // forever (the #2793 idle path excludes `review:human`). The declared rule decides whether to re-assert
-          // the idle conflict finding; off (or any other answer) leaves it exactly as before.
+        if (!watcherMarker) {
+          // Card xkugvzd (live: #4481) — no watcher stand-down, so the statute recheck below has nothing to change.
+          // A `review:human` PR still conflicting with no live `review:changes` used to be skipped here forever (the
+          // #2793 idle path excludes `review:human`). The declared rule decides whether to re-assert the idle
+          // conflict finding; off, a live bounce, or any stand-down on the thread (a fix agent's own judgment call)
+          // leaves it exactly as before.
           const decision = decideConflictReassert({
-            labels: pr?.labels, hasLiveWatcherMarker: false, settings: conflictReassertSettings,
+            labels: pr?.labels, hasLiveWatcherMarker: false, hasStandDown: standDownComments(comments).length > 0,
+            settings: conflictReassertSettings,
           });
           if (!decision.reassert) continue;
           reassertIdleConflict(comments, 'review-human');
           continue;
         }
+        // Already superseded (and dispatched) on an earlier sweep — the supersede comment is the durable record,
+        // so re-posting it and a fresh finding every tick is pure noise (live on #2549, 2026-09-24).
+        if (isWatcherMarkerAlreadySuperseded(comments)) continue;
         if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         let filesForCheck = null;
         try { filesForCheck = listPrFiles({ number: pr?.number, repo: resolvedRepo }); } catch { /* handled below */ }
@@ -2188,6 +2191,7 @@ if (IS_CLI) {
     try {
       const results = watchParkedPrConflicts({
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
+        conflictReassertSettings: resolveConflictReassertSettings(),
       });
       for (const r of results) {
         const verb2 = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
