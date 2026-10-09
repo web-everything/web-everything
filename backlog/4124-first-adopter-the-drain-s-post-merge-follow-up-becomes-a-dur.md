@@ -6,7 +6,7 @@ priority: high
 parent: "4075"
 status: open
 blockedBy: ["4125", "4127", "4134", "4121"]
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lane-drain.mjs", "we:scripts/lib/drain-followup-hook.mjs", "we:scripts/settings/drain-followup.json", "we:scripts/lib/drain-followup-job.mjs", "we:scripts/drain-followup-job.mjs", "we:scripts/lib/__tests__/drain-followup-wiring.test.mjs", "we:scripts/lib/__tests__/drain-followup-job.test.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lane-drain.mjs", "we:scripts/lib/drain-followup-hook.mjs", "we:scripts/settings/drain-followup.json", "we:scripts/lib/drain-followup-job.mjs", "we:scripts/drain-followup-job.mjs", "we:scripts/lib/__tests__/drain-followup-wiring.test.mjs", "we:scripts/lib/__tests__/drain-followup-job.test.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/__tests__/lane-drain.test.mjs"]
 dateOpened: "2026-09-24"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "3ca3228f39bd7758802386f47630a4d63a277b73"
