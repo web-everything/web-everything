@@ -8,10 +8,12 @@
  */
 import { statSync, realpathSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { laneHoldVerdict, laneHoldNeedsWorkState, resolveLaneHoldSettings, LANE_HOLD_CLOCK_SKEW_MS } from './lane-lease.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from './lane-verify.mjs';
 import { laneHead, laneStateSnapshot } from './lane-history.mjs';
+import { laneGitHardeningEnv } from './lane-git-hardening.mjs';
 import {
   readAwaitVerifyRecord, listStoredAwaitVerify, awaitVerifyStoreDir, resolveAwaitVerifyPath,
   clearAwaitVerifyRecord, clearStoredAwaitVerify,
@@ -128,12 +130,39 @@ export function checkLaneHold(dir, { action, byHolder = false, nowMs = Date.now(
   return { ...verdict, facts };
 }
 
-/** Is `revision` the tip of a branch or PR head ref on the live `origin`? One bounded call; false on any error. */
+// Transports a lane's origin may use. `ext::<cmd>` runs a command and is the one a lane URL must never reach.
+const LIVE_REMOTE_PROTOCOLS = 'file:git:http:https:ssh';
+
+/**
+ * The lane's `remote.origin.url`, read as DATA (`config --file` runs nothing) in a neutral cwd. A lane's `.git/config`
+ * is agent-writable, so the URL is only ever a string to hand on: null when it is missing, shaped like an option, or
+ * the lane is not a plain clone. A relative local path is resolved against the lane.
+ */
+function laneOriginUrl(dir) {
+  const gitDir = join(dir, '.git');
+  if (!statSync(gitDir).isDirectory()) return null;
+  const url = execFileSync('git', ['config', '--file', join(gitDir, 'config'), '--get', 'remote.origin.url'], {
+    cwd: tmpdir(), encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: laneGitHardeningEnv(process.env),
+  }).trim();
+  if (!url || url.startsWith('-') || /[\0\n\r]/.test(url)) return null;
+  return /^[a-z][a-z0-9+.-]*:|^[^/]+:/i.test(url) ? url : resolve(dir, url);
+}
+
+/**
+ * Is `revision` the tip of a branch or PR head ref on the live `origin`? One bounded call; false on any error.
+ *
+ * The call runs in a NEUTRAL directory against the URL read from the lane, never inside the lane: git loads the cwd
+ * repo's config, and a lane's own `.git/config` can name programs it then runs with the daemon's credentials
+ * (`core.sshCommand`, `core.gitProxy`, `credential.helper`, `remote.origin.uploadpack`, `protocol.ext.allow`…). Pinning
+ * a few keys would leave the rest (we:scripts/lib/lane-git-hardening.mjs); loading no lane config closes the class.
+ */
 export function liveRemoteHasRevision(dir, revision) {
   try {
-    const out = execFileSync('git', ['ls-remote', 'origin', 'refs/heads/*', 'refs/pull/*/head'], {
-      cwd: dir, encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    const url = laneOriginUrl(dir);
+    if (!url) return false;
+    const out = execFileSync('git', ['ls-remote', '--', url, 'refs/heads/*', 'refs/pull/*/head'], {
+      cwd: tmpdir(), encoding: 'utf8', timeout: 20_000, maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+      env: laneGitHardeningEnv({ ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_ALLOW_PROTOCOL: LIVE_REMOTE_PROTOCOLS }),
     });
     return out.split('\n').some((line) => line.split(/\s+/)[0] === revision);
   } catch { return false; }

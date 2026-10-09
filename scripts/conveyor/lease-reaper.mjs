@@ -79,6 +79,11 @@
  */
 
 import { readGit } from '../lib/proc-read.mjs';
+import { laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
+
+// A lane's `.git/config` is agent-writable, so every git this file runs INSIDE a lane runs with the lane-config pins
+// (`core.fsmonitor` would otherwise run on each `git status`). Read per call: the base env can change under test.
+const laneGitEnv = () => laneGitHardeningEnv(process.env);
 import { parseSessionSlug } from './session-slug.mjs';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -331,6 +336,7 @@ function defaultGitSymbolicRef(dir) {
   try {
     return readGit(['symbolic-ref', '--short', 'HEAD'], {
       cwd: dir,
+      env: laneGitEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: resolveChildTimeoutMs(),
@@ -368,6 +374,7 @@ function defaultGitStatusPorcelain(dir) {
   try {
     return readGit(['status', '--porcelain'], {
       cwd: dir,
+      env: laneGitEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: resolveChildTimeoutMs(),
@@ -450,6 +457,7 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
     // API response, or any future caller feeding this untrusted input) can never be misread as a flag.
     exec('git', ['merge-base', '--is-ancestor', '--', 'HEAD', sha], {
       cwd: dir,
+      env: laneGitEnv(),
       stdio: ['ignore', 'ignore', 'ignore'],
       timeout: resolveChildTimeoutMs(),
       killSignal: 'SIGKILL',
@@ -466,6 +474,7 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
     try {
       const out = exec('git', ['cherry', '--', sha, 'HEAD'], {
         cwd: dir,
+        env: laneGitEnv(),
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: resolveChildTimeoutMs(),
@@ -492,6 +501,7 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
     // aggregate tier below must never accept a lane whose history carries an unaccounted-for merge commit.
     const gitRead = (args) => exec('git', args, {
       cwd: dir,
+      env: laneGitEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: resolveChildTimeoutMs(),
@@ -513,9 +523,10 @@ export function defaultGitIsAncestor(dir, sha, { exec = execFileSync } = {}) {
       const base = gitRead(['merge-base', '--', 'HEAD', sha]).trim();
       if (!base) return null;
       const stablePatchId = (from, to) => {
-        const diff = gitRead(['diff', '--no-ext-diff', '--end-of-options', from, to, '--']);
+        const diff = gitRead(['diff', '--no-ext-diff', '--no-textconv', '--end-of-options', from, to, '--']);
         const id = exec('git', ['patch-id', '--stable'], {
           cwd: dir,
+          env: laneGitEnv(),
           input: diff,
           encoding: 'utf8',
           stdio: ['pipe', 'pipe', 'pipe'],

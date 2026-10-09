@@ -603,6 +603,16 @@ export const LANE_HOLD_CLOCK_SKEW_MS = 5 * 60_000;
  *  Without the upper bound a future-dated time has a negative age and would hold forever. */
 const holdLive = (atMs, nowMs, holdMs) => Number.isFinite(atMs) && atMs <= nowMs + LANE_HOLD_CLOCK_SKEW_MS && nowMs - atMs <= holdMs;
 
+const isPlainRecord = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
+const LANE_HOLD_VERIFY_STATES = Object.freeze(['running', 'passed', 'failed', 'unreadable']);
+
+/** `awaits` is absent or a list of records; `verify` is absent or one record naming a known state. Anything else is
+ *  not a fact we can read — a malformed entry reads as "unknown", never as "no signal". (A record whose TIME is not
+ *  finite is a different case and stays "holds nothing": it names a state, only its age is unknown; the IO shell
+ *  substitutes the file's own time before it gets here.) */
+const nestedFactsWellFormed = (facts) => (facts.awaits == null || (Array.isArray(facts.awaits) && facts.awaits.every(isPlainRecord)))
+  && (facts.verify == null || (isPlainRecord(facts.verify) && LANE_HOLD_VERIFY_STATES.includes(facts.verify.state)));
+
 /**
  * Does the decision for these facts depend on `unpushed`? Lets an IO shell skip the (costly) work-state read
  * when the answer cannot change. Pure; same fact shape as {@link laneHoldVerdict}.
@@ -610,6 +620,8 @@ const holdLive = (atMs, nowMs, holdMs) => Number.isFinite(atMs) && atMs <= nowMs
 export function laneHoldNeedsWorkState(facts, settings = BUILT_IN_LANE_HOLD_SETTINGS) {
   if (!facts || settings.mode === 'off') return false;
   if (facts.byHolder === true && facts.action === 'release') return false;
+  // Malformed nested facts are refused outright by the verdict whatever `unpushed` says.
+  if (!nestedFactsWellFormed(facts)) return false;
   const holdMs = settings.holdMinutes * 60_000;
   if ((facts.awaits ?? []).some((a) => holdLive(a?.requestedAtMs, facts.nowMs, holdMs))) return false;
   const v = facts.verify;
@@ -641,6 +653,7 @@ export function laneHoldVerdict(facts, settings = BUILT_IN_LANE_HOLD_SETTINGS) {
     return hold('work-state-unknown', 'facts missing or malformed — never act blind');
   }
   if (facts.byHolder === true && facts.action === 'release') return allow('the holder releases its own lane');
+  if (!nestedFactsWellFormed(facts)) return hold('work-state-unknown', 'nested facts malformed — never act blind');
   const holdMs = (settings?.holdMinutes ?? BUILT_IN_LANE_HOLD_SETTINGS.holdMinutes) * 60_000;
   const { nowMs } = facts;
   if ((facts.awaits ?? []).some((a) => holdLive(a?.requestedAtMs, nowMs, holdMs))) {

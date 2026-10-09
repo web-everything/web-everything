@@ -329,6 +329,54 @@ describe('every guard has a test that reddens without it', () => {
   });
 });
 
+describe('the live-remote check never runs code named by the lane\'s own git config', () => {
+  // A lane's `.git/config` is agent-writable. `core.sshCommand` runs for an ssh remote; the verified-unpushed
+  // branch of the hold calls `git ls-remote origin`, so it must run with the lane-config pins.
+  it('a planted core.sshCommand is never executed when the hold asks the live remote', () => {
+    const { dir } = parkedFixerLane({ awaitRecord: false, verified: true });
+    const sentinel = join(base, 'sshcommand-ran');
+    const script = join(base, 'plant.sh');
+    writeFileSync(script, `#!/bin/sh\necho ran > '${sentinel}'\nexit 1\n`, { mode: 0o755 });
+    git(['config', 'core.sshCommand', script], dir);
+    git(['config', 'remote.origin.url', 'ssh://127.0.0.1:1/repo.git'], dir);
+    const v = checkLaneHold(dir, { action: 'release', storeDir, env: {} });
+    expect(v).toMatchObject({ allowed: false, hold: 'verified-unpushed' }); // remote unreachable: the hold stands
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  // `git ls-remote origin` run INSIDE the lane loads the lane's config, which can name programs by many keys, not just
+  // sshCommand; the call must load no lane config at all.
+  it.each([
+    ['remote.origin.uploadpack', (dir, script) => git(['config', 'remote.origin.uploadpack', script], dir)],
+    ['credential.helper', (dir, script) => { git(['config', 'credential.helper', `!${script}`], dir); git(['config', 'remote.origin.url', 'http://127.0.0.1:1/repo.git'], dir); }],
+    ['core.gitProxy', (dir, script) => { git(['config', 'core.gitProxy', script], dir); git(['config', 'remote.origin.url', 'git://127.0.0.1:1/repo.git'], dir); }],
+    ['protocol.ext.allow with an ext:: origin url',(dir, script) => { git(['config', 'protocol.ext.allow', 'always'], dir); git(['config', 'remote.origin.url', `ext::${script}`], dir); }],
+  ])('a planted %s is never executed when the hold asks the live remote', (_label, plant) => {
+    const { dir } = parkedFixerLane({ awaitRecord: false, verified: true });
+    const sentinel = join(base, 'planted-ran');
+    const script = join(base, 'plant.sh');
+    writeFileSync(script, `#!/bin/sh\necho ran > '${sentinel}'\nexec git-upload-pack "$@"\n`, { mode: 0o755 });
+    plant(dir, script);
+    checkLaneHold(dir, { action: 'release', storeDir, env: {} });
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  it('an option-shaped or missing origin url is not a remote (the hold stands)', () => {
+    const { dir } = parkedFixerLane({ awaitRecord: false, verified: true });
+    git(['config', 'remote.origin.url', '--upload-pack=touch x'], dir);
+    expect(checkLaneHold(dir, { action: 'release', storeDir, env: {} })).toMatchObject({ allowed: false, hold: 'verified-unpushed' });
+    git(['config', '--unset', 'remote.origin.url'], dir);
+    expect(checkLaneHold(dir, { action: 'release', storeDir, env: {} })).toMatchObject({ allowed: false, hold: 'verified-unpushed' });
+  });
+
+  it('the ssh pin does not stop an ordinary remote answering (a pushed head is released)', () => {
+    const { dir } = parkedFixerLane({ awaitRecord: false, verified: true });
+    git(['push', '--quiet', 'origin', 'HEAD:refs/heads/lane/pushed-head'], dir);
+    git(['update-ref', '-d', 'refs/remotes/origin/lane/pushed-head'], dir);
+    expect(checkLaneHold(dir, { action: 'release', storeDir, env: {} })).toMatchObject({ allowed: true });
+  });
+});
+
 describe('checkLaneHold fails closed on malformed or unreadable facts', () => {
   const verifyPath = (dir) => join(dir, '.git', '.lane-verify');
   const check = (dir, extra = {}) => checkLaneHold(dir, { action: 'release', storeDir, env: {}, remoteHas: () => false, ...extra });

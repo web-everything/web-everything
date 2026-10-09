@@ -689,6 +689,37 @@ describe('lane hold rule — replay fixtures', () => {
   it.each(FIXTURES)('mode off reproduces the pre-rule behaviour (always allowed): %s', (_name, f) => {
     expect(laneHoldVerdict(f, { ...BUILT_IN_LANE_HOLD_SETTINGS, mode: 'off' }).allowed).toBe(true);
   });
+  // Malformed NESTED facts must fail closed too, never throw: a throw escapes the IO shell's guard as a crash,
+  // which is neither a hold nor an allow.
+  it.each([
+    ['awaits an object', { awaits: {} }],
+    ['awaits a string', { awaits: 'parked' }],
+    ['awaits a number', { awaits: 3 }],
+    ['awaits a boolean', { awaits: true }],
+    ['verify an array', { verify: [] }],
+    ['verify a string', { verify: 'green' }],
+    ['verify a number', { verify: 7 }],
+    ['an awaits entry null', { awaits: [null] }],
+    ['an awaits entry a string', { awaits: ['x'] }],
+    ['an awaits entry an array', { awaits: [[]] }],
+    ['verify with no state', { verify: {} }],
+    ['verify with a state nobody writes', { verify: { state: 'bogus', atMs: NOW } }],
+  ])('malformed nested facts (%s) return work-state-unknown without throwing', (_label, over) => {
+    let v;
+    expect(() => { v = laneHoldVerdict(facts(over)); }).not.toThrow();
+    expect({ allowed: v.allowed, hold: v.hold }).toEqual({ allowed: false, hold: 'work-state-unknown' });
+    expect(() => laneHoldNeedsWorkState(facts(over))).not.toThrow();
+  });
+  it('the exact shape the reviewer named (awaits {} with nowMs 0) is refused, not thrown', () => {
+    expect(laneHoldVerdict({ action: 'release', nowMs: 0, awaits: {} })).toMatchObject({ allowed: false, hold: 'work-state-unknown' });
+  });
+  it('absent awaits / verify (null or undefined) are an ordinary empty lane, not malformed', () => {
+    expect(laneHoldVerdict(facts({ awaits: undefined, verify: undefined }))).toMatchObject({ allowed: true });
+    expect(laneHoldVerdict(facts({ awaits: null, verify: null }))).toMatchObject({ allowed: true });
+  });
+  it('the holder releasing its own lane is still allowed whatever the nested facts say', () => {
+    expect(laneHoldVerdict(facts({ byHolder: true, awaits: {} }))).toMatchObject({ allowed: true });
+  });
   it('holdMinutes is the window for every signal', () => {
     const f = facts({ awaits: [{ requestedAtMs: min(31) }] });
     expect(laneHoldVerdict(f, { ...BUILT_IN_LANE_HOLD_SETTINGS, holdMinutes: 30 }).allowed).toBe(true);
