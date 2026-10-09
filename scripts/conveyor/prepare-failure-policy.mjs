@@ -16,15 +16,28 @@ export const DISPATCH_TRANSIENT_STAGE = 'dispatch';
 /**
  * Live 2026-10-09 16:47Z: the builder listed 28 prepares held after ONE attempt. These classes were not the card's
  * fault and are retried within {@link INFRA_RETRY_BUDGET} (each one observed text, never the prompt):
- *  - another dispatch holds the lane (`could not acquire a lane: … a LIVE lease`, #4423/#4425/#4433/#4440-#4442);
- *  - the raw git ref-lock race at ANY stage (`cannot lock ref 'refs/remotes/origin/main'`, stamp-stage #4341/#4647);
+ *  - another dispatch holds the lane (`could not acquire a lane: … a LIVE lease`, #4423/#4425/#4433/#4440-#4442) —
+ *    retried on the exponential backoff (`dispatch-transient`, code `lane-busy`), because the lease can outlast
+ *    any immediate retry;
+ *  - the raw git ref-lock race (`cannot lock ref 'refs/remotes/origin/main'`, stamp-stage #4341/#4647) — at the
+ *    dispatch stage it stays `dispatch-transient` (backoff);
  *  - the dispatch scratch dir lost its CLI trust grant to a concurrent `~/.claude.json` write (#4426; the grant
  *    itself exists, we:scripts/operations/dispatch-lane-io.mjs#grantDispatchTrust);
  *  - the worker was retired by orphan adoption across a daemon restart (#4319/#4322/#4327/#4414/#4445);
  *  - a prepare result refused by the card-edit rule as it stood THEN (#4392/#4421/#4469 ran 2026-10-01, before
  *    `size:` became prepare-owned on 2026-10-03, #4670): re-running under today's rule is the fix.
  */
-const INFRA_TRANSIENT_RE = /\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)|git-ref-lock-transient|cannot lock ref '[^'\n]*'|could not acquire a lane:[^\n]*\ba LIVE lease\b|workspace not trusted\b/i;
+const INFRA_TRANSIENT_RE = /\bHTTP\s+429\b|\b429 Too Many Requests\b|rate.limit(?: exceeded| reached)|ECONNRESET|ENETUNREACH|EAI_AGAIN|network (?:error|unavailable)|git-ref-lock-transient/i;
+/** Live 2026-10-09 additions. Both can ALSO be the text inside a dispatch-stage `Command failed: …` reason, which the
+ * backoff RULES already class `dispatch-transient` (exponential delay, longer budget): at that stage the backoff wins. */
+const INFRA_TRANSIENT_LIVE_RE = /cannot lock ref '[^'\n]*'|Unable to create '[^'\n]*\.lock': File exists|workspace not trusted\b/i;
+/** A lane held by another LIVE lease can stay held for hours (a review loop): retried on the exponential backoff, not
+ * on the immediate {@link INFRA_RETRY_BUDGET}, which two consecutive ticks would spend while the lease is still held. */
+const LANE_BUSY_RE = /could not acquire a lane:[^\n]*\ba LIVE lease\b/i;
+const LANE_BUSY_REASON_CODE = 'lane-busy';
+/** The reason code a `dispatch-transient` record carries: the backoff RULES' code, else `lane-busy`. */
+const transientReasonCode = (evidence) => evidenceReasonCode(evidence)
+  ?? (LANE_BUSY_RE.test(String(evidence?.error ?? evidence?.reason ?? '')) ? LANE_BUSY_REASON_CODE : null);
 const ORPHAN_RETIRED_RE = /^build-dispatch-orphan-adopt: dispatch retired\b/;
 const PREPARE_CARD_RULE_RE = /^not built: the worker edited the item's own backlog card\b/;
 const ALREADY_DONE_HOLD = (commit) => `spec already done on main: commit ${commit}`;
@@ -59,6 +72,11 @@ export function classifyPrepareFailure(evidence = {}, stage = undefined) {
   // builder-starved-2 (2026-10-07) — the agent never got a lane: `lane-pool.mjs acquire` could not resolve an origin
   // from its scratch cwd (#4174). That is the launcher's fault, not the card's, so it is retried, never held for good.
   if (LANE_ACQUIRE_INFRA_RE.test(`${error}\n${String(evidence.terminal ?? '')}`)) return 'infra-transient';
+  // The 2026-10-09 classes. A dispatch-stage failure that already carries a backoff reason code keeps its backoff.
+  if (LANE_BUSY_RE.test(error)) return 'dispatch-transient';
+  // At the dispatch stage the backoff wins whatever wrapper the daemon put round the git/CLI text (`Command failed:`,
+  // `step-refused at …:`, bare stderr): the wrappers vary, the stage does not.
+  if (INFRA_TRANSIENT_LIVE_RE.test(error)) return stage === DISPATCH_TRANSIENT_STAGE ? 'dispatch-transient' : 'infra-transient';
   if (evidence.sessionAbsent === true) return 'no-session';
   if (evidence.resultDiscarded === true && evidence.resultAuthored === true) return 'result-lost';
   if (evidence.stoppedBeforeCompletion === true) return 'agent-stopped-early';
@@ -144,7 +162,8 @@ export async function recordPrepareFailure({ num, attempt, stage, evidence = {} 
     // count every unfinished, not-yet-re-armed transient failure of this card; at the cap it stays held
     // (`exhausted`) until a re-arm, which starts a fresh budget (a re-armed record no longer counts).
     const attempts = Object.values(state.failures).filter(f => f.num === num && f.cause === 'dispatch-transient' && !f.completed && !f.rearmedAt && !f.budgetResetAt).length + 1;
-    Object.assign(failure, { reasonCode: evidenceReasonCode(evidence), attempts, ...backoffVerdict({ attempts, now, settings, code: evidenceReasonCode(evidence) }) });
+    const code = transientReasonCode(evidence);
+    Object.assign(failure, { reasonCode: code, attempts, ...backoffVerdict({ attempts, now, settings, code }) });
   }
   state.failures[key] = failure;
   if (cause === 'unknown') {
@@ -201,7 +220,7 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
   let healed = false;
   for (const f of Object.values(state.failures)) {
     if (!f.held || f.completed || f.stage !== DISPATCH_TRANSIENT_STAGE) continue;
-    const code = evidenceReasonCode(f.evidence);
+    const code = transientReasonCode(f.evidence);
     if (isCloneWideReasonCode(code)) {
       Object.assign(f, { held: false, retry: true, exhausted: false, healedAt: new Date(now).toISOString(), healedFrom: f.cause, cause: 'clone-wide', reasonCode: code });
       touched.add(f.num); healed = true;
@@ -230,6 +249,15 @@ export function releaseDuePrepareRetries({ path = failureStatePath(), now = Date
       if (used >= INFRA_RETRY_BUDGET) continue;
       Object.assign(f, { cause, healedFrom: f.cause, held: false, retry: true, healedAt });
       touched.add(f.num); healed = true;
+    } else if (cause === 'dispatch-transient') {
+      // A held lane-busy record (or any record today's policy backs off): the backoff it would get now, counted from
+      // when it was recorded, so a long-held card is released at once and a fresh one waits its delay.
+      const at = Date.parse(f.recordedAt ?? f.attempt);
+      const code = transientReasonCode(f.evidence);
+      const attempts = Object.values(state.failures).filter(o => o !== f && o.num === f.num && o.cause === 'dispatch-transient' && !o.completed && !o.rearmedAt && !o.budgetResetAt).length + 1;
+      Object.assign(f, { cause, healedFrom: f.cause, healedAt, reasonCode: code, attempts,
+        ...backoffVerdict({ attempts, now: Number.isFinite(at) ? at : now, settings, code }) });
+      healed = true;
     } else if (cause === 'already-done' || cause === 'needs-you') {
       const route = preparedReportRoute(f.evidence);
       Object.assign(f, { cause, healedFrom: f.cause, healedAt }, route.routeHold
@@ -299,16 +327,20 @@ export function rearmFalseHolds({ path = failureStatePath(), before = NOT_CONFIR
   const cutoff = typeof before === 'string' && ISO_CUTOFF.test(before) ? Date.parse(before) : NaN;
   if (!Number.isFinite(cutoff)) throw new Error(`rearm refused: --before must be an ISO timestamp, got ${JSON.stringify(before)}`);
   if (cutoff > Date.now()) throw new Error(`rearm refused: --before ${before} is in the future`);
-  const unknownCodes = codes.filter(c => !BACKOFF_REASON_CODES.includes(c));
-  if (!codes.length || unknownCodes.length) throw new Error(`rearm refused: --codes must name known reason codes (${BACKOFF_REASON_CODES.join(', ')}), got ${JSON.stringify(unknownCodes.length ? unknownCodes : codes)}`);
+  const knownCodes = [...BACKOFF_REASON_CODES, LANE_BUSY_REASON_CODE];
+  const unknownCodes = codes.filter(c => !knownCodes.includes(c));
+  if (!codes.length || unknownCodes.length) throw new Error(`rearm refused: --codes must name known reason codes (${knownCodes.join(', ')}), got ${JSON.stringify(unknownCodes.length ? unknownCodes : codes)}`);
   const state = readFailureState(path);
   const rearmed = [];
   for (const f of Object.values(state.failures)) {
     if (!f.held || f.completed) continue;
     // Only a failure of the dispatch launch is ever a false/transient hold; a stamp/result-stage hold has its own
     // diagnose card and is cleared by a reviewed release, not by a reason-code match on its text.
-    if (f.stage !== undefined && f.stage !== DISPATCH_TRANSIENT_STAGE) continue;
-    if (!codes.includes(evidenceReasonCode(f.evidence))) continue;
+    // (A lane-busy hold is the one exception: it is recorded at the result stage, and an exhausted one — a lease that
+    // outlasted the whole backoff — would otherwise have no way back.)
+    const code = transientReasonCode(f.evidence);
+    if (f.stage !== undefined && f.stage !== DISPATCH_TRANSIENT_STAGE && code !== LANE_BUSY_REASON_CODE) continue;
+    if (!codes.includes(code)) continue;
     const at = Date.parse(f.recordedAt ?? f.attempt);
     if (!f.exhausted && Number.isFinite(at) && at >= cutoff) continue;
     rearmed.push(f);
