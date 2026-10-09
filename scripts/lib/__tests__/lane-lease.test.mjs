@@ -669,6 +669,15 @@ describe('lane hold rule — replay fixtures', () => {
     ['verified unpushed but past the window: salvage may take it', facts({ verify: { state: 'passed', revision: 'r2', atMs: min(151) }, unpushed: true }), { allowed: true, hold: null }],
     ['unreadable verify record, unpushed: refused', facts({ verify: { state: 'unreadable', revision: null, atMs: min(1) }, unpushed: true }), { allowed: false, hold: 'verify-unreadable' }],
     ['unreadable verify record, nothing unpushed: allowed', facts({ verify: { state: 'unreadable', revision: null, atMs: min(1) }, unpushed: false }), { allowed: true, hold: null }],
+    // A hold must END: a future-dated time (a clock-skewed writer, a corrupt or hand-edited record) has a
+    // negative age, and `age <= window` alone would keep it live forever. Small forward skew is tolerated.
+    ['await dated a year ahead: not a live hold', facts({ awaits: [{ requestedAtMs: NOW + 365 * 86_400_000 }] }), { allowed: true, hold: null }],
+    ['await dated 2 min ahead (clock skew): still held', facts({ awaits: [{ requestedAtMs: NOW + 2 * 60_000 }] }), { allowed: false, hold: 'awaiting-verify' }],
+    ['await dated 1 hour ahead: not a live hold', facts({ awaits: [{ requestedAtMs: NOW + 60 * 60_000 }] }), { allowed: true, hold: null }],
+    ['running verify dated a year ahead: not a live hold', facts({ action: 'reset', verify: { state: 'running', revision: 'r2', atMs: NOW + 365 * 86_400_000 } }), { allowed: true, hold: null }],
+    ['verified-unpushed dated a year ahead: not a live hold', facts({ verify: { state: 'passed', revision: 'r2', atMs: NOW + 365 * 86_400_000 }, unpushed: true }), { allowed: true, hold: null }],
+    ['verified record naming no commit: cannot compare, refused', facts({ verify: { state: 'passed', revision: null, atMs: min(4) }, unpushed: true }), { allowed: false, hold: 'work-state-unknown' }],
+    ['verified record, lane head unreadable: cannot compare, refused', facts({ revision: null, verify: { state: 'passed', revision: 'r2', atMs: min(4) }, unpushed: true }), { allowed: false, hold: 'work-state-unknown' }],
     ['malformed facts: refused (never act blind)', { action: 'release' }, { allowed: false, hold: 'work-state-unknown' }],
     ['unknown action: refused', facts({ action: 'delete-everything' }), { allowed: false, hold: 'work-state-unknown' }],
   ];

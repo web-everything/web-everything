@@ -595,7 +595,13 @@ export function resolveLaneHoldSettings({ env = {}, raw = null } = {}) {
 /** The actions the rule judges. `take-over` = a new holder claiming a lane whose lease went stale. */
 export const LANE_HOLD_ACTIONS = Object.freeze(['release', 'reset', 'remove', 'reclaim', 'take-over']);
 
-const holdLive = (atMs, nowMs, holdMs) => Number.isFinite(atMs) && nowMs - atMs <= holdMs;
+/** How far ahead of `now` a hold's timestamp may read and still be trusted (two writers' clocks never agree
+ *  exactly). Past this the time is not a time we can age, so it holds nothing. */
+export const LANE_HOLD_CLOCK_SKEW_MS = 5 * 60_000;
+
+/** A hold is live while its timestamp is a real time, no further ahead than clock skew, and inside the window.
+ *  Without the upper bound a future-dated time has a negative age and would hold forever. */
+const holdLive = (atMs, nowMs, holdMs) => Number.isFinite(atMs) && atMs <= nowMs + LANE_HOLD_CLOCK_SKEW_MS && nowMs - atMs <= holdMs;
 
 /**
  * Does the decision for these facts depend on `unpushed`? Lets an IO shell skip the (costly) work-state read
@@ -643,6 +649,8 @@ export function laneHoldVerdict(facts, settings = BUILT_IN_LANE_HOLD_SETTINGS) {
   const v = facts.verify;
   if (v && holdLive(v.atMs, nowMs, holdMs)) {
     if (v.state === 'running') return hold('verifying', 'a verify gate is running or queued for this lane');
+    // A verified record that names no commit, or a lane whose head cannot be read, cannot be compared: unknown, not "no hold".
+    if (v.state === 'passed' && (!v.revision || !facts.revision)) return hold('work-state-unknown', 'cannot tell which commit was verified');
     const atHead = v.state === 'passed' && !!v.revision && v.revision === facts.revision;
     if (atHead || v.state === 'unreadable') {
       if (facts.unpushed === false) return allow('verified work is already pushed');

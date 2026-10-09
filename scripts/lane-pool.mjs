@@ -175,7 +175,7 @@ import {
 } from './lib/bounded-child.mjs';
 import { VERIFY_FILENAME, keepMarkerAfterReset, readVerifyMarker } from './lib/lane-verify.mjs';
 // xbdixjc — the lane hold rule: every release/reset/remove/reclaim below asks it (pure rule in lane-lease.mjs).
-import { checkLaneHold, laneHoldJournalFields } from './lib/lane-hold-io.mjs';
+import { checkLaneHold, laneHoldJournalFields, clearLaneAwaitRecords } from './lib/lane-hold-io.mjs';
 import { resolveLaneHoldSettings } from './lib/lane-lease.mjs';
 import { laneGitHardeningEnv } from './lib/lane-git-hardening.mjs';
 
@@ -1803,6 +1803,7 @@ function laneHoldRefuses(dir, action, { byHolder = false, unpushed } = {}) {
   if (verdict.allowed) return null;
   const n = /lane-(\d+)$/.exec(dir)?.[1] ?? '?';
   log(`  lane-${n}: ${action} REFUSED — ${verdict.reason}`);
+  if (action === 'release') log(`    (only the holder may release this lane: pass --session=<the lease's session or its minted holder slug>)`);
   journalLaneEvent(dir, {
     action: 'hold-refused', reason: `${action} refused — ${verdict.reason}`, loud: true,
     ...laneHoldJournalFields(verdict),
@@ -2712,7 +2713,12 @@ function cmdRelease(repo) {
     const beforeLitter = laneStateSnapshot(dir, `origin/${repo.branch}`);
     // xbdixjc — a release by anyone but the holder (the reaper's `--force`, a delivered-lease release) may not
     // drop a lane whose fixer is parked awaiting verify or that holds verifying / verified-unpushed work.
-    if (laneHoldRefuses(dir, 'release', { byHolder: owned, unpushed: beforeLitter.unpushed ?? undefined })) continue;
+    // "The holder" is a STRICT proof: the exact lease `session` or the minted holder slug. `owned` also counts the
+    // `ownerSession` fallback, which only says "same Claude session" — an orchestrator and the fixer subagent it
+    // spawned share that id, so it cannot tell the holder from a sibling (or from a reaper launched by the same
+    // session). Such a caller may still release an unparked lane; it may not drop a parked one.
+    const holderProven = leaseOwnedBy(lease, session) || (!!laneHolderSlug(lease) && !!session && laneHolderSlug(lease) === session);
+    if (laneHoldRefuses(dir, 'release', { byHolder: holderProven, unpushed: beforeLitter.unpushed ?? undefined })) continue;
     const litter = cleanLaneLitter(dir);
     if (litter?.removed?.length) {
       journalLaneEvent(dir, {
@@ -2733,6 +2739,14 @@ function cmdRelease(repo) {
       continue;
     }
     if (delivered) log(`  lane-${n}: contested lease released — its work is fully landed (clean tree, HEAD on upstream main), nothing to lose`);
+    // The holder is done with this lane, so the parked-fixer records IT wrote are dead: left behind they refuse every
+    // acquire / trim / reclaim of the lane for the whole hold window. Cleared only after the lease is confirmed
+    // dropped (above), only for the holder's own release, only for records that holder wrote, and never while the
+    // lane still holds unpushed work (the await-verify pass pushes the verified sha from the record).
+    if (holderProven && beforeLitter.unpushed === false) {
+      const clearedAwaits = clearLaneAwaitRecords(dir, { holders: [lease.session, laneHolderSlug(lease), lease.workerSession, session] });
+      if (clearedAwaits.length) log(`  lane-${n}: cleared ${clearedAwaits.length} await-verify record(s) of the released holder`);
+    }
     // #3383 — record the release in the lane-history ledger (best-effort; the marker is confirmed ours to drop).
     appendLaneHistory(dir, laneHistoryEntry({
       event: 'release', session, ownerSession: lease.ownerSession || null, workerSession: lease.workerSession || null,
