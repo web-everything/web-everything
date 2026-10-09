@@ -1,9 +1,10 @@
 ---
+bornAs: xhe5aej
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/__tests__/merge-queue.replay.test.mjs", "we:scripts/lib/merge-queue.mjs", "we:scripts/lib/merge-freshness.mjs", "we:backlog/xs1hdl7-drain-fresh-main.md", "we:scripts/lib/__tests__/merge-queue.test.mjs", "we:scripts/lib/__tests__/merge-freshness.test.mjs"]
+scope: ["we:scripts/lib/__tests__/merge-queue.replay.test.mjs", "we:scripts/lib/merge-queue.mjs", "we:scripts/lib/merge-freshness.mjs", "we:backlog/5541-drain-fresh-main.md", "we:scripts/lib/__tests__/merge-queue.test.mjs", "we:scripts/lib/__tests__/merge-freshness.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -16,7 +17,7 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 2. `we:scripts/lib/merge-queue.mjs:99` — Add a replay case in which the head is `refuse`, and define in the protocol card whether the next entry may be promoted. File it as a follow-up before the drain hook lands.
 3. `we:scripts/lib/merge-freshness.mjs:53` — Add `validateFreshnessSettings` (finite positive `maxAgeMinutes`, boolean flags), call it from `assessMergeFreshness` and `planQueue`, and add a table test of bad values. A lint or standards rule against `x > NaN`-prone threshold math on config values would be broader.
 4. `we:scripts/lib/merge-queue.mjs:99` — Add a ruled policy for a blocked head (a max wait, then demote the head or skip it) and a replay test with a refused or pending head ahead of a fresh PR. Do this before the drain hook is enabled.
-5. `we:backlog/xs1hdl7-drain-fresh-main.md:79` — Add a line to the drain-hook acceptance saying the class must come from a trusted source (an allowlisted actor or label-applier), plus a hook test that an unauthorised marker leaves the class `normal`.
+5. `we:backlog/5541-drain-fresh-main.md:79` — Add a line to the drain-hook acceptance saying the class must come from a trusted source (an allowlisted actor or label-applier), plus a hook test that an unauthorised marker leaves the class `normal`.
 6. `we:scripts/lib/merge-freshness.mjs:53` — Add a CI-enforced parameterized test covering incomplete file facts with allowDisjointMainMoves both false and true, asserting facts-incomplete from assessMergeFreshness and refuse from planQueue.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4538@83bb2b829bade24cebe07ce2c3007b025fe25ea6
