@@ -6,7 +6,7 @@ status: active
 scaffoldedBy: "priority-class-s1"
 dateScaffolded: "2026-10-08"
 relatedTo: ["5468", "5510"]
-scope: ["we:scripts/lib/delivery-priority.mjs", "we:scripts/lib/delivery-priority-settings.json", "we:scripts/lib/__tests__/delivery-priority.replay.test.mjs", "we:scripts/lib/__tests__/fixtures/delivery-priority.replay.json", "we:scripts/conveyor/delivery-priority-shadow.mjs", "we:scripts/conveyor/__tests__/delivery-priority-shadow.test.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
+scope: ["we:scripts/lib/delivery-priority.mjs", "we:scripts/lib/delivery-priority-settings.json", "we:scripts/lib/__tests__/delivery-priority.replay.test.mjs", "we:scripts/lib/__tests__/fixtures/delivery-priority.replay.json", "we:scripts/conveyor/delivery-priority-shadow.mjs", "we:scripts/conveyor/__tests__/delivery-priority-shadow.test.mjs", "we:scripts/conveyor/__tests__/fixtures/fix-pass-2026-10-09.json", "we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
 dateOpened: "2026-10-08"
 tags: [conveyor, delivery-standard, priority]
 ---
