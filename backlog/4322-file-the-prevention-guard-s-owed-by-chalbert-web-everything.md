@@ -5,6 +5,7 @@ size: 5
 parent: "4075"
 status: open
 scope: ["we:scripts/conveyor/land-overlap-yield.mjs", "we:scripts/conveyor/__tests__/land-overlap-yield.test.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/__tests__/merge-ai-prs-overlap-yield.test.mjs", "we:docs/agent/testing.md"]
+scopeRationale: "The overlap-yield projection in we:scripts/merge-ai-prs.mjs is covered by the dedicated we:scripts/__tests__/merge-ai-prs-overlap-yield.test.mjs, which is in scope; the broad we:scripts/__tests__/merge-ai-prs.test.mjs suite is not edited by this item (it only runs unchanged as a regression check)."
 dateOpened: "2026-09-27"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "09e2a5802b5492a1bad15b788757b143bf0434e4"
