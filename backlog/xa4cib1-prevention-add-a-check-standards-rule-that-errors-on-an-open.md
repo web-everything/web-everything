@@ -19,7 +19,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A1] **Executable** — `npm run test:unit -- check-standards-rules-content-lint` (the suite in we:scripts/__tests__/check-standards-rules-content-lint.test.mjs) fails before this item lands and passes after: the new cases assert that an open, gated or approved story card whose Acceptance section still holds the scaffold placeholder is an error (with or without a proof claim in its prose), and that a card moving from open to in-progress or ready is refused while any `TODO:` remains in Acceptance, Non-goals or Edge cases.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
