@@ -44,6 +44,7 @@ import {
   DEFAULT_STALL_TICKS,
   buildDecisionTrace,
   lanePoolListArgsForRepo,
+  reuseFailedLanePoolRead,
 } from '../tick-core.mjs';
 import { HELD_REASONS } from '../../readiness/dispatch-plan.mjs';
 import { sessionSlugFor } from '../../operations/dispatch-lane.mjs';
@@ -2375,5 +2376,20 @@ describe('card 80 — prepare just in time', () => {
   it('without the window every candidate is offered (other callers unchanged)', () => {
     const r = tick({});
     expect(r.decisions.notes.some((n) => n.kind === 'prepare-ahead-window')).toBe(false);
+  });
+});
+
+describe('reuseFailedLanePoolRead — never re-run a lane-pool read dispatch-plan just watched fail', () => {
+  const failed = { lanePool: { freeLanes: 'unavailable', error: 'lane-pool list failed: scan budget' } };
+  it('same pool (no --repo args) and the plan reports the read unavailable → reuse its error', () => {
+    expect(reuseFailedLanePoolRead(failed, [])).toBe('lane-pool list failed: scan budget');
+  });
+  it('a different pool (--repo args) is a different read → do it', () => {
+    expect(reuseFailedLanePoolRead(failed, ['--repo=frontierui'])).toBeNull();
+  });
+  it('a plan whose lane-pool read succeeded (or a fixture plan) → do the read', () => {
+    expect(reuseFailedLanePoolRead({}, [])).toBeNull();
+    expect(reuseFailedLanePoolRead({ lanePool: { freeLanes: 'explicit' } }, [])).toBeNull();
+    expect(reuseFailedLanePoolRead(null, [])).toBeNull();
   });
 });
