@@ -1,4 +1,5 @@
 ---
+bornAs: x60i0ie
 kind: story
 size: 8
 status: open
