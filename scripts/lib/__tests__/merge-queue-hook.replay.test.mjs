@@ -12,14 +12,13 @@
  *   The hook lets #4453 merge and refreshes #4547 instead of merging it.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { SETTINGS_DIR } from '../settings-files.mjs';
-import { mkdtempSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   loadMergeQueueSettings, hookEnabled, readMergeFreshnessFacts, decideMergeQueueAction, requiredCheckFact,
-  prioritizeMainFix, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV,
+  prioritizeMainFix, readRefreshed, recordRefreshed, refreshStalePr, MERGE_QUEUE_OFF_ENV, MERGE_QUEUE_SETTINGS_FILE_ENV,
 } from '../merge-queue-hook.mjs';
 
 const SETTINGS_FILE = JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8'));
@@ -74,6 +73,14 @@ describe('settings: the operator-chosen mode is ON in scripts/settings/merge-que
     expect(hookEnabled(loadMergeQueueSettings({ file: SETTINGS_FILE, env: { [MERGE_QUEUE_OFF_ENV]: 'off' } }))).toBe(false);
     // hermetic: a spawned drain CLI inside a test run never reads the live file
     expect(hookEnabled(loadMergeQueueSettings({ env: { VITEST: 'true' } }))).toBe(false);
+  });
+  it('the env settings file arms the hook even inside a test run; an unreadable one is named, never silent', () => {
+    const p = join(mkdtempSync(join(tmpdir(), 'mqs-')), 's.json');
+    writeFileSync(p, JSON.stringify(SETTINGS_FILE));
+    expect(hookEnabled(loadMergeQueueSettings({ env: { VITEST: 'true', [MERGE_QUEUE_SETTINGS_FILE_ENV]: p } }))).toBe(true);
+    const bad = loadMergeQueueSettings({ env: { [MERGE_QUEUE_SETTINGS_FILE_ENV]: p + '.missing' } });
+    expect(hookEnabled(bad)).toBe(false);
+    expect(bad.errors[0]).toMatch(/WE_MERGE_QUEUE_SETTINGS_FILE/);
   });
   it('an unbuilt batch size falls back to the queue defaults and is named', () => {
     const s = loadMergeQueueSettings({ file: { mergeQueue: { enabled: true, batchSize: 3 }, mergeFreshness: { enabled: true } }, env: {} });

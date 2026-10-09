@@ -25,11 +25,13 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { planQueue, validateQueueSettings, MERGE_QUEUE_DEFAULTS } from './merge-queue.mjs';
 import { MERGE_FRESHNESS_DEFAULTS } from './merge-freshness.mjs';
-import { readSettings } from './settings-files.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 
 export const MERGE_QUEUE_OFF_ENV = 'WE_DRAIN_MERGE_QUEUE';
+/** Env: a JSON settings file read INSTEAD of the declared files (always honoured — this is how a test arms the hook). */
+export const MERGE_QUEUE_SETTINGS_FILE_ENV = 'WE_MERGE_QUEUE_SETTINGS_FILE';
 /** GitHub caps: compare returns at most 300 files; the PR files endpoint at most 3000. */
 export const COMPARE_FILES_CAP = 300;
 export const PR_FILES_CAP = 3000;
@@ -43,12 +45,22 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
  */
 export function loadMergeQueueSettings({ file, env = process.env } = {}) {
   let src = file;
-  // Hermetic by default (the main-red-priority.mjs precedent): inside a test run only an explicit `file` is read,
-  // never the live settings, so a test that spawns the real drain CLI keeps today's behaviour.
-  if (src === undefined) src = (env?.VITEST || env?.WE_UNDER_TEST) ? {} : (() => { try { return readSettings(); } catch { return {}; } })();
+  const errors = [];
+  const override = String(env?.[MERGE_QUEUE_SETTINGS_FILE_ENV] ?? '').trim();
+  if (src === undefined && override) {
+    try { src = JSON.parse(readFileSync(override, 'utf8')); } catch (e) { src = {}; errors.push(`${MERGE_QUEUE_SETTINGS_FILE_ENV}: ${firstLine(e)}`); }
+  }
+  // Hermetic by default (the main-red-priority.mjs precedent): inside a test run the live files are not read, so a
+  // test that spawns the real drain CLI keeps today's behaviour unless it arms the hook through the env file above.
+  if (src === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) src = {};
+  if (src === undefined) {
+    const read = readDeclaredSettings();
+    src = read.settings;
+    // A broken settings file is never silent: the drain logs `errors` every pass (the hook would read as off).
+    errors.push(...read.errors.map((e) => `${e.source}: ${e.error}`));
+  }
   const queue = { ...MERGE_QUEUE_DEFAULTS, ...(isObj(src?.mergeQueue) ? src.mergeQueue : {}) };
   const freshness = { ...MERGE_FRESHNESS_DEFAULTS, ...(isObj(src?.mergeFreshness) ? src.mergeFreshness : {}) };
-  const errors = [];
   const valid = validateQueueSettings(queue);
   if (!valid.ok) { errors.push(...valid.errors.map((e) => `mergeQueue: ${e}`)); Object.assign(queue, MERGE_QUEUE_DEFAULTS); }
   if (!Number.isFinite(freshness.maxAgeMinutes) || freshness.maxAgeMinutes <= 0) {
@@ -59,7 +71,8 @@ export function loadMergeQueueSettings({ file, env = process.env } = {}) {
   return { queue, freshness, errors };
 }
 
-/** Is the hook doing anything? Off ⇒ the drain skips every read here (byte-for-byte today). */
+/** Is the freshness hook on? Off ⇒ the merge site does no freshness read and merges as today. (Main-fix ordering
+ *  has its own switch, `mergeQueue.enabled`.) */
 export function hookEnabled(settings) {
   return !!settings?.freshness?.enabled;
 }

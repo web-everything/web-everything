@@ -5496,7 +5496,8 @@ async function runCli() {
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
   const MERGE_QUEUE = loadMergeQueueSettings();
-  if (MERGE_QUEUE.errors.length && !AS_JSON) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
+  if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
+  if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainRedPriority() : null;
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
@@ -5682,7 +5683,8 @@ async function runCli() {
           // pass still proves THIS merge: the pass is on the pinned head, main moved only on files this PR does not
           // touch (allowDisjointMainMoves), and the pass is younger than maxAgeMinutes. Not fresh → refresh the PR onto
           // main once per head through the sanctioned refreshOntoMain path (or re-run its check when it is already on
-          // the main tip) and skip this pass. It only ADDS a requirement; off (the built-in default) skips all of it.
+          // the main tip) and skip this pass. It only ADDS a requirement; with `mergeFreshness.enabled` off (the built-in
+          // default) no freshness read happens and the merge proceeds exactly as before.
           // Live 2026-10-09: #4547 merged on a 128-min-old pass after #4453 landed; main went red at 07:44 ET.
           if (mergeQueueHookEnabled(MERGE_QUEUE)) {
             const mqKey = `${c.repo || localSlug || 'cwd'}#${c.num}`;
@@ -5702,7 +5704,9 @@ async function runCli() {
                 if (DRY_RUN) out = { ok: true, action: 'would-refresh' };
                 else if (!cloneDir) out = { ok: false, action: 'skipped-remote', error: `no ${c.repo} clone provisioned` };
                 else out = await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId: facts.pr.requiredCheck?.runId ?? null });
-                if (!DRY_RUN) recordRefreshed(MERGE_QUEUE_STATE, mqKey, revalidated.headSha); // once per head, success or not
+                // Once per head, recorded only when the refresh went through: a failed attempt (a transient `gh` or
+                // git error, no clone) is retried next pass rather than parking the head as `wait` forever.
+                if (!DRY_RUN && out.ok) recordRefreshed(MERGE_QUEUE_STATE, mqKey, revalidated.headSha);
                 if (out.ok && out.action === 'rebased' && needsAcceptanceRestamp(c, { action: 'rebased' })) {
                   const rs = restampAcceptance({ pr: c.num, repo: c.repo, newHead: out.newCommit, cwd: isLocalRepo(c.repo) ? undefined : cloneDir });
                   if (!AS_JSON && !rs.ok) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} acceptance re-stamp failed (${rs.reason}) — it may re-park\n`);
