@@ -11,7 +11,6 @@
   "scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs": 1,
   "scripts/conveyor/__tests__/reconcile-pass.test.mjs": 1,
   "scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs": 1,
-  "scripts/conveyor/soak/breaks/build-dispatch-orphan-adopt.mjs": 1,
   "scripts/conveyor/soak/breaks/ci-heal-loop-stale-label-review-gate.mjs": 1,
   "scripts/conveyor/soak/breaks/review-human-red-ci-never-healed.mjs": 1,
   "scripts/conveyor/soak/breaks/stale-fixing-label-ci-heal-owed.mjs": 1,

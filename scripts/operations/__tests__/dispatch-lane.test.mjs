@@ -3173,6 +3173,7 @@ describe('readTick — the ground-truth check is LAZY: one gh call per dispatch 
     readText: () => BRIEF,
     loadItems: () => [{ num: '3037', slug: 'declare-dispatch', scope: ['we:scripts/operations/'] }],
     listAgents: () => [],
+    checkBuildDelivery: () => null,
   };
 
   it('calls checkAlreadyDone exactly once when a launch was cleared, and threads its verdict onto the read', () => {

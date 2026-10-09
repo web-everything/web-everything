@@ -2,7 +2,9 @@
  * @file scripts/lib/__tests__/test-cache-shadow.test.mjs
  * @description prepare-124 S2 — shadow decisions, the atomic store, and the reporter (off under CI, writes under a temp dir).
  */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { makeGitOverlay } from '../hermetic-git-overlay.mjs';
+import { DEFAULT_REPO_ROOT } from '../hermetic-tests.mjs';
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,16 +12,12 @@ import { decideShadow, falseSkipCategory, storeAllowedForRun, summarizeFile } fr
 import { isQuarantined, readEntry, writeEntry, writeQuarantine, writeShadowLog, entryPath } from '../test-result-store.mjs';
 import ShadowReporter, { laneName } from '../../test-cache/shadow-reporter.mjs';
 
-// The reporter records `git merge-base HEAD origin/main` as the run's base sha; hermetic tests may not read the real
-// checkout's remote refs. Answer that one probe with "no base" (the reporter already treats it as null); everything
-// else passes through.
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
-    execFileSync: (cmd, args, ...rest) => (cmd === 'git' && args?.[0] === 'merge-base' ? '' : actual.execFileSync(cmd, args, ...rest)),
-  };
-});
+// Hermetic (card xcu4cqf): the reporter records `git merge-base HEAD origin/main` of the checkout it runs in. That
+// read goes through a git overlay of this checkout whose `origin/main` is pinned to HEAD (no live remote ref).
+let overlay;
+beforeAll(() => { overlay = makeGitOverlay(DEFAULT_REPO_ROOT); });
+afterAll(() => overlay?.cleanup());
+beforeEach(() => { Object.assign(process.env, overlay.env); }); // restored after each test by vitest.setup.ts
 
 const dirs = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'tcs-')); dirs.push(d); return d; };
