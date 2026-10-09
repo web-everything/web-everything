@@ -158,6 +158,7 @@ import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { resolvePausedKinds, isScopedPause } from '../readiness/dispatch-pause.mjs';
 import { createQueueBudget, dispatchDemandMinutes, DEFAULT_ARRIVAL_WINDOW_MINUTES } from '../readiness/heavy-queue-projection.mjs'; // card xkyw1x4 — the pure queue-time admission (the IO half lives in heavy-admission.mjs)
 import { prepareAheadNums } from './build-dispatch-policy.mjs'; // card 80 — prepare just in time (pure)
+import { costAdmissionOn, jobCostClass } from '../lib/cost-admission.mjs'; // card x60i0ie — heavy/light cost classes (pure)
 
 /** Held reasons (from {@link ../readiness/dispatch-plan.mjs HELD_REASONS}) that already have their OWN dedicated
  *  note elsewhere in {@link planTick} — `needs-slice` from `state.needsSlice`, `needs-decision` from
@@ -1211,7 +1212,10 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     prepareTtlTicks: config.prepareTtlTicks ?? DEFAULT_PREPARE_TTL_TICKS,
     prepareItemTtlTicks: config.prepareItemTtlTicks ?? DEFAULT_PREPARE_ITEM_TTL_TICKS,
     prepareItemRetryCap: config.prepareItemRetryCap ?? DEFAULT_PREPARE_ITEM_RETRY_CAP,
-    maxConcurrentItemPrepares: config.maxConcurrentItemPrepares ?? 2,
+    // Card x60i0ie — with cost-class admission ON, item prepares (light) run under the LIGHT cap instead.
+    maxConcurrentItemPrepares: costAdmissionOn(config.costAdmission)
+      ? config.costAdmission.lightMaxConcurrent
+      : (config.maxConcurrentItemPrepares ?? 2),
     fixTtlTicks: config.fixTtlTicks ?? DEFAULT_FIX_TTL_TICKS,
     fixRetryCap: config.fixRetryCap ?? DEFAULT_FIX_RETRY_CAP,
     ciHealTtlTicks: config.ciHealTtlTicks ?? DEFAULT_CI_HEAL_TTL_TICKS,
@@ -1393,8 +1397,17 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // baseline (held + waiting + dispatched-not-yet-queued) plus this conveyor's OWN fresh spawns whose lane is not
   // leased yet (the baseline reads leases, so a session spawned moments ago would otherwise be invisible), then
   // charged spawn by spawn — builds first, then prepares, fixes and CI-heals — so the Nth quick dispatch is the one held.
+  // Card x60i0ie — COST-CLASS ADMISSION (`we:scripts/lib/cost-admission.mjs`). OFF (the default) changes nothing
+  // below. ON: a LIGHT prepare kind (scope / decision / item prepare — no local test run) is not a heavy-slot
+  // consumer, so it is neither charged to the queue-time budget nor held by the heavy load-cap; it is held only by
+  // its own gentle CPU floor (`lightCpuIdleMinPct`, read off the same load-admission sample) and its own cap.
+  // `investigate` stays HEAVY (an investigator may run tests) and keeps every heavy gate.
+  const costOn = costAdmissionOn(config.costAdmission);
+  const isLightPrepareKind = (k) => costOn && jobCostClass(k || 'prepare') === 'light';
+  const lightIdle = loadAdmission && Number.isFinite(loadAdmission.idlePct) ? loadAdmission.idlePct : null;
+  const lightFloorHeld = costOn && lightIdle != null && lightIdle < config.costAdmission.lightCpuIdleMinPct;
   const queueBudget = createQueueBudget(queueAdmission, {
-    extraMinutes: freshSpawnDemandMinutes({ build: build.live, prepare: prepare.live, fix: fix.live, ciHeal: ciHeal.live }, { lanes, now, queueAdmission, itemSizes }),
+    extraMinutes: freshSpawnDemandMinutes({ build: build.live, prepare: prepare.live.filter((g) => !isLightPrepareKind(g?.kind)), fix: fix.live, ciHeal: ciHeal.live }, { lanes, now, queueAdmission, itemSizes }),
   });
   const queueHeldBuilds = [];
   const queueAdmittedBuilds = [];
@@ -1459,6 +1472,8 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // when held, every lane the fixed ceiling still admitted is withheld too, so the four spawn kinds combined
   // draw from an EMPTY pool this tick rather than each independently racing whatever the ceiling left them.
   availableLanes = loadHeld ? [] : capacityBudget.admitted;
+  // Card x60i0ie — the LIGHT pool: the same capacity-ceiling lanes, gated by the light CPU floor instead of load-cap.
+  const lightLanes = lightFloorHeld ? [] : capacityBudget.admitted;
   // `notes` is declared further down (step 9) — stash these here and splice them in there, rather than reorder
   // the whole function around one early-arriving note kind.
   // #4347 — ONE summary note for the whole withheld batch, never one per withheld lane. A real tick can have
@@ -1493,7 +1508,7 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   //    KIND-SCOPED (epic #3383): the three prepare-family kinds are held INDEPENDENTLY. `pausedKinds` is handed
   //    straight to `planPrepareSpawns`, so a held kind short-circuits at its OWN `dispatch-paused` admission gate
   //    (traced, #xupukxa) and consumes no lane — an UNHELD sibling kind still gets the lanes it would have had.
-  let prep = planPrepareSpawns({
+  const prepareArgs = {
     unshaped: scopeOrSizeNeeded,
     decisions,
     investigations,
@@ -1509,9 +1524,31 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     now,
     trace: true,
     pausedKinds: planPausedKinds,
-  });
-  const prepareQueue = applyQueueCapToPrepareSpawns(prep, queueBudget);
-  prep = prepareQueue.prep;
+  };
+  let prep;
+  let prepareQueue;
+  if (!costOn) {
+    prep = planPrepareSpawns(prepareArgs);
+    prepareQueue = applyQueueCapToPrepareSpawns(prep, queueBudget);
+    prep = prepareQueue.prep;
+  } else {
+    // Card x60i0ie — two passes over disjoint candidate sets: the LIGHT kinds draw from the light pool with no
+    // queue charge; then `investigate` (heavy) draws from the heavy pool and is queue-capped exactly as before.
+    const light = planPrepareSpawns({ ...prepareArgs, investigations: [], availableLanes: lightLanes });
+    const lightTaken = new Set(light.consumedLanes.map(String));
+    const heavyRaw = planPrepareSpawns({ ...prepareArgs, unshaped: [], decisions: [], needsPrepare: [],
+      livePrepareGuards: [...prepare.live, ...light.newGuards], availableLanes: availableLanes.filter((l) => !lightTaken.has(String(l))) });
+    prepareQueue = applyQueueCapToPrepareSpawns(heavyRaw, queueBudget);
+    const heavy = prepareQueue.prep;
+    prep = {
+      scopeSpawns: light.scopeSpawns, decisionSpawns: light.decisionSpawns,
+      investigationSpawns: heavy.investigationSpawns, itemPrepareSpawns: light.itemPrepareSpawns,
+      newGuards: [...light.newGuards, ...heavy.newGuards],
+      consumedLanes: [...light.consumedLanes, ...heavy.consumedLanes],
+      notes: [...light.notes, ...heavy.notes],
+      admission: [...(light.admission ?? []), ...(heavy.admission ?? [])],
+    };
+  }
   const consumed = new Set(prep.consumedLanes.map(String));
   availableLanes = availableLanes.filter((l) => !consumed.has(String(l)));
   const livePrepareGuards = [...prepare.live, ...prep.newGuards];
@@ -1566,6 +1603,11 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
   // 9. Surface notes — the deterministic, no-agent surfaces (§3d epics, §3e prepared decisions) + guard TTL
   //    re-dispatch warnings, gathered so the skill posts them without re-deriving.
   const notes = [...capacityCapNotes, ...loadCapNotes];
+  // Card x60i0ie — the light CPU floor held this tick's light prepares (only said when there was one to hold).
+  const lightCandidates = scopeOrSizeNeeded.length + decisions.filter((d) => d?.prepared !== true).length + needsPrepareHeld.length;
+  if (lightFloorHeld && lightCandidates > 0) {
+    notes.push({ kind: 'light-cpu-floor', text: `⏸ light prepares withheld — cpu idle ${lightIdle.toFixed(1)}% < light floor ${config.costAdmission.lightCpuIdleMinPct}% (WE_MIN_CPU_IDLE_PCT_LIGHT)` });
+  }
   // #3609 — ONE aggregate note for the manual dispatch-pause (rather than per-spawn-kind notes each spawn
   // planner would otherwise emit): the individual `plan.held` items already carry their own per-num
   // `dispatch-paused` note below, so this note covers only what those DON'T — the tick's own prepare/fix/
@@ -1732,6 +1774,10 @@ export function planTick({ state = {}, plan = {}, freeLanes = [], bookkeeping = 
     spawnInvestigations: prep.investigationSpawns,
     spawnFixes: fixPlan.spawns,
     spawnCiHeals: ciHealPlan.spawns,
+    // Card x60i0ie — the cost-class admission verdict for this tick's light pool (`mode:'off'` = today's gates).
+    costAdmission: costOn
+      ? { mode: 'on', lightIdlePct: lightIdle, lightCpuIdleMinPct: config.costAdmission.lightCpuIdleMinPct, lightFloorHeld, heavyLoadHeld: loadHeld === true, lightLanes: lightLanes.length }
+      : { mode: 'off' },
     queueCapHeld: {
       prepare: prepareQueue.held,
       build: queueHeldBuilds.map((l) => ({ num: l.num, lane: l.lane, projectedMinutes: l.projectedMinutes, demandMinutes: l.demandMinutes })),
@@ -2166,6 +2212,15 @@ async function main(argv) {
   // just above — a human or another agent can flip a currently-running driver loud without restarting it.
   // FAILS OPEN: a missing module or unreadable/corrupt marker leaves verbose OFF (the terse default never
   // silently becomes noisy from a read failure).
+  // Card x60i0ie — the declared cost-class admission settings (env + dispatch-settings.json), unless the caller
+  // passed its own. Fails open to `off` (today's gates) on any read failure.
+  if (config.costAdmission == null) {
+    try {
+      const { readCostAdmissionSettings } = await import('../lib/cost-admission-facts.mjs');
+      config.costAdmission = readCostAdmissionSettings();
+    } catch { config.costAdmission = null; }
+  }
+
   if (config.verbose == null) {
     try {
       const { readAndAdvanceVerboseState } = await import('../readiness/driver-verbose.mjs');
