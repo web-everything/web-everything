@@ -35,7 +35,7 @@
  * {@link unfreezeDispatch} / {@link readFreeze} / {@link isDispatchFrozen}) touch fs — injectable path for tests.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync, rmSync, linkSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve, join } from 'node:path';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
@@ -44,8 +44,9 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..', '..'); // scripts/readiness → repo root
 
-/** The durable dispatch-freeze marker: a GITIGNORED `.conveyor/` sidecar (the same convention as the #2680
- *  dispatch log / #2659 infra-blocked state). Present ⇒ the line is STOPPED; absent ⇒ dispatch is clear.
+/** The durable dispatch-freeze marker, in the host's coordination root (one source for every clone; see
+ *  {@link resolveFreezeMarkerPath}; it used to be a per-clone GITIGNORED `.conveyor/` sidecar — {@link migrateLegacyFreeze}
+ *  carries an old one across). Present ⇒ the line is STOPPED; absent ⇒ dispatch is clear.
  *  Env-overridable so a drain-only session (or a test) can point at a specific copy. */
 export const FREEZE_MARKER_PATH = resolveFreezeMarkerPath();
 
@@ -62,6 +63,64 @@ export function resolveFreezeMarkerPath(env = process.env) {
   if (env.WE_RED_MAIN_FREEZE) return env.WE_RED_MAIN_FREEZE;
   if (env.VITEST || env.WE_UNDER_TEST) return join(ROOT, '.conveyor', 'red-main-freeze.json');
   return join(resolveCoordinationRoot({ env }), 'red-main-freeze.json');
+}
+
+/** The pre-2026-10-09 per-clone marker location (`<this clone>/.conveyor/`). `WE_RED_MAIN_FREEZE_LEGACY` points a test at a temp copy. */
+export function resolveLegacyFreezeMarkerPath(env = process.env) {
+  return env.WE_RED_MAIN_FREEZE_LEGACY || join(ROOT, '.conveyor', 'red-main-freeze.json');
+}
+
+/**
+ * Retire this clone's legacy marker (rename aside, never delete) so it can NEVER be read again. The new path is the
+ * ONLY authority: an old file left lying around would be carried across by a later pass and re-freeze the line after
+ * the operator lifted it (`unfreeze`) or re-raised it (`freeze`). No-op without a legacy file, under an explicit
+ * `WE_RED_MAIN_FREEZE` override, or when both paths are the same (a test run). Never throws.
+ * @returns {boolean} whether a legacy file was retired
+ */
+export function retireLegacyFreeze({ env = process.env, path = resolveFreezeMarkerPath(env), legacyPath = resolveLegacyFreezeMarkerPath(env), suffix = 'retired' } = {}) {
+  try {
+    if (env.WE_RED_MAIN_FREEZE || resolve(path) === resolve(legacyPath) || !existsSync(legacyPath)) return false;
+    renameSync(legacyPath, `${legacyPath}.${suffix}`);
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * One-time rollout migration: a freeze raised before the marker moved to the coordination root sits in this clone's
+ * `.conveyor/`, and readers now look only at the new path — so an operator's live freeze would be silently dropped
+ * (review of PR #4624). Move it across ONCE: copy it to the new path (stamped `migratedFrom`), then rename the old
+ * file to `*.migrated` so only ONE source is ever read. When the new path already holds a marker it wins and the
+ * legacy file is renamed `*.superseded` (never left to resurface after an `unfreeze`). The copy never clobbers a
+ * marker raised concurrently (hard-link, EEXIST ⇒ the new path wins). No-op without a legacy marker, under an
+ * explicit `WE_RED_MAIN_FREEZE` override, or when both paths are the same (a test run). Never throws; a failed
+ * final rename still reports `migrated:true` (the copy happened — the marker is live at the new path).
+ * @returns {{migrated:boolean, from?:string, to?:string, reason?:string}}
+ */
+export function migrateLegacyFreeze({ env = process.env, path = resolveFreezeMarkerPath(env), legacyPath = resolveLegacyFreezeMarkerPath(env) } = {}) {
+  try {
+    if (env.WE_RED_MAIN_FREEZE) return { migrated: false, reason: 'explicit-override' };
+    if (resolve(path) === resolve(legacyPath)) return { migrated: false, reason: 'same-path' };
+    if (!existsSync(legacyPath)) return { migrated: false, reason: 'no-legacy-marker' };
+    const superseded = (reason) => { retireLegacyFreeze({ env, path, legacyPath, suffix: 'superseded' }); return { migrated: false, reason }; };
+    if (existsSync(path)) return superseded('new-path-already-holds-a-marker');
+    const marker = JSON.parse(readFileSync(legacyPath, 'utf8'));
+    if (!marker || typeof marker !== 'object') return { migrated: false, reason: 'unreadable-legacy-marker' };
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.${process.pid}.tmp`; // per-process: two migrators (or a concurrent `freeze`) never share a temp file
+    writeFileSync(tmp, JSON.stringify({ ...marker, migratedFrom: legacyPath }, null, 2) + '\n');
+    try { linkSync(tmp, path); } // no-clobber: a fresher freeze raised in the gap keeps the new path
+    catch (e) {
+      if (e?.code === 'EEXIST') { unlinkSync(tmp); return superseded('new-path-already-holds-a-marker'); }
+      // A filesystem without hard links (EPERM/EXDEV/ENOTSUP): fall back to an exclusive create, still no-clobber.
+      try { writeFileSync(path, readFileSync(tmp), { flag: 'wx' }); }
+      catch (e2) { unlinkSync(tmp); if (e2?.code === 'EEXIST') return superseded('new-path-already-holds-a-marker'); throw e2; }
+    }
+    unlinkSync(tmp);
+    retireLegacyFreeze({ env, path, legacyPath, suffix: 'migrated' });
+    return { migrated: true, from: legacyPath, to: path };
+  } catch (e) {
+    return { migrated: false, reason: `error: ${e?.message || e}` };
+  }
 }
 
 /**
@@ -163,14 +222,18 @@ export function freezeDispatch(meta = {}, path = FREEZE_MARKER_PATH) {
     revertAuthority: true,
   };
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(marker, null, 2) + '\n');
   renameSync(tmp, path);
+  if (path === FREEZE_MARKER_PATH) retireLegacyFreeze(); // the new path is the one authority
   return marker;
 }
 
-/** Lift the dispatch-freeze (main verified green again). Idempotent — a missing marker is a no-op. */
+/** Lift the dispatch-freeze (main verified green again). Idempotent — a missing marker is a no-op. Also retires this
+ *  clone's legacy marker (default path only), so an old file can never be carried across and re-freeze the line. */
 export function unfreezeDispatch(path = FREEZE_MARKER_PATH) {
+  // Legacy FIRST: a drain pass landing between the two steps would otherwise migrate the old file straight back.
+  if (path === FREEZE_MARKER_PATH) retireLegacyFreeze();
   try { if (existsSync(path)) rmSync(path); } catch { /* best-effort */ }
 }
 
@@ -198,7 +261,10 @@ function runCli(argv) {
     unfreezeDispatch();
     writeAllSync(1, JSON.stringify({ frozen: false }, null, 2) + '\n');
   } else if (cmd === 'status') {
-    writeAllSync(1, JSON.stringify({ frozen: isDispatchFrozen(), path: FREEZE_MARKER_PATH, marker: readFreeze() }, null, 2) + '\n');
+    // Read-only: report a not-yet-migrated legacy marker instead of moving it (the next drain pass migrates it).
+    const legacy = resolveLegacyFreezeMarkerPath();
+    const legacyPending = !process.env.WE_RED_MAIN_FREEZE && resolve(legacy) !== resolve(FREEZE_MARKER_PATH) && existsSync(legacy) ? legacy : null;
+    writeAllSync(1, JSON.stringify({ frozen: isDispatchFrozen(), path: FREEZE_MARKER_PATH, marker: readFreeze(), legacyMarkerPending: legacyPending }, null, 2) + '\n');
   } else if (cmd === 'decide') {
     const d = decidePostLand({ trigger: flags.trigger, ref: flags.ref, result: flags.result, mergeSha: flags['merge-sha'] });
     writeAllSync(1, JSON.stringify(d, null, 2) + '\n');

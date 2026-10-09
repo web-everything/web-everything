@@ -168,7 +168,7 @@ import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
-import { isDispatchFrozen, readFreeze } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
+import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
 // #2399 — the ONE remote-manifest `gh api` argv, shared with `/finish` (lane-resume) so the two readers never
 // drift. Re-exported to keep this file's public surface (and its tests' import site) stable.
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
@@ -6283,7 +6283,21 @@ async function runCli() {
   // red-main-hold (contain): with the hold ON, a manual freeze no longer stops the whole line — it feeds the
   // per-PR hold in `sweepOnce`, which still holds EVERY PR except the published main-fix PR(s). OFF = the old stop.
   const redMainFreezeStop = () => {
-    if (redMainBypass || !isDispatchFrozen()) return null;
+    if (redMainBypass) return null;
+    // A freeze raised before the marker moved to the coordination root is carried across once, so rollout never drops it.
+    // (skipped on --dry-run: a read-only pass must not move files.) Any non-benign outcome is logged, never silent.
+    if (!flags['dry-run']) {
+      const mig = migrateLegacyFreeze();
+      const BENIGN = new Set(['no-legacy-marker', 'same-path', 'explicit-override', 'new-path-already-holds-a-marker']);
+      if (mig.migrated) {
+        let age = '';
+        try { const at = Date.parse(readFreeze()?.at); if (Number.isFinite(at)) age = ` (raised ${Math.round((Date.now() - at) / 3_600_000)}h ago)`; } catch { /* age is informational */ }
+        process.stderr.write(`merge-ai-prs · red-main freeze marker migrated ${mig.from} → ${mig.to}${age} — one source from now on\n`);
+      } else if (mig.reason && !BENIGN.has(mig.reason)) {
+        process.stderr.write(`merge-ai-prs · WARNING: a legacy red-main freeze marker was NOT migrated (${mig.reason}) — it is being ignored; check ${resolveLegacyFreezeMarkerPath()}\n`);
+      }
+    }
+    if (!isDispatchFrozen()) return null;
     if (resolveRedMainHoldSetting().value === 'on') return null;
     const fr = readFreeze();
     return {

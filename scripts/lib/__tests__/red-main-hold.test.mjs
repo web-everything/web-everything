@@ -7,7 +7,8 @@ import {
   RED_MAIN_HOLD_REASON, resolveRedMainHoldSetting, redMainSignal, decideRedMainHold, redMainHoldReason, replayRedMainHold,
 } from '../red-main-hold.mjs';
 import { classifySkipReason } from '../drain-skip-reasons.mjs';
-import { resolveFreezeMarkerPath } from '../../readiness/red-main-remediation.mjs';
+import { resolveFreezeMarkerPath, migrateLegacyFreeze, retireLegacyFreeze } from '../../readiness/red-main-remediation.mjs';
+import { existsSync, mkdirSync } from 'node:fs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIX = JSON.parse(readFileSync(join(HERE, 'fixtures', 'red-main-hold-windows-2026-10.json'), 'utf8'));
@@ -107,5 +108,58 @@ describe('red-main freeze marker — ONE source (held item 166)', () => {
   });
   it('inside a test run it never points at the live coordination root', () => {
     expect(resolveFreezeMarkerPath({ VITEST: 'true', WE_COORDINATION_ROOT: '/coord' })).not.toContain('/coord');
+  });
+});
+
+describe('red-main freeze marker — one-time legacy migration (PR #4624 review)', () => {
+  const setup = (legacy, current) => {
+    const d = mkdtempSync(join(tmpdir(), 'rmf-mig-'));
+    const legacyPath = join(d, 'clone', '.conveyor', 'red-main-freeze.json');
+    const path = join(d, 'coord', 'red-main-freeze.json');
+    if (legacy !== undefined) { mkdirSync(dirname(legacyPath), { recursive: true }); writeFileSync(legacyPath, legacy); }
+    if (current !== undefined) { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, current); }
+    return { legacyPath, path };
+  };
+  const M = JSON.stringify({ frozen: true, reason: 'r', mergeSha: 'abc' });
+
+  it('preserves an existing manual freeze when switching to coordination storage', () => {
+    const { legacyPath, path } = setup(M);
+    const r = migrateLegacyFreeze({ env: {}, path, legacyPath });
+    expect(r).toMatchObject({ migrated: true, from: legacyPath, to: path });
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ frozen: true, reason: 'r', mergeSha: 'abc', migratedFrom: legacyPath });
+    expect(existsSync(legacyPath)).toBe(false);
+    expect(existsSync(`${legacyPath}.migrated`)).toBe(true);
+  });
+  it('is idempotent — a second call finds no legacy marker', () => {
+    const { legacyPath, path } = setup(M);
+    migrateLegacyFreeze({ env: {}, path, legacyPath });
+    expect(migrateLegacyFreeze({ env: {}, path, legacyPath })).toMatchObject({ migrated: false, reason: 'no-legacy-marker' });
+  });
+  it('the new path wins: an existing coordination marker is never overwritten, the legacy file is set aside (never resurfaces)', () => {
+    const cur = JSON.stringify({ frozen: true, reason: 'newer' });
+    const { legacyPath, path } = setup(M, cur);
+    expect(migrateLegacyFreeze({ env: {}, path, legacyPath })).toMatchObject({ migrated: false, reason: 'new-path-already-holds-a-marker' });
+    expect(readFileSync(path, 'utf8')).toBe(cur);
+    expect(existsSync(legacyPath)).toBe(false);
+    expect(existsSync(`${legacyPath}.superseded`)).toBe(true);
+  });
+  it('retireLegacyFreeze sets the old file aside, is a no-op without one, and respects the explicit override and the same-path case', () => {
+    const { legacyPath, path } = setup(M);
+    expect(retireLegacyFreeze({ env: { WE_RED_MAIN_FREEZE: '/x.json' }, path, legacyPath })).toBe(false);
+    expect(retireLegacyFreeze({ env: {}, path: legacyPath, legacyPath })).toBe(false);
+    expect(retireLegacyFreeze({ env: {}, path, legacyPath })).toBe(true);
+    expect(existsSync(`${legacyPath}.retired`)).toBe(true);
+    expect(retireLegacyFreeze({ env: {}, path, legacyPath })).toBe(false);
+  });
+  it('an explicit WE_RED_MAIN_FREEZE override is never migrated into', () => {
+    const { legacyPath, path } = setup(M);
+    expect(migrateLegacyFreeze({ env: { WE_RED_MAIN_FREEZE: '/x.json' }, path, legacyPath })).toMatchObject({ migrated: false, reason: 'explicit-override' });
+    expect(existsSync(path)).toBe(false);
+  });
+  it('same path (a test run) and a corrupt legacy marker are no-ops that never throw', () => {
+    const { legacyPath, path } = setup('not json');
+    expect(migrateLegacyFreeze({ env: {}, path: legacyPath, legacyPath })).toMatchObject({ migrated: false, reason: 'same-path' });
+    expect(migrateLegacyFreeze({ env: {}, path, legacyPath }).migrated).toBe(false);
+    expect(existsSync(path)).toBe(false);
   });
 });
