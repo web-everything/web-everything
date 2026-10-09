@@ -877,6 +877,32 @@ function retype() {
 }
 
 /**
+ * block <NNN> --on=<NNN|hash>[,…] — add `blockedBy` edges to an existing item (frontmatter only, dedupes, keeps
+ * the existing edges). Each target must resolve to a backlog file. Cycles are left to check:standards (the DAG
+ * gate). Before this verb, adding an edge to a filed card had no sanctioned path and needed a hand-edit.
+ */
+function block() {
+  const file = resolveFile(positional[0]);
+  const rel = `backlog/${file}`;
+  const abs = join(DIR, file);
+  let src = readFileSync(abs, 'utf8');
+  const on = (flag('on') || '').split(',').map((s) => s.trim()).filter(Boolean).map(normalizeId);
+  if (!on.length) die('block needs --on=<NNN>[,<NNN>…]');
+  const self = idFromName(file);
+  for (const t of on) { if (t === self) die(`#${self} cannot block on itself`); resolveFile(t); }
+  const cur = readField(src, 'blockedBy');
+  let list = [];
+  if (cur) { try { list = JSON.parse(cur); } catch { die(`#${self} has a blockedBy line that is not a JSON array: ${cur}`); } }
+  const added = on.filter((t) => !list.includes(t));
+  if (!added.length) return ok({ verb: 'block', id: file.replace(/\.md$/, ''), file: rel, added: [] }, `#${self} already blocked by ${on.join(', ')}`);
+  list = [...list, ...added];
+  src = setFrontmatterField(src, 'blockedBy', `[${list.map((t) => JSON.stringify(t)).join(', ')}]`, { after: ['status', 'parent', 'size', 'kind'] });
+  writeBacklogMd(abs, rel, src);
+  ok({ verb: 'block', id: file.replace(/\.md$/, ''), file: rel, added },
+    `${GRN}✓ blocked${RST} ${BLD}#${self}${RST} ${DIM}+blockedBy ${added.join(', ')}${RST}`);
+}
+
+/**
  * prioritize <NNN> [--to=<value>|--clear] — set or clear the item's `priority` frontmatter (the same field
  * the readiness/batch machinery reads when it ranks work). Frontmatter-only, like {@link retype}. `--to`
  * takes a simple lowercase token (e.g. `low`); `--clear` (or an empty `--to`) removes the field, returning
@@ -1404,6 +1430,7 @@ switch (verb) {
   case 'number-stranded': numberStranded(); break;
   case 'retype': retype(); break;
   case 'prioritize': prioritize(); break;
+  case 'block': block(); break;
   case 'tier': tier(); break;
   case 'rank': rank(); break;
   case 'weights': weights(); break;
@@ -1431,6 +1458,7 @@ switch (verb) {
       `  ${GRN}release${RST} <NNN>               active|preparing → open\n` +
       `  ${GRN}unresolve${RST} <NNN> --reason=<why> --force   resolved → open, dropping dateResolved/graduatedTo/codifiedIn (#2779-incident correction path — a resolve that should never have happened, never a routine reopen)\n` +
       `  ${GRN}retype${RST} <NNN> [--to=story|epic|task|decision|feature] [--size=N|none] [--status=parked]   sanctioned pack-phase flag-fix (no LANE_GUARD_OFF); frontmatter-only\n` +
+      `  ${GRN}block${RST} <NNN> --on=<NNN>[,<NNN>]   add blockedBy edges to an existing item (dedupes; cycles caught by check:standards); frontmatter-only\n` +
       `  ${GRN}prioritize${RST} <NNN> [--to=low|--clear]   set or clear the item's \`priority\` frontmatter (the field readiness/batch ranks by); frontmatter-only\n` +
       `  ${GRN}tier${RST} <NNN> --to=pinned|normal|someday|won't [--clear]   set the build-queue TIER (#2528, the coarse ordering bucket); frontmatter-only\n` +
       `  ${GRN}rank${RST} <NNN> --to=<key> | --after=<NNN> [--before=<NNN>]   set the build-queue LexoRank (#2528, manual drag-order within a tier)\n` +
