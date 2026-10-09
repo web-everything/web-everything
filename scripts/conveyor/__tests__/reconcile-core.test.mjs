@@ -3749,3 +3749,43 @@ describe('held item 141: an older-head block the current-head reviewer ruled not
     expect(disputeOrSendBack(replay(file, beforeRulings)).length).toBeGreaterThan(0);
   });
 });
+
+// ── Card xu1nixv (incident 2026-10-08) — the red-main fix PR's fast lane ─────────────────────────────────────
+// #4522 (the fix for red main) sat as a draft ("still a draft"), then was refused `owed-ci-rerun` ("main is red")
+// while every other PR waited for main. With the published priority record, that one PR goes first, is promoted
+// from draft at once, and is never told to wait for main. `mainRedPriority: null` = before this card.
+describe('xu1nixv — the red-main fix PR is first, never a waiting draft, never owed-ci-rerun', () => {
+  const MAIN_RED_WINDOWS = [{ start: '2026-09-25T01:30:55Z', end: '2026-09-25T02:31:25Z' }];
+  const priority = (pr) => ({ repo: 'we', pr, firstRedSha: '7c731a95e', setAt: NOW, expiresAt: NOW + 30 * 60_000 });
+  const redOnMain = (over = {}) => pr1563({ number: 4522, labels: [], statusCheckRollup: redRollup, comments: [],
+    requiredCheckCompletedAt: '2026-09-25T01:57:47Z', aheadByOnMain: 33, ...over });
+
+  it('before this card the fix PR is refused owed-ci-rerun; with priority it is planned a ci-heal', () => {
+    const before = planReconcile({ prs: [redOnMain()], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS });
+    expect(before.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', prNumber: 4522 })]);
+    const after = planReconcile({ prs: [redOnMain()], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS, mainRedPriority: priority(4522) });
+    expect(after.refusals.some((r) => r.kind === 'owed-ci-rerun')).toBe(false);
+    expect(after.dispatch).toEqual([expect.objectContaining({ kind: 'ci-heal', prNumber: 4522 })]);
+  });
+
+  it('other PRs keep waiting for main (only the owner is exempt)', () => {
+    const plan = planReconcile({ prs: [redOnMain({ number: 2635 })], agents: [], now: NOW, mainRedWindows: MAIN_RED_WINDOWS, mainRedPriority: priority(4522) });
+    expect(plan.refusals).toEqual([expect.objectContaining({ kind: 'owed-ci-rerun', prNumber: 2635 })]);
+  });
+
+  it('a draft fix PR is promoted at once, even before its checks are green', () => {
+    const draft = pr1563({ number: 4522, isDraft: true, labels: lbl('review:pending'), statusCheckRollup: pendingRollup, comments: [] });
+    expect(planReconcile({ prs: [draft], agents: [], now: NOW }).dispatch).toEqual([]);
+    expect(planReconcile({ prs: [draft], agents: [], now: NOW, mainRedPriority: priority(4522) }).dispatch)
+      .toEqual([expect.objectContaining({ kind: 'promote-draft', prNumber: 4522 })]);
+  });
+
+  it('the fix PR is planned first (review queue order); an expired record changes nothing', () => {
+    const a = pr1563({ number: 4600, labels: lbl('review:pending'), statusCheckRollup: greenRollup, comments: [] });
+    const fix = pr1563({ number: 4522, labels: lbl('review:pending'), statusCheckRollup: greenRollup, comments: [] });
+    const first = planReconcile({ prs: [a, fix], agents: [], now: NOW, mainRedPriority: priority(4522) }).dispatch.map((d) => d.prNumber);
+    expect(first).toEqual([4522, 4600]);
+    const expired = { ...priority(4522), expiresAt: NOW - 1 };
+    expect(planReconcile({ prs: [a, fix], agents: [], now: NOW, mainRedPriority: expired }).dispatch.map((d) => d.prNumber)).toEqual([4600, 4522]);
+  });
+});

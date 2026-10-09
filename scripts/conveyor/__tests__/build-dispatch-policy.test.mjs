@@ -165,7 +165,7 @@ describe('planBuildDispatch', () => {
       .toEqual([{ repo: 'we', number: 1, headRefName: 'lane/1-x', labels: ['l'], files: [{ repo: 'we', path: 'a' }] }]);
   });
   it('declares every operator rule with who enforces it', () => {
-    expect(BUILD_DISPATCH_POLICY.rules.map((r) => r.id)).toEqual(['cap', 'wip-cap', 'landing-freeze', 'scope-vs-open-prs', 'hot-file', 'branch-name', 'scratch-prefix', 'draft-first', 'needs-prepare', 'prepare-ahead-window', 'prepare-stale']);
+    expect(BUILD_DISPATCH_POLICY.rules.map((r) => r.id)).toEqual(['cap', 'wip-cap', 'landing-freeze', 'main-red', 'scope-vs-open-prs', 'hot-file', 'branch-name', 'scratch-prefix', 'draft-first', 'needs-prepare', 'prepare-ahead-window', 'prepare-stale']);
     expect(BUILD_DISPATCH_POLICY.maxConcurrentBuilds).toBe(1);
     expect(BUILD_DISPATCH_POLICY.maxConcurrentExternalBuilds).toBe(4);
     expect(BUILD_DISPATCH_POLICY.maxOpenItems).toBe(7);
@@ -494,5 +494,24 @@ describe('collectBuildHolds — every held card names its stage and reason', () 
 
   it('never lists a card that was dispatched this tick', () => {
     expect(collectBuildHolds({ policyHold: [{ num: '1', rule: 'cap', reason: 'x' }], dispatched: [{ num: '1' }] })).toEqual([]);
+  });
+});
+
+// Card xu1nixv — builder freeze kind `main-red` (incident 2026-10-08: merges and builds kept landing on a red main for 6 h).
+describe('main-red freeze', () => {
+  const cands = [{ num: '5600', scope: ['a.mjs'] }, { num: '5601', scope: ['b.mjs'] }];
+  const red = { frozen: true, reason: 'main CI red since 2026-10-08T17:04:20.000Z', exemptNums: ['5601'] };
+  it('holds every new build while main is red, except an exempt main-fix card', () => {
+    const plan = planBuildDispatch({ candidates: cands, policy: { ...BUILD_DISPATCH_POLICY, maxConcurrentBuilds: 4 }, mainRedFreeze: red });
+    expect(plan.hold).toEqual([{ num: '5600', lane: null, rule: 'main-red', reason: red.reason }]);
+    expect(plan.dispatch.map((d) => d.num)).toEqual(['5601']);
+    expect(plan.mainRedFreeze).toEqual({ frozen: true, reason: red.reason });
+    // Kept out of the global freeze: prepares (light) and orphan resumes read `freeze.frozen`, which stays false.
+    expect(plan.freeze.frozen).toBe(false);
+  });
+  it('off / absent = before this card: nothing held for main red', () => {
+    const plan = planBuildDispatch({ candidates: cands, policy: { ...BUILD_DISPATCH_POLICY, maxConcurrentBuilds: 4 }, mainRedFreeze: null });
+    expect(plan.hold).toEqual([]);
+    expect(plan.mainRedFreeze).toEqual({ frozen: false });
   });
 });

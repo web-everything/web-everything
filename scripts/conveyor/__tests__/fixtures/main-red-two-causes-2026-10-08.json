@@ -1,0 +1,64 @@
+{
+  "_source": "Incident review .operations/metrics/perf/2026-10-08/incident-red-main.md + coordinator note 2026-10-09 ~00:15Z. Main's CI failed on two independent causes: the orphan-adopt soak scenario (from 7c731a95e, 17:04Z) and review-pr-io's ledger row id (from ~21:30Z). Each fix PR failed CI on the OTHER cause. Job names are the CI job names of those runs (soak shard / test shard 2); the soak shard number is reconstructed. mainFailingJobs is the live read at 00:26Z 2026-10-09 (run 37863097737); `test` and `daemon-soak` are summary jobs that only gate on the shards.",
+  "mainFailingJobs": [
+    "test-shard (2)",
+    "soak-shard (2)",
+    "test",
+    "daemon-soak"
+  ],
+  "fixPrs": [
+    {
+      "number": 4522,
+      "title": "WE #xh6ij2v: fix — fix red main — orphan-adopt soak declares its own…",
+      "headRefName": "lane/main-red-soak",
+      "headRefOid": "5411d363b0000000000000000000000000000000",
+      "createdAt": "2026-10-08T22:43:39Z",
+      "state": "OPEN",
+      "body": "",
+      "ci": {
+        "status": "red",
+        "failedJobs": [
+          "test-shard (2)",
+          "test"
+        ],
+        "runId": 37859366507,
+        "completedAt": "2026-10-08T23:36:26Z"
+      }
+    },
+    {
+      "number": 4532,
+      "title": "red-main fix: review-run ledger row id from effect key, not wall-clock",
+      "headRefName": "lane/red-main-review-pr-io",
+      "headRefOid": "6103840860000000000000000000000000000000",
+      "createdAt": "2026-10-09T00:08:35Z",
+      "state": "OPEN",
+      "body": "",
+      "ci": {
+        "status": "red",
+        "failedJobs": [
+          "soak-shard (2)",
+          "daemon-soak"
+        ],
+        "completedAt": "2026-10-09T00:13:07Z"
+      }
+    }
+  ],
+  "cardPrs": [
+    {
+      "number": 4523,
+      "title": "backlog: file xu1nixv — a red main gets an owner",
+      "headRefName": "lane/main-red-owner-card",
+      "createdAt": "2026-10-08T22:46:20Z",
+      "state": "OPEN",
+      "body": ""
+    },
+    {
+      "number": 4527,
+      "title": "health: a red main gets an owner — main-ci-red smell + one fixer per broken commit",
+      "headRefName": "lane/main-red-owner",
+      "createdAt": "2026-10-08T22:52:00Z",
+      "state": "OPEN",
+      "body": "Card xu1nixv. Incident 2026-10-08: main's CI was red from 17:04Z (first red commit `7c731a95e`, last green `26b439b79`). It dispatches exactly ONE owner (`main-fix-7c731a95e`) for the whole window."
+    }
+  ]
+}
