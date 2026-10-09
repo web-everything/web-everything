@@ -1,9 +1,10 @@
 ---
+bornAs: x0xuo66
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xa4cib1-prevention-add-a-check-standards-rule-that-errors-on-an-open.md"]
+scope: ["we:backlog/5605-prevention-add-a-check-standards-rule-that-errors-on-an-open.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xa4cib1-prevention-add-a-check-standards-rule-that-errors-on-an-open.md:6` — Add a `check:standards` rule, or extend the JIT-number step, so that a backlog card's `scope` entries of the form `we:backlog/<id>-...` must resolve to an existing file, or are rewritten when the target card is renumbered.
+1. `we:backlog/5605-prevention-add-a-check-standards-rule-that-errors-on-an-open.md:6` — Add a `check:standards` rule, or extend the JIT-number step, so that a backlog card's `scope` entries of the form `we:backlog/<id>-...` must resolve to an existing file, or are rewritten when the target card is renumbered.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4614@d78a757d38459e6dc796205822d9fd26719a7643
 
