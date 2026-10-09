@@ -55,9 +55,19 @@ const MARKER_LINE_RE = /^ {0,3}(?:#{1,6}[ \t]+)?(?:\*\*)?Supersedes(?:\*\*)?[ \t
 /** A fence line: up to 3 SPACES (a tab or no-break space is indented code / not a fence), a run of 3+ backticks or
  *  3+ tildes, then the rest of the line. */
 const FENCE_LINE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-/** A fence opened inside a list item (`- ```` / `1. ````): its closer is indented to the item's content, any depth. */
-const LIST_FENCE_LINE_RE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])[ \t]+(`{3,}|~{3,})(.*)$/;
-const INDENTED_FENCE_LINE_RE = /^ *(`{3,}|~{3,})(.*)$/;
+/** A fence opened inside a list item (`- ```` / `1. ````, markers may nest on one line: `- - ````). CommonMark: the
+ *  closer may be indented at most 3 columns past the item's content column (4+ is code content, not a closer). */
+const LIST_FENCE_LINE_RE = /^ {0,3}(?:(?:[-*+]|\d{1,9}[.)])[ \t]+)+(`{3,}|~{3,})(.*)$/;
+const FENCE_RUN_RE = /^(`{3,}|~{3,})(.*)$/;
+/** Columns a string spans, tabs to the next multiple of 4. */
+const columnsOf = (s) => { let col = 0; for (const ch of s) col += ch === '\t' ? 4 - (col % 4) : 1; return col; };
+/** The content column of a list-item fence opener (where the fence run starts), or null when the gap after the marker
+ *  is 5+ columns (then the text is indented code, not a fence). */
+const listFenceColumn = (line, open) => {
+  const prefix = line.slice(0, line.length - open[1].length - open[2].length);
+  const col = columnsOf(prefix);
+  return col - columnsOf(prefix.trimEnd()) > 4 ? null : col;
+};
 
 /** Most PR numbers one body may declare; a body past it is not a list of real supersedes. */
 export const MAX_SUPERSEDE_TARGETS = 50;
@@ -70,20 +80,27 @@ export const MAX_SUPERSEDE_TARGETS = 50;
 export function parseSupersedes(body) {
   if (typeof body !== 'string' || !body) return [];
   const out = [];
-  let fence = null; // { char, len, inList } of the open fence, CommonMark rules: closes on the same char, at least as long
+  let fence = null; // { char, len, base } of the open fence, CommonMark rules: closes on the same char, at least as long,
+  // indented 0-3 columns past `base` (0 for a top-level fence, the item's content column for a list-item fence)
   let inComment = false; // inside a multi-line `<!-- ... -->` (PR templates carry guidance there)
   for (const line of body.split(/\r?\n/)) {
     if (fence) {
-      const close = (fence.inList ? INDENTED_FENCE_LINE_RE : FENCE_LINE_RE).exec(line);
-      if (close && close[1][0] === fence.char && close[1].length >= fence.len && close[2].trim() === '') fence = null;
+      const lead = /^[ \t]*/.exec(line)[0];
+      const close = FENCE_RUN_RE.exec(line.slice(lead.length));
+      if (close && columnsOf(lead) <= fence.base + 3 && close[1][0] === fence.char && close[1].length >= fence.len
+        && close[2].trim() === '') fence = null;
       continue;
     }
     if (inComment) { if (line.includes('-->')) inComment = false; continue; }
-    const open = FENCE_LINE_RE.exec(line) ?? LIST_FENCE_LINE_RE.exec(line);
+    const topOpen = FENCE_LINE_RE.exec(line);
+    const open = topOpen ?? LIST_FENCE_LINE_RE.exec(line);
     // A backtick fence's info string cannot hold a backtick, so ```text``` on one line is inline code, not a fence.
     if (open && !(open[1][0] === '`' && open[2].includes('`'))) {
-      fence = { char: open[1][0], len: open[1].length, inList: !FENCE_LINE_RE.test(line) };
-      continue;
+      const base = topOpen ? 0 : listFenceColumn(line, open);
+      if (base !== null) {
+        fence = { char: open[1][0], len: open[1].length, base };
+        continue;
+      }
     }
     const m = MARKER_LINE_RE.exec(line);
     if (m) {

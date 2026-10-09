@@ -29,7 +29,9 @@ export default {
       if (planSupersedeHolds({ ...input, openPrs: [{ ...fixture.open, comments }] }).length) violations.push('supersede hold re-planned after trusted comment');
     }
     // PR #4560 review: a Supersedes line inside a nested/mixed fence is documentation, never a hold on an unrelated PR.
-    for (const body of ['````md\n```\nSupersedes #4522\n```\nSupersedes #4523\n````', '~~~\n```\nSupersedes #4522\n~~~']) {
+    // Round 3: a list-item fence's closer sits at most 3 columns past the item's content, so a deeper fence line is code.
+    for (const body of ['````md\n```\nSupersedes #4522\n```\nSupersedes #4523\n````', '~~~\n```\nSupersedes #4522\n~~~',
+      '- ```md\n          ```\n  Supersedes #4522\n  ```', '1. ```md\n   Supersedes #4521\n       ```\n   Supersedes #4522\n   ```']) {
       if (parseSupersedes(body).length) violations.push(`fenced example read as a supersede marker: ${JSON.stringify(body)}`);
     }
     return { violations };
