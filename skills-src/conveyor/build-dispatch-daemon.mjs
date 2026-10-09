@@ -32,7 +32,9 @@
  */
 
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
-import { PLANNING_SNAPSHOT_ENV } from '../../scripts/lib/planning-snapshot.mjs';
+import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
+import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
+import { createFileRunStore } from '../../scripts/operations/run-store.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
 import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
@@ -1069,18 +1071,91 @@ export const BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS = 10 * 60_000;
 
 // EXPORTED (#4464) so a test can assert the env override directly, against an injected `exec` — mirrors this
 // file's own established `{ exec = execFileSync }` seam (`cliRetryInfraBlocked`, below).
-export function cliPlanTick(payload, { exec = execFileSync, config = null } = {}) {
-  const snapshotDir = mkdtempSync(join(tmpdir(), 'builder-plan-'));
+export function cliPlanTick(payload, { exec = execFileSync, config = null, snapshotDir: roundDir = null } = {}) {
+  // #5322 — a round that already started its lane-pool read passes its own snapshot dir (and removes it itself).
+  const snapshotDir = roundDir ?? mkdtempSync(join(tmpdir(), 'builder-plan-'));
   try {
     const text = exec('node', [join(SCRIPTS, 'conveyor', 'tick-core.mjs')], {
       input: JSON.stringify({ bookkeeping: payload || {}, ...(config ? { config } : {}) }), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, [PLANNING_SNAPSHOT_ENV]: snapshotDir,
-        // Speed only (card xwn53th): this planning read re-proved every clean lane every tick (~50 s of the tick).
-        // A clean lane's verdict is reused while its stat fingerprint is unchanged and the entry is young.
-        [CLEAN_VERDICT_MEMO_ENV]: process.env[CLEAN_VERDICT_MEMO_ENV] ?? String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS) },
+      env: { ...planningChildEnv(), [PLANNING_SNAPSHOT_ENV]: snapshotDir },
     });
     return JSON.parse(text);
-  } finally { rmSync(snapshotDir, { recursive: true, force: true }); }
+  } finally { if (!roundDir) rmSync(snapshotDir, { recursive: true, force: true }); }
+}
+
+/** The environment of this daemon's planning children (tick-core, and the round's early lane-pool read). */
+function planningChildEnv() {
+  return { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE,
+    // Speed only (card xwn53th): this planning read re-proved every clean lane every tick (~50 s of the tick).
+    // A clean lane's verdict is reused while its stat fingerprint is unchanged and the entry is young.
+    [CLEAN_VERDICT_MEMO_ENV]: process.env[CLEAN_VERDICT_MEMO_ENV] ?? String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS) };
+}
+
+// #5322 — the exact read tick-core prefetches (`join(scripts/conveyor, '..', 'lane-pool.mjs')` normalises to this
+// path), so the snapshot key matches and tick-core and dispatch-plan find the result instead of scanning again.
+export const PLANNING_LANE_POOL_ARGS = [join(SCRIPTS, 'lane-pool.mjs'), 'list', '--acquirable', '--json'];
+
+function defaultReadLanePool() {
+  return new Promise((resolveRead, rejectRead) => {
+    execFile('node', PLANNING_LANE_POOL_ARGS, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs() * 2, killSignal: 'SIGKILL', env: planningChildEnv() },
+      (err, out) => { if (err) return rejectRead(err); try { resolveRead(JSON.parse(out)); } catch (e) { rejectRead(e); } });
+  });
+}
+
+/**
+ * #5322 (tick overrun) — one builder round's planning snapshot, with the slow lane-pool read (`list --acquirable`,
+ * 20-120 s on a busy pool) STARTED at the top of the round instead of inside tick-core. The read is the same
+ * command with the same environment tick-core would run; only its start time moves, so it overlaps the round's
+ * run-store and prepare reads. A successful result lands in the snapshot (planningRead), where tick-core and
+ * dispatch-plan find it. A failed read stores nothing, and the plan makes its own read exactly as before. If the
+ * plan starts while this read is still running, its own read waits on lane-pool's single-flight lock and takes
+ * this scan's result. `end()` waits for the read, then removes the snapshot.
+ */
+export function startPlanningRound({ readLanePool = defaultReadLanePool } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'builder-plan-'));
+  const prefetch = Promise.resolve()
+    .then(() => planningRead(PLANNING_LANE_POOL_ARGS, readLanePool, { env: { [PLANNING_SNAPSHOT_ENV]: dir } }))
+    .catch(() => null);
+  return {
+    dir,
+    prefetch,
+    end: async () => { await prefetch; rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+/**
+ * #5322 — the round's `planTick`: waits for the round's early lane-pool read, THEN plans inside the round snapshot.
+ * Without the wait, tick-core could start its own identical scan while the early one was still running (the
+ * snapshot has nothing yet), reading the pool twice in one round. The early read began at the top of the round, so
+ * it has overlapped the run-store and prepare reads; a failed read resolves to nothing and the plan reads for itself.
+ */
+export function createRoundPlanTick(round, { plan = cliPlanTick } = {}) {
+  return async (payload, { config } = {}) => {
+    await round.prefetch;
+    return plan(payload, { config, snapshotDir: round.dir });
+  };
+}
+
+/**
+ * #5322 — the backlog and routing inputs `cliPredictRoute` reads, loaded once per round instead of once per
+ * candidate (each backlog load parses every card: ~1.5-4 s, 8-9 candidates a tick). Same loaders, same values,
+ * passed through `cliPredictRoute`'s existing seams. If loading fails, each call falls back to its own read, so
+ * an error surfaces per candidate exactly as before.
+ */
+export async function loadRouteInputs(root = REPO_ROOT) {
+  const io = await import('../../scripts/operations/dispatch-lane-io.mjs');
+  const items = io.defaultLoadItems(root);
+  return { loadItems: () => items, scorecards: io.defaultReadScorecards(), sizePolicy: io.defaultReadSizePolicy({ root }), promotions: io.defaultReadPromotions({ root }) };
+}
+
+export function createRoundRoutePredictor({ predict = cliPredictRoute, loadInputs = () => loadRouteInputs() } = {}) {
+  let inputs;
+  return async (num, scope) => {
+    if (inputs === undefined) {
+      try { inputs = await loadInputs(); } catch { inputs = null; }
+    }
+    return inputs ? predict(num, scope, inputs) : predict(num, scope);
+  };
 }
 
 // #4351's own build-dispatch follow-up (guided by #4309 spend accounting) — this was the top GraphQL spender in the fleet (121
@@ -1101,19 +1176,30 @@ export async function cliFetchOpenPrs() {
   return out;
 }
 
+/**
+ * #5322 — every `dispatch-lane` run record, read once. The run store holds tens of thousands of records of every
+ * operation, so listing it is the expensive part; a round's back-to-back readers (`readBuildRuns`,
+ * `readSettledBuilds`, `readPrepareRuns`) share one read via their `records` option instead of listing it three
+ * times. An unreadable store is `[]` and an unreadable record is skipped — the readers' existing degrade rules.
+ * @returns {Array<{id: string, run: object|null}>}
+ */
+export function readDispatchLaneRunRecords({ store = createFileRunStore() } = {}) {
+  let ids = [];
+  try { ids = store.list().filter((id) => id.startsWith('dispatch-lane')); } catch { return []; }
+  const out = [];
+  for (const id of ids) {
+    try { out.push({ id, run: store.read(id) }); } catch { /* unreadable record: skipped, as before */ }
+  }
+  return out;
+}
+
 // xovjhwh converge round 2 — exported (was module-private) so a test can drive it against a real, broken
 // run-store directory the same way the sibling `cliListSettledBuilds` already is below, and pin the "degrades
 // to `[]`, never throws" claim `deriveDispatchedByBuilder`'s own docblock makes about this exact reader.
-export async function cliListRunStoreInFlight({ now = new Date(), launchKind = 'build', listAgents } = {}) {
-  const { createFileRunStore } = await import('../../scripts/operations/run-store.mjs');
+export async function cliListRunStoreInFlight({ now = new Date(), launchKind = 'build', listAgents, records = null } = {}) {
   const { DISPATCH_EFFECT, dispatchStillHolds } = await import('../../scripts/operations/dispatch-lane.mjs');
-  const store = createFileRunStore();
   const rows = [];
-  let ids = [];
-  try { ids = store.list().filter((id) => id.startsWith('dispatch-lane')); } catch { return rows; }
-  for (const id of ids) {
-    let run;
-    try { run = store.read(id); } catch { continue; }
+  for (const { id, run } of records ?? readDispatchLaneRunRecords()) {
     for (const e of run?.effects || []) {
       if (e?.status !== 'in-flight' || e.type !== DISPATCH_EFFECT || e.payload?.launchKind !== launchKind) continue;
       if (launchKind !== 'prepare-item' && !dispatchStillHolds(e, now.toISOString())) continue;
@@ -1148,16 +1234,10 @@ export async function cliListRunStoreInFlight({ now = new Date(), launchKind = '
  * attempt's own settle apart from an older, already-superseded one for the same item. EXPORTED so a test can
  * drive this against real on-disk run-store state, not just a hand-fed stub.
  */
-export async function cliListSettledBuilds({ launchKind = 'build' } = {}) {
-  const { createFileRunStore } = await import('../../scripts/operations/run-store.mjs');
+export async function cliListSettledBuilds({ launchKind = 'build', records = null } = {}) {
   const { DISPATCH_EFFECT } = await import('../../scripts/operations/dispatch-lane.mjs');
-  const store = createFileRunStore();
   const rows = [];
-  let ids = [];
-  try { ids = store.list().filter((id) => id.startsWith('dispatch-lane')); } catch { return rows; }
-  for (const id of ids) {
-    let run;
-    try { run = store.read(id); } catch { continue; }
+  for (const { id, run } of records ?? readDispatchLaneRunRecords()) {
     for (const e of run?.effects || []) {
       if (e.type !== DISPATCH_EFFECT || e.payload?.launchKind !== launchKind) continue;
       if (e.status !== 'applied' && e.status !== 'failed') continue;
@@ -2105,13 +2185,21 @@ async function dryRun(flags) {
   const timer = createPhaseTimer();
   const effects = cliEffects();
   const prepareEnabled = !flags['no-prepare'];
-  const runStoreRows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight());
+  // #5322 — the same round shape as a live tick: early lane-pool read, one run-store read, route inputs read once.
+  const round = startPlanningRound();
+  effects.planTick = createRoundPlanTick(round);
+  const predictRoute = createRoundRoutePredictor();
+  effects.predictRoute = predictRoute;
+  const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords());
+  const runStoreRows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));
   effects.listRunStoreInFlight = () => runStoreRows;
-  const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds()); // #4349
+  const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds({ records })); // #4349
   effects.listSettledBuilds = () => settledRows;
-  const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item' }));
+  const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item', records }));
   effects.listPrepareInFlight = () => prepareRows;
-  const tick = await runBuildDispatchTick({ bookkeeping: {}, live: false, policy, prepareEnabled, effects, timer });
+  let tick;
+  try { tick = await runBuildDispatchTick({ bookkeeping: {}, live: false, policy, prepareEnabled, effects, timer }); }
+  finally { await round.end(); }
   const core = tick.tickCore;
   const scopeByNum = new Map((core.queue || []).map((r) => [normNum(r.num), r.scope || []]));
   const heldByCore = new Map((core.held || []).map((h) => [normNum(h.num), h.reason]));
@@ -2132,7 +2220,7 @@ async function dryRun(flags) {
   const reportCandidates = [];
   for (const c of [...tick.plan.dispatch, ...tick.plan.hold, ...capacityOnly]) {
     const scope = c.scope || scopeByNum.get(normNum(c.num)) || [];
-    const route = await cliPredictRoute(c.num, scope);
+    const route = await predictRoute(c.num, scope);
     reportCandidates.push({ num: c.num, lane: c.lane, scope, route, executor: route.executor });
   }
   const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight(), mainRedFreeze: cliMainRedFreeze() });
@@ -2148,7 +2236,7 @@ async function dryRun(flags) {
     const pick = ifFreed.dispatch.find((x) => x.num === num);
     const held = ifFreed.hold.find((x) => x.num === num);
     // A card only the hold list names needs no route read (it is not a dispatch candidate this tick).
-    const route = (pick || held || focus.includes(num)) ? await cliPredictRoute(num, scopeByNum.get(num) || []) : null;
+    const route = (pick || held || focus.includes(num)) ? await predictRoute(num, scopeByNum.get(num) || []) : null;
     rows.push({
       num,
       tickCore: coreWhy,
@@ -2233,15 +2321,22 @@ async function live(flags) {
   let bookkeeping = {};
   const rawTickOnce = async () => {
     const timer = createPhaseTimer();
-    const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight());
-    effects.listRunStoreInFlight = () => rows;
-    const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds()); // #4349
-    effects.listSettledBuilds = () => settledRows;
-    const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item' }));
-    effects.listPrepareInFlight = () => prepareRows;
-    const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
-    bookkeeping = r.nextBookkeeping;
-    return r;
+    // #5322 — start the lane-pool read now (it overlaps the reads below), and read route inputs once per round.
+    const round = startPlanningRound();
+    effects.planTick = createRoundPlanTick(round);
+    effects.predictRoute = createRoundRoutePredictor();
+    try {
+      const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords()); // #5322 — one read for the three readers below
+      const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));
+      effects.listRunStoreInFlight = () => rows;
+      const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds({ records })); // #4349
+      effects.listSettledBuilds = () => settledRows;
+      const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item', records }));
+      effects.listPrepareInFlight = () => prepareRows;
+      const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
+      bookkeeping = r.nextBookkeeping;
+      return r;
+    } finally { await round.end(); }
   };
   const { wireSelfSyncAndAppAuth } = flags['self-sync'] === true ? await import('./runner.mjs') : {};
   const tickOnce = gatePausedTicks({
