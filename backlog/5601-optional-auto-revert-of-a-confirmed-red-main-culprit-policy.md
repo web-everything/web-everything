@@ -1,4 +1,5 @@
 ---
+bornAs: xj3qjdn
 kind: story
 size: 5
 status: open
@@ -7,9 +8,9 @@ dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Merge queue: batched testing with bisection (policy option)
+# Optional auto-revert of a confirmed red-main culprit (policy)
 
-Operator 2026-10-09 (merge strategy discussion). Batch N queued PRs into one CI run against current main; on red, bisect to find the culprit, drop it, land the rest; batch size and wait window are policies (standard default → platform preference → tool override, card x5wnfcg). Extends #4538/#4619 merge queue; part of the Ship Evermore integration-authority protocol.
+Operator 2026-10-09 (merge strategy discussion). When the red-main safety net (#4527) names a single culprit PR with confidence, optionally revert it automatically instead of waiting for a fix; off by default; mode is a policy (standard → platform preference → tool override, card 5600); never reverts the main-fix PR; records the revert and reopens the culprit.
 
 ## Acceptance
 
