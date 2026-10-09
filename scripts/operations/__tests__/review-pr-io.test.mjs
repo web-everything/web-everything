@@ -15,7 +15,7 @@ import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
  * assertable without running it.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -211,15 +211,60 @@ describe('the ledger and notice sinks', () => {
 
     it('a #3988 replay: 3 runs on one head yield 3 review-run rows with posted:false', async () => {
       const sinks = createReviewPrSinks({ root });
+      // Each run is its own effect, so each carries its own effect key (#xrw21vx): identity comes from the key,
+      // never from the wall clock, so no sleep between runs is needed to keep them apart.
       for (let i = 0; i < 3; i += 1) {
-        // Three real visits never share a millisecond; rows identical down to `at` are one row by event id (#4498),
-        // so a same-millisecond loop made this test flaky (~1 in 4 on a busy host). Space the visits apart.
-        if (i) await new Promise((r) => setTimeout(r, 3));
-        await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, CTX);
+        await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] },
+          { ...CTX, runId: `run-${i}`, key: `run-${i}#4#0` });
       }
       const rows = readEvents().filter((r) => r.type === 'review-run');
       expect(rows).toHaveLength(3);
       for (const r of rows) expect(r).toMatchObject({ pr: 7, headSha: HEAD, phase: 'completed', posted: false, source: 'review-pr' });
+    });
+
+    // #xrw21vx — the row id is the effect's identity (ctx.key + row type), not a hash of the whole row. A hash of
+    // the row folded in `at`, so two distinct runs stamped in the same millisecond collided into one row, and an
+    // idempotent replay of ONE effect got a fresh `at` and counted twice.
+    it('replaying the SAME effect (same ctx.key) records one review-run row, even across clock ticks', async () => {
+      const sinks = createReviewPrSinks({ root });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        for (let i = 0; i < 3; i += 1) {
+          vi.setSystemTime(new Date(Date.UTC(2026, 9, 8, 12, 0, i)));
+          await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: true, referralKeys: ['["correctness","a.js",1,"bug"]'] }, CTX);
+        }
+      } finally { vi.useRealTimers(); }
+      const rows = readEvents();
+      expect(rows.filter((r) => r.type === 'review-run')).toHaveLength(1);
+      expect(rows.filter((r) => r.type === 'referral')).toHaveLength(1);
+    });
+
+    it('two distinct runs in one frozen millisecond record two review-run rows', async () => {
+      const sinks = createReviewPrSinks({ root });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(new Date(Date.UTC(2026, 9, 8, 12, 0, 0)));
+        for (const runId of ['run-a', 'run-b']) {
+          await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] },
+            { ...CTX, runId, key: `${runId}#4#0` });
+        }
+      } finally { vi.useRealTimers(); }
+      const rows = readEvents().filter((r) => r.type === 'review-run');
+      expect(rows).toHaveLength(2);
+      expect(new Set(rows.map((r) => r.at)).size).toBe(1);
+      expect(new Set(rows.map((r) => r.id)).size).toBe(2);
+    });
+
+    it('with no effect key, each call still records its own row (random id), even in one frozen millisecond', async () => {
+      const sinks = createReviewPrSinks({ root });
+      vi.useFakeTimers({ toFake: ['Date'] });
+      try {
+        vi.setSystemTime(new Date(Date.UTC(2026, 9, 8, 12, 0, 0)));
+        for (let i = 0; i < 2; i += 1) {
+          await sinks[REVIEW_EFFECTS.LEDGER_EVENTS]({ pr: 7, repo: 'o/n', headSha: HEAD, posted: false, referralKeys: [] }, undefined);
+        }
+      } finally { vi.useRealTimers(); }
+      expect(readEvents().filter((r) => r.type === 'review-run')).toHaveLength(2);
     });
 
     it('appends a referral row with hashed finding keys when the run opened findings, plus the review-run row', async () => {
