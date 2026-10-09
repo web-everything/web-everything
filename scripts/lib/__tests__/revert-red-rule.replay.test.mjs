@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { planRevert, newTestTitles, revertRedVerdict, revertRedGate, formatRevertRed, parseFailureLine, changedOutsideNewTests, isStructuralUnproven } from '../revert-red-rule.mjs';
+import { planRevert, newTestTitles, revertRedVerdict, revertRedGate, formatRevertRed, parseFailureLine, changedOutsideNewTests, isStructuralUnproven, scanTestDeclarations, newTestEntries } from '../revert-red-rule.mjs';
 
 const FIXTURES = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/revert-red-replay.json'), 'utf8'));
 
@@ -204,7 +204,128 @@ describe('revert-red rule — changedOutsideNewTests reads the -U0 diff of one t
     expect(changedOutsideNewTests(hunk('@@ -3 +3 @@', '-  // returns 1', '+  // should return 1'))).toBe(false);
   });
 
-  it('a renamed or rewritten existing test title is a changed existing test', () => {
-    expect(changedOutsideNewTests(hunk('@@ -2 +2 @@', "-it('old name', () => {", "+it('new name', () => {"))).toBe(true);
+  it('a renamed test is ONE test: its new title carries it, so no second failure is demanded (red-team break 2)', () => {
+    expect(changedOutsideNewTests(hunk('@@ -2 +2 @@', "-it('old name', () => {", "+it('new name', () => {"))).toBe(false);
+  });
+
+  it('a rewritten existing test whose declaration line is untouched is a changed existing test', () => {
+    expect(changedOutsideNewTests(hunk('@@ -3 +3 @@', '-  expect(a).toBe(1);', '+  expect(a).toBe(2);'))).toBe(true);
+  });
+});
+
+// Post-accept red team of PR 4535: the same-titled-test and single-replacement shapes at the rule's own seam.
+describe('revert-red rule — suite-qualified test identity', () => {
+  const T = 's/__tests__/n.test.mjs';
+  const plan = planRevert({ changes: [{ status: 'M', path: 's/a.mjs' }, { status: 'M', path: T }] });
+  const probe = (killedBy) => ({ applied: true, occurrences: 1, baselineRan: true, baselineGreen: true, mutantRan: true, mutantGreen: false, killedBy, restored: true });
+  const ask = (titles, killedBy, mode = 'enforce') => revertRedVerdict({ mode, changeKind: 'fix', recordMatchesHead: true, plan, titles: { [T]: titles }, probe: probe(killedBy) });
+
+  it('reads the suite chain of each declaration, braces inside strings and comments notwithstanding', () => {
+    const src = [
+      "import { x } from './x.mjs';",
+      "describe('A', () => {",
+      "  // } not a brace",
+      "  it('has a } in its title', () => {});",
+      "  describe('inner', () => {",
+      "    it(`tpl`, () => { const s = '}'; });",
+      '  });',
+      '});',
+      "it('top', () => {});",
+    ].join('\n');
+    const { decls, complete } = scanTestDeclarations(src);
+    expect(complete).toBe(true);
+    expect(decls.map((d) => [...d.suites, d.title].join(' > '))).toEqual(['A > has a } in its title', 'A > inner > tpl', 'top']);
+  });
+
+  it('a dynamic describe, or an unbalanced file, is incomplete: ids are then not trusted', () => {
+    expect(scanTestDeclarations("describe.each([1])('g %s', () => { it('t', () => {}); });").complete).toBe(false);
+    expect(scanTestDeclarations("describe(name, () => { it('t', () => {}); });").complete).toBe(false);
+    expect(scanTestDeclarations("describe('A', () => { it('t', () => {});").complete).toBe(false);
+  });
+
+  it('suite forms the scanner cannot model are incomplete; a plain import list is not one', () => {
+    const complete = (src) => scanTestDeclarations(src).complete;
+    expect(complete("import { describe, it } from 'vitest';\ndescribe('A', () => { it('x', () => {}); });")).toBe(true);
+    expect(complete('describe.each`\n a | b\n`(\'A %s\', () => { it(\'x\', () => {}); });')).toBe(false);
+    expect(complete("describe<Foo>('A', () => { it('x', () => {}); });")).toBe(false);
+    expect(complete("const d = describe;\nd('A', () => { it('x', () => {}); });")).toBe(false);
+    expect(complete("test.describe('A', () => { test('x', () => {}); });")).toBe(false);
+    expect(scanTestDeclarations("suite('S', () => { it('x', () => {}); });").decls[0]).toMatchObject({ title: 'x', suites: ['S'] });
+  });
+
+  it('a regex literal after => or return does not throw the scan out of step', () => {
+    const src = "describe('A', () => {\n  const f = (s) => /\\{/.test(s);\n  const g = (s) => { return /'/.test(s); };\n  it('x', () => {});\n});\ndescribe('B', () => { it('x', () => {}); });";
+    const r = scanTestDeclarations(src);
+    expect(r.complete).toBe(true);
+    expect(r.decls.map((d) => [...d.suites, d.title].join(' > '))).toEqual(['A > x', 'B > x']);
+  });
+
+  it('title escapes are decoded as the runtime does, so the id equals what the runner prints', () => {
+    expect(scanTestDeclarations("it('caf\\u00e9 \\x41 \\n ok', () => {});").decls[0].title).toBe('café A \n ok');
+    expect(newTestTitles(["it('caf\\u00e9', () => {})"])).toEqual(['café']);
+  });
+
+  it('entries carry the qualified id of what the diff ADDED; an existing same-titled test only makes it shared when the id repeats', () => {
+    const headSource = "describe('A', () => {\n  it('works', () => {});\n});\ndescribe('B', () => {\n  it('works', () => {});\n});\n";
+    const diffText = '@@ -0,0 +1,3 @@\n+describe(\'A\', () => {\n+  it(\'works\', () => {});\n+});';
+    expect(newTestEntries({ headSource, diffText })).toEqual([{ title: 'works', id: 'A > works', shared: false, leafShared: true }]);
+  });
+
+  it('entries fall back to the leaf and say when it is declared more than once', () => {
+    const headSource = "describe.each([1])('g %s', () => {\n  it('works', () => {});\n});\nit('works', () => {});\n";
+    const diffText = "@@ -0,0 +4 @@\n+it('works', () => {});";
+    expect(newTestEntries({ headSource, diffText })).toEqual([{ title: 'works', id: null, shared: true, leafShared: true }]);
+  });
+
+  it('a failure in ANOTHER suite is not credited to a new test with a qualified id', () => {
+    const v = ask([{ title: 'works', id: 'A > works', shared: false }], [`${T} > B > works`]);
+    expect(v).toMatchObject({ status: 'flagged', blocking: true });
+    expect(v.nonDiscriminating).toEqual([{ file: T, test: 'A > works' }]);
+  });
+
+  it('the qualified id is matched whole, so the right suite going red is discriminating', () => {
+    const v = ask([{ title: 'works', id: 'A > works', shared: false }], [`${T} > A > works`]);
+    expect(v).toMatchObject({ status: 'clean' });
+    expect(v.discriminating).toEqual([{ file: T, test: 'A > works' }]);
+  });
+
+  it('a shared title with an unknown suite is unproven when anything matches, flagged when nothing does', () => {
+    const entry = [{ title: 'works', id: null, shared: true }];
+    expect(ask(entry, [`${T} > grp 1 > works`])).toMatchObject({ status: 'unproven', reason: 'ambiguous-test-title', blocking: true });
+    expect(ask(entry, [`${T} > something else`]).status).toBe('flagged');
+  });
+
+  it('one test declared once but run under several suites (describe.each, a helper) is one test, not an ambiguity', () => {
+    const v = ask([{ title: 'works', id: null, shared: false, leafShared: false }], [`${T} > A > case 1 > works`, `${T} > A > case 2 > works`]);
+    expect(v).toMatchObject({ status: 'clean' });
+  });
+
+  it('a suite the scanner could not see does not hide the failure, but a DIFFERENT suite still never matches', () => {
+    // helper-declared test: id has no suite, the runner prints the one it ran under
+    expect(ask([{ title: 'h works', id: 'h works', shared: false, leafShared: false }], [`${T} > A > h works`]).status).toBe('clean');
+    // a suite in the middle that the scanner missed
+    expect(ask([{ title: 'x', id: 'Outer > x', shared: false, leafShared: false }], [`${T} > Outer > Inner > x`]).status).toBe('clean');
+    expect(ask([{ title: 'x', id: 'Outer > x', shared: false, leafShared: false }], [`${T} > Other > Inner > x`]).status).toBe('flagged');
+    // an unseen suite plus a same-leaf test elsewhere: two paths hit a leaf the file declares twice => unproven
+    const v = ask([{ title: 'works', id: 'works', shared: false, leafShared: true }], [`${T} > A > works`, `${T} > B > works`]);
+    expect(v).toMatchObject({ status: 'unproven', reason: 'ambiguous-test-title' });
+  });
+
+  it('plain string titles keep their old leaf meaning', () => {
+    expect(ask(['works'], [`${T} > A > works`]).status).toBe('clean');
+  });
+});
+
+describe('revert-red rule — replacing one test needs one failure', () => {
+  const hunk = (head, ...lines) => [head, ...lines].join('\n');
+
+  it('a hunk that swaps a test declaration for a new titled one is attributed to the new test', () => {
+    expect(changedOutsideNewTests(hunk('@@ -2 +2 @@', "-it('old name', () => {", "+it('new name', () => {"))).toBe(false);
+    expect(changedOutsideNewTests(hunk('@@ -2,3 +2,3 @@', "-it('old', () => {", '-  expect(a).toBe(1);', '-});', "+it('new', () => {", '+  expect(a).toBe(2);', '+});'))).toBe(false);
+  });
+
+  it('a rewritten assertion with no new title, or next to a kept declaration, is still a changed existing test', () => {
+    expect(changedOutsideNewTests(hunk('@@ -4 +4 @@', '-  expect(a).toBeTruthy();', '+  expect(a).toBe(true);'))).toBe(true);
+    expect(changedOutsideNewTests(hunk('@@ -4 +4,2 @@', '-  expect(a).toBeTruthy();', '+  expect(a).toBe(true);', "+it('new', () => {}); "))).toBe(true);
   });
 });

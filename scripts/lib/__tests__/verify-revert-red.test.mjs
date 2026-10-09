@@ -205,8 +205,13 @@ describe('revert-red check on a real checkout', () => {
     await withFix(async (ctx) => {
       await leaveReverted(ctx);
       writeFileSync(join(ctx.root, SRC), 'the fixer kept working\n');
-      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true, restored: [], leftAlone: [SRC] });
+      // Uncommitted bytes that are neither the fixed nor the reverted content cannot be told from a half-finished restore:
+      // never overwritten, never discarded — the journal stays and recovery refuses until the work is committed.
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: false, restored: [], unverified: [SRC] });
       expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe('the fixer kept working\n');
+      expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(true);
+      ctx.commit({ [SRC]: 'the fixer kept working\n' }, 'the fixer committed it');
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ ok: true, restored: [], leftAlone: [SRC] });
       expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(false);
     });
     await withFix(async (ctx) => {
@@ -467,5 +472,136 @@ describe('what a revert-red result does to the verify verdict', () => {
   });
   it('never turns a red gate green', () => {
     expect(applyRevertRedToVerdict({ exitCode: 2, failureDetails: { x: 1 }, revertRed: { reason: 'all-new-tests-red-with-fix-reverted', blocking: false } })).toEqual({ exitCode: 2, failureDetails: { x: 1 } });
+  });
+});
+
+// Post-accept red team of PR 4535 (operator send-back 2026-10-09): three confirmed breaks, each reproduced here on a REAL
+// repo and tree before the fix.
+describe('red-team breaks of the revert-red check', () => {
+  /** A runner whose reverted (buggy) run fails exactly the given runner lines, and whose fixed run is green. */
+  const failingWith = (...lines) => (_cmd, _args, opts) => {
+    if (readFileSync(join(opts.cwd, SRC), 'utf8') === BUGGY) {
+      throw Object.assign(new Error('exit 1'), { stdout: 'Test Files  1 failed (1)\n Tests  1 failed (2)\n', stderr: lines.map((l) => ` FAIL  ${l}\n`).join('') });
+    }
+    return 'Test Files  1 passed (1)\n      Tests  2 passed (2)\n';
+  };
+  const check = (ctx, run, mode = 'enforce') => runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode, probe: createRevertProbe({ run }) });
+  const inRepo = (baseTest, fixTest, fn) => withRealRepo(async (ctx) => {
+    ctx.commit({ [SRC]: BUGGY, [TEST]: baseTest }, 'base');
+    const base = ctx.head();
+    ctx.commit({ [SRC]: FIXED, [TEST]: fixTest }, 'fix');
+    return fn({ ...ctx, base });
+  });
+
+  // 1. A leaf title shared by two suites: the failure of ONE must not be credited to the OTHER.
+  const EXISTING_B = "describe('B', () => {\n  it('works', () => {});\n});\n";
+  const WITH_WEAK_A = `describe('A', () => {\n  it('works', () => {});\n});\n${EXISTING_B}`;
+
+  it('1: a weak new test sharing its title with a red test in another suite is flagged, not credited', async () => {
+    await inRepo(EXISTING_B, WITH_WEAK_A, async (ctx) => {
+      const v = await check(ctx, failingWith(`${TEST} > B > works`));
+      expect(v).toMatchObject({ status: 'flagged', blocking: true });
+      expect(v.nonDiscriminating).toEqual([{ file: TEST, test: 'A > works' }]);
+      expect(v.discriminating).toEqual([]);
+    });
+  });
+
+  it('1: two new tests with one leaf title in different suites are judged separately', async () => {
+    const both = "describe('A', () => {\n  it('works', () => {});\n});\ndescribe('B', () => {\n  it('works', () => {});\n});\n";
+    await inRepo("it('other', () => {});\n", both, async (ctx) => {
+      const v = await check(ctx, failingWith(`${TEST} > B > works`));
+      expect(v.status).toBe('flagged');
+      expect(v.discriminating).toEqual([{ file: TEST, test: 'B > works' }]);
+      expect(v.nonDiscriminating).toEqual([{ file: TEST, test: 'A > works' }]);
+    });
+  });
+
+  it('1: when the suites cannot be read, a shared title is unproven (blocks in enforce), never clean', async () => {
+    const dynamic = "describe.each([1])('grp %s', () => {\n  it('works', () => {});\n});\nit('works', () => {});\n";
+    await inRepo("it('other', () => {});\n", dynamic, async (ctx) => {
+      const v = await check(ctx, failingWith(`${TEST} > grp 1 > works`));
+      expect(v).toMatchObject({ status: 'unproven', reason: 'ambiguous-test-title', blocking: true });
+    });
+  });
+
+  // 2. Replacing ONE test (new title, old one removed in the same hunk) needs ONE failure, not two.
+  it('2: a fix that replaces a single test is clean when that one test goes red', async () => {
+    const before = "it('accepts a plain name', () => {});\nit('old dot check', () => { expect(1).toBe(1); });\n";
+    const after = "it('accepts a plain name', () => {});\nit('refuses a dot name', () => { expect(2).toBe(2); });\n";
+    await inRepo(before, after, async (ctx) => {
+      const v = await check(ctx, failingWith(`${TEST} > refuses a dot name`));
+      expect(v).toMatchObject({ status: 'clean', blocking: false });
+      expect(v.nonDiscriminating).toEqual([]);
+    });
+  });
+
+  it('2: a replacement that stays green with the fix reverted is still flagged', async () => {
+    const before = "it('accepts a plain name', () => {});\nit('old dot check', () => { expect(1).toBe(1); });\n";
+    const after = "it('accepts a plain name', () => {});\nit('refuses a dot name', () => { expect(2).toBe(2); });\n";
+    await inRepo(before, after, async (ctx) => {
+      const v = await check(ctx, () => 'Test Files  1 passed (1)\n      Tests  2 passed (2)\n');
+      expect(v).toMatchObject({ status: 'flagged' });
+      expect(v.nonDiscriminating).toEqual([{ file: TEST, test: 'refuses a dot name' }]);
+    });
+  });
+
+  // 3. A failed restore that leaves damaged source: the journal must outlive the recovery attempt.
+  const brokenRestore = (damage) => (p, text) => {
+    if (text === FIXED) { realFs.writeFileSync(p, damage); throw new Error('ENOSPC mid-restore'); }
+    realFs.writeFileSync(p, text);
+  };
+  const failFirstRestore = async (ctx, damage) => {
+    const first = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: createRevertProbe({ run: runner(ctx.root, []), write: brokenRestore(damage) }) });
+    expect(first).toMatchObject({ status: 'unproven', reason: 'not-restored' });
+    expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(true);
+    expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(damage);
+  };
+
+  it('3: a restore that left TRUNCATED source is put back from git by the next recovery, and only then does the journal go', async () => {
+    await withFix(async (ctx) => {
+      await failFirstRestore(ctx, FIXED.slice(0, 12));
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true, restored: [SRC] });
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED);
+      expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(false);
+      expect(ctx.porcelain()).toBe('');
+    });
+  });
+
+  it('3: source that is neither the fixed, the reverted nor half of the fixed content keeps the journal; nothing proceeds on that tree', async () => {
+    await withFix(async (ctx) => {
+      await failFirstRestore(ctx, 'half-edited by somebody\n');
+      const journal = join(ctx.root, '.git', REVERT_JOURNAL);
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: false, unverified: [SRC] });
+      expect(existsSync(journal)).toBe(true);
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe('half-edited by somebody\n'); // nothing overwritten, nothing discarded
+      const second = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: createRevertProbe({ run: runner(ctx.root, []) }) });
+      expect(second).toMatchObject({ status: 'unproven', reason: 'pending-revert-not-recovered' });
+      expect(existsSync(journal)).toBe(true);
+      // Once the file holds the fixed content again, the journal is verified and goes.
+      writeFileSync(join(ctx.root, SRC), FIXED);
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: true });
+      expect(existsSync(journal)).toBe(false);
+    });
+  });
+
+  it('3: an unrelated commit does not let truncated source slip away: it is refused while it differs from what was committed', async () => {
+    await withFix(async (ctx) => {
+      await failFirstRestore(ctx, FIXED.slice(0, 12));
+      ctx.commit({ 'scripts/x/next.mjs': 'n\n' }, 'an unrelated commit moved HEAD');
+      writeFileSync(join(ctx.root, SRC), FIXED.slice(0, 12)); // the commit helper may have touched the tree; the damage stays
+      expect(recoverRevertRed({ checkout: ctx.root })).toMatchObject({ pending: true, ok: false, unverified: [SRC] });
+      expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(true);
+      expect(readFileSync(join(ctx.root, SRC), 'utf8')).toBe(FIXED.slice(0, 12));
+    });
+  });
+
+  it('3: a probe that claims a restore the disk does not show is not trusted: not-restored, journal kept', async () => {
+    await withFix(async (ctx) => {
+      const liar = async () => ({ applied: true, restored: true, baselineRan: true, baselineGreen: true, mutantRan: true, mutantGreen: false, killedBy: [`${TEST} > refuses a dot name`] });
+      writeFileSync(join(ctx.root, SRC), 'garbage\n'); // the probe "restored", but the file is not the fixed content
+      const v = await runRevertRedCheck({ checkout: ctx.root, base: ctx.base, mode: 'warn', probe: liar });
+      expect(v).toMatchObject({ status: 'unproven', reason: 'not-restored' });
+      expect(existsSync(join(ctx.root, '.git', REVERT_JOURNAL))).toBe(true);
+    });
   });
 });

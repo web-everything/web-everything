@@ -26,7 +26,7 @@ import { dirname, join, sep } from 'node:path';
 
 import { laneGitHardeningEnv, hardenLaneGitArgs } from './lane-git-hardening.mjs';
 import { DEFAULT_ADMISSION_CEILING_MS } from '../readiness/heavy-admission.mjs';
-import { planRevert, newTestTitles, changedOutsideNewTests, revertRedVerdict, revertRedGate, formatRevertRed } from './revert-red-rule.mjs';
+import { planRevert, newTestEntries, changedOutsideNewTests, revertRedVerdict, revertRedGate, formatRevertRed } from './revert-red-rule.mjs';
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
@@ -99,6 +99,7 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
   try { currentHead = run(['rev-parse', 'HEAD']).trim(); } catch { /* unreadable → treated as moved */ }
   const restored = [];
   const leftAlone = [];
+  const unverified = [];
   try {
     for (const entry of files) {
       const file = String(entry?.path ?? '');
@@ -108,16 +109,36 @@ export function recoverRevertRed({ checkout, git, fs = nodeFs } = {}) {
       if (!abs) throw new Error(`unsafe journal path ${JSON.stringify(file)}`);
       let onDisk = null;
       try { onDisk = fs.readFileSync(abs); } catch { onDisk = null; }
-      if (currentHead !== head || !onDisk || sha256(onDisk) !== String(entry?.reverted ?? '')) { leftAlone.push(file); continue; }
+      const diskHash = onDisk ? sha256(onDisk) : '';
       const bytes = run(['show', `${head}:${file}`], { buffer: true });
+      // A restore that stopped part-way leaves a proper prefix of the fixed bytes (an empty file included): the only way
+      // this code ever writes such a thing, so it is the one damage put back from git rather than refused.
+      const truncated = Boolean(onDisk) && onDisk.length < bytes.length && Buffer.from(bytes).subarray(0, onDisk.length).equals(Buffer.from(onDisk));
+      if (currentHead !== head) {
+        // Someone committed since. Their work is theirs — unless the file still holds half a restore, which a later
+        // `git add -A` would commit as source.
+        if (truncated && diskHash !== sha256(run(['show', `HEAD:${file}`], { buffer: true }))) unverified.push(file);
+        else leftAlone.push(file);
+        continue;
+      }
+      // Already the fixed content (by hash): the restore is verified, nothing to do.
+      if (onDisk && diskHash === sha256(bytes)) { leftAlone.push(file); continue; }
+      // Neither the reverted bytes this run wrote nor the fixed ones nor half of them: an edit made while the lane was
+      // still reverted. It is never overwritten and never discarded: the journal is KEPT, and nothing proceeds on this tree
+      // until the file holds the fixed content (or a commit moves HEAD past the journal).
+      if (!truncated && (!onDisk || diskHash !== String(entry?.reverted ?? ''))) { unverified.push(file); continue; }
       fs.writeFileSync(abs, bytes);
-      if (!Buffer.from(fs.readFileSync(abs)).equals(Buffer.from(bytes))) throw new Error(`re-read of ${file} differs`);
+      if (sha256(fs.readFileSync(abs)) !== sha256(bytes)) throw new Error(`re-read of ${file} differs`);
       restored.push(file);
+    }
+    if (unverified.length) {
+      return { pending: true, ok: false, restored, leftAlone, unverified,
+        detail: `${unverified.join(', ')} hold neither the fixed content nor the reverted content (a restore that stopped part-way?); the revert journal is kept — put the file back from git or commit it` };
     }
     fs.unlinkSync(path);
     return { pending: true, ok: true, restored, leftAlone };
   } catch (e) {
-    return { pending: true, ok: false, restored, leftAlone, detail: String(e?.message ?? e) };
+    return { pending: true, ok: false, restored, leftAlone, unverified, detail: String(e?.message ?? e) };
   }
 }
 
@@ -234,7 +255,8 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
   try {
     for (const file of plan.tests) {
       const diffText = run(['diff', '-U0', baseSha.value, headSha.value, '--', file]);
-      titles[file] = newTestTitles(addedLines(diffText));
+      // The file as the fix left it, so each new test gets its suite-qualified identity (two tests may share a leaf title).
+      titles[file] = newTestEntries({ headSource: run(['show', `${headSha.value}:${file}`]), diffText });
       // Existing tests changed next to the new ones: their titles are not in `titles`, so the verdict must hear of them.
       changedExisting[file] = changedOutsideNewTests(diffText);
     }
@@ -262,14 +284,17 @@ export async function runRevertRedCheck({ checkout, base, head = 'HEAD', mode, k
   } catch {
     return fail('journal-unwritable');
   }
+  // WHETHER the files are back is read off the disk (by content hash), never assumed from a throw or from the probe's word.
+  const isIntact = () => targets.every((t) => { try { return sha256(fs.readFileSync(join(checkout, t.target))) === sha256(Buffer.from(t.fixed, 'utf8')); } catch { return false; } });
   let result;
   try {
     result = await probe({ cwd: checkout, targets, suite: plan.tests.map((f) => `./${f}`) });
+    // A probe that says it restored, over a tree that does not hold the fixed content, did not: the journal must stay.
+    if (result?.applied !== false && result?.restored === true && !isIntact()) result = { ...result, restored: false, detail: `${result.detail ?? ''} the restore was not verified on disk`.trim() };
   } catch (error) {
-    // The probe restores in its own `finally`; an error escaping it still never reads as a pass. WHETHER the files are
-    // back is read off the disk, not assumed from the throw: a probe that died before (or after) touching anything left
-    // the fixed content in place, and calling that "not restored" turns a warn-mode result red for no reason.
-    const isIntact = () => targets.every((t) => { try { return fs.readFileSync(join(checkout, t.target), 'utf8') === t.fixed; } catch { return false; } });
+    // The probe restores in its own `finally`; an error escaping it still never reads as a pass. A probe that died before
+    // (or after) touching anything left the fixed content in place, and calling that "not restored" turns a warn-mode
+    // result red for no reason.
     let intact = isIntact();
     // Not back: put the fixed content back from git now (the journal names exactly these files), rather than leaving the
     // reverted tree for the next verify to find.
