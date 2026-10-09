@@ -116,6 +116,11 @@ export function writeLocalIdentity(gitDir) {
   git(['config', 'user.name', 'Ops Harness'], { cwd: gitDir });
   git(['config', 'commit.gpgsign', 'false'], { cwd: gitDir });
   git(['config', 'tag.gpgsign', 'false'], { cwd: gitDir });
+  // The `-c gc.auto=0` in IDENTITY_FLAGS only covers OUR git calls. The code under test runs un-injected git
+  // (fetch/commit/push) in this repo, and that can detach a `gc --auto` that is still writing into
+  // `.git/objects` when the fixture's `finally` cleanup runs (ENOTEMPTY, seen on main @ b751cfac0 under load).
+  git(['config', 'gc.auto', '0'], { cwd: gitDir });
+  git(['config', 'maintenance.auto', 'false'], { cwd: gitDir });
 }
 
 /** Write `files` (a map of repo-relative path → content), stage exactly those paths, and commit. */
