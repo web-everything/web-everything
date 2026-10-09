@@ -13,15 +13,15 @@ Held item 168: the fix-daemon rebuild kept conflict-dropping overlays (#4527, #4
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit -- <tests>` (we:scripts/lib/__tests__/settings-files.test.mjs, we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs, we:scripts/conveyor/health-smells/__tests__/overlay-dropped.test.mjs) fails on main (legacy file holds 4 push-on-green keys; no retry pass; no smell) and passes after.
-- [A2] Settings: one reader (we:scripts/lib/settings-files.mjs) merges the legacy we:scripts/dispatch-settings.json and every we:scripts/settings/*.json; a new key in the legacy file, or one leaf owned by two files, fails the layout test. Resolved values are unchanged.
+- [A1] **Executable** — `npm run test:unit -- <tests>` (we:scripts/lib/__tests__/settings-files.test.mjs, we:scripts/lib/__tests__/daemon-rebuild-retry-pass.test.mjs, we:scripts/conveyor/health-smells/__tests__/overlay-dropped.test.mjs) fails on main (no per-feature reader or legacy-key guard; no retry pass; no smell) and passes after.
+- [A2] Settings: one reader (we:scripts/lib/settings-files.mjs) merges the legacy we:scripts/dispatch-settings.json and every we:scripts/settings/*.json; the legacy file is left byte-identical and its current keys are frozen: a new key there, or one leaf owned by two files, fails the layout test. Resolved values are unchanged.
 - [A3] Rebuild: a conflict-dropped overlay is retried once, plain merge only, on the final tip; a still-conflicting one stays dropped. The adoption verifier accepts the retried chain. No merge-gate guard changes.
 - [A4] Smell `overlay-dropped` (high): fires for a registered overlay absent from the adopted build, names the PR and conflicting files, and says settings-only (move keys) vs code conflict (PR must rebase). Live fixture 2026-10-09.
 - [A5] Live: on wev-fix-daemon, #4527 and #4560 are both ancestors of HEAD after this lands on the edge.
 
 ## Non-goals
 
-- [N1] Not moving every legacy key out: the remaining legacy keys stay so open PRs that branched from that file still merge. Migrating the other readers (we:scripts/lib/dispatch-throttle.mjs, the main-red freeze reader) is a follow-up.
+- [N1] Not moving existing legacy keys out: any edit to the shared file conflicts with some open PR (live: #4527 was rebased onto the push-on-green keys mid-change). Moving them, and switching the other readers (we:scripts/lib/dispatch-throttle.mjs, the main-red freeze reader) to the merged reader, is a follow-up for a window when no open PR touches the file.
 - [N2] No JSON-aware merge driver: the retry pass only re-runs the plain merge.
 
 ## Edge cases this change must handle
