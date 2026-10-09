@@ -4,12 +4,13 @@
  *   the clone's HEAD. Replays the live capture of 2026-10-09 01:07 ET (fixture: lane/main-red-owner, PR #4527,
  *   conflict-dropped on scripts/dispatch-settings.json while six other overlays applied) plus synthetic edges.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import overlayDropped, { droppedOverlays, resolveOverlayDroppedSettings, OVERLAY_DROPPED_BUILT_IN } from '../overlay-dropped.mjs';
 import { MINUTE } from '../../health-watch-core.mjs';
+import { LEGACY_ONLY_READERS } from '../../../lib/settings-files.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const live = JSON.parse(readFileSync(join(HERE, 'fixtures/overlay-dropped-2026-10-09.json'), 'utf8'));
@@ -31,6 +32,28 @@ describe('overlay-dropped — live replay 2026-10-09', () => {
     expect(r.summary).toMatch(/PR #4527/);
     expect(r.summary).toMatch(/scripts\/dispatch-settings\.json/);
     expect(r.recommendation).toMatch(/scripts\/settings\/<feature>\.json/);
+  });
+
+  it('never tells a maintainer to move keys whose reader still reads only the legacy file', () => {
+    const { recommendation } = rows[0];
+    expect(recommendation).toMatch(/rebase/);
+    expect(recommendation).toMatch(/do not move/i);
+    for (const reader of LEGACY_ONLY_READERS) expect(recommendation).toContain(reader);
+    expect(recommendation).toMatch(/readSettings\(\)/);
+  });
+
+  it('a conflict in a feature settings file (not the legacy one) just says rebase', () => {
+    const c = {
+      cloneKey: 'k', rebuild: { adopted: { applied: [], head: 'h' } },
+      alerts: [
+        { at: NOW - MINUTE, kind: 'overlay-conflict-unresolved', detail: { ref: 'lane/f', pr: 3, files: ['scripts/settings/x.json'] } },
+        { at: NOW - MINUTE, kind: 'overlay-conflict-dropped', detail: { ref: 'lane/f' } },
+      ],
+    };
+    const [r] = overlayDropped.evaluate({ selfSync: [c] }, { now: NOW });
+    expect(r.measure.settingsOnly).toBe(true);
+    expect(r.recommendation).toMatch(/rebase/);
+    expect(r.recommendation).not.toContain(LEGACY_ONLY_READERS[0]);
   });
 
   it('never flags an applied overlay or one the rebuild unregistered (merged)', () => {
@@ -82,5 +105,40 @@ describe('overlay-dropped — rule edges', () => {
     expect(resolveOverlayDroppedSettings({ overlayDropped: { freshMinutes: 'x' } }).freshMinutes).toBe(OVERLAY_DROPPED_BUILT_IN.freshMinutes);
     expect(resolveOverlayDroppedSettings(null).freshMinutes).toBe(30);
     expect(overlayDropped.freshMs).toBe(30 * MINUTE);
+  });
+
+  it('settings: the module reads the merged settings at load (a non-default window is honoured)', async () => {
+    vi.resetModules();
+    vi.doMock('../../../lib/settings-files.mjs', async (orig) => ({
+      ...(await orig()),
+      readSettings: () => ({ overlayDropped: { freshMinutes: 77 } }),
+    }));
+    try {
+      const mod = await import('../overlay-dropped.mjs');
+      expect(mod.default.freshMs).toBe(77 * MINUTE);
+      // behaviour around that configured cutoff: a drop 60 min old is still fresh under 77, stale under the 30 default
+      const c = { cloneKey: 'k', rebuild: { adopted: { applied: [], head: 'h' } },
+        alerts: [{ at: NOW - 60 * MINUTE, kind: 'overlay-conflict-dropped', detail: { ref: 'lane/w' } }] };
+      expect(mod.default.evaluate({ selfSync: [c] }, { now: NOW })).toHaveLength(1);
+      expect(overlayDropped.evaluate({ selfSync: [c] }, { now: NOW })).toHaveLength(0);
+    } finally {
+      vi.doUnmock('../../../lib/settings-files.mjs');
+      vi.resetModules();
+    }
+  });
+
+  it('settings: an unreadable settings reader falls back to the built-in window', async () => {
+    vi.resetModules();
+    vi.doMock('../../../lib/settings-files.mjs', async (orig) => ({
+      ...(await orig()),
+      readSettings: () => { throw new Error('boom'); },
+    }));
+    try {
+      const mod = await import('../overlay-dropped.mjs');
+      expect(mod.default.freshMs).toBe(30 * MINUTE);
+    } finally {
+      vi.doUnmock('../../../lib/settings-files.mjs');
+      vi.resetModules();
+    }
   });
 });

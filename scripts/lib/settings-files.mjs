@@ -45,16 +45,38 @@ export const LEGACY_SETTINGS_LEAVES = Object.freeze([
   'freeze.mainRed',
 ]);
 
+/**
+ * The scripts that STILL read `scripts/dispatch-settings.json` directly instead of through {@link readSettings}
+ * (backlog xrxmm8e N1: switching them is a follow-up). A key moved out of the legacy file into
+ * `scripts/settings/<feature>.json` is INVISIBLE to these readers — they silently fall back to their built-in
+ * default. So: never move an existing key they own, and a new key only goes in a feature file when its reader
+ * goes through `readSettings`. `settings-files.test.mjs` pins this list against the tree (a new direct reader fails
+ * it; so does a listed one that migrated), and the `overlay-dropped` smell names it in its advice. Shrink this list
+ * as each reader migrates.
+ */
+export const LEGACY_ONLY_READERS = Object.freeze([
+  'scripts/lib/dispatch-throttle.mjs',
+  'scripts/lib/main-red-priority.mjs',
+]);
+
+/** What the legacy-file layout guard tells an author whose new key failed it. */
+export const LEGACY_FILE_GUARD_HINT = 'put a NEW setting in scripts/settings/<feature>.json (overlays conflict-drop on this one shared file) and read it through readSettings() from scripts/lib/settings-files.mjs — a reader that reads scripts/dispatch-settings.json directly (see LEGACY_ONLY_READERS) never sees a feature file';
+
 /** A feature file name: lower-case kebab words, `.json`. */
 export const FEATURE_FILE_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*\.json$/;
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+/** The key a settings file must never write through: `JSON.parse` makes `__proto__` an OWN key, and merging into it
+ *  would reach `Object.prototype`. It is skipped, not merged. (`constructor` / `prototype` are plain own keys here:
+ *  `into.constructor` is a function, never a plain object, so a merge cannot walk through them.) */
+const UNSAFE_KEYS = new Set(['__proto__']);
 
 /** PURE: every leaf path (`a.b.c`) of a plain object. Arrays and scalars are leaves. */
 export function settingsLeaves(obj, prefix = '') {
   if (!isPlainObject(obj)) return [];
   const out = [];
   for (const [k, v] of Object.entries(obj)) {
+    if (UNSAFE_KEYS.has(k)) continue;
     const p = prefix ? `${prefix}.${k}` : k;
     if (isPlainObject(v)) out.push(...settingsLeaves(v, p));
     else out.push(p);
@@ -64,6 +86,7 @@ export function settingsLeaves(obj, prefix = '') {
 
 function deepMerge(into, from) {
   for (const [k, v] of Object.entries(from)) {
+    if (UNSAFE_KEYS.has(k)) continue;
     if (isPlainObject(v) && isPlainObject(into[k])) deepMerge(into[k], v);
     else into[k] = isPlainObject(v) ? deepMerge({}, v) : v;
   }
@@ -77,7 +100,8 @@ function deepMerge(into, from) {
  */
 export function mergeSettingsLayers(layers) {
   const settings = {};
-  const owners = {};
+  // no prototype: a leaf named `toString` / `hasOwnProperty` must not look already owned
+  const owners = Object.create(null);
   const dup = new Map();
   for (const { source, data } of Array.isArray(layers) ? layers : []) {
     if (!isPlainObject(data)) continue;

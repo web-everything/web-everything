@@ -11,14 +11,15 @@
  *   is fresh (within `freshMs`: the rebuild re-logs it every attempt while it stays registered), is newer than any
  *   `overlay-auto-dropped` (unregistered: merged / closed / gone), and the adopted build's `applied` list — what the
  *   clone's HEAD carries — does not name it. The sign names the overlay, its PR and the conflicting files.
- *   A conflict only in JSON settings files is a SHARED-SETTINGS conflict (move the overlay's keys to its own
- *   `scripts/settings/<feature>.json`); anything else is a real code conflict and the PR must rebase.
+ *   A conflict only in JSON settings files is a SHARED-SETTINGS conflict: the PR rebases, and existing keys are NOT
+ *   moved (readers in `LEGACY_ONLY_READERS` read only the legacy file); a NEW key whose reader goes through
+ *   `readSettings()` goes in its own `scripts/settings/<feature>.json`. Anything else is a real code conflict and the PR must rebase.
  *
  * SETTINGS: `we:scripts/settings/overlay-dropped.json` `overlayDropped.freshMinutes` (built-in 30), read through
  *   `we:scripts/lib/settings-files.mjs`.
  */
 import { MINUTE, fmtAge } from '../health-watch-core.mjs';
-import { readSettings } from '../../lib/settings-files.mjs';
+import { readSettings, LEGACY_ONLY_READERS } from '../../lib/settings-files.mjs';
 
 export const OVERLAY_DROPPED_BUILT_IN = Object.freeze({ freshMinutes: 30 });
 
@@ -33,6 +34,17 @@ try { settings = resolveOverlayDroppedSettings(readSettings()); } catch { /* bui
 
 const DROP_KINDS = new Set(['overlay-conflict-dropped', 'pinned-overlay-conflict-skipped']);
 const isSettingsFile = (f) => /\.json$/.test(f) && /(^|\/)(settings\/[^/]+|[^/]*settings[^/]*)\.json$/.test(f);
+
+/**
+ * PURE: the advice for a settings-only conflict. The fix is always a rebase. Moving keys out of the legacy file is
+ * offered ONLY for a NEW key whose reader goes through `readSettings`: the readers in `LEGACY_ONLY_READERS` read
+ * the legacy file alone, so a key moved from it into a feature file silently falls back to their default.
+ */
+function settingsConflictAdvice(d, files) {
+  const legacy = d.files.some((f) => /(^|\/)scripts\/dispatch-settings\.json$|^dispatch-settings\.json$/.test(f));
+  if (!legacy) return `Settings conflict on ${files}: rebase ${d.ref} onto main; the next rebuild re-applies it. Never hand-edit the clone.`;
+  return `Shared-settings conflict on ${files}: rebase ${d.ref} onto main; the next rebuild re-applies it. Do NOT move existing keys out of scripts/dispatch-settings.json — ${LEGACY_ONLY_READERS.join(', ')} read only that file and would silently fall back to their defaults. Only a NEW key whose reader goes through readSettings() (scripts/lib/settings-files.mjs) belongs in its own scripts/settings/<feature>.json. Never hand-edit the clone.`;
+}
 
 /**
  * PURE: the dropped overlays of one clone.
@@ -83,7 +95,7 @@ export default {
   severity: 'high',
   action: 'alert',
   freshMs: settings.freshMinutes * MINUTE,
-  recommendationHint: 'A registered overlay is not in the daemon clone\'s HEAD — the rebuild conflict-dropped it, so its live fix is off the daemon. Settings-only conflict: move the keys to scripts/settings/<feature>.json. Code conflict: the PR must rebase. Never hand-edit the clone.',
+  recommendationHint: 'A registered overlay is not in the daemon clone\'s HEAD — the rebuild conflict-dropped it, so its live fix is off the daemon. The PR must rebase onto main (settings-only conflict too: do not move existing keys out of scripts/dispatch-settings.json — some readers see only that file; a NEW key whose reader uses readSettings() goes in scripts/settings/<feature>.json). Never hand-edit the clone.',
   evaluate({ selfSync }, { now }) {
     const rows = [];
     for (const c of selfSync || []) {
@@ -100,7 +112,7 @@ export default {
           },
           summary: `overlay ${d.ref}${pr} is registered on clone ${c.cloneKey} but not in its HEAD — the rebuild dropped it ${fmtAge(now - d.droppedAt)} ago (conflict on ${files}); its fix is off the daemon.`,
           recommendation: d.settingsOnly
-            ? `Shared-settings conflict on ${files}: move ${d.ref}'s keys into its own scripts/settings/<feature>.json (read by scripts/lib/settings-files.mjs) and rebase the PR; the next rebuild adopts it. Never hand-edit the clone.`
+            ? settingsConflictAdvice(d, files)
             : `Real code conflict on ${files}: ${d.ref}${pr} must rebase onto main; the next rebuild re-applies it. Never hand-edit the clone. History: ~/.claude/daemon-self-sync-state/${c.cloneKey}.alerts.jsonl.`,
         });
       }

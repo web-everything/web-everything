@@ -7,10 +7,10 @@
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import {
   mergeSettingsLayers, readDeclaredSettings, readSettings, settingsLeaves,
-  LEGACY_SETTINGS_LEAVES, LEGACY_SETTINGS_PATH, SETTINGS_DIR, FEATURE_FILE_RE,
+  LEGACY_SETTINGS_LEAVES, LEGACY_SETTINGS_PATH, SETTINGS_DIR, FEATURE_FILE_RE, LEGACY_ONLY_READERS, LEGACY_FILE_GUARD_HINT,
 } from '../settings-files.mjs';
 import { resolveFixerSlotSettings } from '../../conveyor/fixer-slot-rules.mjs';
 import { readCostAdmissionSettings } from '../cost-admission-facts.mjs';
@@ -34,6 +34,25 @@ describe('mergeSettingsLayers — pure', () => {
     ]);
     expect(settings.x.y).toBe(2);
     expect(duplicates).toEqual([{ path: 'x.y', sources: ['settings/a.json', 'settings/b.json'] }]);
+  });
+
+  it('never lets a settings file write onto Object.prototype (__proto__ / constructor / prototype keys)', () => {
+    const data = JSON.parse('{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted2":"yes"}},"ok":{"v":1}}');
+    const { settings, owners } = mergeSettingsLayers([{ source: 'settings/x.json', data }]);
+    expect({}.polluted).toBeUndefined();
+    expect({}.polluted2).toBeUndefined();
+    expect(Object.getPrototypeOf(settings)).toBe(Object.prototype);
+    expect(Object.keys(settings).sort()).toEqual(['constructor', 'ok']);
+    expect(Object.keys(owners).sort()).toEqual(['constructor.prototype.polluted2', 'ok.v']);
+    expect(settingsLeaves(data).sort()).toEqual(['constructor.prototype.polluted2', 'ok.v']);
+  });
+
+  it('a leaf named like an Object.prototype member is not a false duplicate', () => {
+    const { duplicates } = mergeSettingsLayers([
+      { source: 'settings/a.json', data: { toString: 1 } },
+      { source: 'settings/b.json', data: { hasOwnProperty: 2 } },
+    ]);
+    expect(duplicates).toEqual([]);
   });
 
   it('skips non-object layers and never mutates its inputs', () => {
@@ -83,7 +102,32 @@ describe('the real layout (we:scripts/settings/ + legacy dispatch-settings.json)
   it('the legacy shared file holds only its frozen keys — a new setting goes in scripts/settings/<feature>.json', () => {
     const leaves = settingsLeaves(JSON.parse(readFileSync(LEGACY_SETTINGS_PATH, 'utf8')));
     const extra = leaves.filter((l) => !LEGACY_SETTINGS_LEAVES.includes(l));
-    expect(extra, `new keys in scripts/dispatch-settings.json: ${extra.join(', ')} — put them in scripts/settings/<feature>.json instead (overlays conflict-drop on this one shared file)`).toEqual([]);
+    expect(extra, `new keys in scripts/dispatch-settings.json: ${extra.join(', ')} — ${LEGACY_FILE_GUARD_HINT}`).toEqual([]);
+  });
+
+  it('names every script that still reads the legacy file directly (those readers never see scripts/settings/)', () => {
+    const root = join(SETTINGS_DIR, '..', '..');
+    const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const direct = [];
+    const walk = (dir) => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.name === 'node_modules' || e.name === '__tests__') continue;
+        const p = join(dir, e.name);
+        if (e.isDirectory()) walk(p);
+        else if (/\.(mjs|cjs|js)$/.test(e.name)) {
+          const rel = relative(root, p).split(sep).join('/');
+          if (rel === 'scripts/lib/settings-files.mjs') continue;
+          if (/['"`][^'"`\n]*dispatch-settings\.json['"`]|defaultDispatchSettingsPath/.test(stripComments(readFileSync(p, 'utf8')))) direct.push(rel);
+        }
+      }
+    };
+    walk(join(root, 'scripts'));
+    expect(direct.sort(), 'a script reads scripts/dispatch-settings.json directly: read it through readSettings() (scripts/lib/settings-files.mjs) or list it in LEGACY_ONLY_READERS').toEqual([...LEGACY_ONLY_READERS].sort());
+  });
+
+  it('the legacy-file guard message does not promise that every reader sees scripts/settings/', () => {
+    expect(LEGACY_FILE_GUARD_HINT).toMatch(/readSettings/);
+    expect(LEGACY_FILE_GUARD_HINT).toMatch(/LEGACY_ONLY_READERS/);
   });
 
   it('the merged read resolves the same values as the single-file read did', () => {
