@@ -20,6 +20,12 @@
  * SETTINGS: `scripts/settings/merge-queue.json` (`mergeQueue`, `mergeFreshness`), read through
  *   we:scripts/lib/settings-files.mjs. Built-in defaults are OFF = today. Env `WE_DRAIN_MERGE_QUEUE=off` forces
  *   both off (emergency switch). Inside a test run (VITEST / WE_UNDER_TEST) the live file is not read.
+ *
+ * RE-TEST MODE (`mergeFreshness.retestMode`, operator go 2026-10-09 16:35 ET): `any-code` = the middle ground (any
+ *   code main gained since the PR's base forces a refresh); `affected` (default) = only code that can reach the PR
+ *   does (we:scripts/lib/merge-queue-affected.mjs: same files, direct imports either way, the gate itself, CI and
+ *   test infra). Layers: built-in default → the settings file → env `WE_MERGE_QUEUE_RETEST_MODE` (tool override).
+ *   Each judged PR logs one `merge-queue · retest: {...}` line (stderr, so it reaches the daemon log under --json).
  */
 import { readFileSync, mkdirSync } from 'node:fs';
 import { readGit } from './proc-read.mjs';
@@ -30,6 +36,8 @@ import { readMainRedPriority } from './main-red-priority.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
+import { RETEST_MODES, DEFAULT_RETEST_MODE, readAffectedFacts } from './merge-queue-affected.mjs';
+import { isUnderTest } from './under-test.mjs';
 
 export const MERGE_QUEUE_OFF_ENV = 'WE_DRAIN_MERGE_QUEUE';
 /** Env: a JSON settings file read INSTEAD of the declared files (always honoured — this is how a test arms the hook). */
@@ -37,6 +45,8 @@ export const MERGE_QUEUE_SETTINGS_FILE_ENV = 'WE_MERGE_QUEUE_SETTINGS_FILE';
 /** Env: a main-red-priority record file read INSTEAD of the coordination root's (always honoured, like the settings
  *  file above — inside a test run `readMainRedPriority` is otherwise hermetic and reads nothing). */
 export const MERGE_QUEUE_MAIN_FIX_FILE_ENV = 'WE_MERGE_QUEUE_MAIN_FIX_FILE';
+/** Env: the re-test mode, overriding the settings file (`any-code` | `affected`). */
+export const MERGE_QUEUE_RETEST_MODE_ENV = 'WE_MERGE_QUEUE_RETEST_MODE';
 /** GitHub caps: compare returns at most 300 files; the PR files endpoint at most 3000. */
 export const COMPARE_FILES_CAP = 300;
 export const PR_FILES_CAP = 3000;
@@ -75,6 +85,14 @@ export function loadMergeQueueSettings({ file, env = process.env } = {}) {
   if (freshness.nonCodePaths !== undefined && !(Array.isArray(freshness.nonCodePaths) && freshness.nonCodePaths.every((p) => typeof p === 'string' && p))) {
     errors.push('mergeFreshness: nonCodePaths must be a list of non-empty path strings');
     freshness.nonCodePaths = [...DEFAULT_NON_CODE_PATHS];
+  }
+  const modeEnv = String(env?.[MERGE_QUEUE_RETEST_MODE_ENV] ?? '').trim();
+  if (modeEnv) freshness.retestMode = modeEnv;
+  freshness.retestMode ??= DEFAULT_RETEST_MODE;
+  if (!RETEST_MODES.includes(freshness.retestMode)) {
+    // Fail toward MORE re-testing: an unknown mode is today's middle ground, never the looser one.
+    errors.push(`mergeFreshness: retestMode must be one of ${RETEST_MODES.join(', ')} (got ${JSON.stringify(freshness.retestMode)}); using any-code`);
+    freshness.retestMode = 'any-code';
   }
   if (String(env?.[MERGE_QUEUE_OFF_ENV] ?? '').trim().toLowerCase() === 'off') { queue.enabled = false; freshness.enabled = false; }
   return { queue, freshness, errors };
@@ -138,7 +156,7 @@ export function requiredCheckFact(runs, headSha) {
  * the fact null / incomplete, which the rule turns into `facts-incomplete` (fail closed, refuse).
  * @returns {{pr: object, main: object, errors: string[]}}
  */
-export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredCheck = 'test', defaultBranch = 'main', gh }) {
+export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredCheck = 'test', defaultBranch = 'main', gh, retest }) {
   const slug = repo || '{owner}/{repo}';
   const errors = [];
   const json = (args) => {
@@ -171,7 +189,35 @@ export function readMergeFreshnessFacts({ repo = null, num, headSha, requiredChe
     pr.files = rows.flatMap((f) => [f?.filename, f?.previous_filename]).filter((f) => typeof f === 'string');
     pr.filesComplete = rows.length < PR_FILES_CAP && rows.every((f) => typeof f?.filename === 'string');
   } catch (e) { errors.push(`pr-files: ${firstLine(e)}`); }
-  return { pr, main, errors };
+  const affected = readRetestFacts({ num, pr, main, retest });
+  return affected ? { pr, main, errors, affected } : { pr, main, errors };
+}
+
+/**
+ * The `affected` verdict for one judged PR, or null when the mode is not `affected` or the facts are incomplete
+ * (then the `any-code` rule applies). `retest` = `{mode, nonCodePaths, root?, readAffected?, log?}`; omitted, it is
+ * read from the declared settings — never inside a test run, which must arm it explicitly (no git fetch from a test).
+ */
+export function readRetestFacts({ num, pr, main, retest, env = process.env }) {
+  let r = retest;
+  if (r === undefined) {
+    if (isUnderTest(env)) return null;
+    const s = loadMergeQueueSettings({ env });
+    if (!hookEnabled(s)) return null;
+    r = { mode: s.freshness.retestMode, nonCodePaths: s.freshness.nonCodePaths ?? DEFAULT_NON_CODE_PATHS };
+  }
+  if (!r || r.mode !== 'affected') return null;
+  if (main.complete !== true || pr.filesComplete !== true || !(main.commitsSinceBase > 0)) return null;
+  const read = r.readAffected ?? readAffectedFacts;
+  const verdict = read({ root: r.root, num, headSha: pr.headSha, tipSha: main.tipSha, prFiles: pr.files, mainFiles: main.filesChangedSinceBase,
+    nonCodePaths: r.nonCodePaths ?? DEFAULT_NON_CODE_PATHS });
+  const log = r.log ?? ((line) => process.stderr.write(`${line}\n`));
+  try {
+    log(`merge-queue · retest: ${JSON.stringify({ num: Number(num), mode: 'affected', affected: verdict.affected, reasons: verdict.reasons,
+      mainCommits: main.commitsSinceBase, mainCodeFiles: verdict.mainCodeFiles, prFiles: pr.files.length, ms: verdict.ms ?? null,
+      outcome: verdict.affected ? 're-test (refresh) unless otherwise fresh' : 'no re-test needed: main delta cannot reach this PR' })}`);
+  } catch { /* logging is best-effort */ }
+  return verdict;
 }
 
 function defaultReadTip(laneRef, root) {
@@ -208,15 +254,36 @@ export function mainGainedCode(main, patterns = DEFAULT_NON_CODE_PATHS) {
 export function decideMergeQueueAction({ key, num, facts, nowMs, refreshed = {}, settings }) {
   const freshness = { ...settings.freshness };
   refreshed = liveRefreshed(refreshed, { key, check: facts.pr?.requiredCheck, nowMs, windowMs: (freshness.maxAgeMinutes ?? 0) * 60_000 });
-  const codeMoved = freshness.allowDisjointMainMoves && mainGainedCode(facts.main, freshness.nonCodePaths ?? DEFAULT_NON_CODE_PATHS);
+  // `affected` mode, and the main delta provably cannot reach this PR: its passing run still proves its code. Main's
+  // move is excused like a non-code move (file overlap still refreshes), and so is the pass's age — age only stood in
+  // for "main may have changed under it", which the affected check now answers directly.
+  const unaffected = freshness.retestMode === 'affected' && facts.affected?.affected === false;
+  const codeMoved = !unaffected && freshness.allowDisjointMainMoves && mainGainedCode(facts.main, freshness.nonCodePaths ?? DEFAULT_NON_CODE_PATHS);
   if (codeMoved) freshness.allowDisjointMainMoves = false; // disjointness only excuses non-code moves
+  if (unaffected) { freshness.allowDisjointMainMoves = true; freshness.maxAgeMinutes = Infinity; }
   const [row] = planQueue({
     queue: [{ key, num, ...facts.pr }], main: () => facts.main, nowMs, refreshed,
     // The queue order is applied by the drain's own cascade (and `prioritizeMainFix`); here the candidate IS the head.
     queueSettings: { ...settings.queue, batchSize: 1 }, freshnessSettings: freshness,
   });
-  const reasons = codeMoved && row.reasons.includes('base-behind-main') ? ['main-gained-code', ...row.reasons] : row.reasons;
+  let reasons = codeMoved && row.reasons.includes('base-behind-main') ? ['main-gained-code', ...row.reasons] : row.reasons;
+  const why = (facts.affected?.reasons ?? []).map((r) => `${facts.affected.affected ? 'affected' : 'unaffected'}:${r}`);
+  if (freshness.retestMode === 'affected' && why.length && (unaffected ? row.action === 'merge' : codeMoved)) reasons = [...reasons, ...why];
+  if (unaffected && row.action === 'merge') reasons = ['retest-skipped', ...reasons.filter((r) => r !== 'fresh')];
   return { action: row.action, reasons };
+}
+
+/**
+ * PURE. The skip kind for a merge-queue skip reason (`merge-queue: <action> (<reasons>)…`), or null when the reason
+ * is not the merge queue's. Ready for we:scripts/lib/drain-skip-reasons.mjs `classifySkipReason` (wiring is a
+ * follow-up: that file is held by open PRs), so these skips stop reading `unrecognized-reason`.
+ */
+export function classifyMergeQueueSkip(reason) {
+  const m = /^merge-queue: (refresh|wait|refuse|queued)\b(.*)$/s.exec(String(reason ?? ''));
+  if (!m) return null;
+  if (m[1] === 'refuse' && /facts-incomplete/.test(m[2])) return /gh-throttle|rate limit/i.test(m[2]) ? 'merge-queue-gh-throttled' : 'merge-queue-facts-incomplete';
+  if (m[1] === 'refresh' && /\bfailed: /.test(m[2])) return 'merge-queue-refresh-failed';
+  return `merge-queue-${m[1]}`;
 }
 
 /**

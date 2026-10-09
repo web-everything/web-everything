@@ -68,6 +68,21 @@ export function resolveSpecifier(fromFile, spec, fileSet) {
 }
 
 /**
+ * The FORWARD edges of one file: the tracked files `text` (the content of `fromFile`) imports, resolved against
+ * `fileSet`. The same parse the reverse graph uses, so both directions agree (the drain's `affected` re-test rule,
+ * we:scripts/lib/merge-queue-affected.mjs, reads it). Pure.
+ * @returns {string[]}
+ */
+export function resolvedImportsOf(fromFile, text, fileSet) {
+  const out = new Set();
+  for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
+    const target = resolveSpecifier(fromFile, m[1] ?? m[2] ?? m[3] ?? m[4], fileSet);
+    if (target && target !== fromFile) out.add(target);
+  }
+  return [...out];
+}
+
+/**
  * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files (a tracked file deleted in the
  * working tree, whose imports are gone with it) are skipped. Only source files are READ for imports, but any tracked
  * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.
@@ -80,9 +95,7 @@ export function buildReverseImportGraph({ files, readFile }) {
   for (const file of sources) {
     let text;
     try { text = String(readFile(file)); } catch { continue; }
-    for (const m of text.matchAll(SPECIFIER_RE)) {
-      const target = resolveSpecifier(file, m[1] ?? m[2] ?? m[3] ?? m[4], fileSet);
-      if (!target || target === file) continue;
+    for (const target of resolvedImportsOf(file, text, fileSet)) {
       if (!reverse.has(target)) reverse.set(target, new Set());
       reverse.get(target).add(file);
     }
