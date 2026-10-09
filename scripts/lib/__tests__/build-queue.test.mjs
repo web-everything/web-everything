@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync, statSync, utimesSync, existsSync } from 'node:fs';
+import { buildQueueCacheFile } from '../build-queue-cache.mjs';
+import { SETTINGS_DIR, readSettings } from '../settings-files.mjs';
+import { DELIVERY_PRIORITY_SETTINGS_PATH } from '../../conveyor/delivery-priority-shadow.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,19 +17,36 @@ const enforce = (items) => orderQueueDetailed(items, DEFAULT_CONFIG, NOW, { prio
 
 describe('build queue priority settings cascade', () => {
   it('layers mode ownership while preserving other platform preferences', () => {
-    const platform = { mode: 'shadow', agingHours: 8 };
+    // agingHours is deliberately NOT the default (8): losing the platform preference must turn this test red.
+    const platform = { mode: 'shadow', agingHours: 12 };
     const tool = { mode: 'enforce' };
     expect(resolveBuildQueuePrioritySettings()).toMatchObject({ mode: 'off', source: 'default' });
-    expect(resolveBuildQueuePrioritySettings({ platform })).toMatchObject({ mode: 'shadow', source: 'platform' });
+    expect(resolveBuildQueuePrioritySettings({ platform })).toMatchObject({ mode: 'shadow', source: 'platform', agingHours: 12 });
     expect(resolveBuildQueuePrioritySettings({ platform, tool })).toMatchObject({
-      mode: 'enforce', source: 'tool', agingHours: 8,
+      mode: 'enforce', source: 'tool', agingHours: 12,
     });
     expect(resolveBuildQueuePrioritySettings({ platform, tool, env: { WE_BUILD_QUEUE_PRIORITY_MODE: 'off' } }))
-      .toMatchObject({ mode: 'off', source: 'env', agingHours: 8 });
+      .toMatchObject({ mode: 'off', source: 'env', agingHours: 12 });
     expect(resolveBuildQueuePrioritySettings({ platform, tool, env: { WE_BUILD_QUEUE_PRIORITY_MODE: 'invalid' } }))
-      .toMatchObject({ mode: 'enforce', source: 'tool', agingHours: 8 });
+      .toMatchObject({ mode: 'enforce', source: 'tool', agingHours: 12 });
     expect(resolveBuildQueuePrioritySettings({ platform, tool: { maxLiveP0: 3 } }))
-      .toMatchObject({ mode: 'shadow', source: 'platform', maxLiveP0: 3 });
+      .toMatchObject({ mode: 'shadow', source: 'platform', maxLiveP0: 3, agingHours: 12 });
+  });
+
+  it('lets an invalid mode in a layer fall through to the lower layer, like an invalid env mode', () => {
+    const platform = { mode: 'shadow', agingHours: 12 };
+    // typo'd tool mode: the valid platform mode (and its source) survives, not a silent revert to `off`
+    expect(resolveBuildQueuePrioritySettings({ platform, tool: { mode: 'enforc' } }))
+      .toMatchObject({ mode: 'shadow', source: 'platform', agingHours: 12 });
+    // typo'd platform mode with a valid tool mode: the tool still owns the mode
+    expect(resolveBuildQueuePrioritySettings({ platform: { mode: 'shaddow', agingHours: 12 }, tool: { mode: 'enforce' } }))
+      .toMatchObject({ mode: 'enforce', source: 'tool', agingHours: 12 });
+    // both layers invalid: the standard default, reported as such
+    expect(resolveBuildQueuePrioritySettings({ platform: { mode: 'x' }, tool: { mode: 7 } }))
+      .toMatchObject({ mode: 'off', source: 'default' });
+    // the sibling keys follow the same rule: an invalid tool value never overrides a valid platform one
+    expect(resolveBuildQueuePrioritySettings({ platform, tool: { mode: 'enforce', agingHours: -1, maxLiveP0: 'many' } }))
+      .toMatchObject({ mode: 'enforce', source: 'tool', agingHours: 12, maxLiveP0: 2 });
   });
 
   it.each([null, false, 'enforce', 4, []])('ignores non-object layers: %j', (layer) => {
@@ -213,6 +233,111 @@ describe('#4355 build-queue --json reads the cleared set through the queue-store
       }
 
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('#4355 build-queue --json clearance through a JIT-number rename (bornAs)', () => {
+  it('keeps the clearance and addedAt of a numbered card the sidecar still holds under its pre-number hash', () => {
+    const root = mkdtempSync(join(tmpdir(), 'bq-4355-bornas-'));
+    try {
+      const dir = join(root, 'backlog');
+      mkdirSync(dir);
+      const base = { kind: 'story', size: 2, status: 'open', dateOpened: '2026-01-01', tags: [] };
+      card(dir, '9201-renumbered.md', { ...base, bornAs: 'x34h6a2' });
+      card(dir, '9202-never-cleared.md', { ...base, priority: 'high' });
+      const stateDir = join(root, 'state');
+      mkdirSync(join(stateDir, '.conveyor'), { recursive: true });
+      const addedAt = new Date(Date.now() - 2 * 3600e3).toISOString();
+      // The sidecar was written BEFORE the drain numbered the card: it holds the hash, never the number 9201.
+      writeFileSync(join(stateDir, '.conveyor', 'queue.json'), JSON.stringify([{ num: 'x34h6a2', addedAt }]));
+      const env = { ...process.env, CONVEYOR_STATE_ROOT: stateDir, WE_BUILD_QUEUE_CACHE: '0' };
+      delete env.CONVEYOR_QUEUE_FILE;
+      delete env.WE_BUILD_QUEUE_PRIORITY_MODE;
+      const run = (...extra) => JSON.parse(execFileSync('node', [BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${dir}`, ...extra], { encoding: 'utf8', env }));
+      const out = run();
+      expect(out.cleared).toBe(1);
+      expect(out.sidecar).toMatchObject({ entries: 1 });
+      const row = out.queue.find((r) => String(r.num) === '9201');
+      expect(row).toMatchObject({ buildQueued: true, queuedAt: addedAt });
+      expect(out.queue.find((r) => String(r.num) === '9202').buildQueued).toBe(false);
+      // the cleared card is the builder's pick even though the uncleared one has a higher delivery class
+      expect(String(run('--next').next.num)).toBe('9201');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('#4355 build-queue --json cache is invalidated by every input the cleared order reads', () => {
+  it('re-reads after a sidecar edit and after a priority-settings edit (cache enabled)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'bq-4355-cache-'));
+    const backlogDir = join(root, 'backlog');
+    const cacheFile = buildQueueCacheFile(backlogDir);
+    const stateDir = join(root, 'state');
+    const queueFile = join(stateDir, '.conveyor', 'queue.json');
+    const touched = [];
+    // utimes on a settings file changes only its mtime (the cache-key input), never its content; restored in finally.
+    const bump = (path, secondsAhead) => {
+      const before = statSync(path);
+      touched.push([path, before.atime, before.mtime]);
+      utimesSync(path, before.atime, new Date(before.mtimeMs + secondsAhead * 1000));
+    };
+    try {
+      mkdirSync(join(stateDir, '.conveyor'), { recursive: true });
+      mkdirSync(backlogDir);
+      const base = { kind: 'story', size: 2, status: 'open', dateOpened: '2026-01-01', tags: [] };
+      card(backlogDir, '9301-first.md', { ...base, value: 5 });
+      card(backlogDir, '9302-second.md', { ...base, value: 1 });
+      const at = new Date().toISOString();
+      writeFileSync(queueFile, '[]');
+      // WE_BUILD_QUEUE_CACHE=1 opts a --backlog-dir fixture run INTO the cache (it is off by default there).
+      const env = { ...process.env, CONVEYOR_STATE_ROOT: stateDir, WE_BUILD_QUEUE_CACHE: '1' };
+      delete env.CONVEYOR_QUEUE_FILE;
+      delete env.WE_BUILD_QUEUE_PRIORITY_MODE;
+      const run = () => JSON.parse(execFileSync('node', [BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${backlogDir}`], { encoding: 'utf8', env }));
+      const cacheKey = () => JSON.parse(readFileSync(cacheFile, 'utf8')).key;
+
+      const first = run();
+      expect(first.cleared).toBe(0);
+      expect(first.queue).toHaveLength(2);
+      const head = String(first.queue[0].num);
+      const firstKey = cacheKey(); // proves the cache path really ran
+
+      // sidecar edit: a cached read would still say cleared 0
+      writeFileSync(queueFile, JSON.stringify([{ num: head, addedAt: at }]));
+      bump(queueFile, 5);
+      const second = run();
+      expect(second.cleared).toBe(1);
+      expect(second.queue.find((r) => String(r.num) === head)).toMatchObject({ buildQueued: true, queuedAt: at });
+      const secondKey = cacheKey();
+      expect(secondKey).not.toBe(firstKey);
+
+      // the tool layer is the merge of several settings files: the key carries the merged value, not one file's mtime
+      expect(secondKey).toContain(JSON.stringify(JSON.stringify(readSettings().buildQueuePriority ?? null)).slice(1, -1));
+
+      // the mode env var is a key input too: flipping it inside the cache window must change the served mode
+      const withMode = (mode) => JSON.parse(execFileSync('node', [BACKLOG_CLI, 'build-queue', '--json', `--backlog-dir=${backlogDir}`], {
+        encoding: 'utf8', env: { ...env, WE_BUILD_QUEUE_PRIORITY_MODE: mode } }));
+      expect(withMode('off')).toMatchObject({ priorityMode: 'off', prioritySource: 'env' });
+      expect(withMode('enforce')).toMatchObject({ priorityMode: 'enforce', prioritySource: 'env' });
+      run(); // re-prime the cache entry under the unset-mode key for the settings checks below
+      expect(cacheKey()).toBe(secondKey);
+
+      // settings edits: each settings file's mtime must be part of the key, so a bump rewrites the cached entry
+      let previousKey = secondKey;
+      for (const [index, path] of [DELIVERY_PRIORITY_SETTINGS_PATH, join(SETTINGS_DIR, 'build-queue-priority.json')].entries()) {
+        if (!existsSync(path)) continue; // an absent file contributes 'none' to the key; nothing to bump
+        bump(path, 10 * (index + 1));
+        expect(run().cleared).toBe(1);
+        const nextKey = cacheKey();
+        expect(nextKey, `bumping ${path} must change the cache key`).not.toBe(previousKey);
+        previousKey = nextKey;
+      }
+    } finally {
+      for (const [path, atime, mtime] of touched.reverse()) { try { utimesSync(path, atime, mtime); } catch { /* best effort */ } }
+      rmSync(cacheFile, { force: true });
       rmSync(root, { recursive: true, force: true });
     }
   });

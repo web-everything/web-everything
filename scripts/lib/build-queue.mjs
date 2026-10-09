@@ -18,7 +18,7 @@
  * pullable, nor block a ready one.
  */
 
-import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './delivery-priority.mjs';
+import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES, PRIORITY_SETTINGS_OFF } from './delivery-priority.mjs';
 
 /** PURE policy cascade: standard defaults → platform preference → tool override → environment. */
 export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) {
@@ -26,8 +26,14 @@ export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) 
   let source = 'default';
   for (const [name, layer] of [['platform', platform], ['tool', tool]]) {
     if (!layer || typeof layer !== 'object' || Array.isArray(layer)) continue;
-    merged = { ...merged, ...layer };
-    if (Object.hasOwn(layer, 'mode')) source = name;
+    // A layer only overrides the keys it sets VALIDLY: a malformed value (a typo'd mode, a negative agingHours)
+    // falls through to the lower layer instead of overriding it and then failing closed to `off`.
+    const checked = resolvePrioritySettings(layer);
+    for (const key of Object.keys(PRIORITY_SETTINGS_OFF)) {
+      if (!Object.hasOwn(layer, key) || checked.invalid.includes(key)) continue;
+      merged = { ...merged, [key]: checked[key] };
+      if (key === 'mode') source = name;
+    }
   }
   if (env && typeof env === 'object' && !Array.isArray(env) &&
       PRIORITY_MODES.includes(env.WE_BUILD_QUEUE_PRIORITY_MODE)) {
