@@ -460,8 +460,10 @@ function attemptHarness() {
     complete: row => completions.push(row.terminal),
   });
   // One hour after `start()`: past the startup grace, inside HEAL_ATTEMPT_MAX_AGE_MS (the age-ceiling tests pass their own `now`).
-  const observe = (id, extra = {}) => observeHealAttempt(id, { dir, now: () => new Date('2026-10-02T01:00:00Z'), isPidAlive: () => false, settle, ...extra });
-  return { dir, owed, lockRoot, comments, published, completions, start, publication, settle, observe };
+  // The harness clock: rows are stamped 2026-10-02, so a poll on the real clock would prune them once they age past SETTLED_ROW_RETENTION_MS.
+  const now = () => new Date('2026-10-02T01:00:00Z');
+  const observe = (id, extra = {}) => observeHealAttempt(id, { dir, now, isPidAlive: () => false, settle, ...extra });
+  return { dir, owed, lockRoot, comments, published, completions, start, publication, settle, observe, now };
 }
 
 describe('xp0lsdi durable crash recovery and restart soak', () => {
@@ -613,7 +615,7 @@ it('xp0lsdi: an ownership refusal cannot be caught as permission to settle someo
 
 describe('PR #3577 review: attempt rows never become a permanent CI-heal barrier', () => {
   const request = () => ({ launchKind: 'ci-heal', headRefOid: captured3373.headRefOid, pr: 3373, sessionSlug: 'ci-heal-3373', probationWorker: agyClaude, cwd: '/scratch' });
-  const unresolved = (h) => pollHealAttempts({ dir: h.dir, observe: h.observe }).filter(r => r.status !== 'resolved');
+  const unresolved = (h) => pollHealAttempts({ dir: h.dir, now: h.now, observe: h.observe }).filter(r => r.status !== 'resolved');
 
   it('a spawn that throws before any process exists settles the attempt as failed, so nothing stays pending', () => {
     const h = attemptHarness();
@@ -623,7 +625,7 @@ describe('PR #3577 review: attempt rows never become a permanent CI-heal barrier
       beginAttempt: (r, o) => beginHealAttempt(r, { ...o, dir: h.dir, now: () => '2026-10-02T00:00:00Z' }),
       failAttempt: (id, detail) => failHealAttempt(id, detail, { dir: h.dir, publish: row => publishHealAttempt(row, h.publication), complete: () => {} }),
     })).toThrow(boom);
-    const [row] = pollHealAttempts({ dir: h.dir, observe: h.observe });
+    const [row] = pollHealAttempts({ dir: h.dir, now: h.now, observe: h.observe });
     expect(row.status).toBe('resolved');
     expect(readHealAttempt(row.attemptId, { dir: h.dir })).toMatchObject({ settled: true, terminal: { outcome: 'executor-failed', pushed: false } });
     expect(unresolved(h)).toEqual([]);
@@ -643,9 +645,9 @@ describe('PR #3577 review: attempt rows never become a permanent CI-heal barrier
       beginAttempt: (r, o) => beginHealAttempt(r, { ...o, dir: h.dir, now: () => '2026-10-02T00:00:00Z' }),
       failAttempt: () => { throw new Error('ambiguous launches must not be settled eagerly'); },
     })).toThrow(/no pid/);
-    const early = () => pollHealAttempts({ dir: h.dir, observe: (id, o) => h.observe(id, { ...o, now: () => new Date('2026-10-02T00:00:30Z') }) });
+    const early = () => pollHealAttempts({ dir: h.dir, now: h.now, observe: (id, o) => h.observe(id, { ...o, now: () => new Date('2026-10-02T00:00:30Z') }) });
     expect(early()[0].status).toBe('unresolved');
-    const late = pollHealAttempts({ dir: h.dir, observe: h.observe });
+    const late = pollHealAttempts({ dir: h.dir, now: h.now, observe: h.observe });
     expect(late[0].status).toBe('resolved');
     expect(late[0].result.outcome).toBe('executor-failed');
     expect(unresolved(h)).toEqual([]);
@@ -676,7 +678,7 @@ describe('PR #3577 round 2 review: CI-heal attempt bookkeeping stays bounded, is
     const h = attemptHarness();
     for (let i = 0; i < 100; i++) h.settle(h.start().attemptId, failed('x'));
     const settle = vi.fn(() => { throw new Error('a settled row must not be settled again'); });
-    const rows = pollHealAttempts({ dir: h.dir, observe: (id, o) => h.observe(id, { ...o, settle }) });
+    const rows = pollHealAttempts({ dir: h.dir, now: h.now, observe: (id, o) => h.observe(id, { ...o, settle }) });
     expect(rows).toHaveLength(100);
     expect(rows.every(r => r.status === 'resolved')).toBe(true);
     expect(settle).not.toHaveBeenCalled();
@@ -701,13 +703,13 @@ describe('PR #3577 round 2 review: CI-heal attempt bookkeeping stays bounded, is
     writeFileSync(rowPath(h, broken), JSON.stringify({ ...strip, pr: 4000 }) + '\n');
     writeFileSync(rowPath(h, garbage), '{broken');
     const warn = vi.fn();
-    const all = pollHealAttempts({ dir: h.dir, observe: h.observe, warn });
+    const all = pollHealAttempts({ dir: h.dir, now: h.now, observe: h.observe, warn });
     expect(all.find(r => r.attemptId === good).status).toBe('resolved');
     expect(all.find(r => r.attemptId === broken)).toMatchObject({ pr: 4000, status: 'unresolved' });
     expect(warn).toHaveBeenCalledTimes(2);
     // the PR-scoped read used by dispatchCiHeal holds only the PR whose row is readable
-    expect(pollHealAttempts({ dir: h.dir, observe: h.observe, pr: 3373, warn }).filter(r => r.status !== 'resolved')).toEqual([]);
-    expect(pollHealAttempts({ dir: h.dir, observe: h.observe, pr: 4000, warn }).filter(r => r.status !== 'resolved')).toHaveLength(1);
+    expect(pollHealAttempts({ dir: h.dir, now: h.now, observe: h.observe, pr: 3373, warn }).filter(r => r.status !== 'resolved')).toEqual([]);
+    expect(pollHealAttempts({ dir: h.dir, now: h.now, observe: h.observe, pr: 4000, warn }).filter(r => r.status !== 'resolved')).toHaveLength(1);
   });
 
   it.each([
