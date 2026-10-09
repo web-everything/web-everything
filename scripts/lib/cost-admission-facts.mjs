@@ -15,7 +15,8 @@
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { defaultDispatchSettingsPath, resolveMemFreeMinPct } from './dispatch-throttle.mjs';
+import { resolveMemFreeMinPct } from './dispatch-throttle.mjs';
+import { readSettings } from './settings-files.mjs';
 import { sampleHost } from './host-sample.mjs';
 import { resolveCostAdmissionSettings } from './cost-admission.mjs';
 import { resolveCollectorRoot, etDayKeyOnly, utcDayKey } from '../operations/telemetry-summary-io.mjs';
@@ -23,10 +24,11 @@ import { resolveCollectorRoot, etDayKeyOnly, utcDayKey } from '../operations/tel
 export const COST_FACTS_TIMEZONE = 'America/New_York';
 export const CLAUDE_SPEND_CACHE_MS = 60_000;
 
-/** Settings from the declared file + env. Never throws. */
-export function readCostAdmissionSettings({ env = process.env, path = defaultDispatchSettingsPath() } = {}) {
+/** Settings from the declared files (we:scripts/lib/settings-files.mjs — legacy dispatch-settings.json + scripts/settings/*.json)
+ *  + env; `path` reads that one file instead (tests). Never throws. */
+export function readCostAdmissionSettings({ env = process.env, path } = {}) {
   let file = null;
-  try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = null; }
+  if (path) { try { file = JSON.parse(readFileSync(path, 'utf8')); } catch { file = null; } } else file = readSettings();
   return resolveCostAdmissionSettings({ env, file });
 }
 

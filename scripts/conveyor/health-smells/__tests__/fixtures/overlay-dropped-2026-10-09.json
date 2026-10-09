@@ -1,0 +1,212 @@
+{
+  "_about": "Live capture 2026-10-09 01:07 ET (held item 168): fix-daemon clone fde6cfdae10394e1 alerts (overlay kinds, 04:50-05:06Z) + adopted build. lane/main-red-owner (PR #4527) is registered but conflict-dropped on scripts/dispatch-settings.json; the other overlays are applied.",
+  "now": "2026-10-09T05:07:00Z",
+  "clone": {
+    "cloneKey": "fde6cfdae10394e1",
+    "alerts": [
+      {
+        "at": "2026-10-09T04:53:48.770Z",
+        "kind": "overlay-conflict-unresolved",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "pr": 4527,
+          "sha": "4830e9bb990e2b5645be389900b2cf0f8966bd0a",
+          "files": [
+            "scripts/dispatch-settings.json"
+          ],
+          "tried": [
+            "replay"
+          ]
+        }
+      },
+      {
+        "at": "2026-10-09T04:53:48.788Z",
+        "kind": "overlay-auto-dropped",
+        "detail": {
+          "ref": "lane/fixer-class-sweep",
+          "reason": "pr-merged"
+        }
+      },
+      {
+        "at": "2026-10-09T04:53:48.789Z",
+        "kind": "overlay-conflict-dropped",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "reason": "conflict"
+        }
+      },
+      {
+        "at": "2026-10-09T04:57:10.706Z",
+        "kind": "overlay-conflict-unresolved",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "pr": 4527,
+          "sha": "4830e9bb990e2b5645be389900b2cf0f8966bd0a",
+          "files": [
+            "scripts/dispatch-settings.json"
+          ],
+          "tried": [
+            "replay"
+          ]
+        }
+      },
+      {
+        "at": "2026-10-09T04:57:10.712Z",
+        "kind": "overlay-conflict-dropped",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "reason": "conflict"
+        }
+      },
+      {
+        "at": "2026-10-09T05:01:35.006Z",
+        "kind": "overlay-conflict-unresolved",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "pr": 4527,
+          "sha": "4830e9bb990e2b5645be389900b2cf0f8966bd0a",
+          "files": [
+            "scripts/dispatch-settings.json"
+          ],
+          "tried": [
+            "replay"
+          ]
+        }
+      },
+      {
+        "at": "2026-10-09T05:01:35.026Z",
+        "kind": "overlay-auto-dropped",
+        "detail": {
+          "ref": "lane/priority-class-s1",
+          "reason": "pr-merged"
+        }
+      },
+      {
+        "at": "2026-10-09T05:01:35.026Z",
+        "kind": "overlay-conflict-dropped",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "reason": "conflict"
+        }
+      },
+      {
+        "at": "2026-10-09T05:03:44.397Z",
+        "kind": "overlay-conflict-unresolved",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "pr": 4527,
+          "sha": "4830e9bb990e2b5645be389900b2cf0f8966bd0a",
+          "files": [
+            "scripts/dispatch-settings.json"
+          ],
+          "tried": [
+            "replay"
+          ]
+        }
+      },
+      {
+        "at": "2026-10-09T05:03:44.399Z",
+        "kind": "overlay-conflict-dropped",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "reason": "conflict"
+        }
+      },
+      {
+        "at": "2026-10-09T05:04:27.864Z",
+        "kind": "overlay-conflict-unresolved",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "pr": 4527,
+          "sha": "4830e9bb990e2b5645be389900b2cf0f8966bd0a",
+          "files": [
+            "scripts/dispatch-settings.json"
+          ],
+          "tried": [
+            "replay"
+          ]
+        }
+      },
+      {
+        "at": "2026-10-09T05:04:27.866Z",
+        "kind": "overlay-conflict-dropped",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "reason": "conflict"
+        }
+      },
+      {
+        "at": "2026-10-09T05:05:59.311Z",
+        "kind": "overlay-conflict-unresolved",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "pr": 4527,
+          "sha": "4830e9bb990e2b5645be389900b2cf0f8966bd0a",
+          "files": [
+            "scripts/dispatch-settings.json"
+          ],
+          "tried": [
+            "replay"
+          ]
+        }
+      },
+      {
+        "at": "2026-10-09T05:05:59.316Z",
+        "kind": "overlay-conflict-dropped",
+        "detail": {
+          "ref": "lane/main-red-owner",
+          "reason": "conflict"
+        }
+      }
+    ],
+    "rebuild": {
+      "adopted": {
+        "head": "7386c79a069348187e9f9efb83c3881baa8d0e39",
+        "inputsKey": "e7083d74187f7216",
+        "mainSha": "2d095d2390192bb48113bd21b39671a748b2c416",
+        "applied": [
+          {
+            "ref": "lane/worker-contract-s3b",
+            "pr": null,
+            "sha": "58166eab0017fecad215740f79fe69bae57489e2"
+          },
+          {
+            "ref": "lane/overlay-dispatch-smoke",
+            "pr": 4481,
+            "sha": "ee9b4e33a2b68318506efc05702aa62d7fa21a20"
+          },
+          {
+            "ref": "lane/lane-protect-unpushed",
+            "pr": 4508,
+            "sha": "87b039b7e5fdb4866ef2a67db95477e9a1358faa"
+          },
+          {
+            "ref": "lane/revert-red-check",
+            "pr": 4535,
+            "sha": "8443f3b68859605d033c4ea62d5a6abdb808505d"
+          },
+          {
+            "ref": "lane/scope-bloat-deadlock",
+            "pr": 4551,
+            "sha": "5490e1d22ffa10561e4844460517783ff1465188"
+          },
+          {
+            "ref": "lane/fixd-supersede-verdict",
+            "pr": 4560,
+            "sha": "bfb65070bf6a1753016b652fe1b2be49e96fef02"
+          }
+        ],
+        "at": "2026-10-09T05:06:02.968Z"
+      }
+    }
+  },
+  "registered": [
+    "lane/worker-contract-s3b",
+    "lane/overlay-dispatch-smoke",
+    "lane/lane-protect-unpushed",
+    "lane/revert-red-check",
+    "lane/main-red-owner",
+    "lane/scope-bloat-deadlock",
+    "lane/fixd-supersede-verdict"
+  ]
+}
