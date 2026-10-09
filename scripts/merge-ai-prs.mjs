@@ -5658,6 +5658,28 @@ async function runCli() {
             holdCouple(carrier, 'carrier', `not merge-fresh (merge-queue); impl half ${repoTag(c.repo)}${c.num} held with it`);
             continue;
           }
+          // Review of #4619 (codex-correctness) — the same applies to every OTHER impl half of this carrier that has not
+          // merged yet: each is gated only at its own turn, so a fresh first half could land and a stale second half
+          // then be refreshed-and-skipped, splitting the couple. Judge them all HERE, before this half merges: any
+          // stale / refused member holds the whole couple (the stale one has been refreshed by its gate).
+          const siblings = !mergeQueueHookEnabled(MERGE_QUEUE) ? [] : coupleStep.ordered.filter((x) => x !== c && isImplHalf(x) && `${x.coupleCarrier.repo || 'cwd'}::${x.coupleCarrier.num}` === ck
+            && !heldThisIteration.has(candKey(x)) && !merged.some((m) => candKey(m) === candKey(x)));
+          let siblingHold = null;
+          for (const sib of siblings) {
+            const sibFresh = await revalidateFresh(sib.repo, sib.num, {
+              requiredCheck: REQUIRED, allowPendingReview: (escalationRelief.prs || []).includes(Number(sib.num)) || (!!escalationRelief.passWide && !!label),
+              defaultBranch: defaultBranchOf(sib.repo), expectedHeadSha: sib.listedHeadSha || sib.headSha || null,
+            });
+            if (sibFresh.decision !== 'merge') { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} would not merge (${sibFresh.reason})` }; break; }
+            if (!(await mergeQueueGate(sib, sibFresh.headSha, { precheck: true }))) { siblingHold = { sib, why: `its impl half ${repoTag(sib.repo)}${sib.num} is not merge-fresh (merge-queue) — refreshed/held` }; break; }
+          }
+          if (siblingHold) {
+            const why = `${siblingHold.why}; the couple lands together later`;
+            holdCouple(c, 'impl', why);
+            for (const s of siblings) holdCouple(s, 'impl', `${s === siblingHold.sib ? 'not merge-fresh' : 'held with it'} (merge-queue); the couple lands together later`);
+            if (carrier) holdCouple(carrier, 'carrier', `impl half ${repoTag(siblingHold.sib.repo)}${siblingHold.sib.num} not merge-fresh (merge-queue); held with it`);
+            continue;
+          }
         }
         // fix-couple-split — carrier: every impl half ordered ahead of it in this group must have merged.
         let carrierImplsLanded = null;
@@ -5673,6 +5695,17 @@ async function runCli() {
         // fix-couple-split residual — the carrier did not land AFTER its impl half(s) did. Two repos cannot merge
         // atomically, so this is reported loudly (JSON `coupleSplit` + stderr), never silently.
         const noteSplit = (why) => {
+          // Review of #4619 — an impl half refused at its OWN turn after a sibling impl half of the same carrier already
+          // merged (a main move between the preflight above and this turn, past the pin) is a split too: report it loudly.
+          if (isImplHalf(c)) {
+            const ck = `${c.coupleCarrier.repo || 'cwd'}::${c.coupleCarrier.num}`;
+            const landedSibs = merged.filter((m) => candKey(m) !== candKey(c) && coupleStep.ordered.some((x) => candKey(x) === candKey(m) && isImplHalf(x) && `${x.coupleCarrier.repo || 'cwd'}::${x.coupleCarrier.num}` === ck));
+            if (landedSibs.length) {
+              coupleSplit.push({ carrier: { num: c.coupleCarrier.num, repo: c.coupleCarrier.repo ?? null }, landedImpls: landedSibs.map((x) => ({ num: x.num, repo: x.repo ?? null })), unlandedImpl: { num: c.num, repo: c.repo ?? null }, reason: why });
+              if (!AS_JSON) process.stderr.write(`  ‼ COUPLE SPLIT: impl half ${repoTag(c.repo)}${c.num} did not land after its sibling impl half ${landedSibs.map((x) => repoTag(x.repo) + x.num).join(', ')} — ${why}\n`);
+            }
+            return;
+          }
           if (!carrierImplsLanded || !carrierImplsLanded.length) return;
           coupleSplit.push({ carrier: { num: c.num, repo: c.repo ?? null }, landedImpls: carrierImplsLanded.map((x) => ({ num: x.num, repo: x.repo ?? null })), reason: why });
           if (!AS_JSON) process.stderr.write(`  ‼ COUPLE SPLIT: ${repoTag(c.repo)}${c.num} (WE carrier) did not land after its impl half ${carrierImplsLanded.map((x) => repoTag(x.repo) + x.num).join(', ')} — ${why}\n`);

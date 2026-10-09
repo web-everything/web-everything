@@ -26,7 +26,14 @@ if (a[0] === 'pr' && a[1] === 'list') out(prs.filter(p => !landed(p.number)));
 if (a[0] === 'pr' && a[1] === 'view') {
   const p = prs.find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
-  out({ ...p, state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? '2026-10-09T00:00:00Z' : null });
+  // MQ_UNKNOWN_FIRST: GitHub is still recomputing mergeability — the FIRST fresh read (the one that carries
+  // mergeStateStatus) of each PR answers UNKNOWN, every later read answers the fixture's real value.
+  const fresh = (a[a.indexOf('--json') + 1] || '').includes('mergeStateStatus');
+  const seen = F + '.fresh-reads-' + p.number;
+  const n = fs.existsSync(seen) ? Number(fs.readFileSync(seen, 'utf8')) : 0;
+  if (fresh) fs.writeFileSync(seen, String(n + 1));
+  const unknown = process.env.MQ_UNKNOWN_FIRST && fresh && n === 0;
+  out({ ...p, ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed(p.number) ? 'MERGED' : 'OPEN', mergedAt: landed(p.number) ? '2026-10-09T00:00:00Z' : null });
 }
 if (a[0] === 'pr' && a[1] === 'merge') { fs.appendFileSync(F + '.attempts', a[2] + '\\n'); fs.writeFileSync(F + '.merged-' + a[2], ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
@@ -52,7 +59,7 @@ if (a[0] === 'diff') process.exit(1);
 process.exit(0);
 `;
 
-function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null }) {
+function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]], mainFixPr = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-'));
   try {
     const bin = join(dir, 'bin');
@@ -88,7 +95,7 @@ function runCli({ hookOn, seedRefreshed = null, ages = [[3001, 5], [3002, 120]],
       env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir,
         // hook OFF = no settings file at all: the built-in default (a test run never reads the live file)
         ...(hookOn ? { WE_MERGE_QUEUE_SETTINGS_FILE: settings } : {}), ...(mainFixPr ? { WE_MERGE_QUEUE_MAIN_FIX_FILE: mainFixFile } : {}),
-        WE_COORDINATION_ROOT: coord },
+        WE_COORDINATION_ROOT: coord, ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const result = JSON.parse(r.stdout.trim().split('\n').at(-1));
@@ -146,6 +153,21 @@ describe('card xs1hdl7 — merge-queue hook wired at the drain merge site', () =
     expect(runCli({ hookOn: true, ages: both, mainFixPr: 3002 }).attempts).toEqual([3002, 3001]);
   }, 60000);
 
+  // Review of #4619 (test-coverage): the UNKNOWN-mergeability retry was only unit-tested as a helper. Through the real
+  // CLI: the fresh pre-merge re-read answers UNKNOWN once (GitHub recomputing after the cascade's own previous merge),
+  // the retry re-reads, and the PR reaches `gh pr merge` instead of being refused on a transient. (3 s retry wait ×1.)
+  it('a transient UNKNOWN mergeability on the fresh pre-merge re-read is re-read and the PR still merges', () => {
+    const { attempts, stderr } = runCli({ hookOn: true, ages: [[3001, 5]], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
+    expect(attempts).toEqual([3001]);
+    expect(stderr).not.toMatch(/mergeable=UNKNOWN/);
+  }, 30000);
+
+  it('control: with the retry off (0) the same UNKNOWN is refused — the test above does exercise the retry', () => {
+    const { attempts, result } = runCli({ hookOn: true, ages: [[3001, 5]], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '0' } });
+    expect(attempts).toEqual([]);
+    expect(JSON.stringify(result)).toMatch(/mergeable=UNKNOWN/);
+  }, 30000);
+
   it('hook OFF (built-in default): both merge exactly as today, no freshness reads', () => {
     const { attempts, api } = runCli({ hookOn: false });
     expect(attempts.sort()).toEqual([3001, 3002]);
@@ -177,7 +199,13 @@ if (a[0] === 'pr' && a[1] === 'view') {
   const s = slugOf(); const p = prsOf(s).find(p => String(p.number) === a[2]);
   if (!p) process.exit(1);
   const landed = fs.existsSync(mark(s, p.number));
-  out({ ...p, state: landed ? 'MERGED' : 'OPEN', mergedAt: landed ? '2026-10-09T00:00:00Z' : null });
+  // MQ_UNKNOWN_FIRST: the first fresh read (carries mergeStateStatus) of each PR answers UNKNOWN, as in the single-repo shim
+  const fresh = (a[a.indexOf('--json') + 1] || '').includes('mergeStateStatus');
+  const seen = F + '.fresh-reads-' + s.replace(/\\//g, '_') + '-' + p.number;
+  const n = fs.existsSync(seen) ? Number(fs.readFileSync(seen, 'utf8')) : 0;
+  if (fresh) fs.writeFileSync(seen, String(n + 1));
+  const unknown = process.env.MQ_UNKNOWN_FIRST && fresh && n === 0;
+  out({ ...p, ...(unknown ? { mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' } : {}), state: landed ? 'MERGED' : 'OPEN', mergedAt: landed ? '2026-10-09T00:00:00Z' : null });
 }
 if (a[0] === 'pr' && a[1] === 'merge') { const s = slugOf(); fs.appendFileSync(F + '.attempts', s + '#' + a[2] + '\\n'); fs.writeFileSync(mark(s, a[2]), ''); process.exit(0); }
 if (a[0] === 'run' && a[1] === 'rerun') { fs.appendFileSync(F + '.reruns', a[2] + '\\n'); process.exit(0); }
@@ -193,14 +221,16 @@ if (a[0] === 'api') {
     out([{ check_runs: [{ id: 7, name: 'test', head_sha: m[2], status: 'completed', conclusion: 'success',
       started_at: at, completed_at: at, details_url: 'https://github.com/o/r/actions/runs/99' + p.number + '/job/1' }] }]);
   }
-  if (/\\/branches\\/main$/.test(path)) out({ sha: 'tip' });
-  if ((m = /compare\\/([0-9a-f]+)\\.\\.\\.tip$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: ['backlog/elsewhere.md'], n: 1 });
+  // MQ_PA_MOVES: once the frontierui half has merged, plateau-app main moves (new tip, code changed) — a third-party merge mid-pass
+  const moved = !!process.env.MQ_PA_MOVES && /plateauapp\\/plateau-app/.test(path) && fs.existsSync(F + '.attempts') && fs.readFileSync(F + '.attempts', 'utf8').includes('frontier-ui/frontierui#501');
+  if (/\\/branches\\/main$/.test(path)) out({ sha: moved ? 'tip2' : 'tip' });
+  if ((m = /compare\\/([0-9a-f]+)\\.\\.\\.(tip2?)$/.exec(path))) out({ base: 'base-' + m[1], ahead: 3, files: [m[2] === 'tip2' ? 'scripts/moved.mjs' : 'backlog/elsewhere.md'], n: 1 });
   if ((m = /pulls\\/(\\d+)\\/files/.exec(path))) out([[{ filename: 'backlog/leaf-' + m[1] + '.md' }]]);
 }
 process.exit(0);
 `;
 
-function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null }) {
+function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null, env: extraEnv = {} }) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-mq-couple-'));
   try {
     const bin = join(dir, 'bin');
@@ -234,7 +264,7 @@ function runCouple({ implPassAges, carrierPassAges, secondImplPassAges = null })
     const r = spawnSync(process.execPath, ['--import', preload, script, `--repos=${LOCAL},${FUI}${secondImplPassAges ? `,${PA}` : ''}`, '--label=ready-to-merge',
       '--no-drain-lease', '--no-red-main-freeze', '--json'], { // reconcile ON: a couple's gate needs the complete open-PR context
       cwd: dir, encoding: 'utf8', timeout: 60000,
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord },
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, MQ_FIXTURE: fixture, MQ_HOME: dir, WE_MERGE_QUEUE_SETTINGS_FILE: settings, WE_COORDINATION_ROOT: coord, ...extraEnv },
     });
     expect(r.error, r.stderr).toBeUndefined();
     const read = (s) => (existsSync(fixture + s) ? readFileSync(fixture + s, 'utf8').trim().split('\n').filter(Boolean) : []);
@@ -267,6 +297,37 @@ describe('review of #4619 — the WE-carrier pre-check keeps a couple together',
     // Pre-check for the first half reads the carrier's pass at 25 min (fresh); by the second half's pre-check it is 31 min old.
     const { attempts, stderr } = runCouple({ implPassAges: [5], secondImplPassAges: [5], carrierPassAges: [25, 31] });
     expect(attempts).toEqual([`${FUI}#501`, `${PA}#601`, `${LOCAL}#4001`]);
+    expect(stderr).not.toMatch(/COUPLE SPLIT/);
+  }, 90000);
+
+  // The carrier pre-check is the other `revalidateFresh` call site: a transient UNKNOWN on every fresh read in the couple
+  // (impl half and carrier) is re-read, and the couple still lands together.
+  it('a transient UNKNOWN on the couple\'s fresh reads (impl half and the carrier pre-check) is re-read and the couple lands', () => {
+    const { attempts } = runCouple({ implPassAges: [5], carrierPassAges: [5], env: { MQ_UNKNOWN_FIRST: '1', WE_DRAIN_UNKNOWN_MERGEABLE_RETRIES: '1' } });
+    expect(attempts).toEqual([`${FUI}#501`, `${LOCAL}#4001`]);
+  }, 90000);
+
+  // Residual (review of #4619): a third-party merge moves a sibling's repo between the preflight and its own turn, past the
+  // pin. Two repos cannot merge atomically, so the split is REPORTED (JSON coupleSplit), never silent.
+  it('a sibling impl half refused at its own turn after the first half landed is reported as a COUPLE SPLIT', () => {
+    const { attempts, stdout } = runCouple({ implPassAges: [5], secondImplPassAges: [5], carrierPassAges: [5], env: { MQ_PA_MOVES: '1' } });
+    expect(attempts).toEqual([`${FUI}#501`]);
+    const split = JSON.parse(stdout.trim().split('\n').at(-1)).coupleSplit;
+    expect(split).toHaveLength(1);
+    expect(split[0].landedImpls).toEqual([{ num: 501, repo: FUI }]);
+    expect(split[0].unlandedImpl).toEqual({ num: 601, repo: PA });
+  }, 90000);
+
+  // Review of #4619 (codex-correctness, CONFIRMED): the pre-check judged only the carrier, so with two impl halves the
+  // first could merge and the second then be refreshed-and-skipped by its own gate, leaving the couple split. Every
+  // member's freshness is now judged before ANY member merges — make each impl half stale in turn: zero merges.
+  it.each([
+    ['the second impl half (plateau-app)', { implPassAges: [5], secondImplPassAges: [120], carrierPassAges: [5] }],
+    ['the first impl half (frontierui)', { implPassAges: [120], secondImplPassAges: [5], carrierPassAges: [5] }],
+  ])('a stale %s holds every member before any merge', (_who, ages) => {
+    const { attempts, stderr } = runCouple(ages);
+    expect(attempts).toEqual([]);
+    expect(stderr).toMatch(/merge-queue: refresh \(pass-too-old\)/);
     expect(stderr).not.toMatch(/COUPLE SPLIT/);
   }, 90000);
 });
