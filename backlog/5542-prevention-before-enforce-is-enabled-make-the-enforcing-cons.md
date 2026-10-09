@@ -1,4 +1,5 @@
 ---
+bornAs: x450baz
 kind: story
 size: 3
 parent: "4075"
