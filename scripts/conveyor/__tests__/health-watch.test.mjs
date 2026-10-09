@@ -13,8 +13,9 @@ import {
   probeDaemonLogs, probeLeases, probeSelfSync, probeLanePools, tick, healthSectionLines, healthDir,
   probeDaemonStatus, daemonNameForLabel, runTickWithWatchdog, probeAuthExpiredSessions, probeAgents,
   probePrs, probeStaleState, probeMergedPrs, probeProcesses, probeMachineLoad, probeGhShimLanes,
-  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend,
+  probeBgIsolationStalls, probeUntrackedBacklogCards, persistGhSpend, breakthroughEmergency, isRepeatAlert,
 } from '../health-watch.mjs';
+import { decideDelivery, DEFAULT_QUIET_SETTINGS } from '../../lib/quiet-hours.mjs';
 
 
 // Keep the shell, persistence and real detector registry intact; supply deterministic probe results
@@ -1235,4 +1236,173 @@ it('records a cardBatchSeal launch error as a probe error', async () => {
     expect(out.probeErrors.cardBatchSeal).toBe('seal launch failed');
     expect(cardBatchSeal).toHaveBeenCalledWith({ now: expect.any(Number) });
   } finally { sealTestRoot.path = null; }
+});
+
+// quietHours (card xmvc6oc): the breakthrough rule is "a daemon DOWN >= 30 min", so the alert must carry how long the
+// daemon has been silent — not how old the episode is (which is ~0 on the opening alert, i.e. always held overnight).
+describe('quietHours: a daemon-silent alert carries the silence duration, not the episode age', () => {
+  const start = 1790882705935;
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockClear(); });
+
+  it('opening alert after 65 silent minutes says downForMs ~65 min, so it breaks through overnight', async () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const probes = (now, text, over) => ({
+      prs: [], agents: [], operationRuns: [],
+      leases: [{ log: 'fix-dispatch-daemon', role: 'reconcile-fix-dispatch-daemon', pid: 4242, pidAlive: true, heartbeatAt: now }],
+      daemonLogs: [{ name: 'fix-dispatch-daemon', mtimeMs: start, sizeBytes: text.length || 100, text, bootstrap: false, defaultIntervalMs: 120_000, ...over }],
+    });
+    episodeReplay.probes = probes(start, 'fix-dispatch-daemon: tick (1) — dispatched 1, refused 0');
+    await tick({ ...flags, now: new Date(start).toISOString() });
+    episodeReplay.send.mockClear();
+    const later = start + 65 * minute;
+    episodeReplay.probes = probes(later, '');
+    const r = await tick({ ...flags, now: new Date(later).toISOString() });
+    expect(r.transitions).toContainEqual({ type: 'opened', key: 'daemon-silent::fix-dispatch-daemon' });
+    const call = episodeReplay.send.mock.calls.map(([n]) => n).find((n) => /daemon-silent/.test(n.title));
+    expect(call.emergency.kind).toBe('daemon-down');
+    expect(call.emergency.downForMs).toBeGreaterThanOrEqual(60 * minute);
+    expect(call.emergency.downForMs).toBeLessThan(70 * minute);
+  });
+});
+
+// A daemon that dies is first seen minutes after the fact — below the 30-minute breakthrough — so its opening alert
+// is held overnight. The breakthrough depends on elapsed time, so the held alert must be re-sent once the silence
+// crosses the threshold (nothing else re-alerts for hours).
+describe('quietHours: a held daemon-silent alert is re-sent as an emergency once the silence crosses the threshold', () => {
+  const start = 1790882705935;
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockReset(); episodeReplay.send.mockImplementation(() => ({ ok: true })); });
+
+  it('dead daemon: opening alert held at ~3 min, re-sent once at >= 30 min, then not again', async () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    const probes = (now, text, pidAlive) => ({
+      prs: [], agents: [], operationRuns: [],
+      leases: [{ log: 'fix-dispatch-daemon', role: 'reconcile-fix-dispatch-daemon', pid: 4242, pidAlive, heartbeatAt: start }],
+      daemonLogs: [{ name: 'fix-dispatch-daemon', mtimeMs: start, sizeBytes: text.length || 100, text, bootstrap: false, defaultIntervalMs: 120_000 }],
+    });
+    const run = async (offsetMin, text, pidAlive) => {
+      const now = start + offsetMin * minute;
+      episodeReplay.probes = probes(now, text, pidAlive);
+      return tick({ ...flags, now: new Date(now).toISOString() });
+    };
+    const silentCalls = () => episodeReplay.send.mock.calls.map(([n]) => n).filter((n) => /daemon-silent/.test(n.title));
+    await run(0, 'fix-dispatch-daemon: tick (1) — dispatched 1, refused 0', true);
+    episodeReplay.send.mockReset();
+    episodeReplay.send.mockImplementation(() => ({ ok: true, suppressed: true })); // quiet hours hold everything below the threshold
+    await run(3, '', false);
+    expect(silentCalls()).toHaveLength(1);
+    expect(silentCalls()[0].emergency.downForMs).toBeLessThan(30 * minute);
+    await run(20, '', false);
+    expect(silentCalls()).toHaveLength(1); // still below the threshold: no re-send
+    episodeReplay.send.mockImplementation(() => ({ ok: true })); // delivered this time
+    await run(35, '', false);
+    expect(silentCalls()).toHaveLength(2);
+    expect(silentCalls()[1].emergency.downForMs).toBeGreaterThanOrEqual(30 * minute);
+    await run(40, '', false);
+    expect(silentCalls()).toHaveLength(2); // delivered once: not nagged every tick
+  });
+});
+
+// quietHours (card xmvc6oc): the main-red breakthrough must be wired to the health alert a red main really produces
+// (`pre-existing-red-on-main`, titled `Health: pre-existing-red-on-main — main:<sha>`), not just to a title guess.
+describe('quietHours: the main-red health smell is tagged as a main-red emergency', () => {
+  const at2am = Date.parse('2026-10-09T02:00:00-04:00');
+  const redMain = { smell: 'pre-existing-red-on-main', subject: 'main:efd88abcc', measure: { baseSha: 'efd88abcc00' } };
+
+  it('breakthroughEmergency tags the red-main smell {kind:main-red} and a silent daemon {kind:daemon-down}', () => {
+    expect(breakthroughEmergency(redMain)).toEqual({ kind: 'main-red' });
+    expect(breakthroughEmergency({ smell: 'daemon-silent', measure: { silentForMs: 45 * 60_000 } })).toEqual({ kind: 'daemon-down', downForMs: 45 * 60_000 });
+    expect(breakthroughEmergency({ smell: 'red-pr-unattended', subject: 'PR #1' })).toBeUndefined();
+  });
+
+  it('the tagged red-main alert is delivered at 02:00 ET, an untagged routine smell is held', () => {
+    const title = `Health: ${redMain.smell} — ${redMain.subject}`;
+    const tagged = { title, emergency: breakthroughEmergency(redMain) };
+    expect(decideDelivery(tagged, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: at2am, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+  });
+});
+
+// Operator ruling 2026-10-09 ("Add it", PR #4461): a red main is on the always-notify list, so in the default shadow mode
+// it produces a real alert, carries the main-red tag, breaks through quiet hours, and fires once per broken main commit.
+describe('quietHours: a red main is wired end to end (real tick, shadow mode → send → delivery gate)', () => {
+  const start = Date.parse('2026-10-09T02:00:00-04:00');
+  const minute = 60_000;
+  afterEach(() => { episodeReplay.probes = null; episodeReplay.send.mockReset(); episodeReplay.send.mockImplementation(() => ({ ok: true })); });
+  const marker = (baseSha) => ({
+    status: 'red', redCause: 'pre-existing-on-main', head: 'h1', sha: 'h1', pool: 'p', lane: 1,
+    redCauseEvidence: { baseSha, tests: [{ file: 'a.test.mjs', name: 'x' }] },
+  });
+  const setup = () => {
+    const flags = { 'state-root': join(dir, 'state'), 'logs-dir': join(dir, 'logs'),
+      'lock-root': join(dir, 'locks'), 'self-sync-dir': join(dir, 'sync'), 'no-gh': true, 'no-diagnose': true };
+    for (const name of ['logs-dir', 'lock-root', 'self-sync-dir']) mkdirSync(flags[name], { recursive: true });
+    // `baseShas` empty → the lanes stopped showing the red sha (the episode closes after its clean streak).
+    const run = (offset, baseShas) => {
+      const now = start + offset * minute;
+      episodeReplay.probes = { prs: [], agents: [], operationRuns: [], leases: [], daemonLogs: [], laneVerifyMarkers: baseShas.map(marker) };
+      return tick({ ...flags, now: new Date(now).toISOString() });
+    };
+    const redCalls = () => episodeReplay.send.mock.calls.map(([n]) => n).filter((n) => /pre-existing-red-on-main/.test(n.title));
+    return { run, redCalls };
+  };
+
+  it('alerts in shadow mode with the main-red tag; the gate delivers it at 02:00 ET while a routine alert is held', async () => {
+    const { run, redCalls } = setup();
+    await run(0, ['efd88abcc00']);
+    expect(redCalls()).toHaveLength(1);
+    expect(redCalls()[0].title).toBe('Health: pre-existing-red-on-main — main:efd88abcc');
+    expect(redCalls()[0].emergency).toEqual({ kind: 'main-red' });
+    expect(decideDelivery(redCalls()[0], { now: start, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(true);
+    expect(decideDelivery({ title: 'Health: red-pr-unattended — PR #1' }, { now: start, settings: DEFAULT_QUIET_SETTINGS }).deliver).toBe(false);
+  });
+
+  it('alerts once per break: no repeat on later ticks, past the 4 h reminder, as main\'s tip moves, or after a close and reopen', async () => {
+    const { run, redCalls } = setup();
+    await run(0, ['efd88abcc00']);
+    await run(1, ['efd88abcc00']);
+    await run(5 * 60, ['efd88abcc00']); // past reminderAfterMs (4 h): the reminder must not re-alert
+    expect(redCalls()).toHaveLength(1);
+    await run(5 * 60 + 1, ['0123456789ab']); // main merged: lanes now verify at a NEW tip while main is still red
+    await run(5 * 60 + 2, ['0123456789ab', 'aaaaaaaaaaaa']); // two lanes, two tips, same tick
+    await run(5 * 60 + 5, ['aaaaaaaaaaaa']);
+    await run(5 * 60 + 6, []); await run(5 * 60 + 7, []); // lanes go quiet briefly → episode closes
+    await run(5 * 60 + 8, ['aaaaaaaaaaaa']); // reappears inside the 60 min window → same break
+    expect(redCalls()).toHaveLength(1);
+    await run(5 * 60 + 9 + 120, ['bbbbbbbbbbbb']); // red again two hours later, after a gap → a new break alerts
+    expect(redCalls()).toHaveLength(2);
+    expect(redCalls()[1].title).toBe('Health: pre-existing-red-on-main — main:bbbbbbbbb');
+  });
+
+  it('retries a failed send on the next tick until it is delivered, then stops', async () => {
+    const { run, redCalls } = setup();
+    episodeReplay.send.mockImplementation(() => ({ ok: false, error: 'osascript failed' }));
+    await run(0, ['efd88abcc00']);
+    await run(1, ['efd88abcc00']);
+    expect(redCalls()).toHaveLength(2);
+    episodeReplay.send.mockImplementation(() => ({ ok: true }));
+    await run(2, ['efd88abcc00']);
+    await run(3, ['efd88abcc00']);
+    expect(redCalls()).toHaveLength(3);
+  });
+
+  it('yields to an open main-ci-red episode (it already tells the operator about this break)', () => {
+    const redMain = { id: 'a', smell: 'pre-existing-red-on-main', subject: 'main:abc' };
+    const ciRed = { id: 'c', smell: 'main-ci-red', subject: 'main:def', status: 'open' };
+    expect(isRepeatAlert(redMain, { episodes: { c: ciRed }, history: [] }, start)).toBe(true);
+    expect(isRepeatAlert(redMain, { episodes: {}, history: [] }, start)).toBe(false);
+    expect(isRepeatAlert(ciRed, { episodes: { c: ciRed }, history: [] }, start)).toBe(false); // main-ci-red is never held back
+    expect(breakthroughEmergency({ smell: 'main-ci-red' })).toEqual({ kind: 'main-red' });
+  });
+
+  it('ignores a marker whose baseSha is not a sha (a lane-written marker must not raise or crash a main-red alert)', async () => {
+    const { run, redCalls } = setup();
+    await run(0, [{ not: 'a string' }, 'zz; rm -rf', '']);
+    expect(redCalls()).toHaveLength(0);
+  });
 });

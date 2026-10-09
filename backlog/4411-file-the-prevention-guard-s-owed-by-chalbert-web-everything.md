@@ -18,6 +18,13 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2873@a8010179e548da82fb8d1ad0b8b634b4f6d72387
 
+## Ruling (operator, 2026-10-09 ~13:25 ET, same ruling as #4488)
+
+The open choice from the prepare run (heuristic detection of behavioral prose vs explicit claim-to-test
+references) is ruled: guarantee-style comments are handled by a **review lens**, not a `check:standards` rule.
+The reviewer flags a behavioral guarantee in a comment; the author cites the defending test or marks it
+`intentionally unguarded: <reason>`. Item 1 (expose the pure resolver for tests) is unaffected and buildable now.
+
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.

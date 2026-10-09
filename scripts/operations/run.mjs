@@ -106,8 +106,8 @@ import { createRunReader, createRecordVerdictSinks } from './record-verdict-io.m
 import { validateRequest, APPLIABLE_TARGETS } from '../apply-review-request.mjs';
 import { verifyOperation, VERIFY_OP } from './verify.mjs';
 import { createChecksRunner } from './verify-io.mjs';
-import { mutationCheckOperation, MUTATION_CHECK_OP } from './mutation-check.mjs';
-import { createMutationCheckSinks } from './mutation-check-io.mjs';
+import { mutationCheckOperation, MUTATION_CHECK_OP, revertRedCheckOperation, REVERT_RED_CHECK_OP } from './mutation-check.mjs';
+import { createMutationCheckSinks, createRevertRedCheckSinks } from './mutation-check-io.mjs';
 import { exploreOperation, EXPLORE_OP } from './explore.mjs';
 import { createExploreSinks, agentArgsFromEnv as exploreAgentArgsFromEnv } from './explore-io.mjs';
 import { gapSweepStatusOperation, GAP_SWEEP_STATUS_OP } from './gap-sweep-status.mjs';
@@ -209,6 +209,12 @@ export const OPERATIONS = Object.freeze({
   [MUTATION_CHECK_OP]: () => ({
     declaration: mutationCheckOperation(),
     sinks: createMutationCheckSinks(),
+  }),
+  // #5466 — the revert-red check: revert a fix's source changes (keep its tests), require the new tests to go red.
+  // Same transaction shape and the same reason for a sink as `mutation-check` above.
+  [REVERT_RED_CHECK_OP]: () => ({
+    declaration: revertRedCheckOperation(),
+    sinks: createRevertRedCheckSinks(),
   }),
   // #xkp1mv8 — a thin wrap of the existing `we:scripts/gap-sweep-status.mjs` CLI. UNLIKE `verify` above, its
   // one step is an `effect`: `mode: 'snapshot'` writes a file, so the step kind must keep the whole operation

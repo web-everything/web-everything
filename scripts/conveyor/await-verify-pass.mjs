@@ -36,6 +36,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { laneGitConfigArgs, laneGitHardeningEnv, laneFilterDrivers, LANE_CONFIG_LIST_ARGS } from '../lib/lane-git-hardening.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
+import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
@@ -191,6 +192,24 @@ export function findAwaitSession(record, rows) {
 }
 
 /**
+ * {@link findAwaitSession} over a listing that may be INCOMPLETE (its non-enumerable `incomplete` names each population
+ * that could not be read, as `{reason, session}`). A session missing from an incomplete listing is unknown, not gone, so this THROWS and the
+ * pass's per-record catch keeps the record for the next tick (PR #4462 review: reading it as gone dropped the record
+ * and skipped a verified push). A name-only binding (no session id) is also unsafe on an incomplete listing: the
+ * unread population may hold a newer same-named session. Pure.
+ */
+export function lookupAwaitSession(record, listed) {
+  const session = findAwaitSession(record, listed);
+  // Only gaps that could hide THIS record's session count: a whole-population failure (`session: null`), or the unreadable
+  // record of a session by this record's name. One unrelated torn file must not pin every other await record forever.
+  const gaps = (Array.isArray(listed?.incomplete) ? listed.incomplete : []).filter((g) => g?.session == null || g.session === record.who);
+  if (gaps.length && (!session || !record.sessionId)) {
+    throw new Error(`session listing incomplete (${gaps.map((g) => g?.reason ?? String(g)).join('; ')}); cannot tell whether ${record.who ?? 'the session'} is gone`);
+  }
+  return session;
+}
+
+/**
  * Why the daemon must NOT push for this record, or null. The fixer typed `repo`/`pr`/`ref`, so they bind to nothing until
  * proven: `repo` must be a constellation repo, and the fix claim for (repo, pr) must be bound to THIS session's id and name
  * this very branch. A claim whose TTL lapsed during a long verify still counts while no one else has re-claimed the PR (a
@@ -265,7 +284,7 @@ export async function runAwaitVerifyPass({
       let pending = record.pendingResume ?? null;
       if (d.action === 'push') {
         // A record whose session is not live is never pushed for: the session id is the one thing the claim binding compares.
-        if (!findAwaitSession(record, io.listSessions())) {
+        if (!lookupAwaitSession(record, io.listSessions())) {
           clearOrNote(key, record);
           row.result = 'session-gone; not pushed';
           rows.push(row); continue;
@@ -297,7 +316,7 @@ export async function runAwaitVerifyPass({
         if (!persist({ ...record, pendingResume: { ...pending, ...(marker ? { marker: { failureDetails: marker.failureDetails ?? null } } : {}) } })) { rows.push(row); continue; }
       }
       if (!allowResume) { row.result = row.result ?? 'resume-paused'; rows.push(row); continue; }
-      const session = findAwaitSession(record, io.listSessions());
+      const session = lookupAwaitSession(record, io.listSessions());
       if (!session) {
         clearOrNote(key, record);
         row.result = `${row.result ? `${row.result}; ` : ''}session-gone`;
@@ -501,6 +520,7 @@ export async function defaultAwaitVerifyIo({
   weRoot = ROOT, exec = execFileSync, env = process.env, sleep = sleepSync,
   dispatchIo = null, stopSessionFn = null, pushRefusalFn = null, readClaimFn = null, poolRoot = null, realpath = realpathSync,
   pidAliveFn = pidAlive,
+  listWrappedWorkers = listWrappedWorkerAgents, requestWrappedResumeFn = requestWrappedResume,
 } = {}) {
   /** The lane pool the daemon acts in. A record's `lane` is agent-typed, so a path outside the pool is never touched. */
   const lanePoolRoot = poolRoot ?? defaultPoolRoot(weRoot, env);
@@ -661,8 +681,25 @@ export async function defaultAwaitVerifyIo({
         return { ok: false, terminal: true, reason: `GitHub refused the push: ${String(e?.stderr ?? e?.message ?? e).trim().split('\n').slice(-1)[0].slice(0, 200)}` };
       }
     },
-    listSessions: () => io.defaultListAgents({ all: true, env }),
+    // Both populations are listed, and a failure of either is RECORDED on the result (`incomplete`), never swallowed: the
+    // pass reads a session's absence as "gone", so it must be told when the listing could not show it (`lookupSession`).
+    listSessions: () => {
+      const rows = [];
+      const incomplete = [];
+      const why = (e) => String(e?.message ?? e).split('\n')[0].slice(0, 160);
+      // `session: null` = the whole population is unknown; a slug = only that session's record could not be read.
+      // A listing that is not an ARRAY shows nothing about any session (a string would even spread into character "rows").
+      const asRows = (value, what) => { if (!Array.isArray(value)) throw new Error(`${what} is not an array`); return value; };
+      try { rows.push(...asRows(io.defaultListAgents({ all: true, env }), 'claude agents listing')); } catch (e) { incomplete.push({ reason: `claude agents listing failed: ${why(e)}`, session: null }); }
+      try {
+        const wrapped = asRows(listWrappedWorkers(), 'wrapped worker listing');
+        rows.push(...wrapped);
+        incomplete.push(...(wrapped.incomplete ?? []));
+      } catch (e) { incomplete.push({ reason: `wrapped worker listing failed: ${why(e)}`, session: null }); }
+      return Object.defineProperty(rows, 'incomplete', { value: incomplete });
+    },
     resume: ({ session, prompt }) => {
+      if (session?.kind === 'wrapped-worker') return requestWrappedResumeFn({ session, prompt });
       // Every read this port makes of the session list is UNCACHED: the 20s agents cache would otherwise show a
       // pre-stop / pre-spawn row and misjudge both the exit wait and the resume confirmation.
       const liveEnv = { ...env, WE_CLAUDE_AGENTS_CACHE_TTL_MS: '0' };

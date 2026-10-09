@@ -16,7 +16,7 @@
  *        header). The key is now `(repo, kind, pr)`, with `headSha` carried only as diagnostic `meta` — these
  *        tests prove the SAME head-sha-rotation scenario is now refused.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -25,6 +25,9 @@ import {
   releaseSessionFixDispatchClaims, acquireFixDispatchClaim, releaseFixDispatchClaim, readFixDispatchClaim, fixDispatchSessionName,
   isClaimSessionLive, listFixDispatchClaims, refreshLiveFixDispatchClaims, MAX_FIX_DISPATCH_CLAIM_REFRESH_MS,
 } from '../fix-dispatch-claim.mjs';
+import * as dispatchIo from '../../operations/dispatch-lane-io.mjs';
+import { newEnvelopeRecord } from '../../operations/completion-record.mjs';
+import { writeCompletion } from '../../operations/completion-store.mjs';
 import { heartbeat } from '../../readiness/file-locks.mjs';
 import { acquireFixClaim } from '../fix-procedure.mjs';
 import { dispatchFix, tryResumeFix, filterFixesByInFlightScope } from '../reconcile-fix-dispatch.mjs';
@@ -612,4 +615,29 @@ describe('awaiting-verify claim exemption (#5137)', () => {
     expect(result.awaiting).toBeUndefined();
     expect(readFixDispatchClaim(key()).heartbeatAt).toBe(iso(T0));
   });
+});
+
+// 117 S3b regression 2026-10-08: an agent's own fixing claim has no runnerPid and needs the wrapped listing.
+it.each([false, true])('default claim refresh keeps a live wrapped fixing claim (awaiting=%s)', (awaiting) => {
+  const sid = '12345678-1234-4234-8234-123456789abc';
+  const key = { repo: 'we', pr: 3964, kind: 'fixing', lockRoot: claimRoot };
+  const completions = join(claimRoot, 'completions');
+  vi.stubEnv('OPERATION_COMPLETIONS_DIR', completions);
+  const list = vi.spyOn(dispatchIo, 'defaultListAgents').mockReturnValue([]);
+  try {
+    acquireFixClaim({ ...key, who: 'fix-3964', sessionId: sid, nowMs: T0 });
+    const record = newEnvelopeRecord({ session: 'fix-3964', role: 'fix', launcher: 'claude-p', sessionId: sid,
+      pid: process.pid, cwd: '/lane', timeoutMs: 60_000, now: () => iso(T0),
+      ...(awaiting ? { awaitingVerify: { sha: 'a'.repeat(40), pr: 3964, ref: 'lane/fix', requestedAt: iso(T0) } } : {}),
+    });
+    writeCompletion(record, completions);
+    const result = refreshLiveFixDispatchClaims({ lockRoot: claimRoot, nowMs: T0 + 1000, nowIso: () => iso(T0 + 1000), hungInfoFor: () => null, awaitingVerifyFor: () => null });
+    expect(list).toHaveBeenCalledWith({ all: true });
+    expect(result.refreshed).toHaveLength(1);
+    expect(result.released ?? []).toEqual([]);
+    expect(readFixDispatchClaim(key).heartbeatAt).toBe(iso(T0 + 1000));
+  } finally {
+    list.mockRestore();
+    vi.unstubAllEnvs();
+  }
 });
