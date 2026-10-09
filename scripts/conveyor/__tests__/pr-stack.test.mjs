@@ -349,7 +349,8 @@ describe('trust boundary and branch names for idle bottoms', () => {
   });
   it('reads open PR refs from gh and treats anything unreadable as unverified', () => {
     const run = vi.fn(() => JSON.stringify([{ number: 1, headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false }, { number: 2, headRefName: 'lane/b', headRefOid: 'y' }, { nope: 1 }]));
-    const refs = readOpenPrRefs('/repo', { run });
+    const refs = readOpenPrRefs('/repo', { run, repo: 'o/r' });
+    expect(run.mock.calls[0][0].slice(0, 4)).toEqual(['pr', 'list', '--repo', 'o/r']);
     expect(refs.get(1)).toEqual({ headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false });
     expect(refs.get(2).isCrossRepository).toBe(true);
     expect(readOpenPrRefs('/repo', { run: () => { throw Error('gh down'); } }).size).toBe(0);

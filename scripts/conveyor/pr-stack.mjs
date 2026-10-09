@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 export const PR_STACK_DEFAULTS = Object.freeze({ detect: true, bottomFirst: true, restack: true, restackMaxRounds: 3 });
 export const PR_STACK_ENV = Object.freeze({ detect: 'WE_PR_STACK_DETECT', bottomFirst: 'WE_PR_STACK_BOTTOM_FIRST', restack: 'WE_PR_STACK_RESTACK', restackMaxRounds: 'WE_PR_STACK_RESTACK_MAX_ROUNDS' });
@@ -200,10 +201,10 @@ export function readOriginLaneTips(dir, { run = args => execFileSync('git', ['-C
   } catch { return null; }
 }
 // What GitHub reports for the open PRs (branch name, head, fork or not), keyed by number; an empty Map when it cannot be read.
-export function readOpenPrRefs(dir, { run = args => execFileSync('gh', args, { cwd: dir, encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
+export function readOpenPrRefs(dir, { repo = CONSTELLATION_REPOS.we.slug, run = args => execFileSync('gh', args, { cwd: dir, encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
   const refs = new Map();
   try {
-    for (const row of JSON.parse(run(['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,isCrossRepository']))) {
+    for (const row of JSON.parse(run(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,isCrossRepository']))) {
       if (Number.isInteger(row?.number)) refs.set(row.number, { headRefName: row.headRefName ?? null, headRefOid: row.headRefOid ?? null, isCrossRepository: row.isCrossRepository !== false });
     }
   } catch { /* unreadable: the PRs stay unverified */ }
