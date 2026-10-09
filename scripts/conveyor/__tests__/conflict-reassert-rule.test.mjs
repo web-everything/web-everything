@@ -72,7 +72,16 @@ describe('resolveConflictReassertSettings', () => {
     ['missing key', '{"conflictReassert":{}}', {}, false],
     ['env on beats file off', '{"conflictReassert":{"reviewHuman":"off"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: 'on' }, true],
     ['env off beats file on', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: 'off' }, false],
-    ['garbage env falls back to file', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: 'garbage' }, true],
+    // An explicit-but-unparseable override fails OFF (acceptance A2) — it never falls through to the file's 'on'.
+    ['garbage env fails off over file on', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: 'garbage' }, false],
+    ['empty env fails off over file on', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: '' }, false],
+    ['whitespace env fails off over file on', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: '  ' }, false],
+    ['near-miss env fails off over file on', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: 'onn' }, false],
+    ['garbage env with file off stays off', '{"conflictReassert":{"reviewHuman":"off"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: 'garbage' }, false],
+    ['absent env uses file on', '{"conflictReassert":{"reviewHuman":"on"}}', {}, true],
+    ['undefined env value uses file on', '{"conflictReassert":{"reviewHuman":"on"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: undefined }, true],
+    ['valid env mixed case on beats file off', '{"conflictReassert":{"reviewHuman":"off"}}', { [CONFLICT_REASSERT_ENV.reviewHuman]: ' TRUE ' }, true],
+    ['garbage file value is off', '{"conflictReassert":{"reviewHuman":"garbage"}}', {}, false],
   ])('%s', (_name, contents, env, expected) => {
     const reads = [];
     expect(resolveConflictReassertSettings(env, {
@@ -145,6 +154,38 @@ describe('PR #4481 captured conflict replay', () => {
     const { results, findings } = replay({ conflictReassertSettings: undefined });
     expect(results).toEqual([]);
     expect(findings).toEqual([]);
+  });
+  describe('an unreadable comment thread fails closed (no guard evidence is not "no guard applies")', () => {
+    // A stand-down and a spent round cap are both on the thread; a failed read must not erase them.
+    const guarded = () => [...fixture.comments, {
+      body: `${STAND_DOWN_MARKER}\n\n**Who:** fix-4481`,
+      author: { login: 'web-everything' }, createdAt: new Date(now - 60_000).toISOString(),
+    }, ...Array.from({ length: 3 }, (_, i) => ({
+      body: CONFLICT_FIX_COMMENT_MARKER, author: { login: 'web-everything' },
+      createdAt: new Date(now - (3 - i) * 60_000).toISOString(),
+    }))];
+    it.each([
+      ['listPrComments throws', () => { throw new Error('gh: HTTP 502'); }],
+      ['listPrComments returns null', () => null],
+      ['listPrComments returns undefined', () => undefined],
+      ['listPrComments returns a non-array', () => ({ message: 'rate limited' })],
+    ])('refuses review-human reassertion when %s', (_name, listPrComments) => {
+      for (const dryRun of [false, true]) {
+        const { results, findings } = replay({ listPrComments, dryRun });
+        expect(findings).toEqual([]);
+        expect(results).toEqual([]);
+      }
+    });
+    it('reasserts again once the same PR becomes readable (not stuck off)', () => {
+      let reads = 0;
+      const listPrComments = () => { if (reads++ === 0) throw new Error('gh: HTTP 502'); return fixture.comments; };
+      expect(replay({ listPrComments }).findings).toEqual([]);
+      expect(replay({ listPrComments }).findings).toHaveLength(1);
+    });
+    it('still honors the guards on a readable thread carrying them', () => {
+      const { findings } = replay({ listPrComments: guarded });
+      expect(findings).toEqual([]);
+    });
   });
   it('reports the re-assert route in dry-run without posting', () => {
     const { results, findings } = replay({ dryRun: true });

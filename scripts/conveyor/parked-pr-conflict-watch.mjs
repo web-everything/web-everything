@@ -1628,9 +1628,11 @@ export function watchParkedPrConflicts({
     if (idleConflictBounce && !recheckCandidate && !graceDue) {
       // Same lazy-read discipline as `recheckCandidate` just below — this narrow, otherwise-invisible
       // population costs nothing extra on every OTHER tick.
-      let comments = [];
-      try { comments = listPrComments({ number: pr?.number, repo }); } catch { comments = []; }
-      reassertIdleConflict(comments, null);
+      // Same fail-closed read as the review:human route below: an unreadable thread (throw / non-array) hides the
+      // spent round cap and the once-per-round finding, so re-asserting off `[]` would bypass both. Retry next sweep.
+      let comments = null;
+      try { const listed = listPrComments({ number: pr?.number, repo }); if (Array.isArray(listed)) comments = listed; } catch { comments = null; }
+      if (comments) reassertIdleConflict(comments, null);
       continue;
     }
     if (recheckCandidate && !graceDue) {
@@ -1640,7 +1642,14 @@ export function watchParkedPrConflicts({
         // below, and ONLY once a watcher marker is actually found, so the common "nothing to recheck" tick never
         // pays for it (mirrors this file's existing xoh8fkw discipline elsewhere in this loop).
         let comments = [];
-        try { comments = listPrComments({ number: pr?.number, repo }); } catch { comments = []; }
+        // `commentsRead` keeps "the read failed" distinct from "the thread is empty": the new review:human
+        // re-assert below decides from the thread's stand-downs and spent rounds, so an unreadable thread must
+        // never read as "no guard applies".
+        let commentsRead = false;
+        try {
+          const listed = listPrComments({ number: pr?.number, repo });
+          if (Array.isArray(listed)) { comments = listed; commentsRead = true; }
+        } catch { comments = []; }
         const watcherMarker = findWatcherStandDownComment(comments);
         if (!watcherMarker) {
           // Card xkugvzd (live: #4481) — no watcher stand-down, so the statute recheck below has nothing to change.
@@ -1648,6 +1657,7 @@ export function watchParkedPrConflicts({
           // #2793 idle path excludes `review:human`). The declared rule decides whether to re-assert the idle
           // conflict finding; off, a live bounce, or any stand-down on the thread (a fix agent's own judgment call)
           // leaves it exactly as before.
+          if (!commentsRead) continue; // unreadable thread → retry next sweep, post nothing
           const decision = decideConflictReassert({
             labels: pr?.labels, hasLiveWatcherMarker: false, hasStandDown: standDownComments(comments).length > 0,
             settings: conflictReassertSettings,

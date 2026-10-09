@@ -16,6 +16,7 @@
  *
  * Declared setting `conflict-reassert-settings.json` (`{ "conflictReassert": { "reviewHuman": "on" } }`), env
  * `WE_CONFLICT_REASSERT_REVIEW_HUMAN` beats the file; missing/malformed/`off` = the behaviour before this card.
+ * An env override that is set but unparseable also resolves `off` (it never falls through to the file).
  * PURE except {@link resolveConflictReassertSettings}, which reads the settings file and FAILS to `off`.
  */
 import { readFileSync } from 'node:fs';
@@ -45,7 +46,10 @@ export function resolveConflictReassertSettings(env = process.env, { path = conf
   if (!file || typeof file !== 'object') file = {};
   const out = {};
   for (const key of Object.keys(CONFLICT_REASSERT_OFF)) {
-    out[key] = parseSwitch(env?.[CONFLICT_REASSERT_ENV[key]]) ?? parseSwitch(file[key]) ?? false;
+    const override = env?.[CONFLICT_REASSERT_ENV[key]];
+    // An override that is SET but not understood (typo, empty, whitespace) fails OFF — it must never fall
+    // through to the file's `on`. Only an absent override defers to the file.
+    out[key] = override == null ? (parseSwitch(file[key]) ?? false) : (parseSwitch(override) ?? false);
   }
   return out;
 }
