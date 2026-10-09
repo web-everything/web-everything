@@ -1,8 +1,8 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
-import { planIdleRestacks, readRemembered, writeRemembered, PR_STACK_DEFAULTS, resolvePrStackSettings, detectStacks, bottomOf, abovePrs, applyStackOrder, restackKey, markRestackUsed, withRestackHint, nextRemembered, readStacksForPass, readOriginLaneTips, readOpenPrRefs } from '../pr-stack.mjs';
+import { ANCESTRY_BUDGET, MAX_COMPARED_PRS, planIdleRestacks, recordRestackAttempt, gitOnMain, readRemembered, writeRemembered, PR_STACK_DEFAULTS, resolvePrStackSettings, detectStacks, bottomOf, abovePrs, applyStackOrder, restackKey, markRestackUsed, withRestackHint, nextRemembered, readStacksForPass, readOriginLaneTips, readOpenPrRefs } from '../pr-stack.mjs';
 import { filterFixesByInFlightScope, runReconcileFixDispatch } from '../reconcile-fix-dispatch.mjs';
 import { REFUSAL_KINDS } from '../reconcile-core.mjs';
 
@@ -17,7 +17,7 @@ const claim = pr => ({ meta: { repo: 'we', pr, scope } });
 
 describe('stack detection and memory', () => {
   it('detects the live content stack and its helpers', () => {
-    expect(live().pairs).toEqual([{ top: 4631, bottom: 4624, bottomRef: a.headRefName, bottomHead: a.headRefOid, topHead: b.headRefOid, bottomOpen: true, inSync: true, restackedFor: null, restackRounds: 0 }]);
+    expect(live().pairs).toEqual([{ top: 4631, bottom: 4624, bottomRef: a.headRefName, bottomHead: a.headRefOid, containedHead: a.headRefOid, topHead: b.headRefOid, bottomOpen: true, inSync: true, restackedFor: null, restackRounds: 0, restackTopHead: null }]);
     expect(bottomOf(live(), 4631).bottom).toBe(4624);
     expect(abovePrs(live(), 4624)).toEqual(new Set([4631]));
   });
@@ -119,11 +119,11 @@ describe('settings and fail-open IO', () => {
     expect(resolvePrStackSettings({ WE_PR_STACK_DETECT: '0' }, { read: () => { throw Error(); } })).toEqual({ detect: false, bottomFirst: false, restack: false, restackMaxRounds: 3 });
   });
   it('combines planned and open heads, remembers pairs and fails open', () => {
-    const writeMem = vi.fn(); const readHeads = vi.fn(() => new Map([[b.pr, { headRefName: b.headRefName, headRefOid: b.headRefOid, isCrossRepository: false }]]));
+    const writeMem = vi.fn(); const readHeads = vi.fn(() => new Map([a, b].map(p => [p.pr, { headRefName: p.headRefName, headRefOid: p.headRefOid, isCrossRepository: false, author: 'app/bot' }])));
     const options = { root: '/repo', repoKey: 'we', planned: [entries[0]], openPrFiles: [{ pr: b.pr }], settings, readRefs: readHeads, isAncestor: ancestor, onMain: () => false, readMem: () => [], writeMem,
       readLanes: () => new Map([[a.headRefName, a.headRefOid], [b.headRefName, b.headRefOid]]) };
     expect(readStacksForPass(options).pairs[0]).toMatchObject({ top: b.pr, bottom: a.pr });
-    expect(readHeads).toHaveBeenCalledWith('/repo', [b.pr]);
+    expect(readHeads).toHaveBeenCalledWith('/repo', [a.pr, b.pr]);
     expect(writeMem).toHaveBeenCalledWith('/repo', nextRemembered(live()));
     expect(readStacksForPass({ ...options, readMem: () => { throw Error(); } })).toEqual({ pairs: [] });
     expect(readStacksForPass({ ...options, repoKey: 'fui' })).toEqual({ pairs: [] });
@@ -150,23 +150,25 @@ describe('durable idle restacks', () => {
     expect(planIdleRestacks(moved(), { ...opts, fixClaims: [claim(b.pr)] })).toEqual([]);
     expect(planIdleRestacks(moved(), { ...opts, planned: [entries[1]] })).toEqual([]);
     expect(planIdleRestacks(live(), opts)).toEqual([]);
-    for (const patch of [{ restackedFor: 'idle-bottom-v2' }, { restackRounds: 3 }]) {
-      const stacks = moved(); Object.assign(stacks.pairs[0], patch);
-      expect(planIdleRestacks(stacks, opts)).toEqual([]);
-    }
+    // A launched restack that did not catch the top up is retried until the round cap, and held after it.
+    const retried = moved(); Object.assign(retried.pairs[0], { restackedFor: 'idle-bottom-v2', restackRounds: 2 });
+    expect(planIdleRestacks(retried, opts)).toHaveLength(1);
+    const capped = moved(); Object.assign(capped.pairs[0], { restackedFor: 'idle-bottom-v2', restackRounds: 3 });
+    expect(planIdleRestacks(capped, opts)).toEqual([]);
     for (const key of ['detect', 'restack']) expect(planIdleRestacks(moved(), { ...opts, settings: { ...settings, [key]: false } })).toEqual([]);
   });
   it('keys retries to the bottom head, caps owed tops and holds them as peers', () => {
     const stacks = moved(); const used = new Set();
     const first = applyStackOrder([entries[1]], stacks, { settings }).planned[0];
-    expect(restackKey(first)).toBe('restack:4631:idle-bottom-v2');
+    expect(restackKey(first)).toBe('restack:4631:idle-bottom-v2:0');
     markRestackUsed(first, used);
     expect(planIdleRestacks(stacks, { ...opts, used })).toEqual([]);
     stacks.pairs[0].bottomHead = 'idle-bottom-v3';
     expect(planIdleRestacks(stacks, { ...opts, used })).toHaveLength(1);
-    stacks.pairs[0].restackRounds = 3;
+    Object.assign(stacks.pairs[0], { restackedFor: 'idle-bottom-v3', restackRounds: 3 });
     const capped = applyStackOrder([entries[1]], stacks, { settings: { ...settings, bottomFirst: false }, used });
-    expect(capped.planned).toEqual([]);
+    // Exhausted attempts are reported and the top is released to its ordinary dispatch, never held for good.
+    expect(capped.planned).toEqual([entries[1]]);
     expect(capped.refusals[0]).toMatchObject({ kind: 'restack-cap-exhausted', why: expect.stringContaining('3') });
   });
   it('round trips history through disk and fresh detection, resetting for a different bottom', () => {
@@ -190,8 +192,9 @@ describe('durable idle restacks', () => {
       expect(resolvePrStackSettings({}, { read: () => ({ prStack: { restackMaxRounds: value } }) }).restackMaxRounds).toBe(3);
     }
   });
-  it('dispatches both bottom and idle top once, recording history only on success', () => {
+  it('dispatches the idle top while it is owed, holds it while its agent lives, and stops once it caught up', () => {
     const stacks = moved(); stacks.pairs[0].bottomHead = 'dispatch-idle-v2';
+    let claims = [];
     const readPrForRestack = vi.fn(() => ({ ...b, prNumber: b.pr, kind: 'fix', labels: ['review:pending'], body: '', isCrossRepository: false }));
     const readLaneTips = () => new Map([[b.headRefName, b.headRefOid]]);
     const dispatch = vi.fn(p => p);
@@ -201,21 +204,84 @@ describe('durable idle restacks', () => {
       findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1, 2], dispatch,
       fetchItemlessDiffPaths: () => ['scripts/merge-ai-prs.mjs'], resolveFallbackScope: () => scope,
       resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
-      listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null };
+      listBuildClaims: () => [], listFixClaims: () => claims, priorityShadow: null };
     const out = runReconcileFixDispatch(args);
     expect(out.dispatched.map(p => p.pr)).toEqual([a.pr, b.pr]);
     const top = out.dispatched[1];
     expect(top.restack.onto).toBe(a.headRefName);
     expect(withRestackHint('original', top.restack)).toContain('no review findings to address');
     expect(stacks.pairs[0]).toMatchObject({ restackedFor: 'dispatch-idle-v2', restackRounds: 1 });
+    // The agent is alive (its claim is held): nothing is dispatched at the top.
+    claims = [claim(b.pr)];
     expect(runReconcileFixDispatch(args).dispatched.map(p => p.pr)).toEqual([a.pr]);
     expect(readPrForRestack).toHaveBeenCalledTimes(1);
-    stacks.pairs[0].bottomHead = 'dispatch-idle-v3';
+    // The agent exited WITHOUT pushing (claim gone, top still not caught up): the restack is retried, as a second round.
+    claims = [];
+    expect(runReconcileFixDispatch(args).dispatched.map(p => p.pr)).toEqual([a.pr, b.pr]);
+    expect(stacks.pairs[0]).toMatchObject({ restackedFor: 'dispatch-idle-v2', restackRounds: 2 });
+    // The retry pushed: the top now contains the bottom's head, so nothing is owed any more.
+    stacks.pairs[0].inSync = true;
+    expect(runReconcileFixDispatch(args).dispatched.map(p => p.pr)).toEqual([a.pr]);
+    expect(readPrForRestack).toHaveBeenCalledTimes(2);
+    // A launch that throws records nothing.
+    Object.assign(stacks.pairs[0], { bottomHead: 'dispatch-idle-v3', inSync: false });
     dispatch.mockImplementation(() => { throw Error('launch failed'); });
     runReconcileFixDispatch(args);
-    expect(stacks.pairs[0]).toMatchObject({ restackedFor: 'dispatch-idle-v2', restackRounds: 1 });
+    expect(stacks.pairs[0]).toMatchObject({ restackedFor: 'dispatch-idle-v2', restackRounds: 2 });
     readPrForRestack.mockImplementation(() => { throw Error('read failed'); });
     expect(() => runReconcileFixDispatch(args)).not.toThrow();
+  });
+  it('bounds failed restacks per bottom head through repeated passes, then releases the top (no seeded counters)', () => {
+    // Real chain of passes: every pass re-detects from the PERSISTED memory (round-tripped through disk) and the agent never pushes.
+    const root = mkdtempSync(join(tmpdir(), 'pr-stack-cap-'));
+    const bottom = mk(61, 'b'.repeat(40), 'lane/cap-bottom'); const top = mk(62, 'c'.repeat(40), 'lane/cap-top');
+    const dispatched = [];
+    const pass = (bottomOid, extraRefusals = []) => {
+      const prs = [{ ...bottom, headRefOid: bottomOid }, top];
+      const stacks = detectStacks(prs, { remembered: readRemembered(root), isAncestor: (x, y) => x === 'b'.repeat(40) && y === top.headRefOid });
+      writeRemembered(root, nextRemembered(stacks));
+      const out = runReconcileFixDispatch({ root, repo: 'we', checkStaleness: () => ({ stale: false }),
+        reconcile: () => ({ dispatch: [], refusals: [{ kind: 'nothing-owed', prNumber: top.pr }, ...extraRefusals] }),
+        prStack: () => stacks, prStackSettings: settings, readLaneTips: () => new Map([[top.headRefName, top.headRefOid]]),
+        readPrForRestack: () => ({ ...top, prNumber: top.pr, kind: 'fix', labels: [], body: '', isCrossRepository: false }),
+        findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1, 2], dispatch: p => { dispatched.push(p); return p; },
+        fetchItemlessDiffPaths: () => ['scripts/x.mjs'], resolveFallbackScope: () => scope,
+        resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+        listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null });
+      // the dispatcher persists the attempt it just recorded
+      writeRemembered(root, nextRemembered(stacks));
+      return out;
+    };
+    try {
+      const moved = 'd'.repeat(40);
+      // Pass 0: the top contains the bottom's head, so the pair is detected and remembered with nothing owed.
+      pass('b'.repeat(40));
+      expect(dispatched).toEqual([]);
+      expect(readRemembered(root)[0]).toMatchObject({ top: 62, bottom: 61, containedHead: 'b'.repeat(40) });
+      // Attempts 1..3 against the moved bottom head all launch a restack; the agent never pushes.
+      for (const round of [1, 2, 3]) {
+        const before = dispatched.length;
+        const out = pass(moved);
+        expect(out.dispatched.length, `round ${round}`).toBe(dispatched.length - before);
+        expect(dispatched.slice(before).map(p => p.restack?.onto)).toEqual(['lane/cap-bottom']);
+        expect(readRemembered(root)[0]).toMatchObject({ restackedFor: moved, restackRounds: round });
+      }
+      // Attempt 4 is not launched: the cap is reached by those real attempts, and it is reported rather than silent.
+      const before = dispatched.length;
+      const out = pass(moved);
+      expect(dispatched.length).toBe(before);
+      expect(out.refusals.map(r => r.kind)).not.toContain('stacked-above');
+      // A different bottom head is a fresh count.
+      pass('e'.repeat(40));
+      expect(dispatched.at(-1).restack).toMatchObject({ onto: 'lane/cap-bottom', bottomHead: 'e'.repeat(40) });
+      expect(readRemembered(root)[0]).toMatchObject({ restackedFor: 'e'.repeat(40), restackRounds: 1 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('releases a non-idle top to ordinary dispatch once its restacks are exhausted', () => {
+    const stacks = { pairs: [{ ...moved().pairs[0], bottomHead: 'cap-release-v1', restackedFor: 'cap-release-v1', restackRounds: 3 }] };
+    const out = applyStackOrder([entries[1]], stacks, { settings });
+    expect(out.planned).toEqual([entries[1]]);
+    expect(out.refusals).toEqual([expect.objectContaining({ pr: b.pr, kind: 'restack-cap-exhausted' })]);
   });
 });
 
@@ -316,8 +382,11 @@ describe('unknown reads owe nothing, and the memory file is shape-checked', () =
 
 describe('trust boundary and branch names for idle bottoms', () => {
   const lanes = [mk(4624, 'aaa', 'lane/red-main-contain'), mk(4631, 'bbb', 'lane/accept-carry-forward')];
+  // What gh reports for both PRs: the same actor by default; `patch` overrides per PR number.
+  const refsOf = patch => new Map([[4624, { headRefName: 'lane/red-main-contain', headRefOid: 'aaa', isCrossRepository: false, author: 'app/bot', ...patch[4624] }],
+    [4631, { headRefName: 'lane/accept-carry-forward', headRefOid: 'bbb', isCrossRepository: false, author: 'app/bot', ...patch[4631] }]]);
   const base = (over = {}) => ({ root: '/repo', repoKey: 'we', planned: [entryOf(lanes[1])], openPrFiles: [{ pr: 4624 }, { pr: 4631 }], settings,
-    readRefs: () => new Map([[4624, { headRefName: 'lane/red-main-contain', headRefOid: 'aaa', isCrossRepository: false }]]),
+    readRefs: () => refsOf({}),
     isAncestor: (x, y) => x === 'aaa' && y === 'bbb', onMain: () => false,
     readMem: () => [], writeMem: vi.fn(), readLanes: () => new Map([['lane/red-main-contain', 'aaa'], ['lane/accept-carry-forward', 'bbb']]), ...over });
   it('resolves the branch name of an initially idle (unplanned) bottom from origin', () => {
@@ -330,7 +399,7 @@ describe('trust boundary and branch names for idle bottoms', () => {
   it('takes the branch name from GitHub, never from a sha: a twin at the same tip cannot be picked', () => {
     const twinTips = new Map([['lane/red-main-contain', 'aaa'], ['lane/red-main-contain-alt', 'aaa'], ['lane/accept-carry-forward', 'bbb']]);
     expect(readStacksForPass(base({ readLanes: () => twinTips })).pairs[0].bottomRef).toBe('lane/red-main-contain');
-    const altRefs = new Map([[4624, { headRefName: 'lane/red-main-contain-alt', headRefOid: 'aaa', isCrossRepository: false }]]);
+    const altRefs = refsOf({ 4624: { headRefName: 'lane/red-main-contain-alt' } });
     expect(readStacksForPass(base({ readLanes: () => twinTips, readRefs: () => altRefs })).pairs[0].bottomRef).toBe('lane/red-main-contain-alt');
   });
   it('ignores a PR whose head is not the tip of its origin lane branch, a fork PR, and an unreadable PR', () => {
@@ -338,8 +407,7 @@ describe('trust boundary and branch names for idle bottoms', () => {
     expect(readStacksForPass(base({ readLanes: () => new Map([['lane/red-main-contain', 'zzz'], ['lane/accept-carry-forward', 'bbb']]),
       planned: [entryOf(lanes[1]), entryOf(lanes[0])] })).pairs).toEqual([]);
     // A fork PR carrying the same sha under the same lane name as a real origin branch.
-    const fork = new Map([[4624, { headRefName: 'lane/red-main-contain', headRefOid: 'aaa', isCrossRepository: true }]]);
-    expect(readStacksForPass(base({ readRefs: () => fork })).pairs).toEqual([]);
+    expect(readStacksForPass(base({ readRefs: () => refsOf({ 4624: { isCrossRepository: true } }) })).pairs).toEqual([]);
     expect(readStacksForPass(base({ readRefs: () => new Map() })).pairs).toEqual([]);
   });
   it('keeps a remembered pair through a pass where its bottom is transiently untrusted', () => {
@@ -348,11 +416,12 @@ describe('trust boundary and branch names for idle bottoms', () => {
     expect(bottomOf(out, 4631)).toMatchObject({ bottom: 4624, bottomRef: 'lane/red-main-contain', bottomOpen: true });
   });
   it('reads open PR refs from gh and treats anything unreadable as unverified', () => {
-    const run = vi.fn(() => JSON.stringify([{ number: 1, headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false }, { number: 2, headRefName: 'lane/b', headRefOid: 'y' }, { nope: 1 }]));
+    const run = vi.fn(() => JSON.stringify([{ number: 1, headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false }, { number: 2, headRefName: 'lane/b', headRefOid: 'y', author: { login: 'App/Bot' } }, { nope: 1 }]));
     const refs = readOpenPrRefs('/repo', { run, repo: 'o/r' });
     expect(run.mock.calls[0][0].slice(0, 4)).toEqual(['pr', 'list', '--repo', 'o/r']);
-    expect(refs.get(1)).toEqual({ headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false });
-    expect(refs.get(2).isCrossRepository).toBe(true);
+    expect(run.mock.calls[0][0].join(' ')).toContain('author');
+    expect(refs.get(1)).toEqual({ headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false, author: null });
+    expect(refs.get(2)).toMatchObject({ isCrossRepository: true, author: 'app/bot' });
     expect(readOpenPrRefs('/repo', { run: () => { throw Error('gh down'); } }).size).toBe(0);
     expect(readOpenPrRefs('/repo', { run: () => 'not json' }).size).toBe(0);
   });
@@ -386,5 +455,191 @@ describe('trust boundary and branch names for idle bottoms', () => {
     expect(readOriginLaneTips('/repo', { run })).toEqual(new Map([['lane/one', 'a'.repeat(40)], ['lane/two', 'b'.repeat(40)]]));
     expect(run.mock.calls[0][0]).toEqual(['ls-remote', '--end-of-options', 'origin', 'refs/heads/lane/*']);
     expect(readOriginLaneTips('/repo', { run: () => { throw Error('offline'); } })).toBeNull();
+  });
+});
+
+// Review round 2 on PR #4655.
+const sha = ch => ch.repeat(40);
+describe('the immediate bottom survives repeated passes before the restack (persisted memory)', () => {
+  const [A, B, C] = [sha('a'), sha('b'), sha('c')];
+  const B2 = sha('d');
+  const prs = bHead => [mk(1, A), mk(2, bHead), mk(3, C)];
+  // C was built on B (and so on A); B then advanced to B2, which C does not contain.
+  const contains = bHead => ancestry({ [B]: [A], [B2]: [A], [C]: [A, B], [bHead]: [A] });
+  it('keeps C on B for every pass until C contains B2, then follows B2', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-stack-chain-'));
+    try {
+      const first = detectStacks(prs(B), { isAncestor: contains(B) });
+      expect(bottomOf(first, 3)).toMatchObject({ bottom: 2, inSync: true, containedHead: B });
+      writeRemembered(root, nextRemembered(first));
+      for (const pass of [1, 2, 3]) {
+        const stacks = detectStacks(prs(B2), { remembered: readRemembered(root), isAncestor: contains(B2) });
+        expect(bottomOf(stacks, 3), `pass ${pass}`).toMatchObject({ bottom: 2, bottomHead: B2, containedHead: B, inSync: false });
+        expect(applyStackOrder([entryOf(mk(3, C))], stacks, { settings }).planned[0].restack).toMatchObject({ bottomPr: 2, onto: 'lane/p2' });
+        writeRemembered(root, nextRemembered(stacks));
+      }
+      // The restack lands: C now contains B2.
+      const caughtUp = detectStacks([mk(1, A), mk(2, B2), mk(3, sha('e'))], { remembered: readRemembered(root),
+        isAncestor: ancestry({ [B2]: [A], [sha('e')]: [A, B, B2] }) });
+      expect(bottomOf(caughtUp, 3)).toMatchObject({ bottom: 2, inSync: true, containedHead: B2 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('accepts a memory file with or without containedHead, and rejects a malformed one', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-stack-mem2-'));
+    const old = { top: 3, bottom: 2, bottomRef: 'lane/p2', bottomHead: B, restackedFor: null, restackRounds: 0 };
+    try {
+      writeRemembered(root, [old, { ...old, top: 4, containedHead: A }]);
+      expect(readRemembered(root)).toHaveLength(2);
+      writeRemembered(root, [{ ...old, containedHead: '--upload-pack=x' }]);
+      expect(readRemembered(root)).toEqual([]);
+      // an old file (no containedHead) falls back to its bottomHead
+      const stacks = detectStacks(prs(B), { remembered: [old], isAncestor: contains(B) });
+      expect(bottomOf(stacks, 3)).toMatchObject({ bottom: 2, containedHead: B });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('a landed bottom: the restack onto main is done when the top head moved after the launch', () => {
+  const bottomHead = sha('a');
+  const base = { top: 2, bottom: 1, bottomRef: 'lane/p1', bottomHead, containedHead: bottomHead, restackedFor: null, restackRounds: 0 };
+  const onMain = s => s === bottomHead;
+  it('stays owed even if the top contains the bottom\'s last SEEN head (the bottom may have advanced and merged unseen)', () => {
+    // top contains b1, but main holds b2 that this daemon never saw: containing the old head proves nothing.
+    const stacks = detectStacks([mk(2, sha('c'))], { remembered: [base], isAncestor: (x, y) => x === bottomHead && y === sha('c'), onMain });
+    expect(bottomOf(stacks, 2)).toMatchObject({ bottomOpen: false, inSync: false });
+    expect(applyStackOrder([entryOf(mk(2, sha('c')))], stacks, { settings }).planned[0].restack.onto).toBe('main');
+  });
+  it('retries a launched restack whose top did not move, and forgets the pair once the top moved', () => {
+    const launched = { ...base, restackedFor: 'main', restackRounds: 1, restackTopHead: sha('c') };
+    const same = detectStacks([mk(2, sha('c'))], { remembered: [launched], isAncestor: () => false, onMain });
+    expect(bottomOf(same, 2)).toMatchObject({ inSync: false });
+    expect(nextRemembered(same)).toHaveLength(1);
+    const moved = detectStacks([mk(2, sha('d'))], { remembered: [launched], isAncestor: () => false, onMain });
+    expect(bottomOf(moved, 2)).toMatchObject({ inSync: true });
+    expect(applyStackOrder([entryOf(mk(2, sha('d')))], moved, { settings }).planned[0].restack).toBeUndefined();
+    expect(nextRemembered(moved)).toEqual([]);
+  });
+  it('records the top head at launch and keeps it through the memory file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-stack-landed-'));
+    try {
+      const stacks = detectStacks([mk(2, sha('c'))], { remembered: [base], isAncestor: () => false, onMain });
+      const entry = applyStackOrder([entryOf(mk(2, sha('c')))], stacks, { settings }).planned[0];
+      recordRestackAttempt(stacks.pairs[0], entry.restack);
+      writeRemembered(root, nextRemembered(stacks));
+      expect(readRemembered(root)[0]).toMatchObject({ restackedFor: 'main', restackRounds: 1, restackTopHead: sha('c') });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('ownership and bounded git work', () => {
+  const lanePr = (n, oid, author = 'app/bot') => ({ ...mk(n, oid, `lane/own-${n}`), author });
+  const sameActor = (top, bottom) => Boolean(top.author) && top.author === bottom.author;
+  it('forms no new stack across actors or with an unreadable author, but keeps a remembered pair', () => {
+    const prs = (topAuthor, bottomAuthor) => [lanePr(1, sha('a'), bottomAuthor), lanePr(2, sha('b'), topAuthor)];
+    const isAncestor = ancestry({ [sha('b')]: [sha('a')] });
+    expect(detectStacks(prs('app/bot', 'app/bot'), { isAncestor, allowPair: sameActor }).pairs).toHaveLength(1);
+    expect(detectStacks(prs('mallory', 'app/bot'), { isAncestor, allowPair: sameActor }).pairs).toEqual([]);
+    expect(detectStacks(prs(null, null), { isAncestor, allowPair: sameActor }).pairs).toEqual([]);
+    const remembered = nextRemembered(detectStacks(prs('app/bot', 'app/bot'), { isAncestor }));
+    expect(detectStacks(prs('mallory', 'app/bot'), { remembered, isAncestor, allowPair: sameActor }).pairs).toHaveLength(1);
+  });
+  it('readStacksForPass applies the same-actor rule from what gh reports', () => {
+    const lanes = [mk(4624, 'aaa', 'lane/red-main-contain'), mk(4631, 'bbb', 'lane/accept-carry-forward')];
+    const refs = author => new Map([[4624, { headRefName: lanes[0].headRefName, headRefOid: 'aaa', isCrossRepository: false, author: 'app/bot' }],
+      [4631, { headRefName: lanes[1].headRefName, headRefOid: 'bbb', isCrossRepository: false, author }]]);
+    const opts = readRefs => ({ root: '/repo', repoKey: 'we', planned: lanes.map(entryOf), openPrFiles: [{ pr: 4624 }, { pr: 4631 }], settings, readRefs,
+      isAncestor: (x, y) => x === 'aaa' && y === 'bbb', onMain: () => false, readMem: () => [], writeMem: vi.fn(),
+      readLanes: () => new Map(lanes.map(p => [p.headRefName, p.headRefOid])) });
+    expect(readStacksForPass(opts(() => refs('app/bot'))).pairs).toHaveLength(1);
+    expect(readStacksForPass(opts(() => refs('someone-else'))).pairs).toEqual([]);
+    expect(readStacksForPass(opts(() => refs(null))).pairs).toEqual([]);
+    expect(readStacksForPass(opts(() => new Map())).pairs).toEqual([]);
+  });
+  it('asks git at most once per question and never more than the budget, however many PRs are open', () => {
+    const n = 50;
+    const many = Array.from({ length: n }, (_, i) => lanePr(i + 1, String(i + 1).padStart(40, '0')));
+    const isAncestor = vi.fn((x, y) => Number(x) < Number(y));
+    const onMain = vi.fn(() => false);
+    const stacks = detectStacks(many, { isAncestor, onMain, allowPair: sameActor });
+    expect(stacks.pairs.length).toBeGreaterThan(0);
+    expect(onMain.mock.calls.length).toBeLessThanOrEqual(n);
+    expect(new Set(isAncestor.mock.calls.map(c => c.join())).size).toBe(isAncestor.mock.calls.length);
+    expect(isAncestor.mock.calls.length + onMain.mock.calls.length).toBeLessThanOrEqual(ANCESTRY_BUDGET);
+    // A smaller budget stops the questions early: what is not asked reads as unknown, so fewer stacks, never wrong ones.
+    const tight = vi.fn(isAncestor);
+    detectStacks(many, { isAncestor: tight, onMain, allowPair: sameActor, bounds: { budget: 40 } });
+    expect(tight.mock.calls.length).toBeLessThanOrEqual(40);
+    let t = 0;
+    const slow = vi.fn(isAncestor);
+    detectStacks(many, { isAncestor: slow, onMain, allowPair: sameActor, bounds: { deadlineMs: 10, now: () => (t += 4) } });
+    expect(slow.mock.calls.length).toBeLessThan(10);
+  });
+  it('forms no new stack above the comparison cap but keeps remembered pairs', () => {
+    const many = Array.from({ length: MAX_COMPARED_PRS + 1 }, (_, i) => lanePr(i + 1, String(i + 1).padStart(40, '0')));
+    const isAncestor = (x, y) => Number(x) < Number(y);
+    expect(detectStacks(many, { isAncestor, allowPair: sameActor }).pairs).toEqual([]);
+    const remembered = [{ top: 2, bottom: 1, bottomRef: 'lane/own-1', bottomHead: many[0].headRefOid, containedHead: many[0].headRefOid, restackedFor: null, restackRounds: 0 }];
+    expect(detectStacks(many, { remembered, isAncestor, allowPair: sameActor }).pairs.map(p => p.top)).toEqual([2]);
+  });
+  it('keeps a remembered pair, owing nothing, when onMain cannot be answered; forgets it when the head is known NOT to be on main', () => {
+    const remembered = [{ top: 2, bottom: 1, bottomRef: 'lane/own-1', bottomHead: sha('a'), containedHead: sha('a'), restackedFor: null, restackRounds: 0 }];
+    for (const onMain of [() => null, () => { throw Error('git down'); }]) {
+      const kept = detectStacks([lanePr(2, sha('b'))], { remembered, isAncestor: () => false, onMain });
+      expect(kept.pairs).toHaveLength(1);
+      expect(kept.pairs[0]).toMatchObject({ bottomOpen: false, inSync: null });
+      expect(planIdleRestacks(kept, { reconcileRefusals: [{ prNumber: 2, kind: 'nothing-owed' }], settings })).toEqual([]);
+    }
+    expect(detectStacks([lanePr(2, sha('b'))], { remembered, isAncestor: () => false, onMain: () => false }).pairs).toEqual([]);
+    expect(detectStacks([lanePr(2, sha('b'))], { remembered, isAncestor: () => false, onMain: () => true, bounds: { budget: 0 } }).pairs[0].inSync).toBeNull();
+  });
+  it('gitOnMain keeps an unanswered git read unknown instead of "not on main"', () => {
+    expect(gitOnMain('/nonexistent-dir-for-pr-stack')(sha('a'))).toBeNull();
+  });
+});
+
+describe('an exhausted git budget never produces a wrong or lost stack', () => {
+  const chain = n => Array.from({ length: n }, (_, i) => ({ ...mk(i + 1, String(i + 1).padStart(40, '0'), `lane/ch-${i + 1}`) }));
+  const lt = (x, y) => Number(x) < Number(y);
+  const budgets = Array.from({ length: 40 }, (_, i) => i);
+  it('every budget gives either the full answer or fewer pairs, never a skipped-over bottom', () => {
+    const prs = chain(4).reverse(); // top-first order, the worst case for a partial scan
+    const full = detectStacks(prs, { isAncestor: lt, onMain: () => false });
+    expect(full.pairs.map(p => [p.top, p.bottom]).sort()).toEqual([[2, 1], [3, 2], [4, 3]]);
+    for (const budget of budgets) {
+      const out = detectStacks(prs, { isAncestor: lt, onMain: () => false, bounds: { budget } });
+      for (const p of out.pairs) expect(p.bottom, `budget ${budget}`).toBe(p.top - 1);
+    }
+  });
+  it('keeps the remembered immediate bottom whatever the budget, across persisted passes', () => {
+    const [A, B, C, B2] = [sha('a'), sha('b'), sha('c'), sha('d')];
+    const prs = [mk(1, A), mk(2, B2), mk(3, C)];
+    const remembered = [{ top: 3, bottom: 2, bottomRef: 'lane/p2', bottomHead: B2, containedHead: B, restackedFor: null, restackRounds: 0 },
+      { top: 2, bottom: 1, bottomRef: 'lane/p1', bottomHead: A, containedHead: A, restackedFor: null, restackRounds: 0 }];
+    for (const budget of budgets) {
+      const out = detectStacks(prs, { remembered, isAncestor: ancestry({ [B2]: [A], [C]: [A, B] }), bounds: { budget } });
+      expect(bottomOf(out, 3)?.bottom, `budget ${budget}`).toBe(2);
+    }
+  });
+  it('says so when it was cut short, and forms no stack above the comparison cap', () => {
+    const many = chain(MAX_COMPARED_PRS + 1);
+    expect(detectStacks(many, { isAncestor: lt, onMain: () => false })).toMatchObject({ pairs: [], truncated: true });
+    expect(detectStacks(chain(4), { isAncestor: lt, onMain: () => false, bounds: { budget: 3 } }).truncated).toBe(true);
+    expect(detectStacks(chain(4), { isAncestor: lt, onMain: () => false }).truncated).toBeUndefined();
+  });
+  it('a full scan of the maximum number of PRs fits inside the budget', () => {
+    const many = chain(MAX_COMPARED_PRS);
+    const isAncestor = vi.fn(lt); const onMain = vi.fn(() => false);
+    const out = detectStacks(many, { isAncestor, onMain });
+    expect(out.truncated).toBeUndefined();
+    expect(isAncestor.mock.calls.length + onMain.mock.calls.length).toBeLessThanOrEqual(ANCESTRY_BUDGET);
+    expect(out.pairs).toHaveLength(MAX_COMPARED_PRS - 1);
+  });
+  it('writes the memory through a temp file and rename', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-stack-atomic-'));
+    try {
+      writeRemembered(root, [{ top: 2, bottom: 1, bottomRef: 'lane/p1', bottomHead: sha('a'), containedHead: sha('a'), restackedFor: null, restackRounds: 0, restackTopHead: null }]);
+      expect(readdirSync(join(root, '.conveyor'))).toEqual(['pr-stacks.json']);
+      expect(readRemembered(root)).toHaveLength(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

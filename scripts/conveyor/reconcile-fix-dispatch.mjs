@@ -110,7 +110,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
-import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
+import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -1613,8 +1613,9 @@ export function runReconcileFixDispatch({
       if (entry.restack) {
         markRestackUsed(entry, restackedHeads);
         const pair = stacks.pairs.find(pair => pair.top === entry.pr);
-        pair.restackedFor = entry.restack.bottomHead ?? 'main';
-        pair.restackRounds = (pair.restackRounds ?? 0) + 1;
+        // Launched, not succeeded: the pair keeps owing the restack until the top contains the bottom's head, so a
+        // launched agent that exits without pushing is retried (bounded by the round cap), and a live one is held off by its claim.
+        recordRestackAttempt(pair, entry.restack);
         restackMemoryChanged = true;
       }
       if (entry.overlapExempt && !entry.restack) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
