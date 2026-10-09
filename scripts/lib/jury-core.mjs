@@ -1488,6 +1488,20 @@ function fixerChangeNearFinding(finding, files, { strictAlias = false } = {}) {
   return { path, state: files[path].some(n => Math.abs(n - line) <= LATER_ROUND_CHANGE_WINDOW) ? 'near' : 'far' };
 }
 
+/**
+ * Card 5469 — WHERE A FINDING SITS RELATIVE TO A FIX RANGE, for callers outside this file (the scoped re-review rule,
+ * we:scripts/lib/review-round-rules.mjs). The SAME reading both round classifiers here use, with the strict alias
+ * rule (a bare basename that fits two changed files names neither). `null` when the range is absent, unreadable or
+ * malformed: the caller must then treat the change as unknown (the fail-closed direction). PURE.
+ * @param {object} finding
+ * @param {object|null} latestFix - `{priorHead, head, files}` as `readLatestFixRange` returns it.
+ * @returns {'untouched'|'inconclusive'|'near'|'far'|null}
+ */
+export function findingChangeState(finding, latestFix) {
+  if (!latestFix || typeof latestFix !== 'object' || latestFix.error || !isWellFormedLatestFix(latestFix)) return null;
+  return fixerChangeNearFinding(finding, latestFix.files, { strictAlias: true }).state;
+}
+
 export function classifyLaterRoundAdvisory(findings, options = {}) {
   const { lens, mandatoryLenses = MANDATORY_LENSES, scope, latestFix } = options ?? {};
   const list = Array.isArray(findings) ? findings : [];
