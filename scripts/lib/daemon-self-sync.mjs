@@ -91,6 +91,10 @@
  *      `rebuild()` again (the SAME gated path, never a raw merge). Adoption with imported changes restarts
  *      immediately, without the normal debounce. Otherwise re-discover under a fresh read lock once in this
  *      pass; do not sleep away the opportunity the successful rebuild just created.
+ * x44lnnt (live 2026-10-09: no fix-daemon tick for 68 min behind 10-24 min smokes): with background builds on
+ * for this daemon (we:scripts/lib/daemon-background-build-settings.json, default off), step 1 is skipped — a
+ * detached builder process runs the same gated rebuild, started only between ticks — and step 3's HEAD-moved
+ * restart becomes the swap, at most once per `swapMinIntervalMs`. See we:scripts/lib/daemon-background-build.mjs.
  * `selfSyncCheckout` (the old merge-based IO) is no longer called anywhere on this path — kept exported only
  * because nothing else in this codebase imports it privately, and removing a public export for no functional
  * reason is its own kind of breakage. `sync`/`gate` stay ACCEPTED options (runner.mjs forwards them) but are
@@ -116,6 +120,11 @@ import {
 } from './daemon-clone-lock.mjs';
 import { basename } from 'node:path';
 import { repairCloneRefs } from './lane-repair.mjs';
+import {
+  loadBackgroundBuildSettings, resolveBackgroundBuild, decideBuilderStart, tickStarvedSmell,
+  BUILT_IN_BACKGROUND_BUILD_SETTINGS,
+  makeBuilderApi, makeTickProgressStore,
+} from './daemon-background-build.mjs';
 
 /** Setting: how long a STARVED reader (see `daemon-clone-lock.mjs` "reader fairness") waits, within the same
  *  tick, for draining writers to back off before it skips. Default 30s; a writer that already holds the clone
@@ -506,9 +515,7 @@ export function skippedTick(reason) {
 export function withSelfSync(effects, {
   root, onRestart, sync = selfSyncCheckout, syncPoc = selfSyncCheckoutPoc, base = 'main', pocBranch, env = process.env,
   log = console, timeoutMs, readHead = readHeadSha, readOriginRef = readOriginRefSha, hasStaleRefusal, gate = gateMergedCommit,
-  mainOnly = false, rebuild = (o = {}) => rebuildClone({
-    root, env, log, mainOnly, entries, ...o,
-  }), acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
+  mainOnly = false, rebuild: rebuildOpt, acquireRead = acquireReadLock, releaseRead = releaseReadLock, readState = readRebuildState,
   entries = [process.argv[1]], diffFiles = changedFilesBetween, importClosure = collectImportClosure,
   minRestartIntervalMs = resolveRestartMinIntervalMs(env), now = Date.now,
   sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -518,8 +525,23 @@ export function withSelfSync(effects, {
   // Card 89 S5. `versions`: undefined resolves from the settings (default off), null forces the legacy path.
   // `tickContext.tickRoot` is set for the duration of each versioned tick: the folder this tick's children run from.
   versions, tickContext = {}, versionApi = { currentVersion, pin: pinVersion, unpin: unpinVersion },
+  // x44lnnt — build the next version OFF the tick path (see daemon-background-build.mjs). `background`: undefined
+  // resolves from daemon-background-build-settings.json by this daemon's entry name (default OFF = the inline
+  // rebuild below, unchanged); an object overrides it. `builder` / `tickProgress` are the IO (injectable); they
+  // default to the real files only when `rebuild` is the real one, so a test never writes real daemon state.
+  background, builder, tickProgress,
 }) {
   const tick = effects.tickOnce;
+  const realIo = rebuildOpt === undefined;
+  const rebuild = rebuildOpt ?? ((o = {}) => rebuildClone({
+    root, env, log, mainOnly, entries, ...o,
+  }));
+  const bg = background === undefined
+    ? resolveBackgroundBuild({ entry: entries?.[0], settings: loadBackgroundBuildSettings(), env })
+    : (background ? { ...BUILT_IN_BACKGROUND_BUILD_SETTINGS, ...background, enabled: !!background.enabled } : null);
+  const bgOn = !!bg?.enabled;
+  const builderApi = builder ?? (realIo ? makeBuilderApi({ root, entries, env, mainOnly }) : null);
+  const progress = tickProgress ?? (realIo ? makeTickProgressStore({ root, entry: entries?.[0], env }) : null);
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
   const syncOpts = () => ({ root, ...(timeoutMs != null ? { timeoutMs } : {}) });
@@ -546,17 +568,18 @@ export function withSelfSync(effects, {
   let closureBuilt = false;
   const loggedHeads = new Set();
   let lastStuckLogAt = -Infinity;
-  const restartGate = (headNow, { urgent = false, diffRoot = root } = {}) => {
+  const swapMinIntervalMs = bgOn ? bg.swapMinIntervalMs : minRestartIntervalMs;
+  const restartGate = (headNow, { urgent = false, diffRoot = root, minIntervalMs = minRestartIntervalMs } = {}) => {
     if (!closureBuilt) {
       closureBuilt = true;
       try { closure = importClosure({ root, entries }); } catch { closure = null; }
     }
     const changedFiles = diffFiles({ root: diffRoot, from: bootSha, to: headNow, ...(timeoutMs != null ? { timeoutMs } : {}) });
-    const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minRestartIntervalMs });
+    const d = decideRestart({ changedFiles, closure, uptimeMs: now() - bootAt, minIntervalMs: urgent ? 0 : minIntervalMs });
     if (!d.restart && !loggedHeads.has(`${headNow}:${d.reason}`)) {
       loggedHeads.add(`${headNow}:${d.reason}`);
       log.error?.(d.reason === 'min-interval'
-        ? `daemon-self-sync: clone moved to ${headNow} and ${d.relevant.length} imported file(s) changed — restart deferred until this process has run ${Math.round(minRestartIntervalMs / 1000)}s (#4044 restart gate)`
+        ? `daemon-self-sync: clone moved to ${headNow} and ${d.relevant.length} imported file(s) changed — restart deferred until this process has run ${Math.round(minIntervalMs / 1000)}s (#4044 restart gate)`
         : `daemon-self-sync: clone moved to ${headNow} (${changedFiles.length} file(s) changed since boot, none imported by this daemon) — no restart needed, ticking on (#4044 restart gate)`);
     }
     return d;
@@ -611,6 +634,54 @@ export function withSelfSync(effects, {
       return tickResult;
     }
   };
+  // x44lnnt — the `tick-starved` smell, for EVERY daemon (the inline path is exactly where it happens). Never throws.
+  let lastStarvedLogAt = -Infinity;
+  const checkTickStarved = () => {
+    const thresholdMs = bg?.tickStarvedSmellMs ?? 0;
+    if (!progress || !(thresholdMs > 0)) return;
+    try {
+      const nowMs = now();
+      progress.markSeen(nowMs);
+      if (nowMs - lastStarvedLogAt < thresholdMs) return;
+      const p = progress.read() || {};
+      const adoptedAt = readState(root, env)?.adopted?.at ?? null;
+      const smell = tickStarvedSmell({
+        lastTickDoneAtMs: Date.parse(p.lastTickDoneAt || ''), firstSeenAtMs: Date.parse(p.firstSeenAt || ''),
+        lastAdoptedAtMs: Date.parse(adoptedAt || ''), nowMs, thresholdMs,
+      });
+      if (!smell.starved) return;
+      lastStarvedLogAt = nowMs;
+      const mins = Math.round(smell.sinceTickMs / 60_000);
+      log.error?.(`daemon-self-sync: SMELL tick-starved — no completed tick for ${mins} min while rebuilds keep adopting (last adoption ${adoptedAt}); `
+        + (bgOn
+          ? 'background builds are on, so something else blocks the tick — check the read lock and the tick itself (x44lnnt)'
+          : 'the inline rebuild + restart is running instead of the tick — turn background builds on for this daemon in scripts/lib/daemon-background-build-settings.json (x44lnnt)'));
+      progress.alert('tick-starved', { sinceTickMs: smell.sinceTickMs, lastTickDoneAt: p.lastTickDoneAt ?? null, lastAdoptedAt: adoptedAt, background: bgOn, entry: basename(String(entries?.[0] || '')) }, nowMs);
+    } catch { /* a smell never breaks a tick */ }
+  };
+  const markTickDone = () => { try { progress?.markTickDone(now()); } catch { /* best-effort */ } };
+
+  // x44lnnt — start the builder BETWEEN ticks only (after the read lock is released), coalesced. Never throws.
+  let swapPending = false;
+  const maybeStartBuilder = () => {
+    if (!bgOn || !builderApi) return null;
+    try {
+      const st = builderApi.read();
+      const startedMs = Date.parse(st?.startedAt || '');
+      const d = decideBuilderStart({
+        enabled: true, builderAlive: !!builderApi.alive?.(st), lastStartedAtMs: Number.isFinite(startedMs) ? startedMs : null,
+        swapPending, nowMs: now(), buildMinIntervalMs: bg.buildMinIntervalMs,
+      });
+      if (!d.start) return d;
+      const started = builderApi.start({ nowMs: now() });
+      log.error?.(`daemon-self-sync: started a background build (pid ${started?.pid ?? '?'}) — the daemon keeps ticking on its current code; it swaps onto a passed build only between ticks, at most once per ${Math.round(bg.swapMinIntervalMs / 60_000)} min (x44lnnt)`);
+      return d;
+    } catch (e) {
+      log.error?.(`daemon-self-sync: could not start a background build (${String((e && e.message) || e).split('\n')[0]}) — ticking on, the next tick retries (x44lnnt)`);
+      return null;
+    }
+  };
+
   return {
     ...effects,
     // Forwards whatever arguments the caller's own tickOnce takes (e.g. runner.mjs's per-tick bookkeeping
@@ -647,9 +718,22 @@ export function withSelfSync(effects, {
 
       // ---- DEFAULT (non-POC) path — full clone rebuild (#4044 Module E, see file header) ----
 
+      checkTickStarved();
+      // x44lnnt — background mode: never rebuild on the tick path. A clone re-cloned by the builder (plain
+      // origin/main, never smoked) runs no children until the builder's rebuild on it has finished, as inline.
+      if (bgOn) {
+        const bst = builderApi?.read?.();
+        if (bst?.recloned) {
+          maybeStartBuilder();
+          log.error?.('daemon-self-sync: the clone was re-cloned by the background build and nothing has been adopted on it yet — skipping this tick (x44lnnt)');
+          return skippedTick('clone-recloned');
+        }
+      }
+
       // 1. Rebuild (gated: takes the WRITE lock itself, runs the live smoke inside it). An adopted build
       //    restarts INSTEAD of ticking — the read lock below is never even acquired for this tick.
-      const rebuildResult = await rebuild();
+      //    x44lnnt: skipped in background mode — the builder process does it, and the swap is step 3's HEAD check.
+      const rebuildResult = bgOn ? null : await rebuild();
       if (rebuildResult && rebuildResult.reason === 'clone-recloned') {
         // The checkout was replaced under this process (plain origin/main, never smoked; this process's modules and cwd
         // are the old tree's). Run no children on it; the next tick rebuilds the overlays and restarts onto them.
@@ -731,16 +815,29 @@ export function withSelfSync(effects, {
           // only moves `root`'s HEAD after its candidate's live smoke has already passed elsewhere (unlocked), so
           // a rejected build never lands on `root` in the first place.
           const headNow = readHead(syncOpts());
-          if (bootSha != null && headNow != null && headNow !== bootSha && restartGate(headNow, { urgent: attempt > 0 }).restart) {
-            releaseOnce();
-            log.error?.(`daemon-self-sync: HEAD moved from ${bootSha} to ${headNow} since this process booted (an adopted rebuild) — restarting onto the new code (#4044)`);
-            return onRestart({ merged: false, commits: 0, reason: 'head-moved', headSha: headNow });
+          if (bootSha != null && headNow != null && headNow !== bootSha) {
+            // x44lnnt: in background mode this IS the swap — at a tick boundary, at most once per swapMinIntervalMs.
+            const d = restartGate(headNow, { urgent: attempt > 0, minIntervalMs: swapMinIntervalMs });
+            if (d.restart) {
+              releaseOnce();
+              log.error?.(`daemon-self-sync: HEAD moved from ${bootSha} to ${headNow} since this process booted (an adopted rebuild) — restarting onto the new code (#4044)${bgOn ? ' — swap between ticks (x44lnnt)' : ''}`);
+              return onRestart({ merged: false, commits: 0, reason: 'head-moved', headSha: headNow });
+            }
+            swapPending = d.reason === 'min-interval';
           }
 
           // 4. Run the real tick under the read lock.
           tickResult = await tick(...args);
+          markTickDone();
         } finally {
           releaseOnce();
+        }
+
+        // x44lnnt — between ticks: the read lock is released, so the builder's short locked prepare never waits
+        // on this process. Its smoke then runs while the next ticks run.
+        if (bgOn) {
+          maybeStartBuilder();
+          return tickResult;
         }
 
         // 5. #3383 bug 1 (unchanged in spirit) — this SAME tick's own result shows it hit the stale-main refusal

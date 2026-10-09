@@ -1,0 +1,6 @@
+{
+  "enabled": { "reconcile-fix-dispatch-daemon.mjs": true },
+  "swapMinIntervalMs": 600000,
+  "buildMinIntervalMs": 300000,
+  "tickStarvedSmellMs": 1800000
+}
