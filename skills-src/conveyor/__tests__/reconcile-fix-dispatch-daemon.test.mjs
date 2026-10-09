@@ -379,6 +379,10 @@ const noopNotesTick = () => ({ notes: [], prsByNumber: new Map() });
 // against these fixtures' fake repo names and throws `not a constellation repo` — a tick-failed refusal these
 // tests never expected.
 const noopPromoteDraftTick = () => ({ dispatched: [], refusals: [] });
+// card xiqtf7w — the supersede-hold half runs on every REAL tick (one with neither `fixTick` nor `ciHealTick`
+// injected), and its default lists open PRs through `gh` — forbidden in tests. A real-tick test must pass this
+// stand-in as `supersedeTick`.
+const noopSupersedeTick = ({ repo }) => ({ repo, holds: [], applied: [] });
 
 describe('runTickAllRepos — the daemon tick now runs BOTH fix and ci-heal dispatch, merged (#xngv3vn)', () => {
   it('awaits the async ci-heal half and merges both halves\' dispatched/refusals into one result', async () => {
@@ -1103,7 +1107,7 @@ describe('runTickAllRepos — draft-first PRs: the promote-draft half rides THIS
     const promoteDraftTick = vi.fn(({ repo }) => (repo === 'repo-a' ? { dispatched: [{ pr: 2813, kind: 'promote-draft' }], refusals: [] } : { dispatched: [], refusals: [] }));
     const out = await runTickAllRepos({
       repos: ['repo-a', 'repo-b'], hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
-      missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick,
+      missingRunTick: noopMissingRunTick, notesTick: noopNotesTick, promoteDraftTick, supersedeTick: noopSupersedeTick,
       authGateOverride: () => ({ paused: true, reason: 'paused: Claude login expired' }),
     });
     expect(out.authPaused).toBe(true);
