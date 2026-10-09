@@ -1,9 +1,10 @@
 ---
+bornAs: x38g872
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:agent-memory-src/151-policy-cascade-team-practice.md", "we:backlog/xj3qjdn-optional-auto-revert-of-a-confirmed-red-main-culprit-policy.md"]
+scope: ["we:agent-memory-src/151-policy-cascade-team-practice.md", "we:backlog/5601-optional-auto-revert-of-a-confirmed-red-main-culprit-policy.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
@@ -13,7 +14,7 @@ tags: []
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
 1. `we:agent-memory-src/151-policy-cascade-team-practice.md:18` — Add a check:memory rule that every [\[target]\] resolves to an agent-memory-src leaf stem.
-2. `we:backlog/xj3qjdn-optional-auto-revert-of-a-confirmed-red-main-culprit-policy.md:12` — Add a deterministic preparation gate requiring safety guarantees and configuration defaults to map to named planned tests, repository-qualified files, and observable assertions before a card becomes implementation-ready.
+2. `we:backlog/5601-optional-auto-revert-of-a-confirmed-red-main-culprit-policy.md:12` — Add a deterministic preparation gate requiring safety guarantees and configuration defaults to map to named planned tests, repository-qualified files, and observable assertions before a card becomes implementation-ready.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4623@16e9778963753e7bdaf34583e414f3f4550e2af9
 
