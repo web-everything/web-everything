@@ -143,7 +143,7 @@ describe('card scope helpers', () => {
 describe('enrichPrsWithScopeBloat — the io shell fails open and remembers the refresh', () => {
   const pr = (over = {}) => ({ number: 4361, title: 'WE #xykwe0h: build', headRefName: 'lane/build-outcomes', headRefOid: 'a'.repeat(40),
     files: FILES_4361.map((path) => ({ path, additions: 1, deletions: 0 })), comments: [], ...over });
-  const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, repo: 'web-everything/web-everything', env: {} };
+  const readers = { readNet: () => OWN, readScope: () => CARD_SCOPE, readBaseSha: () => 'base0', repo: 'web-everything/web-everything', env: {} };
 
   it('annotates a bloated PR and leaves a clean one alone', () => {
     const [bloated] = enrichPrsWithScopeBloat([pr()], readers);

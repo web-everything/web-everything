@@ -4,7 +4,7 @@
  *   laptop and the laptop plan from a container.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   REPO_ROOT,
@@ -75,10 +75,17 @@ describe('memoryDirs', () => {
   });
 });
 
+// HERMETIC (xcu4cqf): `main()` has no `readdir` seam, so an always-true `exists` made `trustableDirs` list the
+// REAL lane pool of whatever checkout runs the suite. Every path EXCEPT a lane-pool directory itself (`.lanes/<pool>`) exists here: the
+// pool is then "not provisioned", nothing is listed, and the trusted set is the primary checkout alone.
+const everythingButThePool = (p) => !/[\\/]\.lanes[\\/][^\\/]+[\\/]?$/.test(p);
+// Real `existsSync` for everything else (what `planSteps` defaults to), with the pool hidden the same way.
+const realButThePool = (p) => everythingButThePool(p) && existsSync(p);
+
 describe('planSteps', () => {
   it('deploys every skill on an ephemeral host and only the present ones on a laptop', () => {
-    expect(step(planSteps({ ephemeral: true }), 'skills').argv).toEqual(['--all']);
-    expect(step(planSteps({ ephemeral: false }), 'skills').argv).toEqual([]);
+    expect(step(planSteps({ ephemeral: true, exists: realButThePool }), 'skills').argv).toEqual(['--all']);
+    expect(step(planSteps({ ephemeral: false, exists: realButThePool }), 'skills').argv).toEqual([]);
   });
 
   // The step still SKIPS — a SessionStart hook must not block for minutes cloning two lanes and their
@@ -86,26 +93,26 @@ describe('planSteps', () => {
   // being the first thing a cloud session reads it left agents believing the primary was writable. It is not:
   // guard-lane.mjs ships in the COMMITTED settings. So the message must carry the ACTION, not a rationale.
   it('skips the lane pool on an ephemeral host — but tells you to provision one, and how', () => {
-    const lanes = step(planSteps({ ephemeral: true }), 'lanes');
+    const lanes = step(planSteps({ ephemeral: true, exists: realButThePool }), 'lanes');
     expect(lanes.skip).toMatch(/lane-pool\.mjs provision --count=2/);   // the runnable command
     expect(lanes.skip).toMatch(/only writable surface/);                 // why it is not optional
   });
 
   it('never tells an ephemeral host that a pool buys nothing', () => {
     // The regression guard proper: any of these clauses coming back means the misleading rationale returned.
-    const lanes = step(planSteps({ ephemeral: true }), 'lanes');
+    const lanes = step(planSteps({ ephemeral: true, exists: realButThePool }), 'lanes');
     expect(lanes.skip).not.toMatch(/buys nothing|no branch guard to work around|reclaimed on idle/);
   });
 
   it('never plans to install the guard on an ephemeral host', () => {
-    expect(step(planSteps({ ephemeral: true }), 'guard').skip).toBeTruthy();
+    expect(step(planSteps({ ephemeral: true, exists: realButThePool }), 'guard').skip).toBeTruthy();
   });
 
   // `toBeTruthy()` above passes for ANY non-empty string, so it never noticed that this message said
   // "there is no pool here" — which reads as "the guard is absent", pairs with the `lanes` message, and
   // together told a cloud session it could edit the primary. Assert the CONTENT, and guard the regression.
   it('says the guard is already enforcing here — only its USER-level install is skipped', () => {
-    const guard = step(planSteps({ ephemeral: true }), 'guard').skip;
+    const guard = step(planSteps({ ephemeral: true, exists: realButThePool }), 'guard').skip;
     expect(guard).toMatch(/already enforces|already enforcing/);
     expect(guard).not.toMatch(/no pool here|not installed/);
   });
@@ -963,7 +970,7 @@ describe('main() — the installer orchestration', () => {
       uninstallHook: () => { io.hooks.push('uninstall'); return 'removed'; },
       runSkills: (script, argv, opts) => { io.skills.push({ script, argv, ...opts }); return { ok: true, out: 'in sync' }; },
       symlink: (target, path) => io.links.push({ target, path }),
-      exists: () => true,
+      exists: everythingButThePool,
       env: {},
       out: (line) => io.lines.push(line),
       ...over,
@@ -1014,7 +1021,7 @@ describe('main() — the installer orchestration', () => {
     // redden on the MACHINE rather than on the code — in a file whose whole philosophy is that every handle
     // is injected. Reproduced in an alias-less layout before fixing (review finding, 2026-08-26).
     it('writes nothing when every checkout is already trusted', () => {
-      const exists = () => true;                        // the one probe BOTH derivations below run through
+      const exists = everythingButThePool;              // the one probe BOTH derivations below run through
       const trusted = trustableDirs(REPO_ROOT, exists).map((d) => [d, { hasTrustDialogAccepted: true }]);
       const { io } = run(['--json'], VM, { exists, readTrust: () => ({ projects: Object.fromEntries(trusted) }) });
       expect(io.trustWrites).toEqual([]);
@@ -1067,7 +1074,7 @@ describe('main() — the installer orchestration', () => {
 
   describe('the aliases step', () => {
     // WE resolves as `web-everything`; its `webeverything` alias is the one thing absent.
-    const NO_ALIAS = (p) => !String(p).endsWith('webeverything');
+    const NO_ALIAS = (p) => !String(p).endsWith('webeverything') && everythingButThePool(p);
     const aliasStep = (io) => report(io).steps.find((s) => s.id === 'aliases');
 
     it('creates the missing alias on a host it may write to, target first', () => {

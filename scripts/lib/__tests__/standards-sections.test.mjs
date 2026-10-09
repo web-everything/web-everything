@@ -1,11 +1,12 @@
 // #70d — scoped check:standards runs only the sections whose declared inputs a touched file matches.
 // Invariant under test: a section whose inputs include a touched file is NEVER skipped; one whose inputs
 // match nothing touched IS skipped (and recorded); an unscoped run never skips anything.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { makeGitOverlay } from '../hermetic-git-overlay.mjs';
 import {
   createSectionGate, globToRegExp, matchesAny, SECTION_INPUTS, ALWAYS_TRIGGERS, SKIP_REASON,
 } from '../standards-sections.mjs';
@@ -93,9 +94,14 @@ describe('check-standards.mjs wiring', () => {
     expect([...used].sort()).toEqual(Object.keys(SECTION_INPUTS).sort());
   });
 
-  // Real runs of the real gate on the real repo (slow: each is a full scoped check:standards).
+  // Real runs of the real gate on the real repo (slow: each is a full scoped check:standards). The gate reads
+  // `origin/main` (merge-base, ls-tree); hermetic tests (card xcu4cqf) give it a git overlay whose `origin/main` is
+  // pinned to HEAD — same tree, same objects, no live remote ref.
+  let overlay;
+  beforeAll(() => { overlay = makeGitOverlay(ROOT); });
+  afterAll(() => overlay?.cleanup());
   const run = (args) => JSON.parse(execFileSync(process.execPath, [CHECK, ...args, '--json'], {
-    cwd: ROOT, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'],
+    cwd: ROOT, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, ...overlay.env },
   }));
   const card = `backlog/${readdirSync(join(ROOT, 'backlog')).filter((f) => f.endsWith('.md')).sort()[0]}`;
 

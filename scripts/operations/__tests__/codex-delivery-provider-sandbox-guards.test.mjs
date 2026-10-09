@@ -11,7 +11,7 @@
  *   3. The clone-topology fixture: production lanes are `git clone --reference` clones with a directory `.git`.
  */
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -251,4 +251,6 @@ describe('4807 production-shaped clone fixture', () => {
   });
 });
 
-function realHome() { return homedir(); }
+// The fixture's base is `realpathSync`'d, and under hermetic tests the home is a per-file fake under the OS temp dir
+// (`/var/...` -> `/private/var/...` on macOS), so the claim "below home" must compare canonical paths.
+function realHome() { return realpathSync(homedir()); }

@@ -1,5 +1,7 @@
 /** Real subprocess/disk fidelity, separate from the filesystem-free injected unit suite. */
-import { it, expect } from 'vitest';
+import { it, expect, beforeAll, afterAll } from 'vitest';
+import { makeGitOverlay } from '../../lib/hermetic-git-overlay.mjs';
+import { DEFAULT_REPO_ROOT } from '../../lib/hermetic-tests.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -53,6 +55,10 @@ it('kills a snapshot blocked in an actual filesystem read at the hard deadline',
 }, READ_TIMEOUT_MS + 40_000);
 
 const CLI = join(process.cwd(), 'scripts/operations/run.mjs');
+// Pin origin/main to HEAD so the CLI's runner-freshness check stays local.
+let overlay;
+beforeAll(() => { overlay = makeGitOverlay(DEFAULT_REPO_ROOT); });
+afterAll(() => overlay?.cleanup());
 
 // The production IO deadline is already short (2s). The wall clock also includes the real CLI's
 // module loading, nested Node startups, scheduling and SIGKILL/exit propagation. CI has exhausted
@@ -75,7 +81,7 @@ it.each(['resume', 'initial-write', 'subsequent-write', 'call-log'])(
         : stage === 'call-log' ? join(calls, new Date().toISOString().slice(0, 10) + '.jsonl')
           : join(root, 'write-fifo');
       execFileSync('mkfifo', [fifo], { timeout: 2000 });
-      const env = { ...process.env, OPERATION_RUNS_DIR: runs, OPERATION_CALLS_DIR: calls,
+      const env = { ...process.env, ...overlay.env, OPERATION_RUNS_DIR: runs, OPERATION_CALLS_DIR: calls,
         CONVEYOR_RUNNER_LOCK_ROOT: join(root, 'absent-locks') };
       if (stage.includes('write')) {
         // Atomic writes use an unpredictable PID/timestamp temp path. Redirect that write to
@@ -122,7 +128,7 @@ it.each(['resume', 'initial-write', 'subsequent-write', 'call-log'])(
 
 it('persists and resumes runner-activity through the actual CLI', async () => {
   await withRealRepo(({ root }) => {
-    const env = { ...process.env, OPERATION_RUNS_DIR: join(root, 'runs'),
+    const env = { ...process.env, ...overlay.env, OPERATION_RUNS_DIR: join(root, 'runs'),
       OPERATION_CALLS_DIR: join(root, 'calls'), CONVEYOR_RUNNER_LOCK_ROOT: join(root, 'absent') };
     for (const flag of ['--run-id=healthy', '--resume=healthy']) {
       // #4075 follow-up (ci-heal-2721): same real-CLI round trip as above, so the same load-tolerant outer

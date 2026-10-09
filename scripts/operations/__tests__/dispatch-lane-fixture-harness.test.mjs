@@ -58,6 +58,7 @@ import {
   inFlightDispatchesFor, persistLastSeenLive,
 } from '../dispatch-lane-io.mjs';
 import { shapeDispatchRead, DISPATCH_EFFECT } from '../dispatch-lane.mjs';
+import { readBuildDelivery, defaultListBuildPrs } from '../../conveyor/build-delivery-evidence.mjs';
 import { createFileRunStore } from '../run-store.mjs';
 import { isInFlightResult } from '../effect-executor.mjs';
 
@@ -214,6 +215,14 @@ describe('dispatch-lane fixture-root harness — REAL argv-building + guard logi
         root: REPO_ROOT, // the real checkout — so the brief filled below is the REAL delivery-agent-brief.md
         exec: fakeExec,
         runNode: () => JSON.stringify({ decisions, nextState }),
+        // The card is a synthetic fixture (#9001) that does not exist on origin/main: its status/dateOpened read
+        // as unknown (null), exactly what the real `git ls-tree origin/main` lookup yielded — without reading
+        // the real checkout's remote refs. The PR list still goes through the fake `gh`.
+        checkBuildDelivery: (n) => readBuildDelivery(n, {
+          listPrs: (k) => defaultListBuildPrs(k, { exec: fakeExec, cwd: caseRoot }),
+          readCardStatus: () => null,
+          readCardOpened: () => null,
+        }),
         loadItems: () => [{ num: NUM, slug: 'ready-item', scope: ['we:scripts/fixture-thing.mjs'], openBlockers: [] }],
         listInFlightDispatches: (key) => inFlightDispatchesFor(key, { store: createFileRunStore(runsDir) }),
         listAgents: () => defaultListAgents({ exec: fakeExec, env: combinedEnv }),

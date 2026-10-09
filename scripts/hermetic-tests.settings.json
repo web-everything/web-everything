@@ -1,0 +1,63 @@
+{
+  "$comment": "Hermetic tests by default (card xcu4cqf). Read by we:scripts/lib/hermetic-tests.mjs (the guard), we:scripts/lib/hermetic-test-scan.mjs (the ratchet), every vitest config (blocking configs exclude liveSuite.tests; vitest.live.config.ts runs only them) and pinned against we:.github/workflows/live-tests.yml (the cron must equal liveSuite.schedule.cron).",
+  "liveSuite": {
+    "$comment": "The ONLY tests allowed to reach live GitHub / remote refs / host state. They never run in a blocking suite (unit, integration, soak). They run on a schedule and a failure is reported as a health-smell issue, never as a PR or main gate. Each entry needs a reason; moving a test here is the opt-out marker.",
+    "schedule": { "cron": "23 */6 * * *", "intervalHours": 6 },
+    "issueLabel": "health-smell",
+    "tests": [
+      {
+        "file": "scripts/operations/__tests__/route-pr-outcome-io-live.test.mjs",
+        "reason": "the #2949 fidelity qualifier against the REAL gh binary: its whole claim is how a real, unauthenticated gh subprocess fails, which no fake can observe (moved out of the blocking integration tier)"
+      }
+    ]
+  },
+  "hermeticDebt": {
+    "$comment": "Blocking-suite test files still making live accesses that could not be fixed in card xcu4cqf because another open PR holds the file (free-scope). Their accesses are RECORDED and printed, not failed: the old behaviour (fake gh, real git/fs). The list may only shrink — we:scripts/lib/__tests__/hermetic-tests.test.mjs pins its maximum length; remove an entry by fixing the file once its blocking PR lands.",
+    "files": [
+      { "file": "scripts/conveyor/__tests__/reconcile-pass.test.mjs", "reason": "reconcile pass reads origin/main in the real checkout (rev-parse/diff); file held by open PRs #4527 #4525 #4522 #4512 #4511 #4510 #4502" },
+      { "file": "scripts/conveyor/__tests__/ci-red-recovery-watch.test.mjs", "reason": "one gh api branch-protection read (frontierui); file held by open PRs #4527 #4525 #4522 #4512 #4511 #4510 #4502" },
+      { "file": "scripts/lib/__tests__/daemon-live-smoke.test.mjs", "reason": "gh pr view 900001 through the default runner; file held by open PRs #4453 #4439" },
+      { "file": "scripts/conveyor/__tests__/health-watch.test.mjs", "reason": "gh api rate_limit / secrets reads through default runners; file held by open PR #4461" }
+    ]
+  },
+  "guardedRoots": [
+    { "id": "conveyor-state", "path": "~/.claude/daemon-self-sync-state", "why": "the machine-wide automation state home: the build queue, run scorecards, daemon last-good" },
+    { "id": "conveyor-home", "path": "~/.claude/conveyor", "why": "the conveyor runner's own state" },
+    { "id": "jobs", "path": "~/.claude/jobs", "why": "live agent session registry" },
+    { "id": "github-app-token", "path": "~/.claude/github-app-token", "why": "real GitHub credentials and the gh shim" },
+    { "id": "operations", "path": "~/workspace/.operations", "why": "coordination root, telemetry, daemon clones" },
+    { "id": "lane-pool", "path": "~/workspace/.lanes", "why": "other lanes and the pool's lease/cache files (the checkout under test and its sibling repos are exempt)" },
+    { "id": "primary-backlog", "path": "~/workspace/webeverything/backlog", "why": "the primary checkout's live backlog (exempt when the primary IS the checkout under test)" },
+    { "id": "primary-queue", "path": "~/workspace/webeverything/.conveyor", "why": "the primary checkout's legacy queue" }
+  ],
+  "fakeHome": {
+    "$comment": "Hermetic runs give every test file a private, empty HOME (env HOME + os.homedir()), so a default path built from the home (~/.claude/*, ~/workspace/.lanes, ~/workspace/.operations) resolves into a throwaway fixture instead of the operator's live state. Tool caches below stay pointed at the REAL home (only when unset and present) so npx/playwright/cargo do not re-download.",
+    "toolEnv": {
+      "npm_config_cache": "~/.npm",
+      "PLAYWRIGHT_BROWSERS_PATH": "~/Library/Caches/ms-playwright",
+      "CARGO_HOME": "~/.cargo",
+      "RUSTUP_HOME": "~/.rustup",
+      "BUN_INSTALL": "~/.bun"
+    }
+  },
+  "fixtureRootEnv": {
+    "$comment": "Roots NOT derived from the home (the lane pool and telemetry dir are found from the checkout's own location, so a test run inside a lane would otherwise read its sibling lanes). Hermetic runs point each at a private, empty per-file dir unless the launcher already set it.",
+    "LANE_POOL_ROOT": "lanes",
+    "OPERATION_TELEMETRY_DIR": "telemetry"
+  },
+  "ambientRootEnv": ["CONVEYOR_STATE_ROOT", "WE_DAEMON_STATE_DIR", "LANE_POOL_ROOT", "WE_COORDINATION_ROOT", "WE_GH_THROTTLE_LOCK_ROOT"],
+  "siblingRepos": ["frontierui", "plateau-app"],
+  "primaryCheckout": "~/workspace/webeverything",
+  "liveReaders": [
+    {
+      "call": "adoptOrphanedBuildClaims",
+      "requires": ["readDelivery", "recordFailure", "releaseLaneLease", "sessionLivenessFor", "listClaims", "spawnResume"],
+      "why": "its defaults read gh + origin/main backlog (readDelivery), the jobs registry, the real backoff store and lane pool — the 2026-10-08 main-red incident"
+    },
+    {
+      "call": "readBuildDelivery",
+      "requires": ["listPrs", "readCardStatus", "readCardOpened"],
+      "why": "defaults to gh pr list + git show origin/main:backlog"
+    }
+  ]
+}

@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,8 +34,25 @@ const coroner = () => ({
   } } },
 });
 
+// The snapshot sink reads card history from `process.cwd()`'s checkout (fetch + origin/main). Hermetic tests may not
+// touch the real checkout's remote, so the sink runs from a throwaway repo that has a local `refs/remotes/origin/main`.
+function makeScratchRepo(dir) {
+  const git = (...args) => execFileSync('git', ['-c', 'commit.gpgsign=false', '-c', 'user.email=t@t.com', '-c', 'user.name=t', ...args], {
+    cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' },
+  });
+  mkdirSync(join(dir, 'backlog'), { recursive: true });
+  git('init', '--quiet', '--initial-branch=main');
+  writeFileSync(join(dir, 'backlog', '1-seed.md'), '---\nstatus: open\n---\n');
+  git('add', 'backlog');
+  git('commit', '--quiet', '-m', 'seed');
+  git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+}
+
 async function withTemp(fn) {
   const home = mkdtempSync(join(tmpdir(), 'perf-snapshot-'));
+  const repo = join(home, 'scratch-repo');
+  makeScratchRepo(repo);
+  const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(repo);
   try {
     const env = { WE_CORONER_NO_EXECUTORS: '1' };
     for (const key of ['JOBS', 'JOBS_ARCHIVE', 'PROJECTS', 'DAEMON_DIR', 'VERIFY_LOG', 'ADMISSION', 'COORD', 'LANES', 'BACKLOG']) {
@@ -49,7 +67,7 @@ async function withTemp(fn) {
       changeRequests: coroner().changeRequests,
     }));
     return await fn({ home, env, archive });
-  } finally { rmSync(home, { recursive: true, force: true }); }
+  } finally { cwdSpy.mockRestore(); rmSync(home, { recursive: true, force: true }); }
 }
 
 describe('perf-snapshot pure metrics', () => {

@@ -186,6 +186,7 @@ describe('dispatcher fixture-root harness — conveyor-state → dispatch-plan �
     const backlogDir = join(fixtureRoot, 'backlog');
     mkdirSync(backlogDir, { recursive: true });
     const queueFile = join(fixtureRoot, 'queue.json');
+    const fakeGh = withFakeGh({ prs: [] });
     try {
       // An open, scoped, otherwise build-ready item that carries NO `preparedDate` — the exact shape the live
       // queue is full of today (card #4470's own body: "dispatch-plan tags nearly every row 'unprep'").
@@ -194,7 +195,8 @@ describe('dispatcher fixture-root harness — conveyor-state → dispatch-plan �
         scope: ['we:scripts/fixture-thing101.mjs'], dateOpened: '2026-01-01', tags: [],
       }, 'An open, scoped, UNPREPARED fixture item');
       writeFileSync(queueFile, JSON.stringify([{ num: '9101', addedAt: new Date().toISOString() }]), 'utf8');
-      const env = { ...process.env, CONVEYOR_QUEUE_FILE: queueFile };
+      // dispatch-plan lists open PRs; hand it an empty fake `gh` so it never reaches the real/hermetic one.
+      const env = { ...process.env, ...fakeGh.env, CONVEYOR_QUEUE_FILE: queueFile };
 
       // Default (no `--no-prepare-check`): the live daemon's own posture. An unprepared item holds
       // `needs-prepare` — never launches — proving `main()` actually wires `preparePolicy` into `dispatchPlan`
@@ -220,6 +222,7 @@ describe('dispatcher fixture-root harness — conveyor-state → dispatch-plan �
       expect(skipped.launch).toEqual([{ num: '9101', lane: 912 }]);
       expect(skipped.held).toEqual([]);
     } finally {
+      fakeGh.cleanup();
       rmSync(fixtureRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   }, 30_000);

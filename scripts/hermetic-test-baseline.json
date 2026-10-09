@@ -1,0 +1,21 @@
+{
+  "bun-trial/scripts/conveyor/__tests__/duplicate-pr-watch.test.mjs": 1,
+  "bun-trial/scripts/conveyor/__tests__/parked-pr-progress-watch.test.mjs": 1,
+  "bun-trial/scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs": 1,
+  "scripts/__tests__/review-set-label.gh-throttle-fidelity.test.mjs": 7,
+  "scripts/conveyor/__tests__/build-delivery-evidence.test.mjs": 4,
+  "scripts/conveyor/__tests__/build-dispatch-orphan-adopt.test.mjs": 28,
+  "scripts/conveyor/__tests__/duplicate-pr-watch.test.mjs": 1,
+  "scripts/conveyor/__tests__/parked-pr-conflict-watch.test.mjs": 1,
+  "scripts/conveyor/__tests__/parked-pr-progress-watch.test.mjs": 1,
+  "scripts/conveyor/__tests__/reconcile-pass-required-checks.test.mjs": 1,
+  "scripts/conveyor/__tests__/reconcile-pass.test.mjs": 1,
+  "scripts/conveyor/__tests__/sim-scenario-approved-conflict-grace.test.mjs": 1,
+  "scripts/conveyor/soak/breaks/ci-heal-loop-stale-label-review-gate.mjs": 1,
+  "scripts/conveyor/soak/breaks/review-human-red-ci-never-healed.mjs": 1,
+  "scripts/conveyor/soak/breaks/stale-fixing-label-ci-heal-owed.mjs": 1,
+  "scripts/conveyor/soak/breaks/worker-push-during-fix-claim.mjs": 1,
+  "scripts/lib/__tests__/proc-read.test.mjs": 1,
+  "scripts/operations/__tests__/deliver-item-wrapper.test.mjs": 2,
+  "skills-src/conveyor/__tests__/runner.test.mjs": 1
+}
