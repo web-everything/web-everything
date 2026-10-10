@@ -4,10 +4,12 @@ kind: story
 size: 3
 priority: high
 parent: "4075"
-status: open
+status: resolved
 blockedBy: ["4131"]
 scope: ["we:scripts/conveyor/verify-dispatch.mjs", "we:skills-src/conveyor/verify-daemon.mjs", "we:scripts/conveyor/verify-gate-job.mjs"]
 dateOpened: "2026-09-24"
+dateStarted: "2026-10-10"
+dateResolved: "2026-10-10"
 tags: []
 ---
 
@@ -50,3 +52,24 @@ Slice of decision 4120 (daemon job model); audit we:reports/2026-09-24-daemon-bl
 - **Edge.** Overlaid onto the verify daemon clone `wev-control` (PR 4764) and loaded 2026-10-10T13:30:24Z: the
   restarted daemon logs `gates run as detached jobs (~/.claude/daemon-jobs/verify-daemon)` and adopted the two
   in-process runs the old daemon handed off.
+- **Live proof (2026-10-10, verify daemon on `wev-control`).** Lane 16 @ 284dda8f ran as job
+  `job-verify-gate-ce46a837…` (gate pid 42698). Timeline from its record: queued 13:34:47Z · launched/started
+  13:35:06Z (attempt 1) · gate started 13:35:21Z · finished 13:44:46Z — launched once, started once, finished once.
+  Two daemon restarts happened mid-flight; both re-attached, neither killed nor re-dispatched:
+  ```
+  13:35:14.522Z SIGTERM — left 2 gate job(s) running detached — the next daemon re-attaches from the job store.
+  13:35:14.782Z re-attached gate job job-verify-gate-ce46a837… for web-everything/lane-16 @ 284dda8f (gate pid 42698)
+  13:37:47.752Z loop stopped (code-changed) — left 5 gate job(s) running detached
+  13:37:48.332Z re-attached gate job job-verify-gate-ce46a837… for web-everything/lane-16 @ 284dda8f (gate pid 42698)
+  13:37:48.332Z gates run as detached jobs (…/daemon-jobs/verify-daemon); 5 re-attached at boot.
+  ```
+  The code-change restart at 13:37:47Z exited at once with 5 gates in flight (before: it waited 69 minutes).
+  Ticks kept running while the gate ran (13:37:58Z, 13:40:25Z, 13:42:43Z). One verdict: the lane marker is
+  `green @ 284dda8f` finished 13:44:46.337Z, and the job result says `green`, attempt 1. Other lanes' jobs
+  re-attached by the same restart settled once each (`gate job … for web-everything/lane-12 @ da4984d1 settled:
+  green — marker green @ da4984d1 [attempt 1]`).
+- **Supervisor `kill -9` (fixture lane, real detached job).** The dead supervisor was requeued, the new daemon did
+  not re-dispatch the lane (`dispatched=0`), the orphaned gate settled green itself, and attempt 2 found the marker
+  settled and ran nothing (`settled: stale — marker green`); the gate ran once.
+- **Residuals** filed as x8ordg8: the first snapshot build per clone HEAD blocks one tick (28 s live), a relaunch
+  kills a surviving gate instead of re-attaching to it, and verify-lane notice lines now land in the job log.
