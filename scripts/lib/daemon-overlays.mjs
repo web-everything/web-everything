@@ -40,8 +40,11 @@ import {
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { canonicalCloneRoot } from './daemon-clone-layout.mjs';
 import { isSafeBranchName } from './daemon-self-sync.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 
 /** Env var that pins the overlay state root outside any git tree (ruling clause 3(iii)). */
 export const WE_DAEMON_OVERLAY_DIR_ENV = 'WE_DAEMON_OVERLAY_DIR';
@@ -199,16 +202,20 @@ export function writeOverlays(root, list, { env = process.env } = {}) {
  * `pinned:true` marks an overlay the rebuild must never drop for a conflict (it refuses instead — see
  * `daemon-rebuild.mjs#REBUILD_MECHANISM_PATHS`); `pinned:false` clears the flag; leaving it out keeps it as is.
  * @param {string} root
- * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean}} entry
+ * `stackBases` (held item 212) records the PR's base-branch chain, nearest first (e.g. `['lane/b', 'lane/a']` for a PR
+ * stacked on lane/b, itself on lane/a). The rebuild reads it only when gh cannot answer; leaving it out keeps it as is.
+ * @param {{ref:string, pr?:number|null, addedBy?:string|null, reason?:string|null, now?:string, pinned?:boolean,
+ *   stackBases?:string[]}} entry
  * @param {{env?:NodeJS.ProcessEnv}} [o]
  * @returns {Array<object>} the new list
  */
 export function addOverlay(root, {
-  ref, pr = null, addedBy = null, reason = null, now, pinned,
+  ref, pr = null, addedBy = null, reason = null, now, pinned, stackBases,
 } = {}, { env = process.env } = {}) {
   if (!isSafeBranchName(ref)) {
     throw new TypeError(`daemon-overlays: ref ${JSON.stringify(ref)} is not a safe branch name — refusing to add it`);
   }
+  const bases = Array.isArray(stackBases) ? stackBases.filter((b) => isSafeBranchName(b)) : null;
   return withListLock(root, env, (pause) => {
     const list = readOverlaysForWrite(root, env).slice();
     pause();
@@ -217,11 +224,13 @@ export function addOverlay(root, {
       list.push({
         ref, pr: pr ?? null, addedAt: now || new Date().toISOString(), addedBy: addedBy ?? null, reason: reason ?? null,
         ...(pinned === true ? { pinned: true } : {}),
+        ...(bases ? { stackBases: bases } : {}),
       });
     } else {
       const next = { ...list[idx], pr: pr ?? null, reason: reason ?? null };
       if (pinned === true) next.pinned = true;
       else if (pinned === false) delete next.pinned;
+      if (bases) next.stackBases = bases;
       list[idx] = next;
     }
     return writeOverlays(root, list, { env });
@@ -300,4 +309,86 @@ export function appendOverlayEvent(root, event, { env = process.env } = {}) {
   const file = eventsFilePath(root, env);
   mkdirSync(dirname(file), { recursive: true });
   appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, 'utf8');
+}
+
+// ── overlay stacks (held item 212) ─────────────────────────────────────────────────────────────────────────────
+
+/** Env override for `overlay.stackMode`. */
+export const OVERLAY_STACK_MODE_ENV = 'WE_DAEMON_OVERLAY_STACK_MODE';
+/** `tops`: a stack of overlay PRs applies only its tops (default). `independent`: every overlay applies on its own. */
+export const OVERLAY_STACK_MODES = Object.freeze(['tops', 'independent']);
+const OVERLAY_SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), 'daemon-rebuild-settings.json');
+
+/**
+ * IO: `overlay.stackMode` through the policy cascade (standard `tops` → platform → tool block `overlay` in
+ * daemon-rebuild-settings.json → env {@link OVERLAY_STACK_MODE_ENV}). Never throws; an invalid value is ignored.
+ * @returns {{mode:'tops'|'independent', source:string}}
+ */
+export function resolveOverlayStackMode(env = process.env, { settingsPath = OVERLAY_SETTINGS_PATH } = {}) {
+  try {
+    let tool;
+    try { tool = JSON.parse(readFileSync(settingsPath, 'utf8'))?.overlay; } catch { tool = undefined; }
+    const ev = typeof env?.[OVERLAY_STACK_MODE_ENV] === 'string' ? env[OVERLAY_STACK_MODE_ENV].trim() : undefined;
+    const r = cascadePolicy('overlay', tool, {
+      env,
+      standard: { stackMode: 'tops' },
+      envValues: { stackMode: ev || undefined },
+      valid: { stackMode: (v) => OVERLAY_STACK_MODES.includes(v) },
+    });
+    const mode = r.value?.stackMode;
+    return OVERLAY_STACK_MODES.includes(mode) ? { mode, source: r.sources?.stackMode ?? 'standard' } : { mode: 'tops', source: 'standard' };
+  } catch {
+    return { mode: 'tops', source: 'standard' };
+  }
+}
+
+/** Both reads are one small JSON row / one URL line; anything bigger is not what we asked for. */
+const GH_MAX_BUFFER = 1024 * 1024;
+
+function ghSlug(root) {
+  const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
+  const m = r.status === 0 ? String(r.stdout || '').trim().match(/github\.com[:/]+([^/]+)\/([^/.]+?)(?:\.git)?\/?$/) : null;
+  return m ? `${m[1]}/${m[2]}` : null;
+}
+
+function ghJson(args) {
+  const r = spawnSync('gh', args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
+  if (r.status !== 0) return undefined;
+  try { return JSON.parse(String(r.stdout || '')); } catch { return undefined; }
+}
+
+/**
+ * IO: a `prBaseChain(pr)` for {@link planRebuild}: the PR's base branch, then that branch's own open PR's base, and so on
+ * until `main` (nearest first, at most `maxDepth` hops). Asks gh; when gh cannot answer (no gh, no auth, a non-GitHub
+ * origin) it falls back to the entry's recorded `stackBases`, else `null` (unknown — the rebuild then judges by ancestry
+ * alone). Lookups are memoised for the life of the returned function (one rebuild).
+ * @param {{root:string, overlays?:Array<object>, gh?:(args:string[])=>unknown, maxDepth?:number}} o
+ * @returns {(pr:number)=>Promise<string[]|null>}
+ */
+export function makePrBaseChain({ root, overlays = [], gh = ghJson, maxDepth = 8 } = {}) {
+  let slug;
+  const slugOf = () => { if (slug === undefined) { try { slug = ghSlug(root); } catch { slug = null; } } return slug; };
+  const baseOfRef = new Map();
+  const recorded = (pr) => {
+    const e = overlays.find((o) => o && o.pr === pr);
+    return Array.isArray(e?.stackBases) ? e.stackBases.filter((b) => typeof b === 'string' && b) : null;
+  };
+  return async (pr) => {
+    if (pr == null) return null;
+    const s = slugOf();
+    const first = s ? gh(['pr', 'view', String(pr), '--repo', s, '--json', 'baseRefName']) : undefined;
+    const base = first?.baseRefName;
+    if (typeof base !== 'string' || !base) return recorded(pr);
+    const chain = [];
+    let ref = base;
+    while (ref && ref !== 'main' && chain.length < maxDepth && !chain.includes(ref)) {
+      chain.push(ref);
+      if (!baseOfRef.has(ref)) {
+        const rows = gh(['pr', 'list', '--repo', s, '--head', ref, '--state', 'open', '--json', 'baseRefName', '--limit', '1']);
+        baseOfRef.set(ref, Array.isArray(rows) && typeof rows[0]?.baseRefName === 'string' ? rows[0].baseRefName : null);
+      }
+      ref = baseOfRef.get(ref);
+    }
+    return chain;
+  };
 }
