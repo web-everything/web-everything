@@ -1165,12 +1165,12 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     );
   }
 
+  const netChangedFiles = Array.isArray(net.paths) ? net.paths.map(String) : [];
   // `git diff --name-only` (the net list) names only the NEW path of a rename or copy; the diff TEXT carries the old one.
-  // Both belong in the list the roster and the care level are scored from, or a code file renamed into a prose path
-  // reads as an all-prose PR.
-  const netChangedFiles = Array.isArray(net.paths)
-    ? [...new Set([...net.paths.map(String), ...renameSourcePaths(diff.text)])]
-    : [];
+  // Kept apart from `netChangedFiles` on purpose: that list is the juror's ground truth, the citation scope and the
+  // care-level score, whose callers derive their declared band from a path-only list, so adding sources there would
+  // change what they are held to. Only the roster check reads these (see `assertRosterHolds`).
+  const netRenameSources = renameSourcePaths(diff.text).filter((p) => !netChangedFiles.includes(p));
   const degradedReason = net.scored === true ? '' : String(net.reason || 'unscored');
 
   // #xu2pp2m — A DEGRADED BASIS THAT ALSO PRODUCED NO DIFF AT ALL IS `unrun`, NOT A REVIEW. THROWS.
@@ -1264,6 +1264,8 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     humanComment: detail.humanComment ?? null,
     // ── GROUND TRUTH ──────────────────────────────────────────────────────────────────────────────────────
     netChangedFiles,
+    // The old path of every rename or copy in the net diff (the path-only list above lacks it); read by the roster check only.
+    netRenameSources,
     // THE BASIS IS PINNED TO COMMITS, NOT REFS. `base` is already a merge-base SHA. `rev` used to be
     // `computeNetDiffPaths`'s `candidate`, i.e. `origin/<headRefName>` — a ref that moves the moment the lane
     // pushes again, so the recorded basis stopped describing the diff that was actually judged. The io shell
@@ -2438,7 +2440,7 @@ export function reviewPrOperation({
         );
         // The roster was chosen from a file list read BEFORE the run; the net list just computed is the ground truth.
         assertRosterHolds({
-          declared: securitySeat !== false, netChangedFiles: finding.netChangedFiles,
+          declared: securitySeat !== false, netChangedFiles: [...finding.netChangedFiles, ...finding.netRenameSources],
           lens: view.input.lens, pr: view.input.pr, repo: view.input.repo,
         });
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with

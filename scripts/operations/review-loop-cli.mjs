@@ -479,11 +479,11 @@ function defaultReadChangedFiles({ pr, repo }) {
  * seat simply waits for the primary lane (`./parallel-judges.mjs`). Released when the batch settles; a crash leaves
  * the lease to the lane pool's own reaper, exactly like the review job's own lease.
  *
- * THE LANE'S TREE IS THE PRIMARY LANE'S TREE, ON PURPOSE. `review-job.mjs#acquireLane` leases the primary lane with
- * the same `acquire --adopt` and NO `--base`, so a review juror's `cwd` is a lane reset to `origin/main`, never a
- * checkout of the PR head: the diff the juror judges is stated in its mandate (the NET diff, pinned by `read`), and its
- * tools read the repository around it. A seat lane that checked out something else would make the two tool-bearing
- * seats read different trees. The arguments are pinned against the review job's by the seat-lane tests.
+ * THE LANE'S TREE MATCHES THE PRIMARY LANE'S TREE. `review-job.mjs#acquireLane` leases the primary lane with the same
+ * `acquire --adopt` and NO `--base`, so a review juror's `cwd` is a lane reset to `origin/main`, not a checkout of the
+ * PR head; the diff the juror judges is stated in its mandate (the NET diff, pinned by `read`). This provider adds no
+ * `--base` either (the seat-lane tests check that), so the two tool-bearing seats read the same tree. That tree being
+ * main rather than the PR head is a property of the primary lane too, tracked apart from this provider.
  * @param {{pr: number, repo: string, root?: string}} o
  */
 export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) {

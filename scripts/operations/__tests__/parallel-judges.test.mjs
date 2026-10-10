@@ -23,14 +23,14 @@ import { describe, it, expect } from 'vitest';
 import { createRegistry, op } from '../registry.mjs';
 import { compute, judge as judgeStep } from '../step-kinds.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
-import { startRun, advance } from '../engine.mjs';
+import { startRun, advance, rewindRunToStep } from '../engine.mjs';
 import { driveRun, judgeOutcome, restampStepStart } from '../cli-adapter.mjs';
 import { planJudgeBatch, readsAnyStep, runJudgeBatch } from '../parallel-judges.mjs';
 import {
   REVIEW_EFFECTS, reviewPrOperation, renameSourcePaths, seatSecurityForTouchSet, securitySeatFromRun, SECURITY_SEAT_STEP,
 } from '../review-pr.mjs';
 import {
-  chooseSecuritySeat, createSeatLaneProvider, declaresSecuritySeat, pathsWithRenameSources, runReviewLoopOnce, TOUCH_SET_FILE_CAP,
+  chooseSecuritySeat, createSeatLaneProvider, declaresSecuritySeat, pathsWithRenameSources, RESUME_STEP, runReviewLoopOnce, TOUCH_SET_FILE_CAP,
 } from '../review-loop-cli.mjs';
 import { resolveReviewSeatSetting } from '../../lib/review-seat-settings.mjs';
 
@@ -394,7 +394,7 @@ describe('review.seatsByTouchSet — the seat list comes from the touch-set, bef
         appendLearning: () => ({ path: '/dev/null' }), fileItem: async () => ({ code: 0, lines: ['{}'] }),
         findResumableRun: () => resumable,
       });
-      return { out, declaration };
+      return { out, declaration, registry };
     };
 
     it.each([
@@ -408,6 +408,12 @@ describe('review.seatsByTouchSet — the seat list comes from the touch-set, bef
       const judged = { n: 0 };
       const next = await round({ store, opts: nextOpts, runId: 'r-fresh', resumable: 'r-parked', judged });
       expect(declaresSecuritySeat(next.declaration)).toBe(nextOpts.securitySeat);
+      // TWO LAYERS hold this guarantee. `rosterMatches` refuses the resume up front; behind it the engine itself refuses to
+      // rewind a run whose steps the declaration no longer matches (the roster moves every later step's index), and the
+      // driver's catch turns that refusal into a fresh review. This test pins the guarantee, not one line: the outcome
+      // above is fresh either way, and the engine's own refusal is pinned here so the second layer cannot silently go.
+      expect(() => rewindRunToStep(store.read('r-parked'), { registry: next.registry, step: RESUME_STEP }))
+        .toThrow(/declaration changed under a suspended run/);
       expect(next.out.run.id).toBe('r-fresh');          // a fresh review, not the parked run rewound
       expect(judged.n).toBeGreaterThan(0);              // the panel really sat again
       expect(store.read('r-parked').pending?.kind).toBe('confirm'); // and the parked run was left as it was
@@ -479,9 +485,13 @@ describe('review.seatsByTouchSet — a rename carries its source path (code move
     expect(ok.run.findings).not.toHaveProperty(SECURITY_SEAT_STEP);
   });
 
-  it('the rename source reaches the juror’s ground-truth list too, and the care level is scored over it', async () => {
+  it('the rename source is recorded apart: the juror list, citation scope and care-level score stay path-only', async () => {
     const { run } = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-rename-full', opts: { netPaths: PROSE_PATHS, diffText: RENAME_DIFF } });
-    expect(run.findings.read.netChangedFiles).toEqual(['backlog/x-a-card.md', 'scripts/operations/review-pr.mjs']);
+    expect(run.findings.read.netChangedFiles).toEqual(['backlog/x-a-card.md']);
+    expect(run.findings.read.netRenameSources).toEqual(['scripts/operations/review-pr.mjs']);
+    // A source the net list already names is not listed twice.
+    const dup = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-rename-dup', opts: { netPaths: ['backlog/x-a-card.md', 'scripts/operations/review-pr.mjs'], diffText: RENAME_DIFF } });
+    expect(dup.run.findings.read.netRenameSources).toEqual([]);
   });
 });
 
