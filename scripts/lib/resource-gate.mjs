@@ -12,15 +12,18 @@
  *      over: build, fix, ci-heal, review and prepare launches decide through `admit({kind})`.
  *   3. {@link decideFixCap} + {@link createResourceFixThrottle} — the fix daemon's fixer cap becomes dynamic. The
  *      cap sits between a FLOOR (today's static cap, `WE_FIX_DISPATCH_MAX_CONCURRENT`) and a CEILING; it rises above
- *      the floor only when the snapshot is fresh, the `fix` kind is admitted, CPU idle is at least
- *      `raiseMinCpuIdlePct` and more than `raiseQueueOver` PRs waited for a fixer slot. Each pass may add at most
- *      `raiseStepPerPass` fixers above what was live when it started, so the next pass re-reads the CPU first.
+ *      the floor only when the snapshot is fresh, the `fix` kind is admitted, free memory / swap / the projected
+ *      heavy-queue wait are inside their raise thresholds and more than `raiseQueueOver` PRs waited for a fixer slot;
+ *      it drops below the floor (by `lowerBy`, never under `lowerMinimum`) when swap, free memory or the heavy wait
+ *      pass their lower thresholds. CPU idle is only a backstop (`holdCpuIdleBelowPct`). Each pass may add at most
+ *      `raiseStepPerPass` fixers above what was live when it started, so the next pass re-reads the signals first.
  *
  *   SETTINGS — one block `resourceGate`, resolved per leaf through the policy cascade (same layers and files as the
  *   `resourceAdmission` policy): standard (below) → Platform Forever preference (`~/.claude/platform-preferences.json`
  *   or `WE_PLATFORM_PREFERENCES`) → tool override (`we:scripts/settings/*.json`) → env. Env keys:
  *   `WE_RESOURCE_CUTOVER` (cutover), `WE_FIX_DISPATCH_MAX_CONCURRENT` (fixCap.floor — the old static cap keeps its
- *   meaning as the floor), `WE_FIX_DISPATCH_MAX_CEILING` (fixCap.ceiling). Every leaf's source is logged once per
+ *   meaning as the floor), `WE_FIX_DISPATCH_MAX_CEILING` (fixCap.ceiling), and `WE_FIX_CAP_<LEAF>` for each signal
+ *   threshold (e.g. `WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT`). Every leaf's source is logged once per
  *   process per distinct set ({@link logGateSettingsOnce}).
  */
 import { readFileSync } from 'node:fs';
@@ -30,6 +33,8 @@ import { fileURLToPath } from 'node:url';
 import { admit, decideAdmission, readSnapshot, shadowAdmission } from './resource-admission.mjs';
 import { countLiveFixSessions, gateHost, isPidAlive, resolveFixDispatchMaxConcurrent } from './dispatch-throttle.mjs';
 import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from './settings-files.mjs';
+// A cycle (heavy-admission imports this module's cut-over step); safe because neither side calls the other at load time.
+import { resolveLiveQueueBaseline } from '../readiness/heavy-admission.mjs';
 
 export const RESOURCE_GATE_STANDARD = Object.freeze({
   cutover: 'enforce',
@@ -38,22 +43,35 @@ export const RESOURCE_GATE_STANDARD = Object.freeze({
     ceiling: null, // null = floor + ceilingAboveFloor
     ceilingAboveFloor: 4,
     raiseQueueOver: 5, // operator 2026-10-10: raise when the queue is longer than ~5
-    raiseMinCpuIdlePct: 30, // sampler p50 CPU idle was 24% (2026-10-09): raise only on a clearly free CPU
     raiseStepPerPass: 2,
+    // Operator 2026-10-10: a fixer mostly waits on the model and its tests already queue on heavy admission, so CPU
+    // idle is the wrong main signal (23% idle held the cap at the floor while swap 26.5/27.6 GB was what hurt).
+    // The cap moves on free memory + swap and on the projected heavy-queue wait; CPU is only a backstop.
+    raiseMinMemFreePct: 10, raiseMaxSwapUsedPct: 60, raiseMaxHeavyWaitMinutes: 15,
+    lowerBelowMemFreePct: 3, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
+    holdCpuIdleBelowPct: 10,
   }),
 });
+const FIX_CAP_SIGNAL_LEAVES = ['raiseMinMemFreePct', 'raiseMaxSwapUsedPct', 'raiseMaxHeavyWaitMinutes', 'lowerBelowMemFreePct',
+  'lowerAboveSwapUsedPct', 'lowerAboveHeavyWaitMinutes', 'lowerBy', 'lowerMinimum', 'holdCpuIdleBelowPct'];
+const envNameOf = (leaf) => `WE_FIX_CAP_${leaf.replace(/[A-Z]/g, (c) => `_${c}`).toUpperCase()}`;
 export const RESOURCE_GATE_ENV = Object.freeze({
   cutover: 'WE_RESOURCE_CUTOVER', 'fixCap.floor': 'WE_FIX_DISPATCH_MAX_CONCURRENT', 'fixCap.ceiling': 'WE_FIX_DISPATCH_MAX_CEILING',
+  ...Object.fromEntries(FIX_CAP_SIGNAL_LEAVES.map((leaf) => [`fixCap.${leaf}`, envNameOf(leaf)])),
 });
 const int = (min) => (v) => Number.isInteger(v) && v >= min;
+const pct = (v) => Number.isFinite(v) && v >= 0 && v <= 100;
+const minutes = (v) => Number.isFinite(v) && v >= 0;
 const VALID = {
   cutover: (v) => v === 'shadow' || v === 'enforce',
   'fixCap.floor': (v) => v === null || int(1)(v),
   'fixCap.ceiling': (v) => v === null || int(1)(v),
   'fixCap.ceilingAboveFloor': int(0),
   'fixCap.raiseQueueOver': int(0),
-  'fixCap.raiseMinCpuIdlePct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
   'fixCap.raiseStepPerPass': int(1),
+  'fixCap.raiseMinMemFreePct': pct, 'fixCap.raiseMaxSwapUsedPct': pct, 'fixCap.raiseMaxHeavyWaitMinutes': minutes,
+  'fixCap.lowerBelowMemFreePct': pct, 'fixCap.lowerAboveSwapUsedPct': pct, 'fixCap.lowerAboveHeavyWaitMinutes': minutes,
+  'fixCap.lowerBy': int(0), 'fixCap.lowerMinimum': int(1), 'fixCap.holdCpuIdleBelowPct': pct,
 };
 const LEAVES = Object.keys(VALID);
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -185,25 +203,57 @@ export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, le
 }
 
 /**
- * PURE: the dynamic fixer cap for one pass. Never below `floor`, never above `ceiling`. Raised only when the
- * snapshot is fresh, the `fix` kind is admitted, CPU idle ≥ raiseMinCpuIdlePct and queueLength > raiseQueueOver.
- * @param {{fixCap:object, liveAtPassStart:number, queueLength:number|null, snapshot:object|null, nowMs:number, policy?:object}} o
- * @returns {{cap:number, floor:number, ceiling:number, raised:boolean, reason:string, cpuIdlePct:number|null, queueLength:number|null, snapshotAge:number|null}}
+ * PURE: the dynamic fixer cap for one pass, between `lowerMinimum` and `ceiling` (operator 2026-10-10).
+ * LOWERED below the floor (to floor - lowerBy, never under lowerMinimum) when free memory, swap or the projected
+ * heavy-queue wait is past its lower threshold. RAISED above the floor only when the snapshot is fresh, `fix` is
+ * admitted, CPU idle is at least the backstop, free memory / swap / heavy wait are inside their raise thresholds
+ * and queueLength > raiseQueueOver. An unknown memory, swap or wait reading never blocks on its own (named as `?`).
+ * @param {{fixCap:object, liveAtPassStart:number, queueLength:number|null, heavyWaitMinutes?:number|null, snapshot:object|null, nowMs:number, policy?:object}} o
  */
-export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, snapshot = null, nowMs = Date.now(), policy } = {}) {
-  const { floor, ceiling, raiseQueueOver, raiseMinCpuIdlePct, raiseStepPerPass } = fixCap;
+export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, heavyWaitMinutes = null, snapshot = null, nowMs = Date.now(), policy } = {}) {
+  const f = { ...RESOURCE_GATE_STANDARD.fixCap, ...fixCap };
+  const { floor, ceiling, raiseQueueOver, raiseStepPerPass } = f;
   const d = decideAdmission({ kind: 'fix', snapshot, nowMs, ...(policy ? { policy } : {}) });
+  const num = (v) => (Number.isFinite(v) ? v : null);
   const cpu = d.inputs?.cpuIdlePct ?? null;
+  const fresh = !d.unknown;
+  const mem = fresh ? num(snapshot?.memory?.freePct) : null;
+  const swap = fresh ? num(snapshot?.memory?.swapUsedPct) : null;
+  const wait = num(heavyWaitMinutes);
   const q = Number.isFinite(queueLength) ? queueLength : null;
-  const base = { floor, ceiling, cap: floor, raised: false, cpuIdlePct: cpu, queueLength: q, snapshotAge: d.snapshotAge };
+  const base = { floor, ceiling, cap: floor, raised: false, lowered: false, cpuIdlePct: cpu, memFreePct: mem, swapUsedPct: swap,
+    heavyWaitMinutes: wait, queueLength: q, snapshotAge: d.snapshotAge };
+  const lowerWhy = [
+    swap !== null && swap > f.lowerAboveSwapUsedPct ? `swap ${swap}% > ${f.lowerAboveSwapUsedPct}%` : null,
+    mem !== null && mem < f.lowerBelowMemFreePct ? `mem free ${mem}% < ${f.lowerBelowMemFreePct}%` : null,
+    wait !== null && wait > f.lowerAboveHeavyWaitMinutes ? `heavy wait ${wait}m > ${f.lowerAboveHeavyWaitMinutes}m` : null,
+  ].filter(Boolean);
+  if (lowerWhy.length) {
+    const cap = Math.max(f.lowerMinimum, Math.min(floor, floor - f.lowerBy));
+    return { ...base, cap, lowered: cap < floor, reason: `lowered: ${lowerWhy.join(', ')} → floor ${floor} - ${f.lowerBy}, minimum ${f.lowerMinimum}` };
+  }
   if (d.unknown) return { ...base, reason: `floor: ${d.reason} (never raise on an unknown snapshot)` };
   if (d.verdict !== 'admit') return { ...base, reason: `floor: fix not admitted (${d.reason})` };
-  if (cpu === null || cpu < raiseMinCpuIdlePct) return { ...base, reason: `floor: cpu idle ${cpu ?? '?'}% < ${raiseMinCpuIdlePct}% raise threshold` };
+  if (cpu !== null && cpu < f.holdCpuIdleBelowPct) return { ...base, reason: `floor: cpu idle ${cpu}% < ${f.holdCpuIdleBelowPct}% backstop` };
+  if (mem !== null && mem < f.raiseMinMemFreePct) return { ...base, reason: `floor: mem free ${mem}% < ${f.raiseMinMemFreePct}% raise threshold` };
+  if (swap !== null && swap > f.raiseMaxSwapUsedPct) return { ...base, reason: `floor: swap ${swap}% > ${f.raiseMaxSwapUsedPct}% raise threshold` };
+  if (wait !== null && wait > f.raiseMaxHeavyWaitMinutes) return { ...base, reason: `floor: heavy wait ${wait}m > ${f.raiseMaxHeavyWaitMinutes}m raise threshold` };
   if (q === null || q <= raiseQueueOver) return { ...base, reason: `floor: fix queue ${q ?? '?'} ≤ ${raiseQueueOver}` };
   const cap = Math.min(ceiling, Math.max(floor, liveAtPassStart + raiseStepPerPass));
   if (cap <= floor) return { ...base, reason: `floor: ${liveAtPassStart} live + step ${raiseStepPerPass} does not pass the floor` };
   return { ...base, cap, raised: true,
-    reason: `raised: cpu idle ${cpu}% ≥ ${raiseMinCpuIdlePct}% and fix queue ${q} > ${raiseQueueOver} → ${liveAtPassStart} live + step ${raiseStepPerPass}, ceiling ${ceiling}` };
+    reason: `raised: mem free ${mem ?? '?'}% ≥ ${f.raiseMinMemFreePct}%, swap ${swap ?? '?'}% ≤ ${f.raiseMaxSwapUsedPct}%, heavy wait ${wait ?? '?'}m ≤ ${f.raiseMaxHeavyWaitMinutes}m and fix queue ${q} > ${raiseQueueOver} → ${liveAtPassStart} live + step ${raiseStepPerPass}, ceiling ${ceiling}` };
+}
+
+/** The projected heavy-queue wait (minutes) a fixer's tests would see: the longer of the heavy and short lanes.
+ *  Null when the live queue cannot be read (inside a test without a private pool, or any read error). */
+export function readLiveHeavyWaitMinutes({ env = process.env } = {}) {
+  try {
+    const b = resolveLiveQueueBaseline({ env: { ...process.env, ...env } });
+    if (!b || b.bypassed) return null;
+    const waits = [b.heavyWaitMinutes, b.projectedWaitMinutes].filter(Number.isFinite);
+    return waits.length ? Math.max(...waits) : null;
+  } catch { return null; }
 }
 
 /**
@@ -214,7 +264,7 @@ export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, 
  */
 export function createResourceFixThrottle({
   listClaims = () => [], env = process.env, alive = isPidAlive, queueLength = null, settings, root, nowMs = () => Date.now(),
-  readSnap = () => readSnapshot(root ? { root } : {}), gate, log = (line) => process.stderr.write(line),
+  readSnap = () => readSnapshot(root ? { root } : {}), readHeavyWait = () => readLiveHeavyWaitMinutes({ env }), gate, log = (line) => process.stderr.write(line),
   sample, loadavg, cpuCount, // forwarded to the legacy gate (the logged comparison)
 } = {}) {
   const resolved = settings ? { settings, sources: {}, invalid: [] } : loadResourceGateSettings({ env });
@@ -228,10 +278,17 @@ export function createResourceFixThrottle({
     let snap = null;
     try { snap = readSnap(); } catch { snap = null; }
     const q = typeof queueLength === 'function' ? queueLength() : queueLength;
-    capDecision = decideFixCap({ fixCap: resolved.settings.fixCap, liveAtPassStart: live, queueLength: q, snapshot: snap, nowMs: nowMs() });
+    let wait = null;
+    try { wait = readHeavyWait(); } catch { wait = null; }
+    capDecision = decideFixCap({ fixCap: resolved.settings.fixCap, liveAtPassStart: live, queueLength: q, heavyWaitMinutes: wait, snapshot: snap, nowMs: nowMs() });
     capDecision.effective = resolved.settings.cutover === 'enforce' ? capDecision.cap : legacyCap;
     try {
-      log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: cap ${capDecision.cap} (floor ${capDecision.floor}, ceiling ${capDecision.ceiling}; ${capDecision.reason}; ${live} live) → using ${capDecision.effective} (${resolved.settings.cutover})\n`);
+      const c = capDecision; const v = (x, unit) => `${x ?? '?'}${unit}`;
+      const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, ...resolved.settings.fixCap };
+      const thresholds = FIX_CAP_SIGNAL_LEAVES.map((leaf) => `${leaf}=${fixCap[leaf]} (${resolved.sources?.[`fixCap.${leaf}`] ?? 'standard'})`).join(', ');
+      log(`resource-gate fix-cap: old: static cap ${legacyCap} | new: cap ${c.cap} (floor ${c.floor}, ceiling ${c.ceiling}; ${c.reason}; ${live} live) → using ${c.effective} (${resolved.settings.cutover})`
+        + ` · inputs: mem free ${v(c.memFreePct, '%')} · swap ${v(c.swapUsedPct, '%')} · heavy wait ${v(c.heavyWaitMinutes, 'm')} · cpu idle ${v(c.cpuIdlePct, '%')} · fix queue ${v(c.queueLength, '')}`
+        + ` · thresholds: ${thresholds}\n`);
     } catch { /* best effort */ }
     return capDecision;
   };
