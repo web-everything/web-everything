@@ -1,8 +1,9 @@
 ---
+bornAs: xkuflno
 kind: story
 size: 8
 priority: high
-parent: "x6woyws"
+parent: "5712"
 status: resolved
 scope: ["we:scripts/lib/resource-admission.mjs", "we:scripts/lib/__tests__/resource-admission.test.mjs", "we:scripts/lib/resource-sampler.mjs", "we:scripts/lib/__tests__/resource-sampler.test.mjs", "we:scripts/conveyor/resource-sampler-job.mjs", "we:scripts/conveyor/resource-sampler-daemon.mjs", "we:scripts/conveyor/__tests__/resource-sampler-job.test.mjs", "we:skills-src/conveyor/launchd/com.we.resource-sampler.plist.example", "we:scripts/operations/resource-status.mjs", "we:scripts/operations/__tests__/resource-status.test.mjs", "we:scripts/operations/run.mjs", "we:scripts/dispatch-settings.json", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs"]
 dateOpened: "2026-10-09"

@@ -1,10 +1,11 @@
 ---
+bornAs: x9xkupj
 kind: story
 size: 5
 priority: high
-parent: "x6woyws"
+parent: "5712"
 status: open
-blockedBy: ["xkuflno"]
+blockedBy: ["5713"]
 scope: ["we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/__tests__/daemon-live-smoke.test.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs", "we:scripts/lib/daemon-rebuild/smoke-classify/load-shaped.mjs", "we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
