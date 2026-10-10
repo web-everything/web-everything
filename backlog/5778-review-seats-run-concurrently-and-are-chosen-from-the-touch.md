@@ -1,4 +1,5 @@
 ---
+bornAs: xe2s04u
 kind: story
 size: 5
 status: resolved
