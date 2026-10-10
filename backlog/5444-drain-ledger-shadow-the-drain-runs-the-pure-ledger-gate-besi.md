@@ -40,7 +40,7 @@ Ledger product review, operator 2026-10-08, D4 (slice I2 of the verdict-ledger p
 
 ## Outcome
 
-- The shadow lives in we:scripts/lib/drain-ledger-shadow.mjs. The drain (we:scripts/merge-ai-prs.mjs) calls it once per pass, after every merge decision is final, with three added lines. It compares each considered PR's label answer with `decideLedgerGate` in `ledger` mode and writes one `drain-ledger-shadow` run record per pass. Each row holds the PR, head, label verdict, ledger verdict, status, direction and reason. Verdicts are never changed and `mergeGate.reviewAuthority` stays `labels`.
+- The shadow lives in we:scripts/lib/drain-ledger-shadow.mjs. The drain (we:scripts/merge-ai-prs.mjs) calls it once per pass, after every merge decision is final, with five added lines and no other change to the pass. The pass prints one `ledger shadow:` line to stderr, so the daemon log shows it. It compares each considered PR's label answer with `decideLedgerGate` in `ledger` mode and writes one `drain-ledger-shadow` run record per pass. Each row holds the PR, head, label verdict, ledger verdict, status, direction and reason. Verdicts are never changed and `mergeGate.reviewAuthority` stays `labels`.
 - An unreadable or late (20 s) ledger read is recorded as `unreadable`, never as agreement (A4). A PR with no ledger row is a ledger hold.
 - `review-ledger-check --history` (we:scripts/review-ledger-check.mjs, we:scripts/lib/review-ledger-history.mjs) now also prints per-day shadow counts: passes, compared, disagreements per direction, unreadable.
 - The flip to `both` (A3) is still a separate operator change. It is gated on #5462 (readers on the shared store), 7 clean days, and the async store contract.
