@@ -7,16 +7,17 @@
  *   00:24Z boot had not ticked 20 min later. Profiling one cold tick's reads with every write stubbed took ~30 s,
  *   so the read side was never the 10 minutes: the inline rebuild was.
  *
- *   The fix is the background builder the fix daemon already runs (x44lnnt, card 5572): the shipped settings turn
- *   it on for `review-daemon.mjs`, so a restarted review daemon ticks first and the next version builds off the
- *   tick path. Same gated rebuild, same smoke, same swap rule (only between ticks, at most once per window) —
- *   nothing is skipped, only moved off the tick.
+ *   The fix was the background builder process (x44lnnt, card 5572). Since x0m7a8x (card 5691) the build + smoke
+ *   runs as the detached REBUILD JOB (#4126) instead, and the builder process is retired: each tick runs only the
+ *   job's fast tick side, so a restarted review daemon ticks first. Same gated rebuild, same smoke, same swap rule
+ *   (only between ticks, at most once per window) — nothing is skipped, only moved off the tick.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadBackgroundBuildSettings, resolveBackgroundBuild } from '../daemon-background-build.mjs';
+import { resolveRebuildAsJob } from '../daemon-rebuild/rebuild-job.mjs';
 import { withSelfSync } from '../daemon-self-sync.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -45,67 +46,100 @@ describe('replay — tonight\'s review-daemon log (2026-10-09)', () => {
   });
 });
 
-describe('settings — the review daemon builds off the tick path', () => {
-  it('the committed file turns the background build on for review-daemon.mjs', () => {
-    const r = resolveBackgroundBuild({ entry: REVIEW_ENTRY, settings: loadBackgroundBuildSettings() });
-    expect(r).toMatchObject({ enabled: true, source: 'file' });
+describe('settings — the review daemon builds off the tick path (x0m7a8x: via the rebuild job)', () => {
+  it('the committed rebuildAsJob entries put review-daemon.mjs (and the fix daemon) on the detached rebuild job', () => {
+    expect(resolveRebuildAsJob({ entries: [REVIEW_ENTRY], env: {} })).toBe(true);
+    expect(resolveRebuildAsJob({ entries: ['/clone/skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs'], env: {} })).toBe(true);
   });
 
-  it('the operator can still force it off for one process (env beats file)', () => {
-    const r = resolveBackgroundBuild({ entry: REVIEW_ENTRY, settings: loadBackgroundBuildSettings(), env: { WE_DAEMON_BACKGROUND_BUILD: '0' } });
-    expect(r.enabled).toBe(false);
+  it('the swap spacing (x44lnnt) is kept for the review daemon by the committed file', () => {
+    const r = resolveBackgroundBuild({ entry: REVIEW_ENTRY, settings: loadBackgroundBuildSettings() });
+    expect(r).toMatchObject({ enabled: true, source: 'file', swapMinIntervalMs: 10 * MIN });
+  });
+
+  it('WE_DAEMON_BACKGROUND_BUILD=1 starts no builder process any more: every tick runs the job tick side instead', async () => {
+    const start = vi.fn();
+    const rebuild = vi.fn(async () => ({ moved: false, reason: 'rebuild-job-running', job: { id: 'j1' }, finishedJobs: [] }));
+    const tick = vi.fn(async () => ({ repos: [] }));
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/clone', env: { WE_DAEMON_BACKGROUND_BUILD: '1' }, log: { error: () => {} }, versions: null, entries: [REVIEW_ENTRY],
+      rebuild, readHead: () => 'h1', readOriginRef: () => null, acquireRead: () => ({ ok: true }), releaseRead: () => {},
+      readState: () => ({}), now: () => 0, onRestart: vi.fn(), builder: { read: () => null, alive: () => false, start }, tickProgress: null,
+    });
+    await w.tickOnce();
+    await w.tickOnce();
+    expect(start).not.toHaveBeenCalled();
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(tick).toHaveBeenCalledTimes(2);
   });
 });
 
 // ── simulation: real `withSelfSync`, settings resolved from the committed file, tonight's review-daemon smokes ──
 const SMOKES = FIXTURE.events.filter((e) => e.kind === 'smoke-done').map((e) => e.ms);
 
-async function run({ background, horizonMs = 3 * 60 * MIN, intervalMs = 2 * MIN, tickMs = 4 * MIN, bootMs = 10_000 }) {
-  const world = { clock: 0, head: 0, smokeIdx: 0 };
+async function run({ mode, horizonMs = 3 * 60 * MIN, intervalMs = 2 * MIN, tickMs = 4 * MIN, bootMs = 10_000 }) {
+  const world = { clock: 0, head: 0, smokeIdx: 0, ready: null };
   const boots = [];
   const tickDoneAt = [];
   const swaps = [];
   let inTick = false;
-  let builder = null;
+  let job = null;
+  let jobs = 0;
   const nextSmoke = () => SMOKES[(world.smokeIdx++) % SMOKES.length];
   const mainHead = () => Math.floor(world.clock / (3 * MIN)) + 1;
-  const settleBuilder = () => {
-    if (builder && !builder.finishedAt && world.clock >= builder.doneAt) { world.head = builder.target; builder.finishedAt = builder.doneAt; }
-  };
-  const builderApi = {
-    read: () => { settleBuilder(); return builder ? { startedAt: new Date(builder.startedAt).toISOString(), finishedAt: builder.finishedAt ?? null } : null; },
-    alive: (st) => !!st && !st.finishedAt,
-    start: () => { builder = { startedAt: world.clock, doneAt: world.clock + nextSmoke(), target: mainHead() }; return { pid: 1 }; },
-  };
-  const progress = { read: () => ({}), markSeen: () => {}, markTickDone: () => {}, alert: () => {} };
+  // OLD: the pre-#4126 inline rebuild — the smoke runs on the tick path.
   const inlineRebuild = vi.fn(async () => {
     const target = mainHead();
     world.clock += nextSmoke();
     world.head = target;
     return { moved: true, adopted: true, head: `h${target}` };
   });
+  // NEW: the rebuild job's tick side — consume a finished job, adopt its ready candidate, else queue / watch one.
+  // It never advances the clock: the smoke runs in the detached job.
+  const jobRebuild = vi.fn(async () => {
+    const finishedJobs = [];
+    if (job && !job.consumed && world.clock >= job.doneAt) {
+      job.consumed = true;
+      finishedJobs.push({ id: job.id, status: 'succeeded', reason: 'ready-recorded', readyRecorded: true });
+      world.ready = job.target;
+    }
+    if (job && !job.consumed) return { moved: false, reason: 'rebuild-job-running', job: { id: job.id }, finishedJobs };
+    if (world.ready != null) {
+      world.head = world.ready;
+      world.ready = null;
+      return { moved: true, adopted: true, head: `h${world.head}`, finishedJobs };
+    }
+    if (mainHead() > world.head) {
+      jobs += 1;
+      job = { id: `j${jobs}`, doneAt: world.clock + nextSmoke(), target: mainHead() };
+      return { moved: false, reason: 'rebuild-job-started', job: { id: job.id }, finishedJobs };
+    }
+    return { moved: false, reason: 'up-to-date', finishedJobs };
+  });
+  const rebuild = mode === 'inline' ? inlineRebuild : jobRebuild;
+  const progress = { read: () => ({}), markSeen: () => {}, markTickDone: () => {}, alert: () => {} };
   while (world.clock < horizonMs) {
     world.clock += bootMs;
-    settleBuilder();
     boots.push(world.clock);
     let restarted = false;
     const bootClock = world.clock;
     const w = withSelfSync({
-      tickOnce: async () => { inTick = true; world.clock += tickMs; settleBuilder(); inTick = false; tickDoneAt.push(world.clock); return { repos: [] }; },
+      tickOnce: async () => { inTick = true; world.clock += tickMs; inTick = false; tickDoneAt.push(world.clock); return { repos: [] }; },
     }, {
       root: '/clone', env: {}, log: { error: () => {} }, versions: null, entries: [REVIEW_ENTRY],
-      rebuild: inlineRebuild, readHead: () => `h${world.head}`, readOriginRef: () => null,
+      rebuild, readHead: () => `h${world.head}`, readOriginRef: () => null,
       acquireRead: () => ({ ok: true }), releaseRead: () => {}, readState: () => ({ quarantine: null, adopted: null }),
       diffFiles: () => ['skills-src/conveyor/review-daemon.mjs'], importClosure: () => null,
       now: () => world.clock,
       onRestart: () => { swaps.push({ at: world.clock, uptimeMs: world.clock - bootClock, inTick }); restarted = true; return { restarted: true }; },
-      // `undefined` = resolve from the committed settings file by entry name — exactly what the live daemon does.
-      background, builder: builderApi, tickProgress: progress,
+      // `undefined` = resolve the swap spacing from the committed settings file by entry name, as the live daemon does.
+      // inline = the pre-#4126 daemon, which had no swap spacing (the plain 2-min restart window)
+      background: mode === 'inline' ? null : undefined, tickProgress: progress,
     });
     while (!restarted && world.clock < horizonMs) {
       // eslint-disable-next-line no-await-in-loop
       await w.tickOnce();
-      if (!restarted) { world.clock += intervalMs; settleBuilder(); }
+      if (!restarted) world.clock += intervalMs;
     }
   }
   const firstTickWait = boots.map((b, i) => {
@@ -113,18 +147,18 @@ async function run({ background, horizonMs = 3 * 60 * MIN, intervalMs = 2 * MIN,
     const t = tickDoneAt.find((x) => x > b && x < next);
     return t === undefined ? null : t - b;
   });
-  return { boots, tickDoneAt, swaps, inlineRebuild, firstTickWait };
+  return { boots, tickDoneAt, swaps, inlineRebuild, jobRebuild, firstTickWait };
 }
 
 describe('simulation — main moving every 3 min, a 4-min pass, tonight\'s smoke durations', () => {
-  it('OLD (inline rebuild, settings off): a restarted review daemon restarts again before its first tick', async () => {
-    const r = await run({ background: null });
+  it('OLD (inline rebuild on the tick path): a restarted review daemon restarts again before its first tick', async () => {
+    const r = await run({ mode: 'inline' });
     expect(r.inlineRebuild).toHaveBeenCalled();
     expect(r.firstTickWait.filter((w) => w !== null)).toHaveLength(0);
   });
 
-  it('NEW (committed settings): every restarted process completes its first pass within one pass length, never after a smoke', async () => {
-    const r = await run({ background: undefined });
+  it('NEW (rebuild job, no builder process): every restarted process completes its first pass within one pass length, never after a smoke', async () => {
+    const r = await run({ mode: 'job' });
     expect(r.inlineRebuild).not.toHaveBeenCalled();
     expect(r.boots.length).toBeGreaterThan(2); // the swap still happens, so new code is still picked up
     const waits = r.firstTickWait.slice(0, -1); // the last boot may be cut off by the horizon
