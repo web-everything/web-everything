@@ -19,6 +19,8 @@
  */
 
 import { deliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES, PRIORITY_SETTINGS_OFF } from './delivery-priority.mjs';
+import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+import { readSettings } from './settings-files.mjs';
 
 /** PURE policy cascade: standard defaults → platform preference → tool override → environment. */
 export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) {
@@ -53,6 +55,24 @@ export function resolveBuildQueuePrioritySettings({ platform, tool, env } = {}) 
   }
   return { ...resolvePrioritySettings(merged), source, requestsFirstInClass, requestsFirstSource };
 }
+
+/**
+ * IO: the live build-queue priority settings — platform preference `deliveryPriority` (the shared policy cascade,
+ * we:scripts/lib/policy-cascade.mjs) → tool `buildQueuePriority` (declared settings) → env. Logs the source of each
+ * effective value once per process. Never throws.
+ */
+export function readBuildQueuePrioritySettings({ env = process.env, read = readSettings } = {}) {
+  let tool;
+  try { tool = read()?.buildQueuePriority; } catch { tool = undefined; }
+  const platform = platformPreference('deliveryPriority', { env });
+  const s = resolveBuildQueuePrioritySettings({ platform, tool, env });
+  logCascadeSources('buildQueuePriority', {
+    value: { mode: s.mode, requestsFirstInClass: s.requestsFirstInClass },
+    sources: { mode: CASCADE_SOURCE[s.source] ?? s.source, requestsFirstInClass: CASCADE_SOURCE[s.requestsFirstSource] ?? s.requestsFirstSource },
+  }, { env });
+  return s;
+}
+const CASCADE_SOURCE = Object.freeze({ default: 'standard' });
 
 // ── Tiers (fixed enum; the primary sort key AND the human override) ─────────────────────────────────
 export const TIERS = ['pinned', 'normal', 'someday', "won't"];

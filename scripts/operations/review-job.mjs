@@ -629,8 +629,8 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     if (typeof io.runRedTeamGate === 'function') {
       let gate;
       try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
-      io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ? ` (${gate.reason})` : ''}`);
-      out.redTeamGate = { status: gate?.status ?? null, outcome: gate?.outcome ?? null, ...(gate?.reason ? { reason: gate.reason } : {}),
+      io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ?? gate?.error ? ` (${gate.reason ?? gate.error})` : ''}`);
+      out.redTeamGate = { status: gate?.status ?? null, outcome: gate?.outcome ?? null, ...(gate?.reason ?? gate?.error ? { reason: gate.reason ?? gate.error } : {}),
         ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
     }
   }

@@ -49,6 +49,7 @@ import { admitLaunch, costAdmissionOn, freezeHolds, lightCapFor, summarizeCostAd
 import { readCostAdmissionSettings, readCostFacts } from '../../scripts/lib/cost-admission-facts.mjs';
 import { builderExecutorFor } from '../../scripts/lib/fix-slot-borrow.mjs';
 import { startDetachedLaunch, settleLaunches, PENDING_LAUNCHES_DIRNAME } from '../../scripts/conveyor/pending-launches.mjs';
+import { loadBuilderLaunchPolicy, formatBuilderLaunchPolicyLine, FREE_SLOTS } from '../../scripts/lib/builder-launch-policy.mjs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -59,7 +60,7 @@ import { normNum } from '../../scripts/conveyor/queue-store.mjs';
 import { collectProtectedNums } from '../../scripts/conveyor/queue-prune.mjs';
 import {
   BUILD_DISPATCH_POLICY, planBuildDispatch, normalizeOpenPrs, prDeliversNum, prDeliveredNum, reportOpenItems,
-  collectBuildHolds, stampCoversClaim,
+  collectBuildHolds, stampCoversClaim, firstScopeOverlap,
 } from '../../scripts/conveyor/build-dispatch-policy.mjs';
 import {
   acquireBuildDispatchClaim, releaseBuildDispatchClaim, listBuildDispatchClaims,
@@ -640,11 +641,29 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // #4139 host-load gate on NEW launches only: refuse with a logged `host-load` reason, never touch running work, and
   // take no claim (so nothing needs releasing). Re-read per launch: a detached launch raises the load immediately.
   const loadHolds = [];
-  // 78b — ONE detached launch in flight at a time. Two concurrent `dispatch-lane` runs (same tick) both failed to
-  // confirm live; they share the lane pool and run store. Launching is now instant, so serializing costs one tick.
+  // 78b serialised detached launches to ONE in flight at a time (two concurrent `dispatch-lane` runs once shared a
+  // lane; x87v3ed now has each launch lease its own lane first). Card x3mdsyv — the bound is the setting
+  // `builder.maxLaunchesPerTick` (policy cascade, `we:scripts/lib/builder-launch-policy.mjs`): detached launches still
+  // starting (earlier ticks' pending + this tick's) never exceed it. 'free-slots' (the live default) = no extra bound:
+  // the free prepare/build slots and every admission gate below decide. A policy without the field (an older caller)
+  // keeps the 78b bound of 1.
+  const launchLimit = launchLimitOf(policy);
   let startedThisTick = 0;
   const launchSlotBusy = () => typeof effects.settleLaunches === 'function'
-    && (pendingLaunch.build.size + pendingLaunch.prepare.size + startedThisTick) > 0;
+    && (pendingLaunch.build.size + pendingLaunch.prepare.size + startedThisTick) >= launchLimit;
+  // x3mdsyv — what this tick launched, so two same-tick launches never share a card (a build and a prepare of one num)
+  // or a scope. Build-vs-build scope overlap is the planner's `hot-file` rule (its `picked` list); this also holds a
+  // prepare whose scope overlaps a build or prepare launched earlier in the same tick.
+  const launchedThisTick = [];
+  const sameTickClash = (num, scope) => {
+    for (const l of launchedThisTick) {
+      if (l.num === normNum(num)) return `#${l.num} already launched this tick (${l.kind})`;
+      const hit = firstScopeOverlap(scope ?? [], l.scope ?? []);
+      if (hit) return `${hit} is in #${l.num}, launched this tick (${l.kind})`;
+    }
+    return null;
+  };
+  const sameTickHolds = [];
   // Card x60i0ie — cost-class admission (`we:scripts/lib/cost-admission.mjs`). `off` (the default) = today's gates.
   // Every launch decision this tick (heavy and light) is recorded for the one report line.
   const costSettings = policy?.costAdmission ?? null;
@@ -694,20 +713,37 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   const launchBuilds = async () => {
     for (const pick of plan.dispatch) {
       if (launchSlotBusy()) continue;
-      if (!(await cloneGate('build', pick.num))) continue;
-      const gate = loadGateFor('build', pick.num);
-      if (!gate.admit) continue;
-      const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
-      if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
-      let res;
-      try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
-      if (res?.pending) startedThisTick += 1;
-      if (res?.dispatching) { dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null }); if (!res.pending) effects.clearBuildFailure?.({ num: pick.num }); }
-      else {
-        effects.releaseClaim({ num: pick.num });
-        const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
-        if (live) surfaceCardRefusal(pick.num, rec, res);
-        failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
+      const clash = sameTickClash(pick.num, pick.scope);
+      if (clash) { sameTickHolds.push({ num: pick.num, kind: 'build', why: clash }); continue; }
+      // x3mdsyv — one launch's failure (a throwing gate, claim or dispatch) never aborts the others.
+      let claimed = false;
+      try {
+        if (!(await cloneGate('build', pick.num))) continue;
+        const gate = loadGateFor('build', pick.num);
+        if (!gate.admit) continue;
+        let claim;
+        try { claim = effects.acquireClaim({ num: pick.num, scope: pick.scope }); }
+        catch (e) { claim = { ok: false, reason: String(e?.message || e).split('\n')[0] }; }
+        if (!claim.ok) { failures.push({ num: pick.num, stage: 'claim', reason: `${claim.reason}${claim.heldBy ? ` by ${claim.heldBy}` : ''}` }); continue; }
+        claimed = true;
+        let res;
+        try { res = await effects.dispatch({ num: pick.num, bookkeeping, tick: out, tickBookkeeping, tickAt }); } catch (e) { res = { dispatching: false, reason: String(e?.message || e).split('\n')[0] }; }
+        if (res?.pending) startedThisTick += 1;
+        if (res?.dispatching) {
+          claimed = false;
+          launchedThisTick.push({ num: normNum(pick.num), kind: 'build', scope: pick.scope });
+          dispatched.push({ num: pick.num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
+          if (!res.pending) effects.clearBuildFailure?.({ num: pick.num });
+        } else {
+          claimed = false;
+          effects.releaseClaim({ num: pick.num });
+          const rec = effects.recordBuildFailure?.({ num: pick.num, reason: res?.reason ?? 'not dispatched', output: res?.output ?? res?.reason });
+          if (live) surfaceCardRefusal(pick.num, rec, res);
+          failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
+        }
+      } catch (e) {
+        if (claimed) { try { effects.releaseClaim({ num: pick.num }); } catch { /* the orphan sweep reclaims it */ } }
+        failures.push({ num: pick.num, stage: 'launch', reason: String(e?.message || e).split('\n')[0] });
       }
     }
   };
@@ -943,39 +979,51 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
-      if (!(await cloneGate('prepare', num))) continue;
-      if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
-      // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
-      // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
-      // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
-      // effects stub without the read records nothing — only a test double lacks it.)
-      let replacesStamp;
+      const clash = sameTickClash(num, scopeByNum.get(num));
+      if (clash) { sameTickHolds.push({ num, kind: 'prepare', why: clash }); continue; }
+      // x3mdsyv — one prepare launch throwing never aborts the remaining launches of the tick.
+      let prepareClaimed = false;
       try {
-        const before = await effects.readPreparedStamp?.({ num });
-        if (before) replacesStamp = before.preparedDate
-          ? { preparedDate: before.preparedDate, preparedAgainstSha: before.preparedAgainstSha ?? null } : null;
+        if (!(await cloneGate('prepare', num))) continue;
+        if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
+        // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
+        // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
+        // record the claim would fall back to the date rule, which retires it on the very stamp it replaces. (An
+        // effects stub without the read records nothing — only a test double lacks it.)
+        let replacesStamp;
+        try {
+          const before = await effects.readPreparedStamp?.({ num });
+          if (before) replacesStamp = before.preparedDate
+            ? { preparedDate: before.preparedDate, preparedAgainstSha: before.preparedAgainstSha ?? null } : null;
+        } catch (e) {
+          prepareBusy.add(num);
+          await failPrepare(num, 'stamp-read', String(e?.message || e));
+          continue;
+        }
+        const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [],
+          ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
+        if (!claim.ok) {
+          prepareBusy.add(num);
+          await failPrepare(num, 'claim', claim.reason);
+          continue;
+        }
+        prepareClaimed = true;
+        let res;
+        try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
+        catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
+        if (res?.pending) startedThisTick += 1;
+        prepareClaimed = false;
+        if (res?.dispatching) {
+          prepareBusy.add(num);
+          launchedThisTick.push({ num, kind: 'prepare', scope: scopeByNum.get(num) ?? [] });
+          prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
+        } else {
+          effects.releasePrepareClaim({ num });
+          await failPrepare(num, res?.refused ? 'dispatch-refused' : 'dispatch', res?.reason ?? 'not dispatched', res?.evidence ?? {}, res?.attempt ?? new Date().toISOString());
+        }
       } catch (e) {
-        prepareBusy.add(num);
-        await failPrepare(num, 'stamp-read', String(e?.message || e));
-        continue;
-      }
-      const claim = effects.acquirePrepareClaim({ num, scope: scopeByNum.get(num) ?? [],
-        ...(replacesStamp !== undefined ? { replacesStamp } : {}) });
-      if (!claim.ok) {
-        prepareBusy.add(num);
-        await failPrepare(num, 'claim', claim.reason);
-        continue;
-      }
-      let res;
-      try { res = await effects.dispatch({ num, bookkeeping, launchKind: 'prepare-item', prepareFallback: fallback, tick: out, tickBookkeeping, tickAt }); }
-      catch (e) { res = { dispatching: false, reason: String(e?.message || e) }; }
-      if (res?.pending) startedThisTick += 1;
-      if (res?.dispatching) {
-        prepareBusy.add(num);
-        prepare.launched.push({ num, lane: res.lane ?? pick.lane, sessionSlug: res.sessionSlug ?? null });
-      } else {
-        effects.releasePrepareClaim({ num });
-        await failPrepare(num, res?.refused ? 'dispatch-refused' : 'dispatch', res?.reason ?? 'not dispatched', res?.evidence ?? {}, res?.attempt ?? new Date().toISOString());
+        if (prepareClaimed) { try { effects.releasePrepareClaim({ num }); } catch { /* the retirement pass reclaims it */ } }
+        prepare.failures.push({ num, stage: 'launch', reason: String(e?.message || e).split('\n')[0], cause: 'daemon-observation', retry: true });
       }
     }
   }
@@ -1009,6 +1057,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     dispatched,
     // 78b/#4139 — launches deferred by the host-load gate, and the detached-launch settlement this tick did.
     loadHolds,
+    // x3mdsyv — the launch bound this tick ran under (and which cascade layer set it), and launches skipped because
+    // they shared a card or scope with an earlier launch of the same tick.
+    launchPolicy: { maxLaunchesPerTick: policy?.maxLaunchesPerTick ?? 1, source: policy?.maxLaunchesPerTickSource ?? 'legacy-default', launchedThisTick: launchedThisTick.length },
+    sameTickHolds,
     // The stale-code refusal this tick's launches were held on (null when the clone was fresh or nothing launched).
     cloneStale: cloneFresh && !cloneFresh.fresh ? cloneFresh.why : null,
     // Card x60i0ie — the one cost-class admission line for this tick (heavy vs light, admitted/refused and why).
@@ -2186,7 +2238,17 @@ export function policyFrom(flags, env = process.env) {
     preparedMaxAgeDays: offOr(flags['prepared-max-age-days'] ?? env.WE_BUILD_DAEMON_PREPARED_MAX_AGE_DAYS, BUILD_DISPATCH_POLICY.preparedMaxAgeDays),
     // Card x60i0ie — declared cost-class admission settings (env + dispatch-settings.json); built-in `off`.
     costAdmission: readCostAdmissionSettings({ env }),
+    // Card x3mdsyv — `builder.maxLaunchesPerTick` through the policy cascade (standard 'free-slots' → platform
+    // preference → tool settings → env WE_BUILDER_MAX_LAUNCHES_PER_TICK); the layer that set it rides along for the log.
+    ...(() => { const p = loadBuilderLaunchPolicy({ env }); return { maxLaunchesPerTick: p.maxLaunchesPerTick, maxLaunchesPerTickSource: p.source, maxLaunchesPerTickInvalid: p.invalid }; })(),
   };
+}
+
+/** x3mdsyv — the per-tick detached-launch bound: 'free-slots' = Infinity; a positive integer; absent/invalid = 1 (78b). */
+export function launchLimitOf(policy) {
+  const v = policy?.maxLaunchesPerTick;
+  if (v === FREE_SLOTS) return Infinity;
+  return Number.isInteger(v) && v >= 1 ? v : 1;
 }
 
 /** A count setting that can be switched off: unset → the default; `off` / a negative number → `null` (off). */
@@ -2398,6 +2460,7 @@ async function live(flags) {
   });
   const intervalMs = Number(flags['interval-ms']) > 0 ? Number(flags['interval-ms']) : DEFAULT_INTERVAL_MS;
   console.error(`build-dispatch-daemon: live on ${hostname()}:${process.pid}, caps Claude ${policy.maxConcurrentBuilds} / external ${policy.maxConcurrentExternalBuilds}, tick every ${intervalMs}ms${flags['self-sync'] ? ', self-sync ON' : ''}.`);
+  console.error(`build-dispatch-daemon: ${formatBuilderLaunchPolicyLine({ maxLaunchesPerTick: policy.maxLaunchesPerTick, source: policy.maxLaunchesPerTickSource, invalid: policy.maxLaunchesPerTickInvalid })}`);
   const { stoppedReason } = await runDaemonLoop({
     tickOnce, sleep: realSleep, isAlive, intervalMs, fixedCadence: true, maxTicks: flags.once ? 1 : Infinity,
     onTick: (r, _tick, loop) => {
@@ -2407,7 +2470,7 @@ async function live(flags) {
       // or for an older record with none) so the operator's tick line names WHO is running each build without
       // reading scorecards. Additive over the previous bare-num array — nothing on `main` parses this stdout
       // JSON as a strict array-of-strings today (grepped 2026-09-29).
-      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, capacity: tickCapacity(r) })}\n`);
+      process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), timings: { ...r.timings, loop }, status: r.statusLine, freeze: r.plan.freeze, inFlight: r.plan.inFlight.map((f) => ({ num: f.num, executor: f.executor ?? null })), openItems: reportOpenItems(r.plan.openItems), dispatched: r.dispatched, buildHolds: r.buildHolds, prepare: r.prepare, hold: r.plan.hold, dispatchHolds: r.dispatchHolds, failures: r.failures, needsYou: r.needsYou, retired: r.retired, infraRetry: r.infraRetry, orphanAdoption: r.orphanAdoption, queuePrune: r.queuePrune, draftRecovery: r.draftRecovery, holdRouting: r.holdRouting, holdRoutingResult: r.holdRoutingResult, loadHolds: r.loadHolds, costAdmission: r.costAdmission ? { line: r.costAdmission.line, tally: r.costAdmission.tally } : null, launchSettlement: r.launchSettlement, launchPolicy: r.launchPolicy, sameTickHolds: r.sameTickHolds, capacity: tickCapacity(r) })}\n`);
       if (r.costAdmission?.line) console.error(`build-dispatch-daemon: ${r.costAdmission.line}`);
     },
     onTickError: (e, _tick, loop) => {
