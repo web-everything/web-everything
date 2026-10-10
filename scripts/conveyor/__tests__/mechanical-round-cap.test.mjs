@@ -73,7 +73,10 @@ describe('a conflict-watch bounce is not a review verdict', () => {
     const comments = [...spent, takeover, rearm(8), conflictBounce(9), mechMarker(10)];
     expect(takeoverReviewGrant({ pr: pr(comments), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0 });
     const p = plan(pr(comments, { mechanicalRound: facts({ priorHead: 'd'.repeat(40) }) }));
-    expect(row(p)).toMatchObject({ kind: 'review', takeoverReview: { ok: true } });
+    // Since the takeover is a round beyond the cap (reviewCap = roundCap + started takeovers, card xx0055i), 6 attempts
+    // against a cap of 5 + 1 takeover is a plain owed review, not a cap-exhausted refusal that needs the grant.
+    expect(row(p)).toMatchObject({ kind: 'review' });
+    expect(refusal(p)).toBeUndefined();
   });
 });
 
