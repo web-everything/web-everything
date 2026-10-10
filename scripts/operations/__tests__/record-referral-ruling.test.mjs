@@ -227,13 +227,19 @@ describe('#4979 the sanctioned writer', () => {
   it('the reader hands the ruled PR and its head to the card resolver', () => {
     const rec = referral();
     const seen = [];
-    const reader = createRecordReferralRulingReader({ assertFresh: () => {},
-      readable: (ref) => ref.endsWith('@pr7'),
-      openPrHead: (args) => { seen.push(args); return { list: () => ['x0e6tik-follow-up.md'], read: () => '---\na: 1\n---\n' }; },
-      readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
-    const context = reader({ repo, pr: 7, card: 'x0e6tik' });
-    expect(seen).toEqual([{ repo, pr: 7, head }]);
-    expect(context.card).toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr7', readable: true, foundIn: 'pr-head' });
+    // An isolated, empty backlog root: the provisional id must be "not on main" whatever the real backlog holds
+    // (card x0e6tik later landed as 5733 with `bornAs: x0e6tik`, which shadowed this fixture and red main at 2cb94418d).
+    const root = mkdtempSync(join(tmpdir(), 'ruling-reader-pr-'));
+    try {
+      mkdirSync(join(root, 'backlog'));
+      const reader = createRecordReferralRulingReader({ root, assertFresh: () => {},
+        readable: (ref) => ref.endsWith('@pr7'),
+        openPrHead: (args) => { seen.push(args); return { list: () => ['x0e6tik-follow-up.md'], read: () => '---\na: 1\n---\n' }; },
+        readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+      const context = reader({ repo, pr: 7, card: 'x0e6tik' });
+      expect(seen).toEqual([{ repo, pr: 7, head }]);
+      expect(context.card).toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr7', readable: true, foundIn: 'pr-head' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 
