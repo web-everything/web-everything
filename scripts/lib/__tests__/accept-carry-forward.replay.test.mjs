@@ -10,15 +10,16 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import {
-  decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE, decideMechanicalHold, LIVE_LABEL_ATTESTATION,
+  decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE,
   laterReviewHold, isKnownMachineBody,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
-import { buildVerdictRecord } from '../verdict-ledger.mjs';
-import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
+import {
+  parseLatestHumanClearedSha, parseOperatorClearance, REVIEW_LABELS, decideMechanicalPark, isReviewHoldLabel, hasUnclearedReviewLabel,
+} from '../review-escalation.mjs';
 import {
   readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND,
-  buildTestGamingParkReason, buildHeldReviewHoldReason, applyTestGamingParkLabel, readNetDiffAtHead,
+  buildTestGamingParkReason, buildHeldReviewHoldReason, decideTestGamingPark, readNetDiffAtHead,
 } from '../../merge-ai-prs.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { REBASE_ONTO_MAIN_COMMENT_MARKER, MISSING_RUN_COMMENT_MARKER } from '../../conveyor/main-red-recovery.mjs';
@@ -35,16 +36,13 @@ import {
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/accept-carry-forward-4535.json'), 'utf8'));
 const OTHER_FP = 'a'.repeat(64);
 // Marker-anchored fixtures come from the drain's OWN exported builders, never a hand-typed look-alike (PR #4631 round 4, F1):
-// `MECHANICAL_PARK_RE` / `TEST_GAMING_PARK_REASON_RE` anchor on this text, so a reworded drain park must redden the tests.
+// `MECHANICAL_PARK_RE` anchors on this text, so a reworded drain park must redden the tests.
 const PARK_REASON = buildTestGamingParkReason(['1 test removed']);
 const parkBody = (reason) => buildDrainReasonComment('park', reason);
-// A drain park ledger row in the REAL record shape (`buildVerdictRecord`), attested the way `applyTestGamingParkLabel`
-// stamps it; `over` overrides top-level fields, so a rename of `actor.declared` / `actor.session` reddens these tests.
-const parkRow = (at, over = {}) => ({
-  ...buildVerdictRecord({ repo: 'web-everything/web-everything', pr: 5, verdict: 'human', at, reason: PARK_REASON,
-    declaredActor: 'drain', source: 'merge-ai-prs', session: LIVE_LABEL_ATTESTATION }),
-  ...over,
-});
+// PR #4631 (ruling a): the drain's own mechanical-park label, read from the single source (a rename reddens these tests).
+const MECH_LABEL = REVIEW_LABELS.heldMechanical;
+// The live #4535 re-park labels with the hold the drain now writes for that park (its own label, never review:human).
+const MECH_AFTER_REPARK = fx.labelsAfterRepark.map((l) => (l === 'review:human' ? MECH_LABEL : l));
 const OLD = fx.acceptedHead;
 const NEW = fx.newHead;
 
@@ -68,24 +66,35 @@ describe('#4535 replay — merge-queue refresh fcc29ce1 → 143107a87, net diff 
     expect(decideAcceptCarryForward({ setting: 'off', record, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('off');
   });
 
-  it('restamp crosses the review:human re-hold only with that proof, and drops the hold + advisory labels', () => {
+  // PR #4631 (operator ruling a): the live re-park put `review:human` on #4535; the drain now parks the same case with its
+  // OWN label. The live labels stay the measurement — and a `review:human` like them is never crossed.
+  it('restamp crosses ONLY the drain\'s mechanical park with that proof, and drops it + the advisory labels', () => {
     const humanCarry = decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] });
-    const d = decideSetLabel({ to: 'restamp', currentLabels: fx.labelsAfterRepark, humanCarry });
+    const d = decideSetLabel({ to: 'restamp', currentLabels: MECH_AFTER_REPARK, humanCarry });
     expect(d.allowed).toBe(true);
     expect(d.addLabel).toBe('review:accepted');
-    expect(d.removeLabels).toEqual(expect.arrayContaining(['review:human', 'advisory:accepted', 'review:awaiting-advisory']));
+    expect(d.removeLabels).toEqual(expect.arrayContaining([MECH_LABEL, 'advisory:accepted', 'review:awaiting-advisory']));
+    expect(d.removeLabels).not.toContain('review:human');
     expect(d.keepsHuman).toBe(false);
+    // The live #4535 labels (a review:human hold): the same proof never lifts it.
+    expect(decideSetLabel({ to: 'restamp', currentLabels: fx.labelsAfterRepark, humanCarry }).allowed).toBe(false);
   });
 
   it('the review daemon sweep plans #4535 and hands it to the sanctioned re-stamp once per head', () => {
     _resetAcceptCarryMemo();
-    const prs = [{ number: 4535, labels: fx.labelsAfterRepark.map((name) => ({ name })), headRefOid: NEW, comments: fx.comments }];
+    const prs = [{ number: 4535, labels: MECH_AFTER_REPARK.map((name) => ({ name })), headRefOid: NEW, comments: fx.comments }];
     expect(planAcceptCarry(prs, { setting: 'on' })).toEqual([{ num: 4535, head: NEW, from: OLD }]);
     const calls = [];
     const runRestamp = (c) => { calls.push(c); return { ok: true, detail: 'ok' }; };
     expect(sweepAcceptCarry({ prs, repo: fx.repo, setting: 'on', runRestamp })).toEqual([{ num: 4535, carry: 'carried', detail: 'ok' }]);
     expect(sweepAcceptCarry({ prs, repo: fx.repo, setting: 'on', runRestamp })).toEqual([]);
     expect(calls).toHaveLength(1);
+  });
+
+  it('the sweep never plans a review:human PR — the live #4535 labels, or the drain label with a person\'s hold beside it', () => {
+    for (const labels of [fx.labelsAfterRepark, [...MECH_AFTER_REPARK, 'review:human']]) {
+      expect(planAcceptCarry([{ number: 4535, labels, headRefOid: NEW, comments: fx.comments }], { setting: 'on' })).toEqual([]);
+    }
   });
 });
 
@@ -97,7 +106,7 @@ describe('guards — anything but a proven-identical net diff falls back to toda
     const v = decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: OTHER_FP });
     expect(v.action).toBe('review-owed');
     expect(v.reason).toMatch(/goes back to the operator/);
-    const d = decideSetLabel({ to: 'restamp', currentLabels: fx.labelsAfterRepark, humanCarry: v });
+    const d = decideSetLabel({ to: 'restamp', currentLabels: MECH_AFTER_REPARK, humanCarry: v });
     expect(d.allowed).toBe(false);
   });
 
@@ -120,7 +129,9 @@ describe('guards — anything but a proven-identical net diff falls back to toda
     const rec = latestAcceptRecord(comments);
     expect(rec.laterBodyDerivedHold).toBe(true);
     expect(decideAcceptCarryForward({ setting: 'on', record: rec, headSha: NEW, headDiff: fx.netDiff[NEW] }).action).toBe('none');
-    expect(planAcceptCarry([{ number: 1, labels: ['review:human'], headRefOid: NEW, comments }], { setting: 'on' })).toEqual([]);
+    // The sweep still hands it to the CLI (the one decider), which refuses the carry and hands the hold to the operator
+    // — a pre-filter here would strand it on the drain label (PR #4631 round 10 self-review).
+    expect(planAcceptCarry([{ number: 1, labels: [MECH_LABEL], headRefOid: NEW, comments }], { setting: 'on' })).toHaveLength(1);
   });
 
   it('an untrusted commenter cannot forge a clearance record', () => {
@@ -131,27 +142,39 @@ describe('guards — anything but a proven-identical net diff falls back to toda
   it('an agent accept (no cleared-human) never crosses a review:human hold', () => {
     const v = decideAcceptCarryForward({ setting: 'on', record: { ...record, humanCleared: false }, headSha: NEW, headDiff: fx.netDiff[NEW] });
     expect(v).toMatchObject({ action: 'carry', human: false });
-    expect(decideSetLabel({ to: 'restamp', currentLabels: fx.labelsAfterRepark, humanCarry: v }).allowed).toBe(false);
+    expect(decideSetLabel({ to: 'restamp', currentLabels: MECH_AFTER_REPARK, humanCarry: v }).allowed).toBe(false);
   });
 
   it('a live review:changes send-back is never overridden', () => {
     const v = decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] });
-    expect(decideSetLabel({ to: 'restamp', currentLabels: [...fx.labelsAfterRepark, 'review:changes'], humanCarry: v }).allowed).toBe(false);
-    expect(planAcceptCarry([{ number: 1, labels: ['review:human', 'review:changes'], headRefOid: NEW, comments: fx.comments }], { setting: 'on' })).toEqual([]);
+    expect(decideSetLabel({ to: 'restamp', currentLabels: [...MECH_AFTER_REPARK, 'review:changes'], humanCarry: v }).allowed).toBe(false);
+    expect(planAcceptCarry([{ number: 1, labels: [MECH_LABEL, 'review:changes'], headRefOid: NEW, comments: fx.comments }], { setting: 'on' })).toEqual([]);
   });
 
   it('restamp on review:human without proof is refused exactly as before', () => {
     expect(decideSetLabel({ to: 'restamp', currentLabels: ['review:human'] }).allowed).toBe(false);
+    expect(decideSetLabel({ to: 'restamp', currentLabels: [MECH_LABEL] }).allowed).toBe(false);
   });
 
-  it('same head: nothing to carry, the sweep skips it', () => {
+  it('same head: the rule says same-head; a drain label standing on it is still handed to the CLI (an orphaned lift)', () => {
     expect(decideAcceptCarryForward({ setting: 'on', record, headSha: OLD, headDiff: fx.netDiff[OLD] }).action).toBe('same-head');
-    expect(planAcceptCarry([{ number: 1, labels: ['review:human'], headRefOid: OLD, comments: fx.comments }], { setting: 'on' })).toEqual([]);
+    expect(planAcceptCarry([{ number: 1, labels: [MECH_LABEL], headRefOid: OLD, comments: fx.comments }], { setting: 'on' }))
+      .toEqual([{ num: 1, head: OLD, from: OLD }]);
   });
 
-  it('the sweep is inert when the setting is off', () => {
-    const prs = [{ number: 4535, labels: ['review:human'], headRefOid: NEW, comments: fx.comments }];
-    expect(sweepAcceptCarry({ prs, setting: 'off', runRestamp: () => { throw new Error('must not run'); } })).toEqual([]);
+  it('setting off (or a rollback): a drain label is still handed to the CLI, which hands it to the operator — never stranded', () => {
+    _resetAcceptCarryMemo();
+    const prs = [{ number: 4535, labels: [MECH_LABEL], headRefOid: NEW, comments: fx.comments }];
+    const calls = [];
+    expect(sweepAcceptCarry({ prs, setting: 'off', runRestamp: (c) => { calls.push(c.num); return { ok: false, retryable: false, detail: 'handed off' }; } }))
+      .toEqual([{ num: 4535, carry: 'refused', detail: 'handed off' }]);
+    expect(calls).toEqual([4535]);
+  });
+
+  it('PRs with no drain label, or with a person\'s hold or a send-back beside it, are never planned', () => {
+    for (const labels of [[], ['review:pending'], ['review:accepted'], ['review:human'], [MECH_LABEL, 'review:human'], [MECH_LABEL, 'review:changes']]) {
+      expect(planAcceptCarry([{ number: 1, labels, headRefOid: NEW, comments: fx.comments }], { setting: 'on' })).toEqual([]);
+    }
   });
 });
 
@@ -165,7 +188,7 @@ describe('a later verdict or deliberate hold is never carried past (positive ide
   // heading, so a reworded drain park must redden these cases instead of silently never carrying.
   const drainPark = parkBody;
   const verdict = (comments) => decideAcceptCarryForward({ setting: 'on', record: latestAcceptRecord(comments), headSha: NEW, headDiff: fx.netDiff[NEW] });
-  const planned = (comments) => planAcceptCarry([{ number: 7, labels: ['review:human'], headRefOid: NEW, comments }], { setting: 'on' });
+  const planned = (comments) => planAcceptCarry([{ number: 7, labels: [MECH_LABEL], headRefOid: NEW, comments }], { setting: 'on' });
 
   const BLOCKING = {
     'a changes verdict (review-set-label / review-pr)': '🔁 review — changes requested\n\nRecorded by agent. A real concern.',
@@ -183,11 +206,11 @@ describe('a later verdict or deliberate hold is never carried past (positive ide
   };
 
   for (const [name, body] of Object.entries(BLOCKING)) {
-    it(`${name} after the clear-human blocks the carry in the rule AND the sweep plan`, () => {
+    it(`${name} after the clear-human blocks the carry in the rule (the sweep hands it to the CLI, which hands it off)`, () => {
       const comments = after(body);
       expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
       expect(verdict(comments).action).toBe('none');
-      expect(planned(comments)).toEqual([]);
+      expect(planned(comments)).toHaveLength(1);
     });
   }
 
@@ -205,11 +228,11 @@ describe('a later verdict or deliberate hold is never carried past (positive ide
   const FREE_TEXT_HOLDS = ['hold, don\'t merge', 'Hold.', 'not yet', 'NACK', 'I have concerns about the restamp path', 'wait for the security pass',
     '/hold', 'do not merge until #4700 lands', 'lgtm but let me look again', '🛑 stop', '👎'];
   for (const text of FREE_TEXT_HOLDS) {
-    it(`operator free text ${JSON.stringify(text)} after the clear-human blocks the carry (rule + sweep plan)`, () => {
+    it(`operator free text ${JSON.stringify(text)} after the clear-human blocks the carry (rule; the CLI then hands it off)`, () => {
       const comments = after(text, { login: 'chalbert' });
       expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
       expect(verdict(comments).action).toBe('none');
-      expect(planned(comments)).toEqual([]);
+      expect(planned(comments)).toHaveLength(1);
     });
   }
 
@@ -340,23 +363,20 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   const BOT = { login: 'web-everything' };
   const clearComment = () => ({ author: BOT, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
 
-  // The live #4535 evidence shape: the drain ledgered its test-gaming park, then added the label 9 s later.
-  const PARK_AT = '2026-10-09T14:36:41.318Z';
-  const dRow = (over = {}) => parkRow(PARK_AT, { pr: 9, ...over });
-  const labeledAt = (created_at, login = 'chalbert') => ({ event: 'labeled', created_at, label: { name: 'review:human' }, actor: { login } });
-  const MECHANICAL = { ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] };
+  // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's mechanical park is its OWN label. Its presence
+  // is the whole proof the hold is mechanical — no ledger row, no label timeline, no event count is read.
+  const MECH = REVIEW_LABELS.heldMechanical;
 
-  /** Drives the real CLI with a recording provider; returns what was written. `events: null` = timeline unreadable. */
-  const restamp = ({ comments, labels = ['review:human'], ledger = MECHANICAL.ledger, events = MECHANICAL.events, reviews = [], fullComments = null, setting = 'on', headRefOid = null }) => {
+  /** Drives the real CLI with a recording provider; returns what was written. `liveLabels` = the hand-off's live re-read. */
+  const restamp = ({ comments, labels = [MECH], liveLabels = labels, reviews = [], fullComments = null, setting = 'on', headRefOid = null }) => {
     const writes = { setLabels: [], postComment: [] };
     const reads = { reviews: 0, comments: 0 };
     const provider = {
       name: 'stub', currentRepo: () => 'o/n',
-      readHoldLabelEvents: () => { if (events === null) throw new Error('gh api failed'); return events; },
       readPrReviews: () => { reads.reviews += 1; if (reviews === null) throw new Error('gh api failed'); return reviews; },
       readComments: () => { reads.comments += 1; if (fullComments === null) throw new Error('gh api failed'); return fullComments; },
       readPrState: () => ({ labels: labels.map((name) => ({ name })), comments, headRefOid: headRefOid ?? heads.head, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '', title: '' }),
-      readLabels: () => labels.map((name) => ({ name })),
+      readLabels: () => liveLabels.map((name) => ({ name })),
       setLabels: (_r, _p, spec) => { writes.setLabels.push(spec); },
       postComment: (_r, _p, body) => { writes.postComment.push(body); },
     };
@@ -370,7 +390,6 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     try {
       runReviewLabelCli({
         defaultActor: 'test', usage: 'usage: test', emit: (l) => chunks.push(String(l)), provider,
-        readLedgerRows: () => (typeof ledger === 'function' ? ledger() : ledger),
         argv: ['9', '--repo=o/n', '--to=restamp', '--actor=review-daemon', '--channel=accept-carry-forward', '--reason=head moved by a mechanical pass'],
         buildComment: ({ to, actor, headSha, reason, reviewedDiff, clearerId, independence, humanClearance }) => buildVerdictComment({
           to, actor, headSha, reason, reviewedDiff, clearerId, independence, channel: 'accept-carry-forward', humanClearance,
@@ -397,11 +416,24 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(parseOperatorClearance([{ author: BOT, body }])).toEqual({ actor: 'chalbert' });
   });
 
-  it('F2-F4: a deliberate changes verdict after the clear-human makes the restamp refuse, with NO label or comment write', () => {
-    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
-    const r = restamp({ comments: [clearComment(), later] });
+  const NO_WRITES = { setLabels: [], postComment: [] };
+  const printedOf = (r) => JSON.parse(r.out.trim().split('\n').pop());
+  // A DECIDED refusal across the drain's mechanical park hands the hold to the operator: the drain label becomes
+  // `review:human` (+ awaiting-advisory), with a comment naming why — and NO acceptance (no accept label, no markers).
+  const expectHandedOff = (r) => {
     expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual({ setLabels: [], postComment: [] });
+    // Explanation first, then awaiting-advisory, then the swap (once `review:human` stands the sweep stops planning it).
+    expect(r.writes.setLabels).toEqual([{ add: 'review:awaiting-advisory', remove: [] }, { add: 'review:human', remove: [MECH] }]);
+    expect(r.writes.postComment).toHaveLength(1);
+    expect(r.writes.postComment[0]).toMatch(/mechanical hold handed to the operator/);
+    expect(r.writes.postComment[0]).not.toMatch(/reviewed-sha|cleared-human|reviewed-diff/);
+    expect(printedOf(r)).toMatchObject({ refused: true });
+    expect(printedOf(r).retryable).toBeUndefined();
+  };
+
+  it('F2-F4: a deliberate changes verdict after the clear-human refuses the carry and hands the hold to the operator (no accept)', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
+    expectHandedOff(restamp({ comments: [clearComment(), later] }));
   });
 
   it('F1 (plain restamp, no live hold): a diff-less clearance on a review:accepted PR still keeps cleared-human', () => {
@@ -413,101 +445,102 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.head);
   });
 
-  it('F2-F4: a later escalation-policy drain park makes the restamp refuse, with NO write', () => {
+  it('F2-F4: a later escalation-policy drain park refuses the carry and hands the hold to the operator (no accept)', () => {
     const later = { author: BOT, body: parkBody('review escalation: blast-radius over threshold') };
-    const r = restamp({ comments: [clearComment(), later] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual({ setLabels: [], postComment: [] });
+    expectHandedOff(restamp({ comments: [clearComment(), later] }));
   });
 
-  it('the #4535 shape: only a test-gaming drain park after the clear-human — the restamp still carries', () => {
+  // Operator ruling 2026-10-10 ~14:20 ET (option a): `review:human` always means a person set the hold and is NEVER
+  // removed automatically, whatever the evidence beside it (a drain park comment, an identical diff, a clean thread).
+  it('RULING (a): a review:human hold is never lifted by a restamp, even with the full #4535 mechanical evidence: NO write', () => {
+    const later = { author: BOT, body: parkBody(PARK_REASON) };
+    const r = restamp({ comments: [clearComment(), later], labels: ['review:human'] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(r.out).toMatch(/review:human is uncleared — a person set it/);
+  });
+
+  it('the #4535 shape: the drain\'s mechanical park + its test-gaming park comment after the clear-human — the carry lifts ONLY the drain label', () => {
     const later = { author: BOT, body: parkBody(PARK_REASON) };
     const r = restamp({ comments: [clearComment(), later] });
     expect(r.exitCode).toBe(0);
     expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
-    expect(r.writes.setLabels[0].add).toBe('review:accepted');
+    expect(r.writes.setLabels).toEqual([{ add: 'review:accepted', remove: [MECH] }]);
   });
 
-  // PR #4631 review round 2 (F3/F4). An identical diff proves the CONTENT is what was cleared; it says nothing about
-  // WHO put the standing review:human there. Without positive provenance the restamp must refuse and write nothing.
-  const NO_WRITES = { setLabels: [], postComment: [] };
-
-  it('a deliberate label-only human re-hold survives an identical-diff restamp', () => {
-    // The operator re-adds review:human by hand after the clear-human: a label event, no comment, NO drain ledger row.
-    const r = restamp({ comments: [clearComment()], ledger: [], events: [labeledAt('2026-10-09T15:00:00Z')] });
+  // The two holes the round-9 stand-down named, now closed by construction (no history is read to attribute a hold):
+  it('CONCURRENT: an operator review:human added while the drain parked (both labels stand) is never lifted: NO write', () => {
+    const later = { author: BOT, body: parkBody(PARK_REASON) };
+    const r = restamp({ comments: [clearComment(), later], labels: [MECH, 'review:human'] });
     expect(r.exitCode).not.toBe(0);
     expect(r.writes).toEqual(NO_WRITES);
-    expect(r.out).toMatch(/not proven mechanical/);
-    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true });
   });
 
-  it('a held-park comment does not launder a deliberate hold (it is posted BECAUSE a hold stands, whoever put it there)', () => {
+  it('REMOVE + RE-ADD: the operator swapped the drain label for their own review:human after the park: NO write', () => {
+    const later = { author: BOT, body: parkBody(PARK_REASON) };
+    const r = restamp({ comments: [clearComment(), later], labels: ['review:human'] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a held-park restatement beside a review:human hold changes nothing: NO write', () => {
     const held = { author: BOT, body: parkBody(buildHeldReviewHoldReason({ labels: ['review:human'], body: '' })) };
-    const r = restamp({ comments: [clearComment(), held], ledger: [], events: [labeledAt('2026-10-09T15:00:00Z')] });
+    const r = restamp({ comments: [clearComment(), held], labels: ['review:human'] });
     expect(r.exitCode).not.toBe(0);
     expect(r.writes).toEqual(NO_WRITES);
   });
 
-  it('a hold re-added by hand BEFORE a later drain park is not explained by that park (unpaired label event)', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T13:00:00Z')] });
+  it('a review:changes beside the drain label is never crossed: NO write', () => {
+    const r = restamp({ comments: [clearComment()], labels: [MECH, 'review:changes'] });
     expect(r.exitCode).not.toBe(0);
     expect(r.writes).toEqual(NO_WRITES);
   });
 
-  it('a hold re-added by hand AFTER the drain park is the latest add, not the park\'s own', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), labeledAt('2026-10-09T18:00:00Z')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
+  it('setting off (or rolled back): a drain label is handed to the operator, never stranded (no accept)', () => {
+    expectHandedOff(restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }], setting: 'off' }));
   });
 
-  // PR #4631 round 3 (F3, codex): a person's REMOVE + RE-ADD inside the 120 s window after the drain's own add. The latest add
-  // is then inside the window, so timing alone read it as the park's. Every one of these must write nothing.
-  const unlabeledAt = (created_at, login = 'chalbert') => ({ event: 'unlabeled', created_at, label: { name: 'review:human' }, actor: { login } });
-  it('a hold removed and re-added by hand INSIDE the window after the park is not the park\'s own add: NO write', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), unlabeledAt('2026-10-09T14:37:20Z'), labeledAt('2026-10-09T14:37:30Z')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-    expect(r.out).toMatch(/a person touched the hold/);
-  });
-
-  it('a hold removed by hand after the park (and not re-added) is a changed hold too: NO write', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), unlabeledAt('2026-10-09T14:37:20Z')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-  });
-
-  it('a second add by hand INSIDE the window (two adds, no removal logged) is not the park\'s own either: NO write', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), labeledAt('2026-10-09T14:37:30Z')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-  });
-
-  it('a label event with an unparseable time cannot be placed before the park, so it counts as a touch: NO write', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), unlabeledAt('not-a-time')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-  });
-
-  it('a remove + re-add that happened BEFORE the park (the drain\'s add is then the only event since) still carries', () => {
-    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T13:00:00Z'), unlabeledAt('2026-10-09T13:10:00Z'), labeledAt('2026-10-09T14:36:50Z')] });
+  // Crash between writes: a lift posts its record (cleared-human naming the LIVE head) and then its label swap fails.
+  const clearedAtLive = () => ({ author: BOT, body: `📌 review — acceptance re-stamped after a rebase (no new review)\n<!-- reviewed-sha: ${heads.head} -->\n<!-- cleared-human: chalbert -->` });
+  it('ORPHANED LIFT: a clearance already naming the live head under the drain label is lifted (not handed off, not skipped)', () => {
+    const r = restamp({ comments: [clearComment(), { author: BOT, body: parkBody(PARK_REASON) }, clearedAtLive()] });
     expect(r.exitCode).toBe(0);
-    expect(r.writes.setLabels[0].add).toBe('review:accepted');
+    expect(r.writes.setLabels).toEqual([{ add: 'review:accepted', remove: [MECH] }]);
+    expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
+  });
+
+  it('ORPHANED LIFT with a later objection is handed off; with unreadable reviews it is a RETRYABLE miss', () => {
+    expectHandedOff(restamp({ comments: [clearComment(), clearedAtLive(), { author: { login: 'chalbert' }, body: 'hold' }] }));
+    const r = restamp({ comments: [clearComment(), clearedAtLive()], reviews: null });
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(printedOf(r)).toMatchObject({ refused: true, retryable: true });
+  });
+
+  it('a clear-human past comment 100 is read in full across the drain label even when page 1\'s latest record is not human', () => {
+    const agentAccept = { author: BOT, body: `✅ review — accepted\n<!-- reviewed-sha: ${heads.cleared} -->` };
+    const page = [agentAccept, ...filler(99)];
+    const r = restamp({ comments: page, fullComments: [...page, clearComment()] });
+    expect(r.reads.comments).toBe(1);
+    expect(r.exitCode).toBe(0);
+    expect(r.writes.setLabels).toEqual([{ add: 'review:accepted', remove: [MECH] }]);
+  });
+
+  it('hand-off re-reads live labels: a review:human that appeared since the run read the PR is left alone (no label write)', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent.' };
+    const r = restamp({ comments: [clearComment(), later], liveLabels: [MECH, 'review:human'] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
   });
 
   // PR #4631 round 3 (F2, security): a formal GitHub review is not in `gh pr view --json comments`; it is read through its
   // own paginated call and an unreadable one is a RETRYABLE miss, never "no review stands".
   const review = (state, submitted_at = '2026-10-09T16:00:00Z') => ({ state, submitted_at, user: { login: 'rev' } });
-  it('a formal CHANGES_REQUESTED review after the clear-human makes the restamp refuse, with NO write', () => {
-    const r = restamp({ comments: [clearComment()], reviews: [review('CHANGES_REQUESTED')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true });
+  it('a formal CHANGES_REQUESTED review after the clear-human refuses the carry (the hold goes to the operator, no accept)', () => {
+    expectHandedOff(restamp({ comments: [clearComment()], reviews: [review('CHANGES_REQUESTED')] }));
   });
 
-  it('a review that only COMMENTS after the clear-human is a possible objection too: NO write', () => {
-    const r = restamp({ comments: [clearComment()], reviews: [review('COMMENTED')] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
+  it('a review that only COMMENTS after the clear-human is a possible objection too (no accept)', () => {
+    expectHandedOff(restamp({ comments: [clearComment()], reviews: [review('COMMENTED')] }));
   });
 
   it('an APPROVED or DISMISSED review does not block, and neither does an empty review list', () => {
@@ -528,12 +561,11 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   // Truncated-read row: `gh pr view --json comments` stops at one page (100). A full page is re-read through the paginated
   // comments call; a hold past comment 100 must be seen, and a failed re-read is a retryable miss, never "no hold".
   const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: BOT, body: `🔒 conveyor fix-begin — fix claim held #${i}` }));
-  it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the restamp, with NO write', () => {
+  it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the carry (no accept)', () => {
     const page = [clearComment(), ...filler(99)];
     const r = restamp({ comments: page, fullComments: [...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
     expect(r.reads.comments).toBe(1);
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
+    expectHandedOff(r);
   });
 
   it('a full page whose complete thread has nothing standing against the clearance still carries', () => {
@@ -570,63 +602,27 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(restamp({ comments: [clearComment()], labels: ['review:accepted'], setting: 'off' }).reads).toEqual({ reviews: 0, comments: 0 });
   });
 
-  it('operator free text "hold, don\'t merge" after the clear-human makes the restamp refuse, with NO write', () => {
-    const r = restamp({ comments: [clearComment(), { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
+  it('operator free text "hold, don\'t merge" after the clear-human refuses the carry (no accept)', () => {
+    expectHandedOff(restamp({ comments: [clearComment(), { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] }));
   });
 
-  it('a sanctioned verdict ledgered after the drain park supersedes the clearance', () => {
-    const later = dRow({ verdict: 'changes', source: 'review-set-label', actor: { declared: 'chalbert' }, reason: 'changes', at: '2026-10-09T14:40:00.000Z' });
-    const r = restamp({ comments: [clearComment()], ledger: [dRow(), later] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
+  it('a content refusal (changed diff) is a settled decision, NOT retryable: the hold goes to the operator', () => {
+    expectHandedOff(restamp({ comments: [{ ...clearComment(), body: `${clearComment().body}\n<!-- reviewed-diff: ${OTHER_FP} -->` }] }));
   });
 
-  it('a drain park older than the clearance does not count', () => {
-    const cleared = { ...clearComment(), createdAt: '2026-10-09T15:30:00Z' };
-    const r = restamp({ comments: [cleared], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] });
+  it('a failed hand-off write is RETRYABLE (the sweep comes back), never a settled refusal', () => {
+    const r = restamp({ comments: [{ ...clearComment(), body: `${clearComment().body}\n<!-- reviewed-diff: ${OTHER_FP} -->` }], liveLabels: null });
     expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-  });
-
-  it('an unreadable label timeline refuses as a RETRYABLE read miss, with NO write', () => {
-    const r = restamp({ comments: [clearComment()], events: null });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
-  });
-
-  it('an unreadable verdict ledger is a RETRYABLE read miss, not "no park ledgered"', () => {
-    const r = restamp({ comments: [clearComment()], ledger: () => { throw new Error('EACCES'); } });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
-  });
-
-  it('a retry after a failed restamp is not blocked by the failed attempt\'s own `restamped` ledger row', () => {
-    const own = dRow({ verdict: 'restamped', source: 'review-set-label', actor: { declared: 'review-daemon' }, at: '2026-10-09T14:40:00.000Z', reason: 'carried' });
-    const r = restamp({ comments: [clearComment()], ledger: [dRow(), own] });
-    expect(r.exitCode).toBe(0);
-    expect(r.writes.setLabels[0].add).toBe('review:accepted');
-  });
-
-  it('a content refusal (changed diff) is a settled decision, NOT retryable', () => {
-    const r = restamp({ comments: [{ ...clearComment(), body: `${clearComment().body}\n<!-- reviewed-diff: ${OTHER_FP} -->` }] });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-    const printed = JSON.parse(r.out.trim().split('\n').pop());
-    expect(printed.refused).toBe(true);
-    expect(printed.retryable).toBeUndefined();
+    expect(r.writes.setLabels).toEqual([]);
+    expect(printedOf(r)).toMatchObject({ refused: true, retryable: true });
   });
 
   // PR #4631 round 7 (toctou-head-binding). The PR read names head H1 (a different diff); the branch, fetched later,
   // points at the identical-diff head. The proof must be read AT H1, the commit the restamp stamps, never at the branch.
-  it('the head the PR read names is the head whose diff is proven: a branch now at an identical-diff head proves nothing for it, NO write', () => {
+  it('the head the PR read names is the head whose diff is proven: a branch now at an identical-diff head proves nothing for it (no accept)', () => {
     const r = restamp({ comments: [clearComment()], headRefOid: heads.unreviewed });
-    expect(r.exitCode).not.toBe(0);
-    expect(r.writes).toEqual(NO_WRITES);
-    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true });
+    expectHandedOff(r);
+    expect(r.writes.setLabels.map((s) => s.add)).not.toContain('review:accepted');
   });
 
   it('a head whose commit is not in the clone after the fetch is unproven (never the branch\'s diff instead), NO write', () => {
@@ -664,134 +660,50 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   });
 });
 
-describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
-  const T = Date.parse('2026-10-09T14:36:41.318Z');
-  const iso = (ms) => new Date(T + ms).toISOString();
-  const row = (over = {}) => parkRow(iso(0), over);
-  const ev = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: 'review:human' } });
-  const decide = (o) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows: [row()], events: [ev(9_000)], ...o });
+// PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's test-gaming park picks its LABEL; the label is
+// the proof. A decided refusal (or no clearance at all) parks `review:human`; only a read miss parks the drain's own label.
+describe('decideTestGamingPark — the drain\'s mechanical park uses its OWN label, never review:human (pure)', () => {
+  const A = 'a'.repeat(40);
+  const B = 'b'.repeat(40);
+  const park = (o = {}) => decideTestGamingPark({ setting: 'on', currentLabels: ['review:accepted'], humanClearedSha: A, headSha: B, carryRetryable: true, ...o });
 
-  it('the live #4535 pairing (label add 9 s after the ledger row) is mechanical', () => {
-    expect(decide({}).mechanical).toBe(true);
+  it('an operator clearance on an older head whose carry could not be read: review:held-mechanical, never review:human', () => {
+    const d = park();
+    expect(d.addLabel).toBe(MECH_LABEL);
+    expect(d.removeLabels).not.toContain('review:human');
+    expect(d.removeLabels).toContain('review:accepted');
+    expect(d).toEqual(decideMechanicalPark({ currentLabels: ['review:accepted'] }));
   });
-  it('a row from another PR / a non-drain source / a non-test-gaming reason / a non-human verdict is not proof', () => {
-    for (const rows of [[row({ pr: 6 })], [row({ source: 'review-set-label' })], [row({ reason: 'held — a review hold' })],
-      [row({ verdict: 'pending' })], [row({ actor: { declared: 'chalbert' } })]]) {
-      expect(decide({ rows }).mechanical).toBe(false);
+  it('a DECIDED refusal (diff changed / later verdict), no clearance, the same head, a fetch miss, or the setting off: review:human', () => {
+    for (const o of [{ carryRetryable: false }, { humanClearedSha: null }, { headSha: null }, { headSha: A }, { setting: 'off' }]) {
+      expect(park(o).addLabel).toBe('review:human');
     }
   });
-  it('an unanchored mention of the phrase in another reason is not proof (the reason must LEAD with it)', () => {
-    expect(decide({ rows: [row({ reason: 'review escalation: touches test-gaming suspected — notes' })] }).mechanical).toBe(false);
+  it('a drain label already standing stays the drain\'s on a re-listed PR (never converted to review:human by the drain)', () => {
+    expect(park({ currentLabels: [MECH_LABEL], humanClearedSha: null, carryRetryable: false }).addLabel).toBe(MECH_LABEL);
+    // …unless a person's hold already stands beside it (then the ordinary park, which never removes it).
+    expect(park({ currentLabels: [MECH_LABEL, 'review:human'], humanClearedSha: null, carryRetryable: false }).addLabel).toBe('review:human');
   });
-  it('the label add must follow the row within the window and must be the latest add', () => {
-    expect(decide({ events: [ev(200_000)] }).mechanical).toBe(false);
-    expect(decide({ events: [ev(-60_000)] }).mechanical).toBe(false);
-    expect(decide({ events: [ev(9_000), ev(600_000)] }).mechanical).toBe(false);
-    expect(decide({ events: [] }).mechanical).toBe(false);
+  it('the mechanical label is a hold like any other (never mergeable, refused next to an accept, CI review-gate)', () => {
+    expect(isReviewHoldLabel(MECH_LABEL)).toBe(true);
+    expect(hasUnclearedReviewLabel([MECH_LABEL])).toBe(true);
+    expect(hasUnclearedReviewLabel([MECH_LABEL, 'review:accepted'])).toBe(true);
+    expect(hasUnclearedReviewLabel([MECH_LABEL], { allowPending: true })).toBe(true);
   });
-  it('an unreadable timeline (null) is retryable; no proof is not', () => {
-    expect(decide({ events: null })).toMatchObject({ mechanical: false, retryable: true });
-    expect(decide({ rows: [] }).retryable).toBeUndefined();
-  });
-  // PR #4631 round 3 (F3): from the park row onward the timeline must hold exactly ONE review:human event, the drain's add.
-  const un = (ms, created_at = iso(ms)) => ({ event: 'unlabeled', created_at, label: { name: 'review:human' } });
-  it('a remove + re-add inside the late window is a person touching the hold, not the park', () => {
-    expect(decide({ events: [ev(9_000), un(30_000), ev(40_000)] }).mechanical).toBe(false);
-    expect(decide({ events: [ev(9_000), un(30_000), ev(40_000)] }).reason).toMatch(/changed 3 times/);
-    expect(decide({ events: [ev(9_000), un(30_000)] }).mechanical).toBe(false);
-    expect(decide({ events: [ev(9_000), ev(40_000)] }).mechanical).toBe(false);
-  });
-  it('events before the park row (incl. a removal) do not count; an unplaceable event does', () => {
-    expect(decide({ events: [ev(-600_000), un(-500_000), ev(9_000)] }).mechanical).toBe(true);
-    expect(decide({ events: [ev(9_000), un(0, 'garbage')] }).mechanical).toBe(false);
-    expect(decide({ events: [ev(9_000), un(0, undefined)] }).mechanical).toBe(false);
-  });
-  it('other labels on the timeline are ignored', () => {
-    const other = { event: 'unlabeled', created_at: iso(30_000), label: { name: 'ready-to-merge' } };
-    expect(decide({ events: [ev(9_000), other] }).mechanical).toBe(true);
+  it('only the operator (clear-human) or a proven carry (restamp) lifts it — an agent accept never does', () => {
+    expect(decideSetLabel({ to: 'accepted', currentLabels: [MECH_LABEL] }).allowed).toBe(false);
+    const cleared = decideSetLabel({ to: 'clear-human', currentLabels: [MECH_LABEL] });
+    expect(cleared.allowed).toBe(true);
+    expect(cleared.removeLabels).toContain(MECH_LABEL);
+    const carry = { action: 'carry', human: true, from: A, to: B, reason: 'identical' };
+    expect(decideSetLabel({ to: 'restamp', currentLabels: [MECH_LABEL], humanCarry: carry })).toMatchObject({ allowed: true, addLabel: 'review:accepted' });
+    // review:human is never crossed, with or without the drain label beside it.
+    expect(decideSetLabel({ to: 'restamp', currentLabels: ['review:human'], humanCarry: carry }).allowed).toBe(false);
+    expect(decideSetLabel({ to: 'restamp', currentLabels: [MECH_LABEL, 'review:human'], humanCarry: carry }).allowed).toBe(false);
+    expect(decideSetLabel({ to: 'restamp', currentLabels: [MECH_LABEL], humanCarry: { ...carry, action: 'review-owed' } }).allowed).toBe(false);
   });
 });
 
-// PR #4631 round 4 (F2, CONFIRMED broken): the pure rule cannot tell the drain's label add from an operator's when both
-// are the same login and the drain's add was a no-op (the operator's `review:human` landed between the drain's ledger row
-// and its add, or in the batch before it): ONE label event pairs with the drain's row and the restamp erased the hold.
-// Attribution therefore lives in the WRITER: no ledger row unless a LIVE read shows the label absent just before the add.
-describe('applyTestGamingParkLabel — only a live-absent label is attested as the drain\'s own add', () => {
-  const T = Date.parse('2026-10-09T14:36:41.318Z');
-  const iso = (ms) => new Date(T + ms).toISOString();
-  const LABEL = 'review:human';
-  const operatorAdd = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: LABEL } });
-  const run = (live, failAdd = false) => {
-    const log = [];
-    const rows = [];
-    const out = applyTestGamingParkLabel({
-      repo: 'web-everything/web-everything', pr: 5, label: LABEL, reason: buildTestGamingParkReason(['1 test removed']), headSha: 'a'.repeat(40),
-      readLiveLabels: typeof live === 'function' ? live : () => live,
-      // The row is built by the real record builder from exactly what the writer passes, so a dropped attestation reddens.
-      record: (o) => {
-        log.push('record');
-        rows.push(buildVerdictRecord({ repo: o.repo, pr: o.pr, verdict: 'human', at: iso(500), reason: o.reason, declaredActor: 'drain', source: 'merge-ai-prs', session: o.session }));
-        return { ok: true, errors: [] };
-      },
-      addLabel: (l) => { if (failAdd) throw new Error('gh down'); log.push(`add:${l}`); },
-    });
-    return { out, log, rows };
-  };
-  const decide = (rows, events) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows, events });
-
-  it('positive control (#4535): label absent live -> the add FIRST, then an attested ledger row; the pairing is mechanical', () => {
-    const { out, log, rows } = run([{ name: 'ready-to-merge' }]);
-    // The row must not sit between the live read and the add (a ledger write is seconds; the add is the one round trip).
-    expect(log).toEqual([`add:${LABEL}`, 'record']);
-    expect(out).toMatchObject({ ledgered: true, added: true });
-    expect(rows[0].actor.session).toBe(LIVE_LABEL_ATTESTATION);
-    // The label event lands just BEFORE the row (add, then row), inside the early pairing slack.
-    expect(decide(rows, [operatorAdd(-400)]).mechanical).toBe(true);
-    expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(true);
-  });
-  it('a failed add writes NO row (a row must never claim an add that threw)', () => {
-    const { out, log, rows } = run([], true);
-    expect(log).toEqual([]);
-    expect(out).toMatchObject({ ledgered: false, added: false });
-    expect(rows).toEqual([]);
-  });
-  it('a row from an older drain build (no live-read attestation) is not proof of a mechanical hold', () => {
-    const legacy = buildVerdictRecord({ repo: 'web-everything/web-everything', pr: 5, verdict: 'human', at: iso(0), reason: buildTestGamingParkReason(['x']), declaredActor: 'drain', source: 'merge-ai-prs' });
-    expect(decide([legacy], [operatorAdd(9_000)])).toMatchObject({ mechanical: false });
-    expect(decide([legacy], [operatorAdd(9_000)]).reason).toMatch(/no drain test-gaming park is ledgered/);
-  });
-  // NARROWED, NOT CLOSED: if the operator's label lands AFTER this live read and before the drain's add (one `gh` round
-  // trip), the add is still a no-op and one event pairs with the row. GitHub has no compare-and-swap on labels and the
-  // drain shares the operator's login, so that gap is not closable from the client; it is disclosed on the card.
-  it('operator label already standing at the live read: no row, no add, so the hold is never mechanical', () => {
-    const { out, log, rows } = run([{ name: LABEL }]);
-    expect(log).toEqual([]);
-    expect(out).toMatchObject({ ledgered: false, added: false });
-    // The lone label event on the timeline is the operator's; with no drain row to pair with it the restamp refuses.
-    expect(decide(rows, [operatorAdd(2_000)])).toMatchObject({ mechanical: false });
-    expect(decide(rows, [operatorAdd(2_000)]).reason).toMatch(/no drain test-gaming park is ledgered/);
-  });
-  it('labels as bare strings are read too (the gh label shape is not assumed)', () => {
-    expect(run([LABEL]).log).toEqual([]);
-  });
-  it('an unreadable live read (null, throw, non-array) still PLACES the hold but writes no row, so the origin is unattested', () => {
-    for (const live of [null, () => { throw new Error('gh down'); }, () => 'nope', undefined]) {
-      const { out, log, rows } = run(live);
-      expect(log).toEqual([`add:${LABEL}`]);
-      expect(out).toMatchObject({ ledgered: false, added: true });
-      expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(false);
-    }
-  });
-  it('a failing ledger append never blocks or undoes the add', () => {
-    const failingRecord = applyTestGamingParkLabel({ repo: 'a/b', pr: 5, label: LABEL, reason: 'r', readLiveLabels: () => [], addLabel: () => {}, record: () => ({ ok: false, errors: ['disk full'] }) });
-    expect(failingRecord).toMatchObject({ ledgered: false, added: true, errors: ['disk full'] });
-  });
-  it('the reason it ledgers is the real builder\'s text, which TEST_GAMING_PARK_REASON_RE anchors on', () => {
-    const { rows } = run([]);
-    expect(rows[0].reason).toBe(buildTestGamingParkReason(['1 test removed']));
-    expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(true);
-  });
-});
 
 // PR #4631 round 3 (F2): the thread reader's two new channels, pure.
 describe('later hold channels — free text and formal reviews (pure)', () => {
@@ -865,6 +777,18 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
   });
   it('a changed net diff is not carried', () => {
     expect(run({ netDiffText: { scored: true, text: `${TEXT}+one more line\n`, rev: NEW } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  // PR #4631 (ruling a): `retryable` picks the park label — a READ miss parks the drain's own review:held-mechanical (the
+  // sweep retries), a DECIDED refusal parks review:human (a review of the change is owed).
+  it('retryable: a read miss (unscored diff, mis-bound diff, moved head, unreadable reviews) vs a decision (changed diff, agent accept)', () => {
+    for (const o of [{ netDiffText: { scored: false, text: TEXT } }, { netDiffText: { scored: true, text: TEXT, rev: 'b'.repeat(40) } },
+      { pinnedHeadSha: 'c'.repeat(40) }, { reviews: null }]) {
+      expect(run(o)).toMatchObject({ carried: false, retryable: true });
+    }
+    for (const o of [{ netDiffText: { scored: true, text: `${TEXT}+one more line\n`, rev: NEW } }, { comments: [agentAccept()] }]) {
+      expect(run(o)).toMatchObject({ carried: false, retryable: false });
+    }
+    expect(run()).toMatchObject({ carried: true, retryable: false });
   });
   // PR #4631 round 7 (toctou-head-binding): the batch diff was read at the branch NAME; a push between that read and the
   // live head read leaves an identical text that belongs to ANOTHER commit. Only a diff read at the live SHA proves it.
@@ -942,7 +866,7 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
 
 describe('the sweep runs the restamp in the PR repo\'s own checkout and remembers only settled outcomes (PR #4631 F1/F2)', () => {
   beforeEach(() => _resetAcceptCarryMemo());
-  const prs = [{ number: 217, labels: ['review:human'], headRefOid: NEW, comments: fx.comments }];
+  const prs = [{ number: 217, labels: [MECH_LABEL], headRefOid: NEW, comments: fx.comments }];
   const cand = { repo: 'plateauapp/plateau-app', num: 217, head: NEW, from: OLD };
   const spawnOf = (result) => { const calls = []; return { calls, spawn: (cmd, args, opts) => { calls.push({ cmd, args, opts }); return result; } }; };
 

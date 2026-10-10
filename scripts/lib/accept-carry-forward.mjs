@@ -65,7 +65,7 @@ const BODY_DERIVED_HOLD_RE = /manifest baseline mismatch/i;
  *     those bytes, so an identical diff proves it still covers: the #4535 shape this PR exists for); an
  *     escalation-policy park, a clearance-revocation park or any other reason is a decision about the PR, not the bytes.
  *   A label-only `review:human` re-add leaves no comment at all, so it is handled where the hold is crossed, not here:
- *   {@link decideMechanicalHold} (the restamp refuses unless the standing hold is the drain's own ledgered park).
+ *   the restamp crosses only the drain's own `review:held-mechanical` label and never `review:human` (PR #4631 ruling a).
  *   Free text cannot be classified by author (the drain posts under the operator's own login on this host), so the rule
  *   is INVERTED (PR #4631 review round 3): a comment after the accept that is not positively recognised as a known
  *   MACHINE shape ({@link isKnownMachineBody}: fix claims, CI-heal / restack notes, advisory notes that are not a
@@ -219,89 +219,12 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   return { ...base, action: 'carry', reason: `net diff byte-identical to the accept at ${record.sha.slice(0, 9)} (reviewed-diff ${accepted.slice(0, 12)}); accept carried to ${head.slice(0, 9)}` };
 }
 
-/** The drain's anti-test-gaming re-park, as its verdict-ledger row spells the reason (`merge-ai-prs.mjs`). */
-const TEST_GAMING_PARK_REASON_RE = /^\s*test-gaming suspected\s+[—-]/i;
-/**
- * The `actor.session` stamp on a drain park row, written by `applyTestGamingParkLabel` (`merge-ai-prs.mjs`) only AFTER a
- * live label read showed `review:human` absent and the drain's own add succeeded (PR #4631 round 4, F2). A row without
- * it — from an older drain build that wrote the row before the add, with no live read — proves nothing about who put the
- * label there, so it is not accepted as proof of a mechanical hold.
+/*
+ * WHICH HOLD A CARRY MAY LIFT (PR #4631, operator ruling 2026-10-10 ~14:20 ET, option a). Not a function of this module:
+ * a LABEL. The drain's mechanical park holds with its own `review:held-mechanical` (`REVIEW_LABELS.heldMechanical`,
+ * written only by `decideTestGamingPark` in merge-ai-prs.mjs), and `review-set-label.mjs --to=restamp` lifts only that
+ * label, only on a `carry` verdict from `decideAcceptCarryForward`. `review:human` always means a person set the hold and
+ * is never removed automatically. No timing, label-timeline event or event count is read to attribute a hold: on this
+ * host the drain shares the operator's login, so a person's concurrent or re-added `review:human` could never be told
+ * apart from the drain's by its history (rounds 2-9 tried a ledger row, a live-read attestation and event counts).
  */
-export const LIVE_LABEL_ATTESTATION = 'live-label-absent-v1';
-/**
- * The drain now writes the ledger row just AFTER its label add (round 4; the old order was row first, live #4535: row
- * 14:36:41, `labeled review:human` 14:36:50), so the label event may precede the row by the add's round trip plus clock
- * skew between GitHub and this host; the late window still covers the old order's observed gap.
- */
-export const HOLD_PAIR_EARLY_MS = 15_000;
-export const HOLD_PAIR_LATE_MS = 120_000;
-
-const msOf = (iso) => { const t = Date.parse(String(iso ?? '')); return Number.isFinite(t) ? t : null; };
-const isDrainTestGamingPark = (r) => r?.verdict === 'human' && r?.source === 'merge-ai-prs' && r?.actor?.declared === 'drain'
-  && r?.actor?.session === LIVE_LABEL_ATTESTATION
-  && TEST_GAMING_PARK_REASON_RE.test(String(r?.reason ?? ''));
-
-/**
- * PR #4631 review round 2 (F3/F4): was the standing `review:human` put there by the drain's mechanical anti-test-gaming
- * re-park, or by a person? Carrying the operator's clearance across a hold is only safe for the first. Pure.
- *
- * WHY NOT THE COMMENT THREAD OR THE LABEL'S ACTOR. A label-only hold (`gh pr edit --add-label review:human`) leaves no
- * comment, and on this host the drain runs under the operator's own credential (live #4535: every label event and the
- * park comment are `chalbert`), so neither the thread nor the actor can tell the two apart. The drain's verdict ledger
- * can: the drain appends a `human` row (source `merge-ai-prs`, declared actor `drain`, reason `test-gaming suspected
- * — …`) just after its own label add succeeds (round 4; older builds wrote it just before), and nothing else writes that row. So the hold is mechanical only when ALL of:
- *   1. the latest such ledger row for the PR is newer than the clearance;
- *   2. no later ledger row of any other kind follows it (a sanctioned verdict after the park supersedes the clearance);
- *   3. the LATEST `labeled review:human` event on the PR timeline is that park's own label add (it follows the row by
- *      at most {@link HOLD_PAIR_LATE_MS}). A person re-adding the label — before or after the park — is a later or
- *      unpaired event, so a deliberate hold is never explained away by an earlier or unrelated drain row;
- *   4. (round 3) from the park row onward that add is the ONLY `review:human` event on the timeline, adds AND removals: the
- *      drain adds the label once, so a person's remove + re-add seconds later (both inside the late window) is another
- *      event and refuses. An event with an unparseable time cannot be placed before the park, so it counts.
- *   0. (round 4) the row itself is attested by its WRITER: `applyTestGamingParkLabel` (`merge-ai-prs.mjs`) appends it only
- *      after a LIVE read shows `review:human` absent, so a drain add that was a no-op because a person's label already
- *      stood leaves NO row here. This rule cannot recover that on its own — same login, one label event, nothing to
- *      pair or count against — which is why the proof is withheld at the writer and missing proof refuses below.
- * Only the test-gaming park counts. The drain restating an already-standing hold (`held — a review hold`) is posted
- * BECAUSE a hold stands, whoever put it there, so it proves nothing about origin (and writes no such ledger row).
- * Missing proof refuses (the hold stays); an unreadable timeline refuses as `retryable` (a read miss, not a decision).
- *
- * The head SHA is deliberately NOT part of the binding: the live row names `b55fa00ae`, not the PR head
- * `143107a87` (the drain's verdict snapshot is not the refreshed head), so a SHA match would refuse the very case
- * this exists for. The net-diff identity is the content proof; this only attributes the hold.
- * @param {{rows?: Array, events?: Array|null, pr: number|string, clearAt?: string|null}} o — `events` null = unreadable.
- * @returns {{mechanical: boolean, retryable?: boolean, reason: string}}
- */
-export function decideMechanicalHold({ rows = [], events = null, pr, clearAt = null } = {}) {
-  if (!Array.isArray(events)) return { mechanical: false, retryable: true, reason: 'the label timeline could not be read; the hold\'s origin is unproven' };
-  const n = Number(pr);
-  // `observed` is a shadow prediction; `restamped` is this carry's OWN record, written before its label swap — if the swap
-  // then failed, the retry must not read the earlier attempt's row as a later verdict that supersedes the clearance.
-  const mine = (Array.isArray(rows) ? rows : []).filter((r) => Number(r?.pr) === n && r?.verdict !== 'observed' && r?.verdict !== 'restamped');
-  const clearMs = msOf(clearAt);
-  const parks = mine.filter((r) => isDrainTestGamingPark(r) && msOf(r.at) !== null && (clearMs === null || msOf(r.at) > clearMs));
-  if (!parks.length) return { mechanical: false, reason: 'no drain test-gaming park is ledgered since the clearance; the review:human hold is not proven mechanical (a deliberate label-only hold is indistinguishable)' };
-  const park = parks.reduce((a, b) => (msOf(b.at) >= msOf(a.at) ? b : a));
-  const parkMs = msOf(park.at);
-  if (mine.some((r) => msOf(r.at) !== null && msOf(r.at) > parkMs && !isDrainTestGamingPark(r))) {
-    return { mechanical: false, reason: 'a later ledgered verdict follows the drain park; the clearance does not cover it' };
-  }
-  const holdEvents = events.filter((e) => (e?.event === 'labeled' || e?.event === 'unlabeled') && e?.label?.name === 'review:human');
-  const labeled = holdEvents
-    .filter((e) => e.event === 'labeled' && msOf(e.created_at) !== null && (clearMs === null || msOf(e.created_at) > clearMs))
-    .map((e) => msOf(e.created_at));
-  if (!labeled.length) return { mechanical: false, reason: 'no review:human label event since the clearance explains the hold' };
-  const last = Math.max(...labeled);
-  if (last < parkMs - HOLD_PAIR_EARLY_MS || last > parkMs + HOLD_PAIR_LATE_MS) {
-    return { mechanical: false, reason: 'the latest review:human label add is not the drain park\'s own (a person re-held it); the clearance is not carried over it' };
-  }
-  // PR #4631 round 3: the window alone cannot tell the drain's add from a person's REMOVE + RE-ADD a few seconds later
-  // (same login, both inside the late window). The drain adds the label exactly once, so from its ledger row onward the
-  // timeline must hold exactly ONE `review:human` event and it must be that add; any further add or removal is a person
-  // touching the hold. An event with a missing / unparseable time cannot be placed before the park, so it counts.
-  const sincePark = holdEvents.filter((e) => { const t = msOf(e.created_at); return t === null || t >= parkMs - HOLD_PAIR_EARLY_MS; });
-  if (sincePark.length !== 1) {
-    return { mechanical: false, reason: `the review:human label changed ${sincePark.length} times since the drain park's ledger row (expected exactly its own add); a person touched the hold, so the clearance is not carried over it` };
-  }
-  return { mechanical: true, reason: 'the standing review:human is the drain\'s own test-gaming re-park (ledger row paired with its label add)' };
-}

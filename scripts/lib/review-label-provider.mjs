@@ -115,14 +115,10 @@ export const GH_ARGV = Object.freeze({
   // file's documented reason for avoiding `reconcile-core.mjs#assessLiveness` — a heavy load-time import chain
   // is exactly the hazard both sides are keeping out of each other's graph).
   readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[].filename'],
-  // The PR's `review:human` label-add events (card xu7kxtt / PR #4631 F3: who put the hold there, and when). One JSON
-  // object per line so `--paginate` pages concatenate; `--method GET` for the same reason as `readPrFiles`.
-  // `unlabeled` too (PR #4631 round 3): a person's remove + re-add is invisible if only the adds are read.
-  readHoldLabelEvents: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${pr}/events`,
-    '--jq', '.[] | select((.event == "labeled" or .event == "unlabeled") and .label.name == "review:human") | {event, created_at, label: {name: .label.name}, actor: {login: .actor.login}}'],
   // The PR's formal reviews (PR #4631 round 3): `gh pr view --json comments` never returns them, so a "Request changes"
   // review was invisible to the carry rule. A dedicated paginated read (not a `readPrState` field, which would change
-  // that argv for every caller and cannot be shown to page); one JSON object per line, `--method GET` as above.
+  // that argv for every caller and cannot be shown to page); one JSON object per line so `--paginate` pages
+  // concatenate, `--method GET` for the same reason as `readPrFiles`.
   readPrReviews: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/reviews`,
     '--jq', '.[] | {state, submitted_at, user: {login: .user.login}}'],
   // The COMPLETE comment thread, in the shape `gh pr view --json comments` returns (`author.login`, `body`, `createdAt`).
@@ -198,12 +194,6 @@ export function createGhProvider({
     readPrFiles(repo, pr) {
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
       return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean);
-    },
-
-    /** The `labeled` / `unlabeled review:human` events on the PR timeline, oldest first. Throws on a read miss (the
-     *  caller treats that as unreadable, never as "no events"). */
-    readHoldLabelEvents(repo, pr) {
-      return parseJsonLines(exec(GH_ARGV.readHoldLabelEvents(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
     },
 
     /** The PR's formal reviews, every page. Throws on a read miss (the caller treats that as unreadable, never as

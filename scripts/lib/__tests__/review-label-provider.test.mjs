@@ -164,19 +164,10 @@ describe('the gh adapter', () => {
     expect(p.readPrFiles('o/n', 2223)).toEqual([]);
   });
 
-  it('readHoldLabelEvents reads the issue events with --method GET and parses one JSON event per line (PR #4631 F3)', () => {
-    const argv = GH_ARGV.readHoldLabelEvents('o/n', 9);
-    expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/9/events']);
-    expect(argv.join(' ')).toContain('review:human');
-    const line = '{"event":"labeled","created_at":"2026-10-09T14:36:50Z","label":{"name":"review:human"},"actor":{"login":"x"}}';
-    expect(createGhProvider({ exec: () => `${line}\n${line}\n` }).readHoldLabelEvents('o/n', 9)).toHaveLength(2);
-    expect(createGhProvider({ exec: () => '' }).readHoldLabelEvents('o/n', 9)).toEqual([]);
-  });
-
-  it('readHoldLabelEvents also selects `unlabeled` events (a person\'s remove + re-add is invisible if only adds are read; PR #4631 round 3)', () => {
-    const jq = GH_ARGV.readHoldLabelEvents('o/n', 9).join(' ');
-    expect(jq).toContain('.event == "unlabeled"');
-    expect(jq).toContain('.event == "labeled"');
+  // PR #4631 (operator ruling a): no label-timeline reader exists — a hold's origin is its LABEL, never its history.
+  it('there is no label-timeline reader (the carry never infers a hold\'s origin from events)', () => {
+    expect(GH_ARGV.readHoldLabelEvents).toBeUndefined();
+    expect(createGhProvider({ exec: () => '' }).readHoldLabelEvents).toBeUndefined();
   });
 
   it('readPrReviews pages the dedicated reviews endpoint with --method GET and parses one JSON review per line (PR #4631 round 3)', () => {
@@ -200,11 +191,6 @@ describe('the gh adapter', () => {
   it('readPrReviews throws on a malformed line or a gh failure (never "no reviews")', () => {
     expect(() => createGhProvider({ exec: () => 'not json\n' }).readPrReviews('o/n', 9)).toThrow();
     expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readPrReviews('o/n', 9)).toThrow(/gh failed/);
-  });
-
-  it('readHoldLabelEvents throws on a malformed line or a gh failure (the caller treats a throw as an unreadable timeline)', () => {
-    expect(() => createGhProvider({ exec: () => 'not json\n' }).readHoldLabelEvents('o/n', 9)).toThrow();
-    expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readHoldLabelEvents('o/n', 9)).toThrow(/gh failed/);
   });
 });
 

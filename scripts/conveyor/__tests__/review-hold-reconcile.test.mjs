@@ -310,8 +310,11 @@ describe('sweepReviewHoldLabels', () => {
     // A repo with no provisioned checkout, NOT the fixture's real slug: if the `acceptCarry` seam ever breaks, the default runner
     // must stop at "no checkout provisioned" rather than spawn a real `review-set-label --to=restamp` against GitHub.
     const REPO = 'o/n';
+    // PR #4631 (operator ruling a): the drain now parks the #4535 shape with its OWN `review:held-mechanical`, the only hold
+    // the carry may lift; the live labels' `review:human` is swapped for it (a review:human PR is never planned).
     const carryPr = () => ({
-      number: fx.pr, labels: fx.labelsAfterRepark.map((name) => ({ name })), headRefOid: fx.newHead, comments: fx.comments,
+      number: fx.pr, labels: fx.labelsAfterRepark.map((name) => ({ name: name === 'review:human' ? 'review:held-mechanical' : name })),
+      headRefOid: fx.newHead, comments: fx.comments,
     });
     // The setting is read from env first; pin it so a host `WE_ACCEPT_CARRY_FORWARD=off` cannot silently skip the leg under test.
     beforeEach(() => { vi.stubEnv('WE_ACCEPT_CARRY_FORWARD', 'on'); _resetAcceptCarryMemo(); });
@@ -347,7 +350,7 @@ describe('sweepReviewHoldLabels', () => {
     });
 
     it('a failure inside the carry leg itself becomes one sweep-failed entry and the later legs still run', () => {
-      const boom = { number: 9, labels: [{ name: 'review:human' }], headRefOid: fx.newHead, get comments() { throw new Error('comments unreadable\nstack line'); } };
+      const boom = { number: 9, labels: [{ name: 'review:held-mechanical' }], headRefOid: fx.newHead, get comments() { throw new Error('comments unreadable\nstack line'); } };
       const results = sweepReviewHoldLabels({
         repo: REPO, provider: provider(), listPrs: () => [boom], acceptCarry: () => { throw new Error('unreachable'); },
       });

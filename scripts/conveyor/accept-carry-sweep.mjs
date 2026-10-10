@@ -5,17 +5,18 @@
  *   refreshed it onto main (143107a87, net diff byte-identical); the drain re-parked `review:human`; the review daemon
  *   then paused (`head 143107a87 was already reviewed 1 time(s)`), so the PR waited forever for a second approval.
  *
- *   PLAN (pure): a PR is a candidate when it carries `review:human` (no `review:changes`), its latest trusted accept
- *   record is a `clear-human` on an OLDER head, and no body-derived hold came after it. The candidate is handed to the
- *   ONE sanctioned writer, `review-set-label.mjs --to=restamp`, which re-reads the PR, computes the live net diff and
- *   carries the clearance only on a byte-identical strict reviewed-diff (`decideAcceptCarryForward`) AND only when the
- *   standing `review:human` is provably the drain's own mechanical park (`decideMechanicalHold`: its ledgered row paired
- *   with its label add), never a deliberate hold; otherwise it refuses and nothing changes. This sweep never touches a
- *   label itself, and it plans from the comment thread alone: the restamp CLI is the one authority on both proofs.
+ *   PLAN (pure): a PR is a candidate when it carries the drain's own mechanical park, `review:held-mechanical` (PR #4631,
+ *   operator ruling 2026-10-10 ~14:20 ET, option a: a label only the drain writes, so its presence proves the hold is
+ *   mechanical), and NO `review:human` (a person's hold, never removed automatically, whenever it was set) nor
+ *   `review:changes` — whatever its thread says and whatever the setting (see {@link planAcceptCarry}). The candidate is
+ *   handed to the ONE sanctioned writer, `review-set-label.mjs --to=restamp`, which re-reads the full thread and formal
+ *   reviews, computes the live net diff and lifts the drain's label only on a proven carry of a `clear-human` record
+ *   (`decideAcceptCarryForward`); on a decided refusal it hands the hold to the operator (`review:human`), on a read miss
+ *   it leaves it for a retry. This sweep never touches a label itself: the restamp CLI is the one authority on the proof.
  *
  *   The child runs in the PR repo's OWN checkout (the CLI reads the net diff off its cwd); no checkout → not attempted.
  *   A DECISION (carried, or refused for a changed diff / unproven hold) is attempted once per PR head per process. A read
- *   miss (spawn error, timeout, gh failure, unreadable diff / timeline / ledger) is not a decision: it is retried with
+ *   miss (spawn error, timeout, gh failure, unreadable diff / reviews / thread) is not a decision: it is retried with
  *   exponential backoff ({@link transientBackoffMs}, capped at 30 min) and never given up on.
  */
 import { spawnSync } from 'node:child_process';
@@ -24,6 +25,7 @@ import { join } from 'node:path';
 
 import { resolveAcceptCarryForward, latestAcceptRecord } from '../lib/accept-carry-forward.mjs';
 import { repoProfile } from '../lib/repo-profile.mjs';
+import { REVIEW_LABELS } from '../lib/review-escalation.mjs';
 
 const SET_LABEL = new URL('../review-set-label.mjs', import.meta.url).pathname;
 const names = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
@@ -36,22 +38,29 @@ export const TRANSIENT_BACKOFF_BASE_MS = 60_000;
 export const TRANSIENT_BACKOFF_MAX_MS = 30 * 60_000;
 export const transientBackoffMs = (n) => Math.min(TRANSIENT_BACKOFF_BASE_MS * 2 ** Math.max(0, n - 1), TRANSIENT_BACKOFF_MAX_MS);
 
-/** Pure: which open PRs are owed a carry-forward attempt. */
-export function planAcceptCarry(prs, { setting = 'off' } = {}) {
-  if (setting !== 'on') return [];
+/**
+ * Pure: which open PRs are owed a carry-forward attempt. EVERY PR standing on the drain's mechanical park (and no
+ * `review:human` / `review:changes`) is planned, whatever its thread says and whatever the setting: the restamp CLI is the
+ * ONE decider, and it either lifts the drain label (proven carry) or hands the hold to the operator (any decided refusal,
+ * incl. the setting off). A thread-only pre-filter here would disagree with the CLI's full read (the list call caps
+ * comments and has no reviews) and strand the PR on a drain label no operator view shows (PR #4631 round 10 self-review).
+ * `setting` is kept for the callers' signature; it no longer gates planning.
+ */
+export function planAcceptCarry(prs, { setting: _setting = 'off' } = {}) {
   const out = [];
   for (const pr of Array.isArray(prs) ? prs : []) {
     const labels = names(pr?.labels);
-    if (!labels.includes('review:human') || labels.includes('review:changes')) continue;
+    if (!labels.includes(REVIEW_LABELS.heldMechanical) || labels.includes(REVIEW_LABELS.human) || labels.includes(REVIEW_LABELS.changes)) continue;
     const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.toLowerCase() : '';
-    // Planning reads the thread only (no `reviews` channel here: the list call has none); the restamp CLI it dispatches reads
-    // the PR's formal reviews itself and is the one authority on a standing review.
+    if (!head) continue;
+    // `from` only labels the log line / reason; the CLI re-reads the full thread and formal reviews itself.
     const rec = latestAcceptRecord(pr?.comments);
-    if (!rec || !rec.humanCleared || !head || rec.sha === head || rec.laterBodyDerivedHold || rec.laterVerdict) continue;
-    out.push({ num: Number(pr.number), head, from: rec.sha });
+    out.push({ num: Number(pr.number), head, from: rec?.sha ?? null });
   }
   return out;
 }
+
+const short = (sha) => (typeof sha === 'string' && sha ? sha.slice(0, 9) : 'unknown');
 
 /**
  * The checkout of `repo` the restamp child must run in. `review-set-label --to=restamp` reads the net diff off the
@@ -75,7 +84,7 @@ export function defaultRunRestamp({ repo, num, head, from }, { spawn = spawnSync
   if (cwd === null) return { ok: false, retryable: true, detail: `no ${repo} checkout provisioned; not attempted` };
   const r = spawn(process.execPath, [SET_LABEL, String(num), ...(repo ? [`--repo=${repo}`] : []), '--to=restamp',
     '--actor=review-daemon', '--channel=accept-carry-forward',
-    `--reason=head moved ${from} → ${head} by a mechanical pass; carry the operator clearance if the net diff is unchanged (card xu7kxtt)`],
+    `--reason=head moved ${from || 'unknown'} → ${head} by a mechanical pass; carry the operator clearance if the net diff is unchanged (card xu7kxtt)`],
   { encoding: 'utf8', timeout: 180_000, ...(cwd ? { cwd } : {}) });
   const last = String(r.stdout || r.stderr || '').trim().split('\n').pop() || `exit ${r.status}`;
   const detail = last.slice(0, 300);
@@ -97,7 +106,7 @@ export function sweepAcceptCarry({ prs, repo = null, dryRun = false, setting = r
   for (const c of planAcceptCarry(prs, { setting })) {
     const key = `${repo ?? ''}#${c.num}@${c.head}`;
     if (attempted.has(key)) continue;
-    if (dryRun) { results.push({ num: c.num, carry: 'would-try', detail: `${c.from.slice(0, 9)} → ${c.head.slice(0, 9)}` }); continue; }
+    if (dryRun) { results.push({ num: c.num, carry: 'would-try', detail: `${short(c.from)} → ${short(c.head)}` }); continue; }
     if ((transient.get(key)?.next ?? 0) > now()) continue; // still backing off after a read miss
     let r;
     try { r = runRestamp({ repo, ...c }); } catch (e) { r = { ok: false, retryable: true, detail: String(e?.message ?? e).split('\n')[0] }; }

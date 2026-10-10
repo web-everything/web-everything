@@ -92,17 +92,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
-import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, decideMechanicalHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
-import { parseVerdictLog, verdictLedgerPath } from './lib/verdict-ledger.mjs'; // PR #4631 F3: the drain's own park rows attribute a standing hold
-import { readFileSync as readLedgerFileSync } from 'node:fs';
-
-/** The repo's home verdict-ledger rows. A MISSING file is `[]` (nothing was ever ledgered); any other read error THROWS
- *  so the caller can tell a read miss (retryable) from "no park ledgered" (`readVerdictLedger` swallows both). */
-export function readLedgerRowsStrict(repo) {
-  let text;
-  try { text = readLedgerFileSync(verdictLedgerPath(repo), 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; }
-  return parseVerdictLog(text);
-}
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 import { referralLiveContext } from './lib/referral-live-context.mjs';
@@ -274,6 +264,9 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   }
 
   const isHuman = hasReviewLabel(currentLabels, REVIEW_LABELS.human);
+  // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's own mechanical park. It needs a human or a
+  // proven carry exactly like `review:human`, but it is the ONE hold `restamp` may lift (see that branch).
+  const isHeldMechanical = hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical);
 
   // we:scripts/review-set-label.mjs#decideSetLabel — clear-human (#2895): the ONE target that removes
   // `review:human`, and the only sanctioned way to clear a gate-self PR. It exists because #2882 closed the raw
@@ -296,7 +289,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // it binds importers only, and today it binds none (see its doc on `runReviewLabelCli`). None of the three is
   // a barrier.
   if (to === 'clear-human') {
-    if (!isHuman) {
+    // The operator may also clear the drain's mechanical park by hand (it is a hold a human resolves when no carry can).
+    if (!isHuman && !isHeldMechanical) {
       return {
         allowed: false,
         addLabel: '',
@@ -327,7 +321,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // `clear-human` at 13:38:11Z left `advisory:accepted` (stamped 13:29:54Z, while still `review:human`) sitting
       // on the PR through three more review rounds with no `review:human` left to explain it.
       removeLabels: [
-        REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
+        REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
         ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
@@ -435,31 +429,36 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // THE REFUSALS ARE THE WHOLE GUARD. A `restamp` that could CREATE an acceptance would be a strictly worse
   // `accepted`: one that skips INVARIANT 2, skips #2844's independence check, and claims a review nobody ran.
   if (to === 'restamp') {
-    // card xu7kxtt (#5472, ruling P4) — the ONE way a re-stamp crosses a live `review:human`: the operator already
-    // cleared this exact net diff (`humanCarry`, the caller's proof from `decideAcceptCarryForward`: a trusted
-    // `clear-human` record whose strict reviewed-diff equals the live head's), and a mechanical pass re-held it only
-    // because the head SHA moved (live #4535: merge-queue refresh fcc29ce1 → 143107a87, re-parked 14:36Z). It
-    // completes nothing new: the human verdict it carries was given for these exact bytes. Any other shape — no
-    // proof, an agent accept, a changed diff — stays refused, exactly as before.
-    if (isHuman && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes)
+    // card xu7kxtt (#5472, ruling P4; PR #4631 operator ruling 2026-10-10 ~14:20 ET, option a) — the ONE way a
+    // re-stamp crosses a hold: the hold is the drain's OWN mechanical park (`review:held-mechanical`, a label only the
+    // drain writes, so its presence is the proof the hold is mechanical), and the operator already cleared this exact
+    // net diff (`humanCarry`, the caller's proof from `decideAcceptCarryForward`: a trusted `clear-human` record whose
+    // strict reviewed-diff equals the live head's, nothing after it standing against it). Live #4535: merge-queue
+    // refresh fcc29ce1 → 143107a87, re-parked 14:36Z. It completes nothing new: the verdict it carries was given for
+    // these exact bytes. `review:human` is NEVER crossed — it always means a person set the hold, whatever evidence
+    // sits beside it — so a PR carrying both (an operator held it before, during or after the drain's park) stays held.
+    if (isHeldMechanical && !isHuman && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes)
       && humanCarry && humanCarry.action === 'carry' && humanCarry.human === true) {
       return {
         allowed: true,
         addLabel: REVIEW_LABELS.accepted,
-        // The same superset `clear-human` drops (see its comment): the hold, any parked/advisory state riding on it.
+        // The mechanical hold and any parked/advisory state riding on it (the superset `clear-human` drops, minus
+        // `review:human`, which is not present here and is never this target's to remove).
         removeLabels: [
-          REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.redteamAccepted, REVIEW_LABELS.awaitingAdvisory,
+          REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.redteamAccepted, REVIEW_LABELS.awaitingAdvisory,
           ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
         ],
         keepsHuman: false,
         humanCarried: true,
-        reason: `re-stamped — the operator's clearance carried across a mechanical re-hold (${humanCarry.reason}); no review was re-run`,
+        reason: `re-stamped — the operator's clearance carried across the drain's mechanical park (${humanCarry.reason}); no review was re-run`,
       };
     }
-    if (isHuman) {
+    if (isHuman || isHeldMechanical) {
       return {
-        allowed: false, addLabel: '', removeLabels: [], keepsHuman: true,
-        reason: 'gate-self: review:human is uncleared — a re-stamp carries an acceptance, it cannot complete one'
+        allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman,
+        reason: (isHuman
+          ? 'gate-self: review:human is uncleared — a person set it, and a re-stamp never removes it'
+          : 'review:held-mechanical is uncleared — a re-stamp lifts it only on a proven carry of the operator clearance')
           + (humanCarry?.reason ? ` (carry-forward: ${humanCarry.action} — ${humanCarry.reason})` : ''),
       };
     }
@@ -497,6 +496,14 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       removeLabels: [],
       keepsHuman: isHuman,
       reason: 'gate-self: review:human is human-ceremony-only — clear via /review in a session',
+    };
+  }
+  // PR #4631 (ruling a): the drain's mechanical park is the anti-test-gaming hold on an operator-cleared PR; an agent
+  // accept never clears it (only a proven carry, `restamp`, or the operator's `clear-human`).
+  if (to === 'accepted' && isHeldMechanical) {
+    return {
+      allowed: false, addLabel: '', removeLabels: [], keepsHuman: false,
+      reason: 'review:held-mechanical is the drain\'s test-gaming park of an operator-cleared PR — it is lifted only by a proven carry (--to=restamp) or the operator (--to=clear-human)',
     };
   }
 
@@ -938,8 +945,6 @@ export function runReviewLabelCli({
   // real `file-item` subprocess ever running.
   fileApprovalPrevention = fileApprovalPreventionCard,
   findFiledApprovalPrevention = findApprovalPreventionCardOnDisk,
-  // PR #4631 F3 — the drain's park rows (`(repo) => verdict rows`), injected for the same reason `provider` is.
-  readLedgerRows = readLedgerRowsStrict,
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function — there are seventeen — goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1216,9 +1221,14 @@ export function runReviewLabelCli({
   // reason (`we:scripts/operations/review-pr-io.mjs`'s label sink) renders it into the body and passes no
   // `--reason` flag at all — see `bounceEvidenceFromWriteUp`.
   const bounceEvidence = bounceEvidenceFromWriteUp(verdictBody);
-  // card xu7kxtt — a re-stamp on a `review:human` PR is decided AFTER the net diff is read (below): its only
-  // allowed shape needs the live fingerprint as proof. Every other refusal still exits here, before any read.
-  const restampAcrossHold = to === 'restamp' && !guardedRestamp && hasReviewLabel(currentLabels, REVIEW_LABELS.human);
+  // card xu7kxtt — a re-stamp across the drain's MECHANICAL park is decided AFTER the net diff is read (below): its only
+  // allowed shape needs the live fingerprint as proof. Every other refusal still exits here, before any read. PR #4631
+  // (operator ruling 2026-10-10 ~14:20 ET, option a): only `review:held-mechanical` — the label only the drain writes —
+  // is ever crossed; a PR that also carries `review:human` (a person's hold, whenever it was set) or a live
+  // `review:changes` send-back is refused right here, with no write.
+  const restampAcrossHold = to === 'restamp' && !guardedRestamp
+    && hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical) && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
   let decision = decideSetLabel({
     to,
     currentLabels,
@@ -1326,7 +1336,9 @@ export function runReviewLabelCli({
     evidenceRead = { comments, reviews };
     return evidenceRead;
   };
-  const carryThread = () => (resolveAcceptCarryForward().value === 'on' && latestAcceptRecord(prComments)?.humanCleared
+  // Across the drain's mechanical park the full evidence is ALWAYS read (setting on): a clear-human past comment 100 must
+  // not read as "no clearance", which would hand the hold to the operator instead of lifting it.
+  const carryThread = () => (resolveAcceptCarryForward().value === 'on' && (restampAcrossHold || latestAcceptRecord(prComments)?.humanCleared)
     ? readCarryEvidence() : { comments: prComments, reviews: undefined });
   const deriveHumanCarry = () => {
     const thread = carryThread();
@@ -1341,44 +1353,69 @@ export function runReviewLabelCli({
         if (old.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) }; else proofReadMissed = true;
       } catch { proofReadMissed = true; }
     }
-    const humanCarry = decideAcceptCarryForward({
+    let humanCarry = decideAcceptCarryForward({
       setting: resolveAcceptCarryForward().value,
       record,
       headSha,
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });
     if (proofReadMissed && humanCarry.action === 'review-owed') humanCarry.retryable = true;
+    // PR #4631 round 10 (self-review, crash between writes): a lift posts its record (a `cleared-human` comment naming the
+    // LIVE head) before its label swap; a swap that then fails leaves the drain label under a clearance that already names
+    // this exact head. That is not a refusal — the operator's verdict covers these bytes — so it lifts, provided nothing
+    // since stands against it (`same-head` is decided before the later-hold checks, so they are re-applied here).
+    if (restampAcrossHold && humanCarry.action === 'same-head' && humanCarry.human === true) {
+      if (record.reviewsUnreadable) {
+        humanCarry = { ...humanCarry, action: 'review-owed', retryable: true, reason: 'the PR\'s formal reviews could not be read; a standing changes-requested review is unproven absent' };
+      } else if (!record.laterVerdict && !record.laterBodyDerivedHold) {
+        humanCarry = { ...humanCarry, action: 'carry', reason: `the operator clearance already names the live head ${String(headSha).slice(0, 9)} (an earlier lift recorded it but did not swap the label)` };
+      } else {
+        humanCarry = { ...humanCarry, action: 'none', reason: 'a later verdict or deliberate hold supersedes the clearance on the live head' };
+      }
+    }
     const clearer = parseOperatorClearance((Array.isArray(thread.comments) ? thread.comments : []).filter(isTrustedMarkerAuthor));
     const clearance = humanCarry.action === 'carry' && humanCarry.human === true
       ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
     return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable };
   };
+  // PR #4631 (ruling a): a DECIDED refusal to carry across the drain's mechanical park (the diff changed, a later
+  // verdict or objection stands, the clearance has no fingerprint) means a review of the change is owed — exactly what
+  // the drain's park would have said had its own carry read succeeded (`decideTestGamingPark` parks `review:human` on a
+  // decided refusal). So the hold is handed to the operator: `review:held-mechanical` → `review:human` (plus
+  // `review:awaiting-advisory`, which every `review:human` site carries), with a comment naming why. It ADDS the human
+  // hold and removes only the drain's own label; it never removes `review:human`. Re-read live first: a PR whose labels
+  // moved since this run read them is left alone. Any write miss marks the refusal retryable, so the sweep comes back.
+  let handOffRetryable = false;
+  const handMechanicalHoldToOperator = (why) => {
+    try {
+      const live = provider.readLabels(repo, pr);
+      if (!hasReviewLabel(live, REVIEW_LABELS.heldMechanical) || hasReviewLabel(live, REVIEW_LABELS.human)) return;
+      // The explanation FIRST: once the label swap lands the sweep stops planning this PR (`review:human` stands), so a
+      // comment posted after it would be lost on a failure. A comment with no swap behind it is retried (and repeated).
+      provider.postComment(repo, pr, [
+        '🧑‍⚖️ review — mechanical hold handed to the operator',
+        '',
+        `The drain's \`${REVIEW_LABELS.heldMechanical}\` park could not be lifted by carrying the operator's clearance: ${String(why || 'the carry was refused')}.`,
+        `A review of this head is owed, so the hold is now \`${REVIEW_LABELS.human}\` (card xu7kxtt, PR #4631 ruling a).`,
+      ].join('\n'));
+      if (!hasReviewLabel(live, REVIEW_LABELS.awaitingAdvisory)) provider.setLabels(repo, pr, { add: REVIEW_LABELS.awaitingAdvisory, remove: [] });
+      provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.heldMechanical] });
+    } catch (e) {
+      handOffRetryable = true;
+      process.stderr.write(`review-set-label: mechanical-hold hand-off failed (retryable) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+    }
+  };
   if (restampAcrossHold) {
     const derived = deriveHumanCarry();
-    const { clearance } = derived;
-    let { humanCarry } = derived;
-    // PR #4631 round 2 (F3/F4): an identical diff proves the CONTENT is what the operator cleared, not that the standing
-    // `review:human` is the mechanical re-park rather than a deliberate hold (a label-only hold leaves no comment).
-    // Crossing it needs positive provenance: the drain's own ledgered test-gaming park paired with its label add.
-    let holdRetryable = false;
-    if (humanCarry.action === 'carry' && humanCarry.human === true) {
-      let events = null;
-      try { events = typeof provider.readHoldLabelEvents === 'function' ? provider.readHoldLabelEvents(repo, pr) : null; } catch { events = null; }
-      // An unreadable ledger is a read miss (retryable), not "no park ledgered": only a MISSING file means no rows.
-      let rows = null;
-      try { rows = readLedgerRows(repo); } catch { rows = null; }
-      const prov = Array.isArray(rows)
-        ? decideMechanicalHold({ rows, events, pr, clearAt: latestAcceptRecord(carryThread().comments)?.at ?? null })
-        : { mechanical: false, retryable: true, reason: 'the verdict ledger could not be read; the hold\'s origin is unproven' };
-      if (!prov.mechanical) {
-        humanCarry = { ...humanCarry, action: 'none', human: false, reason: prov.reason };
-        holdRetryable = !!prov.retryable;
-      }
-    }
+    const { clearance, humanCarry } = derived;
+    // PR #4631 (ruling a): the hold's ORIGIN needs no inference — `review:held-mechanical` is written only by the drain's
+    // test-gaming park (`decideTestGamingPark`, merge-ai-prs.mjs), so its presence is the proof. What is left to prove
+    // is the CONTENT: the operator cleared exactly these bytes and nothing since stands against it (`humanCarry`).
     decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
     if (!decision.allowed) {
-      // `retryable`: the refusal is a read miss (unreadable diff / timeline), not a decision about the PR.
-      if (holdRetryable || humanCarry.retryable) decision = { ...decision, retryable: true };
+      // `retryable`: the refusal is a read miss (unreadable diff / reviews / thread), not a decision about the PR.
+      if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason);
+      if (humanCarry.retryable || handOffRetryable) decision = { ...decision, retryable: true };
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
     }

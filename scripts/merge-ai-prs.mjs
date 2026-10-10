@@ -153,6 +153,7 @@ import { scoreEscalation, parseDeviationDisclosure, diffHunksFrom, decideReviewG
   // single-label-home doctrine (#2644); the decision itself lives beside `shouldReparkForTestTampering`, the
   // predicate that already proves this target's own precondition (see `decideParkToHuman`'s own docstring).
   decideParkToHuman,
+  decideMechanicalPark, // PR #4631 (ruling a) — the drain-only `review:held-mechanical` park
   normalizeDiffFingerprint, // card xu7kxtt — strict net-diff identity for carrying a clearance
 } from './lib/review-escalation.mjs';
 import { emptyBaselineState, parseBaselineState, serializeBaselineState, getBaseline, recordBaseline, diffBaseline } from './lib/review-baseline-state.mjs';
@@ -194,7 +195,7 @@ import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
-import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, LIVE_LABEL_ATTESTATION } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -658,33 +659,36 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * exactly the `humanClearedSha` the gate already parsed (`carry.from`); its strict reviewed-diff equals the live head's; and
  * nothing after it stands against it (a later verdict, an unrecognised comment, a standing formal review — `reviews` is the
  * PR's formal reviews, `null` = unreadable, which refuses).
- * Anything else returns `humanClearedSha` unchanged, so the caller's re-park still fires (fails closed).
- * @returns {{humanClearedSha: string|null, carried: boolean, reason: string}}
+ * Anything else returns `humanClearedSha` unchanged, so the caller's re-park still fires (fails closed). `retryable`
+ * (PR #4631 ruling a) says the refusal was a READ miss (the head moved under the pass, an unscored or mis-bound diff, an
+ * unreadable thread / review list), not a decision about the PR: the caller then parks with the drain's own
+ * `review:held-mechanical` (`decideTestGamingPark`), which the carry sweep retries; a decided refusal parks `review:human`.
+ * @returns {{humanClearedSha: string|null, carried: boolean, reason: string, retryable: boolean}}
  */
 export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null } = {}) {
-  const unchanged = (reason) => ({ humanClearedSha, carried: false, reason });
+  const unchanged = (reason, retryable = false) => ({ humanClearedSha, carried: false, reason, retryable });
   if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
   if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
   // The merge is pinned to the pass-start head (`--match-head-commit`); a clearance carried onto any other head would
   // let the pinned commit merge on another commit's proof.
-  if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven');
+  if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven', true);
   // `readHeadDiff(headSha)` (the drain's call site: `readNetDiffAtHead` in the PR's clone) reads the live head's own diff,
   // only once a carry is otherwise possible; `netDiffText` is the already-read form. A throw is an unscored read.
   if (typeof readHeadDiff === 'function') {
     try { netDiffText = readHeadDiff(headSha); } catch { netDiffText = null; }
   }
-  if (!netDiffText?.scored || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven');
+  if (!netDiffText?.scored || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven', true);
   // PR #4631 round 7 (toctou-head-binding): the diff must be the live head's OWN — read at that SHA (`rev` is the commit
   // `computeNetDiffText` actually diffed). A diff read at the branch name can describe another commit than `headSha`.
-  if (netDiffText.rev !== headSha) return unchanged('the net diff was not read at the live head; identity unproven');
+  if (netDiffText.rev !== headSha) return unchanged('the net diff was not read at the live head; identity unproven', true);
   const carry = decideAcceptCarryForward({
     setting, record: latestAcceptRecord(comments, Array.isArray(reviews) ? reviews : null),
     headSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
   });
   if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
-    return { humanClearedSha: headSha, carried: true, reason: carry.reason };
+    return { humanClearedSha: headSha, carried: true, reason: carry.reason, retryable: false };
   }
-  return unchanged(carry.reason);
+  return unchanged(carry.reason, carry.retryable === true);
 }
 
 /**
@@ -866,7 +870,8 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   const reviewUncleared = hasUnclearedReviewLabel(pr?.labels, { allowPending: allowPendingReview });
   const heldLabel = hasLabel(pr, REVIEW_LABELS.changes) ? REVIEW_LABELS.changes
     : hasLabel(pr, REVIEW_LABELS.human) ? REVIEW_LABELS.human
-      : REVIEW_LABELS.pending;
+      : hasLabel(pr, REVIEW_LABELS.heldMechanical) ? REVIEW_LABELS.heldMechanical
+        : REVIEW_LABELS.pending;
   let decision = 'merge';
   // #2820-review-fix (finding 3) — `reviewHeld` means the review hold is the OPERATIVE blocker: the PR is
   // otherwise fully landable (certified, green, cleanly mergeable, real body) and ONLY the uncleared review label
@@ -2748,8 +2753,8 @@ const auditLineFor = (x) => x.hasManifest ? manifestAuditLine(x) : undefined;
  * @param {{repo: string, pr: number|string, applyLabel: string, reason?: string, headSha?: string|null}} o
  * @returns {{ok: boolean, errors: string[]}}
  */
-export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha = null, session = '' } = {}) {
-  return recordParkVerdict({ repo, pr, applyLabel, reason, headSha, declaredActor: 'drain', source: 'merge-ai-prs', session });
+export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha = null } = {}) {
+  return recordParkVerdict({ repo, pr, applyLabel, reason, headSha, declaredActor: 'drain', source: 'merge-ai-prs' });
 }
 
 /**
@@ -2761,13 +2766,13 @@ export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha 
  * @param {{repo: string, pr: number|string, applyLabel: string, reason?: string, headSha?: string|null, declaredActor: string, source: string}} o
  * @returns {{ok: boolean, errors: string[]}}
  */
-export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha = null, declaredActor, source, session = '' } = {}) {
+export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha = null, declaredActor, source } = {}) {
   const verdict = labelVerdictOf([applyLabel]);
   if (!verdict) return { ok: false, errors: [`no VERDICTS member for label ${JSON.stringify(applyLabel)}`] };
   try {
     const appended = appendVerdict(buildVerdictRecord({
       repo, pr, verdict, at: new Date().toISOString(), reason, headSha,
-      declaredActor, source, session,
+      declaredActor, source,
     }));
     return appended.ok ? { ok: true, errors: [] } : { ok: false, errors: appended.errors };
   } catch (e) {
@@ -2777,7 +2782,7 @@ export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha =
 
 /**
  * The drain's anti-test-gaming re-park reason, as the verdict-ledger row AND the park comment spell it. ONE builder so
- * the text `MECHANICAL_PARK_RE` / `TEST_GAMING_PARK_REASON_RE` (`accept-carry-forward.mjs`) anchor on is the text the
+ * the text `MECHANICAL_PARK_RE` (`accept-carry-forward.mjs`) anchors on is the text the
  * drain really writes, and a test can build it from here instead of hand-typing a look-alike (PR #4631 round 4, F1).
  * @param {string[]} reasons — the gate's finding reasons
  * @param {{sharedPaths: string[]}|null} [stackedOrigin] — `describeStackedTestGamingOrigin`, when the finding is inherited
@@ -2792,46 +2797,30 @@ export function buildTestGamingParkReason(reasons, stackedOrigin = null, stacked
 }
 
 /**
- * The drain's anti-test-gaming re-park, LABEL step (PR #4631 round 4, F2; extracted from `runCli` so the interleaving is
- * testable). The ledger row this writes is the ONLY thing that lets `decideMechanicalHold` (`accept-carry-forward.mjs`)
- * call the standing `review:human` mechanical and carry an operator's clearance across it. On this host the drain runs
- * under the operator's own credential, so the row is only evidence that the label add was the DRAIN'S when the drain
- * saw the label ABSENT immediately before it added it. `v.prLabels` is a snapshot from the start of the batch — far too
- * old: an operator's own `review:human` (before OR after the batch read, up to the early pairing slack) would leave the
- * drain's add a no-op, the lone label event would pair with the drain's row, and the restamp would erase the deliberate
- * hold. So the labels are re-read LIVE here and:
- *   - `review:human` already stands -> the drain's add changes nothing and attributes nothing: NO ledger row, no add;
- *   - the live read failed -> the hold is still placed (placing it is the safe direction) but NO row is written, so the
- *     origin is unattested and the restamp refuses (fails closed toward a human re-review);
- *   - absent -> the add FIRST, then (only if the add succeeded) the row, stamped {@link LIVE_LABEL_ATTESTATION}. The
- *     ledger write (a home write plus a git push with retries, seconds or more) must NOT sit between the live read
- *     and the add, or the window an operator's label can slip into is a ledger write, not a round trip; and a row
- *     must never claim an add that threw. The row therefore lands just AFTER the label event, which the rule's early
- *     pairing slack ({@link HOLD_PAIR_EARLY_MS}) covers. A crash between add and row leaves a hold with no row: the
- *     restamp refuses (safe direction).
- * The attestation stamp is what makes rows from an older drain build (unattested, written before the add) unusable as
- * proof. The one window left is the gap between this live read and the add (one `gh` round trip); GitHub has no
- * compare-and-swap on labels, so it cannot be closed from the client — it is narrowed from "the whole batch" to that.
- * @param {{repo:string, pr:number|string, label:string, reason:string, headSha?:string|null,
- *   readLiveLabels:() => Array<string|{name?:string}>|null, addLabel:(label:string) => void, record?:Function}} o
- * @returns {{ledgered:boolean, added:boolean, errors:string[], note:string}}
+ * The drain's anti-test-gaming re-park, LABEL decision (PR #4631, operator ruling 2026-10-10 ~14:20 ET, option a). Pure.
+ * When carry-forward is on, a successful read showed the operator's clearance names an OLDER head (`humanClearedSha`
+ * set and not the live `headSha`), and the drain's own carry (`carryHumanClearanceOnIdenticalDiff`) could not DECIDE
+ * because a read missed (`carryRetryable`), this is the MECHANICAL park the #4535 shape produces: it holds with the
+ * drain's OWN `review:held-mechanical` (`decideMechanicalPark`), the one hold the carry sweep may lift once it can read.
+ * Every other test-gaming park — no clearance, a fetch miss before the clearance was read, carry-forward off, or a
+ * DECIDED refusal (the diff changed, a later verdict stands: a review of the change is owed) — is the ordinary
+ * `review:human` park (`decideParkToHuman`), which is never removed automatically.
+ *
+ * Why a label, not a marker beside `review:human` (the round-4..9 designs: a ledger row, its live-read attestation, the
+ * label timeline): with the drain on the operator's own login, an operator's `review:human` added concurrently with the
+ * drain's (a no-op add leaves no trace) or removed and re-added after the park is indistinguishable from the drain's own
+ * hold. Two labels cannot be confused: a person's `review:human` survives every carry, whenever it was added.
+ * @param {{setting?:string, currentLabels?:Array, humanClearedSha?:string|null, headSha?:string|null, keepHumanClearance?:boolean, carryRetryable?:boolean}} o
  */
-export function applyTestGamingParkLabel({ repo, pr, label, reason, headSha = null, readLiveLabels, addLabel, record = recordDrainVerdict } = {}) {
-  let live = null;
-  try { live = readLiveLabels(); } catch { live = null; }
-  if (Array.isArray(live) && hasReviewLabel(live, label)) {
-    return { ledgered: false, added: false, errors: [], note: `${label} already stood when the drain went to re-park; its add would be a no-op, so no ledger row claims that hold` };
-  }
-  let added = false;
-  try { addLabel(label); added = true; } catch { /* label best-effort */ }
-  let ledgered = { ok: false, errors: [] };
-  if (added && Array.isArray(live)) ledgered = record({ repo, pr, applyLabel: label, reason, headSha, session: LIVE_LABEL_ATTESTATION });
-  return {
-    ledgered: !!ledgered.ok, added, errors: ledgered.errors || [],
-    note: !added ? 'the label add failed; no ledger row claims it'
-      : Array.isArray(live) ? 'live labels read; hold origin attested by the ledger row'
-        : 'live labels unreadable; hold placed but its origin is not attested (no ledger row)',
-  };
+export function decideTestGamingPark({ setting = 'off', currentLabels = [], humanClearedSha = null, headSha = null, keepHumanClearance = false, carryRetryable = false } = {}) {
+  // A drain label already standing stays the drain's (a re-listed PR whose accept the first park removed has no clearance
+  // to re-read here): re-parking it as `review:human` would turn a mechanical hold into a person's for good. The carry
+  // sweep is the one place that decides it (lift, or hand to the operator).
+  const alreadyMechanical = setting === 'on' && hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.human);
+  const mechanical = alreadyMechanical || (setting === 'on' && carryRetryable === true && typeof humanClearedSha === 'string' && humanClearedSha !== ''
+    && typeof headSha === 'string' && headSha !== '' && humanClearedSha !== headSha);
+  return mechanical ? decideMechanicalPark({ currentLabels }) : decideParkToHuman({ currentLabels, keepHumanClearance });
 }
 
 /**
@@ -5292,6 +5281,9 @@ async function runCli() {
       // direction — a transient read failure must never suppress the anti-gaming gate).
       let tamperHeadSha = null;
       let humanClearedSha = null;
+      // PR #4631 (ruling a): did the carry below fail on a READ miss (→ the drain's own `review:held-mechanical` park,
+      // which the carry sweep retries) rather than a decision (→ `review:human`)? A throw mid-carry counts as a miss.
+      let carryRetryable = false;
       if (netDiffText.scored && gaming.tampered && hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted)) {
         try {
           const cd = JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'headRefOid,comments'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}');
@@ -5301,6 +5293,7 @@ async function runCli() {
           // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
           // 143107a87, reviewed-diff b945d333… on both) was re-parked here and waited for a second approval.
           if (humanClearedSha && tamperHeadSha && humanClearedSha !== tamperHeadSha) {
+            carryRetryable = true; // until the carry returns its own answer
             // The PR's formal reviews and (on a full page) its complete thread are separate reads (`gh pr view --json comments`
             // stops at 100 and never returns reviews); a miss leaves `reviews` null, which the carry refuses.
             const ghLines = (argv) => parseJsonLines(readGh(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }));
@@ -5318,6 +5311,7 @@ async function runCli() {
               readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
             });
             humanClearedSha = carried.humanClearedSha;
+            carryRetryable = carried.retryable === true;
             if (carried.carried && !AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carried.reason}\n`);
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
@@ -5348,30 +5342,35 @@ async function runCli() {
           // match would have made `shouldReparkForTestTampering` return `false` above — so `false` here is a
           // proven fact, not a guess.
           const keepHumanClearance = hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && tamperHeadSha === null;
-          const parkDecision = decideParkToHuman({ currentLabels: v.prLabels, keepHumanClearance });
+          // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): a re-park of an operator-cleared PR whose head
+          // moved holds with the drain's OWN `review:held-mechanical`, never `review:human` — see decideTestGamingPark.
+          const parkDecision = decideTestGamingPark({
+            setting: resolveAcceptCarryForward().value, currentLabels: v.prLabels, humanClearedSha, headSha: tamperHeadSha, keepHumanClearance, carryRetryable,
+          });
+          const mechanicalPark = parkDecision.addLabel === REVIEW_LABELS.heldMechanical;
           if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {
             // E3 (#3929) — the ledger row is additive and fail-soft (same posture as the ordinary park): a miss is
-            // reported and never changes the label write. PR #4631 round 4 (F2): unlike the ordinary park, the order
-            // here is live read → label add → row, and the row is only written when that read showed the label absent
-            // and the add succeeded, so it attests the add was the drain's (see applyTestGamingParkLabel).
-            const parkedLabel = applyTestGamingParkLabel({
-              repo: v.repo || localSlug, pr: v.num, label: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null,
-              readLiveLabels: () => JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim() || '{}').labels ?? null,
-              addLabel: (l) => execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', l], { stdio: ['ignore', 'ignore', 'pipe'] }),
-            });
-            if ((parkedLabel.errors.length || !parkedLabel.ledgered) && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${parkedLabel.errors.join('; ') || parkedLabel.note}\n`);
+            // reported and never changes the label write. The mechanical hold has no VERDICTS member (`labelVerdictOf`
+            // maps the four review verdict labels), so it writes no row; the label itself is its record.
+            if (!mechanicalPark) {
+              const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
+              if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
+            }
+            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
           }
           // mechanical-dispatcher — same as the manifest-tamper park above: a re-park has not been re-advised
-          // either, so carry review:awaiting-advisory alongside review:human here too (#xlw02hw clears it).
-          if (shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
+          // either, so carry review:awaiting-advisory alongside review:human here too (#xlw02hw clears it). Not on a
+          // mechanical park: the advisory runs for `review:human` PRs only, so the label would never be cleared; the
+          // carry sweep adds it if it hands the hold to the operator (`review-set-label.mjs --to=restamp`).
+          if (!mechanicalPark && shouldApplyReviewLabel(REVIEW_LABELS.awaitingAdvisory, v.prLabels)) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', REVIEW_LABELS.awaitingAdvisory], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
           }
-          // #2832 / #984 F2 — same as the manifest-tamper park above: this site CREATES a review:human hold on
+          // #2832 / #984 F2 — same as the manifest-tamper park above: this site CREATES a review hold on
           // a go-ahead-carrying candidate and `continue`s, so it must strip through the shared seam here.
-          stripReadyOnPark(v, { applyLabel: REVIEW_LABELS.human });
+          stripReadyOnPark(v, { applyLabel: parkDecision.addLabel });
           const posted = postDrainReasonComment(v.repo, v.num, 'park', v.reason, auditLineFor(v));
           if (posted && !AS_JSON) process.stderr.write(`  💬 ${repoTag(v.repo)}${v.num} test-gaming reason stamped on PR\n`);
         }
