@@ -275,12 +275,16 @@ describe('PR #4708 — a cut-off comment list never removes a label, and the liv
     expect(results).toEqual([{ num: 4708, remove: ['advisory:accepted'] }]);
   });
 
-  it('defaultReadPr reads ONE PR with `gh pr view` (which pages through every comment), never `gh pr list`', () => {
+  it('defaultReadPr reads ONE PR: labels/head from `gh pr view`, the WHOLE thread from the paginated reader', () => {
     const calls = [];
-    const exec = (file, argv) => { calls.push([file, ...argv]); return JSON.stringify(live(LABELS)); };
-    const got = defaultReadPr({ repo: 'web-everything/web-everything', number: 4708, exec });
+    const exec = (file, argv) => { calls.push([file, ...argv]); const { comments, ...rest } = live(LABELS); return JSON.stringify(rest); };
+    const readComments = (number, o) => { calls.push(['readComments', number, o.repo]); return allComments; };
+    const got = defaultReadPr({ repo: 'web-everything/web-everything', number: 4708, exec, readComments });
     expect(got.comments).toHaveLength(120);
-    expect(calls[0].slice(0, 5)).toEqual(['gh', 'pr', 'view', '4708', '--repo']);
-    expect(calls[0]).toContain('number,state,labels,headRefOid,comments');
+    expect(got.headRefOid).toBe(LIVE_HEAD);
+    expect(calls[0]).toEqual(['gh', 'pr', 'view', '4708', '--repo', 'web-everything/web-everything', '--json', 'number,state,labels,headRefOid']);
+    expect(calls[1]).toEqual(['readComments', 4708, 'web-everything/web-everything']);
+    // A failed comment read throws (never a partial thread).
+    expect(() => defaultReadPr({ repo: 'o/n', number: 1, exec, readComments: () => { throw new Error('502'); } })).toThrow('502');
   });
 });

@@ -34,7 +34,8 @@
  * an older head, so the sweep removed the `advisory:accepted` that the 20:47:49Z accept note (covering the live
  * head) had just earned, and every later tick read the same cut-off list, so the repair never fired. Now the
  * snapshot only NOMINATES a PR (a non-empty plan, or a comment list that may be cut off); the plan that is
- * written is re-derived from `gh pr view` (which pages through every comment), and a failed live read writes
+ * written is re-derived from a live read of that one PR (`gh pr view` for labels/head, the paginated
+ * `readCompletePrComments` for the whole thread), and a failed live read writes
  * nothing. A label comes off only when the live newest trusted advisory names a DIFFERENT head than the live head
  * — no advisory at all is not proof the head moved.
  *
@@ -53,6 +54,7 @@ import {
 } from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
+import { LIST_COMMENTS_PAGE_SIZE, readCompletePrComments } from './pr-comments-complete.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 
 export const PR_LIST_LIMIT = 200;
@@ -90,7 +92,7 @@ export function defaultListPrs({ exec = execFileSyncThrottled, repo = null } = {
 }
 
 /** `gh pr list --json comments` returns at most this many comments per PR (the oldest ones). */
-export const LIST_COMMENTS_CAP = 100;
+export const LIST_COMMENTS_CAP = LIST_COMMENTS_PAGE_SIZE;
 
 /** True when a listed PR's comments may be cut off, so its newest advisory may be missing from the list. */
 export function commentsMayBeTruncated(pr) {
@@ -98,13 +100,18 @@ export function commentsMayBeTruncated(pr) {
 }
 
 /**
- * Read ONE PR live, with every comment — `gh pr view` pages through the whole comment list, unlike `gh pr list`.
- * @param {{repo: string, number: number, exec?: Function}} o
+ * Read ONE PR live: its state, labels and head from `gh pr view`, and its COMPLETE comment thread from the
+ * paginated reader (`readCompletePrComments`) — never a one-page `--json comments` read. Throws on any failed
+ * read, so a partial thread never decides a write.
+ * @param {{repo: string, number: number, exec?: Function, readComments?: Function}} o
  */
-export function defaultReadPr({ repo, number, exec = execFileSyncThrottled }) {
-  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid,comments'];
-  const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
-  return JSON.parse(String(out || '{}'));
+export function defaultReadPr({ repo, number, exec = execFileSyncThrottled, readComments = readCompletePrComments }) {
+  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid'];
+  const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+  const pr = JSON.parse(String(out || '{}'));
+  const comments = readComments(number, { repo });
+  if (!Array.isArray(comments)) throw new Error('comments read returned no array');
+  return { ...pr, comments };
 }
 
 /**
