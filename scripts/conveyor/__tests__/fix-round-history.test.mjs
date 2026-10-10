@@ -87,7 +87,8 @@ describe('fix round history (card xx0055i)', () => {
   });
 
   it('a failed thread read returns null (never throws)', () => {
-    expect(readRoundHistoryInputs({ pr: 1, repoSlug: 'o/r', exec: () => { throw new Error('gh down'); } })).toBeNull();
+    expect(readRoundHistoryInputs({ pr: 1, repoSlug: 'o/r', readComments: () => [], exec: () => { throw new Error('gh down'); } })).toBeNull();
+    expect(readRoundHistoryInputs({ pr: 1, repoSlug: 'o/r', readComments: () => { throw new Error('gh down'); }, exec: () => '{}' })).toBeNull();
   });
 
   it('the dispatcher puts the section in front of the brief only when the setting is on', () => {

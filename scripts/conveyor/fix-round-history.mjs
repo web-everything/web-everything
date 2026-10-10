@@ -16,11 +16,12 @@
  * capped at {@link ROUND_HISTORY_MAX_CHARS}. The text is reviewer/fixer prose quoted as DATA, and the section
  * says so.
  *
- * PURE except {@link readRoundHistoryInputs} (one bounded `gh pr view` read).
+ * PURE except {@link readRoundHistoryInputs} (the complete thread read + one `gh pr view` read).
  */
 import { execFileSync } from 'node:child_process';
 import { buildPrRounds, normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 export const ROUND_HISTORY_MAX_CHARS = 8000;
 export const ROUND_HISTORY_MAX_FINDINGS = 8;
@@ -128,16 +129,18 @@ export function withRoundHistory(prompt, section) {
 }
 
 /**
- * IO: one `gh pr view` read of the thread + commits, mapped to the coroner's input shape. Returns null on any
- * failure — the history is best effort and must never block a fix dispatch.
+ * IO: the COMPLETE comment thread (`pr-comments-complete.mjs`, paginated — a long thread is never cut at 100) plus
+ * one `gh pr view` read of commits and refs, mapped to the coroner's input shape. Returns null on any failure — the
+ * history is best effort and must never block a fix dispatch.
  */
-export function readRoundHistoryInputs({ pr, repoSlug, exec = execFileSync }) {
+export function readRoundHistoryInputs({ pr, repoSlug, exec = execFileSync, readComments = readCompletePrComments }) {
   try {
-    const raw = exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'comments,commits,baseRefName,headRefName'],
+    const comments = readComments(pr, { repo: repoSlug });
+    const raw = exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'commits,baseRefName,headRefName'],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 64 * 1024 * 1024 });
     const j = JSON.parse(raw);
     return {
-      comments: Array.isArray(j.comments) ? j.comments : [],
+      comments: Array.isArray(comments) ? comments : [],
       commits: (Array.isArray(j.commits) ? j.commits : []).map((c) => ({ sha: c.oid, commit: { committer: { date: c.committedDate } }, parents: (c.parents ?? []).map((p) => ({ sha: p.oid })) })),
       baseRefName: j.baseRefName ?? null, headRefName: j.headRefName ?? null,
     };
