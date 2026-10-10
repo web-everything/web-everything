@@ -196,6 +196,52 @@ describe('planReconcile takeover call sites and the post-takeover tick (card xx0
     expect(withMarker.refusals.find((r) => r.prNumber === 7)).toBeUndefined();
   });
 
+  describe('a takeover that started ABOVE the cap still owes its own final review (red-team round 2)', () => {
+    const pending = (comments) => ({ ...cappedPr(comments), labels: [{ name: 'review:pending' }], statusCheckRollup: green });
+    const markerAt = (attempts, head = HEAD) => ({ author: BOT, createdAt: '2026-10-10T00:00:00Z', body: takeoverMarkerBody({ pr: 7, head, attempts, cap: 5, rung: { id: 'stronger-model' } }) });
+    const reviewRow = (p) => p.dispatch.find((d) => d.prNumber === 7);
+    const refusal = (p) => p.refusals.find((r) => r.prNumber === 7);
+
+    it('started at 6/5: its re-arm makes 7, and that is reviewed (allowance is relative to the launch count, not the cap)', () => {
+      const p = plan(pending([...rearms(7), markerAt(6)]));
+      expect(reviewRow(p)).toMatchObject({ kind: 'review', attempts: 7 });
+      expect(refusal(p)).toBeUndefined();
+    });
+
+    it('started at 7/5 (counts can run further ahead than one): still exactly one round past its launch count', () => {
+      const p = plan(pending([...rearms(8), markerAt(7)]));
+      expect(reviewRow(p)).toMatchObject({ kind: 'review', attempts: 8 });
+    });
+
+    it('but only ONE round past the launch count: a further re-arm is refused', () => {
+      const p = plan(pending([...rearms(8), markerAt(6)]));
+      expect(refusal(p)).toMatchObject({ kind: 'cap-exhausted', capKind: 'review' });
+    });
+
+    it('a marker with no launch count (older shape) keeps the cap+1 allowance', () => {
+      const legacy = { author: BOT, createdAt: '2026-10-10T00:00:00Z', body: takeoverMarkerBody({ pr: 7, head: HEAD, cap: 5, rung: { id: 'stronger-model' } }) };
+      expect(reviewRow(plan(pending([...rearms(6), legacy])))).toMatchObject({ kind: 'review', attempts: 6 });
+      expect(refusal(plan(pending([...rearms(7), legacy])))).toMatchObject({ kind: 'cap-exhausted', capKind: 'review' });
+    });
+
+    it('a voided takeover earns nothing even when its marker carried a high launch count', () => {
+      const voidedMarker = { author: BOT, createdAt: '2026-10-10T01:00:00Z', body: takeoverVoidMarkerBody({ pr: 7, head: HEAD }) };
+      const p = plan(pending([...rearms(7), markerAt(6), voidedMarker]));
+      expect(refusal(p)).toMatchObject({ kind: 'cap-exhausted', capKind: 'review' });
+    });
+
+    it('a forged marker (untrusted login) claiming a huge launch count grants nothing', () => {
+      const forged = { author: { login: 'stranger' }, createdAt: '2026-10-10T00:00:00Z', body: takeoverMarkerBody({ pr: 7, head: HEAD, attempts: 900, cap: 5, rung: {} }) };
+      expect(refusal(plan(pending([...rearms(7), forged])))).toMatchObject({ kind: 'cap-exhausted', capKind: 'review' });
+    });
+
+    it('the launch count round-trips through the marker (and a garbage count is not read)', () => {
+      expect(takeoverMarkers([markerAt(6)])).toMatchObject([{ head: HEAD, attempts: 6 }]);
+      const garbage = { author: BOT, createdAt: '2026-10-10T00:00:00Z', body: `<!-- conveyor-fix-takeover head=${HEAD} attempts=-3 -->` };
+      expect(takeoverMarkers([garbage])).toMatchObject([{ head: HEAD, attempts: null }]);
+    });
+  });
+
   it('a voided takeover earns no extra review round', () => {
     const voidedMarker = { author: BOT, createdAt: '2026-10-10T01:00:00Z', body: takeoverVoidMarkerBody({ pr: 7, head: HEAD }) };
     const p = plan({ ...cappedPr([...rearms(6), marker(HEAD), voidedMarker]), labels: [{ name: 'review:pending' }], statusCheckRollup: green });
