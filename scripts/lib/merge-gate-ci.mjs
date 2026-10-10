@@ -9,7 +9,8 @@
  *   One result per inventory gate (`./merge-gate-inventory.mjs`):
  *     pass | hold (the drain would not merge) | fail-closed (an input is unreadable or has no shared source yet)
  *     | queue (GitHub's merge queue guarantees it) | enqueue (drain scheduling, not a merge-safety gate)
- *     | skipped-by-policy (drain-direct with gatePlacement 'drain': the drain, the merger, keeps it).
+ *     | skipped-by-policy (a `pull_request` run under drain-direct with gatePlacement 'drain': the drain, the
+ *       merger, keeps it; never on a `merge_group` run, where the queue merges).
  *   A PR passes only with no `hold` and no `fail-closed`. A merge group passes only when every PR in it passes.
  *
  *   NEVER WEAKER THAN THE DRAIN: the operator relief valve (`--no-review-escalation`) is never applied; every
@@ -75,10 +76,13 @@ const r = (id, status, reason) => ({ id, status, reason });
 /**
  * Evaluate every inventory gate for one PR. Pure.
  * @param {object} facts  gathered by the CLI — see merge-gate-check.mjs `gatherPrFacts` for the shape.
- * @param {{policy?:object, requiredCheck?:string, trustLabel?:string, blockOnCodeQL?:boolean}} [o]
+ * `mergeEvent` is the event this run is actually evaluating for: `'pull_request'` or `'merge_group'`. Only
+ * `'pull_request'` may hand a gate to the drain (`skipped-by-policy`); the queue merges on `'merge_group'`, so
+ * nothing is skipped there, and an omitted / unrecognised value evaluates every gate (fail closed).
+ * @param {{policy?:object, requiredCheck?:string, trustLabel?:string, blockOnCodeQL?:boolean, mergeEvent?:string}} [o]
  * @returns {{num:number, ok:boolean, results:Array<{id,status,reason}>, blocking:Array}}
  */
-export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED_CHECK, trustLabel = TRUST_LABEL, blockOnCodeQL = true } = {}) {
+export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED_CHECK, trustLabel = TRUST_LABEL, blockOnCodeQL = true, mergeEvent = null } = {}) {
   const num = Number(facts?.pr?.number ?? facts?.num);
   const out = new Map();
   const set = (id, status, reason) => out.set(id, r(id, status, reason));
@@ -87,7 +91,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   const mergeGateIds = DRAIN_GATES.filter((g) => g.where === 'merge-gate').map((g) => g.id);
   if (!facts?.pr || facts.prReadError) {
     for (const id of mergeGateIds) set(id, 'fail-closed', `PR read failed: ${facts?.prReadError || 'no PR facts'}`);
-    return finish(num, out, policy);
+    return finish(num, out, policy, mergeEvent);
   }
   const pr = facts.pr;
   const labels = pr.labels || [];
@@ -170,7 +174,10 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   // duplicate-id-on-main
   const dup = facts.duplicateIds;
   if (!dup || dup.error) set('duplicate-id-on-main', 'fail-closed', `duplicate-id scan failed: ${dup?.error || 'not run'}`);
-  else {
+  else if (mergeEvent === 'merge_group' && !Array.isArray(dup.group)) {
+    // The queue merges the group tree, so a merge_group run without the group scan has only checked main.
+    set('duplicate-id-on-main', 'fail-closed', 'merge_group run without the group-tree duplicate-id scan (--group-tree missing)');
+  } else {
     const ids = [...(dup.main || []), ...(dup.group || [])];
     set('duplicate-id-on-main', ids.length ? 'hold' : 'pass', ids.length ? `duplicate backlog ids: ${ids.map((d) => d.id ?? d).join(', ')}` : 'no duplicate ids');
   }
@@ -194,7 +201,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     set('ledger', ledger.clear ? 'pass' : ledger.defer ? 'fail-closed' : 'hold', `${ledger.authority}: ${ledger.reason}`);
   }
 
-  return finish(num, out, policy);
+  return finish(num, out, policy, mergeEvent);
 }
 
 function gateCard(id) {
@@ -202,10 +209,15 @@ function gateCard(id) {
   return g?.card ? `card ${g.card}` : 'no card';
 }
 
-function finish(num, out, policy) {
+function finish(num, out, policy, mergeEvent) {
+  // A gate is handed to the drain only on a `pull_request` run, where the drain really is the merger and
+  // re-checks it. On a `merge_group` run GitHub's queue merges, whatever `strategy` is configured, so no
+  // drain re-check follows: evaluate everything. Anything but the exact string 'pull_request' (omitted,
+  // unknown, wrong case) fails closed to evaluating.
+  const drainMerges = mergeEvent === 'pull_request' && policy?.strategy === 'drain-direct';
   const results = DRAIN_GATES.map((g) => {
     const res = out.get(g.id) || r(g.id, 'fail-closed', 'not evaluated');
-    if (g.where === 'merge-gate' && policy?.strategy === 'drain-direct' && placementOf(policy, g.id) === 'drain') {
+    if (g.where === 'merge-gate' && drainMerges && placementOf(policy, g.id) === 'drain') {
       return r(g.id, 'skipped-by-policy', `placement drain (drain-direct merges): ${res.reason}`);
     }
     return res;
