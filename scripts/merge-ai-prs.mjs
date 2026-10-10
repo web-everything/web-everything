@@ -190,6 +190,7 @@ import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overla
 import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
+import { applyHumanClearanceCarry, withHumanClearance } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
@@ -684,7 +685,14 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
         reason: `review acceptance verification unreadable — merge deferred this pass: ${error.message || error}` };
     }
   }
-  return decideReviewGate({ ...gateInputs, labels, ...evidence });
+  // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
+  // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
+  const carry = applyHumanClearanceCarry({ evidence: withHumanClearance(evidence), pr: readOptions?.pr, repo: readOptions?.repo,
+    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun, ...readOptions?.carry });
+  if (carry?.action === 'defer') return carry;
+  if (carry?.carried) evidence = { ...evidence, humanClearedSha: evidence.headSha };
+  const gate = decideReviewGate({ ...gateInputs, labels, ...evidence });
+  return carry?.carried ? { ...gate, carriedClearance: carry.carried } : gate;
 }
 
 /** Label coexistence alone cannot clear pending: require the merge gate's coverage proof first. */
@@ -5192,7 +5200,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
