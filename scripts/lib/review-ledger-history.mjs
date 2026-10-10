@@ -28,6 +28,8 @@ import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { listRunIds, resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 
 export const CHECK_OP = 'review-ledger-check';
+/** #5444 — the drain's per-pass ledger-shadow records (we:scripts/lib/drain-ledger-shadow.mjs). */
+export const SHADOW_OP = 'drain-ledger-shadow';
 export const REQUIRED_CLEAN_DAYS = 7;
 export const HISTORY_TZ = 'America/New_York';
 
@@ -54,14 +56,14 @@ export function dayBefore(day, n = 1) {
  * Read every check run record. A corrupt record is skipped and counted (never fatal, never evidence).
  * @returns {{runs: object[], corrupt: number}}
  */
-export function readCheckRuns({ dir = resolveRunsDir(), listIds = listRunIds, read = tryReadRun } = {}) {
+export function readCheckRuns({ dir = resolveRunsDir(), listIds = listRunIds, read = tryReadRun, op = CHECK_OP } = {}) {
   const runs = [];
   let corrupt = 0;
   for (const id of listIds(dir)) {
-    if (!id.startsWith(`${CHECK_OP}-`)) continue;
+    if (!id.startsWith(`${op}-`)) continue;
     let rec;
     try { rec = read(id, dir); } catch { corrupt += 1; continue; }
-    if (rec?.op === CHECK_OP) runs.push(rec);
+    if (rec?.op === op) runs.push(rec);
   }
   return { runs, corrupt };
 }
@@ -169,5 +171,45 @@ export function renderCleanDays(q, { corrupt = 0, runCount = 0 } = {}) {
   if (!Object.keys(q.families).length || !runCount) lines.push('  no run records yet — run `npm run review:ledger-check` first.');
   lines.push('  legend: ✓ clean · x drift · ? unreadable PRs · ~ a repo has no run · · no run');
   if (corrupt) lines.push(`  ${corrupt} corrupt run record(s) skipped`);
+  return lines.join('\n');
+}
+
+/**
+ * #5444 — the DRAIN SHADOW, counted per ET day over the last `windowDays` days: drain passes, PRs compared, and
+ * label-vs-ledger disagreements (per direction) and unreadable reads. Report-only evidence beside the per-family
+ * streak; it does not change readiness. A record with no readable summary is counted `corrupt`, never clean. Pure.
+ */
+export function shadowDailyCounts(runs = [], { now = new Date(), windowDays = REQUIRED_CLEAN_DAYS } = {}) {
+  const today = etDay(now);
+  const days = [];
+  for (let i = windowDays - 1; i >= 0; i -= 1) days.push({ day: dayBefore(today, i), passes: 0, compared: 0, disagree: 0, unreadable: 0,
+    ledgerHoldsLabelClears: 0, ledgerClearsLabelHolds: 0, disagreeingPrs: [] });
+  const byDay = new Map(days.map((d) => [d.day, d]));
+  let corrupt = 0;
+  for (const r of runs) {
+    const d = byDay.get(etDay(r?.input?.at));
+    if (!d) continue;
+    const s = r?.findings?.summary;
+    if (!s || !isCount(s.compared) || !isCount(s.disagree) || !isCount(s.unreadable)) { corrupt += 1; continue; }
+    d.passes += 1; d.compared += s.compared; d.disagree += s.disagree; d.unreadable += s.unreadable;
+    d.ledgerHoldsLabelClears += s.directions?.['ledger-holds-label-clears'] ?? 0;
+    d.ledgerClearsLabelHolds += s.directions?.['ledger-clears-label-holds'] ?? 0;
+    for (const row of r.findings.rows ?? []) {
+      const key = `${row?.repo}#${row?.pr}`;
+      if (row?.status === 'disagree' && !d.disagreeingPrs.includes(key)) d.disagreeingPrs.push(key);
+    }
+  }
+  return { today, days, corrupt };
+}
+
+/** Human lines for the drain-shadow counts. Pure. */
+export function renderShadowDays(q) {
+  const lines = ['drain ledger shadow (#5444) · per ET day: passes · compared · disagree (ledger-holds/label-clears, ledger-clears/label-holds) · unreadable'];
+  for (const d of q.days) {
+    lines.push(`  ${d.day}  passes ${String(d.passes).padStart(3)} · compared ${String(d.compared).padStart(5)} · disagree ${String(d.disagree).padStart(4)}`
+      + ` (${d.ledgerHoldsLabelClears}/${d.ledgerClearsLabelHolds}) · unreadable ${d.unreadable}`
+      + (d.disagreeingPrs.length ? ` · ${d.disagreeingPrs.slice(0, 8).join(' ')}${d.disagreeingPrs.length > 8 ? ' …' : ''}` : ''));
+  }
+  if (q.corrupt) lines.push(`  ${q.corrupt} shadow record(s) without a readable summary skipped`);
   return lines.join('\n');
 }

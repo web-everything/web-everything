@@ -52,7 +52,7 @@ import { LIFECYCLE_STATES } from './conveyor/pr-lifecycle.mjs';
 import { newRunRecord } from './operations/run-record.mjs';
 import { newRunId, writeRun } from './operations/run-store.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { DEFAULT_REPOS, REQUIRED_CLEAN_DAYS, cleanDaysPerFamily, readCheckRuns, renderCleanDays } from './lib/review-ledger-history.mjs';
+import { DEFAULT_REPOS, REQUIRED_CLEAN_DAYS, SHADOW_OP, cleanDaysPerFamily, readCheckRuns, renderCleanDays, renderShadowDays, shadowDailyCounts } from './lib/review-ledger-history.mjs';
 
 const MAX_HISTORY_DAYS = 366; // bounds the window loop: `--days=30000000` would spin for minutes
 
@@ -395,8 +395,12 @@ export async function runAllRepos({ repos = DEFAULT_REPOS, json = false, stdout 
  * every family that has ever been checked is `ready`; no history at all is not ready.
  */
 export function runHistory({ repos = DEFAULT_REPOS, days = REQUIRED_CLEAN_DAYS, json = false, now = new Date(), read = readCheckRuns,
+  // #5444 — the drain's ledger-shadow records. Defaults to the real store only alongside the real `read`, so an injected
+  // `read` (tests) never touches disk through this second reader.
+  readShadow = read === readCheckRuns ? () => readCheckRuns({ op: SHADOW_OP }) : () => ({ runs: [], corrupt: 0 }),
   stdout = (text) => writeAllSync(1, text) } = {}) {
   const { runs, corrupt } = read();
+  const shadow = shadowDailyCounts(readShadow().runs, { now, windowDays: days });
   // The family set is pinned, so a family absent from the records is unknown (streak 0), never silently omitted.
   const query = cleanDaysPerFamily(runs, { repos, now, windowDays: days, families: LABEL_FAMILIES.map((f) => f.family) });
   const fams = Object.values(query.families);
@@ -408,9 +412,9 @@ export function runHistory({ repos = DEFAULT_REPOS, days = REQUIRED_CLEAN_DAYS, 
     for (const f of fams) { f.subsetReady = f.ready; f.ready = false; }
   }
   const verdictLine = ready ? 'ALL FAMILIES READY' : partialScope ? 'NOT READY — partial scope: --repos omits constellation repos, so this is not the readiness answer' : 'NOT READY';
-  if (json) stdout(`${JSON.stringify({ ...query, runCount: runs.length, corrupt, partialScope, ready }, null, 2)}\n`);
-  else stdout(`${renderCleanDays(query, { corrupt, runCount: runs.length })}\n${verdictLine}\n`);
-  return { ...query, runCount: runs.length, corrupt, partialScope, ready, exitCode: ready ? 0 : 1 };
+  if (json) stdout(`${JSON.stringify({ ...query, runCount: runs.length, corrupt, partialScope, ready, shadow }, null, 2)}\n`);
+  else stdout(`${renderCleanDays(query, { corrupt, runCount: runs.length })}\n${verdictLine}\n${renderShadowDays(shadow)}\n`);
+  return { ...query, runCount: runs.length, corrupt, partialScope, ready, shadow, exitCode: ready ? 0 : 1 };
 }
 
 async function main(argv) {
