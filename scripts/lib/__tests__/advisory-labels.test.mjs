@@ -187,15 +187,31 @@ describe('planAdvisoryRepairLabels — re-derives a missed label write from the 
     expect(plan(['review:human'], [note({ outcome: 'accept', login: 'chalbert' })]).add).toBe('advisory:accepted');
   });
 
-  // The sweep header promises its boundary; this pins it: the only non-`advisory:*` label it may ever remove is
-  // `review:pending`, and the only label it may ever add is an `advisory:*` one.
-  it('only ever removes advisory:* labels and review:pending, and only ever adds an advisory:* label', () => {
-    const all = ['review:human', 'review:pending', 'review:changes', 'review:accepted', 'advisory:accepted', 'advisory:changes'];
+  // #4722 — escalated to review:human AFTER its head was reviewed: the advisory exists and the label already shows
+  // it, but `review:awaiting-advisory` was added by the escalation and no second `advise` run will ever clear it.
+  it('drops a stale review:awaiting-advisory once a trusted advisory covers the head (the PR #4722 shape)', () => {
+    expect(plan(['review:human', 'review-round:1', 'review:awaiting-advisory', 'advisory:accepted'], [note({ verdict: '✅ pass — no blocking findings' })]))
+      .toEqual({ add: null, remove: ['review:awaiting-advisory'] });
+    expect(plan(['review:human', 'review:awaiting-advisory'], [note({ outcome: 'accept' })]))
+      .toEqual({ add: 'advisory:accepted', remove: ['review:awaiting-advisory'] });
+  });
+
+  it('keeps review:awaiting-advisory while no trusted advisory covers the live head', () => {
+    expect(plan(['review:human', 'review:awaiting-advisory'], [])).toEqual(NONE);
+    expect(plan(['review:human', 'review:awaiting-advisory'], [note({ outcome: 'accept', head: 'c'.repeat(40) })])).toEqual(NONE);
+    expect(plan(['review:human', 'review:awaiting-advisory'], [note({ outcome: 'accept', login: 'drive-by-user' })])).toEqual(NONE);
+    expect(plan(['review:human', 'review:awaiting-advisory'], [note({ outcome: 'inconclusive' })])).toEqual(NONE);
+  });
+
+  // The sweep header promises its boundary; this pins it: the only non-`advisory:*` labels it may ever remove are
+  // `review:pending` and `review:awaiting-advisory`, and the only label it may ever add is an `advisory:*` one.
+  it('only ever removes advisory:* labels, review:pending and review:awaiting-advisory, and only ever adds an advisory:* label', () => {
+    const all = ['review:human', 'review:pending', 'review:changes', 'review:accepted', 'advisory:accepted', 'advisory:changes', 'review:awaiting-advisory'];
     for (const outcome of ['accept', 'changes', 'inconclusive']) {
       for (let mask = 0; mask < 2 ** all.length; mask += 1) {
         const names = all.filter((_, i) => mask & (1 << i));
         const p = plan(names, [note({ outcome })]);
-        for (const r of p.remove) expect(['advisory:accepted', 'advisory:changes', 'review:pending']).toContain(r);
+        for (const r of p.remove) expect(['advisory:accepted', 'advisory:changes', 'review:pending', 'review:awaiting-advisory']).toContain(r);
         if (p.add) expect(Object.values(ADVISORY_LABELS)).toContain(p.add);
       }
     }

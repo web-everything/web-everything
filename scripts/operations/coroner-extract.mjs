@@ -25,6 +25,7 @@ import { collectExecutorLogs, executorTable } from './coroner-executors.mjs';
 import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
 import { collectChangeRequests } from './coroner-rounds.mjs';
 import { redact, buildFrictions, claudeFriction, collectAgyFrictions, collectCodexFrictions, collectDispatchRuns, summarizeBuildOutcomes } from './coroner-transcripts.mjs';
+import { parseSelectionLine } from '../lib/verify-selection-log.mjs';
 
 const MiB = 1024 * 1024;
 const MAX_LINE = 256 * 1024;
@@ -622,6 +623,8 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
   const verifyDaemon = { starts: 0, superseded: 0, codeNull: 0, codeChanged: 0, sigterm: 0, note: 'untimestamped log tail window' };
   const patterns = { starts: /^\s*dispatching verify for /, superseded: /superseded by a newer request/, codeNull: /exited with code null/, codeChanged: /loop stopped \(code-changed\)/, sigterm: /^verify-daemon: SIGTERM/ };
   for (const raw of verifyLines) { const line = stripLogTimestamp(raw); for (const [key, pattern] of Object.entries(patterns)) if (pattern.test(line)) verifyDaemon[key]++; }
+  // #xlewnhs — which test selection the dispatched gates used (since-last-green vs whole-PR vs full), from their selection lines.
+  for (const raw of verifyLines) { const sel = parseSelectionLine(raw); if (sel?.kind === 'selection') (verifyDaemon.selectionModes ??= {})[sel.mode] = (verifyDaemon.selectionModes[sel.mode] ?? 0) + 1; }
   for (const line of refusalLines) {
     // Tick summaries report counts, not individual refusal events/reasons.
     if (/\bdispatched \d+, refused \d+\b/.test(line)) continue;

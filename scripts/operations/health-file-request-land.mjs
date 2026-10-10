@@ -139,12 +139,29 @@ export function releaseLane(acq, runFn = runCmd) {
 }
 
 /**
+ * Offer a freshly committed card to the card batch (`./card-batch-file.mjs`, run from THIS clone so a daemon
+ * overlay applies even before the lane's own copy lands). Returns `{batchRef}` when admitted, else null — a
+ * non-zero exit (3 = not batched) or unreadable output means "take the per-card path".
+ */
+export function batchCard({ lane, cardFile, entry, runFn = runCmd }) {
+  let out;
+  try {
+    out = runFn('node', [join(REPO_ROOT, 'scripts', 'operations', 'card-batch-file.mjs'), `--lane=${lane}`, `--card=${cardFile}`,
+      `--note=health filing request ${entry.episodeId ?? entry.key ?? ''}`.trim(), '--json'], lane);
+  } catch { return null; }
+  try {
+    const result = JSON.parse(String(out).trim().split('\n').pop());
+    return result?.batched && result.batchRef ? { batchRef: result.batchRef } : null;
+  } catch { return null; }
+}
+
+/**
  * Land ONE claimed entry. Every effect goes through `runFn` (default {@link runCmd}) — no other subprocess call
  * exists anywhere in this function, so a test can substitute a recording fake and assert every `(cmd, args,
  * cwd)` triple used a lane path, never `REPO_ROOT`/the daemon clone's own cwd (beyond the two lane-pool calls,
  * which are the only ones legitimately run from `REPO_ROOT` — acquiring/releasing a lane is not "editing the
  * daemon clone", it is the pool's own bookkeeping).
- * @returns {{status:'landed'|'failed', card?, cardFile?, pr?, prUrl?, error?}}
+ * @returns {{status:'landed'|'failed', card?, cardFile?, pr?, prUrl?, batchRef?, error?}}
  */
 export function landOne(entry, { runFn = runCmd, acquireFn = acquireLane, releaseFn = releaseLane } = {}) {
   const stage = nextLandingStage(entry);
@@ -176,6 +193,11 @@ export function landOne(entry, { runFn = runCmd, acquireFn = acquireLane, releas
       if (!filedCardFile) throw new Error(`health-file-request-land: file-item did not report a filed card path (${out.slice(0, 500)})`);
       runFn('git', ['add', '--', filedCardFile], lane);
       runFn('git', ['commit', '-m', `${machinePrTitle({ item: filedCard, kind: 'file', card: entry })}\n\nFiled by the health daemon's lane-bound landing pass (#4079); uncleared (--queue=false).\n`], lane);
+      // CARD BATCH (operator go 2026-10-10): a mechanical filing joins the rolling card-only batch PR instead of
+      // opening its own. Admission makes the card durable on the batch ref, so the per-card push below is skipped.
+      // Any non-admission (setting off, refusal, error) falls through to the per-card path unchanged.
+      const batched = batchCard({ lane, cardFile: filedCardFile, entry, runFn });
+      if (batched) return { status: 'landed', card: filedCard, cardFile: filedCardFile, pr: null, prUrl: null, batchRef: batched.batchRef };
       // THE DURABLE HANDOFF POINT (#4079 review round 1, finding 1): push the commit to `entry.ref` on origin
       // BEFORE verify/open-pr can fail and strand it in a lane that gets hard-reset to `origin/main` on its
       // next acquire. `card`/`cardFile` (the outer, catch-visible variables) are only promoted AFTER this
@@ -279,7 +301,8 @@ export function landPending({
     if (!claimed) { results.push({ status: 'skipped', key: candidate.key, reason }); skipped.add(candidate.key); continue; }
     const outcome = landOne(claimed, { runFn, acquireFn, releaseFn });
     const patch = outcome.status === 'landed'
-      ? { status: 'landed', card: outcome.card, cardFile: outcome.cardFile, pr: outcome.pr, prUrl: outcome.prUrl, landedAt: now }
+      ? { status: 'landed', card: outcome.card, cardFile: outcome.cardFile, pr: outcome.pr, prUrl: outcome.prUrl, landedAt: now,
+        ...(outcome.batchRef ? { batchRef: outcome.batchRef } : {}) }
       : { status: 'pending', card: outcome.card ?? claimed.card, cardFile: outcome.cardFile ?? claimed.cardFile };
     const patched = patchLedgerEntry(dir, claimed.key, claimed.attemptId, patch);
     if (patched) {

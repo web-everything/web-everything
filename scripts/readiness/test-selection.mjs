@@ -260,6 +260,57 @@ export function pinnedMergeBase({ base = 'origin/main', runGit } = {}) {
   }
 }
 
+/** #xgqwuq5 — how many of the PR's own commits {@link findLastGreenAncestor} looks back through. */
+export const LAST_GREEN_LOOKBACK = 50;
+
+/**
+ * #xgqwuq5 — the newest EARLIER commit of this PR (`<merge-base>..HEAD^`, newest first, at most
+ * {@link LAST_GREEN_LOOKBACK}) that `hasGreen(sha)` vouches for, or null. Pure over `runGit` + `hasGreen`; any git
+ * failure is null (no green ⇒ the caller keeps the whole-PR selection).
+ * @param {{base?: string, runGit: (args: string[]) => string, hasGreen: (sha: string) => boolean}} args
+ * @returns {string|null}
+ */
+export function findLastGreenAncestor({ base = 'origin/main', runGit, hasGreen } = {}) {
+  if (typeof hasGreen !== 'function') return null;
+  const mergeBase = pinnedMergeBase({ base, runGit });
+  if (!mergeBase) return null;
+  try {
+    const shas = String(runGit(['rev-list', `--max-count=${LAST_GREEN_LOOKBACK}`, `${mergeBase}..HEAD^`]))
+      .split('\n').map((s) => s.trim()).filter(Boolean);
+    return shas.find((sha) => { try { return hasGreen(sha) === true; } catch { return false; } }) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #xgqwuq5 — may the gate select from `<greenSha>..HEAD` instead of the whole PR? Only when that range holds just the
+ * PR's own commits: `greenSha` is a STRICT ancestor of HEAD, the range has no merge commit (a merge of main brings
+ * code the green never saw), and the merge-base with `base` is the same for both ends (no rebase onto a newer main).
+ * Pure over `runGit`; any git failure is `eligible: false` (fail closed to the whole-PR selection).
+ * @param {{base?: string, runGit: (args: string[]) => string, greenSha: string|null}} args
+ * @returns {{eligible: boolean, reason: string}}
+ */
+export function decideSinceLastGreen({ base = 'origin/main', runGit, greenSha } = {}) {
+  if (!greenSha) return { eligible: false, reason: 'no green verify recorded for an earlier commit of this PR' };
+  const short = String(greenSha).slice(0, 8);
+  try {
+    const head = String(runGit(['rev-parse', 'HEAD'])).trim();
+    if (head === greenSha) return { eligible: false, reason: `last green ${short} is HEAD itself` };
+    try { runGit(['merge-base', '--is-ancestor', greenSha, 'HEAD']); } catch {
+      return { eligible: false, reason: `last green ${short} is not an ancestor of HEAD (rebased or rewritten)` };
+    }
+    const merges = String(runGit(['rev-list', '--merges', `${greenSha}..HEAD`])).trim();
+    if (merges) return { eligible: false, reason: `${greenSha.slice(0, 8)}..HEAD contains a merge commit (${merges.split('\n')[0].slice(0, 8)})` };
+    const headBase = String(runGit(['merge-base', base, 'HEAD'])).trim();
+    const greenBase = String(runGit(['merge-base', base, greenSha])).trim();
+    if (!headBase || headBase !== greenBase) return { eligible: false, reason: `merge-base with ${base} moved since last green ${short} (${greenBase.slice(0, 8)} → ${headBase.slice(0, 8)})` };
+    return { eligible: true, reason: `${short}..HEAD holds only this PR's own commits` };
+  } catch {
+    return { eligible: false, reason: `could not check ${short}..HEAD with git` };
+  }
+}
+
 /**
  * The NET changed set: the files that differ between the PINNED merge-base ({@link pinnedMergeBase}) and HEAD.
  * This is property 1 (select off the diff) + the round-2 merge-base pin. `runGit` is injectable. Returns a

@@ -46,6 +46,33 @@ let store;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'we-daemon-jobs-')); store = createJobStore(dir); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
+describe('createJobStore.list — sidecar files vs torn records', () => {
+  // Live case: the rebuild job keeps `consumed.json` (a JSON ARRAY of consumed job ids) in the same folder.
+  // It is not a record at all, yet it was reported "corrupt — left untouched" on every daemon tick.
+  it('ignores a parseable non-record .json sidecar (consumed.json array) — not corrupt, not a record', async () => {
+    const rec = enqueueJob({ store, kindDef: noop, codeSha: "a".repeat(40) });
+    writeFileSync(join(dir, 'consumed.json'), `${JSON.stringify([rec.id, 'job-noop-old'])}\n`);
+    writeFileSync(join(dir, 'notes.json'), '{"lastSweep":"2026-10-10T00:00:00Z"}\n');
+    const { records, corrupt } = store.list();
+    expect(corrupt).toEqual([]);
+    expect(records.map((r) => r.id)).toEqual([rec.id]);
+    const logs = [];
+    const out = await reattachTick({ store, kinds, maxConcurrent: 1, launch: () => null, observation: { now: Date.now(), slept: false, gapMs: 0 }, log: (m) => logs.push(m) });
+    expect(out.corrupt).toEqual([]);
+    expect(logs.filter((m) => m.includes('corrupt'))).toEqual([]);
+  });
+
+  it('still reports a torn job record (unparseable, or record-shaped but invalid) as corrupt and never deletes it', () => {
+    const rec = enqueueJob({ store, kindDef: noop, codeSha: "a".repeat(40) });
+    writeFileSync(join(dir, 'job-noop-torn.json'), '{"v":1,"id":"job-noop-tor');
+    writeFileSync(join(dir, 'job-noop-empty.json'), '');
+    writeFileSync(join(dir, 'job-noop-bad.json'), '{"v":1,"id":"job-noop-bad","job":"not-an-object"}');
+    const { records, corrupt } = store.list();
+    expect(records.map((r) => r.id)).toEqual([rec.id]);
+    expect(corrupt.sort()).toEqual(['job-noop-bad', 'job-noop-empty', 'job-noop-torn']);
+  });
+});
+
 describe('handle liveness', () => {
   it('reads this process as alive and refuses the same pid with another start time (pid reuse)', () => {
     const me = selfHandle();

@@ -31,7 +31,24 @@ export const ACCEPTED_EVENTS = Object.freeze({
   check_suite: new Set(['completed']),
   check_run: new Set(['completed']),
   pull_request_review: new Set(['submitted', 'dismissed']),
+  // Kept ONLY when the comment is on a PR and is an advisory note or an operator ruling (see classifyPrComment);
+  // stored as a `kind` tag — never the body. Live 2026-10-09 (PR #4624): these are what make a fix owed, and the
+  // fix daemon could not wake on them.
+  issue_comment: new Set(['created']),
 });
+
+/** The advisory-note shape `review-pr.mjs#renderAdvisoryNote` emits (`advisory-labels.mjs#parseAdvisories` reads the
+ *  same two lines) and the operator-ruling marker (`jury-core.mjs#OPERATOR_RULING_MARKER`). Inlined: the Worker
+ *  bundle must not import repo code. */
+export const OPERATOR_RULING_COMMENT_MARKER = 'mandatory-referral-operator-ruling-v1';
+
+/** PURE: `'advisory'`, `'ruling'`, or `null` for a PR comment body. */
+export function classifyPrComment(body) {
+  const b = typeof body === 'string' ? body : '';
+  if (b.includes(OPERATOR_RULING_COMMENT_MARKER)) return 'ruling';
+  if (/^\*\*Verdict:\*\*/m.test(b) && /^Net basis: `[a-f0-9]+\.\.[a-f0-9]+`/im.test(b)) return 'advisory';
+  return null;
+}
 
 export const DEFAULT_MAX_EVENTS = 5000;
 export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -99,6 +116,12 @@ export function parseGithubEvent(eventName, payload, { deliveryId = null, receiv
   if (eventName === 'check_run') {
     const r = payload.check_run || {};
     return { ...base, prs: prNumbers(r.pull_requests), sha: r.head_sha || null, conclusion: r.conclusion || null, name: r.name || null, app: r.app?.slug || null };
+  }
+  if (eventName === 'issue_comment') {
+    const issue = payload.issue || {};
+    if (!issue.pull_request || !Number.isInteger(issue.number)) return null;
+    const kind = classifyPrComment(payload.comment?.body);
+    return kind ? { ...base, prs: [issue.number], sha: null, kind } : null;
   }
   // pull_request_review
   const rv = payload.review || {};

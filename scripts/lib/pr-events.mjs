@@ -112,7 +112,9 @@ export const ROLE_RELEVANCE = Object.freeze({
   // Fix daemon: a red check, a changes-requested review, a label flip (review:changes / ci:failed), a new push.
   fix: (e) => (e.type === 'pull_request' && ['labeled', 'unlabeled', 'synchronize', 'closed'].includes(e.action))
     || ((e.type === 'check_suite' || e.type === 'check_run') && NOT_GREEN(e.conclusion))
-    || (e.type === 'pull_request_review' && e.state === 'changes_requested'),
+    || (e.type === 'pull_request_review' && e.state === 'changes_requested')
+    // An advisory note or an operator ruling can make a fix owed (live 2026-10-09, PR #4624).
+    || (e.type === 'issue_comment' && (e.kind === 'advisory' || e.kind === 'ruling')),
   // Drain: the last land-precondition completing — green CI, an approving review, a review:* label, ready/closed.
   drain: (e) => (e.type === 'pull_request' && ['labeled', 'unlabeled', 'ready_for_review', 'closed'].includes(e.action))
     || (e.type === 'check_suite' && e.conclusion === 'success')

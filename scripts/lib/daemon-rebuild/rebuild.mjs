@@ -18,6 +18,7 @@ import { makeSkipCheck } from './skip-unrelated.mjs';
 import { prepareRebuild } from './prepare.mjs';
 import { smokeAndAdopt } from './smoke.mjs';
 import { resolveVersionedContext, versionedRebuild } from '../daemon-version-runtime.mjs';
+import { rebuildCloneAsJob, resolveRebuildAsJob } from './rebuild-job.mjs';
 
 // ── rebuildClone — the IO shell ──────────────────────────────────────────────────────────────────────────────
 
@@ -37,14 +38,32 @@ import { resolveVersionedContext, versionedRebuild } from '../daemon-version-run
 export async function rebuildClone({
   root, env = process.env, log = console, run = gitRun, runSmoke = runLiveSmokeWithRetry,
   prState = (pr) => defaultPrState({ pr, root }), lockOpts = {}, stateOpts = {}, mainOnly = false,
-  now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke,
+  now = () => Date.now(), sleep, versions, skipCheck, entries, dispatchSmoke, readyOnly = false, adoptOnly = false,
+  asJob,
 } = {}) {
+  // #4126 — the opted-in daemon's tick never smokes: it adopts a ready candidate (fast) and otherwise starts or
+  // watches a detached rebuild JOB (`rebuild-job.mjs`). `asJob` undefined resolves from daemon-rebuild-settings.json
+  // by the caller's `entries`; the job itself and the adopt-only pass inside it always run the inline path.
+  if (!readyOnly && !adoptOnly && (asJob === undefined ? resolveRebuildAsJob({ entries, env }) : asJob)) {
+    return rebuildCloneAsJob({
+      root, env, log, mainOnly, entries,
+      adopt: (o = {}) => rebuildClone({
+        root, env, log, run, runSmoke, prState, lockOpts, stateOpts, mainOnly, now, sleep, versions, skipCheck, entries,
+        dispatchSmoke, ...o, adoptOnly: true, asJob: false,
+      }),
+    });
+  }
   // Card 89 S5: a versioned clone never moves in place — it builds a version and flips `current`, taking no
   // clone lock at all. `versions: null` forces the legacy path; unset resolves from the settings (default off).
   const vctx = versions === undefined ? resolveVersionedContext({ root, env }) : versions;
   if (vctx) return versionedRebuild({ ctx: vctx, log });
   // daemonRebuild.skipUnrelated (default on): `skipCheck` is injectable; else built from the daemon's `entries`.
-  const skipDecider = skipCheck === undefined ? makeSkipCheck({ root, entries, env }) : skipCheck;
+  // #4126 readyOnly (the rebuild job) never moves `root`: no skip-unrelated adoption here (the tick's adopt-only
+  // pass does that), and a ready candidate already waiting is the tick's to adopt — nothing to build.
+  const skipDecider = readyOnly ? null : (skipCheck === undefined ? makeSkipCheck({ root, entries, env }) : skipCheck);
+  if (readyOnly && readReadyCandidate(root, { ...env, ...(stateOpts?.env || {}) })) {
+    return { moved: false, reason: 'ready-pending', alerts: [] };
+  }
   const lockRootFromEnv = env && env.WE_DAEMON_CLONE_LOCK_ROOT;
   // #4044 (live 2026-09-25 10:28-10:40 ET): the fix daemon's tick-start rebuild waited SILENTLY up to the lock's
   // 600s default for the review daemon's 10-minute tick to release its read slot — no ticks, no log line. A
@@ -100,11 +119,25 @@ export async function rebuildClone({
     plan, prevHead, lease, overlays: overlaysBefore = [], alerts: prepAlerts,
   } = prep.value;
 
+  // #4126 adopt-only (the job-mode tick): never build or smoke here — hand the lease back and say a build is due.
+  if (adoptOnly) {
+    try {
+      await withWriteLock(root, () => {
+        const st = readRebuildState(root, stEnv);
+        releaseBuildLease(st, lease);
+        writeRebuildState(root, st, stEnv);
+      }, finalLockOpts);
+    } catch { /* the owner's next call takes an unreleased lease back anyway */ } finally {
+      ACTIVE_BUILD_TOKENS.delete(lease.token);
+    }
+    return { moved: false, reason: 'needs-build', plan, alerts: prepAlerts };
+  }
+
   // ── Phase 2 (UNLOCKED — the whole point of xa4qo7n): build + smoke a disposable candidate ───────────────
   try {
     return await smokeAndAdopt({
       root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-      finalLockOpts, finalizeLockOpts, dispatchSmoke,
+      finalLockOpts, finalizeLockOpts, dispatchSmoke, readyOnly,
     });
   } catch (e) {
     // Best-effort: never leave a thrown build's lease on disk to hold a sibling off until it ages out.

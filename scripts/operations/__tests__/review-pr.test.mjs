@@ -1,5 +1,7 @@
 import { ADVISORY_NOTE_MARKER, countAdvisoryComments } from '../../conveyor/advisory-round-count.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
 import { renderReferralRecord, mandatoryReferralReviewer, explainPanelOutcome } from '../../lib/jury-core.mjs';
 import { createReviewPrSinks } from '../review-pr-io.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
@@ -129,8 +131,11 @@ function stubReader({
   // #xu2pp2m, because PR #2122 merged on a clean accept over exactly that). Defaulted to real diff text so
   // the existing degrade tests keep testing the case they were written for; the empty-diff tests pass `''`.
   degradedDiffText = '--- a/x\n+++ b/x\n+a line the degraded read still saw\n',
+  // Held item 177 — the stack base `readPr` attaches when the PR is a stacked top judged against its bottom's head.
+  stackBase = undefined,
 } = {}) {
   return ({ pr, repo }) => ({
+    ...(stackBase ? { stackBase } : {}),
     state,
     comments,
     clearerId,
@@ -4228,5 +4233,90 @@ describe('card 84 — review.seatProvider.<lens> and the advisory agy-correctnes
     });
     expect(run.findings.reduce.lensProviders.correctness).toBe('agy');
     expect(run.findings.reduce.lensProviders.security).toBeUndefined();
+  });
+});
+
+// ── Cards 5471 / 5470 — the read carries the round settings through to the run record ────────────────────────────────
+describe('cards 5471 + 5470: shapeReadFinding carries the round budget, the ledger round and the on mode', () => {
+  it('carries roundBudget, reviewRound and scopedRereview on; off adds no key', () => {
+    const base = stubReader({})({ pr: 1, repo: 'o/n' });
+    const on = shapeReadFinding({ ...base, roundBudget: 3, reviewRound: 4, scopedRereview: 'on' }, { pr: 1, repo: 'o/n' });
+    expect(on).toMatchObject({ roundBudget: 3, reviewRound: 4, scopedRereview: 'on' });
+    const unknownRound = shapeReadFinding({ ...base, roundBudget: 3, reviewRound: null }, { pr: 1, repo: 'o/n' });
+    expect(unknownRound).toMatchObject({ roundBudget: 3, reviewRound: null });
+    const off = shapeReadFinding(base, { pr: 1, repo: 'o/n' });
+    expect(off).not.toHaveProperty('roundBudget');
+    expect(off).not.toHaveProperty('reviewRound');
+    expect(off).not.toHaveProperty('scopedRereview');
+  });
+});
+
+// ── Held item 177 — AN ACCEPT ON A STACKED TOP NEVER BECOMES `review:accepted` (effect level) ─────────────────────────
+// The unit test of `planRecordDecision` only shows a marker is planned. The guarantee is about EFFECTS: drive the real
+// operation to `record` and apply what it declares through the real sinks, with only the forge (comment poster) and the
+// single-home subprocess injected. Removing the STACK_HOLD early return in `record` would declare LABEL/LEDGER/NOTICE
+// again and this goes red.
+describe('held item 177: a stacked accept declares and applies only the stack hold', () => {
+  const STACK_HEAD = 'b'.repeat(40);
+  const stackBase = {
+    pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: 'e'.repeat(40), fingerprint: 'f'.repeat(64),
+  };
+  const drive = async ({ answer, stack = stackBase, answers, id }) => {
+    const { registry } = registryFor({ netRev: STACK_HEAD, stackBase: stack });
+    const input = { ...BASE_INPUT, pr: 4631 };
+    const { run } = atConfirm({ registry, input, answer: answer === 'changes' ? BLOCKING_ANSWER : CLEAN_ANSWER, answers, id });
+    return { registry, declared: await driveToRecordDeclared({ run, registry, answer }) };
+  };
+  const types = (declared, step) => declared.effects.filter((e) => e.step === step).map((e) => e.type);
+
+  it('declares STACK_HOLD alone on `record` — no label swap, no ledger clearance row, no notice', async () => {
+    const { declared } = await drive({ answer: 'accept', id: 'run-stack-accept' });
+    expect(types(declared, 'record')).toEqual([REVIEW_EFFECTS.STACK_HOLD]);
+    const hold = declared.effects.find((e) => e.type === REVIEW_EFFECTS.STACK_HOLD);
+    expect(hold.idempotent).toBe(false);
+    expect(hold.payload.note).toContain('**Accept held — stacked on #4624.**');
+    expect(hold.payload.marker).toContain(`"topHead":"${STACK_HEAD}"`);
+    for (const type of [REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE]) {
+      expect(declared.effects.some((e) => e.type === type), type).toBe(false);
+    }
+    // No declared effect in the whole run adds a label or names an accepted verdict target.
+    expect(declared.effects.filter((e) => e.payload?.addLabel || e.payload?.to === 'accepted')).toEqual([]);
+  });
+
+  it('applied through the real sinks: one bare comment ending in the marker, and the single home is never shelled', async () => {
+    const root = mkdtempSync(joinPath(tmpdir(), 'stack-hold-effects-'));
+    try {
+      const posted = []; const shelled = [];
+      const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+        runNode: (argv) => { shelled.push(argv); return '{"ok":true}'; } });
+      const { declared } = await drive({ answer: 'accept', id: 'run-stack-apply' });
+      const hold = declared.effects.find((e) => e.type === REVIEW_EFFECTS.STACK_HOLD);
+      const result = await sinks[REVIEW_EFFECTS.STACK_HOLD](hold.payload, { runId: declared.id });
+      expect(result).toEqual({ posted: true, held: true });
+      expect(shelled).toEqual([]);
+      expect(posted).toHaveLength(1);
+      const lines = posted[0].body.split('\n');
+      expect(lines[0]).toBe(hold.payload.note);
+      expect(lines.at(-1)).toBe(hold.payload.marker);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a stacked `changes` verdict still goes through the ordinary label swap (a bounce lands nothing)', async () => {
+    const { declared } = await drive({ answer: 'changes', id: 'run-stack-changes' });
+    expect(types(declared, 'record')).toEqual([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE]);
+    expect(declared.effects.find((e) => e.type === REVIEW_EFFECTS.LABEL).payload.to).toBe('changes');
+  });
+
+  it('an unstacked accept on the same read still declares the ordinary label swap (control)', async () => {
+    const { declared } = await drive({ answer: 'accept', stack: null, id: 'run-unstacked-accept' });
+    expect(types(declared, 'record')).toEqual([REVIEW_EFFECTS.LABEL, REVIEW_EFFECTS.LEDGER, REVIEW_EFFECTS.NOTICE]);
+    expect(declared.effects.find((e) => e.type === REVIEW_EFFECTS.LABEL).payload.addLabel).toBe('review:accepted');
+  });
+
+  it('a stack base with an unpinned diff basis falls back to the ordinary path (no hold without a pinned head)', async () => {
+    const { registry } = registryFor({ netRev: 'def456', stackBase });
+    const { run } = atConfirm({ registry, input: { ...BASE_INPUT, pr: 4631 }, id: 'run-stack-unpinned' });
+    const declared = await driveToRecordDeclared({ run, registry, answer: 'accept' });
+    expect(types(declared, 'record')).not.toContain(REVIEW_EFFECTS.STACK_HOLD);
   });
 });

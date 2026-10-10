@@ -10,7 +10,9 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  *     its newest advisory covers the live head and accepts. The comment is the source of truth; the label is a
  *     derived view of it. Any disagreement between the two is reported in NOT READY as the reason, never resolved
  *     silently in either direction;
- *   - CI is green, the PR is not conflicting, and GitHub reports it MERGEABLE.
+ *   - CI is green, the PR is not conflicting, and GitHub reports it MERGEABLE;
+ *   - (card x1b8hlo) the post-accept red team has no CONFIRMED break on the live head that `redTeam.confirmedBreaks`
+ *     sends back to the fixer (`we:scripts/lib/red-team-gate.mjs#redTeamQueueReason`).
  *
  * THREE BUCKETS, not two. `mergeable: UNKNOWN` is GitHub's transient "still computing" state, and reporting it in
  * NOT READY ("agent work is owed") made a healthy PR flap between ready and not-ready from run to run. So an
@@ -43,6 +45,9 @@ import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { stuckDispatchEpisodes } from '../conveyor/stuck-pr-dispatch-marker.mjs';
 import { standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
+// Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
+// keeps the PR out of NEEDS YOU while it is unresolved on the live head.
+import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason } from '../lib/red-team-gate.mjs';
 // Loaded lazily and fail-soft, like `laneReclaimQueue`: the ledger pulls in `jury-core.mjs`'s whole graph, which this
 // file's header deliberately keeps out of its own (a copy staged without it must still run and print the queue).
 let rulingLedger = null;
@@ -68,6 +73,12 @@ export function rulingNeededRow(repo, pr) {
   };
 }
 
+/** The open-PR listing's stdout cap (it carries every PR's comments). See the listing call in `main`. */
+export const PR_LIST_MAX_BUFFER = 256 * 1024 * 1024;
+
+/** The `review:*` label an opening path adds beside `review:human` until the advisory comment posts. */
+export const AWAITING_ADVISORY_LABEL = 'review:awaiting-advisory';
+
 /** How many times an UNKNOWN mergeability is re-polled, and the first backoff (doubling each attempt). */
 export const MERGEABLE_POLL_ATTEMPTS = 4;
 export const MERGEABLE_POLL_DELAY_MS = 1000;
@@ -77,7 +88,7 @@ export const MERGEABLE_POLL_DELAY_MS = 1000;
  * @returns {{ready: boolean, reasons: string[], transient: boolean}} `transient` is true when the ONLY thing
  *   between this PR and `ready` is GitHub's still-computing mergeability — `ready` is then false and `reasons` empty.
  */
-export function evaluatePr(pr) {
+export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS } = {}) {
   const reasons = [];
   if (!hasLabel(pr, 'review:human')) reasons.push('no review:human label');
 
@@ -114,6 +125,20 @@ export function evaluatePr(pr) {
     // A converted note's `inconclusive` (PR #2781 review, round 4): neither cleared nor blocking, no label owed.
     reasons.push(`advisory is ${parsed} on this head (a human must confirm the escalation)`);
   }
+
+  // #4722 — `review:awaiting-advisory` says "the advisory has not posted yet". When the comment on this head exists
+  // the label is stale, and that is a disagreement like any other: reported, never resolved silently here. Its
+  // owner (the advisory-label sweep's repair path) clears it. Without an advisory on this head the label is
+  // consistent and the "no advisory" reasons above already explain the wait.
+  if (hasLabel(pr, AWAITING_ADVISORY_LABEL) && parsed) {
+    reasons.push(`label/comment disagreement: ${AWAITING_ADVISORY_LABEL} is set but ${parsedText}`);
+  }
+
+  // Card x1b8hlo — the post-accept red team CONFIRMED a break on this exact head that `redTeam.confirmedBreaks` sends
+  // back: the fixer owns it, not the operator (live PR #4722). A new head clears it; the gate's `round-cap` record
+  // hands it to the operator instead.
+  const redTeam = redTeamQueueReason(pr, redTeamSetting);
+  if (redTeam) reasons.push(redTeam);
 
   const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
   const pending = checks.filter((check) => check.status !== 'COMPLETED');
@@ -346,18 +371,23 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
       const prs = JSON.parse(execFileSync('gh', [
         'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json',
         'number,title,labels,headRefOid,mergeable,statusCheckRollup,comments',
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+        // #4722 — `comments` on every open PR is MEGABYTES (review write-ups, red-team notes, fix-claim chatter).
+        // Node's default 1MB `maxBuffer` threw ENOBUFS, and that one throw dropped EVERY PR of the repo from every
+        // section (live 2026-10-10: web-everything/web-everything, 25 open PRs, all invisible). Same cap as the
+        // advisory-label sweep's own comment-carrying listing.
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER }));
       const readyNumbersThisRepo = new Set();
+      const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
         let pr = listed;
-        let result = evaluatePr(pr);
+        let result = evaluatePr(pr, { redTeamSetting });
         // Only a PR that would otherwise be ready is worth re-polling — one with a real failure is not-ready
         // whatever GitHub says about mergeability.
         if (result.transient) {
           pr = { ...pr, mergeable: pollMergeable({
             repo, number: pr.number, sleep, attempts: pollAttempts, delayMs: pollDelayMs,
           }) };
-          result = evaluatePr(pr);
+          result = evaluatePr(pr, { redTeamSetting });
         }
         const row = { repo, number: pr.number, title: pr.title };
         if (result.ready) {
@@ -394,6 +424,12 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     console.log(JSON.stringify(report, null, 2));
   } else {
     for (const error of report.errors) console.error(`ERROR ${error}`);
+    // #4722 — a repo whose listing failed shows NONE of its PRs below, so the failure must be on the same page as
+    // the sections, never only on stderr (where it read as "nothing is waiting").
+    if (report.errors.length) {
+      console.log('ERRORS — the sections below are INCOMPLETE (these reads failed):');
+      console.log(report.errors.join('\n'));
+    }
     if (health) console.log(health.join('\n'));
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
     console.log(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');

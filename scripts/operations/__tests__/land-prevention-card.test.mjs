@@ -10,12 +10,13 @@
  * here, matching the no-fs/no-subprocess convention every sibling operation test already uses.
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync, existsSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   landPreventionCard, parseLandPreventionCardArgv, parseRunJsonTail, runLandPreventionCardCli,
   boundCardText, boundLandPreventionCardInput, CARD_TEXT_CAPS, buildLandingRetractionComment, postLandingRetraction,
+  runCardDedupe,
 } from '../land-prevention-card.mjs';
 import {
   hasApprovalPreventionMarkerForHead, buildApprovalPreventionMarker, buildApprovalPreventionJobMarker,
@@ -229,6 +230,96 @@ describe('landPreventionCard — the real acquire → file-item → commit → v
       expect(made).toHaveLength(1);
       expect(existsSync(made[0])).toBe(false);
     });
+  });
+});
+
+// Dedupe before filing (operator go 2026-10-10): a REAL lane dir holding a real open card, the real planner, only the
+// policy and the PR lookup injected (no gh, no settings file read).
+describe('landPreventionCard — dedupe before filing', () => {
+  const CLAIM = 'Treat any non-empty probeErrors as unreadable, or have readPrFacts expose a degraded flag. Add a table-driven test over each probe error string.';
+  const AGAIN = 'Make deriveRow treat any non-empty facts.probeErrors as unreadable. Add a table-driven test over every probe error readPrFacts can emit.';
+  const cardText = (status) => `---\nkind: story\nstatus: ${status}\ndateOpened: "2026-10-03"\n---\n\n`
+    + `# Prevention — Treat probeErrors as unreadable (from o/r#10 review)\n\nFiled mechanically ON APPROVAL — owed:\n\n`
+    + `1. \`we:scripts/review-ledger-check.mjs:40\` — ${CLAIM}\n\n## Done when\n\n1. tests pass\n`;
+  const REL = 'backlog/4706-prevention-treat-probeerrors.md';
+  let lane;
+  const setup = (status = 'open') => {
+    lane = mkdtempSync(join(tmpdir(), 'land-prevention-dedupe-'));
+    mkdirSync(join(lane, 'backlog'));
+    writeFileSync(join(lane, REL), cardText(status));
+    return JSON.stringify({ lane: 7, path: lane, session: 's', holder: 'h' });
+  };
+  const dedupe = (input, o) => runCardDedupe(input, { ...o, loadPolicy: () => ({ dedupe: true, similarity: 0.3, source: { dedupe: 'test', similarity: 'test' } }), readPrCards: () => [] });
+  const input = (file = 'scripts/review-ledger-check.mjs') => ({
+    ...INPUT, title: 'Prevention — Make deriveRow treat probeErrors as unreadable (from o/r#77 review)',
+    digest: `Filed mechanically ON APPROVAL — owed:\n\n1. \`we:${file}:44\` — ${AGAIN}\n\nIdempotency key (do not edit): approval-prevention-key:o/r#77@abc`,
+    scope: `we:${file}`,
+  });
+  const cleanup = () => rmSync(lane, { recursive: true, force: true });
+
+  it('a duplicate becomes an "Also raised by" line on the open card: no file-item, the edit lands through the same gate + PR', async () => {
+    const acquire = setup();
+    try {
+      const { exec, calls } = scriptedExec([acquire, 'added-card', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const written = [];
+      const result = await landPreventionCard(input(), {
+        exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, dedupe,
+        writeFile: (p, c, e) => { written.push({ p, c }); if (p.startsWith(lane)) writeFileSync(p, c, e); },
+      });
+      expect(result).toMatchObject({ ok: true, step: 'done', num: null, rel: null, pr: 5555, mentions: 1 });
+      expect(calls.some((c) => c.args.includes('file-item'))).toBe(false);
+      expect(calls[1].args).toEqual(['-C', lane, 'add', '--', REL]);
+      const after = readFileSync(join(lane, REL), 'utf8');
+      expect(after).toContain('## Also raised by');
+      expect(after).toContain('- Also raised by o/r#77 (finding 1: `we:scripts/review-ledger-check.mjs:44` — ');
+      // The filing's key is now on the existing card, so the approval filer's on-disk lookup finds it on a retry.
+      expect(after).toContain('approval-prevention-key:o/r#77@abc');
+      expect(written.find(({ p }) => p.endsWith('commit-msg.txt')).c.split('\n')[0]).toMatch(/^WE #4706: prevention — also raised: /);
+      expect(calls[4].args.find((a) => a.startsWith('--ref='))).toBe('--ref=lane/prevention-card-test');
+    } finally { cleanup(); }
+  });
+
+  it('a different target file is filed as today, and the open card is untouched', async () => {
+    const acquire = setup();
+    try {
+      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const result = await landPreventionCard(input('scripts/other-check.mjs'), { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe });
+      expect(result).toMatchObject({ ok: true, num: 9001 });
+      expect(calls[1].args).toContain('file-item');
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('open'));
+    } finally { cleanup(); }
+  });
+
+  it('a claimed (status active) card is never touched: the finding is filed instead', async () => {
+    const acquire = setup('active');
+    try {
+      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const result = await landPreventionCard(input(), { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe });
+      expect(result).toMatchObject({ ok: true, num: 9001 });
+      expect(calls[1].args).toContain('file-item');
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('active'));
+    } finally { cleanup(); }
+  });
+
+  it('a card claimed between the plan and the write is re-checked on the lane copy: filed, not mentioned', async () => {
+    const acquire = setup();
+    try {
+      const { exec, calls } = scriptedExec([acquire, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+      const racing = (i, o) => { const plan = dedupe(i, o); writeFileSync(join(lane, REL), cardText('active')); return plan; };
+      const result = await landPreventionCard(input(), { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe: racing });
+      expect(result).toMatchObject({ ok: true, num: 9001 });
+      const fileArgs = calls[1].args;
+      expect(fileArgs).toContain('file-item');
+      expect(fileArgs.find((a) => a.startsWith('--digest='))).toContain('probeErrors');
+      expect(readFileSync(join(lane, REL), 'utf8')).toBe(cardText('active'));
+    } finally { cleanup(); }
+  });
+
+  it('a dedupe that throws files exactly as before', async () => {
+    const { exec, calls } = scriptedExec([ACQUIRE_OK, FILE_ITEM_OK, 'added', 'committed', VERIFY_GREEN, OPEN_PR_OPENED, 'released']);
+    const result = await landPreventionCard(INPUT, { exec, write: () => {}, mkTmp: () => '/tmp/x', rmTmp: () => {}, writeFile: () => {}, dedupe: () => { throw new Error('boom'); } });
+    expect(result).toMatchObject({ ok: true, num: 9001 });
+    expect(calls[1].args).toContain('file-item');
   });
 });
 

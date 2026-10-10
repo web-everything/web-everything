@@ -71,7 +71,8 @@ import { writeFileSync, renameSync, existsSync, readFileSync, readdirSync, unlin
 import { execFileSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix } from './lib/lane-verify.mjs';
+import { VERIFY_FILENAME, VERIFY_PREVIOUS_FILENAME, verifyServerVerdict, verifyStartBody, verifyFinishBody, verificationInfrastructureFailure, verifyGateDecision, readVerifyMarker, resolveVerifyOptions, waitForVerifySettle, resolveWaitCeilingMs, VERIFY_MARKER_NONCE_ENV, markerNonceSuffix, greenLedgerDir, greenLedgerWritable, shouldRecordGreen, recordGreenLedger, hasGreenLedger } from './lib/lane-verify.mjs';
+import { isAllowlistedLitterPath } from './lib/lane-litter.mjs';
 import { LEASE_FILENAME, isLeaseStale, isConfirmedOwnLease } from './lib/lane-lease.mjs';
 import { defaultPoolRoot } from './lib/lane-pool-paths.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
@@ -84,6 +85,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
 const flags = {};
@@ -176,7 +178,14 @@ function writeMarker(record) {
   renameSync(tmp, MARKER);
 }
 
+// #xlewnhs — a daemon-dispatched run (`--run-id`) says which selection it used on its selection and verdict lines, as
+// `⚠ verify-lane:` notices the dispatcher copies into the daemon log (we:scripts/lib/verify-selection-log.mjs).
+const DISPATCHED_RUN = typeof flags['run-id'] === 'string';
+let SELECTION = null;
 function emit(result, exitCode) {
+  if (DISPATCHED_RUN && MODE === 'verify') {
+    try { process.stderr.write(`${verdictNotice({ sha: result.sha, status: result.status, summary: SELECTION })}\n`); } catch { /* logging only */ }
+  }
   if (AS_JSON) writeAllSync(1, JSON.stringify(result) + '\n');
   else process.stderr.write(`verify-lane [lane @ ${result.sha ? result.sha.slice(0, 8) : '?'}] ${result.status}: ${result.detail}\n`);
   process.exit(exitCode);
@@ -315,6 +324,24 @@ function readCheckoutScripts() {
 }
 // #5128 — one reader for the related-test graph; its identity keys the graph cache across the #66 variant matching.
 const readRepoFile = (p) => readFileSync(join(REPO, p), 'utf8');
+// #xgqwuq5 — the green ledger (scripts/lib/lane-verify.mjs): `verify.selection: since-last-green` asks it whether an
+// earlier commit of this PR verified green, and a clean-tree default-gate green below records this HEAD in it.
+const GREEN_LEDGER_DIR = greenLedgerDir({ env: process.env, coordinationRoot: resolveCoordinationRoot() });
+const hasGreen = (sha) => hasGreenLedger({ dir: GREEN_LEDGER_DIR, sha });
+// Clean = nothing tracked or untracked differs from HEAD, ignoring allowlisted lane litter (never committed).
+function treeIsClean() {
+  const out = tryGit(['status', '--porcelain', '--untracked-files=all']);
+  if (out == null) return false;
+  return out.split('\n').filter(Boolean).every((line) => !line.includes(' -> ') && line.startsWith('??') && isAllowlistedLitterPath(line.slice(3)));
+}
+function maybeRecordGreen({ status, treeHash, skipped = null }) {
+  if (!greenLedgerWritable({ repo: REPO, env: process.env })) return;
+  if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree: treeIsClean(), skipped })) return;
+  if (recordGreenLedger({ dir: GREEN_LEDGER_DIR, sha: headSha, record: { status: 'green', repo: REPO, recordedAt: new Date().toISOString(),
+    suites: GATE, selectionMode: resolvedGate?.decision?.selectionMode?.mode ?? null } })) {
+    process.stderr.write(`green ledger: recorded ${headSha.slice(0, 8)} (clean tree, default gate) for since-last-green selection\n`);
+  }
+}
 // The default gate's selected test half: `vitest related <changed>` or (#5128) a bounded `vitest run <tests>`.
 const SELECTED_TEST_COMMAND = /^npx vitest (?:related|run) /;
 // `run` is the fix / ci-heal reproduce-and-confirm gate (`gateFor`): a card-only PR is CI-red exactly when CI's full
@@ -334,7 +361,7 @@ if (typeof flags.gate === 'string') {
     // Only a KNOWN diff whose selection is blocked counts; an unresolvable diff (no `origin/main`) is unchanged.
     let defaultBlocked = false;
     try {
-      const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP });
+      const { decision } = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
       defaultBlocked = decision.mode === 'blocked' && Array.isArray(decision.changedFiles) && decision.changedFiles.length > 0;
     } catch { /* cannot tell ⇒ unchanged behaviour */ }
     const refusal = defaultBlocked ? explicitGateRefusal(GATE) : null;
@@ -349,7 +376,7 @@ if (typeof flags.gate === 'string') {
     }
   }
 } else {
-  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP });
+  const resolved = resolveDefaultGate({ runGit: git, env: process.env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
   if (resolved.decision.mode === 'blocked') emit({ sha: headSha, status: 'selection-required', reason: 'local-selection-bound', ok: false, redCause: 'refused', redCauseFiles: [], detail: describeGate(resolved) }, 3);
   GATE = resolved.command;
   resolvedGate = resolved;
@@ -363,7 +390,7 @@ if (typeof flags.gate === 'string') {
 let admissionFallback = null;
 if (!resolvedGate && typeof flags.gate === 'string') {
   try {
-    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP });
+    const resolveUnder = (env) => resolveDefaultGate({ runGit: git, env, scripts: readCheckoutScripts(), fileExists: (p) => existsSync(join(REPO, p)), readRepoFile, allowCardOnlySkip: ALLOW_CARD_ONLY_SKIP, hasGreen });
     const resolved = resolveUnder(process.env);
     if (resolved.command === GATE) resolvedGate = resolved;
     // The requester (an agent session, often on an older lane base) resolves its default gate under ITS settings,
@@ -383,6 +410,9 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }
 }
+
+SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
+if (DISPATCHED_RUN && MODE === 'verify') process.stderr.write(`${selectionNotice({ sha: headSha, summary: SELECTION })}\n`);
 
 // 1. Stamp the `running` marker BEFORE the suites start, so a kill mid-run leaves a stranded (detectably
 //    unfinished) marker rather than nothing.
@@ -458,6 +488,7 @@ if (resolvedGate?.decision?.mode === 'card-only-skip') {
   const detail = `card-only diff (CI's definition) - local gate skipped for ${headSha.slice(0, 8)}; CI's check:standards stays the merge authority.`;
   writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
     { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only' });
+  maybeRecordGreen({ status: 'green', treeHash: currentTreeHash, skipped: 'card-only' });
   emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail }, 0);
 }
 
@@ -817,6 +848,7 @@ const finished = verifyFinishBody(startBody, {
   treeHash: stableTreeHash(currentTreeHash, preGateTreeHash, treeHashNow()),
 });
 writeMarker({ ...finished, ...redCauseFields, phases, ...(revertRed ? { revertRed } : {}) });
+maybeRecordGreen({ status: finished.status, treeHash: finished.treeHash });
 process.stderr.write(`⏱ ${formatVerifyPhases(phases)}\n`);
 if (infrastructure) emit({ sha: headSha, status: finished.status, reason: infrastructure.reason, exitCode, infrastructure, ...redCauseFields, phases, detail: infrastructure.detail }, 3);
 
