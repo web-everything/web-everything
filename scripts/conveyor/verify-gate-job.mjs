@@ -298,8 +298,10 @@ export function createVerifyGateJobs({
       } catch (e) {
         log(`verify-daemon: gate-job reattach pass failed (${String(e?.message || e).split('\n')[0]}) — the next tick retries`);
       }
-      const records = mine();
-      const live = new Set();
+      const listing = store.list();
+      const records = listing.records.filter((r) => r.job.kind === kind);
+      // A record that will not parse is never "removed": its entry (and the lane) stays held until it reads again.
+      const live = new Set(listing.corrupt || []);
       // Every live job and held survivor of each lane, whichever entry the registry shows: when the job owning a lane's
       // entry ends, another holder takes the lane over in this same sync, never one tick later (a dispatch in between,
       // e.g. a rollback's in-process gate, would start beside it).

@@ -194,6 +194,14 @@ describe('createVerifyGateJobs — the daemon side over a real job store', () =>
     expect(inFlight.get(INPUT.dir).startedMs).not.toBe(1); // its own entry, not B's
   });
 
+  it('a job whose record will not parse keeps its lane: an unreadable record is never read as a removed job', async () => {
+    const x = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    writeFileSync(join(dir, `${x.id}.json`), '{"torn');
+    const inFlight = new Map([[INPUT.dir, { pool: 'we', lane: 3, dir: INPUT.dir, runId: 'run-1', jobId: x.id, pid: null, startedMs: 1 }]]);
+    await mk().sync(inFlight);
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: x.id });
+  });
+
   it('once that gate is gone the lane is released', async () => {
     const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
     store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
