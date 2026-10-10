@@ -55,6 +55,14 @@ describe('since-last-green selection (#xgqwuq5)', () => {
     expect(pr.decision.changedFiles).toEqual(['scripts/lib/a.mjs', 'scripts/lib/b.mjs']);
   });
 
+  it('verify.selection=pr never looks for a green, and says so', () => {
+    markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
+    commit('fixer', { 'scripts/lib/b.mjs': 'export const b = 2;\n' });
+    const gate = resolve({ WE_VERIFY_SELECTION: 'pr' });
+    expect(gate.decision.selectionMode).toEqual({ mode: 'pr', reason: "verify.selection is 'pr'" });
+    expect(describeGate(gate)).toContain("selection mode: pr — whole PR diff vs origin/main (verify.selection is 'pr')");
+  });
+
   it('uncommitted fixer edits on top of the delta are part of the selection', () => {
     markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
     commit('fixer', { 'scripts/lib/b.mjs': 'export const b = 2;\n' });
