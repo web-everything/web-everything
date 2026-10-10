@@ -1,20 +1,16 @@
 ---
-kind: story
-size: 3
-parent: "4075"
+bornAs: xcnbnk2
+kind: task
+parent: "5712"
 status: open
-scope: ["we:scripts/lib/pr-limit.mjs", "we:scripts/lib/__tests__/pr-limit.test.mjs"]
-dateOpened: "2026-10-10"
+scope: ["we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
+dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Require isDraft === true for the exemption and add a deterministic counter regression test compar… (from web-everything/web-everything#4785 review)
+# Resource service: register the sampler supervisor as a managed daemon in daemon-manifest
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-
-1. `we:scripts/lib/pr-limit.mjs:87` — Require isDraft === true for the exemption and add a deterministic counter regression test comparing draft and non-draft PRs with identical qualifying labels and base chains.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4785@e0f5f964d0aed199d9328f486c8cb06217b867d9
+Split out of 5714: the sampler (com.we.resource-sampler, PR #4722) runs as a hand-loaded launchd agent; register it in we:skills-src/conveyor/daemon-manifest.mjs so daemon-status/self-sync manage it. Deferred from slice 2 because PR #4691 (review:changes/human) holds both manifest files.
 
 ## Acceptance
 
