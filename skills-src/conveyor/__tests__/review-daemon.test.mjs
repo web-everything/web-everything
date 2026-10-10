@@ -720,6 +720,37 @@ describe('runReviewTick — #4133 shared reads (opt-in via readPrs/readAgents)',
     expect(out.reconcileError).toBe('gh: rate limited');
     expect(out.dispatched).toEqual([]);
   });
+
+  // Live 2026-10-09 22:43Z-00:00Z: the drain's self-sync smoke was rejected 3 times with only
+  // "Command failed: gh pr list ... --json <16 fields>" — the error's first line is the command, gh's stderr
+  // (the actual cause) sat on line 2+ and was dropped, then the held-state detail was cut at 300 chars.
+  it('an execFileSync "Command failed" keeps gh stderr, cause FIRST, so a downstream 300-char cut never drops it', () => {
+    const cmd = 'gh pr list --repo web-everything/web-everything --state open --limit 35 --json number,title,body,url,isDraft,createdAt,updatedAt,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,labels,files,comments,statusCheckRollup';
+    const readPrs = () => {
+      const err = new Error(`Command failed: ${cmd}\nGraphQL: Something went wrong while executing your query. This may be the result of a timeout.\n`);
+      err.status = 1;
+      err.stderr = 'GraphQL: Something went wrong while executing your query. This may be the result of a timeout.\n';
+      throw err;
+    };
+    const out = runReviewTick({ reconcile: () => ({ dispatch: [], refusals: [] }), readPrs, readAgents: () => [], dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(out.reconcileError.slice(0, 300)).toContain('Something went wrong while executing your query');
+    expect(out.reconcileError).toContain('exit 1');
+    expect(out.reconcileError).toContain('gh pr list');
+  });
+
+  it('a "Command failed" with EMPTY stderr says so explicitly instead of looking like a truncation', () => {
+    const readPrs = () => { const err = new Error('Command failed: gh pr list --repo a/b'); err.status = null; err.signal = 'SIGKILL'; err.stderr = ''; throw err; };
+    const out = runReviewTick({ reconcile: () => ({ dispatch: [], refusals: [] }), readPrs, readAgents: () => [], dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(out.reconcileError).toContain('no output');
+    expect(out.reconcileError).toContain('SIGKILL');
+  });
+
+  it('never carries a token-shaped string from stderr into reconcileError', () => {
+    const readPrs = () => { const err = new Error('Command failed: gh pr list'); err.status = 1; err.stderr = 'HTTP 401: Bad credentials (token ghs_abcdefghijklmnopqrstuvwxyz0123456789)\n'; throw err; };
+    const out = runReviewTick({ reconcile: () => ({ dispatch: [], refusals: [] }), readPrs, readAgents: () => [], dispatch: () => ({}), tagRound: () => {}, tagStatus: () => {}, statusCandidates: () => [] });
+    expect(out.reconcileError).toContain('HTTP 401');
+    expect(out.reconcileError).not.toMatch(/ghs_[A-Za-z0-9]{10}/);
+  });
 });
 
 describe('runReviewTick — real dispatchReview contract (regression, #3876 live-caught)', () => {

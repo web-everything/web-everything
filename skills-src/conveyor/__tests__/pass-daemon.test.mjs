@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import {
   runPassDaemonLoop, passDaemonLeaseKey, realSleep, DEFAULT_HEARTBEAT_INTERVAL_MS,
   PASS_DAEMON_SELF_SYNC_ENV, passDaemonSelfSyncEnabled, MAIN_ONLY_PASSES, spawnPassOnce,
-  waitForManifestEntry,
+  waitForManifestEntry, passEnvFor,
 } from '../pass-daemon.mjs';
 import { DAEMON_MANIFEST } from '../daemon-manifest.mjs';
 import { withSelfSync, DAEMON_SELF_SYNC_BRANCH_ENV } from '../../../scripts/lib/daemon-self-sync.mjs';
@@ -357,5 +357,22 @@ describe('who watches the watcher — consecutive failed runs raise an operator 
     expect(sent[0].title).toMatch(/health-watch is failing/);
     expect(sent[0].body).toMatch(/2 runs in a row/);
     expect(lines[0]).toMatch(/ALERT/);
+  });
+});
+
+describe('passEnvFor — the pass child env is read at spawn time (2026-10-09 personal-login leak)', () => {
+  it('sees the gh shim PATH that refreshAuth put on the env AFTER the daemon started', () => {
+    const env = { PATH: '/usr/bin' };
+    const atStart = passEnvFor('lease-reaper', env); // BEFORE: the old code spawned every pass with this snapshot
+    env.PATH = '/home/.claude/github-app-token/gh-shim.d/abc:/usr/bin'; // what per-owner refreshAuth does
+    expect(atStart.PATH).toBe('/usr/bin');
+    expect(passEnvFor('lease-reaper', env)).toEqual({ PATH: '/home/.claude/github-app-token/gh-shim.d/abc:/usr/bin', GH_CALLER: 'lease-reaper' });
+  });
+
+  it('main() builds the env per spawn, never once before the loop', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync(fileURLToPath(new URL('../pass-daemon.mjs', import.meta.url)), 'utf8');
+    expect(src).not.toMatch(/const passEnv = \{ \.\.\.process\.env/);
+    expect(src).toMatch(/env: passEnv\(\)/);
   });
 });

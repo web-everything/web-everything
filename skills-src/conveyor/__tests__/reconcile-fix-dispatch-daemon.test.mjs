@@ -1276,3 +1276,41 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     expect(src).toMatch(/\n  awaitLoop\.start\(\);\n/);
   });
 });
+
+describe('fix daemon pass timing', () => {
+  it('formats finite phases slowest first, or returns null without timing', async () => {
+    const { formatPassTiming } = await import('../reconcile-fix-dispatch-daemon.mjs');
+    expect(formatPassTiming({ passMs: 12000, phaseMs: { notes: 1000, 'ci-heal': 2000, fix: 9000, bad: NaN } }))
+      .toBe('pass-timing total 12.0s — fix 9.0s, ci-heal 2.0s, notes 1.0s');
+    expect(formatPassTiming({ passMs: 0, phaseMs: {} })).toBe('pass-timing total 0.0s — no phases');
+    for (const result of [undefined, null, {}, { passMs: 12 }, { phaseMs: {} }, { phaseMs: {}, passMs: Infinity }]) {
+      expect(formatPassTiming(result)).toBeNull();
+    }
+  });
+
+  it('measures every injected half and logs timing immediately after the tick summary', async () => {
+    let time = 0;
+    const result = await runTickAllRepos({
+      repos: ['test/repo'], now: () => { time += 100; return time; },
+      fixTick: () => ({ dispatched: [], refusals: [] }),
+      ciHealTick: async () => ({ dispatched: [], refusals: [] }),
+      hungCiTick: noopHungCiTick, mainRedRebaseTick: noopMainRedRebaseTick,
+      missingRunTick: noopMissingRunTick, promoteDraftTick: noopPromoteDraftTick, notesTick: noopNotesTick,
+      awaitVerifyTick: async () => ({ rows: [] }), stuckFixerTick: async () => ({ rows: [] }),
+      supersedeTick: ({ repo }) => ({ repo, holds: [], applied: [] }),
+      authGateOverride: () => ({ paused: false, reason: null }),
+    });
+    expect(Object.keys(result.phaseMs).sort()).toEqual([
+      'fix', 'ci-heal', 'hung-ci', 'main-red-rebase', 'missing-run', 'promote-draft', 'notes',
+      'auth-gate', 'await-verify', 'stuck-fixers', 'supersede',
+    ].sort());
+    for (const ms of Object.values(result.phaseMs)) expect(ms).toBeGreaterThan(0);
+    expect(result.passMs).toBeGreaterThanOrEqual(Object.values(result.phaseMs).reduce((a, b) => a + b, 0));
+    expect(result.refusals).toEqual([]);
+    const lines = [];
+    buildCliDaemonEffects({ owner: 't', log: { error: (line) => lines.push(line) } }).onTick(result);
+    const summary = lines.findIndex((line) => line.includes('tick ('));
+    expect(summary).toBeGreaterThanOrEqual(0);
+    expect(lines[summary + 1]).toContain('pass-timing total');
+  });
+});

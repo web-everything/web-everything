@@ -3787,6 +3787,108 @@ const r = cp.spawnSync(${JSON.stringify(realGit)}, process.argv.slice(2), {stdio
   });
 });
 
+// Held item 177 — the stack carry's pinned accept: `--to=accepted --expect-head=<sha> --expect-fingerprint=<sha256>` accepts
+// exactly the compared commit and net diff, and refuses (no comment, no label) when either differs. Real git objects and a
+// local forge, like the guarded restamp above.
+describe('pinned accept write boundary (stack carry, held item 177)', () => {
+  const script = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'review-set-label.mjs');
+  let dir, git, head, pushedHead, diff;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'pinned-accept-'));
+    git = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    git('init', '-b', 'main'); git('config', 'user.name', 'Replay'); git('config', 'user.email', 'replay@example.test');
+    writeFileSync(join(dir, 'source.js'), 'export const value = 1;\n');
+    git('add', '.'); git('commit', '-m', 'base');
+    const base = git('rev-parse', 'HEAD');
+    git('checkout', '-b', 'lane');
+    writeFileSync(join(dir, 'source.js'), 'export const value = 2;\n');
+    git('commit', '-am', 'the compared change'); head = git('rev-parse', 'HEAD');
+    diff = git('diff', base, head);
+    // A push that lands after the caller compared `head`: the branch now holds a different, never compared diff.
+    writeFileSync(join(dir, 'source.js'), 'export const value = 3;\n');
+    git('commit', '-am', 'a push in the gap'); pushedHead = git('rev-parse', 'HEAD');
+    git('checkout', 'main'); git('remote', 'add', 'origin', dir);
+    mkdirSync(join(dir, 'bin'));
+    writeFileSync(join(dir, 'bin', 'gh'), `#!${process.execPath}
+const fs = require('node:fs');
+const a = process.argv.slice(2), s = JSON.parse(fs.readFileSync('state.json', 'utf8'));
+fs.appendFileSync('calls.jsonl', JSON.stringify(a) + '\\n');
+if (a[0] === 'pr' && a[1] === 'view') {
+ s.reads = (s.reads || 0) + 1;
+ if (s.race === 'head' && s.reads >= 2) s.headRefOid = s.racedHead;
+ console.log(JSON.stringify(s));
+} else if (a[0] === 'pr' && a[1] === 'comment') {
+ s.comments.push({author:{login:'web-everything'}, body: fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8')});
+} else if (a[0] === 'pr' && a[1] === 'edit') {
+ const add = a.flatMap((x, i) => (x === '--add-label' ? [a[i + 1]] : []));
+ const rm = a.flatMap((x, i) => (x === '--remove-label' ? [a[i + 1]] : []));
+ s.labels = s.labels.filter(l => !rm.includes(l.name)).concat(add.map(name => ({name})));
+} else { console.error('unexpected forge call', a); process.exit(1); }
+fs.writeFileSync('state.json', JSON.stringify(s));
+`);
+    chmodSync(join(dir, 'bin', 'gh'), 0o755);
+    writeFileSync(join(dir, 'verdict.md'), 'Stacked accept carried forward.\n');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function run({ livehead = head, expectHead = head, expectFingerprint = normalizeDiffFingerprint(diff), race, extra = [] } = {}) {
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({
+      number: 42, title: 'a stacked top', body: '', state: 'OPEN', isDraft: false, headRefOid: livehead, headRefName: 'lane',
+      labels: [{ name: 'review:pending' }], comments: [], race, racedHead: pushedHead,
+    }));
+    const r = spawnSync(process.execPath, [script, '42', '--repo=web-everything/web-everything', '--to=accepted', '--actor=carry',
+      '--body-file=verdict.md', ...(expectHead === null ? [] : [`--expect-head=${expectHead}`]),
+      ...(expectFingerprint === null ? [] : [`--expect-fingerprint=${expectFingerprint}`]), ...extra], {
+      cwd: dir, encoding: 'utf8', env: { ...process.env, PATH: `${join(dir, 'bin')}:${process.env.PATH}`, CLAUDE_CODE_SESSION_ID: 'carry-session',
+        WE_VERDICT_LEDGER_DIR: join(dir, 'ledger'), WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'lock') },
+    });
+    const final = JSON.parse(readFileSync(join(dir, 'state.json'), 'utf8'));
+    const calls = existsSync(join(dir, 'calls.jsonl')) ? readFileSync(join(dir, 'calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse) : [];
+    return { r, final, calls, wrote: calls.some(a => a[1] === 'comment' || a[1] === 'edit') };
+  }
+  const refused = (result) => {
+    expect(result.r.status, result.r.stdout + result.r.stderr).not.toBe(0);
+    expect(result.wrote, JSON.stringify(result.calls)).toBe(false);
+    expect(result.final.labels).toEqual([{ name: 'review:pending' }]);
+    expect(result.final.comments).toEqual([]);
+    // Nothing durable at all: not even the shadow ledger row.
+    expect(existsSync(join(dir, 'ledger'))).toBe(false);
+  };
+
+  it('accepts exactly the compared head and net diff, stamping that head', () => {
+    const result = run();
+    expect(result.r.status, result.r.stdout + result.r.stderr).toBe(0);
+    expect(result.final.labels.map(l => l.name)).toContain('review:accepted');
+    expect(parseReviewedSha(result.final.comments)).toBe(head);
+    expect(parseReviewedDiff(result.final.comments)).toBe(normalizeDiffFingerprint(diff));
+  });
+  it('refuses when a push moved the live head after the comparison (the race the pin closes)', () => {
+    refused(run({ livehead: pushedHead }));
+  });
+  it('refuses when the head moves between the writer\'s first and second read', () => {
+    refused(run({ race: 'head' }));
+  });
+  it('refuses when the pinned commit\'s net diff differs from the compared fingerprint', () => {
+    refused(run({ expectFingerprint: normalizeDiffFingerprint(diff.replace('+export const value = 2', '+export const value = 9')) }));
+  });
+  it('refuses an unresolvable pinned commit (unscored, fail closed — no unpinned fallback)', () => {
+    refused(run({ livehead: 'b'.repeat(40), expectHead: 'b'.repeat(40) }));
+  });
+  it.each([
+    ['no fingerprint', () => ({ expectFingerprint: null })],
+    ['no head', () => ({ expectHead: null })],
+    ['a short head', () => ({ expectHead: head.slice(0, 10) })],
+    ['a short fingerprint', () => ({ expectFingerprint: 'abc123' })],
+    ['--new-head', () => ({ extra: [`--new-head=${head}`] })],
+  ])('refuses a half-pinned or malformed pin: %s', (_name, over) => refused(run(over())));
+  it('rejects --expect-fingerprint on any other target', () => {
+    const r = spawnSync(process.execPath, [script, '42', '--repo=web-everything/web-everything', '--to=changes', '--actor=x',
+      '--body-file=verdict.md', `--expect-fingerprint=${'a'.repeat(64)}`], { cwd: dir, encoding: 'utf8' });
+    expect(r.status).not.toBe(0);
+    expect(r.stdout + r.stderr).toMatch(/--expect-fingerprint is only valid with --to=accepted/);
+  });
+});
+
 describe('xe8y12n missing-only rearm boundary', () => {
   it.each([[], ['bug'], ['redteam:accepted']].map(labels => [labels]))('permits a valid empty family %j', labels => {
     const result = decideSetLabel({ to: 'rearm', requireLive: 'missing', currentLabels: labels });

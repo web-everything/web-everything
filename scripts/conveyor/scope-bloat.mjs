@@ -28,6 +28,7 @@ import { countRebaseOntoMainComments } from './main-red-recovery.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { coversFile } from '../readiness/scope-lease.mjs';
 import { readNetSets, resolveNetScopeSettings, scopeFilesFor } from './net-scope.mjs';
+import { readStackBases, stackNetFiles } from './review-stack-base.mjs';
 
 export const SCOPE_BLOAT_REASON = 'scope-bloat';
 export const SCOPE_BLOAT_DEFAULTS = Object.freeze({ alreadyOnMain: 3, outsideScope: 10, minFiles: 12 });
@@ -201,9 +202,20 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
   // still diffs against the PR's old base after a merge of `main` and stops at 100 files. Real git only when the
   // other reads are real too (a test that injects `readNet` never shells out); `null` = GitHub's list (today).
   readMergeBaseNet = readNet === readNetFiles ? ((pr) => readNetSets([pr], { dir: root }).get(pr.number)) : null,
-  netScope = resolveNetScopeSettings(env) } = {}) {
+  netScope = resolveNetScopeSettings(env),
+  // Held item 177 — stack-aware review. A stacked top's own change is its diff from the stack base (the bottom PR's
+  // head merged into its merge-base with main), not from main: judged against main, #4631 carried #4624's 13 files and
+  // was refused as scope-bloat until #4624 landed. Real git only when the other reads are real too (a test injecting
+  // `readNet` never shells out); injectable; `null` = no stack detection (today).
+  readStacks = readNet === readNetFiles ? ((list) => readStackBases({ root, env, prs: list })) : null,
+  readStackFiles = (base) => stackNetFiles({ tree: base.tree, topHead: base.topHead, root }) } = {}) {
   if (!Array.isArray(prs) || (repo && repoKeyForSlug(repo) !== 'we')) return prs;
   const limits = scopeBloatLimits(env);
+  let stacks = null; // read once per call, lazily, and only when some PR is big enough to be judged at all
+  const stackBases = () => {
+    if (stacks == null) { try { stacks = (readStacks && readStacks(prs.filter((p) => p && !p.isDraft))) || new Map(); } catch { stacks = new Map(); } }
+    return stacks;
+  };
   let baseSha = null; // read once per call, lazily: a pass over PRs that all fail the cheap checks never shells out
   const baseTip = () => {
     if (baseSha == null) { try { baseSha = readBase({ base: defaultBranch, root }) || 'unknown'; } catch { baseSha = 'unknown'; } }
@@ -216,7 +228,21 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
       // costs one failed read (cat-file, fetch, diff; 30 s each) rather than one per main advance.
       const headKey = `${pr.number}:${pr.headRefOid}`;
       if (unreadable.has(headKey)) return pr;
-      const key = `${headKey}:${baseTip()}`;
+      const listed = pr.files.length;
+      const stackBase = listed >= Math.min(limits.alreadyOnMain || Infinity, limits.minFiles || Infinity) ? stackBases().get(Number(pr.number)) ?? null : null;
+      const stackInfo = stackBase ? { pr: stackBase.pr, ref: stackBase.ref, head: stackBase.head, contained: stackBase.contained } : null;
+      const key = `${headKey}:${baseTip()}${stackBase ? `:stack:${stackBase.tree}` : ''}`;
+      if (!memo.has(key) && stackBase) {
+        // A stacked top: its own files are the diff from the stack base. They are by construction not on main and are
+        // judged against the card's scope as usual. An unreadable stack diff falls through to the main basis (today).
+        let own = null;
+        try { own = readStackFiles(stackBase); } catch { own = null; }
+        if (Array.isArray(own)) {
+          const scope = scopeSignalOn(limits) && own.length >= limits.minFiles ? readScope({ title: pr.title ?? '', base: defaultBranch, root }) : null;
+          memo.set(key, assessScopeBloat({ prFiles: own, netFiles: own, cardScope: scope, env }));
+          if (memo.size > 500) memo.delete(memo.keys().next().value);
+        }
+      }
       if (!memo.has(key)) {
         let mergeBaseNet = null;
         if (netScope?.scopeBloat && readMergeBaseNet) { try { mergeBaseNet = readMergeBaseNet(pr); } catch { mergeBaseNet = null; } }
@@ -237,7 +263,8 @@ export function enrichPrsWithScopeBloat(prs, { repo = null, defaultBranch = 'mai
       // because the fix daemon is another process and must see that the refresh was tried.
       const refresh = bloat ? (scopeBloatRefreshFor(pr.number, pr.headRefOid)
         ?? (countRebaseOntoMainComments(pr.comments, pr.headRefOid) > 0 ? { attempted: true, ok: null, action: 'marker', error: null } : null)) : null;
-      return bloat ? { ...pr, scopeBloat: refresh ? { ...bloat, refresh } : bloat } : pr;
+      const withStack = stackInfo ? { ...pr, stackBase: stackInfo } : pr;
+      return bloat ? { ...withStack, scopeBloat: refresh ? { ...bloat, refresh } : bloat } : withStack;
     } catch { return pr; }
   });
 }
