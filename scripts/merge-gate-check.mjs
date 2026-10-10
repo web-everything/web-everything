@@ -179,6 +179,15 @@ export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'mai
   return groupMembership({ headRef, headSha, entries, commits, commitsRead, resolved });
 }
 
+/**
+ * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
+ * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
+ * queue merge; otherwise a pull_request run. `evaluatePrGates` may hand a gate to the drain only for the latter.
+ */
+export function mergeEventOfFlags(f, env = process.env) {
+  return f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group' ? 'merge_group' : 'pull_request';
+}
+
 async function main() {
   const f = parseArgs(process.argv.slice(2));
   const repo = typeof f.repo === 'string' ? f.repo : process.env.GITHUB_REPOSITORY;
@@ -205,6 +214,7 @@ async function main() {
       const d = join(resolve(f['group-tree']), 'backlog');
       groupDup = existsSync(d) ? findDuplicateIds(d) : [{ id: `group tree has no backlog dir (${d})` }];
     }
+    // Without --group-tree, evaluatePrGates fails duplicate-id-on-main closed for every PR on this merge_group run.
   } else {
     nums = String(f.pr || '').split(',').map((x) => Number(x.trim())).filter((x) => Number.isInteger(x) && x > 0);
     if (!nums.length) { process.stderr.write('merge-gate-check: --pr=<n>[,<n>…] or --merge-group required\n'); process.exit(3); }
@@ -212,7 +222,7 @@ async function main() {
 
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
   const ledgerConfig = readLedgerConfig();
-  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig }), { policy, blockOnCodeQL }));
+  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig }), { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
   const verdict = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, policy, prs }, null, 2)}\n`);
   else {
