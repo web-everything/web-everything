@@ -151,7 +151,7 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
   it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper re-park; the test-gaming re-park goes through applyTestGamingParkLabel', () => {
     expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(2);
     // PR #4631 round 4 (F2): the test-gaming site writes its row only after a LIVE label read (the function's own
-    // default `record` is recordDrainVerdict), still ledger-before-label, and the runCli site hands it the live reader.
+    // default `record` is recordDrainVerdict), live read, add, then row, and the runCli site hands it the live reader.
     const site = src.indexOf('const parkedLabel = applyTestGamingParkLabel({');
     expect(site).toBeGreaterThan(-1);
     expect(src.indexOf("'--json', 'labels']", site)).toBeGreaterThan(site);
@@ -161,8 +161,9 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
     const add = src.indexOf('addLabel(label)', fn);
     expect(fn).toBeGreaterThan(-1);
     expect(read).toBeGreaterThan(fn);
-    expect(record).toBeGreaterThan(read);
-    expect(add).toBeGreaterThan(record);
+    // live read -> the add -> the attested row (the ledger write must not sit inside the read-to-add window).
+    expect(add).toBeGreaterThan(read);
+    expect(record).toBeGreaterThan(add);
   });
 
   it('the call sits inside the shouldApplyReviewLabel guard, AHEAD of the `gh pr edit --add-label` transport call', () => {

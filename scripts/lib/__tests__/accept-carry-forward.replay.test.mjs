@@ -10,10 +10,11 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import {
-  decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE, decideMechanicalHold,
+  decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE, decideMechanicalHold, LIVE_LABEL_ATTESTATION,
   laterReviewHold, isKnownMachineBody,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
+import { buildVerdictRecord } from '../verdict-ledger.mjs';
 import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
 import {
   readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND,
@@ -37,6 +38,13 @@ const OTHER_FP = 'a'.repeat(64);
 // `MECHANICAL_PARK_RE` / `TEST_GAMING_PARK_REASON_RE` anchor on this text, so a reworded drain park must redden the tests.
 const PARK_REASON = buildTestGamingParkReason(['1 test removed']);
 const parkBody = (reason) => buildDrainReasonComment('park', reason);
+// A drain park ledger row in the REAL record shape (`buildVerdictRecord`), attested the way `applyTestGamingParkLabel`
+// stamps it; `over` overrides top-level fields, so a rename of `actor.declared` / `actor.session` reddens these tests.
+const parkRow = (at, over = {}) => ({
+  ...buildVerdictRecord({ repo: 'web-everything/web-everything', pr: 5, verdict: 'human', at, reason: PARK_REASON,
+    declaredActor: 'drain', source: 'merge-ai-prs', session: LIVE_LABEL_ATTESTATION }),
+  ...over,
+});
 const OLD = fx.acceptedHead;
 const NEW = fx.newHead;
 
@@ -327,8 +335,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
 
   // The live #4535 evidence shape: the drain ledgered its test-gaming park, then added the label 9 s later.
   const PARK_AT = '2026-10-09T14:36:41.318Z';
-  const dRow = (over = {}) => ({ pr: 9, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: PARK_AT,
-    reason: PARK_REASON, ...over });
+  const dRow = (over = {}) => parkRow(PARK_AT, { pr: 9, ...over });
   const labeledAt = (created_at, login = 'chalbert') => ({ event: 'labeled', created_at, label: { name: 'review:human' }, actor: { login } });
   const MECHANICAL = { ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] };
 
@@ -610,7 +617,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
 describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
   const T = Date.parse('2026-10-09T14:36:41.318Z');
   const iso = (ms) => new Date(T + ms).toISOString();
-  const row = (over = {}) => ({ pr: 5, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: iso(0), reason: PARK_REASON, ...over });
+  const row = (over = {}) => parkRow(iso(0), over);
   const ev = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: 'review:human' } });
   const decide = (o) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows: [row()], events: [ev(9_000)], ...o });
 
@@ -664,24 +671,44 @@ describe('applyTestGamingParkLabel — only a live-absent label is attested as t
   const iso = (ms) => new Date(T + ms).toISOString();
   const LABEL = 'review:human';
   const operatorAdd = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: LABEL } });
-  const run = (live) => {
+  const run = (live, failAdd = false) => {
     const log = [];
     const rows = [];
     const out = applyTestGamingParkLabel({
       repo: 'web-everything/web-everything', pr: 5, label: LABEL, reason: buildTestGamingParkReason(['1 test removed']), headSha: 'a'.repeat(40),
       readLiveLabels: typeof live === 'function' ? live : () => live,
-      record: (o) => { log.push('record'); rows.push({ pr: o.pr, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: iso(0), reason: o.reason }); return { ok: true, errors: [] }; },
-      addLabel: (l) => { log.push(`add:${l}`); },
+      // The row is built by the real record builder from exactly what the writer passes, so a dropped attestation reddens.
+      record: (o) => {
+        log.push('record');
+        rows.push(buildVerdictRecord({ repo: o.repo, pr: o.pr, verdict: 'human', at: iso(500), reason: o.reason, declaredActor: 'drain', source: 'merge-ai-prs', session: o.session }));
+        return { ok: true, errors: [] };
+      },
+      addLabel: (l) => { if (failAdd) throw new Error('gh down'); log.push(`add:${l}`); },
     });
     return { out, log, rows };
   };
   const decide = (rows, events) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows, events });
 
-  it('positive control (#4535): label absent live -> ledger row FIRST, then the add; the pairing is mechanical', () => {
+  it('positive control (#4535): label absent live -> the add FIRST, then an attested ledger row; the pairing is mechanical', () => {
     const { out, log, rows } = run([{ name: 'ready-to-merge' }]);
-    expect(log).toEqual(['record', `add:${LABEL}`]);
+    // The row must not sit between the live read and the add (a ledger write is seconds; the add is the one round trip).
+    expect(log).toEqual([`add:${LABEL}`, 'record']);
     expect(out).toMatchObject({ ledgered: true, added: true });
+    expect(rows[0].actor.session).toBe(LIVE_LABEL_ATTESTATION);
+    // The label event lands just BEFORE the row (add, then row), inside the early pairing slack.
+    expect(decide(rows, [operatorAdd(-400)]).mechanical).toBe(true);
     expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(true);
+  });
+  it('a failed add writes NO row (a row must never claim an add that threw)', () => {
+    const { out, log, rows } = run([], true);
+    expect(log).toEqual([]);
+    expect(out).toMatchObject({ ledgered: false, added: false });
+    expect(rows).toEqual([]);
+  });
+  it('a row from an older drain build (no live-read attestation) is not proof of a mechanical hold', () => {
+    const legacy = buildVerdictRecord({ repo: 'web-everything/web-everything', pr: 5, verdict: 'human', at: iso(0), reason: buildTestGamingParkReason(['x']), declaredActor: 'drain', source: 'merge-ai-prs' });
+    expect(decide([legacy], [operatorAdd(9_000)])).toMatchObject({ mechanical: false });
+    expect(decide([legacy], [operatorAdd(9_000)]).reason).toMatch(/no drain test-gaming park is ledgered/);
   });
   // NARROWED, NOT CLOSED: if the operator's label lands AFTER this live read and before the drain's add (one `gh` round
   // trip), the add is still a no-op and one event pairs with the row. GitHub has no compare-and-swap on labels and the
@@ -705,9 +732,7 @@ describe('applyTestGamingParkLabel — only a live-absent label is attested as t
       expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(false);
     }
   });
-  it('a failing add is best-effort (the park comment and ledger still stand); a failing ledger append never blocks the add', () => {
-    const failingAdd = applyTestGamingParkLabel({ repo: 'a/b', pr: 5, label: LABEL, reason: 'r', readLiveLabels: () => [], addLabel: () => { throw new Error('x'); }, record: () => ({ ok: true, errors: [] }) });
-    expect(failingAdd).toMatchObject({ ledgered: true, added: false });
+  it('a failing ledger append never blocks or undoes the add', () => {
     const failingRecord = applyTestGamingParkLabel({ repo: 'a/b', pr: 5, label: LABEL, reason: 'r', readLiveLabels: () => [], addLabel: () => {}, record: () => ({ ok: false, errors: ['disk full'] }) });
     expect(failingRecord).toMatchObject({ ledgered: false, added: true, errors: ['disk full'] });
   });

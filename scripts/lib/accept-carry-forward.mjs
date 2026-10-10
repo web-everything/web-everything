@@ -221,12 +221,24 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
 
 /** The drain's anti-test-gaming re-park, as its verdict-ledger row spells the reason (`merge-ai-prs.mjs`). */
 const TEST_GAMING_PARK_REASON_RE = /^\s*test-gaming suspected\s+[—-]/i;
-/** The drain writes the ledger row BEFORE it adds the label (live #4535: row 14:36:41, `labeled review:human` 14:36:50). */
-export const HOLD_PAIR_EARLY_MS = 5_000;
+/**
+ * The `actor.session` stamp on a drain park row, written by `applyTestGamingParkLabel` (`merge-ai-prs.mjs`) only AFTER a
+ * live label read showed `review:human` absent and the drain's own add succeeded (PR #4631 round 4, F2). A row without
+ * it — from an older drain build that wrote the row before the add, with no live read — proves nothing about who put the
+ * label there, so it is not accepted as proof of a mechanical hold.
+ */
+export const LIVE_LABEL_ATTESTATION = 'live-label-absent-v1';
+/**
+ * The drain now writes the ledger row just AFTER its label add (round 4; the old order was row first, live #4535: row
+ * 14:36:41, `labeled review:human` 14:36:50), so the label event may precede the row by the add's round trip plus clock
+ * skew between GitHub and this host; the late window still covers the old order's observed gap.
+ */
+export const HOLD_PAIR_EARLY_MS = 15_000;
 export const HOLD_PAIR_LATE_MS = 120_000;
 
 const msOf = (iso) => { const t = Date.parse(String(iso ?? '')); return Number.isFinite(t) ? t : null; };
 const isDrainTestGamingPark = (r) => r?.verdict === 'human' && r?.source === 'merge-ai-prs' && r?.actor?.declared === 'drain'
+  && r?.actor?.session === LIVE_LABEL_ATTESTATION
   && TEST_GAMING_PARK_REASON_RE.test(String(r?.reason ?? ''));
 
 /**

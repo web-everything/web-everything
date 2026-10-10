@@ -194,7 +194,7 @@ import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
-import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, LIVE_LABEL_ATTESTATION } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -2711,8 +2711,8 @@ const auditLineFor = (x) => x.hasManifest ? manifestAuditLine(x) : undefined;
  * @param {{repo: string, pr: number|string, applyLabel: string, reason?: string, headSha?: string|null}} o
  * @returns {{ok: boolean, errors: string[]}}
  */
-export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha = null } = {}) {
-  return recordParkVerdict({ repo, pr, applyLabel, reason, headSha, declaredActor: 'drain', source: 'merge-ai-prs' });
+export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha = null, session = '' } = {}) {
+  return recordParkVerdict({ repo, pr, applyLabel, reason, headSha, declaredActor: 'drain', source: 'merge-ai-prs', session });
 }
 
 /**
@@ -2724,13 +2724,13 @@ export function recordDrainVerdict({ repo, pr, applyLabel, reason = '', headSha 
  * @param {{repo: string, pr: number|string, applyLabel: string, reason?: string, headSha?: string|null, declaredActor: string, source: string}} o
  * @returns {{ok: boolean, errors: string[]}}
  */
-export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha = null, declaredActor, source } = {}) {
+export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha = null, declaredActor, source, session = '' } = {}) {
   const verdict = labelVerdictOf([applyLabel]);
   if (!verdict) return { ok: false, errors: [`no VERDICTS member for label ${JSON.stringify(applyLabel)}`] };
   try {
     const appended = appendVerdict(buildVerdictRecord({
       repo, pr, verdict, at: new Date().toISOString(), reason, headSha,
-      declaredActor, source,
+      declaredActor, source, session,
     }));
     return appended.ok ? { ok: true, errors: [] } : { ok: false, errors: appended.errors };
   } catch (e) {
@@ -2766,8 +2766,14 @@ export function buildTestGamingParkReason(reasons, stackedOrigin = null, stacked
  *   - `review:human` already stands -> the drain's add changes nothing and attributes nothing: NO ledger row, no add;
  *   - the live read failed -> the hold is still placed (placing it is the safe direction) but NO row is written, so the
  *     origin is unattested and the restamp refuses (fails closed toward a human re-review);
- *   - absent -> row first (the rule pairs the label event with it), then the add.
- * The one window left is the gap between this live read and the add (one `gh` round trip); GitHub has no
+ *   - absent -> the add FIRST, then (only if the add succeeded) the row, stamped {@link LIVE_LABEL_ATTESTATION}. The
+ *     ledger write (a home write plus a git push with retries, seconds or more) must NOT sit between the live read
+ *     and the add, or the window an operator's label can slip into is a ledger write, not a round trip; and a row
+ *     must never claim an add that threw. The row therefore lands just AFTER the label event, which the rule's early
+ *     pairing slack ({@link HOLD_PAIR_EARLY_MS}) covers. A crash between add and row leaves a hold with no row: the
+ *     restamp refuses (safe direction).
+ * The attestation stamp is what makes rows from an older drain build (unattested, written before the add) unusable as
+ * proof. The one window left is the gap between this live read and the add (one `gh` round trip); GitHub has no
  * compare-and-swap on labels, so it cannot be closed from the client — it is narrowed from "the whole batch" to that.
  * @param {{repo:string, pr:number|string, label:string, reason:string, headSha?:string|null,
  *   readLiveLabels:() => Array<string|{name?:string}>|null, addLabel:(label:string) => void, record?:Function}} o
@@ -2779,13 +2785,15 @@ export function applyTestGamingParkLabel({ repo, pr, label, reason, headSha = nu
   if (Array.isArray(live) && hasReviewLabel(live, label)) {
     return { ledgered: false, added: false, errors: [], note: `${label} already stood when the drain went to re-park; its add would be a no-op, so no ledger row claims that hold` };
   }
-  let ledgered = { ok: false, errors: [] };
-  if (Array.isArray(live)) ledgered = record({ repo, pr, applyLabel: label, reason, headSha });
   let added = false;
   try { addLabel(label); added = true; } catch { /* label best-effort */ }
+  let ledgered = { ok: false, errors: [] };
+  if (added && Array.isArray(live)) ledgered = record({ repo, pr, applyLabel: label, reason, headSha, session: LIVE_LABEL_ATTESTATION });
   return {
     ledgered: !!ledgered.ok, added, errors: ledgered.errors || [],
-    note: Array.isArray(live) ? 'live labels read; hold origin attested by the ledger row' : 'live labels unreadable; hold placed but its origin is not attested (no ledger row)',
+    note: !added ? 'the label add failed; no ledger row claims it'
+      : Array.isArray(live) ? 'live labels read; hold origin attested by the ledger row'
+        : 'live labels unreadable; hold placed but its origin is not attested (no ledger row)',
   };
 }
 
@@ -5283,7 +5291,7 @@ async function runCli() {
             // LIVE read shows the label absent, so it attests the add was the drain's (see applyTestGamingParkLabel).
             const parkedLabel = applyTestGamingParkLabel({
               repo: v.repo || localSlug, pr: v.num, label: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null,
-              readLiveLabels: () => JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').labels ?? null,
+              readLiveLabels: () => JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim() || '{}').labels ?? null,
               addLabel: (l) => execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', l], { stdio: ['ignore', 'ignore', 'pipe'] }),
             });
             if ((parkedLabel.errors.length || !parkedLabel.ledgered) && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${parkedLabel.errors.join('; ') || parkedLabel.note}\n`);
