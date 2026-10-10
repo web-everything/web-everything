@@ -39,10 +39,20 @@ it('opens through park then immediately holds, and refreshes the body on later p
   await publishBatch(f.input, f.opts);
   const index = f.calls.findIndex(call => call.includes('open-pr'));
   expect(f.calls[index]).toContain('--mode=park');
+  // The held draft opens before any verify; pr-land's marker requirement is waived for it (live: refused `unverified`).
+  const openOptions = f.exec.mock.calls.find(([, args]) => args[1] === 'open-pr')[2];
+  expect(openOptions.env.WE_REQUIRE_VERIFIED).toBe('0');
   expect(f.calls[index + 1]).toEqual(['gh', 'pr', 'edit', '9', '--repo', 'org/repo', '--add-label', HOLD_LABEL]);
   expect(f.calls.some(call => call.includes('create'))).toBe(false);
   await publishBatch(f.input, f.opts);
   expect(f.calls.at(-1)).toContain('--body-file');
+});
+it('the sealing label-on-green keeps the verify requirement (no waiver)', async () => {
+  const f = fixture({ maxCards: 1 });
+  expect((await publishBatch(f.input, f.opts)).action).toBe('sealed');
+  const [, args, options] = f.exec.mock.calls.find(([, a]) => a[1] === 'open-pr' && a.includes('--mode=label-on-green'));
+  expect(args).toContain('--requireVerified=true');
+  expect(options.env?.WE_REQUIRE_VERIFIED).toBeUndefined();
 });
 it('refuses a live admission lease without commands', async () => {
   const f = fixture(); writeFileSync(f.statePath + '.lock', JSON.stringify({ token: 'other', expiresAt: 9000 }));

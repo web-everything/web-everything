@@ -105,7 +105,11 @@ export async function publishBatch(input, opts = {}) {
         `--sha=${state.headSha}`, `--bodyFile=${bodyPath}`, `--mode=${mode}`, '--json'];
       if (mode === 'label-on-green') args.push('--requireVerified=true');
       let report;
-      try { report = parseRunJsonTail(await run('node', args, { timeout: 45 * 60_000 })); }
+      // The held draft is opened BEFORE any verify (verify runs once, on the sealed head, and label-on-green then
+      // demands that green marker). pr-land requires a marker by default, so the draft open opts out explicitly;
+      // live 2026-10-10 the first real batch draft was refused `unverified` without this.
+      const env = mode === 'park' ? { env: { ...process.env, WE_REQUIRE_VERIFIED: '0' } } : {};
+      try { report = parseRunJsonTail(await run('node', args, { timeout: 45 * 60_000, ...env })); }
       catch (error) { report = parseRunJsonTail(error.stdout); if (!report) throw error; }
       const submit = extractSubmitResult(report);
       if (submit.outcome !== 'opened' || !submit.pr) throw new Error(submit.reason ?? 'open-pr unrun');

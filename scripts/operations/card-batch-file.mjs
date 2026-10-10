@@ -24,6 +24,7 @@
  *   Exit 0 when batched; exit 3 when not batched (the caller then opens its own PR); exit 1 on a usage error.
  */
 import { execFileSync, spawn as spawnChild } from 'node:child_process';
+import { closeSync, openSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir } from './card-batch-io.mjs';
@@ -57,9 +58,13 @@ export function cardIdOf(cardPath) {
 const git = (cwd, args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024 }).trim();
 
 /** Start the detached seal worker: it opens/refreshes the batch PR and seals at the count limit. Never waits. */
-export function launchSealJob(statePath, { spawn = spawnChild } = {}) {
+export function launchSealJob(statePath, { spawn = spawnChild, open = openSync } = {}) {
+  // The job's outcome goes to `<state>.seal.log`: a detached failure (live 2026-10-10: `unverified`) must be readable.
+  let log = 'ignore';
+  try { log = open(`${statePath}.seal.log`, 'a'); } catch { /* no log; the job still runs */ }
   const child = spawn(process.execPath, [join(ROOT, 'scripts/operations/card-batch-seal-job.mjs'), `--state=${statePath}`],
-    { cwd: ROOT, detached: true, stdio: 'ignore' });
+    { cwd: ROOT, detached: true, stdio: ['ignore', log, log] });
+  if (typeof log === 'number') { try { closeSync(log); } catch { /* the child holds its own copy */ } }
   child.on?.('error', () => {}); // the health-watch tick relaunches a batch whose PR or seal is still owed
   child.unref?.();
 }
