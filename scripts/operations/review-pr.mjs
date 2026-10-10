@@ -355,17 +355,45 @@ export function seatSecurityForTouchSet({ changedFiles = [], lens = DEFAULT_LENS
 }
 
 /**
- * THE SECURITY SEAT A SAVED RUN WAS STARTED WITH, for a resume — read off the RUN, like `codexAdvisoryFromRun`, so a
- * settings flip or a different touch-set read between start and resume cannot change the roster under it. A run
- * whose first seat has answered seated security iff it holds a `judgeSecurity` finding; a run that has not got that
- * far reads as the full roster (the default).
+ * THE SECURITY SEAT A SAVED RUN WAS STARTED WITH, for a resume — read off the RUN, so a settings flip or a different
+ * touch-set read between start and resume cannot change the roster under it. The roster is RECORDED by the build's own
+ * `read` step on `findings.read.securitySeat` (a finding no caller can set — an input flag could be refused at `read` and
+ * still be left on a saved run that a later resume would trust), never inferred from which seats have answered: a seat
+ * that failed or has not run yet has no finding either, so an inference cannot tell "not seated" from "not yet answered"
+ * (a run that failed AT the security seat was resumed without it).
+ *
+ * A run with no `read` finding yet has judged nothing and has no roster to keep, so it reads as the full roster (the
+ * fail-closed superset; its first step is the same either way). So does a record from before the setting existed.
  * @param {object|null|undefined} record
  * @returns {boolean}
  */
 export function securitySeatFromRun(record) {
-  const findings = record && typeof record === 'object' && record.findings && typeof record.findings === 'object' ? record.findings : null;
-  if (!findings || !Object.prototype.hasOwnProperty.call(findings, JUDGE_SEATS[0].step)) return true;
-  return Object.prototype.hasOwnProperty.call(findings, SECURITY_SEAT_STEP);
+  const read = record && typeof record === 'object' && record.findings && typeof record.findings === 'object' ? record.findings.read : undefined;
+  return !(read && typeof read === 'object' && read.securitySeat === false);
+}
+
+/**
+ * REFUSE A SECURITY-LESS ROSTER THE PR'S NET DIFF CONTRADICTS. THROWS. PURE. Called from the `read` step.
+ *
+ * A build that does NOT seat the security juror was chosen from a `gh pr view --json files` read taken BEFORE the run.
+ * The net file list `read` has just computed is the ground truth the juror is shown, so a code file in it that the
+ * earlier read did not see (the author pushed in between) refuses the run before a juror is paid for. The refused run
+ * has no `read` finding, so a resume of it reads as the full roster (see {@link securitySeatFromRun}) and a fresh round
+ * chooses its roster from a new read. An empty net list scores nothing and proceeds, exactly as
+ * {@link assertDeclaredShapeHolds} does (the finding's `degraded` note already says so).
+ *
+ * @param {{declared: boolean, netChangedFiles?: string[], lens?: string, pr?: number|string, repo?: string}} o
+ */
+export function assertRosterHolds({ declared, netChangedFiles, lens, pr, repo } = {}) {
+  if (declared || !Array.isArray(netChangedFiles) || netChangedFiles.length === 0) return;
+  if (seatSecurityForTouchSet({ changedFiles: netChangedFiles, lens }).securitySeat) {
+    throw new Error(
+      `review-pr.read: this run's roster leaves the security juror out because ${repo}#${pr} touched only prose when its `
+      + `roster was chosen, but its ${netChangedFiles.length} NET changed file(s) now include code. A review of this diff `
+      + 'owes both mandatory seats. Refusing before a juror is spawned; the next review round chooses its roster from a '
+      + 'fresh read of the touch-set.',
+    );
+  }
 }
 
 /**
@@ -2376,10 +2404,18 @@ export function reviewPrOperation({
         // narrower question than the floor above (see `assertSeatSpentOnMandatoryLens`) and does not weaken
         // it: both run, in this order, and #3344's is still the one that can never be satisfied by an input.
         assertSeatSpentOnMandatoryLens({ lens: view.input.lens, careLevel: view.input.careLevel });
-        return shapeReadFinding(
+        const finding = shapeReadFinding(
           readPr({ pr: view.input.pr, repo: view.input.repo }),
           { pr: view.input.pr, repo: view.input.repo, careLevel: view.input.careLevel },
         );
+        // The roster was chosen from a file list read BEFORE the run; the net list just computed is the ground truth.
+        assertRosterHolds({
+          declared: securitySeat !== false, netChangedFiles: finding.netChangedFiles,
+          lens: view.input.lens, pr: view.input.pr, repo: view.input.repo,
+        });
+        // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
+        // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it.
+        return { ...finding, securitySeat: securitySeat !== false };
       },
     }),
 

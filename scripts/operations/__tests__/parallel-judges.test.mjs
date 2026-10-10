@@ -34,7 +34,7 @@ import { resolveReviewSeatSetting } from '../../lib/review-seat-settings.mjs';
 
 const NET_PATHS = ['scripts/operations/review-pr.mjs'];
 
-function stubReader() {
+function stubReader(paths = NET_PATHS) {
   return ({ pr, repo }) => ({
     state: 'OPEN',
     clearerId: undefined,
@@ -43,17 +43,21 @@ function stubReader() {
       pr, repo, title: 'a PR', url: `https://example.invalid/${pr}`,
       labels: ['review:pending'], humanRequired: false, reviewClass: 'pending',
       disposition: { mode: 'converge', autoLand: false }, escalationReason: [], advisoryComment: null, humanComment: null,
-      diffStat: NET_PATHS.map((p) => ({ path: p, additions: 1, deletions: 0 })),
+      diffStat: paths.map((p) => ({ path: p, additions: 1, deletions: 0 })),
     },
     headRefName: 'lane/thing',
     body: 'the PR description',
-    net: { paths: NET_PATHS, base: 'abc123', rev: 'def456', scored: true },
+    net: { paths, base: 'abc123', rev: 'def456', scored: true },
     diff: { text: '--- a/x\n+++ b/x\n+one line\n', scored: true },
   });
 }
 
-function build(opts = {}) {
-  const declaration = reviewPrOperation({ readPr: stubReader(), codexAdvisory: true, correctnessAdvisory: true, ...opts });
+const PROSE_PATHS = ['backlog/x-a-card.md'];
+
+/** `opts.netPaths` is the PR's net changed-file list the stub reader reports; a prose roster defaults to a prose PR. */
+function build({ netPaths, ...opts } = {}) {
+  const paths = netPaths ?? (opts.securitySeat === false ? PROSE_PATHS : NET_PATHS);
+  const declaration = reviewPrOperation({ readPr: stubReader(paths), codexAdvisory: true, correctnessAdvisory: true, ...opts });
   const registry = createRegistry();
   registry.register(declaration);
   return { declaration, registry };
@@ -235,6 +239,39 @@ describe('planJudgeBatch — only independent judge steps are batched', () => {
   });
 });
 
+describe('driveRun — a changed request never commits its early answer', () => {
+  it('discards the answer planned for the old request, records its spend, and respawns the seat', async () => {
+    const shape = { type: 'object' };
+    let n = 0; // the request of `b` differs every time it is built: the plan's copy and the engine's copy disagree
+    const declaration = op('drift-fixture', {
+      input: { x: 'number' },
+      a: judgeStep({ reads: ['input.x'], request: () => ({ mandate: 'm', input: 'a', shape }) }),
+      b: judgeStep({ reads: ['input.x'], request: () => { n += 1; return { mandate: 'm', input: `b-${n}`, shape }; } }),
+      done: compute({ reads: ['findings.a', 'findings.b'], fn: (v) => ({ a: v.findings.a, b: v.findings.b }) }),
+    });
+    const registry = createRegistry();
+    registry.register(declaration);
+    const calls = [];
+    const judge = async (request) => {
+      calls.push(request.input);
+      return judgeOutcome({ answered: request.input }, { costUsd: 0.1, sessionId: `s-${calls.length}` });
+    };
+    const store = createMemoryRunStore();
+    const run = startRun({ op: 'drift-fixture', id: 'r-drift', input: { x: 1 }, registry });
+    const out = await driveRun({ run, registry, store, sinks: {}, judge, parallelJudges: true, log: () => {} });
+    expect(out.stopped).toBe('complete');
+    // `b` was answered once for the planned request and once for the request the engine really asked for.
+    expect(calls.filter((c) => c.startsWith('b-'))).toHaveLength(2);
+    const planned = calls.find((c) => c.startsWith('b-'));
+    // The committed answer is the fresh one, never the planned one.
+    expect(out.run.findings.b.answered).not.toBe(planned);
+    expect(out.run.findings.b.answered).toBe(calls.filter((c) => c.startsWith('b-'))[1]);
+    // The planned answer's spend is on the record: a row for `b` beyond the committed one.
+    expect(out.run.telemetry.filter((t) => t.step === 'b')).toHaveLength(2);
+    expect(out.run.telemetry).toHaveLength(3);
+  });
+});
+
 describe('driveRun — parallel off by default', () => {
   it('a caller that does not ask stays sequential', async () => {
     const { registry } = build();
@@ -269,9 +306,61 @@ describe('review.seatsByTouchSet — the seat list comes from the touch-set, bef
     expect(chooseSecuritySeat(['--pr=5'], { readChangedFiles: () => { throw new Error('gh down'); } }).securitySeat).toBe(true);
     expect(chooseSecuritySeat(['--pr=5'], { readChangedFiles: () => Array.from({ length: TOUCH_SET_FILE_CAP }, (_, i) => `backlog/${i}.md`) }).securitySeat).toBe(true);
     expect(chooseSecuritySeat([], { readChangedFiles: prose }).securitySeat).toBe(true);
+    // A run STARTED on the prose roster reads back as prose, whatever it has answered so far.
     const store = createMemoryRunStore();
-    store.write({ ...startRun({ op: 'review-pr', id: 'r-saved', input: { pr: 5, repo: 'r/r' }, registry: build().registry }), findings: { read: {}, judge: {} } });
+    store.write({ ...startRun({ op: 'review-pr', id: 'r-saved', input: { pr: 5, repo: 'r/r' }, registry: build({ securitySeat: false }).registry }), findings: { read: { securitySeat: false }, judge: {} } });
     expect(chooseSecuritySeat(['--resume=r-saved'], { store, readChangedFiles: () => { throw new Error('must not read'); } }).securitySeat).toBe(false);
+  });
+
+  it('a resume reads the roster the run STARTED with — a seat that failed or never answered does not change it', async () => {
+    // The reviewer's case: a full-roster run answers `judge`, then `judgeSecurity` fails. The saved run has
+    // `findings.judge` and no `findings.judgeSecurity`, and is pending ON the security seat.
+    const fullStore = createMemoryRunStore();
+    await expect(loop({ parallel: true, judge: scriptedJudge({ fail: (l) => l === 'security' }), seatLanes: lanes().provider, runId: 'r-full-fail', store: fullStore })).rejects.toThrow('seat security crashed');
+    const failed = fullStore.read('r-full-fail');
+    expect(failed.pending?.step).toBe(SECURITY_SEAT_STEP);
+    expect(failed.findings).not.toHaveProperty(SECURITY_SEAT_STEP);
+    const fullSeating = chooseSecuritySeat(['--resume=r-full-fail'], { store: fullStore, readChangedFiles: () => { throw new Error('must not read'); } });
+    expect(fullSeating.securitySeat).toBe(true);
+    expect(securitySeatFromRun(failed)).toBe(true);
+    // Registered the way both CLIs register it, the resume completes (no 'suspended at step … but …' refusal).
+    const done = await loop({ parallel: true, judge: scriptedJudge(), seatLanes: lanes().provider, runId: 'r-full-fail', store: fullStore, argv: ['--resume=r-full-fail', '--json'], opts: { securitySeat: fullSeating.securitySeat } });
+    expect(done.run.findings).toHaveProperty(SECURITY_SEAT_STEP);
+    expect(done.run.cursor).toBe(done.declaration.steps.length);
+
+    // The opposite shape (codex): a PROSE run interrupted before its first seat answered must stay prose.
+    const proseStore = createMemoryRunStore();
+    await expect(loop({ parallel: false, judge: scriptedJudge({ fail: (l) => l === 'correctness' }), runId: 'r-prose-fail', store: proseStore, opts: { securitySeat: false } })).rejects.toThrow('seat correctness crashed');
+    const proseFailed = proseStore.read('r-prose-fail');
+    expect(proseFailed.findings).not.toHaveProperty('judge');
+    const proseSeating = chooseSecuritySeat(['--resume=r-prose-fail'], { store: proseStore, readChangedFiles: () => { throw new Error('must not read'); } });
+    expect(proseSeating.securitySeat).toBe(false);
+    const proseDone = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-prose-fail', store: proseStore, argv: ['--resume=r-prose-fail', '--json'], opts: { securitySeat: proseSeating.securitySeat } });
+    expect(declaresSecuritySeat(proseDone.declaration)).toBe(false);
+    expect(proseDone.run.findings).not.toHaveProperty(SECURITY_SEAT_STEP);
+  });
+
+  it('a prose roster refuses when the net diff the run reads now holds code (the author pushed after the touch-set read)', async () => {
+    const judge = scriptedJudge();
+    const refused = await loop({ parallel: false, judge, runId: 'r-toctou', opts: { securitySeat: false, netPaths: ['backlog/x-a-card.md', 'scripts/operations/review-pr.mjs'] } });
+    expect(refused.out.code).toBe(1);
+    expect(JSON.stringify(refused.out)).toMatch(/roster leaves the security juror out/);
+    expect(judge.calls).toHaveLength(0); // refused before any juror was paid for
+    // The same run on a PR that is still all prose proceeds.
+    const ok = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-toctou-ok', opts: { securitySeat: false } });
+    expect(ok.run.findings).not.toHaveProperty(SECURITY_SEAT_STEP);
+  });
+
+  it('the roster is not an input a caller can name, and a refused prose run resumes on the full roster', async () => {
+    // The roster is stamped on `findings.read` by the build itself; naming it at start is an unknown input.
+    const { registry } = build();
+    expect(() => startRun({ op: 'review-pr', id: 'r-bypass', input: { pr: 1, repo: 'web-everything/web-everything', securitySeat: false }, registry }))
+      .toThrow(/unknown input field `securitySeat`/);
+    // A prose run refused at `read` (code in the net list) never recorded a roster, so a resume is the full roster.
+    const refused = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-refused', opts: { securitySeat: false, netPaths: ['scripts/operations/review-pr.mjs'] } });
+    expect(refused.out.code).toBe(1);
+    expect(refused.run.findings).not.toHaveProperty('read');
+    expect(securitySeatFromRun(refused.run)).toBe(true);
   });
 
   it('a docs-only run seats no security juror, reduces on correctness alone, and reads back as such', async () => {
@@ -288,10 +377,16 @@ describe('review.seatsByTouchSet — the seat list comes from the touch-set, bef
 
   it('a parked run is never resumed under a different roster', async () => {
     // Covered by `rosterMatches` in runReviewLoopOnce: a saved full-roster run and a docs-only declaration disagree.
-    const full = { findings: { judge: {}, judgeSecurity: {} } };
+    const full = { findings: { read: { securitySeat: true }, judge: {} } };
     expect(securitySeatFromRun(full)).toBe(true);
-    expect(securitySeatFromRun({ findings: { judge: {} } })).toBe(false);
+    expect(securitySeatFromRun({ findings: { read: { securitySeat: false }, judge: {} } })).toBe(false);
+    // The roster is read off the `read` finding, never off which seats answered: no security finding does not mean none seated.
+    expect(securitySeatFromRun({ findings: { read: { securitySeat: true }, judge: {} } })).toBe(true);
+    // No recorded roster (nothing judged yet, or a record from before the setting): the full roster.
+    expect(securitySeatFromRun({ findings: { judge: {} } })).toBe(true);
     expect(securitySeatFromRun({ findings: {} })).toBe(true);
+    expect(securitySeatFromRun(null)).toBe(true);
+    expect(securitySeatFromRun({ findings: { read: { securitySeat: 'false' } } })).toBe(true);
   });
 });
 
