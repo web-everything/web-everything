@@ -44,6 +44,8 @@ import { fileURLToPath } from 'node:url';
 
 import { assembleReviewDetail } from '../review-detail.mjs';
 import { computeNetDiffPaths, computeNetDiffText, resolveNetDiffBasis } from '../merge-ai-prs.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
+import { fingerprintOf, readStackBase, stackNetDiffText, stackNetFiles } from '../conveyor/review-stack-base.mjs';
 import { currentActorId, parseAuthorActorId } from '../lib/review-independence.mjs';
 // #xlw02hw — the `advise` step's sink posts a BARE comment (never `we:scripts/review-set-label.mjs`, which
 // always couples a comment with a label swap — #2644 — and this step swaps no label). `createGhProvider`'s
@@ -211,6 +213,11 @@ export function readPr({
   // Card 5471 — the declared `roundBudget` K, and the ledger reader the round count comes from; injectable for tests.
   roundBudget = null,
   readLedgerRows = defaultReadLedgerRows,
+  // Held item 177 — the stack base for this PR (`we:scripts/conveyor/review-stack-base.mjs`), or null. Injectable;
+  // the default reads the open PRs and git in this checkout and fails open to null (the main basis, as before).
+  // Inert under test unless injected: the default reads `gh` and the network.
+  readStack = isUnderTest() ? () => null : ({ pr: n, cwd: dir }) => readStackBase({ pr: n, root: dir }),
+  stackRead = { files: stackNetFiles, text: stackNetDiffText },
 } = {}) {
   // The net-diff helpers take no `cwd`, so it is baked into the injected `exec` (the drain does the same thing
   // for the opposite reason — see the `escCwd` note in `we:scripts/merge-ai-prs.mjs`).
@@ -272,13 +279,33 @@ export function readPr({
   const basis = resolveNetDiffBasis({
     exec: gitExec, rev: headRefName, fetchExtraRefs: headRefName ? [headRefName] : [],
   });
-  const netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
+  let netText = computeNetDiffText({ exec: gitExec, rev: headRefName, fetchExtraRefs: [], basis });
   // `computeNetDiffPaths` resolves its own basis (it takes no `basis` param); the fetch above has already put
   // the head ref in this clone, so the second resolution is a local probe, not a second network round trip.
-  const netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [] });
+  let netPaths = computeNetDiffPaths({ exec: gitExec, rev: headRefName, fetchExtraRefs: [] });
 
   const priorRounds = priorRoundsFor(repo, pr);
   const revSha = revParseCommit(gitExec, netPaths.rev);
+
+  // Held item 177 — A STACKED TOP IS JUDGED AGAINST ITS STACK BASE. Only when the stack was detected on the SAME
+  // head this clone diffed (`revSha`); any mismatch or failed read keeps the main basis (today's behaviour).
+  let stackBase = null;
+  if (netPaths.scored === true && revSha) {
+    let stack = null;
+    try { stack = readStack({ pr, repo, cwd }); } catch { stack = null; }
+    if (stack && stack.topHead === revSha) {
+      try {
+        const text = String(stackRead.text({ tree: stack.tree, topHead: revSha, root: cwd }));
+        const paths = stackRead.files({ tree: stack.tree, topHead: revSha, root: cwd });
+        const fingerprint = fingerprintOf(text);
+        if (Array.isArray(paths) && fingerprint) {
+          netText = { text, base: stack.tree, rev: netText.rev ?? netPaths.rev, scored: true };
+          netPaths = { ...netPaths, paths, base: stack.tree, scored: true };
+          stackBase = { pr: stack.pr, ref: stack.ref, head: stack.head, contained: stack.contained, tree: stack.tree, fingerprint };
+        }
+      } catch { stackBase = null; }
+    }
+  }
   const scopedMode = resolveScopedRereviewMode(scopedRereview);
   const budget = resolveRoundBudget(roundBudget);
 
@@ -312,6 +339,7 @@ export function readPr({
     net: { ...netPaths, revSha },
     latestFix: readLatestFixRange({ exec: gitExec, comments: view.comments, head: revSha }),
     diff: netText,
+    ...(stackBase ? { stackBase } : {}),
     // Card 5469 — carried only when the shadow is on (or `on`, card 5470), so an `off` read is byte-identical to before.
     ...(['shadow', 'on'].includes(scopedMode) ? { scopedRereview: scopedMode } : {}),
     // Card 5471 — the round budget K and this PR's reviewed-head round from the ledger. Carried only when the budget is
@@ -1363,6 +1391,21 @@ export function createReviewPrSinks({
     },
 
     // ── 3. THE EVENT: the operator notice, rendered by `renderReviewNotice` in the declaration. ──────────────
+    // ── Held item 177 — a stacked accept: the staged write-up plus the `reviewed-stack` marker, as ONE bare comment.
+    // No label is touched (the same reason `ADVISORY_NOTE` avoids the single home): the accept must not become
+    // `review:accepted` while the bottom PR is open. `review-job.mjs` reads the marker back to hold or carry.
+    [REVIEW_EFFECTS.STACK_HOLD]: async (payload, ctx) => {
+      const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
+      let staged = '';
+      try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
+      // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
+      // so it cannot carry a forged marker (or hide the real one); the note opens and the marker closes the comment, and
+      // `parseStackMarkers` reads only those two ends.
+      postComment(payload.repo, payload.pr, [String(payload.note), '', staged.replaceAll('<!--', '&lt;!--'), '', String(payload.marker)].join('\n'));
+      out(`review-pr: ${payload.repo}#${payload.pr} accept held — stacked; recorded reviewed-stack, no label change`);
+      return { posted: true, held: true };
+    },
+
     [REVIEW_EFFECTS.NOTICE]: async (payload) => {
       out(String(payload.notice));
       return { reported: true };

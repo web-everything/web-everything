@@ -36,7 +36,10 @@ const TS_TWINS = { '.js': ['.ts', '.tsx'], '.mjs': ['.mts'], '.jsx': ['.tsx'] };
 
 // Calibrated against this repo's own ~460 test files with a disjoint change: caps of 4 hops / 300 reads cut the walk
 // short for 43% of them (196) and so mislabelled unrelated failures `in-diff-failure`; 12 hops / 2000 reads leave 8.
-export const REACH_MAX_DEPTH = 12;
+// The import graph keeps deepening as modules gain imports (the longest chain a test needs walked grew from 17 to 23
+// hops when the stack-aware review modules landed, leaving 79 of 539 `unknown` against the 10% calibration bound), so
+// the hop cap carries headroom; `REACH_MAX_FILES` is what actually bounds the cost of a walk.
+export const REACH_MAX_DEPTH = 32;
 export const REACH_MAX_FILES = 2000;
 
 /**
