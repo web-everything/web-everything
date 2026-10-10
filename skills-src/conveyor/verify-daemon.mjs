@@ -9,6 +9,13 @@
  * registry for the process lifetime. A code-change restart waits (still ticking) until it is empty; shutdown
  * kills its process groups.
  *
+ * #4135 (statute `#daemon-jobs`): by default each gate is a DETACHED DURABLE JOB
+ * (we:scripts/conveyor/verify-gate-job.mjs) with its own supervisor process and record under
+ * `~/.claude/daemon-jobs/verify-daemon/`. The in-flight registry is rebuilt from that store every tick (before
+ * dispatch), so a restart — graceful, code-change, crash or `kill -9` — re-attaches to running gates instead of
+ * killing or re-dispatching them, and a code-change restart no longer waits for gates to drain. The paragraph
+ * above now describes only the rollback mode (`WE_VERIFY_GATE_AS_JOB=0`) and runs adopted from an older daemon.
+ *
  * THE GAP THIS CLOSES (confirmed by direct read — the one real gap named in the whole daemon-split epic).
  * `we:scripts/conveyor/verify-dispatch.mjs`'s own header justified its blocking safety entirely on "the runner
  * is a SINGLETON... so there is no risk of two dispatches racing the same lane's marker" — a property that

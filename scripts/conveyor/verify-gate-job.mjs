@@ -48,7 +48,8 @@ const CLONE_ROOT = resolve(dirname(SELF), '..', '..');
 export const VERIFY_GATE_AS_JOB_ENV = 'WE_VERIFY_GATE_AS_JOB';
 export const GATE_SUFFIX = '.gate';
 export const RESULT_SUFFIX = '.result';
-const CONSUMED_FILE = 'consumed.json';
+// Not `.json`: the run store lists every `*.json` in the jobs dir as a job record (and calls this one corrupt).
+const CONSUMED_FILE = 'consumed.ids';
 /** A consumed job's files are kept this long for diagnosis, then removed. */
 export const FINISHED_GATE_JOB_KEEP_MS = 6 * 60 * 60_000;
 
