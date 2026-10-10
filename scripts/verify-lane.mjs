@@ -326,9 +326,9 @@ function treeIsClean() {
   if (out == null) return false;
   return out.split('\n').filter(Boolean).every((line) => !line.includes(' -> ') && line.startsWith('??') && isAllowlistedLitterPath(line.slice(3)));
 }
-function maybeRecordGreen({ status, treeHash }) {
+function maybeRecordGreen({ status, treeHash, skipped = null }) {
   if (!greenLedgerWritable({ repo: REPO, env: process.env })) return;
-  if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree: treeIsClean() })) return;
+  if (!shouldRecordGreen({ status, defaultGate: !!resolvedGate, admissionFallback, treeHash, cleanTree: treeIsClean(), skipped })) return;
   if (recordGreenLedger({ dir: GREEN_LEDGER_DIR, sha: headSha, record: { status: 'green', repo: REPO, recordedAt: new Date().toISOString(),
     suites: GATE, selectionMode: resolvedGate?.decision?.selectionMode?.mode ?? null } })) {
     process.stderr.write(`green ledger: recorded ${headSha.slice(0, 8)} (clean tree, default gate) for since-last-green selection\n`);
@@ -477,7 +477,7 @@ if (resolvedGate?.decision?.mode === 'card-only-skip') {
   const detail = `card-only diff (CI's definition) - local gate skipped for ${headSha.slice(0, 8)}; CI's check:standards stays the merge authority.`;
   writeMarker({ ...verifyFinishBody(verifyStartBody({ sha: headSha, suites: GATE, startedAt: now, treeHash: currentTreeHash }),
     { finishedAt: now, exitCode: 0, sha: headSha, suites: GATE, treeHash: currentTreeHash }), skipped: 'card-only' });
-  maybeRecordGreen({ status: 'green', treeHash: currentTreeHash });
+  maybeRecordGreen({ status: 'green', treeHash: currentTreeHash, skipped: 'card-only' });
   emit({ sha: headSha, status: 'green', reason: 'card-only-skip', exitCode: 0, detail }, 0);
 }
 

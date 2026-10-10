@@ -32,5 +32,5 @@ Fix rounds re-select tests from the whole PR diff vs origin/main (we:scripts/ver
 3. **Shared state files** — ledger writes are atomic (temp + rename) into `<coordination root>/verify-green/`; written only from pool lanes (`/.lanes/`) or an explicit `WE_VERIFY_GREEN_LEDGER_DIR`, so test fixtures never write there.
 4. **Fail closed** — every unknown falls back to the whole-PR selection (A3).
 5. **Identity scoping** — a record is keyed by commit sha; it only counts when that sha is a strict ancestor of HEAD within this PR's own commits (same merge-base, no merges).
-6. **State over time** — a green recorded with a dirty tree, an explicit `--gate=` override, or a whole-gate admission fallback is never recorded, so a ledger entry always describes the commit itself under the default gate.
-7. **Who wrote it** — a forged record can only narrow a LOCAL selection; it never blesses a landing (marker keyed to HEAD) and CI still runs everything.
+6. **State over time** — a green recorded with a dirty tree, an explicit `--gate=` override, or a whole-gate admission fallback, or a run that skipped its gate (the card-only skip) is never recorded, so a ledger entry always describes the commit itself under the default gate.
+7. **Who wrote it** — a forged record can only narrow a LOCAL selection; it never blesses a landing (marker keyed to HEAD) and CI still runs everything. The card-only skip is judged on the WHOLE PR (CI's definition), never on the delta: a doc-only fixer commit on a PR that carries code still runs a (delta) gate.

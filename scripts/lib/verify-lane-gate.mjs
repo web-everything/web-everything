@@ -338,8 +338,14 @@ export function resolveDefaultGate({ base = 'origin/main', runGit, env = process
   const greenSha = findLastGreenAncestor({ base, runGit, hasGreen });
   const eligibility = decideSinceLastGreen({ base, runGit, greenSha });
   if (!eligibility.eligible) return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', reason: `fallback — ${eligibility.reason}` });
+  // Card-only is CI's WHOLE-PR definition, never the delta's: a PR that is card-only as a whole takes the whole-PR
+  // path (which may skip); otherwise the delta resolve below must never card-only-skip (a doc-only fixer commit on a
+  // PR that carries code would otherwise write a landing-eligible marker for a gate that never ran).
+  if (allowCardOnlySkip && resolveVerifySettings({ fileConfig, env }).values.skipLocalForCardOnly && localDiffIsCardOnly({ base, runGit })) {
+    return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', reason: 'fallback — the whole PR is card-only (CI\'s definition)' });
+  }
   // The green sha is an ancestor of HEAD, so its merge-base with HEAD is itself: the changed set is `<green>..worktree`.
-  const delta = resolveGateFromBase({ ...args, base: greenSha });
+  const delta = resolveGateFromBase({ ...args, base: greenSha, allowCardOnlySkip: false });
   if (delta.decision.mode === 'blocked') {
     return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', base: greenSha,
       reason: `fallback — the delta since ${greenSha.slice(0, 8)} cannot use a selected run (${delta.decision.reasons.join('; ')})` });

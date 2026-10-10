@@ -12,7 +12,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { resolveDefaultGate, matchRequestedDefaultGate, describeGate } from '../verify-lane-gate.mjs';
-import { decideSinceLastGreen, findLastGreenAncestor } from '../../readiness/test-selection.mjs';
+import { decideSinceLastGreen, findLastGreenAncestor, LAST_GREEN_LOOKBACK } from '../../readiness/test-selection.mjs';
 import { recordGreenLedger, hasGreenLedger, shouldRecordGreen, greenLedgerDir, greenLedgerWritable, verifyGateDecision, VERIFY_GREEN_LEDGER_ENV } from '../lane-verify.mjs';
 import { validateVerifySettings, resolveVerifySettings } from '../verify-settings.mjs';
 
@@ -138,6 +138,77 @@ describe('since-last-green selection (#xgqwuq5)', () => {
     expect(gate.decision.changedFiles).toEqual(['package.json', 'scripts/lib/a.mjs']);
   });
 
+  // Review round 1, finding 1: card-only is CI's WHOLE-PR definition, never the delta's. A fixer commit that touches
+  // only a backlog card, on a PR that also carries code, must still run a real (delta) gate and never card-only-skip.
+  describe('skipLocalForCardOnly (shipped value: true)', () => {
+    const skipConfig = validateVerifySettings({ relatedMode: 'import-only', standards: 'always', skipLocalForCardOnly: true, relatedMaxTests: 0 });
+    const resolveSkip = (env = {}) => resolveDefaultGate({ runGit: git, env: { WE_VERIFY_SELECTION: 'since-last-green', ...env }, fileConfig: skipConfig, hasGreen });
+    it('a card-only fixer commit after a code green does NOT card-only-skip (the PR is not card-only)', () => {
+      markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
+      commit('fixer card', { 'backlog/zz9-card.md': '# card\n' });
+      const gate = resolveSkip();
+      expect(gate.decision.mode).not.toBe('card-only-skip');
+      expect(gate.command).not.toContain('local gate skipped');
+      expect(gate.decision.selectionMode).toMatchObject({ mode: 'since-last-green' });
+      expect(gate.decision.changedFiles).toEqual(['backlog/zz9-card.md']);
+    });
+    it('a PR that is card-only as a whole still skips (whole-PR fallback, CI\'s definition)', () => {
+      markGreen(commit('author card', { 'backlog/zz8-card.md': '# card\n' }));
+      commit('fixer card', { 'backlog/zz9-card.md': '# card\n' });
+      const gate = resolveSkip();
+      expect(gate.decision.mode).toBe('card-only-skip');
+      expect(gate.decision.selectionMode.mode).toBe('pr');
+    });
+  });
+
+  // Review round 1, finding 3: every git query the eligibility check makes fails closed to the whole-PR selection.
+  describe('falls back to whole-PR selection when any eligibility git query fails', () => {
+    const wholePr = ['scripts/lib/a.mjs', 'scripts/lib/b.mjs'];
+    const seed = () => {
+      markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
+      commit('fixer', { 'scripts/lib/b.mjs': 'export const b = 2;\n' });
+    };
+    const failing = (matches) => (args) => {
+      if (matches(args)) throw new Error('injected git failure');
+      return git(args);
+    };
+    const queries = [
+      ['rev-parse HEAD', (a) => a[0] === 'rev-parse' && a[1] === 'HEAD', /could not check/],
+      ['merge-base --is-ancestor', (a) => a[0] === 'merge-base' && a[1] === '--is-ancestor', /not an ancestor/],
+      ['rev-list --merges', (a) => a[0] === 'rev-list' && a.includes('--merges'), /could not check/],
+      ['merge-base origin/main <green>', (a) => a[0] === 'merge-base' && a[1] === 'origin/main' && a[2] !== 'HEAD', /could not check/],
+      ['rev-list lookback', (a) => a[0] === 'rev-list' && !a.includes('--merges'), /no green verify/],
+    ];
+    it('the pinned merge-base query failing leaves no since-last-green selection (and no narrowed set)', () => {
+      seed();
+      const gate = resolveDefaultGate({ runGit: failing((a) => a[0] === 'merge-base' && a[1] === 'origin/main' && a[2] === 'HEAD'),
+        env: { WE_VERIFY_SELECTION: 'since-last-green' }, fileConfig, hasGreen });
+      expect(gate.decision.selectionMode.mode).toBe('pr');
+      expect(gate.decision.changedFiles).toBeNull();
+    });
+    it('empty output from the merge-base queries is ineligible, not a match', () => {
+      seed();
+      const empty = (a) => (a[0] === 'merge-base' && a[1] === 'origin/main' && a[2] !== 'HEAD' ? '' : git(a));
+      const gate = resolveDefaultGate({ runGit: empty, env: { WE_VERIFY_SELECTION: 'since-last-green' }, fileConfig, hasGreen });
+      expect(gate.decision.selectionMode.mode).toBe('pr');
+      expect(gate.decision.changedFiles).toEqual(wholePr);
+    });
+    it('a green older than the lookback window is not found (whole-PR selection)', () => {
+      markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
+      for (let i = 0; i < LAST_GREEN_LOOKBACK + 1; i++) commit(`fixer ${i}`, { 'scripts/lib/b.mjs': `export const b = ${i + 2};\n` });
+      const gate = resolve();
+      expect(gate.decision.selectionMode).toMatchObject({ mode: 'pr', reason: expect.stringMatching(/no green verify/) });
+      expect(gate.decision.changedFiles).toEqual(wholePr);
+    });
+    it.each(queries)('%s', (_name, matches, reason) => {
+      seed();
+      const gate = resolveDefaultGate({ runGit: failing(matches), env: { WE_VERIFY_SELECTION: 'since-last-green' }, fileConfig, hasGreen });
+      expect(gate.decision.selectionMode.mode).toBe('pr');
+      expect(gate.decision.selectionMode.reason).toMatch(reason);
+      expect(gate.decision.changedFiles).toEqual(wholePr);
+    });
+  });
+
   it('the dispatched child still recognizes an older requester\'s whole-PR stamp', () => {
     markGreen(commit('author', { 'scripts/lib/a.mjs': 'export const a = 2;\n' }));
     commit('fixer', { 'scripts/lib/b.mjs': 'export const b = 2;\n' });
@@ -177,6 +248,14 @@ describe('green ledger (#xgqwuq5)', () => {
     expect(shouldRecordGreen({ ...ok, admissionFallback: 'whole-gate' })).toBe(false);
     expect(shouldRecordGreen({ ...ok, treeHash: null })).toBe(false);
     expect(shouldRecordGreen({ ...ok, cleanTree: false })).toBe(false);
+    // A run that skipped its gate (card-only) vouches for nothing: it must never become a "last green".
+    expect(shouldRecordGreen({ ...ok, skipped: 'card-only' })).toBe(false);
+    expect(shouldRecordGreen({ ...ok, skipped: true })).toBe(false);
+    // Records the pre-fix card-only path already wrote (shared coordination-root ledger) stop vouching on read.
+    writeFileSync(join(ledger, `${sha}.json`), JSON.stringify({ sha, status: 'green', suites: "echo 'verify-lane: card-only diff - local gate skipped; CI runs the full check:standards'" }));
+    expect(hasGreenLedger({ dir: ledger, sha })).toBe(false);
+    writeFileSync(join(ledger, `${sha}.json`), JSON.stringify({ sha, status: 'green', skipped: 'card-only' }));
+    expect(hasGreenLedger({ dir: ledger, sha })).toBe(false);
   });
   it('lives in the coordination root and is written only from pool lanes or an explicit override', () => {
     expect(greenLedgerDir({ env: {}, coordinationRoot: '/c' })).toBe(join('/c', 'verify-green'));

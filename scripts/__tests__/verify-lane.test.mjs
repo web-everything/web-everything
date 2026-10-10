@@ -128,7 +128,13 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
     try {
       const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
       git('update-ref', 'refs/remotes/origin/main', 'HEAD');
-      commitFile('backlog/zz2-card.md');
+      // A REAL default-gate green (code diff, so no card-only skip): a stub `vitest` on the checkout's own
+      // node_modules/.bin stands in for the test runner, and `.gitignore` keeps the tree clean (the ledger needs that).
+      mkdirSync(join(dir, 'node_modules', '.bin'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', '.bin', 'vitest'), '#!/bin/sh\nexit 0\n');
+      chmodSync(join(dir, 'node_modules', '.bin', 'vitest'), 0o755);
+      writeFileSync(join(dir, '.gitignore'), 'node_modules/\n');
+      commitFile('scripts/lib/zz2-green.mjs');
       const green = headSha();
       const first = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env });
       expect(JSON.parse(first.stdout.trim().split('\n').pop())).toMatchObject({ status: 'green' });
@@ -136,10 +142,23 @@ describe('verify-lane — card-only diff skips the local gate (skipLocalForCardO
       commitFile('scripts/lib/zz-fix.mjs');
       const second = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env });
       expect(second.stderr).toContain(`selection mode: since-last-green — delta ${green.slice(0, 8)}..HEAD only`);
-      expect(second.stderr).not.toContain('zz2-card.md');
+      expect(second.stderr).not.toContain('zz2-green.mjs');
       const prMode = spawnSync('node', [VERIFY_LANE, 'request', '--json'], { cwd: dir, encoding: 'utf8', env: { ...env, WE_VERIFY_SELECTION: 'pr' } });
       expect(prMode.stderr).toContain('selection mode: pr');
-      expect(prMode.stderr).toContain('zz2-card.md');
+      expect(prMode.stderr).toContain('zz2-green.mjs');
+    } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
+  });
+  // Review round 1 (finding 2): a card-only skip runs NO gate, so it must never become a "last green" in the ledger.
+  it('a card-only skip writes the marker but records nothing in the green ledger', () => {
+    const ledgerDir = mkdtempSync(join(tmpdir(), 'green-ledger-'));
+    try {
+      const env = { ...process.env, CONVEYOR_RUNNER_LOCK_ROOT: lockRoot, WE_VERIFY_GREEN_LEDGER_DIR: ledgerDir, WE_VERIFY_SELECTION: 'since-last-green' };
+      git('update-ref', 'refs/remotes/origin/main', 'HEAD');
+      commitFile('backlog/zz3-card.md');
+      const first = spawnSync('node', [VERIFY_LANE, 'verify', '--json'], { cwd: dir, encoding: 'utf8', env });
+      expect(JSON.parse(first.stdout.trim().split('\n').pop())).toMatchObject({ status: 'green', reason: 'card-only-skip' });
+      expect(JSON.parse(readFileSync(marker(), 'utf8'))).toMatchObject({ skipped: 'card-only' });
+      expect(existsSync(join(ledgerDir, `${headSha()}.json`))).toBe(false);
     } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
   });
   // The fix / ci-heal reproduce-and-confirm gate (`gateFor` → `verify-lane run`): a card-only PR is CI-red exactly

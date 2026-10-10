@@ -170,9 +170,10 @@ export function greenLedgerWritable({ repo, env = process.env }) {
 
 /** Should a finished verify record its sha in the ledger? Pure. A GREEN for the default gate (never an arbitrary
  *  `--gate=` override, never a whole-gate admission fallback), whose tree held still (`treeHash` recorded) and had no
- *  uncommitted change, so the green describes the COMMIT itself. */
-export function shouldRecordGreen({ status, defaultGate, admissionFallback, treeHash, cleanTree }) {
-  return status === 'green' && defaultGate === true && !admissionFallback && typeof treeHash === 'string' && treeHash !== '' && cleanTree === true;
+ *  uncommitted change, so the green describes the COMMIT itself. A run that skipped its gate (`skipped`, e.g. the
+ *  card-only skip) executed nothing and vouches for nothing: never recorded. */
+export function shouldRecordGreen({ status, defaultGate, admissionFallback, treeHash, cleanTree, skipped }) {
+  return status === 'green' && defaultGate === true && !admissionFallback && !skipped && typeof treeHash === 'string' && treeHash !== '' && cleanTree === true;
 }
 
 /** Write one ledger record (atomic temp + rename). IO; best-effort — returns false on any failure, never throws. */
@@ -193,7 +194,9 @@ export function hasGreenLedger({ dir, sha }) {
   if (!SHA_RE.test(String(sha))) return false;
   try {
     const rec = JSON.parse(readFileSync(join(dir, `${sha}.json`), 'utf8'));
-    return !!rec && typeof rec === 'object' && rec.sha === sha && rec.status === 'green';
+    // A record written by the earlier card-only-skip path (no gate ran; its `suites` is the no-op skip command) never vouches.
+    const gateLess = typeof rec?.suites === 'string' && rec.suites.includes('local gate skipped');
+    return !!rec && typeof rec === 'object' && rec.sha === sha && rec.status === 'green' && !rec.skipped && !gateLess;
   } catch { return false; }
 }
 
