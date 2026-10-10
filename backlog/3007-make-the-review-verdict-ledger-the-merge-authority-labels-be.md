@@ -1,7 +1,8 @@
 ---
 bornAs: x3q28ce
 kind: epic
-blockedBy: ["3214", "3215", "3217", "3216", "3255", "3929"]
+priority: high
+blockedBy: ["3214", "3215", "3217", "3216", "3255", "3929", "5647", "5649", "5444"]
 status: open
 parent: "2405"
 dateOpened: "2026-08-08"

@@ -276,11 +276,18 @@ export async function smokeAndAdopt({
     removeCandidate({
       root, path: candidate.path, run, env,
     });
+    // x5059uu — per-step timings on EVERY smoke (live 2026-10-09: smokes took 421 s and 1,002 s), so a slow step is
+    // visible in the log before it crosses the smoke-slow line; the dispatch smoke counts as its own step.
+    const checks = [
+      ...(smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`),
+      ...(dispatch?.result?.ms != null ? [`dispatch-smoke:${dispatch.result.ms}ms`] : []),
+    ].join(' ');
+    log.error?.(`daemon-rebuild: smoke-timings ${JSON.stringify({ ms, ...(label ? { candidate: label } : {}), checks })}`);
     if (ms >= SLOW_SMOKE_ALERT_MS) {
       alert('smoke-slow', {
         ms,
         ...(label ? { candidate: label } : {}),
-        checks: (smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`).join(' '),
+        checks,
       });
     }
     if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null && (!dispatch || dispatch.result.ok)

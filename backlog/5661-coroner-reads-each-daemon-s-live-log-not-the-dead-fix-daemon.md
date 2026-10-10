@@ -1,10 +1,14 @@
 ---
+bornAs: xi7nyx1
 kind: story
 size: 1
 priority: high
-status: open
+status: resolved
 scope: ["we:scripts/operations/coroner-extract.mjs"]
 dateOpened: "2026-10-09"
+dateStarted: "2026-10-09"
+dateResolved: "2026-10-09"
+graduatedTo: none
 tags: []
 ---
 

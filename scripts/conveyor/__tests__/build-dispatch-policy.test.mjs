@@ -42,6 +42,39 @@ describe('branch-name rule', () => {
 });
 
 describe('planBuildDispatch', () => {
+  it('replays the 2026-10-09 tick: 17 open PRs contain only 7 in-flight code PRs', () => {
+    const openPrs = [
+      ...Array.from({ length: 7 }, (_, i) => pr('we', i + 1, [`src/code${i}.js`])),
+      ...Array.from({ length: 4 }, (_, i) => pr('we', i + 8, [`backlog/card${i}.md`], i === 0 ? ['review:accepted'] : [])),
+      ...Array.from({ length: 6 }, (_, i) => pr('we', i + 12, [`src/accepted${i}.js`], ['review:accepted'])),
+    ];
+    const r = planBuildDispatch({ candidates: [cand('1', ['we:unrelated.js'])], openPrs, policy: { ...BUILD_DISPATCH_POLICY, maxOpenPrs: 12, openPrCapScope: undefined } });
+    expect(r.freeze.frozen).toBe(false);
+    expect(r.dispatch.map((x) => x.num)).toEqual(['1']);
+    expect(r.openPrCap).toEqual({ total: 17, counted: 7, cardOnly: 4, accepted: 6, cap: 12,
+      countedPrs: Array.from({ length: 7 }, (_, i) => `we#${i + 1}`),
+      cardOnlyPrs: Array.from({ length: 4 }, (_, i) => `we#${i + 8}`),
+      acceptedPrs: Array.from({ length: 6 }, (_, i) => `we#${i + 12}`) });
+  });
+  it('freezes 13 code PRs plus 5 card-only PRs with an auditable count', () => {
+    const openPrs = [
+      ...Array.from({ length: 13 }, (_, i) => pr('we', i + 1, [`src/code${i}.js`])),
+      ...Array.from({ length: 5 }, (_, i) => pr('we', i + 14, [`backlog/card${i}.md`])),
+    ];
+    const r = planBuildDispatch({ openPrs, policy: { ...BUILD_DISPATCH_POLICY, maxOpenPrs: 12 } });
+    expect(r.freeze).toEqual({ frozen: true, kinds: ['open-prs'], reasons: ['13 open PRs counted (5 card-only, 0 accepted excluded) > maxOpenPrs 12'] });
+  });
+  it.each([
+    ['src/a.js', ['review:accepted']],
+    ['backlog/a.md', []],
+  ])('excluded PR touching %s still holds an overlapping build', (path, labels) => {
+    const r = planBuildDispatch({ candidates: [cand('1', [`we:${path}`])], openPrs: [pr('we', 99, [path], labels)] });
+    expect(r.freeze.frozen).toBe(false);
+    expect(r.openPrCap.counted).toBe(0);
+    expect(r.dispatch).toEqual([]);
+    expect(r.hold[0]).toMatchObject({ rule: 'scope-vs-open-prs', reason: expect.stringContaining('we#99') });
+  });
+
   it('caps concurrent builds, counting durable in-flight work', () => {
     const r = planBuildDispatch({
       candidates: [cand('1', ['we:a']), cand('2', ['we:b']), cand('3', ['we:c'])],
@@ -422,6 +455,35 @@ describe('card 80 — prepare just in time', () => {
     ];
     expect([...prepareAheadNums({ queue, launch, held, window: 4 })]).toEqual(['7', '1', '3', '4']);
     expect(prepareAheadNums({ queue, launch, held, window: 4 }).has('6')).toBe(false);
+  });
+
+  it('prepareAheadNums puts delivery class before pinned cards', () => {
+    const queue = [{ num: '7', tier: 'pinned', priorityClass: 'P3' }, { num: '1', priorityClass: 'P3' }, { num: '9', priorityClass: 'P1' }];
+    const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
+    expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual(['9']);
+    expect([...prepareAheadNums({ queue, held, window: 2 })]).toEqual(['9', '7']);
+  });
+
+  it.each([
+    [[{ num: '5', tier: 'pinned', priorityClass: 'P1' }, { num: '6', priorityClass: 'P1' }], '5'],
+    [[{ num: '9', priorityClass: 'P1' }, { num: '7', tier: 'pinned', priorityClass: 'P1' }], '9'],
+  ])('prepareAheadNums preserves queue order within classified queues: %j', (queue, first) => {
+    const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
+    expect([...prepareAheadNums({ queue, held, window: 1 })]).toEqual([first]);
+  });
+
+  it('prepareAheadNums treats missing and unknown classes as P3 and orders all classes', () => {
+    const queue = [
+      { num: '4', priorityClass: 'P4', tier: 'pinned' },
+      { num: '3', priorityClass: 'unknown', tier: 'pinned' },
+      { num: '8' },
+      { num: '7', priorityClass: 'P3' },
+      { num: '2', priorityClass: 'P2' },
+      { num: '1', priorityClass: 'P1' },
+      { num: '0', priorityClass: 'P0' },
+    ];
+    const held = queue.map(({ num }) => ({ num, reason: 'needs-prepare' }));
+    expect([...prepareAheadNums({ queue, held, window: 7 })]).toEqual(['0', '1', '2', '3', '8', '7', '4']);
   });
 
   it('prepareAheadNums is off (null) for a non-finite or negative window', () => {
