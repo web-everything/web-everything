@@ -15,6 +15,7 @@
   "revertRed": "warn",
   "revertRedSince": "2026-10-08",
   "revertRedMaxFiles": 40,
+  "selection": "since-last-green",
   "alwaysRunTests": [
     "skills-src/conveyor/__tests__/runner-pass-coverage.test.mjs",
     "skills-src/conveyor/__tests__/launchd-templates.test.mjs",
