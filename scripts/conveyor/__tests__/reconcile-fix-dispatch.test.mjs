@@ -1856,3 +1856,39 @@ it('keeps the live claim conservative on a failed diff read and preserves foreig
   expect(result.dispatched).toEqual([]);
   expect(result.refusals[0]).toMatchObject({ kind: 'scope-overlap', pr: 1 });
 });
+
+// Live 2026-10-09, PR #4624: identify the fix pass and narrow lag to its own code.
+describe('fix dispatch staleness contract', () => {
+  it('recognizes its runtime closure and fails closed when that closure is unknown', async () => {
+    const { isFixCodePath, fixCodeClosure, FIX_STALE_GUARD_OPTS, FIX_DISPATCH_STALE_LABEL } = await import('../reconcile-fix-dispatch.mjs');
+    expect(fixCodeClosure().files.has('scripts/conveyor/reconcile-core.mjs')).toBe(true);
+    expect(isFixCodePath('scripts/conveyor/reconcile-core.mjs')).toBe(true);
+    expect(isFixCodePath('backlog/x.md')).toBe(false);
+    const closure = { complete: true, files: new Set(['scripts/conveyor/reconcile-core.mjs']), bareDeps: false, jsonNames: new Set() };
+    expect(isFixCodePath('scripts/conveyor/reconcile-core.mjs', { closure })).toBe(true);
+    expect(isFixCodePath('scripts/unrelated.mjs', { closure })).toBe(false);
+    for (const unknown of [null, { ...closure, complete: false }]) {
+      expect(isFixCodePath('scripts/unrelated.mjs', { closure: unknown })).toBe(true);
+      expect(isFixCodePath('backlog/x.md', { closure: unknown })).toBe(false);
+      expect(isFixCodePath('', { closure: unknown })).toBe(false);
+    }
+    expect(FIX_DISPATCH_STALE_LABEL).toBe('reconcile-fix-dispatch');
+    expect(FIX_STALE_GUARD_OPTS.label).toBe('reconcile-fix-dispatch');
+    expect(FIX_STALE_GUARD_OPTS.dispatchPath('scripts/conveyor/reconcile-core.mjs')).toBe(true);
+  });
+
+  it('names the fix pass in a stale refusal before reading the plan', () => {
+    const previous = process.env.WE_DAEMON_MANAGED_CLONE;
+    delete process.env.WE_DAEMON_MANAGED_CLONE;
+    const reconcile = vi.fn();
+    try {
+      expect(() => runReconcileFixDispatch({
+        root: '/repo', reconcile, checkStaleness: () => ({ action: 'warn', behind: 3, ahead: 1, dirty: false }),
+      })).toThrow(/^reconcile-fix-dispatch:.*STALE code/);
+      expect(reconcile).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE;
+      else process.env.WE_DAEMON_MANAGED_CLONE = previous;
+    }
+  });
+});

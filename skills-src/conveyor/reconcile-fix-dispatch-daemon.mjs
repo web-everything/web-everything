@@ -682,7 +682,13 @@ export async function runTickAllRepos({
   // default here would spend one for every dispatched row those fakes produce. The real daemon
   // (`buildCliDaemonEffects`, below) opts in via {@link defaultTagDispatchStatus}.
   tagDispatchStatus = null,
+  // Injectable clock for the per-phase timing (live 2026-10-09: an untimed 15.7-min pass delayed PR #4624's fix).
+  now = Date.now,
 } = {}) {
+  const passStart = now();
+  const phaseMs = {};
+  const timed = (name, fn) => { const t = now(); try { return fn(); } finally { phaseMs[name] = now() - t; } };
+  const timedAsync = async (name, fn) => { const t = now(); try { return await fn(); } finally { phaseMs[name] = now() - t; } };
   // card x5kagse (epic #4075/#3383) — computed ONCE per tick, shared by both dispatching halves below. Real IO
   // (`planClaudeAuthDispatchGate`'s own `claude agents --json --all` read + health read + cheap probe) runs
   // ONLY for a genuine production tick — mirrors `queueAdmission`'s own "only read when a real tick runs" rule
@@ -691,26 +697,26 @@ export async function runTickAllRepos({
   // perf C1d — once a real tick: refresh the PR-facts mirror from the Worker (NOT a GitHub call). Best-effort; the
   // timeout-evidence reads then try the store first and fall back to GitHub on stale/partial (see `fix-facts.mjs`).
   const realTick = !fixTick && !ciHealTick;
-  const factsWarm = realTick ? await warmFixFacts(repos) : null;
-  const authGate = authGateOverride ? authGateOverride()
-    : ((fixTick || ciHealTick) ? { paused: false, reason: null } : planClaudeAuthDispatchGate());
+  const factsWarm = realTick ? await timedAsync('facts', () => warmFixFacts(repos)) : null;
+  const authGate = timed('auth-gate', () => (authGateOverride ? authGateOverride()
+    : ((fixTick || ciHealTick) ? { paused: false, reason: null } : planClaudeAuthDispatchGate())));
   // #5137 — FIRST, before any fresh dispatch: a fixer that ended its turn awaiting a verdict is pushed (green,
   // exact sha) or resumed (red) here, so the model never holds a turn open on `check --wait`. Pushing needs no
   // Claude login; resuming does, so a paused login only defers the resume (the record keeps it pending).
   // xn025gx (R4 push-wake-cadence): with all three fixDispatch push-on-green settings off (loop seconds 0, the two switches off) this is exactly the pass above; with the fast loop
   // alive the loop owns the pass and this tick skips it; otherwise the tick runs the same R3/R5 cycle under the cycle lock.
-  const awaitVerify = awaitVerifyTick ? await awaitVerifyTick({ allowResume: !authGate.paused })
-    : (realTick ? await buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] });
+  const awaitVerify = await timedAsync('await-verify', async () => (awaitVerifyTick ? awaitVerifyTick({ allowResume: !authGate.paused })
+    : (realTick ? buildAwaitVerifyStep()({ allowResume: !authGate.paused }) : { rows: [] })));
   // card xccgzu5 — SECOND, still before any fresh dispatch: a fixer the watchdog flagged stuck (live 2026-10-08,
   // ci-heal-4453 idle 1h on a verify for a commit it had already pushed) is stopped and its claims released here,
   // so THIS tick's ci-heal/fix halves see the PR unowned and re-dispatch it, and its reserved slot frees up.
-  const stuckFixers = stuckFixerTick ? await stuckFixerTick()
-    : (realTick ? await runFixerStuckReclaimPass() : { rows: [] });
+  const stuckFixers = await timedAsync('stuck-fixers', async () => (stuckFixerTick ? stuckFixerTick()
+    : (realTick ? runFixerStuckReclaimPass() : { rows: [] })));
   // card xiqtf7w — THIRD, before any fresh dispatch: a PR a merged PR declares it supersedes gets its terminal
   // stand-down now, so this tick's fix/ci-heal halves (and the review daemon) already read it as stood down.
   // No Claude session is spawned, so the auth gate never pauses it.
-  const supersede = supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
-    : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] });
+  const supersede = timed('supersede', () => (supersedeTick ? runSupersedeAllRepos({ repos, tick: supersedeTick })
+    : (realTick ? runSupersedeAllRepos({ repos }) : { repos: [] })));
   const pausedDispatchResult = () => ({
     repos: repos.map((repo) => ({ repo, result: { dispatched: [], refusals: [] } })),
     dispatched: [], refusals: [], reconcileRefusals: [],
@@ -729,31 +735,31 @@ export async function runTickAllRepos({
     listBuildClaims: () => listBuildDispatchClaims(), listFixClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }),
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
-  const fix = authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate }) });
-  const ciHeal = authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission, dispatchThrottle }) });
-  const hungCi = runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) });
+  const fix = timed('fix', () => (authGate.paused ? pausedDispatchResult()
+    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate }) })));
+  const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
+    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission, dispatchThrottle }) })));
+  const hungCi = timed('hung-ci', () => runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) }));
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
   // reason `hungCi` already does — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const mainRedRebase = runMainRedRebaseAllRepos({ repos, ...(mainRedRebaseTick ? { tick: mainRedRebaseTick } : {}) });
+  const mainRedRebase = timed('main-red-rebase', () => runMainRedRebaseAllRepos({ repos, ...(mainRedRebaseTick ? { tick: mainRedRebaseTick } : {}) }));
   // xi4od2p (#4075/#3383) — the SIXTH half this daemon now owns: see {@link runMissingRunRecoveryAllRepos}'s
   // own docblock for why this daemon, specifically, is where it lives (same reason `hungCi`/`mainRedRebase`
   // already do — the pass's own `daemon-manifest.mjs` entry has no launchd job installed).
-  const missingRun = runMissingRunRecoveryAllRepos({ repos, ...(missingRunTick ? { tick: missingRunTick } : {}) });
+  const missingRun = timed('missing-run', () => runMissingRunRecoveryAllRepos({ repos, ...(missingRunTick ? { tick: missingRunTick } : {}) }));
   // draft-first PRs (operator-approved 2026-09-27) — the SEVENTH half this daemon now owns: see
   // {@link runPromoteDraftDispatchAllRepos}'s own docblock for why this daemon, specifically, is where it
   // lives (same reason `hungCi`/`mainRedRebase`/`missingRun` already do). UNPAUSED by `authGate` — see that
   // function's own docblock for why (no Claude session is ever spawned by this half).
-  const promoteDraft = runPromoteDraftDispatchAllRepos({ repos, ...(promoteDraftTick ? { tick: promoteDraftTick } : {}) });
+  const promoteDraft = timed('promote-draft', () => runPromoteDraftDispatchAllRepos({ repos, ...(promoteDraftTick ? { tick: promoteDraftTick } : {}) }));
   // #4191 (epic #4075/#3383) — the FIFTH half this daemon now owns: surface `planReconcile`'s own `notes`
   // (`ci-heal-exhausted`/`awaiting-permission`) that neither `fix` nor `ci-heal` above ever forwards — see
   // {@link runReconcileNotesAllRepos}'s own docblock for why this is a separate, independent read rather than a
   // field threaded through either of those two.
-  const notes = runReconcileNotesAllRepos({
+  const notes = timed('notes', () => runReconcileNotesAllRepos({
     repos, ...(notesTick ? { tick: notesTick } : {}), ...(notesDryRun == null ? {} : { dryRun: notesDryRun }),
-  });
+  }));
   // #3383 follow-up — tag EVERY freshly-dispatched fix/ci-heal session's PR right away, `fix`+`ci-heal`
   // ONLY: `hungCi`/`mainRedRebase`/`missingRun` are mechanical git/gh actions with no live Claude session bound
   // to a `fix-<pr>`/`ci-heal-<pr>` name, so `review-status:*` (a label about a SESSION, not a mechanical patch)
@@ -791,6 +797,7 @@ export async function runTickAllRepos({
     stuckFixers, // card xccgzu5 — one row per unacknowledged fixer-stuck event (reclaim / hold / ack)
     supersede, // card xiqtf7w — per repo: the supersede holds planned and posted this tick
     ...(realTick ? { factsWarm, factsStats: takeFixReadStats() } : {}), // perf C1d — where this tick's PR facts came from
+    phaseMs, passMs: now() - passStart, // how long each half of this pass took (see formatPassTiming)
   };
 }
 
@@ -958,6 +965,21 @@ export function buildDaemonExits({ awaitLoop, releaseLease, exit = (code) => pro
   };
 }
 
+/**
+ * PURE: one log line naming how long this pass took and where the time went, slowest half first — or `null` when
+ * the result carries no timing. Live 2026-10-09: the pass that ended 19:09:31Z ran 15.7 min (started 18:53:51Z)
+ * and PR #4624's advisory, posted at 18:55:54Z, waited for it with no record of which half was slow.
+ * @param {{phaseMs?: Record<string, number>, passMs?: number}} result
+ */
+export function formatPassTiming(result) {
+  const phaseMs = result?.phaseMs;
+  if (!phaseMs || !Number.isFinite(result?.passMs)) return null;
+  const sec = (ms) => `${(ms / 1000).toFixed(1)}s`;
+  const parts = Object.entries(phaseMs).filter(([, ms]) => Number.isFinite(ms)).sort((a, b) => b[1] - a[1])
+    .map(([name, ms]) => `${name} ${sec(ms)}`);
+  return `pass-timing total ${sec(result.passMs)} — ${parts.join(', ') || 'no phases'}`;
+}
+
 /** Build the real effects for {@link runDaemonLoop}: a real tick of {@link runTickAllRepos} (`fix` +
  *  `ci-heal`, #xngv3vn), a real interval sleep, and a real keyed lease heartbeat. Kept as its own factory
  *  (mirroring `buildCliTickEffects` in runner.mjs) so `main()` stays a thin wire-up. */
@@ -984,6 +1006,8 @@ export function buildCliDaemonEffects({ owner, intervalMs = DEFAULT_INTERVAL_MS,
         log.error(`reconcile-fix-dispatch-daemon: pr-facts ${w?.skipped ? `off (${w.skipped})` : (w?.warmed ?? []).map((x) => `${x.repo.split('/')[1]}=${x.ok ? 'store' : `github (${x.reason})`}`).join(' ')} — reads: ${formatFixReadStats(result.factsStats)}`);
       }
       log.error(`reconcile-fix-dispatch-daemon: tick (${repos.map((r) => r.repo).join(', ')}) — dispatched ${dispatched.length}, refused ${refusals.length}`);
+      const timing = formatPassTiming(result);
+      if (timing) log.error(`reconcile-fix-dispatch-daemon: ${timing}`);
       // card x5kagse (epic #4075/#3383) — logged EVERY tick fix/ci-heal dispatch stays paused, exact wording
       // required by the card and matched by the soak scenario/live-proof read; never merely implied by an
       // empty `dispatched` count.

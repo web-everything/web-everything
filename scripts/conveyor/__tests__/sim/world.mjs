@@ -295,6 +295,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // smoking inline, but every scenario here scripts the inline rebuild moving the clone within the tick. Pin the
     // inline path; rebuild-job tests own the job mode.
     WE_DAEMON_REBUILD_AS_JOB: '0',
+    // PR #4686 — a build adopted within the last `WE_STALE_GUARD_REBUILD_GRACE_MS` (default 60 min) is no longer
+    // refused as stale. Every sim tick adopts a build moments (sim-time) before the scenario moves origin/main, so
+    // the default would silently turn the I-18 mid-tick stale-main refusal (self-sync-sibling A2) into no refusal.
+    // Pin the grace off (the pre-fix rule); daemon-last-good.test.mjs owns the grace itself.
+    WE_STALE_GUARD_REBUILD_GRACE_MS: '0',
     // dispatch-throttle.mjs: the fix/ci-heal live-session cap and the host-load gate defer launches off the REAL
     // host's loadavg and live claims — a soak must be hermetic, or a busy CI runner (4 shards in parallel) reads as
     // an owed PR "never dispatched". Pinned wide open; dispatch-throttle.test.mjs owns the throttle itself.
