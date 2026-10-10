@@ -607,6 +607,36 @@ describe('no gate record is ever missing or reduced while its gate runs, and no 
     expect(runGate).toHaveBeenCalledTimes(1);
   });
 
+  it('two jobs starting together: the one whose pending record came first spawns, the later one refuses and stops pending', async () => {
+    const peer = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, runId: 'run-p' }, codeSha: 'c0de' }); // unfinished
+    const runGate = vi.fn(async () => {});
+    // The peer recorded its gate first and has not spawned yet: no process carries its run id, so liveness alone says "dead".
+    writeFileSync(gatePath(dir, peer.id), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-p', dir: INPUT.dir, at: '2000-01-01T00:00:00.000Z' }));
+    const out = await runGateStep({ jobId: 'c1', input: INPUT, jobsDir: dir, runGate, ...quiet, scan: () => [] });
+    expect(runGate).not.toHaveBeenCalled();
+    expect(out.outcome).toBe('failed');
+    expect(JSON.parse(readFileSync(gatePath(dir, 'c1'), 'utf8')).pending).toBeFalsy(); // nobody waits on a refused job
+    // The peer recorded AFTER us: we are first, so we spawn (the peer's own check refuses beside us).
+    writeFileSync(gatePath(dir, peer.id), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-p', dir: INPUT.dir, at: '2999-01-01T00:00:00.000Z' }));
+    expect((await runGateStep({ jobId: 'c2', input: INPUT, jobsDir: dir, runGate, ...quiet, scan: () => [] })).outcome).toBe('green');
+    // A finished peer's pending record is judged by its run id alone (no process carries it: gone).
+    store.update(peer.id, (r) => markFailed(r, { at: AT, reason: 'gave up' }));
+    writeFileSync(gatePath(dir, peer.id), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-p', dir: INPUT.dir, at: '2000-01-01T00:00:00.000Z' }));
+    expect((await runGateStep({ jobId: 'c3', input: INPUT, jobsDir: dir, runGate, ...quiet, scan: () => [] })).outcome).toBe('green');
+  });
+
+  it('an unreadable job record holds only the lane its sidecar names, never every lane', async () => {
+    const bad = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    writeFileSync(join(dir, `${bad.id}.json`), '{"not a job record');
+    writeFileSync(gatePath(dir, bad.id), JSON.stringify({ pid: 902, handle: 'h:902:x', runId: 'run-b', dir: '/lanes/we/lane-9' }));
+    const runGate = vi.fn(async () => {});
+    const deps = { ...quiet, probe: () => 'unknown' };
+    expect((await runGateStep({ jobId: 'k1', input: INPUT, jobsDir: dir, runGate, ...deps })).outcome).toBe('green');
+    writeFileSync(gatePath(dir, bad.id), JSON.stringify({ pid: 902, handle: 'h:902:x', runId: 'run-b', dir: INPUT.dir }));
+    expect((await runGateStep({ jobId: 'k2', input: INPUT, jobsDir: dir, runGate, ...deps })).outcome).toBe('failed');
+    expect(runGate).toHaveBeenCalledTimes(1);
+  });
+
   it('a gate no sidecar names at all (another daemon, a rolled-back in-process sweep) refuses the start; a failed scan does too', async () => {
     const runGate = vi.fn(async () => {});
     const out = await runGateStep({ jobId: 'n1', input: INPUT, jobsDir: dir, runGate, ...quiet, scanLane: () => [6001] });

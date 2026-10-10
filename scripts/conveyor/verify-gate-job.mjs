@@ -448,16 +448,6 @@ export async function runGateStep({
     return finish({ outcome: 'failed', status: null, signal: null, message });
   }
 
-  // 1b. Nor beside ANY other gate on this lane: another job's survivor (a daemon that dispatched before its first sync,
-  // a second daemon on the same store), or a gate no sidecar names (another store, a rolled-back in-process sweep).
-  // Only proven gone lets the run go on; such a gate is never killed from here (it is not this job's to signal).
-  const blocker = otherLaneGate({ jobId, input, jobsDir, listJobs, scanLane, probe, pidExists, scan, groupExists });
-  if (blocker) {
-    const message = `${blocker}; refusing to start a second gate on this lane`;
-    log(`[verify-gate-job ${jobId}] attempt ${attempt}: ${message}`);
-    return finish({ outcome: 'failed', status: null, signal: null, message });
-  }
-
   // 2. Run nothing unless the marker is still this request (a relaunch may find it settled or superseded).
   const { marker, headSha } = laneState(input.dir);
   if (!markerStillOurs(marker, headSha, input)) {
@@ -467,12 +457,28 @@ export async function runGateStep({
 
   // 3. Record the gate BEFORE spawning it: a supervisor that dies between the spawn and the pid write must not leave
   // a gate no sidecar names (the relaunch and the tick would read "no gate" and start a second one beside it). The
-  // pending sidecar carries the run id the gate is spawned with (`--run-id=`), so it is found by that until the pid lands.
+  // pending sidecar carries the run id the gate is spawned with (`--run-id=`), so it is found by that until the pid lands,
+  // and the lane, so a check from another job can scope it even when that job's own record will not parse.
+  const pendingRec = { pid: null, handle: null, pending: true, runId: input.runId, dir: input.dir, at: new Date().toISOString(), attempt };
   try {
-    writeJson(gatePath(jobsDir, jobId), { pid: null, handle: null, pending: true, runId: input.runId, at: new Date().toISOString(), attempt });
+    writeJson(gatePath(jobsDir, jobId), pendingRec);
   } catch (e) {
     return finish({ outcome: 'failed', status: null, signal: null,
       message: `could not record the gate before spawning it (${String(e?.message || e).split('\n')[0]}); not started` });
+  }
+
+  // 3b. Nor beside ANY other gate on this lane: another job's survivor (a daemon that dispatched before its first sync,
+  // a second daemon on the same store), or a gate no sidecar names (another store, a rolled-back in-process sweep).
+  // Checked only AFTER our own pending record is down: two jobs starting together each see the other's, and the
+  // earlier one wins ({@link otherLaneGate}). Only proven gone lets the run go on; such a gate is never killed from
+  // here (it is not this job's to signal).
+  const blocker = otherLaneGate({ jobId, input, own: pendingRec, jobsDir, listJobs, scanLane, probe, pidExists, scan, groupExists });
+  if (blocker) {
+    const message = `${blocker}; refusing to start a second gate on this lane`;
+    log(`[verify-gate-job ${jobId}] attempt ${attempt}: ${message}`);
+    // No longer pending: a record that names no gate, so no other job's check waits on this one.
+    try { writeJson(gatePath(jobsDir, jobId), { pid: null, handle: null, runId: input.runId, dir: input.dir, refused: true, at: new Date().toISOString(), attempt }); } catch {}
+    return finish({ outcome: 'failed', status: null, signal: null, message });
   }
 
   // 4. The gate — the same code, ceilings and settlement as the in-process sweep.
@@ -490,7 +496,7 @@ export async function runGateStep({
       log,
       onSpawn: (pid) => {
         onGate(pid); // first: a SIGTERM from here on kills the gate even if the sidecar write below fails
-        const base = { pid, handle: null, runId: input.runId, spawnedAt: new Date().toISOString(), attempt };
+        const base = { pid, handle: null, runId: input.runId, dir: input.dir, spawnedAt: new Date().toISOString(), attempt };
         // The pid lands BEFORE the start-time read (a `ps` that can take seconds): a supervisor that dies inside it
         // leaves a record whose process group is still checked, not a pending one found only by its leader's argv.
         try { record(base); } catch (e) {
@@ -524,20 +530,30 @@ export async function runGateStep({
 
 /**
  * Why another gate may still be running on `input.dir`, or null when none provably is: any other gate job of this
- * lane whose recorded gate is not proven gone ({@link gateState}), a sidecar of an unreadable job record that is not
- * proven gone (its lane is unknown, so it counts), or a dispatched gate process on the lane that no sidecar names.
- * A listing or a scan that fails is never "none".
+ * lane whose recorded gate is not proven gone ({@link gateState}); a still-pending gate of an unfinished job that
+ * recorded itself BEFORE ours (`own`: ordered by its `at`, then job id — two jobs starting together each see the
+ * other's pending record, and only the earlier spawns); the same for a sidecar naming this lane whose job record will
+ * not parse (one naming no lane, or another lane, is left to the `ps` scan — it must not hold every lane); or a
+ * dispatched gate process on the lane that no sidecar names. A listing or a scan that fails is never "none".
  */
-function otherLaneGate({ jobId, input, jobsDir, listJobs, scanLane, probe, pidExists, scan, groupExists }) {
+function otherLaneGate({ jobId, input, own, jobsDir, listJobs, scanLane, probe, pidExists, scan, groupExists }) {
   const kind = VERIFY_GATE_JOB_KIND.kind;
   let listing;
   try { listing = listJobs(); } catch (e) { return `the gate jobs could not be listed (${String(e?.message || e).split('\n')[0]})`; }
-  const ids = [
-    ...(listing?.records || []).filter((r) => r.id !== jobId && r.job?.kind === kind && r.input?.dir === input.dir).map((r) => r.id),
-    ...(listing?.corrupt || []).filter((id) => id !== jobId),
+  const peers = [
+    ...(listing?.records || []).filter((r) => r.id !== jobId && r.job?.kind === kind && r.input?.dir === input.dir)
+      .map((r) => ({ id: r.id, gate: readJson(gatePath(jobsDir, r.id)), unfinished: !TERMINAL_JOB_STATUSES.includes(r.job.status) })),
+    ...(listing?.corrupt || []).filter((id) => id !== jobId)
+      .map((id) => ({ id, gate: readJson(gatePath(jobsDir, id)), unfinished: true })).filter((p) => p.gate?.dir === input.dir),
   ];
-  for (const id of ids) {
-    const gate = readJson(gatePath(jobsDir, id));
+  const ownAt = Date.parse(own?.at || '');
+  for (const { id, gate, unfinished } of peers) {
+    if (gate?.pending && unfinished) {
+      const at = Date.parse(gate.at || '');
+      if (!Number.isFinite(at) || !Number.isFinite(ownAt) || at < ownAt || (at === ownAt && id < jobId)) {
+        return `job ${id} recorded its gate (run ${gate.runId ?? '?'}) before this one and may be about to spawn it`;
+      }
+    }
     const state = gateState(gate, { probe, pidExists, scan, groupExists });
     if (state !== 'dead') return `job ${id}'s gate ${gate?.pid ? `pid ${gate.pid}` : `(run ${gate?.runId ?? '?'})`} may still run on this lane (${state})`;
   }
