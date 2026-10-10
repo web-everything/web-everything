@@ -1,10 +1,11 @@
 ---
+bornAs: x6nuodj
 kind: story
 size: 8
 priority: high
-parent: "x6woyws"
+parent: "5712"
 status: open
-blockedBy: ["x9xkupj"]
+blockedBy: ["5714"]
 scope: ["we:scripts/lib/cost-admission.mjs", "we:scripts/lib/cost-admission-facts.mjs", "we:scripts/lib/__tests__/cost-admission.test.mjs", "we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/conveyor/__tests__/tick-core-cost-admission.test.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs", "we:scripts/lib/dispatch-throttle.mjs", "we:scripts/lib/fix-slot-borrow.mjs", "we:scripts/lib/ci-heal-reserve.mjs"]
 dateOpened: "2026-10-09"
 tags: []

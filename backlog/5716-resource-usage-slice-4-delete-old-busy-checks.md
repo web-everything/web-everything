@@ -1,10 +1,11 @@
 ---
+bornAs: xmd6ngm
 kind: story
 size: 5
 priority: high
-parent: "x6woyws"
+parent: "5712"
 status: open
-blockedBy: ["x6nuodj"]
+blockedBy: ["5715"]
 scope: ["we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/cost-admission.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/lib/dispatch-throttle.mjs", "we:scripts/lib/fix-slot-borrow.mjs", "we:scripts/lib/ci-heal-reserve.mjs", "we:scripts/dispatch-settings.json", "we:scripts/held-cards-io.mjs", "we:scripts/operations/land-advance-io.mjs"]
 dateOpened: "2026-10-09"
 tags: []

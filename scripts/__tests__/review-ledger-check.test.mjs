@@ -26,6 +26,8 @@ import { REVIEW_LABELS } from '../lib/review-escalation.mjs';
 
 const REPO = 'web-everything/web-everything';
 const AT = '2026-08-10T12:00:00.000Z';
+const COMPLETE_SCAN = { limit: 200, listed: 3, truncated: false, storeShared: true };
+const summaryFor = (scan) => ({ ...summarizeDerived([]), total: scan.listed }); // a run record's scored total matches the listed PR count
 const rec = (over) => buildVerdictRecord({ repo: REPO, pr: 1, verdict: VERDICTS.ACCEPTED, at: AT, source: 'test', ...over });
 const L = (...names) => names.map((name) => ({ name }));
 
@@ -42,8 +44,21 @@ describe('readOpenPrs — one gh read, open PRs only', () => {
     expect(out).toEqual([{ number: 5, labels: [{ name: REVIEW_LABELS.pending }] }]);
   });
 
-  it('tolerates a non-array payload rather than crashing the sweep', () => {
-    expect(readOpenPrs({ repo: REPO, exec: () => 'null' })).toEqual([]);
+  it('a non-array or empty payload is a failed read (throws), never "no open PRs"', () => {
+    expect(() => readOpenPrs({ repo: REPO, exec: () => 'null' })).toThrow(/non-array/);
+    expect(() => readOpenPrs({ repo: REPO, exec: () => '{"message":"boom"}' })).toThrow(/non-array/);
+    expect(() => readOpenPrs({ repo: REPO, exec: () => '' })).toThrow();
+    expect(readOpenPrs({ repo: REPO, exec: () => '[]' })).toEqual([]);
+  });
+
+  it('runCheck exits 2 and records nothing when the PR list read fails', async () => {
+    let writes = 0;
+    const store = { name: 'git', shared: true, durable: true, ordering: 'total', singleWriter: 'push-race-retry' };
+    const res = await runCheck({ repo: REPO, store: 'git', stdout: () => {}, stderr: () => {},
+      readEvents: async () => ({ status: 'ok', rows: [], store }),
+      listPrs: () => readOpenPrs({ repo: REPO, exec: () => 'null' }), appendRun: () => { writes += 1; } });
+    expect(res.exitCode).toBe(2);
+    expect(writes).toBe(0);
   });
 });
 
@@ -209,6 +224,10 @@ describe('slice F — derived vs live labels', () => {
     expect(deriveRow({ pr: 7, repo: REPO, events: null, facts: facts(), liveLabels: [] }).status).toBe('unreadable');
     expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: null, liveLabels: [] }).status).toBe('unreadable');
     expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: facts({ probeErrors: ['GitHub PR unavailable'] }), liveLabels: [] }).status).toBe('unreadable');
+    // ANY probe error (partial CI/head/comment/referral read) is unreadable, not a clean "no label" derivation
+    for (const err of ['GitHub head/comments unavailable', 'check rollup truncated at 100', 'required-check set empty; readiness unknown', 'jobs scan capped at 500']) {
+      expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: facts({ probeErrors: [err] }), liveLabels: [] }).status).toBe('unreadable');
+    }
     const s = summarizeDerived([deriveRow({ pr: 7, repo: REPO, events: null, facts: facts(), liveLabels: [] })]);
     expect(s).toMatchObject({ unreadable: 1, agree: 0, mismatch: 0 });
     expect(s.perFamily.review.compared).toBe(0);
@@ -351,7 +370,7 @@ describe('#3930 — every constellation repo, and the run history as a query', (
     const runs = [];
     for (let i = 0; i < 7; i += 1) {
       const day = new Date(Date.UTC(2026, 9, 9 - i, 15)).toISOString();
-      for (const repo of DEFAULT_REPOS) runs.push(buildCheckRunRecord({ id: `review-ledger-check-h${i}${repo.length}`, repo, at: day, summary: summarizeDerived([]), phase1: {} }));
+      for (const repo of DEFAULT_REPOS) runs.push(buildCheckRunRecord({ id: `review-ledger-check-h${i}${repo.length}`, repo, at: day, summary: summaryFor(COMPLETE_SCAN), phase1: {}, scan: COMPLETE_SCAN }));
     }
     let out = '';
     const ok = runHistory({ now, read: () => ({ runs, corrupt: 0 }), stdout: (t) => { out += t; } });
@@ -360,5 +379,77 @@ describe('#3930 — every constellation repo, and the run history as a query', (
     const short = runHistory({ now, read: () => ({ runs: runs.slice(3), corrupt: 0 }), json: true, stdout: () => {} });
     expect(short).toMatchObject({ ready: false, exitCode: 1 });
     expect(runHistory({ now, read: () => ({ runs: [], corrupt: 0 }), stdout: () => {} }).exitCode).toBe(1);
+  });
+
+  describe('runHistory readiness cannot be faked by a narrower question', () => {
+    const now = new Date('2026-10-09T18:00:00Z');
+    const weekOfRuns = (repos, scan = COMPLETE_SCAN) => Array.from({ length: 7 }, (_, i) => repos.map((repo) => buildCheckRunRecord({
+      id: `review-ledger-check-p${i}${repo.length}`, repo, at: new Date(Date.UTC(2026, 9, 9 - i, 15)).toISOString(), summary: summaryFor(scan), phase1: {}, scan,
+    }))).flat();
+
+    it('--repos with only part of the constellation is a partial scope: exit 1 and never READY', () => {
+      const runs = weekOfRuns([DEFAULT_REPOS[0]]); // WE has a perfect week; the others have no runs at all
+      let out = '';
+      const res = runHistory({ now, repos: [DEFAULT_REPOS[0]], read: () => ({ runs, corrupt: 0 }), stdout: (t) => { out += t; } });
+      expect(res).toMatchObject({ partialScope: true, ready: false, exitCode: 1 });
+      expect(Object.values(res.families).every((f) => f.subsetReady === true && f.ready === false)).toBe(true); // the subset is clean, but no family says READY
+      expect(out).not.toMatch(/READY\s*$/m);
+      expect(out).toContain('partial scope');
+      expect(out).not.toContain('ALL FAMILIES READY'); // ...but the answer is never "ready"
+    });
+
+    it('the repo list is matched case-insensitively and a superset still answers for the whole constellation', () => {
+      const runs = [...weekOfRuns(DEFAULT_REPOS), ...weekOfRuns(['other/extra'])];
+      const upper = runHistory({ now, repos: DEFAULT_REPOS.map((r) => r.toUpperCase()), read: () => ({ runs, corrupt: 0 }), stdout: () => {} });
+      expect(upper).toMatchObject({ partialScope: false, ready: true, exitCode: 0 });
+    });
+
+    it('the family set is pinned to LABEL_FAMILIES: records lacking one family are NOT ready', () => {
+      const runs = weekOfRuns(DEFAULT_REPOS);
+      for (const r of runs) delete r.findings.derived.perFamily['ci-failed'];
+      const res = runHistory({ now, read: () => ({ runs, corrupt: 0 }), stdout: () => {} });
+      expect(Object.keys(res.families)).toEqual(LABEL_FAMILIES.map((f) => f.family));
+      expect(res.families['ci-failed']).toMatchObject({ streak: 0, ready: false });
+      expect(res).toMatchObject({ ready: false, exitCode: 1 });
+    });
+
+    it('a week of truncated scans is not ready', () => {
+      const res = runHistory({ now, read: () => ({ runs: weekOfRuns(DEFAULT_REPOS, { limit: 1, listed: 1, truncated: true }), corrupt: 0 }), stdout: () => {} });
+      expect(res).toMatchObject({ ready: false, exitCode: 1 });
+    });
+
+    it('no history at all still prints the no-records hint now that the families are pinned', () => {
+      let out = '';
+      runHistory({ now, read: () => ({ runs: [], corrupt: 0 }), stdout: (t) => { out += t; } });
+      expect(out).toContain('no run records yet');
+    });
+  });
+
+  describe('the scan evidence a run records', () => {
+    const store = { name: 'git', shared: true, durable: true, ordering: 'total', singleWriter: 'push-race-retry' };
+    const check = async (prs, limit) => {
+      let recorded;
+      await runCheck({ repo: REPO, store: 'git', limit, json: true, stdout: () => {},
+        readEvents: async () => ({ status: 'ok', rows: [], store }), listPrs: async () => prs,
+        readFacts: () => ({ headSha: 'a'.repeat(40), labels: [], checks: [], requiredChecks: [], probeErrors: [] }),
+        appendRun: (r) => { recorded = r; return { ok: true }; } });
+      return buildCheckRunRecord({ id: 'review-ledger-check-s', repo: REPO, at: AT, summary: summarizeDerived([]), phase1: {}, scan: recorded.scan });
+    };
+
+    it('a list shorter than the limit is recorded complete; a list as long as the limit is recorded truncated', async () => {
+      const prs = [{ number: 1, labels: [] }, { number: 2, labels: [] }];
+      expect((await check(prs, 200)).findings.scan).toEqual({ limit: 200, listed: 2, truncated: false, storeShared: true });
+      expect((await check(prs, 2)).findings.scan).toEqual({ limit: 2, listed: 2, truncated: true, storeShared: true });
+      expect((await check(prs, 1)).findings.scan).toEqual({ limit: 1, listed: 2, truncated: true, storeShared: true });
+    });
+
+    it('appendCheckRun persists the scan so the history can read it back', () => {
+      const dir = mkdtempSync(join(tmpdir(), 'rlc-scan-'));
+      try {
+        appendCheckRun({ repo: REPO, summary: summarizeDerived([]), phase1: {}, scan: COMPLETE_SCAN, write: (r) => writeRun(r, dir) });
+        const saved = JSON.parse(readFileSync(join(dir, readdirSync(dir)[0]), 'utf8'));
+        expect(saved.findings.scan).toEqual(COMPLETE_SCAN);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
   });
 });

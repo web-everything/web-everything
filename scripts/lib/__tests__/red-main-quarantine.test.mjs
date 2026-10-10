@@ -1,0 +1,174 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  QUARANTINE_REF, validateQuarantineList, canWriteQuarantine, addEntries, pruneOnGreen, testsToSkip,
+  classifyQuarantinedFailure, decideQuarantineHold, testArea, vitestExcludeArgs, resolveFixFiles, listedPrFiles, QUARANTINE_MAX_TTL_MS, QUARANTINE_DEFAULT_TTL_MS,
+} from '../red-main-quarantine.mjs';
+import { redMainSignal, resolveRedMainMode } from '../red-main-hold.mjs';
+import { assertPushRef } from '../git-transport-branch.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const FIX = JSON.parse(readFileSync(join(HERE, 'fixtures', 'red-main-hold-windows-2026-10.json'), 'utf8'));
+const T = (iso) => Date.parse(iso);
+const NOW = T('2026-10-09T14:00:00Z');
+const SHA = '7e51376635bbb571dfc596f1986960bf35a03fd6';
+const TEST = 'skills-src/conveyor/__tests__/reconcile-fix-dispatch-daemon.test.mjs';
+const listWith = (tests, sha = SHA, now = NOW) => addEntries(null, { tests, brokenSha: sha, owner: 'main-fix-7e5137663', reason: 'red on main', actor: 'red-main-safety-net', now }).list;
+
+describe('quarantine — settings', () => {
+  it('mode defaults to stop; the shipped platform preference is stop; env can switch it', () => {
+    expect(resolveRedMainMode({ env: {}, file: '/nonexistent' })).toEqual({ value: 'stop', source: 'default' });
+    expect(resolveRedMainMode({ env: {} }).value).toBe('stop');
+    expect(resolveRedMainMode({ env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } })).toEqual({ value: 'quarantine', source: 'env' });
+  });
+});
+
+describe('quarantine — who may write, and where', () => {
+  it('only the red-main safety net or the operator may write', () => {
+    expect(canWriteQuarantine('red-main-safety-net')).toBe(true);
+    expect(canWriteQuarantine('operator')).toBe(true);
+    expect(canWriteQuarantine('pr-4613')).toBe(false);
+    expect(addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'x', reason: 'y', actor: 'some-pr', now: NOW }).ok).toBe(false);
+  });
+  it('the push-ref guard allows exactly refs/heads/ops/quarantine', () => {
+    expect(assertPushRef('ops/quarantine', QUARANTINE_REF)).toBe(QUARANTINE_REF);
+    expect(() => assertPushRef('main', QUARANTINE_REF)).toThrow();
+    expect(() => assertPushRef('+ops/quarantine', QUARANTINE_REF)).toThrow();
+    expect(() => assertPushRef('ops/review-requests', QUARANTINE_REF)).toThrow();
+  });
+  it('every add is an audit event; a malformed test id is refused', () => {
+    const r = addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW });
+    expect(r.events).toEqual([expect.objectContaining({ type: 'quarantine-added', test: TEST, actor: 'operator' })]);
+    expect(addEntries(null, { tests: ['../../etc/passwd'], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW }).ok).toBe(false);
+    expect(validateQuarantineList({ version: 2 }).ok).toBe(false);
+  });
+});
+
+describe('quarantine — lifetime', () => {
+  it('main green removes every entry (with removal events); unknown removes only expired ones', () => {
+    const l = listWith([TEST]);
+    expect(pruneOnGreen(l, { mainGreen: null, now: NOW + 1000 }).list.entries).toHaveLength(1);
+    const g = pruneOnGreen(l, { mainGreen: true, now: NOW + 1000 });
+    expect(g.list.entries).toHaveLength(0);
+    expect(g.events[0]).toMatchObject({ type: 'quarantine-removed', why: 'main-green' });
+    expect(pruneOnGreen(l, { mainGreen: false, now: NOW + 7 * 3600_000 }).events[0].why).toBe('expired');
+  });
+});
+
+describe('quarantine — what CI skips', () => {
+  const l = listWith([TEST]);
+  it('an ordinary PR skips the quarantined test', () => {
+    expect(testsToSkip({ list: l, now: NOW, prNumber: 4613, fixPrs: [4617] })).toEqual([TEST]);
+  });
+  it('the main-fix PR and main itself RUN it', () => {
+    expect(testsToSkip({ list: l, now: NOW, prNumber: 4617, fixPrs: [4617] })).toEqual([]);
+    expect(testsToSkip({ list: l, now: NOW, onMain: true })).toEqual([]);
+  });
+  it('a PR red only on quarantined tests is routed to a re-run; any other failure is not', () => {
+    expect(classifyQuarantinedFailure({ failedTests: [TEST], list: l, now: NOW }).rerun).toBe(true);
+    expect(classifyQuarantinedFailure({ failedTests: [TEST, 'scripts/x.test.mjs'], list: l, now: NOW }).rerun).toBe(false);
+    expect(classifyQuarantinedFailure({ failedTests: [], list: l, now: NOW }).rerun).toBe(false);
+  });
+  // PR #4624 review: a `file::test name` entry names ONE test, never the whole file.
+  const NAMED = `${TEST}::dispatches the fix`;
+  it('a name-qualified entry is never "covered": the per-file exclude does not skip it, so a re-run would loop; a whole-file entry still covers its file', () => {
+    const ln = listWith([NAMED]);
+    expect(classifyQuarantinedFailure({ failedTests: [NAMED], list: ln, now: NOW }).rerun).toBe(false);
+    expect(classifyQuarantinedFailure({ failedTests: [`${TEST}::some other test`], list: ln, now: NOW }).rerun).toBe(false);
+    expect(classifyQuarantinedFailure({ failedTests: [TEST], list: ln, now: NOW }).rerun).toBe(false);
+    expect(classifyQuarantinedFailure({ failedTests: [NAMED], list: l, now: NOW }).rerun).toBe(true);
+  });
+  it('rerun routing and the CI skip agree: a failure routes to a re-run iff the next run\'s vitest args exclude its file', () => {
+    for (const entries of [[TEST], [NAMED], [TEST, NAMED], ['scripts/other.test.mjs']]) {
+      const list = listWith(entries);
+      const { args } = vitestExcludeArgs(testsToSkip({ list, now: NOW, prNumber: 1, fixPrs: [2] }));
+      for (const failed of [TEST, NAMED, `${TEST}::another`]) {
+        const rerun = classifyQuarantinedFailure({ failedTests: [failed], list, now: NOW }).rerun;
+        expect(rerun, `${entries} / ${failed}`).toBe(args.includes(`--exclude=${failed.split('::')[0]}`));
+      }
+    }
+  });
+  it('an entry TTL is capped at a day, and a bad TTL falls back to the default', () => {
+    const e = (ttlMs) => addEntries(null, { tests: [TEST], brokenSha: SHA, owner: 'o', reason: 'r', actor: 'operator', now: NOW, ttlMs }).list.entries[0];
+    expect(e(1e15).expiresAt - NOW).toBe(QUARANTINE_MAX_TTL_MS);
+    expect(e(Infinity).expiresAt - NOW).toBe(QUARANTINE_DEFAULT_TTL_MS);
+    expect(e(-5).expiresAt - NOW).toBe(QUARANTINE_DEFAULT_TTL_MS);
+    expect(e(60_000).expiresAt - NOW).toBe(60_000);
+  });
+  it('listedPrFiles: null when absent or at the 100-file listing cap (it may be truncated), else the paths', () => {
+    expect(listedPrFiles(undefined)).toBeNull();
+    expect(listedPrFiles({ files: null })).toBeNull();
+    expect(listedPrFiles({ files: Array.from({ length: 100 }, (_, i) => ({ path: `f${i}` })) })).toBeNull();
+    expect(listedPrFiles({ files: [{ path: 'a' }, 'b', {}] })).toEqual(['a', 'b']);
+    expect(listedPrFiles({ files: [] })).toEqual([]);
+  });
+  it('vitest format: a whole-file entry becomes --exclude; a name-qualified entry never excludes its file (and never reaches a shell)', () => {
+    expect(vitestExcludeArgs([TEST])).toEqual({ args: [`--exclude=${TEST}`], unsupported: [] });
+    const r = vitestExcludeArgs([NAMED, 'a/b.test.mjs::x; rm -rf $HOME `id`']);
+    expect(r.args).toEqual([]);
+    expect(r.unsupported).toHaveLength(2);
+    expect(vitestExcludeArgs([TEST, NAMED, TEST])).toEqual({ args: [`--exclude=${TEST}`], unsupported: [NAMED] });
+    expect(vitestExcludeArgs(undefined)).toEqual({ args: [], unsupported: [] });
+  });
+});
+
+describe('quarantine — the main-fix PR files stay unknown when unknown (PR #4624 review)', () => {
+  const sig = redMainSignal({ mainRedState: { red: true, firstRedSha: SHA, since: NOW - 3600_000, expiresAt: NOW + 60_000 }, priority: { repo: 'we', pr: 4617, prs: [4617, 4620], expiresAt: NOW + 60_000 }, now: NOW });
+  const l = listWith([TEST]);
+  it('resolveFixFiles: [] only with no fix PR; null when ANY fix PR\'s files are unreadable; else the union', () => {
+    expect(resolveFixFiles({ fixPrs: [], filesOf: () => null })).toEqual([]);
+    expect(resolveFixFiles({ fixPrs: [4617], filesOf: () => null })).toBeNull();
+    expect(resolveFixFiles({ fixPrs: [4617, 4620], filesOf: (n) => (n === 4617 ? ['a'] : null) })).toBeNull();
+    expect(resolveFixFiles({ fixPrs: [4617, 4620], filesOf: (n) => (n === 4617 ? ['a'] : ['b']) })).toEqual(['a', 'b']);
+  });
+  it('end to end with decideQuarantineHold: an unreadable fix PR holds an otherwise-disjoint PR (fail closed), a readable one does not', () => {
+    const unknown = resolveFixFiles({ fixPrs: sig.fixPrs, filesOf: (n) => (n === 4617 ? ['x.mjs'] : null) });
+    expect(decideQuarantineHold({ num: 2, files: ['backlog/a.md'], signal: sig, list: l, fixFiles: unknown, now: NOW })).toMatchObject({ hold: true, reason: expect.stringMatching(/fix PR's files are unknown/) });
+    const known = resolveFixFiles({ fixPrs: sig.fixPrs, filesOf: () => ['x.mjs'] });
+    expect(decideQuarantineHold({ num: 2, files: ['backlog/a.md'], signal: sig, list: l, fixFiles: known, now: NOW }).hold).toBe(false);
+  });
+});
+
+describe('quarantine — drain hold', () => {
+  const sig = redMainSignal({ mainRedState: { red: true, firstRedSha: SHA, since: NOW - 3600_000, expiresAt: NOW + 60_000 }, priority: { repo: 'we', pr: 4617, prs: [4617], expiresAt: NOW + 60_000 }, now: NOW });
+  const l = listWith([TEST]);
+  const fixFiles = [TEST];
+  it('area of a __tests__ file is its package dir', () => { expect(testArea({ test: TEST })).toBe('skills-src/conveyor/'); });
+  it('no quarantine entry for this red ⇒ stop (fail closed)', () => {
+    expect(decideQuarantineHold({ num: 1, files: ['backlog/a.md'], signal: sig, list: null, fixFiles, now: NOW })).toMatchObject({ hold: true, fallback: 'stop' });
+    expect(decideQuarantineHold({ num: 1, files: ['backlog/a.md'], signal: sig, list: listWith([TEST], 'abcdef0123'), fixFiles, now: NOW }).fallback).toBe('stop');
+  });
+  it('unknown files ⇒ held', () => {
+    expect(decideQuarantineHold({ num: 1, files: null, signal: sig, list: l, fixFiles, now: NOW }).hold).toBe(true);
+  });
+  it('the fix PR lands; a disjoint PR lands; an overlapping PR is held', () => {
+    expect(decideQuarantineHold({ num: 4617, files: fixFiles, signal: sig, list: l, fixFiles, now: NOW })).toEqual({ hold: false, fix: true });
+    expect(decideQuarantineHold({ num: 2, files: ['backlog/a.md'], signal: sig, list: l, fixFiles, now: NOW }).hold).toBe(false);
+    expect(decideQuarantineHold({ num: 3, files: ['skills-src/conveyor/x.mjs'], signal: sig, list: l, fixFiles: [], now: NOW }).reason).toMatch(/area/);
+  });
+});
+
+describe('quarantine — replay of the 2026-10-09 red windows', () => {
+  for (const w of FIX.windows) {
+    it(w.name, () => {
+      const rows = [];
+      for (const p of w.landed) {
+        const at = T(p.at);
+        const redNow = (w.mainRedState && at >= T(w.mainRedState.since)) || (w.manualFreeze && at >= T(w.manualFreezeFrom) && at < T(w.manualFreezeUntil));
+        if (!redNow) continue;
+        const sig = redMainSignal({
+          mainRedState: w.mainRedState ? { ...w.mainRedState, since: T(w.mainRedState.since), expiresAt: at + 1 } : null,
+          manualFreeze: w.manualFreeze && !w.mainRedState ? w.manualFreeze : null,
+          priority: { ...w.priority, expiresAt: at + 1 }, now: at,
+        });
+        const list = listWith(w.quarantine.tests, w.quarantine.brokenSha, at - 1);
+        const fixFiles = w.landed.filter((x) => sig.fixPrs.includes(x.num)).flatMap((x) => x.files);
+        rows.push({ num: p.num, ...decideQuarantineHold({ num: p.num, files: p.files, signal: sig, list, fixFiles, now: at }) });
+      }
+      expect(rows.filter((r) => r.hold).map((r) => r.num)).toEqual(w.expectQuarantine.held);
+      expect(rows.filter((r) => r.fix).map((r) => r.num)).toEqual(w.expectQuarantine.fix);
+    });
+  }
+});

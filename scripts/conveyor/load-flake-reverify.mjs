@@ -10,7 +10,7 @@ import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.
 import { runBounded } from '../lib/bounded-child.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment, buildLoadFlakeRedispatchResolvedComment } from './stand-down.mjs';
-import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
+import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm, loadFlakeAttemptResults } from './load-flake-hold.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
@@ -79,9 +79,9 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
     if (!state.live) return [];
     if (state.hold.redispatch) {
       if (!quiet) { loadDeferred = true; return []; }
-      return [{ pr, ...state, attempts: loadFlakeResults(pr.comments).filter((r) => r.redispatch && r.result === 'redispatched').length }];
+      return [{ pr, ...state, attempts: loadFlakeAttemptResults(pr.comments).filter((r) => r.redispatch && r.result === 'redispatched').length }];
     }
-    const reds = loadFlakeResults(pr.comments).filter((r) => r.sha === state.hold.alt.sha && r.result === 'red-again');
+    const reds = loadFlakeAttemptResults(pr.comments).filter((r) => r.sha === state.hold.alt.sha && r.result === 'red-again');
     if (reds.length && now - Date.parse(reds.at(-1).createdAt) < config.cooloffMs) return [];
     return [{ pr, ...state, attempts: reds.length }];
   }).sort((a, b) => Date.parse(a.hold.createdAt) - Date.parse(b.hold.createdAt));

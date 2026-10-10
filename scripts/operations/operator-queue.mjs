@@ -68,6 +68,12 @@ export function rulingNeededRow(repo, pr) {
   };
 }
 
+/** The open-PR listing's stdout cap (it carries every PR's comments). See the listing call in `main`. */
+export const PR_LIST_MAX_BUFFER = 256 * 1024 * 1024;
+
+/** The `review:*` label an opening path adds beside `review:human` until the advisory comment posts. */
+export const AWAITING_ADVISORY_LABEL = 'review:awaiting-advisory';
+
 /** How many times an UNKNOWN mergeability is re-polled, and the first backoff (doubling each attempt). */
 export const MERGEABLE_POLL_ATTEMPTS = 4;
 export const MERGEABLE_POLL_DELAY_MS = 1000;
@@ -113,6 +119,14 @@ export function evaluatePr(pr) {
   } else if (parsed && parsed !== ADVISORY_OUTCOMES.ACCEPT && parsed !== ADVISORY_OUTCOMES.CHANGES) {
     // A converted note's `inconclusive` (PR #2781 review, round 4): neither cleared nor blocking, no label owed.
     reasons.push(`advisory is ${parsed} on this head (a human must confirm the escalation)`);
+  }
+
+  // #4722 — `review:awaiting-advisory` says "the advisory has not posted yet". When the comment on this head exists
+  // the label is stale, and that is a disagreement like any other: reported, never resolved silently here. Its
+  // owner (the advisory-label sweep's repair path) clears it. Without an advisory on this head the label is
+  // consistent and the "no advisory" reasons above already explain the wait.
+  if (hasLabel(pr, AWAITING_ADVISORY_LABEL) && parsed) {
+    reasons.push(`label/comment disagreement: ${AWAITING_ADVISORY_LABEL} is set but ${parsedText}`);
   }
 
   const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
@@ -346,7 +360,11 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
       const prs = JSON.parse(execFileSync('gh', [
         'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json',
         'number,title,labels,headRefOid,mergeable,statusCheckRollup,comments',
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+        // #4722 — `comments` on every open PR is MEGABYTES (review write-ups, red-team notes, fix-claim chatter).
+        // Node's default 1MB `maxBuffer` threw ENOBUFS, and that one throw dropped EVERY PR of the repo from every
+        // section (live 2026-10-10: web-everything/web-everything, 25 open PRs, all invisible). Same cap as the
+        // advisory-label sweep's own comment-carrying listing.
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER }));
       const readyNumbersThisRepo = new Set();
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
         let pr = listed;
@@ -394,6 +412,12 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     console.log(JSON.stringify(report, null, 2));
   } else {
     for (const error of report.errors) console.error(`ERROR ${error}`);
+    // #4722 — a repo whose listing failed shows NONE of its PRs below, so the failure must be on the same page as
+    // the sections, never only on stderr (where it read as "nothing is waiting").
+    if (report.errors.length) {
+      console.log('ERRORS — the sections below are INCOMPLETE (these reads failed):');
+      console.log(report.errors.join('\n'));
+    }
     if (health) console.log(health.join('\n'));
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
     console.log(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');

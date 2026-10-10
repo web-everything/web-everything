@@ -82,22 +82,56 @@ export function operatorAnswerForStandDown(comments, index) {
  * A stand-down is resolved by an operator answer that names it — or (#4522, live 2026-10-09) by a LATER answer
  * carrying a DISPOSITION, which rules the whole PR, not one question. #4522 had two stand-downs (a fixer's, then
  * supersede-watch's); the `close-superseded` answer named the latest, the earlier one stayed "unresolved", and
- * REFUSAL 1 (`stood-down`) fired before the disposition branch every tick, so the PR never closed. Only a
- * disposition widens; a stand-down posted AFTER the answer is untouched.
+ * REFUSAL 1 (`stood-down`) fired before the disposition branch every tick, so the PR never closed. Since plateau
+ * #220 (2026-10-10) any answer is NEWEST-WINS: it also resolves every terminal record at or before the one it names;
+ * a disposition reaches every record before the answer. A stand-down posted AFTER the answer is untouched.
  */
 export function isOperatorAnswerStandDownSuperseded(comments, index) {
   if (operatorAnswerForStandDown(comments, index) !== null) return true;
   if (!Array.isArray(comments) || !isTerminal(comments[index])) return false;
   for (let i = index + 1; i < comments.length; i += 1) {
     const answer = parseOperatorAnswer(comments[i]);
-    if (answer && answerDisposition(answer) && answersEarlierStandDown(comments, i, answer)) return true;
+    if (!answer) continue;
+    const named = namedStandDownIndex(comments, i, answer);
+    if (named < 0) continue;
+    // NEWEST WINS (live plateau #220, 2026-10-10): an answer to a stand-down also answers every terminal record at
+    // or before it — the operator answered the newest question the PR was blocked on, and an older record left
+    // standing would refuse `stood-down` forever. A disposition rules the whole PR, so it reaches every record
+    // before the answer. A record posted AFTER the named one (a newer question the operator has not seen) stays.
+    if (index <= named || answerDisposition(answer)) return true;
   }
   return false;
 }
 
+/** Index of the terminal comment `answer` (at `comments[i]`) names, before it on this thread; -1 when none. */
+function namedStandDownIndex(comments, i, answer) {
+  for (let j = i - 1; j >= 0; j -= 1) {
+    const c = comments[j];
+    if (isTerminal(c) && c.id != null && String(c.id) === answer.standDownId) return j;
+  }
+  return -1;
+}
+
 /** Does `answer` (at `comments[i]`) name a terminal comment that precedes it on this thread? */
 function answersEarlierStandDown(comments, i, answer) {
-  return comments.slice(0, i).some((c) => isTerminal(c) && c.id != null && String(c.id) === answer.standDownId);
+  return namedStandDownIndex(comments, i, answer) >= 0;
+}
+
+/**
+ * `createdAt` of the latest operator answer that answers a stand-down before it, or null. Retry counters that a
+ * stand-down caps (the load-flake reverify attempts) restart from here: the operator's answer IS the human step the
+ * cap asked for, so counting the attempts made before it would exhaust the very first retry it ordered (live
+ * plateau #220: answered at 12:16Z, re-dispatched, then "Retry cap reached" at 12:37Z on 3 pre-answer attempts).
+ * @param {Array<object>|null|undefined} comments - oldest first.
+ * @returns {string|null}
+ */
+export function latestOperatorAnswerAt(comments) {
+  if (!Array.isArray(comments)) return null;
+  for (let i = comments.length - 1; i >= 0; i -= 1) {
+    const answer = parseOperatorAnswer(comments[i]);
+    if (answer && answersEarlierStandDown(comments, i, answer)) return comments[i]?.createdAt ?? null;
+  }
+  return null;
 }
 
 export function latestUnresolvedStandDown(comments) {

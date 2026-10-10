@@ -167,7 +167,7 @@ import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
-import { isDispatchFrozen, readFreeze } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
+import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
 // #2399 — the ONE remote-manifest `gh api` argv, shared with `/finish` (lane-resume) so the two readers never
 // drift. Re-exported to keep this file's public surface (and its tests' import site) stable.
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
@@ -185,11 +185,16 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
+import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
 import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
+import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
+import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
+import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
 // #2414 — the local, machine-scoped FIRST-DRAIN-SIGHTING manifest baseline the land-time tamper gate diffs a
@@ -1380,12 +1385,17 @@ export function resolveIdsForLandedPass(o = {}) {
  * `log`/`asJson` make this fully unit-testable without touching real fs/git/locks or running the rest of this
  * 5000+-line module.
  *
- * @param {{dryRun?:boolean, asJson?:boolean, sweepFn?:function, lockFn?:function, syncFn?:function, pushFn?:function, log?:function}} [o]
+ * `redMainHeld` (red-main-hold, PR #4624): while main is red only the main-fix PR writes to main, so the step
+ * previews but never applies — the flip is not urgent and the next green pass resolves it. The old freeze stop
+ * exited before this step ran; with the hold ON the pass runs, so the step must hold itself.
+ *
+ * @param {{dryRun?:boolean, asJson?:boolean, redMainHeld?:boolean, sweepFn?:function, lockFn?:function, syncFn?:function, pushFn?:function, log?:function}} [o]
  * @returns {{ok:boolean, ran:boolean, autoResolvable:Array, applied:Array, error:(string|null), skipped?:string, pushed?:boolean, pushWarning?:string}}
  */
 export function runStrandedSweepStep({
   dryRun = false,
   asJson = false,
+  redMainHeld = false,
   sweepFn = autoStrandedSweepPass,
   lockFn = withLandWriteLock,
   syncFn = defaultStrandedSweepSync,
@@ -1405,6 +1415,10 @@ export function runStrandedSweepStep({
     return errored(e);
   }
   let push = null;
+  if (redMainHeld && report && typeof report === 'object' && report.ok && (report.autoResolvable || []).length) {
+    if (!asJson) log(`  · stranded-sweep${dryRun ? ' DRY-RUN' : ''}: main is red (${RED_MAIN_HOLD_REASON}) — not resolving ${report.autoResolvable.map((h) => `#${h.id}`).join(', ')} this pass; only the main-fix PR writes to main until it is green\n`);
+    return { ok: true, ran: false, autoResolvable: report.autoResolvable, applied: [], error: null, skipped: RED_MAIN_HOLD_REASON };
+  }
   if (!dryRun && report && typeof report === 'object' && report.ok && !report.mainLogUnavailable && (report.autoResolvable || []).length) {
     let lock;
     try {
@@ -5372,6 +5386,53 @@ async function runCli() {
   // land while the carrier sat parked (R5). The join mutates `verdicts` in place (stamping `coupleDefer`); the
   // cascade below re-orders those same stamped verdicts. This is runCli's SINGLE plan producer (R4) — the
   // `replan` closure below only re-orders across merges, it never re-derives the join wiring.
+  // ── red-main-hold — the "contain" third of the red-main safety net ─────────────────────────────────────────
+  // While main's CI is red (the health watch's published record, its fix-owner priority record, or the manual
+  // freeze marker), only the published main-fix PR(s) may land; every other local PR becomes `skip` with reason
+  // `red-main-hold`. Applied AFTER every other decision and BEFORE the couple join, so it only ever ADDS a hold
+  // (a fix PR still passes every gate above) and a held WE carrier defers its impl half the usual way. Lifts by
+  // itself when main is green (the health watch removes its record; both records also expire on their TTL).
+  // `redMainHeld` also holds this pass's other main writes (the stranded-card sweep below): only the fix PR writes.
+  // Setting OFF: the freeze stop ran before this pass, but a freeze raised (or the setting switched OFF) since then
+  // would reach no hold at all — so a manual freeze seen HERE holds every PR, the fix PR too, as the OFF stop does.
+  let redMainHeld = false;
+  {
+    const holdSetting = resolveRedMainHoldSetting();
+    const holdOn = holdSetting.value === 'on';
+    const manualFreeze = redMainBypass ? null : readFreeze();
+    if (!redMainBypass && (holdOn || manualFreeze)) {
+      const sig = holdOn
+        ? redMainSignal({ mainRedState: readMainRedState(), priority: readMainRedPriority(), manualFreeze, now: Date.now() })
+        : redMainSignal({ manualFreeze, now: Date.now() }); // OFF: no fix-PR exemption, nothing lands
+      if (sig.red) {
+        redMainHeld = true;
+        let held = 0;
+        // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
+        // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
+        // A MANUAL freeze is the operator's stop-the-line: quarantine never relaxes it (stop mode for every PR).
+        const mode = resolveRedMainMode();
+        const quarantine = mode.value === 'quarantine' && !sig.sources.includes('manual');
+        let qList = null;
+        let filesOf = () => null;
+        if (quarantine) {
+          const q = readQuarantine();
+          qList = q.ok ? q.list : null;
+          const localPrs = [...(openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map())].filter(([r]) => isLocalRepo(r)).flatMap(([, prs]) => prs || []);
+          filesOf = (n) => listedPrFiles(localPrs.find((x) => Number(x?.number) === Number(n))); // null ⇒ unknown OR cut off at the listing cap (fail closed)
+        }
+        // Unknown fix-PR files stay `null` (decideQuarantineHold fails closed on it) — never coerced to "no files".
+        const fixFiles = quarantine ? resolveFixFiles({ fixPrs: sig.fixPrs, filesOf }) : null;
+        for (const v of verdicts) {
+          if (v.decision !== 'merge') continue;
+          const d = quarantine && isLocalRepo(v.repo)
+            ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
+            : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
+          if (d.hold) { v.decision = 'skip'; v.reason = d.reason; v.redMainHold = true; held++; }
+        }
+        if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
+      }
+    }
+  }
   const candidateHeldByKey = new Map();
   for (const v of verdicts) candidateHeldByKey.set(`${v.repo || 'cwd'}::${v.num}`, v.decision !== 'merge');
   // #4308 — one overlap-yield computation per planLabelDrain/replan CALL (never hoisted out of the cascade):
@@ -5454,7 +5515,9 @@ async function runCli() {
       if (!held.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger drain-hold append (E3 #3929, non-fatal) — ${held.errors.join('; ')}\n`);
     }
     for (const v of skipped) {
-      if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed) continue;
+      // red-main-hold: a transient, pass-level hold recorded in the skip-reasons line + the drain-hold ledger; no PR
+      // comment (one `gh pr view` per held PR per pass would burn the shared API budget for the whole red window).
+      if (v.escalated === 'yes' || v.reviewParked || v.collisionHealed || v.redMainHold) continue;
       if (!(v.certifyLabel || v.aiGenerated)) continue;
       // xnsk54v follow-up — mirror the park path: record the acted-on manifest values into the durable skip
       // comment for a manifest-carrying PR (tamper-evidence), leaving orphan/impl skip comments unchanged.
@@ -6148,7 +6211,7 @@ async function runCli() {
   // exactly what a real pass would resolve, without writing anything. `runStrandedSweepStep` never throws —
   // any failure (an unreadable `backlog/`, `git log` unavailable, a thrown resolve) is logged and this pass
   // continues exactly as if the sweep found nothing.
-  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN, asJson: AS_JSON });
+  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN, asJson: AS_JSON, redMainHeld });
 
   // #2318 — POST-LAND DUPLICATE-NNN TRIPWIRE (LOUD-ONLY, #xsyia6k). JIT numbering (#2288) makes two lanes racing
   // to one birth-NNN structurally rare, but a bug on ANY land path could still put two files at one numeric id on
@@ -6212,6 +6275,10 @@ async function runCli() {
   // per-pass log cadence). `timingSteps` (never `timings`, which already carries its OWN `total` key) is what
   // goes to the formatter — it computes+appends the trailing `total=` itself; passing `timings` here would
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
+  // #5444 — SHADOW ONLY: the pure ledger gate beside the label gate for every considered PR, journaled as one run
+  // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
+  const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
+  process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
   const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
@@ -6254,19 +6321,38 @@ async function runCli() {
     for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0)); // → triggers the exit handler → frees the lease
   }
 
-  // ── RED-MAIN dispatch-freeze (#2681) — the sole writer STOPS THE LINE while main is red ─────────────────────
+  // ── RED-MAIN dispatch-freeze (#2681) — while main is red, nothing but the main-fix PR writes to main ─────────
   // Diff-driven shrink (#2681) can let a PR land green while a test outside its selected set is red against the
   // merged tree; the post-land full-suite backstop then reds main. Under the sole writer that is a GLOBAL red —
-  // every subsequent land builds on a broken tree. So before landing anything, consult the durable red-main
-  // freeze marker (raised by red-main-remediation.mjs on a post-land red). A live freeze ⇒ refuse to land and
-  // surface the stop-the-line, symmetric to the duplicate-id-on-main hard stop below. `--no-red-main-freeze`
-  // (or WE_MERGE_BREAK_GLASS) is the documented admin bypass. Absent marker ⇒ this is a no-op (the default, and
-  // the ONLY state while the shrink flag is off), so it changes nothing about today's landing behaviour.
-  // Consulted BEFORE the one-shot land AND at the top of every WATCH pass (a freeze can be raised MID-watch, so
-  // like the dup-id stop below it must be re-checked each pass — reading `redMainFreezeStop()` per pass).
+  // every subsequent land builds on a broken tree. So consult the durable red-main freeze marker (raised by
+  // red-main-remediation.mjs on a post-land red) before landing anything, and again at the top of every WATCH pass
+  // (a freeze can be raised MID-watch). `--no-red-main-freeze` (or WE_MERGE_BREAK_GLASS) is the admin bypass.
+  // Two shapes, by the red-main-hold setting (scripts/settings/red-main-hold.json):
+  //   - OFF: the old stop-the-line — exit 5 before the pass, so nothing in it runs. A freeze that appears after this
+  //     check is still caught by the hold block in `sweepOnce`, which then holds every PR (the fix PR too).
+  //   - ON (default): the pass runs, so `sweepOnce` must hold every write to main itself — every PR except the
+  //     published main-fix PR(s) is skipped `red-main-hold` (a manual freeze is always stop mode, never quarantine),
+  //     and the stranded-card sweep does not push (`redMainHeld`). The real CLI is defended in
+  //     merge-ai-prs-red-main-hold-wiring.test.mjs, which runs WITHOUT the bypass and asserts both the
+  //     `gh pr merge` calls and every `git push` to main.
   const redMainBypass = !!flags['no-red-main-freeze'] || process.env.WE_MERGE_BREAK_GLASS === '1';
   const redMainFreezeStop = () => {
-    if (redMainBypass || !isDispatchFrozen()) return null;
+    if (redMainBypass) return null;
+    // A freeze raised before the marker moved to the coordination root is carried across once, so rollout never drops it.
+    // (skipped on --dry-run: a read-only pass must not move files.) Any non-benign outcome is logged, never silent.
+    if (!flags['dry-run']) {
+      const mig = migrateLegacyFreeze();
+      const BENIGN = new Set(['no-legacy-marker', 'same-path', 'explicit-override', 'new-path-already-holds-a-marker']);
+      if (mig.migrated) {
+        let age = '';
+        try { const at = Date.parse(readFreeze()?.at); if (Number.isFinite(at)) age = ` (raised ${Math.round((Date.now() - at) / 3_600_000)}h ago)`; } catch { /* age is informational */ }
+        process.stderr.write(`merge-ai-prs · red-main freeze marker migrated ${mig.from} → ${mig.to}${age} — one source from now on\n`);
+      } else if (mig.reason && !BENIGN.has(mig.reason)) {
+        process.stderr.write(`merge-ai-prs · WARNING: a legacy red-main freeze marker was NOT migrated (${mig.reason}) — it is being ignored; check ${pendingLegacyFreezeMarkers().join(', ') || resolveLegacyFreezeMarkerPath()}\n`);
+      }
+    }
+    if (!isDispatchFrozen()) return null;
+    if (resolveRedMainHoldSetting().value === 'on') return null;
     const fr = readFreeze();
     return {
       marker: fr,
