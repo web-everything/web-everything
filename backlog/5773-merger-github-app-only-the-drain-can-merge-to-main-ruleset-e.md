@@ -1,4 +1,5 @@
 ---
+bornAs: x7hljd1
 humanGate: { kind: setup, what: "operator creates the merger GitHub App and the main ruleset restricting updates to it" }
 kind: story
 size: 3
