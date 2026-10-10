@@ -1263,7 +1263,15 @@ export function runReviewLabelCli({
   // card xu7kxtt (#5472) — the proof a re-stamp needs to cross a `review:human` re-hold: the latest trusted accept is
   // the operator's `clear-human`, and its strict reviewed-diff equals THIS head's net diff. Unscored diff → no proof
   // → refused (fail closed). The comment records both SHAs (the reason names the cleared one; the marker the new one).
-  if (restampAcrossHold) {
+  // PR #4631 review round 1 (F1): the clearance this re-stamp carries is DERIVED FROM THE SAME carry verdict that let it
+  // cross the hold (`decideAcceptCarryForward`), never re-derived by a second function. `decideRestampHumanClearance`
+  // reads the diff marker off the clearing comment, which is empty exactly when the carry proof was re-derived from
+  // git (plateau-app #217): it returned null, the re-stamp minted no `cleared-human` marker, and the next hold check
+  // saw a plain accept that no longer covered the head.
+  let carriedHumanClearance = null;
+  // The ONE derivation of the carry verdict, shared by the across-hold path below and the plain (no hold) restamp's
+  // fallback further down, so the two can never disagree on what a clearance covers.
+  const deriveHumanCarry = () => {
     let record = latestAcceptRecord(prComments);
     // A clearance stamped without a diff fingerprint (cross-repo checkout, live plateau-app #217): re-derive the
     // cleared commit's own net diff from git. Unreadable → no proof → refused.
@@ -1279,11 +1287,19 @@ export function runReviewLabelCli({
       headSha,
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });
+    const clearer = parseOperatorClearance((Array.isArray(prComments) ? prComments : []).filter(isTrustedMarkerAuthor));
+    const clearance = humanCarry.action === 'carry' && humanCarry.human === true
+      ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
+    return { humanCarry, clearance };
+  };
+  if (restampAcrossHold) {
+    const { humanCarry, clearance } = deriveHumanCarry();
     decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
     if (!decision.allowed) {
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
     }
+    carriedHumanClearance = clearance;
     clearReason = `carried from ${humanCarry.from} to ${humanCarry.to}: ${humanCarry.reason}. ${clearReason}`.trim();
   }
 
@@ -1313,9 +1329,15 @@ export function runReviewLabelCli({
   // #x9krtkb (bug 1) — DOES THIS RESTAMP OWE A CARRIED HUMAN CLEARANCE? See `decideRestampHumanClearance`'s own
   // docstring for the full decision; only `to==='restamp'` ever asks (a plain accept/changes/clear-human has no
   // rebase to carry anything across).
-  const humanClearance = to === 'restamp'
-    ? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff })
-    : null;
+  // A plain (no live hold) restamp of a clearance whose clearing comment has no diff marker (plateau-app #217) is the
+  // same F1 shape: `decideRestampHumanClearance` cannot prove coverage from the comment alone, so it falls back to the
+  // shared carry derivation (git-re-derived fingerprint, setting on, no later verdict). Never for a CI-heal restamp,
+  // which has its own coverage proof above.
+  let humanClearance = null;
+  if (to === 'restamp') {
+    humanClearance = carriedHumanClearance ?? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff });
+    if (!humanClearance && !guardedRestamp && !restampAcrossHold) humanClearance = deriveHumanCarry().clearance;
+  }
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
   // that are size-checked, written and posted are the same bytes.

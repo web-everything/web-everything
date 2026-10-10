@@ -30,7 +30,7 @@ export function planAcceptCarry(prs, { setting = 'off' } = {}) {
     if (!labels.includes('review:human') || labels.includes('review:changes')) continue;
     const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.toLowerCase() : '';
     const rec = latestAcceptRecord(pr?.comments);
-    if (!rec || !rec.humanCleared || !head || rec.sha === head || rec.laterBodyDerivedHold) continue;
+    if (!rec || !rec.humanCleared || !head || rec.sha === head || rec.laterBodyDerivedHold || rec.laterVerdict) continue;
     out.push({ num: Number(pr.number), head, from: rec.sha });
   }
   return out;

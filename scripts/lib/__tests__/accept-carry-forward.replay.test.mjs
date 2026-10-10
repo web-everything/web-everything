@@ -2,8 +2,9 @@
  * Card xu7kxtt (#5472, ruling P4) — replay fixtures for the accept carry-forward rule and its two consumers:
  * the restamp decision (review-set-label) and the review daemon's carry sweep. Live case: PR #4535, 2026-10-09.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
-import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -11,7 +12,8 @@ import { fileURLToPath } from 'node:url';
 import {
   decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE,
 } from '../accept-carry-forward.mjs';
-import { decideSetLabel } from '../../review-set-label.mjs';
+import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
+import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
 import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
 import { acceptanceCoversHead } from '../review-escalation.mjs';
 import { planAcceptCarry, sweepAcceptCarry, _resetAcceptCarryMemo } from '../../conveyor/accept-carry-sweep.mjs';
@@ -119,6 +121,188 @@ describe('guards — anything but a proven-identical net diff falls back to toda
   it('the sweep is inert when the setting is off', () => {
     const prs = [{ number: 4535, labels: ['review:human'], headRefOid: NEW, comments: fx.comments }];
     expect(sweepAcceptCarry({ prs, setting: 'off', runRestamp: () => { throw new Error('must not run'); } })).toEqual([]);
+  });
+});
+
+// PR #4631 review round 1 (F2-F4): `laterVerdict` was a rule input NO caller supplied, so a deliberate later hold that
+// leaves no `reviewed-sha` marker was invisible and an identical diff cancelled it. It is now read off the thread by
+// `latestAcceptRecord`, so the drain gate, the restamp and the sweep all see it from the one place.
+describe('a later verdict or deliberate hold is never carried past (positive identification, every consumer)', () => {
+  const BOT = { login: 'web-everything' };
+  const after = (body, author = BOT) => [...fx.comments, { author, body, createdAt: '2026-10-09T15:00:00Z' }];
+  const drainPark = (reason) => `<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\n${reason}`;
+  const verdict = (comments) => decideAcceptCarryForward({ setting: 'on', record: latestAcceptRecord(comments), headSha: NEW, headDiff: fx.netDiff[NEW] });
+  const planned = (comments) => planAcceptCarry([{ number: 7, labels: ['review:human'], headRefOid: NEW, comments }], { setting: 'on' });
+
+  const BLOCKING = {
+    'a changes verdict (review-set-label / review-pr)': '🔁 review — changes requested\n\nRecorded by agent. A real concern.',
+    'a human-review changes verdict': '🔁 human review — changes requested\n\nfix the thing',
+    'a re-arm (an independent re-review is owed)': '🔧 conveyor fix — re-armed for re-review\n\nround 2',
+    'a stand-down': '🛑 conveyor fix — stood down, human judgment needed\n\nreason: needs-judgment',
+    'a CI-heal escalation': '🚦 conveyor CI-heal — escalated\n\nout of attempts',
+    'a CI-heal void verdict': '🚦 conveyor CI-heal — verdict void\n\nthe head moved',
+    'a referral hold': 'review paused: blocked referral findings',
+    'an escalation-policy drain park': drainPark('review escalation: blast-radius over threshold'),
+    // PR-author text inside a trusted comment must not forge the exemption (anchored match, not a substring).
+    'a drain park whose reason merely MENTIONS test-gaming (path text from the PR)': drainPark('review escalation: touches scripts/test-gaming suspected—notes.test.mjs'),
+    'a drain park that quotes the exempt phrase after other text': drainPark('blast radius — see also: test-gaming suspected — in the PR body'),
+    'a manifest-tamper drain park': drainPark('manifest baseline mismatch — post-review tamper'),
+  };
+
+  for (const [name, body] of Object.entries(BLOCKING)) {
+    it(`${name} after the clear-human blocks the carry in the rule AND the sweep plan`, () => {
+      const comments = after(body);
+      expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+      expect(verdict(comments).action).toBe('none');
+      expect(planned(comments)).toEqual([]);
+    });
+  }
+
+  it('an untrusted commenter\'s verdict-shaped comment does not block (it cannot forge a hold either way)', () => {
+    const comments = after(BLOCKING['a changes verdict (review-set-label / review-pr)'], { login: 'someone-else' });
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+    expect(verdict(comments).action).toBe('carry');
+  });
+
+  it('the anti-test-gaming drain park (a function of the diff) does NOT block: the #4535 shape this card exists for', () => {
+    const comments = after(drainPark('test-gaming suspected — CI-green may be manufactured by tampering with tests: 1 test removed'));
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+    expect(verdict(comments)).toMatchObject({ action: 'carry', human: true });
+    expect(planned(comments)).toEqual([{ num: 7, head: NEW, from: OLD }]);
+  });
+
+  it('the drain restating an already-standing hold (posted after the test-gaming re-park strips ready-to-merge) does NOT block', () => {
+    const comments = after(drainPark('held — a review hold (review:human) stands on this PR'));
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+    expect(planned(comments)).toEqual([{ num: 7, head: NEW, from: OLD }]);
+  });
+
+  it('neutral conveyor chatter (fix claims, CI-heal notes) does not block', () => {
+    const comments = after('🔒 conveyor fix-begin — fix claim held\n\n**Who:** `fix-1`');
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+    expect(verdict(comments).action).toBe('carry');
+  });
+
+  it('a verdict posted BEFORE the clear-human is superseded by it and does not block', () => {
+    const early = [{ author: BOT, body: '🔁 review — changes requested\n\nold round', createdAt: '2026-10-09T09:00:00Z' }];
+    const comments = [fx.comments[0], ...early, ...fx.comments.slice(1)];
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+    expect(verdict(comments).action).toBe('carry');
+  });
+
+  it('an explicit laterVerdict fact still blocks (OR with the derived one)', () => {
+    expect(decideAcceptCarryForward({ setting: 'on', record: latestAcceptRecord(fx.comments), headSha: NEW, headDiff: fx.netDiff[NEW], laterVerdict: true }).action).toBe('none');
+  });
+
+  it('both later-hold facts are derived into the record the rule is handed (not left to each caller to supply)', () => {
+    const rec = latestAcceptRecord(after(BLOCKING['a changes verdict (review-set-label / review-pr)']));
+    expect(Object.keys(rec)).toEqual(expect.arrayContaining(['laterVerdict', 'laterBodyDerivedHold']));
+  });
+});
+
+// The restamp CLI end to end against a REAL throwaway git repo (the plateau-app #217 shape: the clear-human comment has
+// only `reviewed-sha`, no diff marker, so the carry proof is re-derived from git). Pins F1 (the posted comment keeps the
+// `cleared-human` marker) and the caller-level half of F2-F4 (a later hold makes the restamp refuse with NO write).
+describe('review-set-label --to=restamp across a review:human re-hold (CLI, real git)', () => {
+  let dir = null;
+  let heads = null;
+  const git = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', ...args],
+    { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } }).trim();
+  const build = () => {
+    dir = mkdtempSync(join(tmpdir(), 'acf-restamp-'));
+    git('init', '-q', '-b', 'main');
+    writeFileSync(join(dir, 'f.txt'), 'base\n'); git('add', 'f.txt'); git('commit', '-q', '-m', 'base');
+    git('checkout', '-q', '-b', 'lane/x');
+    writeFileSync(join(dir, 'a.txt'), 'feature\n'); git('add', 'a.txt'); git('commit', '-q', '-m', 'feature');
+    const cleared = git('rev-parse', 'HEAD');
+    git('checkout', '-q', 'main');
+    writeFileSync(join(dir, 'g.txt'), 'unrelated main work\n'); git('add', 'g.txt'); git('commit', '-q', '-m', 'main moves');
+    git('checkout', '-q', 'lane/x');
+    git('merge', '-q', '--no-edit', '--no-ff', 'main');
+    git('remote', 'add', 'origin', dir);
+    heads = { cleared, head: git('rev-parse', 'HEAD') };
+  };
+  beforeAll(build);
+  afterAll(() => { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } } });
+
+  const BOT = { login: 'web-everything' };
+  const clearComment = () => ({ author: BOT, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
+
+  /** Drives the real CLI with a recording provider; returns what was written. */
+  const restamp = ({ comments, labels = ['review:human'] }) => {
+    const writes = { setLabels: [], postComment: [] };
+    const provider = {
+      name: 'stub', currentRepo: () => 'o/n',
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments, headRefOid: heads.head, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '', title: '' }),
+      readLabels: () => labels.map((name) => ({ name })),
+      setLabels: (_r, _p, spec) => { writes.setLabels.push(spec); },
+      postComment: (_r, _p, body) => { writes.postComment.push(body); },
+    };
+    const chunks = [];
+    const realExit = process.exit.bind(process);
+    const prev = { GIT_DIR: process.env.GIT_DIR, WE_ACCEPT_CARRY_FORWARD: process.env.WE_ACCEPT_CARRY_FORWARD };
+    process.exit = (code) => { const e = new Error('process.exit'); e.exitCode = code; throw e; };
+    process.env.GIT_DIR = join(dir, '.git');
+    process.env.WE_ACCEPT_CARRY_FORWARD = 'on';
+    let exitCode = 0;
+    try {
+      runReviewLabelCli({
+        defaultActor: 'test', usage: 'usage: test', emit: (l) => chunks.push(String(l)), provider,
+        argv: ['9', '--repo=o/n', '--to=restamp', '--actor=review-daemon', '--channel=accept-carry-forward', '--reason=head moved by a mechanical pass'],
+        buildComment: ({ to, actor, headSha, reason, reviewedDiff, clearerId, independence, humanClearance }) => buildVerdictComment({
+          to, actor, headSha, reason, reviewedDiff, clearerId, independence, channel: 'accept-carry-forward', humanClearance,
+        }),
+        successResult: (o) => ({ ok: true, ...o }),
+        refusalResult: ({ decision }) => ({ error: decision.reason }),
+      });
+    } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; } finally {
+      process.exit = realExit;
+      for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    }
+    return { exitCode, writes, out: chunks.join('') };
+  };
+
+  it('F1: a clearance proven by re-derived git diff still stamps cleared-human on the NEW head', () => {
+    const r = restamp({ comments: [clearComment()] });
+    expect(r.exitCode).toBe(0);
+    expect(r.writes.postComment).toHaveLength(1);
+    const body = r.writes.postComment[0];
+    expect(body).toContain(`reviewed-sha: ${heads.head}`);
+    expect(body).toContain('cleared-human: chalbert');
+    // The next hold check binds reviewed-sha and cleared-human to one comment: it must now name the NEW head.
+    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.head);
+    expect(parseOperatorClearance([{ author: BOT, body }])).toEqual({ actor: 'chalbert' });
+  });
+
+  it('F2-F4: a deliberate changes verdict after the clear-human makes the restamp refuse, with NO label or comment write', () => {
+    const later = { author: BOT, body: '🔁 review — changes requested\n\nRecorded by agent. A real concern.' };
+    const r = restamp({ comments: [clearComment(), later] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual({ setLabels: [], postComment: [] });
+  });
+
+  it('F1 (plain restamp, no live hold): a diff-less clearance on a review:accepted PR still keeps cleared-human', () => {
+    const r = restamp({ comments: [clearComment()], labels: ['review:accepted'] });
+    expect(r.exitCode).toBe(0);
+    const body = r.writes.postComment[0];
+    expect(body).toContain(`reviewed-sha: ${heads.head}`);
+    expect(body).toContain('cleared-human: chalbert');
+    expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.head);
+  });
+
+  it('F2-F4: a later escalation-policy drain park makes the restamp refuse, with NO write', () => {
+    const later = { author: BOT, body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nreview escalation: blast-radius over threshold' };
+    const r = restamp({ comments: [clearComment(), later] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual({ setLabels: [], postComment: [] });
+  });
+
+  it('the #4535 shape: only a test-gaming drain park after the clear-human — the restamp still carries', () => {
+    const later = { author: BOT, body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\ntest-gaming suspected — CI-green may be manufactured' };
+    const r = restamp({ comments: [clearComment(), later] });
+    expect(r.exitCode).toBe(0);
+    expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
+    expect(r.writes.setLabels[0].add).toBe('review:accepted');
   });
 });
 

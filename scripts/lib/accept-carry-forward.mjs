@@ -53,6 +53,43 @@ const REVIEWED_DIFF_RE = /<!--\s*reviewed-diff:\s*([0-9a-f]{64})\s*-->/gi;
 const CLEARED_HUMAN_RE = /<!--\s*cleared-human:\s*([^>]*?)\s*-->/i;
 /** A drain park whose reason is NOT a function of the diff: an identical diff proves nothing about it. */
 const BODY_DERIVED_HOLD_RE = /manifest baseline mismatch/i;
+/**
+ * A LATER VERDICT or deliberate hold, recognised by positive identification of the shapes this repo writes (PR #4631
+ * review, round 1). Neither leaves a `reviewed-sha` marker, so `latestAcceptRecord` cannot see it as a record:
+ *   - a changes verdict (`review-set-label --to=changes`, the review-pr operation, the conflict watch): the durable
+ *     heading `🔁 review — changes requested` / `🔁 human review — changes requested`;
+ *   - a re-arm (`rearm-review.mjs`: an independent re-review is owed): its own marker line;
+ *   - a stand-down, a CI-heal escalation / void verdict, or a referral hold (a person or an escalation now stands on it);
+ *   - a drain park (`<!-- drain-park-reason -->`) whose reason is anything BUT the anti-test-gaming gate or the drain
+ *     restating an already-standing hold. A test-gaming park is a function of the diff (the operator cleared exactly
+ *     those bytes, so an identical diff proves it still covers: the #4535 shape this PR exists for); an
+ *     escalation-policy park, a clearance-revocation park or any other reason is a decision about the PR, not the bytes.
+ *   Not recognised (residual, filed): a label-only `review:human` re-add, free-text operator comments, operator ruling
+ *   comments, and a formal GitHub CHANGES_REQUESTED review (`--json comments` never returns it).
+ * Everything else a bot posts (fix claims, CI-heal notes, advisory notes) says nothing about the clearance.
+ */
+const LATER_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
+const LATER_REARM_RE = /^\s*🔧 conveyor fix — re-armed for re-review/i; // `REARM_COMMENT_MARKER`, we:scripts/conveyor/rearm-review.mjs
+/** Other shapes that say a person or an escalation now stands on the PR (each a leading line some script writes). */
+const LATER_STANDING_HOLD_RE = /^\s*(?:🛑 conveyor fix — stood down|🚦 conveyor CI-heal — (?:escalated|verdict void)|review paused:)/i;
+const DRAIN_PARK_MARKER_RE = /<!--\s*drain-park-reason\s*-->/i;
+/**
+ * The ONLY drain parks that carry through, matched at the START of the comment under the drain's own heading (never
+ * anywhere in the body: park reasons embed PR-author text such as file paths and `## Escalation reason` bullets, so an
+ * unanchored match could be forged from the PR itself):
+ *   - `test-gaming suspected —`: the anti-test-gaming gate, a function of the diff (live #4535);
+ *   - `held — a review hold`: the drain restating a hold that already stands (`HELD_PARK_PREFIX`, merge-ai-prs.mjs); it
+ *     decides nothing new, and it is posted mechanically after the test-gaming re-park strips `ready-to-merge`.
+ */
+const MECHANICAL_PARK_RE = /^\s*<!--\s*drain-park-reason\s*-->\s*\n⏸ \*\*Parked for review by the drain\*\*\s*\n\s*(?:test-gaming suspected\s+[—-]|held\s+[—-]\s+a review hold)/i;
+
+/** Pure: is this (trusted) comment body a later verdict / deliberate hold that an identical diff proves nothing about? */
+export function isLaterVerdictBody(body) {
+  const text = typeof body === 'string' ? body : '';
+  if (!text) return false;
+  if (LATER_VERDICT_HEADING_RE.test(text) || LATER_REARM_RE.test(text) || LATER_STANDING_HOLD_RE.test(text)) return true;
+  return DRAIN_PARK_MARKER_RE.test(text) && !MECHANICAL_PARK_RE.test(text);
+}
 
 const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while ((m = re.exec(body)) !== null) out = m[1].toLowerCase(); return out; };
 
@@ -60,7 +97,7 @@ const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while
  * The latest trusted accept record on a PR thread, and what was posted after it. Pure.
  * @param {Array<{body?:string, author?:object, createdAt?:string}>} comments
  * @returns {{sha:string, diff:string|null, humanCleared:boolean, actor:string|null, index:number,
- *   laterBodyDerivedHold:boolean}|null}
+ *   laterBodyDerivedHold:boolean, laterVerdict:boolean}|null}
  */
 export function latestAcceptRecord(comments) {
   const list = Array.isArray(comments) ? comments : [];
@@ -74,9 +111,10 @@ export function latestAcceptRecord(comments) {
     rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index };
   });
   if (!rec) return null;
-  const laterBodyDerivedHold = list.slice(rec.index + 1)
-    .some((c) => isTrustedMarkerAuthor(c) && BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
-  return { ...rec, laterBodyDerivedHold };
+  const later = list.slice(rec.index + 1).filter((c) => isTrustedMarkerAuthor(c));
+  const laterBodyDerivedHold = later.some((c) => BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
+  const laterVerdict = later.some((c) => isLaterVerdictBody(c?.body));
+  return { ...rec, laterBodyDerivedHold, laterVerdict };
 }
 
 /**
@@ -96,7 +134,9 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   if (!SHA_RE.test(head)) return { action: 'none', reason: 'live head unknown' };
   const base = { from: record.sha, to: head, human: !!record.humanCleared };
   if (record.sha === head) return { ...base, action: 'same-head', reason: 'the accept already names the live head' };
-  if (laterVerdict) return { ...base, action: 'none', reason: 'a later verdict supersedes the accept' };
+  // `laterVerdict` is derived from the thread by `latestAcceptRecord` (a caller cannot forget to supply it); the
+  // explicit fact is kept as an OR for a caller that knows something the comments do not.
+  if (laterVerdict || record.laterVerdict) return { ...base, action: 'none', reason: 'a later verdict or deliberate hold supersedes the accept' };
   if (record.laterBodyDerivedHold) return { ...base, action: 'none', reason: 'a later hold is not derived from the diff (manifest tamper); an identical diff proves nothing about it' };
   const accepted = typeof record.diff === 'string' ? record.diff.toLowerCase() : '';
   const live = typeof headDiff === 'string' ? headDiff.toLowerCase() : '';
