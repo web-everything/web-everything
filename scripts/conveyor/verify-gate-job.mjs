@@ -177,7 +177,13 @@ export function gateState(gate, {
   }
   const pid = Number(gate.pid);
   if (Number.isInteger(pid) && pid > 0) {
-    try { return pidExists(pid) ? 'unknown' : groupGone(pid); } catch { return 'unknown'; }
+    try {
+      if (!pidExists(pid)) return groupGone(pid);
+      // No handle, so the pid alone may be reused. A sidecar naming its run id can tell: the gate's argv carries
+      // `--run-id=<runId>`, and a pid without it is another process (our group, sharing that id, is gone with it).
+      if (!RUN_ID_RE.test(String(gate.runId ?? ''))) return 'unknown';
+      return scan(gate.runId).includes(pid) ? 'unknown' : 'dead';
+    } catch { return 'unknown'; }
   }
   if (!gate.pending) return 'dead';
   if (!RUN_ID_RE.test(String(gate.runId ?? ''))) return 'unknown';
@@ -242,6 +248,15 @@ export function createVerifyGateJobs({
     return { gate, state };
   };
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
+  /** The registry entry for a job's lane — one shape for live jobs and held survivors. `pid` only when proven alive. */
+  const entryFor = (r, pid, prev) => {
+    const input = r.input;
+    return {
+      pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
+      suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
+      jobId: r.id, pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
+    };
+  };
   const consumedPath = join(store.dir, CONSUMED_FILE);
   const readConsumed = () => new Set(readJson(consumedPath) || []);
 
@@ -280,12 +295,7 @@ export function createVerifyGateJobs({
           const { gate, alive } = liveGate(store.dir, r.id, { probe, pidExists, scan, groupExists }); // a throwing probe reads as `unknown`, not an abort
           const prev = inFlight.get(input.dir);
           if (prev && prev.jobId !== r.id && !prev.jobId) continue; // a legacy (adopted) run still owns this lane
-          inFlight.set(input.dir, {
-            pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
-            suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
-            jobId: r.id, pid: alive ? gatePid(gate) : null, startedMs: prev?.startedMs ?? queuedMs(r, now),
-            keptFor: prev?.keptFor,
-          });
+          inFlight.set(input.dir, entryFor(r, alive ? gatePid(gate) : null, prev));
           if (gate?.gateStartedAt && alive && !startLogged.has(r.id)) {
             startLogged.add(r.id);
             log(`  ▶ gate started for ${input.pool}/lane-${input.lane} @ ${String(input.headSha).slice(0, 8)} — ${gate.gateStartedAt} (job ${r.id}, pid ${gate.pid})`);
@@ -308,13 +318,7 @@ export function createVerifyGateJobs({
             log(`verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} is finished but its gate pid ${survivor.gate.pid} may still be alive (${survivor.state}) — lane held${killed ? ', killing it each tick' : ', NOT killed (no trustworthy pid / unprobeable)'}`);
           }
           const prev = inFlight.get(input.dir);
-          if (!prev || prev.jobId === r.id) {
-            inFlight.set(input.dir, {
-              pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
-              suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
-              jobId: r.id, pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
-            });
-          }
+          if (!prev || prev.jobId === r.id) inFlight.set(input.dir, entryFor(r, pid, prev));
         }
         if (consumed.has(r.id)) continue;
         consumed.add(r.id);
@@ -473,12 +477,21 @@ export async function runGateStep({
     marker: after ? { status: after.status, sha: after.sha ?? null, runId: after.runId ?? null } : null });
 }
 
+/**
+ * The supervisor's SIGTERM/SIGINT handler: a stopped supervisor (stalled, or `restartInFlight: kill`) takes its gate
+ * group down with it — never an orphan. `getPid` reads the pid `onGate` captured at spawn (before the sidecar write).
+ */
+export function gateStopHandler({ getPid, kill = process.kill.bind(process), exit = (code) => process.exit(code) }) {
+  return () => {
+    const pid = getPid();
+    try { if (Number.isInteger(pid) && pid > 1) kill(-pid, 'SIGKILL'); } catch {}
+    exit(143);
+  };
+}
+
 async function jobMain() {
   let gatePid = null;
-  for (const sig of ['SIGTERM', 'SIGINT']) {
-    // A stopped supervisor (stalled, or `restartInFlight: kill`) takes its gate down with it — never an orphan.
-    process.on(sig, () => { try { if (gatePid > 0) process.kill(-gatePid, 'SIGKILL'); } catch {} process.exit(143); });
-  }
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, gateStopHandler({ getPid: () => gatePid }));
   const jobsDir = process.env.OPERATION_RUNS_DIR;
   const attempt = Number(process.env[JOB_ATTEMPT_ENV]) || 1;
   const out = await runJob({

@@ -5,13 +5,13 @@
  *   store-backed registry (re-attach, consume-once, failure reporting) against a REAL job store in a temp dir.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
   classifyGateOutcome, markerStillOurs, runGateStep, createVerifyGateJobs, resolveGateAsJob, killGateGroup,
-  gatePath, resultPath, VERIFY_GATE_JOB_KIND, gateState, findGatePidsDefault,
+  gatePath, resultPath, VERIFY_GATE_JOB_KIND, gateState, findGatePidsDefault, gateStopHandler,
 } from '../verify-gate-job.mjs';
 import { createJobStore, enqueueJob, hostName, readProcStart } from '../../lib/daemon-jobs-runtime.mjs';
 import { formatJobHandle } from '../../operations/job-record.mjs';
@@ -451,6 +451,72 @@ describe('a gate is its whole process group, not just its leader (PR 4764 round 
     await exited;
     expect(findGatePidsDefault(runId)).toEqual([]);
   }, 20_000);
+});
+
+describe('a handle-less sidecar is told from a reused pid by its run id (PR 4764 round 4)', () => {
+  it('pid exists: unknown only while that pid still carries our --run-id; a sidecar with no run id stays unknown', () => {
+    const gate = { pid: 4242, handle: null, runId: 'run-1' };
+    const opts = { pidExists: () => true, groupExists: () => true };
+    expect(gateState(gate, { ...opts, scan: () => [4242] })).toBe('unknown');
+    expect(gateState(gate, { ...opts, scan: () => [] })).toBe('dead'); // reused pid: our group cannot share its id
+    expect(gateState(gate, { ...opts, scan: () => [9999] })).toBe('dead');
+    expect(gateState(gate, { ...opts, scan: () => { throw new Error('ps timed out'); } })).toBe('unknown');
+    expect(gateState({ pid: 4242, handle: null }, { ...opts, scan: () => [] })).toBe('unknown');
+  });
+});
+
+describe('stopping gate jobs (restartInFlight: kill) and the supervisor stop handler (PR 4764 round 4)', () => {
+  const noReattach = async () => ({ actions: [] });
+  it('stopAll stops each live supervisor, then kills its gate group only if a probe AFTER the stop proves it alive', async () => {
+    const running = (input) => {
+      const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input, codeSha: 'c0de' });
+      store.update(q.id, (r) => markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: `h:${input.lane}00:s`, host: 'h', pid: Number(`${input.lane}00`), procStart: 's' }));
+      return q;
+    };
+    const a = running(INPUT);
+    const b = running({ ...INPUT, lane: 4, dir: '/l4' });
+    writeFileSync(gatePath(dir, a.id), JSON.stringify({ pid: 901, handle: 'h:901:s' }));
+    writeFileSync(gatePath(dir, b.id), JSON.stringify({ pid: 902, handle: 'h:902:s' }));
+    const stopped = new Set();
+    const stop = vi.fn(async (handle) => { stopped.add(handle); });
+    // a's supervisor takes its gate down when stopped; b's gate survives the stop.
+    const probe = (h) => (h === 'h:901:s' && stopped.has('h:300:s') ? 'dead' : 'alive');
+    const kill = vi.fn();
+    const jobs = createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {}, probe, evict: () => {},
+      snapshot: {}, pidExists: () => false, groupExists: () => false });
+    await jobs.stopAll({ stop, kill });
+    expect(stop).toHaveBeenCalledWith('h:300:s');
+    expect(stop).toHaveBeenCalledWith('h:400:s');
+    expect(kill).not.toHaveBeenCalledWith(-901, 'SIGKILL');
+    expect(kill).toHaveBeenCalledWith(-902, 'SIGKILL');
+  });
+
+  it('the supervisor stop handler kills the gate group captured at spawn (before its sidecar write), and only an ordinary pid', async () => {
+    let pid = null;
+    const kill = vi.fn();
+    const exit = vi.fn();
+    const handler = gateStopHandler({ getPid: () => pid, kill, exit });
+    handler(); // stopped before any gate spawned
+    expect(kill).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledWith(143);
+    // The sidecar write after the spawn fails (the path is now a non-empty directory) — the handler still knows the pid.
+    const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
+    let writeFailed = false;
+    await runGateStep({ jobId: 'sig', input: INPUT, jobsDir: dir, log: () => {}, laneState: () => ({ marker: running, headSha: 'abc12345' }),
+      readStart: () => 's', onGate: (p) => { pid = p; },
+      runGate: async (o) => {
+        rmSync(gatePath(dir, 'sig'), { force: true });
+        mkdirSync(join(gatePath(dir, 'sig'), 'blocker'), { recursive: true });
+        try { o.onSpawn(4243); } catch { writeFailed = true; }
+      } });
+    expect(writeFailed).toBe(true);
+    handler();
+    expect(kill).toHaveBeenCalledWith(-4243, 'SIGKILL');
+    pid = 1;
+    kill.mockClear();
+    handler();
+    expect(kill).not.toHaveBeenCalled();
+  });
 });
 
 describe('a superseded gate job is killed only after a fresh probe (PR 4764 round 4)', () => {
