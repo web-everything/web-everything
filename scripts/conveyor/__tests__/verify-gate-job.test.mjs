@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
-  classifyGateOutcome, markerStillOurs, runGateStep, createVerifyGateJobs, resolveGateAsJob,
+  classifyGateOutcome, markerStillOurs, runGateStep, createVerifyGateJobs, resolveGateAsJob, killGateGroup,
   gatePath, resultPath, VERIFY_GATE_JOB_KIND,
 } from '../verify-gate-job.mjs';
 import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
@@ -211,5 +211,19 @@ describe('createVerifyGateJobs — the daemon side over a real job store', () =>
     const inFlight = new Map([[INPUT.dir, legacy]]);
     await mk().sync(inFlight);
     expect(inFlight.get(INPUT.dir)).toBe(legacy);
+  });
+});
+
+describe('killGateGroup — only a gate whose handle and pid agree, and an ordinary pid, is ever signalled', () => {
+  it('kills the handle\'s group; refuses pid 1, a pid that disagrees with the handle, and a missing or malformed handle', () => {
+    const kill = vi.fn();
+    expect(killGateGroup({ pid: 999, handle: 'h:999:s' }, kill)).toBe(true);
+    expect(kill).toHaveBeenCalledWith(-999, 'SIGKILL');
+    kill.mockClear();
+    for (const gate of [{ pid: 1, handle: 'h:1:s' }, { pid: 998, handle: 'h:999:s' }, { pid: -1, handle: 'h:999:s' },
+      { pid: 999 }, { pid: 999, handle: 'nonsense' }, null]) {
+      expect(killGateGroup(gate, kill)).toBe(false);
+    }
+    expect(kill).not.toHaveBeenCalled();
   });
 });

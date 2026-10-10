@@ -36,7 +36,7 @@ import {
   hostName, JOB_ID_ENV, JOB_ATTEMPT_ENV, JOB_HEARTBEAT_MS_ENV,
 } from '../lib/daemon-jobs-runtime.mjs';
 import { evictSnapshots } from '../lib/daemon-job-snapshots.mjs';
-import { TERMINAL_JOB_STATUSES, formatJobHandle } from '../operations/job-record.mjs';
+import { TERMINAL_JOB_STATUSES, formatJobHandle, parseJobHandle } from '../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import { cloneNodeModulesInstaller } from '../lib/daemon-rebuild/rebuild-job.mjs';
 import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, gateCeilings } from './verify-dispatch.mjs';
@@ -120,6 +120,18 @@ export function liveGate(dir, id, { probe = probeHandle } = {}) {
 }
 
 /**
+ * SIGKILL a recorded gate's process group. The pid comes from the probed handle (never the bare `pid` field alone),
+ * must agree with that field, and must be an ordinary pid (> 1): a corrupt or stale sidecar must not turn into
+ * `kill(-1)` or a kill of an unrelated group. Returns whether a kill was attempted.
+ */
+export function killGateGroup(gate, kill = process.kill.bind(process)) {
+  const pid = parseJobHandle(gate?.handle)?.pid;
+  if (!Number.isInteger(pid) || pid <= 1 || pid !== gate.pid) return false;
+  try { kill(-pid, 'SIGKILL'); } catch {}
+  return true;
+}
+
+/**
  * The daemon's handle on its gate jobs.
  * @param {{store?:object, cloneRoot?:string, log?:(m:string)=>void, maxConcurrent?:number, reattach?:Function,
  *   snapshot?:object, readHead?:()=>string, probe?:Function, now?:()=>number, onSettled?:(f:object)=>void,
@@ -135,6 +147,7 @@ export function createVerifyGateJobs({
   const clock = createTickClock();
   const snap = snapshot ?? { repoDir: cloneRoot, install: cloneNodeModulesInstaller(cloneRoot) };
   const startLogged = new Set();
+  const survivorLogged = new Set();
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
   const consumedPath = join(store.dir, CONSUMED_FILE);
   const readConsumed = () => new Set(readJson(consumedPath) || []);
@@ -190,7 +203,11 @@ export function createVerifyGateJobs({
         // queues a fresh job with no gate sidecar and starts a second gate beside the survivor. Retry the kill each tick.
         const survivor = liveGate(store.dir, r.id, { probe });
         if (survivor.alive && survivor.gate?.pid > 0) {
-          try { kill(-survivor.gate.pid, 'SIGKILL'); } catch {}
+          if (!survivorLogged.has(r.id)) {
+            survivorLogged.add(r.id);
+            log(`verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} is finished but its gate pid ${survivor.gate.pid} is still alive — lane held, killing it each tick`);
+          }
+          killGateGroup(survivor.gate, kill);
           const prev = inFlight.get(input.dir);
           if (!prev || prev.jobId === r.id) {
             live.add(r.id);
@@ -244,7 +261,7 @@ export function createVerifyGateJobs({
         if (TERMINAL_JOB_STATUSES.includes(r.job.status)) continue;
         const { gate, alive } = liveGate(store.dir, r.id, { probe });
         if (r.job.handle) { try { await stop(r.job.handle); } catch {} }
-        if (alive && gate?.pid > 0) { try { kill(-gate.pid, 'SIGKILL'); } catch {} }
+        if (alive) killGateGroup(gate, kill);
       }
     },
   };
@@ -277,7 +294,7 @@ export async function runGateStep({
   const prior = liveGate(jobsDir, jobId, { probe });
   if (prior.alive) {
     log(`[verify-gate-job ${jobId}] attempt ${attempt}: previous gate pid ${prior.gate.pid} still alive — killing its group`);
-    try { kill(-prior.gate.pid, 'SIGKILL'); } catch {}
+    killGateGroup(prior.gate, kill);
     for (let i = 0; i < 50 && probe(prior.gate.handle) === 'alive'; i += 1) await sleep(100);
     // A bounded kill attempt is not proof of death: never start a second gate beside one that still owns the marker.
     if (probe(prior.gate.handle) === 'alive') {
