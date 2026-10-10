@@ -1,5 +1,4 @@
 {
-  "$comment": "Platform preference (card x1b8hlo). redTeam.confirmedBreaks: what a post-accept red-team finding does, per class. broken = confirmed by Claude's re-check with impact broken/unrecoverable (or none stated); degraded = confirmed with impact degraded/cosmetic; unconfirmed = the re-check did not confirm it. Actions: send-back (review:changes with the findings as the fix list, bounded by the round cap), card (a follow-up backlog card), advisory (comment only). Tool override env WE_RED_TEAM_CONFIRMED_BREAKS=broken=send-back,degraded=card. See scripts/lib/red-team-gate.mjs.",
   "redTeam": {
     "confirmedBreaks": {
       "broken": "send-back",
