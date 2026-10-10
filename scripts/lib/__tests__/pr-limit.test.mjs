@@ -284,7 +284,7 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const awaiting = (n, base, head) => ({ ...code(n), headRefName: head ?? `lane/d${n}`, baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
     const count = (rows) => countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope });
-    const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', files: [{ path: 'backlog/x.md' }] };
+    const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', isCrossRepository: false, files: [{ path: 'backlog/x.md' }] };
     // a card-only base shields nobody: both drafts hang off an uncounted PR and are counted
     expect(count([cardBase, awaiting(6, 'lane/card-base'), awaiting(7, 'lane/card-base')])).toMatchObject({ count: 2, stacked: 0, cardOnly: 1 });
     // an accepted base likewise
