@@ -13,7 +13,7 @@ import {
   resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
-import { decideDrainReviewGate } from '../../merge-ai-prs.mjs';
+import { decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const DIFF = 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -1 +1 @@\n-old\n+new\n';
 const FP = normalizeDiffFingerprint(DIFF);
@@ -350,5 +350,76 @@ describe('buildCarryRecordBody', () => {
     expect(body).not.toContain('@victim');
     expect(body.split('\n').filter((l) => l.includes('cleared-human:'))).toHaveLength(1);
     expect(parseLatestHumanClearedSha([{ viewerDidAuthor: true, body }])).toBe(HEAD);
+  });
+});
+
+describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch tip that moves mid-read)', () => {
+  const OLD_TIP = 'c'.repeat(40);
+  const NEW_TIP = 'd'.repeat(40);
+  const FORK = 'e'.repeat(40);
+  const view = () => ({ headRefOid: NEW_TIP, headRefName: 'lane/3432', comments: [plainAccept(CLEARED)] });
+  const read = (exec, extra = {}) => readDrainAcceptance({ pr: 3432, repo: 'web-everything/web-everything', cwd: '/ws', local: true, exec, ...extra });
+  // A tracking ref that a concurrent fetch advances right after the diff is read: `origin/lane/3432` is OLD_TIP until
+  // a `git diff` has run, NEW_TIP after. Diffs of a sha are stable; diffs of the moving ref name are not.
+  function movingTipExec() {
+    let ref = OLD_TIP;
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push([cmd, ...args].join(' '));
+      if (cmd === 'gh') return JSON.stringify(view());
+      if (args[0] === 'fetch') throw new Error('offline'); // the fetch fails: the cached tracking ref is used
+      if (args[0] === 'merge-base') return `${FORK}\n`;
+      if (args[0] === 'rev-parse') return `${args.at(-1).startsWith('origin/lane/3432') ? ref : args.at(-1).replace(/\^\{commit\}$/, '')}\n`;
+      if (args[0] === 'diff' && args.includes('--numstat')) return '1\t1\tx.mjs\n';
+      if (args[0] === 'diff') { ref = NEW_TIP; return DIFF; }
+      return '';
+    };
+    return { exec, calls };
+  }
+
+  it('never labels the cleared (old-tip) diff with a newer tip the ref moved to after the read', () => {
+    const { exec, calls } = movingTipExec();
+    const evidence = read(exec);
+    expect(evidence.headDiff).toBe(DIFF);
+    expect(evidence.headDiffSha).toBe(OLD_TIP);
+    expect(evidence.headDiffSha).not.toBe(evidence.headSha);
+    // the text diff names the resolved sha, never the moving ref name
+    const textDiff = calls.find((c) => c.startsWith('git diff --no-ext-diff'));
+    expect(textDiff).toContain(OLD_TIP);
+    expect(textDiff).not.toContain('origin/lane/3432');
+  });
+
+  it('end to end: the moved-tip diff is refused by the carry (no record is written, nothing is carried)', () => {
+    const { exec } = movingTipExec();
+    const evidence = { ...read(exec), humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' } };
+    const onComment = vi.fn();
+    const r = applyHumanClearanceCarry({ evidence, pr: 3432, cwd: '/ws', exec: onComment, setting: ON, log: quiet });
+    expect(r).toBe(null);
+    expect(onComment).not.toHaveBeenCalled();
+  });
+
+  it('a tip that cannot be resolved reads as unscored (no diff, so no carry can bind it)', () => {
+    const exec = (cmd, args) => {
+      if (cmd === 'gh') return JSON.stringify(view());
+      if (args[0] === 'rev-parse') throw new Error('unknown revision');
+      return args[0] === 'diff' ? (args.includes('--numstat') ? '1\t1\tx.mjs\n' : DIFF) : `${FORK}\n`;
+    };
+    const evidence = read(exec);
+    expect(evidence.headDiffSha).toBe(null);
+    expect(evidence.headDiff).toBe(null);
+  });
+
+  it('a scored read that names no pinned sha leaves headDiffSha null — no second lookup labels it', () => {
+    const exec = vi.fn(() => JSON.stringify(view()));
+    const evidence = read(exec, { netDiff: () => ({ scored: true, text: DIFF, rev: 'origin/lane/3432' }) });
+    expect(evidence.headDiff).toBe(DIFF);
+    expect(evidence.headDiffSha).toBe(null);
+    expect(exec.mock.calls.filter(([cmd]) => cmd === 'git')).toEqual([]); // no post-diff rev-parse
+  });
+
+  it('the fork point is taken from the pinned sha, not the moving ref name', () => {
+    const { exec, calls } = movingTipExec();
+    read(exec);
+    expect(calls.filter((c) => c.startsWith('git merge-base')).at(-1)).toContain(OLD_TIP);
   });
 });

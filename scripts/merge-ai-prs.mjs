@@ -662,18 +662,15 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     try {
       const net = netDiff({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        rev: d.headRefName, fetchExtraRefs: [d.headRefName],
+        rev: d.headRefName, fetchExtraRefs: [d.headRefName], pinRev: true,
       });
+      // #xnqxtdy — `headRefOid` and the branch tip the diff was read from are two non-atomic reads. The tip the diff is FOR
+      // is resolved to one sha BEFORE the diff and the diff is taken from that sha (`pinRev`), so the carry can refuse a
+      // diff that belongs to a different push than the head it would stamp. A scored read that names no sha leaves
+      // `headDiffSha` null (the carry refuses it) — it is never labelled by a second, later lookup of a ref that can move.
       evidence.headDiff = net?.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
-      // #xnqxtdy — `headRefOid` and the branch tip the diff was read from are two non-atomic reads. Pin the tip the diff
-      // is FOR, so the carry can refuse a diff that belongs to a newer push than the head it would stamp.
-      if (evidence.headDiff !== null && net?.rev) {
-        try {
-          evidence.headDiffSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${net.rev}^{commit}`],
-            { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase() || null;
-        } catch { evidence.headDiffSha = null; }
-      }
+      evidence.headDiffSha = net?.scored && typeof net.revSha === 'string' && net.revSha ? net.revSha : null;
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
@@ -3503,7 +3500,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
-export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -3514,7 +3511,27 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   // candidate probe, shared with `computeNetDiffChangedFiles`); otherwise resolve our own exactly as before.
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
-  const { diffBase, candidate } = basis;
+  let { diffBase, candidate } = basis;
+  // #xnqxtdy — `pinRev`: a caller that STAMPS the tip next to this text (the human-clearance carry) cannot read the
+  // tip in a second step: a concurrent fetch can move the tracking ref between the two reads and label an old diff with
+  // a newer sha. Resolve the tip to ONE commit sha first, then take the fork point AND the text from that sha only, and
+  // hand the sha back as `revSha` — the diff and its label can no longer disagree. Any failure is unscored (fail closed).
+  let revSha;
+  if (pinRev) {
+    try {
+      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
+      if (basis.basisKind === 'merge-base') {
+        diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+        if (!diffBase) return { ...unscored, reason: 'diff-failed' };
+      }
+      candidate = revSha;
+    } catch (err) {
+      return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
+    }
+  }
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
@@ -3526,7 +3543,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
     const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
-    return { text, base: diffBase, rev: candidate, scored: true };
+    return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
