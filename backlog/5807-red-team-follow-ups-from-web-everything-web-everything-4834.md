@@ -1,4 +1,5 @@
 ---
+bornAs: xlrh60k
 kind: story
 size: 2
 status: open
