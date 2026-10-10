@@ -85,6 +85,7 @@ import { revertRedForVerify, appendRevertRedLog, recoverRevertRed, applyRevertRe
 import { createRevertProbe } from './operations/mutation-check-io.mjs';
 import { resolveCoordinationRoot } from './operations/coordination-root.mjs';
 import { admissionLockRoot, resolveCap, resolveTimeoutMs, acquireSlotBlocking, releaseOwnedSlot, ADMISSION_HELD_ENV, classifyCommandKind } from './readiness/heavy-admission.mjs';
+import { summarizeSelection, selectionNotice, verdictNotice } from './lib/verify-selection-log.mjs';
 
 // ── tiny arg parsing (matches push-if-green.mjs / lane-pool.mjs) ─────────────────────────────────────
 const flags = {};
@@ -177,7 +178,14 @@ function writeMarker(record) {
   renameSync(tmp, MARKER);
 }
 
+// #xlewnhs — a daemon-dispatched run (`--run-id`) says which selection it used on its selection and verdict lines, as
+// `⚠ verify-lane:` notices the dispatcher copies into the daemon log (we:scripts/lib/verify-selection-log.mjs).
+const DISPATCHED_RUN = typeof flags['run-id'] === 'string';
+let SELECTION = null;
 function emit(result, exitCode) {
+  if (DISPATCHED_RUN && MODE === 'verify') {
+    try { process.stderr.write(`${verdictNotice({ sha: result.sha, status: result.status, summary: SELECTION })}\n`); } catch { /* logging only */ }
+  }
   if (AS_JSON) writeAllSync(1, JSON.stringify(result) + '\n');
   else process.stderr.write(`verify-lane [lane @ ${result.sha ? result.sha.slice(0, 8) : '?'}] ${result.status}: ${result.detail}\n`);
   process.exit(exitCode);
@@ -402,6 +410,9 @@ if (!resolvedGate && typeof flags.gate === 'string') {
     process.stderr.write(`\n⚠ verify-lane: whole-gate admission — ${admissionFallback}\n`);
   }
 }
+
+SELECTION = summarizeSelection({ gate: resolvedGate, explicitGate: typeof flags.gate === 'string' });
+if (DISPATCHED_RUN && MODE === 'verify') process.stderr.write(`${selectionNotice({ sha: headSha, summary: SELECTION })}\n`);
 
 // 1. Stamp the `running` marker BEFORE the suites start, so a kill mid-run leaves a stranded (detectably
 //    unfinished) marker rather than nothing.

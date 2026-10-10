@@ -20,7 +20,8 @@ describe('card batch policy', () => {
     const policy = loadCardBatchPolicy();
     expect(Object.isFrozen(policy)).toBe(true);
     for (const name of CARD_BATCH_KINDS) {
-      expect(policy[name]).toEqual({ enabled: name === 'prevention', maxCards: 10, maxAgeMinutes: 120, highPriorityBypass: true });
+      // Filing carries the operator's cards.* defaults (2026-10-10): batching on, 10 cards or 60 minutes.
+      expect(policy[name]).toEqual({ enabled: name !== 'prepare', maxCards: 10, maxAgeMinutes: name === 'filing' ? 60 : 120, highPriorityBypass: true });
       expect(Object.isFrozen(policy[name])).toBe(true);
     }
   });
