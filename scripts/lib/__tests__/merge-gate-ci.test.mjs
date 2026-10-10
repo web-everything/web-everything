@@ -9,7 +9,7 @@ import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueu
 import { DRAIN_GATES } from '../merge-gate-inventory.mjs';
 import { scoreEscalation } from '../review-escalation.mjs';
 import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
-import { gatherPrFacts, readGroupPrs, readLedgerConfig } from '../../merge-gate-check.mjs';
+import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags } from '../../merge-gate-check.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
@@ -117,7 +117,54 @@ describe('evaluatePrGates', () => {
   it('skips CodeQL in CI when drain-direct policy keeps it in the drain', () => {
     check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'skipped-by-policy', true, {
       policy: { strategy: 'drain-direct', gatePlacement: { codeql: 'drain' } },
+      mergeEvent: 'pull_request',
     });
+  });
+
+  // The merge actually happens in the queue on a merge_group run, whatever strategy is configured: a drain
+  // placement there means NO merger re-checks the gate, so it must be evaluated, never skipped.
+  it('never skips a gate on a merge_group run, even under drain-direct + placement drain', () => {
+    const policy = { strategy: 'drain-direct', gatePlacement: { codeql: 'drain' } };
+    check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'hold', false, { policy, mergeEvent: 'merge_group' });
+  });
+
+  it('fails closed to evaluating when the merge event is unknown or omitted', () => {
+    const policy = { strategy: 'drain-direct', gatePlacement: { codeql: 'drain' } };
+    check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'hold', false, { policy });
+    check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'hold', false, { policy, mergeEvent: 'workflow_dispatch' });
+    check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'hold', false, { policy, mergeEvent: 'MERGE_GROUP' });
+  });
+
+  it('also evaluates every drain-placed gate on a merge_group run (all placements, not just codeql)', () => {
+    const gatePlacement = Object.fromEntries(DRAIN_GATES.filter((g) => g.where === 'merge-gate').map((g) => [g.id, 'drain']));
+    const result = evaluatePrGates(facts(), { policy: { strategy: 'drain-direct', gatePlacement }, mergeEvent: 'merge_group' });
+    expect(result.results.filter((row) => row.status === 'skipped-by-policy')).toEqual([]);
+  });
+
+  it('threads the merge event from the CLI: --merge-group runs as merge_group, --pr as pull_request', () => {
+    expect(mergeEventOfFlags({ 'merge-group': true }, {})).toBe('merge_group');
+    expect(mergeEventOfFlags({ pr: '7' }, {})).toBe('pull_request');
+    expect(mergeEventOfFlags({ pr: '7', 'merge-group': true }, {})).toBe('merge_group');
+  });
+
+  it('a merge_group run without the group-tree duplicate scan fails duplicate-id-on-main closed; pull_request is unaffected', () => {
+    const noGroup = facts({ duplicateIds: { main: [] } });
+    check(noGroup, 'duplicate-id-on-main', 'fail-closed', false, { mergeEvent: 'merge_group' });
+    check(noGroup, 'duplicate-id-on-main', 'pass', true, { mergeEvent: 'pull_request' });
+    check(facts({ duplicateIds: { main: [], group: [] } }), 'duplicate-id-on-main', 'pass', true, { mergeEvent: 'merge_group' });
+  });
+
+  it('the runner event wins over the flags: GITHUB_EVENT_NAME=merge_group is a merge_group run even via --pr', () => {
+    expect(mergeEventOfFlags({ pr: '7' }, { GITHUB_EVENT_NAME: 'merge_group' })).toBe('merge_group');
+    expect(mergeEventOfFlags({ pr: '7' }, { GITHUB_EVENT_NAME: 'pull_request' })).toBe('pull_request');
+  });
+
+  it('the workflow cannot reach --pr on a merge_group event: no head sha and no PR number fails closed', () => {
+    const run = workflowOf('merge-gate.yml').jobs['merge-gate'].steps.find((s) => /merge-gate-check\.mjs/.test(s.run || '')).run;
+    // --merge-group is chosen by the group head sha alone; the --pr branches need a PR number / dispatch list,
+    // which a merge_group event never carries, and the final else exits 1.
+    expect(run).toMatch(/if \[ -n "\$MG_HEAD_SHA" \]; then[\s\S]*--merge-group[\s\S]*elif \[ -n "\$PR_NUMBER" \]/);
+    expect(run).toMatch(/else[\s\S]*failing closed[\s\S]*exit 1/);
   });
 });
 
