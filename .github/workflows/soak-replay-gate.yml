@@ -37,6 +37,11 @@ on:
   pull_request:
     branches: [main, 'lane/**']  # lane/**: a GitHub-stacked PR runs its own required checks while its base is open (stack.reviewWhileBaseOpen)
     types: [opened, synchronize, reopened, edited]
+  # GitHub merge queue (merge-delivery strategy `github-merge-queue`): the required `soak-replay-gate` check must
+  # also report on each merge-group commit. There it evaluates EVERY PR in the group (listed by
+  # scripts/merge-gate-check.mjs --list-group) with that PR's own live body and base/head — the same verdict the
+  # pull_request run gives, re-read right before the merge. No PR identifiable ⇒ fail closed.
+  merge_group:
 
 permissions:
   contents: read
@@ -44,7 +49,7 @@ permissions:
 
 # Queue relief: the verdict reads the live PR body and head, so only the latest run per PR matters.
 concurrency:
-  group: soak-replay-gate-${{ github.event.pull_request.number }}
+  group: soak-replay-gate-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: true
 
 jobs:
@@ -65,6 +70,7 @@ jobs:
         run: npm ci --ignore-scripts
 
       - name: Does this PR fix a live daemon break without a soak replay or a waiver?
+        if: ${{ github.event_name == 'pull_request' }}
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           GH_TOKEN: ${{ github.token }}
@@ -98,3 +104,32 @@ jobs:
             FILES_STATUS=$(git diff --name-status -M "$MERGE_BASE" "$HEAD_SHA")
             node scripts/soak-replay-gate-cli.mjs --title="$PR_TITLE" --body="$PR_BODY" --files-status="$FILES_STATUS"
           fi
+
+      - name: Merge group — every PR in it, each with its own live body and base/head
+        if: ${{ github.event_name == 'merge_group' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_REPO: ${{ github.repository }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          if [ ! -f scripts/soak-replay-gate-cli.mjs ] || [ ! -f scripts/merge-gate-check.mjs ]; then
+            echo "::error::soak-replay gate: merge-group support not on main yet — failing closed." >&2
+            exit 1
+          fi
+          git fetch origin "$MG_HEAD_SHA" "$MG_BASE_SHA"
+          PRS=$(node scripts/merge-gate-check.mjs --repo="$PR_REPO" --merge-group --list-group --head-sha="$MG_HEAD_SHA" --base-sha="$MG_BASE_SHA" --head-ref="$MG_HEAD_REF") || { echo "::error::could not list the merge group's PRs — failing closed." >&2; exit 1; }
+          [ -n "$PRS" ] || { echo "::error::empty merge group — failing closed." >&2; exit 1; }
+          rc=0
+          for N in $PRS; do
+            echo "── PR #$N"
+            if ! PR_JSON=$(gh api "repos/$PR_REPO/pulls/$N"); then echo "::error::cannot read PR #$N" >&2; rc=1; continue; fi
+            TITLE=$(printf '%s' "$PR_JSON" | jq -r '.title // ""')
+            BODY=$(printf '%s' "$PR_JSON" | jq -r '.body // ""')
+            BASE=$(printf '%s' "$PR_JSON" | jq -r '.base.sha')
+            HEAD=$(printf '%s' "$PR_JSON" | jq -r '.head.sha')
+            git fetch origin "$HEAD" "$BASE"
+            node scripts/soak-replay-gate-cli.mjs --title="$TITLE" --body="$BODY" --base-sha="$BASE" --head-sha="$HEAD" || rc=1
+          done
+          exit $rc

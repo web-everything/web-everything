@@ -259,7 +259,12 @@ export function isDispatchFrozen(path = FREEZE_MARKER_PATH) {
  * @returns {object} the written marker
  */
 export function freezeDispatch(meta = {}, path = FREEZE_MARKER_PATH) {
-  const marker = {
+  return writeFreezeMarker(buildFreezeMarker(meta), path);
+}
+
+/** The marker a freeze would write (pure) — the CLI builds it first so it can publish the shared copy BEFORE the local write. */
+export function buildFreezeMarker(meta = {}) {
+  return {
     frozen: true,
     at: meta.at || new Date().toISOString(),
     reason: meta.reason || REMEDIATION_SPEC.trigger,
@@ -267,6 +272,9 @@ export function freezeDispatch(meta = {}, path = FREEZE_MARKER_PATH) {
     mergeSha: meta.mergeSha || null,
     revertAuthority: true,
   };
+}
+
+function writeFreezeMarker(marker, path) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(marker, null, 2) + '\n');
@@ -297,15 +305,36 @@ function parseFlags(argv) {
   return flags;
 }
 
-function runCli(argv) {
+async function runCli(argv) {
   const cmd = argv[0];
   const flags = parseFlags(argv.slice(1));
+  // xyd06qo: the shared ops/* copy CI's merge-gate reads. A RAISE publishes it FIRST, then writes the local marker, so a
+  // failure between the two can only leave the shared copy frozen (CI holds), never clear. A failed publish still writes
+  // the local marker (the drain stops) and exits 1. Only an explicit CLEAR (`unfreeze`) may publish frozen:false —
+  // "no marker here" (a clone without the gitignored file, or a corrupt one) is never a clear.
+  const shared = () => import('../lib/red-main-freeze-shared.mjs');
+  const raise = async (meta) => {
+    const marker = buildFreezeMarker(meta);
+    // Whatever goes wrong publishing (even loading the module), the local marker MUST still be written: the drain stops on it.
+    try { await (await shared()).publishFreezeFromCli({ marker }); }
+    catch (e) { process.stderr.write(`red-main freeze: ✗ the SHARED copy was NOT published (${String(e?.message || e).split('\n')[0].slice(0, 300)}); writing the local marker anyway. Retry: node scripts/readiness/red-main-remediation.mjs publish\n`); process.exitCode = 1; }
+    return freezeDispatch(marker);
+  };
   if (cmd === 'freeze') {
-    const m = freezeDispatch({ reason: flags.reason, redRef: flags['red-ref'], mergeSha: flags['merge-sha'] });
+    const m = await raise({ reason: flags.reason, redRef: flags['red-ref'], mergeSha: flags['merge-sha'] });
     process.stdout.write(JSON.stringify(m, null, 2) + '\n');
   } else if (cmd === 'unfreeze') {
     unfreezeDispatch();
+    // The clear is published only once the local freeze is really gone: unfreezeDispatch swallows rm errors, and a
+    // surviving (or legacy, migrate-back) marker means the drain is still frozen — clearing CI then would split the two.
+    const legacyLeft = process.env.WE_RED_MAIN_FREEZE ? [] : pendingLegacyFreezeMarkers().filter((p) => resolve(p) !== resolve(FREEZE_MARKER_PATH));
+    if (isDispatchFrozen() || legacyLeft.length) {
+      process.stderr.write(`red-main freeze: ✗ unfreeze did not clear the local marker (${isDispatchFrozen() ? FREEZE_MARKER_PATH : legacyLeft[0]} still present); the SHARED copy is unchanged. Remove it, then re-run: node scripts/readiness/red-main-remediation.mjs unfreeze\n`);
+      process.exitCode = 1;
+      return;
+    }
     writeAllSync(1, JSON.stringify({ frozen: false }, null, 2) + '\n');
+    await (await shared()).publishFreezeFromCli({ marker: null, clear: true });
   } else if (cmd === 'status') {
     // Read-only: report a not-yet-migrated legacy marker instead of moving it (the next drain pass migrates it).
     const legacyPending = process.env.WE_RED_MAIN_FREEZE ? [] : pendingLegacyFreezeMarkers().filter((p) => resolve(p) !== resolve(FREEZE_MARKER_PATH));
@@ -313,9 +342,13 @@ function runCli(argv) {
   } else if (cmd === 'decide') {
     const d = decidePostLand({ trigger: flags.trigger, ref: flags.ref, result: flags.result, mergeSha: flags['merge-sha'] });
     writeAllSync(1, JSON.stringify(d, null, 2) + '\n');
-    if (d.action === 'stop-the-line' && flags.apply) freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'] });
+    // A `proceed` decision raises nothing, so it publishes nothing either (it must not mirror an absent marker as a clear).
+    if (d.action === 'stop-the-line' && flags.apply) await raise({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'] });
+  } else if (cmd === 'publish') {
+    // Republish the current local FREEZE to the shared branch — the retry after a failed raise. No valid marker → refused.
+    await (await shared()).publishFreezeFromCli({ marker: readFreeze() });
   } else {
-    process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide> [--flags]\n');
+    process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide|publish> [--flags]\n');
     process.exit(2);
   }
 }
