@@ -1,0 +1,20 @@
+{
+  "id": "event-stream-state-manager",
+  "title": "One event stream and one state manager for many daemons: Kubernetes informers, event sourcing, SQLite, brokers, Durable Objects and git, measured against the conveyor's own state on 2026-10-10",
+  "status": "open",
+  "summary": "Grounds decision xqux73p (one event stream and one state manager for all daemons, operator pages and tools). INVENTORY: 68 gh pr list call expressions in 56 non-test files, of which 11 try the shared snapshot first; three PR-state caches (pr-snapshot, the pr-facts mirror of the webhook Durable Object, live gh); three host-load samplers; 20+ append-only JSONL logs each with its own lock and format; one unwired cursor module; no SQLite, broker or fs.watch at runtime. MEASURED 2026-10-10: ledger shadow 591 of 593 compares unreadable (git ENOBUFS on whole-file reads); operator-queue ENOBUFS hid 25 PRs; fixer passes up to 2322 s with each PR planned 4 times; reviewer restarted 27 times since midnight with 4-9 minute cold starts; drain listing p90 41 s; 1,479 full 24-hour session re-scans for the WIP page. PRIOR ART: Kubernetes list+watch with resourceVersion, 410 relist, shared informer caches and level-triggered reconcile; event sourcing with upcasting; SQLite WAL is single-host; node:sqlite is a release candidate only from Node 25.7; JSONL appends are atomic only under PIPE_BUF; NATS JetStream and Redis Streams need a reachable service; Litestream and LiteFS are async single-writer replication; Durable Objects are single-threaded strongly consistent sequencers with WebSocket hibernation; git as a database suffers push contention; Nomad, Consul and CI runners long-poll outbound; GitHub does not redeliver failed webhooks on its own. FINDING: most parts are already ruled per kind (#5452 E1-E7, #4601, #5767, #5712); the gap is one envelope, one sequenced stream for shared kinds, one informer library with durable cursors and a warm host cache, one GitHub reconciler, and one authority per kind. An independent Codex review agreed on every default; a skeptic pass withdrew the claim that a ledger mirror fixes the ENOBUFS failure (it needs its own buffer fix) and added per-type append permission, the no-authority-before-restore rule and live pre-land read exemptions.",
+  "dateOpened": "2026-10-10",
+  "lastReviewed": "2026-10-10",
+  "reviewHorizon": "P3M",
+  "tags": [
+    "conveyor",
+    "daemons",
+    "event-driven",
+    "state-store",
+    "decision-prep"
+  ],
+  "relatedBlocks": [],
+  "relatedPlugs": [],
+  "relatedProject": "conveyor",
+  "relatedReport": "reports/2026-10-10-event-stream-state-manager.md"
+}
