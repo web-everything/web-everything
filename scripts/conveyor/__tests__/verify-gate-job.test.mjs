@@ -160,6 +160,37 @@ describe('createVerifyGateJobs — the daemon side over a real job store', () =>
     expect(failures).toEqual([expect.objectContaining({ lane: 3, timedOut: true, timedOutPhase: 'gate' })]);
   });
 
+  it('a finished job whose recorded gate is still alive keeps the lane occupied, so no second gate is queued beside it', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 999, handle: 'h:999:s' }));
+    writeFileSync(resultPath(dir, q.id), JSON.stringify({ outcome: 'failed', message: 'previous gate pid 999 survived SIGKILL' }));
+    const kill = vi.fn();
+    const failures = [];
+    const inFlight = new Map();
+    const jobs = mk({ kill, onSettled: (f) => failures.push(f) }); // probe stays 'alive'
+    await jobs.sync(inFlight);
+    await jobs.sync(inFlight);
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: q.id, pid: 999, runId: 'run-1', sha: 'abc12345' });
+    expect(kill).toHaveBeenCalledWith(-999, 'SIGKILL'); // each tick retries the kill
+    expect(failures).toHaveLength(1); // the failure is still reported exactly once
+  });
+
+  it('once that gate is gone the lane is released', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 999, handle: 'h:999:s' }));
+    writeFileSync(resultPath(dir, q.id), JSON.stringify({ outcome: 'failed', message: 'x' }));
+    let state = 'alive';
+    const inFlight = new Map();
+    const jobs = mk({ kill: vi.fn(), probe: () => state });
+    await jobs.sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(true);
+    state = 'dead';
+    await jobs.sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(false);
+  });
+
   it('a green/red verdict is not a failure; a job the runtime failed (supervisor died twice) is', async () => {
     const green = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
     store.update(green.id, (r) => markSucceeded(r, { at: AT }));

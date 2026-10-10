@@ -123,12 +123,12 @@ export function liveGate(dir, id, { probe = probeHandle } = {}) {
  * The daemon's handle on its gate jobs.
  * @param {{store?:object, cloneRoot?:string, log?:(m:string)=>void, maxConcurrent?:number, reattach?:Function,
  *   snapshot?:object, readHead?:()=>string, probe?:Function, now?:()=>number, onSettled?:(f:object)=>void,
- *   evict?:Function}} o
+ *   evict?:Function, kill?:Function}} o
  */
 export function createVerifyGateJobs({
   store = createJobStore(verifyJobsDir()), cloneRoot = CLONE_ROOT, log = (m) => process.stderr.write(`${m}\n`),
   maxConcurrent = 8, reattach = reattachTick, snapshot, readHead = () => readHeadOf(cloneRoot), probe = probeHandle,
-  now = () => Date.now(), onSettled = () => {}, evict = evictSnapshots,
+  now = () => Date.now(), onSettled = () => {}, evict = evictSnapshots, kill = process.kill.bind(process),
 } = {}) {
   mkdirSync(store.dir, { recursive: true });
   const kind = VERIFY_GATE_JOB_KIND.kind;
@@ -185,6 +185,22 @@ export function createVerifyGateJobs({
           }
           continue;
         }
+        // A finished job's gate can outlive it (the supervisor refused to start a second gate beside a survivor, or died
+        // for good with its gate running). The lane stays occupied until that gate is gone — otherwise the next dispatch
+        // queues a fresh job with no gate sidecar and starts a second gate beside the survivor. Retry the kill each tick.
+        const survivor = liveGate(store.dir, r.id, { probe });
+        if (survivor.alive && survivor.gate?.pid > 0) {
+          try { kill(-survivor.gate.pid, 'SIGKILL'); } catch {}
+          const prev = inFlight.get(input.dir);
+          if (!prev || prev.jobId === r.id) {
+            live.add(r.id);
+            inFlight.set(input.dir, {
+              pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
+              suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
+              jobId: r.id, pid: survivor.gate.pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
+            });
+          }
+        }
         if (consumed.has(r.id)) continue;
         consumed.add(r.id);
         startLogged.delete(r.id);
@@ -211,7 +227,7 @@ export function createVerifyGateJobs({
       }
       // Housekeeping: prune consumed jobs past the keep window; evict snapshots no live job references.
       for (const r of records) {
-        if (!TERMINAL_JOB_STATUSES.includes(r.job.status) || !consumed.has(r.id)) continue;
+        if (!TERMINAL_JOB_STATUSES.includes(r.job.status) || !consumed.has(r.id) || live.has(r.id)) continue;
         if (now() - Date.parse(r.job.finishedAt || 0) < FINISHED_GATE_JOB_KEEP_MS) continue;
         try { deleteRun(r.id, store.dir); } catch {}
         for (const ext of ['.log', GATE_SUFFIX, RESULT_SUFFIX, '.json.lock']) rmSync(join(store.dir, `${r.id}${ext}`), { force: true });
