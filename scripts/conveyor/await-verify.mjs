@@ -205,13 +205,20 @@ export function selfReviewKey({ repo, pr } = {}) {
   const n = Number(pr);
   return repoKey && Number.isInteger(n) && n > 0 ? `${repoKey}-${n}` : null;
 }
-export function readSelfReview({ repo, pr }, { dir = selfReviewStoreDir(), readFileSyncFn = readFileSync } = {}) {
-  try {
-    const key = selfReviewKey({ repo, pr });
-    if (!key) return null;
-    const r = JSON.parse(readFileSyncFn(join(dir, `${key}.json`), 'utf8'));
-    return isObject(r) && SELF_REVIEW_STATES.includes(r.state) ? r : null;
-  } catch { return null; }
+/** Read one record. Missing is null. Unreadable/malformed is null, or THROWS with `strict` (a caller that must fail closed). */
+export function readSelfReview({ repo, pr }, { dir = selfReviewStoreDir(), readFileSyncFn = readFileSync, strict = false } = {}) {
+  const key = selfReviewKey({ repo, pr });
+  if (!key) return null;
+  let raw;
+  try { raw = readFileSyncFn(join(dir, `${key}.json`), 'utf8'); } catch (e) {
+    if (e?.code === 'ENOENT' || !strict) return null;
+    throw new Error(`self-review record ${key} unreadable (${e?.code ?? e?.message ?? e})`);
+  }
+  let r = null;
+  try { r = JSON.parse(raw); } catch { r = null; }
+  if (isObject(r) && SELF_REVIEW_STATES.includes(r.state)) return r;
+  if (strict) throw new Error(`self-review record ${key} malformed`);
+  return null;
 }
 export function writeSelfReview(record, { dir = selfReviewStoreDir(), writeFileSyncFn = writeFileSync, renameSyncFn = renameSync,
   unlinkSyncFn = unlinkSync, mkdirSyncFn = mkdirSync, uniqueId = randomUUID } = {}) {
@@ -241,14 +248,14 @@ export function selfReviewBelongsTo(record, { sessionId = null, who = null } = {
 }
 /**
  * Why this session's round must stay held on its self-review, or null. `pending` holds until the review returns;
- * `must-fix` holds while the fix round has not moved past the reviewed sha (the repair commit's `mark` flips it to
- * `repaired`). A record of ANOTHER session never holds. Pure.
+ * `must-fix` holds until a repair commit is marked AFTER it returned (that `mark` flips it to `repaired`), whatever
+ * sha the await record names — a red-repair marked while the review was still out does not address its finding.
+ * A record of ANOTHER session never holds. Pure.
  */
-export function selfReviewHold(record, { sessionId = null, who = null, sha = null } = {}) {
+export function selfReviewHold(record, { sessionId = null, who = null } = {}) {
   if (!record || !SELF_REVIEW_HOLDING.has(record.state) || !selfReviewBelongsTo(record, { sessionId, who })) return null;
   if (record.state === 'pending') return `self-review pending since ${record.startedAt ?? '?'} (reviewing ${String(record.sha ?? '').slice(0, 8)})`;
-  if (sha && record.sha && String(sha).toLowerCase() !== String(record.sha).toLowerCase()) return null;
-  return `self-review returned must-fix for ${String(record.sha ?? '').slice(0, 8)}; the repair is not committed and marked yet`;
+  return `self-review returned must-fix for ${String(record.sha ?? '').slice(0, 8)}; no repair commit marked since`;
 }
 
 /** Lane refs a record may name for the daemon's push: `lane/*` only, never `main` or a flag-shaped string. */
@@ -339,7 +346,8 @@ export function main(argv = process.argv.slice(2), {
       if (!stored.ok) { clear(cwd); err(`store ${stored.reason}`); return 2; }
       // fix.selfReviewParallel: marking the repair of a must-fix self-review (a NEW sha) ends that hold.
       const sr = record.kind === 'fix' ? readSelfReviewFn({ repo: record.repo, pr: record.pr }) : null;
-      if (sr?.state === 'must-fix' && selfReviewBelongsTo(sr, record) && String(sr.sha).toLowerCase() !== record.sha.toLowerCase()) {
+      if (sr?.state === 'must-fix' && selfReviewBelongsTo(sr, record) && String(sr.sha).toLowerCase() !== record.sha.toLowerCase()
+        && String(sr.repairBaseSha ?? '').toLowerCase() !== record.sha.toLowerCase()) {
         writeSelfReviewFn({ ...sr, state: 'repaired', repairSha: record.sha, repairedAt: record.requestedAt });
       }
     }
@@ -374,8 +382,18 @@ function selfReviewCommand({ verb, flags, env, now, git, out, err, sessionId, re
   }
   if (verb === 'clean' || verb === 'must-fix') {
     if (!existing || !selfReviewBelongsTo(existing, { sessionId, who })) { err(`no self-review started by this session for ${flags.repo} PR #${ref.pr}`); return 2; }
-    if (existing.state !== 'pending') { err(`self-review is already ${existing.state}, not pending`); return 2; }
-    const record = { ...existing, state: verb, returnedAt: at, ...(typeof flags.note === 'string' ? { note: flags.note.slice(0, 500) } : {}) };
+    // must-fix → clean is the owning session DISMISSING the finding (allowed only with a recorded reason, as the brief's
+    // dismissal rules require); every other transition starts from pending.
+    const dismiss = existing.state === 'must-fix' && verb === 'clean';
+    if (dismiss && !(typeof flags.note === 'string' && flags.note.trim())) { err('dismissing a must-fix needs --note="<not the same class | outside scope (filed as <card>)>"'); return 2; }
+    if (existing.state !== 'pending' && !dismiss) { err(`self-review is already ${existing.state}, not pending`); return 2; }
+    let head = null;
+    try { head = git(['rev-parse', 'HEAD']).trim(); } catch { head = null; }
+    const record = {
+      ...existing, state: verb, returnedAt: at, ...(dismiss ? { dismissedAt: at } : {}),
+      ...(verb === 'must-fix' && head ? { repairBaseSha: head } : {}),
+      ...(typeof flags.note === 'string' ? { note: flags.note.slice(0, 500) } : {}),
+    };
     const w = writeSelfReviewFn(record);
     if (!w.ok) { err(`self-review ${w.reason}`); return 2; }
     out(JSON.stringify(record));

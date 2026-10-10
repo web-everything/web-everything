@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
   resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS, AWAIT_VERIFY_NO_PUSH_KINDS,
-  readSelfReview, selfReviewHold, selfReviewStoreDir,
+  readSelfReview, selfReviewHold, selfReviewStoreDir, selfReviewBelongsTo,
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
 import { computeWorkingTreeHash } from '../lib/verify-lane-gate.mjs';
@@ -287,6 +287,32 @@ function runEarlyPush({ io, record, nowMs, policy, persist }) {
     : { ...base, result: `not sent (${pushed.reason ?? 'push failed'})${done ? '' : '; retry next tick'}` };
 }
 
+/**
+ * fix.selfReviewParallel (card xloi1c0) — this record's self-review standing: `hold` (why a green must wait), `overdue`
+ * (the hold, once past `selfReviewMaxMs` or with an unparsable time), `note` (a returned review's window, for the log).
+ */
+export function selfReviewGate({ io, record, nowMs, limits = AWAIT_VERIFY_LIMITS }) {
+  const sr = record?.kind === 'fix' && typeof io?.readSelfReview === 'function' ? io.readSelfReview(record) : null;
+  const owner = { sessionId: record?.sessionId ?? null, who: record?.who ?? null };
+  const hold = selfReviewHold(sr, owner);
+  let overdue = null;
+  if (hold) {
+    const since = Date.parse(sr.state === 'pending' ? sr.startedAt : (sr.returnedAt ?? sr.startedAt));
+    const maxMs = limits.selfReviewMaxMs ?? AWAIT_VERIFY_LIMITS.selfReviewMaxMs;
+    if (!Number.isFinite(since) || nowMs - since > maxMs) overdue = hold;
+  }
+  const note = sr && !hold && sr.returnedAt && selfReviewBelongsTo(sr, owner)
+    ? `self-review ${sr.state} (started ${sr.startedAt}, returned ${sr.returnedAt})` : null;
+  return { sr, hold, overdue, note };
+}
+/** Log the first hold of a green (once per record), then wait quietly. */
+function holdGreen(row, record, gate, persist, nowMs) {
+  if (!record.selfReviewHeldAt) {
+    if (!persist({ ...record, selfReviewHeldAt: new Date(nowMs).toISOString() })) return;
+    Object.assign(row, { action: 'self-review-hold', reason: gate.hold, result: 'verify green; push + resume withheld until the self-review returns (fix claim still held)' });
+  } else Object.assign(row, { action: 'wait', reason: `green; ${gate.hold}` });
+}
+
 /** Records already acted on to completion whose store entry could not be deleted (see `clearOrNote`). */
 const UNCLEARABLE_DONE = new Set();
 /** The last fix-push-policy line this process logged (see runAwaitVerifyPass). */
@@ -348,26 +374,13 @@ export async function runAwaitVerifyPass({
           rows.push(row); continue;
         }
         // fix.selfReviewParallel (card xloi1c0): a green verdict is NOT handed back while this session's self-review is still
-        // out (or returned must-fix for this very sha). The verdict marker stays valid for the sha, so the next tick
-        // re-decides; nothing is pushed or resumed meanwhile. Bounded: past `selfReviewMaxMs` the green proceeds with an
-        // instruction to finish the review first, and fix-end still refuses a hand-back release while it is open.
-        const sr = record.kind === 'fix' && typeof io.readSelfReview === 'function' ? io.readSelfReview(record) : null;
-        const srHold = selfReviewHold(sr, { sessionId: record.sessionId, who: record.who, sha: record.sha });
-        let srOverdue = null;
-        if (srHold) {
-          const since = Date.parse(sr.state === 'pending' ? sr.startedAt : (sr.returnedAt ?? sr.startedAt));
-          const maxMs = limits.selfReviewMaxMs ?? AWAIT_VERIFY_LIMITS.selfReviewMaxMs;
-          if (!(Number.isFinite(since) && nowMs - since > maxMs)) {
-            if (!record.selfReviewHeldAt) {
-              if (!persist({ ...record, selfReviewHeldAt: new Date(nowMs).toISOString() })) { rows.push(row); continue; }
-              Object.assign(row, { action: 'self-review-hold', reason: srHold, result: 'verify green; push + resume withheld until the self-review returns (fix claim still held)' });
-            } else Object.assign(row, { action: 'wait', reason: `green; ${srHold}` });
-            rows.push(row); continue;
-          }
-          srOverdue = srHold;
-        }
-        const srNote = sr && sr.state !== 'pending' && sr.returnedAt && (!record.sessionId || !sr.sessionId || sr.sessionId === record.sessionId)
-          ? `self-review ${sr.state} (started ${sr.startedAt}, returned ${sr.returnedAt})` : null;
+        // out (or returned must-fix with no repair marked since). The verdict marker stays valid for the sha, so the next
+        // tick re-decides; nothing is pushed or resumed meanwhile. Bounded: past `selfReviewMaxMs` (or an unparsable
+        // time) the green proceeds with an instruction to finish the review, and fix-end still refuses a hand-back.
+        const gate = selfReviewGate({ io, record, nowMs, limits });
+        if (gate.hold && !gate.overdue) { holdGreen(row, record, gate, persist, nowMs); rows.push(row); continue; }
+        const srOverdue = gate.overdue;
+        const srNote = gate.note;
         const attempt = record.pushRetries ?? 0;
         if (!persist({ ...record, pushRetries: attempt + 1 })) { rows.push(row); continue; }
         const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
@@ -397,6 +410,11 @@ export async function runAwaitVerifyPass({
         if (!persist({ ...record, pendingResume: { ...pending, ...(marker ? { marker: { failureDetails: marker.failureDetails ?? null } } : {}) } })) { rows.push(row); continue; }
       }
       if (!allowResume) { row.result = row.result ?? 'resume-paused'; rows.push(row); continue; }
+      if (record.pendingResume?.kind === 'green' && !record.pendingResume.selfReviewOverdue && d.action !== 'push') {
+        const gate = selfReviewGate({ io, record, nowMs, limits });
+        if (gate.hold && !gate.overdue) { holdGreen(row, record, gate, persist, nowMs); rows.push(row); continue; }
+        if (gate.overdue && !persist({ ...record, pendingResume: { ...record.pendingResume, selfReviewOverdue: gate.overdue } })) { rows.push(row); continue; }
+      }
       const session = lookupAwaitSession(record, io.listSessions());
       if (!session) {
         clearOrNote(key, record);

@@ -143,12 +143,43 @@ describe('self-review must-fix → a second push under the same claim', () => {
     expect(h.calls.resume[0].prompt).toMatch(new RegExp(`sha ${SHA2}.*Verify is GREEN`, 's'));
   });
 
-  it('selfReviewHold: must-fix holds only the reviewed sha; pending holds any sha; repaired/clean never hold', () => {
+  it('a red-repair marked while the review was still out does NOT satisfy a later must-fix', async () => {
+    const h = harness();
+    h.sr.value = pending();
+    // verify red on SHA → the fixer commits SHA2 and re-marks while the review is still pending (nothing flips) …
+    h.store.set(SESSION, rec({ sha: SHA2, attempt: 2 }));
+    h.state.lane = { head: SHA2, dirty: false, treeHash: TREE };
+    // … then the review returns must-fix for SHA, and verify goes green on SHA2.
+    h.sr.value = { ...h.sr.value, state: 'must-fix', returnedAt: new Date(T0 + 60_000).toISOString(), repairBaseSha: SHA2 };
+    h.state.marker = marker('green', SHA2);
+    await pass(h, 70_000);
+    expect(h.calls.resume).toEqual([]);
+  });
+
+  it('a saved green resume (pushed, delivery deferred) is held too when the review is open', async () => {
+    const h = harness();
+    h.store.set(SESSION, rec({ pendingResume: { kind: 'green', detail: 'pushed' } }));
+    h.sr.value = pending();
+    await pass(h);
+    expect(h.calls.resume).toEqual([]);
+    h.sr.value = { ...h.sr.value, state: 'clean', returnedAt: new Date(T0 + 40_000).toISOString() };
+    await pass(h, 50_000);
+    expect(h.calls.resume).toHaveLength(1);
+  });
+
+  it('an unparsable review time counts as overdue (never an unbounded hold)', async () => {
+    const h = harness();
+    h.sr.value = pending({ startedAt: 'garbage' });
+    h.state.marker = marker('green');
+    await pass(h);
+    expect(h.calls.resume).toHaveLength(1);
+    expect(h.calls.resume[0].prompt).toMatch(/has not reported/);
+  });
+
+  it('selfReviewHold: pending and must-fix hold whatever the sha; repaired/clean never hold', () => {
     const who = { sessionId: SESSION, who: 'fix-4115' };
-    expect(selfReviewHold(pending(), { ...who, sha: SHA2 })).toMatch(/pending/);
-    expect(selfReviewHold(pending({ state: 'must-fix' }), { ...who, sha: SHA })).toMatch(/must-fix/);
-    expect(selfReviewHold(pending({ state: 'must-fix' }), { ...who, sha: SHA2 })).toBeNull();
-    expect(selfReviewHold(pending({ state: 'must-fix' }), who)).toMatch(/must-fix/); // fix-end: no sha → still held
+    expect(selfReviewHold(pending(), who)).toMatch(/pending/);
+    expect(selfReviewHold(pending({ state: 'must-fix' }), who)).toMatch(/must-fix/);
     expect(selfReviewHold(pending({ state: 'repaired' }), who)).toBeNull();
     expect(selfReviewHold(pending({ state: 'clean' }), who)).toBeNull();
     expect(selfReviewHold(pending(), { sessionId: 'other', who: 'fix-4115' })).toBeNull();
@@ -197,16 +228,27 @@ describe('the self-review CLI', () => {
     expect(m.sr).toBeNull();
   });
 
-  it('marking the repair commit (a new sha) flips must-fix → repaired; re-marking the reviewed sha does not', () => {
+  it('marking the repair commit (a new sha) flips must-fix → repaired; re-marking the reviewed or the then-HEAD sha does not', () => {
     const { m, deps } = mem();
     main(['self-review', 'start', ...args], deps);
+    m.head = SHA2; // a red-repair committed while the review was out
     main(['self-review', 'must-fix', ...args], deps);
+    expect(m.sr.repairBaseSha).toBe(SHA2);
     const mark = ['mark', '--repo=web-everything/web-everything', '--pr=4115', '--who=fix-4115', '--ref=lane/item-68b', '--kind=fix', '--attempt=1'];
     expect(main(mark, deps)).toBe(0);
     expect(m.sr.state).toBe('must-fix');
-    m.head = SHA2;
+    m.head = 'c'.repeat(40);
     expect(main(mark, deps)).toBe(0);
-    expect(m.sr).toMatchObject({ state: 'repaired', repairSha: SHA2 });
+    expect(m.sr).toMatchObject({ state: 'repaired', repairSha: 'c'.repeat(40) });
+  });
+
+  it('a must-fix may be dismissed to clean only with a recorded reason', () => {
+    const { m, deps } = mem();
+    main(['self-review', 'start', ...args], deps);
+    main(['self-review', 'must-fix', ...args], deps);
+    expect(main(['self-review', 'clean', ...args], deps)).toBe(2);
+    expect(main(['self-review', 'clean', ...args, '--note=not the same class'], deps)).toBe(0);
+    expect(m.sr).toMatchObject({ state: 'clean', note: 'not the same class' });
   });
 
   it('the store round-trips under a repo-key filename', () => {
@@ -229,9 +271,11 @@ describe('claim release requires BOTH verify green and the self-review returned'
     expect(a.ok).toBe(true);
     return root;
   };
-  const end = (root, selfReview, completion, cleared = []) => fixEnd({
-    repo: 'we', pr: 4115, who: 'fix-4115', sessionId: SESSION, gh, labels: labels(), lockRoot: root,
-    readSelfReview: async () => selfReview, readCompletion: async () => completion, clearSelfReview: (r) => cleared.push(r),
+  const self = { sessionId: SESSION, who: 'fix-4115' };
+  const end = (root, selfReview, completion, cleared = [], selfRelease = self) => fixEnd({
+    repo: 'we', pr: 4115, who: 'fix-4115', sessionId: SESSION, gh, labels: labels(), lockRoot: root, selfRelease,
+    readSelfReview: async () => { if (selfReview instanceof Error) throw selfReview; return selfReview; },
+    readCompletion: async () => completion, clearSelfReview: (r) => cleared.push(r),
   });
   const done = (outcome) => ({ status: 'done', outcome, sessionId: SESSION, updatedAt: new Date().toISOString() });
 
@@ -259,6 +303,39 @@ describe('claim release requires BOTH verify green and the self-review returned'
     try {
       expect(await end(root, pending(), done('gate-red'))).toMatchObject({ ok: true });
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('escalated-rearm-refused / not-applicable are not exits: still refused', async () => {
+    const root = setup();
+    try {
+      expect(await end(root, pending(), done('escalated-rearm-refused'))).toMatchObject({ ok: false });
+      expect(await end(root, pending(), done('not-applicable'))).toMatchObject({ ok: false });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('an unreadable self-review record fails CLOSED for a self-release', async () => {
+    const root = setup();
+    try {
+      expect(await end(root, new Error('EACCES'), null)).toMatchObject({ ok: false, reason: expect.stringMatching(/^self-review-unreadable/) });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('the stuck-fixer reclaim (a harness release, no selfRelease) still frees the claim and clears the record', async () => {
+    const root = setup();
+    try {
+      const cleared = [];
+      expect(await end(root, pending(), { status: 'started', sessionId: SESSION }, cleared, null)).toMatchObject({ ok: true });
+      expect(cleared).toEqual([{ repo: 'we', pr: 4115 }]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('a previous round\'s id-less gate-red completion never releases this round', () => {
+    const claimedAt = new Date(T0).toISOString();
+    const stale = { status: 'done', outcome: 'gate-red', sessionId: null, updatedAt: new Date(T0 - 60_000).toISOString() };
+    const fresh = { ...stale, updatedAt: new Date(T0 + 60_000).toISOString() };
+    const args = { selfReview: pending(), sessionId: SESSION, who: 'fix-4115', claimedAt, hold: selfReviewHold };
+    expect(selfReviewReleaseRefusal({ ...args, completion: stale })).toMatch(/self-review-open/);
+    expect(selfReviewReleaseRefusal({ ...args, completion: fresh })).toBeNull();
   });
 
   it('no self-review record is today\'s flow', async () => {
