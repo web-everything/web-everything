@@ -55,6 +55,21 @@ describe('resource shadow observations', () => {
     });
     expect(admit).not.toHaveBeenCalled();
   });
+  // Every decision shape: busy ⇔ a KNOWN non-admit. An unknown hold (sampler down: snapshot-missing/stale) is no
+  // evidence about the host, so the legacy load rule decides — never "busy" (that would launder a hung probe into a skip).
+  it.each([
+    ['admit', false, 63, false], ['wait', false, 3, true], ['hold', false, 3, true],
+    ['hold', true, 3, false], ['hold', true, 63, true], ['wait', true, 63, true],
+  ])('decision %s (unknown=%s) at load %s → busy=%s', (verdict, unknown, load1, busy) => {
+    const shadow = vi.fn(() => ({ verdict, unknown, reason: unknown ? 'snapshot-stale (age 900s)' : 'x' }));
+    expect(hostLooksBusy({}, { load: () => load1, cores: () => 12, shadow, admit: vi.fn() })).toBe(busy);
+  });
+  it('an unknown decision honours WE_SMOKE_BUSY_LOAD_RATIO', () => {
+    const shadow = () => ({ verdict: 'hold', unknown: true, reason: 'snapshot-missing' });
+    const host = { load: () => 25, cores: () => 10, shadow, admit: vi.fn() };
+    expect(hostLooksBusy({}, host)).toBe(true);
+    expect(hostLooksBusy({ WE_SMOKE_BUSY_LOAD_RATIO: '4' }, host)).toBe(false);
+  });
   it('falls back from an absent shadow decision to admission', () => {
     const env = {}; const admit = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 40% ≥ 5%' }));
     expect(hostLooksBusy(env, { load: () => 63, cores: () => 12, shadow: () => {}, admit })).toBe(false);
