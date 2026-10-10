@@ -103,11 +103,17 @@ import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
+import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
 export const GH_CADENCE_MS = 15 * MINUTE;
+/** PURE: is a cadence stamped `at` due at `now`, every `everyMs`? A missing, non-numeric or future stamp (a clock
+ *  stepped back, or a forged state.json) is due — it must never make a cadence wait out the offset. */
+export function cadenceDue(at, now, everyMs = GH_CADENCE_MS) {
+  return typeof at !== 'number' || !Number.isFinite(at) || at <= 0 || at > now || now - at >= everyMs;
+}
 export const CHILD_TIMEOUT_MS = 30_000;
 
 /**
@@ -881,8 +887,9 @@ export function probeSessionWatchdog({
   const isolated = anyFixture || scoped;
   const prev = anyFixture ? null : readJson(cachePath, null);
   const prevAt = Date.parse(prev?.at ?? '');
-  // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass.
-  if (prev && Number.isFinite(prevAt) && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
+  // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass. A cached `at` in
+  // the future (a clock stepped back, or a forged cache file) is stale, never a reason to skip the pass.
+  if (prev && Number.isFinite(prevAt) && prevAt <= now && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
     return { ...prev, cached: true, configError };
   }
   const readFix = (k) => JSON.parse(readFileSync(flags[k], 'utf8'));
@@ -975,8 +982,8 @@ export function probeBgIsolationStalls(agents, { readInfo = readBgIsolationStall
  * other child call in this file.
  * @returns {{observedAt:string, records:Array<object>, gaps:string[]}}
  */
-export function probeStaleState({ exec = run, timeoutMs = 90_000 } = {}) {
-  const out = exec(process.execPath, [join(REPO_ROOT, 'scripts/operations/run.mjs'), 'stale-state', '--json'], { timeoutMs });
+export function probeStaleState({ exec = run, timeoutMs = 90_000, repoRoot = REPO_ROOT } = {}) {
+  const out = exec(process.execPath, [join(repoRoot, 'scripts/operations/run.mjs'), 'stale-state', '--json'], { timeoutMs, cwd: repoRoot });
   return JSON.parse(out).verdict;
 }
 
@@ -988,9 +995,61 @@ export function probeStaleState({ exec = run, timeoutMs = 90_000 } = {}) {
  * never a duplicate merged-PR fetch.
  * @returns {{cards:Array<{stem:string, body:string}>, prs:Array<object>}}
  */
-export function probeMergedPrs({ exec = run, limit = 800, timeoutMs = 60_000 } = {}) {
+export function probeMergedPrs({ exec = run, limit = 800, timeoutMs = 60_000, repoRoot = REPO_ROOT } = {}) {
   const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', CONSTELLATION_REPOS.we.slug, '--state', 'merged', '--limit', String(limit), '--json', 'number,title,headRefName,body'], { timeoutMs }));
-  return { cards: readBacklogCards(REPO_ROOT), prs };
+  return { cards: readBacklogCards(repoRoot), prs };
+}
+
+// Every probe name `collectGhProbes` can report under — the gh-cadence group's error-streak keys and the allowlist
+// for a job result — lives in health-watch-job.mjs (which this file imports; the reverse would be a cycle).
+export { GH_GROUP_PROBE_NAMES };
+
+/**
+ * #4131 — the gh-cadence probe group (every 15 min): open PRs, the agent listing and everything read off it,
+ * stale-state and merged PRs. The slow part of a tick (live 2026-10-09: ~130 s of a ~150 s tick). Run inline by
+ * the tick, or inside the `health-gh-probe` job's worker thread (we:scripts/conveyor/health-watch-job.mjs).
+ * Each probe's failure is captured in `errors` (scrubbed), never thrown, so one failing read never blocks the
+ * others. `sourceRoot` is the daemon clone: the job runs from a pinned code snapshot, so every read of the
+ * checkout itself (backlog, review jobs, the stale-state CLI) must name the real clone, never the snapshot.
+ * @returns {{probes: object, errors: Record<string, string>}}
+ */
+export function collectGhProbes({ now = Date.now(), sourceRoot = REPO_ROOT, skipBuildSessions = false } = {}) {
+  const probes = {};
+  const errors = {};
+  const attempt = (name, fn) => {
+    try { return fn(); } catch (e) { errors[name] = scrubText(String(e?.message || e).split('\n')[0]); return undefined; }
+  };
+  const prs = attempt('prs', () => probePrs({ now }));
+  const agents = attempt('agents', () => probeAgents());
+  // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
+  // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
+  // only `prs` and must not sit blocked on a failing `agents` read too. `ghCache.at` still needs both, so a
+  // partial gh hiccup keeps `ghDue` true and retries sooner rather than waiting the full cadence.
+  if (prs) probes.prs = prs;
+  if (agents) probes.agents = agents;
+  // claude-auth-expired's own probe needs only `agents` (the exact same listing, same cadence) — independent
+  // of whether `prs` also succeeded this tick, same reasoning as stale-claim's two probes just below.
+  if (agents) probes.authExpired = attempt('authExpired', () => probeAuthExpiredSessions(agents));
+  // #x9fbg1x — same cadence/gating reasoning as `authExpired` just above: needs only the same `agents`
+  // listing, independent of whether `prs` also succeeded this tick.
+  if (agents) probes.bgIsolationStalls = attempt('bgIsolationStalls', () => probeBgIsolationStalls(agents));
+  // #4068 — same `agents` listing, same gating: what can hold a PR as `live-process` (review jobs + PR-bound
+  // sessions) and how long since each last did anything.
+  if (agents) {
+    probes.liveBindings = attempt('liveBindings', () => probeLiveBindings(agents, {
+      nowMs: now, roots: [sourceRoot, ...daemonCloneRoots(workspaceOf(sourceRoot))],
+    }));
+  }
+  // Build/prepare supervision (operator 2026-10-06) — same `agents` listing, bounded transcript tail reads.
+  if (agents && !skipBuildSessions) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
+  // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
+  // prs/agents pairing above — one failing never blocks the other.
+  const staleState = attempt('staleState', () => probeStaleState({ repoRoot: sourceRoot }));
+  if (staleState) probes.staleState = staleState;
+  const mergedPrs = attempt('mergedPrs', () => probeMergedPrs({ repoRoot: sourceRoot }));
+  if (mergedPrs) probes.mergedPrs = mergedPrs;
+  for (const k of Object.keys(probes)) if (probes[k] === undefined) delete probes[k];
+  return { probes, errors };
 }
 
 // ── the tick ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1019,7 +1078,7 @@ function archiveOptions(config, flags, now) {
 }
 
 /** One tick: probe, evaluate, diagnose, and persist. Returns the CLI summary. */
-export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun } = {}) {
+export async function tick(flags = {}, { collectInventory = collectCredentialInventory, tmpSweepRun, ...deps } = {}) {
   const started = Date.now();
   const now = flags.now ? Date.parse(flags.now) : started;
   const dir = healthDir(flags['state-root']);
@@ -1035,8 +1094,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     try { const value = fn(); return value?.then ? value.catch(failed) : value; } catch (e) { return failed(e); }
   };
   const sweepAllowed = flags['tmp-sweep-root'] || (!flags['state-root'] && !flags['dry-run']);
-  const sweepDue = config.tmpSweepEnabled && (!prev.tmpSweep?.completedAt
-    || now - prev.tmpSweep.completedAt >= config.tmpSweepEveryMs || prev.tmpSweep.complete === false);
+  // Both daily stamps come from state.json, so they go through `cadenceDue`: a future one must not park the sweep.
+  const sweepDue = config.tmpSweepEnabled && (prev.tmpSweep?.complete === false
+    || cadenceDue(prev.tmpSweep?.completedAt, now, config.tmpSweepEveryMs));
   const tmpSweep = sweepAllowed && sweepDue
     ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun, prev.tmpSweep?.nextCursor)))
     : null;
@@ -1044,8 +1104,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
-  const archiveDue = config.claudeJobsArchiveEnabled && (!prev.claudeJobsArchive?.completedAt
-    || now - prev.claudeJobsArchive.completedAt >= config.claudeJobsArchiveEveryMs || prev.claudeJobsArchive.complete === false);
+  const archiveDue = config.claudeJobsArchiveEnabled && (prev.claudeJobsArchive?.complete === false
+    || cadenceDue(prev.claudeJobsArchive?.completedAt, now, config.claudeJobsArchiveEveryMs));
   const claudeJobsArchive = archiveAllowed && archiveDue
     ? await attempt('claudeJobsArchive', () => archiveClaudeJobs(archiveOptions(config, flags, now)))
     : null;
@@ -1162,10 +1222,14 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());
 
-  const ghCache = prev.ghCache || {};
-  const ghDue = !flags['no-gh'] && (flags['force-gh'] || !ghCache.at || now - ghCache.at >= GH_CADENCE_MS);
+  // state.json is a user-writable file: a non-object `ghCache` reads as empty, and every cadence stamp goes through
+  // `cadenceDue`, so a corrupt or future value can never park a cadence.
+  const ghCache = prev.ghCache && typeof prev.ghCache === 'object' && !Array.isArray(prev.ghCache) ? prev.ghCache : {};
+  let jobsState = prev.jobs;
+  let ghJob = null;
+  const ghDue = !flags['no-gh'] && (flags['force-gh'] || cadenceDue(ghCache.at, now));
   // Inventory has its own cadence stamp: unrelated GitHub failures cannot cause repeated log scans.
-  const inventoryDue = !flags['no-gh'] && (flags['force-gh'] || !prev.credentialInventoryAt || now - prev.credentialInventoryAt >= GH_CADENCE_MS);
+  const inventoryDue = !flags['no-gh'] && (flags['force-gh'] || cadenceDue(prev.credentialInventoryAt, now));
   if (flags['credential-inventory-fixture'] || inventoryDue) {
     try {
       probes.credentialInventory = normalizeInventory(flags['credential-inventory-fixture']
@@ -1176,33 +1240,38 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
       if (errors.length) probeErrors.credentialInventory = errors.join('; ');
     } catch { probeErrors.credentialInventory = 'unavailable'; }
   }
-  if (ghDue) {
-    const prs = attempt('prs', () => probePrs({ now }));
-    const agents = attempt('agents', () => probeAgents());
-    // Each probe is set independently of the other succeeding: red-pr-unattended still only evaluates once BOTH
-    // are present (its own `probes: ['prs', 'agents']` declaration already gates that), but stale-claim needs
-    // only `prs` and must not sit blocked on a failing `agents` read too. `ghCache.at` still needs both, so a
-    // partial gh hiccup keeps `ghDue` true and retries sooner rather than waiting the full cadence.
-    if (prs) probes.prs = prs;
-    if (agents) probes.agents = agents;
-    if (prs && agents) ghCache.at = now;
-    // claude-auth-expired's own probe needs only `agents` (the exact same listing, same cadence) — independent
-    // of whether `prs` also succeeded this tick, same reasoning as stale-claim's two probes just below.
-    if (agents) probes.authExpired = attempt('authExpired', () => probeAuthExpiredSessions(agents));
-    // #x9fbg1x — same cadence/gating reasoning as `authExpired` just above: needs only the same `agents`
-    // listing, independent of whether `prs` also succeeded this tick.
-    if (agents) probes.bgIsolationStalls = attempt('bgIsolationStalls', () => probeBgIsolationStalls(agents));
-    // #4068 — same `agents` listing, same gating: what can hold a PR as `live-process` (review jobs + PR-bound
-    // sessions) and how long since each last did anything.
-    if (agents) probes.liveBindings = attempt('liveBindings', () => probeLiveBindings(agents, { nowMs: now }));
-    // Build/prepare supervision (operator 2026-10-06) — same `agents` listing, bounded transcript tail reads.
-    if (agents && !flags['lock-root']) probes.buildSessions = attempt('buildSessions', () => probeBuildSessions(agents, { nowMs: now, prs: prs || [] }));
-    // stale-claim's two probes ride the same 'gh' cadence (both are gh/git-heavy reads); independent of the
-    // prs/agents pairing above — one failing never blocks the other.
-    const staleState = attempt('staleState', () => probeStaleState());
-    if (staleState) probes.staleState = staleState;
-    const mergedPrs = attempt('mergedPrs', () => probeMergedPrs());
-    if (mergedPrs) probes.mergedPrs = mergedPrs;
+  // #4131 — the gh-cadence group is the slow part of a tick (live: ~130 s of a ~150 s tick). With the
+  // `ghProbes` job switch on, it runs as a detached durable job (we:scripts/conveyor/health-watch-job.mjs) and
+  // this tick only consumes a finished job's result; otherwise it runs inline, exactly as before. A dry run or a
+  // fixture tick never touches the host job store (a test supplies its own store through `deps.ghJobs`).
+  const jobsAllowed = (!fixtureTick || !!deps.ghJobs) && !flags['dry-run'] && !flags['no-gh'];
+  const ghJobsOn = jobsAllowed && resolveHealthJobSwitches(config).ghProbes;
+  // Switched off with job state left behind (a rollback): still reconcile — reattach, consume, never queue — so an
+  // in-flight job is never stranded; the group runs inline meanwhile. Stops once no health job record remains.
+  const reconcileOnly = jobsAllowed && !ghJobsOn && !!prev.jobs;
+  let ghFromJob = false;
+  if (ghJobsOn || reconcileOnly) {
+    const out = await attempt('ghJob', () => runGhProbeJobs({
+      ...(deps.ghJobs || {}), now, due: ghJobsOn && ghDue, state: prev.jobs, drain: reconcileOnly,
+      input: { now, sourceRoot: REPO_ROOT, skipBuildSessions: !!flags['lock-root'] },
+    }));
+    if (out) {
+      jobsState = reconcileOnly && !out.summary.remaining ? undefined : out.state;
+      ghJob = out.summary;
+      if (out.result) {
+        ghFromJob = true;
+        Object.assign(probes, out.result.probes);
+        for (const [k, v] of Object.entries(out.result.errors || {})) probeErrors[k] = v;
+        if (out.result.probes.prs && out.result.probes.agents) ghCache.at = Math.min(out.result.sampledAt, now);
+      }
+      if (out.failure) probeErrors.ghJob = scrubText(out.failure);
+    }
+  }
+  if (!ghJobsOn && ghDue && !ghFromJob) {
+    const got = (deps.collectGh || collectGhProbes)({ now, skipBuildSessions: !!flags['lock-root'] });
+    Object.assign(probes, got.probes);
+    Object.assign(probeErrors, got.errors);
+    if (got.probes.prs && got.probes.agents) ghCache.at = now;
   }
 
   // A tick the watchdog killed last time is the overrun smell's input.
@@ -1214,12 +1283,24 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // Silences live in their OWN file, written only by `silence`/`unsilence` and only read here, so a silence
   // set while a tick runs can never be lost to the tick's state.json write (nor roll that write back). Which
   // expired silences were already announced is tick state (`notifiedSilences`).
-  const notified = new Set(prev.notifiedSilences || []);
+  // Both are file data: a non-list (or a non-object entry) reads as nothing rather than throwing before state.json
+  // is rewritten, which would fail every later tick the same way.
+  const notified = new Set(Array.isArray(prev.notifiedSilences) ? prev.notifiedSilences : []);
   const silenceSig = (x) => `${x.smell}|${x.subject ?? '*'}|${x.card ?? ''}|${x.expiresAt ?? ''}`;
-  const silences = readJson(join(dir, 'silences.json'), []).map((x) => ({ ...x, expiredNotified: notified.has(silenceSig(x)) }));
+  const silenceList = readJson(join(dir, 'silences.json'), []);
+  const silences = (Array.isArray(silenceList) ? silenceList : [])
+    .filter((x) => x && typeof x === 'object' && !Array.isArray(x))
+    .map((x) => ({ ...x, expiredNotified: notified.has(silenceSig(x)) }));
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
-  const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, SMELLS, now, { config, probeErrors, activeCards });
+  // Job mode, cadence still due, no result consumed: the group took no sample this tick (its job is queued or
+  // running). Inline, a failed read stays due and is re-supplied every tick, so its streak grows; here it must be
+  // held — not cleared by the ticks between a job's failed samples (the core clears a streak whenever a probe
+  // supplies nothing). A cadence that is satisfied is an off-cadence tick, and clears exactly as it does inline.
+  // `ghJob` (the job's own failure, supplied once when it is consumed) is held the same way, so a job that keeps
+  // dying builds its own streak across the ticks between its failures.
+  const carryProbeErrors = ghJobsOn && ghDue && !ghFromJob ? [...GH_GROUP_PROBE_NAMES, 'ghJob'] : [];
+  const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, deps.smells || SMELLS, now, { config, probeErrors, activeCards, carryProbeErrors });
   // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
   if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
     probes.processes ? summarizeSample(findUngatedHeavyRuns(probes.processes), new Date(now).toISOString())
@@ -1236,24 +1317,54 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   state.cursors = logs ? { ...(prev.cursors || {}), ...logs.cursors } : prev.cursors;
   state.builderCursors = builderLogs ? { ...(prev.builderCursors || {}), ...builderLogs.cursors } : prev.builderCursors;
   state.ghCache = { at: ghCache.at ?? null };
+  if (jobsState) state.jobs = jobsState;
+  else delete state.jobs;
   if (probes.credentialInventory) {
     state.credentialInventoryAt = now;
     state.credentialInventoryCache = probes.credentialInventory.ciFindings;
   }
 
   // Deterministic diagnoses (allowed in shadow mode) — hard timeout each.
+  // Live 2026-10-09 (#4131): nine stale-claim episodes opened in one tick, each running the SAME 30 s sweep, and
+  // the watchdog killed the tick at 180 s — so no state was saved, and the next tick reopened all nine. Two
+  // bounds: an identical command runs once per tick (its output is shared), and no new diagnosis starts once the
+  // tick has used 1.5x its budget (the rest are reported as deferred, never as a killed tick).
   const diagnoses = [];
-  for (const p of result.plan.filter((x) => x.kind === 'diagnose')) {
+  const diagnosisRuns = new Map();
+  const diagnoseDeadline = started + (config.tickBudgetMs ?? DEFAULT_HEALTH_CONFIG.tickBudgetMs) * 1.5;
+  const deferredDiagnoses = [];
+  // A diagnosis the budget deferred leaves `diagnosisDeferredAt` on its episode (state.json). The planner only
+  // asks for a diagnosis on an open/flapping transition, so without this the skipped work would never be asked
+  // for again. Carried-over deferrals run first, oldest first, so a slow tick cannot starve them.
+  const smellById = Object.fromEntries((deps.smells || SMELLS).map((s) => [s.id, s]));
+  const planned = new Set(result.plan.filter((x) => x.kind === 'diagnose').map((x) => x.key));
+  const carriedDiagnoses = Object.values(state.episodes)
+    .filter((e) => Number.isFinite(e.diagnosisDeferredAt) && (e.status === 'open' || e.status === 'flapping')
+      && !planned.has(e.key) && smellById[e.smell]?.diagnose)
+    .sort((a, b) => a.diagnosisDeferredAt - b.diagnosisDeferredAt)
+    .map((e) => ({ kind: 'diagnose', key: e.key, diagnose: smellById[e.smell].diagnose }));
+  for (const p of [...carriedDiagnoses, ...result.plan.filter((x) => x.kind === 'diagnose')]) {
     const ep = state.episodes[p.key];
     if (!ep || flags['no-diagnose']) continue;
     const { command, args = [], timeoutMs = CHILD_TIMEOUT_MS } = p.diagnose;
-    let d;
-    try { d = { command: [command, ...args].join(' '), code: 0, output: run(command, args, { timeoutMs }) }; }
-    catch (e) { d = { command: [command, ...args].join(' '), code: e?.status ?? null, timedOut: e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM', output: `${e?.stdout || ''}${e?.stderr || ''}` || String(e?.message || e) }; }
-    d.output = scrubText(summarizeDiagnosisOutput(d.output)); // scrubbed at capture: every persisted copy is redacted
-    ep.diagnosis = d;
+    const commandLine = [command, ...args].join(' ');
+    let d = diagnosisRuns.get(commandLine);
+    if (!d) {
+      if ((deps.clock || Date.now)() > diagnoseDeadline) {
+        deferredDiagnoses.push(p.key);
+        ep.diagnosisDeferredAt ??= now; // keeps the first deferral time across ticks
+        continue;
+      }
+      try { d = { command: commandLine, code: 0, output: (deps.runDiagnosis || run)(command, args, { timeoutMs }) }; }
+      catch (e) { d = { command: commandLine, code: e?.status ?? null, timedOut: e?.code === 'ETIMEDOUT' || e?.signal === 'SIGTERM', output: `${e?.stdout || ''}${e?.stderr || ''}` || String(e?.message || e) }; }
+      d.output = scrubText(summarizeDiagnosisOutput(d.output)); // scrubbed at capture: every persisted copy is redacted
+      diagnosisRuns.set(commandLine, d);
+    }
+    ep.diagnosis = { ...d };
+    delete ep.diagnosisDeferredAt;
     diagnoses.push({ key: p.key, command: d.command, code: d.code });
   }
+  if (deferredDiagnoses.length) probeErrors.diagnoseDeferred = `${deferredDiagnoses.length} diagnosis(es) skipped past the tick budget: ${deferredDiagnoses.slice(0, 5).join(', ')}`;
 
   // #4078 — the diagnose-only investigation agent: stop what is due, dispatch what the budget clears (nothing
   // unless config `investigateDispatch` is on), and put each episode's investigation status + findings on the
@@ -1393,7 +1504,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   }
   // The whole summary goes through the scrub too (the last choke point before stdout).
   return scrubDeep({
-    now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs,
+    now: new Date(now).toISOString(), durationMs, mode: config.mode, stateDir: dir, ghSampled: !!probes.prs, ghJob,
     claudeJobsArchive: claudeJobsArchive ?? null, tmpSweep: tmpSweep ?? null, ghSpend: ghSpend ?? null, probeErrors, transitions: result.transitions.map((t) => ({ type: t.type, key: t.key })),
     plan: result.plan.map(({ diagnose, ...rest }) => rest), diagnoses, notifications, investigations, reports: written,
     section: renderHealthSection(state, { now, reportDir }),
