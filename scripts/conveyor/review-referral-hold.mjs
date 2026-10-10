@@ -3,7 +3,7 @@
  * Persistence failures get three retries (15/30/60 minutes), then the same event-driven hold.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { referralCardReadable } from '../lib/referral-card-readable.mjs';
@@ -62,20 +62,55 @@ export function reviewRunEvidence(run) {
 
 // Cache only small projections, never full diffs/seat transcripts. A changed file is parsed again.
 const evidenceCache = new Map();
-export function readReviewRunEvidence({ dir = resolveRunsDir() } = {}) {
+/** The on-disk projection beside the records (not `.json`, so no run-store listing reads it as a record). Live
+ *  2026-10-10: 3,303 review-pr records (0.8 GB) were re-parsed by EVERY reconcile-pass process — minutes under host
+ *  load, enough to time out the drain rebuild's reconcile/dispatch smoke checks. Keyed by the projection's own source,
+ *  so a change to {@link reviewRunEvidence} never serves a stale projection. */
+export const REVIEW_EVIDENCE_CACHE_FILE = '.review-run-evidence.cache';
+const EVIDENCE_CODE = createHash('sha256').update(String(reviewRunEvidence)).digest('hex').slice(0, 16);
+function readEvidenceDiskCache(file) {
+  try {
+    const c = JSON.parse(readFileSync(file, 'utf8'));
+    return c?.v === 1 && c.code === EVIDENCE_CODE && c.entries && typeof c.entries === 'object' ? c.entries : {};
+  } catch { return {}; }
+}
+function writeEvidenceDiskCache(file, entries) {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify({ v: 1, code: EVIDENCE_CODE, entries }));
+    renameSync(tmp, file);
+  } catch { try { unlinkSync(tmp); } catch { /* best effort: the cache is only a speed-up */ } }
+}
+export function readReviewRunEvidence({ dir = resolveRunsDir(), readRun = tryReadRun, memo = evidenceCache, persist = true } = {}) {
   let names;
   try { names = readdirSync(dir); } catch (e) { if (e.code === 'ENOENT') return []; throw e; }
-  return names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).flatMap(name => {
+  const file = join(dir, REVIEW_EVIDENCE_CACHE_FILE);
+  let disk = null;
+  let dirty = false;
+  const kept = {};
+  const out = names.filter(n => n.startsWith('review-pr-') && n.endsWith('.json')).flatMap(name => {
     const path = join(dir, name);
     const stat = statSync(path);
     const key = `${stat.mtimeMs}:${stat.size}`;
-    let cached = evidenceCache.get(path);
-    if (cached?.key !== key) {
-      cached = { key, evidence: reviewRunEvidence(tryReadRun(name.slice(0, -5), dir)) };
-      evidenceCache.set(path, cached);
+    let cached = memo.get(path);
+    if (cached?.key !== key && persist) {
+      disk ??= readEvidenceDiskCache(file);
+      const hit = disk[name];
+      if (hit?.key === key) cached = { key, evidence: hit.evidence ?? null };
     }
+    if (cached?.key !== key) {
+      cached = { key, evidence: reviewRunEvidence(readRun(name.slice(0, -5), dir)) };
+      dirty = true;
+    }
+    memo.set(path, cached);
+    kept[name] = cached;
     return cached.evidence ? [cached.evidence] : [];
   });
+  if (persist) {
+    disk ??= readEvidenceDiskCache(file);
+    if (dirty || Object.keys(disk).some(n => !kept[n])) writeEvidenceDiskCache(file, kept);
+  }
+  return out;
 }
 
 /** The events on the PR thread that wake a parked review, each tagged with what woke it. `ruling` (a reviewer's or

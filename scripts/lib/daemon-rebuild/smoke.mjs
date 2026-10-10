@@ -19,6 +19,8 @@ import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
 import { pinnedStatus, planRebuild } from './plan.mjs';
+import { runBounded } from '../bounded-child.mjs';
+import { cascadePolicy } from '../policy-cascade.mjs';
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
@@ -87,6 +89,72 @@ function failedRows(smokeResult) {
 export function failsSameChecks(candidateFailed, controlFailed) {
   const c = new Set((controlFailed || []).map((r) => r.name));
   return Array.isArray(candidateFailed) && candidateFailed.length > 0 && candidateFailed.every((r) => c.has(r.name));
+}
+
+// ── the rebuild's smoke BUDGET (live 2026-10-10) ─────────────────────────────────────────────────────────────
+// The drain clone's rebuild job was killed (SIGTERM, no result) on both attempts: the overlay smoke took ~10 min,
+// then the plain-main fallback ran a FULL second smoke (~22 min) and the child crossed the job's 60-min limit, so the
+// clone never adopted new code. Every smoke of one build now shares ONE total budget: a fallback stage starts only if
+// at least `fallbackMinMs` of it is left, each child's timeout is capped at what is left, and on plain main a check
+// that A already failed stops the smoke the moment it fails again (the rest cannot change the outcome).
+
+/** Built-in (standard-layer) budget; the cascade's platform / tool (`rebuildSmokeBudget` in
+ *  daemon-rebuild-settings.json) / env layers override it per leaf. Total stays under the job's 60-min child limit. */
+export const REBUILD_SMOKE_BUDGET_STANDARD = Object.freeze({ totalMs: 50 * 60_000, fallbackMinMs: 5 * 60_000, failFast: true });
+export const REBUILD_SMOKE_BUDGET_ENV = Object.freeze({
+  totalMs: 'WE_REBUILD_SMOKE_TOTAL_MS', fallbackMinMs: 'WE_REBUILD_SMOKE_FALLBACK_MIN_MS', failFast: 'WE_REBUILD_SMOKE_FAIL_FAST',
+});
+const REBUILD_SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-rebuild-settings.json');
+
+/** IO: the rebuild smoke budget through the policy cascade, with the layer each leaf came from. Never throws. */
+export function resolveRebuildSmokeBudget(env = process.env, { settingsPath = REBUILD_SETTINGS_PATH } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(settingsPath, 'utf8'))?.rebuildSmokeBudget; } catch { tool = undefined; }
+  const ms = (k) => { const n = Number(env?.[REBUILD_SMOKE_BUDGET_ENV[k]]); return env?.[REBUILD_SMOKE_BUDGET_ENV[k]] != null && n > 0 ? n : undefined; };
+  const ff = env?.[REBUILD_SMOKE_BUDGET_ENV.failFast];
+  const posMs = (v) => Number.isFinite(v) && v > 0;
+  const r = cascadePolicy('rebuildSmokeBudget', tool, {
+    env,
+    standard: REBUILD_SMOKE_BUDGET_STANDARD,
+    envValues: { totalMs: ms('totalMs'), fallbackMinMs: ms('fallbackMinMs'), failFast: ff === '0' ? false : ff === '1' ? true : undefined },
+    valid: { totalMs: posMs, fallbackMinMs: posMs, failFast: (v) => typeof v === 'boolean' },
+  });
+  return { ...REBUILD_SMOKE_BUDGET_STANDARD, ...(r.value || {}), source: r.sources };
+}
+
+/** The smoke check a child process belongs to, for the two checks that dominate the smoke's time (see
+ *  `daemon-live-smoke.mjs#checkReconcileDryRun` / `#checkDispatchDryRun`); `null` for every other child. */
+export function smokeCheckOfChild(cmd, args = []) {
+  if (cmd !== 'node' || !Array.isArray(args)) return null;
+  if (String(args[0] ?? '').endsWith('scripts/conveyor/reconcile-pass.mjs')) return 'reconcile-dry-run';
+  if (args[0] === '--input-type=module' && args[1] === '-e') return 'dispatch-dry-run';
+  return null;
+}
+
+/**
+ * The `runChild` every smoke of one build gets: each child's timeout capped at the time left before `deadline`, no
+ * child started once less than `minChildMs` is left, and — when `failFast` names checks — every child after one of
+ * them fails is refused at once. Exposes `deadline` / `failFast` for the caller's log and tests.
+ */
+export function budgetedRunChild({ runChild = runBounded, deadline, now = Date.now, failFast = [], minChildMs = 1_000 }) {
+  const ff = new Set(failFast || []);
+  let stopped = null;
+  const run = async (cmd, args = [], opts = {}) => {
+    if (stopped) throw new Error(`skipped: fail-fast — ${stopped} failed on the overlay build and again on this one`);
+    const left = deadline - now();
+    if (!(left >= minChildMs)) throw new Error(`skipped: rebuild smoke budget exhausted (${Math.max(0, Math.round(left))}ms left)`);
+    const timeoutMs = Number.isFinite(opts?.timeoutMs) ? Math.min(opts.timeoutMs, left) : left;
+    try {
+      return await runChild(cmd, args, { ...opts, timeoutMs });
+    } catch (e) {
+      const check = smokeCheckOfChild(cmd, args);
+      if (check && ff.has(check)) stopped = check;
+      throw e;
+    }
+  };
+  run.deadline = deadline;
+  run.failFast = [...ff];
+  return run;
 }
 
 // ── xhiqxz3 — the real DISPATCH SMOKE inside the rebuild ─────────────────────────────────────────────────────
@@ -205,6 +273,20 @@ export async function smokeAndAdopt({
   };
   const git = makeGit({ run, cwd: root, env });
   const smokeEnv = candidateSmokeEnv({ root, env });
+  // One total budget for every smoke of this build (A, plain main, confirm, last-good) — see budgetedRunChild.
+  const budget = resolveRebuildSmokeBudget(env);
+  const deadline = now() + budget.totalMs;
+  log.error?.(`daemon-rebuild: smoke-budget ${JSON.stringify({ totalMs: budget.totalMs, fallbackMinMs: budget.fallbackMinMs, failFast: budget.failFast, source: budget.source })}`);
+  /** May a further smoke `stage` start? When not, say so (with the budget's source) — the caller skips the stage. */
+  const budgetAllows = (stage) => {
+    const remainingMs = deadline - now();
+    if (remainingMs >= budget.fallbackMinMs) return true;
+    alert('smoke-budget-exhausted', {
+      stage, remainingMs: Math.max(0, remainingMs), totalMs: budget.totalMs, fallbackMinMs: budget.fallbackMinMs, source: budget.source,
+      message: `not starting the ${stage} smoke: less than fallbackMinMs of the rebuild smoke budget is left`,
+    });
+    return false;
+  };
   const adoptedState = readRebuildState(root, stEnv).adopted ?? null;
   const adoptedHead = adoptedState?.head ?? null;
 
@@ -260,7 +342,7 @@ export async function smokeAndAdopt({
   };
 
   /** Materialize `sha` as the candidate worktree, smoke it, tear it down. */
-  const smokeSha = async (sha, changedFiles, label, suspects = []) => {
+  const smokeSha = async (sha, changedFiles, label, suspects = [], { failFast = [] } = {}) => {
     // Every smoke of this build (A, then B / C) reuses the lease's own unique path, one after another.
     const candidate = materializeCandidate({
       root, sha, run, env, path: lease.path,
@@ -271,7 +353,8 @@ export async function smokeAndAdopt({
     let dispatch = null;
     const t0 = now();
     try {
-      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles });
+      const runChild = budgetedRunChild({ deadline, now, failFast: budget.failFast ? failFast : [] });
+      smokeResult = await runSmoke({ root: candidate.path, env: smokeEnv, changedFiles, runChild });
     } catch (e) {
       threw = e;
     }
@@ -568,16 +651,20 @@ export async function smokeAndAdopt({
         const fin = await finalize(planB, dropSuspects, fallbackReady);
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }
-      const b = await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied));
+      // Fail fast on every check A failed: if plain main fails one of them too, the rest of B cannot change the outcome.
+      const b = budgetAllows('plain-main')
+        ? await smokeSha(planB.finalSha, loadOnly ? null : changedSince(planB.finalSha), 'plain-main', suspectsFor(planB.applied), { failFast: failedA.map((r) => r.name) })
+        : { budgetSkipped: true };
       if (b.dispatch && !b.dispatch.result.ok) {
         alert('fallback-plain-main-dispatch-smoke-failed', { reason: b.dispatch.result.reason, suspects: b.dispatch.suspects.map((s) => s.ref) });
       }
       const bPassed = !b.worktreeFailed && !b.threw && b.smokeResult?.verdict === 'pass' && (!b.dispatch || b.dispatch.result.ok);
       if (bPassed && loadOnly) {
         // Same-run differential, second half: re-smoke A now that plain main passed.
-        const a2 = await smokeSha(plan.finalSha, null, 'confirm', aSuspects);
+        // No budget left for the re-smoke: no same-run differential, so treat it as load (never blame the overlay).
+        const a2 = budgetAllows('confirm') ? await smokeSha(plan.finalSha, null, 'confirm', aSuspects) : { budgetSkipped: true };
         if (a2.dispatch && !a2.dispatch.result.ok) return dispatchFailed(a2.dispatch);
-        if (!a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
+        if (!a2.budgetSkipped && !a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass') {
           if (a2.dispatch) dispatchPassedAlert(a2.dispatch);
           alert('smoke-load-confirm-passed', {
             failed: failedNames, suspects: suspectInfo,
@@ -590,7 +677,7 @@ export async function smokeAndAdopt({
         const failedNamesA = new Set(failedA.map((r) => r.name));
         const reproduced = failedA2.some((r) => failedNamesA.has(r.name) && !isLoadShapedRow(r, env));
         if (!reproduced) {
-          envLoadAlert({ plainMain: 'passed', confirm: failedA2.map((r) => r.name).join(',') || (a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw') });
+          envLoadAlert({ plainMain: 'passed', confirm: failedA2.map((r) => r.name).join(',') || (a2.budgetSkipped ? 'skipped: budget' : a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : 'threw') });
           // Plain main passed: adopt it so the clone stays current, keep every overlay, back A off.
           const recordBackoff = () => {
             const st = readRebuildState(root, stEnv);
@@ -607,7 +694,7 @@ export async function smokeAndAdopt({
         return { ...fin, reason: 'fallback-plain-main', fallback: { from: plan.finalSha, to: planB.finalSha, dropped: suspectInfo } };
       }
       bFailed = b.smokeResult ? failedRows(b.smokeResult) : null;
-      alert('fallback-plain-main-failed', {
+      if (!b.budgetSkipped) alert('fallback-plain-main-failed', {
         failed: (bFailed || []).map((r) => r.name).join(',') || (b.worktreeFailed ? `worktree: ${b.worktreeFailed}` : 'threw'),
       });
       if (loadOnly) {
@@ -623,7 +710,7 @@ export async function smokeAndAdopt({
   }
 
   // ── (c) control: smoke the LAST-GOOD build itself — does the harness fail it the same way? ────────────
-  const c = await smokeSha(prevHead, null, 'last-good');
+  const c = budgetAllows('last-good') ? await smokeSha(prevHead, null, 'last-good') : { budgetSkipped: true };
   const cFailed = c.smokeResult ? failedRows(c.smokeResult) : null;
   const harnessBroken = !!(cFailed && failsSameChecks(failedA, cFailed));
   if (harnessBroken) {
@@ -661,7 +748,7 @@ export async function smokeAndAdopt({
     });
     return { moved: false, reason: 'smoke-harness-broken', plan, alerts: [...prepAlerts, ...alertsList] };
   }
-  if (!c.smokeResult) alert('last-good-control-unavailable', { reason: c.worktreeFailed ?? String(c.threw?.message || c.threw) });
+  if (!c.smokeResult && !c.budgetSkipped) alert('last-good-control-unavailable', { reason: c.worktreeFailed ?? String(c.threw?.message || c.threw) });
   await hold('smoke-rejected', failedA, { controlPassed: !!(c.smokeResult && c.smokeResult.verdict === 'pass') });
   return { moved: false, reason: 'smoke-rejected', plan, alerts: [...prepAlerts, ...alertsList] };
 }

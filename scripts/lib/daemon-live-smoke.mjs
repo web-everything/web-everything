@@ -77,6 +77,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { shadowAdmission } from './resource-admission.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
@@ -222,11 +223,20 @@ export const BUSY_POOL_SIGNATURES = Object.freeze([
 export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
 
 /** Is the host busy, judged from outside the tree under test? Injectable via `ctx.hostBusy`. */
-export function hostLooksBusy(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length } = {}) {
+export function hostLooksBusy(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission } = {}) {
+  let busy = false;
+  let load1, coreCount, ratio;
   try {
-    const ratio = envMs(env, SMOKE_BUSY_LOAD_RATIO_ENV, 1);
-    return load() >= Math.max(1, cores()) * ratio;
-  } catch { return false; }
+    ratio = envMs(env, SMOKE_BUSY_LOAD_RATIO_ENV, 1);
+    load1 = load();
+    coreCount = Math.max(1, cores());
+    busy = load1 >= coreCount * ratio;
+  } catch { /* Unavailable host probes retain the existing false result. */ }
+  try {
+    shadow({ gate: 'rebuild-smoke.hostLooksBusy', kind: 'rebuild-smoke',
+      oldVerdict: busy ? 'hold' : 'admit', oldReason: `load1 ${load1} vs ${coreCount}×${ratio}`, env });
+  } catch { /* Observation must never change the gate. */ }
+  return busy;
 }
 
 /** PURE-ish: the `skipped: busy pool` result for a failed probe, or `null` when the failure must stand. */
@@ -716,9 +726,19 @@ export async function runLiveSmoke({
   root, env = process.env, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
   clock = Date.now, hostBusy = undefined,
+  load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
-  const budgets = resolveSmokeBudgets(env);
+  // Reuse the budget calculation's readings for its one per-run observation.
+  let load1, coreCount;
+  const host = { load: () => load1 ??= load(), cores: () => coreCount ??= cores() };
+  const budgets = resolveSmokeBudgets(env, host);
+  try {
+    const factor = smokeLoadFactor(env, host);
+    shadow({ gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke',
+      oldVerdict: factor > 1 ? 'hold' : 'admit',
+      oldReason: `timeouts scaled ×${factor} by load1 ${host.load()}/${host.cores()} cores`, env });
+  } catch { /* Observation must never change the budgets or smoke result. */ }
   const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
   const ghChildEnv = ghDispatchedSessionEnv(env);
   // xp4lw2v — the porcelain snapshot BEFORE any check below runs, best-effort (never throws, never blocks the

@@ -5,7 +5,7 @@
  *   wait primitive's fail-open timeout. Against a real temp lock root (mirrors `file-locks.test.mjs`'s own
  *   discipline of proving the atomic fs layer for real, not just its pure decision logic).
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, mkdirSync, realpathSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -29,6 +29,53 @@ import {
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
+
+// In-process fixtures use a no-op; subprocess fixtures inherit the explicit off switch.
+vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn() }));
+beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
+afterEach(() => vi.unstubAllEnvs());
+
+describe('load admission shadow observation', () => {
+  it.each([63, 3])('preserves the complete decision at load %s', (load1) => {
+    const now = new Date('2026-10-09T12:00:00Z');
+    writeFileSync(join(lockRoot, `${utcDayKey(now)}.jsonl`),
+      metricLine('host.cpu.load1', load1, now.toISOString()) + metricLine('host.cpu.count', 12, now.toISOString()));
+    const options = { env: {}, root: lockRoot, now };
+    const baseline = resolveLoadAdmission({ ...options, shadow: () => {} });
+    expect(baseline.held).toBe(load1 === 63);
+    for (const kind of [undefined, 'review']) {
+      const shadow = vi.fn(() => ({ verdict: baseline.held ? 'admit' : 'hold' }));
+      expect(JSON.stringify(resolveLoadAdmission({ ...options, kind, shadow }))).toBe(JSON.stringify(baseline));
+      expect(shadow).toHaveBeenCalledTimes(1);
+      expect(shadow).toHaveBeenCalledWith({
+        gate: 'heavy-admission.load-status', kind: kind ?? 'build',
+        oldVerdict: baseline.held ? 'hold' : 'admit',
+        oldReason: baseline.reason ?? `admitted (idle ${baseline.idlePct}%, load1 ${baseline.load1})`, env: options.env,
+      });
+    }
+    expect(resolveLoadAdmission({ ...options, shadow: () => { throw Error('observer failed'); } })).toEqual(baseline);
+  });
+
+  it.each([{ [LOAD_ADMISSION_SWITCH_ENV]: 'off' }, { CI: 'true' }])('does not observe bypassed admission: %j', (env) => {
+    const shadow = vi.fn();
+    resolveLoadAdmission({ env, shadow });
+    expect(shadow).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'review'])('keeps CLI JSON clean and sends kind %s only to the shadow log', (kind) => {
+    const args = [CLI, 'load-status', '--json', `--load-root=${lockRoot}`];
+    if (kind) args.push(`--kind=${kind}`);
+    const env = { ...process.env, CI: '', [LOAD_ADMISSION_SWITCH_ENV]: 'on', WE_COORDINATION_ROOT: lockRoot };
+    const baseline = spawnSync(process.execPath, args, { encoding: 'utf8', env });
+    const observed = spawnSync(process.execPath, args, { encoding: 'utf8', env: { ...env, WE_RESOURCE_SHADOW: 'on' } });
+    expect(observed.status).toBe(0);
+    expect(observed.stdout).toBe(baseline.stdout);
+    expect(JSON.parse(observed.stdout).held).toBe(false);
+    expect(observed.stderr).toContain(`resource-shadow gate=heavy-admission.load-status kind=${kind ?? 'build'}`);
+    const rows = readFileSync(join(lockRoot, 'resource', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(rows.at(-1)).toMatchObject({ gate: 'heavy-admission.load-status', kind: kind ?? 'build', old: { verdict: 'admit' } });
+  });
+});
 
 const T0 = Date.parse('2026-09-03T12:00:00.000Z');
 const iso = (ms) => new Date(ms).toISOString();

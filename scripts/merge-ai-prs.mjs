@@ -169,6 +169,7 @@ import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
 // #2399 — the ONE remote-manifest `gh api` argv, shared with `/finish` (lane-resume) so the two readers never
@@ -188,8 +189,10 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
+import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
-import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
+import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
@@ -811,6 +814,20 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
 }
 
 /**
+ * Attach the LIVE fix claim to a merge-site re-read (`data.fixClaim`), so `classifyPr` refuses a PR a fixer still
+ * holds. The reader is injected (production: `readLiveFixClaim`). An unreadable claim store fails CLOSED — a
+ * placeholder claim is attached so this merge is refused and the next pass re-reads — like draft promotion.
+ * A readable-but-unclaimed PR gets no `fixClaim`. Mutates and returns `data`.
+ */
+export function attachLiveFixClaim(data, { claimKey, readClaim }) {
+  try {
+    const claim = claimKey ? readClaim({ repo: claimKey, pr: data.number }) : null;
+    if (claim?.meta?.who) data.fixClaim = { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null };
+  } catch { data.fixClaim = { who: '(fix-claim store unreadable)' }; }
+  return data;
+}
+
+/**
  * Classify one PR into a merge/skip verdict. Pure — no gh calls. Returns
  *   { num, title, decision: 'merge'|'skip', reason, aiGenerated, certifyLabel, testGreen, state, mergeable }.
  * `decision === 'merge'` requires ALL of: producer-certified, required check green, mergeable, a landable
@@ -859,7 +876,11 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   const certified = certifyLabel || aiGenerated || humanCleared; // #2195: the label OR every-commit-AI OR a human clear certifies
   const testGreen = isRequiredCheckGreen(pr, requiredCheck);
   const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
-  const offDefaultBase = typeof defaultBranch === 'string' && defaultBranch !== '' && base !== '' && base !== defaultBranch;
+  // stack.reviewWhileBaseOpen (2026-10-10): a stacked PR now runs CI and is reviewed while its base is open, so its `test`
+  // can be green and this arm is THE merge guard for it. A `lane/*` base is never a repo's default branch: held even when
+  // `defaultBranch` could not be resolved this pass (fail closed), so it lands only after its base merges and the drain
+  // retargets it to the default branch.
+  const offDefaultBase = base !== '' && ((typeof defaultBranch === 'string' && defaultBranch !== '' && base !== defaultBranch) || base.startsWith('lane/'));
   const state = String(pr?.mergeStateStatus || '').toUpperCase();
   const mergeable = String(pr?.mergeable || '').toUpperCase();
   const landableState = state === 'CLEAN' || state === 'UNSTABLE'; // UNSTABLE = mergeable, only non-required checks red
@@ -888,10 +909,14 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
+  // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
+  // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
+  else if (pr?.fixClaim?.who) { decision = 'skip'; reason = `fix claim held by ${pr.fixClaim.who} — the head may be an unverified intermediate push; lands only after its fix-end`; }
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
-  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch} (${base})`; }
+  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
   else if (!testGreen) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
@@ -4277,7 +4302,9 @@ async function runCli() {
         'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
-      return data && data.number != null ? await resolveChecks(repo, data) : null;
+      if (!data || data.number == null) return null;
+      attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
+      return await resolveChecks(repo, data);
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
@@ -6257,10 +6284,22 @@ async function runCli() {
   // repo merge advanced that repo's origin, which this clone doesn't track).
   // x2e120n — "postMergeSync": local-checkout pull + the detached-cwd resync + the operator's primary-checkout
   // ff-sync below, all pure git housekeeping after a land, none of it per-PR (all three run at most once a pass).
+  // x4y74wj — the follow-up point. With `drainFollowupJob` on (we:scripts/settings/drain-followup-job.json) a
+  // pass that landed a local PR records ONE detached `drain-followup` job (numbering, resolve-on-land, push,
+  // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
+  const followup = await handOffDrainFollowup({
+    landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
+    buildInput: () => buildFollowupInput({ landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
+  });
+  if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
   let localSynced = false;
-  const landedLocal = !DRY_RUN && merged.some((m) => isLocalRepo(m.repo));
-  if (landedLocal) {
+  const landedLocalAny = !DRY_RUN && merged.some((m) => isLocalRepo(m.repo));
+  const landedLocal = landedLocalAny && !followup.handedOff;
+  // The pass's OWN checkout is refreshed inline even when the job takes the rest (cheap, and the duplicate-id
+  // tripwire below reads this tree): the job only syncs a separate `primary`, so skipping this left a
+  // single-checkout run (no --primary) permanently behind and the tripwire scanning a pre-land backlog.
+  if (landedLocalAny) {
     try { readGit(['pull', '--ff-only', '--autostash'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); localSynced = true; }
     catch { localSynced = false; }
     if (!AS_JSON) process.stderr.write(localSynced ? `  ✓ local main fast-forwarded to origin (autostash preserved local edits)\n` : `  · local main NOT fast-forwarded (diverged, or a reapplied local edit conflicts) — reconcile by hand\n`);
@@ -6273,7 +6312,7 @@ async function runCli() {
   // doc for the full story — this is how #2347/#2418 stranded a hash on main). Best-effort, non-fatal — a
   // skip/failure is reported and the numbering/regen steps below simply see whatever tree cwd already has
   // (their existing best-effort contract, unchanged).
-  const detachedResync = resyncDetachedCwdForLand({ exec: execFileSync, landedLocal, localSynced });
+  const detachedResync = resyncDetachedCwdForLand({ exec: execFileSync, landedLocal: landedLocalAny, localSynced });
   if (detachedResync.resynced) {
     localSynced = true;
     if (!AS_JSON) process.stderr.write(`  ✓ cwd resynced to origin/main for JIT numbering + derived regen (#2348/#2419)\n`);
@@ -6490,11 +6529,16 @@ async function runCli() {
   // per-pass log cadence). `timingSteps` (never `timings`, which already carries its OWN `total` key) is what
   // goes to the formatter — it computes+appends the trailing `total=` itself; passing `timings` here would
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
+  // #5444 — SHADOW ONLY: the pure ledger gate beside the label gate for every considered PR, journaled as one run
+  // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
+  const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
+  process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
   const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
 
