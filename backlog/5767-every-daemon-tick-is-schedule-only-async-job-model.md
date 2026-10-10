@@ -1,4 +1,5 @@
 ---
+bornAs: xz2yynk
 kind: epic
 parent: "4075"
 status: open
@@ -31,8 +32,8 @@ Held item 201 (operator 2026-10-10: "All daemons"; design settled 2026-10-10, re
 
 S1 (x7cvrkd, item 200, built in lane-17) || S2a || L1 || S6a -> W1 -> S3 shadow -> S3t (the fixer win) -> S4 reviewer -> S5 builder -> S6b drain -> S9 pass daemons -> optional S6, S7, S8. Each slice card carries its required crash/seam tests (jury round 2 findings J2-0..J2-24 mapped to tests); the 8 blue-green findings moved to the sibling blue-green epic.
 
-Slice cards: S1 = x7cvrkd; S2a = xs4ewgh; L1 = xxynru6; S6a = xh8442i; W1 = xt3sgtl; S3 = xuumz76; S3t = xsk4k0g; S4 = xis51n3; S5 = xlldqyx; S6b = xjuobaq (also held item 203); S9 = x9bxzp0; optional S6 = xmdx8tm, S7 = xxdbwoa, S8 = x7xmjh3 (filed unqueued).
-Sibling epic: xug956g (Blue-green daemon hand-over).
+Slice cards: S1 = x7cvrkd; S2a = 5754; L1 = 5762; S6a = 5745; W1 = 5757; S3 = 5759; S3t = 5765; S4 = 5763; S5 = 5764; S6b = 5749 (also held item 203); S9 = 5755; optional S6 = 5756, S7 = 5760, S8 = 5741 (filed unqueued).
+Sibling epic: 5766 (Blue-green daemon hand-over).
 
 ## Acceptance
 
@@ -41,7 +42,7 @@ Sibling epic: xug956g (Blue-green daemon hand-over).
 
 ## Non-goals
 
-- [N1] Blue-green hand-over: the sibling epic xug956g "Blue-green daemon hand-over (separate design)".
+- [N1] Blue-green hand-over: the sibling epic 5766 "Blue-green daemon hand-over (separate design)".
 - [N2] Any change to the drain lease (R4).
 
 ## Edge cases this change must handle

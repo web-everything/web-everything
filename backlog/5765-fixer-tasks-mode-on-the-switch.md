@@ -1,8 +1,9 @@
 ---
+bornAs: xsk4k0g
 kind: task
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xuumz76", "xt3sgtl", "xxynru6", "xh8442i"]
+blockedBy: ["5759", "5757", "5762", "5745"]
 scope: ["we:scripts/settings/", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
 dateOpened: "2026-10-10"
 tags: []

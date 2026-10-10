@@ -1,9 +1,10 @@
 ---
+bornAs: x9bxzp0
 kind: story
 size: 3
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh"]
+blockedBy: ["5754"]
 scope: ["we:skills-src/conveyor/pass-daemon.mjs", "we:skills-src/conveyor/runner.mjs"]
 dateOpened: "2026-10-10"
 tags: []

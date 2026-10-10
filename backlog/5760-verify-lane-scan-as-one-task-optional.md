@@ -1,9 +1,10 @@
 ---
+bornAs: xxdbwoa
 kind: story
 size: 2
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh"]
+blockedBy: ["5754"]
 scope: ["we:skills-src/conveyor/verify-daemon.mjs"]
 dateOpened: "2026-10-10"
 tags: []

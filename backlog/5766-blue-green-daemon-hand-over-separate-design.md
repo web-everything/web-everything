@@ -1,9 +1,10 @@
 ---
+bornAs: xug956g
 kind: epic
 parent: "4075"
 priority: high
 status: open
-blockedBy: ["xs4ewgh", "xt3sgtl", "xxynru6"]
+blockedBy: ["5754", "5757", "5762"]
 scope: ["we:scripts/lib/daemon-rebuild/", "we:skills-src/conveyor/runner-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs"]
 dateOpened: "2026-10-10"
 tags: []

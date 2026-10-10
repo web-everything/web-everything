@@ -1,9 +1,10 @@
 ---
+bornAs: xlldqyx
 kind: story
 size: 5
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh", "xt3sgtl", "xxynru6"]
+blockedBy: ["5754", "5757", "5762"]
 scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/conveyor/open-pr-fetch.mjs", "we:scripts/conveyor/build-dispatch-claim.mjs"]
 dateOpened: "2026-10-10"
 tags: []

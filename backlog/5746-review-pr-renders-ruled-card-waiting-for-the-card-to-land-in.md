@@ -1,4 +1,5 @@
 ---
+bornAs: xhr079k
 kind: story
 size: 1
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # review-pr renders "ruled card -- waiting for the card to land" instead of "Awaiting a ruling"
 
-Held item 211, part (3) only (session 2026-10-10; stuck-PR class; build after #4795 merges). Parts (1) and (2) -- record-referral-ruling-io judging card readability against origin/main, and we:scripts/lib/referral-card-readable.mjs falling back to origin/main -- are being built now by another worker. Live #4708: the operator ruled card -> x7r0t8w at 16:47Z; the card reached main 18:30Z (#4793) but the review daemon's build lagged, so the 17:44Z review re-asked the same question (identical advisory). Fix (3): we:scripts/operations/review-pr.mjs renders "ruled card -- waiting for the card to land" instead of "Awaiting a ruling" when a `card` ruling exists but the card is not yet readable. Evidence: replay (daemon backlog -> pending; main -> none).
+Held item 211, part (3) only (session 2026-10-10; stuck-PR class; build after #4795 merges). Parts (1) and (2) -- record-referral-ruling-io judging card readability against origin/main, and we:scripts/lib/referral-card-readable.mjs falling back to origin/main -- are being built now by another worker. Live #4708: the operator ruled card -> 5727 at 16:47Z; the card reached main 18:30Z (#4793) but the review daemon's build lagged, so the 17:44Z review re-asked the same question (identical advisory). Fix (3): we:scripts/operations/review-pr.mjs renders "ruled card -- waiting for the card to land" instead of "Awaiting a ruling" when a `card` ruling exists but the card is not yet readable. Evidence: replay (daemon backlog -> pending; main -> none).
 
 ## Acceptance
 

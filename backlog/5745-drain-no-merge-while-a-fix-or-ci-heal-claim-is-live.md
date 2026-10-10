@@ -1,6 +1,7 @@
 ---
+bornAs: xh8442i
 kind: task
-parent: "xz2yynk"
+parent: "5767"
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-10"

@@ -1,9 +1,10 @@
 ---
+bornAs: xis51n3
 kind: story
 size: 3
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh", "xt3sgtl", "xxynru6"]
+blockedBy: ["5754", "5757", "5762"]
 scope: ["we:skills-src/conveyor/review-daemon.mjs", "we:scripts/operations/review-job.mjs", "we:scripts/conveyor/review-pr-task.mjs"]
 dateOpened: "2026-10-10"
 tags: []

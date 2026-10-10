@@ -1,4 +1,5 @@
 ---
+bornAs: xug05a8
 kind: story
 size: 2
 status: open

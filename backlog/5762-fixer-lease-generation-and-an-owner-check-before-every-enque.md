@@ -1,7 +1,8 @@
 ---
+bornAs: xxynru6
 kind: story
 size: 2
-parent: "xz2yynk"
+parent: "5767"
 status: open
 scope: ["we:skills-src/conveyor/runner-lock.mjs", "we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs"]
 dateOpened: "2026-10-10"

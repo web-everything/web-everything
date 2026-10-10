@@ -1,7 +1,8 @@
 ---
+bornAs: xjuobaq
 kind: story
 size: 2
-parent: "xz2yynk"
+parent: "5767"
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs"]
 dateOpened: "2026-10-10"

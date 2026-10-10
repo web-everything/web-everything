@@ -1,8 +1,9 @@
 ---
+bornAs: xh5sg8r
 kind: story
 size: 5
 status: open
-blockedBy: ["xz2yynk", "xug956g"]
+blockedBy: ["5767", "5766"]
 scope: ["we:skills-src/conveyor/prepare-item-agent-brief.md", "we:skills-src/jury/", "we:scripts/lib/review-core.mjs"]
 dateOpened: "2026-10-10"
 tags: []

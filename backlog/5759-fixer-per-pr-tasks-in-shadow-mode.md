@@ -1,9 +1,10 @@
 ---
+bornAs: xuumz76
 kind: story
 size: 3
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh"]
+blockedBy: ["5754"]
 scope: ["we:skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs", "we:scripts/conveyor/fix-pr-task.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/operations/ci-heal-pr-dispatch.mjs", "we:scripts/operations/promote-draft-pr-dispatch.mjs"]
 dateOpened: "2026-10-10"
 tags: []

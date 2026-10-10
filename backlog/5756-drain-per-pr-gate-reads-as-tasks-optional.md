@@ -1,9 +1,10 @@
 ---
+bornAs: xmdx8tm
 kind: story
 size: 3
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh"]
+blockedBy: ["5754"]
 scope: ["we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-10"
 tags: []

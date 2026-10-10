@@ -1,7 +1,8 @@
 ---
+bornAs: xs4ewgh
 kind: story
 size: 5
-parent: "xz2yynk"
+parent: "5767"
 status: open
 scope: ["we:scripts/lib/daemon-jobs.mjs", "we:scripts/lib/daemon-jobs-runtime.mjs", "we:scripts/lib/daemon-item-tasks.mjs", "we:scripts/operations/job-record.mjs"]
 dateOpened: "2026-10-10"

@@ -1,9 +1,10 @@
 ---
+bornAs: xt3sgtl
 kind: story
 size: 5
-parent: "xz2yynk"
+parent: "5767"
 status: open
-blockedBy: ["xs4ewgh"]
+blockedBy: ["5754"]
 scope: ["we:scripts/conveyor/fix-dispatch-claim.mjs", "we:scripts/operations/worker-wrapper.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs"]
 dateOpened: "2026-10-10"
 tags: []

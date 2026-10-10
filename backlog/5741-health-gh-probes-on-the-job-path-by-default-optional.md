@@ -1,7 +1,8 @@
 ---
+bornAs: x7xmjh3
 kind: story
 size: 2
-parent: "xz2yynk"
+parent: "5767"
 status: open
 scope: ["we:skills-src/conveyor/daemon-manifest.mjs", "we:scripts/conveyor/health-watch.mjs"]
 dateOpened: "2026-10-10"
