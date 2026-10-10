@@ -25,7 +25,7 @@ Builder cost admission (we:scripts/lib/cost-admission.mjs admitLaunch, CPU idle 
 - [A5] Every gate logs `old … | new …` and then `decided by admit({kind})`; the settings line names each leaf's source.
 - [A6] `resourceGate.cutover: shadow` (or `WE_RESOURCE_CUTOVER=shadow`) puts every gate back on its legacy verdict while still logging the pair.
 
-Must: on any error reading the snapshot or the policy the shared rule refuses heavy work (hold) and admits light work; a failure of the observer itself leaves the legacy verdict (never an unconditional admit).
+Must: on any error reading the snapshot the shared rule refuses heavy work (hold) and admits light work; an unreadable settings (policy) layer drops only that layer and the standard thresholds apply (edge case 4); a failure of the observer itself leaves the legacy verdict (never an unconditional admit). An `unknown` (no-data) hold is never treated as outside evidence that the host is busy (the rebuild-smoke busy-pool skip keeps the legacy load rule).
 
 ## Non-goals
 

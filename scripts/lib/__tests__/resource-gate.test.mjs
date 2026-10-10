@@ -105,6 +105,11 @@ describe('light launches (cost admission) decide through admit({kind:"light"})',
     const d = lightResourceDecision({ env: { WE_COORDINATION_ROOT: root }, facts: {}, now: NOW, settings, gateSettings: { cutover: 'enforce' } });
     expect(d).toMatchObject({ admit: true, decidedBy: 'admit', admission: { unknown: true } });
   });
+  it('the production call (no explicit settings) resolves the default settings layer and still decides', () => {
+    writeSnap(snap({ idle: 3 }));
+    const d = lightResourceDecision({ env: { WE_COORDINATION_ROOT: root }, facts: { cpuIdlePct: 50, memFreePct: 40, minMemFreePct: 15 }, now: NOW, gateSettings: { cutover: 'enforce' } });
+    expect(d).toMatchObject({ admit: false, decidedBy: 'admit' });
+  });
   it('a legacy-decided resource fact (shadow) leaves the legacy floor in force', () => {
     const facts = { cpuIdlePct: 2, resource: { admit: true, decidedBy: 'legacy' }, lightInFlight: 0 };
     expect(admitLaunch({ kind: 'prepare-item', settings, facts })).toMatchObject({ admit: false, reason: 'light-cpu-floor' });

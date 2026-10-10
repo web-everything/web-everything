@@ -258,7 +258,10 @@ export function hostLooksBusy(env = process.env, { load = () => loadavg()[0], co
   // x9xkupj: the shared `rebuild-smoke` decision decides (busy ⇔ not admitted); the load rule above is the logged comparison.
   const decision = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs: { gate: 'rebuild-smoke.hostLooksBusy', kind: 'rebuild-smoke',
     oldVerdict: busy ? 'hold' : 'admit', oldReason: `load1 ${load1} vs ${coreCount}×${ratio}`, env } });
-  return decision ? decision.verdict !== 'admit' : busy;
+  // An `unknown` hold means the sampler had NO data (stale/missing snapshot) — that is not evidence from outside
+  // the tree that the host is busy (the anti-laundering guard above), so the legacy load rule stands.
+  if (!decision || decision.unknown) return busy;
+  return decision.verdict !== 'admit';
 }
 
 /** PURE-ish: the `skipped: busy pool` result for a failed probe, or `null` when the failure must stand. */

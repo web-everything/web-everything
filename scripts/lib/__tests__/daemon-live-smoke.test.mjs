@@ -55,6 +55,17 @@ describe('resource shadow observations', () => {
     });
     expect(admit).not.toHaveBeenCalled();
   });
+  it.each([[3, false], [63, true]])('treats an unknown (no-data) hold as no evidence: legacy load %s decides', (load1, busy) => {
+    const unknown = { verdict: 'hold', unknown: true, reason: 'snapshot stale' };
+    const shadow = vi.fn(() => unknown); const admit = vi.fn(() => unknown);
+    expect(hostLooksBusy({}, { load: () => load1, cores: () => 12, shadow, admit })).toBe(busy);
+  });
+  it('busyPoolSkip stands (null) when the only busy signal is an unknown hold on a quiet host', () => {
+    const unknown = { verdict: 'hold', unknown: true };
+    const detail = 'lane-pool list failed: timed out after 60000ms (process group killed)';
+    const hostBusy = () => hostLooksBusy({}, { load: () => 1, cores: () => 12, shadow: () => unknown, admit: () => unknown });
+    expect(busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: 60_000, capMs: 60_000, ctx: { env: {}, hostBusy } })).toBeNull();
+  });
   it('falls back from an absent shadow decision to admission', () => {
     const env = {}; const admit = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 40% ≥ 5%' }));
     expect(hostLooksBusy(env, { load: () => 63, cores: () => 12, shadow: () => {}, admit })).toBe(false);
