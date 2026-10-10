@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveFixSettings, planTakeover, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
+  launchProvedNotStarted,
   FIX_SETTINGS_FILE,
 } from '../fix-takeover.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -132,16 +133,32 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
     // the third attempt's marker is posted (3 starts) but only two voids are honoured: it stands, and the PR is spent
     expect(takeoverMarkers(upTo(3))).toHaveLength(1);
     expect(planTakeover({ pr: cappedPr(upTo(3)), roundCapAction: 'takeover', fixerLadder: LADDER }))
-      .toMatchObject({ ok: false, reason: 'takeover-unlaunchable' });
+      .toMatchObject({ ok: false, reason: 'takeover-void-limit' });
   });
 
-  it('the operator note says the takeover could not launch (not that it "already ran") when the voids ran out', () => {
+  it('a trusted comment that merely QUOTES a marker is not one (the match is anchored at the start of the body)', () => {
+    const quoted = { author: BOT, createdAt: '2026-10-10T00:00:00Z', body: `summary of the takeover:\n${takeoverMarkerBody({ pr: 7, head: HEAD, attempts: 5, cap: 5 })}` };
+    const quotedVoid = { author: BOT, createdAt: '2026-10-10T00:00:00Z', body: `quoting: ${takeoverVoidMarkerBody({ pr: 7, head: HEAD })}` };
+    expect(takeoverMarkers([quoted])).toEqual([]);
+    expect(takeoverMarkers([marker(HEAD), quotedVoid])).toHaveLength(1);
+  });
+
+  it('launchProvedNotStarted: only a failure that cannot have started a session; a timeout or kill is indeterminate', () => {
+    expect(launchProvedNotStarted(Object.assign(new Error('x'), { status: 1 }))).toBe(true);
+    expect(launchProvedNotStarted(Object.assign(new Error('x'), { code: 'ENOENT' }))).toBe(true);
+    expect(launchProvedNotStarted(Object.assign(new Error('x'), { code: 'ETIMEDOUT', signal: 'SIGKILL', status: null }))).toBe(false);
+    expect(launchProvedNotStarted(Object.assign(new Error('x'), { status: 1, signal: 'SIGKILL' }))).toBe(false);
+    expect(launchProvedNotStarted(new Error('no exit information'))).toBe(false);
+    expect(launchProvedNotStarted(null)).toBe(false);
+  });
+
+  it('the operator note names launch faults (not that it "already ran") when the voids ran out', () => {
     const NOW = Date.parse('2026-10-10T00:00:00Z');
     const thread = [...Array.from({ length: 5 }, (_, i) => rearm(i + 1)),
       marker(HEAD), voided(HEAD), marker(HEAD), voided(HEAD), marker(HEAD), voided(HEAD)];
     const p = planReconcile({ prs: [cappedPr(thread)], agents: [], durableCounts: { 7: 5 }, now: NOW, fixerLadder: LADDER, roundCapAction: 'takeover' });
     const text = p.notes.find((n) => n.kind === 'round-cap-exhausted')?.text ?? '';
-    expect(text).toMatch(/could not launch/);
+    expect(text).toMatch(/launch faults/);
     expect(text).not.toMatch(/already ran/);
   });
 
@@ -256,15 +273,30 @@ describe('dispatchFix takeover ordering and failure (card xx0055i review round 1
   });
 
   it('voids the marker when the spawn fails AFTER it was posted, so the retry still owns the takeover', () => {
-    const { calls, opts } = harness({ spawnAgent: vi.fn(() => { throw new Error('claude --bg failed'); }) });
+    const { calls, opts } = harness({ spawnAgent: vi.fn(() => { throw Object.assign(new Error('claude --bg failed'), { status: 1 }); }) });
     expect(() => dispatchFix(planned, opts)).toThrow('claude --bg failed');
-    expect(calls).toEqual(['marker', 'release', 'void']);
+    expect(calls).toEqual(['marker', 'void', 'release']); // the void goes up BEFORE the claim is released
     expect(opts.postTakeoverVoidMark).toHaveBeenCalledWith({ repo: 'we', pr: 4708, head: HEAD }); // no error text goes to the PR
+  });
+
+  it('a launch TIMEOUT is indeterminate (the session may be live): the marker stands, no void, so no second takeover starts', () => {
+    const timeout = Object.assign(new Error('spawnSync claude ETIMEDOUT'), { code: 'ETIMEDOUT', signal: 'SIGKILL', status: null });
+    const { calls, opts } = harness({ spawnAgent: vi.fn(() => { throw timeout; }) });
+    expect(() => dispatchFix(planned, opts)).toThrow('ETIMEDOUT');
+    expect(calls).toEqual(['marker', 'release']);
+    expect(opts.postTakeoverVoidMark).not.toHaveBeenCalled();
+  });
+
+  it('a failure BEFORE any launch call ran (no agent can exist) voids even without exit information', () => {
+    const { calls, opts } = harness({ mintSessionId: () => { throw new Error('no session id'); } });
+    expect(() => dispatchFix(planned, opts)).toThrow('no session id');
+    expect(opts.spawnAgent).not.toHaveBeenCalled();
+    expect(calls).toEqual(['marker', 'void', 'release']);
   });
 
   it('a void that cannot be posted never masks the spawn failure', () => {
     const { opts } = harness({
-      spawnAgent: vi.fn(() => { throw new Error('claude --bg failed'); }),
+      spawnAgent: vi.fn(() => { throw Object.assign(new Error('claude --bg failed'), { status: 1 }); }),
       postTakeoverVoidMark: vi.fn(() => { throw new Error('gh down'); }),
     });
     expect(() => dispatchFix(planned, opts)).toThrow('claude --bg failed');

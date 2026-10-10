@@ -1717,7 +1717,7 @@ export function planReconcile({
         ...(extra.capKind === 'fix' ? { parkToHuman: true } : {}),
         text: roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
           + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
-          + (takeover?.reason === 'takeover-unlaunchable' ? ' (the automatic takeover could not launch — see the void notes on the thread)' : ''),
+          + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
       });
     };
     const refuseCapExhausted = capExhaustedVia(refuse);

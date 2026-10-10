@@ -55,10 +55,25 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
  *  that head, so a fault in the launch does not burn the only takeover. */
 export const FIX_TAKEOVER_VOID_MARKER = '<!-- conveyor-fix-takeover-void';
 
+// Anchored at the start of the body (like the sibling counters): a trusted comment that merely QUOTES a marker
+// (a fixer's summary, say) is not one.
 const markerHead = (body, prefix) => {
-  const m = body.match(new RegExp(`${prefix} head=([0-9a-f]{7,40}|unknown)`));
+  const m = body.trimStart().match(new RegExp(`^${prefix} head=([0-9a-f]{7,40}|unknown)`));
   return m ? (m[1] === 'unknown' ? null : m[1]) : undefined; // undefined = not this kind of marker
 };
+
+/**
+ * PURE: does a launch failure PROVE no agent session started? Only then may the takeover marker be voided. A launch
+ * that exited non-zero on its own, or never ran (`ENOENT`/`EACCES`), cannot have started a session. A timeout or a
+ * kill signal is indeterminate (the session may be live: `dispatch-lane-io.mjs#SPAWN_TIMEOUT_MS`), and so is an error
+ * with no exit information at all; for both the marker stands and the one-takeover bound holds.
+ */
+export function launchProvedNotStarted(error) {
+  if (!error || typeof error !== 'object') return false;
+  if (error.signal || error.killed || error.code === 'ETIMEDOUT') return false;
+  if (error.code === 'ENOENT' || error.code === 'EACCES') return true;
+  return Number.isInteger(error.status) && error.status !== 0;
+}
 
 /** How many voids one PR may be given back: a launch fault that outlasts this many retries stops posting comments and
  *  the operator is asked (otherwise a persistent fault would post two comments per tick, forever). */
@@ -85,7 +100,7 @@ export function takeoverMarkers(comments) {
   const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined)
     .slice(0, TAKEOVER_MAX_VOIDS);
   for (const h of voids) {
-    // Cancel the latest start for this head (any start when the void names no head).
+    // Cancel the latest start for this head (a void with an `unknown` head cancels only an `unknown` start).
     const at = starts.map((m, i) => ({ m, i })).reverse().find(({ m }) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
     if (at) starts.splice(at.i, 1);
   }
@@ -124,9 +139,10 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr =
   const head = pr?.headRefOid ?? null;
   const sameHead = markers.some((m) => sameHeadSha(m.head, head));
   if (sameHead || markers.length >= Math.max(0, takeoverMaxPerPr)) {
-    // `takeover-unlaunchable`: the voids ran out, so the bound is spent by launch faults, not by a takeover that ran.
-    const unlaunchable = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
-    return { ok: false, reason: unlaunchable ? 'takeover-unlaunchable' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
+    // `takeover-void-limit`: launch faults used up the void allowance, so the last start marker stands. Whether that
+    // last one ran is not knowable from the thread, so the note says only that faults were recorded.
+    const voidLimit = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
+    return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
   }
   return { ok: true, ...takeoverRung(fixerLadder) };
 }
@@ -144,8 +160,8 @@ export function takeoverMarkerBody({ pr, head, attempts, cap, rung }) {
  *  phrase only: the spawn error (paths, stderr) is never copied onto the PR. */
 export function takeoverVoidMarkerBody({ pr, head }) {
   return `${FIX_TAKEOVER_VOID_MARKER} head=${head ?? 'unknown'} -->\n`
-    + `↩️ conveyor fix takeover — the takeover session for PR #${pr} did not start; it does not count against the `
-    + `takeover bound, and the next pass retries (at most ${TAKEOVER_MAX_VOIDS} times per PR).`;
+    + `↩️ conveyor fix takeover — the takeover session for PR #${pr} did not start; the next pass retries it `
+    + `(at most ${TAKEOVER_MAX_VOIDS} such retries per PR, after which the operator is asked).`;
 }
 
 /**

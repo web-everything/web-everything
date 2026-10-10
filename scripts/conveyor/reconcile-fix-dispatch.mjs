@@ -144,7 +144,7 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
  *  guard ran with the `review-dispatch` default label, so the log blamed a review step that never ran). */
 // Card xx0055i — round history + takeover at the round cap (imports kept here, away from the import block).
 import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
-import { resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from './fix-takeover.mjs';
+import { resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, launchProvedNotStarted, withTakeover } from './fix-takeover.mjs';
 import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
 
 export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
@@ -1208,7 +1208,8 @@ export function dispatchFix(planned, {
   }
   // #3850 — the cwd this dispatch actually spawned into, so a trust heal grants THAT dir (never a placeholder).
   let spawnCwd = null;
-  let takeoverMarked = false; // card xx0055i — the takeover marker is up; a failure before an agent starts must void it.
+  let takeoverMarked = false; // card xx0055i — the takeover marker is up; a failure that proves no agent started must void it.
+  let launchAttempted = false; // card xx0055i — a launch call (borrowed / wrapped / bg) has been issued: a failure may be indeterminate.
   try {
     const sessionSlug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
     // #3960 — the repo-aware quintet, computed once from `repo`'s own profile (never re-derived here). The
@@ -1261,6 +1262,7 @@ export function dispatchFix(planned, {
       const promptFile = writeBorrowedPrompt(sessionSlug, withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack));
       let handle;
       try {
+        launchAttempted = true;
         handle = spawnBorrowed({
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
@@ -1323,6 +1325,7 @@ export function dispatchFix(planned, {
       // 117 S3b — same argv, run as `claude -p` to completion by the detached wrapper. The handle is the wrapper's pid
       // (`pid:<n>`), stamped on the claim so the claim's liveness is that process (`isClaimRunnerDead`); the wrapper's
       // v2 record stands in for the `claude agents` row (`listWrappedWorkerAgents`). Claim kept, as for `--bg`.
+      launchAttempted = true;
       const launched = launchWrapped({
         role: 'fix', session: sessionSlug, bgArgv: argv, cwd: sessionCwd, env: workerSpawnEnv(), pr: planned.pr, item: planned.itemNum,
         model: argv[argv.indexOf('--model') + 1] ?? null, sessionId,
@@ -1338,6 +1341,7 @@ export function dispatchFix(planned, {
     // #3331 — READ THE REAL ID BACK OFF STDOUT, exactly as the resume branch above already does. `claude --bg`
     // discards `--session-id` and assigns its own, so the minted uuid addresses nothing; `agentId` is what
     // `claude agents`/`logs`/`stop` take. `sessionId` stays on the result for callers that already read it.
+    launchAttempted = true;
     const stdout = String(spawnAgent(argv, { cwd: sessionCwd }) ?? '');
     // #x0jphk5 — the claim is DELIBERATELY NOT released here on success: see this function's own docblock for
     // why it must outlive this call (the 26+s listing-lag window a fresh spawn is exposed to).
@@ -1349,13 +1353,17 @@ export function dispatchFix(planned, {
   } catch (e) {
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
-    releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
-    // Card xx0055i — no agent started, so the takeover marker posted above did not buy a takeover: void it, or the
-    // retry reads `takeover-spent` and the operator is told a takeover "already ran" that never did. Best effort: if
-    // the void cannot be posted the marker stands (the conservative side of the bound).
-    if (takeoverMarked) {
+    // Card xx0055i — the void goes up BEFORE the claim is released, so no other dispatcher can re-plan in the gap and
+    // read a marker with no void. Void only when the failure PROVES no agent started: a failure before any launch
+    // call ran, or a launch that failed in a way that cannot have started a session. A launch timeout (the CLI
+    // killed mid-spawn) is indeterminate: the session may be live, so the marker stands and the bound holds. Best
+    // effort: if the void cannot be posted the marker stands (the conservative side of the bound).
+    if (takeoverMarked && (!launchAttempted || launchProvedNotStarted(e))) {
       try { postTakeoverVoidMark({ repo, pr: planned.pr, head: planned.headRefOid }); } catch { /* the bound stays spent */ }
     }
+    // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
+    // by our own failed attempt.
+    releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
     // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,
