@@ -39,10 +39,32 @@ it('opens through park then immediately holds, and refreshes the body on later p
   await publishBatch(f.input, f.opts);
   const index = f.calls.findIndex(call => call.includes('open-pr'));
   expect(f.calls[index]).toContain('--mode=park');
+  // The held draft opens before any verify; pr-land's marker requirement is waived for it (live: refused `unverified`).
+  const openOptions = f.exec.mock.calls.find(([, args]) => args[1] === 'open-pr')[2];
+  expect(openOptions.env.WE_REQUIRE_VERIFIED).toBe('0');
   expect(f.calls[index + 1]).toEqual(['gh', 'pr', 'edit', '9', '--repo', 'org/repo', '--add-label', HOLD_LABEL]);
   expect(f.calls.some(call => call.includes('create'))).toBe(false);
   await publishBatch(f.input, f.opts);
   expect(f.calls.at(-1)).toContain('--body-file');
+});
+it('a remembered seal lane now leased by someone else falls back to any lane (live: lane-2 taken by a fix worker)', async () => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealLane: 2 }));
+  const exec = vi.fn((cmd, args, options) => {
+    if (args[1] === 'acquire' && args.includes('--lane=2')) throw new Error('lane-2 is leased by fix-4717');
+    return f.exec(cmd, args, options);
+  });
+  await publishBatch(f.input, { ...f.opts, exec });
+  const acquires = exec.mock.calls.filter(([, a]) => a[1] === 'acquire').map(([, a]) => a.some(x => x.startsWith('--lane=')));
+  expect(acquires).toEqual([true, false]);
+  expect(f.read().pr).toBe(9);
+});
+it('the sealing label-on-green keeps the verify requirement (no waiver)', async () => {
+  const f = fixture({ maxCards: 1 });
+  expect((await publishBatch(f.input, f.opts)).action).toBe('sealed');
+  const [, args, options] = f.exec.mock.calls.find(([, a]) => a[1] === 'open-pr' && a.includes('--mode=label-on-green'));
+  expect(args).toContain('--requireVerified=true');
+  expect(options.env?.WE_REQUIRE_VERIFIED).toBeUndefined();
 });
 it('refuses a live admission lease without commands', async () => {
   const f = fixture(); writeFileSync(f.statePath + '.lock', JSON.stringify({ token: 'other', expiresAt: 9000 }));
