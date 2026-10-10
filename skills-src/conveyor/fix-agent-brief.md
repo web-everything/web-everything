@@ -479,7 +479,7 @@ before-output from step 2; step 6 posts both as the evidence.
 
 **Load-flake exception.** When verify is red ONLY on timeouts that pass alone under high host load, save and push
 the fix to `lane/<head>-fix-<N>-alt`, then use the load-flake exit instead of the terminal gate-red exit below. It
-releases the fix claim like every other exit. Pass the PR's FULL 40-character head sha (`git rev-parse origin/<head ref>`).
+releases the fix claim like every other exit. Pass the PR's FULL 40-character head sha as GitHub has it (`git ls-remote origin refs/heads/<head ref> | cut -f1` — under push-before-gate that is your own early-pushed sha, and a local `origin/<ref>` is stale).
 Only `web-everything/web-everything` has a reverify worker; for any other repo the script records the terminal
 gate-red stand-down instead (a hold nothing would ever retry), so use the gate-red exit below there:
 
@@ -493,7 +493,9 @@ Report `blocked-on-load-flake` and exit; the quiet-host reverify pass retries th
 
 **Otherwise a red gate is a hard stop.** Record the stand-down on the PR, leave it `review:changes` (do **not**
 re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Never hand a red head back for review. (With push-before-gate
-the red commit is already on the PR; the stand-down marker is what keeps it held — that is expected, not a leak.)
+the red commit is already on the PR; the stand-down marker is what keeps it held — that is expected, not a leak.
+The same holds for the blocked-on-infra and load-flake exits: they release the claim but leave `review:changes`, so an
+unverified head is never handed back for review or landed.)
 
 ```bash
 node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \

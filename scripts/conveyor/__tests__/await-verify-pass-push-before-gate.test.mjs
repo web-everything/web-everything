@@ -4,7 +4,7 @@
  * real reconcile planner, ci-heal admission and drain classifier.
  */
 import { describe, it, expect } from 'vitest';
-import { runAwaitVerifyPass, isEarlyPushOwed, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS } from '../await-verify-pass.mjs';
+import { runAwaitVerifyPass, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS } from '../await-verify-pass.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { classifyPr } from '../../merge-ai-prs.mjs';
 import { dispatchCiHeal } from '../../operations/ci-heal-pr-dispatch.mjs';
@@ -110,6 +110,19 @@ describe('push-before-gate: red → fix → push → green releases once', () =>
     await pass(h, { nowMs: T0 + 500_000 });
     expect(h.state.events.filter((e) => e === 'claim released')).toHaveLength(1);
     expect(h.store.size).toBe(0);
+  });
+});
+
+describe('load-flake exits after an early push name the pushed sha as the PR head', () => {
+  it('redispatch and WE alt-branch prompts', () => {
+    const r = rec({ earlyPush: { sha: SHA, ok: true, done: true, at: 'x' } });
+    const m = marker('red', { failureDetails: { tests: [{ file: 'a.test.mjs', name: 'x' }] } });
+    const redis = buildAwaitVerifyResumePrompt({ kind: 'load-flake-redispatch', record: { ...r, repo: 'plateauapp/plateau-app' }, marker: m });
+    expect(redis).toContain(`--head=${SHA}`);
+    expect(redis).not.toContain('git rev-parse origin/');
+    expect(buildAwaitVerifyResumePrompt({ kind: 'load-flake', record: r, marker: m })).toContain(`pass --head=${SHA}`);
+    // without an early push the prompts are unchanged
+    expect(buildAwaitVerifyResumePrompt({ kind: 'load-flake-redispatch', record: rec(), marker: m })).toContain('git rev-parse origin/lane/item-68b');
   });
 });
 
