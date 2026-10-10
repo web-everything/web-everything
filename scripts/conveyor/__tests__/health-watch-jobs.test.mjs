@@ -77,6 +77,87 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
     expect(g.failure).toBeNull();
   });
 
+  describe('the result sidecar is untrusted input (user-writable directory)', () => {
+    /** Finish a queued job with a raw sidecar body, so a hostile file is written byte for byte. */
+    let n = 0;
+    async function consumeRaw(body, over = {}, now = 1_200_000) {
+      const store = createJobStore(join(dir, `raw-${n += 1}`));
+      const q = await runGhProbeJobs({ ...base(store), now: 1_000_000, due: true });
+      const id = q.summary.enqueued;
+      store.update(id, (r) => markLaunching(r, { at: iso(1_100_000) }));
+      store.update(id, (r) => markClaimed(r, { at: iso(1_100_000), handle: `h:${process.pid}:x`, host: 'h', pid: process.pid, procStart: 'x' }));
+      writeFileSync(join(store.dir, `${id}${RESULT_SUFFIX}`), typeof body === 'string' ? body : JSON.stringify(body));
+      store.update(id, (r) => markSucceeded(r, { at: iso(1_100_000) }));
+      return runGhProbeJobs({ ...base(store), now, due: true, state: q.state, ...over });
+    }
+
+    it('rejects a sampledAt in the future instead of parking the gh cadence behind it', async () => {
+      const out = await consumeRaw({ sampledAt: 1_200_000 + 1e10, probes: { prs: [], agents: [] }, errors: {} });
+      expect(out.result).toBeNull();
+      expect(out.failure).toMatch(/future/);
+    });
+
+    it('still accepts a sampledAt a little ahead of now (clock skew), but no further than the allowance', async () => {
+      const ok = await consumeRaw({ sampledAt: 1_200_000 + 60_000, probes: { prs: [], agents: [] }, errors: {} });
+      expect(ok.result).not.toBeNull();
+      const bad = await consumeRaw({ sampledAt: 1_200_000 + 10 * 60_000, probes: { prs: [], agents: [] }, errors: {} });
+      expect(bad.result).toBeNull();
+    });
+
+    it('drops every probe and error key outside the gh group — processes, daemonLogs and an own __proto__ key', async () => {
+      const raw = '{"sampledAt":1100000,"probes":{"prs":[1],"agents":[],"processes":["evil"],"daemonLogs":{"x":1},"__proto__":{"polluted":true}},'
+        + '"errors":{"staleState":"boom","processes":"hide it","__proto__":{"p":1}}}';
+      const out = await consumeRaw(raw);
+      expect(Object.keys(out.result.probes).sort()).toEqual(['agents', 'prs']);
+      expect(Object.keys(out.result.errors)).toEqual(['staleState']);
+      expect(Object.getPrototypeOf(out.result.probes)).toBe(Object.prototype);
+      expect(out.result.probes.polluted).toBeUndefined();
+      expect(out.summary.dropped.sort()).toEqual(['__proto__', 'daemonLogs', 'processes']);
+    });
+
+    it('never echoes an untrusted key name raw: odd names become <invalid>, and the list is capped', async () => {
+      const keys = { 'evil\nkey`x': 1, 'a b': 1, 'ok_name': 1, ...Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`k${i}`, 1])) };
+      const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: [], agents: [], ...keys }, errors: {} });
+      expect(out.summary.dropped.length).toBeLessThanOrEqual(10);
+      for (const name of out.summary.dropped) expect(name).toMatch(/^([A-Za-z0-9_$]{1,64}|<invalid>)$/);
+      expect(out.summary.dropped).toContain('<invalid>');
+      expect(JSON.stringify(out.summary)).not.toMatch(/evil|\\u2028/);
+    });
+
+    it('keeps only the first line of an error text, with credentials redacted, as the inline path does', async () => {
+      const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: [], agents: [] },
+        errors: { staleState: 'boom ghp_abcdefghijklmnopqrstuvwxyz0123456789\nsecond line `x`' } });
+      expect(out.result.errors.staleState).toBe('boom [redacted]');
+    });
+
+    it('a sampledAt a little ahead of now is clamped to now, so it can never outlast the cadence', async () => {
+      const out = await consumeRaw({ sampledAt: 1_200_000 + 60_000, probes: { prs: [], agents: [] }, errors: {} });
+      expect(out.result.sampledAt).toBe(1_200_000);
+    });
+
+    it('rejects a result whose probes/errors are not plain objects, or whose error text is not a string', async () => {
+      for (const bad of [
+        { sampledAt: 1_100_000, probes: [], errors: {} },
+        { sampledAt: 1_100_000, probes: { prs: [] }, errors: 'x' },
+        { sampledAt: '1100000', probes: {}, errors: {} },
+        [],
+        null,
+      ]) {
+        const out = await consumeRaw(bad);
+        expect(out.result).toBeNull();
+        expect(out.failure).toMatch(/invalid|unreadable/);
+      }
+      const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: [], agents: [] }, errors: { staleState: { not: 'text' } } });
+      expect(out.result.errors).toEqual({});
+    });
+
+    it('refuses to parse a sidecar over the size cap', async () => {
+      const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: ['x'.repeat(500)], agents: [] }, errors: {} }, { maxResultBytes: 100 });
+      expect(out.result).toBeNull();
+      expect(out.failure).toMatch(/too large/);
+    });
+  });
+
   it('prunes consumed finished records older than the keep window, with their result sidecar', async () => {
     const store = createJobStore(join(dir, 'jobs'));
     const q = await runGhProbeJobs({ ...base(store), now: 1_000_000, due: true });
@@ -156,6 +237,32 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(fourth.ghSampled).toBe(false);
     expect(fourth.ghJob.enqueued).toBeNull(); // ghCache.at = the job's sample time: not due again yet
     expect(store.list().records).toHaveLength(1);
+  }, 30000);
+
+  it('a tampered sidecar with a far-future sampledAt is a probe error and never parks the gh cadence', async () => {
+    const { flags, hd } = setup('future');
+    const store = createJobStore(join(dir, 'jobs'));
+    const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    const first = await tick({ ...flags, now: iso(t0) }, deps);
+    finish(store, first.ghJob.enqueued, { at: t0 + 1e11, probes: { prs: [], agents: [] } });
+    const second = await tick({ ...flags, now: iso(t0 + 600_000) }, deps);
+    expect(second.ghSampled).toBe(false);
+    expect(second.probeErrors.ghJob).toMatch(/future/);
+    expect(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).ghCache.at).toBeNull();
+    // The cadence is still due, so a fresh job is queued rather than waiting out the forged timestamp.
+    expect(second.ghJob.enqueued).toBeTruthy();
+  }, 30000);
+
+  it('a ghCache.at already ahead of now (clock stepped back, or a forged state) reads as due, not parked', async () => {
+    const { flags, hd } = setup('stale-future');
+    const store = createJobStore(join(dir, 'jobs'));
+    const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    const sp = join(hd, 'state.json');
+    writeFileSync(sp, JSON.stringify({ ghCache: { at: t0 + 1e11 } }));
+    const next = await tick({ ...flags, now: iso(t0) }, deps);
+    expect(next.ghJob.enqueued).toBeTruthy(); // due, not waiting out a 1e11 ms offset
   }, 30000);
 
   it('a failed job is a probe error, and the gh cadence stays due', async () => {

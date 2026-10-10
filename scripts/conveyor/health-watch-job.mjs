@@ -28,7 +28,7 @@
  *       # live proof only: queue a gh-probe job whose worker blocks for --block-ms, then returns no probes
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
@@ -38,6 +38,7 @@ import { createJobStore, enqueueJob, launchJob, reattachTick, runJob } from '../
 import { detectSleep, markFailed } from '../lib/daemon-jobs.mjs';
 import { ensureCodeSnapshot, ensureNodeModulesStore, evictSnapshots, npmCiInstaller, snapshotsRoot } from '../lib/daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../operations/job-record.mjs';
+import { scrubText } from './health-watch-core.mjs';
 import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import {
   HEALTH_GH_PROBE_KIND, HEALTH_WATCH_JOB_CAP, HEALTH_WATCH_JOB_DAEMON, HEALTH_WATCH_JOB_KINDS, HEALTH_WATCH_JOB_SWITCHES,
@@ -54,6 +55,19 @@ export const RESULT_SUFFIX = '.result';
 /** A finished result sampled longer ago than this is consumed but never applied: after a rollback and a later
  *  re-enable, an old job's result must not pass for the current observation (two gh cadences). */
 export const MAX_RESULT_AGE_MS = 30 * 60_000;
+/** The result sidecar sits in a user-writable directory, so it is untrusted input. A `sampledAt` further ahead of
+ *  the tick than this (clock skew allowance) is rejected, not stored: it would park the gh cadence behind it. */
+export const MAX_RESULT_FUTURE_SKEW_MS = 5 * 60_000;
+/** A sidecar over this size is never parsed. Live sidecars (2026-10-09) are ~34 MB, mostly the merged-PR list, so
+ *  this leaves ~7x headroom for its growth while still bounding what a corrupt file can make the tick load. */
+export const MAX_RESULT_BYTES = 256 * 1024 * 1024;
+/** Longest error text kept per probe. */
+const MAX_RESULT_ERROR_CHARS = 2_000;
+/** At most this many unexpected key names are reported back (as identifier-shaped text or `<invalid>`). */
+const MAX_DROPPED_KEYS_REPORTED = 10;
+/** Every probe name `collectGhProbes` can report under — the gh-cadence group. These are the ONLY keys a job
+ *  result may contribute to the tick's probe set and error map, and the error-streak keys carried across queued ticks. */
+export const GH_GROUP_PROBE_NAMES = Object.freeze(['prs', 'agents', 'authExpired', 'bgIsolationStalls', 'liveBindings', 'buildSessions', 'staleState', 'mergedPrs']);
 
 const WORKER_MARK = 'health-gh-probe-worker';
 const iso = (ms) => new Date(ms).toISOString();
@@ -315,8 +329,45 @@ function readHeadSha(sourceRoot) {
   return readGit(['-C', sourceRoot, 'rev-parse', 'HEAD'], { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 }
 
-function readResult(dir, id) {
-  return JSON.parse(readFileSync(join(dir, `${id}${RESULT_SUFFIX}`), 'utf8'));
+function readResult(dir, id, maxBytes = MAX_RESULT_BYTES) {
+  const file = join(dir, `${id}${RESULT_SUFFIX}`);
+  const size = statSync(file).size;
+  if (size > maxBytes) throw new Error(`too large (${size} bytes, cap ${maxBytes})`);
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/**
+ * Validate a parsed result sidecar before any of it reaches the tick. Pure: returns the cleaned result, or why it
+ * was rejected. `probes` / `errors` are rebuilt from the gh-group allowlist alone — an own `__proto__`, `processes`
+ * or `daemonLogs` key can never be assigned onto the tick's probe set — and `sampledAt` must be a finite number no
+ * further ahead of `now` than the skew allowance.
+ * @returns {{ok: true, sampledAt: number, probes: object, errors: object, dropped: string[]}|{ok: false, reason: string}}
+ */
+export function validateJobResult(res, { now, maxFutureSkewMs = MAX_RESULT_FUTURE_SKEW_MS } = {}) {
+  if (!isPlainObject(res)) return { ok: false, reason: 'invalid result (not an object)' };
+  if (typeof res.sampledAt !== 'number' || !Number.isFinite(res.sampledAt)) return { ok: false, reason: 'invalid result (sampledAt is not a finite number)' };
+  if (res.sampledAt - now > maxFutureSkewMs) return { ok: false, reason: `invalid result (sampledAt ${Math.round((res.sampledAt - now) / 1000)}s in the future)` };
+  if (res.probes !== undefined && !isPlainObject(res.probes)) return { ok: false, reason: 'invalid result (probes is not an object)' };
+  if (res.errors !== undefined && !isPlainObject(res.errors)) return { ok: false, reason: 'invalid result (errors is not an object)' };
+  const allowed = new Set(GH_GROUP_PROBE_NAMES);
+  const probes = {};
+  const errors = {};
+  const unexpected = new Set();
+  for (const k of Object.keys(res.probes || {})) {
+    if (allowed.has(k)) probes[k] = res.probes[k]; else unexpected.add(k);
+  }
+  for (const k of Object.keys(res.errors || {})) {
+    if (!allowed.has(k)) { unexpected.add(k); continue; }
+    // As the inline path does: first line only, credential-shaped text redacted.
+    if (typeof res.errors[k] === 'string') errors[k] = scrubText(res.errors[k].split('\n')[0]).slice(0, MAX_RESULT_ERROR_CHARS);
+  }
+  // Key names are untrusted text: only identifier-shaped ones are ever echoed, and only a handful of them.
+  const dropped = [...unexpected].slice(0, MAX_DROPPED_KEYS_REPORTED).map((k) => (/^[A-Za-z0-9_$]{1,64}$/.test(k) ? k : '<invalid>'));
+  // A sample can be no newer than the tick that reads it: clamping the allowed skew means a slightly-future
+  // `sampledAt` can never be stored as `ghCache.at` and outlast its cadence.
+  return { ok: true, sampledAt: Math.min(res.sampledAt, now), probes, errors, dropped: [...new Set(dropped)] };
 }
 
 function removeJobFiles(dir, id) {
@@ -340,7 +391,7 @@ export async function runGhProbeJobs({
   store = createJobStore(daemonJobsDir(HEALTH_WATCH_JOB_DAEMON)), kinds = HEALTH_WATCH_JOB_KINDS,
   maxConcurrent = HEALTH_WATCH_JOB_CAP, codeSha, reattach = reattachTick, reattachOpts = {},
   snapshot, evict = evictToTrash, wallNow = Date.now, monoNow = hostMonotonicMs, log = () => {},
-  maxResultAgeMs = MAX_RESULT_AGE_MS, drain = false, warmGate = {},
+  maxResultAgeMs = MAX_RESULT_AGE_MS, maxResultBytes = MAX_RESULT_BYTES, drain = false, warmGate = {},
 }) {
   const kind = HEALTH_GH_PROBE_KIND.kind;
   mkdirSync(store.dir, { recursive: true });
@@ -351,15 +402,18 @@ export async function runGhProbeJobs({
   let result = null;
   const failures = [];
   const stale = [];
+  const dropped = [];
   const finished = mine().filter((r) => TERMINAL_JOB_STATUSES.includes(r.job.status) && !consumed.has(r.id))
     .sort((a, b) => Date.parse(a.job.finishedAt || 0) - Date.parse(b.job.finishedAt || 0));
   for (const r of finished) {
     consumed.add(r.id);
     if (r.job.status === 'failed') { failures.push(`job ${r.id} failed: ${r.job.error ?? 'unknown'}`); continue; }
     try {
-      const res = readResult(store.dir, r.id);
-      if (!Number.isFinite(res.sampledAt) || now - res.sampledAt > maxResultAgeMs) { stale.push(r.id); continue; }
-      result = { jobId: r.id, sampledAt: res.sampledAt, probes: res.probes || {}, errors: res.errors || {} };
+      const res = validateJobResult(readResult(store.dir, r.id, maxResultBytes), { now });
+      if (!res.ok) { failures.push(`job ${r.id} ${res.reason}`); continue; }
+      if (res.dropped.length) { dropped.push(...res.dropped.filter((k) => !dropped.includes(k))); log(`health-jobs: job ${r.id} result carried unexpected keys, dropped ${res.dropped.length}: ${res.dropped.join(', ')}`); }
+      if (now - res.sampledAt > maxResultAgeMs) { stale.push(r.id); continue; }
+      result = { jobId: r.id, sampledAt: res.sampledAt, probes: res.probes, errors: res.errors };
     } catch (e) { failures.push(`job ${r.id} result unreadable: ${String(e?.message || e).split('\n')[0]}`); }
   }
 
@@ -398,7 +452,7 @@ export async function runGhProbeJobs({
     result,
     failure: failures.length ? failures.join('; ') : null,
     summary: {
-      consumed: result?.jobId ?? null, enqueued, stale,
+      consumed: result?.jobId ?? null, enqueued, stale, dropped,
       remaining: left.filter((r) => r.job.kind === kind).length,
       inFlight: current && !TERMINAL_JOB_STATUSES.includes(current.job.status)
         ? { id: current.id, status: current.job.status, attempt: current.job.attempts, handle: current.job.handle } : null,

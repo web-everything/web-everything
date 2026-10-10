@@ -103,7 +103,7 @@ import { readBacklogCards } from '../backlog-stranded-sweep.mjs';
 import { readPrEventsStatuses } from '../lib/pr-events.mjs';
 import { readSeatCapUsage } from '../operations/review-extra-seats.mjs';
 import { runSessionWatchdogPass, resolveSessionWatchdogConfig } from './session-watchdog.mjs';
-import { runGhProbeJobs, resolveHealthJobSwitches } from './health-watch-job.mjs';
+import { runGhProbeJobs, resolveHealthJobSwitches, GH_GROUP_PROBE_NAMES } from './health-watch-job.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
@@ -994,8 +994,9 @@ export function probeMergedPrs({ exec = run, limit = 800, timeoutMs = 60_000, re
   return { cards: readBacklogCards(repoRoot), prs };
 }
 
-/** Every probe name `collectGhProbes` can report an error under — the gh-cadence group's error-streak keys. */
-export const GH_GROUP_PROBE_NAMES = Object.freeze(['prs', 'agents', 'authExpired', 'bgIsolationStalls', 'liveBindings', 'buildSessions', 'staleState', 'mergedPrs']);
+// Every probe name `collectGhProbes` can report under — the gh-cadence group's error-streak keys and the allowlist
+// for a job result — lives in health-watch-job.mjs (which this file imports; the reverse would be a cycle).
+export { GH_GROUP_PROBE_NAMES };
 
 /**
  * #4131 — the gh-cadence probe group (every 15 min): open PRs, the agent listing and everything read off it,
@@ -1217,7 +1218,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const ghCache = prev.ghCache || {};
   let jobsState = prev.jobs;
   let ghJob = null;
-  const ghDue = !flags['no-gh'] && (flags['force-gh'] || !ghCache.at || now - ghCache.at >= GH_CADENCE_MS);
+  const ghDue = !flags['no-gh'] && (flags['force-gh'] || !ghCache.at || ghCache.at > now || now - ghCache.at >= GH_CADENCE_MS);
   // Inventory has its own cadence stamp: unrelated GitHub failures cannot cause repeated log scans.
   const inventoryDue = !flags['no-gh'] && (flags['force-gh'] || !prev.credentialInventoryAt || now - prev.credentialInventoryAt >= GH_CADENCE_MS);
   if (flags['credential-inventory-fixture'] || inventoryDue) {
@@ -1252,7 +1253,7 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
         ghFromJob = true;
         Object.assign(probes, out.result.probes);
         for (const [k, v] of Object.entries(out.result.errors || {})) probeErrors[k] = v;
-        if (out.result.probes.prs && out.result.probes.agents) ghCache.at = out.result.sampledAt;
+        if (out.result.probes.prs && out.result.probes.agents) ghCache.at = Math.min(out.result.sampledAt, now);
       }
       if (out.failure) probeErrors.ghJob = scrubText(out.failure);
     }
