@@ -342,14 +342,17 @@ export function resolveOverlayStackMode(env = process.env, { settingsPath = OVER
   }
 }
 
+/** Both reads are one small JSON row / one URL line; anything bigger is not what we asked for. */
+const GH_MAX_BUFFER = 1024 * 1024;
+
 function ghSlug(root) {
-  const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+  const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
   const m = r.status === 0 ? String(r.stdout || '').trim().match(/github\.com[:/]+([^/]+)\/([^/.]+?)(?:\.git)?\/?$/) : null;
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
 function ghJson(args) {
-  const r = spawnSync('gh', args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' });
+  const r = spawnSync('gh', args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
   if (r.status !== 0) return undefined;
   try { return JSON.parse(String(r.stdout || '')); } catch { return undefined; }
 }
