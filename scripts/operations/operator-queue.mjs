@@ -10,7 +10,9 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  *     its newest advisory covers the live head and accepts. The comment is the source of truth; the label is a
  *     derived view of it. Any disagreement between the two is reported in NOT READY as the reason, never resolved
  *     silently in either direction;
- *   - CI is green, the PR is not conflicting, and GitHub reports it MERGEABLE.
+ *   - CI is green, the PR is not conflicting, and GitHub reports it MERGEABLE;
+ *   - (card x1b8hlo) the post-accept red team has no CONFIRMED break on the live head that `redTeam.confirmedBreaks`
+ *     sends back to the fixer (`we:scripts/lib/red-team-gate.mjs#redTeamQueueReason`).
  *
  * THREE BUCKETS, not two. `mergeable: UNKNOWN` is GitHub's transient "still computing" state, and reporting it in
  * NOT READY ("agent work is owed") made a healthy PR flap between ready and not-ready from run to run. So an
@@ -43,6 +45,9 @@ import { readUnsupported } from '../conveyor/unsupported-repo.mjs';
 import { stuckDispatchEpisodes } from '../conveyor/stuck-pr-dispatch-marker.mjs';
 import { standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
+// Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
+// keeps the PR out of NEEDS YOU while it is unresolved on the live head.
+import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason } from '../lib/red-team-gate.mjs';
 // Loaded lazily and fail-soft, like `laneReclaimQueue`: the ledger pulls in `jury-core.mjs`'s whole graph, which this
 // file's header deliberately keeps out of its own (a copy staged without it must still run and print the queue).
 let rulingLedger = null;
@@ -83,7 +88,7 @@ export const MERGEABLE_POLL_DELAY_MS = 1000;
  * @returns {{ready: boolean, reasons: string[], transient: boolean}} `transient` is true when the ONLY thing
  *   between this PR and `ready` is GitHub's still-computing mergeability — `ready` is then false and `reasons` empty.
  */
-export function evaluatePr(pr) {
+export function evaluatePr(pr, { redTeamSetting = CONFIRMED_BREAKS_DEFAULTS } = {}) {
   const reasons = [];
   if (!hasLabel(pr, 'review:human')) reasons.push('no review:human label');
 
@@ -128,6 +133,12 @@ export function evaluatePr(pr) {
   if (hasLabel(pr, AWAITING_ADVISORY_LABEL) && parsed) {
     reasons.push(`label/comment disagreement: ${AWAITING_ADVISORY_LABEL} is set but ${parsedText}`);
   }
+
+  // Card x1b8hlo — the post-accept red team CONFIRMED a break on this exact head that `redTeam.confirmedBreaks` sends
+  // back: the fixer owns it, not the operator (live PR #4722). A new head clears it; the gate's `round-cap` record
+  // hands it to the operator instead.
+  const redTeam = redTeamQueueReason(pr, redTeamSetting);
+  if (redTeam) reasons.push(redTeam);
 
   const checks = (pr.statusCheckRollup ?? []).filter((check) => check.name !== 'review-gate');
   const pending = checks.filter((check) => check.status !== 'COMPLETED');
@@ -366,16 +377,17 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
         // advisory-label sweep's own comment-carrying listing.
       ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER }));
       const readyNumbersThisRepo = new Set();
+      const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
         let pr = listed;
-        let result = evaluatePr(pr);
+        let result = evaluatePr(pr, { redTeamSetting });
         // Only a PR that would otherwise be ready is worth re-polling — one with a real failure is not-ready
         // whatever GitHub says about mergeability.
         if (result.transient) {
           pr = { ...pr, mergeable: pollMergeable({
             repo, number: pr.number, sleep, attempts: pollAttempts, delayMs: pollDelayMs,
           }) };
-          result = evaluatePr(pr);
+          result = evaluatePr(pr, { redTeamSetting });
         }
         const row = { repo, number: pr.number, title: pr.title };
         if (result.ready) {

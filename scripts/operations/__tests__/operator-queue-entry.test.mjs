@@ -62,6 +62,9 @@ const stage = (root) => {
   copyFileSync(join(dirname(LEAF), 'daemon-last-good.mjs'), join(root, 'lib/daemon-last-good.mjs'));
   // item 68a — the health parsers strip the daemon-log timestamp via the import-free `../lib/log-timestamp.mjs`.
   copyFileSync(join(dirname(LEAF), 'log-timestamp.mjs'), join(root, 'lib/log-timestamp.mjs'));
+  // card x1b8hlo — the queue reads the red-team gate's light leaf (it imports only `marker-authorship.mjs`, staged
+  // above). Its settings file is optional: absent, the built-in default stands.
+  copyFileSync(join(dirname(LEAF), 'red-team-gate.mjs'), join(root, 'lib/red-team-gate.mjs'));
 };
 
 let dir;
