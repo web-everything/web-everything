@@ -187,3 +187,12 @@ describe('createEventWaker.sleep', () => {
     expect(res.wake).toBe(true);
   });
 });
+
+describe('PR comment wake relevance', () => {
+  it.each(['advisory', 'ruling', 'other', undefined])('routes comment kind %s only to the fix role when relevant', (kind) => {
+    const event = { type: 'issue_comment', action: 'created', repo: 'web-everything/web-everything', prs: [4624], ...(kind ? { kind } : {}) };
+    expect(isRelevantEvent(event, 'fix')).toBe(kind === 'advisory' || kind === 'ruling');
+    expect(isRelevantEvent(event, 'review')).toBe(false);
+    expect(isRelevantEvent(event, 'drain')).toBe(false);
+  });
+});

@@ -1,1 +1,1 @@
-{ "daemonRebuild": { "skipUnrelated": true }, "wrongBranchHeal": { "branches": ["ops/review-requests"], "pathPrefixes": ["verdict-ledger/"] } }
+{ "daemonRebuild": { "skipUnrelated": true }, "wrongBranchHeal": { "branches": ["ops/review-requests"], "pathPrefixes": ["verdict-ledger/"] }, "rebuildAsJob": { "entries": ["merge-ai-prs.mjs", "review-daemon.mjs", "build-dispatch-daemon.mjs", "reconcile-fix-dispatch-daemon.mjs"], "minIntervalMs": 300000 }, "depsAsJob": { "enabled": true, "retryMs": 300000 } }

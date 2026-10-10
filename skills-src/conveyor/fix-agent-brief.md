@@ -390,11 +390,22 @@ file (step 6) as ONE fenced block with the info string `class-sweep`, JSON insid
 ```
 ````
 
-Then run the check on that file. It prints one line and records the sweep for this session; paste the line into the
-evidence comment. In `warn` mode it never blocks; it tells you what is missing:
+**The same class anywhere in the PR (card 5536).** Reviewers keep raising the same class next round in ANOTHER file
+of this PR (#4624: round 1 swept the "manual freeze silently not honoured" class in `red-main-remediation.mjs`;
+round 3 found it again in `red-main-hold.mjs`, a file of the same PR no sweep row named). So, in the same pass, look
+for each finding's class in EVERY file this PR changes (`git diff --name-only origin/<base>...HEAD`), not only around
+the fixed site. Every changed file must be named by one of the finding's rows: the four paths above, or extra rows
+with `"path":"pr"` (`{"path":"pr","site":"scripts/lib/x.mjs","status":"checked","note":"no freeze read here"}`). A
+row's `site` may be a directory prefix ending in `/` (`scripts/lib/__tests__/`) to cover the files under it.
+`backlog/` cards are exempt. A same-class instance you find this way is fixed in this round, like any variant.
+
+Then run the check on that file, from your lane. It reads the PR's changed files from the lane, prints one line,
+and records the sweep for this session; paste the line into the evidence comment. `pr-unswept-<n>` means `n`
+changed files no row names (the list is in the record). In `warn` mode it never blocks; it tells you what is missing:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}}
+BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="$LANE" --base="origin/$BASE_REF"
 ```
 
 ### 4. Run the gate GREEN (the item's own locus gate)
@@ -407,6 +418,15 @@ its push. Then hand the wait over:
 node {{WE_ROOT}}/scripts/verify-lane.mjs request --repo=.                        # returns almost instantly — nothing has run yet
 node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs mark --repo={{REPO}} --pr={{PR_NUM}} --who={{SESSION_SLUG}} --ref={{LANE_REF}} --kind=fix --attempt=1
 ```
+
+**Push before the gate (`fix.pushBeforeGate`, default on — we:scripts/lib/fix-push-policy.mjs).** Once you `mark`,
+the harness pushes your marked commit to `{{LANE_REF}}` within seconds (normal push, never force), so CI starts while
+the local gate runs. **You keep the fix claim until the local gate is green for the pushed head** — review, ci-heal,
+draft promotion and the drain all refuse the PR while you hold it, so a red CI run on an intermediate head
+dispatches nothing. Pushing while you hold the claim is allowed; **releasing it on red is never allowed** (no
+hand-back, no re-arm, no `fix-end` on a red head — except through the gate-red / load-flake exits below). Because
+your commit may already be on the PR, **never amend, rebase or force-push a marked commit**: repair with a NEW
+commit on top. With the setting off, nothing is pushed until green (the flow below is unchanged either way).
 
 Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never
 `sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), never `reset` or re-`request`
@@ -421,7 +441,7 @@ quoted path is denied). Do not run `verify-lane.mjs run` here; `request` stamps 
 
 The harness acts on the same verdict `verify-lane.mjs check` prints — the **`check` output**, never the `request`
 acknowledgement — and the resume message tells you which branch you are on:
-`green` → the harness has already pushed your exact sha to `{{LANE_REF}}`; continue at step 6's evidence comment
+`green` → the harness has already pushed your exact sha to `{{LANE_REF}}` (or confirmed the early push is there); continue at step 6's evidence comment
 and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,
 `request`, `mark` again with `--attempt=<n+1>`, and end your turn; on the third red the message tells you to take
 the gate-red hard stop below. A red the gate classifies as load-only → the message tells you to take the load-flake
@@ -459,7 +479,7 @@ before-output from step 2; step 6 posts both as the evidence.
 
 **Load-flake exception.** When verify is red ONLY on timeouts that pass alone under high host load, save and push
 the fix to `lane/<head>-fix-<N>-alt`, then use the load-flake exit instead of the terminal gate-red exit below. It
-releases the fix claim like every other exit. Pass the PR's FULL 40-character head sha (`git rev-parse origin/<head ref>`).
+releases the fix claim like every other exit. Pass the PR's FULL 40-character head sha as GitHub has it (`git ls-remote origin refs/heads/<head ref> | cut -f1` — under push-before-gate that is your own early-pushed sha, and a local `origin/<ref>` is stale).
 Only `web-everything/web-everything` has a reverify worker; for any other repo the script records the terminal
 gate-red stand-down instead (a hold nothing would ever retry), so use the gate-red exit below there:
 
@@ -472,7 +492,10 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 Report `blocked-on-load-flake` and exit; the quiet-host reverify pass retries the saved fix automatically.
 
 **Otherwise a red gate is a hard stop.** Record the stand-down on the PR, leave it `review:changes` (do **not**
-re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff.
+re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Never hand a red head back for review. (With push-before-gate
+the red commit is already on the PR; the stand-down marker is what keeps it held — that is expected, not a leak.
+The same holds for the blocked-on-infra and load-flake exits: they release the claim but leave `review:changes`, so an
+unverified head is never handed back for review or landed.)
 
 ```bash
 node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
@@ -508,8 +531,8 @@ node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
 Commit only the repair's files (explicit paths, never `git add -A`; one commit) on the lane's current branch,
-BEFORE step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: on a green verdict for exactly this commit the
-harness pushes it to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never
+BEFORE step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: the harness pushes it — right after your `mark`
+under push-before-gate, else on a green verdict for exactly this commit — to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never
 `gh pr create`, never `pr-land` — the PR already exists):
 
 ```bash

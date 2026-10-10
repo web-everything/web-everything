@@ -1,4 +1,5 @@
 {
   "referralDefault": "auto-block",
-  "scopedRereview": "shadow"
+  "scopedRereview": "shadow",
+  "roundBudget": 3
 }

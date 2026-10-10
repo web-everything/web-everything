@@ -13,8 +13,13 @@
  * A day where some expected repo has no run is `incomplete`; a day with no run at all is `missing`. Both break
  * a streak: "7 clean days" means 7 consecutive days with evidence, not 7 scattered ones.
  *
- * THE STREAK counts back from today. If today has no run yet it starts from yesterday, so the morning before
- * the first run does not reset a week of evidence.
+ * A run counts as complete only when its record says the PR list was not truncated by `--limit` (`scan.truncated
+ * === false`) and `unreadable` is a validated zero. Records without that evidence are unknown.
+ * Only runs for the QUERIED repos shape a day: another repo's run never starts, ends or resets the streak.
+ *
+ * THE STREAK counts back from today. If today has no run yet, or is still `incomplete` (some repo has not run
+ * yet), it starts from yesterday, so the morning before the runs finish does not reset a week of evidence. A
+ * `drift` or `unknown` today does count.
  *
  * Pure except `readCheckRuns`, whose IO is injectable.
  */
@@ -23,6 +28,8 @@ import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { listRunIds, resolveRunsDir, tryReadRun } from '../operations/run-store.mjs';
 
 export const CHECK_OP = 'review-ledger-check';
+/** #5444 — the drain's per-pass ledger-shadow records (we:scripts/lib/drain-ledger-shadow.mjs). */
+export const SHADOW_OP = 'drain-ledger-shadow';
 export const REQUIRED_CLEAN_DAYS = 7;
 export const HISTORY_TZ = 'America/New_York';
 
@@ -49,31 +56,46 @@ export function dayBefore(day, n = 1) {
  * Read every check run record. A corrupt record is skipped and counted (never fatal, never evidence).
  * @returns {{runs: object[], corrupt: number}}
  */
-export function readCheckRuns({ dir = resolveRunsDir(), listIds = listRunIds, read = tryReadRun } = {}) {
+export function readCheckRuns({ dir = resolveRunsDir(), listIds = listRunIds, read = tryReadRun, op = CHECK_OP } = {}) {
   const runs = [];
   let corrupt = 0;
   for (const id of listIds(dir)) {
-    if (!id.startsWith(`${CHECK_OP}-`)) continue;
+    if (!id.startsWith(`${op}-`)) continue;
     let rec;
     try { rec = read(id, dir); } catch { corrupt += 1; continue; }
-    if (rec?.op === CHECK_OP) runs.push(rec);
+    if (rec?.op === op) runs.push(rec);
   }
   return { runs, corrupt };
 }
 
-/** One run's per-family verdict: `clean` | `drift` | `unknown` (no per-family data, or unreadable PRs). Pure. */
+const isCount = (n) => Number.isInteger(n) && n >= 0;
+
+/**
+ * One run's per-family verdict: `clean` | `drift` | `unknown`. Pure. Clean needs POSITIVE evidence of a complete
+ * scan: a validated zero `unreadable`, and a `scan` that says the PR list was not cut off by `--limit`. A record
+ * that omits either (older, hand-built, or a partial scan) is unknown, never clean.
+ */
 export function runFamilyVerdict(run, family) {
   const derived = run?.findings?.derived;
   const fam = derived?.perFamily?.[family];
-  if (!fam || typeof fam.disagree !== 'number') return 'unknown';
+  if (!fam || !isCount(fam.disagree)) return 'unknown';
   if (fam.disagree > 0) return 'drift';
-  if ((derived.unreadable ?? 0) > 0) return 'unknown';
+  if (!isCount(derived.unreadable) || derived.unreadable > 0) return 'unknown';
+  // Clean needs a complete scan (not cut off by --limit), made against a SHARED ledger store (rows written on other
+  // machines are invisible to an unshared one), whose listed count matches what was scored.
+  const scan = run.findings.scan;
+  if (scan?.truncated !== false || scan.storeShared !== true || !isCount(scan.listed) || scan.listed !== derived.total) return 'unknown';
   return 'clean';
 }
 
-/** Every family named by any run, in first-seen order, unioned with `families`. Pure. */
+/**
+ * The families to judge. When the caller pins `families`, ONLY those count: a record's own family names are
+ * untrusted (a retired family, an unrelated repo's record, a `__proto__` key) and must not move the answer.
+ * With no pin, it is the union of every family any run names, in first-seen order. Pure.
+ */
 function familiesOf(runs, families = []) {
-  const out = [...families];
+  if (families.length) return [...families];
+  const out = [];
   for (const r of runs) for (const f of Object.keys(r?.findings?.derived?.perFamily ?? {})) if (!out.includes(f)) out.push(f);
   return out;
 }
@@ -85,11 +107,13 @@ function familiesOf(runs, families = []) {
  */
 export function dailyFamilyStatus(runs = [], { repos = DEFAULT_REPOS, families = [] } = {}) {
   const fams = familiesOf(runs, families);
+  const wanted = new Set(repos.map((r) => r.toLowerCase()));
   const byDay = new Map();
   for (const r of runs) {
     const day = etDay(r?.input?.at);
     const repo = r?.input?.repo;
     if (!day || !repo) continue;
+    if (!wanted.has(String(repo).toLowerCase())) continue; // a repo outside the query never creates or shapes a day
     if (!byDay.has(day)) byDay.set(day, []);
     byDay.get(day).push(r);
   }
@@ -104,7 +128,9 @@ export function dailyFamilyStatus(runs = [], { repos = DEFAULT_REPOS, families =
         perRepo[repo] = verdicts.length ? verdicts.reduce((a, b) => (rank[b] > rank[a] ? b : a)) : 'missing';
       }
       const vals = Object.values(perRepo);
-      const status = vals.includes('drift') ? 'drift' : vals.includes('missing') ? 'incomplete' : vals.includes('unknown') ? 'unknown' : 'clean';
+      // unknown outranks missing: a repo that already ran with unreadable/truncated evidence breaks the streak even
+      // while another repo has not run yet (a merely `incomplete` day is treated as still in progress).
+      const status = vals.includes('drift') ? 'drift' : vals.includes('unknown') ? 'unknown' : vals.includes('missing') ? 'incomplete' : 'clean';
       days[day][family] = { status, repos: perRepo };
     }
   }
@@ -121,7 +147,10 @@ export function cleanDaysPerFamily(runs = [], { repos = DEFAULT_REPOS, families 
   const result = {};
   for (const family of fams) {
     const statusOn = (day) => days[day]?.[family]?.status ?? 'missing';
-    let cursor = days[today] ? today : dayBefore(today);
+    // Today is still being filled in while it is `incomplete` (a repo has not run yet) or absent, so the streak
+    // starts from yesterday. A `drift` or `unknown` today is real evidence against the streak and counts now.
+    const todayStatus = statusOn(today);
+    let cursor = todayStatus === 'incomplete' || todayStatus === 'missing' ? dayBefore(today) : today;
     let streak = 0;
     while (statusOn(cursor) === 'clean') { streak += 1; cursor = dayBefore(cursor); }
     const window = [];
@@ -139,8 +168,48 @@ export function renderCleanDays(q, { corrupt = 0, runCount = 0 } = {}) {
     lines.push(`  ${family.padEnd(15)} streak ${String(f.streak).padStart(2)}/${q.required} · clean in window ${f.cleanInWindow}/${f.window.length}`
       + `  [${f.window.map((w) => mark[w.status]).join('')}]${f.ready ? '  READY' : ''}`);
   }
-  if (!Object.keys(q.families).length) lines.push('  no run records yet — run `npm run review:ledger-check` first.');
+  if (!Object.keys(q.families).length || !runCount) lines.push('  no run records yet — run `npm run review:ledger-check` first.');
   lines.push('  legend: ✓ clean · x drift · ? unreadable PRs · ~ a repo has no run · · no run');
   if (corrupt) lines.push(`  ${corrupt} corrupt run record(s) skipped`);
+  return lines.join('\n');
+}
+
+/**
+ * #5444 — the DRAIN SHADOW, counted per ET day over the last `windowDays` days: drain passes, PRs compared, and
+ * label-vs-ledger disagreements (per direction) and unreadable reads. Report-only evidence beside the per-family
+ * streak; it does not change readiness. A record with no readable summary is counted `corrupt`, never clean. Pure.
+ */
+export function shadowDailyCounts(runs = [], { now = new Date(), windowDays = REQUIRED_CLEAN_DAYS } = {}) {
+  const today = etDay(now);
+  const days = [];
+  for (let i = windowDays - 1; i >= 0; i -= 1) days.push({ day: dayBefore(today, i), passes: 0, compared: 0, disagree: 0, unreadable: 0,
+    ledgerHoldsLabelClears: 0, ledgerClearsLabelHolds: 0, disagreeingPrs: [] });
+  const byDay = new Map(days.map((d) => [d.day, d]));
+  let corrupt = 0;
+  for (const r of runs) {
+    const d = byDay.get(etDay(r?.input?.at));
+    if (!d) continue;
+    const s = r?.findings?.summary;
+    if (!s || !isCount(s.compared) || !isCount(s.disagree) || !isCount(s.unreadable)) { corrupt += 1; continue; }
+    d.passes += 1; d.compared += s.compared; d.disagree += s.disagree; d.unreadable += s.unreadable;
+    d.ledgerHoldsLabelClears += s.directions?.['ledger-holds-label-clears'] ?? 0;
+    d.ledgerClearsLabelHolds += s.directions?.['ledger-clears-label-holds'] ?? 0;
+    for (const row of r.findings.rows ?? []) {
+      const key = `${row?.repo}#${row?.pr}`;
+      if (row?.status === 'disagree' && !d.disagreeingPrs.includes(key)) d.disagreeingPrs.push(key);
+    }
+  }
+  return { today, days, corrupt };
+}
+
+/** Human lines for the drain-shadow counts. Pure. */
+export function renderShadowDays(q) {
+  const lines = ['drain ledger shadow (#5444) · per ET day: passes · compared · disagree (ledger-holds/label-clears, ledger-clears/label-holds) · unreadable'];
+  for (const d of q.days) {
+    lines.push(`  ${d.day}  passes ${String(d.passes).padStart(3)} · compared ${String(d.compared).padStart(5)} · disagree ${String(d.disagree).padStart(4)}`
+      + ` (${d.ledgerHoldsLabelClears}/${d.ledgerClearsLabelHolds}) · unreadable ${d.unreadable}`
+      + (d.disagreeingPrs.length ? ` · ${d.disagreeingPrs.slice(0, 8).join(' ')}${d.disagreeingPrs.length > 8 ? ' …' : ''}` : ''));
+  }
+  if (q.corrupt) lines.push(`  ${q.corrupt} shadow record(s) without a readable summary skipped`);
   return lines.join('\n');
 }

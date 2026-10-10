@@ -52,7 +52,6 @@
   "scripts/mine-golden-corpus.mjs": 2,
   "scripts/operations/dispatch-lane-io.mjs": 2,
   "scripts/operations/handoff-home.mjs": 2,
-  "scripts/operations/operator-queue.mjs": 1,
   "scripts/operations/record-verdict-io.mjs": 2,
   "scripts/operations/review-extra-seats.mjs": 3,
   "scripts/operations/runner-freshness.mjs": 1,

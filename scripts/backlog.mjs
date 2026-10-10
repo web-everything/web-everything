@@ -58,13 +58,14 @@ import { fitAffineCost, budgetFromFit, impliedCapacity, isKnownStopReason, KNOWN
 import { BACKLOG_KINDS } from './check-standards-rules.mjs';
 import { numberPendingHashes, landedNumberFor } from './lane-drain.mjs';
 import { laneGuardDecision, resolveReal, isLaneLocus } from './guard-lane.mjs';
-import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, resolveBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
+import { TIERS, rankBetween, DEFAULT_CONFIG, validateConfig, orderQueueDetailed, readBuildQueuePrioritySettings, classOrder, formatBuildQueuePriorityShadowLine } from './lib/build-queue.mjs';
 import { loadOverlapYieldConfig, writeOverlapYieldConfig, defaultOverlapYieldConfigPath } from './conveyor/land-overlap-yield.mjs';
 import { localToday } from './lib/local-date.mjs';
 import { buildQueueCacheFile, buildQueueCacheKey, readBuildQueueCache, writeBuildQueueCache } from './lib/build-queue-cache.mjs';
 import { readQueueFile, resolveQueuePath, resolveQueueSource, normNum, bornAsIndexFromItems, resolveBornAsRefs } from './conveyor/queue-store.mjs';
 import { DELIVERY_PRIORITY_SETTINGS_PATH } from './conveyor/delivery-priority-shadow.mjs';
 import { readSettings, SETTINGS_DIR } from './lib/settings-files.mjs';
+import { PLATFORM_PREFERENCES_PATH } from './lib/policy-cascade.mjs';
 import { writeAllSync, writeLineSync } from './lib/write-all-sync.mjs';
 import { writeBacklogMd as writeBacklogMdCore, writeBacklogMdUnguarded as writeBacklogMdUnguardedCore } from './backlog/guarded-write.mjs';
 // #3034 — `claim` runs through this declared operation, not a second hand-rolled implementation. See
@@ -886,14 +887,16 @@ function block() {
   const rel = `backlog/${file}`;
   const abs = join(DIR, file);
   let src = readFileSync(abs, 'utf8');
-  const on = (flag('on') || '').split(',').map((s) => s.trim()).filter(Boolean).map(normalizeId);
+  const canon = (ref) => normalizeId(idFromName(String(ref).trim()) ?? String(ref).trim()); // strip the slug FIRST, then pad: `7-foo` is `007`
+  const on = [...new Set((flag('on') || '').split(',').map((s) => s.trim()).filter(Boolean).map(canon))]; // a repeated target is one edge, however its slug or padding is spelled
   if (!on.length) die('block needs --on=<NNN>[,<NNN>…]');
   const self = idFromName(file);
   for (const t of on) { if (t === self) die(`#${self} cannot block on itself`); resolveFile(t); }
   const cur = readField(src, 'blockedBy');
   let list = [];
   if (cur) { try { list = JSON.parse(cur); } catch { die(`#${self} has a blockedBy line that is not a JSON array: ${cur}`); } }
-  const added = on.filter((t) => !list.includes(t));
+  const have = new Set(list.map(canon)); // an existing edge spelled `<id>-<slug>` or unpadded is the same edge
+  const added = on.filter((t) => !have.has(t));
   if (!added.length) return ok({ verb: 'block', id: file.replace(/\.md$/, ''), file: rel, added: [] }, `#${self} already blocked by ${on.join(', ')}`);
   list = [...list, ...added];
   src = setFrontmatterField(src, 'blockedBy', `[${list.map((t) => JSON.stringify(t)).join(', ')}]`, { after: ['status', 'parent', 'size', 'kind'] });
@@ -1126,7 +1129,8 @@ function buildQueue() {
   const baseKey = cacheEnabled ? buildQueueCacheKey({ backlogDir: DIR, configPath: BUILD_QUEUE_CONFIG_PATH,
     next: argv.includes('--next') }) : null;
   const key = baseKey === null ? null
-    : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH),
+    : JSON.stringify([baseKey, queueSrc.path, mtimeOf(queueSrc.path), mtimeOf(DELIVERY_PRIORITY_SETTINGS_PATH), mtimeOf(PLATFORM_PREFERENCES_PATH),
+      process.env.WE_PLATFORM_PREFERENCES_FILE,
       mtimeOf(join(SETTINGS_DIR, 'build-queue-priority.json')), process.env.WE_BUILD_QUEUE_PRIORITY_MODE,
       // The tool layer is the MERGE of dispatch-settings.json + every scripts/settings/*.json, so a later-sorting file can
       // set it too: key on the merged value itself, not only on the one file's mtime.
@@ -1178,13 +1182,8 @@ function buildQueue() {
     catch { rawTier = undefined; }
     return { ...it, tier: rawTier, ...queue };
   });
-  // Keep platform preferences raw so the tool and environment override only their declared keys.
-  let platform;
-  try { platform = JSON.parse(readFileSync(DELIVERY_PRIORITY_SETTINGS_PATH, 'utf8')).deliveryPriority; }
-  catch { platform = undefined; }
-  const priority = resolveBuildQueuePrioritySettings({
-    platform, tool: readSettings().buildQueuePriority, env: process.env,
-  });
+  // Platform preference → tool → env through the shared policy cascade (logs each value's source once).
+  const priority = readBuildQueuePrioritySettings({ env: process.env });
   const detailed = orderQueueDetailed(items, config, Date.now(), { priority });
   const shadow = priority.mode === 'shadow'
     ? { shadowClassOrder: classOrder(detailed).map((r) => r.item.num) } : {};

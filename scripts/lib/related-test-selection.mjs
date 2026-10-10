@@ -25,7 +25,7 @@
 
 // `from '<spec>'` is matched on its own, not anchored to its `import {`: a multi-line import list can hold a comment
 // with a quote or `;` in it. A stray match in a comment or string only ADDS an edge (more tests), never drops one.
-const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]/g;
+const SPECIFIER_RE = /\bfrom\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*['"]([^'"\n]+)['"]\s*\)|\bimport\s+['"]([^'"\n]+)['"]|\b(?:require|mock|doMock|unmock|doUnmock|importActual|importMock)\s*\(\s*['"]([^'"\n]+)['"]|\bimport\s*\(\s*`([^`$\n]+)/g;
 const SOURCE_EXT_RE = /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts)$/;
 const RESOLVE_SUFFIXES = ['', '.mjs', '.js', '.ts', '.tsx', '.cjs', '.mts', '.jsx', '/index.mjs', '/index.js', '/index.ts', '/index.tsx', '/index.cjs', '/index.mts', '/index.jsx'];
 
@@ -68,6 +68,49 @@ export function resolveSpecifier(fromFile, spec, fileSet) {
 }
 
 /**
+ * The FORWARD edges of one file: the tracked files `text` (the content of `fromFile`) imports, resolved against
+ * `fileSet`. The same parse the reverse graph uses, so both directions agree (the drain's `affected` re-test rule,
+ * we:scripts/lib/merge-queue-affected.mjs, reads it). Pure.
+ * @returns {string[]}
+ */
+export function resolvedImportsOf(fromFile, text, fileSet) {
+  const out = new Set();
+  for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
+    // m[5]: a template-literal dynamic import (`import(\`../x.mjs?v=${n}\`)`): the static prefix up to `${` is the path.
+    const target = resolveSpecifier(fromFile, m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5], fileSet);
+    if (target && target !== fromFile) out.add(target);
+  }
+  return [...out];
+}
+
+/**
+ * The path BASES of the relative specifiers in `text` (before suffix resolution: `./x` → `scripts/lib/x`), resolved or
+ * not. A specifier that resolves to nothing today still names a file that a later change can add; the drain's
+ * `affected` rule pairs these with {@link specifierBasesResolvingTo}. Pure.
+ * @returns {string[]}
+ */
+export function relativeSpecifierBases(fromFile, text) {
+  const out = new Set();
+  for (const m of String(text ?? '').matchAll(SPECIFIER_RE)) {
+    const spec = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[5];
+    if (!spec || !(spec.startsWith('./') || spec.startsWith('../'))) continue;
+    const base = normalizeJoin(fromFile, spec.split('?')[0]);
+    if (base != null) out.add(base);
+  }
+  return [...out];
+}
+
+/** Every specifier base that {@link resolveSpecifier} would resolve to `path` once `path` exists (itself, a stripped suffix, a `.js`-for-`.ts` swap). Pure. */
+export function specifierBasesResolvingTo(path) {
+  const p = String(path);
+  const bases = new Set([p]);
+  for (const suffix of RESOLVE_SUFFIXES) if (suffix && p.endsWith(suffix)) bases.add(p.slice(0, -suffix.length));
+  const ts = /^(.*)\.(ts|tsx|mts|cts)$/.exec(p);
+  if (ts) for (const ext of { ts: ['.js'], tsx: ['.js'], mts: ['.mjs'], cts: ['.cjs'] }[ts[2]]) bases.add(ts[1] + ext);
+  return [...bases];
+}
+
+/**
  * The reverse-import graph: `Map<imported file, Set<importing file>>`. Unreadable files (a tracked file deleted in the
  * working tree, whose imports are gone with it) are skipped. Only source files are READ for imports, but any tracked
  * file can be an import TARGET, so a test that imports a changed JSON fixture still has its edge.
@@ -80,9 +123,7 @@ export function buildReverseImportGraph({ files, readFile }) {
   for (const file of sources) {
     let text;
     try { text = String(readFile(file)); } catch { continue; }
-    for (const m of text.matchAll(SPECIFIER_RE)) {
-      const target = resolveSpecifier(file, m[1] ?? m[2] ?? m[3] ?? m[4], fileSet);
-      if (!target || target === file) continue;
+    for (const target of resolvedImportsOf(file, text, fileSet)) {
       if (!reverse.has(target)) reverse.set(target, new Set());
       reverse.get(target).add(file);
     }

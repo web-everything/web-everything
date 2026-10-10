@@ -82,7 +82,7 @@ import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-s
 import { randomUUID } from 'node:crypto';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
 import { createQueueBudget } from '../readiness/heavy-queue-projection.mjs'; // card xkyw1x4 — queue-time admission
@@ -101,8 +101,10 @@ import {
 import { stopSession } from '../operations/dispatch-abort.mjs';
 import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from '../operations/worker-wrapper-launch.mjs';
 import { assertMainNotStale } from '../operations/review-dispatch.mjs';
-import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
+import { armSelfReexecOnFastForward, isCodePath } from '../lib/main-staleness.mjs';
+import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
 import { BRIEF_REQUIRED_BY_KIND, OPTIONAL_BRIEF_PLACEHOLDERS, REPO_AWARE_VALUE_PATTERNS, fillBrief, sessionSlugFor } from '../operations/dispatch-lane.mjs';
+import { briefWithContextPack } from './fix-context-pack.mjs'; // fixer context pack: finding + code + files staged in the brief
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
 import { laneRefItemNum } from './lease-reaper.mjs';
 import {
@@ -110,6 +112,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
+import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -137,6 +140,36 @@ import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
 import { readOverlayConflictWakes } from '../lib/overlay-conflict-wake.mjs';
 // Card xjddimd — delivery priority class, SHADOW only: logged per pass, never changes order or dispatch.
 import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
+
+/** The label every fix-dispatch / ci-heal-dispatch stale-guard refusal carries (live 2026-10-09 19:18:51Z: the
+ *  guard ran with the `review-dispatch` default label, so the log blamed a review step that never ran). */
+export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
+const FIX_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+let fixClosureMemo;
+
+/** The static import closure of THIS file in the running tree (memoized), or `null` if unreadable: the code a
+ *  fix/ci-heal dispatch pass runs. A managed clone behind `origin/main` only outside it is not stale for it. */
+export function fixCodeClosure() {
+  if (fixClosureMemo === undefined) {
+    fixClosureMemo = collectImportClosure({ root: FIX_CODE_ROOT, entries: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] });
+  }
+  return fixClosureMemo;
+}
+
+/** Is `path` (repo-relative) on the fix-dispatch code path? Live 2026-10-09 19:18:51Z (PR #4624): the fix
+ *  daemon's managed clone was 12 commits behind, the guard had no dispatch path, and it refused EVERY repo's
+ *  fix pass — #4624's block-ruled fix waited a further tick. Passing this as `dispatchPath` gives the fix pass
+ *  the same #4387 off-path tolerance and rebuild grace the review and promote passes already have. An unknown
+ *  or incomplete closure fails closed (every code file counts, the plain #4044 rule). */
+export function isFixCodePath(path, { closure = fixCodeClosure() } = {}) {
+  const p = String(path || '');
+  if (!p) return false;
+  if (!closure || !closure.complete) return isCodePath(p);
+  return closureHits({ closure, changedFiles: [p] }).length > 0;
+}
+
+/** The narrowing both fix-side passes hand `assertMainNotStale`. */
+export const FIX_STALE_GUARD_OPTS = Object.freeze({ label: FIX_DISPATCH_STALE_LABEL, dispatchPath: (p) => isFixCodePath(p) });
 
 /** The template `we:skills-src/conveyor/fix-agent-brief.md` — the SAME brief `dispatch-lane.mjs`'s own
  *  tick-core-driven fix dispatch fills, read fresh per dispatch so an edit takes effect with no restart. */
@@ -1043,7 +1076,11 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
 export function dispatchFix(planned, {
   repo = 'we',
   root = REPO_ROOT,
-  readBrief = (r) => readFileSync(fixBriefPath(r), 'utf8'),
+  // Fixer context pack (`fix.contextPack`, `fix.localTests`) — the template arrives with the finding verbatim, the code
+  // at each named line, the PR's file list and the proof-only tests rule in front, and the sections the pack makes
+  // redundant trimmed (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
+  readBrief = (r) => packFixBrief(readFileSync(fixBriefPath(r), 'utf8')),
+  packFixBrief = (template) => briefWithContextPack(template, { kind: 'fix', repo, toSlug: ghRepoSlug, pr: planned.pr, exec: execFileSyncThrottled }),
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,
   extraArgs = [],
@@ -1165,7 +1202,7 @@ export function dispatchFix(planned, {
     }
     if (borrowed && borrowed.executor !== 'claude') {
       // Card 87 — the borrowed slot belongs to a non-Claude executor: same claim and brief, other launcher.
-      const promptFile = writeBorrowedPrompt(sessionSlug, withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch));
+      const promptFile = writeBorrowedPrompt(sessionSlug, withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack));
       let handle;
       try {
         handle = spawnBorrowed({
@@ -1212,7 +1249,7 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
@@ -1370,6 +1407,23 @@ export function runReconcileFixDispatch({
   // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
   // setting). Real git only with the real reconcile; an injected `reconcile` (every test) keeps its own fences.
   netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
+  prStack = reconcile === runReconcilePass ? readStacksForPass : null,
+  prStackSettings = resolvePrStackSettings(),
+  // Where the remembered stacks are saved: the real memory file with the real stack reader, nowhere for an injected one.
+  writeStacks = prStack === readStacksForPass ? writeRemembered : null,
+  readPrForRestack = prStack === readStacksForPass ? (pr) => {
+    try {
+      const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
+      const data = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo',
+        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body,isCrossRepository'],
+      { cwd: root, encoding: 'utf8', timeout: 30e3 }));
+      return { kind: 'fix', prNumber: data.number, headRefName: data.headRefName,
+        headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body,
+        isCrossRepository: data.isCrossRepository !== false };
+    } catch { return null; }
+  } : null,
+  // Origin's lane/* tips, to verify an idle restack target at dispatch time (the push-capable step).
+  readLaneTips = readOriginLaneTips,
   resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
   // #xmtbdgs multi-repo slice 6 — the item-less diff read; UN-prefixed (see `planFixesFromReconcile`'s own
   // docblock for why this is a distinct binding from `resolveFallbackScope` above, which IS prefixed). #xcla4iv
@@ -1411,7 +1465,7 @@ export function runReconcileFixDispatch({
   // was therefore the wrong condition — it let a stale WE checkout record foreign-repo unsupported rows (and
   // will, once fix dispatch is turned on for that repo, dispatch fixes) from code that had already been proven
   // stale. Run it for every repo.
-  assertMainNotStale(root, checkStaleness);
+  assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciledRaw = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
@@ -1472,14 +1526,47 @@ export function runReconcileFixDispatch({
     const scope = actualScopes.get(pr);
     return scope ? { ...claim, meta: { ...claim.meta, scope } } : claim;
   });
+  const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
+  const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
+  // A started stacked-above hold clock is memory too (written right after the idle pass below).
+  let restackMemoryChanged = stackOrder.holdChanged;
+  const heldTops = new Set(stackOrder.heldTops);
+  let idleLaneTips;
+  for (const { top } of planIdleRestacks(stacks, {
+    planned: plannedAll, reconcileRefusals: reconciled.refusals, fixClaims: claims,
+    settings: prStackSettings, used: restackedHeads,
+  })) {
+    let synthetic;
+    try { synthetic = readPrForRestack?.(top); } catch { continue; }
+    if (!synthetic) continue;
+    // The agent pushes to this branch: only a same-repo PR whose head is the tip of its origin lane/* branch qualifies.
+    if (synthetic.isCrossRepository !== false || !/^lane\//.test(synthetic.headRefName ?? '')) continue;
+    idleLaneTips ??= readLaneTips(root);
+    if (!idleLaneTips || idleLaneTips.get(synthetic.headRefName) !== synthetic.headRefOid) continue;
+    const idle = planFixesFromReconcile([synthetic], findItemFn, loadItems, resolveFallbackScope,
+      repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
+    planRefusals.push(...idle.refusals);
+    const ordered = applyStackOrder(idle.planned, stacks, { settings: prStackSettings, used: restackedHeads });
+    // An idle top is only ever dispatched for its restack, so a release to ordinary dispatch is not one: say nothing of it.
+    stackOrder.refusals.push(...ordered.refusals.filter(r => r.kind !== 'stacked-above-aged'));
+    if (ordered.holdChanged) restackMemoryChanged = true;
+    for (const top of ordered.heldTops) heldTops.add(top);
+    for (const entry of ordered.planned) {
+      if (entry.restack) stackOrder.planned.push({ ...entry, restack: { ...entry.restack, idle: true } });
+    }
+  }
+  // The hold clock counts a CONTINUOUS hold. Write it now, before any lane pop or spawn below can throw or time out the pass:
+  // a clock saved only at the end of the pass restarts on every pass that dies early, and the hold never ages out.
+  if (clearUnheldHolds(stacks, heldTops)) restackMemoryChanged = true;
+  if (restackMemoryChanged && writeStacks) { writeStacks(root, nextRemembered(stacks)); restackMemoryChanged = false; }
   // Serialize against live claims and higher-ranked waiters, including blocked ones.
   let urgentPrs = new Set();
   try { urgentPrs = new Set(readOverlayConflictWakes(process.env).keys()); } catch { /* best-effort wake */ }
   const scopeFilter = filterFixesByInFlightScope(
-    plannedAll, listBuildClaims(), claims, { urgentPrs },
+    stackOrder.planned, listBuildClaims(), claims, { urgentPrs, stackAbove: stackOrder.stackAbove },
   );
   const planned = scopeFilter.planned;
-  const refusals = [...ciHealRefusals, ...planRefusals, ...scopeFilter.refusals];
+  const refusals = [...ciHealRefusals, ...planRefusals, ...stackOrder.refusals, ...scopeFilter.refusals];
   // Card xjddimd — log the class each owed PR WOULD get (shadow). Best-effort; reads nothing the pass uses.
   const priorityShadowResult = priorityShadow
     ? priorityShadow({ planned: plannedAll, ranks: scopeFilter.ranks, refusals: scopeFilter.refusals, dispatchEntries, repoKey }) : null;
@@ -1535,7 +1622,7 @@ export function runReconcileFixDispatch({
     // gets, now extended to cover this earlier call site too.
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
-    if (entry.isConflict && !borrowed) {
+    if (entry.isConflict && !borrowed && !entry.restack) {
       let attempt;
       try {
         attempt = tryResume(entry, { root, repo: repoKey });
@@ -1570,12 +1657,21 @@ export function runReconcileFixDispatch({
         continue;
       }
       dispatched.push(borrowed ? { ...result, borrowed, reason: BORROW_REASON } : result);
-      if (entry.overlapExempt) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
+      if (entry.restack) {
+        markRestackUsed(entry, restackedHeads);
+        const pair = stacks.pairs.find(pair => pair.top === entry.pr);
+        // Launched, not succeeded: the pair keeps owing the restack until the top contains the bottom's head, so a
+        // launched agent that exits without pushing is retried (bounded by the round cap), and a live one is held off by its claim.
+        recordRestackAttempt(pair, entry.restack);
+        restackMemoryChanged = true;
+      }
+      if (entry.overlapExempt && !entry.restack) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
     } catch (e) {
       refusals.push({ pr: entry.pr, kind: 'dispatch-failed', why: describeDispatchFailure(e) });
     }
   }
 
+  if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
   return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 
@@ -1729,7 +1825,7 @@ export function planFixDispatchClaimStatus({
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
-  assertMainNotStale(root, checkStaleness);
+  assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
@@ -1879,6 +1975,7 @@ export function resolveScopeOverlapMaxWaitMinutes(env = process.env) {
 }
 
 // Card xd1tvd0 — one exempt stale-base rebase per PR head, remembered for the life of this process.
+const restackedHeads = new Set();
 const exemptRebaseHeads = new Set();
 /** The live exemption: the `rebaseExempt` setting, read per call, with this process's per-head memory. */
 export const defaultRebaseExempt = (entry) => rebaseOverlapExemption(entry, { on: resolveNetScopeSettings().rebaseExempt, used: exemptRebaseHeads });
@@ -1888,6 +1985,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   // Card xd1tvd0 — a stale-base rebase edits none of the PR's files: it is admitted past every overlap and blocks nobody.
   // `null` = no exemption (the behaviour before the card).
   rebaseExempt = defaultRebaseExempt,
+  stackAbove = new Map(),
 } = {}) {
   const accepted = [];
   const refusals = [];
@@ -1918,6 +2016,8 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
   const orderedRanks = queue.map((entry, index) => ({ ...rankByPr.get(entry.pr), rank: index + 1 }));
   const ordinal = (n) => `${n}${n % 100 >= 11 && n % 100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th')}`;
   for (const entry of queue) {
+    if (entry.overlapExempt) { accepted.push(entry); continue; }
+    const above = stackAbove.get(entry.pr) ?? new Set();
     const exemption = rebaseExempt ? rebaseExempt(entry) : null;
     if (exemption?.exempt) { accepted.push({ ...entry, overlapExempt: exemption.why }); continue; }
     const inFlight = [
@@ -1925,9 +2025,9 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
         .filter((c) => !(entry.itemNum != null && String(c.meta?.num) === String(entry.itemNum)))
         .map((c) => ({ id: `build #${c.meta?.num}`, scope: c.meta?.scope })),
       ...fixClaims
-        .filter((c) => c.meta?.pr !== entry.pr)
+        .filter((c) => c.meta?.pr !== entry.pr && !above.has(Number(c.meta?.pr)))
         .map((c) => ({ id: `fix PR #${c.meta?.pr}`, scope: c.meta?.scope })),
-      ...picked,
+      ...picked.filter(c => !above.has(c.pr)),
     ];
     let blockers = urgentPrs.has(entry.pr) ? [] : inFlight.filter((c) => overlapsInFlight(scopeFor(entry), [c]));
     // #3881 — aging override: past the bound, only a fix ACCEPTED earlier in this same pass still blocks.
@@ -1939,7 +2039,7 @@ export function filterFixesByInFlightScope(planned, buildClaims = [], fixClaims 
     // Even a blocked waiter retains its place: a lower-ranked PR must not bypass it
     // through a second file in its scope. Deduplicate claims for the same fixer.
     const ahead = [...new Set(blockers.map((c) => c.id))];
-    picked.push({ id: `fix PR #${entry.pr}`, scope: scopeFor(entry) });
+    picked.push({ pr: entry.pr, id: `fix PR #${entry.pr}`, scope: scopeFor(entry) });
     if (hit) {
       refusals.push({
         pr: entry.pr, kind: 'scope-overlap',
