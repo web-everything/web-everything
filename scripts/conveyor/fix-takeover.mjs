@@ -11,9 +11,11 @@
  *   - the setting is `person`.
  *
  * Settings (policy cascade, like `we:scripts/lib/red-main-hold.mjs`): env > `we:scripts/settings/fix.json` >
- * built-in. `roundCapAction` person|takeover (built-in takeover), `roundHistory` on|off (built-in on),
- * `takeoverMaxPerPr` (built-in 1), and (card xrbu1bp, `we:scripts/conveyor/fix-resume.mjs`) `resumeAcrossRounds`
- * on|off (built-in on) and `strongerModelFromRound` (built-in 3, 0 = off).
+ * built-in. `fix.roundCapAction` person|takeover (built-in takeover), `fix.roundHistory` on|off (built-in on),
+ * `fix.takeoverMaxPerPr` (built-in 1; 0 turns the takeover off), and (card xrbu1bp, `we:scripts/conveyor/fix-resume.mjs`)
+ * `fix.resumeAcrossRounds` on|off (built-in on) and `fix.strongerModelFromRound` (built-in 3, 0 = off). The file keeps
+ * them under a `fix` object, so the merged settings view (`we:scripts/lib/settings-files.mjs`) carries the same
+ * `fix.*` paths the docs name.
  *
  * The planner half ({@link planTakeover}) is PURE; the marker post and the settings read are the only IO.
  */
@@ -35,11 +37,13 @@ const ONOFF = ['on', 'off'];
 
 /**
  * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, `WE_FIX_TAKEOVER_MAX_PER_PR`) > settings file > built-in.
- * Unknown values fall through to the next layer. Never throws.
+ * The file layer is its `fix` object (a flat top-level key is not a setting). Unknown values fall through to the
+ * next layer, except the takeover limit, which fails closed to 0 (see below). Never throws.
  */
 export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
   let fromFile = {};
-  try { fromFile = JSON.parse(read(file)) ?? {}; } catch { fromFile = {}; }
+  try { fromFile = JSON.parse(read(file))?.fix ?? {}; } catch { fromFile = {}; }
+  if (!fromFile || typeof fromFile !== 'object') fromFile = {};
   const pick = (envVal, fileVal, ok, dflt) => {
     const e = String(envVal ?? '').trim().toLowerCase();
     if (ok(e)) return { value: e, source: 'env' };
@@ -49,7 +53,15 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   };
   const action = pick(env.WE_FIX_ROUND_CAP_ACTION, fromFile.roundCapAction, (v) => ACTIONS.includes(v), FIX_SETTINGS_DEFAULTS.roundCapAction);
   const history = pick(env.WE_FIX_ROUND_HISTORY, fromFile.roundHistory, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.roundHistory);
-  const max = pick(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr));
+  // The takeover limit fails CLOSED: a value that is present but not a 0-99 count (`-1`, `off`, `100`) turns the
+  // takeover off (0) instead of falling through to the built-in 1, so a typo never silently enables a takeover.
+  const present = (v) => String(v ?? '').trim() !== '';
+  const maxOk = (v) => /^\d{1,2}$/.test(v);
+  const max = present(env.WE_FIX_TAKEOVER_MAX_PER_PR) && !maxOk(String(env.WE_FIX_TAKEOVER_MAX_PER_PR).trim())
+    ? { value: '0', source: 'env-invalid' }
+    : !present(env.WE_FIX_TAKEOVER_MAX_PER_PR) && present(fromFile.takeoverMaxPerPr) && !maxOk(String(fromFile.takeoverMaxPerPr).trim())
+      ? { value: '0', source: 'settings-invalid' }
+      : pick(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, maxOk, String(FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr));
   // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
   const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
   const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
@@ -72,6 +84,13 @@ export const FIX_TAKEOVER_VOID_MARKER = '<!-- conveyor-fix-takeover-void';
 const markerHead = (body, prefix) => {
   const m = body.trimStart().match(new RegExp(`^${prefix} head=([0-9a-f]{7,40}|unknown)`));
   return m ? (m[1] === 'unknown' ? null : m[1]) : undefined; // undefined = not this kind of marker
+};
+
+/** The fix-round count the takeover launched at (`attempts=N` in the start marker's first line), or null when the
+ *  marker carries none or a malformed one. Anchored like {@link markerHead}: only the header line counts. */
+const markerAttempts = (body) => {
+  const m = body.trimStart().match(/^<!-- conveyor-fix-takeover head=(?:[0-9a-f]{7,40}|unknown) attempts=(\d{1,6}) -->/);
+  return m ? Number(m[1]) : null;
 };
 
 /**
@@ -107,7 +126,7 @@ export function takeoverVoidCount(comments) {
 export function takeoverMarkers(comments) {
   const trusted = trustedBodies(comments);
   const starts = trusted
-    .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null }))
+    .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null, attempts: markerAttempts(c.body) }))
     .filter((m) => m.head !== undefined);
   const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined)
     .slice(0, TAKEOVER_MAX_VOIDS);
@@ -117,6 +136,19 @@ export function takeoverMarkers(comments) {
     if (at) starts.splice(at.i, 1);
   }
   return starts;
+}
+
+/**
+ * The highest attempt count a REVIEW may still be owed at: every takeover that actually started is a round beyond the
+ * cap, so its own re-arm (launch count + 1) is reviewed like the last ordinary fix. Measured from the count the takeover
+ * LAUNCHED at, not from the cap: the planner takes over at `attempts >= cap`, and the count can already be above the cap
+ * then. A marker with no launch count (older shape) falls back to one extra round per started takeover. Reads
+ * {@link takeoverMarkers}, so only trusted, un-voided markers grant anything. Only the fix path's own cap refusal stays
+ * at `roundCap`: another fixer is never dispatched past it.
+ */
+export function takeoverReviewCap(comments, roundCap) {
+  const started = takeoverMarkers(comments);
+  return started.reduce((cap, m) => Math.max(cap, Number.isInteger(m.attempts) ? m.attempts + 1 : 0), roundCap + started.length);
 }
 
 /** Two shas are the same head when one is a prefix of the other (a marker may carry an abbreviated sha). */
@@ -142,15 +174,20 @@ export function takeoverRung(fixerLadder) {
 
 /**
  * PURE: is a takeover owed instead of the round-cap note? `{ ok: true, rung, route }` or `{ ok: false, reason }`.
- * Reasons: `setting-person`, `ruling-dispute`, `takeover-spent` (a takeover already ran for this PR/head).
+ * Reasons: `setting-person`, `setting-disabled` (`takeoverMaxPerPr` is 0, or not a number: no takeover ever runs),
+ * `ruling-dispute`, `takeover-spent` (a takeover already ran for this PR/head), `takeover-void-limit`.
  */
 export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr = 1, fixerLadder } = {}) {
   if (roundCapAction !== 'takeover') return { ok: false, reason: 'setting-person' };
+  // Checked before the markers: with a budget of 0 nothing ran, so "spent" would tell the operator a takeover ran.
+  // A value that is not a number fails closed (no takeover) rather than comparing as NaN (always false = take over).
+  const max = takeoverMaxPerPr === null || takeoverMaxPerPr === '' ? Number.NaN : Number(takeoverMaxPerPr);
+  if (!Number.isFinite(max) || max <= 0) return { ok: false, reason: 'setting-disabled' };
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const markers = takeoverMarkers(pr?.comments);
   const head = pr?.headRefOid ?? null;
   const sameHead = markers.some((m) => sameHeadSha(m.head, head));
-  if (sameHead || markers.length >= Math.max(0, takeoverMaxPerPr)) {
+  if (sameHead || markers.length >= max) {
     // `takeover-void-limit`: launch faults used up the void allowance, so the last start marker stands. Whether that
     // last one ran is not knowable from the thread, so the note says only that faults were recorded.
     const voidLimit = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
@@ -161,7 +198,10 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr =
 
 /** The durable marker comment, posted before the takeover session starts (the one-per-PR/head bound). */
 export function takeoverMarkerBody({ pr, head, attempts, cap, rung }) {
-  return `${FIX_TAKEOVER_MARKER} head=${head ?? 'unknown'} -->\n`
+  // `attempts=N` is the count the takeover launched at: its own re-arm lands at N+1, and that is what the review
+  // allowance is measured from (a takeover can start above the cap when several counts ran ahead of the rearm count).
+  const launchCount = Number.isSafeInteger(attempts) && attempts >= 0 ? ` attempts=${attempts}` : '';
+  return `${FIX_TAKEOVER_MARKER} head=${head ?? 'unknown'}${launchCount} -->\n`
     + `🛟 conveyor fix takeover — PR #${pr} spent its fix rounds (${attempts}/${cap})\n\n`
     + `One takeover session was dispatched on head \`${String(head ?? '').slice(0, 9)}\` with the full round history, `
     + `on the \`${rung?.id ?? 'resend'}\` route${rung?.model ? ` (${rung.model})` : ''}. If it does not clear this PR, `
