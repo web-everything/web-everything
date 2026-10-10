@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
+  judgeBottomLanded, readBottomLanded, readOffMainSets, stackBaseTree, stackNetFiles, stackNetDiffText,
   containedCommit, findStackBases, resolveStackAwareReview, renderStackMarker, stackHoldHeading,
   parseStackMarkers, decideStackDispatch, fingerprintOf, readStackBases, mainNetDiffText,
 } from '../review-stack-base.mjs';
@@ -145,6 +150,7 @@ describe('stack accept markers', () => {
 });
 
 describe('decideStackDispatch', () => {
+  const LANDED = { ok: true };
   const decide = (over = {}) => decideStackDispatch({ pr: 4631, stack: STACK, comments: [comment()], ...over });
   it('reviews when there is no marker', () => {
     expect(decide({ comments: [] })).toEqual({ action: 'review' });
@@ -157,7 +163,17 @@ describe('decideStackDispatch', () => {
     expect(decide({ stackFingerprint: DIFFERENT }).action).toBe('review');
   });
   it('carries an accept when the collapsed stack has the same main diff', () => {
-    expect(decide({ stack: null, mainFingerprint: FINGERPRINT }).action).toBe('carry');
+    expect(decide({ stack: null, mainFingerprint: FINGERPRINT, bottomLanded: LANDED }).action).toBe('carry');
+  });
+  it.each([
+    ['no bottom verdict at all (unverified is never assumed fine)', undefined],
+    ['a null verdict', null],
+    ['a bottom that moved after the accept', { ok: false, why: '#4624 moved after the accept' }],
+  ])('reviews, with a reason, instead of carrying on an identical own diff when there is %s', (_name, bottomLanded) => {
+    const d = decide({ stack: null, mainFingerprint: FINGERPRINT, bottomLanded });
+    expect(d.action).toBe('review');
+    expect(d.why).toContain('stack-carry-refused');
+    if (bottomLanded?.why) expect(d.why).toContain(bottomLanded.why);
   });
   it('reviews when the collapsed stack has a different main diff', () => {
     expect(decide({ stack: null, mainFingerprint: DIFFERENT }).action).toBe('review');
@@ -174,11 +190,11 @@ describe('decideStackDispatch', () => {
     });
     it('a fresh hold after the verdict is live again', () => {
       const comments = [comment(), verdict('🔁 review — changes requested\n\nx'), comment()];
-      expect(decide({ stack: null, comments, mainFingerprint: FINGERPRINT }).action).toBe('carry');
+      expect(decide({ stack: null, comments, mainFingerprint: FINGERPRINT, bottomLanded: LANDED }).action).toBe('carry');
     });
     it('an untrusted verdict-looking comment does not consume it', () => {
       const comments = [comment(), { viewerDidAuthor: false, author: { login: 'mallory' }, body: '🔁 review — changes requested' }];
-      expect(decide({ stack: null, comments, mainFingerprint: FINGERPRINT }).action).toBe('carry');
+      expect(decide({ stack: null, comments, mainFingerprint: FINGERPRINT, bottomLanded: LANDED }).action).toBe('carry');
     });
   });
   it('ignores markers for another PR', () => {
@@ -229,13 +245,14 @@ describe('review-pr stack basis and recording', () => {
 
 describe('checkStackBeforeReview', () => {
   // Every IO seam is injected. Call records also prove the skipped paths do no carry work.
-  const probe = ({ base = STACK, comments = [], carryOk = true, ...over } = {}) => {
-    const calls = { stack: [], thread: [], stackText: [], mainText: [], carry: [], log: [] };
+  const probe = ({ base = STACK, comments = [], carryOk = true, bottomLanded = { ok: true }, ...over } = {}) => {
+    const calls = { stack: [], thread: [], stackText: [], mainText: [], bottom: [], carry: [], log: [] };
     const out = checkStackBeforeReview({ pr: 4631, repo: REPO, env: { WE_STACK_AWARE_REVIEW: 'on' },
       readStack: n => { calls.stack.push(n); return base; },
       readThread: n => { calls.thread.push(n); return { comments, headRefName: 'lane/accept-carry-forward', headRefOid: TOP }; },
       stackText: b => { calls.stackText.push(b); return DIFF; },
       mainText: ref => { calls.mainText.push(ref); return { scored: true, text: DIFF }; },
+      readBottom: m => { calls.bottom.push(m); return bottomLanded; },
       carry: (n, decision) => { calls.carry.push([n, decision]); return { ok: carryOk }; },
       log: line => calls.log.push(line), ...over,
     });
@@ -264,6 +281,26 @@ describe('checkStackBeforeReview', () => {
     expect(calls.carry).toEqual([[4631, expect.objectContaining({
       action: 'carry', head: TOP, fingerprint: FINGERPRINT, marker: expect.objectContaining({ fingerprint: FINGERPRINT }) })]]);
   });
+  it('reads the landed bottom from the marker, only on the path that would carry', () => {
+    expect(probe({ base: null, comments: [comment()] }).calls.bottom).toEqual([expect.objectContaining({ bottom: 4624, contained: CONTAINED })]);
+    expect(probe({ comments: [comment()] }).calls.bottom).toEqual([]); // still stacked: held, nothing landed yet
+    expect(probe({ base: null, comments: [comment()], mainText: () => ({ scored: true, text: DIFF.replace('+new', '+x') }) }).calls.bottom).toEqual([]);
+  });
+  it.each([
+    ['the bottom moved after the accept', { ok: false, why: '#4624 moved after the accept' }],
+    ['the bottom landing could not be verified', { ok: false }],
+    ['the bottom read returned nothing', null],
+  ])('never carries when %s, even though the top\'s own diff is byte-identical', (_name, bottomLanded) => {
+    const { out, calls } = probe({ base: null, comments: [comment()], bottomLanded });
+    expect(out).toEqual({ base: null });
+    expect(calls.carry).toEqual([]);
+    expect(calls.log.join('\n')).toContain('stack-carry-refused');
+  });
+  it('never carries when reading the bottom throws', () => {
+    const { out, calls } = probe({ base: null, comments: [comment()], readBottom: () => { throw new Error('gh down'); } });
+    expect(out).toEqual({ base: null });
+    expect(calls.carry).toEqual([]);
+  });
   it('never compares or carries without a full pinned head sha', () => {
     const { out, calls } = probe({ base: null, comments: [comment()],
       readThread: () => ({ comments: [comment()], headRefName: 'lane/accept-carry-forward', headRefOid: 'abc123' }) });
@@ -287,7 +324,7 @@ describe('checkStackBeforeReview', () => {
   ])('does no reads when %s', (_name, opts) => {
     const { out, calls } = probe(opts);
     expect(out).toEqual({ base: null });
-    expect(calls).toEqual({ stack: [], thread: [], stackText: [], mainText: [], carry: [], log: [] });
+    expect(calls).toEqual({ stack: [], thread: [], stackText: [], mainText: [], bottom: [], carry: [], log: [] });
   });
   it('dispatchReviewByMode returns the injected skip before dispatching a job', () => {
     const calls = [];
@@ -411,5 +448,254 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
   it('findStackBases applies the ownership rule by default', () => {
     expect(findStackBases(rows().map((r) => ({ ...r, author: r.pr === 4631 ? 'someone-else' : r.author })), sets())).toEqual(new Map());
     expect(findStackBases(rows().map(({ author: _a, ...r }) => r), sets())).toEqual(new Map());
+  });
+});
+
+// ── real git graphs ──────────────────────────────────────────────────────────────────────────────────────────────
+// Every fixture above answers git with a canned tree. These build an actual repository, so a regression in the
+// merge-base choice or the merge-tree arguments shows up as wrong diff CONTENT. The repository is isolated from the
+// host's git config and hooks (the single-branch hook would otherwise fire inside the test).
+
+const makeRepo = () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stack-base-git-'));
+  const env = { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@example.test', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@example.test',
+    GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z', GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z' };
+  const run = (args, opts = {}) => String(execFileSync('git', ['-C', dir, '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', ...args],
+    { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'], ...opts }));
+  const sha = (rev) => run(['rev-parse', rev]).trim();
+  const write = (file, text) => writeFileSync(join(dir, file), text);
+  const commit = (msg, files) => { for (const [f, t] of Object.entries(files)) write(f, t); run(['add', '-A']); run(['commit', '-q', '-m', msg]); return sha('HEAD'); };
+  run(['init', '-q', '-b', 'main']);
+  return { dir, run, sha, commit, write, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+};
+const LINES = (...xs) => `${xs.join('\n')}\n`;
+
+describe('the synthetic stack base on a real git graph', () => {
+  // main and the bottom advance independently AFTER the top merged an OLDER bottom commit, and the top's own change
+  // touches a file the bottom also touched (shared.txt, a different region).
+  const build = () => {
+    const g = makeRepo();
+    const m0 = g.commit('m0', { 'shared.txt': LINES('s1', 's2', 's3', 's4', 's5', 's6', 's7', 's8'), 'bottom.txt': LINES('b0'), 'top.txt': LINES('t0'), 'other.txt': LINES('o0') });
+    g.run(['checkout', '-q', '-b', 'bottom']);
+    const b1 = g.commit('bottom 1', { 'bottom.txt': LINES('b0', 'b1'), 'shared.txt': LINES('s1', 'B1', 's3', 's4', 's5', 's6', 's7', 's8') });
+    g.run(['checkout', '-q', '-b', 'top', m0]);
+    g.run(['merge', '-q', '--no-ff', '-m', 'merge bottom 1', b1]);
+    const t1 = g.commit('top own', { 'top.txt': LINES('t0', 'T1'), 'shared.txt': LINES('s1', 'B1', 's3', 's4', 's5', 's6', 's7', 'T8') });
+    g.run(['checkout', '-q', 'bottom']);
+    const b2 = g.commit('bottom 2', { 'bottom.txt': LINES('b0', 'b1', 'b2') });
+    g.run(['checkout', '-q', 'main']);
+    const m1 = g.commit('main 1', { 'other.txt': LINES('o0', 'o1') });
+    return { g, m0, b1, b2, m1, top: t1 };
+  };
+
+  it('keeps every top-owned change and drops inherited and main-only changes, from the OLDER merged bottom commit', () => {
+    const { g, b1, b2, top } = build();
+    try {
+      const sets = readOffMainSets([top, b2], { root: g.dir, run: g.run, base: 'main' });
+      expect(containedCommit(sets, b2, top)).toBe(b1); // the top holds b1, not the bottom's newer head b2
+      const tree = stackBaseTree({ contained: b1, topHead: top, root: g.dir, run: g.run, base: 'main' });
+      expect(tree).toMatch(/^[0-9a-f]{40}$/);
+      expect(stackNetFiles({ tree, topHead: top, root: g.dir, run: g.run }).sort()).toEqual(['shared.txt', 'top.txt']);
+      const text = stackNetDiffText({ tree, topHead: top, root: g.dir, run: g.run });
+      expect(text).toContain('+T1');
+      expect(text).toContain('+T8');
+      expect(text).toContain('-s8');
+      expect(text).not.toContain('b1');         // the bottom's change (bottom.txt) is inherited, not the top's
+      expect(text).not.toContain('B1');         // ... including the bottom's edit inside the shared file
+      expect(text).not.toContain('o1');         // ... and main's own advance since the top forked
+      expect(text).not.toContain('b2');
+    } finally { g.cleanup(); }
+  });
+
+  it('is the bottom commit the top HOLDS that makes the base: a base built from the bottom\'s newer head would leak it', () => {
+    // Pins the argument choice: with the bottom's head instead of the held commit, bottom.txt appears as a top change.
+    const { g, b2, top } = build();
+    try {
+      const wrong = stackBaseTree({ contained: b2, topHead: top, root: g.dir, run: g.run, base: 'main' });
+      expect(stackNetFiles({ tree: wrong, topHead: top, root: g.dir, run: g.run })).toContain('bottom.txt');
+    } finally { g.cleanup(); }
+  });
+
+  it('fails open (null) when git cannot build the base (an unknown commit)', () => {
+    const g = makeRepo();
+    try {
+      g.commit('m0', { 'f.txt': LINES('x') });
+      const top = g.commit('t1', { 'f.txt': LINES('top') });
+      expect(stackBaseTree({ contained: '0'.repeat(40), topHead: top, root: g.dir, run: g.run, base: 'main' })).toBeNull();
+    } finally { g.cleanup(); }
+  });
+});
+
+describe('judgeBottomLanded — the carry needs the bottom that was accepted against', () => {
+  const M = { bottom: 4624, contained: CONTAINED };
+  const MC = 'a'.repeat(40);
+  const NEW_HEAD = 'b'.repeat(40);
+  const facts = (over = {}) => ({ onMain: () => true, isAncestor: () => true, intact: () => true, sameTree: () => false, ownPatch: () => null, ...over });
+  const judge = (bottom, f = facts()) => judgeBottomLanded({ marker: M, bottom, facts: f });
+  const landed = (over = {}) => ({ state: 'MERGED', headRefOid: CONTAINED, mergeOid: MC, ...over });
+
+  it('accepts a bottom that landed exactly as reviewed', () => {
+    expect(judge(landed())).toEqual({ ok: true });
+  });
+  it('accepts a rebased bottom with the same tree, or the same own patch', () => {
+    expect(judge(landed({ headRefOid: NEW_HEAD }), facts({ sameTree: () => true }))).toEqual({ ok: true });
+    expect(judge(landed({ headRefOid: NEW_HEAD }), facts({ ownPatch: () => 'p'.repeat(64) }))).toEqual({ ok: true });
+  });
+  it('refuses a bottom that gained a commit after the accept (even though the reviewed commit is its ancestor)', () => {
+    const v = judge(landed({ headRefOid: NEW_HEAD }), facts({ ownPatch: (sha) => (sha === NEW_HEAD ? 'n'.repeat(64) : 'o'.repeat(64)) }));
+    expect(v.ok).toBe(false);
+    expect(v.why).toContain('moved after the accept');
+  });
+  it.each([
+    ['a bottom that is still open', landed({ state: 'OPEN', mergeOid: undefined }), facts()],
+    ['a bottom closed without merging', landed({ state: 'CLOSED', mergeOid: undefined }), facts()],
+    ['no bottom record', null, facts()],
+    ['a missing merge commit', landed({ mergeOid: undefined }), facts()],
+    ['a non-sha final head', landed({ headRefOid: 'abc' }), facts()],
+    ['a merge commit that is not on main', landed(), facts({ onMain: () => false })],
+    ['a squash/rebase landing (head not in the merge commit)', landed(), facts({ isAncestor: () => false })],
+    ['a bottom reverted or changed on main after it landed', landed(), facts({ intact: () => false })],
+    ['an intactness check that throws', landed(), facts({ intact: () => { throw new Error('x'); } })],
+    ['a git fact that throws', landed({ headRefOid: NEW_HEAD }), facts({ sameTree: () => { throw new Error('x'); }, ownPatch: () => null })],
+    ['an empty own patch on both sides', landed({ headRefOid: NEW_HEAD }), facts({ ownPatch: () => null })],
+  ])('refuses %s', (_name, bottom, f) => {
+    expect(judge(bottom, f).ok).toBe(false);
+  });
+  it('refuses a marker whose reviewed commit is not a sha', () => {
+    expect(judgeBottomLanded({ marker: { bottom: 4624, contained: 'zz' }, bottom: landed(), facts: facts() }).ok).toBe(false);
+  });
+});
+
+describe('readBottomLanded on a real git graph — the reviewer\'s case: the bottom moves, the top\'s own diff does not', () => {
+  const build = () => {
+    const g = makeRepo();
+    const m0 = g.commit('m0', { 'bottom.txt': LINES('b0'), 'top.txt': LINES('t0'), 'other.txt': LINES('o0') });
+    g.run(['checkout', '-q', '-b', 'bottom']);
+    const b1 = g.commit('bottom 1', { 'bottom.txt': LINES('b0', 'b1') });
+    g.run(['checkout', '-q', '-b', 'top', m0]);
+    g.run(['merge', '-q', '--no-ff', '-m', 'merge bottom 1', b1]);
+    const t1 = g.commit('top own', { 'top.txt': LINES('t0', 'T1') });
+    g.run(['checkout', '-q', 'main']);
+    return { g, m0, b1, top: t1 };
+  };
+  const marker = (b1) => ({ bottom: 4624, contained: b1 });
+  const land = (g, branch) => { g.run(['merge', '-q', '--no-ff', '-m', `merge ${branch}`, branch]); return g.sha('HEAD'); };
+  const read = (g, b1, bottom) => readBottomLanded({ marker: marker(b1), repo: REPO, root: g.dir, run: g.run, base: 'main', readBottom: () => bottom });
+
+  it('carries when the bottom landed as reviewed', () => {
+    const { g, b1 } = build();
+    try {
+      const mc = land(g, 'bottom');
+      expect(read(g, b1, { state: 'MERGED', headRefOid: b1, mergeOid: mc })).toEqual({ ok: true });
+    } finally { g.cleanup(); }
+  });
+
+  it('REFUSES when the bottom gained a commit after the accept, and checkStackBeforeReview then never carries', () => {
+    const { g, b1, top } = build();
+    try {
+      g.run(['checkout', '-q', 'bottom']);
+      const b2 = g.commit('bottom 2 (after the accept)', { 'bottom.txt': LINES('b0', 'b1', 'b2') });
+      g.run(['checkout', '-q', 'main']);
+      const mc = land(g, 'bottom');
+      const bottom = { state: 'MERGED', headRefOid: b2, mergeOid: mc };
+      const verdict = read(g, b1, bottom);
+      expect(verdict.ok).toBe(false);
+      expect(verdict.why).toContain('moved after the accept');
+      // The top's own diff is untouched by the bottom's move: only the bottom check stands between it and a carry.
+      const topOwn = g.run(['diff', '--no-ext-diff', `${mc}`, top]);
+      expect(topOwn).toContain('T1');
+      const calls = [];
+      const body = holdBody({ contained: b1 });
+      const out = checkStackBeforeReview({ pr: 4631, repo: REPO, env: { WE_STACK_AWARE_REVIEW: 'on' },
+        readStack: () => null,
+        readThread: () => ({ comments: [{ viewerDidAuthor: true, body }], headRefName: 'lane/accept-carry-forward', headRefOid: top }),
+        mainText: () => ({ scored: true, text: DIFF }),
+        readBottom: (m) => readBottomLanded({ marker: m, repo: REPO, root: g.dir, run: g.run, base: 'main', readBottom: () => bottom }),
+        carry: () => { calls.push('carry'); return { ok: true }; }, log: () => {} });
+      expect(out).toEqual({ base: null });
+      expect(calls).toEqual([]);
+    } finally { g.cleanup(); }
+  });
+
+  it('refuses when the bottom landed as reviewed and was REVERTED on main afterwards (the top\'s own diff is unchanged)', () => {
+    const { g, b1 } = build();
+    try {
+      const mc = land(g, 'bottom');
+      expect(read(g, b1, { state: 'MERGED', headRefOid: b1, mergeOid: mc })).toEqual({ ok: true });
+      g.run(['revert', '--no-edit', '-m', '1', mc]);
+      const v = read(g, b1, { state: 'MERGED', headRefOid: b1, mergeOid: mc });
+      expect(v.ok).toBe(false);
+      expect(v.why).toContain('reverted or changed since landing');
+    } finally { g.cleanup(); }
+  });
+
+  it('refuses when a later commit on main changed the bottom\'s files', () => {
+    const { g, b1 } = build();
+    try {
+      const mc = land(g, 'bottom');
+      g.commit('someone edits the bottom\'s file', { 'bottom.txt': LINES('b0', 'b1', 'later') });
+      expect(read(g, b1, { state: 'MERGED', headRefOid: b1, mergeOid: mc }).ok).toBe(false);
+    } finally { g.cleanup(); }
+  });
+
+  it('carries when the bottom was rebased onto a moved main with the same change', () => {
+    const { g, b1 } = build();
+    try {
+      const m1 = g.commit('main advances', { 'other.txt': LINES('o0', 'o1') });
+      g.run(['checkout', '-q', '-b', 'bottom-rebased', m1]);
+      g.run(['cherry-pick', b1]);
+      const rebased = g.sha('HEAD');
+      expect(rebased).not.toBe(b1);
+      g.run(['checkout', '-q', 'main']);
+      const mc = land(g, 'bottom-rebased');
+      expect(read(g, b1, { state: 'MERGED', headRefOid: rebased, mergeOid: mc })).toEqual({ ok: true });
+    } finally { g.cleanup(); }
+  });
+
+  it('refuses a rebased bottom whose change differs from the reviewed one', () => {
+    const { g, b1 } = build();
+    try {
+      const m1 = g.commit('main advances', { 'other.txt': LINES('o0', 'o1') });
+      g.run(['checkout', '-q', '-b', 'bottom-rebased', m1]);
+      const changed = g.commit('bottom, different', { 'bottom.txt': LINES('b0', 'DIFFERENT') });
+      g.run(['checkout', '-q', 'main']);
+      const mc = land(g, 'bottom-rebased');
+      expect(read(g, b1, { state: 'MERGED', headRefOid: changed, mergeOid: mc }).ok).toBe(false);
+    } finally { g.cleanup(); }
+  });
+
+  it('refuses a squash landing with different content (the head is not in the merge commit)', () => {
+    const { g, b1 } = build();
+    try {
+      g.run(['checkout', '-q', 'bottom']);
+      const b2 = g.commit('bottom 2', { 'bottom.txt': LINES('b0', 'b1', 'b2') });
+      g.run(['checkout', '-q', 'main']);
+      const squash = g.commit('squash of #4624 (different content)', { 'bottom.txt': LINES('b0', 'b1', 'SQUASHED') });
+      const v = read(g, b1, { state: 'MERGED', headRefOid: b2, mergeOid: squash });
+      expect(v.ok).toBe(false);
+      expect(v.why).toContain('squash/rebase');
+    } finally { g.cleanup(); }
+  });
+
+  it('refuses when the merge commit is not on main, and when the bottom is not merged', () => {
+    const { g, b1 } = build();
+    try {
+      g.run(['checkout', '-q', '-b', 'side', 'main']);
+      const mc = land(g, 'bottom');
+      g.run(['checkout', '-q', 'main']);
+      expect(read(g, b1, { state: 'MERGED', headRefOid: b1, mergeOid: mc }).why).toContain('not on main');
+      expect(read(g, b1, { state: 'OPEN', headRefOid: b1 }).ok).toBe(false);
+    } finally { g.cleanup(); }
+  });
+
+  it('refuses (and does not throw) when the bottom cannot be read, or the marker names no PR', () => {
+    const { g, b1 } = build();
+    try {
+      const boom = readBottomLanded({ marker: marker(b1), repo: REPO, root: g.dir, run: g.run, base: 'main', readBottom: () => { throw new Error('gh: HTTP 502'); } });
+      expect(boom.ok).toBe(false);
+      expect(boom.why).toContain('could not be read');
+      expect(readBottomLanded({ marker: { bottom: 'x; rm', contained: b1 }, repo: REPO, root: g.dir, run: g.run, readBottom: () => { throw new Error('unreachable'); } }).ok).toBe(false);
+    } finally { g.cleanup(); }
   });
 });

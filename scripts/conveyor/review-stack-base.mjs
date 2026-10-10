@@ -190,12 +190,16 @@ export function liveStackMarkers(comments) {
  * What the review dispatcher owes this PR. PURE.
  *   - `held`   the PR is still a stacked top and its own diff (vs the stack base) matches an accepted marker:
  *              nothing to review until the bottom lands.
- *   - `carry`  the PR is no longer stacked and its net diff vs main is byte-identical to an accepted marker's: carry
+ *   - `carry`  the PR is no longer stacked, its net diff vs main is byte-identical to an accepted marker's, AND the
+ *              bottom that landed is the content the accept was reviewed against ({@link judgeBottomLanded}): carry
  *              the accept forward through the single home instead of re-reviewing.
- *   - `review` anything else (no marker, a changed diff, an unreadable fingerprint): review as usual.
- * @param {{pr:number, stack:object|null, comments:Array, stackFingerprint?:string|null, mainFingerprint?:string|null}} o
+ *   - `review` anything else (no marker, a changed diff, an unreadable fingerprint, a bottom that moved or whose landing
+ *              could not be verified — an absent `bottomLanded` is unverified, never assumed fine): review as usual.
+ *              The top's own diff alone cannot vouch for the COMBINED result: it stays identical when the bottom changes.
+ * @param {{pr:number, stack:object|null, comments:Array, stackFingerprint?:string|null, mainFingerprint?:string|null,
+ *   bottomLanded?:{ok:boolean, why?:string}|null}} o
  */
-export function decideStackDispatch({ pr, stack, comments, stackFingerprint = null, mainFingerprint = null }) {
+export function decideStackDispatch({ pr, stack, comments, stackFingerprint = null, mainFingerprint = null, bottomLanded = null }) {
   const markers = liveStackMarkers(comments).filter((m) => m.top === Number(pr));
   const latest = markers.at(-1);
   if (!latest) return { action: 'review' };
@@ -208,10 +212,53 @@ export function decideStackDispatch({ pr, stack, comments, stackFingerprint = nu
     return { action: 'review', marker: latest };
   }
   if (mainFingerprint && mainFingerprint === latest.fingerprint) {
+    if (bottomLanded?.ok !== true) {
+      return { action: 'review', marker: latest,
+        why: `stack-carry-refused: ${bottomLanded?.why ?? `the landing of #${latest.bottom} was not verified`}` };
+    }
     return { action: 'carry', marker: latest,
       why: `stack-accept-carried: #${latest.bottom} is no longer below #${pr} and its net diff vs main is byte-identical to the diff accepted against ${latest.bottomRef}@${String(latest.contained).slice(0, 9)}` };
   }
   return { action: 'review', marker: latest };
+}
+
+/**
+ * Did the bottom land as the content the top's accept was reviewed against? PURE over git facts the caller supplies.
+ *
+ * The carry compares only the TOP's own diff, and that stays byte-identical when the bottom changes after the accept
+ * (the top's own change is the same text either way). The result the accept vouched for is bottom + top, so before a
+ * carry the landed bottom must be that same bottom. FAIL CLOSED: every unknown is "not verified" → a normal review.
+ *   1. the bottom PR is MERGED, and its merge commit is on main;
+ *   2. that merge commit holds the bottom's final head (a merge commit; a squash/rebase landing is not provable here);
+ *   3. the final head is what the accept saw: the same commit, the same tree, or the same OWN patch (the bottom's own
+ *      change against main as it stood just before the merge — survives a rebase onto a moved main).
+ * A bottom that gained a commit since the accept is NOT carried, even though the accept's `contained` is an ancestor of
+ * it: the added commit is exactly what nobody reviewed with the top.
+ * @param {{marker:{bottom:number, contained:string}, bottom:{state?:string, headRefOid?:string, mergeOid?:string}|null,
+ *   facts:{onMain:Function, isAncestor:Function, sameTree:Function, ownPatch:Function}}} o
+ * @returns {{ok:boolean, why?:string}}
+ */
+export function judgeBottomLanded({ marker, bottom, facts }) {
+  const no = (why) => ({ ok: false, why });
+  const n = marker?.bottom;
+  const ask = (f, ...a) => { try { return facts?.[f]?.(...a); } catch { return null; } };
+  if (!bottom || bottom.state !== 'MERGED') return no(`#${n} is not merged (state ${bottom?.state ?? 'unknown'}), so what landed is unknown`);
+  const head = String(bottom.headRefOid ?? '');
+  const mc = String(bottom.mergeOid ?? '');
+  if (!SHA.test(head) || !SHA.test(mc) || !SHA.test(String(marker?.contained ?? ''))) return no(`#${n}'s final head or merge commit is unknown`);
+  if (ask('onMain', mc) !== true) return no(`#${n}'s merge commit ${mc.slice(0, 9)} is not on main`);
+  if (ask('isAncestor', head, mc) !== true) return no(`#${n} did not land as a merge of its head ${head.slice(0, 9)} (squash/rebase), so the landed content is unproven`);
+  // Landed is not the same as STILL there: a revert after the landing leaves the top's own diff (and the merge commit
+  // on main) untouched while main no longer holds the bottom. Its paths must still read as the merge left them.
+  if (ask('intact', head, mc) !== true) return no(`#${n}'s files differ on main from how its merge ${mc.slice(0, 9)} left them (reverted or changed since landing)`);
+  const reviewed = marker.contained;
+  if (head !== reviewed && ask('sameTree', head, reviewed) !== true) {
+    const landed = ask('ownPatch', head, mc);
+    if (!landed || landed !== ask('ownPatch', reviewed, mc)) {
+      return no(`#${n} moved after the accept: it landed at ${head.slice(0, 9)}, the accept was reviewed against ${reviewed.slice(0, 9)}`);
+    }
+  }
+  return { ok: true };
 }
 
 // ── io shell ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -287,6 +334,54 @@ export function readStackThread(n, { repo, root = ROOT, readComments = readCompl
 
 /** The diff fingerprint `review-set-label.mjs` stamps (`normalizeDiffFingerprint`), or null. */
 export const fingerprintOf = (text) => normalizeDiffFingerprint(String(text ?? ''));
+
+/**
+ * Read what landed for the marker's bottom PR and judge it ({@link judgeBottomLanded}). FAILS CLOSED: any failed read
+ * is `{ok:false}`, which {@link decideStackDispatch} turns into a normal review. The PR number comes from the trusted
+ * marker (an integer, checked here again before it reaches a ref name). A merged bottom's branch is usually deleted,
+ * so its commits are fetched through GitHub's own `refs/pull/<n>/head`.
+ */
+export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root), base = 'origin/main',
+  readBottom = (n) => {
+    const j = JSON.parse(String(execFileSync('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'state,headRefOid,mergeCommit'],
+      { cwd: root, encoding: 'utf8', timeout: 60e3, maxBuffer: 4 * 1024 * 1024 })));
+    return { state: j?.state, headRefOid: j?.headRefOid, mergeOid: j?.mergeCommit?.oid };
+  } } = {}) {
+  try {
+    const n = marker?.bottom;
+    if (!Number.isInteger(n) || n <= 0) return { ok: false, why: 'the marker names no valid bottom PR' };
+    const bottom = readBottom(n);
+    const have = (sha) => { try { run(['cat-file', '-e', `${sha}^{commit}`]); return true; } catch { return false; } };
+    const fetchRef = (ref) => { try { run(['fetch', '-q', '--end-of-options', 'origin', ref]); } catch { /* left unknown */ } };
+    if (SHA.test(String(bottom?.mergeOid ?? '')) && !have(bottom.mergeOid)) fetchRef('main');
+    if ([bottom?.headRefOid, marker.contained].some((s) => SHA.test(String(s ?? '')) && !have(s))) fetchRef(`refs/pull/${n}/head`);
+    const ok = (args) => { try { run(args); return true; } catch { return false; } };
+    const out = (args) => { try { return run(args).trim(); } catch { return ''; } };
+    const facts = {
+      onMain: (sha) => ok(['merge-base', '--is-ancestor', '--end-of-options', sha, base]),
+      isAncestor: (a, b) => ok(['merge-base', '--is-ancestor', '--end-of-options', a, b]),
+      // `rev-parse` echoes `--end-of-options` back into its output, so these two take no guard: both operands are
+      // 40-hex shas (checked in judgeBottomLanded) and `--verify` accepts exactly one revision.
+      sameTree: (a, b) => { const ta = out(['rev-parse', '--verify', `${a}^{tree}`]); return SHA.test(ta) && ta === out(['rev-parse', '--verify', `${b}^{tree}`]); },
+      // Every path the bottom changed reads on `base` as the merge commit left it (no revert, no later edit).
+      intact: (head, mc) => {
+        const parent = out(['rev-parse', '--verify', `${mc}^1`]);
+        const fork = SHA.test(parent) ? out(['merge-base', '--end-of-options', head, parent]) : '';
+        if (!SHA.test(fork)) return false;
+        const paths = run(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', fork, head]).split('\0').filter(Boolean);
+        return paths.length > 0 && ok(['diff', '--quiet', '--no-ext-diff', '--end-of-options', mc, base, '--', ...paths]);
+      },
+      // The bottom's OWN change as the merge saw it: its head against its fork point from the merge commit's first parent.
+      ownPatch: (sha, mc) => {
+        const parent = out(['rev-parse', '--verify', `${mc}^1`]);
+        const fork = SHA.test(parent) ? out(['merge-base', '--end-of-options', sha, parent]) : '';
+        const text = SHA.test(fork) ? run(['diff', '--no-ext-diff', '--end-of-options', fork, sha]) : '';
+        return text.trim() ? fingerprintOf(text) : null;
+      },
+    };
+    return judgeBottomLanded({ marker, bottom, facts });
+  } catch (e) { return { ok: false, why: `the landing of #${marker?.bottom} could not be read (${String(e?.message ?? e).split('\n')[0].slice(0, 120)})` }; }
+}
 
 /**
  * Resolve every stacked top among the open PRs, end to end. Fails open to an empty Map.

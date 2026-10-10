@@ -96,7 +96,7 @@ import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { extraSeatsEnabled, redTeamEnabled, resolveSeatTimeoutMs } from './review-extra-seats.mjs';
 import { redTeamRequired } from '../lib/jury-core.mjs';
-import { decideStackDispatch, fingerprintOf, mainNetDiffText, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
+import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -648,6 +648,7 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
   readThread = (n) => readStackThread(n, { repo, root }),
   stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
   mainText = (pin) => mainNetDiffText(pin, { root }),
+  readBottom = (marker) => readBottomLanded({ marker, repo, root }),
   carry = (n, decision) => carryStackAccept({ pr: n, repo, root, env, decision }),
   log = (line) => writeLineSync(2, line) } = {}) {
   if (!resolveStackAwareReview(env) || repoKeyForSlug(repo) !== 'we') return { base: null };
@@ -665,7 +666,15 @@ export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = proce
     // below is bound to that same commit and fingerprint.
     try { const net = mainText({ headRefName: thread.headRefName, headRefOid: thread.headRefOid }); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
   }
-  const decision = decideStackDispatch({ pr, stack: base, comments, stackFingerprint, mainFingerprint });
+  // The bottom is read only for a PR that would otherwise carry (collapsed stack, identical own diff): a bottom that
+  // moved after the accept must be reviewed again, whatever the top's own diff says.
+  let bottomLanded = null;
+  const latest = liveStackMarkers(comments).filter((m) => m.top === Number(pr)).at(-1);
+  if (!base && latest && mainFingerprint && mainFingerprint === latest.fingerprint) {
+    try { bottomLanded = readBottom(latest); } catch (e) { bottomLanded = { ok: false, why: `the landing could not be read (${String(e?.message ?? e).slice(0, 120)})` }; }
+  }
+  const decision = decideStackDispatch({ pr, stack: base, comments, stackFingerprint, mainFingerprint, bottomLanded });
+  if (decision.action === 'review' && decision.why) log(`review-job: ${repo}#${pr} ${decision.why} — reviewing as usual`);
   if (decision.action === 'held') return { base, skipped: decision.why };
   if (decision.action === 'carry') {
     const done = carry(pr, { ...decision, head: thread.headRefOid, fingerprint: mainFingerprint });
