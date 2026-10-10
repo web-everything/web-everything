@@ -191,6 +191,45 @@ describe('createVerifyGateJobs — the daemon side over a real job store', () =>
     expect(inFlight.has(INPUT.dir)).toBe(false);
   });
 
+  it('a probe that throws (ps timeout) neither aborts the sync nor kills: the lane is held and the failure still reported', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 999, handle: 'h:999:s' }));
+    writeFileSync(resultPath(dir, q.id), JSON.stringify({ outcome: 'failed', message: 'x' }));
+    const kill = vi.fn();
+    const failures = [];
+    const inFlight = new Map();
+    const jobs = mk({ kill, probe: () => { throw new Error('ps timed out'); }, onSettled: (f) => failures.push(f) });
+    await expect(jobs.sync(inFlight)).resolves.toMatchObject({ live: 1 });
+    expect(inFlight.has(INPUT.dir)).toBe(true); // unknown liveness holds the lane (fail closed)
+    expect(kill).not.toHaveBeenCalled(); // ...but never signals a pid it cannot prove is still the gate
+    expect(failures).toHaveLength(1);
+  });
+
+  it('a dead handle is probed once, not on every later tick', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 999, handle: 'h:999:s' }));
+    writeFileSync(resultPath(dir, q.id), JSON.stringify({ outcome: 'green' }));
+    const probe = vi.fn(() => 'dead');
+    const jobs = mk({ probe });
+    await jobs.sync(new Map());
+    await jobs.sync(new Map());
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('a corrupt sidecar pid (handle says 999, field says 1) never reaches the registry, so a supersede cannot kill(-1)', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 1, handle: 'h:999:s' }));
+    writeFileSync(resultPath(dir, q.id), JSON.stringify({ outcome: 'green' }));
+    const kill = vi.fn();
+    const inFlight = new Map();
+    await mk({ kill }).sync(inFlight);
+    expect(kill).not.toHaveBeenCalled();
+    expect(inFlight.get(INPUT.dir)?.pid ?? null).toBeNull();
+  });
+
   it('a green/red verdict is not a failure; a job the runtime failed (supervisor died twice) is', async () => {
     const green = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
     store.update(green.id, (r) => markSucceeded(r, { at: AT }));

@@ -25,7 +25,7 @@
  *   2. JOB CHILD — {@link runGateStep}: re-checks that the marker is still this request, kills a previous attempt's
  *      gate if one survived, runs the gate, writes `<id>.result`.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readGit } from '../lib/proc-read.mjs';
@@ -75,7 +75,12 @@ export function verifyJobsDir(env = process.env) {
 }
 
 const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
-const writeJson = (path, value) => writeFileSync(path, `${JSON.stringify(value)}\n`);
+// Write-then-rename: a crash mid-write must not leave a truncated sidecar that reads back as "no gate".
+const writeJson = (path, value) => {
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(value)}\n`);
+  renameSync(tmp, path);
+};
 export const gatePath = (dir, id) => join(dir, `${id}${GATE_SUFFIX}`);
 export const resultPath = (dir, id) => join(dir, `${id}${RESULT_SUFFIX}`);
 
@@ -125,10 +130,16 @@ export function liveGate(dir, id, { probe = probeHandle } = {}) {
  * `kill(-1)` or a kill of an unrelated group. Returns whether a kill was attempted.
  */
 export function killGateGroup(gate, kill = process.kill.bind(process)) {
-  const pid = parseJobHandle(gate?.handle)?.pid;
-  if (!Number.isInteger(pid) || pid <= 1 || pid !== gate.pid) return false;
+  const pid = gatePid(gate);
+  if (!pid) return false;
   try { kill(-pid, 'SIGKILL'); } catch {}
   return true;
+}
+
+/** The recorded gate's pid when it is trustworthy (parsed from the handle, agrees with the `pid` field, > 1); else null. */
+export function gatePid(gate) {
+  const pid = parseJobHandle(gate?.handle)?.pid;
+  return Number.isInteger(pid) && pid > 1 && pid === gate.pid ? pid : null;
 }
 
 /**
@@ -148,6 +159,17 @@ export function createVerifyGateJobs({
   const snap = snapshot ?? { repoDir: cloneRoot, install: cloneNodeModulesInstaller(cloneRoot) };
   const startLogged = new Set();
   const survivorLogged = new Set();
+  const goneHandles = new Set(); // a dead handle never comes back (its start time is part of it): skip re-probing it each tick
+  /** A finished job's still-living gate: `{gate, state}` with state `alive`, or `unknown` when the probe threw; else null. */
+  const survivorOf = (id) => {
+    const gate = readJson(gatePath(store.dir, id));
+    if (!gate?.handle || goneHandles.has(gate.handle)) return null;
+    let state;
+    try { state = probe(gate.handle); } catch { return { gate, state: 'unknown' }; }
+    if (state === 'alive') return { gate, state };
+    if (state === 'dead') goneHandles.add(gate.handle);
+    return null;
+  };
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
   const consumedPath = join(store.dir, CONSUMED_FILE);
   const readConsumed = () => new Set(readJson(consumedPath) || []);
@@ -183,13 +205,14 @@ export function createVerifyGateJobs({
         if (!input.dir) continue;
         if (!TERMINAL_JOB_STATUSES.includes(r.job.status)) {
           live.add(r.id);
-          const { gate, alive } = liveGate(store.dir, r.id, { probe });
+          // A probe that throws (ps timeout) must not abort the whole sync: treat the gate as not yet seen this tick.
+          const { gate, alive } = liveGate(store.dir, r.id, { probe: (h) => { try { return probe(h); } catch { return 'unknown'; } } });
           const prev = inFlight.get(input.dir);
           if (prev && prev.jobId !== r.id && !prev.jobId) continue; // a legacy (adopted) run still owns this lane
           inFlight.set(input.dir, {
             pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
             suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
-            jobId: r.id, pid: alive ? gate.pid : null, startedMs: prev?.startedMs ?? queuedMs(r, now),
+            jobId: r.id, pid: alive ? gatePid(gate) : null, startedMs: prev?.startedMs ?? queuedMs(r, now),
             keptFor: prev?.keptFor,
           });
           if (gate?.gateStartedAt && alive && !startLogged.has(r.id)) {
@@ -201,20 +224,23 @@ export function createVerifyGateJobs({
         // A finished job's gate can outlive it (the supervisor refused to start a second gate beside a survivor, or died
         // for good with its gate running). The lane stays occupied until that gate is gone — otherwise the next dispatch
         // queues a fresh job with no gate sidecar and starts a second gate beside the survivor. Retry the kill each tick.
-        const survivor = liveGate(store.dir, r.id, { probe });
-        if (survivor.alive && survivor.gate?.pid > 0) {
+        const survivor = survivorOf(r.id);
+        if (survivor) {
+          live.add(r.id); // its sidecar must outlive the prune below even when another job's entry owns the lane
+          const pid = gatePid(survivor.gate);
+          // An unreadable process table (`unknown`) holds the lane but never kills: with no proof the handle is still
+          // this gate, a kill could hit a reused pid.
+          const killed = survivor.state === 'alive' && killGateGroup(survivor.gate, kill);
           if (!survivorLogged.has(r.id)) {
             survivorLogged.add(r.id);
-            log(`verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} is finished but its gate pid ${survivor.gate.pid} is still alive — lane held, killing it each tick`);
+            log(`verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} is finished but its gate pid ${survivor.gate.pid} may still be alive (${survivor.state}) — lane held${killed ? ', killing it each tick' : ', NOT killed (no trustworthy pid / unprobeable)'}`);
           }
-          killGateGroup(survivor.gate, kill);
           const prev = inFlight.get(input.dir);
           if (!prev || prev.jobId === r.id) {
-            live.add(r.id);
             inFlight.set(input.dir, {
               pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
               suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
-              jobId: r.id, pid: survivor.gate.pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
+              jobId: r.id, pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
             });
           }
         }

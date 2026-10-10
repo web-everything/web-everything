@@ -678,7 +678,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
         }
         if (!dryRun && process.env.VERIFY_DISPATCH_KILL_SUPERSEDED !== '0'
           && inFlightSuperseded(entry, marker, headSha, supersedePolicy)) {
-          try { if (entry.pid > 0) process.kill(-entry.pid, 'SIGKILL'); } catch {}
+          try { if (entry.pid > 1) process.kill(-entry.pid, 'SIGKILL'); } catch {}
           log(`  ✂ ${pool}/lane-${lane}: in-flight run ${String(entry.runId).slice(0, 8)} superseded by a newer request — killed`);
           superseded.push({ pool, lane, runId: entry.runId });
         }
