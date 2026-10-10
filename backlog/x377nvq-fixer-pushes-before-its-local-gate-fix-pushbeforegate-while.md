@@ -31,7 +31,7 @@ Operator go 2026-10-10: the harness pushes a fixer's marked commit to the PR bra
 1. **Untrusted text** — the record's repo/pr/ref are fixer-typed; the early push reuses the green push port, which binds them to the fix claim, the open PR's head ref and the lane pool.
 2. **Truncated reads** — an incomplete session listing defers the early push (logged), never pushes on a guess.
 3. **Shared state files** — the early-push attempt is persisted on the await record BEFORE the push, so a crash cannot repeat it unboundedly (transient retries capped at maxRetries).
-4. **Fail closed** — invalid setting values fall to the next layer and are logged; the drain refuses a merge when the claim store is unreadable.
+4. **Fail closed** — invalid setting values fall to the next layer and are logged; the drain refuses a merge when the claim store is unreadable (`attachLiveFixClaim` in we:scripts/merge-ai-prs.mjs; pinned by the test 'merge-site reread refuses an unreadable fix claim store', which injects a throwing claim reader).
 5. **Identity scoping** — the push names the record's session id, which must hold the fix claim on that exact branch.
 6. **State over time** — a re-mark writes a fresh record, so each new sha gets exactly one early push; a known red is never pushed early.
 7. **Who wrote it** — only the fix daemon pushes; the fixer never pushes the PR ref itself.

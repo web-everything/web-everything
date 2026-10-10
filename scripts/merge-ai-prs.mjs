@@ -704,6 +704,20 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
 }
 
 /**
+ * Attach the LIVE fix claim to a merge-site re-read (`data.fixClaim`), so `classifyPr` refuses a PR a fixer still
+ * holds. The reader is injected (production: `readLiveFixClaim`). An unreadable claim store fails CLOSED — a
+ * placeholder claim is attached so this merge is refused and the next pass re-reads — like draft promotion.
+ * A readable-but-unclaimed PR gets no `fixClaim`. Mutates and returns `data`.
+ */
+export function attachLiveFixClaim(data, { claimKey, readClaim }) {
+  try {
+    const claim = claimKey ? readClaim({ repo: claimKey, pr: data.number }) : null;
+    if (claim?.meta?.who) data.fixClaim = { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null };
+  } catch { data.fixClaim = { who: '(fix-claim store unreadable)' }; }
+  return data;
+}
+
+/**
  * Classify one PR into a merge/skip verdict. Pure — no gh calls. Returns
  *   { num, title, decision: 'merge'|'skip', reason, aiGenerated, certifyLabel, testGreen, state, mergeable }.
  * `decision === 'merge'` requires ALL of: producer-certified, required check green, mergeable, a landable
@@ -4110,13 +4124,7 @@ async function runCli() {
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
       if (!data || data.number == null) return null;
-      // The merge-site re-read carries the LIVE fix claim, so classifyPr refuses a PR a fixer still holds.
-      const claimKey = repoKeyForSlug(repo ?? localSlug);
-      // An unreadable claim store fails CLOSED (refuse this merge; the next pass re-reads), like draft promotion.
-      try {
-        const claim = claimKey ? readLiveFixClaim({ repo: claimKey, pr: data.number }) : null;
-        if (claim?.meta?.who) data.fixClaim = { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null };
-      } catch { data.fixClaim = { who: '(fix-claim store unreadable)' }; }
+      attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
       return await resolveChecks(repo, data);
     } catch { return null; }
   };

@@ -6,7 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { runAwaitVerifyPass, isEarlyPushOwed, buildAwaitVerifyResumePrompt, formatAwaitVerifyLines, AWAIT_VERIFY_LIMITS } from '../await-verify-pass.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
-import { classifyPr } from '../../merge-ai-prs.mjs';
+import { classifyPr, attachLiveFixClaim } from '../../merge-ai-prs.mjs';
 import { dispatchCiHeal } from '../../operations/ci-heal-pr-dispatch.mjs';
 
 const SHA = '65a382e81413952ab11e5448e36f01bb7ce4c332';
@@ -180,5 +180,24 @@ describe('the held claim blocks every dispatch on a red intermediate head', () =
     const { fixClaim, ...released } = green;
     expect(fixClaim).toBeTruthy();
     expect(classifyPr(released).decision).toBe('merge');
+  });
+  it('merge-site reread refuses an unreadable fix claim store', () => {
+    const green = () => { const { fixClaim, ...p } = redPr({ mergeStateStatus: 'CLEAN', labels: [{ name: 'review:accepted' }, { name: 'ready-to-merge' }],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] }); return { ...p, number: 4115 }; };
+    const throwing = () => { throw new Error('EACCES: lock store unreadable'); };
+    // unreadable store -> fail closed: the merge is refused, naming the placeholder holder
+    const unreadable = attachLiveFixClaim(green(), { claimKey: 'we', readClaim: throwing });
+    expect(unreadable.fixClaim).toMatchObject({ who: '(fix-claim store unreadable)' });
+    expect(classifyPr(unreadable)).toMatchObject({ decision: 'skip', reason: expect.stringMatching(/fix claim held by \(fix-claim store unreadable\)/) });
+    // controls: readable + claimed -> refused for the holder; readable + unclaimed -> merges
+    const seen = [];
+    const claimed = attachLiveFixClaim(green(), { claimKey: 'we', readClaim: (a) => { seen.push(a); return { meta: { who: 'fix-4115', claimedAt: 't' } }; } });
+    expect(seen).toEqual([{ repo: 'we', pr: 4115 }]);
+    expect(classifyPr(claimed)).toMatchObject({ decision: 'skip', reason: expect.stringMatching(/fix-4115/) });
+    const unclaimed = attachLiveFixClaim(green(), { claimKey: 'we', readClaim: () => null });
+    expect(unclaimed.fixClaim).toBeUndefined();
+    expect(classifyPr(unclaimed).decision).toBe('merge');
+    // no repo key (unknown slug): the reader is never called, nothing attached
+    expect(attachLiveFixClaim(green(), { claimKey: null, readClaim: throwing }).fixClaim).toBeUndefined();
   });
 });
