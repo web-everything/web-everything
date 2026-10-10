@@ -378,6 +378,20 @@ export function readOpenPrRefs(dir, { repo = CONSTELLATION_REPOS.we.slug, run = 
   } catch { /* unreadable: the PRs stay unverified */ }
   return refs;
 }
+// THE ONE TRUST RULE for taking part in a NEW stack, shared by the fix daemon (`readStacksForPass` below) and the
+// review side (`review-stack-base.mjs#readStackBases`). Rows the daemon itself PLANNED (`known` below) are its own
+// already-dispatched lane entries and keep their existing handling; every row read from GitHub goes through this rule.
+//   - a PR row's `fork` is `isCrossRepository !== false` of the GitHub record, and a PR with NO record at all is a fork
+//     (`stackRowFlags`): unknown means untrusted.
+//   - a row is `untrusted` when it is a fork, or its head is not the tip of the origin lane/* branch GitHub names for it.
+//   - a NEW stack needs both PRs by the same actor; an unreadable author forms no stack (`sameStackActor`).
+export const stackRowFlags = ref => ({
+  fork: ref ? ref.isCrossRepository !== false : true,
+  author: typeof ref?.author === 'string' && ref.author ? ref.author.toLowerCase() : null,
+});
+export const flagUntrustedStackRows = (rows, tips) => rows.map(p => ({ ...p,
+  untrusted: Boolean(p.fork) || !(p.headRefOid && p.headRefName && tips.get(p.headRefName) === p.headRefOid) }));
+export const sameStackActor = (top, bottom) => Boolean(top.author) && top.author === bottom.author;
 // Branch names come from GitHub and are only VERIFIED against origin's tips, never inferred from a sha.
 export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], settings,
   readRefs = readOpenPrRefs, isAncestor = gitIsAncestor(root), onMain = gitOnMain(root), readMem = readRemembered, writeMem = writeRemembered,
@@ -399,14 +413,12 @@ export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], se
       const known = prs.get(pr);
       prs.set(pr, known
         ? { ...known, author: ref?.author ?? null }
-        : { pr, headRefName: ref?.headRefName ?? null, headRefOid: ref?.headRefOid ?? null, fork: ref ? ref.isCrossRepository !== false : true, author: ref?.author ?? null });
+        : { pr, headRefName: ref?.headRefName ?? null, headRefOid: ref?.headRefOid ?? null, ...stackRowFlags(ref) });
     }
-    const flagged = [...prs.values()].map(p => ({ ...p,
-      untrusted: Boolean(p.fork) || !(p.headRefOid && p.headRefName && tips.get(p.headRefName) === p.headRefOid) }));
+    const flagged = flagUntrustedStackRows([...prs.values()], tips);
     // Ownership: a NEW stack needs both PRs by the same actor. Someone else's PR whose head merely sits inside (or under)
     // this one neither holds it nor gets the daemon pushing their commits into it. An unreadable author forms no stack.
-    const sameActor = (top, bottom) => Boolean(top.author) && top.author === bottom.author;
-    const stacks = detectStacks(flagged, { isAncestor, onMain, remembered: readMem(root), allowPair: sameActor, now });
+    const stacks = detectStacks(flagged, { isAncestor, onMain, remembered: readMem(root), allowPair: sameStackActor, now });
     writeMem(root, nextRemembered(stacks));
     if (stacks.truncated) console.warn(`pr-stack: detection was bounded (more than ${MAX_COMPARED_PRS} trusted PRs, or the git budget/deadline ran out) — PRs not compared this pass are treated as peers`);
     return stacks;

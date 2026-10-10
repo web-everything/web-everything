@@ -36,7 +36,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { detectStacks, readOriginLaneTips, readOpenPrRefs } from './pr-stack.mjs';
+import { detectStacks, readOriginLaneTips, readOpenPrRefs, flagUntrustedStackRows, sameStackActor, stackRowFlags } from './pr-stack.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
@@ -110,11 +110,13 @@ export function stackAnswers(sets) {
  * detector) with the widened containment answers.
  * @param {Array<{pr:number, headRefName:string|null, headRefOid:string|null, untrusted?:boolean}>} prs open PRs
  * @param {OffMainSets} sets
+ * @param {{allowPair?:Function}} [o] `allowPair` — the ownership rule for a pair; by default the SAME one the fix daemon
+ *   applies (`pr-stack.mjs#sameStackActor`: both PRs by the same, known actor), so a stack never forms between authors.
  * @returns {Map<number, {pr:number, ref:string, head:string, contained:string}>} top PR → its stack base
  */
-export function findStackBases(prs, sets) {
+export function findStackBases(prs, sets, { allowPair = sameStackActor } = {}) {
   const { isAncestor, onMain } = stackAnswers(sets);
-  const stacks = detectStacks(prs, { isAncestor, onMain, remembered: [] });
+  const stacks = detectStacks(prs, { isAncestor, onMain, remembered: [], allowPair });
   const out = new Map();
   for (const pair of stacks.pairs) {
     if (!pair.bottomOpen || !pair.bottomHead || !LANE_REF.test(String(pair.bottomRef ?? ''))) continue;
@@ -133,21 +135,55 @@ export function renderStackMarker({ top, topHead, bottom, bottomRef, bottomHead,
   return `<!-- ${STACK_MARKER}: ${JSON.stringify(payload)} -->`;
 }
 
-const MARKER_RE = new RegExp(`<!-- ${STACK_MARKER}: (\\{[^\\n]*?\\}) -->`, 'g');
+/** The opening of a stack-hold comment (`review-pr.mjs` writes it; the marker reader requires it). */
+export const stackHoldHeading = (bottom) => `**Accept held — stacked on #${bottom}.**`;
 
-/** Every well-formed `reviewed-stack` marker on TRUSTED comments, oldest first. PURE. */
+const MARKER_LINE_RE = new RegExp(`^<!-- ${STACK_MARKER}: (\\{[^\\n]*\\}) -->$`);
+
+/**
+ * Every well-formed `reviewed-stack` marker on TRUSTED stack-hold comments, oldest first. PURE.
+ *
+ * A marker drives a LABEL (the carry applies `review:accepted`), and the automation's own comments quote juror text, so
+ * "a marker appears somewhere in a trusted comment" proves nothing: a juror can be prompted to echo one, and the echo
+ * posts under the trusted identity. A marker counts only in the one shape the STACK_HOLD sink writes: the comment OPENS
+ * with {@link stackHoldHeading} for the marker's own bottom PR and the marker is its LAST line. The sink composes both
+ * ends itself, so juror text can reach neither (it sits between them; the sink also defuses any `<!--` in it).
+ * Anything else — a marker mid-comment, in a verdict write-up, on a comment that does not open with the heading — is
+ * ignored.
+ */
 export function parseStackMarkers(comments) {
   const out = [];
   for (const c of (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor)) {
-    for (const m of String(c?.body ?? '').matchAll(MARKER_RE)) {
-      try {
-        const p = JSON.parse(m[1]);
-        if (p?.v === 1 && p.verdict === 'accept' && Number.isInteger(p.top) && Number.isInteger(p.bottom)
-          && SHA.test(String(p.topHead)) && /^[0-9a-f]{64}$/.test(String(p.fingerprint))) out.push(p);
-      } catch { /* malformed: ignored */ }
-    }
+    const lines = String(c?.body ?? '').replace(/\r\n?/g, '\n').trim().split('\n');
+    const m = MARKER_LINE_RE.exec(lines.at(-1) ?? '');
+    if (!m || lines.length < 2) continue;
+    try {
+      const p = JSON.parse(m[1]);
+      if (p?.v === 1 && p.verdict === 'accept' && Number.isInteger(p.top) && Number.isInteger(p.bottom)
+        && SHA.test(String(p.topHead)) && SHA.test(String(p.bottomHead)) && SHA.test(String(p.contained))
+        && LANE_REF.test(String(p.bottomRef)) && /^[0-9a-f]{64}$/.test(String(p.fingerprint))
+        && lines[0].startsWith(`${stackHoldHeading(p.bottom)} `)) out.push(p);
+    } catch { /* malformed: ignored */ }
   }
   return out;
+}
+
+const VERDICT_HEADING_RE = /^(?:✅|🔁)\s+(?:human\s+)?review\b/u;
+
+/**
+ * The markers still in force: a `reviewed-stack` marker is CONSUMED by any later trusted verdict comment (`✅ review —
+ * accepted`, `🔁 review — changes requested`, including the carry's own comment). Without this, a carried accept that a
+ * later `changes` verdict (or re-arm) superseded would be carried again on the same diff, overwriting the newer verdict
+ * without a review. Oldest first. PURE.
+ */
+export function liveStackMarkers(comments) {
+  let live = [];
+  for (const c of (Array.isArray(comments) ? comments : []).filter(isTrustedMarkerAuthor)) {
+    const found = parseStackMarkers([c]);
+    if (found.length) live = live.concat(found);
+    else if (VERDICT_HEADING_RE.test(String(c?.body ?? '').trimStart())) live = [];
+  }
+  return live;
 }
 
 /**
@@ -160,7 +196,7 @@ export function parseStackMarkers(comments) {
  * @param {{pr:number, stack:object|null, comments:Array, stackFingerprint?:string|null, mainFingerprint?:string|null}} o
  */
 export function decideStackDispatch({ pr, stack, comments, stackFingerprint = null, mainFingerprint = null }) {
-  const markers = parseStackMarkers(comments).filter((m) => m.top === Number(pr));
+  const markers = liveStackMarkers(comments).filter((m) => m.top === Number(pr));
   const latest = markers.at(-1);
   if (!latest) return { action: 'review' };
   if (stack) {
@@ -225,12 +261,17 @@ export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root
 }
 
 /**
- * The PR's net diff TEXT vs main, through the SAME `computeNetDiffText` `review-set-label.mjs` fingerprints, so a
- * carry compares like with like.
+ * The net diff TEXT vs main of ONE COMMIT of the PR, through the SAME `computeNetDiffText` `review-set-label.mjs`
+ * fingerprints, so a carry compares like with like. The diff is taken from the pinned `headRefOid`, never from the
+ * branch name (a name moves on every push), and it is `scored` only when the diff really came from that commit: the
+ * carry that follows is bound to this exact head (`carryStackAccept` → `review-set-label.mjs --expect-head`).
+ * `headRefName` is used only to fetch the commit.
  */
-export function mainNetDiffText(ref, { root = ROOT } = {}) {
+export function mainNetDiffText({ headRefName, headRefOid }, { root = ROOT } = {}) {
+  if (!SHA.test(String(headRefOid ?? '')) || !LANE_REF.test(String(headRefName ?? ''))) return { text: '', base: null, rev: null, scored: false };
   const exec = (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
-  return computeNetDiffText({ exec, rev: ref, fetchExtraRefs: [ref] });
+  const net = computeNetDiffText({ exec, rev: headRefOid, fetchExtraRefs: [headRefName] });
+  return net?.scored && net.rev === headRefOid ? net : { text: '', base: null, rev: null, scored: false };
 }
 
 /**
@@ -261,14 +302,17 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
     if (!settingOn) return out;
     const tips = readLanes(root);
     if (!tips) return out;
-    const rows = Array.isArray(prs)
-      ? prs.map((p) => ({ pr: Number(p.number), headRefName: p.headRefName ?? null, headRefOid: p.headRefOid ?? null,
-        fork: p.isCrossRepository === true }))
-      : [...readRefs(root).entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid,
-        fork: r.isCrossRepository !== false }));
-    // Trust boundary (as `pr-stack.mjs#readStacksForPass`): a non-fork PR whose head is the origin lane branch's tip.
-    const trusted = rows.filter((r) => Number.isInteger(r.pr) && !r.fork && r.headRefOid && r.headRefName
-      && LANE_REF.test(r.headRefName) && tips.get(r.headRefName) === r.headRefOid);
+    // Trust boundary: the SAME rule as the fix daemon's `pr-stack.mjs#readStacksForPass` (shared helpers, not a copy).
+    // Fork status and AUTHOR always come from GitHub's own open-PR record, never from the caller's list (which may
+    // lack them): a PR with no record is a fork, and a pair needs one known actor on both sides (`sameStackActor`,
+    // applied by `findStackBases`). The caller's list only says which PRs, at which head, to look at.
+    const refs = readRefs(root);
+    const listed = Array.isArray(prs)
+      ? prs.map((p) => ({ pr: Number(p.number), headRefName: p.headRefName ?? null, headRefOid: p.headRefOid ?? null }))
+      : [...refs.entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid }));
+    const rows = listed.map((r) => ({ ...r, ...stackRowFlags(refs.get(r.pr)) }));
+    const trusted = flagUntrustedStackRows(rows, tips)
+      .filter((r) => Number.isInteger(r.pr) && !r.untrusted && LANE_REF.test(r.headRefName));
     const missing = trusted.filter((r) => { try { run(['cat-file', '-e', `${r.headRefOid}^{commit}`]); return false; } catch { return true; } });
     if (missing.length) {
       try { run(['fetch', '-q', '--end-of-options', 'origin', ...missing.map((r) => r.headRefName)]); } catch { /* left unknown */ }

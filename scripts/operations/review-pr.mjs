@@ -264,7 +264,7 @@ import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
 // `operator-queue.mjs` so nobody restates it.
 import { ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { isValidRoundBudget } from '../lib/review-settings.mjs';
-import { renderStackMarker } from '../conveyor/review-stack-base.mjs';
+import { renderStackMarker, stackHoldHeading } from '../conveyor/review-stack-base.mjs';
 
 /** The operation's stable id. Adapters resolve it by this name. */
 export const REVIEW_PR_OP = 'review-pr';
@@ -1851,7 +1851,8 @@ export function planRecordDecision(view) {
         top: pr, topHead: read.netBasis.rev, bottom: read.stackBase.pr, bottomRef: read.stackBase.ref,
         bottomHead: read.stackBase.head, contained: read.stackBase.contained, fingerprint: read.stackBase.fingerprint,
       }),
-      note: `**Accept held — stacked on #${read.stackBase.pr}.** Reviewed against #${read.stackBase.pr}'s head `
+      // The heading is the marker reader's anchor (`parseStackMarkers` requires it as the comment's first words).
+      note: `${stackHoldHeading(read.stackBase.pr)} Reviewed against #${read.stackBase.pr}'s head `
         + `(\`${read.stackBase.ref}\` @ ${read.stackBase.contained.slice(0, 12)}), so this covers only this PR's own change. `
         + `No \`review:accepted\` label while #${read.stackBase.pr} is open; once it lands and this PR is restacked, an `
         + 'identical net diff carries this accept forward without another review.',

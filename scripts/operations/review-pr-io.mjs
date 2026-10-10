@@ -1395,7 +1395,10 @@ export function createReviewPrSinks({
       const bodyPath = reviewBodyPath({ root, runId: ctx?.runId, bodyFile: payload.bodyFile });
       let staged = '';
       try { staged = readFileSync(bodyPath, 'utf8'); } catch { staged = ''; }
-      postComment(payload.repo, payload.pr, [String(payload.note), '', staged, '', String(payload.marker)].join('\n'));
+      // The staged write-up quotes juror text, which an attacker's diff can steer. Defuse every HTML-comment opener in it
+      // so it cannot carry a forged marker (or hide the real one); the note opens and the marker closes the comment, and
+      // `parseStackMarkers` reads only those two ends.
+      postComment(payload.repo, payload.pr, [String(payload.note), '', staged.replaceAll('<!--', '&lt;!--'), '', String(payload.marker)].join('\n'));
       out(`review-pr: ${payload.repo}#${payload.pr} accept held — stacked; recorded reviewed-stack, no label change`);
       return { posted: true, held: true };
     },
