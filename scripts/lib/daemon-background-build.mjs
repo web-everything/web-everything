@@ -33,6 +33,7 @@ import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 
 // ── settings ─────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -74,9 +75,13 @@ export function validateBackgroundBuildSettings(raw) {
   return out;
 }
 
-export function loadBackgroundBuildSettings(path = defaultBackgroundBuildSettingsPath()) {
-  try { return validateBackgroundBuildSettings(JSON.parse(readFileSync(path, 'utf8'))); }
-  catch { return validateBackgroundBuildSettings(null); }
+/** The file is the tool layer over the team's platform preference `daemonBackgroundBuild` (shared policy cascade,
+ *  we:scripts/lib/policy-cascade.mjs): a key the file leaves unset takes the platform value. */
+export function loadBackgroundBuildSettings(path = defaultBackgroundBuildSettingsPath(), { env = process.env } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(path, 'utf8')); } catch { tool = undefined; }
+  const c = cascadePolicy('daemonBackgroundBuild', tool, { env, standard: BUILT_IN_BACKGROUND_BUILD_SETTINGS });
+  return validateBackgroundBuildSettings(c.layered ?? null);
 }
 
 /**

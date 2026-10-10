@@ -106,7 +106,7 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
-import { takeoverMarkers } from './fix-takeover.mjs';
+import { takeoverReviewCap } from './fix-takeover.mjs';
 import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
@@ -1359,10 +1359,11 @@ function dispatchReviewRow({
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
   // count exceeds the cap: the last allowed fix is always owed its final review.
   const finalReview = attempts >= roundCap;
-  // Card xx0055i — a takeover is a round BEYOND the cap: its re-arm comment makes the count cap+1, and that last fix is
-  // owed its review exactly like the last ordinary one. One extra attempt per takeover that actually started (void
-  // markers are already cancelled by `takeoverMarkers`); the fix path still refuses another fixer past the cap.
-  const reviewCap = roundCap + takeoverMarkers(pr?.comments).length;
+  // Card xx0055i — a takeover is a round BEYOND the cap: its re-arm comment lands one past the count it launched at (cap+1
+  // when it launched at the cap, more when the count was already above it), and that last fix is owed its review exactly
+  // like the last ordinary one. `takeoverReviewCap` measures from the launch count each trusted, un-voided takeover marker
+  // records; the fix path still refuses another fixer past the cap.
+  const reviewCap = takeoverReviewCap(pr?.comments, roundCap);
   const finalWhy = finalReview
     ? ' — final review of the last allowed fix; if it returns changes the fix path escalates' : '';
   const findings = countFindings(pr?.comments);
@@ -1806,6 +1807,7 @@ export function planReconcile({
         text: takeover?.reason === 'takeover-not-converging'
           ? notConvergingText(prNumber, takeover)
           : roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
+            + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover budget — fix.takeoverBudget or env WE_FIX_TAKEOVER_BUDGET — is 0 or invalid)' : '')
             + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
             + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
             + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),

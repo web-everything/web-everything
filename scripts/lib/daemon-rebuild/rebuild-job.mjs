@@ -37,6 +37,7 @@ import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
 import { readGit } from '../proc-read.mjs';
+import { cascadePolicy } from '../policy-cascade.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -60,10 +61,14 @@ export const REBUILD_JOB_KIND = defineJobKind({
 });
 export const REBUILD_JOB_KINDS = kindRegistry([REBUILD_JOB_KIND]);
 
-/** The `rebuildAsJob` block of daemon-rebuild-settings.json (missing / unreadable = off). */
-export function loadRebuildAsJobSettings(path = SETTINGS_PATH) {
+/** The `rebuildAsJob` block of daemon-rebuild-settings.json (missing / unreadable = off), as the tool layer over the
+ *  team's platform preference `rebuildAsJob` (shared policy cascade, we:scripts/lib/policy-cascade.mjs). */
+export function loadRebuildAsJobSettings(path = SETTINGS_PATH, { env = process.env } = {}) {
   try {
-    const raw = JSON.parse(readFileSync(path, 'utf8'))?.rebuildAsJob;
+    let tool;
+    try { tool = JSON.parse(readFileSync(path, 'utf8'))?.rebuildAsJob; } catch { tool = undefined; }
+    const raw = cascadePolicy('rebuildAsJob', tool, { env,
+      standard: { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS } }).layered;
     if (!raw || typeof raw !== 'object') return { entries: [], minIntervalMs: DEFAULT_REBUILD_JOB_MIN_INTERVAL_MS };
     return {
       entries: Array.isArray(raw.entries) ? raw.entries.filter((e) => typeof e === 'string' && e) : [],

@@ -18,13 +18,23 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { rankByDeliveryPriority, resolvePrioritySettings } from '../lib/delivery-priority.mjs';
+import { cascadePolicy, platformPreference } from '../lib/policy-cascade.mjs';
+import { readSettings } from '../lib/settings-files.mjs';
 
 export const DELIVERY_PRIORITY_SETTINGS_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'delivery-priority-settings.json');
 export const PRIORITY_OVERRIDE_LABELS = Object.freeze({ 'priority:urgent': 'urgent', 'priority:low': 'low' });
 
-/** Declared settings, resolved; any read or parse failure gives the off value. */
-export function readDeliveryPrioritySettings({ path = DELIVERY_PRIORITY_SETTINGS_PATH, read = readFileSync } = {}) {
-  try { return resolvePrioritySettings(JSON.parse(String(read(path, 'utf8'))).deliveryPriority); } catch { return resolvePrioritySettings(undefined); }
+/** Declared settings, resolved through the shared policy cascade (we:scripts/lib/policy-cascade.mjs): this file is
+ *  the PLATFORM preference `deliveryPriority`; a `deliveryPriority` block in the declared settings is the tool
+ *  override. Any read or parse failure gives the off value. An explicit `path`/`read` (tests) reads only that file. */
+export function readDeliveryPrioritySettings({ path = DELIVERY_PRIORITY_SETTINGS_PATH, read = readFileSync, env = process.env, readTool = readSettings } = {}) {
+  try {
+    const explicit = path !== DELIVERY_PRIORITY_SETTINGS_PATH || read !== readFileSync;
+    const platform = explicit ? JSON.parse(String(read(path, 'utf8'))).deliveryPriority : platformPreference('deliveryPriority', { env });
+    let tool;
+    if (!explicit) { try { tool = readTool()?.deliveryPriority; } catch { tool = undefined; } }
+    return resolvePrioritySettings(cascadePolicy('deliveryPriority', tool, { env, platform: platform ?? null }).layered);
+  } catch { return resolvePrioritySettings(undefined); }
 }
 
 /** The live main-red owner record `{repo, pr}`, or null (absent, unreadable, malformed, expired). */

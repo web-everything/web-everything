@@ -21,12 +21,14 @@
  *   merge-ai-prs.mjs, imports pr-facts (pinned by __tests__/pr-facts-merge-gate-isolation.test.mjs).
  *
  * SETTINGS (`drainFactsSource` in we:scripts/settings/drain-facts-source.json): `source: 'store-first' | 'github'`.
- *   Layers: built-in default (`store-first`) → the settings file → env `WE_DRAIN_FACTS_SOURCE` (tool override).
+ *   Layers (we:scripts/lib/policy-cascade.mjs): built-in default (`store-first`) → platform preference
+ *   `drainFactsSource` → the settings file → env `WE_DRAIN_FACTS_SOURCE`.
  *
  * EVIDENCE: every pass logs one `merge-ai-prs · facts-source: {...}` line ({@link formatFactsSourceLine}): per repo
  *   which source answered and why, and how many check reads the store served vs GitHub.
  */
 import { readDeclaredSettings } from './settings-files.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 
 export const DRAIN_FACTS_SOURCES = Object.freeze(['store-first', 'github']);
 export const DRAIN_FACTS_DEFAULTS = Object.freeze({ source: 'store-first' });
@@ -43,8 +45,11 @@ export function loadDrainFactsSettings({ file, env = process.env } = {}) {
     src = read.settings;
     errors.push(...read.errors.map((e) => `${e.source}: ${e.error}`));
   }
-  const s = { ...DRAIN_FACTS_DEFAULTS, ...(isObj(src?.drainFactsSource) ? src.drainFactsSource : {}) };
   const override = String(env?.[DRAIN_FACTS_SOURCE_ENV] ?? '').trim();
+  // Platform preference under the tool block (shared policy cascade; logs each value's source once).
+  const c = cascadePolicy('drainFactsSource', isObj(src?.drainFactsSource) ? src.drainFactsSource : undefined, {
+    env, standard: DRAIN_FACTS_DEFAULTS, envValues: { source: override || undefined } });
+  const s = { ...DRAIN_FACTS_DEFAULTS, ...(isObj(c.layered) ? c.layered : {}) };
   if (override) s.source = override;
   if (!DRAIN_FACTS_SOURCES.includes(s.source)) {
     errors.push(`drainFactsSource: source must be one of ${DRAIN_FACTS_SOURCES.join(', ')} (got ${JSON.stringify(s.source)}); using github`);

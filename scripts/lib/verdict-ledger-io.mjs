@@ -16,7 +16,17 @@
  *      carrying every attempt's error. It never returns a quiet failure value a caller could ignore.
  *
  * Reuses `we:scripts/lib/git-transport-branch.mjs` (worktree dance, explicit refspec); does not duplicate it.
+ *
+ * THE READ BUFFER IS SIZED TO THE BLOB (live 2026-10-10: the web-everything ledger passed 1 MiB, every `git show` hit
+ * the default `maxBuffer` with `spawnSync git ENOBUFS`, and the drain's ledger shadow read 491 of 493 PRs as
+ * unreadable). The default read now resolves the ledger file to its blob id, asks git for the blob's exact size,
+ * and reads that immutable blob with a buffer of size + headroom. A blob larger than the read cap is refused before
+ * it is read and reported `unreadable` (`ledger-exceeds-read-cap`), naming the cap and the layer that set it.
+ * The cap is a setting (cascade: standard default -> repo settings `verdictLedger.readMaxBytes` -> env
+ * `WE_VERDICT_LEDGER_READ_MAX_BYTES`); the effective value and its source are logged once per process.
  */
+import { execFileSync } from 'node:child_process';
+import { readSettings } from './settings-files.mjs';
 import {
   assertPushRef,
   readFromTransportBranch,
@@ -30,6 +40,74 @@ export const LEDGER_DIR = 'verdict-ledger';
 export const DEFAULT_APPEND_ATTEMPTS = 5;
 /** The ONLY ref the ledger push path may write (operator decision 2026-10-08): never main, never a lane, never a force. */
 export const LEDGER_PUSH_REF = `refs/heads/${LEDGER_TRANSPORT_BRANCH}`;
+
+/** Standard read cap: far above today's ledger (1.47 MB on 2026-10-10), low enough that a runaway file is refused. */
+export const DEFAULT_LEDGER_READ_MAX_BYTES = 64 * 1024 * 1024;
+export const LEDGER_READ_MAX_BYTES_ENV = 'WE_VERDICT_LEDGER_READ_MAX_BYTES';
+/** Extra buffer beyond the blob's exact size (git's own output is the blob bytes only; this is slack, not a guess). */
+export const LEDGER_READ_HEADROOM_BYTES = 64 * 1024;
+const READ_CAP_CODE = 'LEDGER_READ_CAP';
+
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const validCap = (v) => Number.isSafeInteger(v) && v > 0;
+
+/**
+ * PURE cascade for the ledger read cap. The highest layer that sets it VALIDLY wins; an invalid layer is ignored
+ * and listed in `invalid` (the layer below answers).
+ * @returns {{maxBytes: number, sources: {maxBytes: 'standard'|'repo'|'env'}, invalid: string[]}}
+ */
+export function resolveLedgerReadSettings({ repo, env } = {}) {
+  let maxBytes = DEFAULT_LEDGER_READ_MAX_BYTES;
+  let source = 'standard';
+  const invalid = [];
+  const repoLayer = isPlainObject(repo?.verdictLedger) ? repo.verdictLedger : null;
+  if (repoLayer && Object.hasOwn(repoLayer, 'readMaxBytes')) {
+    if (validCap(repoLayer.readMaxBytes)) { maxBytes = repoLayer.readMaxBytes; source = 'repo'; } else invalid.push('repo.verdictLedger.readMaxBytes');
+  }
+  const raw = isPlainObject(env) ? env[LEDGER_READ_MAX_BYTES_ENV] : undefined;
+  if (raw !== undefined && raw !== '') {
+    const n = /^\d+$/.test(String(raw).trim()) ? Number(String(raw).trim()) : NaN;
+    if (validCap(n)) { maxBytes = n; source = 'env'; } else invalid.push(`env.${LEDGER_READ_MAX_BYTES_ENV}`);
+  }
+  return { maxBytes, sources: { maxBytes: source }, invalid };
+}
+
+/** One log line naming the effective cap and the layer that set it. */
+export function formatLedgerReadSettings(s) {
+  const tail = s.invalid?.length ? `, ignored invalid: ${s.invalid.join(', ')}` : '';
+  return `verdict-ledger-io: read cap verdictLedger.readMaxBytes=${s.maxBytes} (${s.sources?.maxBytes ?? 'standard'})${tail}`;
+}
+
+function defaultExec(args, opts = {}) {
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...opts });
+}
+
+/**
+ * A `run` for `readFromTransportBranch` whose `show <rev>:<path>` reads the blob with a buffer sized to it.
+ * Resolves the path to an immutable blob id first, so the size and the bytes always describe the same object
+ * (a concurrent fetch moving the ref between the two calls cannot make the read overflow).
+ * THROWS (code `LEDGER_READ_CAP`) when the blob is larger than `maxBytes`; the reader reports that as unreadable.
+ * Every other git call passes straight through.
+ */
+export function sizedLedgerRun({ maxBytes = DEFAULT_LEDGER_READ_MAX_BYTES, source = 'standard', exec = defaultExec } = {}) {
+  return (args, opts = {}) => {
+    if (args[0] !== 'show' || args.length !== 2) return exec(args, opts);
+    const oid = String(exec(['rev-parse', '--verify', '--quiet', args[1]], opts)).trim();
+    if (!/^[0-9a-f]{4,64}$/i.test(oid)) throw new Error(`verdict-ledger-io: could not resolve ${args[1]} to a blob id`);
+    const sizeText = String(exec(['cat-file', '-s', oid], opts)).trim();
+    const size = /^\d+$/.test(sizeText) ? Number(sizeText) : NaN;
+    if (!Number.isSafeInteger(size)) throw new Error(`verdict-ledger-io: unreadable blob size ${JSON.stringify(sizeText.slice(0, 40))} for ${args[1]}`);
+    if (size > maxBytes) {
+      const e = new Error(`verdict-ledger-io: ledger blob ${args[1]} is ${size} bytes, which exceeds the read cap verdictLedger.readMaxBytes=${maxBytes} (${source})`);
+      e.code = READ_CAP_CODE;
+      throw e;
+    }
+    return exec(['cat-file', 'blob', oid], { ...opts, maxBuffer: size + LEDGER_READ_HEADROOM_BYTES });
+  };
+}
+
+const loggedCaps = new Set();
+const defaultLog = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* logging never fails a read */ } };
 
 /** Repo-relative path of one repo's ledger on the transport branch. Same slug rule as `verdictLedgerPath`. */
 export function ledgerGitPath(repo) {
@@ -53,13 +131,23 @@ export class LedgerAppendExhaustedError extends Error {
  *
  * @returns {{status: 'ok', records: object[], text: string} | {status: 'unreadable', reason: string, error: string}}
  */
-export function readLedgerFromGit({ board, repo, branch = LEDGER_TRANSPORT_BRANCH, run } = {}) {
+export function readLedgerFromGit({
+  board, repo, branch = LEDGER_TRANSPORT_BRANCH, run, exec, env = process.env, settings, log = defaultLog,
+} = {}) {
   const path = ledgerGitPath(repo);
   let files;
   try {
-    files = readFromTransportBranch({ board, branch, paths: [path], ...(run ? { run } : {}) });
+    // An injected `run` keeps full control (unit seams). The default sizes the blob read to the blob (see header).
+    if (!run) {
+      const cap = resolveLedgerReadSettings({ repo: settings ?? readSettings(), env });
+      const line = formatLedgerReadSettings(cap);
+      if (!loggedCaps.has(line)) { loggedCaps.add(line); log(line); }
+      run = sizedLedgerRun({ maxBytes: cap.maxBytes, source: cap.sources.maxBytes, ...(exec ? { exec } : {}) });
+    }
+    files = readFromTransportBranch({ board, branch, paths: [path], run });
   } catch (e) {
-    return { status: 'unreadable', reason: 'transport-read-failed', error: String(e?.message ?? e) };
+    const reason = e?.code === READ_CAP_CODE ? 'ledger-exceeds-read-cap' : 'transport-read-failed';
+    return { status: 'unreadable', reason, error: String(e?.message ?? e) };
   }
   const text = files[path] ?? '';
   return { status: 'ok', records: parseVerdictLog(text), text };
