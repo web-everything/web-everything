@@ -390,11 +390,22 @@ file (step 6) as ONE fenced block with the info string `class-sweep`, JSON insid
 ```
 ````
 
-Then run the check on that file. It prints one line and records the sweep for this session; paste the line into the
-evidence comment. In `warn` mode it never blocks; it tells you what is missing:
+**The same class anywhere in the PR (card 5536).** Reviewers keep raising the same class next round in ANOTHER file
+of this PR (#4624: round 1 swept the "manual freeze silently not honoured" class in `red-main-remediation.mjs`;
+round 3 found it again in `red-main-hold.mjs`, a file of the same PR no sweep row named). So, in the same pass, look
+for each finding's class in EVERY file this PR changes (`git diff --name-only origin/<base>...HEAD`), not only around
+the fixed site. Every changed file must be named by one of the finding's rows: the four paths above, or extra rows
+with `"path":"pr"` (`{"path":"pr","site":"scripts/lib/x.mjs","status":"checked","note":"no freeze read here"}`). A
+row's `site` may be a directory prefix ending in `/` (`scripts/lib/__tests__/`) to cover the files under it.
+`backlog/` cards are exempt. A same-class instance you find this way is fixed in this round, like any variant.
+
+Then run the check on that file, from your lane. It reads the PR's changed files from the lane, prints one line,
+and records the sweep for this session; paste the line into the evidence comment. `pr-unswept-<n>` means `n`
+changed files no row names (the list is in the record). In `warn` mode it never blocks; it tells you what is missing:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}}
+BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evidence-file> --kind=fix --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="$LANE" --base="origin/$BASE_REF"
 ```
 
 ### 4. Run the gate GREEN (the item's own locus gate)
