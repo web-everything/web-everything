@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { builderMetrics, ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parseTranscript, percentile, rateMetric, readBounded, runCoroner } from '../coroner-extract.mjs';
+import { builderMetrics, ciCheckName, collectInputs, extractMetrics, fetchCiRuns, fixOutcome, gateCause, parseMarkers, parsePlistXml, resolveDaemonLog, parseTranscript, percentile, rateMetric, readBounded, runCoroner } from '../coroner-extract.mjs';
 
 const since = '2026-10-05T17:00:00.000Z', until = '2026-10-05T18:00:00.000Z';
 const at = (minutes) => new Date(Date.parse(since) + minutes * 60000).toISOString();
@@ -485,3 +485,74 @@ describe('coroner error rates (reported first)', () => {
 });
 
 function run0(gh) { return runCoroner([`--since=${since}`, '--json', '--no-save'], { env, home: root, now: until, gh }); }
+
+describe('xi7nyx1 live daemon logs', () => {
+  const daemon = 'fix-dispatch-daemon';
+  const plist = (path) => {
+    env.WE_CORONER_LAUNCH_AGENTS = join(root, 'agents');
+    return write(join(env.WE_CORONER_LAUNCH_AGENTS, 'com.we.fix-dispatch-daemon.plist'),
+      `<?xml version="1.0"?><plist version="1.0"><dict><key>StandardOutPath</key><string>${path}</string></dict></plist>`);
+  };
+  const livePath = () => join(root, 'workspace/wev-fix-daemon/.conveyor/fix-dispatch-daemon.log');
+  it('[A1] reads the live plist log and its rotation instead of the dead shared log', () => {
+    const file = livePath(); plist(file);
+    write(join(env.WE_CORONER_DAEMON_DIR, daemon + '.log'), 'reconcile-refused fix-claimed PR #3990');
+    write(file, 'reconcile-refused fix-claimed PR #4600');
+    write(file + '.1', 'reconcile-refused fix-claimed PR #4601');
+    const { metrics } = run();
+    expect(metrics.refusalByPr).toEqual([{ pr: 4600, count: 1 }, { pr: 4601, count: 1 }]);
+    expect(metrics.sources[daemon + '.log']).toMatchObject({ path: file, via: 'plist', lastWriteAt: new Date(fs.statSync(file).mtimeMs).toISOString() });
+    expect(metrics.sources['review-daemon.log'].via).toBe('env');
+    expect(metrics.sources.warnings).toBeUndefined();
+  });
+  it.each(['/etc/passwd', '../outside.log'])('refuses an unsafe plist path %s', (path) => {
+    const file = plist(path);
+    expect(resolveDaemonLog(daemon, { env, home: root, io: fs })).toEqual({
+      file: join(env.WE_CORONER_DAEMON_DIR, daemon + '.log'), via: 'env',
+      warnings: [{ kind: 'plist-path-refused', daemon, file, path }],
+    });
+  });
+  it('falls back with a warning for garbage, missing keys and oversized plists', () => {
+    const file = plist(livePath());
+    for (const text of ['garbage', '<plist><dict/></plist>', ' '.repeat(65537)]) {
+      write(file, text);
+      expect(resolveDaemonLog(daemon, { env, home: root, io: fs })).toEqual({
+        file: join(env.WE_CORONER_DAEMON_DIR, daemon + '.log'), via: 'env',
+        warnings: [{ kind: 'plist-unreadable', daemon, file }],
+      });
+    }
+  });
+  it('[A2] reports the stale live source timestamp', () => {
+    const file = livePath(); plist(file); write(file, '');
+    fs.utimesSync(file, new Date('2026-10-01T00:00:00Z'), new Date('2026-10-01T00:00:00Z'));
+    expect(run().metrics.sources.warnings).toEqual([
+      { kind: 'stale-source', daemon, file, lastWriteAt: '2026-10-01T00:00:00.000Z' },
+    ]);
+  });
+  it('uses each registry clone and warns when its live log and rotation are missing', () => {
+    delete env.WE_CORONER_DAEMON_DIR;
+    const file = livePath();
+    expect(resolveDaemonLog(daemon, { env, home: root, io: fs })).toEqual({ file, via: 'registry', warnings: [] });
+    const { sources } = run().metrics;
+    expect(sources.warnings).toEqual([
+      { kind: 'no-live-source', daemon, file },
+      { kind: 'no-live-source', daemon: 'review-daemon', file: join(root, 'workspace/wev-review-daemon/.conveyor/review-daemon.log') },
+    ]);
+    write(file + '.1', 'reconcile-refused fix-claimed PR #4600');
+    expect(run().metrics.sources.warnings).not.toContainEqual({ kind: 'no-live-source', daemon, file });
+  });
+  it('parses entities and nested plist values without confusing top-level keys', () => {
+    expect(parsePlistXml(`<?xml version="1.0"?>
+      <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+      <plist version="1.0"><dict>
+      <key>nested</key><dict><key>StandardOutPath</key><string>wrong</string></dict>
+      <key>args</key><array><string>arg</string><dict><key>x</key><false/></dict></array>
+      <key>StandardOutPath</key><string>/a&amp;b&lt;c&gt;&quot;&apos;</string>
+      <key>count</key><integer>42</integer><key>enabled</key><true/>
+      </dict></plist>`)).toMatchObject({ StandardOutPath: "/a&b<c>\"'", count: 42, enabled: true });
+    for (const text of ['bplist00', 'garbage', '<plist><array/></plist>', '<plist><dict><key>x</key></dict></plist>',
+      '<plist><dict><key>x</key><string>bad</dict></plist>', '<plist><dict/></plist>junk']) {
+      expect(parsePlistXml(text)).toBeNull();
+    }
+  });
+});
