@@ -1,8 +1,15 @@
 /** @file The review-hold reconcile sweep (#x01u7az) — drops a stray review:pending beside a live review:human,
  *  and a stray advisory:* left behind once review:human is gone. No `gh`. */
-import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { needsReviewHoldCleanup, planReviewHoldCleanup, sweepReviewHoldLabels } from '../review-hold-reconcile.mjs';
+import { _resetAcceptCarryMemo } from '../accept-carry-sweep.mjs';
+
+// The REAL #4535 measurement (card xu7kxtt): a cleared-human accept on an older head, the merge queue moved the head, the drain re-parked.
+const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../lib/__tests__/fixtures/accept-carry-forward-4535.json'), 'utf8'));
 
 const pr = (number, names) => ({ number, labels: names.map((name) => ({ name })) });
 
@@ -294,5 +301,56 @@ describe('sweepReviewHoldLabels', () => {
     const p = provider();
     sweepReviewHoldLabels({ repo: null, provider: p, listPrs: () => [pr(1, ['review:human', 'review:pending'])] });
     expect(p.calls.currentRepo).toBe(1);
+  });
+
+  // Card xu7kxtt (#5472), PR #4631 round 5: the call from this sweep into `sweepAcceptCarry` was only exercised by tests that call
+  // `planAcceptCarry` / `sweepAcceptCarry` directly. Deleting the block, dropping `prs` / `repo`, or breaking the `acceptCarry` seam left
+  // every one of them green while the daemon silently stopped carrying an operator clearance past a mechanical review:human re-hold.
+  describe('accept carry-forward leg (card xu7kxtt)', () => {
+    const carryPr = () => ({
+      number: fx.pr, labels: fx.labelsAfterRepark.map((name) => ({ name })), headRefOid: fx.newHead, comments: fx.comments,
+    });
+    // The setting is read from env first; pin it so a host `WE_ACCEPT_CARRY_FORWARD=off` cannot silently skip the leg under test.
+    beforeEach(() => { vi.stubEnv('WE_ACCEPT_CARRY_FORWARD', 'on'); _resetAcceptCarryMemo(); });
+    afterEach(() => { vi.unstubAllEnvs(); _resetAcceptCarryMemo(); });
+
+    it('hands the listed #4535-shaped PR to the injected restamp runner and reports one carried entry', () => {
+      const calls = [];
+      const results = sweepReviewHoldLabels({
+        repo: fx.repo, provider: provider(), listPrs: () => [carryPr()],
+        acceptCarry: (c) => { calls.push(c); return { ok: true, detail: 'ok' }; },
+      });
+      // `repo` and the planned head / accepted head travel with the call: dropping any of them reddens this.
+      expect(calls).toEqual([{ repo: fx.repo, num: fx.pr, head: fx.newHead, from: fx.acceptedHead }]);
+      expect(results.filter((r) => r.carry)).toEqual([{ num: fx.pr, carry: 'carried', detail: 'ok' }]);
+    });
+
+    it('--dry-run reports would-try and never runs the restamp', () => {
+      const results = sweepReviewHoldLabels({
+        repo: fx.repo, provider: provider(), listPrs: () => [carryPr()], dryRun: true,
+        acceptCarry: () => { throw new Error('dry-run must not run the restamp'); },
+      });
+      expect(results.filter((r) => r.carry)).toEqual([
+        { num: fx.pr, carry: 'would-try', detail: `${fx.acceptedHead.slice(0, 9)} → ${fx.newHead.slice(0, 9)}` },
+      ]);
+    });
+
+    it('a restamp runner that throws is a retry entry for that PR — it does not fail the sweep or hide the PR', () => {
+      const results = sweepReviewHoldLabels({
+        repo: fx.repo, provider: provider(), listPrs: () => [carryPr()],
+        acceptCarry: () => { throw new Error('spawn blew up\nstack line'); },
+      });
+      expect(results.filter((r) => r.carry)).toEqual([{ num: fx.pr, carry: 'retry', detail: 'spawn blew up' }]);
+    });
+
+    it('a failure inside the carry leg itself becomes one sweep-failed entry and the later legs still run', () => {
+      const boom = { number: 9, labels: [{ name: 'review:human' }], headRefOid: fx.newHead, get comments() { throw new Error('comments unreadable\nstack line'); } };
+      const results = sweepReviewHoldLabels({
+        repo: fx.repo, provider: provider(), listPrs: () => [boom], acceptCarry: () => { throw new Error('unreachable'); },
+      });
+      expect(results.filter((r) => r.carry)).toEqual([{ num: 0, carry: 'sweep-failed', error: 'comments unreadable' }]);
+      // Containment: the sweep returned (did not throw) and a sibling leg's own failure entry is still reported after the carry one.
+      expect(results.some((r) => r.autoBlock || r.ruling)).toBe(true);
+    });
   });
 });
