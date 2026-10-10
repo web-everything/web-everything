@@ -1,0 +1,5 @@
+{
+  "$comment": "Platform preference (card x5wnfcg). redMainHold on|off: while main's CI is red the drain contains it (tool override env WE_DRAIN_RED_MAIN_HOLD). redMainMode stop|quarantine: stop = only the main-fix PR(s) land, others held red-main-hold; quarantine = known failing tests skipped via ops/quarantine and other PRs keep landing (OFF until its red-team review; tool override env WE_DRAIN_RED_MAIN_MODE). See scripts/lib/red-main-hold.mjs and scripts/lib/red-main-quarantine.mjs.",
+  "redMainHold": "on",
+  "redMainMode": "stop"
+}
