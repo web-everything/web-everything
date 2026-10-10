@@ -73,7 +73,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  * IMPURE, but every effect goes through an injected `io` so the whole arc is unit-tested with fakes.
  */
 
-import { spawn, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -96,6 +96,11 @@ import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { extraSeatsEnabled, redTeamEnabled, resolveSeatTimeoutMs } from './review-extra-seats.mjs';
 import { redTeamRequired } from '../lib/jury-core.mjs';
+import { decideStackDispatch, fingerprintOf, readStackBase, resolveStackAwareReview, stackNetDiffText, parseStackMarkers } from '../conveyor/review-stack-base.mjs';
+import { computeNetDiffText } from '../merge-ai-prs.mjs';
+import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
@@ -613,12 +618,81 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }) {
  * The daemon's dispatch: the job by default, the old `claude --bg` session only when
  * {@link REVIEW_DISPATCH_MODE_ENV}`=session` asks for it.
  */
-export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), ...opts } = {}) {
+// Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
+export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
+  // Held item 177 — a stacked top whose accept is recorded against its stack base is HELD (no review until the
+  // bottom lands) or, once the stack collapsed with an identical net diff, CARRIED. Either way nothing is dispatched.
+  let stack = null;
+  try { stack = stackCheck({ pr: opts.pr, repo: opts.repo, root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }); }
+  catch { stack = null; }
+  if (stack?.skipped) return { mode, pr: opts.pr, repo: opts.repo, skipped: stack.skipped };
+  const named = (r) => (stack?.base && r && !r.skipped
+    ? { ...r, mode: `${r.mode ?? mode} against stack base #${stack.base.pr} (${stack.base.ref}@${stack.base.contained.slice(0, 9)})` }
+    : r);
   if (mode === 'session') {
     const { preferLane, ...sessionOpts } = opts;
-    return { mode: 'session', ...dispatchReview(sessionOpts) };
+    return named({ mode: 'session', ...dispatchReview(sessionOpts) });
   }
-  return dispatchReviewJob(opts);
+  return named(dispatchReviewJob(opts));
+}
+
+const execIn = (root) => (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
+
+/**
+ * Held item 177 — before a review is dispatched, read this PR's stack state and any `reviewed-stack` accept marker.
+ * FAILS OPEN: any read error dispatches the review as before. Only the Web Everything repo (the clone this runs in).
+ * @returns {{skipped?:string, base?:object|null}}
+ */
+export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = process.env,
+  readStack = (n) => readStackBase({ pr: n, root, env }),
+  readThread = (n) => JSON.parse(String(execFileSync('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'comments,headRefName,headRefOid'], { cwd: root, encoding: 'utf8', timeout: 60e3, maxBuffer: 16 * 1024 * 1024 }))),
+  stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
+  mainText = (ref) => computeNetDiffText({ exec: execIn(root), rev: ref, fetchExtraRefs: [ref] }),
+  carry = (n, decision) => carryStackAccept({ pr: n, repo, root, env, decision }),
+  log = (line) => writeLineSync(2, line) } = {}) {
+  if (!resolveStackAwareReview(env) || repoKeyForSlug(repo) !== 'we') return { base: null };
+  const base = readStack(pr);
+  let thread = null;
+  try { thread = readThread(pr); } catch { thread = null; }
+  const comments = Array.isArray(thread?.comments) ? thread.comments : [];
+  if (base) log(`review-job: ${repo}#${pr} is stacked on #${base.pr} — its review reads the diff against ${base.ref}@${base.contained.slice(0, 9)} (the bottom's head), not main`);
+  if (!parseStackMarkers(comments).some((m) => m.top === Number(pr))) return { base };
+  let stackFingerprint = null;
+  let mainFingerprint = null;
+  if (base) { try { stackFingerprint = fingerprintOf(stackText(base)); } catch { stackFingerprint = null; } }
+  else if (thread?.headRefName) {
+    try { const net = mainText(thread.headRefName); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
+  }
+  const decision = decideStackDispatch({ pr, stack: base, comments, stackFingerprint, mainFingerprint });
+  if (decision.action === 'held') return { base, skipped: decision.why };
+  if (decision.action === 'carry') {
+    const done = carry(pr, decision);
+    if (done?.ok) { log(`review-job: ${repo}#${pr} ${decision.why} — accept carried forward`); return { base, skipped: decision.why }; }
+    log(`review-job: ${repo}#${pr} stack-accept carry failed (${done?.error ?? 'unknown'}) — reviewing as usual`);
+  }
+  return { base };
+}
+
+/**
+ * Carry a stacked accept forward through the SINGLE HOME (`review-set-label.mjs --to=accepted`), which re-derives
+ * the net diff vs main itself and stamps `reviewed-sha`/`reviewed-diff` for it. It is only called on a byte-identical
+ * fingerprint, so what it stamps is exactly the diff the panel accepted.
+ */
+export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env, decision,
+  run = (args, o) => spawnSync(process.execPath, args, o) } = {}) {
+  try {
+    const bodyPath = join('/tmp', `review-stack-carry-${String(repo).replace(/[^\w.-]+/g, '-')}-${pr}-${randomUUID()}.md`);
+    const m = decision.marker;
+    writeFileSync(bodyPath, [
+      `**Stacked accept carried forward.** This PR was accepted against #${m.bottom}'s head (\`${m.bottomRef}\` @ ${String(m.contained).slice(0, 12)}).`,
+      `#${m.bottom} is no longer below it, and its net diff vs main is byte-identical to the accepted diff (fingerprint \`${m.fingerprint.slice(0, 16)}\`), so the accept stands without another review.`,
+    ].join('\n\n'), 'utf8');
+    const res = run([join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`, '--to=accepted',
+      `--actor=${UNATTENDED_REVIEW_ACTOR}`, `--body-file=${bodyPath}`],
+    { cwd: root, encoding: 'utf8', timeout: 180e3, env: { ...env, [ACTOR_ENV]: `review-stack-carry-${randomUUID()}` } });
+    try { rmSync(bodyPath, { force: true }); } catch { /* tmp */ }
+    return res?.status === 0 ? { ok: true } : { ok: false, error: String(res?.stderr || res?.stdout || `exit ${res?.status}`).trim().split('\n').pop() };
+  } catch (e) { return { ok: false, error: String(e?.message ?? e) }; }
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────
