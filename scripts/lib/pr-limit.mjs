@@ -255,14 +255,26 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const limit = resolvePrLimit(repoKey, env);
   if (!meta) return { repoKey, slug: null, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
   const prs = fetchOpenPrs(meta.slug, { exec, localOnly, readShared });
-  if (prs === null) return { repoKey, slug: meta.slug, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
+  if (prs === null) return { repoKey, slug: meta.slug, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0, excludeCardOnly };
   // Excluded BEFORE any commits read: an accepted or card-only PR never costs an authorship lookup.
   const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
   const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
   const cardOnlySet = new Set(cardOnlyPrs);
   const openHeadRefs = new Set(prs.map((pr) => pr?.headRefName).filter((h) => typeof h === 'string' && h));
+  // A stacked PR is excluded only while its base chain ends at a PR that still carries load: a base that is itself
+  // accepted or card-only (excluded) would shield any number of labelled drafts, and two PRs each the other's base
+  // (a cycle) would shield each other. The walk keeps a visited set; reaching nothing countable → the PR counts.
+  const byHead = new Map();
+  for (const pr of prs) if (typeof pr?.headRefName === 'string' && pr.headRefName) byHead.set(pr.headRefName, [...(byHead.get(pr.headRefName) ?? []), pr]);
+  const isAccepted = (pr) => hasLabel(pr, REVIEW_LABELS.accepted);
+  const isCandidate = (pr) => isStackedAwaitingBasePr(pr, openHeadRefs);
+  const chainEndsAtCounted = (pr, seen) => {
+    if (seen.has(pr)) return false;
+    seen.add(pr);
+    return (byHead.get(pr.baseRefName) ?? []).some((b) => b !== pr && !isAccepted(b) && !cardOnlySet.has(b) && (!isCandidate(b) || chainEndsAtCounted(b, seen)));
+  };
   const stackedPrs = excludeStacked
-    ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr) && isStackedAwaitingBasePr(pr, openHeadRefs))
+    ? prs.filter((pr) => !isAccepted(pr) && !cardOnlySet.has(pr) && isCandidate(pr) && chainEndsAtCounted(pr, new Set()))
     : [];
   for (const pr of stackedPrs) cardOnlySet.add(pr); // excluded from the authorship lookup and the count alike
   // GitHub-call budget for the per-PR commits reads (git is tried first and is not counted); an exhausted budget

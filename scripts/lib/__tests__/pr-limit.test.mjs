@@ -279,6 +279,30 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     expect(isStackedAwaitingBasePr(awaiting(7, 'lane/real-base'))).toBe(false);
   });
 
+  it('a labelled draft whose base PR is itself excluded (card-only / accepted) or part of a cycle still counts; a chain that ends at a counted PR does not', () => {
+    const awaiting = (n, base, head) => ({ ...code(n), headRefName: head ?? `lane/d${n}`, baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const count = (rows) => countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope });
+    const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', files: [{ path: 'backlog/x.md' }] };
+    // a card-only base shields nobody: both drafts hang off an uncounted PR and are counted
+    expect(count([cardBase, awaiting(6, 'lane/card-base'), awaiting(7, 'lane/card-base')])).toMatchObject({ count: 2, stacked: 0, cardOnly: 1 });
+    // an accepted base likewise
+    const acceptedBase = { ...code(51), headRefName: 'lane/acc-base', labels: [{ name: 'review:accepted' }] };
+    expect(count([acceptedBase, awaiting(6, 'lane/acc-base')])).toMatchObject({ count: 1, stacked: 0, accepted: 1 });
+    // a two-PR cycle (each the other's base) shields neither
+    expect(count([awaiting(6, 'lane/d7'), awaiting(7, 'lane/d6')])).toMatchObject({ count: 2, stacked: 0 });
+    // a chain d8 → d7 → real counted base: both drafts are excluded
+    const real = { ...code(9), headRefName: 'lane/real' };
+    expect(count([real, awaiting(7, 'lane/real'), awaiting(8, 'lane/d7')])).toMatchObject({ count: 1, stacked: 2, stackedPrNumbers: [7, 8] });
+    // the same chain over a card-only root counts both
+    expect(count([cardBase, awaiting(7, 'lane/card-base'), awaiting(8, 'lane/d7')])).toMatchObject({ count: 2, stacked: 0 });
+  });
+
+  it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
+    const r = countOpenPrsForRepo('we', { exec: () => { throw new Error('boom'); }, env: {}, scope: { excludeCardOnly: false, excludeStackedAwaitingBase: true } });
+    expect(r).toMatchObject({ unavailable: true, excludeCardOnly: false });
+  });
+
   it('fetchOpenPrs requests baseRefName on both the direct and the shared-snapshot read (the stacked test needs it)', () => {
     const exec = (args) => { expect(args[args.indexOf('--json') + 1].split(',')).toContain('baseRefName'); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
