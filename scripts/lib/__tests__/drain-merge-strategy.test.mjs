@@ -24,8 +24,8 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     if (args[0] === 'pr' && args[1] === 'merge') throw new Error('merge API must never be called');
     if (args[0] === 'pr' && args[1] === 'comment') return '';
     if (args[0] === 'api' && args[1] === 'user') { if (selfLogin == null) throw new Error('gh: not logged in'); return `${selfLogin}\n`; }
-    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,changedFiles')) return '{"id":"PR_NODE","changedFiles":1}';
-    if (args[0] === 'api' && args.includes('--paginate')) return '["scripts/x.mjs",""]\n';
+    if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : ''; // the pinned change list of the judged head
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,headRefOid,baseRefName')) return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
     if (args[0] === 'pr' && args[1] === 'view' && viewThrows.includes(Number(args[2]))) throw new Error('gh: HTTP 502');
     if (args[0] === 'pr' && args[1] === 'view') { onView[args[2]]?.(); return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN' }); }
     if (args[0] === 'api' && args[1] === 'graphql') {
@@ -241,8 +241,8 @@ describe('drain merge strategy — github-merge-queue', () => {
     let writes = 0;
     const exec = (cmd, args) => {
       if (args[0] === 'pr' && args[1] === 'comment') return '';
-      if (args[0] === 'pr' && args[1] === 'view') return '{"id":"PR_NODE","changedFiles":1}';
-      if (args[0] === 'api' && args.includes('--paginate')) return '["scripts/x.mjs",""]\n';
+      if (cmd === 'git') return args[0] === 'diff' ? 'scripts/x.mjs\0' : '';
+      if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({ id: 'PR_NODE', headRefOid: HEAD, baseRefName: 'main' });
       if (args[0] === 'api' && args[1] === 'graphql') { broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
       throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
     };

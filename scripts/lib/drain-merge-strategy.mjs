@@ -141,6 +141,7 @@ export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
   statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
   readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
+  cwd = process.cwd(), // a clone of the local repo: enqueuePr reads the judged commit's change list from it
 } = {}) {
   const { policy, note } = resolved;
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
@@ -210,7 +211,7 @@ export function createDrainMergeStrategy({
         try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
-      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, exec });
+      const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, cwd, exec });
       if (!r.ok) throw new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
       const state = readQueueState(statePath, readFile);
       // The file can break between the pre-check above and here. Writing over it would erase every other pending
