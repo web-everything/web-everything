@@ -114,7 +114,7 @@ import { fileURLToPath } from 'node:url';
 import { rebuildClone, dryRunRebuild } from './daemon-rebuild/index.mjs';
 
 // ── CLI ──────────────────────────────────────────────────────────────────────────────────────────────────
-// `node scripts/lib/daemon-rebuild.mjs --clone=<path> [--dry-run] [--json]`
+// `node scripts/lib/daemon-rebuild.mjs --clone=<path> [--dry-run] [--json] [--ready-only] [--entry=<script>]... [--main-only]`
 
 function parseFlags(argv) {
   const flags = {};
@@ -150,7 +150,14 @@ async function runCli(argv) {
     return;
   }
 
-  const result = await rebuildClone({ root });
+  // #4126 — `--ready-only` is the rebuild JOB's child (rebuild-job.mjs): a passing smoke is recorded as the ready
+  // candidate and the clone is never moved; the daemon adopts it at its own tick. `--entry` (repeatable) names the
+  // daemon's scripts, `--main-only` builds plain main. Job mode is always off here: this IS the build.
+  const entries = argv.filter((a) => a.startsWith('--entry=')).map((a) => a.slice('--entry='.length)).filter(Boolean);
+  const result = await rebuildClone({
+    root, asJob: false, readyOnly: !!flags['ready-only'], mainOnly: !!flags['main-only'],
+    ...(entries.length ? { entries } : {}),
+  });
   if (flags.json) {
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } else {
