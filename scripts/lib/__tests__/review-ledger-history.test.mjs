@@ -19,8 +19,9 @@ const PA = 'plateauapp/plateau-app';
 let seq = 0;
 
 /** A run record as the checker writes it. `drift` names the families with a disagreement. */
-function run({ repo = WE, at, drift = [], unreadable = 0, scan = { limit: 200, listed: 3, truncated: false } }) {
+function run({ repo = WE, at, drift = [], unreadable = 0, scan = { limit: 200, listed: 3, truncated: false, storeShared: true } }) {
   const summary = summarizeDerived([]);
+  summary.total = scan?.listed ?? 0; // the scored total matches the listed PR count, as the checker writes it
   for (const f of drift) summary.perFamily[f] = { compared: 1, agree: 0, disagree: 1 };
   summary.unreadable = unreadable;
   return buildCheckRunRecord({ id: `review-ledger-check-t${seq++}`, repo, at, summary, phase1: {}, scan });
@@ -135,6 +136,30 @@ describe('cleanDaysPerFamily — THE QUERY', () => {
     const rec = run({ at: NOW.toISOString(), scan: { limit: 200, listed: 3 } });
     expect(rec.findings.scan.truncated).toBe(true);
     expect(runFamilyVerdict(rec, 'review')).toBe('unknown');
+  });
+
+  it('a run against an unshared ledger store, or whose scored total disagrees with the listed PRs, is unknown', () => {
+    const clean = run({ at: NOW.toISOString() });
+    expect(runFamilyVerdict(clean, 'review')).toBe('clean');
+    for (const storeShared of [false, undefined, 'true']) {
+      expect(runFamilyVerdict(run({ at: NOW.toISOString(), scan: { limit: 200, listed: 3, truncated: false, storeShared } }), 'review')).toBe('unknown');
+    }
+    const skewed = structuredClone(clean);
+    skewed.findings.derived.total = 2; // 3 PRs listed, 2 scored
+    expect(runFamilyVerdict(skewed, 'review')).toBe('unknown');
+    const noListed = structuredClone(clean);
+    delete noListed.findings.scan.listed;
+    expect(runFamilyVerdict(noListed, 'review')).toBe('unknown');
+  });
+
+  it('pinned families ignore family names a record brings (retired, unrelated repo, __proto__)', () => {
+    const week7 = week('2026-10-08', 7).flatMap((d) => cleanDay(d));
+    const odd = run({ repo: 'x/unrelated', at: '2026-10-08T15:00:00Z' });
+    odd.findings.derived.perFamily = JSON.parse('{"__proto__":{"disagree":0},"\\u001b[31mRED":{"disagree":0},"retired":{"disagree":9}}');
+    const q = cleanDaysPerFamily([...week7, odd], { now: NOW, families: ['review'] });
+    expect(Object.keys(q.families)).toEqual(['review']);
+    expect(Object.getPrototypeOf(q.families)).toBe(Object.prototype);
+    expect(q.families.review).toMatchObject({ streak: 7, ready: true });
   });
 
   it('runs from unselected repos never shape a scoped query (cannot reset or extend the streak)', () => {

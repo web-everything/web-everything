@@ -388,6 +388,17 @@ describe('backlog.mjs CLI — ephemeral-clone integration smoke (#2273/#2274)', 
     expect(run(['block', '9015', '--on=9015-n']).code).toBe(1);
   });
 
+  it('block --on: short ids are padded AFTER the slug is stripped (7-a is 007, so it still hits the self-block check)', () => {
+    write('007-a.md', item({ kind: 'epic', status: 'open', blockedBy: '["8"]', dateOpened: '"2026-07-01"' }));
+    write('008-b.md', item({ kind: 'story', size: 2, status: 'open', dateOpened: '"2026-07-01"' }));
+    expect(run(['block', '007', '--on=7-a']).code).toBe(1);
+    expect(run(['block', '007', '--on=7']).code).toBe(1);
+    const res = run(['block', '007', '--on=8,008,8-b,008-b']);
+    expect(res.code).toBe(0);
+    expect(res.json.added).toEqual([]); // the existing unpadded edge "8" is the same card as every spelling given
+    expect(read('007-a.md')).toContain('blockedBy: ["8"]');
+  });
+
   it('prioritize --clear: removes the priority field, returning to the default', () => {
     write('9011-j.md', item({ kind: 'story', size: 3, status: 'open', priority: 'low', dateOpened: '"2026-07-01"' }));
     const res = run(['prioritize', '9011', '--clear']);

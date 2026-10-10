@@ -26,7 +26,8 @@ import { REVIEW_LABELS } from '../lib/review-escalation.mjs';
 
 const REPO = 'web-everything/web-everything';
 const AT = '2026-08-10T12:00:00.000Z';
-const COMPLETE_SCAN = { limit: 200, listed: 3, truncated: false };
+const COMPLETE_SCAN = { limit: 200, listed: 3, truncated: false, storeShared: true };
+const summaryFor = (scan) => ({ ...summarizeDerived([]), total: scan.listed }); // a run record's scored total matches the listed PR count
 const rec = (over) => buildVerdictRecord({ repo: REPO, pr: 1, verdict: VERDICTS.ACCEPTED, at: AT, source: 'test', ...over });
 const L = (...names) => names.map((name) => ({ name }));
 
@@ -223,6 +224,10 @@ describe('slice F — derived vs live labels', () => {
     expect(deriveRow({ pr: 7, repo: REPO, events: null, facts: facts(), liveLabels: [] }).status).toBe('unreadable');
     expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: null, liveLabels: [] }).status).toBe('unreadable');
     expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: facts({ probeErrors: ['GitHub PR unavailable'] }), liveLabels: [] }).status).toBe('unreadable');
+    // ANY probe error (partial CI/head/comment/referral read) is unreadable, not a clean "no label" derivation
+    for (const err of ['GitHub head/comments unavailable', 'check rollup truncated at 100', 'required-check set empty; readiness unknown', 'jobs scan capped at 500']) {
+      expect(deriveRow({ pr: 7, repo: REPO, events: [], facts: facts({ probeErrors: [err] }), liveLabels: [] }).status).toBe('unreadable');
+    }
     const s = summarizeDerived([deriveRow({ pr: 7, repo: REPO, events: null, facts: facts(), liveLabels: [] })]);
     expect(s).toMatchObject({ unreadable: 1, agree: 0, mismatch: 0 });
     expect(s.perFamily.review.compared).toBe(0);
@@ -358,7 +363,7 @@ describe('#3930 — every constellation repo, and the run history as a query', (
     const runs = [];
     for (let i = 0; i < 7; i += 1) {
       const day = new Date(Date.UTC(2026, 9, 9 - i, 15)).toISOString();
-      for (const repo of DEFAULT_REPOS) runs.push(buildCheckRunRecord({ id: `review-ledger-check-h${i}${repo.length}`, repo, at: day, summary: summarizeDerived([]), phase1: {}, scan: COMPLETE_SCAN }));
+      for (const repo of DEFAULT_REPOS) runs.push(buildCheckRunRecord({ id: `review-ledger-check-h${i}${repo.length}`, repo, at: day, summary: summaryFor(COMPLETE_SCAN), phase1: {}, scan: COMPLETE_SCAN }));
     }
     let out = '';
     const ok = runHistory({ now, read: () => ({ runs, corrupt: 0 }), stdout: (t) => { out += t; } });
@@ -372,7 +377,7 @@ describe('#3930 — every constellation repo, and the run history as a query', (
   describe('runHistory readiness cannot be faked by a narrower question', () => {
     const now = new Date('2026-10-09T18:00:00Z');
     const weekOfRuns = (repos, scan = COMPLETE_SCAN) => Array.from({ length: 7 }, (_, i) => repos.map((repo) => buildCheckRunRecord({
-      id: `review-ledger-check-p${i}${repo.length}`, repo, at: new Date(Date.UTC(2026, 9, 9 - i, 15)).toISOString(), summary: summarizeDerived([]), phase1: {}, scan,
+      id: `review-ledger-check-p${i}${repo.length}`, repo, at: new Date(Date.UTC(2026, 9, 9 - i, 15)).toISOString(), summary: summaryFor(scan), phase1: {}, scan,
     }))).flat();
 
     it('--repos with only part of the constellation is a partial scope: exit 1 and never READY', () => {
@@ -426,9 +431,9 @@ describe('#3930 — every constellation repo, and the run history as a query', (
 
     it('a list shorter than the limit is recorded complete; a list as long as the limit is recorded truncated', async () => {
       const prs = [{ number: 1, labels: [] }, { number: 2, labels: [] }];
-      expect((await check(prs, 200)).findings.scan).toEqual({ limit: 200, listed: 2, truncated: false });
-      expect((await check(prs, 2)).findings.scan).toEqual({ limit: 2, listed: 2, truncated: true });
-      expect((await check(prs, 1)).findings.scan).toEqual({ limit: 1, listed: 2, truncated: true });
+      expect((await check(prs, 200)).findings.scan).toEqual({ limit: 200, listed: 2, truncated: false, storeShared: true });
+      expect((await check(prs, 2)).findings.scan).toEqual({ limit: 2, listed: 2, truncated: true, storeShared: true });
+      expect((await check(prs, 1)).findings.scan).toEqual({ limit: 1, listed: 2, truncated: true, storeShared: true });
     });
 
     it('appendCheckRun persists the scan so the history can read it back', () => {

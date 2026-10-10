@@ -231,7 +231,9 @@ export function compareDerivedLabels({ derived = [], live = [] } = {}) {
  */
 export function deriveRow({ pr, repo, events, facts, liveLabels, settings = {} }) {
   if (events == null) return { pr, status: 'unreadable', lifecycleState: null, families: [], reason: 'the verdict ledger could not be read' };
-  if (!facts || (facts.probeErrors ?? []).some((e) => /^GitHub PR/.test(e))) {
+  // ANY probe error means a fact (CI rollup, head, comments, referrals…) was not fully read; deriving labels from the
+  // rest would score a partial read as agreement, so the whole row is unreadable.
+  if (!facts || (facts.probeErrors ?? []).length > 0) {
     return { pr, status: 'unreadable', lifecycleState: null, families: [], reason: 'the GitHub facts for this PR could not be read' };
   }
   const mine = events.filter((e) => e.pr === pr && String(e.repo).toLowerCase() === repo.toLowerCase());
@@ -294,7 +296,7 @@ export function buildCheckRunRecord({ id, repo, at, summary, phase1, scan }) {
   rec.findings = { derived: { total: summary.total, agree: summary.agree, mismatch: summary.mismatch, unreadable: summary.unreadable,
     perFamily: summary.perFamily, mismatches: summary.mismatches }, phase1 };
   // Completeness evidence for the history query: a record with no `scan` can never score a clean day.
-  if (scan) rec.findings.scan = { limit: scan.limit, listed: scan.listed, truncated: scan.truncated !== false }; // anything but an explicit `false` is recorded truncated
+  if (scan) rec.findings.scan = { limit: scan.limit, listed: scan.listed, truncated: scan.truncated !== false, storeShared: scan.storeShared === true }; // anything but an explicit `false`/`true` is recorded as the unsafe value
   rec.verdict = summary.mismatch || summary.unreadable ? 'drift' : 'clean';
   return rec;
 }
@@ -357,7 +359,7 @@ export async function runCheck({
   const derivedRows = buildDerivedRows({ repo, prs, events, readFacts });
   const derived = summarizeDerived(derivedRows);
   // A list as long as the limit may have been cut off, so it is recorded as truncated (never trusted as complete).
-  const scan = { limit, listed: prs.length, truncated: prs.length >= limit };
+  const scan = { limit, listed: prs.length, truncated: prs.length >= limit, storeShared: ledger.store?.shared === true };
   const run = noRecord ? { ok: false, skipped: true } : await appendRun({ repo, summary: derived, scan, phase1: { total: summary.total, counts: summary.counts, phase2Safe: summary.phase2Safe } });
   const report = { repo, store: ledger.store, ledgerRows: events.length, rows, summary, derived: { ...derived, rows: derivedRows }, run };
   if (json) {

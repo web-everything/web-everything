@@ -79,13 +79,21 @@ export function runFamilyVerdict(run, family) {
   if (!fam || !isCount(fam.disagree)) return 'unknown';
   if (fam.disagree > 0) return 'drift';
   if (!isCount(derived.unreadable) || derived.unreadable > 0) return 'unknown';
-  if (run.findings.scan?.truncated !== false) return 'unknown';
+  // Clean needs a complete scan (not cut off by --limit), made against a SHARED ledger store (rows written on other
+  // machines are invisible to an unshared one), whose listed count matches what was scored.
+  const scan = run.findings.scan;
+  if (scan?.truncated !== false || scan.storeShared !== true || !isCount(scan.listed) || scan.listed !== derived.total) return 'unknown';
   return 'clean';
 }
 
-/** Every family named by any run, in first-seen order, unioned with `families`. Pure. */
+/**
+ * The families to judge. When the caller pins `families`, ONLY those count: a record's own family names are
+ * untrusted (a retired family, an unrelated repo's record, a `__proto__` key) and must not move the answer.
+ * With no pin, it is the union of every family any run names, in first-seen order. Pure.
+ */
 function familiesOf(runs, families = []) {
-  const out = [...families];
+  if (families.length) return [...families];
+  const out = [];
   for (const r of runs) for (const f of Object.keys(r?.findings?.derived?.perFamily ?? {})) if (!out.includes(f)) out.push(f);
   return out;
 }
