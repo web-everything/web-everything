@@ -136,13 +136,29 @@ const RUN_ID_RE = /^[\w.-]{1,128}$/;
  * Throws when `ps` does not answer — a scan that did not run is never "no such gate".
  */
 export function findGatePidsDefault(runId) {
+  return psCommands().filter(({ command }) => command.split(/\s+/).includes(`--run-id=${runId}`)).map(({ pid }) => pid);
+}
+
+/**
+ * The pids of dispatched gates on lane `dir`, whoever started them: a process carrying the exact `--repo=<dir>`
+ * token next to a `--run-id=` token (every dispatched `verify-lane.mjs` gate has both; an agent's `request`/`check`
+ * has no run id). Throws when `ps` does not answer.
+ */
+export function findLaneGatePidsDefault(dir) {
+  return psCommands().filter(({ command }) => {
+    const padded = ` ${command} `;
+    return padded.includes(` --repo=${dir} `) && / --run-id=\S/.test(padded);
+  }).map(({ pid }) => pid);
+}
+
+function psCommands() {
   const out = execRead('ps', ['-axww', '-o', 'pid=,command='], { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
-  const pids = [];
+  const rows = [];
   for (const line of out.split('\n')) {
     const m = line.match(/^\s*(\d+)\s+(.*)$/);
-    if (m && Number(m[1]) !== process.pid && m[2].split(/\s+/).includes(`--run-id=${runId}`)) pids.push(Number(m[1]));
+    if (m && Number(m[1]) !== process.pid) rows.push({ pid: Number(m[1]), command: m[2] });
   }
-  return pids;
+  return rows;
 }
 
 /**
@@ -396,6 +412,7 @@ export async function runGateStep({
   laneState = readLaneState, probe = probeHandle, readStart = readProcStart, kill = process.kill.bind(process),
   onGate = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pidExists = pidExistsDefault,
   scan = findGatePidsDefault, groupExists = groupExistsDefault,
+  listJobs = () => createJobStore(jobsDir).list(), scanLane = findLaneGatePidsDefault,
 }) {
   const where = `${input.pool}/lane-${input.lane} @ ${String(input.headSha).slice(0, 8)}`;
   const finish = (result) => {
@@ -431,6 +448,16 @@ export async function runGateStep({
     return finish({ outcome: 'failed', status: null, signal: null, message });
   }
 
+  // 1b. Nor beside ANY other gate on this lane: another job's survivor (a daemon that dispatched before its first sync,
+  // a second daemon on the same store), or a gate no sidecar names (another store, a rolled-back in-process sweep).
+  // Only proven gone lets the run go on; such a gate is never killed from here (it is not this job's to signal).
+  const blocker = otherLaneGate({ jobId, input, jobsDir, listJobs, scanLane, probe, pidExists, scan, groupExists });
+  if (blocker) {
+    const message = `${blocker}; refusing to start a second gate on this lane`;
+    log(`[verify-gate-job ${jobId}] attempt ${attempt}: ${message}`);
+    return finish({ outcome: 'failed', status: null, signal: null, message });
+  }
+
   // 2. Run nothing unless the marker is still this request (a relaunch may find it settled or superseded).
   const { marker, headSha } = laneState(input.dir);
   if (!markerStillOurs(marker, headSha, input)) {
@@ -449,6 +476,11 @@ export async function runGateStep({
   }
 
   // 4. The gate — the same code, ceilings and settlement as the in-process sweep.
+  // The record is kept in memory and only ever rewritten whole: re-reading it from disk could read back nothing
+  // (a torn or unreadable file) and shrink it to a record that names no gate while that gate runs.
+  let recorded = null;
+  let unrecorded = null;
+  const record = (rec) => { writeJson(gatePath(jobsDir, jobId), rec); recorded = rec; };
   let ok = true;
   let error = null;
   try {
@@ -458,14 +490,23 @@ export async function runGateStep({
       log,
       onSpawn: (pid) => {
         onGate(pid); // first: a SIGTERM from here on kills the gate even if the sidecar write below fails
+        const base = { pid, handle: null, runId: input.runId, spawnedAt: new Date().toISOString(), attempt };
+        // The pid lands BEFORE the start-time read (a `ps` that can take seconds): a supervisor that dies inside it
+        // leaves a record whose process group is still checked, not a pending one found only by its leader's argv.
+        try { record(base); } catch (e) {
+          // A gate its record does not name cannot be found once its leader is gone: never leave one running.
+          unrecorded = e;
+          try { if (Number.isInteger(pid) && pid > 1) kill(-pid, 'SIGKILL'); } catch {}
+          return;
+        }
         let procStart = null;
         try { procStart = readStart(pid); } catch {}
-        const handle = procStart ? formatJobHandle({ host: hostName(), pid, procStart }) : null;
-        writeJson(gatePath(jobsDir, jobId), { pid, handle, runId: input.runId, spawnedAt: new Date().toISOString(), attempt });
+        if (procStart) {
+          try { record({ ...base, handle: formatJobHandle({ host: hostName(), pid, procStart }) }); } catch {} // the pid-only record stands
+        }
       },
       onGateStarted: () => {
-        const g = readJson(gatePath(jobsDir, jobId)) || {};
-        writeJson(gatePath(jobsDir, jobId), { ...g, gateStartedAt: new Date().toISOString() });
+        if (recorded) record({ ...recorded, gateStartedAt: new Date().toISOString() });
       },
     });
   } catch (e) {
@@ -473,8 +514,37 @@ export async function runGateStep({
     error = e;
   }
   const after = laneState(input.dir).marker;
-  return finish({ ...classifyGateOutcome({ ok, error }),
-    marker: after ? { status: after.status, sha: after.sha ?? null, runId: after.runId ?? null } : null });
+  const markerOut = after ? { status: after.status, sha: after.sha ?? null, runId: after.runId ?? null } : null;
+  if (unrecorded) {
+    return finish({ outcome: 'failed', status: null, signal: null, marker: markerOut,
+      message: `could not record the gate's pid (${String(unrecorded?.message || unrecorded).split('\n')[0]}); killed it` });
+  }
+  return finish({ ...classifyGateOutcome({ ok, error }), marker: markerOut });
+}
+
+/**
+ * Why another gate may still be running on `input.dir`, or null when none provably is: any other gate job of this
+ * lane whose recorded gate is not proven gone ({@link gateState}), a sidecar of an unreadable job record that is not
+ * proven gone (its lane is unknown, so it counts), or a dispatched gate process on the lane that no sidecar names.
+ * A listing or a scan that fails is never "none".
+ */
+function otherLaneGate({ jobId, input, jobsDir, listJobs, scanLane, probe, pidExists, scan, groupExists }) {
+  const kind = VERIFY_GATE_JOB_KIND.kind;
+  let listing;
+  try { listing = listJobs(); } catch (e) { return `the gate jobs could not be listed (${String(e?.message || e).split('\n')[0]})`; }
+  const ids = [
+    ...(listing?.records || []).filter((r) => r.id !== jobId && r.job?.kind === kind && r.input?.dir === input.dir).map((r) => r.id),
+    ...(listing?.corrupt || []).filter((id) => id !== jobId),
+  ];
+  for (const id of ids) {
+    const gate = readJson(gatePath(jobsDir, id));
+    const state = gateState(gate, { probe, pidExists, scan, groupExists });
+    if (state !== 'dead') return `job ${id}'s gate ${gate?.pid ? `pid ${gate.pid}` : `(run ${gate?.runId ?? '?'})`} may still run on this lane (${state})`;
+  }
+  let pids;
+  try { pids = scanLane(input.dir); } catch (e) { return `the lane's gate processes could not be listed (${String(e?.message || e).split('\n')[0]})`; }
+  if (pids.length) return `gate process ${pids.join(', ')} is already running on this lane`;
+  return null;
 }
 
 /**

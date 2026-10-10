@@ -13,6 +13,7 @@ import {
   classifyGateOutcome, markerStillOurs, runGateStep, createVerifyGateJobs, resolveGateAsJob, killGateGroup,
   gatePath, resultPath, VERIFY_GATE_JOB_KIND, gateState, findGatePidsDefault, gateStopHandler,
 } from '../verify-gate-job.mjs';
+import * as gateJob from '../verify-gate-job.mjs';
 import { createJobStore, enqueueJob, hostName, readProcStart } from '../../lib/daemon-jobs-runtime.mjs';
 import { formatJobHandle } from '../../operations/job-record.mjs';
 import { spawn, execFileSync } from 'node:child_process';
@@ -540,5 +541,91 @@ describe('a superseded gate job is killed only after a fresh probe (PR 4764 roun
     state = 'alive';
     expect(jobs.killJobGate(entry)).toBe(true);
     expect(kill).toHaveBeenCalledWith(-999, 'SIGKILL');
+  });
+});
+
+describe('no gate record is ever missing or reduced while its gate runs, and no gate starts beside another on its lane (PR 4764 round 5)', () => {
+  const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
+  const laneState = () => ({ marker: running, headSha: 'abc12345' });
+  const quiet = { log: () => {}, laneState, scanLane: () => [], sleep: async () => {} };
+
+  it('gate start never reduces the record to a timestamp when the sidecar cannot be read back', async () => {
+    const runGate = vi.fn(async (o) => {
+      o.onSpawn(4243);
+      writeFileSync(gatePath(dir, 'r1'), '{"pid":42'); // an unreadable read-back (torn by another writer, EMFILE…)
+      o.onGateStarted();
+    });
+    await runGateStep({ jobId: 'r1', input: INPUT, jobsDir: dir, runGate, ...quiet, readStart: () => 'Sat Oct 10 10:00:00 2026' });
+    const gate = JSON.parse(readFileSync(gatePath(dir, 'r1'), 'utf8'));
+    expect(gate).toMatchObject({ pid: 4243, runId: 'run-1' });
+    expect(gate.handle).toMatch(/:4243:/);
+    expect(gate.gateStartedAt).toBeTruthy();
+  });
+
+  it('the pid is on disk before the start-time read, so a supervisor that dies inside it leaves a findable group', async () => {
+    let seen = null;
+    const runGate = vi.fn(async (o) => { o.onSpawn(4245); });
+    await runGateStep({ jobId: 'r2', input: INPUT, jobsDir: dir, runGate, ...quiet,
+      readStart: () => { seen = JSON.parse(readFileSync(gatePath(dir, 'r2'), 'utf8')); return 'Sat Oct 10 10:00:00 2026'; } });
+    expect(seen).toMatchObject({ pid: 4245, runId: 'run-1' });
+    expect(seen.pending).toBeFalsy();
+  });
+
+  it('a gate whose pid cannot be recorded is killed at once and the run fails — never left running unrecorded', async () => {
+    const kill = vi.fn();
+    const runGate = vi.fn(async (o) => {
+      rmSync(gatePath(dir, 'r3'), { force: true });
+      mkdirSync(gatePath(dir, 'r3')); // the record can no longer be written
+      try { o.onSpawn(4244); } catch {} // runLaneGate swallows an onSpawn throw, exactly like this
+    });
+    const out = await runGateStep({ jobId: 'r3', input: INPUT, jobsDir: dir, runGate, kill, ...quiet, readStart: () => 'x' });
+    expect(kill).toHaveBeenCalledWith(-4244, 'SIGKILL');
+    expect(out.outcome).toBe('failed');
+    expect(JSON.parse(readFileSync(resultPath(dir, 'r3'), 'utf8')).message).toMatch(/could not record/);
+  });
+
+  it('another job\'s surviving gate on the same lane refuses the start (and is never killed from here); it runs once that gate is gone', async () => {
+    const a = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, runId: 'run-0' }, codeSha: 'c0de' });
+    store.update(a.id, (r) => markFailed(r, { at: AT, reason: 'handle dead; 2/2 attempts used' }));
+    writeFileSync(gatePath(dir, a.id), JSON.stringify({ pid: 900, handle: 'h:900:x', runId: 'run-0' }));
+    const other = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, dir: '/lanes/we/lane-9', runId: 'run-9' }, codeSha: 'c0de' });
+    writeFileSync(gatePath(dir, other.id), JSON.stringify({ pid: 901, handle: 'h:901:x', runId: 'run-9' }));
+    let aAlive = 'alive';
+    const probe = (h) => (h === 'h:900:x' ? aAlive : 'alive');
+    const runGate = vi.fn(async () => {});
+    const kill = vi.fn();
+    const deps = { ...quiet, probe, kill, pidExists: () => false, groupExists: () => false };
+    const out = await runGateStep({ jobId: 'b1', input: INPUT, jobsDir: dir, runGate, ...deps });
+    expect(runGate).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+    expect(out.outcome).toBe('failed');
+    expect(JSON.parse(readFileSync(resultPath(dir, 'b1'), 'utf8')).message).toContain(a.id);
+    aAlive = 'unknown'; // liveness unknown is not gone
+    expect((await runGateStep({ jobId: 'b2', input: INPUT, jobsDir: dir, runGate, ...deps })).outcome).toBe('failed');
+    aAlive = 'dead'; // gone — and a live gate on ANOTHER lane never blocks this one
+    expect((await runGateStep({ jobId: 'b3', input: INPUT, jobsDir: dir, runGate, ...deps })).outcome).toBe('green');
+    expect(runGate).toHaveBeenCalledTimes(1);
+  });
+
+  it('a gate no sidecar names at all (another daemon, a rolled-back in-process sweep) refuses the start; a failed scan does too', async () => {
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'n1', input: INPUT, jobsDir: dir, runGate, ...quiet, scanLane: () => [6001] });
+    expect(runGate).not.toHaveBeenCalled();
+    expect(out.outcome).toBe('failed');
+    expect(JSON.parse(readFileSync(resultPath(dir, 'n1'), 'utf8')).message).toMatch(/6001/);
+    const failed = await runGateStep({ jobId: 'n2', input: INPUT, jobsDir: dir, runGate, ...quiet, scanLane: () => { throw new Error('ps timed out'); } });
+    expect(failed.outcome).toBe('failed');
+    expect(runGate).not.toHaveBeenCalled();
+  });
+
+  it('findLaneGatePidsDefault finds a real gate by its exact --repo token (with a --run-id), and nothing else', async () => {
+    const lane = join(dir, 'lane 7'); // a space in the path must still match exactly
+    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', `--repo=${lane}`, '--json', '--run-id=r-x'], { stdio: 'ignore' });
+    const decoy = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', `--repo=${lane}`, 'request'], { stdio: 'ignore' });
+    try {
+      for (let i = 0; i < 50 && !gateJob.findLaneGatePidsDefault(lane).includes(child.pid); i += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(gateJob.findLaneGatePidsDefault(lane)).toEqual([child.pid]); // the decoy carries no --run-id: not a dispatched gate
+      expect(gateJob.findLaneGatePidsDefault(`${lane}x`)).toEqual([]);
+    } finally { child.kill('SIGKILL'); decoy.kill('SIGKILL'); }
   });
 });
