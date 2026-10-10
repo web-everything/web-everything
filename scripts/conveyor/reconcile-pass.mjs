@@ -78,7 +78,8 @@ import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { REPO_ROOT, defaultListAgents } from '../operations/dispatch-lane-io.mjs';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { countRearmComments } from './rearm-review.mjs';
-import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls } from './reconcile-core.mjs';
+import { readFileSync } from 'node:fs';
+import { resolveRoundCap, planReconcile, DISPATCH_KINDS, REFUSAL_KINDS, markSelfReportedDone, resolveInfraRetryCooloffMs, resolveInfraTransientCooloffMs, markHungSessions, markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, resolveOperatorRulingExtraRounds } from './reconcile-core.mjs';
 import { tryReadCompletion } from '../operations/completion-store.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 // we:backlog/x5uqim1-*.md (#4075/#3383) — the two extra facts `reconcile-core.mjs#isPrCiFailureOwedRerun` needs
@@ -111,7 +112,7 @@ import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { resolveFixSettings } from './fix-takeover.mjs';
-import { resolveTakeoverBudget } from './takeover-budget.mjs';
+import { resolveTakeoverBudget, PLATFORM_PREFERENCES_PATH, REPO_FIX_SETTINGS_PATH } from './takeover-budget.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
 import { enrichPrsWithMechanicalRound, resolveMechanicalRoundsSetting } from './mechanical-round-cap.mjs';
 
@@ -148,6 +149,23 @@ function fixCapSettings(load, env, resolveBudget = resolveTakeoverBudget, log = 
     }
   } catch { /* keep the pure default */ }
   return out;
+}
+
+/** `fix.operatorRulingExtraRounds` — the cascade layers read here (the pure core resolves them). Unreadable = skipped. */
+export function loadOperatorRulingExtraRounds({ env = process.env, read = (f) => readFileSync(f, 'utf8') } = {}) {
+  const json = (f) => { try { return JSON.parse(read(f)); } catch { return null; } };
+  return resolveOperatorRulingExtraRounds({ env, platform: json(PLATFORM_PREFERENCES_PATH), repo: json(REPO_FIX_SETTINGS_PATH) });
+}
+/** The last logged `fix.operatorRulingExtraRounds` resolution, so a daemon logs the layer once per change. */
+let loggedOperatorRulingRounds = '';
+/** `fix.operatorRulingExtraRounds` for `planReconcile`, logging the cascade layer it came from. */
+function operatorRulingRoundsSetting(load, env, log = (line) => console.error(line)) {
+  let r;
+  try { r = load({ env }); } catch { return {}; }
+  if (!Number.isInteger(r?.value)) return {};
+  const line = `operator-ruling-round: fix.operatorRulingExtraRounds=${r.value} (source: ${r.source})`;
+  if (line !== loggedOperatorRulingRounds) { loggedOperatorRulingRounds = line; log(line); }
+  return { operatorRulingExtraRounds: r };
 }
 
 /** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
@@ -1330,6 +1348,8 @@ export function runReconcilePass({
   loadFixSettings = resolveFixSettings,
   // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
   loadTakeoverBudget = resolveTakeoverBudget,
+  // `fix.operatorRulingExtraRounds` (standard 1 → platform preference → we:scripts/settings/fix.json → env). Injectable.
+  loadOperatorRulingRounds = loadOperatorRulingExtraRounds,
   // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
   loadReviewSettings = resolveReviewSettings,
   // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
@@ -1400,6 +1420,7 @@ export function runReconcilePass({
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
+    ...operatorRulingRoundsSetting(loadOperatorRulingRounds, env),
     ...takeoverReviewSetting(loadReviewSettings, env),
     ...mechanicalSetting,
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
