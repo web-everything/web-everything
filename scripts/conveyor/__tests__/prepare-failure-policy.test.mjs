@@ -216,6 +216,50 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
     expect(releaseDuePrepareRetries({ path, now: Date.now(), cardChange: () => { throw new Error('git broke'); } })).toEqual([]);
     expect(readFailureState(path).failures['4354:r:result']).toMatchObject({ held: true });
   });
+  // Review of #4663: the comment said "without a card-change reader nothing is released" but no test called it that way.
+  it('without a card-change reader a needs-you hold is never released, however old it is', () => {
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { '4354:r:result': { num: '4354', attempt: 'r', stage: 'result', cause: 'needs-you',
+      evidence: couldNot, holdReason: 'needs-you: prepare blocked (needs-ruling) - x', retry: false, held: true, recordedAt: '2020-01-01T00:00:00Z' } } }));
+    const before = readFailureState(path);
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T19:00:00Z') })).toEqual([]);
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T19:00:00Z'), cardChange: null })).toEqual([]);
+    expect(readFailureState(path)).toEqual(before);
+    expect(readFailureState(path).failures['4354:r:result']).toMatchObject({ held: true, retry: false });
+  });
+  // Review of #4663: "one extra prepare per card edit, can't loop" — a prepare that stops again after the release is
+  // held by a NEW record (own, later recordedAt), which stays held until the card changes AGAIN.
+  it('a re-stopped prepare after a release is held again and is not re-released until the card changes again', async () => {
+    const fileCard = vi.fn();
+    const t0 = Date.parse('2026-10-09T10:00:00Z');
+    const first = await recordPrepareFailure({ num: '4354', attempt: 'run 1', stage: 'result', evidence: couldNot }, { path, fileCard, now: t0 });
+    expect(first).toMatchObject({ cause: 'needs-you', held: true });
+    // The ruling lands after the hold -> released.
+    const ruling = { commit: 'a'.repeat(40), at: '2026-10-09T11:00:00Z' };
+    let latest = ruling;
+    const asked = [];
+    const cardChange = (num, since) => { asked.push(since); return Date.parse(latest.at) > Date.parse(since) ? latest : null; };
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T11:05:00Z'), cardChange })).toEqual(['4354']);
+    // The next prepare reads the edited card and stops again: a different attempt -> a NEW record, held, with a later recordedAt.
+    const second = await recordPrepareFailure({ num: '4354', attempt: 'run 2', stage: 'result', evidence: couldNot }, { path, fileCard, now: Date.parse('2026-10-09T11:10:00Z') });
+    expect(second).toMatchObject({ cause: 'needs-you', held: true, recordedAt: '2026-10-09T11:10:00.000Z' });
+    const keys = Object.keys(readFailureState(path).failures);
+    expect(keys).toEqual(['4354:run 1:result', '4354:run 2:result']);
+    // No newer card commit: every later tick leaves the new record held (no release/prepare loop).
+    for (const minute of ['11:15', '11:20', '12:00']) {
+      expect(releaseDuePrepareRetries({ path, now: Date.parse(`2026-10-09T${minute}:00Z`), cardChange })).toEqual([]);
+    }
+    expect(asked).toContain('2026-10-09T11:10:00.000Z');
+    const f = readFailureState(path).failures;
+    expect(f['4354:run 1:result']).toMatchObject({ held: false, retry: true });
+    expect(f['4354:run 2:result']).toMatchObject({ held: true, retry: false });
+    // Re-recording the same attempt returns the existing record unchanged (the key does not mint a fresh recordedAt).
+    expect(await recordPrepareFailure({ num: '4354', attempt: 'run 2', stage: 'result', evidence: couldNot }, { path, fileCard, now: Date.parse('2026-10-09T13:00:00Z') }))
+      .toMatchObject({ recordedAt: '2026-10-09T11:10:00.000Z' });
+    // A genuinely newer card commit releases it again.
+    latest = { commit: 'b'.repeat(40), at: '2026-10-09T12:30:00Z' };
+    expect(releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T12:35:00Z'), cardChange })).toEqual(['4354']);
+    expect(readFailureState(path).failures['4354:run 2:result']).toMatchObject({ held: false, retry: true, releasedBy: { cardChange: 'b'.repeat(40) } });
+  });
   // PR #4643 review — the new infra patterns must not steal a DISPATCH-stage failure from its backoff schedule.
   describe('new infra patterns at every stage (review of #4643)', () => {
     const dispatchRefLock = { reason: "Command failed: git fetch -q origin main\nerror: cannot lock ref 'refs/remotes/origin/main': is at a04b734 but expected adde7a6\n" };

@@ -3167,4 +3167,26 @@ describe('cliCardChangedSince', () => {
     expect(cliCardChangedSince('4354', '2026-10-09T18:00:00Z', { root: repo })).toBeNull();
     expect(cliCardChangedSince('9999', '2026-10-09T00:00:00Z', { root: repo })).toBeNull();
   });
+
+  // Review of #4663: the linear fixture above cannot tell `--first-parent` from plain history. A ruling committed on a
+  // branch BEFORE the hold and merged to main AFTER it landed on main after the hold: the merge commit's time counts.
+  it('releases a hold for a card edit merged after the hold despite an older branch commit', () => {
+    const mainBranch = git('branch', '--show-current');
+    git('checkout', '-q', '-b', 'ruling');
+    writeFileSync(join(repo, 'backlog/4354-survive-a-switch.md'), 'card\n\n## Ruling\nrecord + resume\n');
+    commitAt('2026-10-09T06:00:00Z', 'ruling on branch');
+    const branchSha = git('rev-parse', 'HEAD');
+    git('checkout', '-q', mainBranch);
+    writeFileSync(join(repo, 'backlog/43540-other.md'), 'other edit\n');
+    commitAt('2026-10-09T09:00:00Z', 'main moves on');
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-ff', '-q', '-m', 'Merge ruling', 'ruling'],
+      { cwd: repo, env: { ...process.env, GIT_COMMITTER_DATE: '2026-10-09T17:00:00Z', GIT_AUTHOR_DATE: '2026-10-09T17:00:00Z' } });
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
+    const mergeSha = git('rev-parse', 'HEAD');
+    expect(mergeSha).not.toBe(branchSha);
+    // The hold was recorded at 12:00, after the branch commit (06:00) but before the merge (17:00).
+    expect(cliCardChangedSince('4354', '2026-10-09T12:00:00Z', { root: repo })).toEqual({ commit: mergeSha, at: '2026-10-09T17:00:00Z' });
+    // A hold recorded after the merge is not released by it.
+    expect(cliCardChangedSince('4354', '2026-10-09T18:00:00Z', { root: repo })).toBeNull();
+  });
 });
