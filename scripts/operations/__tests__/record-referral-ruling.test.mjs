@@ -185,13 +185,55 @@ describe('#4979 the sanctioned writer', () => {
   it('xc7ctn1: --card we:backlog/<file>.md@pr<N> is taken as a full reference and its readability comes from the injected reader', () => {
     const asked = [];
     const readable = (ref, root) => { asked.push(ref); return ref.endsWith('@pr7'); };
-    expect(resolveCardRef('we:backlog/x.md@pr7', { readable })).toEqual({ requested: 'we:backlog/x.md@pr7', ref: 'we:backlog/x.md@pr7', readable: true, reason: 'readable' });
+    expect(resolveCardRef('we:backlog/x.md@pr7', { readable })).toEqual({ requested: 'we:backlog/x.md@pr7', ref: 'we:backlog/x.md@pr7', readable: true, foundIn: 'pr-head', reason: 'readable' });
     expect(resolveCardRef('we:backlog/x.md@pr8', { readable })).toMatchObject({ ref: 'we:backlog/x.md@pr8', readable: false });
     // A malformed @pr shape is never taken as a reference, so the reader is never asked about it.
     for (const bad of ['we:backlog/x.md@pr0', 'we:backlog/x.md@pr1234567890', 'we:backlog/x.md?ref=main@pr7']) {
       expect(resolveCardRef(bad, { readable }), bad).toMatchObject({ ref: null, readable: false });
     }
     expect(asked).toEqual(['we:backlog/x.md@pr7', 'we:backlog/x.md@pr8']);
+  });
+
+  it('a card filed by the ruled PR itself resolves from that PR\'s head (read-only) and records where it was found', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ruling-card-pr-'));
+    try {
+      mkdirSync(join(root, 'backlog'));
+      writeFileSync(join(root, 'backlog', '5100-landed.md'), '---\nbornAs: xvm9vbu\nstatus: open\n---\n# card\n');
+      const prFiles = { 'x0e6tik-follow-up.md': '---\nstatus: open\n---\n# card\n',
+        '5200-renumbered.md': '---\nbornAs: xqq11qq\nstatus: open\n---\n# card\n' };
+      const opened = [];
+      const prHead = { list: () => { opened.push('list'); return Object.keys(prFiles); }, read: (f) => prFiles[f] };
+      const readable = (ref, r) => ref.endsWith('@pr4689') ? true : referralCardReadable(ref, r);
+      // On main: found locally, the PR head is never opened.
+      expect(resolveCardRef('xvm9vbu', { root, readable, pr: 4689, prHead }))
+        .toMatchObject({ ref: 'we:backlog/5100-landed.md', readable: true, foundIn: 'main' });
+      expect(opened).toEqual([]);
+      // Only on the PR: cited as `@pr<N>`, the form the gate reads at that PR's head.
+      expect(resolveCardRef('x0e6tik', { root, readable, pr: 4689, prHead }))
+        .toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr4689', readable: true, foundIn: 'pr-head' });
+      expect(resolveCardRef('xqq11qq', { root, readable, pr: 4689, prHead }))
+        .toMatchObject({ ref: 'we:backlog/5200-renumbered.md@pr4689', foundIn: 'pr-head' });
+      expect(resolveCardRef('we:backlog/x0e6tik-follow-up.md', { root, readable, pr: 4689, prHead }))
+        .toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr4689', readable: true, foundIn: 'pr-head' });
+      // Neither on main nor on the PR head: still refused, and an unreadable PR head is a miss, never a throw.
+      expect(resolveCardRef('xzz99zz', { root, readable, pr: 4689, prHead })).toMatchObject({ ref: null, readable: false });
+      const broken = { list: () => { throw new Error('fetch failed'); }, read: () => null };
+      expect(resolveCardRef('x0e6tik', { root, readable, pr: 4689, prHead: broken })).toMatchObject({ ref: null, readable: false });
+      // Without a PR the behaviour is unchanged.
+      expect(resolveCardRef('x0e6tik', { root, readable })).toMatchObject({ ref: null, readable: false });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('the reader hands the ruled PR and its head to the card resolver', () => {
+    const rec = referral();
+    const seen = [];
+    const reader = createRecordReferralRulingReader({ assertFresh: () => {},
+      readable: (ref) => ref.endsWith('@pr7'),
+      openPrHead: (args) => { seen.push(args); return { list: () => ['x0e6tik-follow-up.md'], read: () => '---\na: 1\n---\n' }; },
+      readJson: () => ({ headRefOid: head, comments: [gh(renderReferralRecord(rec))], body: rec.authorBody }) });
+    const context = reader({ repo, pr: 7, card: 'x0e6tik' });
+    expect(seen).toEqual([{ repo, pr: 7, head }]);
+    expect(context.card).toMatchObject({ ref: 'we:backlog/x0e6tik-follow-up.md@pr7', readable: true, foundIn: 'pr-head' });
   });
 });
 
