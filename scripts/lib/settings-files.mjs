@@ -71,12 +71,15 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
  *  `into.constructor` is a function, never a plain object, so a merge cannot walk through them.) */
 const UNSAFE_KEYS = new Set(['__proto__']);
 
-/** PURE: every leaf path (`a.b.c`) of a plain object. Arrays and scalars are leaves. */
+/** PURE: every leaf path (`a.b.c`) of a plain object. Arrays and scalars are leaves.
+ *  A top-level `$comment` is documentation, not a setting: every feature file may carry its own, so it has no owner
+ *  and never counts as a duplicate leaf (two feature files each documenting themselves is not a conflict). */
 export function settingsLeaves(obj, prefix = '') {
   if (!isPlainObject(obj)) return [];
   const out = [];
   for (const [k, v] of Object.entries(obj)) {
     if (UNSAFE_KEYS.has(k)) continue;
+    if (!prefix && k === '$comment') continue;
     const p = prefix ? `${prefix}.${k}` : k;
     if (isPlainObject(v)) out.push(...settingsLeaves(v, p));
     else out.push(p);

@@ -66,8 +66,22 @@ describe('planReconcile with a takeover head over the cap', () => {
     expect(p.refusals.find((r) => r.prNumber === 7 && r.kind === 'cap-exhausted')).toBeUndefined();
   });
   it('a takeover that re-armed to review:pending (6 rounds > cap 5) is still reviewed once', () => {
+    // The base takeover work (fix-takeover.mjs#takeoverMarkers) already raises the review cap by one per started
+    // takeover, so this head is dispatched through the ordinary review path, not through the grant.
     const p = plan(pr(TAKE, [...spent, marker(OLD, 7), rearm(8)], ['review:pending']), { durableCounts: { 7: 6 } });
-    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review', takeoverReview: { ok: true } });
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
+    expect(p.refusals.find((r) => r.prNumber === 7 && r.kind === 'cap-exhausted')).toBeUndefined();
+  });
+  it('the operator send-back cap site opts out of takeover: no takeover-review dispatch replaces it', () => {
+    // Same shape as fix-takeover.test.mjs's send-back case (red CI, five rounds before the operator's verdict, grant
+    // spent), with the takeover signals added: the grant must honour `allowTakeover: false` and leave the note to a person.
+    const sendBack = { id: 'op-send-back', createdAt: at(6), author: { login: 'chalbert' },
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' };
+    const red = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', headSha: TAKE }];
+    const p = plan({ ...pr(TAKE, [rearm(1), rearm(2), rearm(3), rearm(4), rearm(5), sendBack, operatorTakeover(7), marker(TAKE, 8)]),
+      statusCheckRollup: red }, { durableCounts: { 7: 7 } });
+    expect(p.dispatch.filter((x) => x.prNumber === 7 && (x.takeoverReview || x.mode === 'takeover'))).toEqual([]);
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toMatchObject({ capKind: 'fix', parkToHuman: true });
   });
   it('a second push after the takeover review is capped again (cap-exhausted, no dispatch)', () => {
     const p = plan(pr(NEXT, [...spent, marker(TAKE, 8), advisory(TAKE, 9), bounce(TAKE, 10)]), { durableCounts: { 7: 6 } });
