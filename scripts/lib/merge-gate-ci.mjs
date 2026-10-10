@@ -29,6 +29,7 @@ import { extractManifestFromBody } from '../readiness/lane-manifest.mjs';
 import { classifyPr, buildDrainVerdicts, drainGateInputs, isCodeQLFailed } from '../merge-ai-prs.mjs';
 import { DRAIN_GATES } from './merge-gate-inventory.mjs';
 import { placementOf } from './merge-delivery-policy.mjs';
+import { workflowEditHold } from './merge-queue-enqueue.mjs';
 
 export const TRUST_LABEL = 'ready-to-merge';
 export const REQUIRED_CHECK = 'test';
@@ -130,9 +131,15 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     defaultBranchOf: () => facts.defaultBranch || null,
   });
 
-  // review-acceptance — scoreEscalation + decideReviewGate on the drain's own inputs.
+  // review-acceptance — scoreEscalation + decideReviewGate on the drain's own inputs. FIRST, the human-only
+  // workflow-edit rule (PR #4708 round 6): a PR whose change list AT THE PINNED HEAD (`facts.gatePaths`, git
+  // `--no-renames` so both sides of a rename count) touches .github/workflows/** or .github/actions/** changes
+  // the checks that judge it. An AI-reviewable escalation cannot clear that; only a `clear-human` ceremony whose
+  // reviewed sha IS the pinned head can. An unread or missing change list fails closed.
   const sig = facts.netSignals;
-  if (facts.manifest?.error) set('review-acceptance', 'fail-closed', `manifest read failed: ${facts.manifest.error}`);
+  const wf = workflowEditFact(facts);
+  if (wf) set('review-acceptance', wf.status, wf.reason);
+  else if (facts.manifest?.error) set('review-acceptance', 'fail-closed', `manifest read failed: ${facts.manifest.error}`);
   else if (!sig || (!sig.scored && !sig.fallbackFiles)) set('review-acceptance', 'fail-closed', `net diff unreadable: ${sig?.error || 'not computed'}`);
   else {
     const score = scoreEscalation({
@@ -209,6 +216,24 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   }
 
   return finish(num, out, policy, mergeEvent);
+}
+
+/**
+ * The human-only workflow-edit verdict for `review-acceptance`, or null when the PR touches no gate path and may
+ * proceed to the ordinary review decision. Pure.
+ * @returns {null|{status:'hold'|'fail-closed', reason:string}}
+ */
+export function workflowEditFact(facts) {
+  const pinned = facts?.pinnedHead?.sha;
+  const gp = facts?.gatePaths;
+  if (!pinned) return { status: 'fail-closed', reason: `workflow-edit check: head not pinned (${facts?.pinnedHead?.error || 'no pinned head'})` };
+  if (!gp || gp.error || !Array.isArray(gp.files)) return { status: 'fail-closed', reason: `workflow-edit check: pinned change list unreadable (${gp?.error || 'not read'})` };
+  const hold = workflowEditHold({ files: gp.files, expectedCount: gp.files.length });
+  if (!hold.hold) return null;
+  if (!hold.humanOnly) return { status: 'fail-closed', reason: `workflow-edit check: ${hold.error}` };
+  const cleared = String(facts?.acceptance && !facts.acceptance.error ? facts.acceptance.humanClearedSha || '' : '').toLowerCase();
+  if (cleared && cleared === String(pinned).toLowerCase()) return null;
+  return { status: 'hold', reason: `human-only: the diff at ${String(pinned).slice(0, 9)} touches ${hold.paths.join(', ')} — workflow files decide the required checks, so only a clear-human ceremony at this exact head can accept it${cleared ? ` (human clearance is for ${cleared.slice(0, 9)})` : ''}` };
 }
 
 function gateCard(id) {

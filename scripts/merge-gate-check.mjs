@@ -22,10 +22,13 @@
  * SCRIPTS. The PR's body/labels/diff are read as DATA only, and every git read is pinned to the PR's exact head
  * SHA (`headRefOid`, the event's sha, or for a merge group each PR's sha inside the group) — never to the branch
  * NAME, which can move after the event or name a different ref (`pinnedHeadOf` / `gatherPrFacts`).
- * The workflow YAML is read by GitHub from the PR merge ref / group commit, so (1) the evaluation refuses to pass
- * unless the RUNNING workflow file is byte-identical to main's (`verifyRunningWorkflow`; fail closed) and (2) the
- * only defence against a YAML edit that never reaches this script (`exit 0`) is the ruleset's `workflows` pin to
- * refs/heads/main plus the GitHub Actions integration-id restriction (`--print-ruleset`).
+ * The PR leg runs on `pull_request_target`, so GitHub reads that run's YAML from main; the `merge_group` leg's YAML
+ * comes from the group commit. So (1) the PR-leg run holds any PR whose PINNED change list touches a workflow or
+ * action for a HUMAN (`facts.gatePaths` → `workflowEditFact`), and a PR must pass that run to enter the queue;
+ * (2) the evaluation refuses to pass unless the RUNNING workflow file is byte-identical to main's
+ * (`verifyRunningWorkflow`; fail closed); (3) a YAML edit that never reaches this script (`exit 0`, or a new
+ * workflow posting `merge-gate`) is closed by the ruleset's `workflows` pin to refs/heads/main plus the GitHub
+ * Actions integration-id restriction (`--print-ruleset`).
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -41,7 +44,7 @@ import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine } from './lib/m
 import { readSettings, readDeclaredSettings } from './lib/settings-files.mjs';
 import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
 import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
-import { rulesetSuggestion } from './lib/merge-queue-enqueue.mjs';
+import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
@@ -197,6 +200,11 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     } catch (e) { facts.netSignals = { scored: false, error: firstLine(e) }; }
   }
 
+  // The pinned change list for the human-only workflow-edit rule (`workflowEditFact`): git at the judged sha,
+  // `--no-renames`, the same reader the enqueue refusal uses. Unpinned or unreadable → the rule fails closed.
+  facts.gatePaths = pin.error ? { error: `head not pinned: ${pin.error}` }
+    : readPinnedChangedFiles({ headSha: pin.sha, base: defaultBranch || 'main', cwd, exec });
+
   // Review acceptance evidence (comments + markers), read exactly as the drain reads it, but its live-diff read
   // is pinned to the judged sha and its own head read must agree with the pin (else it describes another commit).
   if ((pr.labels || []).some((l) => (l?.name ?? l) === 'review:accepted')) {
@@ -303,7 +311,8 @@ export function groupHeadsOf(commits = []) {
  */
 export function mergeEventOfFlags(f, env = process.env) {
   if (f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group') return 'merge_group';
-  return env?.GITHUB_EVENT_NAME === 'pull_request' ? 'pull_request' : null;
+  // `pull_request_target` is how merge-gate.yml runs for a PR (the YAML comes from main): same PR-leg semantics.
+  return env?.GITHUB_EVENT_NAME === 'pull_request' || env?.GITHUB_EVENT_NAME === 'pull_request_target' ? 'pull_request' : null;
 }
 
 async function main() {
