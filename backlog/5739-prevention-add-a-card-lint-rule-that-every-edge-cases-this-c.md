@@ -51,4 +51,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#4810 (finding 1: `we:backlog/xz2yynk-every-daemon-tick-is-schedule-only-async-job-model.md` — A lint rule enforcing the presence of 'Risks' and 'Test plan' headings in backlog cards.)
+- Also raised by web-everything/web-everything#4810 (finding 1: `we:backlog/5767-every-daemon-tick-is-schedule-only-async-job-model.md` — A lint rule enforcing the presence of 'Risks' and 'Test plan' headings in backlog cards.)

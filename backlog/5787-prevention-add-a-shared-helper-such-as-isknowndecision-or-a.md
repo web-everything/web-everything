@@ -1,22 +1,21 @@
 ---
+bornAs: xuyjc5l
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xqux73p-one-event-stream-and-one-state-manager-for-all-daemons-the-o.md"]
+scope: ["we:scripts/conveyor/load-flake-reverify.mjs", "we:scripts/conveyor/__tests__/load-flake-reverify.test.mjs"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Prevention — Add "Read access and data scrubbing (who may read each kind, what is scrubbed before it leaves th… (from web-everything/web-everything#4822 review)
+# Prevention — Add a shared helper such as isKnownDecision (or a decisionOrNull) in we:resource-admission.mjs an… (from web-everything/web-everything#4750 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xqux73p-one-event-stream-and-one-state-manager-for-all-daemons-the-o.md:55` — Add "Read access and data scrubbing (who may read each kind, what is scrubbed before it leaves the host)" as a required edge-case class in the decision-card template. Back it with a prepare-time check:standards rule that rejects a card ruling on a shared or hosted store while that class is empty.
-2. `we:backlog/xqux73p-one-event-stream-and-one-state-manager-for-all-daemons-the-o.md` — Define stream generation identity or an explicit reset exception, and gate the informer implementation on a deterministic reset-to-lower-sequence conformance test.
 
-Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 3 → #5668.
+1. `we:scripts/conveyor/load-flake-reverify.mjs:72` — Add a shared helper such as `isKnownDecision` (or a `decisionOrNull`) in we:resource-admission.mjs and use it in every cut-over gate, so an unknown decision is handled uniformly. Add a test per gate for the sampler-down case.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4822@3760fbbe0b14f8447eda1168f528a6e47ac1f55f
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4750@7cc10d50c782d423fc82734e08e74129929d22ca
 
 ## Acceptance
 

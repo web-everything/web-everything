@@ -1,9 +1,10 @@
 ---
+bornAs: xss4m4n
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/xh8442i-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md", "we:backlog/x3a69zv-ci-overflow-skip-the-local-gate-when-it-would-not-save-time.md", "we:backlog/xs4ewgh-per-item-task-core-exclusion-timeout-outcomes-effect-declara.md", "we:backlog/xt3sgtl-worker-launch-and-claim-lifecycle-hand-off-before-spawn-watc.md", "we:backlog/xug05a8-temporary-policy-overrides-carry-their-own-end-condition.md", "we:backlog/xh5sg8r-prepare-runs-an-earned-design-review-and-every-design-keeps.md"]
+scope: ["we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md", "we:backlog/5740-ci-overflow-skip-the-local-gate-when-it-would-not-save-time.md", "we:backlog/5754-per-item-task-core-exclusion-timeout-outcomes-effect-declara.md", "we:backlog/5757-worker-launch-and-claim-lifecycle-hand-off-before-spawn-watc.md", "we:backlog/5758-temporary-policy-overrides-carry-their-own-end-condition.md", "we:backlog/5768-prepare-runs-an-earned-design-review-and-every-design-keeps.md"]
 dateOpened: "2026-10-10"
 tags: []
 ---
@@ -11,13 +12,13 @@ tags: []
 # Prevention — A checklist or review bot that cross-references each stated edge case constraint against the list… (from web-everything/web-everything#4810 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-1. `we:backlog/xh8442i-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md` — A checklist or review bot that cross-references each stated edge case constraint against the listed acceptance tests.
-2. `we:backlog/x3a69zv-ci-overflow-skip-the-local-gate-when-it-would-not-save-time.md` — A PR template requiring every stated edge case to map to an explicit test case in the plan.
-3. `we:backlog/xs4ewgh-per-item-task-core-exclusion-timeout-outcomes-effect-declara.md` — A validation rule requiring each numbered edge case class to have a corresponding linked test in the acceptance criteria.
-4. `we:backlog/xt3sgtl-worker-launch-and-claim-lifecycle-hand-off-before-spawn-watc.md` — A check that cross-references each stated edge case constraint against the listed acceptance tests.
+1. `we:backlog/5745-drain-no-merge-while-a-fix-or-ci-heal-claim-is-live.md` — A checklist or review bot that cross-references each stated edge case constraint against the listed acceptance tests.
+2. `we:backlog/5740-ci-overflow-skip-the-local-gate-when-it-would-not-save-time.md` — A PR template requiring every stated edge case to map to an explicit test case in the plan.
+3. `we:backlog/5754-per-item-task-core-exclusion-timeout-outcomes-effect-declara.md` — A validation rule requiring each numbered edge case class to have a corresponding linked test in the acceptance criteria.
+4. `we:backlog/5757-worker-launch-and-claim-lifecycle-hand-off-before-spawn-watc.md` — A check that cross-references each stated edge case constraint against the listed acceptance tests.
 5. `(cited file withheld: not a plain path)` — Update the mandate to recognize 'Edge cases' and 'Acceptance' as aliases, or update the backlog template to match the mandate.
-6. `we:backlog/xug05a8-temporary-policy-overrides-carry-their-own-end-condition.md:16` — A strict LLM pass that cross-references every enumerated feature in the description with the test plan.
-7. `we:backlog/xh5sg8r-prepare-runs-an-earned-design-review-and-every-design-keeps.md:15` — A strict LLM pass that cross-references every enumerated behavioral constraint in the description with the test plan.
+6. `we:backlog/5758-temporary-policy-overrides-carry-their-own-end-condition.md:16` — A strict LLM pass that cross-references every enumerated feature in the description with the test plan.
+7. `we:backlog/5768-prepare-runs-an-earned-design-review-and-every-design-keeps.md:15` — A strict LLM pass that cross-references every enumerated behavioral constraint in the description with the test plan.
 
 Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5739.
 

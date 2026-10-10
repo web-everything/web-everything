@@ -46,4 +46,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#4822 (finding 3: `we:backlog/xqux73p-one-event-stream-and-one-state-manager-for-all-daemons-the-o.md` — Add a deterministic preparation gate requiring each behavioral constraint to reference a repository-qualified planned test, named case, and observable assertion; implementation slices must resolve those references to executable tests.)
+- Also raised by web-everything/web-everything#4822 (finding 3: `we:backlog/5785-one-event-stream-and-one-state-manager-for-all-daemons-the-o.md` — Add a deterministic preparation gate requiring each behavioral constraint to reference a repository-qualified planned test, named case, and observable assertion; implementation slices must resolve those references to executable tests.)
