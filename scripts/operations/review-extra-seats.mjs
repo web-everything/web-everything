@@ -1453,6 +1453,12 @@ export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, en
     if (!fp || fp !== pass.readFingerprint) {
       return { status: 'stale', reason: `the speculative pass judged a different read (head ${String(pass.rev).slice(0, 12)} vs ${String(read?.netBasis?.rev ?? '-').slice(0, 12)})` };
     }
+    // The sequential brief lists the jurors' own findings so the red team does not repeat them; a speculative brief
+    // was written before they existed. Identical only when there were none — otherwise the sequential pass runs.
+    const jurorFindings = claudeFindingsFromLoop(loopPayload);
+    if (Array.isArray(jurorFindings) && jurorFindings.length) {
+      return { status: 'stale', reason: `the jurors raised ${jurorFindings.length} finding(s) the speculative brief could not carry (the sequential brief lists them so the red team does not repeat them)` };
+    }
     let records = [];
     try { records = io.readRecords(); } catch { records = []; }
     if (priorRedTeamRow(records, pr, pass.rev)) return { status: 'superseded', reason: `a clean red-team row for #${pr} at ${String(pass.rev).slice(0, 12)} landed meanwhile` };

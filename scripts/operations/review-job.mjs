@@ -439,6 +439,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
       }
     },
+    speculativeReadSunk: (handle) => existsSync(handle.readSink),
     recordDiscardedRedTeam: (o) => recordDiscardedRedTeam(o, createRedTeamIo({ env })),
     cleanupSpeculativeRedTeam: (handle) => {
       for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
@@ -478,6 +479,16 @@ export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
       const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reserved, reason });
       log(`discarded (${reason}); pass ${pass?.status ?? (reserved ? 'in flight, killed' : 'not started')}; spend ${spend?.status ?? '-'}`);
       return { decision: 'discard', passStatus: pass?.status ?? (reserved ? 'killed-in-flight' : 'not-started'), spend, timings: timings(pass), result: null };
+    }
+    // The loop is over: if it never wrote the read sink (a failed sink write, a loop that stopped before its read
+    // step), the speculative pass can never get a read. Call it off now and run the sequential pass, rather than
+    // waiting out its wall and reporting a red-team error.
+    if (typeof io.speculativeReadSunk === 'function' && io.speculativeReadSunk(spec) === false) {
+      const { spec: pass, reserved } = io.cancelSpeculativeRedTeam(spec);
+      const spend = reserved || pass?.status === 'speculated'
+        ? io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reserved, reason: 'the review loop wrote no read sink' }) : null;
+      log('the loop wrote no read sink — called off; sequential pass instead');
+      return { decision: 'sequential', passStatus: 'no-read', reason: 'the review loop wrote no read sink', ...(spend ? { spend } : {}), timings: timings(pass), result: null };
     }
     const remaining = Math.max(60_000, speculativeRedTeamWallMs() - (Date.now() - spec.startedAt));
     const waited = io.awaitSpeculativeRedTeam(spec, { timeoutMs: remaining });

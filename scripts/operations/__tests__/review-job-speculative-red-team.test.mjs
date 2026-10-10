@@ -3,11 +3,15 @@
  * and keeps it only when the review accepts. No real process, model, git or GitHub call: every effect is a fake.
  */
 import { describe, it, expect } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import { runReviewJob, settleSpeculativeRedTeam } from '../review-job.mjs';
+import { createReviewJobIo, runReviewJob, settleSpeculativeRedTeam } from '../review-job.mjs';
 import {
   speculateRedTeam, finishSpeculativeRedTeam, runRedTeam, buildRedTeamDiscardRow, reserveSeatCalls,
-  RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam,
+  RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam, ACTIVE_SEAT_PIDS, killActiveSeats,
 } from '../review-extra-seats.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 
@@ -138,6 +142,14 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     expect(kinds(calls)).toEqual(['start', 'loop', 'await', 'finish', 'discard-row', 'cleanup', 'sequential', 'gate']);
   });
 
+  it('accept, but the loop never wrote the read sink → called off at once and the sequential pass runs (never a red-team error)', () => {
+    const { io, calls } = jobIo({ over: { speculativeReadSunk: () => false } });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).toEqual(['start', 'loop', 'cancel', 'discard-row', 'cleanup', 'sequential', 'gate']);
+    expect(out.redTeam.status).toBe('ran');
+    expect(out.redTeamSpeculative).toMatchObject({ decision: 'sequential', passStatus: 'no-read' });
+  });
+
   it('setting off → today\'s order: no speculative start, no sink, the red team after the review', () => {
     const { io, calls } = jobIo({ setting: { value: 'off', enabled: false, source: 'tool', invalid: [] } });
     runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
@@ -230,6 +242,17 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
     expect(posts).toEqual([]);
   });
 
+  it('an accept whose jurors raised findings is stale: the sequential brief lists them, the speculative one could not', async () => {
+    const { io, rows, posts } = seatsIo();
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, io);
+    const p = payload('accept');
+    p.findings.judge.findings = [{ summary: 'f(0) divides by zero', file: 'x.mjs' }];
+    const r = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: p, pass, env: {} }, io);
+    expect(r.status).toBe('stale');
+    expect(rows).toEqual([]);
+    expect(posts).toEqual([]);
+  });
+
   it('finishing a non-accept is refused (not owed) — the speculative pass never posts on changes', async () => {
     const { io, posts } = seatsIo();
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, io);
@@ -272,4 +295,34 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
       expect(redTeamReadFingerprint({ ...read(), ...tweak })).not.toBe(base);
     }
   });
+});
+
+// ── real processes: calling a pass off really stops it ───────────────────────────────────────────────────────────
+
+const gone = (pid) => { try { process.kill(pid, 0); return false; } catch { return true; } };
+const exited = (child) => new Promise((resolveExit) => { if (child.exitCode !== null || child.signalCode) resolveExit(); else child.once('exit', () => resolveExit()); });
+
+describe('calling a speculative pass off kills real processes', () => {
+  it('killActiveSeats kills a running seat CLI\'s own (detached) process group', async () => {
+    const seat = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore' });
+    ACTIVE_SEAT_PIDS.add(seat.pid);
+    killActiveSeats('SIGKILL');
+    await exited(seat);
+    ACTIVE_SEAT_PIDS.delete(seat.pid);
+    expect(gone(seat.pid)).toBe(true);
+  });
+
+  it('cancelSpeculativeRedTeam stops a real speculate process that is still waiting, and returns no spend', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xbizuci-'));
+    try {
+      const io = createReviewJobIo({ dir, env: { ...process.env } });
+      const h = io.startSpeculativeRedTeam({ pr: 1, repo: REPO, lanePath: dir, slug: 'cancel-test', waitMs: 60_000 });
+      expect(h?.pid).toBeGreaterThan(0);
+      expect(io.speculativeReadSunk(h)).toBe(false);
+      expect(io.cancelSpeculativeRedTeam(h)).toEqual({ spec: null, reserved: null });
+      // Our own detached child lingers as a zombie until this process reaps it; `ps` must not show it running.
+      const stat = String(spawnSync('ps', ['-o', 'stat=', '-p', String(h.pid)], { encoding: 'utf8' }).stdout ?? '').trim();
+      expect(stat === '' || stat.startsWith('Z')).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 60_000);
 });
