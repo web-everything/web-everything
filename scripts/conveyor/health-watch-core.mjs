@@ -760,9 +760,12 @@ export function renderHealthSection(state, { now, reportDir = '', staleAfterMs =
  * @param {{ daemonLogs?: Array<object>, [probe:string]: any }} probes  raw probe readings from the shell
  * @param {Array<object>} smells  the registry
  * @param {number} now
- * @param {{ config?: object, activeCards?: Set<string>, probeErrors?: Record<string,string> }} [opts]
+ * @param {{ config?: object, activeCards?: Set<string>, probeErrors?: Record<string,string>, carryProbeErrors?: Iterable<string> }} [opts]
+ *   `carryProbeErrors`: probe names that took NO sample this tick (a gh-cadence job still queued or running), so
+ *   their existing error streak is held as it is — neither cleared (a streak is cleared by a success, not by an
+ *   absent read) nor grown (nothing failed again). A name that also appears in `probeErrors` was sampled and grows.
  */
-export function runHealthTick(prevState, probes, smells, now, { config = {}, activeCards, probeErrors = {} } = {}) {
+export function runHealthTick(prevState, probes, smells, now, { config = {}, activeCards, probeErrors = {}, carryProbeErrors = [] } = {}) {
   const cfg = { ...DEFAULT_HEALTH_CONFIG, ...config };
   const state = { ...emptyHealthState(), ...(prevState || {}) };
   const daemons = { ...(state.daemons || {}) };
@@ -773,7 +776,8 @@ export function runHealthTick(prevState, probes, smells, now, { config = {}, act
   const errs = { ...(state.probeErrors || {}) };
   // An IO probe's streak resets when that probe succeeds; a smell's own `smell:<id>` streak resets only when that
   // smell evaluates cleanly (below) — never here, or a smell that throws every tick would never reach 3.
-  for (const name of Object.keys(errs)) if (!name.startsWith('smell:') && !(name in probeErrors)) delete errs[name];
+  const carried = new Set(carryProbeErrors);
+  for (const name of Object.keys(errs)) if (!name.startsWith('smell:') && !(name in probeErrors) && !carried.has(name)) delete errs[name];
   for (const [name, msg] of Object.entries(probeErrors)) errs[name] = { count: (errs[name]?.count ?? 0) + 1, last: String(msg).slice(0, 200) };
 
   // When each heavy-admission slot holder was FIRST seen (the status read carries no acquire time): kept in state,
