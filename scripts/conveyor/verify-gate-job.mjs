@@ -238,7 +238,8 @@ export function createVerifyGateJobs({
 
 /**
  * The job's one step. Idempotent across a relaunch: a surviving gate from a previous attempt is killed (its
- * handle is checked, never a bare pid), and nothing runs unless the marker is still this request.
+ * handle is checked, never a bare pid; one that survives the kill refuses the run with a `failed` result), and
+ * nothing runs unless the marker is still this request.
  * @param {{jobId:string, input:object, jobsDir:string, attempt?:number, log?:(m:string)=>void, runGate?:typeof runLaneGate,
  *   laneState?:(dir:string)=>{marker:object|null, headSha:string|null}, probe?:Function, readStart?:Function,
  *   kill?:Function, onGate?:(pid:number)=>void}} o
@@ -262,6 +263,12 @@ export async function runGateStep({
     log(`[verify-gate-job ${jobId}] attempt ${attempt}: previous gate pid ${prior.gate.pid} still alive — killing its group`);
     try { kill(-prior.gate.pid, 'SIGKILL'); } catch {}
     for (let i = 0; i < 50 && probe(prior.gate.handle) === 'alive'; i += 1) await sleep(100);
+    // A bounded kill attempt is not proof of death: never start a second gate beside one that still owns the marker.
+    if (probe(prior.gate.handle) === 'alive') {
+      const message = `previous gate pid ${prior.gate.pid} survived SIGKILL; refusing to start a second gate on this lane`;
+      log(`[verify-gate-job ${jobId}] attempt ${attempt}: ${message}`);
+      return finish({ outcome: 'failed', status: null, signal: null, message });
+    }
   }
 
   // 2. Run nothing unless the marker is still this request (a relaunch may find it settled or superseded).

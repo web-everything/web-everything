@@ -92,6 +92,33 @@ describe('runGateStep — the job child', () => {
     expect(kill).toHaveBeenCalledWith(-777, 'SIGKILL');
     expect(out.outcome).toBe('stale');
   });
+
+  it('a relaunch refuses to start a second gate while the previous gate survives the kill', async () => {
+    writeFileSync(gatePath(dir, 'j4'), JSON.stringify({ pid: 778, handle: 'h:778:x' }));
+    const kill = vi.fn(); // SIGKILL has no effect (EPERM / uninterruptible): the probe stays alive
+    const runGate = vi.fn();
+    const sleep = vi.fn(async () => {});
+    const logs = [];
+    const out = await runGateStep({ jobId: 'j4', input: INPUT, jobsDir: dir, attempt: 2, log: (m) => logs.push(m), kill,
+      probe: () => 'alive', sleep, laneState: () => ({ marker: running, headSha: 'abc12345' }), runGate });
+    expect(kill).toHaveBeenCalledWith(-778, 'SIGKILL');
+    expect(runGate).not.toHaveBeenCalled();
+    expect(out.outcome).toBe('failed');
+    const result = JSON.parse(readFileSync(resultPath(dir, 'j4'), 'utf8'));
+    expect(result).toMatchObject({ outcome: 'failed', attempt: 2 });
+    expect(result.message).toMatch(/778/);
+  });
+
+  it('a relaunch whose kill is slow but lands within the wait still runs the gate', async () => {
+    writeFileSync(gatePath(dir, 'j5'), JSON.stringify({ pid: 779, handle: 'h:779:x' }));
+    let polls = 0;
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'j5', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, kill: vi.fn(),
+      probe: () => { polls += 1; return polls > 3 ? 'dead' : 'alive'; }, sleep: async () => {},
+      laneState: () => ({ marker: running, headSha: 'abc12345' }), runGate });
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(out.outcome).toBe('green');
+  });
 });
 
 describe('createVerifyGateJobs — the daemon side over a real job store', () => {
