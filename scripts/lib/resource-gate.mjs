@@ -129,6 +129,12 @@ export function loadResourceGateSettings({ env = process.env, repoRoot, home = h
   return { ...resolved, invalid: [...resolved.invalid, ...errors] };
 }
 
+/** The cut-over switch (`enforce` | `shadow`) for gates that consume the shared decision directly rather than through
+ *  {@link cutoverDecision}. Never throws; an unreadable setting is the standard (`enforce`). */
+export function resolveCutoverMode(env = process.env) {
+  try { return loadResourceGateSettings({ env }).settings.cutover; } catch { return RESOURCE_GATE_STANDARD.cutover; }
+}
+
 let lastLogged = null;
 /** One `resource-gate settings · leaf=value (source), …` line per process per distinct effective set. */
 export function logGateSettingsOnce({ settings, sources, invalid = [] }, log = (line) => process.stderr.write(line)) {
