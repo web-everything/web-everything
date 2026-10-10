@@ -4230,3 +4230,18 @@ describe('card 84 — review.seatProvider.<lens> and the advisory agy-correctnes
     expect(run.findings.reduce.lensProviders.security).toBeUndefined();
   });
 });
+
+// ── Cards 5471 / 5470 — the read carries the round settings through to the run record ────────────────────────────────
+describe('cards 5471 + 5470: shapeReadFinding carries the round budget, the ledger round and the on mode', () => {
+  it('carries roundBudget, reviewRound and scopedRereview on; off adds no key', () => {
+    const base = stubReader({})({ pr: 1, repo: 'o/n' });
+    const on = shapeReadFinding({ ...base, roundBudget: 3, reviewRound: 4, scopedRereview: 'on' }, { pr: 1, repo: 'o/n' });
+    expect(on).toMatchObject({ roundBudget: 3, reviewRound: 4, scopedRereview: 'on' });
+    const unknownRound = shapeReadFinding({ ...base, roundBudget: 3, reviewRound: null }, { pr: 1, repo: 'o/n' });
+    expect(unknownRound).toMatchObject({ roundBudget: 3, reviewRound: null });
+    const off = shapeReadFinding(base, { pr: 1, repo: 'o/n' });
+    expect(off).not.toHaveProperty('roundBudget');
+    expect(off).not.toHaveProperty('reviewRound');
+    expect(off).not.toHaveProperty('scopedRereview');
+  });
+});
