@@ -59,11 +59,26 @@ describe('fix settings cascade (card xx0055i)', () => {
     const flat = () => JSON.stringify({ roundCapAction: 'person', roundHistory: 'off', takeoverMaxPerPr: 3 });
     expect(resolveFixSettings({ env: {}, read: flat }).sources).toEqual({ roundCapAction: 'built-in', roundHistory: 'built-in', takeoverMaxPerPr: 'built-in' });
   });
-  it('env beats the settings file; an unknown value falls through', () => {
+  it('env beats the settings file; an unknown roundHistory falls through', () => {
     const read = () => JSON.stringify({ fix: { roundCapAction: 'takeover', roundHistory: 'on' } });
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: 'person' }, read }).roundCapAction).toBe('person');
-    expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: 'bogus' }, read }).roundCapAction).toBe('takeover');
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_HISTORY: 'off' }, read }).roundHistory).toBe('off');
+    expect(resolveFixSettings({ env: { WE_FIX_ROUND_HISTORY: 'bogus' }, read }).roundHistory).toBe('on');
+  });
+  it('an invalid roundCapAction fails closed to person (env or file), never the built-in takeover (self-review)', () => {
+    const takeoverFile = () => JSON.stringify({ fix: { roundCapAction: 'takeover' } });
+    for (const bad of ['bogus', 'persn', 'manual']) {
+      expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: bad }, read: takeoverFile }))
+        .toMatchObject({ roundCapAction: 'person', sources: { roundCapAction: 'env-invalid' } });
+    }
+    for (const bad of ['persn', '', ['person'], false, 1]) {
+      expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { roundCapAction: bad } }) }))
+        .toMatchObject({ roundCapAction: 'person', sources: { roundCapAction: 'settings-invalid' } });
+    }
+    // a valid value keeps working, case/space-insensitive; blank env and a null/absent key fall through
+    expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: ' Takeover ' }, read: () => '{}' }).roundCapAction).toBe('takeover');
+    expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: ' ' }, read: () => JSON.stringify({ fix: { roundCapAction: 'person' } }) }).roundCapAction).toBe('person');
+    expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { roundCapAction: null } }) }).sources.roundCapAction).toBe('built-in');
   });
 });
 
@@ -95,6 +110,12 @@ describe('planTakeover (card xx0055i)', () => {
       const ok = () => JSON.stringify({ fix: { takeoverMaxPerPr: 2 } });
       expect(resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: String(bad) }, read: ok })).toMatchObject({ takeoverMaxPerPr: 0, sources: { takeoverMaxPerPr: 'env-invalid' } });
     }
+    // types are checked, not stringified: an empty string, an array or 1.5 in the file is invalid, not absent or 3
+    for (const bad of ['', [3], ['5'], 1.5, {}]) {
+      expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { takeoverMaxPerPr: bad } }) }))
+        .toMatchObject({ takeoverMaxPerPr: 0, sources: { takeoverMaxPerPr: 'settings-invalid' } });
+    }
+    expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: { takeoverMaxPerPr: '2' } }) }).takeoverMaxPerPr).toBe(2);
     // absent / blank layers still fall through
     expect(resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: '  ' }, read: () => JSON.stringify({ fix: { takeoverMaxPerPr: 2 } }) }).takeoverMaxPerPr).toBe(2);
     expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: {} }) }).takeoverMaxPerPr).toBe(1);
