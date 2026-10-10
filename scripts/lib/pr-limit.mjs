@@ -17,7 +17,7 @@
  * now" — so the override that lifts it must be visible to every lane/session on this machine at once, the
  * same reason `~/.claude/github-app-token` and other machine-wide operator state live under `~/.claude`.
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -32,6 +32,9 @@ import { writeAllSync } from './write-all-sync.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of card-only (backlog/ only, fail-closed) — never re-derived here
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+import { gitRun } from './git-run.mjs';
+import { classifySession } from '../operations/session-role.mjs'; // THE worker/orchestrator marker — the same one pre-pr-review's bypass gate reads
+import { currentActorId } from './review-independence.mjs'; // the harness session id, recorded on every grant/refusal
 
 // ── LIMITS (defaults + per-repo env override) ───────────────────────────────────────────────────────────
 
@@ -428,7 +431,7 @@ export function decideOpenPr({
       allowed: false,
       exempt: false,
       overridden: false,
-      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first, or override (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=…\` / \`node scripts/operations/pr-limit.mjs off --reason=… [--for=2h]\` / \`pr-land --force-open --reason=…\`)`,
+      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first. An agent stops and reports here — exceptions are the operator's to grant (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=… --operator-quote="<verbatim>"\` from the operator's channel, never a worker or lane session; or \`pr-limit.mjs off\`)`,
     };
   }
   return { allowed: true, reason: `under limit (${openCount}/${limit})${split}`, exempt: false, overridden: false };
@@ -458,6 +461,10 @@ export function parseLimitState(text) {
       by: v.by != null ? String(v.by) : null,
       at: v.at != null ? String(v.at) : null,
       until: v.until != null ? String(v.until) : null,
+      // xfaz7ho's grant record — kept when present so a later write never strips an earlier grant's quote.
+      ...(v.operatorQuote != null ? { operatorQuote: String(v.operatorQuote) } : {}),
+      ...(v.channel != null ? { channel: String(v.channel) } : {}),
+      ...(v.session != null ? { session: String(v.session) } : {}),
     };
   }
   return {
@@ -521,12 +528,17 @@ export function clearGlobalOff(state, { by = null, reason = null } = {}, now = D
   return appendHistory(next, { actor: by, reason: reason || 'operator re-armed the limit', action: 'on', target: null }, now);
 }
 
-/** Allow-list one branch (indefinitely, or until `untilMs` from now). PURE. */
-export function allowBranch(state, branch, { reason = null, by = null, untilMs = null } = {}, now = Date.now()) {
+/** Allow-list one branch (indefinitely, or until `untilMs` from now). PURE. `operatorQuote`/`channel`/`session`
+ *  (xfaz7ho) are recorded on the entry when given; entries written without them (before xfaz7ho) stay valid —
+ *  {@link isBranchAllowedNow} never reads them, the gate is at WRITE time ({@link authoriseAllow}). */
+export function allowBranch(state, branch, { reason = null, by = null, untilMs = null, operatorQuote = null, channel = null, session = null } = {}, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const name = String(branch || '').trim();
   if (!name) return s;
   const entry = { reason: reason != null && String(reason).trim() ? String(reason).trim() : 'operator override', by: by || null, at: new Date(now).toISOString(), until: untilMs != null ? new Date(now + untilMs).toISOString() : null };
+  if (operatorQuote) entry.operatorQuote = String(operatorQuote);
+  if (channel) entry.channel = String(channel);
+  if (session) entry.session = String(session);
   const next = { ...s, branches: { ...s.branches, [name]: entry } };
   return appendHistory(next, { actor: entry.by, reason: entry.reason, action: 'allow-branch', target: name }, now);
 }
@@ -559,6 +571,54 @@ export function isBranchAllowedNow(state, branch, nowMs = Date.now()) {
   const untilMs = Date.parse(entry.until);
   return !Number.isFinite(untilMs) || nowMs < untilMs;
 }
+
+// ── WHO MAY GRANT AN EXCEPTION (xfaz7ho) ──────────────────────────────────────────────────────────────────
+
+/** Max length of a recorded operator quote — it is stored verbatim, so it is bounded, not truncated silently. */
+export const OPERATOR_QUOTE_MAX = 1000;
+
+/**
+ * May THIS caller allow-list `branch`? PURE given its inputs. Exceptions are the operator's to grant: twice on
+ * 2026-10-10 a worker ran `pr-limit.mjs allow --branch=<its own branch>` and opened its PR past the limit
+ * (#4786, #4779 — both ratified after the fact). The channel is DERIVED from what the harness and our own spawn
+ * sites put in the environment and from where the command runs — never from an argv flag the caller sets:
+ *   • `worker`  — `WE_CONVEYOR_WORKER=1` (every dispatch spawn site sets it, we:scripts/operations/session-role.mjs) → refused;
+ *   • `unknown` — an unrecognised marker value → refused (fail closed, same as pre-pr-review's bypass gate);
+ *   • `lane`    — run from inside a lane clone (`/.lanes/`), where every worker works → refused;
+ *   • own branch — the target is the branch the calling checkout itself tracks → refused;
+ *   • otherwise `operator-session` (a Claude session outside any lane) or `terminal` (no Claude env) — accepted
+ *     only with a verbatim `--operator-quote`, recorded on the entry (the #2895 honesty tax).
+ * Like review-independence (#2895), this is NOT unforgeable — an agent with a shell can `cd` out and unset vars.
+ * What it buys: a self-grant now takes a deliberate evasion, and every grant and refusal is logged with its channel.
+ * @returns {{ok:boolean, channel:string, refusal:string}}
+ */
+export function authoriseAllow({ branch, operatorQuote, env = {}, cwdReal = '', ownBranch = '' } = {}) {
+  const STOP = 'An agent refused by the limit must stop and report; the operator grants exceptions.';
+  const { role, reason } = classifySession(env);
+  if (role === 'worker') return { ok: false, channel: 'worker', refusal: `pr-limit allow refused: this is a dispatched worker session (${reason}). ${STOP}` };
+  if (role !== 'orchestrator') return { ok: false, channel: 'unknown', refusal: `pr-limit allow refused: the session role is unknown (${reason}), so the grant fails closed. ${STOP}` };
+  if (String(cwdReal || '').includes('/.lanes/')) return { ok: false, channel: 'lane', refusal: `pr-limit allow refused: run from inside a lane clone (${cwdReal}) — that is where workers run; the operator grants from the primary checkout or a terminal. ${STOP}` };
+  const target = normalizeBranchName(branch);
+  const own = normalizeBranchName(String(ownBranch || '').replace(/^(refs\/remotes\/)?origin\//, ''));
+  if (own && own === target) return { ok: false, channel: 'own-branch', refusal: `pr-limit allow refused: ${target} is this checkout's own branch — a session never allow-lists its own branch. ${STOP}` };
+  const channel = env && env.CLAUDECODE ? 'operator-session' : 'terminal';
+  const quote = typeof operatorQuote === 'string' ? operatorQuote.trim() : '';
+  if (!quote) return { ok: false, channel, refusal: `pr-limit allow refused: --operator-quote="<the operator's instruction, verbatim>" is required — exceptions are the operator's to grant, and the grant records their words. ${STOP}` };
+  if (quote.length > OPERATOR_QUOTE_MAX) return { ok: false, channel, refusal: `pr-limit allow refused: --operator-quote is over ${OPERATOR_QUOTE_MAX} characters — quote the instruction itself.` };
+  return { ok: true, channel, refusal: '' };
+}
+
+/** The branch the checkout at `cwd` tracks (its upstream, else its current branch), or '' — fails soft. */
+export function readOwnBranch(cwd) {
+  for (const args of [['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], ['rev-parse', '--abbrev-ref', 'HEAD']]) {
+    const r = gitRun('git', args, { cwd });
+    const out = r.status === 0 ? String(r.stdout).trim() : ''; // not a git checkout, or no upstream — try the next read
+    if (out && out !== 'HEAD' && out !== 'main' && out !== 'origin/main') return out;
+  }
+  return '';
+}
+
+function realpathSafe(p) { try { return realpathSync(p); } catch { return resolve(String(p || '.')); } }
 
 // ── THIN FS SHELL (the boundary) ────────────────────────────────────────────────────────────────────────
 
@@ -617,11 +677,28 @@ function parseFlags(argv) {
 /** The CLI body, exported so `scripts/operations/pr-limit.mjs` can be a thin re-export (mirrors
  *  `dispatch-pause.mjs`'s own inline CLI, kept here since this module already owns every piece of state
  *  the CLI touches). */
-export function runPrLimitCli(argv) {
+export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), path = resolveLimitStatePath(env), ownBranch, stderr = process.stderr, stdout = null } = {}) {
   const cmd = argv[0];
   const flags = parseFlags(argv.slice(1));
-  const path = resolveLimitStatePath();
-  const by = flags.by || process.env.USER || null;
+  const by = flags.by || env.USER || null;
+  const out = (text) => (stdout ? stdout.write(text) : writeAllSync(1, text));
+  if (cmd === 'allow') {
+    if (!flags.branch || flags.branch === true) { stderr.write('usage: pr-limit.mjs allow --branch=<b> --reason=<why> --operator-quote="<operator instruction, verbatim>" [--for=<duration>] [--by=<actor>]\n'); return 2; }
+    const session = currentActorId(env) || null;
+    const decision = authoriseAllow({ branch: flags.branch, operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd), ownBranch: ownBranch ?? readOwnBranch(cwd) });
+    if (!decision.ok) {
+      // LOGGED: the refusal lands in the same override history every grant does, naming channel + session.
+      writeLimitState(appendHistory(readLimitState(path), { actor: by, reason: `${decision.refusal} [channel=${decision.channel}${session ? ` session=${session}` : ''}]`, action: 'allow-refused', target: normalizeBranchName(flags.branch) }), path);
+      stderr.write(`✗ ${decision.refusal}\n`);
+      return 3;
+    }
+    const untilMs = parseDurationMs(flags.for);
+    const state = allowBranch(readLimitState(path), flags.branch, { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session });
+    writeLimitState(state, path);
+    stderr.write(`✓ branch ${normalizeBranchName(flags.branch)} allow-listed — ${state.branches[String(flags.branch).trim()]?.reason}${by ? ` (by ${by})` : ''} via ${decision.channel}; operator quote recorded\n`);
+    out(JSON.stringify(state, null, 2) + '\n');
+    return 0;
+  }
 
   if (cmd === 'off') {
     const untilMs = parseDurationMs(flags.for);
@@ -635,15 +712,6 @@ export function runPrLimitCli(argv) {
     const state = clearGlobalOff(readLimitState(path), { by, reason: flags.reason });
     writeLimitState(state, path);
     process.stderr.write(`▶ pr-limit ON — enforcement re-armed${by ? ` (by ${by})` : ''}\n`);
-    writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
-    return 0;
-  }
-  if (cmd === 'allow') {
-    if (!flags.branch) { process.stderr.write('usage: pr-limit.mjs allow --branch=<b> --reason=<why> [--for=<duration>] [--by=<actor>]\n'); return 2; }
-    const untilMs = parseDurationMs(flags.for);
-    const state = allowBranch(readLimitState(path), flags.branch, { reason: flags.reason, by, untilMs });
-    writeLimitState(state, path);
-    process.stderr.write(`✓ branch ${normalizeBranchName(flags.branch)} allow-listed — ${state.branches[String(flags.branch).trim()]?.reason}${by ? ` (by ${by})` : ''}\n`);
     writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
     return 0;
   }
@@ -661,7 +729,7 @@ export function runPrLimitCli(argv) {
     writeAllSync(1, JSON.stringify(out, null, 2) + '\n');
     return 0;
   }
-  process.stderr.write('usage: pr-limit.mjs <off|on|status|allow> [--reason=<text>] [--for=<duration>] [--branch=<b>] [--by=<who>]\n');
+  stderr.write('usage: pr-limit.mjs <off|on|status|allow> [--reason=<text>] [--for=<duration>] [--branch=<b>] [--operator-quote=<verbatim>] [--by=<who>]\n');
   return 2;
 }
 
