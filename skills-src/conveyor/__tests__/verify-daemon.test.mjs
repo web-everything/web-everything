@@ -19,7 +19,7 @@ import {
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
   reconcileInFlight, pidAlive, processGroupAlive, killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
-  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun,
+  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun, wireGateJobs,
 } from '../verify-daemon.mjs';
 import { laneNeedsVerifyDispatch } from '../../../scripts/conveyor/verify-dispatch.mjs';
 import { VERIFY_FILENAME, verifyStartBody } from '../../../scripts/lib/lane-verify.mjs';
@@ -835,5 +835,21 @@ describe('#4135 — rollback (WE_VERIFY_GATE_AS_JOB=0) still sees running gate j
     await effects.tickOnce();
     expect(gateJobs.sync).toHaveBeenCalledTimes(1);
     expect(runVerify.mock.calls[0][0].launchGate).toBeUndefined();
+  });
+
+  it('main()\'s wiring: WE_VERIFY_GATE_AS_JOB=0 still builds the job store (live jobs hold lanes) and only stops new launches', () => {
+    const create = vi.fn(() => ({ id: 'store' }));
+    expect(wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: false });
+    expect(wireGateJobs({}, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: true });
+  });
+
+  it('every tick hands the dispatch the store\'s re-probing killJobGate, in job mode and in rollback', async () => {
+    for (const gateAsJob of [true, false]) {
+      const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(() => false) };
+      const runVerify = vi.fn(async (o) => { o.killJobGate({ jobId: 'j' }); return { dispatched: [], deferred: [], failures: [] }; });
+      const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} } });
+      await effects.tickOnce();
+      expect(gateJobs.killJobGate).toHaveBeenCalledWith({ jobId: 'j' });
+    }
   });
 });

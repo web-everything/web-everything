@@ -11,9 +11,11 @@ import { tmpdir } from 'node:os';
 
 import {
   classifyGateOutcome, markerStillOurs, runGateStep, createVerifyGateJobs, resolveGateAsJob, killGateGroup,
-  gatePath, resultPath, VERIFY_GATE_JOB_KIND,
+  gatePath, resultPath, VERIFY_GATE_JOB_KIND, gateState, findGatePidsDefault,
 } from '../verify-gate-job.mjs';
-import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
+import { createJobStore, enqueueJob, hostName, readProcStart } from '../../lib/daemon-jobs-runtime.mjs';
+import { formatJobHandle } from '../../operations/job-record.mjs';
+import { spawn, execFileSync } from 'node:child_process';
 import { markClaimed, markFailed, markLaunching, markSucceeded } from '../../lib/daemon-jobs.mjs';
 
 let dir;
@@ -87,7 +89,7 @@ describe('runGateStep — the job child', () => {
     let alive = true;
     const kill = vi.fn(() => { alive = false; });
     const out = await runGateStep({ jobId: 'j3', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, kill,
-      probe: () => (alive ? 'alive' : 'dead'), sleep: async () => {},
+      probe: () => (alive ? 'alive' : 'dead'), sleep: async () => {}, pidExists: () => false, groupExists: () => false,
       laneState: () => ({ marker: { ...running, status: 'infrastructure-failure' }, headSha: 'abc12345' }), runGate: vi.fn() });
     expect(kill).toHaveBeenCalledWith(-777, 'SIGKILL');
     expect(out.outcome).toBe('stale');
@@ -114,7 +116,7 @@ describe('runGateStep — the job child', () => {
     let polls = 0;
     const runGate = vi.fn(async () => {});
     const out = await runGateStep({ jobId: 'j5', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, kill: vi.fn(),
-      probe: () => { polls += 1; return polls > 3 ? 'dead' : 'alive'; }, sleep: async () => {},
+      probe: () => { polls += 1; return polls > 3 ? 'dead' : 'alive'; }, sleep: async () => {}, pidExists: () => false, groupExists: () => false,
       laneState: () => ({ marker: running, headSha: 'abc12345' }), runGate });
     expect(runGate).toHaveBeenCalledTimes(1);
     expect(out.outcome).toBe('green');
@@ -124,7 +126,7 @@ describe('runGateStep — the job child', () => {
 describe('createVerifyGateJobs — the daemon side over a real job store', () => {
   const noReattach = async () => ({ actions: [] });
   const mk = (extra = {}) => createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
-    probe: () => 'alive', evict: () => {}, snapshot: {}, ...extra });
+    probe: () => 'alive', evict: () => {}, snapshot: {}, groupExists: () => false, ...extra });
 
   it('launch queues a readonly-tree job pinned to the clone HEAD with the request identity', () => {
     const jobs = mk();
@@ -270,7 +272,7 @@ describe('killGateGroup — only a gate whose handle and pid agree, and an ordin
 describe('fail-closed gate liveness (PR 4764 round 3)', () => {
   const noReattach = async () => ({ actions: [] });
   const mk = (extra = {}) => createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
-    probe: () => 'alive', evict: () => {}, snapshot: {}, ...extra });
+    probe: () => 'alive', evict: () => {}, snapshot: {}, groupExists: () => false, ...extra });
   const finished = (sidecar) => {
     const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
     store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
@@ -331,9 +333,146 @@ describe('fail-closed gate liveness (PR 4764 round 3)', () => {
   it('a handle-less sidecar whose pid is gone does not block the relaunch', async () => {
     writeFileSync(gatePath(dir, 'u9'), JSON.stringify({ pid: 783, handle: null }));
     const runGate = vi.fn(async () => {});
-    const out = await runGateStep({ jobId: 'u9', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, pidExists: () => false,
+    const out = await runGateStep({ jobId: 'u9', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, pidExists: () => false, groupExists: () => false,
       laneState: () => ({ marker: running, headSha: 'abc12345' }), runGate });
     expect(runGate).toHaveBeenCalledTimes(1);
     expect(out.outcome).toBe('green');
+  });
+});
+
+describe('a gate is recorded before it is spawned, and found by its run id (PR 4764 round 4)', () => {
+  const noReattach = async () => ({ actions: [] });
+  const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
+  const laneState = () => ({ marker: running, headSha: 'abc12345' });
+  // The host's process table: the orphaned gate is `node verify-lane.mjs … --run-id=<runId>`.
+  const procs = new Map();
+  const scan = (runId) => [...procs].filter(([, argv]) => argv.split(' ').includes(`--run-id=${runId}`)).map(([pid]) => pid);
+  // Attempt 1 spawns its gate, then its supervisor dies before the gate is recorded (runGate never returns, and
+  // onSpawn — where the pid and handle are written — is never reached).
+  const dieAfterSpawn = () => {
+    procs.set(5150, `node verify-lane.mjs --repo=${INPUT.dir} --json --run-id=${INPUT.runId}`);
+    return new Promise(() => {});
+  };
+  beforeEach(() => procs.clear());
+
+  it('a relaunch never starts a second gate beside a gate its dead supervisor spawned but never recorded', async () => {
+    void runGateStep({ jobId: 'w1', input: INPUT, jobsDir: dir, attempt: 1, log: () => {}, laneState, runGate: dieAfterSpawn, scan });
+    const runGate = vi.fn(async () => {});
+    const kill = vi.fn();
+    const out = await runGateStep({ jobId: 'w1', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, kill, scan,
+      sleep: async () => {}, laneState, runGate });
+    expect(runGate).not.toHaveBeenCalled(); // the orphan (pid 5150) still runs this request
+    expect(out.outcome).toBe('failed');
+    expect(kill).not.toHaveBeenCalled(); // no handle: identity is the run id, not proof enough to signal a pid
+
+    procs.clear(); // the orphan exits
+    const again = await runGateStep({ jobId: 'w1', input: INPUT, jobsDir: dir, attempt: 3, log: () => {}, scan, laneState, runGate });
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(again.outcome).toBe('green');
+  });
+
+  it('a finished job whose gate was never recorded holds its lane (no pid) while that gate runs, then releases it', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    void runGateStep({ jobId: q.id, input: INPUT, jobsDir: dir, attempt: 1, log: () => {}, laneState, runGate: dieAfterSpawn, scan });
+    store.update(q.id, (r) => markFailed(r, { at: AT, reason: 'handle dead; 2/2 attempts used' }));
+    const kill = vi.fn();
+    const inFlight = new Map();
+    const jobs = createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
+      probe: () => 'dead', evict: () => {}, snapshot: {}, kill, scan });
+    await jobs.sync(inFlight);
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: q.id, pid: null });
+    expect(kill).not.toHaveBeenCalled();
+    procs.clear();
+    await jobs.sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(false);
+  });
+
+  it('a sidecar the supervisor cannot write means no gate is started at all', async () => {
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'w3', input: INPUT, jobsDir: join(dir, 'missing-dir'), log: () => {}, scan, laneState, runGate })
+      .catch((e) => ({ outcome: `threw: ${e.message}` }));
+    expect(runGate).not.toHaveBeenCalled();
+    expect(out.outcome).not.toBe('green');
+  });
+});
+
+describe('a gate is its whole process group, not just its leader (PR 4764 round 4)', () => {
+  const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+  const waitFor = async (cond, ms = 10_000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await sleepMs(50)) if (cond()) return;
+    throw new Error('timed out waiting');
+  };
+  const groupMembers = (pgid) => execFileSync('ps', ['-axo', 'pid=,pgid='], { encoding: 'utf8' }).split('\n')
+    .map((l) => l.trim().split(/\s+/).map(Number)).filter(([p, g]) => g === pgid && p).length;
+
+  it('a recorded gate whose pid is gone but whose group still exists reads unknown, handle or not', () => {
+    expect(gateState({ pid: 4242, handle: null }, { pidExists: () => false, groupExists: () => true })).toBe('unknown');
+    const gone = { probe: () => 'dead', pidExists: () => false };
+    expect(gateState({ pid: 4242, handle: 'h:4242:s' }, { ...gone, groupExists: () => true })).toBe('unknown');
+    expect(gateState({ pid: 4242, handle: 'h:4242:s' }, { ...gone, groupExists: () => { throw new Error('EPERM?'); } })).toBe('unknown');
+    expect(gateState({ pid: 4242, handle: 'h:4242:s' }, { ...gone, groupExists: () => false })).toBe('dead');
+    // The leader's pid already belongs to another process: our group cannot still exist, whatever group -4242 is.
+    expect(gateState({ pid: 4242, handle: 'h:4242:s' }, { probe: () => 'dead', pidExists: () => true, groupExists: () => true })).toBe('dead');
+    expect(gateState({ pid: 4242, handle: null }, { pidExists: () => false, groupExists: () => false })).toBe('dead');
+  });
+
+  it('real processes: the leader dies while its test-runner child runs on — not dead until the whole group is gone', async () => {
+    const childJs = "setTimeout(() => {}, 60000)";
+    const leader = spawn(process.execPath, ['-e',
+      `require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(childJs)}], { stdio: 'ignore' }); ${childJs}`],
+    { detached: true, stdio: 'ignore' });
+    const exited = new Promise((r) => leader.once('exit', r));
+    const pid = leader.pid;
+    try {
+      await waitFor(() => groupMembers(pid) >= 2);
+      const gate = { pid, handle: formatJobHandle({ host: hostName(), pid, procStart: readProcStart(pid) }) };
+      expect(gateState(gate)).toBe('alive');
+      process.kill(pid, 'SIGKILL'); // the leader alone (OOM, crash): its child keeps running in the group
+      await exited;
+      expect(groupMembers(pid)).toBeGreaterThanOrEqual(1);
+      expect(gateState(gate)).toBe('unknown'); // a retry must not start a second gate beside the surviving child
+      process.kill(-pid, 'SIGKILL');
+      await waitFor(() => groupMembers(pid) === 0);
+      expect(gateState(gate)).toBe('dead');
+    } finally {
+      try { process.kill(-pid, 'SIGKILL'); } catch {}
+    }
+  }, 20_000);
+
+  it('findGatePidsDefault finds a real process by its exact --run-id token, and not once it exits', async () => {
+    const runId = `t-${process.pid}-${Date.now()}`;
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', '--', `--run-id=${runId}`], { stdio: 'ignore' });
+    const exited = new Promise((r) => child.once('exit', r));
+    try {
+      await waitFor(() => findGatePidsDefault(runId).includes(child.pid));
+      expect(findGatePidsDefault(`${runId}x`)).toEqual([]); // a token match, not a prefix match
+      expect(findGatePidsDefault(runId.slice(0, -1))).toEqual([]);
+    } finally { child.kill('SIGKILL'); }
+    await exited;
+    expect(findGatePidsDefault(runId)).toEqual([]);
+  }, 20_000);
+});
+
+describe('a superseded gate job is killed only after a fresh probe (PR 4764 round 4)', () => {
+  const noReattach = async () => ({ actions: [] });
+  it('killJobGate re-reads the sidecar and signals only a gate whose handle still proves it alive', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 999, handle: 'h:999:s' }));
+    let state = 'alive';
+    const kill = vi.fn();
+    const jobs = createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
+      probe: () => state, evict: () => {}, snapshot: {}, kill, pidExists: () => false, groupExists: () => false });
+    const inFlight = new Map();
+    await jobs.sync(inFlight);
+    const entry = inFlight.get(INPUT.dir);
+    expect(entry.pid).toBe(999); // proven alive at sync time
+    state = 'dead'; // ...but the gate exits (and its pid may be reused) before the dispatch supersedes it
+    expect(jobs.killJobGate(entry)).toBe(false);
+    state = 'unknown';
+    expect(jobs.killJobGate(entry)).toBe(false);
+    expect(kill).not.toHaveBeenCalled();
+    state = 'alive';
+    expect(jobs.killJobGate(entry)).toBe(true);
+    expect(kill).toHaveBeenCalledWith(-999, 'SIGKILL');
   });
 });

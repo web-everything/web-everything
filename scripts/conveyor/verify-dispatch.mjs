@@ -620,7 +620,9 @@ export function readLaneState(dir) {
  * failure passes `onSettled(failure)`, called once per failure as it settles (a throwing observer is isolated).
  * #4135 — with `launchGate({pool, lane, dir, headSha, marker, runId}) → {id}` (the verify daemon's job mode) a
  * pending lane is handed to that launcher (it queues a detached gate job) instead of spawned here; the registry
- * entry carries the `jobId`, and settlement is the job's, not this sweep's.
+ * entry carries the `jobId`, and settlement is the job's, not this sweep's. A superseded JOB entry is killed only
+ * through `killJobGate(entry)`, which re-probes the job's gate handle first — never by the registry `pid` alone
+ * (proven at the last sync, possibly exited and reused since); with no `killJobGate` a job entry is not signalled.
  * @param {{dryRun?:boolean, spawnGate?:typeof spawnGateBounded, poolRoot?:string,
  *   inFlight?:Map<string, object>|null, awaitSettle?:boolean, maxInFlight?:number,
  *   onSettled?:((failure:object) => void)|null}} [o] `spawnGate` and
@@ -631,7 +633,7 @@ export function readLaneState(dir) {
  */
 export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateBounded, poolRoot = POOL_ROOT,
   inFlight = null, awaitSettle = true, maxInFlight = resolveMaxInFlight(process.env), onSettled = null,
-  launchGate = null,
+  launchGate = null, killJobGate = null,
 } = {}) {
   const deferred = [];
   const superseded = [];
@@ -678,8 +680,13 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
         }
         if (!dryRun && process.env.VERIFY_DISPATCH_KILL_SUPERSEDED !== '0'
           && inFlightSuperseded(entry, marker, headSha, supersedePolicy)) {
-          try { if (entry.pid > 1) process.kill(-entry.pid, 'SIGKILL'); } catch {}
-          log(`  ✂ ${pool}/lane-${lane}: in-flight run ${String(entry.runId).slice(0, 8)} superseded by a newer request — killed`);
+          let killed = !entry.jobId;
+          try {
+            if (entry.jobId) killed = killJobGate?.(entry) === true;
+            else if (entry.pid > 1) process.kill(-entry.pid, 'SIGKILL');
+          } catch {}
+          log(`  ✂ ${pool}/lane-${lane}: in-flight run ${String(entry.runId).slice(0, 8)} superseded by a newer request — ${killed
+            ? 'killed' : `gate job ${entry.jobId} not signalled (its gate is not proven alive right now)`}`);
           superseded.push({ pool, lane, runId: entry.runId });
         }
         continue;

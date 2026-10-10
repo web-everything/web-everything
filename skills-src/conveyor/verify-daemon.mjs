@@ -336,6 +336,8 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
       const result = isDraining()
         ? { dispatched: [], deferred: [], failures: [], draining: true }
         : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled,
+          // A superseded job entry is killed only after the store re-probes its gate handle (both modes hold job entries).
+          ...(gateJobs ? { killJobGate: (e) => gateJobs.killJobGate(e) } : {}),
           ...(gateJobs && gateAsJob ? { launchGate: (o) => gateJobs.launch(o) } : {}) });
       if (gateJobs && result.dispatched?.length) await gateJobs.sync(inFlight);
       return { ...result, orphaned };
@@ -362,6 +364,17 @@ export const DEFAULT_ADOPTED_CEILING_MS = (Number(process.env.VERIFY_DISPATCH_QU
 
 function settleKilledAdopted(entry, ceilingMs) {
   recordKilledVerification(entry.dir, { ...entry, startedAt: null }, { status: null, signal: 'SIGKILL', timedOutPhase: 'gate' }, ceilingMs);
+}
+
+/**
+ * #4135 — `main()`'s gate-job wiring. The job store is built in EVERY mode: `WE_VERIFY_GATE_AS_JOB=0` (rollback)
+ * only stops NEW gates from running as jobs (`gateAsJob: false`); the store is still synced each tick, so a gate a
+ * job supervisor is still running holds its lane instead of getting an in-process gate started beside it.
+ * @param {Record<string,string|undefined>} env
+ * @param {() => object} create builds the store handle ({@link createVerifyGateJobs})
+ */
+export function wireGateJobs(env, create) {
+  return { gateJobs: create(), gateAsJob: resolveGateAsJob(env) };
 }
 
 /** #65 — the declared `restartInFlight` setting: `adopt` (default) or `kill` (the old teardown). */
@@ -512,8 +525,8 @@ async function main() {
   // gates, but the daemon still reads the job store: a gate a job supervisor is still running holds its lane
   // (and settles) instead of getting a second in-process gate beside it.
   let settle = () => {};
-  const gateAsJob = resolveGateAsJob(process.env);
-  const gateJobs = createVerifyGateJobs({ log: (m) => console.error(m), onSettled: (f) => settle(f) });
+  const { gateJobs, gateAsJob } = wireGateJobs(process.env,
+    () => createVerifyGateJobs({ log: (m) => console.error(m), onSettled: (f) => settle(f) }));
   const effects = buildCliDaemonEffects({ isAlive, gateJobs, gateAsJob });
   settle = effects.onSettled;
   const cleanup = createCleanup({

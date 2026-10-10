@@ -16,7 +16,9 @@ import { tmpdir } from 'node:os';
 import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
-import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
+import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
+import { createVerifyGateJobs, VERIFY_GATE_JOB_KIND } from '../verify-gate-job.mjs';
+import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
 
 describe('laneNeedsVerifyDispatch — the pure dispatch decision', () => {
   it('dispatches a running marker for the lane\'s own current HEAD', () => {
@@ -1152,5 +1154,40 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
     expect(result.dispatched).toEqual([]);
     expect(failures).toEqual([expect.objectContaining({ lane: 1 })]);
     expect(inFlight.size).toBe(0);
+  });
+
+  it('a superseded gate JOB is killed only through killJobGate (a fresh probe), never by its registry pid alone', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const stale = { pool: 'flagtest', lane: 1, dir: laneDir, runId: 'old-run', requestStartedAt: 'old', sha: '0000000',
+      suites: 'other', treeHash: null, jobId: 'job-old', pid: 4242424 };
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const killJobGate = vi.fn(() => false); // the fresh probe finds the gate gone (its pid may be reused)
+      const inFlight = new Map([[laneDir, { ...stale }]]);
+      const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, launchGate: () => ({ id: 'x' }), killJobGate });
+      expect(killJobGate).toHaveBeenCalledWith(expect.objectContaining({ jobId: 'job-old' }));
+      expect(result.superseded).toEqual([{ pool: 'flagtest', lane: 1, runId: 'old-run' }]);
+      // With no hook at all, a job entry is still never signalled by its bare pid.
+      await runVerifyDispatch({ poolRoot, inFlight: new Map([[laneDir, { ...stale }]]), awaitSettle: false, launchGate: () => ({ id: 'x' }) });
+      expect(kill).not.toHaveBeenCalledWith(-4242424, 'SIGKILL');
+    } finally { kill.mockRestore(); }
+  });
+
+  it('rollback (WE_VERIFY_GATE_AS_JOB=0) end to end: a live gate job holds its lane, so no in-process gate starts beside it', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    mkdirSync(join(base, 'jobs'), { recursive: true });
+    const store = createJobStore(join(base, 'jobs'));
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de',
+      input: { pool: 'flagtest', lane: 1, dir: laneDir, headSha, runId: 'job-run', suites: 'true', treeHash: null, requestStartedAt: null } });
+    const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, () => createVerifyGateJobs({ store,
+      reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, probe: () => 'dead', evict: () => {}, snapshot: {} }));
+    const spawnGate = vi.fn(() => new Promise(() => {}));
+    const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
+      runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate }) });
+    const result = await effects.tickOnce();
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(effects.inFlight.get(laneDir)).toMatchObject({ runId: 'job-run' });
   });
 });

@@ -22,13 +22,15 @@
  *      `sync(inFlight)` runs the runtime's reattach pass (launch queued jobs, stop stalled ones, relaunch dead
  *      ones once), rebuilds the daemon's in-flight registry from live records, and consumes each finished job
  *      once, logging its verdict. It never waits on a gate.
- *   2. JOB CHILD — {@link runGateStep}: re-checks that the marker is still this request, kills a previous attempt's
- *      gate if one survived, runs the gate, writes `<id>.result`.
+ *   2. JOB CHILD — {@link runGateStep}: refuses to run beside a previous attempt's gate that is not proven gone
+ *      (kills it first when its handle proves it alive), re-checks that the marker is still this request, records
+ *      the gate (`<id>.gate`, written BEFORE the spawn and found by its `--run-id` until the pid lands), runs it,
+ *      writes `<id>.result`.
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readGit } from '../lib/proc-read.mjs';
+import { execRead, readGit } from '../lib/proc-read.mjs';
 
 import { defineJobKind, kindRegistry } from '../lib/daemon-jobs.mjs';
 import {
@@ -122,29 +124,72 @@ export function pidExistsDefault(pid) {
   try { process.kill(pid, 0); return true; } catch (e) { return e?.code !== 'ESRCH'; }
 }
 
+/** Does process group `pgid` still have a member? Fails closed like {@link pidExistsDefault}. */
+export function groupExistsDefault(pgid) {
+  return pidExistsDefault(-pgid);
+}
+
+const RUN_ID_RE = /^[\w.-]{1,128}$/;
+
+/**
+ * The pids of processes started with `--run-id=<runId>` (the gate is `node verify-lane.mjs … --run-id=<runId>`).
+ * Throws when `ps` does not answer — a scan that did not run is never "no such gate".
+ */
+export function findGatePidsDefault(runId) {
+  const out = execRead('ps', ['-axww', '-o', 'pid=,command='], { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] });
+  const pids = [];
+  for (const line of out.split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(.*)$/);
+    if (m && Number(m[1]) !== process.pid && m[2].split(/\s+/).includes(`--run-id=${runId}`)) pids.push(Number(m[1]));
+  }
+  return pids;
+}
+
 /**
  * Is a recorded gate still running? `alive` and `dead` are proven by the handle (`host:pid:procStart`, so never a
- * reused pid). Everything else is `unknown`, which callers treat as "may still be running": a probe that throws, a
- * handle from another host, and a sidecar with no usable handle (start time unreadable at spawn) whose pid still
- * exists. No sidecar, or one with no pid and no handle, records no gate: `dead`.
+ * reused pid); `dead` also needs the gate's process GROUP gone. Everything else is `unknown`, which callers treat as
+ * "may still be running": a probe that throws, a handle from another host, a leader that is gone while its group
+ * still has members, and a sidecar with no usable handle (start time unreadable at spawn) whose pid still exists. A `pending` sidecar (written BEFORE the spawn; its supervisor died before recording the pid) is found by
+ * its run id: `unknown` while any process carries it (or the scan fails), `dead` once none does. No sidecar, or
+ * one with no pid, no handle and no pending run id, records no gate: `dead`.
  */
-export function gateState(gate, { probe = probeHandle, pidExists = pidExistsDefault } = {}) {
+export function gateState(gate, {
+  probe = probeHandle, pidExists = pidExistsDefault, scan = findGatePidsDefault, groupExists = groupExistsDefault,
+} = {}) {
   if (!gate) return 'dead';
-  if (gate.handle && parseJobHandle(gate.handle)) {
+  // The gate is a process GROUP (verify-lane leads it; its test runners share it). A leader that is gone while its
+  // group still exists (crash, OOM, a kill of the leader alone) is not a dead gate: a second gate must not start
+  // beside the surviving members. Never killed on that basis either — the group id alone proves no identity.
+  const groupGone = (pid) => {
+    if (!Number.isInteger(pid) || pid <= 1) return 'dead';
+    try { return groupExists(pid) ? 'unknown' : 'dead'; } catch { return 'unknown'; }
+  };
+  const parsed = gate.handle ? parseJobHandle(gate.handle) : null;
+  if (parsed) {
     try {
       const s = probe(gate.handle);
-      return s === 'alive' || s === 'dead' ? s : 'unknown';
+      if (s === 'alive') return 'alive';
+      if (s !== 'dead') return 'unknown';
+      // The leader is provably gone. If its pid already belongs to another process, our group is gone too (a pid is
+      // never handed out while it is a live process group's id), so that group, if any, is not ours.
+      return pidExists(parsed.pid) ? 'dead' : groupGone(parsed.pid);
     } catch { return 'unknown'; }
   }
   const pid = Number(gate.pid);
-  if (!Number.isInteger(pid) || pid <= 0) return 'dead';
-  try { return pidExists(pid) ? 'unknown' : 'dead'; } catch { return 'unknown'; }
+  if (Number.isInteger(pid) && pid > 0) {
+    try { return pidExists(pid) ? 'unknown' : groupGone(pid); } catch { return 'unknown'; }
+  }
+  if (!gate.pending) return 'dead';
+  if (!RUN_ID_RE.test(String(gate.runId ?? ''))) return 'unknown';
+  try { return scan(gate.runId).length > 0 ? 'unknown' : 'dead'; } catch { return 'unknown'; }
 }
 
 /** The gate process recorded by a job's supervisor: `{gate, state, alive}` ({@link gateState}; `alive` = proven alive). */
-export function liveGate(dir, id, { probe = probeHandle, pidExists = pidExistsDefault } = {}) {
+export function liveGate(dir, id, {
+  probe = probeHandle, pidExists = pidExistsDefault, scan = findGatePidsDefault, groupExists = groupExistsDefault,
+} = {}) {
   const g = readJson(gatePath(dir, id));
-  const state = gateState(g, { probe, pidExists });
+  const state = gateState(g, { probe, pidExists, scan, groupExists });
   return { gate: g, state, alive: state === 'alive' };
 }
 
@@ -176,7 +221,7 @@ export function createVerifyGateJobs({
   store = createJobStore(verifyJobsDir()), cloneRoot = CLONE_ROOT, log = (m) => process.stderr.write(`${m}\n`),
   maxConcurrent = 8, reattach = reattachTick, snapshot, readHead = () => readHeadOf(cloneRoot), probe = probeHandle,
   now = () => Date.now(), onSettled = () => {}, evict = evictSnapshots, kill = process.kill.bind(process),
-  pidExists = pidExistsDefault,
+  pidExists = pidExistsDefault, scan = findGatePidsDefault, groupExists = groupExistsDefault,
 } = {}) {
   mkdirSync(store.dir, { recursive: true });
   const kind = VERIFY_GATE_JOB_KIND.kind;
@@ -184,13 +229,16 @@ export function createVerifyGateJobs({
   const snap = snapshot ?? { repoDir: cloneRoot, install: cloneNodeModulesInstaller(cloneRoot) };
   const startLogged = new Set();
   const survivorLogged = new Set();
-  const goneHandles = new Set(); // a dead handle never comes back (its start time is part of it): skip re-probing it each tick
+  // A dead handle never comes back (its start time is part of it), nor does a finished job's pending gate once no
+  // process carries its run id (nothing relaunches a finished job): skip re-probing either each tick.
+  const goneHandles = new Set();
   /** A finished job's gate that may still run: `{gate, state}` with state `alive` or `unknown` ({@link gateState}); null once provably gone. */
   const survivorOf = (id) => {
     const gate = readJson(gatePath(store.dir, id));
-    if (!gate || (gate.handle && goneHandles.has(gate.handle))) return null;
-    const state = gateState(gate, { probe, pidExists });
-    if (state === 'dead') { if (gate.handle) goneHandles.add(gate.handle); return null; }
+    const key = gate?.handle || (gate?.pending ? `pending:${id}:${gate.runId}` : null);
+    if (!gate || (key && goneHandles.has(key))) return null;
+    const state = gateState(gate, { probe, pidExists, scan, groupExists });
+    if (state === 'dead') { if (key) goneHandles.add(key); return null; }
     return { gate, state };
   };
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
@@ -229,7 +277,7 @@ export function createVerifyGateJobs({
         if (!TERMINAL_JOB_STATUSES.includes(r.job.status)) {
           live.add(r.id);
           // A probe that throws (ps timeout) must not abort the whole sync: treat the gate as not yet seen this tick.
-          const { gate, alive } = liveGate(store.dir, r.id, { probe, pidExists }); // a throwing probe reads as `unknown`, not an abort
+          const { gate, alive } = liveGate(store.dir, r.id, { probe, pidExists, scan, groupExists }); // a throwing probe reads as `unknown`, not an abort
           const prev = inFlight.get(input.dir);
           if (prev && prev.jobId !== r.id && !prev.jobId) continue; // a legacy (adopted) run still owns this lane
           inFlight.set(input.dir, {
@@ -309,10 +357,22 @@ export function createVerifyGateJobs({
     async stopAll({ stop = stopHandle, kill = process.kill.bind(process) } = {}) {
       for (const r of mine()) {
         if (TERMINAL_JOB_STATUSES.includes(r.job.status)) continue;
-        const { gate, alive } = liveGate(store.dir, r.id, { probe });
         if (r.job.handle) { try { await stop(r.job.handle); } catch {} }
+        // Probe AFTER the stop (which may itself have ended the gate): never signal on a stale proof.
+        const { gate, alive } = liveGate(store.dir, r.id, { probe, pidExists, scan, groupExists });
         if (alive) killGateGroup(gate, kill);
       }
+    },
+    /**
+     * The dispatch sweep's supersede kill for a gate JOB's entry: re-read the job's sidecar and signal its group
+     * only when the handle proves, right now, that it is still the gate. The registry `pid` was proven at the last
+     * sync; by the time a newer request supersedes the entry the gate may have exited and its pid been reused.
+     * @returns {boolean} whether a kill was attempted
+     */
+    killJobGate(entry) {
+      if (!entry?.jobId) return false;
+      const { gate, alive } = liveGate(store.dir, entry.jobId, { probe, pidExists, scan, groupExists });
+      return alive ? killGateGroup(gate, kill) : false;
     },
   };
 }
@@ -331,6 +391,7 @@ export async function runGateStep({
   jobId, input, jobsDir, attempt = 1, log = (m) => process.stderr.write(`${m}\n`), runGate = runLaneGate,
   laneState = readLaneState, probe = probeHandle, readStart = readProcStart, kill = process.kill.bind(process),
   onGate = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pidExists = pidExistsDefault,
+  scan = findGatePidsDefault, groupExists = groupExistsDefault,
 }) {
   const where = `${input.pool}/lane-${input.lane} @ ${String(input.headSha).slice(0, 8)}`;
   const finish = (result) => {
@@ -343,23 +404,25 @@ export async function runGateStep({
   // 1. A previous attempt's gate that outlived its supervisor: stop it before anything else runs on this lane.
   // Only a PROVEN-dead gate lets the run go on: `unknown` (a probe that threw, a foreign-host handle, a sidecar with
   // no usable handle whose pid still exists) is refused, and never killed (no proof the pid is still that gate).
-  const prior = liveGate(jobsDir, jobId, { probe, pidExists });
+  // A `pending` sidecar (the previous supervisor died before recording its gate's pid) is found by its run id.
+  const prior = liveGate(jobsDir, jobId, { probe, pidExists, scan, groupExists });
   let state = prior.state;
   if (state === 'alive') {
     log(`[verify-gate-job ${jobId}] attempt ${attempt}: previous gate pid ${prior.gate.pid} still alive — killing its group`);
     killGateGroup(prior.gate, kill);
     for (let i = 0; i < 50; i += 1) {
-      state = gateState(prior.gate, { probe, pidExists });
+      state = gateState(prior.gate, { probe, pidExists, scan, groupExists });
       if (state !== 'alive') break;
       await sleep(100);
     }
     // A bounded kill attempt is not proof of death: never start a second gate beside one that still owns the marker.
-    if (state === 'alive') state = gateState(prior.gate, { probe, pidExists });
+    if (state === 'alive') state = gateState(prior.gate, { probe, pidExists, scan, groupExists });
   }
   if (state !== 'dead') {
+    const which = prior.gate?.pid ? `pid ${prior.gate.pid}` : `(unrecorded pid, run ${prior.gate?.runId ?? '?'})`;
     const message = state === 'alive'
-      ? `previous gate pid ${prior.gate.pid} survived SIGKILL; refusing to start a second gate on this lane`
-      : `previous gate pid ${prior.gate.pid} cannot be proven gone (liveness unknown); refusing to start a second gate on this lane`;
+      ? `previous gate ${which} survived SIGKILL; refusing to start a second gate on this lane`
+      : `previous gate ${which} cannot be proven gone (liveness unknown); refusing to start a second gate on this lane`;
     log(`[verify-gate-job ${jobId}] attempt ${attempt}: ${message}`);
     return finish({ outcome: 'failed', status: null, signal: null, message });
   }
@@ -371,7 +434,17 @@ export async function runGateStep({
       headSha: headSha ?? null });
   }
 
-  // 3. The gate — the same code, ceilings and settlement as the in-process sweep.
+  // 3. Record the gate BEFORE spawning it: a supervisor that dies between the spawn and the pid write must not leave
+  // a gate no sidecar names (the relaunch and the tick would read "no gate" and start a second one beside it). The
+  // pending sidecar carries the run id the gate is spawned with (`--run-id=`), so it is found by that until the pid lands.
+  try {
+    writeJson(gatePath(jobsDir, jobId), { pid: null, handle: null, pending: true, runId: input.runId, at: new Date().toISOString(), attempt });
+  } catch (e) {
+    return finish({ outcome: 'failed', status: null, signal: null,
+      message: `could not record the gate before spawning it (${String(e?.message || e).split('\n')[0]}); not started` });
+  }
+
+  // 4. The gate — the same code, ceilings and settlement as the in-process sweep.
   let ok = true;
   let error = null;
   try {
@@ -380,11 +453,11 @@ export async function runGateStep({
       marker: { ...marker, suites: input.suites ?? marker.suites, startedAt: input.requestStartedAt ?? marker.startedAt },
       log,
       onSpawn: (pid) => {
+        onGate(pid); // first: a SIGTERM from here on kills the gate even if the sidecar write below fails
         let procStart = null;
         try { procStart = readStart(pid); } catch {}
         const handle = procStart ? formatJobHandle({ host: hostName(), pid, procStart }) : null;
-        writeJson(gatePath(jobsDir, jobId), { pid, handle, spawnedAt: new Date().toISOString(), attempt });
-        onGate(pid);
+        writeJson(gatePath(jobsDir, jobId), { pid, handle, runId: input.runId, spawnedAt: new Date().toISOString(), attempt });
       },
       onGateStarted: () => {
         const g = readJson(gatePath(jobsDir, jobId)) || {};
