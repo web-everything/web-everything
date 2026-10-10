@@ -8,6 +8,7 @@ import {
 import { planReconcile } from '../reconcile-core.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { briefWithRoundContext, fixerTableFor, dispatchFix } from '../reconcile-fix-dispatch.mjs';
+import { readDeclaredSettings } from '../../lib/settings-files.mjs';
 import { readFileSync } from 'node:fs';
 
 const BOT = { login: 'web-everything' };
@@ -39,11 +40,27 @@ describe('fix settings cascade (card xx0055i)', () => {
     const s = resolveFixSettings({ env: {}, read: () => { throw new Error('no file'); } });
     expect(s).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
   });
-  it('the shipped platform preference is takeover + on', () => {
-    expect(JSON.parse(readFileSync(FIX_SETTINGS_FILE, 'utf8'))).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on' });
+  it('the shipped platform preference is takeover + on, under the `fix` namespace', () => {
+    expect(JSON.parse(readFileSync(FIX_SETTINGS_FILE, 'utf8'))).toMatchObject({ fix: { roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 } });
+  });
+  it('the documented `fix.*` paths resolve through the merged settings loader (review round 3)', () => {
+    const { settings, owners } = readDeclaredSettings({ legacyPath: null });
+    for (const leaf of ['fix.roundCapAction', 'fix.roundHistory', 'fix.takeoverMaxPerPr']) expect(owners[leaf]).toBe('settings/fix.json');
+    expect(settings.fix).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
+    // no bare leaf leaks into the global namespace
+    for (const leaf of ['roundCapAction', 'roundHistory', 'takeoverMaxPerPr']) expect(owners[leaf]).toBeUndefined();
+  });
+  it('the resolver reads the `fix` namespace of the file; a flat (un-namespaced) key is not a setting', () => {
+    const nested = () => JSON.stringify({ fix: { roundCapAction: 'person', roundHistory: 'off', takeoverMaxPerPr: 3 } });
+    expect(resolveFixSettings({ env: {}, read: nested })).toMatchObject({
+      roundCapAction: 'person', roundHistory: 'off', takeoverMaxPerPr: 3,
+      sources: { roundCapAction: 'settings', roundHistory: 'settings', takeoverMaxPerPr: 'settings' },
+    });
+    const flat = () => JSON.stringify({ roundCapAction: 'person', roundHistory: 'off', takeoverMaxPerPr: 3 });
+    expect(resolveFixSettings({ env: {}, read: flat }).sources).toEqual({ roundCapAction: 'built-in', roundHistory: 'built-in', takeoverMaxPerPr: 'built-in' });
   });
   it('env beats the settings file; an unknown value falls through', () => {
-    const read = () => JSON.stringify({ roundCapAction: 'takeover', roundHistory: 'on' });
+    const read = () => JSON.stringify({ fix: { roundCapAction: 'takeover', roundHistory: 'on' } });
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: 'person' }, read }).roundCapAction).toBe('person');
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: 'bogus' }, read }).roundCapAction).toBe('takeover');
     expect(resolveFixSettings({ env: { WE_FIX_ROUND_HISTORY: 'off' }, read }).roundHistory).toBe('off');
@@ -62,6 +79,23 @@ describe('planTakeover (card xx0055i)', () => {
     expect(planTakeover({ pr: cappedPr([marker(HEAD)]), roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-spent' });
     expect(planTakeover({ pr: cappedPr([marker('b'.repeat(40))]), roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-spent' });
     expect(planTakeover({ pr: cappedPr([marker('b'.repeat(40))]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER })).toMatchObject({ ok: true });
+  });
+  it('takeoverMaxPerPr <= 0 (or not a number) is `setting-disabled`, never `takeover-spent` (review round 3)', () => {
+    for (const max of [0, -1, null, Number.NaN, 'x']) {
+      expect(planTakeover({ pr: cappedPr(), roundCapAction: 'takeover', takeoverMaxPerPr: max, fixerLadder: LADDER }))
+        .toMatchObject({ ok: false, reason: 'setting-disabled' });
+    }
+    // the setting is read through the env layer as 0 too
+    expect(resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: '0' }, read: () => '{}' }).takeoverMaxPerPr).toBe(0);
+  });
+  it('the operator note for a disabled takeover says it is turned off, not that it already ran', () => {
+    const NOW = Date.parse('2026-10-10T00:00:00Z');
+    const thread = Array.from({ length: 5 }, (_, i) => rearm(i + 1));
+    const p = planReconcile({ prs: [cappedPr(thread)], agents: [], durableCounts: { 7: 5 }, now: NOW, fixerLadder: LADDER, roundCapAction: 'takeover', takeoverMaxPerPr: 0 });
+    expect(p.dispatch.filter((d) => d.mode === 'takeover')).toEqual([]);
+    const text = p.notes.find((n) => n.kind === 'round-cap-exhausted')?.text ?? '';
+    expect(text).toMatch(/turned off/);
+    expect(text).not.toMatch(/already ran/);
   });
   it('a forged marker from an untrusted login does not count', () => {
     const forged = { ...marker(HEAD), author: { login: 'mallory' } };

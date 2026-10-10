@@ -1,6 +1,8 @@
 {
-  "$comment": "Platform preference (card xx0055i). roundCapAction person|takeover: at the fix round cap, takeover = dispatch ONE takeover fix (full round history, top claude rung of the fixer ladder) before asking the operator; person = ask the operator at once (tool override env WE_FIX_ROUND_CAP_ACTION). roundHistory on|off: a round N>1 fix brief carries the previous-rounds section (env WE_FIX_ROUND_HISTORY). takeoverMaxPerPr: how many takeovers one PR may get (env WE_FIX_TAKEOVER_MAX_PER_PR). Ruling disputes always go to the operator. See scripts/conveyor/fix-takeover.mjs and scripts/conveyor/fix-round-history.mjs.",
-  "roundCapAction": "takeover",
-  "roundHistory": "on",
-  "takeoverMaxPerPr": 1
+  "$comment": "Platform preference (card xx0055i). fix.roundCapAction person|takeover: at the fix round cap, takeover = dispatch ONE takeover fix (full round history, top claude rung of the fixer ladder) before asking the operator; person = ask the operator at once (tool override env WE_FIX_ROUND_CAP_ACTION). fix.roundHistory on|off: a round N>1 fix brief carries the previous-rounds section (env WE_FIX_ROUND_HISTORY). fix.takeoverMaxPerPr: how many takeovers one PR may get, 0 turns the takeover off (env WE_FIX_TAKEOVER_MAX_PER_PR). Ruling disputes always go to the operator. See scripts/conveyor/fix-takeover.mjs and scripts/conveyor/fix-round-history.mjs.",
+  "fix": {
+    "roundCapAction": "takeover",
+    "roundHistory": "on",
+    "takeoverMaxPerPr": 1
+  }
 }

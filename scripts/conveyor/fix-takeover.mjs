@@ -11,8 +11,9 @@
  *   - the setting is `person`.
  *
  * Settings (policy cascade, like `we:scripts/lib/red-main-hold.mjs`): env > `we:scripts/settings/fix.json` >
- * built-in. `roundCapAction` person|takeover (built-in takeover), `roundHistory` on|off (built-in on),
- * `takeoverMaxPerPr` (built-in 1).
+ * built-in. `fix.roundCapAction` person|takeover (built-in takeover), `fix.roundHistory` on|off (built-in on),
+ * `fix.takeoverMaxPerPr` (built-in 1; 0 turns the takeover off). The file keeps them under a `fix` object, so the
+ * merged settings view (`we:scripts/lib/settings-files.mjs`) carries the same `fix.*` paths the docs name.
  *
  * The planner half ({@link planTakeover}) is PURE; the marker post and the settings read are the only IO.
  */
@@ -30,11 +31,13 @@ const ONOFF = ['on', 'off'];
 
 /**
  * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, `WE_FIX_TAKEOVER_MAX_PER_PR`) > settings file > built-in.
- * Unknown values fall through to the next layer. Never throws.
+ * The file layer is its `fix` object (a flat top-level key is not a setting). Unknown values fall through to the
+ * next layer. Never throws.
  */
 export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
   let fromFile = {};
-  try { fromFile = JSON.parse(read(file)) ?? {}; } catch { fromFile = {}; }
+  try { fromFile = JSON.parse(read(file))?.fix ?? {}; } catch { fromFile = {}; }
+  if (!fromFile || typeof fromFile !== 'object') fromFile = {};
   const pick = (envVal, fileVal, ok, dflt) => {
     const e = String(envVal ?? '').trim().toLowerCase();
     if (ok(e)) return { value: e, source: 'env' };
@@ -150,15 +153,20 @@ export function takeoverRung(fixerLadder) {
 
 /**
  * PURE: is a takeover owed instead of the round-cap note? `{ ok: true, rung, route }` or `{ ok: false, reason }`.
- * Reasons: `setting-person`, `ruling-dispute`, `takeover-spent` (a takeover already ran for this PR/head).
+ * Reasons: `setting-person`, `setting-disabled` (`takeoverMaxPerPr` is 0, or not a number: no takeover ever runs),
+ * `ruling-dispute`, `takeover-spent` (a takeover already ran for this PR/head), `takeover-void-limit`.
  */
 export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr = 1, fixerLadder } = {}) {
   if (roundCapAction !== 'takeover') return { ok: false, reason: 'setting-person' };
+  // Checked before the markers: with a budget of 0 nothing ran, so "spent" would tell the operator a takeover ran.
+  // A value that is not a number fails closed (no takeover) rather than comparing as NaN (always false = take over).
+  const max = takeoverMaxPerPr === null || takeoverMaxPerPr === '' ? Number.NaN : Number(takeoverMaxPerPr);
+  if (!Number.isFinite(max) || max <= 0) return { ok: false, reason: 'setting-disabled' };
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const markers = takeoverMarkers(pr?.comments);
   const head = pr?.headRefOid ?? null;
   const sameHead = markers.some((m) => sameHeadSha(m.head, head));
-  if (sameHead || markers.length >= Math.max(0, takeoverMaxPerPr)) {
+  if (sameHead || markers.length >= max) {
     // `takeover-void-limit`: launch faults used up the void allowance, so the last start marker stands. Whether that
     // last one ran is not knowable from the thread, so the note says only that faults were recorded.
     const voidLimit = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
