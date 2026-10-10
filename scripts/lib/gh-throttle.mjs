@@ -194,6 +194,7 @@ import { isGhDeferred } from './gh-deferred.mjs';
 import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs';
 export { isGhDeferred } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 
 // ── TUNING (env-overridable, mirroring heavy-admission.mjs's own resolve*() convention) ────────────────────
 
@@ -1512,6 +1513,34 @@ export function rotateGhCallLogIfLarge(logPath, { maxBytes = resolveGhCallLogMax
   }
 }
 
+// ── truncated-JSON retry (live 2026-10-10, wev-fix-daemon) ───────────────────────────────────────────────────
+// The reconcile smoke's `gh pr list … --json …,files,comments,statusCheckRollup` failed ~1 in 3 under load with
+// gh's own `unexpected end of JSON input` (GitHub cut the response off). Nothing retried it, so the smoke rejected
+// main, every overlay and the fix alike. A READ (classifyGhRead's conservative allowlist; never a write) whose gh
+// failure is a JSON-parse of a cut-off response is retried `retries` times after `backoffMs`, each logged as an
+// `outcome:'retry'` line with its reason. Policy `ghJsonParseRetry` (platform / env over standard).
+export const GH_JSON_PARSE_FAILURE_PATTERNS = Object.freeze([
+  /unexpected end of JSON input/i,
+  /invalid character '.{1,4}' looking for beginning of value/i,
+]);
+export const GH_JSON_RETRY_STANDARD = Object.freeze({ retries: 1, backoffMs: 2000 });
+/** @returns {{retries:number, backoffMs:number, source:Record<string,string>}} */
+export function resolveGhJsonParseRetry(env = process.env) {
+  const int = (k) => { const v = env?.[k]; const n = Number(v); return v != null && v !== '' && Number.isInteger(n) && n >= 0 ? n : undefined; };
+  try {
+    const r = cascadePolicy('ghJsonParseRetry', undefined, {
+      env, standard: GH_JSON_RETRY_STANDARD,
+      envValues: { retries: int('WE_GH_JSON_RETRIES'), backoffMs: int('WE_GH_JSON_RETRY_BACKOFF_MS') },
+      valid: { retries: (n) => Number.isInteger(n) && n >= 0 && n <= 5, backoffMs: (n) => Number.isInteger(n) && n >= 0 && n <= 60_000 },
+    });
+    return { ...GH_JSON_RETRY_STANDARD, ...(r.value || {}), source: r.sources || {} };
+  } catch { return { ...GH_JSON_RETRY_STANDARD, source: {} }; }
+}
+/** PURE: may this failed call be retried as a cut-off JSON response? Reads only. */
+export function isRetryableGhJsonFailure(args, text) {
+  return classifyGhRead(args) && GH_JSON_PARSE_FAILURE_PATTERNS.some((re) => re.test(String(text ?? '')));
+}
+
 export function recordGhCallLogEntry(logPath, entry) {
   try {
     rotateGhCallLogIfLarge(logPath);
@@ -1649,6 +1678,7 @@ export function runGhSync(args, opts = {}) {
 
   // FAIL OPEN (see `failOpenGate`): an unusable lock root means this call runs ungated, never not at all.
   const gated = failOpenGate('lock-root setup', () => { mkdirSync(lockRoot, { recursive: true }); return true; }, { ...gateOpts, fallback: false, logPath: null });
+  const jsonRetry = { ...resolveGhJsonParseRetry(env), used: 0 };
 
   let attempt = 0;
   for (;;) {
@@ -1701,6 +1731,12 @@ export function runGhSync(args, opts = {}) {
     if (usedPersonalToken && (looksLikeGhAuthFailure(text) || looksLikePersonalAccessDenial(text))) {
       recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'personal_token_rejected', caller, w: isWrite, resource, id: identity, auth: ghAuthProvenance(callEnv), inv });
       fallbackToOriginal(attempt);
+      continue;
+    }
+    if (jsonRetry.used < jsonRetry.retries && isRetryableGhJsonFailure(args, text)) {
+      jsonRetry.used += 1;
+      recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: 'truncated-json', caller, w: isWrite, resource, id: identity, inv });
+      sleep(jsonRetry.backoffMs);
       continue;
     }
     if (!isRateLimitShaped(text)) throw failure;
@@ -1849,6 +1885,7 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
   const capture = resolveCostHeaderCapture(env) && !process.env.GH_DEBUG;
   const inv = randomUUID().slice(0, 12);
   const outer = env[GH_OUTER_INV_ENV] || process.env[GH_OUTER_INV_ENV] || null;
+  const jsonRetry = { ...resolveGhJsonParseRetry(env), used: 0 };
 
   let attempt = 0;
   let appFallbackTried = false;
@@ -1928,6 +1965,13 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     // The call ran and spent points, so it is logged above before the overflow is raised.
     if (stdoutOverflow) throw captureStdoutOverflow(bin, argv);
     if (!failed && isWrite) markPrSnapshotDirty({ repo: repoFromGhArgs(argv), env }); // #gh-graphql-budget
+    // A nested call leaves the truncated-JSON retry to its outer runGhSync (one retry per logical call).
+    if (failed && !outer && jsonRetry.used < jsonRetry.retries && isRetryableGhJsonFailure(argv, stderrText)) {
+      jsonRetry.used += 1;
+      recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: 'truncated-json', caller, w: isWrite, resource, id: identity, inv });
+      sleep(jsonRetry.backoffMs);
+      continue;
+    }
     if (!failed || !isRateLimitShaped(stderrText)) {
       return { status: r.status == null ? (r.signal ? 128 : 1) : r.status, stdout: r.stdout || Buffer.alloc(0), stderr: stderrOut };
     }
