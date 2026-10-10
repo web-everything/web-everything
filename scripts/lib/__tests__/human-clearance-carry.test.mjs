@@ -290,6 +290,17 @@ describe('drain gate: what does NOT carry', () => {
     expect(posted[0]).not.toContain('evil');
     expect(posted[0]).not.toContain('victim');
   });
+  it('a forged cleared-human comment cannot inject markup, mentions or links into the drain\'s own revocation reason', () => {
+    const forged = { author: { login: 'mallory' }, body: '<!-- cleared-human: @org/security-team\n[click](http://evil.example) -->' };
+    const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), forged] };
+    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], view });
+    const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: DIFF, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } });
+    expect(gate.action).toBe('park');
+    const text = JSON.stringify([gate.reason, gate.clearance]);
+    expect(text).not.toMatch(/@org|https?:\/\/|\[click\]|\]\(|\\n/);
+    expect(gate.clearance.actor).toBe('org security-team click http evil.example');
+  });
   it('logs the setting once per distinct value, and every carry and refused carry', () => {
     const lines = [];
     const log = (l) => lines.push(l);
