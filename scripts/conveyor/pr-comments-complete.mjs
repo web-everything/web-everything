@@ -11,7 +11,7 @@
  * the PR is left out of this tick's snapshot, so nothing is decided (or posted) on a view that may miss grants.
  */
 import { execRead } from '../lib/proc-read.mjs';
-import { defaultListPrComments } from './parked-pr-conflict-watch.mjs';
+import { defaultListPrComments } from './pr-comments-list.mjs'; // the leaf — parked-pr-conflict-watch would close an import cycle via rearm-review
 
 /** `gh pr list --json comments` page size; a listed thread this long may be truncated. */
 export const LIST_COMMENTS_PAGE_SIZE = 100;

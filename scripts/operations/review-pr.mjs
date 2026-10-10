@@ -264,6 +264,7 @@ import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
 // `operator-queue.mjs` so nobody restates it.
 import { ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
 import { isValidRoundBudget } from '../lib/review-settings.mjs';
+import { renderStackMarker, stackHoldHeading } from '../conveyor/review-stack-base.mjs';
 
 /** The operation's stable id. Adapters resolve it by this name. */
 export const REVIEW_PR_OP = 'review-pr';
@@ -898,6 +899,8 @@ export const REVIEW_EFFECTS = Object.freeze({
   LEDGER_EVENTS: 'review.ledger-events',
   // Card 5469: the scoped re-review shadow (finding-identity ledger rows + would-block/would-card journal). SHADOW ONLY.
   SCOPED_REREVIEW_SHADOW: 'review.scoped-rereview-shadow',
+  // Held item 177: an ACCEPT on a stacked top, recorded as a `reviewed-stack` marker instead of `review:accepted`.
+  STACK_HOLD: 'review.stack-hold',
 });
 
 /**
@@ -979,6 +982,11 @@ function pinnedSha(value) {
  *   {@link assertDeclaredShapeHolds} for what it is checked against and which direction refuses.
  * @returns {object} the `read` finding.
  */
+const shapeStackBase = (s) => (s && Number.isInteger(s.pr) && typeof s.ref === 'string' && pinnedSha(s.head)
+  && pinnedSha(s.contained) && pinnedSha(s.tree) && /^[0-9a-f]{64}$/.test(String(s.fingerprint ?? ''))
+  ? { pr: s.pr, ref: s.ref, head: pinnedSha(s.head), contained: pinnedSha(s.contained), tree: pinnedSha(s.tree), fingerprint: s.fingerprint }
+  : null);
+
 export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   if (!raw || typeof raw !== 'object') {
     throw new Error(`review-pr.read: the injected reader returned ${typeof raw}, not a PR context object`);
@@ -1169,6 +1177,9 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     },
     diffText: String(diff.text || ''),
     diffScored: diff.scored === true,
+    // Held item 177 — set only when this PR is a stacked top and the diff above was taken from the stack base (the
+    // bottom PR's head merged into this PR's merge-base with main) instead of main. `null` = the main basis.
+    stackBase: shapeStackBase(raw.stackBase),
     // ── NOT GROUND TRUTH: `gh`'s own file list, three-dot and inflated. Carried for DISPLAY only; nothing
     //    downstream of here may hand it to a juror. (#2901 — the console diff stat that disagreed with what the
     //    agent saw is this list, and naming it differently is what stops the two being confused.)
@@ -1209,8 +1220,17 @@ export function renderJudgeInput(read) {
     '',
     read.netChangedFiles.length ? read.netChangedFiles.map((p) => `- ${p}`).join('\n') : '_(none resolved)_',
     '',
-    '## Net diff vs current main',
-    '',
+    ...(read.stackBase
+      ? [
+        `## Net diff vs #${read.stackBase.pr}'s head (\`${read.stackBase.ref}\` @ ${read.stackBase.contained.slice(0, 12)})`,
+        '',
+        `This PR is STACKED on #${read.stackBase.pr}: its branch contains that PR's commits. The base of this diff is `
+          + `#${read.stackBase.pr}'s head merged into this PR's merge-base with main, NOT main, so the diff below is `
+          + `only this PR's own change. #${read.stackBase.pr}'s files are reviewed in #${read.stackBase.pr}, not here; `
+          + `this PR cannot merge before #${read.stackBase.pr} lands.`,
+        '',
+      ]
+      : ['## Net diff vs current main', '']),
     read.diffText?.trim() || '_(the net diff could not be resolved — see the degraded note)_',
   ];
   return lines.join('\n');
@@ -1820,8 +1840,27 @@ export function planRecordDecision(view) {
   // than the reduction was computed over.
   const body = renderVerdictWriteUp({ read, verdict, answer, actor, reason: overrideReason });
 
+  // Held item 177 — AN ACCEPT ON A STACKED TOP IS NOT `review:accepted`. The accept covers only this PR's own diff
+  // (vs the bottom's head); the PR's branch still carries the bottom's commits, so a `review:accepted` label (and the
+  // `reviewed-diff` stamp `review-set-label.mjs` takes against MAIN) would let the drain land it first. Record a
+  // `reviewed-stack` marker instead: the review dispatcher holds the PR while the bottom is open and carries the
+  // accept forward once the stack collapses with a byte-identical net diff. A `changes` verdict goes through as usual.
+  const stackHold = to === 'accepted' && read.stackBase && read.netBasis?.rev
+    ? {
+      marker: renderStackMarker({
+        top: pr, topHead: read.netBasis.rev, bottom: read.stackBase.pr, bottomRef: read.stackBase.ref,
+        bottomHead: read.stackBase.head, contained: read.stackBase.contained, fingerprint: read.stackBase.fingerprint,
+      }),
+      // The heading is the marker reader's anchor (`parseStackMarkers` requires it as the comment's first words).
+      note: `${stackHoldHeading(read.stackBase.pr)} Reviewed against #${read.stackBase.pr}'s head `
+        + `(\`${read.stackBase.ref}\` @ ${read.stackBase.contained.slice(0, 12)}), so this covers only this PR's own change. `
+        + `No \`review:accepted\` label while #${read.stackBase.pr} is open; once it lands and this PR is restacked, an `
+        + 'identical net diff carries this accept forward without another review.',
+    }
+    : null;
+
   return {
-    to, decision, bodyFile, body, pr, repo, actor, read, verdict,
+    to, decision, bodyFile, body, pr, repo, actor, read, verdict, ...(stackHold ? { stackHold } : {}),
   };
 }
 
@@ -2917,6 +2956,16 @@ export function reviewPrOperation({
         const {
           to, decision, bodyFile, pr, repo, actor, read, verdict,
         } = plan;
+        // Held item 177 — a stacked accept posts the staged write-up with the `reviewed-stack` marker and changes no
+        // label: no `review:accepted`, no `reviewed-sha`/`reviewed-diff` stamp, no ledger clearance row.
+        // IDEMPOTENT: FALSE, for the same reason as the label swap: a replay would post a second comment.
+        if (plan.stackHold) {
+          return [{
+            type: REVIEW_EFFECTS.STACK_HOLD,
+            payload: { pr, repo, bodyFile, marker: plan.stackHold.marker, note: plan.stackHold.note },
+            idempotent: false,
+          }];
+        }
 
         return [
           // 0 — THE LABEL SWAP, via `decideSetLabel` and through the SINGLE HOME (`review-set-label.mjs`), which
@@ -3017,7 +3066,8 @@ export function reviewPrOperation({
         const read = view.findings.read;
         const landed = (finding, type) => (finding?.effects ?? []).some((e) => e.type === type && e.status === 'applied');
         const posted = landed(view.findings.advise, REVIEW_EFFECTS.ADVISORY_NOTE)
-          || landed(view.findings.record, REVIEW_EFFECTS.LABEL);
+          || landed(view.findings.record, REVIEW_EFFECTS.LABEL)
+          || landed(view.findings.record, REVIEW_EFFECTS.STACK_HOLD);
         const referralKeys = [];
         for (const f of view.findings.reduce?.referrals ?? []) {
           try { referralKeys.push(referralFindingKey(f.seat, f.original)); } catch { /* an unkeyable referral is skipped, never fatal */ }

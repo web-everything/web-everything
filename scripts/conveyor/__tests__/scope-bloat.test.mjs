@@ -365,3 +365,73 @@ describe('runReviewTick — one mechanical refresh per bloated head, with a dura
     expect(out.failed.map((f) => f.error).join('|')).toMatch(/push refused[\s\S]*gh down|gh down[\s\S]*push refused/);
   });
 });
+
+describe('stack-aware review (held item 177)', () => {
+  // #4631 was refused 55 times on 2026-10-09: 23 files vs main, but only these 11
+  // belong to it. #4624 contributes 13 paths, one overlapping the top's own work.
+  const OWN11 = [
+    'backlog/5472-heal-on-an-accepted-pr-keeps-the-accept-heal-commit-gets-a-d.md',
+    'scripts/__tests__/merge-ai-prs-acceptance-restamp-and-review-coverage.test.mjs',
+    'scripts/conveyor/accept-carry-sweep.mjs',
+    'scripts/conveyor/review-hold-reconcile.mjs',
+    'scripts/lib/__tests__/accept-carry-forward.replay.test.mjs',
+    'scripts/lib/__tests__/fixtures/accept-carry-forward-4535.json',
+    'scripts/lib/accept-carry-forward.mjs',
+    'scripts/merge-ai-prs.mjs',
+    'scripts/review-set-label.mjs',
+    'scripts/settings/accept-carry-forward.json',
+    'skills-src/conveyor/review-daemon.mjs',
+  ];
+  const BOTTOM_ONLY = Array.from({ length: 12 }, (_, i) => `scripts/conveyor/red-main-contain-${i}.mjs`);
+  const ALL23 = [...OWN11, ...BOTTOM_ONLY];
+  const H = '2'.repeat(40);
+  const C = '3'.repeat(40);
+  const T = '8'.repeat(40);
+  const HEAD = '1'.repeat(40);
+  const base = { pr: 4624, ref: 'lane/red-main-contain', head: H, contained: C };
+  const stack = { ...base, tree: T, topHead: HEAD };
+  const pr = () => ({ number: 4631, title: 'WE #5472: accept carry-forward',
+    headRefName: 'lane/accept-carry-forward', headRefOid: HEAD,
+    files: ALL23.map(path => ({ path, additions: 1, deletions: 0 })), comments: [] });
+  const readers = (caseId) => ({
+    repo: 'web-everything/web-everything',
+    env: { WE_STACK_AWARE_REVIEW: 'on', WE_REVIEW_SCOPE_BLOAT_MIN_FILES: '10',
+      WE_REVIEW_SCOPE_BLOAT_OUTSIDE_SCOPE: '10', WE_REVIEW_SCOPE_BLOAT_ALREADY_ON_MAIN: '4' },
+    readNet: () => ALL23, readScope: () => OWN11.map(path => `we:${path}`),
+    // Isolate memo keys so the fallback case must execute its own failing stack read.
+    readBaseSha: () => ({ own: 'a', main: 'b', fallback: 'c' }[caseId].repeat(40)),
+    readMergeBaseNet: () => null, netScope: { scopeBloat: false },
+    readStacks: () => new Map([[4631, stack]]), readStackFiles: () => OWN11,
+  });
+
+  it('judges only its own 11 files and exposes the stack base', () => {
+    expect(ALL23).toHaveLength(23);
+    expect(OWN11).toHaveLength(11);
+    const stackReads = [];
+    const [out] = enrichPrsWithScopeBloat([pr()], { ...readers('own'),
+      readStackFiles: b => { stackReads.push(b); return OWN11; } });
+    expect(stackReads).toEqual([stack]);
+    expect(out.scopeBloat).toBeUndefined();
+    expect(out.stackBase).toEqual(base);
+  });
+
+  it('retains the old wide-scope refusal when there is no stack', () => {
+    const [out] = enrichPrsWithScopeBloat([pr()], { ...readers('main'), readStacks: () => new Map() });
+    expect(out.scopeBloat).toMatchObject({ wide: true });
+    expect(out.scopeBloat.outsideScope).toEqual(BOTTOM_ONLY);
+    expect(out.stackBase).toBeUndefined();
+  });
+
+  it('falls back to the main basis when the stack file read throws', () => {
+    let stackReads = 0;
+    let mainReads = 0;
+    const [out] = enrichPrsWithScopeBloat([pr()], { ...readers('fallback'),
+      readStackFiles: () => { stackReads += 1; throw new Error('unreadable stack tree'); },
+      readNet: () => { mainReads += 1; return ALL23; },
+    });
+    expect(stackReads).toBe(1);
+    expect(mainReads).toBe(1);
+    expect(out.scopeBloat).toMatchObject({ wide: true });
+    expect(out.scopeBloat.outsideScope).toEqual(BOTTOM_ONLY);
+  });
+});
