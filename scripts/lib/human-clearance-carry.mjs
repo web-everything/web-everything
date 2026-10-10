@@ -13,7 +13,8 @@
  *
  *   This module is the drain-side second line, independent of whichever writer moved the head:
  *     1. {@link latestHumanClearance} — the latest trusted accept-shaped comment, ONLY if it is a human
- *        clearance (same binding as `parseLatestHumanClearedSha`), with that SAME comment's reviewed-diff.
+ *        clearance (same binding as `parseLatestHumanClearedSha`), with that SAME comment's reviewed-diff and
+ *        actor. `readDrainAcceptance` calls it, so the drain has no second, looser reader of the clearance.
  *     2. {@link proveMechanicalMove} (IO, git) — the cleared head is an ancestor of the live head, and every
  *        commit between them that is not already on main is a MERGE with a parent on main. A rewrite (rebase,
  *        amend, force-push) or an author commit is not mechanical → no carry.
@@ -79,25 +80,22 @@ export function latestHumanClearance(comments) {
   const trusted = list.filter(isTrustedMarkerAuthor);
   const latest = trusted.findLast((c) => parseReviewedSha([c]));
   if (!latest || parseReviewedSha([latest]) !== sha) return null;
+  // Only a full 40-hex sha can be compared to the live head and fed to git; an attributed clearance needs a named actor
+  // (`parseOperatorClearance` refuses an empty `cleared-human:` where `parseLatestHumanClearedSha` does not).
+  if (!/^[0-9a-f]{40}$/.test(sha)) return null;
   const clearance = parseOperatorClearance([latest]);
-  return { sha, diff: parseReviewedDiff([latest]), actor: clearance ? clearance.actor : 'the operator' };
+  if (!clearance) return null;
+  return { sha, diff: parseReviewedDiff([latest]), actor: sanitizeActor(clearance.actor) };
 }
 
 /**
- * PURE: the same clearance, derived from the drain's existing acceptance evidence (`readDrainAcceptance`) instead
- * of re-reading comments. `humanClearedSha` is non-null ONLY when the latest trusted accept-shaped comment is a human
- * clearance, and `acceptedSha` is that same comment's sha — so requiring them equal binds `acceptedDiff` to it too.
- * @param {object} evidence - `{headSha, acceptedSha, acceptedDiff, humanClearedSha, operatorClearance, headDiff, …}`
- * @returns {object} the evidence plus `humanClearance: {sha, diff, actor}|null`
+ * PURE: an actor name made safe to print in a bot comment's prose. An allow-list, not a deny-list: only letters,
+ * digits, `.`, `_`, `-` and single spaces survive, so no line break, markup, mention, link, URL, cross-reference,
+ * code span or invisible/bidi character can reach the record.
  */
-export function withHumanClearance(evidence) {
-  const e = evidence || {};
-  const sha = typeof e.humanClearedSha === 'string' ? e.humanClearedSha.toLowerCase() : '';
-  const acc = typeof e.acceptedSha === 'string' ? e.acceptedSha.toLowerCase() : '';
-  const humanClearance = sha && sha === acc
-    ? { sha, diff: e.acceptedDiff ?? null, actor: e.operatorClearance?.actor || 'the operator' }
-    : null;
-  return { ...e, humanClearance };
+export function sanitizeActor(actor) {
+  const name = String(actor ?? '').replace(/[^\p{L}\p{N}._-]+/gu, ' ').trim();
+  return name.slice(0, 64) || 'the operator';
 }
 
 /**
@@ -163,7 +161,8 @@ export function buildCarryMarker({ fromSha, toSha, fingerprint }) {
  * (what `parseLatestHumanClearedSha` requires), with the reviewed diff/contribution of the live net diff text.
  * @param {{fromSha:string, toSha:string, fingerprint:string, actor:string, headDiffText:string, mechanicalReason?:string}} o
  */
-export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor, headDiffText, mechanicalReason = '' }) {
+export function buildCarryRecordBody({ fromSha, toSha, fingerprint, actor: rawActor, headDiffText, mechanicalReason = '' }) {
+  const actor = sanitizeActor(rawActor);
   return [
     '📌 review — human clearance carried forward (identical net diff after a mechanical refresh, no new review)',
     '',
@@ -191,7 +190,7 @@ export function logCarrySettingOnce(setting, write = (s) => process.stderr.write
 
 /**
  * IO: the drain's carry step, run once per gate decision on an ACCEPTED PR. Given the drain's acceptance evidence
- * (`readDrainAcceptance`, which carries `humanClearance`, `headSha`, `headDiff`), decide the carry and — when it
+ * (`readDrainAcceptance`, which carries `humanClearance` from {@link latestHumanClearance}, `headSha`, `headDiff`), decide the carry and — when it
  * holds — post the durable record BEFORE the caller honours it. Returns:
  *   null                                  — nothing to carry (today's behaviour, the gate decides as before);
  *   {action:'defer', applyLabel:null, reason} — carry proven but the record could not be written: skip this pass,

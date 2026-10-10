@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
-  resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER,
+  resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
 import { normalizeDiffFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
 import { decideDrainReviewGate } from '../../merge-ai-prs.mjs';
@@ -24,9 +24,9 @@ const quiet = () => {};
 
 const clearHumanComment = (sha, fp = FP) => ({
   author: { login: 'chalbert' },
-  body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n<!-- reviewed-diff: ${fp} -->\n<!-- cleared-human: chalbert -->`,
+  body: `✅ review — \`review:human\` cleared via the sanctioned path\n\n<!-- reviewed-sha: ${sha} -->\n${fp ? `<!-- reviewed-diff: ${fp} -->\n` : ''}<!-- cleared-human: chalbert -->`,
 });
-const plainAccept = (sha) => ({ viewerDidAuthor: true, body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->\n<!-- reviewed-diff: ${FP} -->` });
+const plainAccept = (sha, fp = FP) => ({ viewerDidAuthor: true, body: `✅ review — accepted\n<!-- reviewed-sha: ${sha} -->\n<!-- reviewed-diff: ${fp} -->` });
 
 describe('decideHumanClearanceCarry (pure)', () => {
   const clearance = { sha: CLEARED, diff: FP, actor: 'chalbert' };
@@ -38,6 +38,7 @@ describe('decideHumanClearanceCarry (pure)', () => {
   it.each([
     ['setting off', { enabled: false }, 'off'],
     ['no clearance', { clearance: null }, 'no recorded human clearance'],
+    ['unknown live head', { headSha: '' }, 'live head unknown'],
     ['already bound', { headSha: CLEARED }, 'already bound'],
     ['no recorded fingerprint', { clearance: { ...clearance, diff: null } }, 'no reviewed-diff'],
     ['unreadable live diff', { headDiff: null }, 'unreadable'],
@@ -59,6 +60,22 @@ describe('latestHumanClearance', () => {
   });
   it('ignores an untrusted forger', () => {
     expect(latestHumanClearance([{ author: { login: 'mallory' }, body: clearHumanComment(CLEARED).body }])).toBe(null);
+  });
+  it('a diff-less clearance does NOT inherit an older accept\'s reviewed-diff', () => {
+    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, actor: 'chalbert' });
+  });
+  it('a clearance with an empty actor is not an attributed clearance', () => {
+    const c = { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${CLEARED} -->\n<!-- reviewed-diff: ${FP} -->\n<!-- cleared-human: -->` };
+    expect(latestHumanClearance([c])).toBe(null);
+  });
+  it('a short or mixed-case sha is not compared or fed to git', () => {
+    const short = clearHumanComment(CLEARED.slice(0, 12));
+    expect(latestHumanClearance([short])).toBe(null);
+    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, actor: 'chalbert' });
+  });
+  it('the actor comes from the clearance comment, never from an untrusted later forgery', () => {
+    const forged = { author: { login: 'mallory' }, body: '<!-- cleared-human: evil -->' };
+    expect(latestHumanClearance([clearHumanComment(CLEARED), forged]).actor).toBe('chalbert');
   });
 });
 
@@ -115,6 +132,24 @@ describe('proveMechanicalMove (real git)', () => {
       expect(r.ok).toBe(false);
       expect(r.reason).toContain('not an ancestor');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fails closed when git throws', () => {
+    const exec = () => { throw new Error('git exploded'); };
+    expect(proveMechanicalMove({ exec, fromSha: CLEARED, toSha: HEAD }).ok).toBe(false);
+    expect(proveMechanicalMove({ fromSha: CLEARED, toSha: HEAD }).ok).toBe(false);
+  });
+  it('fails closed when rev-list throws', () => {
+    const exec = (_c, args) => { if (args[0] === 'rev-list') throw new Error('bad object'); return ''; };
+    const r = proveMechanicalMove({ exec, fromSha: CLEARED, toSha: HEAD });
+    expect(r).toMatchObject({ ok: false });
+    expect(r.reason).toContain('rev-list failed');
+  });
+  it('more than MAX_MECHANICAL_COMMITS new commits is not a refresh', () => {
+    const lines = Array.from({ length: MAX_MECHANICAL_COMMITS + 1 }, (_, i) => `c${i} p${i} q${i}`).join('\n');
+    const exec = (_c, args) => (args[0] === 'rev-list' ? lines : '');
+    const r = proveMechanicalMove({ exec, fromSha: CLEARED, toSha: HEAD });
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('not a refresh');
   });
   it('a merge of a non-main branch is not', () => {
     const { dir, g, cleared } = setup();
@@ -214,11 +249,44 @@ describe('drain gate: what does NOT carry', () => {
     expect(posted).toHaveLength(0);
   });
   it('a failed record write defers without a label change', () => {
-    const exec = vi.fn(() => { throw new Error('gh down'); });
     const r = applyHumanClearanceCarry({ evidence: { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert' }, headSha: PR4722.head, headDiff: PR4722.fp },
       pr: 1, exec: graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: () => { throw new Error('gh 502'); } }), setting: ON, log: quiet });
     expect(r).toMatchObject({ action: 'defer', applyLabel: null });
-    expect(exec).not.toHaveBeenCalled();
+  });
+  it('a diff-less human clearance after an older accept that HAD a diff does not carry (no record)', () => {
+    const posted = [];
+    const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [plainAccept(PR4722.r1, PR4722.fp), clearHumanComment(PR4722.e125, null)] };
+    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
+    const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp }), carry: { setting: ON, log: quiet } });
+    expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
+    expect(gate.carriedClearance).toBeUndefined();
+    expect(posted).toHaveLength(0);
+  });
+  it('an untrusted forged cleared-human comment cannot set the actor in the posted record', () => {
+    const posted = [];
+    const forged = { author: { login: 'mallory' }, body: '<!-- cleared-human: evil @victim -->' };
+    const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), forged] };
+    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
+    const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp }), carry: { setting: ON, log: quiet } });
+    expect(gate.action).toBe('merge');
+    expect(gate.carriedClearance.actor).toBe('chalbert');
+    expect(posted[0]).toContain('<!-- cleared-human: chalbert -->');
+    expect(posted[0]).not.toContain('evil');
+    expect(posted[0]).not.toContain('victim');
+  });
+  it('logs the setting once per distinct value, and every carry and refused carry', () => {
+    const lines = [];
+    const log = (l) => lines.push(l);
+    const evidence = { humanClearance: { sha: PR4722.e125, diff: PR4722.fp, actor: 'chalbert' }, headSha: PR4722.head, headDiff: PR4722.fp };
+    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2] });
+    const setting = { value: true, source: 'env' };
+    applyHumanClearanceCarry({ evidence, pr: 7, exec, setting, log });
+    applyHumanClearanceCarry({ evidence: { ...evidence, headDiff: DIFF }, pr: 8, exec, setting, log });
+    expect(lines.filter((l) => l.includes('policy · review.humanClearanceCarryForward=true (env)'))).toHaveLength(1);
+    expect(lines.some((l) => l.includes('#7: CARRIED'))).toBe(true);
+    expect(lines.some((l) => l.includes('#8: NOT carried') && l.includes('net diff changed'))).toBe(true);
   });
   it('dry run carries without writing', () => {
     const onComment = vi.fn();
@@ -229,11 +297,33 @@ describe('drain gate: what does NOT carry', () => {
   });
 });
 
+describe('sanitizeActor', () => {
+  it.each([
+    ['chalbert', 'chalbert'],
+    ['Nic Gilbert', 'Nic Gilbert'],
+    ['see https://evil.example/x', 'see https evil.example x'],
+    ['a​b‮c', 'a b c'],
+    ['org/repo#12 a@b.co', 'org repo 12 a b.co'],
+    ['', 'the operator'],
+    ['<>@@', 'the operator'],
+  ])('%j → %j', (raw, safe) => { expect(sanitizeActor(raw)).toBe(safe); });
+  it('caps the length', () => { expect(sanitizeActor('x'.repeat(500))).toHaveLength(64); });
+});
+
 describe('buildCarryRecordBody', () => {
   it('binds reviewed-sha and cleared-human to the new head in one comment', () => {
     const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, actor: 'chalbert', headDiffText: DIFF });
     expect(body).toContain(`<!-- reviewed-sha: ${HEAD} -->`);
     expect(body).toContain(`<!-- reviewed-diff: ${FP} -->`);
     expect(body).toContain('<!-- cleared-human: chalbert -->');
+  });
+  it('neutralises newlines, markup, mentions and links in the actor wherever it is rendered', () => {
+    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF });
+    const prose = body.split('\n').find((l) => l.startsWith('Recorded by drain'));
+    expect(prose).toContain('ev il');
+    expect(prose).not.toMatch(/@|<|>|\]\(|`c`/);
+    expect(body).not.toContain('@victim');
+    expect(body.split('\n').filter((l) => l.includes('cleared-human:'))).toHaveLength(1);
+    expect(parseLatestHumanClearedSha([{ viewerDidAuthor: true, body }])).toBe(HEAD);
   });
 });
