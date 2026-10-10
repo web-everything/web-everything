@@ -20,7 +20,7 @@ import {
   isGlobalOffNow, isBranchAllowedNow,
   fetchOpenPrs, fetchPrCommits, countOpenPrsForRepo,
   createAuthorshipCache, countOpenPrsForDispatch, DISPATCH_PR_COUNT_API_CAP, AUTHORSHIP_FAILURE_COOLDOWN_MS,
-  PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope,
+  PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope, isStackedAwaitingBasePr,
 } from '../pr-limit.mjs';
 
 describe('resolvePrLimit', () => {
@@ -116,6 +116,15 @@ describe('decideOpenPr — the five required behaviours', () => {
     expect(d.reason).toMatch(/card-only/);
   });
 
+  it('a card-only changeset still meets the limit when excludeCardOnly is OFF (the toggle gates the open exemption too)', () => {
+    const d = decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md'], excludeCardOnly: false });
+    expect(d.allowed).toBe(false);
+    expect(d.exempt).toBe(false);
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md'], excludeCardOnly: true }).allowed).toBe(true);
+    // omitted → the built-in default (exclude)
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md'] }).allowed).toBe(true);
+  });
+
   it('a card plus any non-card file, or an unreadable (empty) changeset, still meets the limit', () => {
     expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md', 'docs/x.md'] }).allowed).toBe(false);
     expect(decideOpenPr({ ...base, openCount: 17, changedFiles: [] }).allowed).toBe(false);
@@ -196,7 +205,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, cardOnly: 0, cardOnlyPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, excludeCardOnly: true, cardOnly: 0, cardOnlyPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -251,11 +260,31 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
 
   it('a stacked draft awaiting its base PR is not counted; a stacked PR without the label, or on main, still is', () => {
     const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
-    const rows = [awaiting(6, 'lane/settings-cascade-audit'), { ...code(7), baseRefName: 'lane/x' }, awaiting(8, 'main'), code(3)];
+    const baseRow = { ...code(9), headRefName: 'lane/settings-cascade-audit' };
+    const rows = [awaiting(6, 'lane/settings-cascade-audit'), { ...code(7), baseRefName: 'lane/x' }, awaiting(8, 'main'), code(3), baseRow];
     const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
-    expect(r).toMatchObject({ count: 3, stacked: 1, stackedPrNumbers: [6] });
+    expect(r).toMatchObject({ count: 4, stacked: 1, stackedPrNumbers: [6] });
     const off = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: false } });
-    expect(off).toMatchObject({ count: 4, stacked: 0 });
+    expect(off).toMatchObject({ count: 5, stacked: 0 });
+  });
+
+  it('a labelled draft whose base is NOT the head of another open PR still counts (the label and a scratch base are not enough)', () => {
+    const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
+    const rows = [awaiting(6, 'scratch/not-a-pr'), awaiting(7, 'lane/real-base'), { ...code(9), headRefName: 'lane/real-base' }];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
+    expect(r).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [7] });
+    expect(isStackedAwaitingBasePr(awaiting(6, 'scratch/not-a-pr'), new Set(['lane/real-base']))).toBe(false);
+    expect(isStackedAwaitingBasePr(awaiting(7, 'lane/real-base'), new Set(['lane/real-base']))).toBe(true);
+    // fail-closed: no open-heads set → not stacked
+    expect(isStackedAwaitingBasePr(awaiting(7, 'lane/real-base'))).toBe(false);
+  });
+
+  it('fetchOpenPrs requests baseRefName on both the direct and the shared-snapshot read (the stacked test needs it)', () => {
+    const exec = (args) => { expect(args[args.indexOf('--json') + 1].split(',')).toContain('baseRefName'); return '[]'; };
+    expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
+    let fields = null;
+    fetchOpenPrs('o/n', { exec: () => '[]', readShared: (o) => { fields = o.fields; return []; } });
+    expect(fields.split(',')).toContain('baseRefName');
   });
 
   it('fetchOpenPrs asks for files (the card-only test needs them)', () => {
@@ -278,7 +307,9 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
 
   it('the setting OFF counts card-only PRs again', () => {
     const r = countOpenPrsForRepo('we', { exec: execFor([card(1), code(3)]), env: {}, scope: { excludeCardOnly: false } });
-    expect(r).toMatchObject({ count: 2, cardOnly: 0 });
+    expect(r).toMatchObject({ count: 2, cardOnly: 0, excludeCardOnly: false });
+    // wiring: pr-land feeds this resolved value into decideOpenPr, so the open exemption follows the same toggle
+    expect(decideOpenPr({ repoKey: 'we', limit: 2, openCount: r.count, excludeCardOnly: r.excludeCardOnly, changedFiles: ['backlog/x.md'] }).allowed).toBe(false);
   });
 
   it('the refusal reports "N counted (M card-only excluded, K accepted excluded)"', () => {
