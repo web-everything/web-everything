@@ -14,7 +14,7 @@ export default {
   fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('defaultReadIsCrossRepository'); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
-    const { sweepMissingRunRecovery, restackStackedPr } = await import(pathToFileURL(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs')).href);
+    const { sweepMissingRunRecovery, restackStackedPr, sweepCiRedRecovery, refreshOntoMain } = await import(pathToFileURL(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs')).href);
     const violations = [];
     const mainRuns = [{ status: 'completed', conclusion: 'success', updatedAt: '2026-10-10T20:13:19Z', headSha: 'b'.repeat(40) }];
     const common = { repo: REPO, readRequiredContexts: () => ['test'], readHeadCommittedAt: () => '2026-10-10T12:00:00Z', now: Date.parse('2026-10-10T21:00:00Z'), mainRuns };
@@ -37,6 +37,16 @@ export default {
     const plan = sweepMissingRunRecovery({ ...common, defaultBranch: 'master', maxRetriesPerSha: 1, readComments: () => [refusal],
       readOpenPrs: () => [{ number: 7, headRefName: 'lane/f', baseRefName: 'master', headRefOid: SHA, statusCheckRollup: [] }] });
     if (!plan.refusals.some((r) => r.prNumber === 7 && r.kind === 'missing-run-cap-exhausted')) violations.push('non-main default-branch fork refusal was refunded, not counted');
+    // 3. The main-red rebase sink: a fork PR (red required check) must never reach rebase+push either.
+    const rebased = [];
+    const mainRed = [{ status: 'completed', conclusion: 'failure', updatedAt: '2026-09-25T01:30:55Z', workflowName: 'CI' },
+      { status: 'completed', conclusion: 'success', updatedAt: '2026-09-25T02:31:25Z', workflowName: 'CI' }];
+    const red = sweepCiRedRecovery({ apply: true, readOpenPrs: () => [{ number: 2635, headRefName: 'lane/shadowed', headRefOid: SHA,
+      statusCheckRollup: [{ __typename: 'CheckRun', name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', completedAt: '2026-09-25T01:57:47Z' }] }],
+    readMainRuns: () => mainRed, readAheadBy: () => 33, readComments: () => [], checkClaim: () => null, postComment: () => {}, readIsCrossRepository: () => true,
+    refresh: (ref, o) => refreshOntoMain(ref, { ...o, rebase: (r) => { rebased.push(r.laneRef); return { action: 'rebased', newCommit: 'x' }; } }) });
+    if (!red.dispatch.length) violations.push('main-red fixture did not dispatch (scenario is vacuous)');
+    if (rebased.length) violations.push(`main-red path rebased/pushed a fork PR's head ref: ${rebased.join(', ')}`);
     return { violations };
   },
   judge(report) { return report.violations; },

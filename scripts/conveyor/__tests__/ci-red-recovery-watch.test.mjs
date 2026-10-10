@@ -1372,20 +1372,36 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     const repo = 'web-everything/web-everything';
     const same = () => false;
     it.each([
-      ['the candidate itself is a fork', (n) => n === 4759],
-      ['a base link is a fork', (n) => n === 4756],
-      ['a link repo cannot be verified (null)', () => null],
-      ['a link repo read throws', () => { throw new Error('gh down'); }],
-    ])('%s', (_name, readIsCrossRepository) => {
+      ['the candidate itself is a fork', (n) => n === 4759, false],
+      ['a base link is a fork', (n) => n === 4756, false],
+      // An unreadable answer is transient: a free deferral, never a burned cap attempt.
+      ['a link repo cannot be verified (null)', () => null, true],
+      ['a link repo read throws', () => { throw new Error('gh down'); }, true],
+    ])('%s', (_name, readIsCrossRepository, deferred) => {
       const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'new' }));
       const fetchRef = vi.fn(() => ({ ok: true }));
       const result = watch.restackStackedPr({ ...stack[1], prNumber: 4759 }, { prs: stack, repo, checkClaim: () => null, readIsCrossRepository, refresh, fetchRef });
       expect(result).toMatchObject({ ok: false, action: 'stack-restack' });
-      expect(result.deferred).toBeUndefined(); // counted, so the per-sha cap bounds it
-      expect(result.error).toMatch(/fork|verif/);
+      expect(result.deferred === true).toBe(deferred);
+      expect(result.error).toMatch(/fork|verified/);
       expect(refresh).not.toHaveBeenCalled();
       expect(fetchRef).not.toHaveBeenCalled();
-      expect(core.countMissingRunComments([{ viewerDidAuthor: true, body: `🚦 conveyor missing-run-recovery\n\nsha: ${sha}\n${result.error}` }], sha, { baseRefName: stack[1].baseRefName })).toBe(1);
+      // A fork refusal is a counted marker (cap-bounded); the sweep posts none for a deferral.
+      if (!deferred) expect(core.countMissingRunComments([{ viewerDidAuthor: true, body: `🚦 conveyor missing-run-recovery\n\nsha: ${sha}\n${result.error}` }], sha, { baseRefName: stack[1].baseRefName })).toBe(1);
+    });
+    it('main-red refresh: a fork PR is never rebased; an unverifiable one defers without a marker', () => {
+      for (const [reader, expectDeferred] of [[() => true, false], [() => null, true]]) {
+        const rebase = vi.fn(() => ({ action: 'rebased', newCommit: 'n' }));
+        const postComment = vi.fn();
+        const result = sweepCiRedRecovery({ apply: true, readOpenPrs: () => [PR_2635], readMainRuns: () => MAIN_RUNS, readAheadBy: () => 33,
+          readComments: () => [], checkClaim: () => null,
+          readIsCrossRepository: reader, refresh: (ref, o) => refreshOntoMain(ref, { ...o, rebase }), postComment });
+        expect(result.dispatch).toHaveLength(1);
+        expect(rebase).not.toHaveBeenCalled();
+        expect(result.applied[0]).toMatchObject({ ok: false });
+        expect(result.applied[0].deferred === true).toBe(expectDeferred);
+        expect(postComment).toHaveBeenCalledTimes(expectDeferred ? 0 : 1);
+      }
     });
     it('a same-repo chain still restacks, reading each link once', () => {
       const read = vi.fn(same);

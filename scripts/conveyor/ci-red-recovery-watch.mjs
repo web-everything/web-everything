@@ -161,11 +161,21 @@ export function buildCandidates(prs, {
  * `we:scripts/lib/rebase-drop-manifest.mjs#rebaseDropManifest` — never a second rebase implementation. Reports
  * `rebaseDropManifest`'s own `action` verbatim (`'rebased'` / `'current'` / `'skip'` / `'error'`) so a reader can
  * tell "refreshed" apart from "was already current" apart from "hit a real conflict, left for a human".
+ * The sink guard: when the caller names the PR (`prNumber`), it must be provably same-repo
+ * ({@link sameRepoRefusal}) before anything is rebased or pushed — a fork PR, or one whose head name merely
+ * shadows a same-repo lane, would otherwise have `origin/<laneRef>` (someone else's branch) force-pushed.
  * @param {string} laneRef
- * @param {{root?:string, base?:string, rebase?:Function}} [o]
- * @returns {{ok:boolean, action:string, error?:string}}
+ * @param {{root?:string, base?:string, rebase?:Function, prNumber?:number, repo?:(string|null), readIsCrossRepository?:Function}} [o]
+ * @returns {{ok:boolean, action:string, error?:string, deferred?:boolean}}
  */
-export function refreshOntoMain(laneRef, { root = REPO_ROOT, base = 'origin/main', rebase = rebaseDropManifest } = {}) {
+export function refreshOntoMain(laneRef, {
+  root = REPO_ROOT, base = 'origin/main', rebase = rebaseDropManifest,
+  prNumber = null, repo = null, readIsCrossRepository = defaultReadIsCrossRepository,
+} = {}) {
+  if (prNumber !== null) {
+    const refused = sameRepoRefusal(prNumber, { repo, readIsCrossRepository });
+    if (refused) return refused;
+  }
   const result = rebase({ laneRef, base, cwd: root });
   if (result.action === 'error') return { ok: false, action: 'error', error: result.reason };
   if (result.action === 'skip') return { ok: false, action: 'skip', error: result.reason };
@@ -216,6 +226,7 @@ export function sweepCiRedRecovery({
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   readComments = defaultReadPrComments, refresh = refreshOntoMain, postComment = defaultPostRebaseComment,
+  readIsCrossRepository = defaultReadIsCrossRepository,
   maxRebaseRetriesPerSha = resolveRecoveryCaps().rebaseRetriesPerSha, checkClaim = pushRefusal,
   // #2811 — injectable so a test can pin the restamp-first/rearm-fallback chain with no `gh`/child-process.
   reconcileAcceptance = reconcileAcceptanceAfterRebase,
@@ -300,10 +311,11 @@ export function sweepCiRedRecovery({
   if (apply) {
     for (const d of plan.dispatch) {
       const held = checkClaim({ repo, branch: d.headRefName });
+      // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
-        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot });
+        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
       // 2026-10-10 live: #4784 claim-held refusals burned the cap.
-      if (held || String(result.error ?? '').includes('holds the fix claim')) {
+      if (held || result.deferred || String(result.error ?? '').includes('holds the fix claim')) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, error: result.error });
         continue;
       }
@@ -861,6 +873,25 @@ export function defaultReadIsCrossRepository(prNumber, { repo = null, exec = exe
   }
 }
 
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#sameRepoRefusal — the one same-repo guard every path that rebases
+ * and force-pushes `origin/<headRefName>` ({@link refreshOntoMain}) must pass first. The open-PR listing carries
+ * no head-repo field, so this reads it per PR. A fork PR is a COUNTED refusal (a marker is posted, so the per-sha
+ * cap bounds it); an unreadable answer is a free `deferred` one (a transient `gh` failure must not burn the cap).
+ * Returns `null` when the PR is provably same-repo.
+ * @param {number} prNumber
+ * @param {{repo?:string|null, readIsCrossRepository?:Function, action?:string}} [o]
+ * @returns {null|{ok:false, action:string, error:string, deferred?:true}}
+ */
+export function sameRepoRefusal(prNumber, { repo = null, readIsCrossRepository = defaultReadIsCrossRepository, action = 'refresh' } = {}) {
+  let cross = null;
+  try { cross = readIsCrossRepository(prNumber, { repo }); } catch { cross = null; }
+  if (cross === false) return null;
+  return cross === true
+    ? { ok: false, action, error: `PR #${prNumber} is from a fork; refusing to rebase and push its head ref` }
+    : { ok: false, action, deferred: true, error: `PR #${prNumber} could not be verified as same-repo; retry next tick` };
+}
+
 export function restackStackedPr(d, {
   prs, repo, defaultBranch = 'main', root = REPO_ROOT, refresh = refreshOntoMain,
   fetchRef = defaultFetchStackRef, checkClaim = pushRefusal, readIsCrossRepository = defaultReadIsCrossRepository,
@@ -883,16 +914,11 @@ export function restackStackedPr(d, {
   const failed = error => ({ ok: false, action, error,
     ...(String(error).includes('holds the fix claim') ? { deferred: true } : {}),
   });
-  // refreshOntoMain rebases and force-pushes `origin/<headRefName>`: a fork PR (or one whose head name merely
-  // shadows a same-repo lane in the chain) must never reach it. The open-PR listing carries no head-repo field, so
-  // verify every link — fail closed, and as a COUNTED failure so the per-sha cap bounds it. Refuse before any mutation.
+  // Every link is verified same-repo before any claim check, fetch or push (a fork PR, or one whose head name
+  // merely shadows a same-repo lane in the chain, must never reach refreshOntoMain).
   for (const pr of chain) {
-    const n = pr.prNumber ?? pr.number;
-    let cross = null;
-    try { cross = readIsCrossRepository(n, { repo }); } catch { cross = null; }
-    if (cross !== false) {
-      return { ok: false, action, error: `stack link PR #${n} (${pr.headRefName}) ${cross === true ? 'is from a fork' : 'could not be verified as same-repo'}; refusing to restack` };
-    }
+    const refused = sameRepoRefusal(pr.prNumber ?? pr.number, { repo, readIsCrossRepository, action });
+    if (refused) return { ...refused, error: `stack link ${pr.headRefName}: ${refused.error}` };
   }
   for (const pr of chain) {
     const held = checkClaim({ repo, branch: pr.headRefName });
@@ -930,7 +956,7 @@ export function restackStackedPr(d, {
  */
 export function sweepMissingRunRecovery({
   repo = null, apply = false, defaultBranch = 'main',
-  mainRuns = null, readMainRuns = defaultReadMainRuns, restack = restackStackedPr,
+  mainRuns = null, readMainRuns = defaultReadMainRuns, restack = restackStackedPr, readIsCrossRepository = defaultReadIsCrossRepository,
   readOpenPrs = defaultReadOpenPrs, readRequiredContexts = defaultReadRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
@@ -977,7 +1003,7 @@ export function sweepMissingRunRecovery({
       // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
       const result = stacked
-        ? restack(d, { prs, repo, defaultBranch, root: resolveLanePoolRepoPath(repo) ?? REPO_ROOT })
+        ? restack(d, { prs, repo, defaultBranch, readIsCrossRepository, root: resolveLanePoolRepoPath(repo) ?? REPO_ROOT })
         : trigger(d, { repo, defaultBranch });
       // Unknown mergeability, a moving head or a held claim is not an attempt.
       if (result.deferred) {
