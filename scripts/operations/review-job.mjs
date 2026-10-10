@@ -100,7 +100,7 @@ import {
 import { redTeamRequired } from '../lib/jury-core.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
-} from '../lib/speculative-red-team.mjs';
+} from '../lib/review-speculative-red-team.mjs';
 import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
@@ -368,7 +368,7 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         return { status: 'error', reason: String(e?.message ?? e).slice(0, 300) };
       }
     },
-    // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/speculative-red-team.mjs`).
+    // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/review-speculative-red-team.mjs`).
     speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
     // Card xbizuci — THE SPECULATIVE RED TEAM, its own detached process group so it runs WHILE the loop runs (the loop
     // is a blocking spawnSync). It waits for the loop's read sink, makes the call, and writes its pass to `passFile`.

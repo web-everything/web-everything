@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, resolveSpeculativeRedTeam,
   withReadSink, SPECULATIVE_RED_TEAM_ENV, TOOL_SETTINGS_FILE, PLATFORM_PREFERENCES_FILE,
-} from '../speculative-red-team.mjs';
+} from '../review-speculative-red-team.mjs';
 
 describe('review.speculativeRedTeam — the policy cascade', () => {
   it('defaults to on, set by the standard layer', () => {

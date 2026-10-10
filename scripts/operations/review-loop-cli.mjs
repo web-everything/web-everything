@@ -84,7 +84,7 @@ import { randomUUID } from 'node:crypto';
 import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
 import { parallelSeatsEnabled, seatsByTouchSetEnabled } from '../lib/review-seat-settings.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
-import { READ_SINK_ENV, withReadSink } from '../lib/speculative-red-team.mjs';
+import { READ_SINK_ENV, withReadSink } from '../lib/review-speculative-red-team.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
 // label.mjs#fileApprovalPreventionCard` was fixed for under #4317: `fileItemForPrevention` below drives
 // `file-item` IN PROCESS, against whatever checkout is running the review daemon (routinely a read-only clone,

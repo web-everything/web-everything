@@ -1,5 +1,5 @@
 /**
- * @file scripts/lib/speculative-red-team.mjs
+ * @file scripts/lib/review-speculative-red-team.mjs
  * @description Card xbizuci — START THE POST-ACCEPT RED TEAM WITH THE JUROR SEATS, NOT AFTER THEM.
  *
  *   The post-accept red team (`we:scripts/operations/review-extra-seats.mjs#runRedTeam`, comment marker
