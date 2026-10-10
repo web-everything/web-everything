@@ -7,7 +7,7 @@
  *   fake (no child process) — the real detached child is health-watch-job.test.mjs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -15,9 +15,11 @@ import { tick } from '../health-watch.mjs';
 import { healthDir } from '../health-watch-section.mjs';
 import {
   runGhProbeJobs, observeTickClock, resolveHealthJobSwitches, FINISHED_JOB_KEEP_MS, RESULT_SUFFIX,
+  prewarmSnapshots, prewarmMain, requestPrewarm, snapshotWarm, createWarmGate, evictToTrash, sweepTrash, isSafeCodeSha,
+  PREWARM_MAX_MS, PREWARM_BACKOFF_BASE_MS, PREWARM_MAX_ATTEMPTS, PREWARM_FAILED_HOLD_MS,
 } from '../health-watch-job.mjs';
 import { createJobStore } from '../../lib/daemon-jobs-runtime.mjs';
-import { markClaimed, markLaunching, markSucceeded, markFailed } from '../../lib/daemon-jobs.mjs';
+import { markClaimed, markLaunching, markSucceeded, markFailed, markRequeued } from '../../lib/daemon-jobs.mjs';
 import { HEALTH_WATCH_JOB_KINDS, HEALTH_WATCH_JOB_CAP } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 
 let dir;
@@ -283,4 +285,250 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     await tick({ ...base, now: '2026-10-09T12:10:00Z' }, { smells: [smell], runDiagnosis });
     expect(calls).toEqual(['-e retry']);
   }, 30000);
+});
+
+describe('runGhProbeJobs — a cold snapshot is never built inside the tick', () => {
+  /** A snapshot whose build is counted: `materialize` is the code snapshot, `install` the node_modules store. */
+  function countingSnapshot() {
+    const calls = { materialize: 0, install: 0 };
+    return {
+      calls,
+      snapshot: {
+        materialize: (into) => { calls.materialize += 1; writeFileSync(join(into, 'package.json'), '{}'); writeFileSync(join(into, 'package-lock.json'), '{"lock":1}'); },
+        install: (into) => { calls.install += 1; mkdirSync(join(into, 'node_modules')); },
+      },
+    };
+  }
+  const run = (store, snapshot, extra, over = {}) => runGhProbeJobs({
+    store, codeSha: 'abc123', evict: () => ({ evicted: [] }), input: { sourceRoot: dir }, snapshot, ...extra, ...over,
+  });
+
+  it('leaves the job queued with no attempt spent and asks for a prewarm; once warm, the next tick launches it', async () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const { calls, snapshot } = countingSnapshot();
+    const prewarms = [];
+    const launched = [];
+    const warmGate = {
+      requestPrewarm: (o) => { prewarms.push(o.codeSha); return { state: 'started' }; },
+      launchFn: ({ id }) => { launched.push(id); return store.read(id); },
+    };
+    const a = await run(store, snapshot, { now: 1_000_000, due: true, warmGate });
+    expect(calls).toEqual({ materialize: 0, install: 0 }); // nothing was built inside the tick
+    expect(prewarms).toEqual(['abc123']);
+    const rec = store.read(a.summary.enqueued);
+    expect(rec.job.status).toBe('queued');
+    expect(rec.job.attempts).toBe(0);
+    expect(launched).toEqual([]);
+    expect(a.summary.warming).toEqual([{ id: a.summary.enqueued, codeSha: 'abc123', state: 'started' }]);
+
+    prewarmSnapshots({ jobsDir: store.dir, codeSha: 'abc123', snapshot }); // the prewarm child's work, off the tick
+    expect(calls).toEqual({ materialize: 1, install: 1 });
+    const b = await run(store, snapshot, { now: 1_060_000, due: true, state: a.state, warmGate });
+    expect(launched).toEqual([a.summary.enqueued]);
+    expect(prewarms).toEqual(['abc123']); // warm: no second request
+    expect(b.summary.warming).toEqual([]);
+    expect(calls).toEqual({ materialize: 1, install: 1 }); // and the tick still built nothing
+  });
+
+  it('a requeued job (dead handle, retry) is gated the same way: it waits queued while its store is cold', async () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const { calls, snapshot } = countingSnapshot();
+    const launched = [];
+    const warmGate = { requestPrewarm: () => ({ state: 'warming' }), launchFn: ({ id }) => { launched.push(id); return store.read(id); } };
+    const a = await run(store, snapshot, { now: 1_000_000, due: true, warmGate });
+    // the job was launched once before, died, and is back in the queue with its retry due
+    store.update(a.summary.enqueued, (r) => markLaunching(r, { at: iso(1_000_500) }));
+    store.update(a.summary.enqueued, (r) => markClaimed(r, { at: iso(1_000_600), handle: 'h:1:x', host: 'h', pid: 1, procStart: 'x' }));
+    store.update(a.summary.enqueued, (r) => markRequeued(r, { at: iso(1_100_000), now: 1_100_000, reason: 'handle dead', resume: false, backoffBaseMs: 1 }));
+    const b = await run(store, snapshot, { now: 1_200_000, due: false, state: a.state, warmGate });
+    expect(launched).toEqual([]);
+    expect(calls).toEqual({ materialize: 0, install: 0 });
+    expect(b.summary.warming.map((w) => w.state)).toEqual(['warming']);
+  });
+
+  it('the drain (rollback) path builds nothing and starts no build: a cold queued job fails visibly', async () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const { calls, snapshot } = countingSnapshot();
+    const asked = [];
+    const warmGate = { requestPrewarm: (o) => { asked.push(o.codeSha); return { state: 'started' }; }, launchFn: () => { throw new Error('must not launch cold'); } };
+    const a = await run(store, snapshot, { now: 1_000_000, due: true, warmGate });
+    const b = await run(store, snapshot, { now: 1_100_000, due: false, drain: true, state: a.state, warmGate });
+    expect(calls).toEqual({ materialize: 0, install: 0 });
+    expect(asked).toEqual(['abc123']); // only the normal tick asked; the drain pass did not
+    expect(store.read(a.summary.enqueued).job.status).toBe('failed');
+    expect(store.read(a.summary.enqueued).job.error).toMatch(/rollback with a cold snapshot/);
+    expect(b.summary.warming).toEqual([{ id: a.summary.enqueued, codeSha: 'abc123', state: 'failed', error: 'rollback' }]);
+  });
+
+  it('a request that throws (marker unwritable) leaves the job queued with a visible state instead of aborting the pass', async () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const { snapshot } = countingSnapshot();
+    const warmGate = { requestPrewarm: () => { throw new Error('ENOSPC: no space left'); }, launchFn: () => { throw new Error('no'); } };
+    const a = await run(store, snapshot, { now: 1_000_000, due: true, warmGate });
+    expect(store.read(a.summary.enqueued).job.status).toBe('queued');
+    expect(a.summary.warming[0]).toMatchObject({ state: 'backoff', error: expect.stringMatching(/prewarm request failed: ENOSPC/) });
+  });
+
+  it('a job whose codeSha is not a safe key fails visibly and never reaches a file name or a CLI argument', async () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const { snapshot } = countingSnapshot();
+    const asked = [];
+    const warmGate = { requestPrewarm: (o) => { asked.push(o); return { state: 'started' }; }, launchFn: () => { throw new Error('no'); } };
+    const a = await run(store, snapshot, { now: 1_000_000, due: true, warmGate, codeSha: '../../etc/x' });
+    expect(asked).toEqual([]);
+    expect(store.read(a.summary.enqueued).job.status).toBe('failed');
+    expect(store.read(a.summary.enqueued).job.error).toMatch(/no valid codeSha/);
+    for (const bad of ['', 'a/b', '..', '../x', 'a..b', '-x', 'x y', 'x\ny', 'x'.repeat(129), null, 42]) expect(isSafeCodeSha(bad)).toBe(false);
+    for (const ok of ['abc123', 'a'.repeat(40), 'test-snapshot', 'v1.2_3']) expect(isSafeCodeSha(ok)).toBe(true);
+  });
+
+  it('a prewarm that keeps failing fails the queued job visibly instead of leaving it queued forever', async () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const { snapshot } = countingSnapshot();
+    const warmGate = { requestPrewarm: () => ({ state: 'failed', error: 'npm ci exploded', attempts: 3 }), launchFn: () => { throw new Error('no'); } };
+    const a = await run(store, snapshot, { now: 1_000_000, due: true, warmGate });
+    const rec = store.read(a.summary.enqueued);
+    expect(rec.job.status).toBe('failed');
+    expect(rec.job.error).toMatch(/could not prepare code: prewarm failed after 3 attempt\(s\): npm ci exploded/);
+    const b = await run(store, snapshot, { now: 1_060_000, due: false, state: a.state, warmGate });
+    expect(b.failure).toMatch(/failed: could not prepare code: prewarm failed.*npm ci exploded/); // surfaces as a probe error, once
+  });
+
+  it('a non-readonly or already-launching record is passed straight to the real launch', () => {
+    const store = createJobStore(join(dir, 'jobs'));
+    const seen = [];
+    const gate = createWarmGate({ jobsDir: store.dir, sourceRoot: dir, launchFn: (o) => { seen.push(o.id); return null; }, isWarm: () => { throw new Error('not consulted'); } });
+    expect(gate.launch({ store, id: 'missing', kindDef: undefined })).toBeNull();
+    expect(seen).toEqual(['missing']);
+  });
+});
+
+describe('requestPrewarm — single flight, backoff and a visible give-up', () => {
+  const sha = 'abc123';
+  const mk = () => { const jobsDir = join(dir, 'jobs'); mkdirSync(jobsDir, { recursive: true }); return jobsDir; };
+  const spawnCalls = (n) => { const spawns = []; return { spawns, spawnFn: () => { spawns.push(n + spawns.length); return 4242; } }; };
+
+  it('starts one build, and a second request while it is alive and young spawns nothing', () => {
+    const jobsDir = mk();
+    const { spawns, spawnFn } = spawnCalls(0);
+    expect(requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1000, spawnFn, pidAlive: () => true })).toEqual({ state: 'started', attempts: 1 });
+    expect(requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 61_000, spawnFn, pidAlive: () => true }).state).toBe('warming');
+    expect(spawns).toHaveLength(1);
+  });
+
+  it('a build whose pid is gone, or that outlived the max age, is a failed attempt: backoff, then one retry', () => {
+    const jobsDir = mk();
+    const { spawns, spawnFn } = spawnCalls(0);
+    requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1000, spawnFn, pidAlive: () => true });
+    const dead = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 2000, spawnFn, pidAlive: () => false });
+    expect(dead).toMatchObject({ state: 'backoff', attempts: 1 }); // died at once: waits out the first backoff
+    const retry = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 2000 + PREWARM_BACKOFF_BASE_MS, spawnFn, pidAlive: () => true });
+    expect(retry).toEqual({ state: 'started', attempts: 2 });
+    const old = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 2000 + PREWARM_BACKOFF_BASE_MS + PREWARM_MAX_MS + 1, spawnFn, pidAlive: () => true });
+    expect(old.state).toBe('backoff'); // alive pid but far too old (pid reuse / hung): also a failure
+    expect(spawns).toHaveLength(2);
+  });
+
+  it('gives up after the max attempts, holds the failure, then resets for a fresh round', () => {
+    const jobsDir = mk();
+    const { spawns, spawnFn } = spawnCalls(0);
+    let t = 0;
+    for (let i = 0; i < PREWARM_MAX_ATTEMPTS; i += 1) {
+      t += PREWARM_BACKOFF_BASE_MS * 2 ** i + 1;
+      expect(requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: t, spawnFn, pidAlive: () => true }).state).toBe('started');
+      prewarmMain({ jobsDir, codeSha: sha, sourceRoot: dir, now: () => t, snapshot: { materialize: () => { throw new Error('npm ci exploded\nstack…'); } } });
+    }
+    const gaveUp = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: t + 1, spawnFn, pidAlive: () => true });
+    expect(gaveUp).toEqual({ state: 'failed', error: 'npm ci exploded', attempts: PREWARM_MAX_ATTEMPTS });
+    expect(spawns).toHaveLength(PREWARM_MAX_ATTEMPTS);
+    const reset = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: t + PREWARM_FAILED_HOLD_MS + 1, spawnFn, pidAlive: () => true });
+    expect(reset).toEqual({ state: 'started', attempts: 1 });
+  });
+
+  it('writes the single-flight marker BEFORE spawning, and patches the pid in without clobbering a child that already finished', () => {
+    const jobsDir = mk();
+    const markerPath = join(jobsDir, '.prewarm', `${sha}.json`);
+    let seenAtSpawn = null;
+    const r = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1000, pidAlive: () => true,
+      spawnFn: () => { seenAtSpawn = JSON.parse(readFileSync(markerPath, 'utf8')); return 4242; } });
+    expect(r.state).toBe('started');
+    expect(seenAtSpawn).toMatchObject({ status: 'running', pid: null, attempts: 1 }); // already on disk when the child starts
+    expect(JSON.parse(readFileSync(markerPath, 'utf8'))).toMatchObject({ status: 'running', pid: 4242 });
+    // a child that fails fast: its failure survives the parent's pid patch
+    rmSync(markerPath);
+    requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 5000, pidAlive: () => true,
+      spawnFn: () => { prewarmMain({ jobsDir, codeSha: sha, sourceRoot: dir, now: () => 5001, snapshot: { materialize: () => { throw new Error('boom'); } } }); return 4243; } });
+    expect(JSON.parse(readFileSync(markerPath, 'utf8'))).toMatchObject({ status: 'failed', error: 'boom' });
+  });
+
+  it('a spawn that throws records a failed attempt (backoff), not an unbounded respawn; an unwritable marker spawns nothing', () => {
+    const jobsDir = mk();
+    const out = requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1000, spawnFn: () => { throw new Error('spawn EAGAIN'); } });
+    expect(out).toMatchObject({ state: 'backoff', attempts: 1, error: expect.stringMatching(/could not start the prewarm build: spawn EAGAIN/) });
+    expect(requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 2000, spawnFn: () => { throw new Error('must not spawn'); } }).state).toBe('backoff');
+    const blocked = join(dir, 'blocked-jobs'); mkdirSync(blocked); writeFileSync(join(blocked, '.prewarm'), 'a file, not a dir');
+    let spawned = 0;
+    expect(() => requestPrewarm({ jobsDir: blocked, codeSha: sha, sourceRoot: dir, now: 1, spawnFn: () => { spawned += 1; return 1; } })).toThrow();
+    expect(spawned).toBe(0);
+  });
+
+  it('a corrupt marker, a bad pid, or a bad sha is never trusted', () => {
+    const jobsDir = mk();
+    mkdirSync(join(jobsDir, '.prewarm'), { recursive: true });
+    const write = (body) => writeFileSync(join(jobsDir, '.prewarm', `${sha}.json`), typeof body === 'string' ? body : JSON.stringify(body));
+    const { spawns, spawnFn } = spawnCalls(0);
+    write('{not json');
+    expect(requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1000, spawnFn }).state).toBe('started');
+    write({ status: 'running', pid: 0, startedAt: 1000, attempts: 1 }); // pid 0 would make kill(0,0) look alive
+    expect(requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1001, spawnFn }).state).toBe('started');
+    expect(spawns).toHaveLength(2);
+    expect(requestPrewarm({ jobsDir, codeSha: '../x', sourceRoot: dir, now: 1, spawnFn })).toMatchObject({ state: 'failed', attempts: 0 });
+    expect(prewarmMain({ jobsDir, codeSha: '../x', sourceRoot: dir, snapshot: {} })).toBe(2);
+    expect(spawns).toHaveLength(2);
+  });
+
+  it('the prewarm child builds the snapshot, clears its marker, and is idempotent; snapshotWarm tells cold from warm without building', () => {
+    const jobsDir = mk();
+    let built = 0;
+    const snapshot = {
+      materialize: (into) => { built += 1; writeFileSync(join(into, 'package.json'), '{}'); writeFileSync(join(into, 'package-lock.json'), '{"l":2}'); },
+      install: (into) => mkdirSync(join(into, 'node_modules')),
+    };
+    expect(snapshotWarm({ jobsDir, codeSha: sha })).toBe(false);
+    expect(built).toBe(0); // asking never builds
+    requestPrewarm({ jobsDir, codeSha: sha, sourceRoot: dir, now: 1, spawnFn: () => 1, pidAlive: () => true });
+    expect(prewarmMain({ jobsDir, codeSha: sha, sourceRoot: dir, snapshot })).toBe(0);
+    expect(existsSync(join(jobsDir, '.prewarm', `${sha}.json`))).toBe(false);
+    expect(snapshotWarm({ jobsDir, codeSha: sha })).toBe(true);
+    expect(snapshotWarm({ jobsDir, codeSha: sha, nodeModules: false })).toBe(true);
+    expect(prewarmMain({ jobsDir, codeSha: sha, sourceRoot: dir, snapshot })).toBe(0);
+    expect(built).toBe(1);
+    expect(snapshotWarm({ jobsDir, codeSha: '../escape' })).toBe(false); // an invalid sha is never "warm"
+  });
+});
+
+describe('evictToTrash — the tick renames, a detached child deletes', () => {
+  it('moves unreferenced snapshot trees out of the live names atomically without deleting them in the tick; sweepTrash then deletes', () => {
+    const jobsDir = join(dir, 'jobs'); const root = join(jobsDir, '.snapshots');
+    const mkStore = (sub, name, ageSec) => {
+      const d = join(root, sub, name); mkdirSync(join(d, 'deep'), { recursive: true }); writeFileSync(join(d, 'deep', 'f'), 'x'); writeFileSync(join(d, '.snapshot-complete'), '');
+      const t = new Date(Date.now() - ageSec * 1000); utimesSync(d, t, t);
+    };
+    for (const [n, age] of [['s1', 400], ['s2', 300], ['s3', 200], ['s4', 100]]) mkStore('code', n, age);
+    mkStore('node-modules', 'k1', 50);
+    let swept = 0;
+    const out = evictToTrash({ jobsDir, referenced: ['code:s1'], spawnSweep: () => { swept += 1; }, now: () => 7 });
+    expect(out.evicted.length).toBeGreaterThan(0);
+    expect(out.evicted.every((r) => r.startsWith('code:'))).toBe(true);
+    expect(existsSync(join(root, 'code', 's1'))).toBe(true); // referenced: kept
+    const gone = out.evicted.map((r) => r.slice(5));
+    for (const n of gone) {
+      expect(existsSync(join(root, 'code', n))).toBe(false); // the live name is free…
+      expect(existsSync(join(root, '.trash', `code-${n}.7`, 'deep', 'f'))).toBe(true); // …but nothing was deleted in the tick
+    }
+    expect(swept).toBe(1);
+    expect(sweepTrash({ jobsDir })).toBe(gone.length);
+    expect(readdirSync(join(root, '.trash'))).toEqual([]);
+    expect(evictToTrash({ jobsDir, referenced: [], spawnSweep: () => { throw new Error('nothing moved, nothing to sweep'); } }).evicted.length).toBeGreaterThanOrEqual(0);
+  });
 });

@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import { runGhProbeJobs, ghProbeStep, runProbeWorker, RESULT_SUFFIX } from '../health-watch-job.mjs';
+import { runGhProbeJobs, ghProbeStep, runProbeWorker, prewarmSnapshots, RESULT_SUFFIX } from '../health-watch-job.mjs';
 import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
 import { HEALTH_GH_PROBE_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 
@@ -36,6 +36,7 @@ describe('health-gh-probe job child', () => {
     const store = createJobStore(join(dir, 'jobs'));
     mkdirSync(store.dir, { recursive: true });
     const job = enqueueJob({ store, kindDef: HEALTH_GH_PROBE_KIND, codeSha: 'test-snapshot', input: { sourceRoot: REPO, proofBlockMs: 2500 } });
+    prewarmSnapshots({ jobsDir: store.dir, codeSha: 'test-snapshot', snapshot }); // what the detached prewarm child does; the tick builds nothing
     const opts = { store, codeSha: 'test-snapshot', snapshot, input: { sourceRoot: REPO }, reattachOpts: { heartbeatIntervalMs: 200 } };
     let state = {};
     const beats = new Set();
@@ -63,6 +64,7 @@ describe('health-gh-probe job child', () => {
     const store = createJobStore(join(dir, 'jobs-stop'));
     mkdirSync(store.dir, { recursive: true });
     const job = enqueueJob({ store, kindDef: HEALTH_GH_PROBE_KIND, codeSha: 'test-snapshot-stop', input: { sourceRoot: REPO, proofBlockMs: 30_000 } });
+    prewarmSnapshots({ jobsDir: store.dir, codeSha: 'test-snapshot-stop', snapshot });
     const opts = { store, codeSha: 'test-snapshot-stop', snapshot, input: { sourceRoot: REPO }, reattachOpts: { heartbeatIntervalMs: 200 } };
     const group = (pgid) => { try { return execFileSync('pgrep', ['-g', String(pgid)], { encoding: 'utf8' }).split('\n').filter(Boolean).map(Number); } catch { return []; } };
     let pid = null;
