@@ -3522,11 +3522,12 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
       revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
       if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
-      if (basis.basisKind === 'merge-base') {
-        diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
-        if (!diffBase) return { ...unscored, reason: 'diff-failed' };
-      }
+      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
+      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
+      if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
+      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
       candidate = revSha;
     } catch (err) {
       return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };

@@ -417,6 +417,18 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     expect(exec.mock.calls.filter(([cmd]) => cmd === 'git')).toEqual([]); // no post-diff rev-parse
   });
 
+  it('a basis with no fork point (diffed against the moving base NAME) is unscored — the base side cannot be pinned', () => {
+    const { exec: inner } = movingTipExec();
+    const exec = (cmd, args) => {
+      if (args?.[0] === 'merge-base') throw new Error('no merge base');
+      return inner(cmd, args);
+    };
+    const evidence = read(exec);
+    expect(evidence.headDiffSha).toBe(null);
+    expect(evidence.headDiff).toBe(null);
+    expect(evidence.headReadFailed).toBe(true);
+  });
+
   it('the fork point is taken from the pinned sha, not the moving ref name', () => {
     const { exec, calls } = movingTipExec();
     read(exec);
