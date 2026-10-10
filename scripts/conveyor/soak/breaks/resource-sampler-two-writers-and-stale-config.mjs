@@ -40,7 +40,8 @@ export default {
   id: 'resource-sampler-two-writers-and-stale-config',
   title: 'a replaced resource sampler stayed alive as a second snapshot writer, and a restart with changed config kept the old config',
   card: 'we:backlog/xkuflno (resource sampler slice 1; PR #4722 red-team round)',
-  fixedBy: { sha: 'f84969979', where: 'lane/resource-usage-service', paths: [`${DAEMON}`, 'scripts/conveyor/resource-sampler-job.mjs'] },
+  // sha list is reverse-applied newest first
+  fixedBy: { sha: '320a78da7,f84969979', where: 'lane/resource-usage-service', paths: [`${DAEMON}`, 'scripts/conveyor/resource-sampler-job.mjs'] },
   fixPresent(root) {
     const p = join(root, DAEMON);
     return existsSync(p) && /sampler config changed/.test(readFileSync(p, 'utf8'));
