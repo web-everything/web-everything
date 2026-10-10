@@ -44,6 +44,13 @@ describe('decideAffected (pure)', () => {
     const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], importsOf: none });
     expect(r).toMatchObject({ affected: false, reasons: ['main-delta-unaffected'], mainCodeFiles: 1 });
   });
+  // Deliberate non-regression pin, not a bug report: the accepted bound on card x0e6tik (operator ruling 2026-10-10). A SOURCE
+  // file a test reads through `fs` as text has no import edge, so the rule cannot see the coupling. Closing it would re-test a
+  // large share of PRs and erase the speed gain; tests still run on main and on the PR per settings, so a miss is caught later.
+  it('documented bound (card x0e6tik): a source file read through fs, with no import edge, is not seen → not affected', () => {
+    const r = decideAffected({ prFiles: ['scripts/scanner.test.mjs'], mainFiles: ['scripts/lib/new-source.mjs'], importsOf: none });
+    expect(r).toMatchObject({ affected: false, reasons: ['main-delta-unaffected'] });
+  });
   it('same file on both sides → affected', () => {
     expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/a.mjs'], importsOf: none }).reasons).toEqual(['same-file:scripts/a.mjs']);
   });

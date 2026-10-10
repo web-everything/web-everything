@@ -33,7 +33,9 @@
  *   7. an import list could not be read, the tip's reverse graph could not be read in full or has more than
  *      {@link MAX_REVERSE_FILES} sources, or a forward closure is larger than {@link MAX_CLOSURE_FILES} — fail closed.
  *   NOT covered, by design: SOURCE files read through `fs` as text (a repo-scanning test) and files loaded through a
- *   computed path — card x0e6tik.
+ *   computed path — card x0e6tik. This is the ACCEPTED BOUND (operator ruling 2026-10-10): closing it would re-test a
+ *   large share of PRs and erase the speed gain, and tests still run on main and on the PR per settings, so a miss is
+ *   caught eventually. The card stays open; do not widen the rule to close it without a new ruling.
  *   Changes under `nonCodePaths` (docs, backlog cards) never count, as in `any-code`.
  *
  * IO ({@link readAffectedFacts}): reads file contents with `git show <sha>:<path>` in the drain's own clone,
