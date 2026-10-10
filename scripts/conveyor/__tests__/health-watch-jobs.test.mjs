@@ -173,7 +173,7 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(second.ghJob.enqueued).not.toBe(first.ghJob.enqueued);
   }, 30000);
 
-  it('preserves probe-error streaks across queued ticks and counts only real failed samples', async () => {
+  it('preserves probe-error streaks across queued ticks and opens an alert after repeated failed samples', async () => {
     // Inline, a failing prs read keeps the cadence due and is retried (and re-supplied) every tick, so its streak
     // grows. As a job the failure arrives on alternate ticks: the ticks between (queued/running) sample nothing and
     // must not clear the streak the core keeps for a probe that supplied neither a sample nor an error.
@@ -210,10 +210,19 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     const episodes = JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).episodes;
     expect(Object.keys(episodes).some((k) => k.includes('health-tick-overrun'))).toBe(true);
 
+    // Queued/running ticks AFTER the threshold must not close the alert either: the episode closes after two clean
+    // evaluations, so a streak cleared by an unsampled tick would close it while prs is still failing.
+    const episodeStatus = () => Object.values(JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).episodes)
+      .find((e) => e.smell === 'health-tick-overrun')?.status;
+    const q4 = await tick({ ...flags, now: iso(t0 + 480_000) }, deps); // queues job 4, samples nothing
+    await tick({ ...flags, now: iso(t0 + 540_000) }, deps); // job 4 running
+    await tick({ ...flags, now: iso(t0 + 600_000) }, deps); // job 4 still running
+    expect(streak()).toBe(3);
+    expect(episodeStatus()).toBe('open');
+
     // A successful sample of prs ends the streak, as it does inline.
-    const q4 = await tick({ ...flags, now: iso(t0 + 480_000) }, deps);
-    finish(store, q4.ghJob.enqueued, { at: t0 + 490_000, probes: { prs: [], agents: [] }, errors: {} });
-    await tick({ ...flags, now: iso(t0 + 540_000) }, deps);
+    finish(store, q4.ghJob.enqueued, { at: t0 + 610_000, probes: { prs: [], agents: [] }, errors: {} });
+    await tick({ ...flags, now: iso(t0 + 660_000) }, deps);
     expect(streak()).toBeUndefined();
   }, 60000);
 
