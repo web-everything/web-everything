@@ -39,6 +39,51 @@ import {
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
 } from '../daemon-live-smoke.mjs';
 
+// Existing fixtures must never observe or write the host's resource state.
+vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn() }));
+beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
+afterEach(() => vi.unstubAllEnvs());
+
+describe('resource shadow observations', () => {
+  it.each([63, 3])('keeps the busy decision at load %s despite shadow disagreement or failure', (load1) => {
+    const env = {};
+    const probes = { load: () => load1, cores: () => 12 };
+    const baseline = hostLooksBusy(env, { ...probes, shadow: () => {} });
+    const shadow = vi.fn(() => ({ verdict: baseline ? 'admit' : 'hold' }));
+    expect(hostLooksBusy(env, { ...probes, shadow })).toBe(baseline);
+    expect(baseline).toBe(load1 === 63);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    expect(shadow).toHaveBeenCalledWith({
+      gate: 'rebuild-smoke.hostLooksBusy', kind: 'rebuild-smoke',
+      oldVerdict: baseline ? 'hold' : 'admit', oldReason: `load1 ${load1} vs 12×1`, env,
+    });
+    expect(hostLooksBusy(env, { ...probes, shadow: () => { throw Error('observer failed'); } })).toBe(baseline);
+  });
+
+  it.each([63, 3])('observes budgets once per run at load %s without changing the result or timeouts', async (load1) => {
+    const env = {};
+    const options = { root: '/x', env, load: () => load1, cores: () => 12,
+      clock: () => 0, changedFiles: [], closureOf: () => [],
+      runChild: vi.fn(async () => '') };
+    const baseline = await runLiveSmoke({ ...options, shadow: () => {} });
+    const calls = options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs);
+    options.runChild.mockClear();
+    const shadow = vi.fn(() => ({ verdict: 'admit' }));
+    const observed = await runLiveSmoke({ ...options, shadow });
+    expect({ ...observed, sessionSlug: null }).toEqual({ ...baseline, sessionSlug: null });
+    expect(options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs)).toEqual(calls);
+    const factor = smokeLoadFactor(env, options);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    expect(shadow).toHaveBeenCalledWith({
+      gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke',
+      oldVerdict: factor > 1 ? 'hold' : 'admit',
+      oldReason: `timeouts scaled ×${factor} by load1 ${load1}/12 cores`, env,
+    });
+    const failed = await runLiveSmoke({ ...options, shadow: () => { throw Error('observer failed'); } });
+    expect({ ...failed, sessionSlug: null }).toEqual({ ...baseline, sessionSlug: null });
+  });
+});
+
 /**
  * xp4lw2v (#4468 extended) — every pre-existing `runChild` fixture in this file predates the checks added since
  * (`dispatch-dry-run`/`tree-stays-clean`/`daemon-entries-boot`) and knows nothing about them. Wrapping a fixture
