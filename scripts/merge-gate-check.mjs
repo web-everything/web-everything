@@ -120,8 +120,11 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     const edits = d?.data?.repository?.pullRequest?.userContentEdits;
     if (!edits) facts.bodyHistory = { error: 'no userContentEdits in response' };
     else {
-      const bodies = [pr.body || '', ...edits.nodes.map((x) => x?.diff).filter((x) => typeof x === 'string')];
-      facts.bodyHistory = { bodies, complete: edits.totalCount <= edits.nodes.length };
+      const nodes = Array.isArray(edits.nodes) ? edits.nodes : [];
+      const bodies = [pr.body || '', ...nodes.map((x) => x?.diff).filter((x) => typeof x === 'string')];
+      // `diff` is nullable (a deleted/redacted edit): a node we could not read is a version we never saw, so the
+      // history is complete only when every counted edit was returned AND carried a readable body.
+      facts.bodyHistory = { bodies, complete: Array.isArray(edits.nodes) && edits.totalCount <= nodes.length && nodes.every((x) => typeof x?.diff === 'string') };
     }
   } catch (e) { facts.bodyHistory = { error: firstLine(e) }; }
 
@@ -182,10 +185,13 @@ export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'mai
 /**
  * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
  * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
- * queue merge; otherwise a pull_request run. `evaluatePrGates` may hand a gate to the drain only for the latter.
+ * queue merge. `'pull_request'` needs POSITIVE proof — the runner reporting exactly `pull_request` — because it is
+ * the only event where `evaluatePrGates` may hand a gate to the drain. An absent or unrecognised runner event (a
+ * local run, workflow_dispatch, odd casing, a future event name) is `null`: every gate is evaluated, none skipped.
  */
 export function mergeEventOfFlags(f, env = process.env) {
-  return f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group' ? 'merge_group' : 'pull_request';
+  if (f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group') return 'merge_group';
+  return env?.GITHUB_EVENT_NAME === 'pull_request' ? 'pull_request' : null;
 }
 
 async function main() {

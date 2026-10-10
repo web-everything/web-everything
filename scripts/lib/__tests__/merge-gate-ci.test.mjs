@@ -141,10 +141,34 @@ describe('evaluatePrGates', () => {
     expect(result.results.filter((row) => row.status === 'skipped-by-policy')).toEqual([]);
   });
 
-  it('threads the merge event from the CLI: --merge-group runs as merge_group, --pr as pull_request', () => {
+  it('threads the merge event from the CLI: --merge-group runs as merge_group, --pr as pull_request only on a pull_request runner', () => {
     expect(mergeEventOfFlags({ 'merge-group': true }, {})).toBe('merge_group');
-    expect(mergeEventOfFlags({ pr: '7' }, {})).toBe('pull_request');
+    expect(mergeEventOfFlags({ pr: '7' }, { GITHUB_EVENT_NAME: 'pull_request' })).toBe('pull_request');
     expect(mergeEventOfFlags({ pr: '7', 'merge-group': true }, {})).toBe('merge_group');
+  });
+
+  // A drain skip needs POSITIVE proof the event is a pull_request. An absent / unrecognised runner event (a local
+  // run, workflow_dispatch, a wrong-cased or future event name) must not read as one, or the queue could merge a
+  // PR that nothing re-checked.
+  it('never reads "pull_request" without proof: no runner event, workflow_dispatch or odd casing evaluates every gate', () => {
+    for (const env of [{}, { GITHUB_EVENT_NAME: '' }, { GITHUB_EVENT_NAME: 'workflow_dispatch' }, { GITHUB_EVENT_NAME: 'PULL_REQUEST' }, { GITHUB_EVENT_NAME: 'merge_queue' }, { GITHUB_EVENT_NAME: ' pull_request' }]) {
+      expect(mergeEventOfFlags({ pr: '7' }, env)).toBeNull();
+      expect(mergeEventOfFlags({}, env)).toBeNull();
+    }
+    const policy = { strategy: 'drain-direct', gatePlacement: { codeql: 'drain' } };
+    check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'hold', false, { policy, mergeEvent: mergeEventOfFlags({ pr: '7' }, {}) });
+  });
+
+  it('the live process.env is the default runner event, so a merge_group runner is never read as pull_request', () => {
+    const prev = process.env.GITHUB_EVENT_NAME;
+    try {
+      process.env.GITHUB_EVENT_NAME = 'merge_group';
+      expect(mergeEventOfFlags({ pr: '7' })).toBe('merge_group');
+      delete process.env.GITHUB_EVENT_NAME;
+      expect(mergeEventOfFlags({ pr: '7' })).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env.GITHUB_EVENT_NAME; else process.env.GITHUB_EVENT_NAME = prev;
+    }
   });
 
   it('a merge_group run without the group-tree duplicate scan fails duplicate-id-on-main closed; pull_request is unaffected', () => {
@@ -262,6 +286,18 @@ describe('gatherPrFacts (injected exec)', () => {
     expect(failed.bodyHistory.error).toContain('rate limited');
     expect(evaluated(failed, 'manifest-baseline').status).toBe('fail-closed');
     expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [{ diff: 'old body' }])]).bodyHistory).toMatchObject({ complete: true });
+  });
+
+  it('never marks body history complete when an edit node has no readable diff (null/redacted/non-string)', () => {
+    // GraphQL UserContentEdit.diff is nullable: a deleted or redacted edit counts toward totalCount but carries no body,
+    // so the baseline would silently skip a version that may have held the manifest.
+    for (const node of [{ diff: null }, {}, null, { diff: 42 }, { diff: ['x'] }]) {
+      const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ diff: 'old body' }, node])]);
+      expect(facts.bodyHistory.complete, JSON.stringify(node)).toBe(false);
+      expect(evaluated(facts, 'manifest-baseline').status, JSON.stringify(node)).toBe('fail-closed');
+    }
+    // a fully readable history is still complete (the empty-string body is a real, readable version)
+    expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ diff: 'old body' }, { diff: '' }])]).bodyHistory.complete).toBe(true);
   });
 
   it('falls back to the gh file list when git cannot score the diff, and test-gaming then fails closed', () => {
