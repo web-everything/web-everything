@@ -108,6 +108,8 @@ import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { planTakeover, takeoverReviewCap } from './fix-takeover.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
+import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
+import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
  *  override (the IO shell, `reconcile-pass.mjs`, passes the loaded ladder with its routing-policy models). */
@@ -1577,6 +1579,10 @@ export function planReconcile({
   // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
   // shell passes the resolved setting.
   takeoverReviewAttempts = 0,
+  // `review.mechanicalRoundsCountTowardCap` (we:scripts/conveyor/mechanical-round-cap.mjs). `false` (the standard
+  // default): a proven mechanical round's head carries its parent's verdict forward on an identical net diff, or earns
+  // one review past the cap when only the conflict hunks changed. `true`: mechanical rounds count as rounds.
+  mechanicalRoundsCountTowardCap = false,
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -1722,6 +1728,35 @@ export function planReconcile({
           return;
         }
       }
+      // A head made by a PROVEN mechanical round (conflict-resolution merge, no other edits) does not spend a round
+      // (live: #4631 f0f4943fb). Identical net diff → the parent head's verdict is carried; only the conflict hunks
+      // changed → one review past the cap. Same review gates as above; the merge gate is untouched.
+      if (extra.capKind === 'fix' || extra.capKind === 'review') {
+        const mech = mechanicalRoundGrant({ pr, countTowardCap: mechanicalRoundsCountTowardCap });
+        if (mech.ok && mech.action === 'review') {
+          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
+          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
+          dispatch.push({
+            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), mechanicalRound: mech,
+            why: `mechanical head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — a conflict-resolution round on`
+              + ` \`${mech.priorHead.slice(0, 9)}\` changed only conflict hunks (${mech.changedFiles.join(', ') || 'none listed'});`
+              + ` it spends no round (${extra.attempts}/${extra.cap}), so this head earns one review`
+              + ' (review.mechanicalRoundsCountTowardCap=false)',
+          });
+          return;
+        }
+        if (mech.ok && mech.action === 'carry' && mech.verdict === 'accept') {
+          // TODO(#4631): the accept itself is re-stamped by the accept carry-forward sweep
+          // (we:scripts/lib/accept-carry-forward.mjs#decideAcceptCarryForward), which owns the head-bound proofs.
+          // Here the planner only stops asking a person to take over a PR whose reviewed diff did not change.
+          const text = `PR #${prNumber}: mechanical round on \`${mech.priorHead.slice(0, 9)}\` left the net diff byte-identical;`
+            + ' its accept is carried forward (no new review, no round spent)';
+          refuseFn('mechanical-carry-forward', { ...extra, mechanicalRound: mech, why: text });
+          notes.push({ kind: 'mechanical-carry-forward', prNumber, verdict: mech.verdict, priorHead: mech.priorHead, text });
+          return;
+        }
+        if (mech.ok && mech.action === 'carry') extra = { ...extra, mechanicalRound: mech };
+      }
       // Card xx0055i — at the FIX round cap, `fix.roundCapAction: takeover` dispatches ONE takeover fix (full round
       // history, top claude rung of the fixer ladder) instead of the "a person must take it over" note. A spent
       // takeover, a ruling dispute, or the `person` setting falls through to the note exactly as before. A call
@@ -1754,7 +1789,7 @@ export function planReconcile({
       operatorBudget?.attempts ?? 0,
       countRearmComments(pr?.comments),
       countAdvisoryComments(pr?.comments),
-    );
+    ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
 
     // ── REFUSAL 1 — `stood-down` is TERMINAL. No decay, no clock: `now` is not read on this path, so the same
     // PR returns the same refusal a week later unless an operator answer or supersede resolves it.
