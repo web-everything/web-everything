@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url';
 import {
   DRAIN_FOLLOWUP_KIND, ensureDepsLink, followupWorktreeLayout, handOffDrainFollowup, resolveDrainFollowupSetting,
 } from '../drain-followup-job.mjs';
-import { createJobStore } from '../daemon-jobs-runtime.mjs';
+import { createJobStore, launchJob, reattachTick } from '../daemon-jobs-runtime.mjs';
 
 const script = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'merge-ai-prs.mjs');
 
@@ -41,10 +41,25 @@ if (a[0] === 'api') {
 }
 process.exit(0);
 `;
+// Beyond the drain's own reads, the shim answers what the follow-up job's worktree preparer asks: \`worktree add\`
+// makes a stub linked worktree (the stub entry exits at once — the job is never run to completion here), and
+// \`rev-parse --git-dir / --git-common-dir\` differ so it passes the linked-worktree check. FU_BREAK_WORKTREE makes
+// \`worktree add\` fail, which is the launch failure the inline fallback must cover.
 const fakeGit = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
 const a = process.argv.slice(2);
 if (a[0] === 'remote' && a[1] === 'get-url') process.stdout.write('git@github.com:fixture/drain-fu.git\\n');
 if (a[0] === 'diff') process.exit(1);
+if (a[0] === 'rev-parse' && a[1] === '--git-dir') process.stdout.write('.git\\n');
+if (a[0] === 'rev-parse' && a[1] === '--git-common-dir') process.stdout.write('/fake-common/.git\\n');
+if (a[0] === 'worktree' && a[1] === 'add') {
+  if (process.env.FU_BREAK_WORKTREE) { process.stderr.write('fatal: simulated worktree add failure\\n'); process.exit(128); }
+  const dir = a[a.length - 2];
+  fs.mkdirSync(path.join(dir, 'scripts'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.git'), 'gitdir: /fake-common/.git/worktrees/x\\n');
+  fs.writeFileSync(path.join(dir, 'scripts', 'drain-followup-job.mjs'), 'process.exit(0);\\n');
+}
 process.exit(0);
 `;
 
@@ -89,11 +104,30 @@ describe('x4y74wj — the drain hands its post-merge follow-up to a detached job
     expect(Array.isArray(jobs[0].input.landedItems)).toBe(true);
     expect(Array.isArray(jobs[0].input.openHeadRefs)).toBe(true);
     expect(result.followupJob).toMatchObject({ handedOff: true, job: { id: jobs[0].id } });
+    // The job really started: a record that FAILED at launch (worktree could not be prepared) is not a hand-off.
+    expect(jobs[0].job.status).not.toBe('failed');
+    expect(result.followupJob.job.status).not.toBe('failed');
+    // The pass still fast-forwards its OWN checkout inline (the duplicate-id tripwire reads it); the job only
+    // syncs a separate primary.
+    expect(result.localSynced).toBe(true);
     // The inline derived regen never ran (inline, its two generators are attempted — and fail in this bare dir).
     expect(result.derivedFailed).toEqual([]);
     expect(result.timings.jitNumbering).toBeUndefined();
     expect(result.timings.derivedRegen).toBeUndefined();
     expect(stderr).toMatch(/follow-up handed to job job-drain-followup-/);
+  }, 30000);
+
+  it('the job fails at launch (worktree cannot be prepared): the pass keeps its inline follow-up — numbering is not dropped', () => {
+    const { result, stderr, jobs } = runCli({ env: { FU_BREAK_WORKTREE: '1' } });
+    expect(result.merged.map((m) => m.num)).toEqual([3001]);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].job.status).toBe('failed');
+    expect(result.followupJob).toMatchObject({ handedOff: false, job: { id: jobs[0].id, status: 'failed' } });
+    expect(result.followupJob.reason).toMatch(/^launch-failed: .*could not prepare code/);
+    // The inline path ran: its two derived generators are attempted (and fail in this bare dir), as with the switch off.
+    expect(result.derivedFailed.map((f) => f.cmd)).toEqual(['npm run gen:inventory', 'npm run gen:reference-index']);
+    expect(stderr).not.toMatch(/follow-up handed to job/);
+    expect(stderr).toMatch(/the job did not start .* running the follow-up inline/);
   }, 30000);
 
   it('switch OFF (tool override): the inline path runs as before and no job is recorded', () => {
@@ -139,6 +173,30 @@ describe('handOffDrainFollowup', () => {
     const out = await handOffDrainFollowup({ landed: true, buildInput: () => { throw new Error('boom'); }, setting: on, store: fresh(), reattach: noTick, prepareWorktree: () => '/x' });
     expect(out).toMatchObject({ handedOff: false, mode: 'inline' });
     expect(out.reason).toMatch(/enqueue-failed: boom/);
+  });
+
+  it('a job the tick failed at launch (prepareWorktree throws) is NOT a hand-off: inline fallback, the failed record is reported', async () => {
+    const store = fresh();
+    const out = await handOffDrainFollowup({
+      landed: true, buildInput: () => ({ landedLocal: true }), setting: on, store, reattach: reattachTick,
+      prepareWorktree: () => { throw new Error('git fetch: network blip'); },
+    });
+    expect(out).toMatchObject({ handedOff: false, mode: 'inline', job: { status: 'failed' } });
+    expect(out.reason).toMatch(/^launch-failed: could not prepare code: git fetch: network blip/);
+    expect(store.list().records).toHaveLength(1); // terminal — nothing will run it, so no duplicate of the inline run
+  });
+
+  it('a launched job (spawned by the tick) stays handed off', async () => {
+    const store = fresh();
+    const worktree = mkdtempSync(join(tmpdir(), 'fu-wt-'));
+    mkdirSync(join(worktree, 'scripts'));
+    writeFileSync(join(worktree, 'scripts', 'drain-followup-job.mjs'), 'process.exit(0);\n');
+    const out = await handOffDrainFollowup({
+      landed: true, buildInput: () => ({ landedLocal: true }), setting: on, store, prepareWorktree: () => worktree,
+      reattach: (o) => reattachTick({ ...o, launch: (l) => launchJob({ ...l, spawnFn: () => 4242 }) }),
+    });
+    expect(out.handedOff).toBe(true);
+    expect(out.job.status).not.toBe('failed');
   });
 
   it('a reattach failure keeps the hand-off (the job stays queued for the next pass)', async () => {

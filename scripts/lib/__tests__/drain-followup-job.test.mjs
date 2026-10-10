@@ -19,7 +19,7 @@ import {
 } from '../drain-followup-job.mjs';
 import { createJobStore, enqueueJob, reattachTick } from '../daemon-jobs-runtime.mjs';
 import { kindRegistry } from '../daemon-jobs.mjs';
-import { planResolveOnLand } from '../../merge-ai-prs.mjs';
+import { planResolveOnLand, syncPrimaryOnLand } from '../../merge-ai-prs.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..', '..');
@@ -181,6 +181,81 @@ describe('followupSteps', () => {
   it('refuses to run in a primary clone (the daemon clone is never reset)', () => {
     const { deps } = fakes();
     expect(() => followupSteps({ ...deps, cwd: clone })[0].run({ input })).toThrow(/not a linked worktree/);
+  });
+});
+
+describe('followupSteps — primary-sync (the third step)', () => {
+  const input = buildFollowupInput({ landedLocal: true, primary: '/ops/primary', primaryHinted: true });
+  /** An exec double answering the primary-checkout git probes; `over` replaces an answer (a function throws/returns). */
+  const primaryExec = (over = {}) => {
+    const calls = [];
+    const exec = (cmd, args) => {
+      calls.push([cmd, ...args]);
+      const sub = args.slice(2).join(' '); // after `-C <primary>`
+      const answer = { 'rev-parse --abbrev-ref HEAD': 'main\n', 'status --porcelain --untracked-files=no': '', 'pull --ff-only': 'Updating\n', ...over }[sub];
+      if (typeof answer === 'function') return answer();
+      if (answer === undefined) throw new Error(`unexpected git ${sub}`);
+      return answer;
+    };
+    return { calls, exec };
+  };
+  const step = (extra = {}) => followupSteps({ ...fakes().deps, syncPrimaryOnLand, ...extra })[2];
+  beforeEach(() => { makeFollowupWorktreePreparer({ repoDir: clone, worktreeDir: worktree })(); }); // the cwd must exist to be compared
+
+  it('is registered third, after numbering and derived regen, so the primary also gets their commits', () => {
+    expect(followupSteps({ ...fakes().deps, syncPrimaryOnLand }).map((x) => x.name)).toEqual(['number-resolve-push', 'derived-regen', 'primary-sync']);
+  });
+
+  it('no primary in the record (or no sync dep) → recorded as not-located, nothing run', () => {
+    const { calls, exec } = primaryExec();
+    expect(step({ exec }).run({ input: buildFollowupInput({ landedLocal: true }) }).primarySync).toMatchObject({ synced: false, reason: 'not-located' });
+    expect(followupSteps({ ...fakes().deps, exec })[2].run({ input }).primarySync).toMatchObject({ synced: false, reason: 'not-located' });
+    expect(calls).toEqual([]);
+  });
+
+  it('a clean primary on main is fast-forwarded with a plain pull --ff-only (never autostash)', () => {
+    const { calls, exec } = primaryExec();
+    expect(step({ exec }).run({ input }).primarySync).toMatchObject({ synced: true, reason: 'synced' });
+    expect(calls.at(-1)).toEqual(['git', '-C', '/ops/primary', 'pull', '--ff-only']);
+    expect(calls.flat()).not.toContain('--autostash');
+  });
+
+  it('every skip is RECORDED, never thrown (a thrown step would burn the job retries)', () => {
+    const boom = () => { throw new Error('fatal'); };
+    const dirty = primaryExec({ 'status --porcelain --untracked-files=no': ' M backlog/x.md\n' });
+    expect(step({ exec: dirty.exec }).run({ input }).primarySync).toMatchObject({ synced: false, reason: 'dirty' });
+    expect(dirty.calls.some((c) => c.includes('pull'))).toBe(false); // a dirty primary is left untouched
+    expect(step({ exec: primaryExec({ 'rev-parse --abbrev-ref HEAD': 'feature\n' }).exec }).run({ input }).primarySync).toMatchObject({ synced: false, reason: 'not-on-main' });
+    expect(step({ exec: primaryExec({ 'rev-parse --abbrev-ref HEAD': boom }).exec }).run({ input }).primarySync).toMatchObject({ synced: false, reason: 'not-a-repo' });
+    expect(step({ exec: primaryExec({ 'status --porcelain --untracked-files=no': boom }).exec }).run({ input }).primarySync).toMatchObject({ synced: false, reason: 'status-failed' });
+    expect(step({ exec: primaryExec({ 'pull --ff-only': boom }).exec }).run({ input }).primarySync).toMatchObject({ synced: false, reason: 'diverged' });
+  });
+
+  it('"is the primary the cwd" is judged against the JOB worktree: the worktree itself is skipped, any other checkout is synced', () => {
+    const { calls, exec } = primaryExec();
+    const self = step({ exec }).run({ input: buildFollowupInput({ landedLocal: true, primary: worktree }) });
+    expect(self.primarySync).toMatchObject({ synced: false, reason: 'from-primary' });
+    expect(calls).toEqual([]);
+    expect(step({ exec }).run({ input: buildFollowupInput({ landedLocal: true, primary: clone }) }).primarySync).toMatchObject({ synced: true });
+  });
+
+  it('a primary that IS the pass\'s own checkout (input.passCwd) is skipped — the pass already synced it inline, the job is not a second writer', () => {
+    const { calls, exec } = primaryExec();
+    const out = step({ exec }).run({ input: buildFollowupInput({ landedLocal: true, primary: clone, passCwd: clone }) });
+    expect(out.primarySync).toMatchObject({ synced: false, reason: 'from-primary' });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('buildFollowupInput — primary', () => {
+  it('round-trips the primary and its hinted flag as plain JSON; absent when there is none', () => {
+    const withPrimary = buildFollowupInput({ landedLocal: true, primary: '/ops/primary', primaryHinted: 1 });
+    expect(withPrimary).toMatchObject({ primary: '/ops/primary', primaryHinted: true });
+    expect(JSON.parse(JSON.stringify(withPrimary))).toEqual(withPrimary);
+    expect(buildFollowupInput({ landedLocal: true, primary: '/p' }).primaryHinted).toBe(false);
+    expect(buildFollowupInput({ landedLocal: true, primary: '/p', passCwd: '/pass' }).passCwd).toBe('/pass');
+    expect('primary' in buildFollowupInput({ landedLocal: true })).toBe(false);
+    expect('primaryHinted' in buildFollowupInput({ landedLocal: true, primaryHinted: true })).toBe(false);
   });
 });
 

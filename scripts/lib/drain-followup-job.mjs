@@ -66,10 +66,11 @@ export function defineDrainFollowupKind({ prepareWorktree, maxAttempts } = {}) {
  * @param {{passId?: string, landedLocal?: boolean, merged?: Array, landedItems?: Array, carriers?: Array,
  *   openHeadRefs?: Iterable}} o
  */
-export function buildFollowupInput({ passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false } = {}) {
+export function buildFollowupInput({ passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false, passCwd = null } = {}) {
   return {
     // The operator's primary checkout to ff-sync once main has the follow-up commits (absent = nothing to sync).
-    ...(primary ? { primary: String(primary), primaryHinted: !!primaryHinted } : {}),
+    // `passCwd`: the pass's own checkout, which the pass already fast-forwards inline — the job must never pull it too.
+    ...(primary ? { primary: String(primary), primaryHinted: !!primaryHinted, ...(passCwd ? { passCwd: String(passCwd) } : {}) } : {}),
     passId: passId == null ? null : String(passId),
     landedLocal: !!landedLocal,
     merged: (Array.isArray(merged) ? merged : []).filter((m) => m && m.num != null)
@@ -203,7 +204,9 @@ export function followupSteps(deps) {
       run: ({ input }) => {
         if (!input?.primary || typeof syncPrimaryOnLand !== 'function') return { primarySync: { synced: false, reason: 'not-located', at: now() } };
         const gitAt = (a) => exec('git', a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-        const isCwd = (p) => { try { return realpathSync(p) === realpathSync(cwd); } catch { return false; } };
+        // "Is this the cwd" means the job worktree OR the pass's checkout: a primary that IS the pass's cwd was
+        // already synced inline, and a second writer there would race the pass's own sweep and git index.
+        const isCwd = (p) => { try { const r = realpathSync(p); return r === realpathSync(cwd) || (!!input.passCwd && r === realpathSync(input.passCwd)); } catch { return false; } };
         const r = syncPrimaryOnLand({ exec: gitAt, primary: input.primary, hinted: !!input.primaryHinted, isCwd });
         return { primarySync: { synced: !!r.synced, reason: r.reason, at: now() } };
       },
@@ -271,8 +274,9 @@ const errLine = (e) => String((e && e.message) || e).split('\n')[0];
  * THE HOOK merge-ai-prs calls at its follow-up point. With the setting on it records one `drain-followup` job
  * for a pass that landed a local PR, then runs one reattach tick (which launches it detached, and resumes or
  * fails a job a dead daemon left behind). It never waits on the job. Returns `handedOff: true` only when the
- * job record exists — anything else (`off`, dry run, nothing landed, a setup or enqueue failure) leaves the
- * pass on its inline path, so a broken job layer can never drop the numbering.
+ * job record exists and did not fail at launch — anything else (`off`, dry run, nothing landed, a setup or
+ * enqueue failure, a job the tick failed because its worktree could not be prepared) leaves the pass on its
+ * inline path, so a broken job layer can never drop the numbering.
  * @param {{landed: boolean, dryRun?: boolean, buildInput: () => object, repoDir?: string, env?: object,
  *   setting?: {value: string, source: string}, store?: object, reattach?: Function, prepareWorktree?: Function,
  *   log?: Function, now?: () => number}} o
@@ -316,6 +320,15 @@ export async function handOffDrainFollowup({
     log(`drain-followup: reattach tick failed (${errLine(e)}) — the job stays queued; the next pass launches it`);
   }
   const rec = queued ? jobStore.read(queued.id) : null;
+  // The record, not the enqueue, decides: the reattach tick fails a job outright when its code cannot be prepared
+  // (a `git fetch` blip, a worktree conflict) and never retries it, so a `failed` record means nothing will run
+  // the follow-up — the pass must keep its inline path, or the numbering is dropped. (A `queued` record after a
+  // tick that threw is different: the next pass launches it, so that stays handed off.)
+  if (queued && (!rec || rec.job.status === 'failed')) {
+    const why = rec ? (rec.job.error || 'job failed at launch') : 'job record unreadable';
+    log(`drain-followup: the job did not start (${errLine(why)}) — running the follow-up inline`);
+    return { handedOff: false, mode: 'inline', reason: `launch-failed: ${errLine(why)}`, job: rec ? { id: rec.id, status: rec.job.status, attempts: rec.job.attempts } : null, actions };
+  }
   return {
     handedOff: !!queued, mode: 'job', ...(queued ? {} : { reason: 'nothing-landed' }),
     job: rec ? { id: rec.id, status: rec.job.status, attempts: rec.job.attempts } : null, actions,
