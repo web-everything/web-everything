@@ -3,7 +3,7 @@
  * unconfirmed → advisory, a stale head → ignored, the round cap, dedup — and review-job runs it after the red team.
  */
 import { describe, expect, it } from 'vitest';
-import { applyRedTeamGate, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
+import { applyRedTeamGate, buildRedTeamCardInput, buildSendBackArgv, buildSendBackBody, gateExitCode, renderGateSummary, RED_TEAM_GATE_ACTOR, RED_TEAM_GATE_CHANNEL } from '../red-team-gate-apply.mjs';
 import { runReviewJob } from '../review-job.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
@@ -85,6 +85,37 @@ describe('applyRedTeamGate', () => {
   it('a round-cap record that cannot be posted is a visible failure too', async () => {
     const { io } = fakeIo({ comments: [comment([F()])], round: 5, postComment: () => { throw new Error('gh down'); } });
     expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'send-back-record-failed', outcome: 'round-cap' });
+  });
+
+  // Prevention for PR #4762 round 2: each action's marker-publication failure is a failure status, a nonzero CLI exit,
+  // and an error the job summary line carries (the review-job side is pinned in the review-job describe below).
+  it.each([
+    ['send-back', () => [F()], 1, 'send-back-record-failed'],
+    ['round-cap', () => [F()], 5, 'send-back-record-failed'],
+    ['card', () => [F({ impactIfUnfixed: 'degraded' })], 1, 'card-record-failed'],
+  ])('a failed %s marker post → %s status, CLI exit 1, error in the summary', async (_action, findings, round, status) => {
+    const { io } = fakeIo({ comments: [comment(findings())], round, postComment: () => { throw new Error('gh down'); } });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r.status).toBe(status);
+    expect(gateExitCode(r)).toBe(1);
+    expect(renderGateSummary(r)).toMatch(/gh down/);
+  });
+  it('a failed send-back marker post on a PR already under review:changes is a failure too', async () => {
+    const { io, calls } = fakeIo({ comments: [comment([F()])], labels: ['review:changes'], postComment: () => { throw new Error('gh down'); } });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r).toMatchObject({ status: 'send-back-record-failed', error: expect.stringMatching(/gh down/) });
+    expect(kinds(calls)).not.toContain('sendBack');
+  });
+  it('a failed card marker after a good send-back marker fails the run and keeps the send-back record', async () => {
+    const comments = [comment([F(), F({ impactIfUnfixed: 'degraded' })])];
+    const { io, calls } = fakeIo({ comments, postComment: (a) => { calls.push(['comment', a]); if (a.body.includes('card-queued')) throw new Error('gh down'); comments.push({ author: { login: 'web-everything' }, body: a.body }); } });
+    const r = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(r).toMatchObject({ status: 'card-record-failed', marker: 'posted' });
+    expect(gateExitCode(r)).toBe(1);
+  });
+  it('gateExitCode: 0 for every non-failure status, 1 for every failure one', () => {
+    for (const status of ['applied', 'already-acted', 'advisory-only', 'no-red-team-on-head', 'dry-run', 'head-moved']) expect(gateExitCode({ status })).toBe(0);
+    for (const status of ['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed']) expect(gateExitCode({ status })).toBe(1);
   });
 
   it('broken + degraded → send-back, THEN the card; each action gets its own record', async () => {

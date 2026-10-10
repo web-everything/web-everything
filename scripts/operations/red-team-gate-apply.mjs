@@ -179,6 +179,12 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
   }
 }
 
+/** Statuses the CLI reports with a nonzero exit: every failure, including a record that could not be posted. */
+export const GATE_FAILURE_STATUSES = Object.freeze(['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed']);
+
+/** The CLI exit code for a gate result: 1 on any failure status, else 0. PURE. */
+export const gateExitCode = (r) => (GATE_FAILURE_STATUSES.includes(r?.status) ? 1 : 0);
+
 /** One-line summary for a job log. PURE. */
 export function renderGateSummary(r) {
   const p = r?.plan;
@@ -234,7 +240,7 @@ if (IS_CLI) {
     applyRedTeamGate({ repo: flag('repo'), pr: Number(flag('pr')), dryRun: argv.includes('--dry-run') }).then((r) => {
       process.stderr.write(`${renderGateSummary(r)}\n`);
       process.stdout.write(`${JSON.stringify(r)}\n`);
-      process.exitCode = ['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed'].includes(r.status) ? 1 : 0;
+      process.exitCode = gateExitCode(r);
     });
   }
 }
