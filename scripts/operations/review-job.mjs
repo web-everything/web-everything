@@ -96,6 +96,10 @@ import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { extraSeatsEnabled, redTeamEnabled, resolveSeatTimeoutMs } from './review-extra-seats.mjs';
 import { redTeamRequired } from '../lib/jury-core.mjs';
+import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
+import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
+import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 
@@ -613,12 +617,103 @@ export function defaultSpawnJob({ argv, cwd, env, logPath }) {
  * The daemon's dispatch: the job by default, the old `claude --bg` session only when
  * {@link REVIEW_DISPATCH_MODE_ENV}`=session` asks for it.
  */
-export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), ...opts } = {}) {
+// Under test the stack check is inert unless a test injects one: the default reads `gh` and the network.
+export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stackCheck = isUnderTest() ? () => ({ base: null }) : checkStackBeforeReview, ...opts } = {}) {
+  // Held item 177 — a stacked top whose accept is recorded against its stack base is HELD (no review until the
+  // bottom lands) or, once the stack collapsed with an identical net diff, CARRIED. Either way nothing is dispatched.
+  let stack = null;
+  try { stack = stackCheck({ pr: opts.pr, repo: opts.repo, root: opts.root ?? REPO_ROOT, env: opts.env ?? process.env }); }
+  catch { stack = null; }
+  if (stack?.skipped) return { mode, pr: opts.pr, repo: opts.repo, skipped: stack.skipped };
+  const named = (r) => (stack?.base && r && !r.skipped
+    ? { ...r, mode: `${r.mode ?? mode} against stack base #${stack.base.pr} (${stack.base.ref}@${stack.base.contained.slice(0, 9)})` }
+    : r);
   if (mode === 'session') {
     const { preferLane, ...sessionOpts } = opts;
-    return { mode: 'session', ...dispatchReview(sessionOpts) };
+    return named({ mode: 'session', ...dispatchReview(sessionOpts) });
   }
-  return dispatchReviewJob(opts);
+  return named(dispatchReviewJob(opts));
+}
+
+const STACK_CARRY_HEAD = /^[0-9a-f]{40}$/;
+const STACK_CARRY_FINGERPRINT = /^[0-9a-f]{64}$/;
+
+/**
+ * Held item 177 — before a review is dispatched, read this PR's stack state and any `reviewed-stack` accept marker.
+ * FAILS OPEN: any read error dispatches the review as before. Only the Web Everything repo (the clone this runs in).
+ * @returns {{skipped?:string, base?:object|null}}
+ */
+export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = process.env,
+  readStack = (n) => readStackBase({ pr: n, root, env }),
+  readThread = (n) => readStackThread(n, { repo, root }),
+  stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
+  mainText = (pin) => mainNetDiffText(pin, { root }),
+  readBottom = (marker) => readBottomLanded({ marker, repo, root }),
+  carry = (n, decision) => carryStackAccept({ pr: n, repo, root, env, decision }),
+  log = (line) => writeLineSync(2, line) } = {}) {
+  if (!resolveStackAwareReview(env) || repoKeyForSlug(repo) !== 'we') return { base: null };
+  const base = readStack(pr);
+  let thread = null;
+  try { thread = readThread(pr); } catch { thread = null; }
+  const comments = Array.isArray(thread?.comments) ? thread.comments : [];
+  if (base) log(`review-job: ${repo}#${pr} is stacked on #${base.pr} — its review reads the diff against ${base.ref}@${base.contained.slice(0, 9)} (the bottom's head), not main`);
+  if (!liveStackMarkers(comments).some((m) => m.top === Number(pr))) return { base };
+  let stackFingerprint = null;
+  let mainFingerprint = null;
+  if (base) { try { stackFingerprint = fingerprintOf(stackText(base)); } catch { stackFingerprint = null; } }
+  else if (thread?.headRefName && STACK_CARRY_HEAD.test(String(thread.headRefOid ?? ''))) {
+    // The fingerprint is of THIS commit (`headRefOid`), not of whatever the branch name points at by now; the carry
+    // below is bound to that same commit and fingerprint.
+    try { const net = mainText({ headRefName: thread.headRefName, headRefOid: thread.headRefOid }); mainFingerprint = net?.scored ? fingerprintOf(net.text) : null; } catch { mainFingerprint = null; }
+  }
+  // The bottom is read only for a PR that would otherwise carry (collapsed stack, identical own diff): a bottom that
+  // moved after the accept must be reviewed again, whatever the top's own diff says.
+  let bottomLanded = null;
+  const latest = liveStackMarkers(comments).filter((m) => m.top === Number(pr)).at(-1);
+  if (!base && latest && mainFingerprint && mainFingerprint === latest.fingerprint) {
+    try { bottomLanded = readBottom(latest); } catch (e) { bottomLanded = { ok: false, why: `the landing could not be read (${String(e?.message ?? e).slice(0, 120)})` }; }
+  }
+  const decision = decideStackDispatch({ pr, stack: base, comments, stackFingerprint, mainFingerprint, bottomLanded });
+  if (decision.action === 'review' && decision.why) log(`review-job: ${repo}#${pr} ${decision.why} — reviewing as usual`);
+  if (decision.action === 'held') return { base, skipped: decision.why };
+  if (decision.action === 'carry') {
+    const done = carry(pr, { ...decision, head: thread.headRefOid, fingerprint: mainFingerprint });
+    if (done?.ok) { log(`review-job: ${repo}#${pr} ${decision.why} — accept carried forward`); return { base, skipped: decision.why }; }
+    log(`review-job: ${repo}#${pr} stack-accept carry failed (${done?.error ?? 'unknown'}) — reviewing as usual`);
+  }
+  return { base };
+}
+
+/**
+ * Carry a stacked accept forward through the SINGLE HOME (`review-set-label.mjs --to=accepted`), which re-derives
+ * the net diff vs main itself and stamps `reviewed-sha`/`reviewed-diff` for it.
+ *
+ * BOUND TO WHAT WAS COMPARED. The comparison read the PR at one commit (`decision.head`) and found its net diff
+ * byte-identical to the accepted one (`decision.fingerprint`). The writer re-reads the PR on its own, so a push in the
+ * gap would otherwise get an accept stamped on a diff nobody compared. Both are therefore handed to the writer
+ * (`--expect-head`, `--expect-fingerprint`), which refuses, before any write, a live head or a derived net diff that
+ * differs. A decision without a full head and fingerprint is refused here, never carried unpinned.
+ */
+export function carryStackAccept({ pr, repo, root = REPO_ROOT, env = process.env, decision,
+  run = (args, o) => spawnSync(process.execPath, args, o) } = {}) {
+  try {
+    const head = String(decision?.head ?? '');
+    const fingerprint = String(decision?.fingerprint ?? '');
+    if (!STACK_CARRY_HEAD.test(head) || !STACK_CARRY_FINGERPRINT.test(fingerprint)) {
+      return { ok: false, error: 'carry refused: the compared head and fingerprint are not both known' };
+    }
+    const bodyPath = join('/tmp', `review-stack-carry-${String(repo).replace(/[^\w.-]+/g, '-')}-${pr}-${randomUUID()}.md`);
+    const m = decision.marker;
+    writeFileSync(bodyPath, [
+      `**Stacked accept carried forward.** This PR was accepted against #${m.bottom}'s head (\`${m.bottomRef}\` @ ${String(m.contained).slice(0, 12)}).`,
+      `#${m.bottom} is no longer below it, and its net diff vs main is byte-identical to the accepted diff (fingerprint \`${m.fingerprint.slice(0, 16)}\`), so the accept stands without another review.`,
+    ].join('\n\n'), 'utf8');
+    const res = run([join(root, 'scripts', 'review-set-label.mjs'), String(pr), `--repo=${repo}`, '--to=accepted',
+      `--actor=${UNATTENDED_REVIEW_ACTOR}`, `--body-file=${bodyPath}`, `--expect-head=${head}`, `--expect-fingerprint=${fingerprint}`],
+    { cwd: root, encoding: 'utf8', timeout: 180e3, env: { ...env, [ACTOR_ENV]: `review-stack-carry-${randomUUID()}` } });
+    try { rmSync(bodyPath, { force: true }); } catch { /* tmp */ }
+    return res?.status === 0 ? { ok: true } : { ok: false, error: String(res?.stderr || res?.stdout || `exit ${res?.status}`).trim().split('\n').pop() };
+  } catch (e) { return { ok: false, error: String(e?.message ?? e) }; }
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────────────────────────────────────

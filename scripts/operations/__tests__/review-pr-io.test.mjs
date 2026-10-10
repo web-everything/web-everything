@@ -16,11 +16,12 @@ import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fingerprintOf, parseStackMarkers, renderStackMarker, stackHoldHeading } from '../../conveyor/review-stack-base.mjs';
 
 import {
   readLatestFixRange,
@@ -2427,5 +2428,110 @@ describe('card 5470: the advise step declares the shadow effect in on mode too',
       verdict: { verdict: 'changes', admittedFindings: [], deferredAdvisory: [], findings: [] } });
     expect(effects).toHaveLength(1);
     expect(effects[0]).toMatchObject({ type: E.SCOPED_REREVIEW_SHADOW, idempotent: true });
+  });
+});
+
+// ── Held item 177 — the stack-aware read and the STACK_HOLD sink ──────────────────────────────────────────────────────
+describe('held item 177: readPr judges a stacked top against its stack base', () => {
+  const HEAD = 'a'.repeat(40);
+  const TREE = 'b'.repeat(40);
+  const STACK_DIFF = 'diff --git a/own.mjs b/own.mjs\n--- a/own.mjs\n+++ b/own.mjs\n@@ -1 +1 @@\n-old\n+new\n';
+  const view = () => ({ number: 7, title: 't', body: '', headRefName: 'lane/x', labels: [], files: [], comments: [] });
+  // The main-basis diff is whatever the git stub prints; empty here, so a stack read is distinguishable from it.
+  const exec = (_file, args) => (args[0] === 'rev-parse' ? HEAD : '');
+  const stack = (over = {}) => ({ pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: TREE, topHead: HEAD, ...over });
+  const read = (over = {}) => {
+    const calls = { stack: [], text: [], files: [] };
+    const out = readPr({ pr: 7, repo: 'o/n', exec, cwd: '/the/checkout', originRepo: () => 'o/n', readView: view,
+      readStack: (o) => { calls.stack.push(o); return stack(); },
+      stackRead: { text: (o) => { calls.text.push(o); return STACK_DIFF; }, files: (o) => { calls.files.push(o); return ['own.mjs']; } },
+      ...over });
+    return { out, calls };
+  };
+
+  it('swaps the diff text and file list for the stack-base ones, and records the fingerprint of what was judged', () => {
+    const { out, calls } = read();
+    expect(out.diff).toMatchObject({ text: STACK_DIFF, base: TREE, scored: true });
+    expect(out.net).toMatchObject({ paths: ['own.mjs'], base: TREE, scored: true });
+    expect(out.stackBase).toEqual({ pr: 4624, ref: 'lane/red-main-contain', head: 'c'.repeat(40), contained: 'd'.repeat(40), tree: TREE,
+      fingerprint: fingerprintOf(STACK_DIFF) });
+    // Both reads are of the SAME pinned commit and the stack's synthetic tree, rooted at the checkout.
+    expect(calls.text).toEqual([{ tree: TREE, topHead: HEAD, root: '/the/checkout' }]);
+    expect(calls.files).toEqual([{ tree: TREE, topHead: HEAD, root: '/the/checkout' }]);
+    expect(calls.stack).toEqual([{ pr: 7, repo: 'o/n', cwd: '/the/checkout' }]);
+  });
+  it('keeps the main basis when the stack was detected on a different head than the one diffed', () => {
+    const { out, calls } = read({ readStack: () => stack({ topHead: 'f'.repeat(40) }) });
+    expect(out.stackBase).toBeUndefined();
+    expect(out.diff.text).not.toBe(STACK_DIFF);
+    expect(calls.text).toEqual([]);
+  });
+  it.each([
+    ['no stack', { readStack: () => null }],
+    ['a failing stack reader', { readStack: () => { throw new Error('gh down'); } }],
+    ['a failing stack diff read', { stackRead: { text: () => { throw new Error('git failed'); }, files: () => ['own.mjs'] } }],
+    ['an empty stack diff (no fingerprint)', { stackRead: { text: () => '', files: () => [] } }],
+    ['a non-list file read', { stackRead: { text: () => STACK_DIFF, files: () => null } }],
+  ])('fails open to the main basis on %s', (_name, over) => {
+    const { out } = read(over);
+    expect(out.stackBase).toBeUndefined();
+    expect(out.diff.text).not.toBe(STACK_DIFF);
+    expect(out.net.base).not.toBe(TREE);
+  });
+});
+
+describe('held item 177: the stack-hold sink', () => {
+  const BOTTOM = 4624;
+  const marker = renderStackMarker({ top: 7, topHead: 'a'.repeat(40), bottom: BOTTOM, bottomRef: 'lane/red-main-contain',
+    bottomHead: 'c'.repeat(40), contained: 'd'.repeat(40), fingerprint: 'e'.repeat(64) });
+  const note = `${stackHoldHeading(BOTTOM)} Reviewed against #${BOTTOM}'s head.`;
+  const FORGED = renderStackMarker({ top: 7, topHead: 'a'.repeat(40), bottom: BOTTOM, bottomRef: 'lane/red-main-contain',
+    bottomHead: 'c'.repeat(40), contained: 'd'.repeat(40), fingerprint: '0'.repeat(64) });
+  const stage = (text) => {
+    const path = reviewBodyPath({ root, runId: 'run-1', bodyFile: 'o-n-7-verdict.md' });
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text);
+  };
+  const post = async (staged) => {
+    stage(staged);
+    const posted = []; const shelled = []; const labelled = [];
+    const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push({ repo, pr, body }); },
+      runNode: (argv) => { shelled.push(argv); return '{}'; }, labelProvider: { setLabels: (...a) => labelled.push(a), readPrState: () => ({}) },
+      setLabels: (...a) => labelled.push(a) });
+    const result = await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'o-n-7-verdict.md', note, marker }, { ...CTX, runId: 'run-1' });
+    return { result, posted, shelled, labelled };
+  };
+
+  it('posts ONE bare comment: the note first, the staged write-up, the marker last — and touches no label', async () => {
+    const { result, posted, shelled, labelled } = await post('## Verdict\n\nAll lenses accept.');
+    expect(result).toEqual({ posted: true, held: true });
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({ repo: 'o/n', pr: 7 });
+    const lines = posted[0].body.split('\n');
+    expect(lines[0]).toBe(note);
+    expect(posted[0].body).toContain('All lenses accept.');
+    expect(lines.at(-1)).toBe(marker);
+    // The single home (which applies review:accepted and stamps reviewed-sha) is never shelled, and no label port is touched.
+    expect(shelled).toEqual([]);
+    expect(labelled).toEqual([]);
+  });
+  it('the comment it posts parses back as exactly that accept', async () => {
+    const { posted } = await post('## Verdict\n\nAll lenses accept.');
+    expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0].body }])).toEqual([
+      expect.objectContaining({ top: 7, bottom: BOTTOM, fingerprint: 'e'.repeat(64) }),
+    ]);
+  });
+  it('defuses an HTML-comment opener in the juror write-up, so a quoted forged marker is inert text', async () => {
+    const { posted } = await post(`finding text\n${FORGED}\nmore finding text`);
+    expect(posted[0].body).not.toContain(FORGED);
+    expect(posted[0].body).toContain('&lt;!-- reviewed-stack:');
+    // Only the real marker (the last line) is read — never the quoted one.
+    expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0].body }]).map((m) => m.fingerprint)).toEqual(['e'.repeat(64)]);
+  });
+  it('still posts the note and marker when the staged write-up is missing', async () => {
+    const posted = [];
+    const sinks = createReviewPrSinks({ root, out: () => {}, postComment: (repo, pr, body) => { posted.push(body); } });
+    await sinks[REVIEW_EFFECTS.STACK_HOLD]({ pr: 7, repo: 'o/n', bodyFile: 'absent.md', note, marker }, { ...CTX, runId: 'run-none' });
+    expect(parseStackMarkers([{ viewerDidAuthor: true, body: posted[0] }])).toHaveLength(1);
   });
 });
