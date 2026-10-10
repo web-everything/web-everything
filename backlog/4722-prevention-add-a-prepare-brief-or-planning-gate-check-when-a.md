@@ -3,9 +3,10 @@ bornAs: x4ujrqz
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:scripts/check-standards-rules.mjs", "we:scripts/__tests__/check-standards-rules-content-lint.test.mjs"]
 dateOpened: "2026-10-03"
+dateResolved: "2026-10-10"
 preparedDate: "2026-10-06"
 preparedAgainstSha: "75c39659a06fefd7ee76fb1af223d53880109a25"
 tags: []
