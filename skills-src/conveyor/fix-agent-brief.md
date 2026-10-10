@@ -419,6 +419,15 @@ node {{WE_ROOT}}/scripts/verify-lane.mjs request --repo=.                       
 node {{WE_ROOT}}/scripts/conveyor/await-verify.mjs mark --repo={{REPO}} --pr={{PR_NUM}} --who={{SESSION_SLUG}} --ref={{LANE_REF}} --kind=fix --attempt=1
 ```
 
+**Push before the gate (`fix.pushBeforeGate`, default on — we:scripts/lib/fix-push-policy.mjs).** Once you `mark`,
+the harness pushes your marked commit to `{{LANE_REF}}` within seconds (normal push, never force), so CI starts while
+the local gate runs. **You keep the fix claim until the local gate is green for the pushed head** — review, ci-heal,
+draft promotion and the drain all refuse the PR while you hold it, so a red CI run on an intermediate head
+dispatches nothing. Pushing while you hold the claim is allowed; **releasing it on red is never allowed** (no
+hand-back, no re-arm, no `fix-end` on a red head — except through the gate-red / load-flake exits below). Because
+your commit may already be on the PR, **never amend, rebase or force-push a marked commit**: repair with a NEW
+commit on top. With the setting off, nothing is pushed until green (the flow below is unchanged either way).
+
 Then **end your turn**: reply with one line (`awaiting verify for <sha>`) and stop. Never `check --wait`, never
 `sleep`, never `run_in_background`, never read output files in a loop (#x36vidg), never `reset` or re-`request`
 yourself. `mark` refuses a dirty tree or a sha that is not HEAD — commit first. The fix daemon reads the verdict
@@ -432,7 +441,7 @@ quoted path is denied). Do not run `verify-lane.mjs run` here; `request` stamps 
 
 The harness acts on the same verdict `verify-lane.mjs check` prints — the **`check` output**, never the `request`
 acknowledgement — and the resume message tells you which branch you are on:
-`green` → the harness has already pushed your exact sha to `{{LANE_REF}}`; continue at step 6's evidence comment
+`green` → the harness has already pushed your exact sha to `{{LANE_REF}}` (or confirmed the early push is there); continue at step 6's evidence comment
 and never push `{{LANE_REF}}` yourself. `red` (exit 2) → the failing tests are in the message: repair, commit,
 `request`, `mark` again with `--attempt=<n+1>`, and end your turn; on the third red the message tells you to take
 the gate-red hard stop below. A red the gate classifies as load-only → the message tells you to take the load-flake
@@ -483,7 +492,8 @@ node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo=
 Report `blocked-on-load-flake` and exit; the quiet-host reverify pass retries the saved fix automatically.
 
 **Otherwise a red gate is a hard stop.** Record the stand-down on the PR, leave it `review:changes` (do **not**
-re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Do not re-push a red diff.
+re-arm), and RETURN `#{{ITEM_NUM}} → fix gate-red`. Never hand a red head back for review. (With push-before-gate
+the red commit is already on the PR; the stand-down marker is what keeps it held — that is expected, not a leak.)
 
 ```bash
 node "{{WE_ROOT}}/scripts/conveyor/stand-down.mjs" {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}} --reason=gate-red \
@@ -519,8 +529,8 @@ node "{{WE_ROOT}}/scripts/operations/run.mjs" pre-pr-check --checkout="$LANE"
 ### 6. Commit (before step 4's request) — the harness re-pushes it to the SAME lane ref
 
 Commit only the repair's files (explicit paths, never `git add -A`; one commit) on the lane's current branch,
-BEFORE step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: on a green verdict for exactly this commit the
-harness pushes it to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never
+BEFORE step 4's `request`. Do **not** push `{{LANE_REF}}` yourself: the harness pushes it — right after your `mark`
+under push-before-gate, else on a green verdict for exactly this commit — to `{{LANE_REF}}` — this **updates the existing PR**, it does not open a new one (never
 `gh pr create`, never `pr-land` — the PR already exists):
 
 ```bash

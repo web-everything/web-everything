@@ -187,7 +187,8 @@ import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './li
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
-import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
+import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
@@ -779,6 +780,10 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
+  // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
+  // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
+  else if (pr?.fixClaim?.who) { decision = 'skip'; reason = `fix claim held by ${pr.fixClaim.who} — the head may be an unverified intermediate push; lands only after its fix-end`; }
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
@@ -4104,7 +4109,15 @@ async function runCli() {
         'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
-      return data && data.number != null ? await resolveChecks(repo, data) : null;
+      if (!data || data.number == null) return null;
+      // The merge-site re-read carries the LIVE fix claim, so classifyPr refuses a PR a fixer still holds.
+      const claimKey = repoKeyForSlug(repo ?? localSlug);
+      // An unreadable claim store fails CLOSED (refuse this merge; the next pass re-reads), like draft promotion.
+      try {
+        const claim = claimKey ? readLiveFixClaim({ repo: claimKey, pr: data.number }) : null;
+        if (claim?.meta?.who) data.fixClaim = { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null };
+      } catch { data.fixClaim = { who: '(fix-claim store unreadable)' }; }
+      return await resolveChecks(repo, data);
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
