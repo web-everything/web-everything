@@ -945,6 +945,9 @@ export function runReviewLabelCli({
   // real `file-item` subprocess ever running.
   fileApprovalPrevention = fileApprovalPreventionCard,
   findFiledApprovalPrevention = findApprovalPreventionCardOnDisk,
+  // #4708 — the referral gate's read seams (`readRuns`, `readNetDiff`), injected only by tests; production reads the
+  // local run store and git, exactly as `assertMandatoryReferralsCleared` defaults.
+  referralOptions = {},
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function — there are seventeen — goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1101,9 +1104,14 @@ export function runReviewLabelCli({
   let prTitle = '';
   let prCreatedAt = '';
   let prComments = [];
+  // #4708 — set when the referral gate accepted this head on an earlier head's carried clean review (see
+  // `referralEvidenceCarry`); the durable comment then records which head, which run and which diff fingerprint.
+  let referralCarry = null;
   try {
     const parsed = provider.readPrState(repo, pr);
-    if (['accepted', 'restamp', 'clear-human'].includes(to)) assertMandatoryReferralsCleared(parsed, { repo, pr });
+    if (['accepted', 'restamp', 'clear-human'].includes(to)) {
+      referralCarry = assertMandatoryReferralsCleared(parsed, { repo, pr, ...referralOptions })?.carry ?? null;
+    }
     currentLabels = onlyIf === 'missing' ? parsed.labels : Array.isArray(parsed.labels) ? parsed.labels : [];
     headSha = typeof parsed.headRefOid === 'string' ? parsed.headRefOid : '';
     // #2979 — the branch name the NET diff is resolved against (see the fingerprint block below). Same gh call,
@@ -1472,7 +1480,7 @@ export function runReviewLabelCli({
   // that are size-checked, written and posted are the same bytes.
   const commentBody = buildComment({
     to, actor, decision, headSha, reason: clearReason, reviewedDiff, clearerId, independence, humanClearance,
-  });
+  }) + renderReferralCarryRecord(referralCarry);
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — THE SIZE GUARD, on the RENDERED bytes, before ANY write.
   // GitHub rejects a comment over `GH_COMMENT_MAX`. The cause this guard exists for: an oversize comment used to
@@ -1538,7 +1546,7 @@ export function runReviewLabelCli({
       if (JSON.stringify(carryEvidence(fresh.comments)) !== JSON.stringify(originalEvidence)) {
         throw new Error('review verdict changed before CI-heal carry');
       }
-      assertMandatoryReferralsCleared(fresh, { repo, pr });
+      assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
     } catch (e) { fail(ghErr(e, 'CI-heal carry state unreadable'), 1); }
   }
   // A pinned accept (held item 177) re-reads the head BEFORE the first durable write too — the shadow ledger row below
@@ -1596,7 +1604,7 @@ export function runReviewLabelCli({
       if (['accepted', 'restamp', 'clear-human'].includes(to)) {
         const fresh = provider.readPrState(repo, pr);
         if (fresh.headRefOid !== headSha && !(to === 'restamp' && newHeadArg && !mandatoryReferralState(fresh.comments).records.length)) throw new Error('head changed before acceptance; hold retained');
-        assertMandatoryReferralsCleared(fresh, { repo, pr });
+        assertMandatoryReferralsCleared(fresh, { repo, pr, ...referralOptions });
       }
       if (onlyIf === 'missing') {
         const fresh = provider.readPrState(repo, pr);
@@ -2220,8 +2228,45 @@ function ghErr(e, fallback) {
 export { referralCardReadable };
 
 /** Fail closed at every acceptance entry point using the fresh durable PR record. */
+/** #4708 — the default strict net-diff read for {@link referralEvidenceCarry}: read AT the SHA (never a branch name).
+ *  A hoisted declaration, not a `const`: this module's CLI bootstrap runs above it at load time. */
+function readNetDiffAtSha(sha) { return readNetDiffAtHead({ exec: execFileSyncThrottled, headSha: sha, headRef: sha }); }
+
+/**
+ * #4708 — may the latest earlier head's review stand in for a head nobody reviewed? Only when ALL hold:
+ *   • no review run exists for `head` itself (a parked or failed review of this head is never overridden);
+ *   • the newest run of this PR on any other head completed CLEAN (not parked, nothing pending, persisted);
+ *   • both heads' strict net diffs (vs merge-base, `normalizeDiffFingerprint`) are readable and byte-identical.
+ * Live: #4708 34590bfe2 (clean run 20:48Z, operator-approved) → drain rebase 01a0a1229, identical diff.
+ * Any read miss returns null (fail closed: the ordinary no-current-head-review-evidence refusal stands).
+ * @returns {{fromHead:string, runId:string, toHead:string, completedAt:number, fingerprint:string}|null}
+ */
+export function referralEvidenceCarry({ runs = [], repo, pr, head, readNetDiff = readNetDiffAtSha } = {}) {
+  if (!repo || !pr || !head) return null;
+  const mine = (Array.isArray(runs) ? runs : []).filter(r => r && r.repo === repo && r.pr === Number(pr));
+  if (mine.some(r => r.head === head)) return null;
+  const prior = [...mine].sort((a, b) => b.completedAt - a.completedAt)[0];
+  if (!prior || prior.persistenceFailed || prior.parked || (prior.pending ?? []).length) return null;
+  let before, after;
+  try { before = readNetDiff(prior.head); after = readNetDiff(head); } catch { return null; }
+  if (!before?.scored || !after?.scored) return null;
+  const fingerprint = normalizeDiffFingerprint(before.text);
+  if (!fingerprint || fingerprint !== normalizeDiffFingerprint(after.text)) return null;
+  return { fromHead: prior.head, runId: prior.id, toHead: head, completedAt: prior.completedAt, fingerprint };
+}
+
+/** #4708 — the durable record of a carry, appended to the verdict comment ('' when nothing was carried). */
+export function renderReferralCarryRecord(carry) {
+  if (!carry) return '';
+  const record = { from: carry.fromHead, run: carry.runId, to: carry.toHead, fingerprint: carry.fingerprint };
+  return `\n\n<!-- referral-evidence-carry: ${JSON.stringify(record)} -->\n`
+    + `Referral evidence carried: no review ran on \`${carry.toHead.slice(0, 9)}\`; the latest review `
+    + `(run \`${carry.runId}\`, head \`${carry.fromHead.slice(0, 9)}\`) completed clean, and the strict net diff is `
+    + `byte-identical (fingerprint \`${carry.fingerprint.slice(0, 12)}\`). That head's referral records and rulings were re-checked live.`;
+}
+
 export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable = referralCardReadable,
-  env = process.env, readRuns = readReviewRunEvidence } = {}) {
+  env = process.env, readRuns = readReviewRunEvidence, readNetDiff = readNetDiffAtSha, carry = true } = {}) {
   const context = referralLiveContext(state, { repo, pr, cardReadable,
     seatDisabled: seat => referralSeatDisabled(seat, env) });
   const result = mandatoryReferralState(state.comments, context);
@@ -2252,6 +2297,15 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
     const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, records: result.records, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
+      // #4708 — a head move that changed nothing (the drain's rebase; strict net diff byte-identical) carries the
+      // latest earlier head's completed CLEAN review as this head's evidence. Not a pass: that head's own verdict is
+      // re-evaluated live (its records, rulings and persistence check), so a hold standing on it still refuses.
+      const carried = carry ? referralEvidenceCarry({ runs: readRuns(), repo, pr, head, readNetDiff }) : null;
+      if (carried) {
+        const verdict = assertMandatoryReferralsCleared({ ...state, headRefOid: carried.fromHead },
+          { repo, pr, cardReadable, env, readRuns, readNetDiff, carry: false });
+        return { ...verdict, carry: carried };
+      }
       throw new Error(`mandatory referral hold: no-current-head-review-evidence; no readable referral record or completed clean review for current head ${head}, and earlier heads still hold ${[...new Set(held)].join(', ')}; review the current head before acceptance`);
     }
   }
