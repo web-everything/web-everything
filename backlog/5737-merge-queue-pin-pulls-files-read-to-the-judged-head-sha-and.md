@@ -1,7 +1,8 @@
 ---
+bornAs: xrmq432
 kind: story
 size: 2
-parent: "xayvwbh"
+parent: "5736"
 status: active
 scaffoldedBy: "fix-4689"
 dateScaffolded: "2026-10-10"

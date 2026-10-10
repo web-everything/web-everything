@@ -1,7 +1,8 @@
 ---
+bornAs: x0e6tik
 kind: story
 size: 3
-parent: "xayvwbh"
+parent: "5736"
 status: open
 scope: ["we:scripts/lib/merge-queue-affected.mjs", "we:scripts/lib/__tests__/merge-queue-affected.test.mjs"]
 dateOpened: "2026-10-09"
@@ -14,7 +15,7 @@ tags: []
 
 **Status (PR 4689 review round 4):** also delivered: (a) a changed non-source file (JSON, YAML, CSS, HTML, images, extensionless) on either side now re-tests (`data-file-changed`, rule 6), so data read through fs is no longer excused; (b) an entry point is a file nothing outside its own import cycle imports, so a closed cycle that CI runs is a meeting point, and an importer the PR itself changes does not count as an outside importer (the PR may drop it). Still open: `docs/` and `backlog/` files that a test or check:standards reads through fs stay exempt (`nonCodePaths`, the same policy as `any-code`; e.g. two cards with a colliding id added by main and the PR), source files read as text by a repo-scanning test, and computed-path loads.
 
-**Accepted bound (operator ruling 2026-10-10):** a test that reads a changed SOURCE file through `fs` as text, with no import edge, stays unseen by the rule. Closing it would re-test a large share of PRs; tests still run on main and on the PR per settings, so any miss is caught eventually. The card stays open and still owns this (source-file fs reads), plus computed-path loads, `docs/` and `backlog/` readers and the red-main replay corpus. The rule is pinned by test `documented bound (card x0e6tik)`.
+**Accepted bound (operator ruling 2026-10-10):** a test that reads a changed SOURCE file through `fs` as text, with no import edge, stays unseen by the rule. Closing it would re-test a large share of PRs; tests still run on main and on the PR per settings, so any miss is caught eventually. The card stays open and still owns this (source-file fs reads), plus computed-path loads, `docs/` and `backlog/` readers and the red-main replay corpus. The rule is pinned by test `documented bound (card 5733)`.
 
 **Status (PR 4689 review round 6):** `nonCodePaths` now exempts PROSE only (Markdown, text): a source or data file under `docs/` or `backlog/` is code (`isNonCodeFile`, one predicate shared with the hook's `mainGainedCode`). The gate rule checks every main file. And a `main-gained-no-code` verdict, which reads no graph, no longer excuses the pass's age (`excusesPassAge`): a prose-only main move is judged exactly as `any-code` judges it, so main-side prose readers (fs, `?raw`) are covered to that extent.
 
