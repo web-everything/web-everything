@@ -1,4 +1,5 @@
 ---
+bornAs: xx7ckd6
 kind: story
 size: 3
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Drain red-main-hold: while main is red only the main-fix PR lands (contain third of the safety net)
 
-Held items 164+166. Freeze marker lived in the importing clone's .conveyor/; the daemon flips code root lane-1/code, so a freeze raised in the code clone (2026-10-09 01:03Z) was ignored and #4537/#4539 merged. Now ONE source in the coordination root. While main is red (health-watch main-ci-red-state/main-red-priority or manual freeze) the drain lands only the published main-fix PR(s); others skip with red-main-hold; lifts when the record clears. Setting redMainHold (x5wnfcg cascade, default on). Replay fixtures 2026-10-09 windows. Branch lane/red-main-contain, stacked on #4619.
+Held items 164+166. Freeze marker lived in the importing clone's .conveyor/; the daemon flips code root lane-1/code, so a freeze raised in the code clone (2026-10-09 01:03Z) was ignored and #4537/#4539 merged. Now ONE source in the coordination root. While main is red (health-watch main-ci-red-state/main-red-priority or manual freeze) the drain lands only the published main-fix PR(s); others skip with red-main-hold; lifts when the record clears. Setting redMainHold (5600 cascade, default on). Replay fixtures 2026-10-09 windows. Branch lane/red-main-contain, stacked on #4619.
 
 ## Acceptance
 
