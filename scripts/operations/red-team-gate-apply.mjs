@@ -20,7 +20,8 @@
  *     5. ONE gate marker comment per ACTION per head records what was done (`sent-back` / `round-cap` after the
  *        send-back step, `card-queued` after the landing job was spawned), so a later run never repeats a finished
  *        action, an action that FAILED stays retryable (`card-failed`), and the operator queue knows the state. A
- *        record that cannot be posted is a visible status (`card-record-failed`), never a silent `applied`. Two
+ *        record that cannot be posted is a visible status (`send-back-record-failed` / `card-record-failed`, exit 1,
+ *        error carried into the review-job summary), never a silent `applied`; the retry records without repeating. Two
  *        gate runs for one PR at once are not serialized here (review-job runs one review per PR at a time).
  *   It never accepts, never removes `review:human`, never edits a label by hand.
  *
@@ -158,6 +159,9 @@ export async function applyRedTeamGate({ repo, pr, dryRun = false, cap = DEFAULT
         }
       }
       marker = record(outcome, { ...plan, card: [] }, { sendBackResult });
+      // The label is written but its record is not: without it the operator queue never learns the fixer owns the break.
+      // Retry-safe: the next run sees review:changes, takes the `already` path (no second label write) and records.
+      if (marker !== 'posted') return { status: 'send-back-record-failed', head, round, outcome, plan, sendBack: sendBackResult, marker, error: marker };
     }
     let cardResult = null;
     let cardMarker = null;
@@ -230,7 +234,7 @@ if (IS_CLI) {
     applyRedTeamGate({ repo: flag('repo'), pr: Number(flag('pr')), dryRun: argv.includes('--dry-run') }).then((r) => {
       process.stderr.write(`${renderGateSummary(r)}\n`);
       process.stdout.write(`${JSON.stringify(r)}\n`);
-      process.exitCode = ['error', 'send-back-failed', 'card-failed', 'card-record-failed'].includes(r.status) ? 1 : 0;
+      process.exitCode = ['error', 'send-back-failed', 'send-back-record-failed', 'card-failed', 'card-record-failed'].includes(r.status) ? 1 : 0;
     });
   }
 }

@@ -66,6 +66,27 @@ describe('applyRedTeamGate', () => {
     expect(kinds(calls)).toEqual(['card']);
   });
 
+  // Round 2 of PR #4762: a send-back whose record cannot be posted looked like success, and without the record the
+  // operator queue never learns the fixer owns the break. Same class as the card record above: one case per record.
+  it('a send-back record that cannot be posted is a visible failure, and the retry restores it without a second label write', async () => {
+    const comments = [comment([F()])];
+    let down = true;
+    const { io, calls } = fakeIo({ comments, postComment: (a) => { calls.push(['comment', a]); if (down) throw new Error('gh down'); comments.push({ author: { login: 'web-everything' }, body: a.body }); } });
+    const first = await applyRedTeamGate({ repo: REPO, pr: 4722 }, io);
+    expect(first).toMatchObject({ status: 'send-back-record-failed', error: expect.stringMatching(/gh down/) });
+    expect(kinds(calls)).toEqual(['sendBack', 'ledger', 'comment']);
+    // GitHub now shows review:changes (the real writer set it); the retry records without sending again.
+    calls.length = 0; down = false;
+    const retryIo = { ...io, readPr: () => ({ headRefOid: HEAD, labels: [{ name: 'review:changes' }], comments }) };
+    expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, retryIo)).status).toBe('applied');
+    expect(kinds(calls)).toEqual(['comment']);
+    expect(calls[0][1].body.startsWith(redTeamGateMarker(4722, HEAD, 'sent-back'))).toBe(true);
+  });
+  it('a round-cap record that cannot be posted is a visible failure too', async () => {
+    const { io } = fakeIo({ comments: [comment([F()])], round: 5, postComment: () => { throw new Error('gh down'); } });
+    expect(await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).toMatchObject({ status: 'send-back-record-failed', outcome: 'round-cap' });
+  });
+
   it('broken + degraded → send-back, THEN the card; each action gets its own record', async () => {
     const { io, calls } = fakeIo({ comments: [comment([F(), F({ impactIfUnfixed: 'degraded' })])] });
     expect((await applyRedTeamGate({ repo: REPO, pr: 4722 }, io)).status).toBe('applied');
@@ -251,6 +272,11 @@ describe('review-job runs the gate right after the red team', () => {
     const { io, calls } = jobIo('changes');
     runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
     expect(calls).toEqual([]);
+  });
+  it('a failing gate status carries its error into the job summary (not just a status word)', () => {
+    const { io } = jobIo('accept', { runRedTeamGate: () => ({ status: 'send-back-record-failed', outcome: 'sent-back', error: 'error: gh down', plan: { sendBack: [1], card: [], advisory: [] } }) });
+    const out = runReviewJob({ pr: 4722, repo: REPO, pid: 1 }, io);
+    expect(out.redTeamGate).toMatchObject({ status: 'send-back-record-failed', reason: 'error: gh down' });
   });
   it('a crashing gate is only a status', () => {
     const { io } = jobIo('accept', { runRedTeamGate: () => { throw new Error('boom'); } });
