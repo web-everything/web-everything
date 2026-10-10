@@ -107,7 +107,7 @@ import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers } from './fix-takeover.mjs';
-import { planTakeover, notConvergingText, budgetSpentRemaining } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
@@ -1805,7 +1805,7 @@ export function planReconcile({
           ? notConvergingText(prNumber, takeover)
           : roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
             + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
-            + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})${budgetSpentRemaining(takeover)}` : '')
+            + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
             + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
       });
     };

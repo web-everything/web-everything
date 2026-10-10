@@ -312,7 +312,7 @@ describe('the last takeover head earns its review even when the budget is spent'
     expect(takeoverReviewGrant({ pr: pr(T2, twice), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'takeover-review-spent' });
   });
 
-  it('after that review returns changes → the operator, with what is still open', () => {
+  it('after that review returns changes → the operator (needs-you)', () => {
     const judged = [...thread, paused(T2, 11), policyRuling(T2, 12), review(T2, 13, FOUR.slice(1))];
     expect(takeoverReviewGrant({ pr: pr(T2, judged), takeoverReviewAttempts: 1 }).ok).toBe(false);
     const p = plan(pr(T2, judged), { durableCounts: { 7: 6 } });
@@ -320,9 +320,7 @@ describe('the last takeover head earns its review even when the budget is spent'
     expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', takeover: 'takeover-budget-spent' });
     const note = p.notes.find((n) => n.kind === 'round-cap-exhausted');
     expect(note.text).toMatch(/takeover budget is spent: 2 of 2/);
-    expect(note.text).toMatch(/takeover not converging/);
-    expect(note.text).toMatch(/still has 4 open finding\(s\)/); // the block-ruled referral + 3 review findings
-    expect(note.text).toContain('src/c.mjs:3');
+    expect(note.parkToHuman).toBe(true);
   });
 
   it('after that review accepts → the normal human ceremony: no takeover, no extra review, no needs-you note', () => {

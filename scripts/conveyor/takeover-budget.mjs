@@ -338,20 +338,6 @@ export function notConvergingText(prNumber, plan) {
     + `(weight ${p.before?.weight ?? '?'}) before it. No further takeover; a person must decide. Still open:${rest || ' (none parsed)'}${more}`;
 }
 
-/**
- * The tail of the budget-spent note: the last takeover's head was reviewed (its one review always runs first,
- * `takeover-review.mjs`) and this is what that review left open — so the operator starts from the findings.
- */
-export function budgetSpentRemaining(plan) {
-  const p = plan?.progress;
-  if (!p?.judged) return '';
-  const rest = (p.remaining ?? []).slice(0, NOT_CONVERGING_MAX_FINDINGS)
-    .map((f) => `\n- ${where(f)} — ${clip(f.claim, 160)}${f.ruling ? ` [${f.ruling}]` : ''}`).join('');
-  const more = (p.remaining?.length ?? 0) > NOT_CONVERGING_MAX_FINDINGS ? `\n- … and ${p.remaining.length - NOT_CONVERGING_MAX_FINDINGS} more` : '';
-  return `. The last takeover's head \`${p.after?.head ?? '?'}\` was reviewed and still has ${p.after?.count ?? '?'} open finding(s)`
-    + ` (weight ${p.after?.weight ?? '?'}): takeover not converging. Still open:${rest || ' (none parsed)'}${more}`;
-}
-
 export const PREVIOUS_TAKEOVER_DIFF_MAX_CHARS = 12000;
 
 /**
