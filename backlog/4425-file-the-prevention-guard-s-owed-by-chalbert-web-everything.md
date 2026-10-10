@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/verify-dispatch.mjs", "we:scripts/conveyor/__tests__/verify-dispatch.test.mjs"]
+
 dateOpened: "2026-09-28"
 tags: []
 ---
@@ -21,3 +21,12 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+## Findings (standalone worker, 2026-10-10)
+
+The build-dispatch daemon held #4425 with:
+
+> worker-declined: could-not-prepare — the requested invariant needs a policy choice. 'we:scripts/readiness/heavy-admission.mjs:946–948' explicitly permits unslotted execution after the hard ceiling; 'we:scripts/verify-lane.mjs:548–564' continues execution on that outcome. Therefore, bounding **all actual gates**, including unslotted children, requires changing that behavior. The unresolved choice is whether to preserve fail-open admission and narrow the guard, or require strict capacity enforcement after the ceiling. Existing tests cover ordinary contention, not this case. Left no diff or stamp. No tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.
