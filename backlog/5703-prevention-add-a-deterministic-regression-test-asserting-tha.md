@@ -1,22 +1,21 @@
 ---
+bornAs: xswczkh
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/lib/__tests__/verify-since-last-green.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/lib/__tests__/lane-verify.test.mjs"]
+scope: ["we:scripts/conveyor/health-smells/github-app-config.mjs", "we:scripts/conveyor/health-smells/__tests__/github-app-config.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a verify-lane e2e case that verifies with an uncommitted edit and asserts the ledger director… (from web-everything/web-everything#4732 review)
+# Prevention — Add a deterministic regression test asserting that a half-configured caller produces a breach wit… (from web-everything/web-everything#4733 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/verify-lane.mjs:326` — Add a verify-lane e2e case that verifies with an uncommitted edit and asserts the ledger directory stays empty. More generally, when a guard is split into a pure predicate plus an IO input, test the IO input's negative case too.
-2. `we:scripts/lib/lane-verify.mjs:148` — Reword the comment and card to say the ledger is advisory and CI is the only backstop. Optionally add a `repo` and `recordedAt` freshness check in `hasGreenLedger`, or a `check:standards` rule that fails when a doc comment claims 'never blesses a landing' with no named test.
-3. `we:scripts/lib/__tests__/verify-since-last-green.test.mjs:232` — For each clause of a validation predicate, require a test that fails with that clause removed, enforced by a mutation spot-check in review.
+1. `we:scripts/conveyor/health-smells/github-app-config.mjs:32` — Add a deterministic regression test asserting that a half-configured caller produces a breach with appToken.present=false; isolate fixture status reads through injected inputs instead.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4732@bff4236adec907e05e23e2fb148c413b30b1ae36
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4733@19afcc91b725ecfb9a7da3bdba90b590af499b58
 
 ## Acceptance
 

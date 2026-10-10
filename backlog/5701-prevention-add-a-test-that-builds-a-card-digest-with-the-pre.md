@@ -1,20 +1,22 @@
 ---
+bornAs: x9cy7l5
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/health-smells/github-app-config.mjs", "we:scripts/conveyor/health-smells/__tests__/github-app-config.test.mjs"]
+scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a deterministic regression test asserting that a half-configured caller produces a breach wit… (from web-everything/web-everything#4733 review)
+# Prevention — Add a test that builds a card digest with the previous raw-text rendering of a file-less guard co… (from web-everything/web-everything#4714 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/health-smells/github-app-config.mjs:32` — Add a deterministic regression test asserting that a half-configured caller produces a breach with appToken.present=false; isolate fixture status reads through injected inputs instead.
+1. `we:scripts/lib/review-loop-policy.mjs:432` — Add a test that builds a card digest with the previous raw-text rendering of a file-less guard containing `@`, `<` and a newline, then asserts cardCoversGuard still matches it. Or compare normalised text on both sides of the match.
+2. `we:scripts/operations/review-pr-io.mjs:339` — Count a budget round only if the head changed the net diff against the previous reviewed head, or only if a fix was dispatched. Add a replay test with N no-op heads that asserts the budget does not act. If the round source is meant to be trusted, state that in the 5471 Risks.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4733@19afcc91b725ecfb9a7da3bdba90b590af499b58
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4714@6d59a6bae5af33fd60ea7dc1b64c936c5f8755c6
 
 ## Acceptance
 

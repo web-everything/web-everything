@@ -1,21 +1,23 @@
 ---
+bornAs: xhiufq1
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
+scope: ["we:scripts/verify-lane.mjs", "we:scripts/lib/lane-verify.mjs", "we:scripts/lib/__tests__/verify-since-last-green.test.mjs", "we:scripts/__tests__/verify-lane.test.mjs", "we:scripts/lib/__tests__/lane-verify.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a test that builds a card digest with the previous raw-text rendering of a file-less guard co… (from web-everything/web-everything#4714 review)
+# Prevention — Add a verify-lane e2e case that verifies with an uncommitted edit and asserts the ledger director… (from web-everything/web-everything#4732 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/review-loop-policy.mjs:432` — Add a test that builds a card digest with the previous raw-text rendering of a file-less guard containing `@`, `<` and a newline, then asserts cardCoversGuard still matches it. Or compare normalised text on both sides of the match.
-2. `we:scripts/operations/review-pr-io.mjs:339` — Count a budget round only if the head changed the net diff against the previous reviewed head, or only if a fix was dispatched. Add a replay test with N no-op heads that asserts the budget does not act. If the round source is meant to be trusted, state that in the 5471 Risks.
+1. `we:scripts/verify-lane.mjs:326` — Add a verify-lane e2e case that verifies with an uncommitted edit and asserts the ledger directory stays empty. More generally, when a guard is split into a pure predicate plus an IO input, test the IO input's negative case too.
+2. `we:scripts/lib/lane-verify.mjs:148` — Reword the comment and card to say the ledger is advisory and CI is the only backstop. Optionally add a `repo` and `recordedAt` freshness check in `hasGreenLedger`, or a `check:standards` rule that fails when a doc comment claims 'never blesses a landing' with no named test.
+3. `we:scripts/lib/__tests__/verify-since-last-green.test.mjs:232` — For each clause of a validation predicate, require a test that fails with that clause removed, enforced by a mutation spot-check in review.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4714@6d59a6bae5af33fd60ea7dc1b64c936c5f8755c6
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4732@bff4236adec907e05e23e2fb148c413b30b1ae36
 
 ## Acceptance
 
