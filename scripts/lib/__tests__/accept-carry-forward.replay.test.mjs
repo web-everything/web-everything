@@ -10,13 +10,16 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 import {
-  decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE,
+  decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE, decideMechanicalHold,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
 import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
 import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
 import { acceptanceCoversHead } from '../review-escalation.mjs';
-import { planAcceptCarry, sweepAcceptCarry, _resetAcceptCarryMemo } from '../../conveyor/accept-carry-sweep.mjs';
+import {
+  planAcceptCarry, sweepAcceptCarry, _resetAcceptCarryMemo, defaultRunRestamp, defaultCloneDirFor,
+  transientBackoffMs, TRANSIENT_BACKOFF_BASE_MS, TRANSIENT_BACKOFF_MAX_MS,
+} from '../../conveyor/accept-carry-sweep.mjs';
 
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/accept-carry-forward-4535.json'), 'utf8'));
 const OTHER_FP = 'a'.repeat(64);
@@ -78,6 +81,12 @@ describe('guards — anything but a proven-identical net diff falls back to toda
 
   it('an unreadable live diff is not proof', () => {
     expect(decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: null }).action).toBe('review-owed');
+  });
+
+  it('an unreadable live diff is a RETRYABLE read miss even when the accept also carries no fingerprint (the #217 shape)', () => {
+    expect(decideAcceptCarryForward({ setting: 'on', record: { ...record, diff: null }, headSha: NEW, headDiff: null }))
+      .toMatchObject({ action: 'review-owed', retryable: true });
+    expect(decideAcceptCarryForward({ setting: 'on', record: { ...record, diff: null }, headSha: NEW, headDiff: fx.netDiff[NEW] }).retryable).toBeUndefined();
   });
 
   it('an accept with no reviewed-diff marker is not proof', () => {
@@ -228,11 +237,19 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   const BOT = { login: 'web-everything' };
   const clearComment = () => ({ author: BOT, body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.cleared} -->\n<!-- cleared-human: chalbert -->` });
 
-  /** Drives the real CLI with a recording provider; returns what was written. */
-  const restamp = ({ comments, labels = ['review:human'] }) => {
+  // The live #4535 evidence shape: the drain ledgered its test-gaming park, then added the label 9 s later.
+  const PARK_AT = '2026-10-09T14:36:41.318Z';
+  const dRow = (over = {}) => ({ pr: 9, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: PARK_AT,
+    reason: 'test-gaming suspected — CI-green may be manufactured by tampering with tests', ...over });
+  const labeledAt = (created_at, login = 'chalbert') => ({ event: 'labeled', created_at, label: { name: 'review:human' }, actor: { login } });
+  const MECHANICAL = { ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] };
+
+  /** Drives the real CLI with a recording provider; returns what was written. `events: null` = timeline unreadable. */
+  const restamp = ({ comments, labels = ['review:human'], ledger = MECHANICAL.ledger, events = MECHANICAL.events }) => {
     const writes = { setLabels: [], postComment: [] };
     const provider = {
       name: 'stub', currentRepo: () => 'o/n',
+      readHoldLabelEvents: () => { if (events === null) throw new Error('gh api failed'); return events; },
       readPrState: () => ({ labels: labels.map((name) => ({ name })), comments, headRefOid: heads.head, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '', title: '' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: (_r, _p, spec) => { writes.setLabels.push(spec); },
@@ -248,12 +265,13 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     try {
       runReviewLabelCli({
         defaultActor: 'test', usage: 'usage: test', emit: (l) => chunks.push(String(l)), provider,
+        readLedgerRows: () => (typeof ledger === 'function' ? ledger() : ledger),
         argv: ['9', '--repo=o/n', '--to=restamp', '--actor=review-daemon', '--channel=accept-carry-forward', '--reason=head moved by a mechanical pass'],
         buildComment: ({ to, actor, headSha, reason, reviewedDiff, clearerId, independence, humanClearance }) => buildVerdictComment({
           to, actor, headSha, reason, reviewedDiff, clearerId, independence, channel: 'accept-carry-forward', humanClearance,
         }),
         successResult: (o) => ({ ok: true, ...o }),
-        refusalResult: ({ decision }) => ({ error: decision.reason }),
+        refusalResult: ({ decision }) => ({ error: decision.reason, refused: true, ...(decision.retryable ? { retryable: true } : {}) }),
       });
     } catch (e) { if (typeof e.exitCode === 'number') exitCode = e.exitCode; else throw e; } finally {
       process.exit = realExit;
@@ -303,6 +321,189 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(r.exitCode).toBe(0);
     expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
     expect(r.writes.setLabels[0].add).toBe('review:accepted');
+  });
+
+  // PR #4631 review round 2 (F3/F4). An identical diff proves the CONTENT is what was cleared; it says nothing about
+  // WHO put the standing review:human there. Without positive provenance the restamp must refuse and write nothing.
+  const NO_WRITES = { setLabels: [], postComment: [] };
+
+  it('a deliberate label-only human re-hold survives an identical-diff restamp', () => {
+    // The operator re-adds review:human by hand after the clear-human: a label event, no comment, NO drain ledger row.
+    const r = restamp({ comments: [clearComment()], ledger: [], events: [labeledAt('2026-10-09T15:00:00Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(r.out).toMatch(/not proven mechanical/);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true });
+  });
+
+  it('a held-park comment does not launder a deliberate hold (it is posted BECAUSE a hold stands, whoever put it there)', () => {
+    const held = { author: BOT, body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nheld — a review hold (review:human) stands on this PR' };
+    const r = restamp({ comments: [clearComment(), held], ledger: [], events: [labeledAt('2026-10-09T15:00:00Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a hold re-added by hand BEFORE a later drain park is not explained by that park (unpaired label event)', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T13:00:00Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a hold re-added by hand AFTER the drain park is the latest add, not the park\'s own', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), labeledAt('2026-10-09T18:00:00Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a sanctioned verdict ledgered after the drain park supersedes the clearance', () => {
+    const later = dRow({ verdict: 'changes', source: 'review-set-label', actor: { declared: 'chalbert' }, reason: 'changes', at: '2026-10-09T14:40:00.000Z' });
+    const r = restamp({ comments: [clearComment()], ledger: [dRow(), later] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a drain park older than the clearance does not count', () => {
+    const cleared = { ...clearComment(), createdAt: '2026-10-09T15:30:00Z' };
+    const r = restamp({ comments: [cleared], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('an unreadable label timeline refuses as a RETRYABLE read miss, with NO write', () => {
+    const r = restamp({ comments: [clearComment()], events: null });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
+  });
+
+  it('an unreadable verdict ledger is a RETRYABLE read miss, not "no park ledgered"', () => {
+    const r = restamp({ comments: [clearComment()], ledger: () => { throw new Error('EACCES'); } });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
+  });
+
+  it('a retry after a failed restamp is not blocked by the failed attempt\'s own `restamped` ledger row', () => {
+    const own = dRow({ verdict: 'restamped', source: 'review-set-label', actor: { declared: 'review-daemon' }, at: '2026-10-09T14:40:00.000Z', reason: 'carried' });
+    const r = restamp({ comments: [clearComment()], ledger: [dRow(), own] });
+    expect(r.exitCode).toBe(0);
+    expect(r.writes.setLabels[0].add).toBe('review:accepted');
+  });
+
+  it('a content refusal (changed diff) is a settled decision, NOT retryable', () => {
+    const r = restamp({ comments: [{ ...clearComment(), body: `${clearComment().body}\n<!-- reviewed-diff: ${OTHER_FP} -->` }] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    const printed = JSON.parse(r.out.trim().split('\n').pop());
+    expect(printed.refused).toBe(true);
+    expect(printed.retryable).toBeUndefined();
+  });
+});
+
+describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
+  const T = Date.parse('2026-10-09T14:36:41.318Z');
+  const iso = (ms) => new Date(T + ms).toISOString();
+  const row = (over = {}) => ({ pr: 5, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: iso(0), reason: 'test-gaming suspected — x', ...over });
+  const ev = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: 'review:human' } });
+  const decide = (o) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows: [row()], events: [ev(9_000)], ...o });
+
+  it('the live #4535 pairing (label add 9 s after the ledger row) is mechanical', () => {
+    expect(decide({}).mechanical).toBe(true);
+  });
+  it('a row from another PR / a non-drain source / a non-test-gaming reason / a non-human verdict is not proof', () => {
+    for (const rows of [[row({ pr: 6 })], [row({ source: 'review-set-label' })], [row({ reason: 'held — a review hold' })],
+      [row({ verdict: 'pending' })], [row({ actor: { declared: 'chalbert' } })]]) {
+      expect(decide({ rows }).mechanical).toBe(false);
+    }
+  });
+  it('an unanchored mention of the phrase in another reason is not proof (the reason must LEAD with it)', () => {
+    expect(decide({ rows: [row({ reason: 'review escalation: touches test-gaming suspected — notes' })] }).mechanical).toBe(false);
+  });
+  it('the label add must follow the row within the window and must be the latest add', () => {
+    expect(decide({ events: [ev(200_000)] }).mechanical).toBe(false);
+    expect(decide({ events: [ev(-60_000)] }).mechanical).toBe(false);
+    expect(decide({ events: [ev(9_000), ev(600_000)] }).mechanical).toBe(false);
+    expect(decide({ events: [] }).mechanical).toBe(false);
+  });
+  it('an unreadable timeline (null) is retryable; no proof is not', () => {
+    expect(decide({ events: null })).toMatchObject({ mechanical: false, retryable: true });
+    expect(decide({ rows: [] }).retryable).toBeUndefined();
+  });
+});
+
+describe('the sweep runs the restamp in the PR repo\'s own checkout and remembers only settled outcomes (PR #4631 F1/F2)', () => {
+  beforeEach(() => _resetAcceptCarryMemo());
+  const prs = [{ number: 217, labels: ['review:human'], headRefOid: NEW, comments: fx.comments }];
+  const cand = { repo: 'plateauapp/plateau-app', num: 217, head: NEW, from: OLD };
+  const spawnOf = (result) => { const calls = []; return { calls, spawn: (cmd, args, opts) => { calls.push({ cmd, args, opts }); return result; } }; };
+
+  it('F1: a non-local repo\'s restamp child is pinned to that repo\'s checkout (cwd), and --repo names it', () => {
+    const { calls, spawn } = spawnOf({ status: 0, stdout: '{"ok":true}\n' });
+    expect(defaultRunRestamp(cand, { spawn, cloneDirFor: () => '/clones/plateau-app' }).ok).toBe(true);
+    expect(calls[0].opts.cwd).toBe('/clones/plateau-app');
+    expect(calls[0].args).toContain('--repo=plateauapp/plateau-app');
+  });
+
+  it('F1: no checkout provisioned → nothing is spawned and the outcome is retryable (not a refusal)', () => {
+    const { calls, spawn } = spawnOf({ status: 0, stdout: '' });
+    expect(defaultRunRestamp(cand, { spawn, cloneDirFor: () => null })).toMatchObject({ ok: false, retryable: true });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('F1: the clone resolver maps a constellation slug to its checkout and returns null when it is not there', () => {
+    expect(defaultCloneDirFor('plateauapp/plateau-app', { profileOf: () => ({ checkoutPath: '/c/pa' }), exists: (p) => p === '/c/pa/.git' })).toBe('/c/pa');
+    expect(defaultCloneDirFor('plateauapp/plateau-app', { profileOf: () => ({ checkoutPath: '/c/pa' }), exists: () => false })).toBeNull();
+    expect(defaultCloneDirFor('nope/nope', { profileOf: () => null })).toBeNull();
+    expect(defaultCloneDirFor(null)).toBeUndefined();
+  });
+
+  it('F2: a printed DECISION is settled; a read-miss refusal, a crash, a timeout and a signal are retryable', () => {
+    const run = (result) => defaultRunRestamp(cand, { spawn: () => result, cloneDirFor: () => '/c' });
+    expect(run({ status: 1, stdout: '{"error":"changed","refused":true}\n' })).toMatchObject({ ok: false, retryable: false });
+    expect(run({ status: 1, stdout: '{"error":"no diff","refused":true,"retryable":true}\n' }).retryable).toBe(true);
+    expect(run({ status: 1, stdout: '{"error":"gh pr view failed"}\n' }).retryable).toBe(true);
+    expect(run({ status: 1, stdout: 'Error: boom\n' }).retryable).toBe(true);
+    expect(run({ status: null, signal: 'SIGTERM', stdout: '' }).retryable).toBe(true);
+    expect(run({ status: null, error: new Error('ETIMEDOUT'), stdout: '' }).retryable).toBe(true);
+  });
+
+  it('F2: a transient failure is retried on the next tick for the same head; a success is then remembered', () => {
+    const results = [{ ok: false, retryable: true, detail: 'fetch miss' }, { ok: true, detail: 'carried' }];
+    const runRestamp = () => results.shift();
+    let t = 5_000_000;
+    const sweep = () => sweepAcceptCarry({ prs, repo: 'plateauapp/plateau-app', setting: 'on', runRestamp, now: () => t });
+    expect(sweep()).toEqual([{ num: 217, carry: 'retry', detail: 'fetch miss' }]);
+    expect(sweep()).toEqual([]); // inside the backoff window
+    t += TRANSIENT_BACKOFF_BASE_MS;
+    expect(sweep()).toEqual([{ num: 217, carry: 'carried', detail: 'carried' }]);
+    t += TRANSIENT_BACKOFF_MAX_MS;
+    expect(sweep()).toEqual([]);
+  });
+
+  it('F2: a settled refusal is not retried for the same head, and a thrown runner counts as transient', () => {
+    let n = 0;
+    const refuse = () => { n += 1; return { ok: false, retryable: false, detail: 'changed diff' }; };
+    sweepAcceptCarry({ prs, setting: 'on', runRestamp: refuse }); sweepAcceptCarry({ prs, setting: 'on', runRestamp: refuse });
+    expect(n).toBe(1);
+    _resetAcceptCarryMemo();
+    expect(sweepAcceptCarry({ prs, setting: 'on', runRestamp: () => { throw new Error('spawn blew up'); } })[0].carry).toBe('retry');
+  });
+
+  it('F2: transient retries back off exponentially (capped) and are never given up on', () => {
+    let n = 0;
+    let t = 1_000_000;
+    const flaky = () => { n += 1; return { ok: false, retryable: true, detail: 'x' }; };
+    const tick = () => sweepAcceptCarry({ prs, setting: 'on', runRestamp: flaky, now: () => t });
+    tick(); tick(); // second call is inside the backoff window
+    expect(n).toBe(1);
+    t += transientBackoffMs(1); tick();
+    expect(n).toBe(2);
+    t += transientBackoffMs(1); tick(); // window is now longer
+    expect(n).toBe(2);
+    expect(transientBackoffMs(1)).toBe(TRANSIENT_BACKOFF_BASE_MS);
+    expect(transientBackoffMs(50)).toBe(TRANSIENT_BACKOFF_MAX_MS);
+    for (let i = 0; i < 20; i += 1) { t += TRANSIENT_BACKOFF_MAX_MS; tick(); } // a long outage still retries
+    expect(n).toBe(22);
   });
 });
 

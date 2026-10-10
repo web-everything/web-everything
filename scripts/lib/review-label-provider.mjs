@@ -115,6 +115,10 @@ export const GH_ARGV = Object.freeze({
   // file's documented reason for avoiding `reconcile-core.mjs#assessLiveness` — a heavy load-time import chain
   // is exactly the hazard both sides are keeping out of each other's graph).
   readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[].filename'],
+  // The PR's `review:human` label-add events (card xu7kxtt / PR #4631 F3: who put the hold there, and when). One JSON
+  // object per line so `--paginate` pages concatenate; `--method GET` for the same reason as `readPrFiles`.
+  readHoldLabelEvents: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${pr}/events`,
+    '--jq', '.[] | select(.event == "labeled" and .label.name == "review:human") | {event, created_at, label: {name: .label.name}, actor: {login: .actor.login}}'],
 });
 
 /**
@@ -175,6 +179,13 @@ export function createGhProvider({
     readPrFiles(repo, pr) {
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
       return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean);
+    },
+
+    /** The `labeled review:human` events on the PR timeline, oldest first. Throws on a read miss (the caller treats
+     *  that as unreadable, never as "no events"). */
+    readHoldLabelEvents(repo, pr) {
+      const out = exec(GH_ARGV.readHoldLabelEvents(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
+      return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).map((l) => JSON.parse(l));
     },
   };
 }

@@ -64,8 +64,11 @@ const BODY_DERIVED_HOLD_RE = /manifest baseline mismatch/i;
  *     restating an already-standing hold. A test-gaming park is a function of the diff (the operator cleared exactly
  *     those bytes, so an identical diff proves it still covers: the #4535 shape this PR exists for); an
  *     escalation-policy park, a clearance-revocation park or any other reason is a decision about the PR, not the bytes.
- *   Not recognised (residual, filed): a label-only `review:human` re-add, free-text operator comments, operator ruling
- *   comments, and a formal GitHub CHANGES_REQUESTED review (`--json comments` never returns it).
+ *   A label-only `review:human` re-add leaves no comment at all, so it is handled where the hold is crossed, not here:
+ *   {@link decideMechanicalHold} (the restamp refuses unless the standing hold is the drain's own ledgered park).
+ *   Not recognised (residual, filed as backlog card xqugnf2): free-text operator comments / ruling comments (the
+ *   drain posts under the operator's own login on this host, so authorship cannot classify them), and a formal GitHub
+ *   CHANGES_REQUESTED review (`--json comments` never returns it).
  * Everything else a bot posts (fix claims, CI-heal notes, advisory notes) says nothing about the clearance.
  */
 const LATER_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
@@ -96,7 +99,7 @@ const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while
 /**
  * The latest trusted accept record on a PR thread, and what was posted after it. Pure.
  * @param {Array<{body?:string, author?:object, createdAt?:string}>} comments
- * @returns {{sha:string, diff:string|null, humanCleared:boolean, actor:string|null, index:number,
+ * @returns {{sha:string, diff:string|null, humanCleared:boolean, actor:string|null, index:number, at:string|null,
  *   laterBodyDerivedHold:boolean, laterVerdict:boolean}|null}
  */
 export function latestAcceptRecord(comments) {
@@ -108,7 +111,8 @@ export function latestAcceptRecord(comments) {
     const sha = body ? lastMatch(REVIEWED_SHA_RE, body) : null;
     if (!sha) return;
     const human = CLEARED_HUMAN_RE.exec(body);
-    rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index };
+    rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index,
+      at: typeof c?.createdAt === 'string' ? c.createdAt : null };
   });
   if (!rec) return null;
   const later = list.slice(rec.index + 1).filter((c) => isTrustedMarkerAuthor(c));
@@ -123,7 +127,7 @@ export function latestAcceptRecord(comments) {
  *   headDiff?:string|null, laterVerdict?:boolean}} facts — `headDiff` is the strict `normalizeDiffFingerprint` of the
  *   live head's net diff (null when it could not be read).
  * @returns {{action:'off'|'none'|'same-head'|'carry'|'review-owed', from?:string, to?:string, human?:boolean,
- *   reason:string}}
+ *   reason:string, retryable?:boolean}} — `retryable`: the refusal is a read miss, not a decision; try again later.
  *   `carry` = the accept holds on the new head (record both SHAs). `review-owed` = the net diff changed or could not
  *   be proven identical: today's path (a review of the change; a `review:human` PR goes back to the operator).
  */
@@ -131,7 +135,7 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   if (setting !== 'on') return { action: 'off', reason: 'acceptCarryForward is off (today: a moved head loses a SHA-bound accept)' };
   const head = typeof headSha === 'string' ? headSha.toLowerCase() : '';
   if (!record || !SHA_RE.test(record.sha ?? '')) return { action: 'none', reason: 'no trusted accept record on the PR' };
-  if (!SHA_RE.test(head)) return { action: 'none', reason: 'live head unknown' };
+  if (!SHA_RE.test(head)) return { action: 'none', reason: 'live head unknown', retryable: true };
   const base = { from: record.sha, to: head, human: !!record.humanCleared };
   if (record.sha === head) return { ...base, action: 'same-head', reason: 'the accept already names the live head' };
   // `laterVerdict` is derived from the thread by `latestAcceptRecord` (a caller cannot forget to supply it); the
@@ -140,10 +144,72 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   if (record.laterBodyDerivedHold) return { ...base, action: 'none', reason: 'a later hold is not derived from the diff (manifest tamper); an identical diff proves nothing about it' };
   const accepted = typeof record.diff === 'string' ? record.diff.toLowerCase() : '';
   const live = typeof headDiff === 'string' ? headDiff.toLowerCase() : '';
+  // A read miss (git/gh) is not a verdict about the PR: `retryable` tells the caller not to remember it as a refusal.
+  // Checked BEFORE the accepted fingerprint: with the live diff unread a diff-less accept (plateau-app #217) cannot be
+  // re-derived either, so "no fingerprint" would otherwise mask the miss as a settled refusal.
+  if (!FP_RE.test(live)) return { ...base, action: 'review-owed', reason: 'the live net diff could not be read; identity unproven', retryable: true };
   if (!FP_RE.test(accepted)) return { ...base, action: 'review-owed', reason: 'the accept carries no reviewed-diff fingerprint; identity unproven' };
-  if (!FP_RE.test(live)) return { ...base, action: 'review-owed', reason: 'the live net diff could not be read; identity unproven' };
   if (accepted !== live) {
     return { ...base, action: 'review-owed', reason: `net diff changed since the accept at ${record.sha.slice(0, 9)} — a review of the change is owed${record.humanCleared ? '; it goes back to the operator' : ''}` };
   }
   return { ...base, action: 'carry', reason: `net diff byte-identical to the accept at ${record.sha.slice(0, 9)} (reviewed-diff ${accepted.slice(0, 12)}); accept carried to ${head.slice(0, 9)}` };
+}
+
+/** The drain's anti-test-gaming re-park, as its verdict-ledger row spells the reason (`merge-ai-prs.mjs`). */
+const TEST_GAMING_PARK_REASON_RE = /^\s*test-gaming suspected\s+[—-]/i;
+/** The drain writes the ledger row BEFORE it adds the label (live #4535: row 14:36:41, `labeled review:human` 14:36:50). */
+export const HOLD_PAIR_EARLY_MS = 5_000;
+export const HOLD_PAIR_LATE_MS = 120_000;
+
+const msOf = (iso) => { const t = Date.parse(String(iso ?? '')); return Number.isFinite(t) ? t : null; };
+const isDrainTestGamingPark = (r) => r?.verdict === 'human' && r?.source === 'merge-ai-prs' && r?.actor?.declared === 'drain'
+  && TEST_GAMING_PARK_REASON_RE.test(String(r?.reason ?? ''));
+
+/**
+ * PR #4631 review round 2 (F3/F4): was the standing `review:human` put there by the drain's mechanical anti-test-gaming
+ * re-park, or by a person? Carrying the operator's clearance across a hold is only safe for the first. Pure.
+ *
+ * WHY NOT THE COMMENT THREAD OR THE LABEL'S ACTOR. A label-only hold (`gh pr edit --add-label review:human`) leaves no
+ * comment, and on this host the drain runs under the operator's own credential (live #4535: every label event and the
+ * park comment are `chalbert`), so neither the thread nor the actor can tell the two apart. The drain's verdict ledger
+ * can: the drain appends a `human` row (source `merge-ai-prs`, declared actor `drain`, reason `test-gaming suspected
+ * — …`) immediately before it adds the label, and nothing else writes that row. So the hold is mechanical only when ALL of:
+ *   1. the latest such ledger row for the PR is newer than the clearance;
+ *   2. no later ledger row of any other kind follows it (a sanctioned verdict after the park supersedes the clearance);
+ *   3. the LATEST `labeled review:human` event on the PR timeline is that park's own label add (it follows the row by
+ *      at most {@link HOLD_PAIR_LATE_MS}). A person re-adding the label — before or after the park — is a later or
+ *      unpaired event, so a deliberate hold is never explained away by an earlier or unrelated drain row.
+ * Only the test-gaming park counts. The drain restating an already-standing hold (`held — a review hold`) is posted
+ * BECAUSE a hold stands, whoever put it there, so it proves nothing about origin (and writes no such ledger row).
+ * Missing proof refuses (the hold stays); an unreadable timeline refuses as `retryable` (a read miss, not a decision).
+ *
+ * The head SHA is deliberately NOT part of the binding: the live row names `b55fa00ae`, not the PR head
+ * `143107a87` (the drain's verdict snapshot is not the refreshed head), so a SHA match would refuse the very case
+ * this exists for. The net-diff identity is the content proof; this only attributes the hold.
+ * @param {{rows?: Array, events?: Array|null, pr: number|string, clearAt?: string|null}} o — `events` null = unreadable.
+ * @returns {{mechanical: boolean, retryable?: boolean, reason: string}}
+ */
+export function decideMechanicalHold({ rows = [], events = null, pr, clearAt = null } = {}) {
+  if (!Array.isArray(events)) return { mechanical: false, retryable: true, reason: 'the label timeline could not be read; the hold\'s origin is unproven' };
+  const n = Number(pr);
+  // `observed` is a shadow prediction; `restamped` is this carry's OWN record, written before its label swap — if the swap
+  // then failed, the retry must not read the earlier attempt's row as a later verdict that supersedes the clearance.
+  const mine = (Array.isArray(rows) ? rows : []).filter((r) => Number(r?.pr) === n && r?.verdict !== 'observed' && r?.verdict !== 'restamped');
+  const clearMs = msOf(clearAt);
+  const parks = mine.filter((r) => isDrainTestGamingPark(r) && msOf(r.at) !== null && (clearMs === null || msOf(r.at) > clearMs));
+  if (!parks.length) return { mechanical: false, reason: 'no drain test-gaming park is ledgered since the clearance; the review:human hold is not proven mechanical (a deliberate label-only hold is indistinguishable)' };
+  const park = parks.reduce((a, b) => (msOf(b.at) >= msOf(a.at) ? b : a));
+  const parkMs = msOf(park.at);
+  if (mine.some((r) => msOf(r.at) !== null && msOf(r.at) > parkMs && !isDrainTestGamingPark(r))) {
+    return { mechanical: false, reason: 'a later ledgered verdict follows the drain park; the clearance does not cover it' };
+  }
+  const labeled = events
+    .filter((e) => e?.event === 'labeled' && e?.label?.name === 'review:human' && msOf(e.created_at) !== null && (clearMs === null || msOf(e.created_at) > clearMs))
+    .map((e) => msOf(e.created_at));
+  if (!labeled.length) return { mechanical: false, reason: 'no review:human label event since the clearance explains the hold' };
+  const last = Math.max(...labeled);
+  if (last < parkMs - HOLD_PAIR_EARLY_MS || last > parkMs + HOLD_PAIR_LATE_MS) {
+    return { mechanical: false, reason: 'the latest review:human label add is not the drain park\'s own (a person re-held it); the clearance is not carried over it' };
+  }
+  return { mechanical: true, reason: 'the standing review:human is the drain\'s own test-gaming re-park (ledger row paired with its label add)' };
 }

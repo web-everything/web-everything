@@ -92,7 +92,17 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
-import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, decideMechanicalHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
+import { parseVerdictLog, verdictLedgerPath } from './lib/verdict-ledger.mjs'; // PR #4631 F3: the drain's own park rows attribute a standing hold
+import { readFileSync as readLedgerFileSync } from 'node:fs';
+
+/** The repo's home verdict-ledger rows. A MISSING file is `[]` (nothing was ever ledgered); any other read error THROWS
+ *  so the caller can tell a read miss (retryable) from "no park ledgered" (`readVerdictLedger` swallows both). */
+export function readLedgerRowsStrict(repo) {
+  let text;
+  try { text = readLedgerFileSync(verdictLedgerPath(repo), 'utf8'); } catch (e) { if (e?.code === 'ENOENT') return []; throw e; }
+  return parseVerdictLog(text);
+}
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 import { referralLiveContext } from './lib/referral-live-context.mjs';
@@ -928,6 +938,8 @@ export function runReviewLabelCli({
   // real `file-item` subprocess ever running.
   fileApprovalPrevention = fileApprovalPreventionCard,
   findFiledApprovalPrevention = findApprovalPreventionCardOnDisk,
+  // PR #4631 F3 — the drain's park rows (`(repo) => verdict rows`), injected for the same reason `provider` is.
+  readLedgerRows = readLedgerRowsStrict,
 } = {}) {
   // Shadows the module-level `fail` so EVERY refusal inside this function — there are seventeen — goes to the
   // injected emitter too. Without this the guards print past an in-process caller's collector (#3061); the
@@ -1274,12 +1286,14 @@ export function runReviewLabelCli({
   const deriveHumanCarry = () => {
     let record = latestAcceptRecord(prComments);
     // A clearance stamped without a diff fingerprint (cross-repo checkout, live plateau-app #217): re-derive the
-    // cleared commit's own net diff from git. Unreadable → no proof → refused.
+    // cleared commit's own net diff from git. Unreadable → no proof → refused (and `retryable`: a git read miss is
+    // not a verdict, so the sweep must not remember it as one).
+    let proofReadMissed = false;
     if (record && !record.diff && diffScored) {
       try {
         const old = computeNetDiffText({ exec: execFileSyncThrottled, rev: record.sha, fetchExtraRefs: [record.sha] });
-        if (old?.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) };
-      } catch { /* no proof */ }
+        if (old?.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) }; else proofReadMissed = true;
+      } catch { proofReadMissed = true; }
     }
     const humanCarry = decideAcceptCarryForward({
       setting: resolveAcceptCarryForward().value,
@@ -1287,15 +1301,38 @@ export function runReviewLabelCli({
       headSha,
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });
+    if (proofReadMissed && humanCarry.action === 'review-owed') humanCarry.retryable = true;
     const clearer = parseOperatorClearance((Array.isArray(prComments) ? prComments : []).filter(isTrustedMarkerAuthor));
     const clearance = humanCarry.action === 'carry' && humanCarry.human === true
       ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
     return { humanCarry, clearance };
   };
   if (restampAcrossHold) {
-    const { humanCarry, clearance } = deriveHumanCarry();
+    const derived = deriveHumanCarry();
+    const { clearance } = derived;
+    let { humanCarry } = derived;
+    // PR #4631 round 2 (F3/F4): an identical diff proves the CONTENT is what the operator cleared, not that the standing
+    // `review:human` is the mechanical re-park rather than a deliberate hold (a label-only hold leaves no comment).
+    // Crossing it needs positive provenance: the drain's own ledgered test-gaming park paired with its label add.
+    let holdRetryable = false;
+    if (humanCarry.action === 'carry' && humanCarry.human === true) {
+      let events = null;
+      try { events = typeof provider.readHoldLabelEvents === 'function' ? provider.readHoldLabelEvents(repo, pr) : null; } catch { events = null; }
+      // An unreadable ledger is a read miss (retryable), not "no park ledgered": only a MISSING file means no rows.
+      let rows = null;
+      try { rows = readLedgerRows(repo); } catch { rows = null; }
+      const prov = Array.isArray(rows)
+        ? decideMechanicalHold({ rows, events, pr, clearAt: latestAcceptRecord(prComments)?.at ?? null })
+        : { mechanical: false, retryable: true, reason: 'the verdict ledger could not be read; the hold\'s origin is unproven' };
+      if (!prov.mechanical) {
+        humanCarry = { ...humanCarry, action: 'none', human: false, reason: prov.reason };
+        holdRetryable = !!prov.retryable;
+      }
+    }
     decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
     if (!decision.allowed) {
+      // `retryable`: the refusal is a read miss (unreadable diff / timeline), not a decision about the PR.
+      if (holdRetryable || humanCarry.retryable) decision = { ...decision, retryable: true };
       emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
       process.exit(1);
     }
@@ -2057,7 +2094,9 @@ if (IS_CLI) {
       humanClearance,
     }),
     successResult: ({ pr, to, labels }) => ({ ok: true, pr, to, labels }),
-    refusalResult: ({ decision }) => ({ error: decision.reason }),
+    // `refused` marks a DECISION (as opposed to a crash / gh failure, which prints `{error}` too); `retryable` marks a
+    // refusal that was only a read miss. The accept-carry sweep memoizes the first, never the second (PR #4631 F2).
+    refusalResult: ({ decision }) => ({ error: decision.reason, refused: true, ...(decision.retryable ? { retryable: true } : {}) }),
     // #2895 — UNCONDITIONAL, so every shell invocation of this CLI is opted in, including one run for
     // `--to=accepted`. The opt-in therefore constrains nothing here; it exists so an IMPORTER of
     // `runReviewLabelCli` has to name the capability in its own source. See `allowClearHuman` on that function

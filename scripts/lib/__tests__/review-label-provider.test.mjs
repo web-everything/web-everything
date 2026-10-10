@@ -163,6 +163,20 @@ describe('the gh adapter', () => {
     const p = createGhProvider({ exec: () => '' });
     expect(p.readPrFiles('o/n', 2223)).toEqual([]);
   });
+
+  it('readHoldLabelEvents reads the issue events with --method GET and parses one JSON event per line (PR #4631 F3)', () => {
+    const argv = GH_ARGV.readHoldLabelEvents('o/n', 9);
+    expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/9/events']);
+    expect(argv.join(' ')).toContain('review:human');
+    const line = '{"event":"labeled","created_at":"2026-10-09T14:36:50Z","label":{"name":"review:human"},"actor":{"login":"x"}}';
+    expect(createGhProvider({ exec: () => `${line}\n${line}\n` }).readHoldLabelEvents('o/n', 9)).toHaveLength(2);
+    expect(createGhProvider({ exec: () => '' }).readHoldLabelEvents('o/n', 9)).toEqual([]);
+  });
+
+  it('readHoldLabelEvents throws on a malformed line or a gh failure (the caller treats a throw as an unreadable timeline)', () => {
+    expect(() => createGhProvider({ exec: () => 'not json\n' }).readHoldLabelEvents('o/n', 9)).toThrow();
+    expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readHoldLabelEvents('o/n', 9)).toThrow(/gh failed/);
+  });
 });
 
 /**
