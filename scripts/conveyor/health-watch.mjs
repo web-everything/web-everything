@@ -1283,9 +1283,14 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // Silences live in their OWN file, written only by `silence`/`unsilence` and only read here, so a silence
   // set while a tick runs can never be lost to the tick's state.json write (nor roll that write back). Which
   // expired silences were already announced is tick state (`notifiedSilences`).
-  const notified = new Set(prev.notifiedSilences || []);
+  // Both are file data: a non-list (or a non-object entry) reads as nothing rather than throwing before state.json
+  // is rewritten, which would fail every later tick the same way.
+  const notified = new Set(Array.isArray(prev.notifiedSilences) ? prev.notifiedSilences : []);
   const silenceSig = (x) => `${x.smell}|${x.subject ?? '*'}|${x.card ?? ''}|${x.expiresAt ?? ''}`;
-  const silences = readJson(join(dir, 'silences.json'), []).map((x) => ({ ...x, expiredNotified: notified.has(silenceSig(x)) }));
+  const silenceList = readJson(join(dir, 'silences.json'), []);
+  const silences = (Array.isArray(silenceList) ? silenceList : [])
+    .filter((x) => x && typeof x === 'object' && !Array.isArray(x))
+    .map((x) => ({ ...x, expiredNotified: notified.has(silenceSig(x)) }));
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
   // Job mode, cadence still due, no result consumed: the group took no sample this tick (its job is queued or

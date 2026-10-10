@@ -418,8 +418,14 @@ export async function runGhProbeJobs({
   // `state` is read back from state.json (user-writable): a non-list `consumed` reads as empty instead of throwing
   // on every tick, which would wedge the gh group with job mode on.
   const consumed = new Set(Array.isArray(state?.consumed) ? state.consumed.filter((id) => typeof id === 'string') : []);
-  // A job record's `finishedAt` is file data too: garbage or a future value counts as "finished long ago".
-  const finishedMs = (r) => { const t = Date.parse(r.job.finishedAt ?? ''); return Number.isFinite(t) && t <= now ? t : 0; };
+  // A job record's `finishedAt` is file data too: garbage, or a value further ahead than the clock-skew allowance,
+  // counts as "finished long ago". A value only a little ahead is real (a job that finished after this tick's `now`
+  // was taken) and reads as `now`, so it still gets its full keep window.
+  const finishedMs = (r) => {
+    const t = Date.parse(r.job.finishedAt ?? '');
+    if (!Number.isFinite(t) || t - now > MAX_RESULT_FUTURE_SKEW_MS) return 0;
+    return Math.min(t, now);
+  };
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
 
   // 1. Consume every finished job not consumed yet. The NEWEST sample is the one kept, judged by its validated

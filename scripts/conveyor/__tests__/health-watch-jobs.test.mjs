@@ -222,6 +222,20 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
       expect(out.summary.pruned).toContain(older);
       expect(out.summary.pruned).not.toContain(newer);
     });
+
+    it('a finishedAt only seconds ahead of the tick (the job finished after `now` was taken) keeps its full keep window', async () => {
+      const store = createJobStore(join(dir, 'just-finished'));
+      const q = await runGhProbeJobs({ ...base(store), now: 1_000_000, due: true });
+      const id = q.summary.enqueued;
+      const now = 2 * FINISHED_JOB_KEEP_MS;
+      store.update(id, (r) => markLaunching(r, { at: iso(1_000_000) }));
+      store.update(id, (r) => markClaimed(r, { at: iso(1_000_000), handle: `h:${process.pid}:x`, host: 'h', pid: process.pid, procStart: 'x' }));
+      writeFileSync(join(store.dir, `${id}${RESULT_SUFFIX}`), JSON.stringify({ jobId: id, sampledAt: now - 1000, probes: { prs: [], agents: [] }, errors: {} }));
+      store.update(id, (r) => markSucceeded(r, { at: iso(now + 10_000) }));
+      const out = await runGhProbeJobs({ ...base(store), now, due: false, state: q.state });
+      expect(out.result.jobId).toBe(id);
+      expect(out.summary.pruned).toEqual([]);
+    });
   });
 
   it('prunes consumed finished records older than the keep window, with their result sidecar', async () => {
@@ -366,6 +380,16 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(out.probeErrors.claudeJobsArchive).toBeUndefined();
     expect(out.claudeJobsArchive).toMatchObject({ complete: true });
   }, 30000);
+
+  it('a corrupt notifiedSilences in state.json or a non-list silences.json does not throw the tick (it would fail every tick after)', async () => {
+    for (const [i, [notifiedSilences, silences]] of [[5, {}], [{}, [null, 3, { smell: 'x' }]], ['x', 'oops']].entries()) {
+      const { flags, hd } = setup(`silences-${i}`);
+      writeFileSync(join(hd, 'state.json'), JSON.stringify({ notifiedSilences }));
+      writeFileSync(join(hd, 'silences.json'), JSON.stringify(silences));
+      const out = await tick({ ...flags, 'no-gh': true, now: iso(Date.parse('2026-10-09T12:00:00Z')) });
+      expect(out.now).toBeTruthy();
+    }
+  }, 60000);
 
   it('a session-watchdog cache stamped in the future is stale, so the pass runs instead of being skipped', () => {
     const wdDir = join(dir, 'watchdog'); mkdirSync(wdDir);
