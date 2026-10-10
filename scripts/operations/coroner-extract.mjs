@@ -5,6 +5,7 @@
  * Missing gate results have no inferred duration. Overlapping gates are summed; share is capped at 1.
  * errorRates is the first output key. WE_CORONER_COORD (build-dispatch log), WE_CORONER_BUILD_TAIL (tick-row tail bytes) and
  * WE_CORONER_NO_CI (skip gh) are the extra knobs; the gh read is bounded to 5 run pages and 40 job lookups.
+ * WE_CORONER_LAUNCH_AGENTS overrides ~/Library/LaunchAgents: daemon logs resolve via their own plist, then WE_CORONER_DAEMON_DIR, then registry clone.
  * changeRequests (card 102, coroner-rounds.mjs): per-PR change-request rounds + attributes; WE_CORONER_NO_ROUNDS skips it,
  * WE_CORONER_RECEIPTS overrides the builder-receipt dir. Bounded: 300 PRs x (comments + commits + files) and 150 compares.
  * frictions + buildOutcomes (card 130, coroner-transcripts.mjs): per-session transcript friction signals grouped by kind x executor, and the
@@ -12,12 +13,13 @@
  */
 import fs from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { classifyCardOnly } from '../ci-card-only.mjs';
+import { DAEMON_CLONE_SEED } from '../lib/daemon-clone-registry.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { collectExecutorLogs, executorTable } from './coroner-executors.mjs';
 import { LOG_TIMESTAMP_RE, expandRepeatedLines, stripLogTimestamp } from '../lib/log-timestamp.mjs';
@@ -664,12 +666,100 @@ export function extractMetrics({ window, changeRequests = null, sessions = [], d
 function children(path, io) { try { return io.readdirSync(path, { withFileTypes: true }).sort((a, b) => compare(a.name, b.name)); } catch { return []; } }
 function exists(path, io) { try { return io.statSync(path).isFile(); } catch { return false; } }
 function directory(path, io) { try { return io.statSync(path).isDirectory(); } catch { return false; } }
+/** Small XML-plist reader: paired dictionary keys, recursive values, no external entity expansion. */
+export function parsePlistXml(text) {
+  try {
+    if (typeof text !== 'string' || /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(text)) return null;
+    text = text.trim().replace(/^<\?xml\s+[^?]*\?>\s*/, '').replace(/^<!DOCTYPE\s+plist\s+[^<>\[\]]*>\s*/, '');
+    const tokens = text.match(/<!--[\s\S]*?-->|<[^<>]*>|[^<]+/g) ?? [];
+    if (tokens.join('') !== text) return null;
+    let i = 0;
+    const bad = () => { throw new Error('malformed plist'); };
+    const skip = () => { while (/^\s*$/.test(tokens[i] ?? 'x') || tokens[i]?.startsWith('<!--')) i++; };
+    const decode = (value) => value.replace(/&(?:amp;|lt;|gt;|quot;|apos;|#\d+;|#x[\da-fA-F]+;)?/g, (entity) => {
+      const named = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" };
+      if (named[entity]) return named[entity];
+      if (!entity.startsWith('&#')) return bad();
+      const n = entity[2] === 'x' ? parseInt(entity.slice(3, -1), 16) : Number(entity.slice(2, -1));
+      if (!(n === 9 || n === 10 || n === 13 || n >= 32 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff))) return bad();
+      return String.fromCodePoint(n);
+    });
+    const read = () => {
+      skip();
+      const open = /^<(plist|dict|array|key|string|integer|true|false)(\s+version\s*=\s*(?:"1\.0"|'1\.0'))?\s*(\/?)>$/.exec(tokens[i++] ?? '');
+      if (!open || open[2] && open[1] !== 'plist') return bad();
+      const tag = open[1], children = [], closed = Boolean(open[3]);
+      let value = '';
+      if (!closed) {
+        if (['key', 'string', 'integer'].includes(tag)) {
+          while (i < tokens.length && !tokens[i].startsWith('</')) {
+            if (tokens[i].startsWith('<!--')) { i++; continue; }
+            if (tokens[i].startsWith('<')) return bad();
+            value += decode(tokens[i++]);
+          }
+        } else {
+          skip();
+          while (i < tokens.length && !tokens[i].startsWith('</')) { children.push(read()); skip(); }
+        }
+        if (tokens[i++] !== `</${tag}>`) return bad();
+      }
+      if (tag === 'dict') {
+        value = {};
+        for (let j = 0; j < children.length; j += 2) {
+          const key = children[j], next = children[j + 1];
+          if (key.tag !== 'key' || !next || ['key', 'plist'].includes(next.tag)) return bad();
+          Object.defineProperty(value, key.value, { value: next.value, enumerable: true, configurable: true });
+        }
+      } else if (tag === 'array') {
+        if (children.some((x) => ['key', 'plist'].includes(x.tag))) return bad();
+        value = children.map((x) => x.value);
+      } else if (tag === 'plist') {
+        if (children.length !== 1 || children[0].tag !== 'dict') return bad();
+        value = children[0].value;
+      } else if (tag === 'integer') {
+        if (!/^[+-]?\d+$/.test(value.trim())) return bad();
+        value = Number(value);
+      } else if (tag === 'true' || tag === 'false') {
+        if (children.length) return bad();
+        value = tag === 'true';
+      }
+      return { tag, value };
+    };
+    const root = read(); skip();
+    return root.tag === 'plist' && i === tokens.length ? root.value : null;
+  } catch { return null; }
+}
+
+export function resolveDaemonLog(name, { env = process.env, home = homedir(), io = fs } = {}) {
+  const clone = { 'fix-dispatch-daemon': 'wev-fix-daemon', 'review-daemon': 'wev-review-daemon' }[name];
+  if (!clone) throw new Error(`unknown daemon: ${name}`);
+  const file = join(env.WE_CORONER_LAUNCH_AGENTS || join(home, 'Library/LaunchAgents'), `com.we.${name}.plist`);
+  const warnings = [];
+  try {
+    const stat = io.statSync(file);
+    if (!stat.isFile() || stat.size > 64 * 1024) throw new Error('oversized or non-file plist');
+    const text = io.readFileSync(file, 'utf8');
+    const plist = Buffer.byteLength(text) <= 64 * 1024 ? parsePlistXml(text) : null;
+    const path = plist?.StandardOutPath;
+    if (path === undefined) throw new Error('no StandardOutPath');
+    if (typeof path === 'string' && isAbsolute(path) && resolve(path).startsWith(resolve(home) + sep)) {
+      return { file: resolve(path), via: 'plist', warnings };
+    }
+    warnings.push({ kind: 'plist-path-refused', daemon: name, file, path });
+  } catch (error) {
+    if (error.code !== 'ENOENT') warnings.push({ kind: 'plist-unreadable', daemon: name, file });
+  }
+  if (env.WE_CORONER_DAEMON_DIR) return { file: join(env.WE_CORONER_DAEMON_DIR, `${name}.log`), via: 'env', warnings };
+  if (!DAEMON_CLONE_SEED.includes(clone)) throw new Error(`unregistered daemon clone: ${clone}`);
+  return { file: join(home, 'workspace', clone, '.conveyor', `${name}.log`), via: 'registry', warnings };
+}
+
 export function collectInputs(window, { env = process.env, home = homedir(), io = fs, gh = null } = {}) {
   const paths = {
     jobs: env.WE_CORONER_JOBS || join(home, '.claude/jobs'),
     archive: env.WE_CORONER_JOBS_ARCHIVE || join(home, '.claude/jobs-archive'),
     projects: env.WE_CORONER_PROJECTS || join(home, '.claude/projects'),
-    daemon: env.WE_CORONER_DAEMON_DIR || '/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor',
+    daemon: env.WE_CORONER_DAEMON_DIR || join(home, 'workspace', 'wev-review-daemon', '.conveyor'),
     verify: env.WE_CORONER_VERIFY_LOG || join(home, 'workspace/.operations/coordination/verify-daemon.log'),
     admission: env.WE_CORONER_ADMISSION || join(home, 'workspace/.lanes/.admission/heavy'),
     coord: env.WE_CORONER_COORD || join(home, 'workspace/.operations/coordination'),
@@ -726,7 +816,20 @@ export function collectInputs(window, { env = process.env, home = homedir(), io 
   const verifyLines = log('verifyDaemon', paths.verify);
   const logNames = ['fix-dispatch-daemon.log', 'review-daemon.log'];
   const extra = children(paths.daemon, io).filter((x) => x.isFile?.() !== false && /^(?:pass-daemon\..+|parked-pr-conflict-watch-.+|lease-reaper)\.log$/.test(x.name)).map((x) => x.name);
-  const daemonLogs = Object.fromEntries([...logNames, ...extra].map((name) => [name.replace(/\.log$/, ''), log(name, join(paths.daemon, name))]));
+  const warnings = [];
+  const daemonLogs = Object.fromEntries(logNames.map((name) => {
+    const daemon = name.replace(/\.log$/, ''), source = resolveDaemonLog(daemon, { env, home, io });
+    const { file, via } = source, lines = log(name, file);
+    let lastWriteAt = null;
+    try { lastWriteAt = new Date(io.statSync(file).mtimeMs).toISOString(); } catch { /* Missing or unavailable timestamp. */ }
+    Object.assign(sources[name], { path: file, via, lastWriteAt });
+    warnings.push(...source.warnings);
+    if (lastWriteAt && stamp(lastWriteAt) < stamp(window.since)) warnings.push({ kind: 'stale-source', daemon, file, lastWriteAt });
+    if (via !== 'env' && !exists(file, io) && !exists(`${file}.1`, io)) warnings.push({ kind: 'no-live-source', daemon, file });
+    return [daemon, lines];
+  }));
+  for (const name of extra) daemonLogs[name.replace(/\.log$/, '')] = log(name, join(paths.daemon, name));
+  if (warnings.length) sources.warnings = warnings.sort((a, b) => compare(a.kind, b.kind) || compare(a.daemon, b.daemon) || compare(a.file, b.file));
   const refusalLines = [...daemonLogs['fix-dispatch-daemon'], ...daemonLogs['review-daemon']];
   // Tick rows are ~300 KB of JSON each: read a larger tail with a larger line cap, keep only the compact fields.
   const buildAll = log('build-dispatch-daemon.log', join(paths.coord, 'build-dispatch-daemon.log'), { cap: positive(env.WE_CORONER_BUILD_TAIL, 48 * MiB), maxLine: 2 * MiB, olderToo: true });
@@ -808,6 +911,10 @@ const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(imp
 if (isMain) {
   // A consumer such as head may close the pipe after its requested prefix.
   process.stdout.on('error', (error) => { if (error.code !== 'EPIPE') { process.stderr.write(`${error.message}\n`); process.exitCode = 1; } });
-  try { process.stdout.write(runCoroner(process.argv.slice(2), { gh: process.env.WE_CORONER_NO_CI ? null : makeGh() }).output + '\n'); }
+  try {
+    const { output, metrics } = runCoroner(process.argv.slice(2), { gh: process.env.WE_CORONER_NO_CI ? null : makeGh() });
+    process.stdout.write(output + '\n');
+    for (const warning of metrics.sources.warnings ?? []) process.stderr.write(`coroner: ${warning.kind} ${warning.daemon} ${warning.file}${warning.lastWriteAt ? ` last write ${warning.lastWriteAt}` : ''}\n`);
+  }
   catch (error) { process.stderr.write(`${error.message}\n`); process.exitCode = 1; }
 }
