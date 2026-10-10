@@ -191,6 +191,7 @@ export function runSafetyNet({
 } = {}) {
   if (!dir) return null;
   const ledgerPath = join(dir, SAFETY_NET_LEDGER);
+  const persist = () => { try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort */ } };
   const shadowPath = join(dir, SAFETY_NET_SHADOW_LOG);
   const ledger = readJson(ledgerPath) ?? { version: 1, reds: {}, shadowList: { version: 1, entries: [] } };
   ledger.reds ??= {};
@@ -252,6 +253,9 @@ export function runSafetyNet({
     let read = { ok: true, list: ledger.shadowList ?? { version: 1, entries: [] } };
     if (isLive) read = readList();
     if (!read.ok) { out.plan = { action: 'none', why: `quarantine list unreadable (${read.error})` }; return out; }
+    // An entry on the shared list that was added for this red counts as "added for this red" whether or not this
+    // ledger recorded it (a push that landed but threw, a lost ledger): it must not be re-added once it expires.
+    if (isLive && rec) for (const e of read.list?.entries ?? []) if (rec.shas?.includes(e.brokenSha) && e.test) rec.added = [...new Set([...(rec.added ?? []), e.test])];
     const pri = mainCiRuns?.priority;
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
@@ -279,7 +283,24 @@ export function runSafetyNet({
     if (isLive) {
       // Record the intent BEFORE the push: a push that lands but throws must still be withdrawable on a flip to stop.
       if (stamping || read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine';
-      const r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change });
+      // Record "added for this red" BEFORE the push, on disk: a push that lands but throws (ack lost) or a crash
+      // between the push and the ledger write must never let the entry be added again once it expires.
+      const intended = plan.action === 'add' && rec ? plan.tests.filter((t) => !(rec.added ?? []).includes(t)) : [];
+      if (intended.length) { rec.added = [...(rec.added ?? []), ...intended]; }
+      persist();
+      let r;
+      try {
+        r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change });
+      } catch (e) {
+        // Roll the intent back only when the list is READABLE and holds none of these tests (the push really did not
+        // land, so the next tick may retry). Landed, or unknown (unreadable): keep it — STOP holds rather than renew.
+        if (intended.length) {
+          let cur = null;
+          try { cur = readList(); } catch { cur = null; }
+          if (cur?.ok && !(cur.list?.entries ?? []).some((en) => intended.includes(en.test))) rec.added = rec.added.filter((t) => !intended.includes(t));
+        }
+        throw e;
+      }
       out.applied = true;
       out.events = r?.events ?? [];
     } else {
@@ -306,7 +327,7 @@ export function runSafetyNet({
     // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window
     // that is red right now is never forgotten: its record is what keeps an expired entry from being re-added.
     for (const [k, v] of Object.entries(ledger.reds)) if (k !== activeKey && now -(Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];
-    try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort */ }
+    persist();
   }
 }
 

@@ -104,9 +104,20 @@ describe('quarantine-skip — the mode is the one the daemon published on the li
     expect(r.line).toBe('');
     expect(r.why).toMatch(/redMainMode is stop/);
   });
-  it('no stamp on the list: fall back to the local cascade', () => {
-    expect(asPr({ read: READ, env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } }).line).toBe(`--exclude=${TEST_FILE}`);
-    expect(asPr({ read: READ, env: { WE_DRAIN_RED_MAIN_MODE: 'stop' } }).line).toBe('');
+  it('no stamp on the list: stop — the PR tree and the job env are never a source for the mode', () => {
+    const r = asPr({ read: READ, env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } });
+    expect(r.line).toBe('');
+    expect(r.why).toMatch(/redMainMode is stop/);
+    expect(asPr({ read: READ, env: {} }).line).toBe('');
+  });
+  it('the mode never comes from the checked-out settings file', () => {
+    expect(readFileSync(new URL('../quarantine-skip.mjs', import.meta.url), 'utf8')).not.toMatch(/resolveRedMainMode|red-main-hold/);
+  });
+  it('stop mode still reads the list once: the mode lives on the list, so there is one bounded fetch even while off', () => {
+    let reads = 0;
+    const r = asPr({ read: undefined, readList: () => { reads += 1; return stamped('stop'); } });
+    expect(r.line).toBe('');
+    expect(reads).toBe(1);
   });
   it('an unreadable list still skips nothing', () => {
     expect(asPr({ read: { ok: false, error: 'no ref' }, env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } }).line).toBe('');

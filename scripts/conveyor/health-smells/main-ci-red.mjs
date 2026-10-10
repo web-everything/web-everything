@@ -12,6 +12,8 @@
  */
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { mainCiRedSettings, mainRedState, isRedLongEnough, MINUTE } from '../main-ci-red-core.mjs';
 import { runSafetyNet } from '../../lib/red-main-quarantine-io.mjs';
 import { healthDir } from '../health-watch-section.mjs';
@@ -28,10 +30,26 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..'
  * test unless a test passes its own `ctx.quarantineSafetyNet`. It never changes what the smell reports.
  */
 const REPLAY_FLAGS = ['--main-ci-runs-fixture', '--dry-run', '--lock-root', '--state-root'];
-export function defaultQuarantineSafetyNet(mainCiRuns, { now, argv = process.argv } = {}) {
-  if (isUnderTest()) return null;
-  const replay = (argv ?? []).some((a) => REPLAY_FLAGS.some((f) => a === f || String(a).startsWith(`${f}=`)));
-  return runSafetyNet({ mainCiRuns, now, dir: healthDir(), board: REPO_ROOT, live: !replay });
+/** The value of `--flag=V` / `--flag V` in argv, or null. */
+const flagValue = (argv, flag) => {
+  const i = argv.findIndex((a) => a === flag || String(a).startsWith(`${flag}=`));
+  if (i < 0) return null;
+  if (argv[i] !== flag) return String(argv[i]).slice(flag.length + 1) || null;
+  const next = argv[i + 1];
+  return next !== undefined && !String(next).startsWith('--') ? String(next) : null;
+};
+/**
+ * A replay tick keeps its state OFF the daemon's real health dir: under the tick's own `--state-root`, else (a fixture /
+ * dry-run / lock-root replay with no state root) in a throwaway dir — never the real ledger or shadow log, which is the
+ * evidence the red-team review reads. `underTest` / `run` are test seams.
+ */
+export function defaultQuarantineSafetyNet(mainCiRuns, { now, argv = process.argv, underTest = isUnderTest(), run = runSafetyNet } = {}) {
+  if (underTest) return null;
+  const args = argv ?? [];
+  const replay = args.some((a) => REPLAY_FLAGS.some((f) => a === f || String(a).startsWith(`${f}=`)));
+  const stateRoot = flagValue(args, '--state-root');
+  const dir = stateRoot ? healthDir(stateRoot) : replay ? mkdtempSync(join(tmpdir(), 'red-main-quarantine-replay-')) : healthDir();
+  return run({ mainCiRuns, now, dir, board: REPO_ROOT, live: !replay });
 }
 
 const fmtMin = (ms) => `${Math.round(ms / MINUTE)} min`;

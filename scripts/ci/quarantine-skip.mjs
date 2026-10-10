@@ -9,9 +9,11 @@
  *   The list is read FRESH from the `ops/quarantine` branch at job start (`git fetch` of that ref,
  *   we:scripts/lib/red-main-quarantine-io.mjs#readQuarantine), NEVER from the PR's own tree, so a PR cannot add an
  *   entry for itself. Prints nothing (CI runs every test) when:
- *     - `redMainMode` is `stop` (the default). The mode is the one the safety net published on the list (`mode`, set
- *       from the daemon's own cascade, which a CI job cannot see); an unstamped list falls back to this job's cascade
- *       (we:scripts/lib/red-main-hold.mjs#resolveRedMainMode);
+ *     - `redMainMode` is `stop` (the default). The mode is ONLY the one the safety net published on the list (`mode`,
+ *       set from the daemon's own cascade, which a CI job cannot see). A list with no stamp means `stop`: the PR's
+ *       checked-out settings file and the job env are never a source for it (a PR could turn quarantine on for itself).
+ *       The mode lives on the list, so this step reads the list (one bounded `git fetch`, <= 60s) in EVERY mode, stop
+ *       included; in stop it then prints nothing;
  *     - the list is unreadable, or the job's PR is unknown;
  *     - the job is main (push / dispatch) or the PR is a recorded main-fix PR (`fixPrs` on the list);
  *   and it always runs a quarantined file the PR itself changes. It never fails the step: any error ⇒ empty output
@@ -26,7 +28,6 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readQuarantine } from '../lib/red-main-quarantine-io.mjs';
 import { decideCiSkip, ciJobContext, RED_MAIN_MODES } from '../lib/red-main-quarantine.mjs';
-import { resolveRedMainMode } from '../lib/red-main-hold.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
@@ -45,13 +46,14 @@ export function changedFilesOf({ board, base, run = git }) {
  */
 export function quarantineSkip({
   env = process.env, board = process.cwd(), now = Date.now(), flags = {},
-  mode = undefined, read = null, changed = undefined, readEvent = (p) => JSON.parse(readFileSync(p, 'utf8')),
+  mode = undefined, read = null, readList = (b) => readQuarantine({ board: b }), changed = undefined, readEvent = (p) => JSON.parse(readFileSync(p, 'utf8')),
 }) {
   // The mode is the one the safety net PUBLISHED on the list (it resolves it through env / preference / settings, which
-  // a CI job cannot see). An unstamped list falls back to this job's own cascade. An injected `mode` wins (replay/tests).
-  const r = read ?? readQuarantine({ board });
+  // a CI job cannot see). No stamp ⇒ stop: this job's tree and env are PR-controlled, never a source for the mode.
+  // An injected `mode` wins (replay/tests).
+  const r = read ?? readList(board);
   const published = r.ok && RED_MAIN_MODES.includes(r.list?.mode) ? { value: r.list.mode, source: 'ops/quarantine' } : null;
-  mode = mode ?? published ?? resolveRedMainMode({ env });
+  mode = mode ?? published ?? { value: 'stop', source: r.ok ? 'no stamp on ops/quarantine' : 'ops/quarantine unreadable' };
   if (mode.value !== 'quarantine') return { line: '', why: `redMainMode is ${mode.value} (${mode.source}) — running everything` };
   let event = null;
   const eventPath = flags['event-path'] ?? env.GITHUB_EVENT_PATH;

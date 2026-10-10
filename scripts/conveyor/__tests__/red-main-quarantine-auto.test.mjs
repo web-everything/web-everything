@@ -15,6 +15,7 @@ import * as quarantine from '../../lib/red-main-quarantine.mjs';
 const { parseVitestFailures, planSafetyNet, addEntries, pruneOnGreen, setMode, validateQuarantineList } = quarantine;
 import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
 import smell, { defaultQuarantineSafetyNet } from '../health-smells/main-ci-red.mjs';
+import { healthDir } from '../health-watch-section.mjs';
 
 const TEST_FILE = 'scripts/operations/__tests__/record-referral-ruling.test.mjs';
 const TEST_NAME = '#4979 the sanctioned writer > the reader hands the ruled PR and its head to the card resolver';
@@ -285,6 +286,48 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
     net({ mode: QUARANTINE, mainCiRuns: win2, list: entry, now: t0 + 60 * 60 * MIN * 50 });
     expect(Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds)).toEqual(['a'.repeat(40)]);
   });
+  describe('a push that lands but throws (PR #4816 review round 2)', () => {
+    const ledger = () => JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8'));
+    const addedEvents = (calls, list) => calls.writes.flatMap((w) => w.change(list).events ?? []).filter((e) => e.type === 'quarantine-added');
+    // A writer that persists the composed list and then throws (the push landed, the ack was lost).
+    const landThenThrow = () => { const box = { list: { version: 1, entries: [] } }; return { box, write: (w) => { box.list = w.change(box.list).list; throw new Error('push: connection reset after the ref moved'); }, readList: () => ({ ok: true, list: box.list }) }; };
+
+    it('never renews the expired entry', () => {
+      const t0 = at;
+      const lost = landThenThrow();
+      const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: t0, write: lost.write, readList: lost.readList });
+      expect(first.r.error).toMatch(/connection reset/);
+      expect(lost.box.list.entries).toHaveLength(1); // it did land
+      const later = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: t0 + 7 * 60 * MIN }); // expired, then pruned
+      expect(later.r.plan.why).toMatch(/expired — STOP/);
+      expect(addedEvents(later.calls, { version: 1, entries: [] })).toEqual([]);
+    });
+    it('the intent is on disk BEFORE the push, so a crash between the push and the ledger write still cannot renew it', () => {
+      let onDisk = null;
+      const crash = { write: () => { onDisk = ledger(); throw new Error('killed'); } };
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, ...crash });
+      expect(Object.values(onDisk.reds)[0].added).toEqual([TEST_FILE]);
+    });
+    it('an unreadable list after the throw keeps the intent (fail closed: STOP holds, nothing is renewed)', () => {
+      let reads = 0; // readable for the tick's own read, unreadable for the check after the throw
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('boom'); }, readList: () => (reads++ === 0 ? { ok: true, list: { version: 1, entries: [] } } : { ok: false, error: 'x' }) });
+      expect(Object.values(ledger().reds)[0].added).toEqual([TEST_FILE]);
+    });
+    it('a push that never landed is retried on the next tick', () => {
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('rejected'); } });
+      expect(Object.values(ledger().reds)[0].added).toEqual([]);
+      const retry = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
+      expect(retry.r.plan.action).toBe('add');
+    });
+    it('a live entry for this red that the ledger does not know is adopted, so it is not renewed after it is pruned', () => {
+      const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+      const entry = first.calls.writes[0].change({ version: 1, entries: [] }).list;
+      rmSync(join(dir, SAFETY_NET_LEDGER)); // the ledger was lost (crash, reset)
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: at + MIN });
+      const later = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: at + 7 * 60 * MIN });
+      expect(later.r.plan.why).toMatch(/expired — STOP/);
+    });
+  });
   it('a red window that has not been seen for 48h is forgotten', () => {
     net({ mainCiRuns: RUNS, now: at });
     net({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, now: at + 49 * 60 * MIN });
@@ -362,5 +405,28 @@ describe('main-ci-red smell hook', () => {
   });
   it('the default net never runs under test (no live IO from a smell test)', () => {
     expect(defaultQuarantineSafetyNet({ runs: RED_RUNS, failing: FAILING }, { now: Date.now() })).toBeNull();
+  });
+  describe('defaultQuarantineSafetyNet — replay flags (PR #4816 review round 2)', () => {
+    const REAL = healthDir();
+    const probe = (argv) => { const seen = []; defaultQuarantineSafetyNet({ runs: RED_RUNS, failing: FAILING }, { now: 1, argv, underTest: false, run: (o) => { seen.push(o); return null; } }); return seen[0]; };
+    it('a normal tick is live and writes under the daemon health dir', () => {
+      const o = probe(['node', 'health-watch.mjs', 'tick']);
+      expect(o.live).toBe(true);
+      expect(o.dir).toBe(REAL);
+    });
+    it('--state-root=DIR keeps the ledger and shadow log under that root, and is shadow', () => {
+      const o = probe(['node', 'health-watch.mjs', 'tick', '--state-root=/fixture/root']);
+      expect(o.live).toBe(false);
+      expect(o.dir).toBe(healthDir('/fixture/root'));
+    });
+    it('--state-root DIR (two words) is read too', () => {
+      expect(probe(['node', 'h.mjs', 'tick', '--state-root', '/fixture/root']).dir).toBe(healthDir('/fixture/root'));
+    });
+    it.each(['--main-ci-runs-fixture=/f.json', '--dry-run', '--lock-root=/l'])('%s without a state root never touches the real health dir', (flag) => {
+      const o = probe(['node', 'h.mjs', 'tick', flag]);
+      expect(o.live).toBe(false);
+      expect(o.dir).not.toBe(REAL);
+      expect(o.dir.startsWith(tmpdir())).toBe(true);
+    });
   });
 });
