@@ -142,6 +142,11 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
 
 /** The label every fix-dispatch / ci-heal-dispatch stale-guard refusal carries (live 2026-10-09 19:18:51Z: the
  *  guard ran with the `review-dispatch` default label, so the log blamed a review step that never ran). */
+// Card xx0055i — round history + takeover at the round cap (imports kept here, away from the import block).
+import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
+import { resolveFixSettings, takeoverMarkerBody, withTakeover } from './fix-takeover.mjs';
+import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
+
 export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
 const FIX_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let fixClosureMemo;
@@ -338,6 +343,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
+        ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
       });
       continue;
     }
@@ -455,6 +461,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       ...(entry.blockRuledReferrals?.length ? { blockRuledReferrals: entry.blockRuledReferrals } : {}),
       ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
+      ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
     });
   }
   return { planned, refusals };
@@ -1008,6 +1015,33 @@ export function fixerTableFor(ruling) {
   return { model: route.model, effort: route.effort, reason: `fixer-escalation rung ${ruling.rung?.id ?? '?'}` };
 }
 
+/**
+ * Card xx0055i — the brief with its round context: on a takeover, the takeover section + ALL rounds; otherwise, when
+ * `fix.roundHistory` is on and the PR has an earlier round, the bounded previous-rounds section. Best effort: an
+ * unreadable thread leaves the brief as it was (a takeover still gets its section, telling it to read the thread).
+ */
+export function briefWithRoundContext(prompt, planned, { repo, fixSettings, readHistoryInputs }) {
+  const wantHistory = planned.takeover || fixSettings?.roundHistory !== 'off';
+  let inputs = null;
+  if (wantHistory) { try { inputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { inputs = null; } }
+  const history = inputs ? buildRoundHistory(inputs) : null;
+  if (planned.takeover) {
+    return withTakeover(prompt, planned.takeover, {
+      allRoundsSection: history ? renderRoundHistory(history, { previousOnly: false, title: 'All rounds so far' }) : '',
+      baseRefName: inputs?.baseRefName ?? null, headRefName: inputs?.headRefName ?? planned.laneRef ?? null,
+    });
+  }
+  return history ? withRoundHistory(prompt, renderRoundHistory(history)) : prompt;
+}
+
+/** Card xx0055i — post the takeover marker (the bound {@link planTakeover} reads back off the thread). */
+export function postTakeoverMarker({ repo, pr, head, takeover, exec = execFileSyncThrottled }) {
+  exec('gh', ['pr', 'comment', String(pr), '--repo', ghRepoSlug(repo), '--body',
+    takeoverMarkerBody({ pr, head, attempts: takeover?.attempts, cap: takeover?.cap, rung: takeover?.rung })],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+  return true;
+}
+
 /** Post the send-back notice once per head (the durable record, and what the fixer reads on the thread). */
 export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
   // `noticedRungs` is read off the thread by the planner: one notice per head AND ladder rung.
@@ -1129,6 +1163,12 @@ export function dispatchFix(planned, {
   // advisor trial (#x331b7u) — the per-run sampling decision and its ledger row; a test stubs both.
   advisorFor = advisorForLaunch,
   recordAdvisor = recordAdvisorRun,
+  // Card xx0055i — the `fix.*` settings, the PR thread read behind the previous-rounds section, and the takeover
+  // marker post (the one-per-PR/head bound). All injectable so a test reads and posts nothing.
+  fixSettings = resolveFixSettings(),
+  // Hermetic under a test runner: a test that wants history injects its own reader.
+  readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
+  postTakeover = postTakeoverMarker,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
@@ -1172,7 +1212,7 @@ export function dispatchFix(planned, {
     // resolve blank ONLY for this population (`tokens.ATTRIBUTION` is already `PR #<n>` in this case —
     // `briefTokensForRepo` computed that from the same `itemNum: null` above, with zero extra logic needed here).
     const optionalNames = planned.itemNum ? undefined : [...OPTIONAL_BRIEF_PLACEHOLDERS, 'ITEM_NUM'];
-    const { prompt, unknownTokens } = fillBrief(readBrief(root), {
+    const { prompt: filledBrief, unknownTokens } = fillBrief(readBrief(root), {
       ITEM_NUM: planned.itemNum ?? '',
       PR_NUM: planned.pr,
       LANE_REF: planned.laneRef,
@@ -1181,9 +1221,11 @@ export function dispatchFix(planned, {
       SCOPE: planned.scope.join(','),
       ...tokens,
     }, BRIEF_REQUIRED_BY_KIND.fix, optionalNames, REPO_AWARE_VALUE_PATTERNS);
+    // Card xx0055i — round N>1 carries the previous rounds; the takeover carries ALL rounds plus its own section.
+    const prompt = briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs });
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.
-    const ladderTable = fixerTableFor(planned.rulingNotAddressed); // may refuse before anything is posted
+    const ladderTable = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover); // may refuse before anything is posted
     try {
       postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
     } catch (e) {
@@ -1191,6 +1233,15 @@ export function dispatchFix(planned, {
       let target = repo;
       try { target = ghRepoSlug(repo); } catch { /* unresolvable: name what we were given */ }
       throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} ruling notice post failed for PR #${planned.pr} (gh pr comment --repo ${target}): ${describeSpawnFailure(e, { label: 'gh comment' })}`);
+    }
+    if (planned.takeover) {
+      // Card xx0055i — the durable one-per-PR/head marker goes up BEFORE the spawn, so no second takeover can start.
+      try {
+        postTakeover({ repo, pr: planned.pr, head: planned.headRefOid, takeover: planned.takeover });
+      } catch (e) {
+        throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} takeover marker post failed for PR #${planned.pr}: ${describeSpawnFailure(e, { label: 'gh comment' })}`);
+      }
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} takeover at the round cap (${planned.takeover.attempts}/${planned.takeover.cap}) rung=${planned.takeover.rung?.id} model=${ladderTable?.model ?? 'default-fix-route'}`);
     }
     if (planned.rulingNotAddressed?.rung) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);

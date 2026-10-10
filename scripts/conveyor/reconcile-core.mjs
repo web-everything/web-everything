@@ -106,6 +106,7 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
+import { planTakeover } from './fix-takeover.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
  *  override (the IO shell, `reconcile-pass.mjs`, passes the loaded ladder with its routing-policy models). */
@@ -1563,6 +1564,9 @@ export function planReconcile({
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
   cardBatchExtract = CARD_BATCH_EXTRACT_WIRED,
   fixerLadder = DEFAULT_FIXER_LADDER,
+  // Card xx0055i — what the FIX round cap does: `person` (this pure core's default, byte-identical to before) or
+  // `takeover` (one takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting.
+  roundCapAction = 'person', takeoverMaxPerPr = 1,
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -1688,11 +1692,25 @@ export function planReconcile({
     // Built over an injected `refuseFn` so the ci-red-parallel review (below) can fold its `cap-exhausted` into
     // the PR's one `owed-ci-rerun` row while still surfacing the SAME note.
     const capExhaustedVia = (refuseFn) => (extra) => {
-      refuseFn('cap-exhausted', extra);
+      // Card xx0055i — at the FIX round cap, `fix.roundCapAction: takeover` dispatches ONE takeover fix (full round
+      // history, top claude rung of the fixer ladder) instead of the "a person must take it over" note. A spent
+      // takeover, a ruling dispute, or the `person` setting falls through to the note exactly as before.
+      const takeover = extra.capKind === 'fix' ? planTakeover({ pr, roundCapAction, takeoverMaxPerPr, fixerLadder }) : null;
+      if (takeover?.ok) {
+        dispatch.push({
+          ...base, ...extra, kind: 'fix', mode: 'takeover', findings: Math.max(1, Number(extra.findings) || 0),
+          ...(Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length ? { blockRuledReferrals: pr.blockRuledReferrals } : {}),
+          takeover: { attempts: extra.attempts, cap: extra.cap, rung: takeover.rung, route: takeover.route },
+          why: `fix rounds exhausted (${extra.attempts}/${extra.cap}) — one automatic takeover on the ${takeover.rung.id} route (fix.roundCapAction=takeover) before the operator is asked`,
+        });
+        return;
+      }
+      refuseFn('cap-exhausted', { ...extra, ...(takeover ? { takeover: takeover.reason } : {}) });
       notes.push({
         kind: 'round-cap-exhausted', prNumber, attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind,
         ...(extra.capKind === 'fix' ? { parkToHuman: true } : {}),
-        text: roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind),
+        text: roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
+          + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : ''),
       });
     };
     const refuseCapExhausted = capExhaustedVia(refuse);
