@@ -14,7 +14,7 @@ import {
 } from '../../lib/stack-review-while-open.mjs';
 import { isDraftOwedPromotion, isPromotionCandidate } from '../draft-promotion-rule.mjs';
 import { runReconcilePromoteDraftDispatch } from '../../operations/promote-draft-pr-dispatch.mjs';
-import { applyStackOrder, markParallelFixPairs, resetHoldMemo } from '../pr-stack.mjs';
+import { applyStackOrder, markParallelFixPairs, resetHoldMemo, detectStacks, readStacksForPass } from '../pr-stack.mjs';
 import { findStackBases, decideStackDispatch, renderStackMarker, stackHoldHeading } from '../review-stack-base.mjs';
 import { classifyPr } from '../../merge-ai-prs.mjs';
 
@@ -197,5 +197,38 @@ describe('drain: never merges a PR whose base is not main', () => {
   it('the same PR retargeted to main after its base merged is no longer held by this arm', () => {
     const v = classifyPr({ ...ready, baseRefName: 'main' }, { defaultBranch: 'main' });
     expect(v.reason).not.toMatch(/base is not/);
+  });
+});
+
+describe('a GitHub stack is a stack regardless of ancestry (live #4759 on #4756, 2026-10-10)', () => {
+  beforeEach(() => resetHoldMemo());
+  const B = sha('1'); const T = sha('2');
+  const rows = [
+    { pr: 4756, headRefName: 'lane/fixer-history-takeover', headRefOid: B, baseRefName: 'main', author: 'bot' },
+    // #4759 names #4756's branch as its base but has NOT merged #4756's latest head: ancestry says "unrelated".
+    { pr: 4759, headRefName: 'lane/takeover-review-attempt', headRefOid: T, baseRefName: 'lane/fixer-history-takeover', author: 'bot' },
+  ];
+  const isAncestor = () => false;
+  it('detectStacks pairs the top with the PR whose head branch is its base, and owes a restack onto it', () => {
+    const { pairs } = detectStacks(rows, { isAncestor, onMain: () => false, allowPair: (a, b) => a.author === b.author });
+    expect(pairs).toEqual([expect.objectContaining({ top: 4759, bottom: 4756, bottomRef: 'lane/fixer-history-takeover', bottomOpen: true, inSync: false })]);
+  });
+  it('a different actor\'s PR named as base forms no stack (same trust rule as ancestry)', () => {
+    const other = [rows[0], { ...rows[1], author: 'someone-else' }];
+    expect(detectStacks(other, { isAncestor, onMain: () => false, allowPair: (a, b) => a.author === b.author }).pairs).toEqual([]);
+  });
+  it('readStacksForPass reads baseRefName from GitHub, so the top is no longer a P1 peer: it is restacked, never fixed on the bottom\'s files as a peer', () => {
+    const stacks = readStacksForPass({
+      root: '.', repoKey: 'we', settings, planned: [{ pr: 4759, laneRef: 'lane/takeover-review-attempt', headRefOid: T }],
+      openPrFiles: [{ pr: 4756 }, { pr: 4759 }],
+      readRefs: () => new Map(rows.map((r) => [r.pr, { headRefName: r.headRefName, headRefOid: r.headRefOid, baseRefName: r.baseRefName, isCrossRepository: false, author: r.author }])),
+      readLanes: () => new Map(rows.map((r) => [r.headRefName, r.headRefOid])),
+      isAncestor, onMain: () => false, readMem: () => [], writeMem: () => {},
+      reviewWhileBaseOpen: () => true, readStackFiles: () => () => null, readClaims: () => [{ meta: { pr: 4756 } }],
+    });
+    expect(stacks.pairs).toEqual([expect.objectContaining({ top: 4759, bottom: 4756, inSync: false })]);
+    const out = applyStackOrder([{ pr: 4759 }, { pr: 4756 }], stacks, { settings });
+    const top = out.planned.find((e) => e.pr === 4759);
+    expect(top.restack).toEqual(expect.objectContaining({ bottomPr: 4756, onto: 'lane/fixer-history-takeover' }));
   });
 });

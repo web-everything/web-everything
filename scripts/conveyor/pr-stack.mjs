@@ -11,7 +11,15 @@ import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { stackReviewWhileBaseOpen, stackedTopMayFixInParallel } from '../lib/stack-review-while-open.mjs';
-import { listFixDispatchClaims } from './fix-dispatch-claim.mjs';
+// The fix-claim reader is loaded AFTER this module graph evaluates: a static import closes a cycle
+// (fix-dispatch-claim → reconcile-core → … → pr-stack) and hit a TDZ ReferenceError in reconcile-core. Until it resolves
+// the claim read is "unknown", which keeps the bottom-first hold (fail closed).
+let listFixDispatchClaims = null;
+import('./fix-dispatch-claim.mjs').then((m) => { listFixDispatchClaims = m.listFixDispatchClaims; }).catch(() => {});
+const readLiveFixClaims = () => {
+  if (typeof listFixDispatchClaims !== 'function') throw new Error('fix-claim reader not loaded yet');
+  return listFixDispatchClaims(undefined, { liveOnly: true });
+};
 
 export const PR_STACK_DEFAULTS = Object.freeze({ detect: true, bottomFirst: true, restack: true, restackMaxRounds: 3, holdMaxAgeMs: 6 * 3600e3 });
 export const PR_STACK_ENV = Object.freeze({ detect: 'WE_PR_STACK_DETECT', bottomFirst: 'WE_PR_STACK_BOTTOM_FIRST', restack: 'WE_PR_STACK_RESTACK', restackMaxRounds: 'WE_PR_STACK_RESTACK_MAX_ROUNDS', holdMaxAgeMs: 'WE_PR_STACK_HOLD_MAX_AGE_MS' });
@@ -173,6 +181,19 @@ export function detectStacks(prs, { isAncestor: rawAncestor, onMain: rawOnMain =
       && isAncestor(nearest.headRefOid, open.get(prior.bottom)?.headRefOid) !== false
       && isAncestor(prior.containedHead, top.headRefOid) !== false;
     if (!held) pairs.set(top.pr, pair(top, nearest, remembered.find(old => old.top === top.pr && old.bottom === nearest.pr)));
+  }
+  // A GitHub stack IS a stack, whatever the ancestry says (live #4759, 2026-10-10): its `baseRefName` is #4756's head
+  // branch, but it had not merged #4756's latest commits, so ancestry paired it with nothing. Treated as a peer, it took
+  // P1 and the fix scope on #4756's own files and blocked #4756 and #4771 behind it. The declared base wins over the
+  // ancestry pick: the bottom is the open, trusted PR whose head branch the top names as its base, by the same actor.
+  // A top that does not contain the bottom's head reads `inSync: false`, so the ordinary restack onto the bottom is owed.
+  const byHeadRef = new Map(trusted.filter(p => isLaneRef(p.headRefName)).map(p => [p.headRefName, p]));
+  for (const top of trusted) {
+    const bottom = isLaneRef(top.baseRefName) ? byHeadRef.get(top.baseRefName) : null;
+    if (!bottom || bottom.pr === top.pr || !allowPair(top, bottom)) continue;
+    const prior = pairs.get(top.pr);
+    if (prior?.bottomOpen && prior.bottom === bottom.pr) continue;
+    pairs.set(top.pr, pair(top, bottom, remembered.find(old => old.top === top.pr && old.bottom === bottom.pr)));
   }
   return { pairs: [...pairs.values()], ...(stats.exhausted || !scan ? { truncated: true } : {}) };
 }
@@ -394,8 +415,8 @@ export function readOriginLaneTips(dir, { run = args => execFileSync('git', ['-C
 export function readOpenPrRefs(dir, { repo = CONSTELLATION_REPOS.we.slug, run = args => execFileSync('gh', args, { cwd: dir, encoding: 'utf8', timeout: 60e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) } = {}) {
   const refs = new Map();
   try {
-    for (const row of JSON.parse(run(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,isCrossRepository,author']))) {
-      if (Number.isInteger(row?.number)) refs.set(row.number, { headRefName: row.headRefName ?? null, headRefOid: row.headRefOid ?? null, isCrossRepository: row.isCrossRepository !== false,
+    for (const row of JSON.parse(run(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,headRefName,headRefOid,baseRefName,isCrossRepository,author']))) {
+      if (Number.isInteger(row?.number)) refs.set(row.number, { headRefName: row.headRefName ?? null, headRefOid: row.headRefOid ?? null, baseRefName: row.baseRefName ?? null, isCrossRepository: row.isCrossRepository !== false,
         author: typeof row.author?.login === 'string' && row.author.login ? row.author.login.toLowerCase() : null });
     }
   } catch { /* unreadable: the PRs stay unverified */ }
@@ -420,7 +441,7 @@ export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], se
   readRefs = readOpenPrRefs, isAncestor = gitIsAncestor(root), onMain = gitOnMain(root), readMem = readRemembered, writeMem = writeRemembered,
   readLanes = readOriginLaneTips, now = Date.now,
   reviewWhileBaseOpen = () => stackReviewWhileBaseOpen(), readStackFiles = gitDiffNames,
-  readClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }) }) {
+  readClaims = readLiveFixClaims }) {
   try {
     if (repoKey !== 'we' || !settings.detect) return { pairs: [] };
     // No open-PR list (a deferred or failed read) proves nothing: keep the memory untouched and detect nothing.
@@ -437,8 +458,8 @@ export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], se
       const ref = refs.get(pr);
       const known = prs.get(pr);
       prs.set(pr, known
-        ? { ...known, author: ref?.author ?? null }
-        : { pr, headRefName: ref?.headRefName ?? null, headRefOid: ref?.headRefOid ?? null, ...stackRowFlags(ref) });
+        ? { ...known, author: ref?.author ?? null, baseRefName: ref?.baseRefName ?? null }
+        : { pr, headRefName: ref?.headRefName ?? null, headRefOid: ref?.headRefOid ?? null, baseRefName: ref?.baseRefName ?? null, ...stackRowFlags(ref) });
     }
     const flagged = flagUntrustedStackRows([...prs.values()], tips);
     // Ownership: a NEW stack needs both PRs by the same actor. Someone else's PR whose head merely sits inside (or under)
@@ -467,7 +488,7 @@ export function gitDiffNames(dir) {
  * hand). Never throws.
  */
 export function markParallelFixPairs(stacks, { root, reviewWhileBaseOpen = () => stackReviewWhileBaseOpen(), readFiles = gitDiffNames,
-  readClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }), base = 'origin/main' } = {}) {
+  readClaims = readLiveFixClaims, base = 'origin/main' } = {}) {
   try {
     if (!stacks?.pairs?.some(p => p.bottomOpen)) return stacks;
     if (!reviewWhileBaseOpen()) return stacks;
