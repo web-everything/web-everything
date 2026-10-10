@@ -107,6 +107,18 @@ describe('decideOpenPr — the five required behaviours', () => {
     expect(d.exempt).toBe(true);
   });
 
+  it('a CARD-ONLY changeset may OPEN even over the limit — it is not counted, so it cannot raise the count (xbxahvf)', () => {
+    const d = decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md', 'backlog/x9dscc7-b.md'] });
+    expect(d.allowed).toBe(true);
+    expect(d.exempt).toBe(true);
+    expect(d.reason).toMatch(/card-only/);
+  });
+
+  it('a card plus any non-card file, or an unreadable (empty) changeset, still meets the limit', () => {
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md', 'docs/x.md'] }).allowed).toBe(false);
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: [] }).allowed).toBe(false);
+  });
+
   it('GLOBAL OFF allows even over the limit', () => {
     const d = decideOpenPr({ ...base, openCount: 9, globalOff: true });
     expect(d.allowed).toBe(true);

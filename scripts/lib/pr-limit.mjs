@@ -360,6 +360,11 @@ export function decideOpenPr({
   if (isExemptChangeset(changedFiles)) {
     return { allowed: true, reason: 'exempt: conveyor/daemon infrastructure changeset (a fix to the review/land machinery itself always gets through)', exempt: true, overridden: false };
   }
+  // A card-only PR is never COUNTED (#4713), so refusing to OPEN one guards a count it cannot raise (xbxahvf; live
+  // 2026-10-10 the first card-batch draft was refused at 17/15). `isCardOnlyDiff` is the one definition, fail-closed.
+  if (isCardOnlyDiff(changedFiles)) {
+    return { allowed: true, reason: 'exempt: card-only changeset (not counted toward the limit)', exempt: true, overridden: false };
+  }
   if (globalOff) {
     return { allowed: true, reason: 'pr-limit is globally OFF (operator override)', exempt: false, overridden: true };
   }
