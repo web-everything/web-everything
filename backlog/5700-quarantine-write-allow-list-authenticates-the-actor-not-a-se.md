@@ -1,15 +1,16 @@
 ---
+bornAs: xgvuwd8
 kind: story
 size: 2
 status: open
-scope: ["we:scripts/lib/red-main-quarantine.mjs"]
+scope: ["we:scripts/lib/red-main-quarantine-io.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Justify or trim quarantine as a second containment policy before it becomes default
+# Quarantine write allow-list authenticates the actor, not a self-declared --actor string
 
-From #4624 round-3 advisory (simplicity): we:scripts/lib/red-main-quarantine.mjs adds a second containment policy whose consumers are deferred. Before the quarantine-default flip, wire its consumers (ci skip step, auto add/prune, rerun routing) or trim it; red-team review required (operator gate). Blocks making quarantine the default.
+From #4624 round-3 advisory (correctness): we:scripts/lib/red-main-quarantine-io.mjs:65 trusts a self-declared --actor name for the write allow-list; module prose says only the red-main safety net or the operator may write. Bind writes to an authenticated identity (signed ledger row / App identity / operator channel). Blocks making quarantine the default.
 
 ## Acceptance
 
