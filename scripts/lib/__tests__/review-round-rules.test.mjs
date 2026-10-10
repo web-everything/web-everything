@@ -232,14 +232,15 @@ describe('projectAvoidedRounds', () => {
 describe('resolveReviewSettings', () => {
   it('preserves the built-in defaults and allows file shadow mode', () => {
     expect(resolveReviewSettings({ fileConfig: null, env: {} }))
-      .toEqual({ scopedRereview: 'off', referralDefault: 'operator' });
+      .toEqual({ scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off' });
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: {} }).scopedRereview).toBe('shadow');
   });
   it('lets an explicit off environment override the file', () => {
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: { WE_REVIEW_SCOPED_REREVIEW: 'off' } })
       .scopedRereview).toBe('off');
   });
-  it.each(['on', 'yes'])('rejects invalid scoped mode %s in file and environment', (invalid) => {
+  // `on` is valid since card 5470 (we:scripts/lib/__tests__/review-settings.test.mjs).
+  it.each(['ON', 'yes'])('rejects invalid scoped mode %s in file and environment', (invalid) => {
     const env = { WE_REVIEW_SCOPED_REREVIEW: invalid };
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env }).scopedRereview).toBe('shadow');
     expect(resolveReviewSettings({ fileConfig: null, env }).scopedRereview).toBe('off');
