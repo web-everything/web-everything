@@ -123,6 +123,8 @@ export const SAFETY_NET_SHADOW_LOG = 'red-main-quarantine-shadow.jsonl';
 const JOB_READ_RETRY_BASE_MS = 60_000;
 const JOB_READ_RETRY_MAX_MS = 15 * 60_000;
 const LEDGER_RETENTION_MS = 48 * 60 * 60 * 1000;
+/** Red commits a window record remembers (newest kept), so the ledger stays bounded on a long red. */
+const RED_SHAS_KEPT = 200;
 
 const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
 
@@ -196,7 +198,7 @@ export function runSafetyNet({
   const state = mainRedState(mainCiRuns?.runs);
   const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false };
   let sha = null;
-  let windowShas = [];
+  let activeKey = null;
   try {
     // Flipped back to `stop` after this daemon published `quarantine` on the list: withdraw the stamp so CI (which
     // reads the mode from the list) stops skipping at once, not at entry expiry. Nothing is written by a daemon
@@ -210,10 +212,14 @@ export function runSafetyNet({
     }
     sha = state.status === 'red' ? String(state.firstRed?.sha ?? '') : null;
     // A truncated read (no green in the window) makes `firstRed` slide to a newer commit as the window moves: the
-    // window's record is found under ANY red commit still in view, so it is neither forked nor orphaned.
-    windowShas = sha ? [sha, ...(state.redShas ?? [])].filter(Boolean) : [];
-    const recKey = windowShas.find((k) => ledger.reds[k]) ?? sha;
-    const rec = sha ? (ledger.reds[recKey] ??= { at: now, added: [] }) : null;
+    // window's record is found by ANY red commit it has seen that is still in view (the record remembers them all, so
+    // a window that slid past its key still overlaps the previous one), so it is neither forked nor orphaned.
+    const windowShas = sha ? [sha, ...(state.redShas ?? [])].filter(Boolean) : [];
+    activeKey = windowShas.find((k) => ledger.reds[k])
+      ?? Object.keys(ledger.reds).find((k) => ledger.reds[k]?.shas?.some((s) => windowShas.includes(s)))
+      ?? sha;
+    const rec = sha ? (ledger.reds[activeKey] ??= { at: now, added: [] }) : null;
+    if (rec) rec.shas = [...new Set([...(rec.shas ?? [activeKey]), ...windowShas])].slice(-RED_SHAS_KEPT);
     if (rec) rec.seenAt = now; // an active window is never evicted from the ledger, however long it runs
     let jobFailures = {};
     const failedJobs = state.status === 'red' ? (mainCiRuns?.failing?.jobs ?? null) : null;
@@ -299,7 +305,7 @@ export function runSafetyNet({
   } finally {
     // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window
     // that is red right now is never forgotten: its record is what keeps an expired entry from being re-added.
-    for (const [k, v] of Object.entries(ledger.reds)) if (!windowShas.includes(k) && now -(Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];
+    for (const [k, v] of Object.entries(ledger.reds)) if (k !== activeKey && now -(Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];
     try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort */ }
   }
 }
