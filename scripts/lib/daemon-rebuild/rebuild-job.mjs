@@ -36,6 +36,7 @@ import { evictSnapshots, npmCiInstaller } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../../operations/run-store.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
+import { readGit } from '../proc-read.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
@@ -121,8 +122,8 @@ function removeJobFiles(dir, id) {
   for (const ext of ['.log', RESULT_SUFFIX, '.json.lock']) rmSync(join(dir, `${id}${ext}`), { force: true });
 }
 function readHead(root) {
-  return execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], {
-    encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+  return readGit(['-C', root, 'rev-parse', 'HEAD'], {
+    timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
   }).trim();
 }
 
