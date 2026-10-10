@@ -229,7 +229,9 @@ const failureLine = (e) => {
 // NO LAUNDERING (the rule `mayBeTransient:false` exists for): the tree's own text can print "no free lane", and
 // a hung tree can simply sleep. So a skip needs ALL of: (1) a time-out/exhaustion signature, (2) the gate's own
 // clock shows the probe really spent >= 90% of its cap, and (3) evidence from OUTSIDE the tree that the host is
-// busy (1-minute load average >= CPU count, `WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
+// busy: a KNOWN non-admit from the shared `rebuild-smoke` resource decision. An `unknown` decision (sampler down:
+// snapshot missing/stale) is no evidence, so the 1-minute load average >= CPU count rule decides instead
+// (`WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
 // (reconcile, dispatch dry-run, daemon boot, tree-stays-clean) still gates adoption.
 /** lane-pool's own "another acquire still held the shared scan lock" refusal (#xj2k2pp). It names a DIFFERENT
  *  caller's work, never the tree under test, so it is busy-pool on its own — no host-load check needed. Live
