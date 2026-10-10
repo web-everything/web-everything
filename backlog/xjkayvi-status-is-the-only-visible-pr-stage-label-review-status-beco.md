@@ -1,7 +1,6 @@
 ---
 kind: story
 size: 5
-parent: "xyr5c8u"
 status: open
 scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/conveyor/review-status-tag.mjs"]
 dateOpened: "2026-10-10"
@@ -10,7 +9,7 @@ tags: []
 
 # status:* is the only visible PR stage label; review-status:* becomes internal state
 
-Refiled: x1hqjfx was scaffolded 2026-10-10 in lane-20 but never reached main or a PR. Operator 2026-10-10 ~12:35 ET: PRs carry both status:fixing and review-status:fixing (and awaiting-ci, ...). Map every review-status:* value (reviewing, fixing, fixing-conflict, awaiting-ci, awaiting-base, draft-withdrawn, fix-stalled, ...) onto a status:* value in we:scripts/conveyor/pr-status-label.mjs; stop writing review-status:* labels in we:scripts/conveyor/review-status-tag.mjs (keep the value as internal state/ledger); remove old labels from open PRs through that single writer; first migrate every reader (operator-queue, /wip, coroner, drain, we:scripts/conveyor/takeover-budget.mjs#gateHoldReason) to internal state or status:*, with tests. Setting labels.legacyReviewStatus (cascade) switches the old labels back on.
+Refiled: x1hqjfx (intended parent xyr5c8u, the takeover-budget card in PR #4779, not on main yet) was scaffolded 2026-10-10 in lane-20 but never reached main or a PR. Operator 2026-10-10 ~12:35 ET: PRs carry both status:fixing and review-status:fixing (and awaiting-ci, ...). Map every review-status:* value (reviewing, fixing, fixing-conflict, awaiting-ci, awaiting-base, draft-withdrawn, fix-stalled, ...) onto a status:* value in we:scripts/conveyor/pr-status-label.mjs; stop writing review-status:* labels in we:scripts/conveyor/review-status-tag.mjs (keep the value as internal state/ledger); remove old labels from open PRs through that single writer; first migrate every reader (operator-queue, /wip, coroner, drain, we:scripts/conveyor/takeover-budget.mjs#gateHoldReason) to internal state or status:*, with tests. Setting labels.legacyReviewStatus (cascade) switches the old labels back on.
 
 ## Acceptance
 
