@@ -384,7 +384,7 @@ export function applyContextPack(brief, { kind = 'fix', settings = CONTEXT_PACK_
   if (!pack) return testsOnly();
   // The pack is applied to the TEMPLATE, before `fillBrief`: a `{{NAME}}` inside quoted reviewer text or code (a
   // finding on a brief template itself) must stay literal, so a word joiner breaks the token shape.
-  return `${escapeTokens ? pack.replace(/\{\{/g, '{⁠{') : pack}\n\n---\n\n${trimmed.text}`;
+  return `${escapeTokens ? pack.replace(/\{\{/g, '{\u2060{') : pack}\n\n---\n\n${trimmed.text}`;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -430,7 +430,7 @@ export function readCiPackInputs({ repoSlug, pr, exec }) {
   if (job) {
     try {
       const log = String(exec('gh', ['run', 'view', '--job', job, '--log-failed', '--repo', repoSlug], GH_OPTS));
-      logTail = log.split('\n').slice(-400).map((l) => l.replace(/^[^\t]*\t[^\t]*\t(?:﻿?\d{4}-\d\d-\d\dT[\d:.]+Z\s?)?/, '')).join('\n');
+      logTail = log.split('\n').slice(-400).map((l) => l.replace(/^[^\t]*\t[^\t]*\t(?:\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z\s?)?/, '')).join('\n');
     } catch { logTail = ''; }
   }
   let files = [];

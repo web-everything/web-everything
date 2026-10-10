@@ -110,7 +110,7 @@ describe('the brief with a context pack', () => {
     expect(pack).toContain('Do NOT re-run it after the fix');
     expect(pack).not.toContain('old ask'); // only the latest changes-requested comment
     // A {{TOKEN}} inside quoted text must survive fillBrief literally (the pack is applied to the template).
-    expect(pack).toContain('{⁠{PR_NUM}}');
+    expect(pack).toContain('{\u2060{PR_NUM}}');
   });
 
   it('the size cap holds and the packed brief is SMALLER than the plain one (redundant sections trimmed)', () => {
