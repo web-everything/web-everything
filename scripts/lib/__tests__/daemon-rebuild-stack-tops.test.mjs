@@ -7,7 +7,8 @@
  *   newcomers colliding with #4756 on fix-takeover.mjs / reconcile-core.mjs, so none of the stack's fixes went live.
  *   In `overlay.stackMode: tops` (the default) a rebuild applies only the stack tops; a base contained in a top is
  *   set aside (it is live through the top), and a base that MOVED away from its children is set aside too, keeping
- *   the children's tops until they are restacked. These tests replay that shape through planRebuild and rebuildClone.
+ *   the children's tops until they are restacked. A PINNED base is never set aside, and an overlay already in main
+ *   takes no part in a stack. These tests replay that shape through planRebuild and rebuildClone.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -260,7 +261,8 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
       overlays: [{ ref: 'lane/mech-base', pr: 9001 }, { ref: 'lane/mech-top', pr: 9002 }],
     });
     // The base is NOT set aside: it applies on its own, and the top (which carries the base's OLD mechanism change,
-    // so it is mechanism-pinned too) conflicts with it — the pin refuses the build instead of dropping either.
+    // so it is mechanism-pinned too) conflicts with it. In this fixture main lacks the mechanism files, so the pin
+    // refuses the build (with them in main the top would be conflict-skipped with an alert) — never dropped silently.
     expect(plan.alerts?.map((a) => a.kind) ?? []).not.toContain('overlay-stack-base-moved');
     expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict', detail: { ref: 'lane/mech-top', pinnedBy: 'mechanism' } });
   });
@@ -276,6 +278,23 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     expect(plan.ok).toBe(true);
     expect(plan.decisions.find((d) => d.ref === 'lane/mech-base')).toMatchObject({ action: 'apply' });
     expect(plan.decisions.find((d) => d.ref === 'lane/mech-base').reason).not.toBe('stack-contained');
+  });
+
+  it.each([
+    ['flag', { pinned: true }, 'lane/pin-base-flag', { [LADDER]: lines({ 3: 'flag base' }) }],
+    ['mechanism', {}, 'lane/pin-base-mech', { [MECH]: lines({ 2: 'mech base' }) }],
+  ])('a %s-pinned base listed AFTER the top that contains it is skipped, never removed as in-main', async (_k, flag, baseRef, files) => {
+    const f = fixture();
+    const p = f.push(baseRef, f.init, files);
+    f.push('lane/pin-top', p, { [TAKEOVER]: lines({ 8: 'top' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: 'lane/pin-top' }, { ref: baseRef, ...flag }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/pin-top')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === baseRef)).toMatchObject({ action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
   });
 
   it('addOverlay records only safe branch names as stackBases', async () => {

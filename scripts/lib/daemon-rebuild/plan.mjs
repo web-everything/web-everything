@@ -157,7 +157,7 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
     // A PINNED base (flag or mechanism) is never set aside, contained or moved: it stays an independent overlay, so a
     // conflict reaches `refusePinned` instead of leaving the build without it.
     if (isPinned(p.raw, p.sha)) continue;
-    const tops =nodes.filter((n) => descendants(p.ref).has(n.ref) && isTop(n.ref));
+    const tops = nodes.filter((n) => descendants(p.ref).has(n.ref) && isTop(n.ref));
     if (tops.length === 0) continue; // a cycle of equal tips — leave it to the plain loop
     const containing = tops.filter((t) => anc(p.sha, t.sha));
     if (containing.length > 0) {
@@ -183,7 +183,9 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
  * from the returned `decisions`.
  * Held item 212 — in `stackMode: 'tops'` (default) stacked overlays are planned as stacks (see {@link planOverlayStacks}):
  * only the tops apply, and a base contained in a top, or a base that moved away from its children, is SKIPPED (stays
- * registered) and comes back on its own only if none of its tops could apply.
+ * registered) and comes back on its own only if none of its tops could apply. Exceptions: a PINNED base is never set
+ * aside (it applies on its own; listed after a top that contains it, it is `skip`ped as `pinned-contained-in-applied`
+ * rather than removed as `in-main`), and an overlay already an ancestor of main is not part of any stack.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
@@ -370,6 +372,14 @@ export async function planRebuild({
     //    compare against `cur` catches it regardless of history shape.
     const curTree = verifyRev(git, `${cur}^{tree}`);
     if (tree && curTree && tree === curTree) {
+      // A PINNED overlay whose tip an already-applied overlay contains (listed after its top) is live through that
+      // top, not in main: it stays registered (`skip`), so the top later leaving never loses it silently.
+      if (pinnedStatus(git, raw, mainSha, ovSha).pinned
+        && git(['merge-base', '--is-ancestor', ovSha, cur]).status === 0
+        && git(['merge-base', '--is-ancestor', ovSha, mainSha]).status !== 0) {
+        decisions.push({ ref, pr, action: 'skip', reason: 'pinned-contained-in-applied', sha: ovSha });
+        continue;
+      }
       decisions.push({ ref, pr, action: 'remove', reason: 'in-main', sha: ovSha });
       continue;
     }
