@@ -263,6 +263,7 @@ import { ADVISORY_NOTE_MARKER } from '../conveyor/advisory-round-count.mjs';
 // The `advisory:*` label pair's outcome vocabulary — a leaf, shared with the sink, the staleness sweep and
 // `operator-queue.mjs` so nobody restates it.
 import { ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { isValidRoundBudget } from '../lib/review-settings.mjs';
 
 /** The operation's stable id. Adapters resolve it by this name. */
 export const REVIEW_PR_OP = 'review-pr';
@@ -1126,8 +1127,12 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     priorRounds: Number(raw?.priorRounds) || 0,
     latestFix: raw?.latestFix && typeof raw.latestFix === 'object' ? raw.latestFix : undefined,
     // Card 5469 — the scoped re-review shadow mode, resolved by the io shell from the declared setting. Absent when
-    // `off` (the built-in), so an off run's record is byte-identical to before.
-    ...(raw?.scopedRereview === 'shadow' ? { scopedRereview: 'shadow' } : {}),
+    // `off` (the built-in), so an off run's record is byte-identical to before. `on` is card 5470's.
+    ...(['shadow', 'on'].includes(raw?.scopedRereview) ? { scopedRereview: raw.scopedRereview } : {}),
+    // Card 5471 — the round budget K and the ledger round, resolved by the io shell. Absent when the budget is off.
+    // An unknown round stays `null` (the budget never acts on it). Read by we:scripts/lib/review-loop-policy.mjs.
+    ...(isValidRoundBudget(raw?.roundBudget)
+      ? { roundBudget: raw.roundBudget, reviewRound: Number.isInteger(raw.reviewRound) && raw.reviewRound >= 1 ? raw.reviewRound : null } : {}),
     pr: Number(detail.pr) || Number(pr) || 0,
     repo: String(detail.repo || repo || ''),
     title: String(detail.title || ''),
@@ -2705,7 +2710,7 @@ export function reviewPrOperation({
           ...(shadowSeats.length ? { shadowSeats } : {}),
           // Card 5469 — the lenses whose seats reduce into the verdict (advisory seats excluded), so the scoped
           // re-review shadow can tell which findings held the live verdict. Recorded only when the shadow is on.
-          ...(read.scopedRereview === 'shadow' ? { basisLenses: Object.keys(verdictAdmitted) } : {}),
+          ...(read.scopedRereview === 'shadow' || read.scopedRereview === 'on' || read.roundBudget ? { basisLenses: Object.keys(verdictAdmitted) } : {}),
         };
       },
     }),
@@ -2772,7 +2777,7 @@ export function reviewPrOperation({
         // (a run parked at `confirm` never reaches `ledgerEvents`) and only after any advisory note/labels landed. It
         // records finding identities and journals would-block / would-card; it never touches a comment, label or verdict,
         // and its sink never throws. Absent when the setting is `off` (the built-in), so `off` is exactly today.
-        const shadow = read.scopedRereview === 'shadow' ? [{
+        const shadow = read.scopedRereview === 'shadow' || read.scopedRereview === 'on' ? [{
           type: REVIEW_EFFECTS.SCOPED_REREVIEW_SHADOW,
           payload: { pr: view.input.pr, repo: view.input.repo, roundFacts: scopedRereviewFacts(read, view.verdict) },
           idempotent: true,
