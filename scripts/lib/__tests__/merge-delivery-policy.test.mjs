@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { STANDARD_MERGE_DELIVERY, resolveMergeDeliveryPolicy, formatMergeDeliverySourcesLine, loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { STANDARD_MERGE_DELIVERY, MERGE_METHODS, resolveMergeDeliveryPolicy, formatMergeDeliverySourcesLine, loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { groupHeadsOf } from '../../merge-gate-check.mjs';
+import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 
 describe('merge delivery policy cascade', () => {
   it('uses standard defaults without layers', () => {
@@ -101,5 +103,34 @@ describe('loadMergeDeliveryPolicy', () => {
   it('keeps the committed platform strategy drain-direct', () => {
     const platform = JSON.parse(readFileSync(new URL('../delivery-platform-preferences.json', import.meta.url), 'utf8'));
     expect(resolveMergeDeliveryPolicy({ platform: platform.mergeDelivery }).strategy).toBe('drain-direct');
+  });
+});
+
+// PR #4708 round-6 finding (merge-delivery-policy.mjs:62): the merge_group gate pins each PR to the SECOND PARENT
+// of its queue merge commit. Every merge method the validator accepts must produce a pinnable group head, or the
+// queue fails every PR closed and nothing merges.
+describe('mergeMethod is tied to merge-group head pinning', () => {
+  // The commit each GitHub merge-queue method writes to the group's first-parent history for one PR.
+  const QUEUE_COMMIT_OF = {
+    merge: (n, head) => ({ subject: `Merge pull request #${n} from o/lane/x`, parents: ['a'.repeat(40), head] }),
+    squash: (n) => ({ subject: `Title (#${n})`, parents: ['a'.repeat(40)] }),
+    rebase: (n) => ({ subject: `Commit (#${n})`, parents: ['a'.repeat(40)] }),
+  };
+
+  it('every accepted mergeMethod yields the PR head sha from groupHeadsOf', () => {
+    const head = 'b'.repeat(40);
+    for (const method of MERGE_METHODS) {
+      expect(QUEUE_COMMIT_OF[method], `no queue-commit shape known for ${method}`).toBeTypeOf('function');
+      expect(groupHeadsOf([QUEUE_COMMIT_OF[method](42, head)]), method).toEqual({ 42: head });
+    }
+  });
+
+  it('refuses squash and rebase (ignored, reported) and the ruleset never suggests them', () => {
+    for (const bad of ['squash', 'rebase']) {
+      const policy = resolveMergeDeliveryPolicy({ tool: { mergeMethod: bad } });
+      expect(policy.mergeMethod).toBe('merge');
+      expect(policy.invalid).toEqual([expect.stringContaining(`mergeMethod="${bad}"`)]);
+      expect(rulesetSuggestion(policy).mergeQueue.mergeMethod).toBe('MERGE');
+    }
   });
 });

@@ -1,20 +1,28 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { readdirSync, readFileSync } from 'node:fs';
-import { ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath } from '../merge-queue-enqueue.mjs';
+import { readdirSync, readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ENQUEUE_MUTATION, mergeActionFor, buildEnqueueArgs, enqueuePr, planQueueFollowUps, rulesetSuggestion, workflowEditHold, normalizeGatePath, readPinnedChangedFiles } from '../merge-queue-enqueue.mjs';
 
 const HEAD = 'a'.repeat(40);
 
-// A fake `gh`: the PR read, the paginated file listing (one `[filename, previous]` JSON line per file), the mutation.
-const execFor = ({ files, changedFiles = files?.length, mutation = '{}', calls = [], filesError }) => (cmd, args) => {
+// A fake `gh` + `git`: the PR read (live head), the pinned git diff of HEAD (NUL-separated paths), the mutation.
+// `--no-renames` means a rename arrives as two paths (old + new), so the fakes list both.
+const execFor = ({ files, liveHead = HEAD, mutation = '{}', calls = [], filesError }) => (cmd, args) => {
   calls.push([cmd, args]);
-  if (args[0] === 'pr') return JSON.stringify({ id: 'PR_1', changedFiles });
-  if (args[0] === 'api' && args[1] === '--paginate') {
-    if (filesError) throw new Error(filesError);
-    return files.map((f) => JSON.stringify(f)).join('\n');
+  if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: 'main' });
+  if (cmd === 'git') {
+    if (args[0] === 'diff') {
+      if (filesError) throw new Error(filesError);
+      return files.map((f) => (Array.isArray(f) ? f.filter(Boolean).join('\0') : f)).join('\0');
+    }
+    return '';
   }
   return mutation;
 };
+const CWD = '/clone';
 
 describe('merge queue enqueue', () => {
   it.each([
@@ -36,14 +44,16 @@ describe('merge queue enqueue', () => {
   it('reads the node id and file list, then enqueues exactly the judged head', () => {
     const calls = [];
     const entry = { id: 'E', position: 1, state: 'QUEUED' };
-    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, exec: execFor({ files: [['scripts/a.mjs', '']], mutation: JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: entry } } }), calls }) });
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['scripts/a.mjs', '']], mutation: JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: entry } } }), calls }) });
     expect(result).toEqual({ ok: true, entry });
-    expect(calls).toHaveLength(3);
-    expect(calls[0]).toEqual(['gh', ['pr', 'view', '7', '--repo', 'o/r', '--json', 'id,changedFiles']]);
-    expect(calls[1][1].slice(0, 3)).toEqual(['api', '--paginate', 'repos/o/r/pulls/7/files?per_page=100']);
-    expect(calls[2][0]).toBe('gh');
-    expect(calls[2][1]).toEqual(buildEnqueueArgs({ nodeId: 'PR_1', headSha: HEAD }));
-    expect(calls[2][1]).toContain(`sha=${HEAD}`);
+    expect(calls[0]).toEqual(['gh', ['pr', 'view', '7', '--repo', 'o/r', '--json', 'id,headRefOid,baseRefName']]);
+    const diff = calls.find(([c, a]) => c === 'git' && a[0] === 'diff');
+    expect(diff[1]).toEqual(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/main...${HEAD}`]);
+    expect(calls.some(([c, a]) => c === 'gh' && a.includes('--paginate'))).toBe(false);
+    const last = calls.at(-1);
+    expect(last[0]).toBe('gh');
+    expect(last[1]).toEqual(buildEnqueueArgs({ nodeId: 'PR_1', headSha: HEAD }));
+    expect(last[1]).toContain(`sha=${HEAD}`);
   });
 
   it.each([
@@ -51,14 +61,14 @@ describe('merge queue enqueue', () => {
     ['permission denied', { ok: false, error: 'permission denied' }],
   ])('handles GraphQL errors: %s', (message, expected) => {
     const calls = [];
-    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, exec: execFor({ files: [['a.txt', '']], mutation: JSON.stringify({ errors: [{ message }] }), calls }) });
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['a.txt', '']], mutation: JSON.stringify({ errors: [{ message }] }), calls }) });
     expect(result).toEqual(expected);
-    expect(calls).toHaveLength(3);
+    expect(calls.filter(([c, a]) => c === 'gh' && a[1] === 'graphql')).toHaveLength(1);
   });
 
   it('fails without enqueueing when the PR read throws', () => {
     let calls = 0;
-    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, exec: () => {
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: () => {
       calls += 1;
       throw new Error('offline');
     } });
@@ -106,7 +116,7 @@ describe('rulesetSuggestion pins the required workflows to main', () => {
 describe('a PR that touches a workflow file is never enqueued (human-only hold)', () => {
   const held = (files, extra = {}) => {
     const calls = [];
-    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, exec: execFor({ files, calls, ...extra }) });
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files, calls, ...extra }) });
     return { result, mutated: calls.some(([, args]) => args[1] === 'graphql') };
   };
 
@@ -131,22 +141,33 @@ describe('a PR that touches a workflow file is never enqueued (human-only hold)'
   });
 
   it.each([
-    ['the PR file listing is truncated', { files: [['a.txt', '']], changedFiles: 2 }],
-    ['the listing has more entries than the PR reports', { files: [['a.txt', ''], ['b.txt', '']], changedFiles: 1 }],
-    ['the PR reports no file count', { files: [['a.txt', '']], changedFiles: null }],
-    ['the listing reaches the 3000-file REST limit', { files: Array.from({ length: 3000 }, (_, i) => [`f${i}.txt`, '']) }],
-    ['the file listing call fails', { files: [], changedFiles: 1, filesError: 'rate limited' }],
-  ])('fails closed (human hold, no mutation) when %s', (_name, opts) => {
+    ['the pinned git diff fails', { files: [], filesError: 'fatal: bad object' }],
+  ])('fails closed (retryable hold, no mutation) when %s', (_name, opts) => {
     const { result, mutated } = held(opts.files, opts);
     expect(result).toMatchObject({ ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable' });
     expect(mutated).toBe(false);
   });
 
-  it('fails closed on a malformed repo or PR number instead of building a REST path from it', () => {
+  it('fails closed with no checkout to read the pinned diff from', () => {
     const calls = [];
-    const result = enqueuePr({ repo: 'o/r/../../x', num: 7, headSha: HEAD, exec: execFor({ files: [['a.txt', '']], calls }) });
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, exec: execFor({ files: [['a.txt', '']], calls }) });
+    expect(result).toMatchObject({ ok: false, held: true, retryable: true, reason: 'unreadable' });
+    expect(calls.some(([, a]) => a[1] === 'graphql')).toBe(false);
+  });
+
+  it('holds (retryable, no mutation) when the PR head is no longer the judged sha', () => {
+    const calls = [];
+    const result = enqueuePr({ repo: 'o/r', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['a.txt', '']], liveHead: 'b'.repeat(40), calls }) });
+    expect(result).toMatchObject({ ok: false, held: true, humanOnly: false, retryable: true, reason: 'head-moved' });
+    expect(calls.some(([c]) => c === 'git')).toBe(false);
+    expect(calls.some(([, a]) => a[1] === 'graphql')).toBe(false);
+  });
+
+  it('fails closed on a malformed repo or PR number before any read', () => {
+    const calls = [];
+    const result = enqueuePr({ repo: 'o/r/../../x', num: 7, headSha: HEAD, cwd: CWD, exec: execFor({ files: [['a.txt', '']], calls }) });
     expect(result).toMatchObject({ ok: false, held: true, reason: 'unreadable' });
-    expect(calls.some(([, a]) => a[1] === 'graphql' || a[1] === '--paginate')).toBe(false);
+    expect(calls).toEqual([]);
   });
 
   it('enqueues an ordinary PR, including one that merely names github or workflows in a path', () => {
@@ -182,5 +203,87 @@ describe('a PR that touches a workflow file is never enqueued (human-only hold)'
     expect(workflowEditHold({ files: [], expectedCount: 0 })).toEqual({ hold: false });
     expect(workflowEditHold({})).toMatchObject({ hold: true, reason: 'unreadable' });
     expect(normalizeGatePath('.\\.GitHub//Workflows/X.yml')).toBe('.github/workflows/x.yml');
+  });
+});
+
+// PR #4708 round-6 finding (merge-queue-enqueue.mjs, ruled block): the workflow-edit refusal read the REST
+// `pulls/{n}/files` list, which describes whatever the branch points at NOW, not the head being enqueued. The
+// refusal now reads git at the exact sha. Real repos: the branch moves between judging and enqueueing.
+describe('the workflow-edit refusal reads the change list of the exact enqueued sha (real git)', () => {
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const setup = () => {
+    const root = mkdtempSync(join(tmpdir(), 'mq-pin-'));
+    const origin = join(root, 'origin.git');
+    const work = join(root, 'work');
+    const clone = join(root, 'clone');
+    git(root, 'init', '-q', '--bare', '-b', 'main', origin);
+    git(root, 'clone', '-q', origin, work);
+    for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(work, 'config', k, v);
+    writeFileSync(join(work, 'a.txt'), 'a\n');
+    git(work, 'add', '.'); git(work, 'commit', '-qm', 'base'); git(work, 'push', '-q', 'origin', 'main');
+    git(work, 'checkout', '-qb', 'lane/x');
+    writeFileSync(join(work, 'b.txt'), 'b\n');
+    git(work, 'add', '.'); git(work, 'commit', '-qm', 'safe');
+    const safe = git(work, 'rev-parse', 'HEAD');
+    mkdirSync(join(work, '.github/workflows'), { recursive: true });
+    writeFileSync(join(work, '.github/workflows/merge-gate.yml'), 'jobs: {}\n');
+    git(work, 'add', '.'); git(work, 'commit', '-qm', 'evil');
+    const evil = git(work, 'rev-parse', 'HEAD');
+    git(work, 'push', '-q', 'origin', 'lane/x');
+    git(root, 'clone', '-q', origin, clone);
+    return { root, work, clone, safe, evil };
+  };
+  // gh answers with the given live head; git runs for real in the clone.
+  const realExec = (liveHead, calls) => (cmd, args, opts) => {
+    calls.push([cmd, args]);
+    if (cmd === 'gh' && args[0] === 'pr') return JSON.stringify({ id: 'PR_1', headRefOid: liveHead, baseRefName: 'main' });
+    if (cmd === 'gh') return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E' } } } });
+    return execFileSync(cmd, args, opts);
+  };
+
+  it('holds the sha that touches a workflow, even when the branch NAME now points at a safe commit', () => {
+    const { root, work, clone, safe, evil } = setup();
+    try {
+      git(work, 'push', '-qf', 'origin', `${safe}:refs/heads/lane/x`); // the branch moves back to the safe commit
+      const calls = [];
+      const result = enqueuePr({ repo: 'o/r', num: 7, headSha: evil, cwd: clone, exec: realExec(evil, calls) });
+      expect(result).toMatchObject({ ok: false, held: true, humanOnly: true, reason: 'workflow-edit', paths: ['.github/workflows/merge-gate.yml'] });
+      expect(calls.some(([c, a]) => c === 'gh' && a[1] === 'graphql')).toBe(false);
+      expect(calls.some(([c, a]) => c === 'git' && a.includes('lane/x'))).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('enqueues the safe sha with expectedHeadOid pinned to it, even though the branch now carries the workflow edit', () => {
+    const { root, clone, safe } = setup();
+    try {
+      const calls = [];
+      const result = enqueuePr({ repo: 'o/r', num: 7, headSha: safe, cwd: clone, exec: realExec(safe, calls) });
+      expect(result).toMatchObject({ ok: true });
+      const mutation = calls.find(([c, a]) => c === 'gh' && a[1] === 'graphql');
+      expect(mutation[1]).toContain(`sha=${safe}`);
+      expect(readPinnedChangedFiles({ headSha: safe, cwd: clone }).files).toEqual(['b.txt']);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('lists both sides of a rename out of the workflows directory', () => {
+    const { root, work, clone, evil } = setup();
+    try {
+      git(work, 'push', '-q', 'origin', `${evil}:refs/heads/main`);
+      git(work, 'mv', '.github/workflows/merge-gate.yml', 'docs-gate.yml');
+      git(work, 'commit', '-qm', 'rename');
+      const renamed = git(work, 'rev-parse', 'HEAD');
+      git(work, 'push', '-qf', 'origin', `${renamed}:refs/heads/lane/x`);
+      const files = readPinnedChangedFiles({ headSha: renamed, cwd: clone }).files;
+      expect(files.sort()).toEqual(['.github/workflows/merge-gate.yml', 'docs-gate.yml']);
+      expect(workflowEditHold({ files, expectedCount: files.length })).toMatchObject({ hold: true, humanOnly: true });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('an unfetchable sha fails closed', () => {
+    const { root, clone } = setup();
+    try {
+      expect(readPinnedChangedFiles({ headSha: 'f'.repeat(40), cwd: clone })).toHaveProperty('error');
+      expect(readPinnedChangedFiles({ headSha: 'nope', cwd: clone })).toHaveProperty('error');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

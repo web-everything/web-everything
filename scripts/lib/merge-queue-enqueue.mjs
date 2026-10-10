@@ -40,9 +40,6 @@ export function isAlreadyQueuedError(text) {
  */
 export const GATE_PATH_PREFIXES = ['.github/workflows/', '.github/actions/'];
 
-/** The REST `pulls/{n}/files` listing stops at 3000 files; a PR that reaches it has an unreadable tail. */
-export const MAX_LISTED_PR_FILES = 3000;
-
 /** A repo path reduced to the form the prefix test uses (separators, case, `./`, NFKC). Pure. */
 export function normalizeGatePath(p) {
   return String(p ?? '').normalize('NFKC').replace(/\\/g, '/').toLowerCase().replace(/\/+/g, '/').replace(/^(?:\.?\/)+/, '');
@@ -52,7 +49,7 @@ export function normalizeGatePath(p) {
  * Does this PR's change list let it be enqueued? Pure. A PR is held for a HUMAN (`humanOnly: true`, not an
  * escalation an AI reviewer can accept) when any changed path, or any renamed-from path, is a workflow or action
  * file; and it is held fail-closed but RETRYABLE (`humanOnly: false`) when the list cannot be trusted to be
- * complete (a gh error or a stale count is transient, not a decision).
+ * complete (a read error or a count mismatch is transient, not a decision).
  * @param {{files:Array<string|{filename:string, previous_filename?:string}>, expectedCount:number}} o
  * @returns {{hold:false}|{hold:true, humanOnly:boolean, retryable?:boolean, reason:'workflow-edit'|'unreadable', paths:string[], error:string}}
  */
@@ -61,7 +58,6 @@ export function workflowEditHold({ files, expectedCount } = {}) {
   if (!Array.isArray(files)) return unreadable('no list');
   if (!Number.isInteger(expectedCount) || expectedCount < 0) return unreadable('no file count');
   if (files.length !== expectedCount) return unreadable(`listed ${files.length} of ${expectedCount}`);
-  if (expectedCount >= MAX_LISTED_PR_FILES) return unreadable(`${expectedCount} files reaches the ${MAX_LISTED_PR_FILES}-file listing limit`);
   const hit = [];
   for (const f of files) {
     for (const raw of typeof f === 'string' ? [f] : [f?.filename, f?.previous_filename]) {
@@ -76,36 +72,54 @@ export function workflowEditHold({ files, expectedCount } = {}) {
     : { hold: false };
 }
 
-/** The PR's full change list (paginated REST, filename + rename source), or `{error}`. */
-function readChangedFiles({ repo, num, exec }) {
-  if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) return { error: 'repo or PR number is malformed' };
+const SHA_RE = /^[0-9a-f]{40}$/;
+const SAFE_BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+
+/**
+ * The change list OF THE EXACT COMMIT being enqueued (`headSha`), read from git — never a listing of whatever the
+ * PR's branch points at now (PR #4708 round 6: the REST `pulls/{n}/files` list is not pinned to a sha, so a head
+ * that moved between the read and the enqueue could be judged on another commit's files). The diff is
+ * `origin/<base>...<headSha>` (merge-base to head, what the queue lands) with `--no-renames`, so a rename shows
+ * BOTH its old and new path. Every path is listed (no 3000-file REST cap). `{files}` or `{error}`. Never throws.
+ */
+export function readPinnedChangedFiles({ headSha, base = 'main', cwd, exec = execFileSync } = {}) {
+  if (!SHA_RE.test(String(headSha))) return { error: 'head sha is not a 40-hex commit id' };
+  if (!SAFE_BRANCH_RE.test(String(base)) || String(base).startsWith('-')) return { error: 'base branch name unusable' };
+  if (!cwd) return { error: 'no checkout to read the pinned diff from' };
+  const git = (args) => String(exec('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 * 1024 * 1024 }) ?? '');
   try {
-    const out = exec('gh', ['api', '--paginate', `repos/${repo}/pulls/${num}/files?per_page=100`, '--jq', '.[] | [.filename, (.previous_filename // "")] | @json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
-    const files = String(out ?? '').split('\n').filter((l) => l.trim()).map((l) => {
-      const [filename, previous] = JSON.parse(l);
-      return { filename, previous_filename: previous || undefined };
-    });
-    return { files };
+    git(['fetch', '--quiet', '--end-of-options', 'origin', headSha, `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+    git(['cat-file', '-e', `${headSha}^{commit}`]);
+    const out = git(['diff', '--name-only', '--no-renames', '-z', '--end-of-options', `refs/remotes/origin/${base}...${headSha}`]);
+    return { files: out.split('\0').filter(Boolean) };
   } catch (e) { return { error: errText(e) }; }
 }
 
 /**
  * Enqueue one PR. Never throws. `{ok:true, entry}` / `{ok:true, already:true}` / `{ok:false, error}`; a PR whose
  * diff touches a workflow file (or whose change list cannot be fully read) comes back `{ok:false, held:true,
- * humanOnly:true, error}` and is never enqueued.
- * @param {{repo:string, num:number, headSha:string, exec?:Function}} o
+ * humanOnly, error}` and is never enqueued.
+ * PINNED TO ONE COMMIT: the PR's live head must equal `headSha` (else it moved since the drain judged it — held,
+ * retryable), the workflow-edit refusal reads the change list OF `headSha` (`readPinnedChangedFiles`), and the
+ * mutation carries `expectedHeadOid: headSha`, so GitHub refuses the entry if the head moves after the read. The
+ * refusal and the queue entry therefore always describe the same commit.
+ * @param {{repo:string, num:number, headSha:string, cwd:string, exec?:Function}} o  `cwd`: a clone of `repo`.
  */
-export function enqueuePr({ repo, num, headSha, exec = execFileSync }) {
-  let nodeId;
-  let changedFiles;
+export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) {
+    return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: 'changed files unreadable (repo or PR number is malformed)' };
+  }
+  let pr;
   try {
-    const pr = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'id,changedFiles'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
-    nodeId = pr?.id;
-    changedFiles = pr?.changedFiles;
+    pr = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'id,headRefOid,baseRefName'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
   } catch (e) { return { ok: false, error: `node id read failed: ${errText(e)}` }; }
+  const nodeId = pr?.id;
   if (!nodeId) return { ok: false, error: 'node id missing' };
-  const read = readChangedFiles({ repo, num, exec });
-  const hold = workflowEditHold({ files: read.files, expectedCount: changedFiles });
+  if (pr?.headRefOid !== headSha) {
+    return { ok: false, held: true, humanOnly: false, retryable: true, reason: 'head-moved', paths: [], error: `PR head is ${String(pr?.headRefOid).slice(0, 9)}, not the judged ${String(headSha).slice(0, 9)} — re-judge the new head before enqueueing` };
+  }
+  const read = readPinnedChangedFiles({ headSha, base: pr?.baseRefName || 'main', cwd, exec });
+  const hold = workflowEditHold({ files: read.files, expectedCount: read.files?.length });
   if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
   try {
     const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
