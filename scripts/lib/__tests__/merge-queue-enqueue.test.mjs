@@ -76,3 +76,20 @@ describe('merge queue enqueue', () => {
     expect(result.requiredStatusChecks).toEqual(expect.arrayContaining(['merge-gate', 'test']));
   });
 });
+
+// The required checks' workflow YAML is read from the PR merge ref / group commit, so the ruleset must run
+// those workflows from main (a `workflows` rule) and only accept a check posted by the GitHub Actions app.
+describe('rulesetSuggestion pins the required workflows to main', () => {
+  const result = rulesetSuggestion({ mergeMethod: 'merge', batchSize: 3, maxGroupWaitMinutes: 5 });
+
+  it('requires merge-gate.yml, ci.yml and soak-replay-gate.yml from refs/heads/main', () => {
+    const byPath = Object.fromEntries(result.requiredWorkflows.map((w) => [w.path, w]));
+    for (const path of ['.github/workflows/merge-gate.yml', '.github/workflows/ci.yml', '.github/workflows/soak-replay-gate.yml']) {
+      expect(byPath[path], path).toMatchObject({ ref: 'refs/heads/main' });
+    }
+  });
+
+  it('only accepts required checks posted by the GitHub Actions app', () => {
+    expect(result.requiredStatusCheckIntegrationId).toBe(15368);
+  });
+});
