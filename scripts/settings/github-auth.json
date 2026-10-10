@@ -1,0 +1,8 @@
+{
+  "github": {
+    "auth": "app",
+    "personalExceptions": {
+      "main-push": "git push to protected main (drain numbering / derived-regen commits) goes over the operator's SSH key, never a gh token: main's classic branch protection requires a PR + green checks and only an admin can bypass it; the App has no admin by design."
+    }
+  }
+}
