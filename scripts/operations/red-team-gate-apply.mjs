@@ -37,6 +37,7 @@ import { EVENT_TYPES, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
 import { spawnPreventionLandingJob } from '../lib/prevention-landing-job.mjs';
 import { readReviewRound } from './review-pr-io.mjs';
 import { appendLedgerEvents } from './record-referral-ruling-io.mjs';
+import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -149,7 +150,11 @@ export function createRedTeamGateIo({ env = process.env, root = REPO_ROOT } = {}
     return String(r.stdout ?? '');
   };
   return {
-    readPr: ({ repo, pr }) => JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,labels,comments'])),
+    // The COMPLETE thread (paginated): a one-page read could miss the red-team comment or the gate's own record.
+    readPr: ({ repo, pr }) => ({
+      ...JSON.parse(gh(['pr', 'view', String(pr), `--repo=${repo}`, '--json', 'headRefOid,labels'])),
+      comments: readCompletePrComments(Number(pr), { repo }),
+    }),
     readSetting: () => readConfirmedBreaks({ env }),
     readRound: ({ repo, pr, head }) => readReviewRound({ repo, pr, head }),
     sendBack: ({ repo, pr, head, body }) => {

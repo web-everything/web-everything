@@ -1072,6 +1072,10 @@ export function buildMissRows({ pr, repo, rev, runCallId, redTeamProvider, redTe
   return rows;
 }
 
+const BT = String.fromCharCode(96);
+const WHITESPACE_RUN = new RegExp('\\s+', 'g');
+const CLASS_UNSAFE = new RegExp('[(),]', 'g');
+
 /** The ONE advisory comment. PURE. Starts with the dedup marker line. */
 export function renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict }) {
   const confirmed = findings.filter((f) => f.confirmedByRecheck);
@@ -1085,11 +1089,13 @@ export function renderRedTeamComment({ pr, rev, provider, model, findings, reche
   if (!findings.length) return [...head, '', 'The red team tried to break this change and reported nothing.'].join('\n');
   // Card x1b8hlo — every field is ONE line: the red-team gate parses this comment, and a model-written field carrying a
   // newline could otherwise forge a `[**confirmed**]` finding line of its own (each field is untrusted model text).
-  const one = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+  const one = (v) => String(v ?? '').replace(WHITESPACE_RUN, ' ').trim();
   const lines = findings.map((f, i) => {
     const tag = f.confirmedByRecheck ? RED_TEAM_CONFIRMED_TAG : RED_TEAM_UNCONFIRMED_TAG;
-    const where = f.file ? ` \`${one(f.file).replace(/`/g, "'")}${Number.isInteger(f.line) ? `:${f.line}` : ''}\`` : '';
-    const cls = (v, fallback) => one(v).replace(/[(),]/g, ' ').trim() || fallback;
+    const file = one(f.file).replaceAll(String.fromCharCode(96), String.fromCharCode(39));
+    const at = Number.isInteger(f.line) ? ':' + f.line : '';
+    const where = f.file ? ' ' + BT + file + at + BT : '';
+    const cls = (v, fallback) => one(v).replace(CLASS_UNSAFE, ' ').trim() || fallback;
     return `${i + 1}. [${tag}] (${cls(f.category, 'uncategorised')}, ${cls(f.impactIfUnfixed, 'impact?')})${where} — ${one(publishable(f.summary))}`
       + `${f.failure_scenario ? `\n   - Scenario: ${one(publishable(f.failure_scenario))}` : ''}`
       + `${f.recheckReason ? `\n   - Re-check: ${one(publishable(f.recheckReason))}` : ''}`;
