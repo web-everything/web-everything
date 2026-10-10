@@ -107,6 +107,7 @@ import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { planTakeover } from './fix-takeover.mjs';
+import { takeoverReviewGrant } from './takeover-review.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
  *  override (the IO shell, `reconcile-pass.mjs`, passes the loaded ladder with its routing-policy models). */
@@ -1567,6 +1568,10 @@ export function planReconcile({
   // Card xx0055i — what the FIX round cap does: `person` (this pure core's default, byte-identical to before) or
   // `takeover` (one takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting.
   roundCapAction = 'person', takeoverMaxPerPr = 1,
+  // A head pushed after a takeover earns this many reviews beyond the round cap (`review.takeoverReviewAttempts`,
+  // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
+  // shell passes the resolved setting.
+  takeoverReviewAttempts = 0,
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -1692,6 +1697,24 @@ export function planReconcile({
     // Built over an injected `refuseFn` so the ci-red-parallel review (below) can fold its `cap-exhausted` into
     // the PR's one `owed-ci-rerun` row while still surfacing the SAME note.
     const capExhaustedVia = (refuseFn) => (extra) => {
+      // A takeover's own head is judged once even though the cap is spent (live: #4708, takeover head 7e29b95c4
+      // refused 5/5 every tick, so the takeover could never be reviewed). Only the FIX/REVIEW round caps, only a head
+      // pushed after a trusted takeover signal that no verdict names yet, and only `takeoverReviewAttempts` reviews.
+      // The review still needs green CI and no referral hold; review:human still needs the operator.
+      if (extra.capKind === 'fix' || extra.capKind === 'review') {
+        const grant = takeoverReviewGrant({ pr, takeoverReviewAttempts });
+        if (grant.ok) {
+          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
+          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
+          dispatch.push({
+            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), takeoverReview: grant,
+            why: `takeover head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
+              + ` but a head pushed by a takeover earns ${grant.allowance} review(s) beyond the cap`
+              + ` (review.takeoverReviewAttempts); ${grant.used} used`,
+          });
+          return;
+        }
+      }
       // Card xx0055i — at the FIX round cap, `fix.roundCapAction: takeover` dispatches ONE takeover fix (full round
       // history, top claude rung of the fixer ladder) instead of the "a person must take it over" note. A spent
       // takeover, a ruling dispute, or the `person` setting falls through to the note exactly as before.
