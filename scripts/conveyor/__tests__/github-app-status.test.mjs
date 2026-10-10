@@ -69,3 +69,30 @@ describe('formatGithubAppStatus — pure, given a status record or null', () => 
     );
   });
 });
+
+import { formatCallerLines } from '../github-app-status.mjs';
+
+describe('per-caller GitHub App status', () => {
+  const callers = [
+    { caller: 'review-daemon.mjs', applied: true, reason: 'ok' },
+    { caller: 'merge-ai-prs.mjs', applied: false, reason: 'half-configured', missing: ['WE_GITHUB_APP_ID'] },
+  ];
+
+  it('omits the caller section when no callers were supplied', () => {
+    expect(formatCallerLines(undefined)).toEqual([]);
+  });
+
+  it('counts App callers and names the personal caller and its missing configuration', () => {
+    const lines = formatCallerLines(callers);
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('1/2 on the App installation');
+    expect(lines[1]).toContain('PERSONAL: merge-ai-prs.mjs (half-configured — missing WE_GITHUB_APP_ID');
+  });
+
+  it('renders callers even when no shared status has been recorded', () => {
+    const output = formatGithubAppStatus({ callers });
+    expect(output.startsWith('github-app-status: no shared status recorded yet.')).toBe(true);
+    expect(output).toContain('1/2 on the App installation');
+    expect(output).toContain('PERSONAL: merge-ai-prs.mjs (half-configured — missing WE_GITHUB_APP_ID');
+  });
+});
