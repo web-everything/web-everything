@@ -28,7 +28,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { readGit } from '../lib/proc-read.mjs';
 
 import { defineJobKind, kindRegistry } from '../lib/daemon-jobs.mjs';
 import {
@@ -107,8 +107,8 @@ const queuedMs = (r, now) => { const t = Date.parse(r.job.timeline?.[0]?.at || '
 // ── tick side ───────────────────────────────────────────────────────────────────────────────────────────────
 
 function readHeadOf(root) {
-  return execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], {
-    encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+  return readGit(['-C', root, 'rev-parse', 'HEAD'], {
+    timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
   }).trim();
 }
 
