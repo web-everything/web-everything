@@ -150,8 +150,19 @@ describe('looksLikeGhAuthFailure / resolvePersonalRouteEnabled — pure classifi
     expect(resolvePersonalRouteEnabled({})).toBe(false);
     expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '0' })).toBe(false);
     expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: 'false' })).toBe(false);
-    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '1' })).toBe(true);
-    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: 'true' })).toBe(true);
+    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '1', WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' })).toBe(true);
+    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: 'true', WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' })).toBe(true);
+  });
+
+  // Operator ruling 2026-10-09 ~21:20 ET: daemons use the App by default. BEFORE this change the env flag alone
+  // sent reads to the operator's personal bucket (drain broke at 13:21Z on "rate limit exceeded for user ID 760299").
+  it('github.auth=app (the default) keeps the route OFF even when a plist still sets the env flag', () => {
+    const appPolicy = { auth: 'app', personalExceptions: {} };
+    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '1' }, { policy: appPolicy })).toBe(false);
+    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '1' }, { policy: { auth: 'app', personalExceptions: { reads: 'x' } } })).toBe(true);
+    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '1' }, { policy: { auth: 'personal', personalExceptions: {} } })).toBe(true);
+    // The live settings file ships `auth: app` with no `reads` exception.
+    expect(resolvePersonalRouteEnabled({ WE_GH_THROTTLE_PERSONAL_ROUTE: '1' })).toBe(false);
   });
 });
 
@@ -394,7 +405,7 @@ describe.each([
   function fixture(overrides = {}, childEnv = APP_ENV) {
     const lockRoot = tmp();
     const exec = vi.fn(() => 'ok');
-    const env = { ...APP_ENV, WE_GH_THROTTLE_PERSONAL_ROUTE: '1' };
+    const env = { ...APP_ENV, WE_GH_THROTTLE_PERSONAL_ROUTE: '1', WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' };
     const opts = { env: childEnv, encoding: 'utf8', throttle: { lockRoot, env, exec, personalToken: PERSONAL_TOKEN, ...overrides } };
     const logs = () => readFileSync(ghThrottleLogPath(lockRoot), 'utf8').trim().split('\n').map(JSON.parse);
     return { lockRoot, exec, opts, logs };
@@ -427,7 +438,7 @@ describe.each([
   });
 
   it.each(['0', undefined])('switch %s preserves the original execution options', (value) => {
-    const env = { ...APP_ENV, WE_GH_THROTTLE_PERSONAL_ROUTE: value };
+    const env = { ...APP_ENV, WE_GH_THROTTLE_PERSONAL_ROUTE: value, WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' };
     const { exec, opts } = fixture({ env });
     run(['pr', 'list'], opts);
     expect(exec.mock.calls[0][1]).toEqual({ env: APP_ENV, encoding: 'utf8' });
@@ -450,7 +461,7 @@ describe.each([
   it('routes an inherited default login and records it separately from default', () => {
     const { exec, opts, logs } = fixture({}, {});
     delete opts.env;
-    opts.throttle.env = { WE_GH_THROTTLE_PERSONAL_ROUTE: '1' };
+    opts.throttle.env = { WE_GH_THROTTLE_PERSONAL_ROUTE: '1', WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' };
     run(['pr', 'list'], opts);
     expect(exec.mock.calls[0][1].env.GH_TOKEN === PERSONAL_TOKEN).toBe(true);
     expect(logs()[0].id).toBe(personalIdentity);
@@ -463,7 +474,7 @@ describe.each([
       vi.stubEnv('GH_TOKEN', 'gho_explicitInherited');
       const { exec, opts, logs } = fixture({}, {});
       delete opts.env;
-      opts.throttle.env = { WE_GH_THROTTLE_PERSONAL_ROUTE: '1' };
+      opts.throttle.env = { WE_GH_THROTTLE_PERSONAL_ROUTE: '1', WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' };
       run(['pr', 'list'], opts);
       expect(exec.mock.calls[0][1]).toEqual({ encoding: 'utf8' });
       expect(logs()[0].id).toBe(ghAuthIdentity({ GH_TOKEN: 'gho_explicitInherited' }));
@@ -473,7 +484,7 @@ describe.each([
       vi.stubEnv('GH_TOKEN', 'ghs_inheritedApp');
       const { exec, opts, logs } = fixture({}, {});
       delete opts.env;
-      opts.throttle.env = { WE_GH_THROTTLE_PERSONAL_ROUTE: '1' };
+      opts.throttle.env = { WE_GH_THROTTLE_PERSONAL_ROUTE: '1', WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS: 'reads' };
       run(['pr', 'list'], opts);
       expect(exec.mock.calls[0][1].env.GH_TOKEN === PERSONAL_TOKEN).toBe(true);
       expect(logs()[0].id).toBe(personalIdentity);
