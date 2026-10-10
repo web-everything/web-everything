@@ -1,15 +1,22 @@
 ---
+bornAs: xrkjay1
 kind: story
-size: 2
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/open-pr.mjs"]
+scope: ["we:scripts/conveyor/pr-stack.mjs", "we:scripts/conveyor/__tests__/pr-stack.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# open-pr reports complete and exits 0 when it refused to open the PR (soak-waiver missing)
+# Prevention — Add a deterministic regression test with default settings that exhausts the cap and asserts that… (from web-everything/web-everything#4655 review)
 
-Live 2026-10-09 ~14:21 ET: `node we:scripts/operations/run.mjs open-pr --ref=lane/stacked-pr-restack ... --json` exited 0 and printed stopped:'complete' with one applied effect, but its run record (run id open-pr-6a90a4b2-576d-4264-bea3-43e7a4b5de51) shows the submit effect's result was outcome:'refused', reason:'soak-declaration', pr:null — the soak precheck (WE_PR_OPEN_SOAK_PRECHECK) wanted a soak break scenario or a soak-waiver line. No PR existed; only a gh pr list showed it. An agent reading the exit code or the default render thinks the PR is open. Fix: when the open-pr submit effect's outcome is 'refused' (any reason), the operation's verdict must say refused with the reason and the CLI must exit non-zero; add a test over the open-pr operation (we:scripts/operations/open-pr.mjs) with a refused submit result. Prove on a live refused open-pr.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+
+1. `we:scripts/conveyor/pr-stack.mjs` — Add a deterministic regression test with default settings that exhausts the cap and asserts that the bottom is blocked by the released top's live claim; cover both release paths with the same parameterized test.
+2. `we:scripts/conveyor/pr-stack.mjs` — Parameterize the fork-validation regression across planned and unplanned PRs, asserting no new pair when GitHub reports isCrossRepository true even when origin name, tip, and author match.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4655@4d8fc1921fcbcda15fd20bfd1085ca4dc4151ca3
 
 ## Acceptance
 
