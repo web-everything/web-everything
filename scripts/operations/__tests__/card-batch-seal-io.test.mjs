@@ -47,6 +47,18 @@ it('opens through park then immediately holds, and refreshes the body on later p
   await publishBatch(f.input, f.opts);
   expect(f.calls.at(-1)).toContain('--body-file');
 });
+it('a remembered seal lane now leased by someone else falls back to any lane (live: lane-2 taken by a fix worker)', async () => {
+  const f = fixture();
+  writeFileSync(f.statePath, JSON.stringify({ ...f.state, sealLane: 2 }));
+  const exec = vi.fn((cmd, args, options) => {
+    if (args[1] === 'acquire' && args.includes('--lane=2')) throw new Error('lane-2 is leased by fix-4717');
+    return f.exec(cmd, args, options);
+  });
+  await publishBatch(f.input, { ...f.opts, exec });
+  const acquires = exec.mock.calls.filter(([, a]) => a[1] === 'acquire').map(([, a]) => a.some(x => x.startsWith('--lane=')));
+  expect(acquires).toEqual([true, false]);
+  expect(f.read().pr).toBe(9);
+});
 it('the sealing label-on-green keeps the verify requirement (no waiver)', async () => {
   const f = fixture({ maxCards: 1 });
   expect((await publishBatch(f.input, f.opts)).action).toBe('sealed');

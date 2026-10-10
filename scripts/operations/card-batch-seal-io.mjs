@@ -81,8 +81,13 @@ export async function publishBatch(input, opts = {}) {
     bodyPath = `${statePath}.${lease.token}.body.md`;
     writeFileSync(bodyPath, renderBatchBody(state));
     const acquireCheckout = async () => {
-      acquired = parseRunJsonTail(await run('node', [join(ROOT, 'scripts/lane-pool.mjs'), 'acquire',
-        '--purpose=card-batch-seal', '--ttl-minutes=180', ...(state.sealLane ? [`--lane=${state.sealLane}`] : []), '--json'], { timeout: 3 * 60_000 }));
+      const acquire = pin => run('node', [join(ROOT, 'scripts/lane-pool.mjs'), 'acquire',
+        '--purpose=card-batch-seal', '--ttl-minutes=180', ...(pin ? [`--lane=${pin}`] : []), '--json'], { timeout: 3 * 60_000 });
+      // The remembered lane is a preference, not a requirement: once released it may be leased by anyone (live
+      // 2026-10-10: lane-2 went to a fix worker and every retry failed). The verify receipt is restored from
+      // state below, so any lane serves.
+      try { acquired = parseRunJsonTail(await acquire(state.sealLane)); }
+      catch (error) { if (!state.sealLane) throw error; acquired = parseRunJsonTail(await acquire(null)); }
       if (!acquired?.path || acquired.lane == null || !acquired.holder) throw new Error('lane acquisition failed');
       cwd = acquired.path;
       await run('git', ['fetch', '--no-tags', remote, `refs/heads/${state.batchRef}`]);
