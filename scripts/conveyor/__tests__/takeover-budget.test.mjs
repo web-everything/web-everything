@@ -191,6 +191,26 @@ describe('each takeover head earns one review past the cap', () => {
   });
 });
 
+describe('any escalation dispatch past the cap earns one review for the head it pushes (#4689)', () => {
+  const notice = (h) => ({ author: BOT, createdAt: at(h), body: '⛔ conveyor — ruling not addressed\n\n**Escalation rung 2 (stronger-model):** x' });
+  // #4689: the ladder notice goes up, the OLD head is still bounced after it, then the rung-2 fixer pushes T1.
+  const thread = [...rounds5, notice(7), review(R5, 8, FIVE), rearm(9)];
+  it('the rung-2 head is granted its review; a verdict on the old head between dispatch and push spends nothing', () => {
+    expect(takeoverReviewGrant({ pr: pr(T1, thread), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0, via: 'escalation-rung' });
+    const p = plan(pr(T1, thread, { labels: [{ name: 'review:pending' }] }));
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
+  });
+  it('once that head is reviewed, the next push is capped again (until the next escalation dispatch)', () => {
+    const judged = [...thread, review(T1, 10, FOUR)];
+    expect(takeoverReviewGrant({ pr: pr(T2, [...judged, rearm(11)]), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'takeover-review-spent' });
+    expect(takeoverReviewGrant({ pr: pr(T2, [...judged, notice(11), rearm(12)]), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true });
+  });
+  it('an untrusted notice grants nothing', () => {
+    expect(takeoverReviewGrant({ pr: pr(T1, [...rounds5, { ...notice(7), author: { login: 'mallory' } }, rearm(9)]), takeoverReviewAttempts: 1 }))
+      .toMatchObject({ ok: false, reason: 'no-takeover' });
+  });
+});
+
 describe('takeover 2+ brief', () => {
   it('carries the previous takeover diff and the review that rejected it', () => {
     const p = plan(pr(T1, [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR)]));

@@ -24,31 +24,57 @@ import { isReviewVerdictComment as isVerdict } from './mechanical-round-cap.mjs'
 
 export { OPERATOR_TAKEOVER_PREFIX };
 
+import { RULING_NOT_ADDRESSED_MARKER } from '../lib/ruling-ledger.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
+/** A trusted fixer turn that pushed work (a re-arm, an advisory fix). */
+const isFixerTurn = (c) => /^🔧 conveyor fix —/.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c);
+/** A trusted escalation-ladder dispatch notice (`reconcile-fix-dispatch.mjs#postRulingNotice`): the system itself sent
+ *  a fixer past the cap on a rung of the fixer-escalation ladder (live: #4689 round 6, rung 2, head 6e0d241df). */
+export const isEscalationDispatch = (c) => bodyOf(c).trimStart().startsWith(RULING_NOT_ADDRESSED_MARKER) && isTrustedMarkerAuthor(c);
+
+/**
+ * PURE: the system's own escalation dispatches, oldest first: `[{ at, via }]` — every takeover (an episode, voids
+ * honoured) and every escalation-ladder dispatch notice. Each one may push a head past the round cap.
+ */
+export function escalationDispatches(comments) {
+  const list = Array.isArray(comments) ? comments : [];
+  return [
+    ...takeoverEpisodes(list).map((e) => ({ at: e.end, via: 'takeover' })),
+    ...list.filter(isEscalationDispatch).map((c) => ({ at: timeOf(c), via: 'escalation-rung' })),
+  ].filter((d) => Number.isFinite(d.at)).sort((a, b) => a.at - b.at);
+}
 
 /**
  * PURE: may this PR's CURRENT head get a review although the round cap is spent?
- * `{ ok: true, anchor, allowance, used }` or `{ ok: false, reason }`. Reasons:
- *   `off` (setting 0), `no-takeover`, `head-already-reviewed` (a verdict names this head — e.g. the head the
- *   automatic takeover started from, before it pushed), `takeover-review-spent` (verdicts after the takeover
- *   already used the allowance — every later head respects the cap).
+ * `{ ok: true, anchor, allowance, used, via }` or `{ ok: false, reason }`. ANY fix the system itself dispatched past
+ * the cap — a takeover (of the PR's `fix.takeoverBudget`) or a fixer-escalation ladder rung — earns
+ * `takeoverReviewAttempts` review(s) for the head it pushes. The anchor is the LATEST such dispatch, moved to the
+ * first fixer push after it (a verdict on the OLD head that lands between the dispatch and the push spends nothing).
+ * How many dispatches run at all stays bounded by the takeover budget/progress guard and the ladder's own human rung.
+ * Reasons: `off` (setting 0), `no-takeover` (no escalation dispatch), `head-already-reviewed` (a verdict names this
+ * head), `takeover-review-spent` (verdicts after the anchor already used the allowance).
  * @param {{pr:{headRefOid?:string, comments?:Array<object>}, takeoverReviewAttempts?:number}} o
  */
 export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const allowance = Number.isInteger(takeoverReviewAttempts) && takeoverReviewAttempts > 0 ? takeoverReviewAttempts : 0;
   if (!allowance) return { ok: false, reason: 'off' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  // The LATEST takeover is the anchor (takeover budget: takeover 2 earns its own review, like takeover 1 did). A void
-  // marker cancels its start marker, so a takeover that never launched grants nothing.
-  const episodes = takeoverEpisodes(comments);
-  if (!episodes.length) return { ok: false, reason: 'no-takeover' };
-  const anchor = episodes.at(-1).end;
+  const dispatches = escalationDispatches(comments);
+  if (!dispatches.length) return { ok: false, reason: 'no-takeover' };
+  const latest = dispatches.at(-1);
+  const push = comments.filter(isFixerTurn).map(timeOf).filter((t) => Number.isFinite(t) && t > latest.at).sort((a, b) => a - b)[0];
+  const anchor = Number.isFinite(push) ? push : latest.at;
   const head = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reason: 'no-head' };
   const verdicts = comments.filter(isVerdict);
   if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head))) return { ok: false, reason: 'head-already-reviewed' };
   const used = verdicts.filter((c) => timeOf(c) > anchor).length;
   if (used >= allowance) return { ok: false, reason: 'takeover-review-spent', used, allowance };
-  return { ok: true, anchor: new Date(anchor).toISOString(), allowance, used, takeover: episodes.length };
+  return {
+    ok: true, anchor: new Date(anchor).toISOString(), allowance, used, via: latest.via,
+    takeover: takeoverEpisodes(comments).length,
+  };
 }

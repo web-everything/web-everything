@@ -1720,8 +1720,8 @@ export function planReconcile({
           if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
           dispatch.push({
             ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), takeoverReview: grant,
-            why: `takeover head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
-              + ` but a head pushed by a takeover earns ${grant.allowance} review(s) beyond the cap`
+            why: `${grant.via === 'escalation-rung' ? 'escalation-rung' : 'takeover'} head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
+              + ` but a head pushed by the system's own escalation (${grant.via ?? 'takeover'}) earns ${grant.allowance} review(s) beyond the cap`
               + ` (review.takeoverReviewAttempts); ${grant.used} used`,
           });
           return;
