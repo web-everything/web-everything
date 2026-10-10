@@ -476,6 +476,16 @@ describe('merge-gate workflow structure', () => {
     expect(header).toMatch(/rulesetSuggestion[\s\S]*requiredWorkflows|requiredWorkflows[\s\S]*refs\/heads\/main/);
   });
 
+  it('names the human-only enqueue refusal as the guard that needs no ruleset, and no longer calls review escalation the only one', () => {
+    const header = readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8').split('\nname:')[0];
+    expect(header).not.toMatch(/the only guard is review escalation/i);
+    expect(header).toMatch(/enqueuePr[\s\S]*refuses[\s\S]*HUMAN[\s\S]*\.github\/workflows\/\*\*/);
+    // honest limits: not wired yet, and a hand-added queue entry bypasses it (only the ruleset pin closes that)
+    expect(header).toMatch(/does not call enqueuePr yet/);
+    expect(header).toMatch(/by hand[\s\S]*bypasses enqueuePr[\s\S]*only the ruleset/);
+    expect(header).not.toMatch(/never decides a merge/);
+  });
+
   describe('bootstrap shim', () => {
     const run = (present) => {
       const root = mkdtempSync(join(tmpdir(), 'merge-gate-boot-'));

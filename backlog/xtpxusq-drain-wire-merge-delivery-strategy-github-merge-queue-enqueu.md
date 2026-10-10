@@ -14,6 +14,7 @@ Modules + tests landed with the merge-gate PR (we:scripts/lib/merge-delivery-pol
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+- [A2] **Must** — the drain enqueues ONLY through `enqueuePr` in we:scripts/lib/merge-queue-enqueue.mjs, which refuses (human-only) a PR whose diff touches `.github/workflows/**` or `.github/actions/**` and holds retryably on an unreadable change list (PR 4708, the we:.github/workflows/merge-gate.yml gate-YAML finding); we:scripts/lib/__tests__/merge-queue-enqueue.test.mjs fails on any other caller of the enqueue mutation.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
 
