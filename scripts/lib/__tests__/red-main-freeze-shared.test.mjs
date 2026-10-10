@@ -85,6 +85,13 @@ describe('shared red-main freeze (xyd06qo)', () => {
     expect(called).toBe(false);
   });
 
+  it('CLI hook: WE_RED_MAIN_FREEZE_SHARED=off skips the push even with VITEST/WE_UNDER_TEST cleared', async () => {
+    let called = false;
+    const r = await publishFreezeFromCli({ marker: null, clear: true, env: { WE_RED_MAIN_FREEZE_SHARED: 'off' }, publish: () => { called = true; } });
+    expect(r).toEqual({ ok: true, skipped: 'disabled' });
+    expect(called).toBe(false);
+  });
+
   it('CLI: `publish` is a known command (republish the local state), skipped under test', () => {
     const dir = mkdtempSync(join(tmpdir(), 'rmf-'));
     try {

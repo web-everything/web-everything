@@ -82,6 +82,8 @@ export function publishSharedFreeze({ marker, clear = false, board = REPO_ROOT, 
  */
 export async function publishFreezeFromCli({ marker, clear = false, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; } } = {}) {
   if ((env.VITEST || env.WE_UNDER_TEST) && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'test-run' };
+  // Explicit off switch for a child CLI that must clear VITEST/WE_UNDER_TEST (they also pick the freeze-marker path) yet must never push the live ops branch.
+  if (env.WE_RED_MAIN_FREEZE_SHARED === 'off' && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'disabled' };
   if (marker == null && clear !== true) {
     stderr('red-main freeze: ✗ refusing to publish — no valid local freeze marker here (missing or corrupt), and "no marker" is not a clear. The shared copy is unchanged. To clear it run: node scripts/readiness/red-main-remediation.mjs unfreeze\n');
     setExitCode(1);
