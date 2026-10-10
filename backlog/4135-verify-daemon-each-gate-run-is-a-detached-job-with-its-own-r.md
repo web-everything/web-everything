@@ -47,3 +47,6 @@ Slice of decision 4120 (daemon job model); audit we:reports/2026-09-24-daemon-bl
 - **Unchanged.** Marker keyed to exact HEAD, heavy admission (verify-lane's own slot), since-last-green selection
   (#4732, inside verify-lane), supersede rules (the daemon kills the job's gate group from its recorded handle), the
   max-in-flight cap, the drain file.
+- **Edge.** Overlaid onto the verify daemon clone `wev-control` (PR 4764) and loaded 2026-10-10T13:30:24Z: the
+  restarted daemon logs `gates run as detached jobs (~/.claude/daemon-jobs/verify-daemon)` and adopted the two
+  in-process runs the old daemon handed off.
