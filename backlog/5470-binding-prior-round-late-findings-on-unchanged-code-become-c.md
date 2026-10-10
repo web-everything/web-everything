@@ -4,11 +4,12 @@ kind: story
 size: 3
 priority: high
 parent: "5467"
-status: open
+status: resolved
 blockedBy: ["5469"]
 relatedTo: ["5468", "5399"]
 scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/operations/review-pr.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
 tags: [review]
 ---
 
@@ -40,3 +41,13 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — "unchanged" is per finding identity and per PR head pair.
 6. **State over time** — the 3-day shadow window is a setting with a recorded start date.
 7. **Who wrote it** — `CONFIRMED` comes only from the review role's ledger row.
+
+## Done when
+
+- `npm run test:unit -- we:scripts/lib/__tests__/review-loop-policy.test.mjs` passes the `5470 [A1] binding prior round replay fixtures (mode on)` block: (a) a round the shadow says would be avoided (late/tolerated finding on unchanged code) becomes cards; (b) broken + CONFIRMED on unchanged code still blocks; (c) a finding on changed code (shadow still blocks) blocks as today; (d) `shadow`/`off`, a missing summary, or a full-review scope change nothing. The per-finding rule R6 (incl. a re-raise of a fixed finding with no reason → card) stays covered by `we:scripts/lib/__tests__/review-round-rules.test.mjs`.
+- `npm run test:unit -- we:scripts/lib/__tests__/review-settings.test.mjs` passes: `scopedRereview` accepts `off | shadow | on` (env `WE_REVIEW_SCOPED_REREVIEW`), and the declared file stays `shadow`.
+- `npm run test:unit -- we:scripts/operations/__tests__/review-pr-io.test.mjs we:scripts/operations/__tests__/review-pr.test.mjs` passes: `on` carries through the read and still declares the shadow effect whose summary the `on` rule reads.
+
+## Resolution (2026-10-09)
+
+The `on` mode is built: `we:scripts/lib/review-loop-policy.mjs#bindingPriorRoundDecision` reads the advise step's shadow summary; when the round would have been avoided, `we:scripts/operations/review-loop-cli.mjs` files the held findings as one card and accepts. [A2]'s shadow and [A4]'s per-finding identity came with 5469. Per the P3 revision (operator 2026-10-08: the B1 replay showed ~0 of 48 later rounds avoided), the declared setting stays `shadow` and no flip is planned, so [A3] (3-day shadow, then flip) and [A5] (live before/after after the flip) are not owed: flipping is a one-line change to `we:scripts/review-settings.json` if the journal ever earns it.
