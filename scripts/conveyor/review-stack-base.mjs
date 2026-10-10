@@ -40,6 +40,8 @@ import { detectStacks, readOriginLaneTips, readOpenPrRefs } from './pr-stack.mjs
 import { readSettings } from '../lib/settings-files.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
+import { computeNetDiffText } from '../merge-ai-prs.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -220,6 +222,26 @@ export function stackNetFiles({ tree, topHead, root = ROOT, run = gitRun(root) }
  */
 export function stackNetDiffText({ tree, topHead, root = ROOT, run = gitRun(root) }) {
   return run(['diff', '--no-ext-diff', '--end-of-options', tree, topHead]);
+}
+
+/**
+ * The PR's net diff TEXT vs main, through the SAME `computeNetDiffText` `review-set-label.mjs` fingerprints, so a
+ * carry compares like with like.
+ */
+export function mainNetDiffText(ref, { root = ROOT } = {}) {
+  const exec = (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
+  return computeNetDiffText({ exec, rev: ref, fetchExtraRefs: [ref] });
+}
+
+/**
+ * The PR's head ref and its COMPLETE comment thread (the paginated reader: a marker past the first 100 comments must
+ * not be missed). Throws on a failed read; the caller fails open to a normal review.
+ */
+export function readStackThread(n, { repo, root = ROOT, readComments = readCompletePrComments,
+  readHead = () => JSON.parse(String(execFileSync('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'headRefName,headRefOid'],
+    { cwd: root, encoding: 'utf8', timeout: 60e3, maxBuffer: 4 * 1024 * 1024 }))) } = {}) {
+  const head = readHead();
+  return { headRefName: head?.headRefName ?? null, headRefOid: head?.headRefOid ?? null, comments: readComments(Number(n), { repo }) };
 }
 
 /** The diff fingerprint `review-set-label.mjs` stamps (`normalizeDiffFingerprint`), or null. */

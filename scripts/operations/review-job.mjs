@@ -73,7 +73,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
  * IMPURE, but every effect goes through an injected `io` so the whole arc is unit-tested with fakes.
  */
 
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -96,8 +96,7 @@ import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { extraSeatsEnabled, redTeamEnabled, resolveSeatTimeoutMs } from './review-extra-seats.mjs';
 import { redTeamRequired } from '../lib/jury-core.mjs';
-import { decideStackDispatch, fingerprintOf, readStackBase, resolveStackAwareReview, stackNetDiffText, parseStackMarkers } from '../conveyor/review-stack-base.mjs';
-import { computeNetDiffText } from '../merge-ai-prs.mjs';
+import { decideStackDispatch, fingerprintOf, mainNetDiffText, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, parseStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
@@ -636,8 +635,6 @@ export function dispatchReviewByMode({ mode = resolveReviewDispatchMode(), stack
   return named(dispatchReviewJob(opts));
 }
 
-const execIn = (root) => (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: root, timeout: 120e3, maxBuffer: 64 * 1024 * 1024, ...o });
-
 /**
  * Held item 177 — before a review is dispatched, read this PR's stack state and any `reviewed-stack` accept marker.
  * FAILS OPEN: any read error dispatches the review as before. Only the Web Everything repo (the clone this runs in).
@@ -645,9 +642,9 @@ const execIn = (root) => (cmd, args, o = {}) => execFileSync(cmd, args, { cwd: r
  */
 export function checkStackBeforeReview({ pr, repo, root = REPO_ROOT, env = process.env,
   readStack = (n) => readStackBase({ pr: n, root, env }),
-  readThread = (n) => JSON.parse(String(execFileSync('gh', ['pr', 'view', String(n), '--repo', repo, '--json', 'comments,headRefName,headRefOid'], { cwd: root, encoding: 'utf8', timeout: 60e3, maxBuffer: 16 * 1024 * 1024 }))),
+  readThread = (n) => readStackThread(n, { repo, root }),
   stackText = (base) => stackNetDiffText({ tree: base.tree, topHead: base.topHead, root }),
-  mainText = (ref) => computeNetDiffText({ exec: execIn(root), rev: ref, fetchExtraRefs: [ref] }),
+  mainText = (ref) => mainNetDiffText(ref, { root }),
   carry = (n, decision) => carryStackAccept({ pr: n, repo, root, env, decision }),
   log = (line) => writeLineSync(2, line) } = {}) {
   if (!resolveStackAwareReview(env) || repoKeyForSlug(repo) !== 'we') return { base: null };
