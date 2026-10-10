@@ -32,8 +32,9 @@
  *
  * THE SETTING (declared in we:scripts/review-settings.json, resolved by we:scripts/lib/review-settings.mjs):
  *   scopedRereview  env WE_REVIEW_SCOPED_REREVIEW  built-in `off` (today: full re-review, no ledger finding rows, no
- *                   journal) | `shadow` (compute + journal; no verdict changes). `on` is card 5470's, after 3 days of
- *                   shadow (P3).
+ *                   journal) | `shadow` (compute + journal; no verdict changes) | `on` (card 5470: a later round R7 says
+ *                   would have been avoided is accepted with its findings filed as a card — the decision lives in
+ *                   we:scripts/lib/review-loop-policy.mjs#bindingPriorRoundDecision; the declared file stays `shadow`).
  */
 import { createHash } from 'node:crypto';
 import { exactCitedPath, findingChangeState, normalizeFinding, earnsRound, isFindingOutstanding,
