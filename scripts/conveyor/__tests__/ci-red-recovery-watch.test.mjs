@@ -1259,6 +1259,13 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     expect(core.resolveRecoveryCaps({ env: { WE_REBASE_RETRIES_PER_SHA: '5' }, file })).toMatchObject({ rebaseRetriesPerSha: 5, sources: { rebaseRetriesPerSha: 'env' } });
     expect(core.resolveRecoveryCaps({ env: { WE_REBASE_RETRIES_PER_SHA: '-1' }, file }).rebaseRetriesPerSha).toBe(2);
   });
+  // PR #4825 review: an empty or whitespace-only env value is "layer not set" — it must never become cap 0 (recovery disabled).
+  it.each(['', '   ', '\t'])('an empty or whitespace env value (%j) never becomes cap 0 for any cap variable', value => {
+    const file = '/tmp/nonexistent-ci-red-recovery-4784.json';
+    const caps = core.resolveRecoveryCaps({ env: { WE_REBASE_RETRIES_PER_SHA: value, WE_MISSING_RUN_RETRIES_PER_SHA: value, WE_MAIN_DEFECT_REBASES_PER_SHA: value }, file });
+    expect(caps).toEqual({ rebaseRetriesPerSha: 2, missingRunRetriesPerSha: 2, mainDefectRebasesPerSha: 1,
+      sources: { rebaseRetriesPerSha: 'standard', missingRunRetriesPerSha: 'standard', mainDefectRebasesPerSha: 'standard' } });
+  });
   it.each(['rebase', 'missing'])('adds main identity without altering legacy %s bodies', kind => {
     const build = kind === 'rebase' ? core.buildRebaseOntoMainComment : core.buildMissingRunComment;
     const old = build({ headSha: sha });
