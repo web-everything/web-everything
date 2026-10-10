@@ -24,9 +24,10 @@
  *
  * Setting cascade (like `mechanical-round-cap.mjs`): standard default 2 → platform preference
  * (`we:scripts/lib/delivery-platform-preferences.json` `fix.takeoverBudget`, when that file exists) → repo
- * (`we:scripts/settings/fix.json` `takeoverBudget`) → env `WE_FIX_TAKEOVER_BUDGET`. The legacy names
+ * (`we:scripts/settings/fix.json` `fix.takeoverBudget`) → env `WE_FIX_TAKEOVER_BUDGET`. The legacy names
  * (`takeoverMaxPerPr`, `WE_FIX_TAKEOVER_MAX_PER_PR`) are read at the same layer when the new name is absent. The
- * resolved value carries its `source` so the daemon logs it.
+ * cascade fails closed (a present but invalid value is 0, not the standard). The resolved value carries its `source`
+ * so the daemon logs it.
  *
  * PURE except {@link resolveTakeoverBudget}'s two file reads.
  */
@@ -49,31 +50,41 @@ export const PLATFORM_PREFERENCES_PATH = resolve(ROOT, 'scripts/lib/delivery-pla
 export const REPO_FIX_SETTINGS_PATH = resolve(ROOT, 'scripts/settings/fix.json');
 
 const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
-/** A budget value: a non-negative integer below 100 (a number or a digit string). Anything else skips the layer. */
-const asBudget = (v) => {
-  const s = String(v ?? '').trim();
-  return /^\d{1,2}$/.test(s) ? Number(s) : null;
+/** A budget value: an integer 0..99 (a number, or a digit string). Types are checked, not stringified: `[3]`, `""`,
+ *  `false` or `1.5` is invalid, not 3 / absent / "false". Returns `undefined` when invalid. */
+const parseBudget = (v) => {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 99 ? v : undefined;
+  return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : undefined;
 };
+/** The first PRESENT value among the named keys of a settings object (`undefined` when none is present). */
+const presentIn = (obj, keys) => keys.map((k) => obj?.[k]).find((v) => v !== undefined && v !== null);
 
 /**
- * The policy cascade for `fix.takeoverBudget`. Each layer is a valid budget or it is skipped.
- * @returns {{value:number, source:'standard'|'platform'|'repo'|'env'}}
+ * The policy cascade for `fix.takeoverBudget`. It fails CLOSED: the highest layer that is present (a non-blank env
+ * var, or a key that is not null in the repo file's / platform preference's `fix` object) decides, and a present value
+ * that is not a valid budget turns the takeover off (value 0, source `<layer>-invalid`) instead of falling through to
+ * the standard 2 — so a typo meant to stop the automatic takeover never starts it.
+ * @returns {{value:number, source:'standard'|'platform'|'repo'|'env'|'platform-invalid'|'repo-invalid'|'env-invalid'}}
  */
 export function resolveTakeoverBudget({
   env = process.env,
   readPlatform = () => readJson(PLATFORM_PREFERENCES_PATH),
   readRepo = () => readJson(REPO_FIX_SETTINGS_PATH),
 } = {}) {
-  let out = { value: TAKEOVER_BUDGET_STANDARD_DEFAULT, source: 'standard' };
-  const platform = readPlatform()?.fix ?? null;
-  const p = asBudget(platform?.[TAKEOVER_BUDGET_SETTING]) ?? asBudget(platform?.takeoverMaxPerPr);
-  if (p !== null) out = { value: p, source: 'platform' };
-  const repo = readRepo();
-  const r = asBudget(repo?.[TAKEOVER_BUDGET_SETTING]) ?? asBudget(repo?.takeoverMaxPerPr);
-  if (r !== null) out = { value: r, source: 'repo' };
-  const e = asBudget(env?.[TAKEOVER_BUDGET_ENV]) ?? asBudget(env?.WE_FIX_TAKEOVER_MAX_PER_PR);
-  if (e !== null) out = { value: e, source: 'env' };
-  return out;
+  const keys = [TAKEOVER_BUDGET_SETTING, 'takeoverMaxPerPr'];
+  const envRaw = [env?.[TAKEOVER_BUDGET_ENV], env?.WE_FIX_TAKEOVER_MAX_PER_PR]
+    .find((v) => typeof v === 'string' && v.trim() !== '');
+  const layers = [
+    ['env', envRaw],
+    ['repo', presentIn(readRepo()?.fix, keys)],
+    ['platform', presentIn(readPlatform()?.fix, keys)],
+  ];
+  for (const [source, raw] of layers) {
+    if (raw === undefined) continue;
+    const v = parseBudget(raw);
+    return v === undefined ? { value: 0, source: `${source}-invalid` } : { value: v, source };
+  }
+  return { value: TAKEOVER_BUDGET_STANDARD_DEFAULT, source: 'standard' };
 }
 
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
@@ -237,7 +248,7 @@ export function openDefects(comments) {
 /**
  * PURE: is a takeover owed instead of the round-cap note? `{ ok: true, n, budget, rung, route, previous }` or
  * `{ ok: false, reason, ... }`. Reasons, in the order they are checked:
- *   `setting-person`, `ruling-dispute` (always the operator, at once), `gate-hold` (the PR's own gate holds it and
+ *   `setting-person`, `setting-disabled` (the budget is 0 or invalid: no takeover ever runs), `ruling-dispute` (always the operator, at once), `gate-hold` (the PR's own gate holds it and
  *   no defect is open — never a takeover), `takeover-void-limit` / `takeover-spent` (the latest takeover never
  *   pushed: its head is still the PR head), `takeover-awaiting-review` (it pushed, no review has judged it yet),
  *   `takeover-budget-spent`, `takeover-not-converging` (the previous takeover did not reduce the open findings).
@@ -247,6 +258,9 @@ export function openDefects(comments) {
 export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1, fixerLadder, defaultBranch = 'main', capKind = 'fix' } = {}) {
   const budget = Number.isInteger(takeoverBudget) && takeoverBudget > 0 ? takeoverBudget : 0;
   if (roundCapAction !== 'takeover') return { ok: false, reason: 'setting-person' };
+  // A budget of 0 (or one that is not a whole number: it fails closed to 0) turns the takeover off. Checked before the
+  // thread is read: with nothing run, "spent" would tell the operator a takeover ran.
+  if (budget < 1) return { ok: false, reason: 'setting-disabled' };
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const comments = pr?.comments;
   const defects = openDefects(comments);
@@ -292,7 +306,6 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
       },
     };
   }
-  if (budget < 1) return { ok: false, reason: 'takeover-budget-spent', n: 0, budget };
   return { ok: true, n: 1, budget, ...takeoverRung(fixerLadder) };
 }
 

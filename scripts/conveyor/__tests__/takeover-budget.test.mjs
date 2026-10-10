@@ -63,14 +63,17 @@ describe('fix.takeoverBudget cascade', () => {
   });
   it('platform preference → repo → env, each layer overriding the one before; the source is named', () => {
     const platform = () => ({ fix: { takeoverBudget: 3 } });
-    const repo = () => ({ takeoverBudget: 1 });
+    const repo = () => ({ fix: { takeoverBudget: 1 } });
     expect(resolveTakeoverBudget({ env: {}, readPlatform: platform, readRepo: none })).toEqual({ value: 3, source: 'platform' });
     expect(resolveTakeoverBudget({ env: {}, readPlatform: platform, readRepo: repo })).toEqual({ value: 1, source: 'repo' });
     expect(resolveTakeoverBudget({ env: { WE_FIX_TAKEOVER_BUDGET: '0' }, readPlatform: platform, readRepo: repo })).toEqual({ value: 0, source: 'env' });
   });
-  it('junk skips the layer; the legacy takeoverMaxPerPr name is read when the new one is absent', () => {
-    expect(resolveTakeoverBudget({ env: { WE_FIX_TAKEOVER_BUDGET: 'lots' }, readPlatform: none, readRepo: () => ({ takeoverBudget: -1 }) })).toEqual({ value: 2, source: 'standard' });
-    expect(resolveTakeoverBudget({ env: {}, readPlatform: none, readRepo: () => ({ takeoverMaxPerPr: 1 }) })).toEqual({ value: 1, source: 'repo' });
+  it('junk fails closed to 0 (not the standard); the legacy takeoverMaxPerPr name is read when the new one is absent', () => {
+    expect(resolveTakeoverBudget({ env: { WE_FIX_TAKEOVER_BUDGET: 'lots' }, readPlatform: none, readRepo: () => ({ fix: { takeoverBudget: 1 } }) })).toEqual({ value: 0, source: 'env-invalid' });
+    expect(resolveTakeoverBudget({ env: {}, readPlatform: none, readRepo: () => ({ fix: { takeoverBudget: -1 } }) })).toEqual({ value: 0, source: 'repo-invalid' });
+    expect(resolveTakeoverBudget({ env: {}, readPlatform: none, readRepo: () => ({ fix: { takeoverMaxPerPr: 1 } }) })).toEqual({ value: 1, source: 'repo' });
+    // a flat (un-namespaced) key in the repo file is not a setting
+    expect(resolveTakeoverBudget({ env: {}, readPlatform: none, readRepo: () => ({ takeoverBudget: 1 }) })).toEqual({ value: 2, source: 'standard' });
   });
   it('the shipped repo setting is the standard budget', () => {
     expect(resolveTakeoverBudget({ env: {}, readPlatform: none }).value).toBe(2);

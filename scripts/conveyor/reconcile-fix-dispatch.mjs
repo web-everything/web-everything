@@ -104,6 +104,7 @@ import { assertMainNotStale } from '../operations/review-dispatch.mjs';
 import { armSelfReexecOnFastForward, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
 import { BRIEF_REQUIRED_BY_KIND, OPTIONAL_BRIEF_PLACEHOLDERS, REPO_AWARE_VALUE_PATTERNS, fillBrief, sessionSlugFor } from '../operations/dispatch-lane.mjs';
+import { briefWithContextPack } from './fix-context-pack.mjs'; // fixer context pack: finding + code + files staged in the brief
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
 import { laneRefItemNum } from './lease-reaper.mjs';
 import {
@@ -1268,7 +1269,11 @@ export function writePrivateBorrowedPrompt(slug, text, base = tmpdir()) {
 export function dispatchFix(planned, {
   repo = 'we',
   root = REPO_ROOT,
-  readBrief = (r) => readFileSync(fixBriefPath(r), 'utf8'),
+  // Fixer context pack (`fix.contextPack`, `fix.localTests`) — the template arrives with the finding verbatim, the code
+  // at each named line, the PR's file list and the proof-only tests rule in front, and the sections the pack makes
+  // redundant trimmed (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
+  readBrief = (r) => packFixBrief(readFileSync(fixBriefPath(r), 'utf8')),
+  packFixBrief = (template) => briefWithContextPack(template, { kind: 'fix', repo, toSlug: ghRepoSlug, pr: planned.pr, exec: execFileSyncThrottled }),
   mintSessionId = () => randomUUID(),
   spawnAgent = defaultSpawnAgent,
   extraArgs = [],

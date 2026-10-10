@@ -38,8 +38,11 @@ describe('fix settings cascade — card xrbu1bp keys', () => {
     expect(resolveFixSettings({ env: {}, read: noFile })).toMatchObject({ resumeAcrossRounds: 'on', strongerModelFromRound: 3 });
   });
   it('settings file, then env, win in that order; a bad value falls through', () => {
-    const read = () => JSON.stringify({ resumeAcrossRounds: 'off', strongerModelFromRound: 4 });
+    const read = () => JSON.stringify({ fix: { resumeAcrossRounds: 'off', strongerModelFromRound: 4 } });
     expect(resolveFixSettings({ env: {}, read })).toMatchObject({ resumeAcrossRounds: 'off', strongerModelFromRound: 4 });
+    // the file layer is its `fix` object: a flat (un-namespaced) key is not a setting
+    const flat = () => JSON.stringify({ resumeAcrossRounds: 'off', strongerModelFromRound: 4 });
+    expect(resolveFixSettings({ env: {}, read: flat })).toMatchObject({ resumeAcrossRounds: 'on', strongerModelFromRound: 3 });
     expect(resolveFixSettings({ env: { WE_FIX_RESUME_ACROSS_ROUNDS: 'on', WE_FIX_STRONGER_MODEL_FROM_ROUND: '2' }, read }))
       .toMatchObject({ resumeAcrossRounds: 'on', strongerModelFromRound: 2, sources: { resumeAcrossRounds: 'env', strongerModelFromRound: 'env' } });
     expect(resolveFixSettings({ env: { WE_FIX_STRONGER_MODEL_FROM_ROUND: 'soon' }, read }).strongerModelFromRound).toBe(4);

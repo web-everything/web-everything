@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- STAGED, NOT INSTALLED (card xkuflno). Adjust the node path for this host and create
+	     the clone's .conveyor log directory before installing. Jobs pin the clone's committed HEAD.
+	     Stopping this supervisor leaves its detached sampler job running for reattachment. -->
+	<key>Label</key>
+	<string>com.we.resource-sampler</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+		<key>WE_DAEMON_RESTART_MIN_INTERVAL_MS</key>
+		<string>120000</string>
+	</dict>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/nicolasgilbert/.nvm/versions/node/v22.1.0/bin/node</string>
+		<string>/Users/nicolasgilbert/workspace/wev-review-daemon/scripts/conveyor/resource-sampler-daemon.mjs</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon</string>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/resource-sampler.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/nicolasgilbert/workspace/wev-review-daemon/.conveyor/resource-sampler.log</string>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+</dict>
+</plist>

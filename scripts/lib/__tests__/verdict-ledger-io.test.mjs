@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
   appendGitRowsSync, createGitLedgerStore, appendLedgerRows, readLedgerFromGit, ledgerGitPath, LedgerAppendExhaustedError, LEDGER_TRANSPORT_BRANCH,
+  resolveLedgerReadSettings, formatLedgerReadSettings, sizedLedgerRun, DEFAULT_LEDGER_READ_MAX_BYTES, LEDGER_READ_MAX_BYTES_ENV,
 } from '../verdict-ledger-io.mjs';
 import { buildVerdictRecord, buildLedgerEvent } from '../verdict-ledger.mjs';
 import { withBareOrigin, git, writeLocalIdentity } from '../../operations/__tests__/helpers/real-repo.mjs';
@@ -240,5 +241,110 @@ describe('idempotent git writes', () => {
     expect(appendGitRowsSync([{}], { repo: REPO })).toMatchObject({ ok: false, appended: 0 });
     const store = createGitLedgerStore({ readRows: () => { throw new Error('offline'); } });
     await expect(store.read({ repo: REPO })).resolves.toMatchObject({ status: 'unreadable', error: 'offline' });
+  });
+});
+
+/** A ledger text of `bytes`+ bytes of valid rows (the live web-everything ledger passed 1 MiB on 2026-10-10). */
+const bigLedger = (bytes) => {
+  const lines = [];
+  let size = 0;
+  for (let pr = 1; size < bytes; pr += 1) {
+    const line = JSON.stringify(row(pr, { note: 'x'.repeat(120) }));
+    lines.push(line);
+    size += line.length + 1;
+  }
+  return { text: `${lines.join('\n')}\n`, rows: lines.length };
+};
+
+describe('ledger read cap: a setting through the cascade, source named', () => {
+  it('defaults to the standard cap', () => {
+    const s = resolveLedgerReadSettings({ repo: {}, env: {} });
+    expect(s).toMatchObject({ maxBytes: DEFAULT_LEDGER_READ_MAX_BYTES, sources: { maxBytes: 'standard' }, invalid: [] });
+    expect(DEFAULT_LEDGER_READ_MAX_BYTES).toBeGreaterThan(1024 * 1024);
+  });
+
+  it('repo settings override the standard; env overrides repo; the source is named', () => {
+    const repo = { verdictLedger: { readMaxBytes: 5_000_000 } };
+    expect(resolveLedgerReadSettings({ repo, env: {} })).toMatchObject({ maxBytes: 5_000_000, sources: { maxBytes: 'repo' } });
+    const both = resolveLedgerReadSettings({ repo, env: { [LEDGER_READ_MAX_BYTES_ENV]: '7000000' } });
+    expect(both).toMatchObject({ maxBytes: 7_000_000, sources: { maxBytes: 'env' } });
+    expect(formatLedgerReadSettings(both)).toMatch(/verdictLedger\.readMaxBytes=7000000 \(env\)/);
+  });
+
+  it('an invalid layer is ignored and reported; the layer below answers', () => {
+    const s = resolveLedgerReadSettings({ repo: { verdictLedger: { readMaxBytes: -1 } }, env: { [LEDGER_READ_MAX_BYTES_ENV]: 'lots' } });
+    expect(s).toMatchObject({ maxBytes: DEFAULT_LEDGER_READ_MAX_BYTES, sources: { maxBytes: 'standard' } });
+    expect(s.invalid).toEqual(['repo.verdictLedger.readMaxBytes', `env.${LEDGER_READ_MAX_BYTES_ENV}`]);
+  });
+});
+
+describe('sizedLedgerRun: the blob read buffer is sized to the blob, bounded by the cap', () => {
+  const fakeExec = (size, text = 'x') => {
+    const calls = [];
+    const exec = (args, opts = {}) => {
+      calls.push({ args, maxBuffer: opts.maxBuffer });
+      if (args[0] === 'rev-parse') return 'abc123\n';
+      if (args[0] === 'cat-file' && args[1] === '-s') return `${size}\n`;
+      if (args[0] === 'cat-file' && args[1] === 'blob') return text;
+      return '';
+    };
+    return { exec, calls };
+  };
+
+  it('reads the blob by its object id with a buffer that fits it', () => {
+    const f = fakeExec(3_000_000);
+    const run = sizedLedgerRun({ maxBytes: 10_000_000, exec: f.exec });
+    run(['show', 'origin/ops/review-requests:verdict-ledger/x.jsonl'], { cwd: '/b' });
+    const blob = f.calls.find((c) => c.args[1] === 'blob');
+    expect(blob.args).toEqual(['cat-file', 'blob', 'abc123']);
+    expect(blob.maxBuffer).toBeGreaterThan(3_000_000);
+    expect(blob.maxBuffer).toBeLessThan(3_000_000 * 2);
+  });
+
+  it('a blob over the cap THROWS (the reader reports unreadable) and is never read', () => {
+    const f = fakeExec(20_000_000);
+    const run = sizedLedgerRun({ maxBytes: 10_000_000, exec: f.exec, source: 'env' });
+    expect(() => run(['show', 'origin/b:p'], { cwd: '/b' })).toThrow(/20000000 bytes.*exceeds.*10000000.*\(env\)/);
+    expect(f.calls.some((c) => c.args[1] === 'blob')).toBe(false);
+  });
+
+  it('an unparseable size throws instead of guessing', () => {
+    const f = fakeExec('nonsense');
+    expect(() => sizedLedgerRun({ maxBytes: 10, exec: f.exec })(['show', 'origin/b:p'], {})).toThrow(/size/);
+  });
+
+  it('other git calls pass straight through', () => {
+    const f = fakeExec(1);
+    sizedLedgerRun({ maxBytes: 10, exec: f.exec })(['fetch', '--quiet', 'origin', 'x'], { cwd: '/b' });
+    expect(f.calls.map((c) => c.args[0])).toEqual(['fetch']);
+  });
+});
+
+describe('real git: a ledger larger than the 1 MiB default buffer (live ENOBUFS, 2026-10-10)', () => {
+  it('reads a >1 MiB ledger as ok with every row, not unreadable (spawnSync git ENOBUFS)', async () => {
+    const big = bigLedger(1.5 * 1024 * 1024);
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { [ledgerGitPath(REPO)]: big.text });
+      const r = readLedgerFromGit({ board: ctx.clone, repo: REPO, log: () => {} });
+      expect(r.error).toBeUndefined();
+      expect(r.status).toBe('ok');
+      expect(r.records).toHaveLength(big.rows);
+      const store = await createGitLedgerStore().read({ board: ctx.clone, repo: REPO, log: () => {} });
+      expect(store.status).toBe('ok');
+      expect(store.rows).toHaveLength(big.rows);
+    });
+  });
+
+  it('a ledger over the configured cap is unreadable with the cap and its source named', async () => {
+    const big = bigLedger(300 * 1024);
+    await withBareOrigin(async (ctx) => {
+      ctx.seedOriginBranch(LEDGER_TRANSPORT_BRANCH, { [ledgerGitPath(REPO)]: big.text });
+      const logs = [];
+      const r = readLedgerFromGit({ board: ctx.clone, repo: REPO, env: { [LEDGER_READ_MAX_BYTES_ENV]: '100000' }, settings: {}, log: (l) => logs.push(l) });
+      expect(r.status).toBe('unreadable');
+      expect(r.reason).toBe('ledger-exceeds-read-cap');
+      expect(r.error).toMatch(/exceeds.*100000.*\(env\)/);
+      expect(logs.join('\n')).toMatch(/verdictLedger\.readMaxBytes=100000 \(env\)/);
+    });
   });
 });

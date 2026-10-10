@@ -106,7 +106,7 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
-import { takeoverMarkers, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
+import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { parseOperatorRulingComment, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
@@ -1360,10 +1360,11 @@ function dispatchReviewRow({
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
   // count exceeds the cap: the last allowed fix is always owed its final review.
   const finalReview = attempts >= roundCap;
-  // Card xx0055i — a takeover is a round BEYOND the cap: its re-arm comment makes the count cap+1, and that last fix is
-  // owed its review exactly like the last ordinary one. One extra attempt per takeover that actually started (void
-  // markers are already cancelled by `takeoverMarkers`); the fix path still refuses another fixer past the cap.
-  const reviewCap = roundCap + takeoverMarkers(pr?.comments).length;
+  // Card xx0055i — a takeover is a round BEYOND the cap: its re-arm comment lands one past the count it launched at (cap+1
+  // when it launched at the cap, more when the count was already above it), and that last fix is owed its review exactly
+  // like the last ordinary one. `takeoverReviewCap` measures from the launch count each trusted, un-voided takeover marker
+  // records; the fix path still refuses another fixer past the cap.
+  const reviewCap = takeoverReviewCap(pr?.comments, roundCap);
   const finalWhy = finalReview
     ? ' — final review of the last allowed fix; if it returns changes the fix path escalates' : '';
   const findings = countFindings(pr?.comments);
@@ -1778,12 +1779,14 @@ export function planReconcile({
     // for why the text carries no clock-derived number.
     // Built over an injected `refuseFn` so the ci-red-parallel review (below) can fold its `cap-exhausted` into
     // the PR's one `owed-ci-rerun` row while still surfacing the SAME note.
-    const capExhaustedVia = (refuseFn) => (extra, { allowTakeover = true } = {}) => {
+    const capExhaustedVia = (refuseFn) => (extra, { allowTakeover = true, allowTakeoverReview = allowTakeover } = {}) => {
       // A takeover's own head is judged once even though the cap is spent (live: #4708, takeover head 7e29b95c4
       // refused 5/5 every tick, so the takeover could never be reviewed). Only the FIX/REVIEW round caps, only a head
       // pushed after a trusted takeover signal that no verdict names yet, and only `takeoverReviewAttempts` reviews.
-      // The review still needs green CI and no referral hold; review:human still needs the operator.
-      if (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') {
+      // The review still needs green CI and no referral hold; review:human still needs the operator. A call site that
+      // passes `allowTakeover: false` (the operator send-back, whose must-fix body a person reads) is never replaced
+      // by a review dispatch either.
+      if (allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix')) {
         const grant = takeoverReviewGrant({ pr, takeoverReviewAttempts });
         if (grant.ok) {
           if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
@@ -1874,6 +1877,7 @@ export function planReconcile({
         text: takeover?.reason === 'takeover-not-converging'
           ? notConvergingText(prNumber, takeover)
           : roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
+            + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover budget — fix.takeoverBudget or env WE_FIX_TAKEOVER_BUDGET — is 0 or invalid)' : '')
             + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
             + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
             + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
@@ -2607,7 +2611,7 @@ export function planReconcile({
         refuseCapExhausted({
           ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
           why: `the PR's own durable attempt count is ${attempts} against a cap of ${effectiveRoundCap} — auto-repair of the block-ruled referrals is exhausted here and a person must take it`,
-        });
+        }, { allowTakeoverReview: false }); // this head is owed a FIX (see above), never the review the takeover grant would send.
         continue;
       }
       dispatch.push({

@@ -34,7 +34,7 @@ One line per class: either the handling, or `n/a: <why>`.
 1. **Untrusted text** — takeover signals and verdicts count only from trusted authors; findings and the previous diff are quoted in the brief as DATA, and a code fence inside the diff cannot close the block.
 2. **Truncated reads** — the previous-takeover diff is cut at 12000 chars with the full `git diff` command named; a failed read leaves the command only.
 3. **Shared state files** — n/a: state lives on the PR thread (markers), no new files.
-4. **Fail closed** — no judged round after a takeover means no further takeover; unparsable settings fall back to the next cascade layer.
+4. **Fail closed** — no judged round after a takeover means no further takeover; a present but unparsable budget setting is 0 (takeover off), never the next cascade layer.
 5. **Identity scoping** — per PR: episodes, rounds and the budget are read off that PR's own thread.
 6. **State over time** — a takeover is an episode (signals with no verdict between); a void marker cancels its start, so a launch fault does not spend the budget.
 7. **Who wrote it** — operator takeover comments and daemon markers both count, only from trusted logins.
