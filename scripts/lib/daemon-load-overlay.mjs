@@ -19,6 +19,10 @@
  * (which rebuilds fresh from `origin/main` + the REGISTERED overlay list, nothing else) would silently drop it
  * again. Registering it as a real overlay is the only way a manual early load survives past this one CLI run.
  *
+ * HISTORY (2026-10-09, PR #4669 load): a ready candidate can predate overlay registration.
+ * ADOPTED means origin/<ref>'s tip is an ancestor of the installed HEAD — never the swap's own success.
+ * A stale adoption gets a bounded follow-up rebuild; ancestry must prove the overlay reached HEAD.
+ *
  * DISPATCH SMOKE (xkhtg2a): an overlay that touches a dispatch-path file must also pass ONE real worker launch
  * before it stays loaded — see the "the DISPATCH SMOKE" section below. A failure removes only this overlay and
  * rebuilds without it. Settings: `overlaySafety` in daemon-rebuild-settings.json, or WE_OVERLAY_DISPATCH_SMOKE
@@ -256,6 +260,31 @@ export function overlayDispatchFiles({ tree, ref, patterns, run = gitRun }) {
   return { inTree: true, required: matched.length > 0, tip, files, matched, reason: matched.length ? 'touches-dispatch-path' : 'off-dispatch-path' };
 }
 
+/**
+ * Verify the fetched overlay tip is an ancestor of the installed HEAD. Read-only IO, failing closed.
+ * @returns {{inHead:boolean, tip:string|null, head:string|null, reason:string}}
+ */
+export function overlayInstalled({ root, ref, run = gitRun }) {
+  try {
+    assertSafeRef(ref, '--ref');
+    const git = (args) => run(args, { cwd: root, timeout: 60_000, killSignal: 'SIGKILL' });
+    const tipRes = git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${ref}^{commit}`]);
+    const headRes = git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
+    const tip = tipRes.status === 0 ? String(tipRes.stdout ?? '').trim() || null : null;
+    const head = headRes.status === 0 ? String(headRes.stdout ?? '').trim() || null : null;
+    if (!tip) return { inHead: false, tip, head, reason: 'ref-unresolved' };
+    if (!head) return { inHead: false, tip, head, reason: 'head-unresolved' };
+    const { status } = git(['merge-base', '--is-ancestor', tip, head]);
+    return { inHead: status === 0, tip, head, reason: status === 0 ? 'in-head' : status === 1 ? 'not-in-head' : 'check-failed' };
+  } catch {
+    return { inHead: false, tip: null, head: null, reason: 'check-threw' };
+  }
+}
+
+function installedClosed(installed, options) {
+  try { return installed(options); } catch { return { inHead: false, reason: 'check-threw' }; }
+}
+
 const PERMISSION_BLOCKER = /permission/i;
 
 /**
@@ -475,7 +504,8 @@ export function withDispatchSmoke({
  * preview.
  * @param {{clone:string, ref:string, pr?:number|null, base?:string, dryRun?:boolean, env?:NodeJS.ProcessEnv,
  *   log?:Console, addedBy?:string|null, reason?:string|null, now?:string,
- *   addOverlayFn?:typeof addOverlay, rebuild?:typeof rebuildClone, dryRunRebuildFn?:typeof dryRunRebuild}} o
+ *   addOverlayFn?:typeof addOverlay, rebuild?:typeof rebuildClone, dryRunRebuildFn?:typeof dryRunRebuild,
+ *   installed?:typeof overlayInstalled, followUpRebuilds?:number}} o
  * @returns {Promise<object>}
  */
 export async function runDaemonLoadOverlay({
@@ -485,6 +515,7 @@ export async function runDaemonLoadOverlay({
   wait = false, waitMs, versions, submit = submitRequest, waitFor = waitForResult, rollbackVersionFn = rollbackVersionIfCurrent,
   settings, baseSmoke = runLiveSmokeWithRetry, dispatchSmoke = runRealDispatchSmoke, inspect = overlayDispatchFiles,
   removeOverlayFn = removeOverlay, appendEventFn = appendOverlayEvent,
+  installed = overlayInstalled, followUpRebuilds = 1,
 }) {
   if (!clone || typeof clone !== 'string') throw new TypeError('daemon-load-overlay: --clone=<path> is required');
   if (!ref || typeof ref !== 'string') throw new TypeError('daemon-load-overlay: --ref=<branch to overlay> is required');
@@ -618,6 +649,27 @@ export async function runDaemonLoadOverlay({
     rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
   }
 
+  let check = installedClosed(installed, { root, ref });
+  let staleAdopt;
+  let followUps = 0;
+  let alerts = rebuildResult.alerts;
+  if (rebuildResult.adopted && !check.inHead) {
+    staleAdopt = { head: rebuildResult.head, tip: check.tip, reason: check.reason };
+    log.error?.(`daemon-load-overlay: the rebuild adopted ${staleAdopt.head} but ${ref} (${check.tip}) is NOT in it (${check.reason}) — that build predates the registration; NOT adopted, rebuilding to include it`);
+    while (followUps < followUpRebuilds) {
+      followUps += 1;
+      try {
+        rebuildResult = await rebuild({ root, env, log, mainOnly: false, runSmoke });
+      } catch (e) {
+        if (!(ctl.ran && ctl.result && !ctl.result.ok)) throw e;
+        rebuildResult = { moved: false, adopted: false, reason: `rebuild-threw: ${String((e && e.message) || e).split('\n')[0]}` };
+      }
+      alerts = [...(alerts || []), ...(rebuildResult.alerts || [])];
+      check = installedClosed(installed, { root, ref });
+      if (check.inHead || (rebuildResult.moved === false && !rebuildResult.adopted)) break;
+    }
+  }
+
   // Adopted without the candidate dispatch smoke (a cached/proven tree skips the smoke; a daemon tick that took the
   // lock first adopts with its own plain smoke): smoke the LIVE clone now, if the overlay is in it and needs one.
   if (smokeOn && !ctl.ran) {
@@ -633,7 +685,13 @@ export async function runDaemonLoadOverlay({
 
   const out = {
     root, ref, homeBranch: base, registered: true, mergedAnything: !!rebuildResult.moved,
-    adopted: !!rebuildResult.adopted, reason: rebuildResult.reason, alerts: rebuildResult.alerts, head: rebuildResult.head,
+    adopted: !!rebuildResult.adopted && check.inHead, reason: rebuildResult.reason, alerts, head: rebuildResult.head,
+    overlayInHead: check.inHead, installedCheck: check, followUps,
+    ...(staleAdopt ? { staleAdopt } : {}),
+    ...((staleAdopt || rebuildResult.adopted) && !check.inHead ? {
+      reason: 'installed-build-lacks-overlay', rebuildReason: rebuildResult.reason, pending: true,
+      checkCommand: `git -C ${root} merge-base --is-ancestor ${check.tip ?? `origin/${ref}`} HEAD`,
+    } : {}),
     warnings, ...(ctl.ran ? { dispatchSmoke: { ...ctl } } : {}),
   };
   if (!ctl.ran || ctl.result?.ok) return out;
@@ -688,10 +746,12 @@ if (IS_CLI) {
         process.stdout.write(result.pending
           ? `daemon-load-overlay: registered ${ref} — versioned clone, request ${result.requestId} queued for the in-tick updater (use --wait to block on its result) (${result.root})\n`
           : `daemon-load-overlay: registered ${ref} — versioned request ${result.requestId} ${result.timedOut ? 'TIMED OUT' : `answered: ${result.reason}`} (${result.root})\n`);
+      } else if (result.staleAdopt && !result.adopted) {
+        process.stdout.write(`daemon-load-overlay: registered ${ref} but NOT adopted — the installed build ${result.installedCheck.head ?? result.head ?? result.staleAdopt.head} does not contain it (${result.installedCheck.reason}; built before the registration). ${result.followUps} follow-up rebuild(s): ${result.rebuildReason ?? result.reason}. It stays registered; the next rebuild includes it. Check: ${result.checkCommand} (${result.root})\n`);
       } else if (!result.mergedAnything) {
         process.stdout.write(`daemon-load-overlay: registered ${ref} — nothing adopted this pass (${result.reason}) (${result.root})\n`);
       } else if (result.adopted) {
-        process.stdout.write(`daemon-load-overlay: registered ${ref} and ADOPTED onto ${result.head} at ${result.root} (${result.reason})\n`);
+        process.stdout.write(`daemon-load-overlay: registered ${ref} and ADOPTED onto ${result.head} at ${result.root} (${result.reason})${result.followUps ? ` (after ${result.followUps} follow-up rebuild(s); the first adopted build predated the overlay)` : ''}\n`);
       } else {
         process.stdout.write(`daemon-load-overlay: registered ${ref} but the rebuild was REJECTED (${result.reason}) at ${result.root}\n`);
       }
@@ -699,7 +759,7 @@ if (IS_CLI) {
       if (!flags.json && result.dispatchSmoke?.result?.ok) {
         process.stdout.write(`  dispatch smoke PASSED (${result.dispatchSmoke.phase}, ${result.dispatchSmoke.result.ms}ms, session ${result.dispatchSmoke.result.sessionId})\n`);
       }
-      process.exitCode = (result.mergedAnything && !result.adopted) || result.timedOut || result.refused || result.rolledBack ? 1 : 0;
+      process.exitCode = (result.mergedAnything && !result.adopted) || (result.staleAdopt && !result.adopted) || result.timedOut || result.refused || result.rolledBack ? 1 : 0;
     })
     .catch((e) => {
       process.stderr.write(`daemon-load-overlay: fatal: ${String((e && e.message) || e)}\n`);

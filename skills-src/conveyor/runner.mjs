@@ -616,7 +616,7 @@ export function resolveSkipPasses(flagValue, { names = MECHANICAL_PASS_NAMES } =
  */
 export function wireSelfSyncAndAppAuth({
   tickOnce, root, onRestart, authOpts = FLEET_APP_AUTH_OPTS, sync, selfSync = false, gate,
-  rebuild, mainOnly, acquireRead, releaseRead, readState,
+  rebuild, mainOnly, acquireRead, releaseRead, readState, hasStaleRefusal,
 }) {
   const authed = withGithubAppAuth({ tickOnce }, authOpts);
   if (selfSync !== true) return authed.tickOnce;
@@ -630,6 +630,8 @@ export function wireSelfSyncAndAppAuth({
     ...(acquireRead ? { acquireRead } : {}),
     ...(releaseRead ? { releaseRead } : {}),
     ...(readState ? { readState } : {}),
+    // A daemon whose tick can tell it hit the stale-main refusal (the builder's `cloneStale`) gets the immediate rebuild.
+    ...(hasStaleRefusal ? { hasStaleRefusal } : {}),
   };
   return withSelfSync(authed, selfSyncOpts).tickOnce;
 }

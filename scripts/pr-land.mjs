@@ -1002,9 +1002,9 @@ function runCli() {
       const repoKeyForLimit = repoKeyForSlug(originSlugOf(REPO)) || 'we';
       let changedFilesForLimit = [];
       try { changedFilesForLimit = gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
-      const { count: openCount, limit } = countOpenPrsForRepo(repoKeyForLimit);
+      const { count: openCount, limit, cardOnly: cardOnlyExcluded, accepted: acceptedExcluded } = countOpenPrsForRepo(repoKeyForLimit);
       const limitDecision = decideOpenPr({
-        repoKey: repoKeyForLimit, limit, openCount, changedFiles: changedFilesForLimit, branch: REF,
+        repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, changedFiles: changedFilesForLimit, branch: REF,
         branchAllowed: isBranchAllowedLive(REF), globalOff: isGlobalOffLive(), forceOpen: FORCE_OPEN, forceReason: FORCE_OPEN_REASON,
       });
       if (!AS_JSON) process.stderr.write(`pr-land [${REPO}] · pr-limit(${repoKeyForLimit}): ${limitDecision.reason}\n`);

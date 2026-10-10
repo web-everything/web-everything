@@ -3,9 +3,10 @@ bornAs: xkfzukn
 kind: story
 size: 5
 priority: high
-status: open
+status: resolved
 scope: ["we:scripts/backlog.mjs", "we:scripts/lib/build-queue.mjs", "we:scripts/conveyor/queue-store.mjs", "we:scripts/conveyor/queue.mjs"]
 dateOpened: "2026-09-28"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
@@ -26,4 +27,24 @@ class, not a score boost or a pin. Aging moves an item up one class after 8 h, n
 
 ## Done when
 
-1. **Executable** — TODO: a command that fails before this item lands and passes after.
+1. **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/build-queue.test.mjs` (red before: 9/9 fail — no
+   class fields, and the CLI case counts `cleared` from frontmatter instead of the state-home sidecar; green after).
+2. **Live** — in `~/workspace/wev-control`, `node we:scripts/backlog.mjs build-queue --json` reports `cleared` from the
+   same sidecar `node we:scripts/conveyor/queue.mjs list` reads (`sidecar.path` / `sidecar.entries` match), and every
+   row is in class order (P0 → P4), with `priority: high` cards in P2 ahead of normal P3 cards.
+
+## Design notes
+
+- Class comes from the shared rule `we:scripts/lib/delivery-priority.mjs` (no re-derivation); the card adapter is
+  `buildQueuePriorityFacts` in `we:scripts/lib/build-queue.mjs`: >= 2 pending dependents → P1, `priority: high` →
+  P2, `priority: low` → the operator `low` override (P4), wait = time since the card was cleared (sidecar
+  `addedAt`), aging +1 class after `agingHours`, never into P0.
+- Sort: class → tier (hand pin, within a class) → fix-queue score (unblocks × 60 + minutes waited) → WSJF → rank →
+  date → num. Mode `off` in `we:scripts/lib/delivery-priority-settings.json` gives the exact pre-class order.
+
+## Follow-up 2026-10-09 (operator ruling ~13:50 ET)
+
+Shadow keeps one meaning everywhere: log only, never reorder. The build queue now has its own key
+`buildQueuePriority.mode` in `we:scripts/settings/build-queue-priority.json`, set to `enforce`.
+The cascade is standard default → platform `deliveryPriority` → tool `buildQueuePriority` → env
+`WE_BUILD_QUEUE_PRIORITY_MODE`. The shared/fix-queue `deliveryPriority.mode` stays `shadow`.

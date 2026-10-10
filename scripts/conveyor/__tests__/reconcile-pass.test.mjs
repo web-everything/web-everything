@@ -1420,3 +1420,47 @@ it('defaultReadMainRuns annotates a failure run with checkConclusions from a com
   const truncated = JSON.stringify({ total_count: 150, jobs });
   expect(defaultReadMainRuns({ repo: 'o/r', exec: (_c, argv) => (argv[0] === 'api' ? truncated : list) })[0].checkConclusions).toBeUndefined();
 });
+
+
+describe('readTimeoutEvidence — authoritative cancelled check suites (#4651)', () => {
+  const repo = 'o/r';
+  const head = 'c'.repeat(40);
+  const pr = { number: 7, headRefOid: head };
+  const url = (run, job) => `https://github.com/${repo}/actions/runs/${run}/job/${job}`;
+  const execFor = (cancelledSuite, successSuite) => vi.fn((_c, [, path]) => {
+    const json = JSON.stringify;
+    if (/\/pulls\/7$/.test(path)) return json({ head: { sha: head }, base: { sha: 'b' }, state: 'open', changed_files: 1 });
+    if (/pulls\/7\/files/.test(path)) return json([{ filename: 'a.ts' }]);
+    if (/check-runs/.test(path)) return json({ total_count: 3, check_runs: [
+      { id: 1, name: 'test', status: 'completed', conclusion: 'success', details_url: url(50, 1), check_suite: { id: 5 } },
+      { id: 12, name: 'soak-replay-gate', status: 'completed', conclusion: 'success', details_url: url(100, 12), check_suite: { id: successSuite } },
+      { id: 11, name: 'soak-replay-gate', status: 'completed', conclusion: 'cancelled', details_url: url(200, 11), check_suite: { id: cancelledSuite } },
+    ] });
+    if (/\/status$/.test(path)) return json({ total_count: 0 });
+    if (/actions\/jobs\/11$/.test(path)) return json({ id: 11, run_id: 200, head_sha: head, run_attempt: 1,
+      name: 'soak-replay-gate', status: 'completed', conclusion: 'cancelled', runner_name: 'r1', runner_id: 1,
+      started_at: '2026-10-09T18:00:32Z', completed_at: '2026-10-09T18:01:04Z', steps: [] });
+    if (/actions\/runs\/200$/.test(path)) return json({ id: 200, head_sha: head, run_attempt: 1,
+      path: '.github/workflows/soak-replay-gate.yml', repository: { full_name: repo } });
+    if (/\/logs$/.test(path)) throw new Error('gh: HTTP 404');
+    throw new Error(`unexpected ${path}`);
+  });
+
+  it('does not rerun a cancelled older suite superseded by a successful newer suite of the same name', () => {
+    const exec = execFor(10, 20);
+    expect(readTimeoutEvidence(pr, { repo, exec })).toEqual({
+      eligible: false, reason: 'timeout-evidence:incomplete-failure-inventory',
+    });
+    expect(exec.mock.calls.some(([, args]) => args[1].includes('/actions/'))).toBe(false);
+  });
+
+  it('reruns only run 200 when its newer suite is cancelled despite the older suite having a higher green check-run id', () => {
+    const exec = execFor(20, 10);
+    const evidence = readTimeoutEvidence(pr, { repo, exec });
+    expect(evidence).toMatchObject({ eligible: true, infraCancelled: true, repo, pr: 7, head });
+    expect(evidence.jobs).toEqual([{ repo, head, run: 200, job: 11, attempt: 1 }]);
+    expect(exec.mock.calls.map(([, args]) => args[1]).filter((path) => path.includes('/actions/'))).toEqual([
+      `repos/${repo}/actions/jobs/11`, `repos/${repo}/actions/runs/200`,
+    ]);
+  });
+});

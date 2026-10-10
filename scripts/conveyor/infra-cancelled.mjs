@@ -110,6 +110,26 @@ export function isInfraCancelledOnlyRun(jobs) {
   return bad.every((j) => isInfraCancelledJob(j) || isAggregateGateFailure(j));
 }
 
+/**
+ * The run GitHub's branch protection actually judges, one per check name. PURE. LIVE 2026-10-09, PR #4651: a re-run of
+ * an OLDER `soak-replay-gate` run (attempt 2, green) cancelled the NEWER run through its concurrency group. GitHub held
+ * the PR `BLOCKED` on the cancelled run: it reads a check from its NEWEST check suite, not from the run that finished
+ * last. So: highest `check_suite.id` wins, ties broken by highest check-run `id`. A row with no suite id ranks lowest.
+ * @param {Array<{id?:number, name?:string, check_suite?:{id?:number}}>} checkRuns REST `commits/<sha>/check-runs` rows
+ * @returns {Array<object>} one row per distinct name
+ */
+export function authoritativeCheckRuns(checkRuns) {
+  const best = new Map();
+  const rank = (c) => [Number(c?.check_suite?.id) || 0, Number(c?.id) || 0];
+  for (const c of Array.isArray(checkRuns) ? checkRuns : []) {
+    const prev = best.get(c?.name);
+    const [s, i] = rank(c);
+    const [ps, pi] = prev ? rank(prev) : [-1, -1];
+    if (!prev || s > ps || (s === ps && i > pi)) best.set(c?.name, c);
+  }
+  return [...best.values()];
+}
+
 /** Resolve the `ciHeal.infraCancelled` mode for a repo key. Env: `WE_CI_HEAL_INFRA_CANCELLED[_<REPOKEY>]`. PURE. */
 export function resolveInfraCancelledMode(repoKey, env = process.env) {
   const suffix = String(repoKey ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '_');

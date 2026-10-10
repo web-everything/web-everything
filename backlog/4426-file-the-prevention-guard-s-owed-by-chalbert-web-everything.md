@@ -4,7 +4,7 @@ kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/4352-important-github-writes-retry-themselves-on-the-next-cycle-i.md", "we:backlog/4309-github-api-budget-queue-refused-writes-and-account-spend-per.md"]
+
 dateOpened: "2026-09-28"
 tags: []
 ---
@@ -26,3 +26,12 @@ Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2
 ## Done when
 
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
+
+## Findings (standalone worker, 2026-10-09)
+
+The build-dispatch daemon held #4426 with:
+
+> worker-declined: could-not-prepare — obligation 6 leaves a consequential scope choice: preserve every refused legacy heal/escalation attempt, or limit distinct-attempt accounting to probation writes. Current code deliberately coalesces legacy writes by '(repo, pr, kind)' while probation writes add 'attemptId' ('we:scripts/conveyor/ci-heal-owed.mjs:13'). Existing coverage pins probation records surviving separately ('we:scripts/conveyor/__tests__/ci-heal-owed.test.mjs:181'). Applying the card’s unrestricted two-attempt guarantee would change that legacy behavior; narrowing it would reduce the stated goal. No file…
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

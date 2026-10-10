@@ -1,0 +1,6 @@
+{
+  "buildQueuePriority": {
+    "mode": "enforce",
+    "requestsFirstInClass": true
+  }
+}
