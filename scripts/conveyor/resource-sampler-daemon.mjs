@@ -15,22 +15,56 @@ import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 export const RESOURCE_SAMPLE_KIND = defineJobKind({ kind: 'resource-sample',
   entry: 'scripts/conveyor/resource-sampler-job.mjs', codeMode: 'readonly-tree', maxAttempts: 1000 });
 
+/** Key-order-independent JSON, so the same config compares equal however its object was built. */
+const canonical = value => JSON.stringify(value, (_key, v) => (v && typeof v === 'object' && !Array.isArray(v)
+  ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v));
+
+const configKey = ({ checkoutRoot: _where, ...config } = {}) => canonical(config);
+
 /** Caller serializes this read/enqueue transaction. Never infer absence from unreadable records. */
 /**
- * The sampler job never finishes, so a job pinned to older code would sample with that code forever (live
- * 2026-10-09: a lane-count fix never reached the running sampler — the dead job was requeued on its old sha).
- * A live job on a different sha is therefore retired: `retire` stops its process (the supervisor passes a
- * SIGTERM-by-handle), the record is marked failed "superseded", and a fresh job is queued on `codeSha`.
+ * The sampler job never finishes, so a job pinned to older code OR older config would sample that way forever
+ * (live 2026-10-09: a lane-count fix never reached the running sampler — the dead job was requeued on its old
+ * sha; and a restart with a new `--interval-ms`/`--root` silently kept the old input).
+ * Exactly one live job may exist, and it must match BOTH `codeSha` and `input`. Every other live job is retired:
+ * the record is marked failed FIRST (so a child that has not claimed yet is refused its claim), and only then is
+ * `retire` called with the record as it stood at that moment — including a handle the child claimed after
+ * `store.list()` read it — so the supervisor's SIGTERM-by-handle reaches the process that really exists.
  */
 export function ensureSamplerJob({ store, kindDef = RESOURCE_SAMPLE_KIND, codeSha, now = Date.now(), input = {}, retire = () => {} }) {
   const { records, corrupt } = store.list();
   if (corrupt.length) throw new Error(`resource-sampler: corrupt job records: ${corrupt.join(', ')}`);
-  const live = records.find(r => r.job.kind === kindDef.kind && !TERMINAL_JOB_STATUSES.includes(r.job.status));
-  if (live && live.job.codeSha === codeSha) return { enqueued: false, record: live };
-  if (live) {
-    retire(live);
-    store.update(live.id, r => markFailed(r, { at: new Date(now).toISOString(), reason: `superseded by ${String(codeSha).slice(0, 9)}` }));
+  const ofKind = records.filter(r => r.job.kind === kindDef.kind);
+  const liveJobs = ofKind.filter(r => !TERMINAL_JOB_STATUSES.includes(r.job.status));
+  // checkoutRoot is where this supervisor happens to live, not sampler config: the job runs the sha-pinned
+  // snapshot either way, so two checkouts at one sha must not retire each other's job every tick.
+  const wanted = configKey(input);
+  const current = liveJobs.find(r => r.job.codeSha === codeSha && configKey(r.input) === wanted);
+  // A failed record keeps `retiredHandle` until its process is confirmed retired, so a retire that threw (or a
+  // supervisor killed between the fail and the signal) is retried on the next call instead of orphaning a writer.
+  let retireError = null;
+  const retireOnce = (record, handle) => {
+    try {
+      retire(handle === record.job.handle ? record : { ...record, job: { ...record.job, handle } });
+      store.update(record.id, r => (r.job.retiredHandle ? { ...r, job: { ...r.job, retiredHandle: null } } : null));
+    } catch (error) { retireError ??= error; }
+  };
+  for (const failed of ofKind) if (failed.job.retiredHandle && TERMINAL_JOB_STATUSES.includes(failed.job.status)) retireOnce(failed, failed.job.retiredHandle);
+  for (const old of liveJobs) {
+    if (old === current) continue;
+    const reason = old.job.codeSha !== codeSha ? `superseded by ${String(codeSha).slice(0, 9)}`
+      : current ? 'superseded: duplicate live sampler' : 'superseded: sampler config changed';
+    let atRetirement = null;
+    store.update(old.id, r => {
+      if (TERMINAL_JOB_STATUSES.includes(r.job.status)) return null;
+      atRetirement = r;
+      const failed = markFailed(r, { at: new Date(now).toISOString(), reason });
+      return r.job.handle ? { ...failed, job: { ...failed.job, retiredHandle: r.job.handle } } : failed;
+    });
+    if (atRetirement) retireOnce({ ...atRetirement, job: { ...atRetirement.job, retiredHandle: atRetirement.job.handle } }, atRetirement.job.handle);
   }
+  if (retireError) throw retireError;
+  if (current) return { enqueued: false, record: current };
   const base = `resource-sample-${new Date(now).toISOString().replace(/[:.]/g, '-')}`;
   let id = base; let suffix = 0;
   while (store.read(id)) id = `${base}-${++suffix}`;
