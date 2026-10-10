@@ -2081,7 +2081,7 @@ export function replayFixLaunch({
           : roundOf(planned) < Number(fixSettings?.strongerModelFromRound) ? `round ${roundOf(planned)} < fix.strongerModelFromRound=${fixSettings?.strongerModelFromRound}`
           : 'no launchable stronger rung on the fixer ladder' },
     launch: launch.decision?.resume
-      ? { mode: 'resume', sessionId: launch.decision.sessionId, lane: launch.decision.lane?.lane ?? null, lanePath: launch.decision.lane?.path ?? null }
+      ? { mode: 'resume', sessionId: launch.decision.sessionId, lane: launch.decision.lane?.lane ?? null, lanePath: launch.decision.lane?.path ?? null, held: launch.decision.lane?.held ?? null }
       : { mode: 'cold-start', reason: launch.decision?.reason ?? launch.resumeAttempt?.refused ?? 'unknown', why: launch.decision?.why ?? launch.resumeAttempt?.why ?? null },
     settings: { resumeAcrossRounds: fixSettings?.resumeAcrossRounds, strongerModelFromRound: fixSettings?.strongerModelFromRound },
   };
@@ -2093,7 +2093,9 @@ export function formatReplay(r) {
     ? `ordinary fix route (${r.route.why})`
     : `${r.route.rung} route — ${r.route.model} (--model ${r.route.cliModel}), from round ${r.route.fromRound}`;
   const launch = r.launch.mode === 'resume'
-    ? `resume ${r.launch.sessionId} in lane-${r.launch.lane} (${r.launch.lanePath}) — no cold start`
+    ? `resume ${r.launch.sessionId} — no cold start; checkout: ${r.launch.held === 'own' ? `its own lane-${r.launch.lane}`
+      : r.launch.held === 'free' ? `re-take its untouched lane-${r.launch.lane} (--no-reset)`
+        : `its lane-${r.launch.lane} was reused since, so a fresh lane at the PR ref (the PR head is what it left)`}`
     : `cold start with the round-history brief — ${r.launch.reason}${r.launch.why ? `: ${r.launch.why}` : ''}`;
   return [
     `replay PR #${r.pr} (${r.state ?? '?'}) — next fix would be round ${r.round}${r.roundOverride ? ' (round given)' : ` (${r.attempts} round(s) spent)`}, head ${String(r.head).slice(0, 9)}, base ${r.base}`,
