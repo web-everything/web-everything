@@ -649,7 +649,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     humanClearedSha: parseLatestHumanClearedSha(d.comments),
     // #xnqxtdy — sha, diff and actor all from the ONE trusted clearance comment (never the latest marker of any comment).
     humanClearance: latestHumanClearance(d.comments),
-    headDiff: null, headContribution: null, headReadFailed: false,
+    headDiff: null, headDiffSha: null, headContribution: null, headReadFailed: false,
   };
   const { acceptedSha, headSha, acceptedDiff, acceptedContribution } = evidence;
   const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha
@@ -662,6 +662,14 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
       });
       evidence.headDiff = net?.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
+      // #xnqxtdy — `headRefOid` and the branch tip the diff was read from are two non-atomic reads. Pin the tip the diff
+      // is FOR, so the carry can refuse a diff that belongs to a newer push than the head it would stamp.
+      if (evidence.headDiff !== null && net?.rev) {
+        try {
+          evidence.headDiffSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${net.rev}^{commit}`],
+            { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase() || null;
+        } catch { evidence.headDiffSha = null; }
+      }
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;

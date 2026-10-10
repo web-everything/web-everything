@@ -207,6 +207,13 @@ export function applyHumanClearanceCarry({
   if (String(evidence.headSha).toLowerCase() === clearance.sha) return null;
   logCarrySettingOnce(setting, log);
   const tag = `${repo ? `${repo}` : ''}#${pr}`;
+  // The record stamps `reviewed-sha` = headSha next to the diff's fingerprint, so the diff must be the one OF that sha: it
+  // is read from the branch tip a moment after `headRefOid`, and a push in between would pair a newer diff with an older head.
+  if (String(evidence.headDiffSha || '').toLowerCase() !== String(evidence.headSha).toLowerCase()) {
+    log(`  human-clearance-carry ${tag}: NOT carried ${clearance.sha.slice(0, 9)}→${String(evidence.headSha).slice(0, 9)} — `
+      + `the live net diff was read from ${evidence.headDiffSha ? String(evidence.headDiffSha).slice(0, 9) : 'an unresolved tip'}, not the live head\n`);
+    return null;
+  }
   // Pure pre-checks first: no git call unless the content already matches.
   const pre = decideHumanClearanceCarry({ enabled: setting.value, clearance, headSha: evidence.headSha,
     headDiff: evidence.headDiff, mechanical: { ok: true, reason: '(not yet checked)' } });
