@@ -266,3 +266,74 @@ describe('killGateGroup — only a gate whose handle and pid agree, and an ordin
     expect(kill).not.toHaveBeenCalled();
   });
 });
+
+describe('fail-closed gate liveness (PR 4764 round 3)', () => {
+  const noReattach = async () => ({ actions: [] });
+  const mk = (extra = {}) => createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
+    probe: () => 'alive', evict: () => {}, snapshot: {}, ...extra });
+  const finished = (sidecar) => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify(sidecar));
+    writeFileSync(resultPath(dir, q.id), JSON.stringify({ outcome: 'failed', message: 'x' }));
+    return q;
+  };
+  const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
+
+  it('a survivor whose liveness is unknown holds the lane with NO pid in the registry, so a superseding dispatch cannot kill it', async () => {
+    const q = finished({ pid: 999, handle: 'h:999:s' });
+    const kill = vi.fn();
+    const inFlight = new Map();
+    await mk({ kill, probe: () => { throw new Error('ps timed out'); } }).sync(inFlight);
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: q.id, pid: null });
+  });
+
+  it('a survivor with no handle (start time unreadable) or a foreign-host handle holds the lane, is never killed, and releases once provably gone', async () => {
+    for (const sidecar of [{ pid: 999, handle: null }, { pid: 999, handle: 'otherhost:999:s' }]) {
+      rmSync(dir, { recursive: true, force: true });
+      dir = mkdtempSync(join(tmpdir(), 'verify-gate-job-'));
+      store = createJobStore(dir);
+      finished(sidecar);
+      const kill = vi.fn();
+      let exists = true;
+      const probe = (h) => (String(h).startsWith('otherhost') ? 'foreign' : 'alive');
+      const jobs = mk({ kill, probe, pidExists: () => exists });
+      const inFlight = new Map();
+      await jobs.sync(inFlight);
+      expect(inFlight.get(INPUT.dir)).toMatchObject({ pid: null });
+      expect(kill).not.toHaveBeenCalled();
+      if (sidecar.handle === null) {
+        exists = false;
+        await jobs.sync(inFlight);
+        expect(inFlight.has(INPUT.dir)).toBe(false);
+      }
+    }
+  });
+
+  it('a relaunch refuses to start a gate when the previous gate cannot be proven gone (no handle, foreign host, probe throws) and never kills', async () => {
+    const cases = [
+      { sidecar: { pid: 780, handle: null }, opts: { pidExists: () => true } },
+      { sidecar: { pid: 781, handle: 'otherhost:781:x' }, opts: { probe: () => 'foreign' } },
+      { sidecar: { pid: 782, handle: 'h:782:x' }, opts: { probe: () => { throw new Error('ps timed out'); } } },
+    ];
+    for (const [i, c] of cases.entries()) {
+      writeFileSync(gatePath(dir, `u${i}`), JSON.stringify(c.sidecar));
+      const kill = vi.fn();
+      const runGate = vi.fn();
+      const out = await runGateStep({ jobId: `u${i}`, input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, kill, sleep: async () => {},
+        laneState: () => ({ marker: running, headSha: 'abc12345' }), runGate, ...c.opts });
+      expect(out.outcome).toBe('failed');
+      expect(runGate).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a handle-less sidecar whose pid is gone does not block the relaunch', async () => {
+    writeFileSync(gatePath(dir, 'u9'), JSON.stringify({ pid: 783, handle: null }));
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'u9', input: INPUT, jobsDir: dir, attempt: 2, log: () => {}, pidExists: () => false,
+      laneState: () => ({ marker: running, headSha: 'abc12345' }), runGate });
+    expect(runGate).toHaveBeenCalledTimes(1);
+    expect(out.outcome).toBe('green');
+  });
+});

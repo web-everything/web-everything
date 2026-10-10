@@ -45,7 +45,8 @@ Slice of decision 4120 (daemon job model); audit we:reports/2026-09-24-daemon-bl
 - **Daemon.** we:skills-src/conveyor/verify-daemon.mjs rebuilds its in-flight registry from the job store every tick
   BEFORE dispatch, queues through `runVerifyDispatch`'s new `launchGate`, launches in the same tick, and consumes each
   finished job once (`gate job … settled: green — marker green @ <sha>`). A code-change restart no longer waits for
-  jobs; no exit kills a job except `restartInFlight: kill`. Rollback: `WE_VERIFY_GATE_AS_JOB=0`.
+  jobs; no exit kills a job except `restartInFlight: kill`. Rollback: `WE_VERIFY_GATE_AS_JOB=0` runs NEW gates
+  in-process, but the daemon still syncs the job store each tick, so a job-supervised gate still running holds its lane.
 - **Unchanged.** Marker keyed to exact HEAD, heavy admission (verify-lane's own slot), since-last-green selection
   (#4732, inside verify-lane), supersede rules (the daemon kills the job's gate group from its recorded handle), the
   max-in-flight cap, the drain file.

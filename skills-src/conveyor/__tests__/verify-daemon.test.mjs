@@ -826,3 +826,14 @@ describe('#4135 — gate jobs: a restart never waits on, kills, or re-dispatches
     expect(inFlight.size).toBe(1);
   });
 });
+
+describe('#4135 — rollback (WE_VERIFY_GATE_AS_JOB=0) still sees running gate jobs', () => {
+  it('syncs the job store every tick (so a live job holds its lane) but launches no new job', async () => {
+    const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn() };
+    const runVerify = vi.fn(async () => ({ dispatched: [], deferred: [], failures: [] }));
+    const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob: false, isDraining: () => false, log: { error: () => {} } });
+    await effects.tickOnce();
+    expect(gateJobs.sync).toHaveBeenCalledTimes(1);
+    expect(runVerify.mock.calls[0][0].launchGate).toBeUndefined();
+  });
+});

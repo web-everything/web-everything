@@ -310,7 +310,7 @@ export function reconcileInFlight(inFlight, {
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining,
-  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000, gateJobs = null,
+  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000, gateJobs = null, gateAsJob = true,
 } = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
@@ -336,7 +336,7 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
       const result = isDraining()
         ? { dispatched: [], deferred: [], failures: [], draining: true }
         : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled,
-          ...(gateJobs ? { launchGate: (o) => gateJobs.launch(o) } : {}) });
+          ...(gateJobs && gateAsJob ? { launchGate: (o) => gateJobs.launch(o) } : {}) });
       if (gateJobs && result.dispatched?.length) await gateJobs.sync(inFlight);
       return { ...result, orphaned };
     },
@@ -508,12 +508,13 @@ async function main() {
     owner,
     onLost: () => console.error(`verify-daemon: lease lost mid-run — will stop after the current tick.`),
   });
-  // #4135 — each gate is a detached durable job (WE_VERIFY_GATE_AS_JOB=0 restores the in-process gate).
+  // #4135 — each gate is a detached durable job. WE_VERIFY_GATE_AS_JOB=0 restores the in-process gate for NEW
+  // gates, but the daemon still reads the job store: a gate a job supervisor is still running holds its lane
+  // (and settles) instead of getting a second in-process gate beside it.
   let settle = () => {};
-  const gateJobs = resolveGateAsJob(process.env)
-    ? createVerifyGateJobs({ log: (m) => console.error(m), onSettled: (f) => settle(f) })
-    : null;
-  const effects = buildCliDaemonEffects({ isAlive, gateJobs });
+  const gateAsJob = resolveGateAsJob(process.env);
+  const gateJobs = createVerifyGateJobs({ log: (m) => console.error(m), onSettled: (f) => settle(f) });
+  const effects = buildCliDaemonEffects({ isAlive, gateJobs, gateAsJob });
   settle = effects.onSettled;
   const cleanup = createCleanup({
     inFlight: effects.inFlight,
@@ -533,7 +534,9 @@ async function main() {
     for (const e of reattached) {
       console.error(`verify-daemon: re-attached gate job ${e.jobId} for ${e.pool}/lane-${e.lane} @ ${String(e.sha).slice(0, 8)}${e.pid ? ` (gate pid ${e.pid})` : ''}`);
     }
-    console.error(`verify-daemon: gates run as detached jobs (${gateJobs.dir}); ${reattached.length} re-attached at boot.`);
+    console.error(gateAsJob
+      ? `verify-daemon: gates run as detached jobs (${gateJobs.dir}); ${reattached.length} re-attached at boot.`
+      : `verify-daemon: in-process gates (WE_VERIFY_GATE_AS_JOB=0); ${reattached.length} gate job(s) from the job store (${gateJobs.dir}) still hold their lanes.`);
   }
   console.error(`verify-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms, heartbeat every ${DEFAULT_HEARTBEAT_INTERVAL_MS}ms.`);
   const cloneRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
