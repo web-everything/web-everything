@@ -25,6 +25,7 @@ import { readFromTransportBranch, stageOnTransportBranch, assertPushRef } from '
 import { cascadePolicy } from './policy-cascade.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
 import { execFileSyncThrottled } from './gh-throttle.mjs';
+import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { resolveRedMainMode, RED_MAIN_HOLD_SETTINGS_FILE } from './red-main-hold.mjs';
 import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
 import {
@@ -172,7 +173,7 @@ const composeChanges = (steps) => (cur) => {
  * @returns {{mode:string, modeSource:string, shadow:boolean, plan:object, applied:boolean, error?:string}|null}
  */
 export function runSafetyNet({
-  mainCiRuns, now = Date.now(), dir, board = process.cwd(), live = true, repoSlug = 'web-everything/web-everything',
+  mainCiRuns, now = Date.now(), dir, board = process.cwd(), live = true, repoSlug = CONSTELLATION_REPOS.we.slug,
   mode = resolveRedMainMode(), settings = resolveQuarantineSettings(),
   exec = execFileSyncThrottled, readJobs = (runId) => readFailedJobs(runId, { exec, repoSlug }),
   readLog = (jobId) => readJobFailures(jobId, { exec, repoSlug }),
