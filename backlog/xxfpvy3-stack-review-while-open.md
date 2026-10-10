@@ -1,9 +1,11 @@
 ---
 kind: story
 size: 5
-status: open
+priority: high
+status: resolved
 scope: ["we:.github/workflows/ci.yml", "we:.github/workflows/soak-replay-gate.yml", "we:scripts/lib/stack-review-while-open.mjs", "we:scripts/settings/stack.json", "we:scripts/conveyor/draft-promotion-rule.mjs", "we:scripts/conveyor/draft-promotion-loop.mjs", "we:scripts/operations/promote-draft-pr-dispatch.mjs", "we:scripts/conveyor/pr-stack.mjs", "we:scripts/merge-ai-prs.mjs"]
 dateOpened: "2026-10-10"
+dateResolved: "2026-10-10"
 tags: []
 ---
 
