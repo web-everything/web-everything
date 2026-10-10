@@ -120,8 +120,11 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
     const edits = d?.data?.repository?.pullRequest?.userContentEdits;
     if (!edits) facts.bodyHistory = { error: 'no userContentEdits in response' };
     else {
-      const bodies = [pr.body || '', ...edits.nodes.map((x) => x?.diff).filter((x) => typeof x === 'string')];
-      facts.bodyHistory = { bodies, complete: edits.totalCount <= edits.nodes.length };
+      const nodes = Array.isArray(edits.nodes) ? edits.nodes : [];
+      const bodies = [pr.body || '', ...nodes.map((x) => x?.diff).filter((x) => typeof x === 'string')];
+      // `diff` is nullable (a deleted/redacted edit): a node we could not read is a version we never saw, so the
+      // history is complete only when every counted edit was returned AND carried a readable body.
+      facts.bodyHistory = { bodies, complete: Array.isArray(edits.nodes) && edits.totalCount <= nodes.length && nodes.every((x) => typeof x?.diff === 'string') };
     }
   } catch (e) { facts.bodyHistory = { error: firstLine(e) }; }
 
