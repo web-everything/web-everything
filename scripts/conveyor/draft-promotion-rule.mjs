@@ -29,6 +29,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 export const DRAFT_PROMOTION_ENV = Object.freeze({ loop: 'WE_DRAFT_PROMOTION_LOOP', intervalSeconds: 'WE_DRAFT_PROMOTION_INTERVAL_SECONDS' });
 export const DRAFT_PROMOTION_DEFAULTS = Object.freeze({ loop: false, intervalSeconds: 60 });
@@ -67,26 +68,34 @@ const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => 
 /**
  * PURE. Is this PR owed `gh pr ready` right now?
  * @param {{pr?:{state?:string, isDraft?:boolean, headRefName?:string, headRefOid?:string, labels?:Array},
- *   checks?:{state?:string, sha?:string}|null}} o — `checks`: the required-check verdict read for `checks.sha`
- *   (`reduceCheckState`'s `green`/`pending`/`red`/`unchecked`); `null` = not read yet.
+ *   checks?:{state?:string, sha?:string}|null, reviewWhileBaseOpen?:boolean, defaultBranch?:string}} o — `checks`: the
+ *   required-check verdict read for `checks.sha` (`reduceCheckState`'s `green`/`pending`/`red`/`unchecked`); `null` =
+ *   not read yet. `reviewWhileBaseOpen`: the `stack.reviewWhileBaseOpen` setting (read when omitted). A GitHub-stacked
+ *   draft (base is another lane branch) is owed promotion on its OWN green checks only while it is on; off, it waits for
+ *   its base to land and the drain to retarget it (the behaviour before 2026-10-10).
  * @returns {{owed:boolean, why:string}}
  */
-export function isDraftOwedPromotion({ pr = {}, checks = null } = {}) {
+export function isDraftOwedPromotion({ pr = {}, checks = null, reviewWhileBaseOpen, defaultBranch = 'main' } = {}) {
   if (String(pr?.state ?? 'OPEN').toUpperCase() !== 'OPEN') return { owed: false, why: 'not open' };
   if (pr?.isDraft !== true) return { owed: false, why: 'not a draft' };
   // A `lane/` prefix is only proof of agent authorship when the branch lives in THIS repo: a fork can name its branch anything.
   if (pr?.isCrossRepository === true) return { owed: false, why: 'cross-repository (fork) branch — a lane/ prefix there is not agent authorship' };
   if (!String(pr?.headRefName ?? '').startsWith(AGENT_HEAD_PREFIX)) return { owed: false, why: 'not an agent lane branch (draft-first covers lane/* only)' };
   if (labelNames(pr?.labels).includes(WITHDRAWN_LABEL)) return { owed: false, why: 'draft is withdrawn — explicit release is required before promotion' };
+  const stacked = isGithubStacked(pr, defaultBranch);
+  if (stacked && !(reviewWhileBaseOpen ?? stackReviewWhileBaseOpen())) {
+    return { owed: false, why: `stacked on ${pr.baseRefName} — stack.reviewWhileBaseOpen is off, so it waits for its base to land` };
+  }
   if (!checks) return { owed: false, why: 'required checks not read yet' };
   if (!pr?.headRefOid || checks.sha !== pr.headRefOid) return { owed: false, why: 'check verdict is for a different head' };
   if (checks.state !== 'green') return { owed: false, why: `required checks read ${checks.state ?? 'unknown'}, not green` };
+  if (stacked) return { owed: true, why: `stacked draft lane PR (base ${pr.baseRefName}, still open) — its own required checks are green on its head; promote it to ready for review while the base is open (stack.reviewWhileBaseOpen); merge still waits for the base` };
   return { owed: true, why: 'draft lane PR — every required check is green on its head; promote it to ready for review (draft-first PRs)' };
 }
 
 /** PURE. Cheap pre-filter on a PR-list row (no check read needed): could this draft be owed promotion at all? */
-export function isPromotionCandidate(pr) {
-  const r = isDraftOwedPromotion({ pr, checks: { state: 'green', sha: pr?.headRefOid } });
+export function isPromotionCandidate(pr, { reviewWhileBaseOpen } = {}) {
+  const r = isDraftOwedPromotion({ pr, checks: { state: 'green', sha: pr?.headRefOid }, reviewWhileBaseOpen });
   return r.owed;
 }
 
