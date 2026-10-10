@@ -151,7 +151,7 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   // Test infrastructure vitest loads for EVERY test file (config, setup, global setup) has no importing test, so no
   // edge shows it. A change on either side that those files reach (a helper `vitest.setup.ts` imports) runs under
   // every test of the merged tree: re-test.
-  for (const [side, closure] of [['pr', fromPr], ['main', fromMain]]) {
+  for (const { side, closure } of [{ side: 'pr', closure: fromPr }, { side: 'main', closure: fromMain }]) {
     for (const [file, root] of closure) if (TEST_INFRA_ENTRY_RE.test(file)) return done(true, [`test-infra-reached:${file} (${side}:${root})`]);
   }
   for (const [file, prRoot] of fromPr) {
