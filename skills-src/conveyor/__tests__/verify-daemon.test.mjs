@@ -767,3 +767,62 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     expect(log.mock.calls.flat().join('\n')).toMatch(/adopted run r1.*finished/);
   });
 });
+
+describe('#4135 — gate jobs: a restart never waits on, kills, or re-dispatches a running gate', () => {
+  it('a code-change restart no longer waits for gate JOBS (they outlive the process); in-process runs still defer it', () => {
+    const inFlight = new Map([['/l1', { jobId: 'j1', pid: 9 }]]);
+    const guard = makeCodeChangedGuard({ inFlight, bootHead: 'a', readHead: () => 'b' });
+    expect(guard()).toBe(true);
+    inFlight.set('/l2', { runId: 'legacy', pid: 10 });
+    expect(guard()).toBe(false);
+  });
+
+  it('every exit leaves gate jobs running (the successor re-attaches); only restartInFlight: kill stops them', async () => {
+    const mk = (restartInFlight, stopJobs = vi.fn(async () => {})) => {
+      const kill = vi.fn();
+      const exit = vi.fn();
+      const inFlight = new Map([['/l1', { jobId: 'j1', pid: 9 }], ['/l2', { runId: 'r', pid: 10 }]]);
+      const cleanup = createCleanup({ inFlight, kill, exit, stopHeartbeat: () => {}, release: () => {}, log: { error: () => {} },
+        restartInFlight, handoff: (m) => [...m.values()], stopJobs });
+      return { cleanup, kill, exit, stopJobs };
+    };
+    const a = mk('adopt');
+    a.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    expect(a.kill).not.toHaveBeenCalled(); // job left, legacy handed off
+    expect(a.stopJobs).not.toHaveBeenCalled();
+    expect(a.exit).toHaveBeenCalledWith(0);
+
+    const b = mk('adopt');
+    b.cleanup.stopAndExit('loop stopped (lease-lost)');
+    expect(b.kill).toHaveBeenCalledWith(-10, 'SIGKILL'); // the in-process run is still killed, as before
+    expect(b.kill).not.toHaveBeenCalledWith(-9, 'SIGKILL'); // the job is not
+    expect(b.stopJobs).not.toHaveBeenCalled();
+
+    const c = mk('kill');
+    c.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    await new Promise((r) => setImmediate(r));
+    expect(c.stopJobs).toHaveBeenCalledTimes(1);
+    expect(c.kill).toHaveBeenCalledWith(-10, 'SIGKILL');
+    expect(c.exit).toHaveBeenCalledWith(0);
+  });
+
+  it('with gateJobs, the tick syncs the store BEFORE dispatch, passes launchGate, and launches in the same tick', async () => {
+    const order = [];
+    const gateJobs = {
+      sync: vi.fn(async () => { order.push('sync'); }),
+      launch: vi.fn(() => ({ id: 'j' })),
+    };
+    const runVerify = vi.fn(async (o) => { order.push('dispatch'); o.launchGate({ lane: 1 }); return { dispatched: [{ lane: 1 }], deferred: [], failures: [] }; });
+    const effects = buildCliDaemonEffects({ runVerify, gateJobs, isDraining: () => false, log: { error: () => {} } });
+    await effects.tickOnce();
+    expect(order).toEqual(['sync', 'dispatch', 'sync']);
+    expect(gateJobs.launch).toHaveBeenCalledWith({ lane: 1 });
+  });
+
+  it('reconcileInFlight never touches a job entry (the job store owns it)', () => {
+    const inFlight = new Map([['/l1', { jobId: 'j1', pid: 123, startedMs: 0 }]]);
+    const { orphaned } = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => true, killGroup: () => { throw new Error('no'); }, nowMs: 1e12, log: () => {} });
+    expect(orphaned).toEqual([]);
+    expect(inFlight.size).toBe(1);
+  });
+});

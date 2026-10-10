@@ -554,6 +554,59 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
 }
 
 /**
+ * Run ONE lane's gate to settlement: spawn `verify-lane.mjs` under both ceilings ({@link spawnGateBounded}) and,
+ * when the run was killed (a ceiling, a signal), stamp the infrastructure failure on the still-owned marker
+ * ({@link recordKilledVerification}). Resolves on a clean exit; rejects with the spawn error otherwise (exit 2 =
+ * red is a rejection with `status: 2`, exactly as before). Shared by the in-process sweep below and the detached
+ * gate job (#4135, we:scripts/conveyor/verify-gate-job.mjs), so both settle a lane by the same code.
+ * @param {{pool:string, lane:number, dir:string, headSha:string, marker:object, runId:string,
+ *   spawnGate?:typeof spawnGateBounded, log?:(m:string)=>void, onSpawn?:(pid:number, logPath:string)=>void,
+ *   onGateStarted?:()=>void, logPath?:string}} o
+ * @returns {Promise<{pid:number}>}
+ */
+export function runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate = spawnGateBounded, log: say = log,
+  onSpawn, onGateStarted, logPath = dispatchLogPath(dir) }) {
+  let owned = { ...marker, startedAt: null, requestStartedAt: marker.startedAt ?? null, runId };
+  const args = [VERIFY_LANE_CLI, `--repo=${dir}`, '--json', `--run-id=${runId}`];
+  if (marker.suites) args.push(`--gate=${marker.suites}`);
+  let gate;
+  try { gate = spawnGate(args, {
+    onSpawn: (pid) => { try { onSpawn?.(pid, logPath); } catch {} },
+    // #65 — the child's stderr goes to a file, not a pipe into this process, so a daemon restart that adopts
+    // in-flight gates (restartInFlight: adopt) never breaks the gate's output stream mid-run.
+    logPath,
+    onNotice: (line) => say(`  ${line.trim().replace(/^⚠ verify-lane:/, `⚠ ${pool}/lane-${lane}:`)}`),
+    queueCeilingMs: QUEUE_PHASE_CEILING_MS,
+    gateCeilingMs: VERIFY_DISPATCH_TIMEOUT_MS,
+    // #4360 — the live proof this card's Proof plan needs: a real per-lane timestamp for when the gate
+    // actually started (as opposed to when it was merely offered to the semaphore), so two lanes' overlap
+    // can be shown from real evidence rather than assumed from the code shape.
+    onGateStarted: () => {
+      const started = markerFor(dir);
+      if (started?.runId === runId) owned = started;
+      say(`  ▶ gate started for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} — ${new Date().toISOString()}`);
+      try { onGateStarted?.(); } catch {}
+    },
+  }); } catch (error) { gate = Promise.reject(error); }
+  return Promise.resolve(gate).catch((error) => {
+    const ceilingMs = error?.timedOutPhase === 'queue' ? QUEUE_PHASE_CEILING_MS : VERIFY_DISPATCH_TIMEOUT_MS;
+    try { recordKilledVerification(dir, owned, error, ceilingMs); }
+    catch (writeError) { say(`  ⚠ ${pool}/lane-${lane}: could not record infrastructure failure: ${writeError.message}`); }
+    throw error;
+  });
+}
+
+/** The two ceilings in force for this process (the gate job reports them in its result). */
+export function gateCeilings() {
+  return { queueCeilingMs: QUEUE_PHASE_CEILING_MS, gateCeilingMs: VERIFY_DISPATCH_TIMEOUT_MS };
+}
+
+/** Exposed for the gate job: the lane's marker (worktree-safe git-dir resolution) and HEAD. */
+export function readLaneState(dir) {
+  return { marker: markerFor(dir), headSha: tryGit(['rev-parse', 'HEAD'], dir) };
+}
+
+/**
  * Run one full sweep: scan every pool/lane for a lane whose marker needs a verify dispatch (per
  * {@link laneNeedsVerifyDispatch}), spawn a bounded gate run for each, and return a plain summary. Never calls
  * `process.exit` — this is the one thing #3878's standalone Verify daemon
@@ -565,6 +618,9 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
  * immediately; the same settlement handler records failures and removes each registry entry in the background.
  * With `awaitSettle:false` the returned `failures` is empty at return time, so a caller that must SEE a late
  * failure passes `onSettled(failure)`, called once per failure as it settles (a throwing observer is isolated).
+ * #4135 — with `launchGate({pool, lane, dir, headSha, marker, runId}) → {id}` (the verify daemon's job mode) a
+ * pending lane is handed to that launcher (it queues a detached gate job) instead of spawned here; the registry
+ * entry carries the `jobId`, and settlement is the job's, not this sweep's.
  * @param {{dryRun?:boolean, spawnGate?:typeof spawnGateBounded, poolRoot?:string,
  *   inFlight?:Map<string, object>|null, awaitSettle?:boolean, maxInFlight?:number,
  *   onSettled?:((failure:object) => void)|null}} [o] `spawnGate` and
@@ -575,6 +631,7 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
  */
 export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateBounded, poolRoot = POOL_ROOT,
   inFlight = null, awaitSettle = true, maxInFlight = resolveMaxInFlight(process.env), onSettled = null,
+  launchGate = null,
 } = {}) {
   const deferred = [];
   const superseded = [];
@@ -652,39 +709,31 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
     // `runId` rides into the marker via the child's own start stamp (`--run-id`), so a queue-phase kill — before
     // `onGateStarted` could capture a `startedAt` — can still tell this run's marker from a newer request's.
     const runId = randomUUID();
-    const logPath = dispatchLogPath(dir);
     const entry = { pool, lane, dir, runId, pid: null, sha: headSha, suites: marker.suites, treeHash: marker.treeHash ?? null,
-      requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath };
+      requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath: null };
+    // #4135 — job mode: the gate runs as a DETACHED DURABLE JOB (we:scripts/conveyor/verify-gate-job.mjs) whose own
+    // supervisor process owns the ceilings, the kill and the settlement, so this sweep only queues it and returns.
+    // The registry entry is the job's; a daemon restart rebuilds it from the job store instead of killing the gate.
+    if (launchGate) {
+      inFlight?.set(dir, entry);
+      try {
+        const job = launchGate({ pool, lane, dir, headSha, marker, runId });
+        Object.assign(entry, { jobId: job?.id ?? null });
+        dispatched.push({ pool, lane, sha: headSha, launched: true, jobId: job?.id ?? null });
+        log(`  queued verify job ${job?.id ?? '?'} for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${suites || 'default'})`);
+      } catch (error) {
+        if (inFlight?.get(dir) === entry) inFlight.delete(dir);
+        log(`  ⚠ ${pool}/lane-${lane}: could not queue a verify job (non-fatal): ${String(error?.message || error).split('\n')[0]}`);
+        recordFailure({ pool, lane, sha: headSha });
+      }
+      return Promise.resolve();
+    }
     inFlight?.set(dir, entry);
     if (!awaitSettle) dispatched.push({ pool, lane, sha: headSha, launched: true });
-    let owned = { ...marker, startedAt: null, requestStartedAt: marker.startedAt ?? null, runId };
     log(`  dispatching verify for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${suites || 'default'})…`);
-    const args = [VERIFY_LANE_CLI, `--repo=${dir}`, '--json', `--run-id=${runId}`];
-    if (suites) args.push(`--gate=${suites}`);
-    let gate;
-    try { gate = spawnGate(args, {
-      onSpawn: (pid) => { entry.pid = pid; },
-      // #65 — the child's stderr goes to a file, not a pipe into this process, so a daemon restart that adopts
-      // in-flight gates (restartInFlight: adopt) never breaks the gate's output stream mid-run.
-      logPath,
-      onNotice: (line) => log(`  ${line.trim().replace(/^⚠ verify-lane:/, `⚠ ${pool}/lane-${lane}:`)}`),
-      queueCeilingMs: QUEUE_PHASE_CEILING_MS,
-      gateCeilingMs: VERIFY_DISPATCH_TIMEOUT_MS,
-      // #4360 — the live proof this card's Proof plan needs: a real per-lane timestamp for when the gate
-      // actually started (as opposed to when it was merely offered to the semaphore), so two lanes' overlap
-      // can be shown from real evidence rather than assumed from the code shape.
-      onGateStarted: () => {
-        const started = markerFor(dir);
-        if (started?.runId === runId) owned = started;
-        log(`  ▶ gate started for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} — ${new Date().toISOString()}`);
-      },
-    }); } catch (error) { gate = Promise.reject(error); }
-    return Promise.resolve(gate).catch((error) => {
-      const ceilingMs = error?.timedOutPhase === 'queue' ? QUEUE_PHASE_CEILING_MS : VERIFY_DISPATCH_TIMEOUT_MS;
-      try { recordKilledVerification(dir, owned, error, ceilingMs); }
-      catch (writeError) { log(`  ⚠ ${pool}/lane-${lane}: could not record infrastructure failure: ${writeError.message}`); }
-      throw error;
-    }).then(
+    const gate = runLaneGate({ pool, lane, dir, headSha, marker, runId, spawnGate, log,
+      onSpawn: (pid, path) => { entry.pid = pid; entry.logPath = path; } });
+    return gate.then(
       value => settle({ status: 'fulfilled', value }, { pool, lane, dir, headSha }),
       reason => settle({ status: 'rejected', reason }, { pool, lane, dir, headSha }),
     ).catch((error) => {

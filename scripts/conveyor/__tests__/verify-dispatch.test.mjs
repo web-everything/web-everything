@@ -1120,3 +1120,37 @@ spawnGateBounded([${JSON.stringify(gate)}], { queueCeilingMs: 60000, gateCeiling
     expect(existsSync(done)).toBe(true);
   }, 15000);
 });
+
+describe('#4135 — job mode: a pending lane is handed to launchGate, never spawned in this process', () => {
+  it('calls launchGate (not spawnGate) once per pending lane, records the jobId on the registry entry, and returns at once', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const spawnGate = vi.fn();
+    const launches = [];
+    const inFlight = new Map();
+    const result = await runVerifyDispatch({ poolRoot, spawnGate, inFlight, awaitSettle: false,
+      launchGate: (o) => { launches.push(o); return { id: 'job-verify-gate-1' }; } });
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toMatchObject({ pool: 'flagtest', lane: 1, dir: laneDir });
+    expect(launches[0].runId).toMatch(/[0-9a-f-]{36}/);
+    expect(launches[0].marker.status).toBe('running');
+    expect(inFlight.get(laneDir)).toMatchObject({ jobId: 'job-verify-gate-1', runId: launches[0].runId });
+    expect(result.dispatched).toEqual([expect.objectContaining({ lane: 1, launched: true, jobId: 'job-verify-gate-1' })]);
+
+    // The next sweep sees the lane in flight and neither queues nor spawns it again.
+    const again = await runVerifyDispatch({ poolRoot, spawnGate, inFlight, awaitSettle: false,
+      launchGate: () => { throw new Error('must not relaunch'); } });
+    expect(again.dispatched).toEqual([]);
+  });
+
+  it('a launchGate that throws is a non-fatal dispatch failure and frees the lane for the next sweep', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const inFlight = new Map();
+    const failures = [];
+    const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, onSettled: (f) => failures.push(f),
+      launchGate: () => { throw new Error('store unwritable'); } });
+    expect(result.dispatched).toEqual([]);
+    expect(failures).toEqual([expect.objectContaining({ lane: 1 })]);
+    expect(inFlight.size).toBe(0);
+  });
+});

@@ -64,6 +64,7 @@ import {
 import { runVerifyDispatch, recordKilledVerification } from '../../scripts/conveyor/verify-dispatch.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
+import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
 
 /** This daemon's own lease key — distinct from the Dispatcher's default sentinel and from the Fix-dispatch
  *  and Review daemons' own keys (#3870, #3876), so none of them ever contend on the same lock dir (#3877).
@@ -264,6 +265,8 @@ export function reconcileInFlight(inFlight, {
 } = {}) {
   const orphaned = [];
   for (const [dir, entry] of inFlight) {
+    // #4135 — a gate JOB's entry is owned by the job store (verify-gate-job.mjs#sync), never reconciled here.
+    if (entry.jobId) continue;
     const { pool, lane, runId, pid, startedMs } = entry;
     // #65 — an ADOPTED gate (left running by a predecessor daemon) has no spawn promise here, so its ceilings are
     // not armed: bound its total age instead, and settle its marker like any ceiling kill.
@@ -300,7 +303,7 @@ export function reconcileInFlight(inFlight, {
  *  its own clock, independent of this factory's caller). Kept as its own factory (mirroring
  *  `buildCliDaemonEffects` in the sibling daemons) so `main()` stays a thin wire-up. */
 export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAlive = () => true, log = console, runVerify = runVerifyDispatch, isDraining = defaultIsDraining,
-  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000,
+  processIsAlive = pidAlive, groupAlive, killGroup, now = Date.now, spawnGraceMs = 120_000, gateJobs = null,
 } = {}) {
   const inFlight = new Map();
   // `awaitSettle:false` returns before any gate settles, so `result.failures` is always empty here: failures
@@ -313,15 +316,21 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
   return {
     inFlight,
     intervalMs,
+    onSettled,
     tickOnce: async () => {
       // #verify-inflight-reconcile — drain and restart must also release orphaned runs.
       const { orphaned } = reconcileInFlight(inFlight, {
         isAlive: processIsAlive, groupAlive, nowMs: now(), spawnGraceMs, killGroup,
         log: (message) => log.error(message),
       });
+      // #4135 — job mode: rebuild the registry from the durable job store BEFORE dispatching (so a restarted daemon
+      // re-attaches to running gates instead of re-dispatching their lanes), then queue, then launch at once.
+      if (gateJobs) await gateJobs.sync(inFlight);
       const result = isDraining()
         ? { dispatched: [], deferred: [], failures: [], draining: true }
-        : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled });
+        : await runVerifyTick({ runVerify, inFlight, awaitSettle: false, onSettled,
+          ...(gateJobs ? { launchGate: (o) => gateJobs.launch(o) } : {}) });
+      if (gateJobs && result.dispatched?.length) await gateJobs.sync(inFlight);
       return { ...result, orphaned };
     },
     sleep: realSleep,
@@ -413,7 +422,9 @@ export function killInFlight(inFlight, kill = process.kill.bind(process)) {
  *  loop KEEPS TICKING meanwhile — exiting with gates running would orphan them, and pausing dispatch until
  *  they drain would re-create the starvation. */
 export function makeCodeChangedGuard({ inFlight, bootHead, readHead }) {
-  return () => inFlight.size === 0 && cloneHeadChanged({ bootHead, readHead });
+  // #4135 — a gate JOB outlives this process (its own supervisor holds the ceilings and the settlement) and the
+  // successor re-attaches to it from the job store, so only in-process (legacy/adopted) runs defer the restart.
+  return () => [...inFlight.values()].every((e) => e.jobId) && cloneHeadChanged({ bootHead, readHead });
 }
 
 /** The ONE teardown every exit path shares (SIGTERM/SIGINT and every loop exit): kill in-flight gates, stop
@@ -422,7 +433,7 @@ export function makeCodeChangedGuard({ inFlight, bootHead, readHead }) {
  *  lane — letting that chain run would stamp a daemon-initiated kill as an `infrastructure-failure` the
  *  successor then skips. Everything effectful is injected so the lifecycle is unit-tested with fakes. */
 export function createCleanup({ inFlight, stopHeartbeat, release, kill, exit = (code) => process.exit(code), log = console,
-  restartInFlight = 'kill', handoff = writeInFlightHandoff }) {
+  restartInFlight = 'kill', handoff = writeInFlightHandoff, stopJobs = null }) {
   let stopping = false;
   return {
     isStopping: () => stopping,
@@ -432,20 +443,37 @@ export function createCleanup({ inFlight, stopHeartbeat, release, kill, exit = (
       if (stopping) return;
       stopping = true;
       log.error(`verify-daemon: ${why} — releasing the lease and exiting.`);
+      // #4135 — gate JOBS are not this process's to kill on an ordinary exit: they run detached under their own
+      // supervisor, and the successor (or, after a lease loss, the live holder) re-attaches from the shared job
+      // store, so no lane is dispatched twice. Only `restartInFlight: kill` (the declared opt-out) stops them.
+      const jobs = [...inFlight.values()].filter((e) => e.jobId);
+      const legacy = new Map([...inFlight].filter(([, e]) => !e.jobId));
+      if (jobs.length > 0) {
+        if (restartInFlight === 'kill' && stopJobs) {
+          log.error(`verify-daemon: stopping ${jobs.length} gate job(s) (restartInFlight: kill).`);
+          killInFlight(legacy, kill);
+          Promise.resolve().then(() => stopJobs()).catch(() => {}).finally(() => finish());
+          return;
+        }
+        log.error(`verify-daemon: left ${jobs.length} gate job(s) running detached — the next daemon re-attaches from the job store.`);
+      }
       let handedOff = false;
-      if (adoptable && restartInFlight === 'adopt' && inFlight.size > 0) {
+      if (adoptable && restartInFlight === 'adopt' && legacy.size > 0) {
         try {
-          const records = handoff(inFlight);
+          const records = handoff(legacy);
           handedOff = true;
           log.error(`verify-daemon: left ${records.length} in-flight gate(s) running for the successor to adopt (restartInFlight: adopt).`);
         } catch (error) {
           log.error(`verify-daemon: in-flight hand-off failed (${String(error?.message || error)}) — killing them instead.`);
         }
       }
-      if (!handedOff) killInFlight(inFlight, kill);
-      stopHeartbeat();
-      release();
-      exit(0);
+      if (!handedOff) killInFlight(legacy, kill);
+      finish();
+      function finish() {
+        stopHeartbeat();
+        release();
+        exit(0);
+      }
     },
   };
 }
@@ -473,18 +501,33 @@ async function main() {
     owner,
     onLost: () => console.error(`verify-daemon: lease lost mid-run — will stop after the current tick.`),
   });
-  const effects = buildCliDaemonEffects({ isAlive });
+  // #4135 — each gate is a detached durable job (WE_VERIFY_GATE_AS_JOB=0 restores the in-process gate).
+  let settle = () => {};
+  const gateJobs = resolveGateAsJob(process.env)
+    ? createVerifyGateJobs({ log: (m) => console.error(m), onSettled: (f) => settle(f) })
+    : null;
+  const effects = buildCliDaemonEffects({ isAlive, gateJobs });
+  settle = effects.onSettled;
   const cleanup = createCleanup({
     inFlight: effects.inFlight,
     kill: process.kill.bind(process),
     stopHeartbeat,
     release: () => releaseRunnerLeaseIfOwned(RUNNER_LOCK_ROOT, owner, { key: VERIFY_DAEMON_LEASE_KEY }),
     restartInFlight: resolveRestartInFlight(process.env),
+    stopJobs: gateJobs ? () => gateJobs.stopAll() : null,
   });
   process.on('SIGTERM', () => cleanup.stopAndExit('SIGTERM', { adoptable: true }));
   process.on('SIGINT', () => cleanup.stopAndExit('SIGINT', { adoptable: true }));
   // #65 — take over the gates a predecessor left running (a restart under restartInFlight: adopt).
   adoptInFlight(effects.inFlight);
+  if (gateJobs) {
+    await gateJobs.sync(effects.inFlight);
+    const reattached = [...effects.inFlight.values()].filter((e) => e.jobId);
+    for (const e of reattached) {
+      console.error(`verify-daemon: re-attached gate job ${e.jobId} for ${e.pool}/lane-${e.lane} @ ${String(e.sha).slice(0, 8)}${e.pid ? ` (gate pid ${e.pid})` : ''}`);
+    }
+    console.error(`verify-daemon: gates run as detached jobs (${gateJobs.dir}); ${reattached.length} re-attached at boot.`);
+  }
   console.error(`verify-daemon: started on ${hostname()}:${process.pid}, tick every ${DEFAULT_INTERVAL_MS}ms, heartbeat every ${DEFAULT_HEARTBEAT_INTERVAL_MS}ms.`);
   const cloneRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
   const readHead = () => { try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: cloneRoot, encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
