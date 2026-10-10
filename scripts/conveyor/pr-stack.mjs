@@ -10,6 +10,8 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { stackReviewWhileBaseOpen, stackedTopMayFixInParallel } from '../lib/stack-review-while-open.mjs';
+import { listFixDispatchClaims } from './fix-dispatch-claim.mjs';
 
 export const PR_STACK_DEFAULTS = Object.freeze({ detect: true, bottomFirst: true, restack: true, restackMaxRounds: 3, holdMaxAgeMs: 6 * 3600e3 });
 export const PR_STACK_ENV = Object.freeze({ detect: 'WE_PR_STACK_DETECT', bottomFirst: 'WE_PR_STACK_BOTTOM_FIRST', restack: 'WE_PR_STACK_RESTACK', restackMaxRounds: 'WE_PR_STACK_RESTACK_MAX_ROUNDS', holdMaxAgeMs: 'WE_PR_STACK_HOLD_MAX_AGE_MS' });
@@ -279,6 +281,27 @@ export function applyStackOrder(planned, stacks, { settings, used = new Set(), n
         continue;
       }
     }
+    // `stack.reviewWhileBaseOpen` (operator go 2026-10-10). Bottom-first (#4655) holds a top ONLY while BOTH are being
+    // fixed on shared files: the bottom owes a fix this pass or holds a live fix claim, AND the top's own change touches
+    // the bottom's files (or that is unknown). Otherwise the top is dispatched as a peer:
+    //   (a) the bottom is idle — no fix owed this pass (round cap, needs-you, nothing owed) and no live fix claim.
+    //       Live #4715 (2026-10-10 08:40→11:03 ET): held 2.5 h behind #4708 while #4708 sat at its round cap.
+    //   (b) the top's own change shares no file with the bottom's.
+    // `pair.stackPolicy` / `pair.parallelFix` / `pair.bottomClaimed` are set by `markParallelFixPairs` (git + claim reads);
+    // an unread claim is "claimed" and an unread diff is "touches" (fail closed: the hold stays).
+    if (pair && settings.bottomFirst && pair.bottomOpen && pair.stackPolicy === true) {
+      const bottomOwed = planned.some(e => Number(e?.pr) === pair.bottom);
+      const bottomBusy = bottomOwed || pair.bottomClaimed !== false;
+      if (!bottomBusy || pair.parallelFix === true) {
+        out.refusals.push({ pr: entry.pr, kind: 'stacked-parallel-fix',
+          why: !bottomBusy
+            ? `PR #${entry.pr} is stacked on #${pair.bottom}, but #${pair.bottom} owes no fix this pass and holds no fix claim — dispatched as a peer, not held behind an idle bottom (stack.reviewWhileBaseOpen)`
+            : `PR #${entry.pr} is stacked on #${pair.bottom}, but its own change touches none of #${pair.bottom}'s files — fixed in parallel (stack.reviewWhileBaseOpen)` });
+        out.planned.push(entry);
+        for (const above of out.stackAbove.values()) above.delete(entry.pr);
+        continue;
+      }
+    }
     if (pair && settings.bottomFirst && pair.bottomOpen) {
       out.heldTops.add(entry.pr);
       if (startHold(pair, now)) out.holdChanged = true;
@@ -395,7 +418,9 @@ export const sameStackActor = (top, bottom) => Boolean(top.author) && top.author
 // Branch names come from GitHub and are only VERIFIED against origin's tips, never inferred from a sha.
 export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], settings,
   readRefs = readOpenPrRefs, isAncestor = gitIsAncestor(root), onMain = gitOnMain(root), readMem = readRemembered, writeMem = writeRemembered,
-  readLanes = readOriginLaneTips, now = Date.now }) {
+  readLanes = readOriginLaneTips, now = Date.now,
+  reviewWhileBaseOpen = () => stackReviewWhileBaseOpen(), readStackFiles = gitDiffNames,
+  readClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }) }) {
   try {
     if (repoKey !== 'we' || !settings.detect) return { pairs: [] };
     // No open-PR list (a deferred or failed read) proves nothing: keep the memory untouched and detect nothing.
@@ -420,9 +445,47 @@ export function readStacksForPass({ root, repoKey, planned, openPrFiles = [], se
     // this one neither holds it nor gets the daemon pushing their commits into it. An unreadable author forms no stack.
     const stacks = detectStacks(flagged, { isAncestor, onMain, remembered: readMem(root), allowPair: sameStackActor, now });
     writeMem(root, nextRemembered(stacks));
+    if (settings.bottomFirst) markParallelFixPairs(stacks, { root, reviewWhileBaseOpen, readFiles: readStackFiles, readClaims });
     if (stacks.truncated) console.warn(`pr-stack: detection was bounded (more than ${MAX_COMPARED_PRS} trusted PRs, or the git budget/deadline ran out) — PRs not compared this pass are treated as peers`);
     return stacks;
   } catch { return { pairs: [] }; }
+}
+// `git diff --name-only a...b` (b's own change since its merge-base with a), or null when git cannot answer.
+export function gitDiffNames(dir) {
+  return (a, b) => {
+    try {
+      return String(execFileSync('git', ['-C', dir, 'diff', '--name-only', '--no-renames', `${a}...${b}`, '--'], { encoding: 'utf8', timeout: 30e3, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }))
+        .split('\n').filter(Boolean);
+    } catch { return null; }
+  };
+}
+/**
+ * `stack.reviewWhileBaseOpen`: annotate each pair with an OPEN bottom for {@link applyStackOrder}:
+ *   `stackPolicy: true`; `parallelFix` — the top's own change (bottom head...top head) shares no file with the bottom's
+ *   change (main...bottom head); `bottomClaimed` — a live fix claim names the bottom PR (`null` when unreadable).
+ * Any unknown read keeps the hold. Mutates the pairs in place (never persisted: `nextRemembered` lists its fields by
+ * hand). Never throws.
+ */
+export function markParallelFixPairs(stacks, { root, reviewWhileBaseOpen = () => stackReviewWhileBaseOpen(), readFiles = gitDiffNames,
+  readClaims = () => listFixDispatchClaims(undefined, { liveOnly: true }), base = 'origin/main' } = {}) {
+  try {
+    if (!stacks?.pairs?.some(p => p.bottomOpen)) return stacks;
+    if (!reviewWhileBaseOpen()) return stacks;
+    let claimed = null;
+    try {
+      const claims = readClaims();
+      if (Array.isArray(claims)) claimed = new Set(claims.map(c => Number(c?.meta?.pr)).filter(Number.isInteger));
+    } catch { claimed = null; }
+    const diff = readFiles(root);
+    for (const pair of stacks.pairs) {
+      if (!pair.bottomOpen) continue;
+      pair.stackPolicy = true;
+      pair.bottomClaimed = claimed ? claimed.has(pair.bottom) : null;
+      if (!pair.bottomHead || !pair.topHead) { pair.parallelFix = false; continue; }
+      pair.parallelFix = stackedTopMayFixInParallel({ topOwnFiles: diff(pair.bottomHead, pair.topHead), bottomFiles: diff(base, pair.bottomHead) }).parallel;
+    }
+  } catch { /* fail closed: pairs stay held */ }
+  return stacks;
 }
 // Test seam: the per-process hold-clock mirror must not leak between cases.
 export const resetHoldMemo = () => heldMemo.clear();
