@@ -557,6 +557,27 @@ export function isInfraStallCompletion(record, { sessionId = null, claimedAt = n
   return Number.isFinite(updated) && (!Number.isFinite(claimed) || updated >= claimed);
 }
 
+/** fix.selfReviewParallel (card xloi1c0): the PR's self-review record (we:scripts/conveyor/await-verify.mjs). */
+const readSelfReviewDefault = async ({ repo, pr }) => {
+  const { readSelfReview } = await import('./await-verify.mjs');
+  return readSelfReview({ repo, pr });
+};
+
+/**
+ * Why `fix-end` must NOT release this claim yet, or null (card xloi1c0). A self-review this session started in
+ * parallel with verify that is still `pending`, or returned `must-fix` with the repair not yet marked, holds a
+ * HAND-BACK release: the claim is released only once verify is green AND the self-review returned. An exit that
+ * does not hand the head back (gate-red, blocked-*, escalated-*, not-applicable — its `done` completion record says
+ * so) still releases, since it leaves the PR held by its own stand-down / label. Pure.
+ */
+export function selfReviewReleaseRefusal({ selfReview, completion, sessionId = null, who = null, hold }) {
+  const reason = hold(selfReview, { sessionId, who });
+  if (!reason) return null;
+  const own = completion && (!completion.sessionId || !sessionId || completion.sessionId === sessionId);
+  const exit = own && completion.status === 'done' && typeof completion.outcome === 'string' && completion.outcome && completion.outcome !== 're-armed';
+  return exit ? null : `self-review-open: ${reason}. Record it first (await-verify.mjs self-review clean|must-fix); a hand-back never releases the claim before the self-review returned`;
+}
+
 const readCompletionDefault = async (who) => {
   const { tryReadCompletion } = await import('../operations/completion-store.mjs');
   return tryReadCompletion(String(who));
@@ -674,12 +695,26 @@ export async function fixBegin({
  */
 export async function fixEnd({
   repo, pr, who, sessionId = callerIdentity().sessionId, token = callerIdentity().token, gh = ghDefault, labels = null, lockRoot = fixDispatchClaimRoot(),
-  readCompletion = readCompletionDefault,
+  readCompletion = readCompletionDefault, readSelfReview = readSelfReviewDefault, clearSelfReview = null,
 } = {}) {
   const repoKey = repoKeyOf(repo);
   const slug = CONSTELLATION_REPOS[repoKey].slug;
+  // fix.selfReviewParallel: never release before the parallel self-review returned (fails CLOSED on an unreadable store
+  // only when a record exists; a missing record is today's flow).
+  let selfReview = null;
+  try { selfReview = await readSelfReview({ repo: repoKey, pr }); } catch { selfReview = null; }
+  if (selfReview) {
+    const { selfReviewHold } = await import('./await-verify.mjs');
+    let completion = null;
+    try { completion = await readCompletion(who); } catch { completion = null; }
+    const refusal = selfReviewReleaseRefusal({ selfReview, completion, sessionId, who, hold: selfReviewHold });
+    if (refusal) return { ok: false, reason: refusal, pr: Number(pr) };
+  }
   const rel = releaseFixClaim({ repo: repoKey, pr, who, sessionId, token, lockRoot });
   if (!rel.released) return { ok: false, reason: rel.reason, heldBy: rel.heldBy ?? null, pr: Number(pr) };
+  if (selfReview && (selfReview.sessionId ? selfReview.sessionId === sessionId : selfReview.who === who)) {
+    try { (clearSelfReview ?? (await import('./await-verify.mjs')).clearSelfReview)({ repo: repoKey, pr }); } catch { /* best-effort: a returned record never holds */ }
+  }
   const wasDraft = Boolean(rel.entry?.meta?.draft);
   const draftReason = rel.entry?.meta?.reason ?? null;
   const heldLabel = wasDraft && FIX_DRAFT_LABEL[draftReason] ? FIX_DRAFT_LABEL[draftReason] : FIXING_LABEL;

@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
   resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS, AWAIT_VERIFY_NO_PUSH_KINDS,
+  readSelfReview, selfReviewHold, selfReviewStoreDir,
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
 import { computeWorkingTreeHash } from '../lib/verify-lane-gate.mjs';
@@ -44,7 +45,7 @@ import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTun
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
-export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3 });
+export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000 });
 /** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
 export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
 const repoKeyOrNull = (slug) => { try { return repoKeyForSlug(slug) ?? null; } catch { return null; } };
@@ -161,7 +162,9 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       // The two briefs end differently: a CI-heal's only PR write is the restart-surviving tally comment (no evidence comment, no hand-back).
       return isCiHeal(record)
         ? `${head}\n\n${pushed} Continue your ${brief(record)} at step 7: post the durable CI-heal comment (\`ci-heal-mark.mjs\` — the attempt tally that survives restarts), then its completion report (\`--outcome=no-change|healed\`) and fix-end. Touch no label.`
-        : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
+        : record.pendingResume?.selfReviewOverdue
+          ? `${head}\n\n${pushed} BUT your parallel self-review has not reported (${record.pendingResume.selfReviewOverdue}). Do not hand back yet: if it is still running, wait for its report; if it was lost, run it again now (blocking). Record its verdict with \`node "${ROOT}/scripts/conveyor/await-verify.mjs" self-review clean|must-fix --repo=${record.repo} --pr=${record.pr} --who=${record.who}\`. must-fix → repair with a NEW commit, \`verify-lane.mjs request\`, mark again (same --attempt) and end your turn. clean → continue your ${brief(record)} from the step after the push. fix-end refuses a hand-back release while the self-review is open.`
+          : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
     }
     case 'push-rejected':
       return isCiHeal(record)
@@ -344,6 +347,27 @@ export async function runAwaitVerifyPass({
           row.result = 'session-gone; not pushed';
           rows.push(row); continue;
         }
+        // fix.selfReviewParallel (card xloi1c0): a green verdict is NOT handed back while this session's self-review is still
+        // out (or returned must-fix for this very sha). The verdict marker stays valid for the sha, so the next tick
+        // re-decides; nothing is pushed or resumed meanwhile. Bounded: past `selfReviewMaxMs` the green proceeds with an
+        // instruction to finish the review first, and fix-end still refuses a hand-back release while it is open.
+        const sr = record.kind === 'fix' && typeof io.readSelfReview === 'function' ? io.readSelfReview(record) : null;
+        const srHold = selfReviewHold(sr, { sessionId: record.sessionId, who: record.who, sha: record.sha });
+        let srOverdue = null;
+        if (srHold) {
+          const since = Date.parse(sr.state === 'pending' ? sr.startedAt : (sr.returnedAt ?? sr.startedAt));
+          const maxMs = limits.selfReviewMaxMs ?? AWAIT_VERIFY_LIMITS.selfReviewMaxMs;
+          if (!(Number.isFinite(since) && nowMs - since > maxMs)) {
+            if (!record.selfReviewHeldAt) {
+              if (!persist({ ...record, selfReviewHeldAt: new Date(nowMs).toISOString() })) { rows.push(row); continue; }
+              Object.assign(row, { action: 'self-review-hold', reason: srHold, result: 'verify green; push + resume withheld until the self-review returns (fix claim still held)' });
+            } else Object.assign(row, { action: 'wait', reason: `green; ${srHold}` });
+            rows.push(row); continue;
+          }
+          srOverdue = srHold;
+        }
+        const srNote = sr && sr.state !== 'pending' && sr.returnedAt && (!record.sessionId || !sr.sessionId || sr.sessionId === record.sessionId)
+          ? `self-review ${sr.state} (started ${sr.startedAt}, returned ${sr.returnedAt})` : null;
         const attempt = record.pushRetries ?? 0;
         if (!persist({ ...record, pushRetries: attempt + 1 })) { rows.push(row); continue; }
         const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
@@ -357,11 +381,13 @@ export async function runAwaitVerifyPass({
         const transientGone = !pushed?.ok && pushed?.transient;
         const salvaged = transientGone ? io.saveSalvage?.({ record, nowMs, reason: pushed.reason }) : null;
         pending = pushed?.ok
-          ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}` }
+          ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
           : transientGone
             ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
             : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
         row.result = pushed?.ok ? 'pushed' : (transientGone ? `push-transient${salvaged?.ok ? '; salvaged' : ''}` : (pushed?.moved ? 'push-rejected' : 'push-refused'));
+        if (pushed?.ok && srNote) row.result += `; ${srNote}`;
+        if (pushed?.ok && srOverdue) row.result += `; ${srOverdue} — OVERDUE, resumed with finish-the-review`;
       } else if (!pending) {
         pending = { kind: d.resume, detail: d.reason };
       }
@@ -613,6 +639,8 @@ export async function defaultAwaitVerifyIo({
   return {
     // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
     pushPolicy: () => loadFixPushPolicy({ env }),
+    // fix.selfReviewParallel (card xloi1c0): the PR's self-review record, read fresh every pass.
+    readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env) }),
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
     clearRecord: (key, record) => {

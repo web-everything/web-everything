@@ -411,8 +411,8 @@ node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<evide
 ### 4. Run the gate GREEN (the item's own locus gate)
 
 **The harness owns the wait, not you (#5137).** The gate verifies a COMMIT and the harness pushes exactly that
-commit, so first finish step 5's self-review, re-run the step-2 test (below), and make step 6's commit — but NOT
-its push. Then hand the wait over:
+commit, so first finish step 5's self-review (in parallel mode it starts right AFTER this `mark` instead), re-run
+the step-2 test (below), and make step 6's commit — but NOT its push. Then hand the wait over:
 
 ```bash
 node {{WE_ROOT}}/scripts/verify-lane.mjs request --repo=.                        # returns almost instantly — nothing has run yet
@@ -509,7 +509,25 @@ deliberate stop from a crash, and re-dispatches a fixer at this PR forever.
 
 ### 5. Converge before handback — self-review the repair (proportionate to the change)
 
-Run this BEFORE step 4's `request`: the harness pushes exactly the commit it verified, so review comes first.
+**Parallel with verify (`fix.selfReviewParallel`, default on — we:scripts/lib/fix-push-policy.mjs, card xloi1c0).**
+Do steps 6 and 4 FIRST (commit, `request`, `mark`), then start the review against the marked commit:
+
+```bash
+node "{{WE_ROOT}}/scripts/conveyor/await-verify.mjs" self-review start --repo={{REPO}} --pr={{PR_NUM}} --who={{SESSION_SLUG}}
+```
+
+Exit 0 (`"mode":"parallel"`) → launch the self-review subagent below **in the background** (`run_in_background: true`
+on the Agent call — the one sanctioned background wait here: the task notification wakes you), then end your turn
+with `awaiting verify + self-review for <sha>`. When its report arrives, record the verdict at once:
+`… await-verify.mjs self-review clean --repo={{REPO}} --pr={{PR_NUM}} --who={{SESSION_SLUG}}` (then end your turn
+again if verify has not resumed you yet), or `… self-review must-fix …` and then repair with a NEW commit on top,
+`verify-lane.mjs request`, `mark` again with the SAME `--attempt`, and end your turn — the harness pushes that commit
+under the same claim and verifies the new head. A verify resume can arrive before the review does: handle it as
+step 4 says, then keep waiting for the review. **The harness withholds the green resume while the review is open,
+and `fix-end` refuses a hand-back release until it returned** — never re-arm review on an open self-review.
+Exit 3 (`"mode":"blocking"`) → the setting is off: run the review as below, BEFORE step 4's `request`.
+
+Blocking mode only: run this BEFORE step 4's `request`: the harness pushes exactly the commit it verified, so review comes first.
 
 For anything beyond a trivial one-liner, spawn **one adversarial code-review subagent** on your repair diff and
 **AWAIT its returned report as the verdict** — the same converge-before-handback discipline the delivery brief
