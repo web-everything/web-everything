@@ -144,7 +144,7 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
  *  guard ran with the `review-dispatch` default label, so the log blamed a review step that never ran). */
 // Card xx0055i — round history + takeover at the round cap (imports kept here, away from the import block).
 import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
-import { resolveFixSettings, takeoverMarkerBody, withTakeover } from './fix-takeover.mjs';
+import { resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from './fix-takeover.mjs';
 import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
 
 export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
@@ -1042,6 +1042,13 @@ export function postTakeoverMarker({ repo, pr, head, takeover, exec = execFileSy
   return true;
 }
 
+/** Post the void marker: the takeover whose marker went up never launched, so it must not spend the bound. */
+export function postTakeoverVoid({ repo, pr, head, reason, exec = execFileSyncThrottled }) {
+  exec('gh', ['pr', 'comment', String(pr), '--repo', ghRepoSlug(repo), '--body', takeoverVoidMarkerBody({ pr, head, reason })],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
+  return true;
+}
+
 /** Post the send-back notice once per head (the durable record, and what the fixer reads on the thread). */
 export function postRulingNotice({ repo, pr, ruling, exec = execFileSyncThrottled }) {
   // `noticedRungs` is read off the thread by the planner: one notice per head AND ladder rung.
@@ -1169,6 +1176,7 @@ export function dispatchFix(planned, {
   // Hermetic under a test runner: a test that wants history injects its own reader.
   readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postTakeover = postTakeoverMarker,
+  postTakeoverVoidMark = postTakeoverVoid,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
@@ -1200,6 +1208,7 @@ export function dispatchFix(planned, {
   }
   // #3850 — the cwd this dispatch actually spawned into, so a trust heal grants THAT dir (never a placeholder).
   let spawnCwd = null;
+  let takeoverMarked = false; // card xx0055i — the takeover marker is up; a failure before an agent starts must void it.
   try {
     const sessionSlug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
     // #3960 — the repo-aware quintet, computed once from `repo`'s own profile (never re-derived here). The
@@ -1241,6 +1250,7 @@ export function dispatchFix(planned, {
       } catch (e) {
         throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} takeover marker post failed for PR #${planned.pr}: ${describeSpawnFailure(e, { label: 'gh comment' })}`);
       }
+      takeoverMarked = true;
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} takeover at the round cap (${planned.takeover.attempts}/${planned.takeover.cap}) rung=${planned.takeover.rung?.id} model=${ladderTable?.model ?? 'default-fix-route'}`);
     }
     if (planned.rulingNotAddressed?.rung) {
@@ -1340,6 +1350,12 @@ export function dispatchFix(planned, {
     // #x0jphk5 — nothing was actually spawned: release so a legitimate retry for this same PR is never blocked
     // by our own failed attempt.
     releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
+    // Card xx0055i — no agent started, so the takeover marker posted above did not buy a takeover: void it, or the
+    // retry reads `takeover-spent` and the operator is told a takeover "already ran" that never did. Best effort: if
+    // the void cannot be posted the marker stands (the conservative side of the bound).
+    if (takeoverMarked) {
+      try { postTakeoverVoidMark({ repo, pr: planned.pr, head: planned.headRefOid, reason: e?.message }); } catch { /* the bound stays spent */ }
+    }
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.
     // Grants the REAL session dir (`grantDispatchTrust` collapses it to the scratch root under the default policy,

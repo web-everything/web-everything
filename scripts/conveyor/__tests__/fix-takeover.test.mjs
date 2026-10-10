@@ -1,10 +1,12 @@
 // Card xx0055i — automatic takeover at the fix round cap.
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
-  resolveFixSettings, planTakeover, takeoverRung, takeoverMarkers, takeoverMarkerBody, withTakeover, FIX_SETTINGS_FILE,
+  resolveFixSettings, planTakeover, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
+  FIX_SETTINGS_FILE,
 } from '../fix-takeover.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
-import { briefWithRoundContext, fixerTableFor } from '../reconcile-fix-dispatch.mjs';
+import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
+import { briefWithRoundContext, fixerTableFor, dispatchFix } from '../reconcile-fix-dispatch.mjs';
 import { readFileSync } from 'node:fs';
 
 const BOT = { login: 'web-everything' };
@@ -22,7 +24,7 @@ const LADDER = {
 const marker = (head) => ({ author: BOT, createdAt: '2026-10-10T00:00:00Z', body: takeoverMarkerBody({ pr: 7, head, attempts: 5, cap: 5, rung: { id: 'stronger-model' } }) });
 
 // A bounced PR that has spent 5 of 5 fix rounds (5 rearm markers), the shape #4708 was in.
-const rearm = (i) => ({ author: BOT, createdAt: `2026-10-0${i}T00:00:00Z`, body: '<!-- conveyor-rearm-review -->\n🔁 conveyor re-armed review' });
+const rearm = (i) => ({ author: BOT, createdAt: `2026-10-0${i}T00:00:00Z`, body: REARM_COMMENT_MARKER });
 function cappedPr(extraComments = []) {
   return {
     number: 7, headRefName: 'lane/x-thing', headRefOid: HEAD, isDraft: false, createdAt: '2026-10-01T00:00:00Z',
@@ -109,5 +111,142 @@ describe('takeover brief (card xx0055i)', () => {
   });
   it('an unreadable thread still gets the takeover section', () => {
     expect(withTakeover('BRIEF', { attempts: 5, cap: 5 })).toMatch(/read the PR thread yourself/);
+  });
+});
+
+describe('takeover marker bound (card xx0055i review round 1)', () => {
+  const other = 'b'.repeat(40);
+  const voided = (head) => ({ author: BOT, createdAt: '2026-10-10T01:00:00Z', body: takeoverVoidMarkerBody({ pr: 7, head, reason: 'claude --bg failed' }) });
+
+  it('refuses the same head while per-PR budget remains (the head guard, not the count, is what refuses)', () => {
+    const r = planTakeover({ pr: cappedPr([marker(HEAD)]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER });
+    expect(r).toMatchObject({ ok: false, reason: 'takeover-spent' });
+    // and an abbreviated sha on the marker is the same head
+    expect(planTakeover({ pr: cappedPr([marker(HEAD.slice(0, 9))]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER }).ok).toBe(false);
+  });
+
+  it('a void marker for the same head gives the takeover back; a void for another head, or from an untrusted login, does not', () => {
+    expect(takeoverMarkers([marker(HEAD), voided(HEAD)])).toEqual([]);
+    expect(planTakeover({ pr: cappedPr([marker(HEAD), voided(HEAD)]), roundCapAction: 'takeover', fixerLadder: LADDER }).ok).toBe(true);
+    expect(takeoverMarkers([marker(HEAD), voided(other)])).toHaveLength(1);
+    expect(takeoverMarkers([marker(HEAD), { ...voided(HEAD), author: { login: 'mallory' } }])).toHaveLength(1);
+    // a void cancels ONE start: two starts and one void leave one
+    expect(takeoverMarkers([marker(HEAD), marker(other), voided(HEAD)]).map((m) => m.head)).toEqual([other]);
+    // a void on its own is not a start marker
+    expect(takeoverMarkers([voided(HEAD)])).toEqual([]);
+  });
+});
+
+describe('planReconcile takeover call sites and the post-takeover tick (card xx0055i review round 1)', () => {
+  const NOW = Date.parse('2026-10-10T00:00:00Z');
+  const plan = (pr, opts) => planReconcile({ prs: [pr], agents: [], durableCounts: {}, now: NOW, fixerLadder: LADDER, roundCapAction: 'takeover', requiredChecks: ['gate'], ...opts });
+  const green = [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+  const rearms = (n) => Array.from({ length: n }, (_, i) => rearm(i + 1));
+
+  it('the takeover is reviewed: with the takeover marker, its own re-arm (cap+1) still owes a review, never cap-exhausted', () => {
+    const pending = (comments) => ({ ...cappedPr(comments), labels: [{ name: 'review:pending' }], statusCheckRollup: green });
+    const without = plan(pending(rearms(6)));
+    expect(without.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', capKind: 'review' });
+    const withMarker = plan(pending([...rearms(6), marker(HEAD)]));
+    expect(withMarker.dispatch.find((d) => d.prNumber === 7)).toMatchObject({ kind: 'review', attempts: 6, finalReview: true });
+    expect(withMarker.refusals.find((r) => r.prNumber === 7)).toBeUndefined();
+  });
+
+  it('a voided takeover earns no extra review round', () => {
+    const voidedMarker = { author: BOT, createdAt: '2026-10-10T01:00:00Z', body: takeoverVoidMarkerBody({ pr: 7, head: HEAD }) };
+    const p = plan({ ...cappedPr([...rearms(6), marker(HEAD), voidedMarker]), labels: [{ name: 'review:pending' }], statusCheckRollup: green });
+    expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', capKind: 'review' });
+  });
+
+  it('after the takeover is reviewed and bounces again, the operator is asked (takeover-spent), not a second takeover', () => {
+    const p = plan(cappedPr([...rearms(6), marker(HEAD)]));
+    expect(p.dispatch.find((d) => d.prNumber === 7)).toBeUndefined();
+    expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', takeover: 'takeover-spent' });
+  });
+
+  it('plain bounce site: a takeover row', () => {
+    expect(plan(cappedPr(rearms(5))).dispatch.find((d) => d.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover' });
+  });
+
+  it('operator send-back site: never replaced by a takeover — the operator\'s must-fix body reaches a person', () => {
+    const sendBack = { id: 'op-send-back', createdAt: '2026-10-09T00:00:00Z', author: { login: 'chalbert' },
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' };
+    const red = [{ name: 'gate', status: 'COMPLETED', conclusion: 'FAILURE' }];
+    // five repair rounds BEFORE the operator's verdict, none after: the grant is 7 and the durable count is already 7.
+    const p = plan({ ...cappedPr([...rearms(5), sendBack]), statusCheckRollup: red }, { durableCounts: { 7: 7 } });
+    expect(p.dispatch.filter((d) => d.prNumber === 7 && d.mode === 'takeover')).toEqual([]);
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toMatchObject({ capKind: 'fix', parkToHuman: true });
+  });
+
+  it('block-ruled-referral site: the takeover row carries the blocked referrals', () => {
+    const referral = { key: 'k1', finding: { file: 'src/a.mjs', line: 1, summary: 'bad' }, ruling: 'block' };
+    const p = plan({ ...cappedPr(rearms(5)), labels: [{ name: 'review:human' }], blockRuledReferrals: [referral] });
+    expect(p.dispatch.find((d) => d.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', blockRuledReferrals: [referral] });
+  });
+});
+
+describe('dispatchFix takeover ordering and failure (card xx0055i review round 1)', () => {
+  const planned = {
+    itemNum: null, pr: 4708, laneRef: 'lane/x', scope: ['we:x'], lane: 3, headRefOid: HEAD,
+    mode: 'takeover', takeover: { attempts: 5, cap: 5, rung: { id: 'stronger-model' }, route: null },
+  };
+  function harness(over = {}) {
+    const calls = [];
+    const opts = {
+      root: '/repo',
+      readBrief: () => '{{PR_NUM}} {{ITEM_NUM}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}} {{LANE_REF}}',
+      readFixClaim: () => null, acquireClaim: () => ({ ok: true }), claimOwner: 'test-dispatcher',
+      releaseClaim: vi.fn(() => { calls.push('release'); }),
+      postNotice: vi.fn(),
+      readHistoryInputs: () => null,
+      fixSettings: { roundHistory: 'off' },
+      postTakeover: vi.fn(() => { calls.push('marker'); }),
+      postTakeoverVoidMark: vi.fn(() => { calls.push('void'); }),
+      spawnAgent: vi.fn(() => { calls.push('spawn'); return ''; }),
+      mintSessionId: () => 'sid-takeover',
+      ...over,
+    };
+    return { calls, opts };
+  }
+
+  it('posts the takeover marker BEFORE the spawn, with the planned head and bound', () => {
+    const { calls, opts } = harness();
+    dispatchFix(planned, opts);
+    expect(calls.indexOf('marker')).toBeGreaterThanOrEqual(0);
+    expect(calls.indexOf('marker')).toBeLessThan(calls.indexOf('spawn'));
+    expect(opts.postTakeover).toHaveBeenCalledWith({ repo: 'we', pr: 4708, head: HEAD, takeover: planned.takeover });
+    expect(opts.postTakeoverVoidMark).not.toHaveBeenCalled();
+  });
+
+  it('does not spawn when the takeover marker post fails: claim released, environment fault, nothing voided', () => {
+    const { opts } = harness({ postTakeover: vi.fn(() => { throw Object.assign(new Error('gh down'), { status: 1, stderr: 'HTTP 502' }); }) });
+    let err;
+    try { dispatchFix(planned, opts); } catch (e) { err = e; }
+    expect(opts.spawnAgent).not.toHaveBeenCalled();
+    expect(opts.releaseClaim).toHaveBeenCalledTimes(1);
+    expect(err.message).toMatch(/^dispatch-env-fault: takeover marker post failed for PR #4708/);
+    expect(opts.postTakeoverVoidMark).not.toHaveBeenCalled(); // the marker never went up
+  });
+
+  it('voids the marker when the spawn fails AFTER it was posted, so the retry still owns the takeover', () => {
+    const { calls, opts } = harness({ spawnAgent: vi.fn(() => { throw new Error('claude --bg failed'); }) });
+    expect(() => dispatchFix(planned, opts)).toThrow('claude --bg failed');
+    expect(calls).toEqual(['marker', 'release', 'void']);
+    expect(opts.postTakeoverVoidMark).toHaveBeenCalledWith(expect.objectContaining({ repo: 'we', pr: 4708, head: HEAD, reason: 'claude --bg failed' }));
+  });
+
+  it('a void that cannot be posted never masks the spawn failure', () => {
+    const { opts } = harness({
+      spawnAgent: vi.fn(() => { throw new Error('claude --bg failed'); }),
+      postTakeoverVoidMark: vi.fn(() => { throw new Error('gh down'); }),
+    });
+    expect(() => dispatchFix(planned, opts)).toThrow('claude --bg failed');
+  });
+
+  it('an ordinary (non-takeover) fix posts no takeover marker and no void', () => {
+    const { opts } = harness({ spawnAgent: vi.fn(() => { throw new Error('boom'); }) });
+    expect(() => dispatchFix({ ...planned, mode: undefined, takeover: undefined }, opts)).toThrow('boom');
+    expect(opts.postTakeover).not.toHaveBeenCalled();
+    expect(opts.postTakeoverVoidMark).not.toHaveBeenCalled();
   });
 });

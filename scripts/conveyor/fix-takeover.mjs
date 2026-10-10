@@ -51,11 +51,37 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   };
 }
 
-/** Takeovers already started on this PR, read off TRUSTED marker comments only: `[{ head }]`. */
+/** Posted when a takeover's session never started after its marker went up (a spawn fault): it voids ONE marker for
+ *  that head, so a fault in the launch does not burn the only takeover. */
+export const FIX_TAKEOVER_VOID_MARKER = '<!-- conveyor-fix-takeover-void';
+
+const markerHead = (body, prefix) => {
+  const m = body.match(new RegExp(`${prefix} head=([0-9a-f]{7,40}|unknown)`));
+  return m ? (m[1] === 'unknown' ? null : m[1]) : undefined; // undefined = not this kind of marker
+};
+
+/**
+ * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
+ * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing.
+ */
 export function takeoverMarkers(comments) {
-  return (Array.isArray(comments) ? comments : [])
-    .filter((c) => typeof c?.body === 'string' && c.body.includes(FIX_TAKEOVER_MARKER) && isTrustedMarkerAuthor(c))
-    .map((c) => ({ head: c.body.match(/<!-- conveyor-fix-takeover head=([0-9a-f]{7,40})/)?.[1] ?? null, at: c.createdAt ?? null }));
+  const trusted = (Array.isArray(comments) ? comments : [])
+    .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c));
+  const starts = trusted
+    .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null }))
+    .filter((m) => m.head !== undefined);
+  const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined);
+  for (const h of voids) {
+    // Cancel the latest start for this head (any start when the void names no head).
+    const at = starts.map((m, i) => ({ m, i })).reverse().find(({ m }) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
+    if (at) starts.splice(at.i, 1);
+  }
+  return starts;
+}
+
+/** Two shas are the same head when one is a prefix of the other (a marker may carry an abbreviated sha). */
+export function sameHeadSha(a, b) {
+  return Boolean(a && b && (a.startsWith(b) || b.startsWith(a)));
 }
 
 /**
@@ -83,7 +109,7 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr =
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const markers = takeoverMarkers(pr?.comments);
   const head = pr?.headRefOid ?? null;
-  const sameHead = markers.some((m) => m.head && head && (head.startsWith(m.head) || m.head.startsWith(head)));
+  const sameHead = markers.some((m) => sameHeadSha(m.head, head));
   if (sameHead || markers.length >= Math.max(0, takeoverMaxPerPr)) {
     return { ok: false, reason: 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
   }
@@ -97,6 +123,13 @@ export function takeoverMarkerBody({ pr, head, attempts, cap, rung }) {
     + `One takeover session was dispatched on head \`${String(head ?? '').slice(0, 9)}\` with the full round history, `
     + `on the \`${rung?.id ?? 'resend'}\` route${rung?.model ? ` (${rung.model})` : ''}. If it does not clear this PR, `
     + 'the operator is asked next. Ruling disputes always go to the operator.';
+}
+
+/** The void marker: the takeover whose marker was posted for `head` never launched, so it does not count. */
+export function takeoverVoidMarkerBody({ pr, head, reason }) {
+  return `${FIX_TAKEOVER_VOID_MARKER} head=${head ?? 'unknown'} -->\n`
+    + `↩️ conveyor fix takeover — the takeover session for PR #${pr} did not start`
+    + `${reason ? ` (${String(reason).replace(/<!--|-->/g, '').replace(/\s+/g, ' ').slice(0, 200)})` : ''}; it does not count against the takeover bound, and the next pass retries.`;
 }
 
 /**
