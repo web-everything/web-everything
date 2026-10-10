@@ -10,7 +10,7 @@ export default {
   id: 'stacked-fork-pr-never-restacked',
   title: 'missing-run recovery rebased and force-pushed origin/<head> for a stacked FORK PR, and counted fork refusals wrongly on a non-main default branch',
   card: 'PR #4825 review (epic #3383/#4075)',
-  fixedBy: { sha: '5ef4dfa279527ced7c46dd5203affd4039e50709', where: 'lane/recovery-caps-after-green', paths: ['scripts/conveyor/ci-red-recovery-watch.mjs'] },
+  fixedBy: { sha: 'd5fab55709d6bca4c48c94655b08e87b183ae482', where: 'lane/recovery-caps-after-green', paths: ['scripts/conveyor/ci-red-recovery-watch.mjs'] },
   fixPresent(root) { return readFileSync(join(root, 'scripts/conveyor/ci-red-recovery-watch.mjs'), 'utf8').includes('defaultReadIsCrossRepository'); },
   async run() {
     const root = process.env.SOAK_TREE_ROOT || new URL('../../../../', import.meta.url).pathname;
