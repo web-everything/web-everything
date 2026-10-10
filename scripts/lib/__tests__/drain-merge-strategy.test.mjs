@@ -20,7 +20,8 @@ function harness({ strategy = null, dryRun = false, initial = null, ghView = {} 
     calls.push([cmd, ...args]);
     if (args[0] === 'pr' && args[1] === 'merge') throw new Error('merge API must never be called');
     if (args[0] === 'pr' && args[1] === 'comment') return '';
-    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id')) return '{"id":"PR_NODE"}';
+    if (args[0] === 'pr' && args[1] === 'view' && args.includes('id,changedFiles')) return '{"id":"PR_NODE","changedFiles":1}';
+    if (args[0] === 'api' && args.includes('--paginate')) return '["scripts/x.mjs",""]\n';
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify(ghView[args[2]] ?? { state: 'OPEN' });
     if (args[0] === 'api' && args[1] === 'graphql') {
       if (enqueueFails) return JSON.stringify({ errors: [{ message: 'Pull request is not mergeable' }] });
@@ -68,9 +69,9 @@ describe('drain merge strategy — github-merge-queue', () => {
     expect(calls.some((c) => c[1] === 'pr' && c[2] === 'merge')).toBe(false);
     const comment = calls.find((c) => c[1] === 'pr' && c[2] === 'comment');
     expect(comment).toContain(buildClearanceComment(HEAD));
-    const gql = calls.find((c) => c[1] === 'api');
+    const gql = calls.find((c) => c[1] === 'api' && c[2] === 'graphql');
     expect(gql).toEqual(expect.arrayContaining(['id=PR_NODE', `sha=${HEAD}`]));
-    expect(calls.findIndex((c) => c[2] === 'comment')).toBeLessThan(calls.findIndex((c) => c[1] === 'api'));
+    expect(calls.findIndex((c) => c[2] === 'comment')).toBeLessThan(calls.findIndex((c) => c[1] === 'api' && c[2] === 'graphql'));
     expect(state().pending).toEqual([expect.objectContaining({ num: 42, repo: null, headSha: HEAD, item: 'x1' })]);
   });
 
