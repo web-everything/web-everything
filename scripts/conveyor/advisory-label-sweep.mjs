@@ -28,6 +28,16 @@
  * Removing a label the PR does not carry is a `gh` error, so removals are intersected with the live labels by
  * construction (the plan only lists present ones).
  *
+ * EVERY WRITE IS DECIDED ON A LIVE RE-READ OF THAT ONE PR (live PR #4708, 2026-10-10). The shared open-PR
+ * snapshot is a `gh pr list`, and `gh pr list --json comments` returns only the FIRST {@link LIST_COMMENTS_CAP}
+ * comments (oldest first). #4708 had 120: the snapshot's newest advisory was a 15:37Z `pending-referral` note for
+ * an older head, so the sweep removed the `advisory:accepted` that the 20:47:49Z accept note (covering the live
+ * head) had just earned, and every later tick read the same cut-off list, so the repair never fired. Now the
+ * snapshot only NOMINATES a PR (a non-empty plan, or a comment list that may be cut off); the plan that is
+ * written is re-derived from `gh pr view` (which pages through every comment), and a failed live read writes
+ * nothing. A label comes off only when the live newest trusted advisory names a DIFFERENT head than the live head
+ * — no advisory at all is not proof the head moved.
+ *
  * PURE-CORE / IO-SHELL: the plan is pure; {@link sweepAdvisoryLabels} is the shell, with the PR list and the
  * label provider injectable so the whole pass is testable with no `gh`.
  */
@@ -37,7 +47,10 @@ import { fileURLToPath } from 'node:url';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readSharedOpenPrs } from '../lib/pr-snapshot.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
-import { ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, planAdvisoryRepairLabels, planAdvisoryStaleLabels } from '../lib/advisory-labels.mjs';
+import {
+  ADVISORY_LABELS, ADVISORY_LABEL_META, labelNames, latestAdvisory, planAdvisoryRepairLabels, planAdvisoryStaleLabels,
+  trustedAdvisoryComments,
+} from '../lib/advisory-labels.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import { readPrsFromFile } from './open-pr-fetch.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -76,29 +89,73 @@ export function defaultListPrs({ exec = execFileSyncThrottled, repo = null } = {
   return Array.isArray(parsed) ? parsed : [];
 }
 
+/** `gh pr list --json comments` returns at most this many comments per PR (the oldest ones). */
+export const LIST_COMMENTS_CAP = 100;
+
+/** True when a listed PR's comments may be cut off, so its newest advisory may be missing from the list. */
+export function commentsMayBeTruncated(pr) {
+  return Array.isArray(pr?.comments) && pr.comments.length >= LIST_COMMENTS_CAP;
+}
+
 /**
- * Drop stale advisory labels off every open PR that carries one.
- * @param {{repo?: string|null, listPrs?: Function, provider?: object, dryRun?: boolean}} [o]
- * @returns {Array<{num: number, remove: string[], error?: string}>} one entry per PR that needed (or would need) a change.
+ * Read ONE PR live, with every comment — `gh pr view` pages through the whole comment list, unlike `gh pr list`.
+ * @param {{repo: string, number: number, exec?: Function}} o
+ */
+export function defaultReadPr({ repo, number, exec = execFileSyncThrottled }) {
+  const argv = ['pr', 'view', String(number), '--repo', repo, '--json', 'number,state,labels,headRefOid,comments'];
+  const out = exec('gh', argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL' });
+  return JSON.parse(String(out || '{}'));
+}
+
+/**
+ * PURE: the label change one PR's data asks for. Stale first, else REPAIR. A label is removed only when the
+ * newest trusted advisory exists and names a DIFFERENT head than `headRefOid` (rule (a), #4708) — the shared
+ * helper also treats "no advisory at all" as stale, which is not proof the head moved.
+ * @returns {{add: string|null, remove: string[]}}
+ */
+export function planForPr(pr) {
+  const input = { currentLabels: pr?.labels, comments: pr?.comments, headRefOid: pr?.headRefOid };
+  const stale = planAdvisoryStaleLabels(input);
+  if (stale.remove.length > 0) {
+    return latestAdvisory(trustedAdvisoryComments(pr?.comments)) ? { add: null, remove: stale.remove } : { add: null, remove: [] };
+  }
+  return planAdvisoryRepairLabels(input);
+}
+
+/**
+ * Drop stale advisory labels off every open PR that carries one, and repair a missing one.
+ * @param {{repo?: string|null, listPrs?: Function, readPr?: Function, provider?: object, dryRun?: boolean}} [o]
+ * @returns {Array<{num: number, remove: string[], add?: string, error?: string, skipped?: string}>} one entry per
+ *   PR that needed (or would need) a change, or whose live re-read failed.
  */
 export function sweepAdvisoryLabels({
-  repo = null, listPrs = defaultListPrs, provider = createGhProvider(), dryRun = false,
+  repo = null, listPrs = defaultListPrs, readPr = defaultReadPr, provider = createGhProvider(), dryRun = false,
 } = {}) {
   const prs = listPrs({ repo });
   const results = [];
-  // Resolved lazily and once, only when a write is about to happen — `GH_ARGV.setLabels` splices `--repo` into
-  // its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict watch documents).
+  // Resolved lazily and once, only when a live read or write is about to happen — `GH_ARGV.setLabels` splices
+  // `--repo` into its argv unconditionally, so a null repo must never reach it (the #xoh8fkw bug the conflict
+  // watch documents).
   let resolvedRepo = repo;
   for (const pr of (Array.isArray(prs) ? prs : []).filter((p) => carriesAdvisoryLabel(p) || isHumanGated(p))) {
-    const input = { currentLabels: pr.labels, comments: pr.comments, headRefOid: pr.headRefOid };
-    // Stale first (head moved past the advisory), else REPAIR (advisory covers head but the label is missing/wrong).
-    const stale = planAdvisoryStaleLabels(input);
-    const plan = stale.remove.length > 0 ? { add: null, remove: stale.remove } : planAdvisoryRepairLabels(input);
+    const nominated = planForPr(pr);
+    if (!nominated.add && nominated.remove.length === 0 && !commentsMayBeTruncated(pr)) continue;
+    // The snapshot only nominates; the write is decided on a live read of this one PR (#4708).
+    let live;
+    try {
+      if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
+      live = readPr({ repo: resolvedRepo, number: pr.number });
+    } catch (e) {
+      results.push({ num: pr.number, remove: [], skipped: `live re-read failed: ${String((e && e.message) || e).split('\n')[0]}` });
+      continue;
+    }
+    if (!live || (live.state && live.state !== 'OPEN')) continue;
+    if (!(carriesAdvisoryLabel(live) || isHumanGated(live))) continue;
+    const plan = planForPr(live);
     if (!plan.add && plan.remove.length === 0) continue;
     const entry = { num: pr.number, remove: plan.remove, ...(plan.add ? { add: plan.add } : {}) };
     if (!dryRun) {
       try {
-        if (resolvedRepo == null) resolvedRepo = provider.currentRepo();
         // `gh pr edit --add-label` refuses a label the repo has never had; ensure is create-or-update.
         if (plan.add) provider.ensureLabel?.(resolvedRepo, plan.add, ADVISORY_LABEL_META[plan.add]);
         provider.setLabels(resolvedRepo, pr.number, { add: plan.add ?? undefined, remove: plan.remove });
@@ -128,6 +185,7 @@ if (IS_CLI) {
         repo, dryRun, ...(prsFile ? { listPrs: () => readPrsFromFile(prsFile) } : {}),
       });
       for (const r of results) {
+        if (r.skipped) { writeLineSync(2, `  ⚠ PR #${r.num}: no label change (${r.skipped})`); continue; }
         const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
         const what = r.add ? `set ${r.add}${r.remove.length ? ` and remove ${r.remove.join(',')}` : ''} (advisory covers head, label missing)`
           // The stale plan only ever removes `advisory:*`; any other removed label is the repair path's.
