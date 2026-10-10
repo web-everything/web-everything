@@ -103,6 +103,7 @@
 import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
+import { ciGateForReview, inheritedProceedWhy } from './review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
@@ -1231,6 +1232,10 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
+  // `review.ciGate` (review-ci-gate.mjs): a review reads the diff, so failures the PR only INHERITED from main's current
+  // red (same job + test) do not hold it. Facts are attached by the IO shell as `pr.reviewCiInheritance`. Merge gate untouched.
+  const inh = !ci.allowed && pr?.reviewCiInheritance ? ciGateForReview({ ...pr.reviewCiInheritance, prChecks: { ...pr.reviewCiInheritance.prChecks, required: ci.affected } }) : null;
+  if (inh?.proceed) { extra.ciInherited = { ...inh, why: inheritedProceedWhy(inh), settingSource: pr.reviewCiInheritance.settingSource ?? null }; return true; }
   if (!ci.allowed) refuse('review-ci', {
     ...withPhase, ...extra, ci,
     why: `${ci.reason}: ${ci.affected.map(row => `${row.name}=${row.reason}`).join(', ')}`,
