@@ -16,13 +16,12 @@
  * PURE: reads only the PR's own comment thread and head sha.
  */
 import { FIX_TAKEOVER_MARKER } from './fix-takeover.mjs';
-import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { REVIEWED_SHA_MARKER } from '../lib/review-escalation.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+// A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
+// #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
+import { isReviewVerdictComment as isVerdict } from './mechanical-round-cap.mjs';
 
 export const OPERATOR_TAKEOVER_PREFIX = '**Takeover (operator OK)';
-/** Leading lines of a review verdict landing on the thread (advisory panel, a bounce). Accepts carry a reviewed-sha marker. */
-const VERDICT_PREFIXES = Object.freeze([ADVISORY_NOTE_MARKER, '🔁 review — changes requested']);
 
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
@@ -30,13 +29,6 @@ const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.
 function isTakeoverSignal(c) {
   const lead = bodyOf(c).trimStart();
   return (lead.startsWith(FIX_TAKEOVER_MARKER) || lead.startsWith(OPERATOR_TAKEOVER_PREFIX)) && isTrustedMarkerAuthor(c);
-}
-
-function isVerdict(c) {
-  const body = bodyOf(c);
-  const lead = body.trimStart();
-  return (VERDICT_PREFIXES.some((p) => lead.startsWith(p)) || body.includes(`<!-- ${REVIEWED_SHA_MARKER}:`))
-    && isTrustedMarkerAuthor(c);
 }
 
 /**
