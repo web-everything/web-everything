@@ -18,18 +18,22 @@
  *      read at the main tip), or a file the PR changed reaches a file main changed (read at the PR head). Through the
  *      repo's own import parser (we:scripts/lib/related-test-selection.mjs, the same one the local gate's test
  *      selection uses);
- *   5. a shared importer: an UNCHANGED test, spec or entry-point file (one nothing imports, such as check:standards
- *      or a build script) reaches (reverse imports, through any unchanged modules, read at the main tip) both a file
+ *   5. a shared importer: an UNCHANGED test, spec or entry-point file (one nothing outside its own import cycle
+ *      imports, such as check:standards or a build script, or a member of a closed cycle) reaches (reverse imports, through any unchanged modules, read at the main tip) both a file
  *      the PR changed and a file main changed. The two forward walks of rule 4 cannot see it; CI running that file
  *      after the merge exercises both together. A file the PR adds counts as imported by every unchanged file that
  *      already names it by a specifier that resolved to nothing or to a lower-priority file;
  *      Test infrastructure vitest loads for every test file (root `vitest.*.{ts,mjs}`: config, setup, global setup) has no
  *      importing test, so a change on either side that those files reach re-tests, under reason `test-infra-reached`;
- *   6. an import list could not be read, the tip's reverse graph could not be read in full or has more than
+ *   6. a changed non-source file (JSON, YAML, CSS, HTML, an image, an extensionless script) on either side: data a test
+ *      or script reads through `fs` has no import edge, and its reader can be an unchanged file or one either side adds,
+ *      so it re-tests, under reason `data-file-changed` (checked last: a data file an import does reach keeps the more
+ *      specific reason);
+ *   7. an import list could not be read, the tip's reverse graph could not be read in full or has more than
  *      {@link MAX_REVERSE_FILES} sources, or a forward closure is larger than {@link MAX_CLOSURE_FILES} — fail closed.
- *   NOT covered, by design: data read through `fs` rather than imported (other than declared settings, rule 1), and
- *   files loaded through a computed path — card x0e6tik (its shared-importer part is rule 5).
- *   Main changes under `nonCodePaths` (docs, backlog cards) never count, as in `any-code`.
+ *   NOT covered, by design: SOURCE files read through `fs` as text (a repo-scanning test) and files loaded through a
+ *   computed path — card x0e6tik.
+ *   Changes under `nonCodePaths` (docs, backlog cards) never count, as in `any-code`.
  *
  * IO ({@link readAffectedFacts}): reads file contents with `git show <sha>:<path>` in the drain's own clone,
  *   fetching the two commits from `origin` when absent. Rule 5 reads the whole tip tree in ONE `git cat-file --batch`
@@ -51,6 +55,8 @@ export const MAX_CLOSURE_FILES = 1500;
 export const MAX_GRAPH_MS = 25_000;
 /** More graph source files than this at the main tip ⇒ the reverse graph is not built; re-test (bounded IO, fail closed). The repo has ~3000 today. */
 export const MAX_REVERSE_FILES = 8000;
+/** Total reverse-walk steps spent deciding whether unchanged files are entry points, per PR; past it, treat the file as an entry (re-test, fail closed). */
+export const ENTRY_WORK_BUDGET = 200_000;
 
 /** The gate itself: a change here always re-tests (operator constraint). Repo-relative path patterns. */
 export const GATE_PATTERNS = Object.freeze([
@@ -154,12 +160,53 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   for (const { side, closure } of [{ side: 'pr', closure: fromPr }, { side: 'main', closure: fromMain }]) {
     for (const [file, root] of closure) if (TEST_INFRA_ENTRY_RE.test(file)) return done(true, [`test-infra-reached:${file} (${side}:${root})`]);
   }
+  // An entry point is a file nothing OUTSIDE its own import cycle imports: a script CI runs directly (check:standards, a
+  // build). "Zero importers" alone misses a cycle (A <-> B, run as A): every member has an importer, so none looked like
+  // a root. A file is an entry point iff every ancestor of it (reverse closure) is also reachable from it, i.e. sits in
+  // its cycle. Any ancestor outside the cycle means a file further up is the entry, and that one is reached too.
+  // The walk ignores importers the PR itself changes: the tip graph shows main's version of such a file, and the PR may
+  // drop its import, leaving the imported file a root in the merged tree. The ones that keep it are covered by the entry
+  // above them, which is reached too. Total work is bounded (ENTRY_WORK_BUDGET); past it, fail closed.
+  let entryWork = 0;
+  const upFrom = (root) => {
+    const seen = new Set([root]);
+    const queue = [root];
+    for (let i = 0; i < queue.length; i++) {
+      if (++entryWork > ENTRY_WORK_BUDGET || seen.size > MAX_CLOSURE_FILES) return 'bounded';
+      const importers = importersOf(queue[i]);
+      if (!Array.isArray(importers)) return 'unreadable';
+      for (const t of importers) if (!prSet.has(t) && !seen.has(t)) { seen.add(t); queue.push(t); }
+    }
+    return seen;
+  };
+  const entryMemo = new Map();
+  const isEntryPoint = (file) => {
+    if (entryMemo.has(file)) return entryMemo.get(file);
+    const answer = (() => {
+      const ancestors = upFrom(file);
+      if (typeof ancestors === 'string') return true; // unbounded or unreadable: cannot show an outside importer, fail closed
+      for (const a of ancestors) {
+        if (a === file) continue;
+        const back = upFrom(a);
+        if (typeof back === 'string') return true;
+        if (!back.has(file)) return false; // `file` is not among `a`'s ancestors, so `a` imports it from outside any cycle
+      }
+      return true; // every ancestor is in a cycle with `file`
+    })();
+    entryMemo.set(file, answer);
+    return answer;
+  };
   for (const [file, prRoot] of fromPr) {
-    // A meeting point is something CI executes: a test or spec file, or an entry point (nothing imports it: a script
-    // CI runs directly, such as check:standards or a build).
+    // A meeting point is something CI executes: a test or spec file, or an entry point (see isEntryPoint).
     if (prSet.has(file) || mainSet.has(file)) continue; // the meeting point is an UNCHANGED file (a changed one is rules 3-4)
-    if (fromMain.has(file) && (isTestFile(file) || importersOf(file)?.length === 0)) return done(true, [`shared-importer:${file} (pr:${prRoot}, main:${fromMain.get(file)})`]);
+    if (fromMain.has(file) && (isTestFile(file) || isEntryPoint(file))) return done(true, [`shared-importer:${file} (pr:${prRoot}, main:${fromMain.get(file)})`]);
   }
+  // Data read through `fs` rather than imported (a fixtures dir a test scans, a JSON/YAML a script loads): no import edge
+  // shows it, and a reader can be on either side (an unchanged test, or one main/the PR adds). A changed non-source file
+  // therefore never counts as "no code". Docs and backlog cards stay exempt (nonCodePaths). Checked last so a data file
+  // an import does reach keeps its more specific reason above.
+  const data = [...mainCode, ...pr.filter((f) => !isNonCode(f, nonCodePaths))].find((f) => !isGraphSourceFile(f));
+  if (data) return done(true, [`data-file-changed:${data}`]);
   return done(false, ['main-delta-unaffected']);
 }
 

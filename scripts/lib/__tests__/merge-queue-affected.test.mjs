@@ -315,6 +315,65 @@ describe('decideAffected — shared unchanged importer (review round 2: the test
     const importsOf = (side, f) => (side === 'main' && f === 'scripts/z.mjs' ? ['scripts/a.mjs'] : []);
     expect(run({ importsOf, importersOf: () => { throw new Error('not asked'); } }).reasons).toEqual(['main-file-imports-pr-file:scripts/z.mjs->scripts/a.mjs']);
   });
+  describe('an entry point inside an import cycle (review round 4: every member has an importer, none is a root)', () => {
+    it('an unchanged two-file cycle that reaches both sides is the meeting point CI runs → affected', () => {
+      const r = run({ importersOf: importers({ 'scripts/a.mjs': ['scripts/x.mjs'], 'scripts/z.mjs': ['scripts/y.mjs'], 'scripts/x.mjs': ['scripts/y.mjs'], 'scripts/y.mjs': ['scripts/x.mjs'] }) });
+      expect(r).toMatchObject({ affected: true, reasons: ['shared-importer:scripts/x.mjs (pr:scripts/a.mjs, main:scripts/z.mjs)'] });
+    });
+    it('a file that imports itself, run directly, is an entry point', () => {
+      const r = run({ importersOf: importers({ 'scripts/a.mjs': ['scripts/s.mjs'], 'scripts/z.mjs': ['scripts/s.mjs'], 'scripts/s.mjs': ['scripts/s.mjs'] }) });
+      expect(r.reasons).toEqual(['shared-importer:scripts/s.mjs (pr:scripts/a.mjs, main:scripts/z.mjs)']);
+    });
+    it('a longer cycle (three files) is still an entry point', () => {
+      const r = run({ importersOf: importers({ 'scripts/a.mjs': ['scripts/x.mjs'], 'scripts/z.mjs': ['scripts/x.mjs'], 'scripts/x.mjs': ['scripts/y.mjs'], 'scripts/y.mjs': ['scripts/w.mjs'], 'scripts/w.mjs': ['scripts/x.mjs'] }) });
+      expect(r.affected).toBe(true);
+    });
+    it('a cycle member with an importer OUTSIDE the cycle is a middle module: the entry above it is named', () => {
+      const r = run({ importersOf: importers({ 'scripts/a.mjs': ['scripts/x.mjs'], 'scripts/z.mjs': ['scripts/y.mjs'], 'scripts/x.mjs': ['scripts/y.mjs', 'scripts/entry.mjs'], 'scripts/y.mjs': ['scripts/x.mjs'] }) });
+      expect(r.reasons).toEqual(['shared-importer:scripts/entry.mjs (pr:scripts/a.mjs, main:scripts/z.mjs)']);
+    });
+    it('an outside importer the PR itself changes may be dropped by the PR: the file stays an entry point', () => {
+      // f is run directly by CI and imports both sides; its only importer at the tip is p, which the PR edits (it may drop `import f`).
+      const r = run({ prFiles: ['scripts/a.mjs', 'scripts/p.mjs'], importersOf: importers({ 'scripts/a.mjs': ['scripts/f.mjs'], 'scripts/z.mjs': ['scripts/f.mjs'], 'scripts/f.mjs': ['scripts/p.mjs'] }) });
+      expect(r).toMatchObject({ affected: true, reasons: ['shared-importer:scripts/f.mjs (pr:scripts/a.mjs, main:scripts/z.mjs)'] });
+    });
+    it('a work budget bounds the cycle check and fails closed past it', () => {
+      // k files in a closed ring with a spoke each: the walk from any member is O(k); the budget is far below k^2.
+      const k = 700;
+      const ring = {};
+      for (let i = 0; i < k; i++) ring[`scripts/r${i}.mjs`] = [`scripts/r${(i + 1) % k}.mjs`];
+      const r = run({ importersOf: importers({ ...ring, 'scripts/a.mjs': ['scripts/r0.mjs'], 'scripts/z.mjs': ['scripts/r1.mjs'] }) });
+      expect(r).toMatchObject({ affected: true, reasons: [expect.stringMatching(/^shared-importer:scripts\/r\d+\.mjs /)] });
+    });
+    it('a cycle that reaches only one side is still not affected', () => {
+      const r = run({ importersOf: importers({ 'scripts/a.mjs': ['scripts/x.mjs'], 'scripts/x.mjs': ['scripts/y.mjs'], 'scripts/y.mjs': ['scripts/x.mjs'] }) });
+      expect(r.affected).toBe(false);
+    });
+  });
+  describe('data read through fs (review round 4: no import edge shows it)', () => {
+    const noImporters = (a) => run({ importersOf: () => [], ...a });
+    it.each([
+      ['main', { mainFiles: ['scripts/z.mjs', 'fixtures/cases.json'] }, 'fixtures/cases.json'],
+      ['the PR', { prFiles: ['scripts/a.mjs', 'fixtures/cases.yaml'] }, 'fixtures/cases.yaml'],
+    ])('a changed data file on %s that no import reaches → affected', (_side, files, data) => {
+      expect(noImporters(files)).toMatchObject({ affected: true, reasons: [`data-file-changed:${data}`] });
+    });
+    it('other non-source kinds (css, html, images, extensionless) are data too', () => {
+      for (const f of ['blocks/x.css', 'site/index.html', 'assets/logo.png', 'scripts/bin/runner']) {
+        expect(noImporters({ mainFiles: [f] }).reasons).toEqual([`data-file-changed:${f}`]);
+      }
+    });
+    it('docs and backlog cards stay exempt, as in any-code', () => {
+      expect(noImporters({ prFiles: ['scripts/a.mjs', 'backlog/1-x.md'], mainFiles: ['scripts/z.mjs', 'docs/guide.md'] }).affected).toBe(false);
+    });
+    it('a data file only an import edge reaches keeps its import-graph reason', () => {
+      const r = run({ mainFiles: ['fixtures/z.json'], importersOf: importers({ 'scripts/a.mjs': ['scripts/t.test.mjs'], 'fixtures/z.json': ['scripts/t.test.mjs'] }) });
+      expect(r.reasons[0]).toMatch(/^shared-importer:/);
+    });
+    it('unreadable importers still win over the data rule (fail closed under the named reason)', () => {
+      expect(run({ mainFiles: ['fixtures/z.json'], importersOf: () => null }).reasons).toEqual(['importers-unreadable:scripts/a.mjs']);
+    });
+  });
   describe('implicit test infrastructure (review round 2: vitest loads these for every test, no test imports them)', () => {
     it('a PR file that vitest.setup.ts imports, against an unrelated main change → affected', () => {
       const r = run({ prFiles: ['scripts/lib/hermetic-tests.mjs'], mainFiles: ['blocks/renderers/jsx/index.ts'], importersOf: importers({ 'scripts/lib/hermetic-tests.mjs': ['vitest.setup.ts'] }) });
@@ -349,6 +408,22 @@ describe('readAffectedFacts — shared unchanged importer through git (one batch
   it('an unchanged test importing both a PR file and a main file → affected, with the test named', () => {
     const { git } = fakeGit(trees());
     expect(readAffectedFacts({ ...facts(), git }).reasons).toEqual(['shared-importer:scripts/__tests__/t.test.mjs (pr:scripts/a.mjs, main:scripts/z.mjs)']);
+  });
+  it('an unchanged test that READS a main-changed data file through fs (no import) → affected through git', () => {
+    const t = trees();
+    t[TIP]['scripts/__tests__/reader.test.mjs'] = "import { a } from '../a.mjs';\nconst rows = JSON.parse(readFileSync(new URL('../../fixtures/cases.json', import.meta.url)));";
+    t[TIP]['fixtures/cases.json'] = '[2]';
+    delete t[TIP]['scripts/__tests__/t.test.mjs'];
+    const { git } = fakeGit(t);
+    expect(readAffectedFacts({ ...facts({ mainFiles: ['scripts/z.mjs', 'fixtures/cases.json'] }), git }).reasons).toEqual(['data-file-changed:fixtures/cases.json']);
+  });
+  it('an import cycle of unchanged files that reaches both sides → affected through git', () => {
+    const t = trees();
+    delete t[TIP]['scripts/__tests__/t.test.mjs'];
+    t[TIP]['scripts/x.mjs'] = "import { a } from './a.mjs';\nimport { y } from './y.mjs';";
+    t[TIP]['scripts/y.mjs'] = "import { z } from './z.mjs';\nimport { x } from './x.mjs';";
+    const { git } = fakeGit(t);
+    expect(readAffectedFacts({ ...facts(), git }).reasons).toEqual(['shared-importer:scripts/x.mjs (pr:scripts/a.mjs, main:scripts/z.mjs)']);
   });
   it('the same tree without that test → not affected', () => {
     const t = trees();
