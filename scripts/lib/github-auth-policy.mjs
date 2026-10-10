@@ -21,6 +21,7 @@
  * Never throws: unreadable settings fall back to the default.
  */
 import { readSettings } from './settings-files.mjs';
+import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 
 export const GITHUB_AUTH_MODES = Object.freeze(['app', 'personal']);
 export const GITHUB_AUTH_DEFAULTS = Object.freeze({ auth: 'app', personalExceptions: Object.freeze({}) });
@@ -35,15 +36,17 @@ const isPlainObject = (v) => v != null && typeof v === 'object' && !Array.isArra
  * @param {{tool?:object, env?:object}} [o]
  * @returns {{auth:'app'|'personal', personalExceptions:Record<string,string>, source:{auth:string}}}
  */
-export function resolveGithubAuthPolicy({ tool = {}, env = {} } = {}) {
+export function resolveGithubAuthPolicy({ platform = {}, tool = {}, env = {} } = {}) {
   let auth = GITHUB_AUTH_DEFAULTS.auth;
   let source = 'default';
+  if (GITHUB_AUTH_MODES.includes(platform?.auth)) { auth = platform.auth; source = 'platform'; }
   if (GITHUB_AUTH_MODES.includes(tool?.auth)) { auth = tool.auth; source = 'tool'; }
   const fromEnv = String(env?.[GITHUB_AUTH_ENV] ?? '').trim().toLowerCase();
   if (GITHUB_AUTH_MODES.includes(fromEnv)) { auth = fromEnv; source = 'env'; }
   const personalExceptions = {};
-  if (isPlainObject(tool?.personalExceptions)) {
-    for (const [name, reason] of Object.entries(tool.personalExceptions)) personalExceptions[name] = String(reason ?? '');
+  for (const layer of [platform, tool]) {
+    if (!isPlainObject(layer?.personalExceptions)) continue;
+    for (const [name, reason] of Object.entries(layer.personalExceptions)) personalExceptions[name] = String(reason ?? '');
   }
   for (const name of String(env?.[GITHUB_AUTH_EXCEPTIONS_ENV] ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
     if (!Object.hasOwn(personalExceptions, name)) personalExceptions[name] = `env ${GITHUB_AUTH_EXCEPTIONS_ENV}`;
@@ -58,16 +61,26 @@ export function personalAllowed(policy, name) {
 }
 
 let cachedTool; // per-process: the settings files do not change under a running process often enough to re-read per gh call
+let cachedPlatform;
 /** Test seam. @test-only-export-ok */
-export function resetGithubAuthPolicyCacheForTest() { cachedTool = undefined; }
+export function resetGithubAuthPolicyCacheForTest() { cachedTool = undefined; cachedPlatform = undefined; }
+
+/** The resolved policy, with its source logged once per process (shared policy cascade). */
+function resolveAndLog({ platform, tool, env }) {
+  const policy = resolveGithubAuthPolicy({ platform, tool, env });
+  logCascadeSources('github', { value: policy, sources: { auth: policy.source.auth === 'default' ? 'standard' : policy.source.auth } }, { env });
+  return policy;
+}
 
 /** Read the live policy (settings files + env). Never throws. The settings layer is read once per process. */
 export function readGithubAuthPolicy({ env = process.env, read = readSettings } = {}) {
   if (cachedTool === undefined || read !== readSettings) {
     let tool = {};
     try { tool = read()?.github ?? {}; } catch { tool = {}; }
-    if (read !== readSettings) return resolveGithubAuthPolicy({ tool, env });
+    const platform = platformPreference('github', { env }) ?? {};
+    if (read !== readSettings) return resolveAndLog({ platform, tool, env });
     cachedTool = tool;
+    cachedPlatform = platform;
   }
-  return resolveGithubAuthPolicy({ tool: cachedTool, env });
+  return resolveAndLog({ platform: cachedPlatform, tool: cachedTool, env });
 }

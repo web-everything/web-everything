@@ -58,6 +58,14 @@
  * title/digest/scope reach `main` with no human gate (`--mode=label-on-green`), so each field is length-capped,
  * stripped of control characters, and cannot carry an HTML-comment marker.
  *
+ * DEDUPE BEFORE FILING (operator go 2026-10-10). Right after the lane is acquired, {@link runCardDedupe} matches each
+ * finding of this filing against the OPEN cards (the lane's origin/main `backlog/` plus cards still in open filing PRs)
+ * by target file, defect class and claim similarity (`we:scripts/lib/card-dedupe.mjs`). A matched finding becomes an
+ * "Also raised by" line on the existing card — appended in THIS lane and landed through the SAME commit → verify →
+ * open-pr sequence below, or, for a card that is still in an open PR, posted there as a PR comment. Only the unmatched
+ * findings are filed; all matched → no new card. Off unless `cards.dedupe` resolves true (policy cascade in that
+ * module); any dedupe failure files exactly as before.
+ *
  * KNOWN RESIDUAL, FILED — not a silent gap. `we:backlog/xxe5jvs-a-partial-failure-in-the-detached-prevention-
  * card-landing-jo.md`: a marker-post failure racing a second approval can still spawn a DUPLICATE landing job
  * for the same guard (the on-disk idempotency lookup, `findApprovalPreventionCardOnDisk`, no longer sees a card
@@ -69,7 +77,7 @@
  */
 import { machinePrTitle, preventionCardTitle } from './machine-pr-title.mjs';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -79,6 +87,11 @@ import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
 } from '../lib/approval-prevention-notice.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import {
+  loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, appendMentions, filingSource,
+  remainingAfter,
+} from '../lib/card-dedupe.mjs';
 
 const HERE = resolve(fileURLToPath(import.meta.url), '..');
 export const REPO_ROOT = resolve(HERE, '..', '..');
@@ -276,6 +289,43 @@ export const VERIFY_TIMEOUT_MS = 70 * 60_000;
 export const OPEN_PR_TIMEOUT_MS = 45 * 60_000;
 
 /**
+ * THE DEDUPE STEP, run in the acquired lane before `file-item`. Returns the plan from
+ * `we:scripts/lib/card-dedupe.mjs#planDedupe` (`action` 'off' | 'file' | 'mention' | 'partial'), or `null` when it could
+ * not run (no lane backlog to read). Never throws on a lookup miss: an unreadable PR list only means fewer candidates.
+ * @param {object} input - the bounded filing input.
+ * @param {{lane: string, root?: string, env?: object, write?: Function, readCards?: Function, readPrCards?: Function,
+ *   loadPolicy?: Function}} o
+ */
+export function runCardDedupe(input, {
+  lane, root = REPO_ROOT, env = process.env, write = () => {},
+  loadPolicy = () => loadCardDedupePolicy({ root, env }),
+  readCards = (dir) => readOpenCards(dir),
+  readPrCards = (dir) => readPrHostedCards({ exec: (c, a, o) => String(execFileSyncThrottled(c, a, o)), cwd: dir }),
+} = {}) {
+  const policy = loadPolicy();
+  write(`land-prevention-card: dedupe policy ${formatCardDedupePolicy(policy)}\n`);
+  if (!policy.dedupe) return planDedupe({ input, cards: [], policy });
+  if (!existsSync(join(lane, 'backlog'))) return null;
+  const cards = [...readCards(lane), ...readPrCards(lane)];
+  const plan = planDedupe({ input, cards, policy });
+  write(`land-prevention-card: dedupe → ${plan.action} (${plan.matches.length} finding(s) already on open cards, `
+    + `${cards.length} open card(s) read)\n`);
+  for (const m of plan.matches) {
+    write(`  finding ${m.item.n} → #${m.card.id} (${m.card.rel}, score ${m.score.toFixed(2)}, class ${m.item.cls})\n`);
+  }
+  return plan;
+}
+
+/**
+ * PURE. The "Also raised by" comment posted on an open filing PR whose (not yet landed) card a finding matched.
+ * @param {{lines: string[]}} mention
+ */
+export function buildPrMentionComment({ card, lines }) {
+  return `Dedupe before filing: these findings match \`${card.rel}\` on this PR, so they were recorded here instead of `
+    + `filing a new card. Carry them onto the card when it lands.\n\n${lines.join('\n')}\n`;
+}
+
+/**
  * THE ORCHESTRATION, INJECTABLE FOR TESTS. `exec` has the SAME `(cmd, args, opts) => string` shape as
  * `execFileSync` (throttled or not) elsewhere in this repo — a test hands it a scripted stub, never a real
  * subprocess. `write` is where narration goes (real stdout in production, captured in a test). `mkTmp`/
@@ -306,7 +356,9 @@ export async function landPreventionCard(input, {
   write = (line) => process.stdout.write(line),
   mkTmp = () => mkdtempSync(join(tmpdir(), 'land-prevention-card-')),
   writeFile = writeFileSync,
+  readFile = (p) => readFileSync(p, 'utf8'),
   rmTmp = (dir) => rmSync(dir, { recursive: true, force: true }),
+  dedupe = runCardDedupe,
 } = {}) {
   // ONE scratch dir per run, created lazily and removed on every exit path (#4317 advisory review, 2026-09-29 —
   // the first cut made a fresh `mkdtempSync` dir for each file and never removed either, leaking two per filing).
@@ -344,31 +396,83 @@ export async function landPreventionCard(input, {
     // does the equivalent by building the lane's own absolute path explicitly.
     const laneRunMjs = join(lane, 'scripts', 'operations', 'run.mjs');
 
-    write(`land-prevention-card: filing the card in ${lane}…\n`);
-    const fileArgv = [
-      laneRunMjs, 'file-item', `--title=${input.title}`, `--kind=${input.kind}`, `--size=${input.size}`,
-      `--digest=${input.digest}`, `--scope=${input.scope}`,
-      ...(input.parent ? [`--parent=${input.parent}`] : []),
-      `--queue=${input.queue}`, '--json',
-    ];
-    let filed;
+    // DEDUPE BEFORE FILING. A failure here never blocks the filing: it files exactly as before.
+    let plan = null;
     try {
-      filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
+      plan = dedupe(input, { lane, write });
     } catch (e) {
-      filed = parseRunJsonTail(e?.stdout);
-      if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
+      write(`land-prevention-card: dedupe failed, filing as before — ${String(e?.message || e).split('\n')[0]}\n`);
     }
-    const num = filed?.verdict?.num ?? null;
-    const rel = filed?.verdict?.rel ?? null;
-    if (!rel) return fail('file-item', filed?.error || 'file-item produced no card path', { num });
+    const mentioned = []; // mentions appended to a card in THIS lane (landed by the PR below)
+    const recorded = []; // every match now written somewhere (this lane, an open PR, or already on the card)
+    if (plan && (plan.action === 'mention' || plan.action === 'partial')) {
+      for (const m of plan.mentions) {
+        const asMatches = m.items.map((item) => ({ item, card: m.card }));
+        if (m.card.host === 'main') {
+          const path = join(lane, m.card.rel);
+          const text = readFileSafe(readFile, path);
+          // Re-checked at write time on the lane's own copy: a claimed (active) or closed card is never touched.
+          if (!/^status:[ \t]*"?open"?[ \t]*$/m.test(text)) {
+            write(`land-prevention-card: ${m.card.rel} is no longer open — filing its finding(s) instead\n`);
+            continue;
+          }
+          const next = appendMentions(text, m.lines);
+          if (next !== text) {
+            writeFile(path, next, 'utf8');
+            exec('git', ['-C', lane, 'add', '--', m.card.rel], {});
+            mentioned.push(m);
+          }
+          recorded.push(...asMatches);
+        } else if (m.card.host?.pr) {
+          try {
+            exec('gh', ['pr', 'comment', String(m.card.host.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--body', buildPrMentionComment(m)], { cwd: lane });
+            recorded.push(...asMatches);
+          } catch (e) {
+            write(`land-prevention-card: mention comment on PR #${m.card.host.pr} failed, filing instead — ${String(e?.message || e).split('\n')[0]}\n`);
+          }
+        }
+      }
+    }
+    // A match whose mention could not be recorded anywhere is filed after all — never dropped.
+    const filingInput = !plan || !recorded.length ? input : remainingAfter(input, recorded);
 
-    write(`land-prevention-card: committing ${rel}…\n`);
+    let num = null;
+    let rel = null;
+    if (filingInput) {
+      write(`land-prevention-card: filing the card in ${lane}…\n`);
+      const fileArgv = [
+        laneRunMjs, 'file-item', `--title=${retitle(filingInput, input)}`, `--kind=${filingInput.kind}`, `--size=${filingInput.size}`,
+        `--digest=${filingInput.digest}`, `--scope=${filingInput.scope}`,
+        ...(filingInput.parent ? [`--parent=${filingInput.parent}`] : []),
+        `--queue=${filingInput.queue}`, '--json',
+      ];
+      let filed;
+      try {
+        filed = parseRunJsonTail(exec('node', fileArgv, { cwd: lane, timeout: FILE_ITEM_TIMEOUT_MS }));
+      } catch (e) {
+        filed = parseRunJsonTail(e?.stdout);
+        if (!filed) return fail('file-item', String(e?.message || e).split('\n')[0]);
+      }
+      num = filed?.verdict?.num ?? null;
+      rel = filed?.verdict?.rel ?? null;
+      if (!rel) return fail('file-item', filed?.error || 'file-item produced no card path', { num });
+    } else if (!mentioned.length) {
+      // Every finding is already recorded (on an open PR's card, or verbatim on the card from a retried filing).
+      write('land-prevention-card: every finding is already on an open card — nothing to file or land\n');
+      return { ok: true, step: 'mentioned', num: null, rel: null, pr: null, url: null, reason: null, mentions: recorded.length };
+    }
+
+    write(`land-prevention-card: committing ${[rel, ...mentioned.map((m) => m.card.rel)].filter(Boolean).join(', ')}…\n`);
     try {
-      exec('git', ['-C', lane, 'add', '--', rel], {});
+      if (rel) exec('git', ['-C', lane, 'add', '--', rel], {});
       const msgPath = scratchFile('commit-msg.txt');
-      const item = num ?? /^(x[0-9a-z]{6})-/.exec(basename(rel))?.[1] ?? '?';
-      // This card is being created now and cannot exist on origin/main yet.
-      const subject = machinePrTitle({ item, kind: 'prevention', card: { title: input.title, raw: input.digest } });
+      const item = rel
+        ? (num ?? /^(x[0-9a-z]{6})-/.exec(basename(rel))?.[1] ?? '?')
+        : mentioned[0].card.id;
+      const subject = rel
+        // This card is being created now and cannot exist on origin/main yet.
+        ? machinePrTitle({ item, kind: 'prevention', card: { title: input.title, raw: input.digest } })
+        : machinePrTitle({ item, kind: 'prevention', card: { title: mentionTitle(input, mentioned[0].items[0]) } });
       writeFile(msgPath, `${subject}\n\n`
         + 'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>\n', 'utf8');
       exec('git', ['-C', lane, 'commit', '-F', msgPath], {});
@@ -389,7 +493,11 @@ export async function landPreventionCard(input, {
 
     write('land-prevention-card: opening the PR…\n');
     const bodyPath = scratchFile('pr-body.md');
-    writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).\n\n${input.digest}\n`, 'utf8');
+    const mentionNote = mentioned.length
+      ? `\n\nDedupe before filing: ${mentioned.length} existing open card(s) got "Also raised by" lines instead of a new card: `
+        + `${mentioned.map((m) => `\`${m.card.rel}\``).join(', ')}.\n`
+      : '';
+    writeFile(bodyPath, `Mechanically filed by the approval-time prevention filer (#4317).${mentionNote}\n\n${input.digest}\n`, 'utf8');
     const ref = preventionCardRef({ num, rel, session: input.session });
     let opened;
     try {
@@ -406,7 +514,10 @@ export async function landPreventionCard(input, {
       return fail('open-pr', submit?.reason ?? 'PR was not opened', { num, rel, pr: submit?.pr, url: submit?.url });
     }
     write(`land-prevention-card: landed — PR #${submit.pr} (${submit.url})\n`);
-    return { ok: true, step: 'done', num, rel, pr: submit.pr ?? null, url: submit.url ?? null, reason: null };
+    return {
+      ok: true, step: 'done', num, rel, pr: submit.pr ?? null, url: submit.url ?? null, reason: null,
+      ...(recorded.length ? { mentions: recorded.length } : {}),
+    };
   } catch (e) {
     return fail('unexpected', String(e?.message || e));
   } finally {
@@ -421,6 +532,25 @@ export async function landPreventionCard(input, {
       try { rmTmp(scratch); } catch (e) { write(`land-prevention-card: scratch cleanup failed (non-fatal) — ${String(e?.message || e)}\n`); }
     }
   }
+}
+
+const readFileSafe = (read, path) => { try { return read(path); } catch { return ''; } };
+
+/**
+ * PURE. The title the (possibly reduced) filing is filed under: a descriptive "Prevention — <first finding> (from …)"
+ * title is rebuilt from the reduced digest, so it names a finding the new card still carries.
+ */
+export function retitle(filingInput, original) {
+  if (filingInput === original) return original.title;
+  const m = /^Prevention — .+ \(from (\S+)#(\d+) review\)$/.exec(original.title);
+  if (!m) return original.title;
+  try { return preventionCardTitle({ repo: m[1], pr: m[2], digest: filingInput.digest }); } catch { return original.title; }
+}
+
+/** PURE. The machine title of a mention-only change: the first mentioned finding, from its source PR. */
+export function mentionTitle(input, item) {
+  const src = filingSource(input) ?? { repo: 'unknown', pr: 0 };
+  return `Prevention — also raised: ${item?.claim ?? 'a finding already on this card'} (from ${src.repo}#${src.pr} review)`;
 }
 
 /**

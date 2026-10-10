@@ -27,8 +27,9 @@
  * at dea2666). Trust boundary as in `pr-stack.mjs`: only non-fork PRs whose head is the tip of the origin `lane/*`
  * branch GitHub names for them take part.
  *
- * SETTING `stackAwareReview` (`on` | `off`), policy cascade: built-in default `on` → platform preference
- * (`we:scripts/settings/stack-aware-review.json`) → tool override (env `WE_STACK_AWARE_REVIEW`).
+ * SETTING `stackAwareReview` (`on` | `off`), policy cascade (we:scripts/lib/policy-cascade.mjs): built-in default
+ * `on` → platform preference `stackAwareReview` → tool override (`we:scripts/settings/stack-aware-review.json`) → env
+ * `WE_STACK_AWARE_REVIEW`.
  *
  * Pure policy first; the io shell below FAILS OPEN to today's behaviour (no stack → main basis, as before).
  */
@@ -38,6 +39,7 @@ import { fileURLToPath } from 'node:url';
 
 import { detectStacks, readOriginLaneTips, readOpenPrRefs, flagUntrustedStackRows, sameStackActor, stackRowFlags } from './pr-stack.mjs';
 import { readSettings } from '../lib/settings-files.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
 import { computeNetDiffText } from '../merge-ai-prs.mjs';
@@ -60,9 +62,13 @@ const onOff = (v) => {
 /** The setting in force: env → settings file → built-in `on`. Never throws. */
 export function resolveStackAwareReview(env = process.env, { read = readSettings } = {}) {
   const fromEnv = onOff(env?.[STACK_AWARE_REVIEW_ENV]);
+  let tool;
+  try { tool = read()?.stackAwareReview; } catch { /* default */ }
+  // Platform preference under the tool block (shared policy cascade; logs each value's source once).
+  const c = cascadePolicy('stackAwareReview', tool, { env, standard: { mode: STACK_AWARE_REVIEW_DEFAULT },
+    envValues: { mode: fromEnv ?? undefined }, valid: { mode: (v) => onOff(v) !== null } });
   if (fromEnv) return fromEnv === 'on';
-  let file = null;
-  try { file = onOff(read()?.stackAwareReview?.mode); } catch { /* default */ }
+  const file = onOff(c.layered?.mode);
   return (file ?? STACK_AWARE_REVIEW_DEFAULT) === 'on';
 }
 
