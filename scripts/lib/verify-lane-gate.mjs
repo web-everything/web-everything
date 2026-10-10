@@ -213,6 +213,9 @@ export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, v
   // admission instead of whole-gate admission. The plan then runs the requester's selection, as for every variant.
   const ours = resolved.decision?.selectionMode?.mode;
   if (!ours) return null;
+  // A since-last-green FALLBACK already resolved the whole-PR selection, which is exactly what 'pr' would resolve:
+  // skip the second (import-graph) resolution, so a non-matching explicit gate costs no more than before.
+  if (ours === 'pr' && String(resolved.decision.selectionMode.reason ?? '').startsWith('fallback')) return null;
   const otherEnv = { ...env, WE_VERIFY_SELECTION: ours === 'pr' ? 'since-last-green' : 'pr' };
   let other;
   try { other = resolveUnder(otherEnv); } catch { return null; }

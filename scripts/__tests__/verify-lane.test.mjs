@@ -1566,7 +1566,9 @@ process.exit(${standardsExit});
 describe('verify-lane request refuses fast when no verify daemon is alive (#4161)', () => {
   function request() {
     const result = spawnSync(process.execPath, [VERIFY_LANE, 'request', '--gate=true', '--json'], {
-      cwd: dir, encoding: 'utf8', timeout: 2000,
+      // 20 s like the other spawned-CLI tests here: a 2 s cap timed out under host load (load avg ~60, #xgqwuq5),
+      // and "fast" only has to prove the refusal never waits on a daemon tick.
+      cwd: dir, encoding: 'utf8', timeout: 20000,
     });
     expect(result.error).toBeUndefined();
     return { code: result.status, json: JSON.parse(result.stdout.trim()) };
