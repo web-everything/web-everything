@@ -31,6 +31,8 @@
  */
 import { readSettings } from '../lib/settings-files.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
+import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 export const CONTEXT_PACK_DEFAULTS = Object.freeze({
   contextPack: true, contextLines: 30, contextMaxBytes: 8000, localTests: 'proof-only',
@@ -115,7 +117,7 @@ const JSON_REF_RE = /"([\w@.-][\w@.\-/]*\.[A-Za-z0-9]{1,8})",\s*(\d{1,6})/g;
  * @param {Array<{body?:string, createdAt?:string, author?:{login?:string}}>} comments
  * @returns {{findings:Array<{kind:'changes'|'advisory', body:string, createdAt:string|null}>, advisory:boolean}}
  */
-export function extractFindings(comments = [], { labels = null } = {}) {
+export function extractFindings(comments = [], { labels = null, isTrusted = () => true } = {}) {
   // The brief's own mode rule: `review:changes` on the PR = ordinary mode (the changes-requested comment is the ask);
   // no `review:changes` but `advisory:changes` = advisory-fix mode (the advisory review is the ask).
   const names = Array.isArray(labels) ? labels.map((l) => (typeof l === 'string' ? l : l?.name)) : null;
@@ -124,6 +126,7 @@ export function extractFindings(comments = [], { labels = null } = {}) {
   let advisory = null;
   (comments ?? []).forEach((c, i) => {
     const body = String(c?.body ?? '');
+    if (!isTrusted(c)) return; // a look-alike comment from anyone else is never staged as the ask
     if (CHANGES_RE.test(body)) changes = { i, c };
     else if (ADVISORY_RE.test(body)) advisory = { i, c };
   });
@@ -254,7 +257,7 @@ export function renderFixPack({ findings = [], refs = [], fileText = () => null,
     '## Context pack — staged by the harness for this round (read this first)',
     '',
     'The finding, the code it names and the PR\'s file list are already below. Do NOT re-fetch the PR thread',
-    '(`gh pr view --json body,comments`) or re-read these excerpts before your first edit; open more of a file only',
+    '(`gh pr view` of the body or the comment thread) or re-read these excerpts before your first edit; open more of a file only',
     'where the excerpt is not enough.',
     ...(removed.length ? [`Brief sections not in play for this dispatch were removed: ${removed.map((r) => `"${r.replace(/^#+\s*/, '')}"`).join(', ')}.`] : []),
   ].join('\n');
@@ -389,10 +392,12 @@ export function applyContextPack(brief, { kind = 'fix', settings = CONTEXT_PACK_
 
 const GH_OPTS = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 };
 
-/** IO: the fix pack's inputs — ONE `gh pr view` (comments, files, head) plus one raw-contents read per named file. */
-export function readFixPackInputs({ repoSlug, pr, exec, maxRefs = 4 }) {
-  const pv = JSON.parse(String(exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'comments,files,headRefOid,labels'], GH_OPTS)));
-  const { findings, advisory } = extractFindings(pv.comments ?? [], { labels: pv.labels ?? null });
+/** IO: the fix pack's inputs — the complete (paginated) comment thread, one `gh pr view` (files, head, labels), and one
+ *  raw-contents read per named file. Only a trusted author's (automation / operator) finding comment is staged. */
+export function readFixPackInputs({ repoSlug, pr, exec, maxRefs = 4, readComments = readCompletePrComments, isTrusted = isTrustedMarkerAuthor }) {
+  const pv = JSON.parse(String(exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'files,headRefOid,labels'], GH_OPTS)));
+  const comments = readComments(pr, { repo: repoSlug, exec });
+  const { findings, advisory } = extractFindings(comments ?? [], { labels: pv.labels ?? null, isTrusted });
   const files = (pv.files ?? []).map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions }));
   const refs = extractFileRefs(findings.map((f) => f.body).join('\n'), { changedPaths: files.map((f) => f.path), max: maxRefs });
   const cache = new Map();
