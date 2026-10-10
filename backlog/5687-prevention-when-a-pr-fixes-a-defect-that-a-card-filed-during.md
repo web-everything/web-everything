@@ -1,21 +1,22 @@
 ---
+bornAs: xvxua8e
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/pr-stack.mjs", "we:scripts/conveyor/__tests__/pr-stack.test.mjs"]
+scope: ["we:backlog/xwnjmra-review-ledger-check-scores-a-pr-whose-github-facts-were-only.md", "we:scripts/review-ledger-check.mjs", "we:scripts/__tests__/review-ledger-check.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a deterministic regression test with default settings that exhausts the cap and asserts that… (from web-everything/web-everything#4655 review)
+# Prevention — When a PR fixes a defect that a card filed during that PR's self-review describes, close the card… (from web-everything/web-everything#4688 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/pr-stack.mjs` — Add a deterministic regression test with default settings that exhausts the cap and asserts that the bottom is blocked by the released top's live claim; cover both release paths with the same parameterized test.
-2. `we:scripts/conveyor/pr-stack.mjs` — Parameterize the fork-validation regression across planned and unplanned PRs, asserting no new pair when GitHub reports isCrossRepository true even when origin name, tip, and author match.
+1. `we:backlog/xwnjmra-review-ledger-check-scores-a-pr-whose-github-facts-were-only.md:15` — When a PR fixes a defect that a card filed during that PR's self-review describes, close the card in the same PR. A backlog check could flag active cards whose title matches a code change in the same diff.
+2. `we:scripts/review-ledger-check.mjs:426` — Add a deterministic CLI regression test asserting that an oversized --days produces windows of at most 366 entries, with a timeout to catch removal of the clamp.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4655@4d8fc1921fcbcda15fd20bfd1085ca4dc4151ca3
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4688@448ee7a76b2cc4f3747ee7c953012436c78a3b8c
 
 ## Acceptance
 
