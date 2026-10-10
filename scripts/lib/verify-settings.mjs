@@ -40,6 +40,12 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   revertRedSince: null,
   // Over this many tests + reverted files, the check records `skipped: too-large` instead of running.
   revertRedMaxFiles: 40,
+  // #xgqwuq5 — which diff a fix round's default gate selects from. 'pr' = the whole PR (working tree vs the merge-base
+  // with origin/main, today's behaviour). 'since-last-green' = only `<last green sha>..HEAD` when an earlier commit of
+  // this PR has a clean-tree default-gate green in the green ledger AND that range holds only the PR's own commits (an
+  // ancestor of HEAD, no merge commits, merge-base with origin/main unchanged); anything else falls back to 'pr'.
+  // CI still runs the full required suite; the merge gate and the exact-HEAD marker binding are unchanged.
+  selection: 'since-last-green',
 });
 
 /** Use the WE root RUNNING verify-lane, never the target lane REPO or cwd:
@@ -65,6 +71,7 @@ const rules = {
   revertRed: value => ['off', 'warn', 'enforce'].includes(value),
   revertRedSince: value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)),
   revertRedMaxFiles: value => Number.isSafeInteger(value) && value >= 1 && value <= 200,
+  selection: value => ['pr', 'since-last-green'].includes(value),
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
     // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
     // cannot become a vitest option), be a test file, and stay inside the repo.
@@ -79,6 +86,7 @@ const envKeys = {
   relatedMaxTests: 'WE_VERIFY_RELATED_MAX_TESTS', relatedDepth: 'WE_VERIFY_RELATED_DEPTH',
   alwaysRunTests: 'WE_VERIFY_ALWAYS_RUN_TESTS', skipLocalForCardOnly: 'WE_VERIFY_SKIP_LOCAL_FOR_CARD_ONLY',
   revertRed: 'WE_VERIFY_REVERT_RED', revertRedSince: 'WE_VERIFY_REVERT_RED_SINCE', revertRedMaxFiles: 'WE_VERIFY_REVERT_RED_MAX_FILES',
+  selection: 'WE_VERIFY_SELECTION',
 };
 const booleanKeys = new Set(['phaseAdmission', 'matchRequestVariants', 'runAllPhases', 'skipLocalForCardOnly']);
 // Preserve which keys survived validation without adding configuration keys to the file shape.

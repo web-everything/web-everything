@@ -62,7 +62,7 @@ import { loadVerifySettingsFile, resolveVerifySettings } from './verify-settings
 import { createHash } from 'node:crypto';
 import { relative, sep } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
-import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS } from '../readiness/test-selection.mjs';
+import { SELECTION_FLAG, pinnedMergeBase, decideLocalSelection, referencedTestNeedles, LOCAL_FULL_SUITE_TRIGGERS, findLastGreenAncestor, decideSinceLastGreen } from '../readiness/test-selection.mjs';
 import { isPolicyCorePath } from './gate-config.mjs';
 import { isAllowlistedLitterPath } from './lane-litter.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
@@ -206,6 +206,22 @@ export function stampedTimeoutFactor(gate) {
  */
 export function matchRequestedDefaultGate({ gate, env, resolved, resolveUnder, variants = true }) {
   if (!resolved || typeof gate !== 'string') return null;
+  const direct = matchUnderSelection({ gate, env, resolved, resolveUnder, variants });
+  if (direct || !variants) return direct;
+  // #xgqwuq5 — the requester may run the other `verify.selection` (an older checkout stamps the whole-PR gate; a newer
+  // one the since-last-green delta). Recognize it against THAT selection's own changed set, so the run keeps phase
+  // admission instead of whole-gate admission. The plan then runs the requester's selection, as for every variant.
+  const ours = resolved.decision?.selectionMode?.mode;
+  if (!ours) return null;
+  const otherEnv = { ...env, WE_VERIFY_SELECTION: ours === 'pr' ? 'since-last-green' : 'pr' };
+  let other;
+  try { other = resolveUnder(otherEnv); } catch { return null; }
+  if (!other || other.decision?.selectionMode?.mode === ours) return null;
+  if (other.command === gate) return other;
+  return matchUnderSelection({ gate, env: otherEnv, resolved: other, resolveUnder, variants });
+}
+
+function matchUnderSelection({ gate, env, resolved, resolveUnder, variants }) {
   const sameDiff = (variant) => JSON.stringify(variant.decision?.changedFiles) === JSON.stringify(resolved.decision?.changedFiles);
   const ours = { relatedMode: resolved.decision?.relatedMode, factor: resolved.decision?.testTimeoutFactor };
   const relatedModes = variants ? [...new Set([ours.relatedMode, 'all', 'import-only'].filter(Boolean))] : [ours.relatedMode];
@@ -310,7 +326,25 @@ export function phaseAdmissionKind({ phase, decision, standardsScoped, env, file
  * @param {{base?: string, runGit: (args:string[]) => string, env?: Record<string,string|undefined>, scripts?: Iterable<string>|null, fileExists?: (repoRelativePath: string) => boolean}} args
  * @returns {{ command: string, gateReasons: string[], decision: import('../readiness/test-selection.mjs').SelectionDecision & {changedFiles: string[]|null} }}
  */
-export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig, allowCardOnlySkip = true } = {}) {
+export function resolveDefaultGate({ base = 'origin/main', runGit, env = process.env, scripts, fileExists, readRepoFile, fileConfig = defaultFileConfig, allowCardOnlySkip = true, hasGreen } = {}) {
+  const args = { runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip };
+  const withMode = (gate, selectionMode) => ({ ...gate, decision: { ...gate.decision, selectionMode } });
+  const setting = resolveVerifySettings({ fileConfig, env }).values.selection;
+  if (setting !== 'since-last-green') return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', reason: `verify.selection is '${setting}'` });
+  // #xgqwuq5 — select from the delta since this PR's last green when that range is only the PR's own commits.
+  const greenSha = findLastGreenAncestor({ base, runGit, hasGreen });
+  const eligibility = decideSinceLastGreen({ base, runGit, greenSha });
+  if (!eligibility.eligible) return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', reason: `fallback — ${eligibility.reason}` });
+  // The green sha is an ancestor of HEAD, so its merge-base with HEAD is itself: the changed set is `<green>..worktree`.
+  const delta = resolveGateFromBase({ ...args, base: greenSha });
+  if (delta.decision.mode === 'blocked') {
+    return withMode(resolveGateFromBase({ ...args, base }), { mode: 'pr', base: greenSha,
+      reason: `fallback — the delta since ${greenSha.slice(0, 8)} cannot use a selected run (${delta.decision.reasons.join('; ')})` });
+  }
+  return withMode(delta, { mode: 'since-last-green', base: greenSha, reason: eligibility.reason });
+}
+
+function resolveGateFromBase({ base, runGit, env, scripts, fileExists, readRepoFile, fileConfig, allowCardOnlySkip }) {
   // xpnhz4o — the changed set is the WORKING TREE against the pinned merge-base (tracked edits, staged or not,
   // plus untracked files), not HEAD's committed diff. The gate runs against the working tree, so that is the set
   // it must key on — and a fixer runs the gate BEFORE committing, which under the old "dirty ⇒ full" rule (#3389)
@@ -692,7 +726,19 @@ export function explicitGateRefusal(gate) {
  * @param {{command: string, decision: object}} gate - `resolveDefaultGate`'s return value
  * @returns {string}
  */
-export function describeGate({ command, decision, scanCommands = [] }) {
+export function describeGate(gate) {
+  const text = describeGateBody(gate);
+  // #xgqwuq5 — say which diff the selection came from and why, right under the selected/fallback line (xpnhz4o).
+  const mode = gate?.decision?.selectionMode;
+  if (!mode) return text;
+  const line = mode.mode === 'since-last-green'
+    ? `  selection mode: since-last-green — delta ${mode.base.slice(0, 8)}..HEAD only (${mode.reason})`
+    : `  selection mode: pr — whole PR diff vs origin/main (${mode.reason})`;
+  const [first, ...rest] = text.split('\n');
+  return [first, line, ...rest].join('\n');
+}
+
+function describeGateBody({ command, decision, scanCommands = [] }) {
   if (decision.mode === 'card-only-skip') return `verify-lane gate: SKIPPED — card-only diff (CI's definition, scripts/ci-card-only.mjs); CI runs the full check:standards and stays the merge authority.`;
   if (decision.mode === 'blocked') return `verify-lane gate: BLOCKED selection — ${decision.reasons.join('; ')}`;
   const out = [];
