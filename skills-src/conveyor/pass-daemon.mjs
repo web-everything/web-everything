@@ -230,6 +230,14 @@ export async function waitForManifestEntry(passName, { manifest = DAEMON_MANIFES
  *  made it — the same precision `process.argv[1]`'s own basename fallback cannot give across this pass's
  *  per-repo instances (`parked-pr-conflict-watch-we` vs `-frontierui` vs `-plateau-app` all share one script
  *  path). */
+/**
+ * The env a pass child is spawned with: the daemon's CURRENT env (read at call time, so the gh shim `refreshAuth`
+ * just put on PATH is included) plus `GH_CALLER` attributing its gh calls to this manifest entry. PURE over `env`.
+ */
+export function passEnvFor(passName, env = process.env) {
+  return { ...env, GH_CALLER: passName };
+}
+
 export function spawnPassOnce({ script, args = [] }, { root = REPO_ROOT, log = console, env = process.env, spawnFn = spawn } = {}) {
   return new Promise((resolve) => {
     // 68b: the child's output is relayed line by line through this process's own (stamped, de-duplicated, rotated)
@@ -358,15 +366,18 @@ async function main(argv) {
   // #gh-write-burst — every `gh` call this pass's own process makes is now attributable to THIS exact manifest
   // entry (see `spawnPassOnce`'s own docblock above for why a per-repo pass needs this and argv[1] alone can't
   // give it).
-  const passEnv = { ...process.env, GH_CALLER: passName };
+  // Built PER SPAWN, never once up front (live 2026-10-09): `refreshAuth` (per-owner App auth) puts the gh shim on
+  // `process.env.PATH` right before each spawn. A snapshot taken here, before the first refresh, never had it, so
+  // every pass child ran gh on the operator's PERSONAL stored login for the daemon's whole life.
+  const passEnv = () => passEnvFor(passName);
   // Card 89 S5: on a versioned clone withSelfSync sets `tickContext.tickRoot` to the version folder this tick is
   // pinned to, and the pass child spawns from THERE (a switch mid-tick never moves a running child's tree).
   const tickContext = {};
   const runPassSelfSynced = passDaemonSelfSyncEnabled()
-    ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { env: passEnv, root: tickContext.tickRoot ?? REPO_ROOT }) }, {
+    ? withSelfSync({ tickOnce: () => spawnPassOnce(entry, { env: passEnv(), root: tickContext.tickRoot ?? REPO_ROOT }) }, {
       root: REPO_ROOT, onRestart: restartOntoNewCode, mainOnly, env: selfSyncEnv, tickContext,
     }).tickOnce
-    : () => spawnPassOnce(entry, { env: passEnv });
+    : () => spawnPassOnce(entry, { env: passEnv() });
 
   const failureAlertAfter = resolveFailureAlertAfter(entry, process.env);
   console.error(`pass-daemon: started "${passName}" (${entry.script}) on interval ${intervalMs}ms, heartbeat every ${heartbeatIntervalMs}ms.`);
