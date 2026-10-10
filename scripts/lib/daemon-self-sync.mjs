@@ -488,18 +488,36 @@ export function recloneMarkerPath(root, env = process.env) {
   return join(daemonStateDir(env), `${cloneKey(root)}.recloned.json`);
 }
 
-/** The real marker IO. Every method never throws (a missing/corrupt file reads as null). */
-export function makeRecloneMarkerStore({ root, env = process.env }) {
+/** What an unreadable (corrupt / truncated) marker file reads as: an unconcluded re-clone of an unknown checkout. */
+export const UNREADABLE_RECLONE_MARKER = Object.freeze({ identity: null, head: null, concluded: false, why: 'marker-unreadable' });
+
+/**
+ * The real marker IO. Never throws. Fail closed: a MISSING file reads as null (no re-clone), but a file that exists
+ * and cannot be parsed reads as {@link UNREADABLE_RECLONE_MARKER} (blocks until a rebuild concludes and overwrites
+ * it). A write that fails is kept in memory and read back from there, so this process still blocks AND still
+ * unblocks (never wedged by an unwritable state dir); the failure is logged, because only the file survives a restart.
+ */
+export function makeRecloneMarkerStore({ root, env = process.env, log = { error: () => {} } }) {
   const path = recloneMarkerPath(root, env);
+  let pending; // set while the newest value exists only in memory (its file write failed)
   return {
-    read: () => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } },
+    read: () => {
+      if (pending !== undefined) return pending;
+      let text;
+      try { text = readFileSync(path, 'utf8'); } catch (e) { return e?.code === 'ENOENT' ? null : UNREADABLE_RECLONE_MARKER; }
+      try { return JSON.parse(text); } catch { return UNREADABLE_RECLONE_MARKER; }
+    },
     write: (v) => {
       try {
         mkdirSync(dirname(path), { recursive: true });
         const tmp = `${path}.${process.pid}.tmp`;
         writeFileSync(tmp, `${JSON.stringify(v)}\n`, 'utf8');
         renameSync(tmp, path);
-      } catch { /* best-effort: the in-process identity check still blocks this process */ }
+        pending = undefined;
+      } catch (e) {
+        pending = v;
+        log.error?.(`daemon-self-sync: could not persist the re-clone marker ${path} (${String(e?.message || e).split('\n')[0]}) — this process keeps it in memory; a restart before the write succeeds loses it (x0m7a8x)`);
+      }
     },
   };
 }
@@ -520,18 +538,50 @@ export function resultReportsReclone(result) {
 }
 
 /**
- * PURE: has a rebuild on the re-cloned checkout concluded (so the tick may run children again)? Yes when the clone
- * moved to an adopted build, when HEAD moved off the re-clone's own HEAD (only an adopted build moves it), when the
- * rebuild found nothing to build (`up-to-date` — the inline path ticked on that too), or when a rebuild JOB that ran
- * (status `succeeded`: its child produced a verdict) finished on it. A job that failed to launch, or one that itself
- * re-cloned again, ran no rebuild on this checkout — it does not count. Nothing else does either: fail closed.
+ * A rebuild JOB that ended `failed` because its rebuild child crashed after it started ("rebuild child exited N with
+ * no JSON result"). It RAN on the checkout, so — parity with the retired builder, whose record counted a rebuild that
+ * threw as a finished run — it concludes a re-clone. A job that never started (`could not prepare code`, `spawn
+ * failed`) or was failed by the reattach pass (dead / stalled past its attempts: the builder's deadline case) does not.
  */
-export function recloneConcluded(result, marker, headNow) {
+export const REBUILD_JOB_CRASHED_RE = /^rebuild child exited\b/;
+
+/**
+ * Which rebuild path does this daemon run? Explicit, resolved once by {@link withSelfSync} and passed to BOTH the
+ * rebuild (`rebuildClone({asJob})`) and {@link recloneConcluded}, so the re-clone rule never infers the mode from a
+ * result's shape. `WE_DAEMON_REBUILD_AS_JOB` ('0'/'1') and daemon-rebuild-settings.json `rebuildAsJob.entries` decide
+ * first; otherwise the retired builder's opt-in `WE_DAEMON_BACKGROUND_BUILD=1` keeps meaning what an operator set it
+ * for — "build off the tick path" — so it selects the job (x0m7a8x: it used to spawn the builder).
+ */
+export function resolveSelfSyncRebuildAsJob({ entries, env = process.env, resolve = resolveRebuildAsJob } = {}) {
+  if (resolve({ entries, env })) return true;
+  if (env?.WE_DAEMON_REBUILD_AS_JOB === '0') return false;
+  return env?.[BACKGROUND_BUILD_ENV] === '1';
+}
+
+/**
+ * PURE: has a rebuild on the re-cloned checkout concluded (so the tick may run children again)? Yes when the clone
+ * moved to an adopted build, when HEAD moved off the re-clone's own HEAD (only an adopted build moves it), or when the
+ * rebuild found nothing to build (`up-to-date` — the inline path ticked on that too). Beyond that it depends on the
+ * daemon's DECLARED rebuild path (`asJob`, never inferred from the result's shape):
+ * - `asJob: false` (INLINE): any verdict concludes — the smoke already ran on this checkout, whatever it said; exactly
+ *   the pre-job inline rule.
+ * - `asJob: true`, or unknown (`undefined` fails closed to the job rule): only a rebuild JOB that RAN on this checkout
+ *   concludes — `succeeded` (its child produced a verdict, a rejected smoke included) or `failed` because its rebuild
+ *   crashed after starting ({@link REBUILD_JOB_CRASHED_RE}). A job that failed to launch, one that itself re-cloned
+ *   again, or one the marker names in `staleJobIds` (in flight before the re-clone, so it ran on the OLD tree) does
+ *   not count. Nothing else does either: a spaced / started / running / queue-failed answer keeps it blocked.
+ * @param {object|null} result @param {object|null} marker @param {string|null} headNow
+ * @param {{asJob?: boolean}} [mode]
+ */
+export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
   if (!marker || marker.concluded) return true;
   if (result?.moved && result?.adopted) return true;
   if (marker.head && headNow && headNow !== marker.head) return true;
   if (result?.reason === 'up-to-date') return true;
-  return (result?.finishedJobs || []).some((j) => j?.status === 'succeeded' && j?.reason !== 'clone-recloned');
+  if (asJob === false) return !!result && typeof result === 'object'; // inline verdict
+  const stale = new Set(marker.staleJobIds || []);
+  return (Array.isArray(result?.finishedJobs) ? result.finishedJobs : []).some((j) => j?.reason !== 'clone-recloned' && !stale.has(j?.id)
+    && (j?.status === 'succeeded' || (j?.status === 'failed' && REBUILD_JOB_CRASHED_RE.test(String(j?.reason ?? '')))));
 }
 
 /**
@@ -593,14 +643,16 @@ export function withSelfSync(effects, {
   // entry name; an object overrides it. Since the builder process is retired it selects only the SWAP SPACING
   // (`swapMinIntervalMs`, for the daemons the file lists) and the tick-starved smell threshold. `tickProgress` /
   // `recloneMarker` are IO (injectable); they default to the real files only when `rebuild` is the real one, so a
-  // test never writes real daemon state. `builder` / `cloneBornAt` are still accepted and ignored (old callers).
-  background, builder, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, cloneBornAt,
+  // test never writes real daemon state.
+  background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity,
+  // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
+  rebuildAsJob: rebuildAsJobOpt,
 }) {
-  void builder; void cloneBornAt;
   const tick = effects.tickOnce;
   const realIo = rebuildOpt === undefined;
+  const rebuildAsJob = rebuildAsJobOpt === undefined ? resolveSelfSyncRebuildAsJob({ entries, env }) : !!rebuildAsJobOpt;
   const rebuild = rebuildOpt ?? ((o = {}) => rebuildClone({
-    root, env, log, mainOnly, entries, ...o,
+    root, env, log, mainOnly, entries, asJob: rebuildAsJob, ...o,
   }));
   const bg = background === undefined
     ? resolveBackgroundBuild({ entry: entries?.[0], settings: loadBackgroundBuildSettings(), env })
@@ -608,7 +660,7 @@ export function withSelfSync(effects, {
   // The listed daemons keep the x44lnnt swap spacing; every other daemon keeps the plain restart window.
   const swapSpaced = !!bg?.enabled;
   const progress = tickProgress ?? (realIo ? makeTickProgressStore({ root, entry: entries?.[0], env }) : null);
-  const marker = recloneMarker ?? (realIo ? makeRecloneMarkerStore({ root, env }) : memoryRecloneMarkerStore());
+  const marker = recloneMarker ?? (realIo ? makeRecloneMarkerStore({ root, env, log }) : memoryRecloneMarkerStore());
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
   const syncOpts = () => ({ root, ...(timeoutMs != null ? { timeoutMs } : {}) });
@@ -639,12 +691,12 @@ export function withSelfSync(effects, {
   const swapMinIntervalMs = swapSpaced ? bg.swapMinIntervalMs : minRestartIntervalMs;
   // x0m7a8x — settings source, said once (the policy-cascade convention: every resolved setting names its source).
   if (!resolvedPocBranch && !vctx && realIo) {
-    const asJob = resolveRebuildAsJob({ entries, env });
+    const asJob = rebuildAsJob;
     log.error?.(`daemon-self-sync: rebuild path = ${asJob ? 'detached rebuild job (#4126)' : 'INLINE rebuild + smoke on the tick path'}`
       + ` (daemon-rebuild-settings.json rebuildAsJob${env?.WE_DAEMON_REBUILD_AS_JOB ? `, env WE_DAEMON_REBUILD_AS_JOB=${env.WE_DAEMON_REBUILD_AS_JOB}` : ''});`
       + ` swap spacing ${Math.round(swapMinIntervalMs / 1000)}s (${swapSpaced ? `daemon-background-build-settings.json, source ${bg.source ?? 'option'}` : 'restart window'}) (x0m7a8x)`);
     if (env?.[BACKGROUND_BUILD_ENV] !== undefined) {
-      log.error?.(`daemon-self-sync: ${BACKGROUND_BUILD_ENV}=${env[BACKGROUND_BUILD_ENV]} — the background builder process is retired (x0m7a8x); the rebuild job builds off the tick path. This env now only selects the swap spacing, which daemon-background-build-settings.json already sets for the listed daemons`);
+      log.error?.(`daemon-self-sync: ${BACKGROUND_BUILD_ENV}=${env[BACKGROUND_BUILD_ENV]} — the background builder process is retired (x0m7a8x). '1' now selects the detached rebuild JOB (off the tick path) plus the swap spacing; '0' turns off only the swap spacing — the rebuild path is set by WE_DAEMON_REBUILD_AS_JOB / daemon-rebuild-settings.json`);
     }
   }
   const restartGate = (headNow, { urgent = false, diffRoot = root, minIntervalMs = minRestartIntervalMs } = {}) => {
@@ -730,7 +782,7 @@ export function withSelfSync(effects, {
       if (!smell.starved) return;
       lastStarvedLogAt = nowMs;
       const mins = Math.round(smell.sinceTickMs / 60_000);
-      const asJob = realIo ? resolveRebuildAsJob({ entries, env }) : null;
+      const asJob = rebuildAsJob;
       log.error?.(`daemon-self-sync: SMELL tick-starved — no completed tick for ${mins} min while rebuilds keep adopting (last adoption ${adoptedAt}); `
         + (asJob === false
           ? 'the inline rebuild + smoke is running instead of the tick — add this daemon to rebuildAsJob.entries in scripts/lib/daemon-rebuild-settings.json (x0m7a8x)'
@@ -745,11 +797,20 @@ export function withSelfSync(effects, {
   // with no concluded marker for it blocks — that closes the window where the rebuild JOB re-clones between this
   // tick's rebuild call and its read lock (a replacement needs the write lock, so under the read lock it is stable).
   let knownIdentity = cloneIdentity(root);
+  // The last rebuild job this process saw in flight BEFORE a re-clone. It ran on the old tree, so when it finishes
+  // `succeeded` it proves nothing about the fresh checkout (`staleJobIds`, see recloneConcluded).
+  let lastJobInFlight = null;
+  const noteJobs = (result) => {
+    if (result?.job?.id && /^rebuild-job-(started|running)$/.test(String(result.reason))) lastJobInFlight = result.job.id;
+  };
   const noteReclone = (why) => {
     const idNow = cloneIdentity(root);
     const cur = marker.read();
-    if (cur && cur.identity === idNow && idNow != null) return;
-    marker.write({ identity: idNow, head: readHead(syncOpts()), at: new Date(now()).toISOString(), concluded: false, why });
+    if (cur && !cur.concluded && cur.identity === idNow && idNow != null) return;
+    marker.write({
+      identity: idNow, head: readHead(syncOpts()), at: new Date(now()).toISOString(), concluded: false, why,
+      staleJobIds: lastJobInFlight ? [lastJobInFlight] : [],
+    });
   };
   /** Must this tick run no children because the checkout is a re-clone no rebuild has concluded on? */
   const recloneBlocks = () => {
@@ -812,12 +873,18 @@ export function withSelfSync(effects, {
         // The checkout was replaced (plain origin/main, never smoked; this process's modules and cwd are the old
         // tree's). Run no children on it until a rebuild on it concludes (x0m7a8x: persisted, shared per clone).
         noteReclone('clone-recloned');
+        noteJobs(rebuildResult); // a job queued in the same call is on the FRESH tree: never stale for this marker
         log.error?.(`daemon-self-sync: the clone was re-cloned (old one kept at ${rebuildResult?.quarantinedTo ?? '?'}) — skipping this tick; no children run until a rebuild on the fresh clone concludes`);
         return skippedTick('clone-recloned');
       }
+      noteJobs(rebuildResult);
       const m = marker.read();
       if (m && !m.concluded) {
-        if (recloneConcluded(rebuildResult, m, readHead(syncOpts()))) {
+        // Compare-before-write: the marker is shared per clone, so a sibling daemon may have written a NEWER
+        // unconcluded marker (a later re-clone) since `m` was read — never mark that one concluded. (The identity
+        // check in recloneBlocks is the backstop: a concluded marker naming another checkout re-blocks.)
+        const fresh = recloneConcluded(rebuildResult, m, readHead(syncOpts()), { asJob: rebuildAsJob }) ? marker.read() : null;
+        if (fresh && !fresh.concluded && fresh.at === m.at && fresh.identity === m.identity) {
           const idNow = cloneIdentity(root);
           marker.write({ ...m, identity: m.identity ?? idNow, concluded: true, concludedAt: new Date(now()).toISOString(), concludedBy: rebuildResult?.reason ?? (rebuildResult?.adopted ? 'adopted' : null) });
           if (idNow != null && (m.identity == null || m.identity === idNow)) knownIdentity = idNow;
@@ -934,7 +1001,8 @@ export function withSelfSync(effects, {
         //    job-mode daemon this adopts a ready candidate or queues the job; it never smokes on the tick path.
         if (attempt === 0 && typeof hasStaleRefusal === 'function' && hasStaleRefusal(tickResult)) {
           const r2 = await rebuild();
-          if (resultReportsReclone(r2)) { noteReclone('clone-recloned'); return tickResult; }
+          if (resultReportsReclone(r2)) { noteReclone('clone-recloned'); noteJobs(r2); return tickResult; }
+          noteJobs(r2);
           if (r2 && r2.moved && r2.adopted) {
             if (restartGate(r2.head, { urgent: true }).restart) {
               log.error?.(`daemon-self-sync: tick hit the stale-main refusal — rebuild adopted ${r2.head} immediately, restarting onto the new code (#3383/#4044), instead of waiting the full interval to lose the same race again`);

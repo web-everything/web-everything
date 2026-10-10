@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +22,8 @@ import {
 import { summarizeRebuildResult, parseBuilderArgs, writeBuilderStateIfOwner, deadlineRecord } from '../daemon-rebuild-builder.mjs';
 import {
   withSelfSync, memoryRecloneMarkerStore, makeRecloneMarkerStore, recloneMarkerPath, recloneConcluded, resultReportsReclone,
+  resolveSelfSyncRebuildAsJob,
+  UNREADABLE_RECLONE_MARKER,
 } from '../daemon-self-sync.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -266,37 +268,34 @@ describe('simulation — withSelfSync, main moving every 3 min, tonight\'s smoke
 /** A job-mode `withSelfSync` over fakes; returns the wrapper plus the spies the tests assert on. */
 function jobDaemon({
   tick = async () => ({ repos: [] }), readState = () => ({}), acquireRead, rebuild, cloneIdentity, readHead = () => 'h1',
-  recloneMarker = memoryRecloneMarkerStore(),
+  recloneMarker = memoryRecloneMarkerStore(), hasStaleRefusal, rebuildAsJob = true,
 } = {}) {
-  const start = vi.fn(() => ({ pid: 7 }));
   const onRestart = vi.fn(() => ({ restarted: true }));
   const tickOnce = vi.fn(tick);
   const rb = rebuild ?? vi.fn(async () => ({ moved: false, reason: 'rebuild-job-running', job: { id: 'j1' }, finishedJobs: [] }));
   const w = withSelfSync({ tickOnce }, {
     root: '/clone', env: {}, log: { error: () => {} }, versions: null, entries: ['/clone/a.mjs'], rebuild: rb,
     readHead, readOriginRef: () => null, acquireRead: acquireRead ?? (() => ({ ok: true })), releaseRead: vi.fn(), readState,
-    now: () => 0, onRestart, recloneMarker,
+    now: () => 0, onRestart, recloneMarker, rebuildAsJob,
     ...(cloneIdentity ? { cloneIdentity } : {}),
-    background: { enabled: true, swapMinIntervalMs: 0, tickStarvedSmellMs: 0 },
-    builder: { read: () => null, alive: () => false, start }, tickProgress: null,
+    ...(hasStaleRefusal ? { hasStaleRefusal } : {}),
+    background: { enabled: true, swapMinIntervalMs: 0, tickStarvedSmellMs: 0 }, tickProgress: null,
   });
-  return { w, start, onRestart, tickOnce, rebuild: rb, recloneMarker };
+  return { w, onRestart, tickOnce, rebuild: rb, recloneMarker };
 }
 
 describe('F1 → x0m7a8x — no skip path needs a builder: the tick\'s own rebuild runs first (a quarantined clone can heal)', () => {
   it('quarantined clone: the tick is skipped, the rebuild (whose adopt pass clears the quarantine) already ran, no builder', async () => {
-    const { w, start, tickOnce, rebuild } = jobDaemon({ readState: () => ({ quarantine: { prevHead: 'p', reason: 'reset-rollback-failed' } }) });
+    const { w, tickOnce, rebuild } = jobDaemon({ readState: () => ({ quarantine: { prevHead: 'p', reason: 'reset-rollback-failed' } }) });
     expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'quarantine' });
     expect(tickOnce).not.toHaveBeenCalled();
     expect(rebuild).toHaveBeenCalledTimes(1);
-    expect(start).not.toHaveBeenCalled();
   });
   it.each([['writer-active'], ['writer-priority']])('read lock refused (%s): the rebuild ran, no builder', async (reason) => {
-    const { w, start, tickOnce, rebuild } = jobDaemon({ acquireRead: () => ({ ok: false, reason }) });
+    const { w, tickOnce, rebuild } = jobDaemon({ acquireRead: () => ({ ok: false, reason }) });
     expect(await w.tickOnce()).toMatchObject({ skipped: true, reason });
     expect(tickOnce).not.toHaveBeenCalled();
     expect(rebuild).toHaveBeenCalledTimes(1);
-    expect(start).not.toHaveBeenCalled();
   });
   it('a tick() that throws: the error still propagates', async () => {
     const { w } = jobDaemon({ tick: async () => { throw new Error('boom'); } });
@@ -305,6 +304,15 @@ describe('F1 → x0m7a8x — no skip path needs a builder: the tick\'s own rebui
 });
 
 describe('x0m7a8x — a re-cloned checkout runs no children until a rebuild on it concludes', () => {
+  it('PURE resolveSelfSyncRebuildAsJob: the retired builder\'s opt-in WE_DAEMON_BACKGROUND_BUILD=1 still moves an UNLISTED daemon off the tick path', () => {
+    const unlisted = () => false;
+    const listed = () => true;
+    expect(resolveSelfSyncRebuildAsJob({ entries: ['/c/x.mjs'], env: {}, resolve: unlisted })).toBe(false);
+    expect(resolveSelfSyncRebuildAsJob({ entries: ['/c/x.mjs'], env: { WE_DAEMON_BACKGROUND_BUILD: '1' }, resolve: unlisted })).toBe(true);
+    expect(resolveSelfSyncRebuildAsJob({ entries: ['/c/x.mjs'], env: { WE_DAEMON_BACKGROUND_BUILD: '0' }, resolve: listed })).toBe(true); // '0' is spacing only
+    // the explicit rebuild-path switch wins over the legacy opt-in
+    expect(resolveSelfSyncRebuildAsJob({ entries: ['/c/x.mjs'], env: { WE_DAEMON_BACKGROUND_BUILD: '1', WE_DAEMON_REBUILD_AS_JOB: '0' }, resolve: unlisted })).toBe(false);
+  });
   it('PURE resultReportsReclone: directly, or through a rebuild job that finished with that reason', () => {
     expect(resultReportsReclone({ reason: 'clone-recloned' })).toBe(true);
     expect(resultReportsReclone({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'succeeded', reason: 'clone-recloned' }] })).toBe(true);
@@ -312,14 +320,130 @@ describe('x0m7a8x — a re-cloned checkout runs no children until a rebuild on i
   });
   it('PURE recloneConcluded: adoption, HEAD moved, up-to-date or a job that RAN; never a failed launch or another re-clone', () => {
     const m = { head: 'h1', concluded: false };
-    expect(recloneConcluded({ moved: true, adopted: true }, m, 'h2')).toBe(true);
-    expect(recloneConcluded({ reason: 'rebuild-job-running' }, m, 'h2')).toBe(true);
-    expect(recloneConcluded({ reason: 'up-to-date' }, m, 'h1')).toBe(true);
-    expect(recloneConcluded({ reason: 'needs-build', finishedJobs: [{ status: 'succeeded', reason: 'held' }] }, m, 'h1')).toBe(true);
-    expect(recloneConcluded({ reason: 'rebuild-job-started', finishedJobs: [] }, m, 'h1')).toBe(false);
-    expect(recloneConcluded({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'failed', reason: 'could not prepare code' }] }, m, 'h1')).toBe(false);
-    expect(recloneConcluded({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'succeeded', reason: 'clone-recloned' }] }, m, 'h1')).toBe(false);
-    expect(recloneConcluded({ reason: 'rebuild-job-spaced' }, null, 'h1')).toBe(true); // no marker: nothing to block
+    const job = { asJob: true };
+    expect(recloneConcluded({ moved: true, adopted: true }, m, 'h2', job)).toBe(true);
+    expect(recloneConcluded({ reason: 'rebuild-job-running' }, m, 'h2', job)).toBe(true); // HEAD moved off the re-clone's
+    expect(recloneConcluded({ reason: 'up-to-date' }, m, 'h1', job)).toBe(true);
+    expect(recloneConcluded({ reason: 'needs-build', finishedJobs: [{ status: 'succeeded', reason: 'held' }] }, m, 'h1', job)).toBe(true);
+    expect(recloneConcluded({ reason: 'rebuild-job-started', finishedJobs: [] }, m, 'h1', job)).toBe(false);
+    expect(recloneConcluded({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'failed', reason: 'could not prepare code: x' }] }, m, 'h1', job)).toBe(false);
+    expect(recloneConcluded({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'failed', reason: 'spawn failed: ENOENT' }] }, m, 'h1', job)).toBe(false);
+    expect(recloneConcluded({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'failed', reason: 'dead: max attempts' }] }, m, 'h1', job)).toBe(false);
+    expect(recloneConcluded({ reason: 'rebuild-job-running', finishedJobs: [{ status: 'succeeded', reason: 'clone-recloned' }] }, m, 'h1', job)).toBe(false);
+    expect(recloneConcluded({ reason: 'rebuild-job-spaced' }, null, 'h1', job)).toBe(true); // no marker: nothing to block
+  });
+  it('PURE recloneConcluded: a JOB-mode result that carries NO finishedJobs never concludes (the mode is declared, not read off the shape)', () => {
+    const m = { head: 'h1', concluded: false };
+    for (const reason of ['rebuild-job-spaced', 'rebuild-job-started', 'rebuild-job-running', 'rebuild-job-queue-failed', 'needs-build', 'error']) {
+      expect(recloneConcluded({ moved: false, reason }, m, 'h1', { asJob: true })).toBe(false);
+      expect(recloneConcluded({ moved: false, reason }, m, 'h1')).toBe(false); // mode unknown: fails closed to the job rule
+    }
+  });
+  it('PURE recloneConcluded: a job whose rebuild CRASHED after starting ran on the checkout — it concludes (builder parity: a thrown rebuild was a finished run)', () => {
+    const m = { head: 'h1', concluded: false, staleJobIds: ['j1'] };
+    expect(recloneConcluded({ reason: 'needs-build', finishedJobs: [{ id: 'j2', status: 'failed', reason: 'rebuild child exited 1 with no JSON result' }] }, m, 'h1', { asJob: true })).toBe(true);
+    expect(recloneConcluded({ reason: 'needs-build', finishedJobs: [{ id: 'j1', status: 'failed', reason: 'rebuild child exited 1 with no JSON result' }] }, m, 'h1', { asJob: true })).toBe(false); // stale
+  });
+  it('PURE recloneConcluded: an INLINE rebuild (declared asJob:false) concludes on ANY verdict, as the pre-job inline path did', () => {
+    const m = { head: 'h1', concluded: false };
+    const inline = { asJob: false };
+    expect(recloneConcluded({ moved: false, reason: 'smoke-failed' }, m, 'h1', inline)).toBe(true);
+    expect(recloneConcluded({ moved: false, reason: 'held' }, m, 'h1', inline)).toBe(true);
+    expect(recloneConcluded(null, m, 'h1', inline)).toBe(false);
+    expect(recloneConcluded({ moved: false, reason: 'smoke-failed', finishedJobs: [] }, m, 'h1', { asJob: true })).toBe(false);
+  });
+  it('PURE recloneConcluded: a job that was in flight BEFORE the re-clone (staleJobIds) ran on the old tree — it never concludes', () => {
+    const m = { head: 'h1', concluded: false, staleJobIds: ['j1'] };
+    expect(recloneConcluded({ reason: 'rebuild-job-started', finishedJobs: [{ id: 'j1', status: 'succeeded', reason: 'ready-recorded' }] }, m, 'h1', { asJob: true })).toBe(false);
+    expect(recloneConcluded({ reason: 'held', finishedJobs: [{ id: 'j2', status: 'succeeded', reason: 'held' }] }, m, 'h1', { asJob: true })).toBe(true);
+  });
+  it('an INLINE-rebuild daemon: the tick after the re-clone ticks again on a rejected rebuild (never stalls while main is unsmokable)', async () => {
+    const results = [
+      { moved: false, reason: 'clone-recloned', quarantinedTo: '/q' },
+      { moved: false, reason: 'smoke-failed' },
+      { moved: false, reason: 'smoke-failed' },
+    ];
+    const { w, tickOnce, recloneMarker } = jobDaemon({ rebuild: vi.fn(async () => results.shift()), rebuildAsJob: false });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    await w.tickOnce();
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(2);
+    expect(recloneMarker.read()).toMatchObject({ concluded: true });
+  });
+  it('a JOB-mode daemon whose tick side answers WITHOUT finishedJobs stays blocked (no rebuild ran on the fresh checkout)', async () => {
+    const results = [
+      { moved: false, reason: 'clone-recloned', quarantinedTo: '/q', finishedJobs: [] },
+      { moved: false, reason: 'rebuild-job-spaced', retryInMs: 1 },
+      { moved: false, reason: 'rebuild-job-started', job: { id: 'j2' } },
+      { moved: false, reason: 'rebuild-job-running', job: { id: 'j2' } },
+    ];
+    const { w, tickOnce, recloneMarker } = jobDaemon({ rebuild: vi.fn(async () => results.shift()) });
+    for (let i = 0; i < 4; i += 1) expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' }); // eslint-disable-line no-await-in-loop
+    expect(tickOnce).not.toHaveBeenCalled();
+    expect(recloneMarker.read()).toMatchObject({ concluded: false });
+  });
+  it('a JOB-mode daemon on an unsmokable main never stalls: a rejected smoke (succeeded job) or a crashed rebuild child concludes', async () => {
+    for (const finished of [
+      { id: 'j2', status: 'succeeded', reason: 'smoke-failed', readyRecorded: false },
+      { id: 'j2', status: 'failed', reason: 'rebuild child exited 1 with no JSON result' },
+    ]) {
+      const results = [
+        { moved: false, reason: 'clone-recloned', quarantinedTo: '/q', finishedJobs: [] },
+        { moved: false, reason: 'rebuild-job-started', job: { id: 'j2' }, finishedJobs: [] },
+        { moved: false, reason: 'needs-build', finishedJobs: [finished] },
+        { moved: false, reason: 'rebuild-job-spaced', finishedJobs: [] },
+      ];
+      const { w, tickOnce, recloneMarker } = jobDaemon({ rebuild: vi.fn(async () => results.shift()) });
+      for (let i = 0; i < 4; i += 1) await w.tickOnce(); // eslint-disable-line no-await-in-loop
+      expect(tickOnce).toHaveBeenCalledTimes(2);
+      expect(recloneMarker.read()).toMatchObject({ concluded: true });
+    }
+  });
+  it('a sibling daemon\'s NEWER re-clone marker written mid-tick is never overwritten as concluded (compare-before-write)', async () => {
+    const m1 = { identity: 'inode-b', head: 'h1', at: 't1', concluded: false };
+    const m2 = { identity: 'inode-c', head: 'h1', at: 't2', concluded: false, why: 'clone-recloned' };
+    let readsAfterRebuild = null; // the sibling writes M2 right after this daemon read M1 post-rebuild
+    let v = m1;
+    const recloneMarker = {
+      read: () => { if (readsAfterRebuild != null && (readsAfterRebuild += 1) === 2) v = m2; return v; },
+      write: vi.fn((n) => { v = n; }),
+    };
+    const rebuild = vi.fn(async () => { readsAfterRebuild = 0; return { moved: false, reason: 'held', finishedJobs: [{ id: 'j2', status: 'succeeded', reason: 'held' }] }; });
+    const { w, tickOnce } = jobDaemon({ recloneMarker, cloneIdentity: () => (v === m1 ? 'inode-b' : 'inode-c'), rebuild }); // M2 names the checkout now on disk
+    await w.tickOnce();
+    expect(recloneMarker.write).not.toHaveBeenCalledWith(expect.objectContaining({ identity: 'inode-b', concluded: true }));
+    expect(v).toMatchObject({ identity: 'inode-c', concluded: false });
+    expect(tickOnce).not.toHaveBeenCalled();
+  });
+  it('a job seen in flight before the re-clone finishing `succeeded` afterwards does NOT unblock; the next job on the fresh tree does', async () => {
+    const results = [
+      { moved: false, reason: 'rebuild-job-running', job: { id: 'j1' }, finishedJobs: [] },
+      { moved: false, reason: 'clone-recloned', quarantinedTo: '/q', finishedJobs: [] },
+      { moved: false, reason: 'rebuild-job-started', job: { id: 'j2' }, finishedJobs: [{ id: 'j1', status: 'succeeded', reason: 'ready-recorded' }] },
+      { moved: false, reason: 'held', finishedJobs: [{ id: 'j2', status: 'succeeded', reason: 'held' }] },
+    ];
+    const { w, tickOnce, recloneMarker } = jobDaemon({ rebuild: vi.fn(async () => results.shift()) });
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(recloneMarker.read()).toMatchObject({ staleJobIds: ['j1'], concluded: false });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    await w.tickOnce();
+    expect(tickOnce).toHaveBeenCalledTimes(2);
+  });
+  it('a re-clone reported by the stale-refusal rebuild (step 5) writes the marker and the next tick runs no children', async () => {
+    const results = [
+      { moved: false, reason: 'rebuild-job-running', job: { id: 'j1' }, finishedJobs: [] },
+      { moved: false, reason: 'needs-build', finishedJobs: [{ id: 'j1', status: 'succeeded', reason: 'clone-recloned' }] },
+      { moved: false, reason: 'rebuild-job-started', job: { id: 'j2' }, finishedJobs: [] },
+    ];
+    const { w, tickOnce, recloneMarker, rebuild } = jobDaemon({ rebuild: vi.fn(async () => results.shift()), hasStaleRefusal: () => true });
+    await w.tickOnce();
+    expect(rebuild).toHaveBeenCalledTimes(2);
+    expect(tickOnce).toHaveBeenCalledTimes(1);
+    expect(recloneMarker.read()).toMatchObject({ concluded: false, why: 'clone-recloned' });
+    expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+    expect(tickOnce).toHaveBeenCalledTimes(1);
   });
   it('the tick that sees the re-clone skips; later ticks skip while the job builds; the first concluded rebuild ticks again', async () => {
     const results = [
@@ -381,6 +505,38 @@ describe('x0m7a8x — a re-cloned checkout runs no children until a rebuild on i
       s.write({ identity: 'x', concluded: false });
       expect(makeRecloneMarkerStore({ root: '/some/clone', env }).read()).toEqual({ identity: 'x', concluded: false });
       expect(recloneMarkerPath('/some/clone', env).startsWith(dir)).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('the real store fails CLOSED on a corrupt marker file: it reads as an unconcluded re-clone, and the tick skips', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reclone-'));
+    try {
+      const env = { WE_DAEMON_STATE_DIR: dir };
+      writeFileSync(recloneMarkerPath('/some/clone', env), '{"identity":"x","conc');
+      const s = makeRecloneMarkerStore({ root: '/some/clone', env });
+      expect(s.read()).toEqual(UNREADABLE_RECLONE_MARKER);
+      const { w, tickOnce } = jobDaemon({ recloneMarker: s, cloneIdentity: () => 'inode-a' });
+      expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+      expect(tickOnce).not.toHaveBeenCalled();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('an unwritable state dir never wedges the process: the marker is kept in memory (blocks, then unblocks) and the failure is logged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'reclone-'));
+    try {
+      const blocker = join(dir, 'not-a-dir');
+      writeFileSync(blocker, 'x'); // the state dir path is a FILE: every mkdir/write under it fails
+      const log = { error: vi.fn() };
+      const s = makeRecloneMarkerStore({ root: '/some/clone', env: { WE_DAEMON_STATE_DIR: blocker }, log });
+      const results = [
+        { moved: false, reason: 'clone-recloned', quarantinedTo: '/q', finishedJobs: [] },
+        { moved: false, reason: 'held', finishedJobs: [{ id: 'j2', status: 'succeeded', reason: 'held' }] },
+      ];
+      const { w, tickOnce } = jobDaemon({ recloneMarker: s, rebuild: vi.fn(async () => results.shift()) });
+      expect(await w.tickOnce()).toMatchObject({ skipped: true, reason: 'clone-recloned' });
+      expect(s.read()).toMatchObject({ concluded: false });
+      expect(log.error.mock.calls.some(([m]) => /could not persist the re-clone marker/.test(m))).toBe(true);
+      await w.tickOnce();
+      expect(tickOnce).toHaveBeenCalledTimes(1);
+      expect(s.read()).toMatchObject({ concluded: true });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

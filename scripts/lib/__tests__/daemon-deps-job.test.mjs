@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -139,5 +139,64 @@ describe('swapNodeModules', () => {
     expect(readdirSync(join(clone, 'node_modules'))).toEqual(['new.txt']);
     expect(readdirSync(clone)).toEqual(['node_modules']);
     expect(existsSync(join(store, 'node_modules', 'new.txt'))).toBe(true); // the store is kept
+  });
+
+  const swapFixture = () => {
+    const clone = mk('swap-root-');
+    mkdirSync(join(clone, 'node_modules'));
+    writeFileSync(join(clone, 'node_modules', 'old.txt'), 'old');
+    const store = mk('swap-store-');
+    mkdirSync(join(store, 'node_modules'));
+    writeFileSync(join(store, 'node_modules', 'new.txt'), 'new');
+    return { clone, store };
+  };
+
+  it('the copy cannot be renamed in AFTER the live tree moved aside: the old tree is renamed back (liveIntact)', () => {
+    const { clone, store } = swapFixture();
+    let calls = 0;
+    const rename = (a, b) => {
+      calls += 1;
+      if (calls === 2) throw Object.assign(new Error('EPERM: rename'), { code: 'EPERM' });
+      renameSync(a, b);
+    };
+    let err;
+    try { swapNodeModules({ root: clone, storeDir: store, rename }); } catch (e) { err = e; }
+    expect(err?.liveIntact).toBe(true);
+    expect(readdirSync(join(clone, 'node_modules'))).toEqual(['old.txt']);
+    expect(readdirSync(clone)).toEqual(['node_modules']);
+  });
+
+  it('when the rollback fails too the error says so, and the caller\'s log never claims an unchanged tree', async () => {
+    const f = fixture();
+    const st = depsStore(f.jobs, f.key);
+    mkdirSync(join(st.dir, 'node_modules'), { recursive: true });
+    writeFileSync(join(st.dir, '.snapshot-complete'), 'x');
+    let calls = 0;
+    const rename = (a, b) => { calls += 1; if (calls >= 2) throw new Error('ENOSPC'); renameSync(a, b); };
+    const log = vi.fn();
+    const r = await refreshDepsAsJob({
+      root: f.root, installed: f.installed, store: f.store, reattach: noReattach, codeSha: SHA, log,
+      swap: (o) => swapNodeModules({ ...o, rename }),
+    });
+    expect(r).toMatchObject({ reason: 'swap-failed', liveIntact: false });
+    expect(f.installed.write).not.toHaveBeenCalled();
+    expect(log.mock.calls.some(([m]) => /could NOT be restored/.test(m))).toBe(true);
+    expect(log.mock.calls.some(([m]) => /is unchanged/.test(m))).toBe(false);
+  });
+
+  it('leftover swap/old dirs from a crashed earlier process (another pid) are removed', () => {
+    const { clone, store } = swapFixture();
+    mkdirSync(join(clone, '.node_modules.old.99999'));
+    mkdirSync(join(clone, '.node_modules.swap.88888'));
+    swapNodeModules({ root: clone, storeDir: store });
+    expect(readdirSync(clone)).toEqual(['node_modules']);
+  });
+
+  it('a crash between the renames (no live node_modules) is healed by the next swap', () => {
+    const { clone, store } = swapFixture();
+    renameSync(join(clone, 'node_modules'), join(clone, '.node_modules.old.77777'));
+    swapNodeModules({ root: clone, storeDir: store });
+    expect(readdirSync(join(clone, 'node_modules'))).toEqual(['new.txt']);
+    expect(readdirSync(clone)).toEqual(['node_modules']);
   });
 });

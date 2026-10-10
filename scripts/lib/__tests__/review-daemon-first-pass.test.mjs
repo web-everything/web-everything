@@ -57,20 +57,41 @@ describe('settings — the review daemon builds off the tick path (x0m7a8x: via 
     expect(r).toMatchObject({ enabled: true, source: 'file', swapMinIntervalMs: 10 * MIN });
   });
 
-  it('WE_DAEMON_BACKGROUND_BUILD=1 starts no builder process any more: every tick runs the job tick side instead', async () => {
-    const start = vi.fn();
+  it('WE_DAEMON_BACKGROUND_BUILD=1 spawns nothing: every tick runs the job tick side, then the tick', async () => {
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'rebuild-job-running', job: { id: 'j1' }, finishedJobs: [] }));
     const tick = vi.fn(async () => ({ repos: [] }));
     const w = withSelfSync({ tickOnce: tick }, {
       root: '/clone', env: { WE_DAEMON_BACKGROUND_BUILD: '1' }, log: { error: () => {} }, versions: null, entries: [REVIEW_ENTRY],
       rebuild, readHead: () => 'h1', readOriginRef: () => null, acquireRead: () => ({ ok: true }), releaseRead: () => {},
-      readState: () => ({}), now: () => 0, onRestart: vi.fn(), builder: { read: () => null, alive: () => false, start }, tickProgress: null,
+      readState: () => ({}), now: () => 0, onRestart: vi.fn(), tickProgress: null,
     });
     await w.tickOnce();
     await w.tickOnce();
-    expect(start).not.toHaveBeenCalled();
     expect(rebuild).toHaveBeenCalledTimes(2);
     expect(tick).toHaveBeenCalledTimes(2);
+  });
+
+  // The operator rollback: env 0/1 still selects the swap spacing (env beats the committed file).
+  const swapAfter5Min = async (env) => {
+    let clock = 0;
+    const onRestart = vi.fn(() => ({ restarted: true }));
+    const tick = vi.fn(async () => ({ repos: [] }));
+    const w = withSelfSync({ tickOnce: tick }, {
+      root: '/clone', env, log: { error: () => {} }, versions: null, entries: [REVIEW_ENTRY],
+      rebuild: async () => ({ moved: true, adopted: true, head: 'h2', finishedJobs: [] }),
+      readHead: () => 'h1', readOriginRef: () => null, acquireRead: () => ({ ok: true }), releaseRead: () => {},
+      readState: () => ({}), now: () => clock, onRestart, diffFiles: () => ['skills-src/conveyor/review-daemon.mjs'],
+      importClosure: () => null, minRestartIntervalMs: 2 * MIN, tickProgress: null,
+    });
+    clock = 5 * MIN;
+    await w.tickOnce();
+    return { restarted: onRestart.mock.calls.length, ticked: tick.mock.calls.length };
+  };
+  it('env WE_DAEMON_BACKGROUND_BUILD=0 beats the file: the plain restart window (2 min) applies, so it swaps at 5 min', async () => {
+    expect(await swapAfter5Min({ WE_DAEMON_BACKGROUND_BUILD: '0' })).toEqual({ restarted: 1, ticked: 0 });
+  });
+  it('no env: the committed file keeps the 10-min swap spacing for the review daemon, so at 5 min it ticks instead', async () => {
+    expect(await swapAfter5Min({})).toEqual({ restarted: 0, ticked: 1 });
   });
 });
 

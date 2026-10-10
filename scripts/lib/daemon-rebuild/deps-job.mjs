@@ -22,7 +22,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, readFileSync, renameSync, rmSync,
+  existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync,
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -87,19 +87,35 @@ export function depsStore(jobsDir, key) {
  * clone (`cp -c`, near-instant; a plain copy where the filesystem has none) into a sibling temp dir; then the live
  * directory is renamed aside, the copy renamed in, and the old one deleted. The store itself is kept (a later
  * rollback or a sibling clone can reuse it).
+ *
+ * Failure handling: a failed copy leaves the live tree untouched. If the copy cannot be renamed in after the live tree
+ * was moved aside, the old tree is renamed BACK (rollback) before the error is rethrown; the error carries
+ * `liveIntact` (false only when that rollback failed too, so the caller's log never claims an unchanged tree it does
+ * not have). Leftover `.node_modules.swap.*` / `.node_modules.old.*` dirs from ANY earlier process (a crash between
+ * the renames) are removed first. A crash between the two renames leaves no `node_modules` until the next call: the
+ * caller's `installed` key is written only after a swap, so that call swaps again from the kept store.
  */
-export function swapNodeModules({ root, storeDir, exec = execFileSync }) {
+export function swapNodeModules({ root, storeDir, exec = execFileSync, rename = renameSync }) {
   const live = join(root, 'node_modules');
   const tmp = join(root, `.node_modules.swap.${process.pid}`);
   const old = join(root, `.node_modules.old.${process.pid}`);
-  rmSync(tmp, { recursive: true, force: true });
+  for (const name of readdirSync(root)) {
+    if (/^\.node_modules\.(swap|old)\.\d+$/.test(name)) rmSync(join(root, name), { recursive: true, force: true });
+  }
   try { exec('cp', ['-cR', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 5 * 60_000 }); } catch {
     rmSync(tmp, { recursive: true, force: true });
     exec('cp', ['-R', join(storeDir, 'node_modules'), tmp], { stdio: 'ignore', timeout: 10 * 60_000 });
   }
-  rmSync(old, { recursive: true, force: true });
-  if (existsSync(live)) renameSync(live, old);
-  renameSync(tmp, live);
+  const hadLive = existsSync(live);
+  if (hadLive) rename(live, old);
+  try {
+    rename(tmp, live);
+  } catch (e) {
+    let restored = !hadLive;
+    if (hadLive) { try { rename(old, live); restored = true; } catch { restored = false; } }
+    rmSync(tmp, { recursive: true, force: true });
+    throw Object.assign(e instanceof Error ? e : new Error(String(e)), { liveIntact: restored });
+  }
   rmSync(old, { recursive: true, force: true });
 }
 
@@ -158,8 +174,11 @@ export async function refreshDepsAsJob({
     try {
       swap({ root, storeDir: st.dir });
     } catch (e) {
-      say(`swap failed (${String(e?.message || e).split('\n')[0]}) — the live node_modules is unchanged; the next call retries`);
-      return { reason: 'swap-failed', key };
+      const intact = e?.liveIntact !== false;
+      say(`swap failed (${String(e?.message || e).split('\n')[0]}) — ${intact
+        ? 'the live node_modules is unchanged'
+        : 'the live node_modules could NOT be restored (it is missing until the swap succeeds)'}; the next call retries`);
+      return { reason: 'swap-failed', key, liveIntact: intact };
     }
     installed.write(key);
     say(`swapped in node_modules for lockfile ${key} at a pass boundary (built off the loop by the install job)`);
