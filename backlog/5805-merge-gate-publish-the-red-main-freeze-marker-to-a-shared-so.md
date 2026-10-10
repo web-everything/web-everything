@@ -1,20 +1,16 @@
 ---
+bornAs: xyd06qo
 kind: story
 size: 3
-parent: "4075"
 status: open
-scope: ["we:scripts/lib/drain-merge-strategy.mjs", "we:scripts/lib/__tests__/drain-merge-strategy.test.mjs"]
-dateOpened: "2026-10-10"
+scope: ["we:scripts/readiness/red-main-remediation.mjs", "we:scripts/merge-gate-check.mjs"]
+dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add to card x79bqrk: the reader must require a live enqueue entry or a recent stamp timestamp. Al… (from web-everything/web-everything#4717 review)
+# merge-gate: publish the red-main freeze marker to a shared source CI can read
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
-
-1. `we:scripts/lib/drain-merge-strategy.mjs:196` — Add to card x79bqrk: the reader must require a live enqueue entry or a recent stamp timestamp. Alternatively, stamp only after a successful enqueue and add a test that a failed enqueue leaves no trusted marker. Pin it in we:drain-merge-strategy.test.mjs.
-
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4717@a90273dcdc861c90f0130d50cea790db0925b0a8
+The required merge-gate CI check (we:scripts/merge-gate-check.mjs, strategy github-merge-queue) FAILS CLOSED on the red-main-freeze gate because the freeze marker (we:.conveyor/red-main-freeze.json, written by freezeDispatch/unfreezeDispatch in we:scripts/readiness/red-main-remediation.mjs) lives only on the drain host. Publish every freeze/unfreeze to a shared ops/* git branch (same transport as ops/review-requests), make we:scripts/merge-gate-check.mjs read it (facts.redMain = {source, frozen, reason}), and keep fail-closed on an unreadable branch. Blocked on #4624 (red-main hold, review:changes/human) which edits we:scripts/readiness/red-main-remediation.mjs. Until this lands every PR's merge-gate is red, so the operator must not require merge-gate yet.
 
 ## Acceptance
 

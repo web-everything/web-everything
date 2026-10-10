@@ -1,20 +1,22 @@
 ---
+bornAs: xnss034
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/__tests__/daemon-live-smoke.test.mjs"]
+scope: ["we:src/wip/shared-source.ts", "we:src/wip/__tests__/shared-source.test.mjs"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Prevention — Add a deterministic policy-precedence test with a false platform setting and explicit env enable;… (from web-everything/web-everything#4841 review)
+# Prevention — Add a gate test whose read outlasts debounceMs and a signal arrives mid-read. It should assert that a not… (from plateauapp/plateau-app#223 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/__tests__/daemon-live-smoke.test.mjs:100` — Add a deterministic policy-precedence test with a false platform setting and explicit env enable; removing the '1' branch must make that named test fail.
+1. `we:src/wip/shared-source.ts:172` — Add a gate test whose read outlasts debounceMs and a signal arrives mid-read. It should assert that a notification fires after the read resolves. As a fix, have the timer callback skip while `inFlight` is set and let `rebuilt()` re-arm via `schedule()`, or have `rebuilt()` re-notify when `dirty` is true.
+2. `we:src/wip/shared-source.ts` — Add a deterministic fake-timer regression test that signals a cached source, calls read repeatedly before minGapMs, and verifies that the underlying reader runs again only after the floor expires.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4841@0ffea26aa94fd5e11de7c11c03b943262de0391b
+Idempotency key (do not edit): approval-prevention-key:plateauapp/plateau-app#223@e992f92b30475879c9b569de3af0c298981fdab2
 
 ## Acceptance
 
