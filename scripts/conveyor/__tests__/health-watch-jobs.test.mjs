@@ -509,9 +509,9 @@ describe('requestPrewarm — single flight, backoff and a visible give-up', () =
 
 describe('evictToTrash — the tick renames, a detached child deletes', () => {
   it('moves unreferenced snapshot trees out of the live names atomically without deleting them in the tick; sweepTrash then deletes', () => {
-    const jobsDir = join(dir, 'jobs'); const root = join(jobsDir, '.snapshots');
+    const jobsDir = join(dir, 'jobs'); const snaps = join(jobsDir, '.snapshots');
     const mkStore = (sub, name, ageSec) => {
-      const d = join(root, sub, name); mkdirSync(join(d, 'deep'), { recursive: true }); writeFileSync(join(d, 'deep', 'f'), 'x'); writeFileSync(join(d, '.snapshot-complete'), '');
+      const d = join(snaps,sub, name); mkdirSync(join(d, 'deep'), { recursive: true }); writeFileSync(join(d, 'deep', 'f'), 'x'); writeFileSync(join(d, '.snapshot-complete'), '');
       const t = new Date(Date.now() - ageSec * 1000); utimesSync(d, t, t);
     };
     for (const [n, age] of [['s1', 400], ['s2', 300], ['s3', 200], ['s4', 100]]) mkStore('code', n, age);
@@ -520,15 +520,15 @@ describe('evictToTrash — the tick renames, a detached child deletes', () => {
     const out = evictToTrash({ jobsDir, referenced: ['code:s1'], spawnSweep: () => { swept += 1; }, now: () => 7 });
     expect(out.evicted.length).toBeGreaterThan(0);
     expect(out.evicted.every((r) => r.startsWith('code:'))).toBe(true);
-    expect(existsSync(join(root, 'code', 's1'))).toBe(true); // referenced: kept
+    expect(existsSync(join(snaps,'code', 's1'))).toBe(true); // referenced: kept
     const gone = out.evicted.map((r) => r.slice(5));
     for (const n of gone) {
-      expect(existsSync(join(root, 'code', n))).toBe(false); // the live name is free…
-      expect(existsSync(join(root, '.trash', `code-${n}.7`, 'deep', 'f'))).toBe(true); // …but nothing was deleted in the tick
+      expect(existsSync(join(snaps,'code', n))).toBe(false); // the live name is free…
+      expect(existsSync(join(snaps,'.trash', `code-${n}.7`, 'deep', 'f'))).toBe(true); // …but nothing was deleted in the tick
     }
     expect(swept).toBe(1);
     expect(sweepTrash({ jobsDir })).toBe(gone.length);
-    expect(readdirSync(join(root, '.trash'))).toEqual([]);
+    expect(readdirSync(join(snaps,'.trash'))).toEqual([]);
     expect(evictToTrash({ jobsDir, referenced: [], spawnSweep: () => { throw new Error('nothing moved, nothing to sweep'); } }).evicted.length).toBeGreaterThanOrEqual(0);
   });
 });
