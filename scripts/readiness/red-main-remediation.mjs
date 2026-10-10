@@ -315,7 +315,9 @@ async function runCli(argv) {
   const shared = () => import('../lib/red-main-freeze-shared.mjs');
   const raise = async (meta) => {
     const marker = buildFreezeMarker(meta);
-    await (await shared()).publishFreezeFromCli({ marker });
+    // Whatever goes wrong publishing (even loading the module), the local marker MUST still be written: the drain stops on it.
+    try { await (await shared()).publishFreezeFromCli({ marker }); }
+    catch (e) { process.stderr.write(`red-main freeze: ✗ the SHARED copy was NOT published (${String(e?.message || e).split('\n')[0].slice(0, 300)}); writing the local marker anyway. Retry: node scripts/readiness/red-main-remediation.mjs publish\n`); process.exitCode = 1; }
     return freezeDispatch(marker);
   };
   if (cmd === 'freeze') {
@@ -323,6 +325,14 @@ async function runCli(argv) {
     process.stdout.write(JSON.stringify(m, null, 2) + '\n');
   } else if (cmd === 'unfreeze') {
     unfreezeDispatch();
+    // The clear is published only once the local freeze is really gone: unfreezeDispatch swallows rm errors, and a
+    // surviving (or legacy, migrate-back) marker means the drain is still frozen — clearing CI then would split the two.
+    const legacyLeft = process.env.WE_RED_MAIN_FREEZE ? [] : pendingLegacyFreezeMarkers().filter((p) => resolve(p) !== resolve(FREEZE_MARKER_PATH));
+    if (isDispatchFrozen() || legacyLeft.length) {
+      process.stderr.write(`red-main freeze: ✗ unfreeze did not clear the local marker (${isDispatchFrozen() ? FREEZE_MARKER_PATH : legacyLeft[0]} still present); the SHARED copy is unchanged. Remove it, then re-run: node scripts/readiness/red-main-remediation.mjs unfreeze\n`);
+      process.exitCode = 1;
+      return;
+    }
     writeAllSync(1, JSON.stringify({ frozen: false }, null, 2) + '\n');
     await (await shared()).publishFreezeFromCli({ marker: null, clear: true });
   } else if (cmd === 'status') {

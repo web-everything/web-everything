@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -193,7 +193,7 @@ function cliFixture() {
   return { root, marker, shared, run, breakOrigin, fixOrigin, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)', () => {
+describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)', { timeout: 60_000 }, () => {
   let fx;
   beforeEach(() => { fx = cliFixture(); });
   afterEach(() => fx.cleanup());
@@ -251,6 +251,20 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     expect(fx.shared()).toMatchObject({ frozen: true });
     expect(fx.run(['unfreeze']).status).toBe(0);
     expect(fx.shared()).toMatchObject({ frozen: false });
+  });
+
+  it.skipIf(typeof process.getuid === 'function' && process.getuid() === 0)('`unfreeze` refuses to publish a clear while the local marker could not be removed', () => {
+    const dir = join(fx.root, 'locked');
+    mkdirSync(dir);
+    const marker = join(dir, 'm.json');
+    expect(fx.run(['freeze', '--reason=red'], { WE_RED_MAIN_FREEZE: marker }).status).toBe(0);
+    chmodSync(dir, 0o555); // rm of the marker now fails (and unfreezeDispatch swallows that)
+    try {
+      const r = fx.run(['unfreeze'], { WE_RED_MAIN_FREEZE: marker });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/did not clear the local marker/);
+      expect(fx.shared()).toMatchObject({ frozen: true, reason: 'red' });
+    } finally { chmodSync(dir, 0o755); }
   });
 
   it('`freeze` publishes BEFORE it writes the local marker (a local write failure cannot leave the shared copy clear)', () => {
