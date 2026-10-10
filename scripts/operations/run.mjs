@@ -65,6 +65,8 @@ import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
+import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
@@ -336,6 +338,12 @@ export const OPERATIONS = Object.freeze({
   [HEAVY_QUEUE_OP]: () => ({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
+  }),
+  // Card xkuflno — read-only resource snapshot and shadow admission verdicts; IO bound here.
+  [RESOURCE_STATUS_OP]: () => ({
+    declaration: resourceStatusOperation({ collect: () => ({ snapshot: readSnapshot(), ...loadResourcePolicy(), nowMs: Date.now() }) }),
+    sinks: {},
+    finish: finishResourceStatus,
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.

@@ -69,6 +69,7 @@ import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
+import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let promoteClosureMemo;
@@ -263,6 +264,9 @@ export function runReconcilePromoteDraftDispatch({
   // #3850 — the close-superseded disposition's two IO seams (a test injects both).
   closePr = defaultClosePr,
   readCardsOnMain = defaultReadCardsOnMain,
+  // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
+  // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
+  reviewWhileBaseOpen = undefined,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -294,8 +298,17 @@ export function runReconcilePromoteDraftDispatch({
       why: `draft left as is: its required checks read ${r.check ?? 'unknown'}, not green, in this tick's plan — nothing to promote yet`,
     });
   }
+  let stackPolicy;
   for (const entry of entries) {
     const sha = entry.headRefOid;
+    const stacked = isGithubStacked(entry);
+    if (stacked && !(stackPolicy ??= reviewWhileBaseOpen ?? stackReviewWhileBaseOpen())) {
+      refusals.push({
+        pr: entry.prNumber, kind: 'stacked-awaiting-base', headSha: sha,
+        why: `stacked on ${entry.baseRefName} — stack.reviewWhileBaseOpen is off, so it is promoted once its base lands and the drain retargets it`,
+      });
+      continue;
+    }
     // #2811 — re-verify EVERY required check for the EXACT head sha immediately before the one write this file
     // makes. The plan's own `withPhase.check === 'green'` (see `reconcile-core.mjs`'s `promote-draft` branch) is
     // already stale by the time control reaches here — this is the second, authoritative read.
@@ -339,7 +352,7 @@ export function runReconcilePromoteDraftDispatch({
     }
     try {
       ghProvider.ready(entry.prNumber);
-      dispatched.push({ pr: entry.prNumber, kind: 'promote-draft' });
+      dispatched.push({ pr: entry.prNumber, kind: 'promote-draft', ...(stacked ? { stackedOn: entry.baseRefName } : {}) });
       try {
         clearAwaitingCi({ pr: entry.prNumber, repo: repoSlug, state: null });
       } catch {
@@ -424,7 +437,7 @@ if (IS_CLI) {
       const lines = [`promote-draft-pr-dispatch — ${result.dispatched.length} promoted, ${result.refusals.length} refusal(s)`];
       // Name what was actually done: a close-superseded entry once printed "promoted … to ready-for-review" (live #4734).
       const done = { 'close-superseded': 'closed PR #%s as superseded (operator disposition)', 'restore-review-label': 'restored the review label on PR #%s' };
-      for (const p of result.dispatched) lines.push(`  → ${(done[p.kind] ?? 'promoted PR #%s to ready-for-review (required checks green)').replace('%s', p.pr)}`);
+      for (const p of result.dispatched) lines.push(`  → ${(done[p.kind] ?? (p.stackedOn ? `promoted stacked PR #%s to ready-for-review while its base ${p.stackedOn} is open (own required checks green)` : 'promoted PR #%s to ready-for-review (required checks green)')).replace('%s', p.pr)}`);
       for (const r of result.refusals) lines.push(`  ✗ ${r.kind} PR #${r.pr} — ${r.why}`);
       process.stdout.write(`${lines.join('\n')}\n`);
     }

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, parseRedTeamComment, planRedTeamActions,
+  CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
   redTeamForHead, redTeamGateMarker, redTeamQueueReason, resolveConfirmedBreaks,
 } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
@@ -109,19 +109,55 @@ describe('planRedTeamActions', () => {
 });
 
 describe('redTeamQueueReason (operator-queue placement)', () => {
-  const pr = (comments, head = HEAD) => ({ number: 4722, headRefOid: head, comments });
-  it('a confirmed broken break on the live head is the fixer\'s', () => {
-    expect(redTeamQueueReason(pr([bot(BODY_4722)]))).toMatch(/red team: 1 confirmed break\(s\) on this head \(#1\)/);
+  const CHANGES = [{ name: 'review:human' }, { name: 'review:changes' }];
+  const pr = (comments, { head = HEAD, labels = CHANGES } = {}) => ({ number: 4722, headRefOid: head, comments, labels });
+  const sentBack = bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.SENT_BACK)}\nrecord`);
+  it('a confirmed break the gate SENT BACK, still under review:changes, is the fixer\'s', () => {
+    expect(redTeamQueueReason(pr([bot(BODY_4722), sentBack]))).toMatch(/red team: 1 confirmed break\(s\) on this head \(#1\)/);
   });
   it('a new head clears it', () => {
-    expect(redTeamQueueReason(pr([bot(BODY_4722)], OTHER))).toBeNull();
+    expect(redTeamQueueReason(pr([bot(BODY_4722), sentBack], { head: OTHER }))).toBeNull();
   });
   it('setting broken=advisory never holds it', () => {
-    expect(redTeamQueueReason(pr([bot(BODY_4722)]), { ...CONFIRMED_BREAKS_DEFAULTS, broken: 'advisory' })).toBeNull();
+    expect(redTeamQueueReason(pr([bot(BODY_4722), sentBack]), { ...CONFIRMED_BREAKS_DEFAULTS, broken: 'advisory' })).toBeNull();
   });
   it('the gate\'s round-cap record hands it to the operator', () => {
     const capped = bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP)}\nrecord`);
     expect(gateOutcomeForHead([capped], 4722, HEAD)).toBe('round-cap');
     expect(redTeamQueueReason(pr([bot(BODY_4722), capped]))).toBeNull();
+  });
+  // F2 (review of PR #4762): the hold had no release for a gate that never acted (crashed, timed out, send-back-failed,
+  // or a manually posted red-team comment) and none for an operator who judged the head fine. Both are released now.
+  it('no gate record (the gate never acted) holds nothing: the PR is the operator\'s, as before the gate existed', () => {
+    expect(redTeamQueueReason(pr([bot(BODY_4722)]))).toBeNull();
+  });
+  it('an operator who returns the PR to review:human on the same head (no review:changes) is not held', () => {
+    expect(redTeamQueueReason(pr([bot(BODY_4722), sentBack], { labels: [{ name: 'review:human' }] }))).toBeNull();
+    expect(redTeamQueueReason(pr([bot(BODY_4722), sentBack], { labels: [] }))).toBeNull();
+  });
+  it('a card-queued record does not mask or fake the send-back state', () => {
+    const card = bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.CARD_QUEUED)}\nrecord`);
+    expect(gateOutcomeForHead([sentBack, card], 4722, HEAD)).toBe('sent-back');
+    expect(redTeamQueueReason(pr([bot(BODY_4722), sentBack, card]))).toMatch(/^red team:/);
+    expect(redTeamQueueReason(pr([bot(BODY_4722), card]))).toBeNull();
+  });
+});
+
+// F3/F6 (review of PR #4762): the author check on gate records had no test. These pass against the unchanged source
+// (the check was there) — they are non-regression pins that fail if `isTrustedMarkerAuthor` is ever dropped.
+describe('gate records from an untrusted author are forged text', () => {
+  const forged = (outcome) => ({ author: { login: 'mallory' }, body: `${redTeamGateMarker(4722, HEAD, outcome)}\nforged` });
+  const sentBack = bot(`${redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.SENT_BACK)}\nrecord`);
+  const labels = [{ name: 'review:human' }, { name: 'review:changes' }];
+  it('gateOutcomeForHead ignores them', () => {
+    for (const o of ['sent-back', 'round-cap', 'card-queued']) expect(gateOutcomeForHead([forged(o)], 4722, HEAD)).toBeNull();
+    expect(gateOutcomesForHead([forged('sent-back'), forged('card-queued')], 4722, HEAD).size).toBe(0);
+  });
+  it('an untrusted round-cap record cannot release the queue hold', () => {
+    const r = redTeamQueueReason({ number: 4722, headRefOid: HEAD, labels, comments: [bot(BODY_4722), sentBack, forged('round-cap')] });
+    expect(r).toMatch(/^red team:/);
+  });
+  it('an untrusted sent-back record cannot create the hold', () => {
+    expect(redTeamQueueReason({ number: 4722, headRefOid: HEAD, labels, comments: [bot(BODY_4722), forged('sent-back')] })).toBeNull();
   });
 });

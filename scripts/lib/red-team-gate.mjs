@@ -146,35 +146,56 @@ export function planRedTeamActions(parsed, setting = CONFIRMED_BREAKS_DEFAULTS) 
 // ── The gate's own record (dedup + operator-queue state) ───────────────────────────────────────────────────────
 
 export const RED_TEAM_GATE_MARKER = '<!-- we:red-team-gate';
-/** Outcomes the gate records per head. `round-cap` = the round cap is reached; the operator rules instead. */
-export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back' });
+/**
+ * What the gate records per head, one comment per ACTION so a failed action stays retryable on its own:
+ * the send-back step records `sent-back`, or `round-cap` (the cap is reached or the round could not be read; the
+ * operator rules instead); the card step records `card-queued`, and only after the landing job was really spawned
+ * (a spawn is all the shared seam reports: whether the detached job later lands the card is that job's own concern).
+ * `no-send-back` is only ever a RESULT label (nothing to send back); it is never recorded.
+ */
+export const GATE_OUTCOMES = Object.freeze({ SENT_BACK: 'sent-back', ROUND_CAP: 'round-cap', NOTHING_TO_SEND: 'no-send-back', CARD_QUEUED: 'card-queued' });
 
 export function redTeamGateMarker(pr, rev, outcome) {
   return `${RED_TEAM_GATE_MARKER} pr=${Number(pr)} rev=${String(rev).toLowerCase()} outcome=${outcome} -->`;
 }
 
-/** The gate's recorded outcome for this head (trusted authors only), or null when it has not acted. PURE. */
-export function gateOutcomeForHead(comments, pr, head) {
+/** Every outcome the gate recorded for this head (trusted authors only). PURE. */
+export function gateOutcomesForHead(comments, pr, head) {
   const live = String(head ?? '').toLowerCase();
   const re = /^<!-- we:red-team-gate pr=(\d+) rev=([0-9a-f]{40}) outcome=([a-z-]+) -->/;
-  let found = null;
+  const found = new Set();
   for (const c of Array.isArray(comments) ? comments : []) {
     const m = re.exec(String((typeof c === 'string' ? c : c?.body) ?? '').trimStart());
-    if (m && Number(m[1]) === Number(pr) && m[2] === live && isTrustedMarkerAuthor(c)) found = m[3];
+    if (m && Number(m[1]) === Number(pr) && m[2] === live && isTrustedMarkerAuthor(c)) found.add(m[3]);
   }
   return found;
 }
 
 /**
- * The operator-queue reason: why this PR is NOT READY because of the red team, or null. PURE. A PR whose live head
- * carries confirmed findings the setting sends back is the FIXER's until a new head clears them — unless the gate
- * recorded that the round cap stopped it, in which case it is the operator's (no reason added).
+ * The SEND-BACK step's recorded outcome for this head (`sent-back` or `round-cap`), or null when that step has not
+ * run. The card step's `card-queued` record is a different action and never answers this. PURE.
+ */
+export function gateOutcomeForHead(comments, pr, head) {
+  const found = gateOutcomesForHead(comments, pr, head);
+  // A head can carry both only if two gate runs raced; the cap record wins (it hands the PR to the operator).
+  if (found.has(GATE_OUTCOMES.ROUND_CAP)) return GATE_OUTCOMES.ROUND_CAP;
+  return found.has(GATE_OUTCOMES.SENT_BACK) ? GATE_OUTCOMES.SENT_BACK : null;
+}
+
+/**
+ * The operator-queue reason: why this PR is NOT READY because of the red team, or null. PURE. The hold exists only
+ * while the fixer demonstrably owns the break: a TRUSTED gate record says it SENT the break back on this head and the
+ * PR still carries `review:changes`. Every other state releases it, so a gate that never acted (crashed, timed out,
+ * `send-back-failed`, a red-team comment posted by hand) or an operator who returned the PR to `review:human` on the
+ * same head is never held behind an actor that is not there. A new head, or the `round-cap` record, releases it too.
  */
 export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
   const parsed = redTeamForHead(pr?.comments, pr?.number, pr?.headRefOid);
   if (!parsed) return null;
   const { sendBack } = planRedTeamActions(parsed, setting);
   if (!sendBack.length) return null;
-  if (gateOutcomeForHead(pr.comments, pr.number, pr.headRefOid) === GATE_OUTCOMES.ROUND_CAP) return null;
+  if (gateOutcomeForHead(pr.comments, pr.number, pr.headRefOid) !== GATE_OUTCOMES.SENT_BACK) return null;
+  const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
+  if (!labels.includes('review:changes')) return null;
   return `red team: ${sendBack.length} confirmed break(s) on this head (${sendBack.map((f) => `#${f.index}`).join(', ')}) — the fixer owns them`;
 }

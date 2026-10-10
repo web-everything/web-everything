@@ -6,6 +6,7 @@
 import { isCardOnlyDiff } from '../ci-card-only.mjs';
 import { hasLabel } from './ai-pr-authorship.mjs';
 import { readSettings } from './settings-files.mjs';
+import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 
 export const OPEN_PR_CAP_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true, excludeAccepted: true });
 // Keep the runtime leaf light; the test pins this to REVIEW_LABELS.accepted.
@@ -32,11 +33,17 @@ export function resolveOpenPrCapScope({ platform, tool, env } = {}) {
   return scope;
 }
 
-/** Read the per-feature tool layer; unreadable settings leave lower layers intact. */
-export function readOpenPrCapScope({ env = process.env, platform } = {}) {
+/** Read the platform preference (shared policy cascade) + per-feature tool layer; unreadable settings leave lower
+ *  layers intact. Logs each value's source once per process. */
+export function readOpenPrCapScope({ env = process.env, platform = platformPreference('openPrCap', { env }), read = readSettings } = {}) {
   let tool;
-  try { tool = readSettings().openPrCap; } catch { /* Defaults/platform/env still apply. */ }
-  return resolveOpenPrCapScope({ platform, tool, env });
+  try { tool = read().openPrCap; } catch { /* Defaults/platform/env still apply. */ }
+  const scope = resolveOpenPrCapScope({ platform, tool, env });
+  logCascadeSources('openPrCap', {
+    value: scope,
+    sources: Object.fromEntries(Object.entries(scope.source).map(([k, l]) => [k, l === 'default' ? 'standard' : l])),
+  }, { env });
+  return scope;
 }
 
 /** Count normalized open PRs, assigning overlapping exclusions to card-only first. */

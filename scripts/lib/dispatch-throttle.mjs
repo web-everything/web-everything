@@ -21,6 +21,7 @@
  *   - fixDispatch.borrowExecutor (env WE_FIX_BORROW_EXECUTOR)            default codex; `codex` | `claude` | `agy-claude`.
  */
 import { readFileSync } from 'node:fs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import os from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -49,17 +50,20 @@ export function defaultDispatchSettingsPath() {
 const valid = (key, n) => Number.isFinite(n) && (INTEGER_KEYS.has(key) ? n >= 1 : n > 0);
 const norm = (key, n) => (INTEGER_KEYS.has(key) ? Math.floor(n) : n);
 
-/** Resolve one setting: valid env wins, then a valid file value, then the built-in. Never throws. */
+/** Resolve one setting through the shared policy cascade (we:scripts/lib/policy-cascade.mjs): valid env wins, then a
+ *  valid file (tool) value, then the team's platform preference `<key>`, then the built-in. Logs the source once per
+ *  process. Never throws. */
 export function resolveDispatchSetting(key, { env = process.env, file } = {}) {
   const fromEnv = env?.[DISPATCH_SETTINGS_ENV[key]];
-  if (fromEnv !== undefined && fromEnv !== '' && valid(key, Number(fromEnv))) return norm(key, Number(fromEnv));
+  const envOk = fromEnv !== undefined && fromEnv !== '' && valid(key, Number(fromEnv));
   let raw = file;
   if (raw === undefined) {
     try { raw = JSON.parse(readFileSync(defaultDispatchSettingsPath(), 'utf8')); } catch { raw = null; }
   }
   const v = raw && typeof raw === 'object' ? raw[key] : undefined;
-  if (typeof v === 'number' && valid(key, v)) return norm(key, v);
-  return DISPATCH_SETTINGS_BUILT_IN[key];
+  const c = cascadePolicy(key, v, { env, standard: DISPATCH_SETTINGS_BUILT_IN[key],
+    envValues: { '': envOk ? norm(key, Number(fromEnv)) : undefined }, valid: (x) => typeof x === 'number' && valid(key, x) });
+  return c.value === undefined ? DISPATCH_SETTINGS_BUILT_IN[key] : norm(key, c.value);
 }
 
 export const resolveFixDispatchMaxConcurrent = (o) => resolveDispatchSetting('fixDispatchMaxConcurrent', o);
