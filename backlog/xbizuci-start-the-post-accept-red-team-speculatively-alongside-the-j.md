@@ -2,10 +2,11 @@
 kind: story
 size: 5
 priority: high
-status: open
+status: resolved
 blockedBy: ["xe2s04u", "x1b8hlo"]
 scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/lib/speculative-red-team.mjs", "we:scripts/settings/review.json"]
 dateOpened: "2026-10-10"
+dateResolved: "2026-10-10"
 tags: []
 ---
 
