@@ -3,8 +3,10 @@ bornAs: xeshb3g
 kind: story
 size: 8
 parent: "3007"
-status: open
+status: resolved
 dateOpened: "2026-08-21"
+dateResolved: "2026-10-09"
+graduatedTo: 0df402031197876446f2f2cfd35ab6573217f1ac
 preparedDate: "2026-10-02"
 preparedAgainstSha: "e7d2d9cad6017871fe726fa4a519534de741e8e5"
 tags: []

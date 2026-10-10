@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   isInfraCancelledJob, isAggregateGateFailure, classifyInfraCancelled, isInfraCancelledOnlyRun, resolveInfraCancelledMode,
-  isHungJob, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
+  authoritativeCheckRuns, isHungJob, DEFAULT_INFRA_CANCELLED_MODE, DEFAULT_INFRA_CANCELLED_MAX_RERUNS,
 } from '../infra-cancelled.mjs';
 import { computeMainRedWindows } from '../main-red-recovery.mjs';
 import { enrichPrsWithTimeoutEvidence, readTimeoutEvidence, defaultReadMainRuns } from '../reconcile-pass.mjs';
@@ -195,5 +195,38 @@ describe('infra-cancelled evidence + planning', () => {
     expect(rerun[0].timeoutRetry).toMatchObject({ eligible: true, infraCancelled: true, cap: 4 });
     const heal = enrichPrsWithTimeoutEvidence([{ ...pr, statusCheckRollup: rollup }], { repo, read, enabled: true, infraMode: 'heal', readBudget: () => ({ confirmed: 0 }) });
     expect(heal[0].timeoutRetry).toEqual({ eligible: false, reason: 'infra-cancelled-heal-mode' });
+  });
+});
+
+
+describe('authoritativeCheckRuns — newest check suite wins (#4651)', () => {
+  it('prefers the newer cancelled suite even when the older success has a higher check-run id', () => {
+    const cancelled = { name: 'soak-replay-gate', id: 11, check_suite: { id: 20 }, conclusion: 'cancelled' };
+    const success = { name: 'soak-replay-gate', id: 12, check_suite: { id: 10 }, conclusion: 'success' };
+    expect(authoritativeCheckRuns([success, cancelled])).toEqual([cancelled]);
+    expect(authoritativeCheckRuns([cancelled, success])).toEqual([cancelled]);
+  });
+
+  it('breaks ties within the same suite by the highest check-run id', () => {
+    const older = { name: 'test', id: 11, check_suite: { id: 20 } };
+    const newer = { name: 'test', id: 12, check_suite: { id: 20 } };
+    expect(authoritativeCheckRuns([older, newer])).toEqual([newer]);
+    expect(authoritativeCheckRuns([newer, older])).toEqual([newer]);
+  });
+
+  it('returns exactly one authoritative row per distinct check name', () => {
+    const test = { name: 'test', id: 12, check_suite: { id: 20 } };
+    const soak = { name: 'soak-replay-gate', id: 11, check_suite: { id: 20 } };
+    const rows = authoritativeCheckRuns([
+      { ...test, id: 2, check_suite: { id: 10 } }, soak, test, { ...soak, id: 3, check_suite: { id: 10 } },
+    ]);
+    expect(rows).toHaveLength(2);
+    expect(rows).toEqual(expect.arrayContaining([test, soak]));
+  });
+
+  it('returns an empty array for non-array input', () => {
+    for (const value of [undefined, null, {}, 'checks', 1, false]) {
+      expect(authoritativeCheckRuns(value)).toEqual([]);
+    }
   });
 });

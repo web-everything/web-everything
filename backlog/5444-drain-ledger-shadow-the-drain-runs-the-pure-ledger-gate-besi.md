@@ -2,6 +2,7 @@
 bornAs: x34aj42
 kind: story
 size: 3
+priority: high
 parent: "3007"
 status: open
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/lib/pr-merge-gate.mjs", "we:scripts/lib/__tests__/pr-merge-gate-ledger.test.mjs"]

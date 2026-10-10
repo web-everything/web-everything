@@ -260,6 +260,11 @@ export async function prepareRebuild({
       const { pr, ref, files } = event.detail;
       markOverlayConflictWake(env, { pr, ref, files, at: nowIso(), clone: root });
     }
+    // x5059uu — a parked newcomer wakes its own PR's fixer with the established overlays it must merge in.
+    if (event.kind === 'overlay-newcomer-parked' && event.detail.pr != null) {
+      const { pr, ref, files, collidesWith } = event.detail;
+      markOverlayConflictWake(env, { pr, ref, files, collidesWith, at: nowIso(), clone: root });
+    }
   }
   for (const [pr, wake] of readOverlayConflictWakes(env, { maxAgeMs: Infinity })) {
     if (wake.clone === root && !overlaysBefore.some((o) => o.pr === pr && o.ref === wake.ref)) {
@@ -296,7 +301,9 @@ export async function prepareRebuild({
       appendOverlayEvent(root, { kind: 'auto-dropped', ref: d.ref, pr: d.pr, reason: d.reason }, { env });
       alert('overlay-auto-dropped', { ref: d.ref, reason: d.reason });
     } else if (d.action === 'drop') {
-      alert('overlay-conflict-dropped', { ref: d.ref, reason: d.reason });
+      alert('overlay-conflict-dropped', {
+        ref: d.ref, reason: d.reason, ...(d.files ? { files: d.files } : {}),
+      });
     }
   }
 
