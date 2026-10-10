@@ -3,19 +3,20 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueuedPr } from '../merge-gate-ci.mjs';
 import { DRAIN_GATES } from '../merge-gate-inventory.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 import { scoreEscalation } from '../review-escalation.mjs';
 import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
-import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags } from '../../merge-gate-check.mjs';
+import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags, pinnedHeadOf, bodyHistoryOf, groupHeadsOf, verifyRunningWorkflow } from '../../merge-gate-check.mjs';
+import { findDuplicateIds } from '../duplicate-id-tripwire.mjs';
 
 const HEAD = 'a'.repeat(40);
 const base = () => ({
   repo: 'o/r', num: 7, defaultBranch: 'main',
-  pr: { number: 7, title: 't', body: 'A real body', baseRefName: 'main', headRefName: 'lane/x', headRefOid: HEAD,
+  pr: { number: 7, title: 't', body: 'A real body', baseRefName: 'main', headRefName: 'lane/x', headRefOid: HEAD, isCrossRepository: false,
     labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }],
     commits: [{ oid: HEAD, messageHeadline: 'x', messageBody: 'Co-Authored-By: Claude <noreply@anthropic.com>' }],
     statusCheckRollup: [] },
@@ -286,25 +287,27 @@ describe('gatherPrFacts (injected exec)', () => {
     const failed = gather([GH_PR, GH_MANIFEST_404, [/api graphql/, failure('rate limited')]]);
     expect(failed.bodyHistory.error).toContain('rate limited');
     expect(evaluated(failed, 'manifest-baseline').status).toBe('fail-closed');
-    expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [{ diff: 'old body' }])]).bodyHistory).toMatchObject({ complete: true });
+    expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ editedAt: '2026-10-02T00:00:00Z', diff: 'A real body' }, { editedAt: '2026-10-01T00:00:00Z', diff: 'old body' }])]).bodyHistory).toMatchObject({ complete: true });
   });
 
   it('never marks body history complete when an edit node has no readable diff (null/redacted/non-string)', () => {
     // GraphQL UserContentEdit.diff is nullable: a deleted or redacted edit counts toward totalCount but carries no body,
     // so the baseline would silently skip a version that may have held the manifest.
     for (const node of [{ diff: null }, {}, null, { diff: 42 }, { diff: ['x'] }]) {
-      const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ diff: 'old body' }, node])]);
+      const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ editedAt: '2026-10-02T00:00:00Z', diff: 'A real body' }, node])]);
       expect(facts.bodyHistory.complete, JSON.stringify(node)).toBe(false);
       expect(evaluated(facts, 'manifest-baseline').status, JSON.stringify(node)).toBe('fail-closed');
     }
     // a fully readable history is still complete (the empty-string body is a real, readable version)
-    expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ diff: 'old body' }, { diff: '' }])]).bodyHistory.complete).toBe(true);
+    expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ editedAt: '2026-10-02T00:00:00Z', diff: 'A real body' }, { editedAt: '2026-10-01T00:00:00Z', diff: '' }])]).bodyHistory.complete).toBe(true);
   });
 
-  it('falls back to the gh file list when git cannot score the diff, and test-gaming then fails closed', () => {
+  it('fails closed when the pinned head sha is not fetchable — never falls back to the live gh file list', () => {
     const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [])]);
-    expect(facts.netSignals).toMatchObject({ scored: false, fallbackFiles: true, changedFiles: ['docs/a.md'] });
+    expect(facts.netSignals).toMatchObject({ scored: false, error: expect.stringContaining('not fetchable') });
+    expect(facts.netSignals.fallbackFiles).toBeUndefined();
     expect(evaluated(facts, 'test-gaming').status).toBe('fail-closed');
+    expect(evaluated(facts, 'review-acceptance').status).toBe('fail-closed');
   });
 
   it('reports a missing backlog dir as an error and a duplicate id as a hold', () => {
@@ -313,12 +316,20 @@ describe('gatherPrFacts (injected exec)', () => {
     const dupRoot = checkout({ files: {} });
     writeFileSync(join(dupRoot, 'backlog', '9001-a.md'), '# a');
     writeFileSync(join(dupRoot, 'backlog', '9001-b.md'), '# b');
-    expect(evaluated(gather(rules, { cwd: dupRoot }), 'duplicate-id-on-main').status).toBe('hold');
+    const row = evaluated(gather(rules, { cwd: dupRoot }), 'duplicate-id-on-main');
+    expect(row.status).toBe('hold');
+    // the reason names the colliding id and files (findDuplicateIds returns {num, names}, not {id})
+    expect(findDuplicateIds(join(dupRoot, 'backlog'))).toEqual([{ num: '9001', names: ['9001-a.md', '9001-b.md'] }]);
+    expect(row.reason).toBe('duplicate backlog ids: #9001 (9001-a.md + 9001-b.md)');
+    expect(row.reason).not.toContain('[object Object]');
   });
 
   it('reads the group tree duplicate scan result through to the gate', () => {
     const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [])], { groupDuplicateIds: [{ num: '5', names: ['a', 'b'] }] });
-    expect(evaluated(facts, 'duplicate-id-on-main').status).toBe('hold');
+    expect(evaluated(facts, 'duplicate-id-on-main')).toMatchObject({ status: 'hold', reason: expect.stringContaining('#5 (a + b)') });
+    // a group tree that could not be scanned is an error (fail closed), never a fake duplicate entry
+    const missing = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [])], { groupDuplicateIds: { error: 'group tree has no backlog dir' } });
+    expect(evaluated(missing, 'duplicate-id-on-main')).toMatchObject({ status: 'fail-closed', reason: expect.stringContaining('group tree') });
   });
 });
 
@@ -387,7 +398,8 @@ describe('ledger authority (mergeGate.reviewAuthority) reaches the evaluator', (
 describe('merge group membership completeness', () => {
   const HEAD_REF = 'refs/heads/gh-readonly-queue/main/pr-42-abc123';
   const group = (over) => ({ repo: 'o/r', headSha: 'h', baseSha: 'b', headRef: HEAD_REF, cwd: '/x', ...over });
-  const log = (...lines) => ['git', /^git log /, lines.map((l) => `${l}\n`).join('')];
+  // `<sha>\t<parents>\t<subject>` (the --format=%H%x09%P%x09%s the reader asks for).
+  const log = (...lines) => ['git', /^git log /, lines.map((l) => { const [sha, ...rest] = l.split('\t'); return `${sha}\tp0 ${sha}h\t${rest.join('\t')}\n`; }).join('')];
   const rulesFor = (...rules) => fakeExec(rules.map(([cmd, re, out]) => [re, out]));
 
   it('rejects incomplete group discovery when only the head ref remains', () => {
@@ -487,7 +499,7 @@ describe('merge-gate workflow structure', () => {
   });
 
   describe('bootstrap shim', () => {
-    const run = (present) => {
+    const run = (present, headSha = 'c'.repeat(40)) => {
       const root = mkdtempSync(join(tmpdir(), 'merge-gate-boot-'));
       tmpRoots.push(root);
       mkdirSync(join(root, 'bin'));
@@ -495,7 +507,7 @@ describe('merge-gate workflow structure', () => {
       mkdirSync(join(root, '.github/workflows'), { recursive: true });
       for (const f of present) writeFileSync(join(root, f), '');
       for (const tool of ['git', 'node']) writeFileSync(join(root, 'bin', tool), `#!/bin/sh\necho "${tool} $@" >> calls.log\n`, { mode: 0o755 });
-      const proc = spawnSync('bash', ['-c', evaluate.run], { cwd: root, encoding: 'utf8', env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, PR_NUMBER: '5', REPO: 'o/r', EVENT: 'pull_request', RUNNER_TEMP: root } });
+      const proc = spawnSync('bash', ['-c', evaluate.run], { cwd: root, encoding: 'utf8', env: { PATH: `${join(root, 'bin')}:/usr/bin:/bin`, PR_NUMBER: '5', PR_HEAD_SHA: headSha, REPO: 'o/r', EVENT: 'pull_request', RUNNER_TEMP: root } });
       let calls = '';
       try { calls = readFileSync(join(root, 'calls.log'), 'utf8'); } catch { /* none */ }
       return { status: proc.status, calls, out: `${proc.stdout}${proc.stderr}` };
@@ -511,7 +523,14 @@ describe('merge-gate workflow structure', () => {
     it('runs the check when the script is present', () => {
       const result = run(['scripts/merge-gate-check.mjs', '.github/workflows/merge-gate.yml']);
       expect(result.status).toBe(0);
-      expect(result.calls).toContain('merge-gate-check.mjs --repo=o/r --pr=5');
+      expect(result.calls).toContain(`merge-gate-check.mjs --repo=o/r --pr=5 --expect-head=${'c'.repeat(40)}`);
+    });
+    it('fails closed on a pull_request without a 40-hex head sha (the pin cannot be dropped)', () => {
+      for (const bad of ['', 'lane/x', '-' + 'c'.repeat(39)]) {
+        const result = run(['scripts/merge-gate-check.mjs', '.github/workflows/merge-gate.yml'], bad);
+        expect(result.status, JSON.stringify(bad)).toBe(1);
+        expect(result.calls, JSON.stringify(bad)).not.toContain('merge-gate-check.mjs');
+      }
     });
     it('references a script that exists in this tree', () => {
       expect(() => readFileSync(new URL('../../merge-gate-check.mjs', import.meta.url))).not.toThrow();
@@ -522,7 +541,11 @@ describe('merge-gate workflow structure', () => {
 
 describe('ci.yml and soak-replay-gate.yml report on merge_group', () => {
   const ci = workflowOf('ci.yml');
-  const onMergeGroup = (job) => job.if === undefined || /merge_group/.test(String(job.if)) || /!cancelled\(\)/.test(String(job.if));
+  // Exact allow-list: a required job runs on merge_group only with no `if`, or an `if` that is exactly
+  // `!cancelled()` (no event filter at all). Any other condition — including one that merely CONTAINS
+  // `!cancelled()` beside an event filter — is refused, because a skipped required job counts as passing.
+  const RUNS_ON_EVERY_EVENT = new Set(['${{ !cancelled() }}', '!cancelled()']);
+  const onMergeGroup = (job) => job.if === undefined || RUNS_ON_EVERY_EVENT.has(String(job.if).trim());
 
   it('triggers on merge_group', () => {
     expect(Object.keys(triggersOf(ci))).toContain('merge_group');
@@ -531,6 +554,15 @@ describe('ci.yml and soak-replay-gate.yml report on merge_group', () => {
   it('runs the daemon-soak scope and aggregator on merge_group, and never excludes test or smoke', () => {
     for (const name of ['daemon-soak-scope', 'daemon-soak']) expect(String(ci.jobs[name].if), name).toMatch(/github\.event_name == 'merge_group'/);
     for (const name of ['test', 'smoke']) expect(onMergeGroup(ci.jobs[name]), name).toBe(true);
+  });
+
+  it('the merge_group predicate rejects a job condition that would skip on merge_group', () => {
+    for (const cond of ["${{ github.event_name == 'pull_request' && !cancelled() }}", "github.event_name != 'merge_group' && !cancelled()",
+      "${{ !cancelled() && github.event_name == 'push' }}", '${{ false }}', "${{ github.event_name == 'merge_group' && false }}"]) {
+      expect(onMergeGroup({ if: cond }), cond).toBe(false);
+    }
+    expect(onMergeGroup({})).toBe(true);
+    expect(onMergeGroup({ if: '${{ !cancelled() }}' })).toBe(true);
   });
 
   it('soak-replay-gate triggers on merge_group and its group step fails closed on a failed or empty list', () => {
@@ -578,5 +610,190 @@ describe('every workflow defining a required check is in the ruleset required-wo
     }
     expect(definers).toEqual(expect.arrayContaining(['.github/workflows/merge-gate.yml']));
     expect(definers.filter((p) => !pinned.has(p)), 'workflow defines a required check but is not pinned to main').toEqual([]);
+  });
+});
+
+// ── every git read is pinned to the PR's exact head sha, never to its branch name (review finding, #4708) ──
+
+function gitRepo() {
+  const root = mkdtempSync(join(tmpdir(), 'merge-gate-pin-'));
+  tmpRoots.push(root);
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const origin = join(root, 'origin.git');
+  const work = join(root, 'work');
+  const clone = join(root, 'clone');
+  git(root, 'init', '--quiet', '--bare', '-b', 'main', origin);
+  git(root, 'clone', '--quiet', origin, work);
+  for (const [k, v] of [['user.name', 't'], ['user.email', 't@t'], ['commit.gpgsign', 'false']]) git(work, 'config', k, v);
+  mkdirSync(join(work, 'backlog'));
+  writeFileSync(join(work, 'backlog', '1-a.md'), '# a');
+  writeFileSync(join(work, 'README.md'), 'base\n');
+  git(work, 'add', '-A'); git(work, 'commit', '--quiet', '-m', 'base'); git(work, 'push', '--quiet', 'origin', 'HEAD:refs/heads/main');
+  const commit = (branch, file, text) => {
+    mkdirSync(join(work, file, '..'), { recursive: true });
+    writeFileSync(join(work, file), text);
+    git(work, 'add', '-A'); git(work, 'commit', '--quiet', '-m', file);
+    git(work, 'push', '--quiet', '-f', 'origin', `HEAD:refs/heads/${branch}`);
+    return git(work, 'rev-parse', 'HEAD');
+  };
+  git(root, 'clone', '--quiet', origin, clone);
+  return { git, work, clone, commit };
+}
+/** Real git in the clone, faked gh. Records every git argv. */
+function realGitExec(clone, ghRules) {
+  const gh = fakeExec(ghRules);
+  const gitCalls = [];
+  const exec = (cmd, args, opts = {}) => {
+    if (cmd !== 'git') return gh(cmd, args, opts);
+    gitCalls.push(args.join(' '));
+    return execFileSync('git', args, { ...opts, cwd: opts.cwd || clone });
+  };
+  exec.gitCalls = gitCalls;
+  return exec;
+}
+
+describe('gatherPrFacts pins every git read to the exact head sha', () => {
+  it('TOCTOU: the branch moves after the PR was read — the gate still judges the pinned sha, not the branch', () => {
+    const { git, work, clone, commit } = gitRepo();
+    git(work, 'checkout', '--quiet', '-b', 'lane/x');
+    const pinned = commit('lane/x', 'docs/a.md', 'pinned change\n');
+    // After the event (and after `gh pr view` returned headRefOid=pinned), the branch is moved to a commit that
+    // edits a test and a workflow. Diffing the branch NAME would judge this commit instead.
+    commit('lane/x', 'scripts/__tests__/x.test.mjs', 'it.skip("x", () => {})\n');
+    const moved = commit('lane/x', '.github/workflows/ci.yml', 'run: exit 0\n');
+    expect(moved).not.toBe(pinned);
+    const exec = realGitExec(clone, [[/pr view 7 .*--json number,title/, () => prJson({ headRefOid: pinned, headRefName: 'lane/x', labels: [{ name: 'ready-to-merge' }] })],
+      GH_MANIFEST_404, GH_HISTORY(0, [])]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: clone, defaultBranch: 'main', ledgerConfig: { authority: 'labels' }, expectedHeadSha: pinned, exec });
+    expect(facts.pinnedHead).toEqual({ sha: pinned });
+    expect(facts.netSignals).toMatchObject({ scored: true, changedFiles: [expect.stringContaining('docs/a.md')] });
+    expect(facts.netSignals.netDiffText.rev).toBe(pinned);
+    expect(facts.netSignals.netDiffText.text).toContain('pinned change');
+    expect(facts.netSignals.netDiffText.text).not.toMatch(/exit 0|it\.skip/);
+    // no git call names the branch — fetch, merge-base and diff all use the sha
+    expect(exec.gitCalls.filter((c) => /lane\/x/.test(c))).toEqual([]);
+    expect(exec.gitCalls.some((c) => c.includes(`fetch --quiet --end-of-options origin ${pinned}`))).toBe(true);
+  });
+
+  it('a head that moved since the event (PR now at another sha) fails the diff-reading gates closed', () => {
+    const { git, work, clone, commit } = gitRepo();
+    git(work, 'checkout', '--quiet', '-b', 'lane/x');
+    const eventSha = commit('lane/x', 'docs/a.md', 'one\n');
+    const now = commit('lane/x', 'docs/b.md', 'two\n');
+    const exec = realGitExec(clone, [[/pr view 7 .*--json number,title/, () => prJson({ headRefOid: now })], GH_MANIFEST_404, GH_HISTORY(0, [])]);
+    const facts = gatherPrFacts({ repo: 'o/r', num: 7, cwd: clone, defaultBranch: 'main', ledgerConfig: { authority: 'labels' }, expectedHeadSha: eventSha, exec });
+    expect(facts.netSignals.error).toMatch(/head moved since the event/);
+    expect(facts.acceptance.error).toMatch(/head moved/);
+    for (const id of ['review-acceptance', 'test-gaming']) expect(evaluated(facts, id).status, id).toBe('fail-closed');
+    expect(exec.gitCalls).toEqual([]);
+  });
+
+  it('fails closed for a fork head, an unread isCrossRepository, a merge-group PR with no pinned sha, and a malformed sha', () => {
+    const live = { headRefOid: HEAD, isCrossRepository: false };
+    expect(pinnedHeadOf(live)).toEqual({ sha: HEAD });
+    expect(pinnedHeadOf(live, { expected: HEAD, requireExpected: true })).toEqual({ sha: HEAD });
+    expect(pinnedHeadOf({ ...live, isCrossRepository: true }).error).toMatch(/fork/);
+    expect(pinnedHeadOf({ headRefOid: HEAD }).error).toMatch(/isCrossRepository unread/);
+    expect(pinnedHeadOf(live, { requireExpected: true }).error).toMatch(/merge group/);
+    expect(pinnedHeadOf(live, { expected: 'lane/x' }).error).toMatch(/40-hex/);
+    expect(pinnedHeadOf({ ...live, headRefOid: 'main' }).error).toMatch(/40-hex/);
+    const fork = gather([[/pr view 7 .*--json number,title/, () => prJson({ isCrossRepository: true })], GH_MANIFEST_404, GH_HISTORY(1, [])]);
+    expect(evaluated(fork, 'review-acceptance').status).toBe('fail-closed');
+    expect(evaluated(fork, 'test-gaming').status).toBe('fail-closed');
+  });
+
+  it('a merge group pins each PR to the second parent of its queue merge commit; ambiguous or squash commits get no pin', () => {
+    const a = '1'.repeat(40); const b = '2'.repeat(40);
+    expect(groupHeadsOf([
+      { sha: 'm1', parents: ['p', a], subject: 'Merge pull request #41 from o/x' },
+      { sha: 'm2', parents: ['m1', b], subject: 'Merge pull request #42 from o/y' },
+      { sha: 'm3', parents: ['m2'], subject: 'squashed thing (#43)' },
+    ])).toEqual({ 41: a, 42: b });
+    expect(groupHeadsOf([
+      { sha: 'm1', parents: ['p', a], subject: 'Merge pull request #41 from o/x' },
+      { sha: 'm2', parents: ['m1', b], subject: 'Merge pull request #41 from o/x' },
+    ])).toEqual({});
+    const exec = fakeExec([[/api graphql/, '{}'], [/^git log /, `m1\tp ${a}\tMerge pull request #41 from o/x\n`]]);
+    expect(readGroupPrs({ repo: 'o/r', headSha: 'h', baseSha: 'b', headRef: '', cwd: '/x', exec })).toMatchObject({ nums: [41], complete: true, heads: { 41: a } });
+  });
+});
+
+// ── historical PR bodies: each edit entry must be PROVEN a full body before it serves as a baseline ────────
+
+describe('bodyHistoryOf', () => {
+  const live = 'A real body';
+  const edits = (...nodes) => ({ totalCount: nodes.length, nodes });
+  it('accepts edit entries as full bodies only when the newest equals the live body', () => {
+    expect(bodyHistoryOf(live, edits())).toEqual({ bodies: [live], complete: true });
+    expect(bodyHistoryOf(live, edits({ editedAt: '2026-10-02T00:00:00Z', diff: live }, { editedAt: '2026-10-01T00:00:00Z', diff: manifestBody })))
+      .toEqual({ bodies: [live, live, manifestBody], complete: true });
+    // CRLF-only difference is the same body (GitHub stores some edits with \r\n)
+    expect(bodyHistoryOf('a\nb', edits({ editedAt: '2026-10-02T00:00:00Z', diff: 'a\r\nb' })).complete).toBe(true);
+  });
+  it('fails closed when the newest entry is not the live body (an entry that is a diff/fragment, not a full body)', () => {
+    for (const nodes of [[{ editedAt: '2026-10-02T00:00:00Z', diff: '+ added line' }], [{ diff: live }],
+      [{ editedAt: '2026-10-01T00:00:00Z', diff: live }, { editedAt: '2026-10-02T00:00:00Z', diff: '- removed manifest' }]]) {
+      const h = bodyHistoryOf(live, edits(...nodes));
+      expect(h.complete, JSON.stringify(nodes)).toBe(false);
+      expect(evaluated(facts({ bodyHistory: h }), 'manifest-baseline').status).toBe('fail-closed');
+    }
+  });
+  it('a manifest in the earliest full body that a later edit removed holds the PR', () => {
+    const h = bodyHistoryOf(live, edits({ editedAt: '2026-10-03T00:00:00Z', diff: live }, { editedAt: '2026-10-01T00:00:00Z', diff: manifestBody }));
+    expect(evaluated(facts({ bodyHistory: h }), 'manifest-baseline')).toMatchObject({ status: 'hold', reason: expect.stringContaining('weakened') });
+  });
+});
+
+// ── the running workflow must be main's (self-check) ─────────────────────────────────────────────────────
+
+describe('verifyRunningWorkflow', () => {
+  const WF = '.github/workflows/merge-gate.yml';
+  const setup = () => {
+    const { git, work, clone, commit } = gitRepo();
+    commit('main', WF, 'name: Merge gate\n');
+    git(clone, 'fetch', '--quiet', 'origin');
+    git(work, 'checkout', '--quiet', '-b', 'lane/x');
+    return { git, work, clone, commit };
+  };
+  const env = (sha, ref = `o/r/${WF}@refs/pull/7/merge`) => ({ GITHUB_ACTIONS: 'true', GITHUB_WORKFLOW_REF: ref, GITHUB_WORKFLOW_SHA: sha });
+  const run = (clone, e) => verifyRunningWorkflow({ env: e, cwd: clone, defaultBranch: 'main', exec: (c, a, o) => execFileSync(c, a, { ...o, cwd: clone }) });
+
+  it('passes when the running workflow file is byte-identical to main, and outside Actions is local-only', () => {
+    const { clone, commit } = setup();
+    const sha = commit('lane/x', 'docs/a.md', 'x\n');
+    expect(run(clone, env(sha))).toMatchObject({ ok: true, path: WF });
+    expect(run(clone, {})).toMatchObject({ ok: true, local: true });
+  });
+  it('fails closed when the PR edits the running workflow, or the ref/sha is unreadable or unfetchable', () => {
+    const { clone, commit } = setup();
+    const sha = commit('lane/x', WF, 'name: Merge gate\non: push\njobs: { merge-gate: { steps: [{ run: exit 0 }] } }\n');
+    expect(run(clone, env(sha))).toMatchObject({ ok: false, reason: expect.stringContaining('differs from main') });
+    expect(run(clone, env(sha, 'garbage'))).toMatchObject({ ok: false, reason: expect.stringContaining('GITHUB_WORKFLOW_REF') });
+    expect(run(clone, env('main'))).toMatchObject({ ok: false, reason: expect.stringContaining('GITHUB_WORKFLOW_SHA') });
+    expect(run(clone, env('f'.repeat(40)))).toMatchObject({ ok: false, reason: expect.stringContaining('could not be compared') });
+    // a new workflow file (named merge-gate job) that main does not have fails closed too
+    const other = commit('lane/x', '.github/workflows/evil.yml', 'jobs: { merge-gate: {} }\n');
+    expect(run(clone, env(other, 'o/r/.github/workflows/evil.yml@refs/pull/7/merge')).ok).toBe(false);
+  });
+});
+
+// ── operator guidance: the printed ruleset carries the workflows pin and the Actions integration id ───────
+
+describe('--print-ruleset (the operator ruleset steps come from rulesetSuggestion)', () => {
+  it('prints the main-pinned required workflows and the GitHub Actions integration id', () => {
+    const script = new URL('../../merge-gate-check.mjs', import.meta.url).pathname;
+    const out = execFileSync(process.execPath, [script, '--print-ruleset'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const rs = JSON.parse(out);
+    expect(rs.requiredStatusCheckIntegrationId).toBe(15368);
+    expect(rs.requiredStatusChecks).toEqual(expect.arrayContaining(['merge-gate', 'test', 'smoke']));
+    expect(rs.requiredWorkflows).toEqual(expect.arrayContaining([{ path: '.github/workflows/merge-gate.yml', ref: 'refs/heads/main' }]));
+    for (const w of rs.requiredWorkflows) expect(w.ref).toBe('refs/heads/main');
+  });
+  it('the workflow header names both the workflows pin and the integration-id restriction, and the self-check', () => {
+    const header = readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8').split('\nname:')[0];
+    expect(header).toMatch(/workflows[\s\S]*refs\/heads\/main/);
+    expect(header).toMatch(/integration id/i);
+    expect(header).toMatch(/--print-ruleset/);
+    expect(header).toMatch(/verifyRunningWorkflow/);
   });
 });
