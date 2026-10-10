@@ -95,9 +95,8 @@ import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 import {
-  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, resolveSeatTimeoutMs,
+  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, redTeamOwedFor, resolveSeatTimeoutMs,
 } from './review-extra-seats.mjs';
-import { redTeamRequired } from '../lib/jury-core.mjs';
 import {
   decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
 } from '../lib/review-speculative-red-team.mjs';
@@ -596,12 +595,14 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
       + `${Array.isArray(extraSeats?.seats) ? `: ${extraSeats.seats.map((x) => `${x.lens}@${x.provider}=${x.status}/${x.findingsCount ?? 0}f/${x.confirmedCount ?? 0}c`).join(', ')}` : ''}`);
     out.extraSeats = summarizeExtraSeats(extraSeats);
   }
-  // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when Claude's review ACCEPTED (`redTeamRequired`), and only after
+  // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when the review ACCEPTED (`redTeamOwedFor`), and only after
   // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
   // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
   // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
   const spec = seatsBox.speculative ?? null;
-  const accepted = Boolean(seatsBox.input) && redTeamRequired(out.verdict);
+  // Card xyyuvyz — EVERY head the panel accepts, a `review:human` advisory accept included (`redTeamOwedFor`); once
+  // per head is the pass's own `(pr, rev)` row + comment marker.
+  const accepted = Boolean(seatsBox.input) && redTeamOwedFor(seatsBox.input.loopPayload);
   if (spec) {
     try {
       out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
