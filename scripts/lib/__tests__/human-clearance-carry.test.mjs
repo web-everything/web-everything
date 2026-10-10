@@ -327,7 +327,7 @@ describe('sanitizeActor', () => {
     ['chalbert', 'chalbert'],
     ['Nic Gilbert', 'Nic Gilbert'],
     ['see https://evil.example/x', 'see https evil.example x'],
-    ['a​b‮c', 'a b c'],
+    ['a\u200Bb\u202Ec', 'a b c'],
     ['org/repo#12 a@b.co', 'org repo 12 a b.co'],
     ['', 'the operator'],
     ['<>@@', 'the operator'],
