@@ -422,7 +422,9 @@ if (IS_CLI) {
       process.stdout.write(`${JSON.stringify(result)}\n`);
     } else {
       const lines = [`promote-draft-pr-dispatch — ${result.dispatched.length} promoted, ${result.refusals.length} refusal(s)`];
-      for (const p of result.dispatched) lines.push(`  → promoted PR #${p.pr} to ready-for-review (required checks green)`);
+      // Name what was actually done: a close-superseded entry once printed "promoted … to ready-for-review" (live #4734).
+      const done = { 'close-superseded': 'closed PR #%s as superseded (operator disposition)', 'restore-review-label': 'restored the review label on PR #%s' };
+      for (const p of result.dispatched) lines.push(`  → ${(done[p.kind] ?? 'promoted PR #%s to ready-for-review (required checks green)').replace('%s', p.pr)}`);
       for (const r of result.refusals) lines.push(`  ✗ ${r.kind} PR #${r.pr} — ${r.why}`);
       process.stdout.write(`${lines.join('\n')}\n`);
     }
