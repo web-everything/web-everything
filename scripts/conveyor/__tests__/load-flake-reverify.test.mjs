@@ -428,3 +428,53 @@ describe('a pushed fix owes its re-arm (#4361)', () => {
     expect(fake.rearm).toHaveBeenCalledWith('web-everything/web-everything', 3881);
   });
 });
+
+
+describe('resource-admission cut-over (x9xkupj)', () => {
+  const decision = (verdict, reason, snapshotAge = 3, unknown = false) =>
+    ({ kind: 'load-flake-reverify', verdict, reason, snapshotAge, unknown });
+  it('redispatches live #220 despite high load when resource admission admits', async () => {
+    const { buildLoadFlakeRedispatchComment } = await import('../stand-down.mjs');
+    const { io, pr } = fixture(); pr.number = 220;
+    pr.comments = [comment(buildLoadFlakeRedispatchComment({ head: pr.headRefOid, detail: 'timing' }))];
+    io.loadavg = () => [22.94, 22.38];
+    io.admission = vi.fn(() => decision('admit', 'cpu idle 42.6% ≥ 20%'));
+    const config = reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'ci', WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE: '1.25' });
+    const out = await runLoadFlakeReverify({ config }, io);
+    expect(io.admission).toHaveBeenCalledTimes(1);
+    expect(io.admission).toHaveBeenCalledWith({ load: [22.94, 22.38], cores: 12, config: expect.anything() });
+    expect(out.redispatched).toEqual([{ pr: 220, result: 'redispatched' }]);
+    expect(io.comment.mock.calls[0][2]).toContain('resource admission admit (cpu idle 42.6% ≥ 20%)');
+  });
+  it.each([
+    ['wait', 'cpu idle 9% < 20%', 2, false],
+    ['hold', 'snapshot-missing', null, true],
+  ])('defers quiet load on admission %s without writes', async (verdict, reason, snapshotAge, unknown) => {
+    const { io } = fixture(); io.loadavg = () => [1, 1];
+    io.admission = vi.fn(() => decision(verdict, reason, snapshotAge, unknown));
+    const config = reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'local' });
+    expect(await runLoadFlakeReverify({ config }, io)).toMatchObject({
+      deferred: 'host-load', admission: { verdict, reason, snapshotAge },
+      load: [1, 1], cores: 12, maxLoadPerCore: config.maxLoadPerCore,
+    });
+    expect(io.acquire).not.toHaveBeenCalled(); expect(io.comment).not.toHaveBeenCalled(); expect(io.push).not.toHaveBeenCalled();
+  });
+  it.each([
+    [[50, 50], 'admit', 'cpu idle 42.6% ≥ 20%'],
+    [[1, 1], 'wait', 'cpu idle 9% < 20%'],
+  ])('plans from admission at load %j (%s)', (load, verdict, reason) => {
+    const { pr } = fixture();
+    const plan = planLoadFlakeReverify({ prs: [pr], load, cores: 12, now, admission: decision(verdict, reason) });
+    if (verdict === 'admit') expect(plan.candidate?.pr).toEqual(pr);
+    else expect(plan).toMatchObject({ deferred: 'host-load' });
+  });
+  it('exports the inclusive legacy load-per-core rule', async () => {
+    const { legacyLoadQuiet } = await import('../load-flake-reverify.mjs');
+    expect(typeof legacyLoadQuiet).toBe('function');
+    expect(legacyLoadQuiet([9, 9], 12, { maxLoadPerCore: 0.75 })).toBe(true);
+    expect(legacyLoadQuiet([9.1, 1], 12, { maxLoadPerCore: 0.75 })).toBe(false);
+  });
+  it('wires admission into the default IO', () => {
+    expect(typeof defaultReverifyIo().admission).toBe('function');
+  });
+});
