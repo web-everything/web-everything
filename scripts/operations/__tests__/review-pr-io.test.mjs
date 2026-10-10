@@ -2372,3 +2372,51 @@ describe('card 5469: the advise step declares the shadow effect only when the se
     expect(effects[0].payload.roundFacts).toMatchObject({ head: 'b'.repeat(40), liveVerdict: 'changes' });
   });
 });
+
+// ── Cards 5471 / 5470 — the read carries the round budget, the ledger round, and the `on` mode ───────────────────────
+describe('cards 5471 + 5470: the io read resolves the round settings and the ledger round', async () => {
+  const { readReviewRound, resolveRoundBudget, resolveScopedRereviewMode } = await import('../review-pr-io.mjs');
+  const H = 'd'.repeat(40);
+  const rows = [
+    { type: 'review-run', pr: 7, headSha: 'a'.repeat(40) },
+    { type: 'finding', pr: 7, headSha: 'b'.repeat(40) },
+    { type: 'review-run', pr: 7, headSha: 'b'.repeat(40) },
+    { type: 'review-run', pr: 8, headSha: 'c'.repeat(40) },
+    { type: 'review-run', pr: 7, headSha: H },
+    { type: 'ruling', pr: 7, headSha: 'e'.repeat(40) },
+  ];
+
+  it('the round is 1 + the distinct earlier heads this PR was reviewed on (review-run and finding rows only)', () => {
+    expect(readReviewRound({ repo: 'o/r', pr: 7, head: H, readLedgerRows: () => rows })).toBe(3);
+    expect(readReviewRound({ repo: 'o/r', pr: 9, head: H, readLedgerRows: () => rows })).toBe(1);
+  });
+
+  it('an unreadable ledger or an unpinned head is an unknown round (null: the budget never acts)', () => {
+    expect(readReviewRound({ repo: 'o/r', pr: 7, head: H, readLedgerRows: () => { throw new Error('gone'); } })).toBeNull();
+    expect(readReviewRound({ repo: 'o/r', pr: 7, head: null, readLedgerRows: () => rows })).toBeNull();
+  });
+
+  it('the round budget resolves from an explicit value, else the setting; any doubt is off', () => {
+    expect(resolveRoundBudget(2)).toBe(2);
+    expect(resolveRoundBudget(null, { settings: () => ({ roundBudget: 3 }) })).toBe(3);
+    expect(resolveRoundBudget(null, { settings: () => ({ roundBudget: 'off' }) })).toBe('off');
+    expect(resolveRoundBudget(null, { settings: () => { throw new Error('unreadable'); } })).toBe('off');
+  });
+
+  it('the scoped mode resolves on (card 5470)', () => {
+    expect(resolveScopedRereviewMode('on')).toBe('on');
+    expect(resolveScopedRereviewMode(null, { settings: () => ({ scopedRereview: 'on' }) })).toBe('on');
+  });
+
+});
+
+describe('card 5470: the advise step declares the shadow effect in on mode too', async () => {
+  const { reviewPrOperation, REVIEW_EFFECTS: E } = await import('../review-pr.mjs');
+  const advise = reviewPrOperation({ readPr: () => ({}) }).steps.find((s) => s.name === 'advise').step;
+  it('on: the same idempotent shadow effect (its summary is what the on rule reads)', () => {
+    const effects = advise.effects({ input: { pr: 7, repo: 'o/r' }, findings: { read: { netBasis: { rev: 'b'.repeat(40) }, labels: [], scopedRereview: 'on' } },
+      verdict: { verdict: 'changes', admittedFindings: [], deferredAdvisory: [], findings: [] } });
+    expect(effects).toHaveLength(1);
+    expect(effects[0]).toMatchObject({ type: E.SCOPED_REREVIEW_SHADOW, idempotent: true });
+  });
+});
