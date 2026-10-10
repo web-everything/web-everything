@@ -549,6 +549,24 @@ describe('buildCliDaemonEffects.onTick — logs the exact pause line when authPa
   });
 });
 
+describe('buildCliDaemonEffects.onTick — logs an accept carry-forward entry from the hold-reconcile sweep (card xu7kxtt)', () => {
+  // PR #4631 round 5 (same class as the sweep call): the log line that makes a carry visible was wired with no test, so deleting it
+  // left the daemon carrying clearances silently.
+  it('logs the carry outcome, its detail and its error, one line per entry', () => {
+    const lines = [];
+    const fx = buildCliDaemonEffects({ owner: 'o', log: { error: (l) => lines.push(l) }, reapSessions: () => null, runReview: () => ({}) });
+    fx.onTick({
+      repos: [{ repo: 'web-everything/web-everything' }], reviewsOwed: 0, dispatched: [], failed: [],
+      holdReconcile: [
+        { repo: 'web-everything/web-everything', num: 4535, carry: 'carried', detail: 'ok' },
+        { repo: 'web-everything/web-everything', num: 0, carry: 'sweep-failed', error: 'comments unreadable' },
+      ],
+    });
+    expect(lines).toContain('review-daemon: web-everything/web-everything#4535 accept carry-forward carried — ok');
+    expect(lines).toContain('review-daemon: web-everything/web-everything#0 accept carry-forward sweep-failed (FAILED: comments unreadable)');
+  });
+});
+
 describe('runReviewTickAllRepos — #3383 bug 3: deferredForLanes aggregates across repos', () => {
   it('sums each repo tick\'s own deferredForLanes into the combined total', () => {
     const tick = vi.fn()
