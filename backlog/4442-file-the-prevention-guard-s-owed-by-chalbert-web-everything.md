@@ -4,7 +4,7 @@ kind: story
 size: 8
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-jobs-runtime.mjs", "we:scripts/lib/daemon-job-snapshots.mjs", "we:scripts/lib/__tests__/daemon-jobs-runtime.test.mjs", "we:scripts/lib/__tests__/daemon-job-snapshots.test.mjs", "we:scripts/conveyor/health-watch-job.mjs", "we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs"]
+scope: ["we:scripts/lib/daemon-jobs-runtime.mjs", "we:scripts/lib/daemon-job-snapshots.mjs", "we:scripts/lib/__tests__/daemon-jobs-runtime.test.mjs", "we:scripts/lib/__tests__/daemon-job-snapshots.test.mjs", "we:scripts/conveyor/health-watch-job.mjs", "we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs", "we:scripts/conveyor/__tests__/health-watch-job.test.mjs"]
 dateOpened: "2026-09-28"
 preparedDate: "2026-10-10"
 preparedAgainstSha: "ab0d3a0995747a390338bda2057d76069936f655"
