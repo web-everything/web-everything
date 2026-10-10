@@ -185,6 +185,15 @@ export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'mai
 }
 
 /**
+ * The shared red-main freeze for this run (xyd06qo): read ONCE, from the run's checkout, off the branch the policy
+ * cascade names — the same knob the writer (`red-main-remediation.mjs`) publishes to. Never throws (unreadable is
+ * `{source, error}`, which the evaluator fails closed on).
+ */
+export function readRedMainFact({ cwd, policy, read = readSharedFreeze }) {
+  return read({ board: cwd, branch: policy.redMainFreezeBranch });
+}
+
+/**
  * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
  * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
  * queue merge. `'pull_request'` needs POSITIVE proof — the runner reporting exactly `pull_request` — because it is
@@ -230,7 +239,7 @@ async function main() {
 
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
   // One read of the shared red-main freeze for the whole run (xyd06qo); branch name from the same policy cascade.
-  const redMain = readSharedFreeze({ board: cwd, branch: policy.redMainFreezeBranch });
+  const redMain = readRedMainFact({ cwd, policy });
   process.stderr.write(`red-main freeze (${redMain.source}): ${redMain.error ? `UNREADABLE — ${redMain.error}` : redMain.frozen ? `FROZEN — ${redMain.reason}` : 'clear'}\n`);
   const ledgerConfig = readLedgerConfig();
   const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, redMain }), { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));

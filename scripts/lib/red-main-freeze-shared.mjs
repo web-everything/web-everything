@@ -6,9 +6,11 @@
  *   now ALSO publishes the state to a shared `ops/*` git branch (same transport as `ops/review-requests`:
  *   `./git-transport-branch.mjs`), and CI reads that branch.
  *
- *   - WRITER: `red-main-remediation.mjs freeze|unfreeze|decide --apply|publish` writes the local marker exactly as
- *     before, THEN calls {@link publishFreezeFromCli}, which mirrors the local marker's state onto the branch.
- *     Both are written; the local marker stays the drain's own source.
+ *   - WRITER: `red-main-remediation.mjs freeze|decide --apply` calls {@link publishFreezeFromCli} FIRST (so a failure
+ *     between the two writes can only leave the shared copy frozen, never clear), THEN writes the local marker.
+ *     `unfreeze` clears locally, then publishes an EXPLICIT clear (`clear: true`). `publish` republishes the local
+ *     freeze and REFUSES when there is none: "no marker" (a clone without the gitignored file, or a corrupt one) is
+ *     never a clear, so only `unfreeze` can publish `frozen:false`. The local marker stays the drain's own source.
  *   - READER: {@link readSharedFreeze} → `facts.redMain = {source, frozen, reason}` for the merge-gate evaluator.
  *     Anything it cannot read or trust (no branch, no file, bad JSON, no boolean `frozen`) is `{source, error}`,
  *     which the evaluator turns into FAIL CLOSED — never into "not frozen".
@@ -16,7 +18,8 @@
  *     validated to `ops/<slug>` so the writer can never push to main or a lane.
  *
  *   A failed publish leaves the local marker in place (the drain still stops) and exits the CLI non-zero with a
- *   loud line: until `red-main-remediation.mjs publish` succeeds, CI may show the previous state.
+ *   loud line: until the named retry (`publish` after a raise, `unfreeze` after a clear) succeeds, CI may show the
+ *   previous state. Closing that window from the drain side is card x09e2bn.
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
@@ -53,8 +56,11 @@ export function buildSharedFreezeDoc(marker, { now = () => new Date().toISOStrin
 }
 
 /** Push the state to the shared branch. Throws on any git failure (the caller decides what that means). */
-export function publishSharedFreeze({ marker, board = REPO_ROOT, branch = resolveFreezeBranch(), run, now, host, transport = {} } = {}) {
+export function publishSharedFreeze({ marker, clear = false, board = REPO_ROOT, branch = resolveFreezeBranch(), run, now, host, transport = {} } = {}) {
   if (!/^ops\/[a-z0-9][a-z0-9-]{0,63}$/.test(String(branch))) throw new Error(`red-main-freeze-shared: refusing to publish to "${branch}" — only an ops/<slug> branch`);
+  // "No marker" is NOT "cleared": a clone without the gitignored local marker (or one holding a corrupt file) reads
+  // `null`, and mirroring that would silently clear a standing freeze. Only an explicit clear may publish frozen:false.
+  if (marker == null && clear !== true) throw new Error('red-main-freeze-shared: refusing to publish frozen:false without an explicit clear (no local freeze marker is not a clear)');
   const doc = buildSharedFreezeDoc(marker, { ...(now ? { now } : {}), ...(host ? { host } : {}) });
   const staged = stageOnTransportBranch({
     board,
@@ -74,15 +80,20 @@ export function publishSharedFreeze({ marker, board = REPO_ROOT, branch = resolv
  * run unless a board is injected, so no test can push the live branch.
  * @returns {Promise<{ok:boolean, skipped?:string, branch?:string, pushed?:boolean, error?:string}>}
  */
-export async function publishFreezeFromCli({ marker, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; } } = {}) {
+export async function publishFreezeFromCli({ marker, clear = false, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; } } = {}) {
   if ((env.VITEST || env.WE_UNDER_TEST) && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'test-run' };
+  if (marker == null && clear !== true) {
+    stderr('red-main freeze: ✗ refusing to publish — no valid local freeze marker here (missing or corrupt), and "no marker" is not a clear. The shared copy is unchanged. To clear it run: node scripts/readiness/red-main-remediation.mjs unfreeze\n');
+    setExitCode(1);
+    return { ok: false, refused: 'no-marker' };
+  }
   try {
-    const r = publish({ marker, ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
+    const r = publish({ marker, ...(clear === true ? { clear: true } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
     stderr(`red-main freeze: shared copy ${r.pushed ? 'published' : 'already current'} on ${r.branch} (frozen=${r.doc.frozen})\n`);
     return { ok: true, branch: r.branch, pushed: r.pushed };
   } catch (e) {
     const error = String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
-    stderr(`red-main freeze: ✗ local marker written, but the SHARED copy was NOT published (${error}). CI's merge-gate may show the previous state — re-run: node scripts/readiness/red-main-remediation.mjs publish\n`);
+    stderr(`red-main freeze: ✗ the SHARED copy was NOT published (${error}); the local marker is as ${clear === true ? 'cleared' : 'written'}. CI's merge-gate may show the previous state — re-run: node scripts/readiness/red-main-remediation.mjs ${clear === true ? 'unfreeze' : 'publish'}\n`);
     setExitCode(1);
     return { ok: false, error };
   }

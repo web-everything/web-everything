@@ -11,6 +11,8 @@ tags: []
 
 Follow-up to xyd06qo. The freeze is now published to the shared ops/red-main-freeze branch (mergeDelivery.redMainFreezeBranch) by we:scripts/readiness/red-main-remediation.mjs freeze/unfreeze, and CI's merge-gate reads it; the drain's own reader (isDispatchFrozen/readFreeze in we:scripts/merge-ai-prs.mjs) still reads only the local marker. Make the drain prefer the shared copy (readSharedFreeze in we:scripts/lib/red-main-freeze-shared.mjs), falling back to the local marker, and treat frozen-in-either as frozen (never fail open). Blocked on PR #4624 (card xx7ckd6), which holds both files and moves the local marker to the coordination root. (No `blockedBy:` edge yet: card xx7ckd6 exists only on #4624's branch, and an edge to a card not on main fails the gate — add `blockedBy: ["xx7ckd6"]` once #4624 lands, or simply start after it.)
 
+Also owed here (from the PR #4715 review, the residual of the "stale clear after a failed publish" finding): `we:scripts/readiness/red-main-remediation.mjs freeze` now publishes the shared copy BEFORE it writes the local marker, so a local-write failure can no longer leave CI clear; but a rejected push still leaves the shared copy at its previous (clear) state while the local marker is frozen, and CI has no way to see the local marker. Close that window on the drain side: when the drain finds a local freeze marker whose state the shared copy does not carry (shared clear or unreadable), it must say so loudly and retry the publish (or refuse to land) rather than assume CI is holding.
+
 ## Acceptance
 
 - [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
