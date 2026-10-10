@@ -18,7 +18,6 @@
  * same reason `~/.claude/github-app-token` and other machine-wide operator state live under `~/.claude`.
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, realpathSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -33,6 +32,7 @@ import { writeAllSync } from './write-all-sync.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of card-only (backlog/ only, fail-closed) — never re-derived here
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+import { gitRun } from './git-run.mjs';
 import { classifySession } from '../operations/session-role.mjs'; // THE worker/orchestrator marker — the same one pre-pr-review's bypass gate reads
 import { currentActorId } from './review-independence.mjs'; // the harness session id, recorded on every grant/refusal
 
@@ -593,10 +593,9 @@ export function authoriseAllow({ branch, operatorQuote, env = {}, cwdReal = '', 
 /** The branch the checkout at `cwd` tracks (its upstream, else its current branch), or '' — fails soft. */
 export function readOwnBranch(cwd) {
   for (const args of [['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], ['rev-parse', '--abbrev-ref', 'HEAD']]) {
-    try {
-      const out = execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-      if (out && out !== 'HEAD' && out !== 'main' && out !== 'origin/main') return out;
-    } catch { /* not a git checkout, or no upstream — try the next read */ }
+    const r = gitRun('git', args, { cwd });
+    const out = r.status === 0 ? String(r.stdout).trim() : ''; // not a git checkout, or no upstream — try the next read
+    if (out && out !== 'HEAD' && out !== 'main' && out !== 'origin/main') return out;
   }
   return '';
 }
