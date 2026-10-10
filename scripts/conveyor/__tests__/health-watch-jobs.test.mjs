@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { tick } from '../health-watch.mjs';
+import { tick, collectGhProbes, GH_GROUP_PROBE_NAMES } from '../health-watch.mjs';
 import { healthDir } from '../health-watch-section.mjs';
 import {
   runGhProbeJobs, observeTickClock, resolveHealthJobSwitches, FINISHED_JOB_KEEP_MS, RESULT_SUFFIX,
@@ -172,6 +172,75 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     expect(second.ghJob.enqueued).toBeTruthy();
     expect(second.ghJob.enqueued).not.toBe(first.ghJob.enqueued);
   }, 30000);
+
+  it('preserves probe-error streaks across queued ticks and counts only real failed samples', async () => {
+    // Inline, a failing prs read keeps the cadence due and is retried (and re-supplied) every tick, so its streak
+    // grows. As a job the failure arrives on alternate ticks: the ticks between (queued/running) sample nothing and
+    // must not clear the streak the core keeps for a probe that supplied neither a sample nor an error.
+    const { flags, hd } = setup('streak');
+    const store = createJobStore(join(dir, 'jobs-streak'));
+    const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+    const streak = () => JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).probeErrors?.prs?.count;
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    const failedSample = { probes: { agents: [] }, errors: { prs: 'gh: HTTP 502' } };
+
+    const q1 = await tick({ ...flags, now: iso(t0) }, deps); // queues job 1
+    finish(store, q1.ghJob.enqueued, { at: t0 + 60_000, ...failedSample });
+    const c1 = await tick({ ...flags, now: iso(t0 + 120_000) }, deps); // consumes the failure
+    expect(c1.probeErrors.prs).toMatch(/502/);
+    expect(streak()).toBe(1);
+
+    const q2 = await tick({ ...flags, now: iso(t0 + 180_000) }, deps); // cadence still due: queues job 2, samples nothing
+    expect(q2.ghJob.enqueued).toBeTruthy();
+    expect(q2.probeErrors.prs).toBeUndefined();
+    expect(streak()).toBe(1); // the unsampled tick neither clears nor grows it
+    const r2 = await tick({ ...flags, now: iso(t0 + 240_000) }, deps); // job 2 still running
+    expect(r2.ghJob.inFlight.id).toBe(q2.ghJob.enqueued);
+    expect(streak()).toBe(1);
+
+    finish(store, q2.ghJob.enqueued, { at: t0 + 250_000, ...failedSample });
+    await tick({ ...flags, now: iso(t0 + 300_000) }, deps); // consumes the second failed sample
+    expect(streak()).toBe(2);
+
+    // The third failed sample reaches the alert threshold: the health-tick-overrun smell opens its episode.
+    const q3 = await tick({ ...flags, now: iso(t0 + 360_000) }, deps);
+    finish(store, q3.ghJob.enqueued, { at: t0 + 370_000, ...failedSample });
+    await tick({ ...flags, now: iso(t0 + 420_000) }, deps);
+    expect(streak()).toBe(3);
+    const episodes = JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).episodes;
+    expect(Object.keys(episodes).some((k) => k.includes('health-tick-overrun'))).toBe(true);
+
+    // A successful sample of prs ends the streak, as it does inline.
+    const q4 = await tick({ ...flags, now: iso(t0 + 480_000) }, deps);
+    finish(store, q4.ghJob.enqueued, { at: t0 + 490_000, probes: { prs: [], agents: [] }, errors: {} });
+    await tick({ ...flags, now: iso(t0 + 540_000) }, deps);
+    expect(streak()).toBeUndefined();
+  }, 60000);
+
+  it('the carried gh-group names are exactly the probe names collectGhProbes can report an error under', () => {
+    // A ninth probe added to the group without its name here would silently lose streak-holding on queued ticks.
+    const used = [...collectGhProbes.toString().matchAll(/attempt\('([A-Za-z]+)'/g)].map((m) => m[1]);
+    expect([...GH_GROUP_PROBE_NAMES].sort()).toEqual([...new Set(used)].sort());
+  });
+
+  it('a job that keeps failing builds its own ghJob streak across the queued ticks between failures', async () => {
+    const { flags, hd } = setup('jobstreak');
+    const store = createJobStore(join(dir, 'jobs-jobstreak'));
+    const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+    const streak = () => JSON.parse(readFileSync(join(hd, 'state.json'), 'utf8')).probeErrors?.ghJob?.count;
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    const q1 = await tick({ ...flags, now: iso(t0) }, deps);
+    store.update(q1.ghJob.enqueued, (r) => markFailed(r, { at: iso(t0 + 1000), reason: 'handle dead; 3/3 attempts used' }));
+    const f1 = await tick({ ...flags, now: iso(t0 + 60_000) }, deps); // consumes the failure, queues job 2
+    expect(f1.probeErrors.ghJob).toMatch(/3\/3 attempts used/);
+    expect(streak()).toBe(1);
+    const mid = await tick({ ...flags, now: iso(t0 + 120_000) }, deps); // job 2 running: nothing consumed
+    expect(mid.probeErrors.ghJob).toBeUndefined();
+    expect(streak()).toBe(1);
+    store.update(f1.ghJob.enqueued, (r) => markFailed(r, { at: iso(t0 + 130_000), reason: 'handle dead; 3/3 attempts used' }));
+    await tick({ ...flags, now: iso(t0 + 180_000) }, deps);
+    expect(streak()).toBe(2);
+  }, 60000);
 
   const inlineSpy = () => {
     const spy = { calls: 0 };

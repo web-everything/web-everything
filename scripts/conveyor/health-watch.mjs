@@ -994,6 +994,9 @@ export function probeMergedPrs({ exec = run, limit = 800, timeoutMs = 60_000, re
   return { cards: readBacklogCards(repoRoot), prs };
 }
 
+/** Every probe name `collectGhProbes` can report an error under — the gh-cadence group's error-streak keys. */
+export const GH_GROUP_PROBE_NAMES = Object.freeze(['prs', 'agents', 'authExpired', 'bgIsolationStalls', 'liveBindings', 'buildSessions', 'staleState', 'mergedPrs']);
+
 /**
  * #4131 — the gh-cadence probe group (every 15 min): open PRs, the agent listing and everything read off it,
  * stale-state and merged PRs. The slow part of a tick (live 2026-10-09: ~130 s of a ~150 s tick). Run inline by
@@ -1275,7 +1278,14 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   const silences = readJson(join(dir, 'silences.json'), []).map((x) => ({ ...x, expiredNotified: notified.has(silenceSig(x)) }));
   // A silence whose tracking card is still `active` never expires (4065 Fork 3): read those cards' status.
   const activeCards = readActiveCards(silences.map((x) => x.card).filter(Boolean), flags['backlog-dir'] || join(REPO_ROOT, 'backlog'));
-  const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, deps.smells || SMELLS, now, { config, probeErrors, activeCards });
+  // Job mode, cadence still due, no result consumed: the group took no sample this tick (its job is queued or
+  // running). Inline, a failed read stays due and is re-supplied every tick, so its streak grows; here it must be
+  // held — not cleared by the ticks between a job's failed samples (the core clears a streak whenever a probe
+  // supplies nothing). A cadence that is satisfied is an off-cadence tick, and clears exactly as it does inline.
+  // `ghJob` (the job's own failure, supplied once when it is consumed) is held the same way, so a job that keeps
+  // dying builds its own streak across the ticks between its failures.
+  const carryProbeErrors = ghJobsOn && ghDue && !ghFromJob ? [...GH_GROUP_PROBE_NAMES, 'ghJob'] : [];
+  const result = runHealthTick({ ...prev, silences, lastTick: lastTickForSmells }, probes, deps.smells || SMELLS, now, { config, probeErrors, activeCards, carryProbeErrors });
   // Read history before evaluation, then persist this tick once. Synthetic process fixtures never persist.
   if (!flags['ps-fixture']) attempt('heavyRunSampleAppend', () => appendSample(heavyRunSamplesPath,
     probes.processes ? summarizeSample(findUngatedHeavyRuns(probes.processes), new Date(now).toISOString())
