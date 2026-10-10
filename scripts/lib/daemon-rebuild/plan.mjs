@@ -108,14 +108,15 @@ function changedFiles(git, mainSha, sha) {
  * ancestor of C's tip (the fallback when gh cannot answer). A TOP has no registered child. Every non-top base P:
  *   - is `stack-contained` when one of its tops contains P's current tip: it is live through that top;
  *   - is `stack-base-moved` when none does (P was rebased; its children still carry the old head): set aside, the
- *     children's tops kept until they are restacked. This deliberately overrides "live overlays win" for P. A
- *     PINNED moved base is never set aside (it may carry mechanism the tops lack) — it stays an independent overlay.
+ *     children's tops kept until they are restacked. This deliberately overrides "live overlays win" for P.
+ * A PINNED base (flag or mechanism), contained or moved, is never set aside — it stays an independent overlay, so
+ * its pin refuses a conflicting build rather than the build silently going without it. A registered overlay whose
+ * tip is already an ancestor of main takes no part either (the main loop removes it as `in-main`).
  * Overlays whose PR is MERGED/CLOSED or whose ref is gone take no part (the main loop removes them).
  * @returns {Promise<{setAside:Map<string,{ref:string,pr:number|null,sha:string,reason:string,tops:Array<object>}>,
  *   tops:Array<{ref:string,pr:number|null,sha:string}>}>} `tops` = the tops of stacks only, in list order.
  */
 export async function planOverlayStacks({ git, mainSha, overlays, stateOf = async () => null, prBaseChain = null, isPinned = () => false }) {
-  void mainSha;
   const nodes = [];
   for (const raw of overlays) {
     if (!raw?.ref || nodes.some((n) => n.ref === raw.ref)) continue;
@@ -124,6 +125,9 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
     if (st === 'MERGED' || st === 'CLOSED') continue;
     const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
     if (!sha) continue;
+    // Already in main by ancestry: no part in any stack. The main loop removes it as `in-main`; left in, it would
+    // be a base of any newer overlay branched from main and be set aside, so it would never be removed.
+    if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) continue;
     let chain = null;
     if (pr != null && typeof prBaseChain === 'function') {
       try { chain = await prBaseChain(pr); } catch { chain = null; }
@@ -150,14 +154,17 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
   const stackTops = new Set();
   for (const p of nodes) {
     if (isTop(p.ref)) continue;
-    const tops = nodes.filter((n) => descendants(p.ref).has(n.ref) && isTop(n.ref));
+    // A PINNED base (flag or mechanism) is never set aside, contained or moved: it stays an independent overlay, so a
+    // conflict reaches `refusePinned` instead of leaving the build without it.
+    if (isPinned(p.raw, p.sha)) continue;
+    const tops =nodes.filter((n) => descendants(p.ref).has(n.ref) && isTop(n.ref));
     if (tops.length === 0) continue; // a cycle of equal tips — leave it to the plain loop
     const containing = tops.filter((t) => anc(p.sha, t.sha));
     if (containing.length > 0) {
       setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-contained', tops: containing.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
-    } else if (!isPinned(p.raw, p.sha)) {
+    } else {
       setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
-    } else continue;
+    }
     for (const t of tops) stackTops.add(t.ref);
   }
   return {

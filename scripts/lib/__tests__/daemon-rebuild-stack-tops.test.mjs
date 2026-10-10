@@ -200,3 +200,88 @@ describe('overlay.stackMode cascade', () => {
     expect(resolveOverlayStackMode({ [OVERLAY_STACK_MODE_ENV]: 'bogus' }, { settingsPath })).toMatchObject({ mode: 'tops' });
   });
 });
+
+describe('held item 212 review round 1 — landed overlays and pinned bases', () => {
+  const MECH = 'scripts/lib/daemon-overlays.mjs';
+  const advanceMain = (f, sha) => { gitOk(f.author, ['push', '-q', '-f', 'origin', `${sha}:refs/heads/main`]); f.fetch(); };
+
+  it('a base already in main is removed as in-main even when a newer overlay branched from main contains it', async () => {
+    const f = fixture();
+    const landed = f.push('lane/landed-a', f.init, { [LADDER]: lines({ 4: 'landed a' }) });
+    advanceMain(f, landed); // A reached main by ancestry (fast-forward / merge commit); gh says nothing (pr null)
+    f.push('lane/after-c', landed, { [TAKEOVER]: lines({ 8: 'c after a' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: 'lane/landed-a' }, { ref: 'lane/after-c' }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/landed-a')).toMatchObject({ action: 'remove', reason: 'in-main' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/after-c')).toMatchObject({ action: 'apply' });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-tops');
+  });
+
+  it('an explicitly pinned base contained in a top that conflicts with main refuses the rebuild (never built without it)', async () => {
+    const f = fixture();
+    const p = f.push('lane/pinned-base', f.init, { [TAKEOVER]: lines({ 2: 'pinned base' }) });
+    f.push('lane/pinned-top', p, { [LADDER]: lines({ 3: 'top' }) });
+    gitOk(f.author, ['fetch', '-q', 'origin']);
+    gitOk(f.author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    write(f.author, TAKEOVER, lines({ 2: 'main moved onto the same line' }));
+    gitOk(f.author, ['commit', '-q', '-am', 'main']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: 'lane/pinned-base', pinned: true }, { ref: 'lane/pinned-top' }],
+    });
+    expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict', detail: { ref: 'lane/pinned-base', pinnedBy: 'flag' } });
+  });
+
+  it('an explicitly pinned MOVED base stays an independent overlay (never stack-base-moved)', async () => {
+    const f = fixture();
+    f.moveBase();
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+      overlays: [{ ref: BASE, pr: 4756, pinned: true }, { ref: LAST, pr: 4792 }],
+    });
+    expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === BASE).reason).not.toBe('stack-base-moved');
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+  });
+
+  it('a mechanism-pinned MOVED base stays an independent overlay', async () => {
+    const f = fixture();
+    const old = f.push('lane/mech-base', f.init, { [MECH]: lines({ 2: 'mech v1' }) });
+    f.push('lane/mech-top', old, { [LADDER]: lines({ 3: 'mech top' }) });
+    f.push('lane/mech-base', f.init, { [MECH]: lines({ 2: 'mech v2' }) }); // rebased: the top keeps the OLD head
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9002 ? ['lane/mech-base'] : []),
+      overlays: [{ ref: 'lane/mech-base', pr: 9001 }, { ref: 'lane/mech-top', pr: 9002 }],
+    });
+    // The base is NOT set aside: it applies on its own, and the top (which carries the base's OLD mechanism change,
+    // so it is mechanism-pinned too) conflicts with it — the pin refuses the build instead of dropping either.
+    expect(plan.alerts?.map((a) => a.kind) ?? []).not.toContain('overlay-stack-base-moved');
+    expect(plan).toMatchObject({ ok: false, reason: 'pinned-overlay-conflict', detail: { ref: 'lane/mech-top', pinnedBy: 'mechanism' } });
+  });
+
+  it('a mechanism-pinned base contained in a top stays an independent overlay too', async () => {
+    const f = fixture();
+    const p = f.push('lane/mech-base', f.init, { [MECH]: lines({ 2: 'mech v1' }) });
+    f.push('lane/mech-top', p, { [LADDER]: lines({ 3: 'mech top' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: 'lane/mech-base' }, { ref: 'lane/mech-top' }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/mech-base')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/mech-base').reason).not.toBe('stack-contained');
+  });
+
+  it('addOverlay records only safe branch names as stackBases', async () => {
+    const f = fixture();
+    const { readOverlays } = await import('../daemon-overlays.mjs');
+    addOverlay(f.clone, { ref: LAST, pr: 4792, stackBases: ['lane/ok-base', '../escape', '--upload-pack=x', 'has space', ''] }, { env: f.env });
+    expect(readOverlays(f.clone, { env: f.env }).find((o) => o.ref === LAST).stackBases).toEqual(['lane/ok-base']);
+  });
+});
