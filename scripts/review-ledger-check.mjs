@@ -54,6 +54,8 @@ import { newRunId, writeRun } from './operations/run-store.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { DEFAULT_REPOS, REQUIRED_CLEAN_DAYS, cleanDaysPerFamily, readCheckRuns, renderCleanDays } from './lib/review-ledger-history.mjs';
 
+const MAX_HISTORY_DAYS = 366; // bounds the window loop: `--days=30000000` would spin for minutes
+
 export const DEFAULT_REPO = 'web-everything/web-everything';
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
@@ -67,8 +69,10 @@ export function readOpenPrs({ repo, limit = 200, exec = execFileSync } = {}) {
   const out = exec('gh', [
     'pr', 'list', '--repo', repo, '--state', 'open', '--limit', String(limit), '--json', 'number,labels,title',
   ], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  const parsed = JSON.parse(String(out || '[]'));
-  return Array.isArray(parsed) ? parsed : [];
+  // Empty or non-array output is a failed read, never "no open PRs": runCheck turns the throw into exit 2 and no record.
+  const parsed = JSON.parse(String(out));
+  if (!Array.isArray(parsed)) throw new Error('gh pr list returned a non-array payload');
+  return parsed;
 }
 
 /**
@@ -227,7 +231,9 @@ export function compareDerivedLabels({ derived = [], live = [] } = {}) {
  */
 export function deriveRow({ pr, repo, events, facts, liveLabels, settings = {} }) {
   if (events == null) return { pr, status: 'unreadable', lifecycleState: null, families: [], reason: 'the verdict ledger could not be read' };
-  if (!facts || (facts.probeErrors ?? []).some((e) => /^GitHub PR/.test(e))) {
+  // ANY probe error means a fact (CI rollup, head, comments, referrals…) was not fully read; deriving labels from the
+  // rest would score a partial read as agreement, so the whole row is unreadable.
+  if (!facts || (facts.probeErrors ?? []).length > 0) {
     return { pr, status: 'unreadable', lifecycleState: null, families: [], reason: 'the GitHub facts for this PR could not be read' };
   }
   const mine = events.filter((e) => e.pr === pr && String(e.repo).toLowerCase() === repo.toLowerCase());
@@ -285,18 +291,20 @@ export async function readRepoEventsFromStore(repo, opts = {}) {
  * The ONE run record a check appends. It reuses the operations run record shape, so it lands in the shared runs
  * folder (`OPERATION_RUNS_DIR` wins) next to every other run. Pure given `id` and `at`.
  */
-export function buildCheckRunRecord({ id, repo, at, summary, phase1 }) {
+export function buildCheckRunRecord({ id, repo, at, summary, phase1, scan }) {
   const rec = newRunRecord({ id, op: 'review-ledger-check', input: { repo, at } });
   rec.findings = { derived: { total: summary.total, agree: summary.agree, mismatch: summary.mismatch, unreadable: summary.unreadable,
     perFamily: summary.perFamily, mismatches: summary.mismatches }, phase1 };
+  // Completeness evidence for the history query: a record with no `scan` can never score a clean day.
+  if (scan) rec.findings.scan = { limit: scan.limit, listed: scan.listed, truncated: scan.truncated !== false, storeShared: scan.storeShared === true }; // anything but an explicit `false`/`true` is recorded as the unsafe value
   rec.verdict = summary.mismatch || summary.unreadable ? 'drift' : 'clean';
   return rec;
 }
 
 /** Append the run record. Never throws: a failed record write is reported, not fatal to a report-only checker. */
-export function appendCheckRun({ repo, summary, phase1, at = new Date().toISOString(), write = writeRun, mintId = newRunId }) {
+export function appendCheckRun({ repo, summary, phase1, scan, at = new Date().toISOString(), write = writeRun, mintId = newRunId }) {
   try {
-    const record = buildCheckRunRecord({ id: mintId('review-ledger-check'), repo, at, summary, phase1 });
+    const record = buildCheckRunRecord({ id: mintId('review-ledger-check'), repo, at, summary, phase1, scan });
     return { ok: true, id: record.id, path: write(record) };
   } catch (e) {
     return { ok: false, error: String(e?.message ?? e) };
@@ -350,7 +358,9 @@ export async function runCheck({
   const summary = summarizeAgreement(rows);
   const derivedRows = buildDerivedRows({ repo, prs, events, readFacts });
   const derived = summarizeDerived(derivedRows);
-  const run = noRecord ? { ok: false, skipped: true } : await appendRun({ repo, summary: derived, phase1: { total: summary.total, counts: summary.counts, phase2Safe: summary.phase2Safe } });
+  // A list as long as the limit may have been cut off, so it is recorded as truncated (never trusted as complete).
+  const scan = { limit, listed: prs.length, truncated: prs.length >= limit, storeShared: ledger.store?.shared === true };
+  const run = noRecord ? { ok: false, skipped: true } : await appendRun({ repo, summary: derived, scan, phase1: { total: summary.total, counts: summary.counts, phase2Safe: summary.phase2Safe } });
   const report = { repo, store: ledger.store, ledgerRows: events.length, rows, summary, derived: { ...derived, rows: derivedRows }, run };
   if (json) {
     stdout(`${JSON.stringify(report, null, 2)}\n`);
@@ -387,12 +397,20 @@ export async function runAllRepos({ repos = DEFAULT_REPOS, json = false, stdout 
 export function runHistory({ repos = DEFAULT_REPOS, days = REQUIRED_CLEAN_DAYS, json = false, now = new Date(), read = readCheckRuns,
   stdout = (text) => writeAllSync(1, text) } = {}) {
   const { runs, corrupt } = read();
-  const query = cleanDaysPerFamily(runs, { repos, now, windowDays: days });
+  // The family set is pinned, so a family absent from the records is unknown (streak 0), never silently omitted.
+  const query = cleanDaysPerFamily(runs, { repos, now, windowDays: days, families: LABEL_FAMILIES.map((f) => f.family) });
   const fams = Object.values(query.families);
-  const ready = fams.length > 0 && fams.every((f) => f.ready);
-  if (json) stdout(`${JSON.stringify({ ...query, runCount: runs.length, corrupt, ready }, null, 2)}\n`);
-  else stdout(`${renderCleanDays(query, { corrupt, runCount: runs.length })}\n${ready ? 'ALL FAMILIES READY' : 'NOT READY'}\n`);
-  return { ...query, runCount: runs.length, corrupt, ready, exitCode: ready ? 0 : 1 };
+  // "Ready" means across ALL constellation repos: a narrowed --repos answers the question for a subset only.
+  const have = new Set(repos.map((r) => r.toLowerCase()));
+  const partialScope = !DEFAULT_REPOS.every((r) => have.has(r.toLowerCase()));
+  const ready = !partialScope && fams.length > 0 && fams.every((f) => f.ready);
+  if (partialScope) { // a subset's per-family READY is not the global answer either: keep it as `subsetReady` only
+    for (const f of fams) { f.subsetReady = f.ready; f.ready = false; }
+  }
+  const verdictLine = ready ? 'ALL FAMILIES READY' : partialScope ? 'NOT READY — partial scope: --repos omits constellation repos, so this is not the readiness answer' : 'NOT READY';
+  if (json) stdout(`${JSON.stringify({ ...query, runCount: runs.length, corrupt, partialScope, ready }, null, 2)}\n`);
+  else stdout(`${renderCleanDays(query, { corrupt, runCount: runs.length })}\n${verdictLine}\n`);
+  return { ...query, runCount: runs.length, corrupt, partialScope, ready, exitCode: ready ? 0 : 1 };
 }
 
 async function main(argv) {
@@ -405,7 +423,7 @@ async function main(argv) {
       process.stderr.write('review-ledger-check: --repos must be a comma list of <owner/name>\n');
       return 2;
     }
-    const days = Number.isInteger(Number(flags.days)) && Number(flags.days) > 0 ? Number(flags.days) : REQUIRED_CLEAN_DAYS;
+    const days = Number.isInteger(Number(flags.days)) && Number(flags.days) > 0 ? Math.min(Number(flags.days), MAX_HISTORY_DAYS) : REQUIRED_CLEAN_DAYS;
     return runHistory({ repos, days, json }).exitCode;
   }
   const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
