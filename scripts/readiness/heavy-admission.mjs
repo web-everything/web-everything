@@ -96,7 +96,7 @@
  * A WAITER NEVER RUNS UNSLOTTED WHILE A HOLDER IS ALIVE by default. At the ceiling, admission DEFERS
  * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
  * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
- * Explicit `run` retains the loud unslotted escape. A final reclaim attempt precedes the ceiling decision.
+ * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
  * Cap and fastSlots use one host-wide resolver; their env overrides apply only to a private LANE_POOL_ROOT
  * pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
@@ -992,7 +992,7 @@ let admissionPolicyLogged = false;
  * with an unexpired lease. While blocked it logs a periodic "still waiting" line every {@link
  * STILL_WAITING_LOG_MS} — plain observability, not a give-up signal. Only `ceilingMs` (default {@link
  * DEFAULT_ADMISSION_CEILING_MS}) defers callers that support re-queuing; others keep waiting. Explicit
- * onTimeout=run permits an unslotted run. The ceiling makes one final unranked reclaim attempt first.
+ * onTimeout=run permits an unslotted run. FCFS ranking still applies at the ceiling.
  * WE_HEAVY_ADMISSION=off is checked before touching the lock root and returns a disabled pass-through.
  * @param {object} opts
  * @param {string} opts.lockRoot
@@ -1052,8 +1052,9 @@ export async function acquireSlotBlocking({
       const fastSlots = resolveEffectiveFastSlots({ policy: policy.settings, waiting: listWaiting(lockRoot), snapshot, nowMs: attempt });
       const slotOrder = slotOrderFor(jobKind, cap, fastSlots);
       const atCeiling = !ceilingChecked && attempt - startedAt >= ceilingMs;
-      // One unranked reclaim attempt at the ceiling; callers that keep waiting resume normal fairness.
-      if (atCeiling || isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
+      // Fairness holds at the ceiling too: only the oldest live waiter of its lane tries (a dead or lease-expired
+      // holder is reclaimed by that attempt, so the ceiling never needs an unranked grab that cuts the queue).
+      if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
         // Card xmh9mtr — WHO holds it is fixed here, at acquire (env first, then the lane lease as it is NOW);

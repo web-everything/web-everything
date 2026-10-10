@@ -10,9 +10,10 @@ import { admitLaunch, resolveCostAdmissionSettings } from '../cost-admission.mjs
 import { lightResourceDecision } from '../cost-admission-facts.mjs';
 
 const NOW = Date.parse('2026-10-10T15:00:00Z');
-const snap = ({ idle = 40, pressure = 1, ageMs = 5000, freshForMs = 20000 } = {}) => ({
+const snap = ({ idle = 40, pressure = 1, ageMs = 5000, freshForMs = 20000, freePct, swapUsedPct } = {}) => ({
   sampledAt: new Date(NOW - ageMs).toISOString(), freshUntil: new Date(NOW - ageMs + freshForMs).toISOString(),
-  cpu: { idlePct: idle, loadAvg: [60] }, memory: { pressureLevel: pressure }, disk: { busyPct: 100 }, heavySlots: { held: 1, cap: 4 },
+  cpu: { idlePct: idle, loadAvg: [60] }, memory: { pressureLevel: pressure, ...(freePct !== undefined ? { freePct } : {}), ...(swapUsedPct !== undefined ? { swapUsedPct } : {}) },
+  disk: { busyPct: 100 }, heavySlots: { held: 1, cap: 4 },
 });
 let root;
 const writeSnap = (s) => { mkdirSync(join(root, 'resource'), { recursive: true }); writeFileSync(join(root, 'resource', 'snapshot.json'), JSON.stringify(s)); };
@@ -115,12 +116,16 @@ describe('settings — one resourceGate block through the policy cascade, with s
   it('standard → platform → tool → env per leaf; invalid values never override', () => {
     const r = resolveResourceGateSettings({
       platform: { cutover: 'shadow', fixCap: { raiseQueueOver: 3, ceiling: 'lots' } },
-      tool: { fixCap: { raiseMinCpuIdlePct: 25 } },
-      env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_RESOURCE_CUTOVER: 'enforce' }, legacyFloor: 2,
+      tool: { fixCap: { holdCpuIdleBelowPct: 12 } },
+      env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8', WE_RESOURCE_CUTOVER: 'enforce', WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT: '50' }, legacyFloor: 2,
     });
-    expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseMinCpuIdlePct: 25, raiseStepPerPass: 2 } });
+    expect(r.settings).toEqual({ cutover: 'enforce', fixCap: { floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 3, raiseStepPerPass: 2,
+      raiseMinMemFreePct: 10, raiseMaxSwapUsedPct: 50, raiseMaxHeavyWaitMinutes: 15,
+      lowerBelowMemFreePct: 3, lowerAboveSwapUsedPct: 90, lowerAboveHeavyWaitMinutes: 45, lowerBy: 4, lowerMinimum: 2,
+      holdCpuIdleBelowPct: 12 } });
     expect(r.sources).toMatchObject({ cutover: 'env WE_RESOURCE_CUTOVER', 'fixCap.floor': 'env WE_FIX_DISPATCH_MAX_CONCURRENT',
-      'fixCap.ceiling': 'floor + 4', 'fixCap.raiseQueueOver': 'platform', 'fixCap.raiseMinCpuIdlePct': 'tool', 'fixCap.raiseStepPerPass': 'standard' });
+      'fixCap.ceiling': 'floor + 4', 'fixCap.raiseQueueOver': 'platform', 'fixCap.holdCpuIdleBelowPct': 'tool', 'fixCap.raiseStepPerPass': 'standard',
+      'fixCap.raiseMaxSwapUsedPct': 'env WE_FIX_CAP_RAISE_MAX_SWAP_USED_PCT' });
     expect(r.invalid).toEqual(['platform.fixCap.ceiling="lots"']);
   });
   it('defaults: enforce; floor = the legacy static cap; a ceiling below the floor is raised to it', () => {
@@ -140,11 +145,44 @@ describe('settings — one resourceGate block through the policy cascade, with s
 });
 
 describe('dynamic fixer cap', () => {
-  const fixCap = { floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 5, raiseMinCpuIdlePct: 30, raiseStepPerPass: 2 };
-  const cap = (o) => decideFixCap({ fixCap, nowMs: NOW, liveAtPassStart: 8, queueLength: 7, snapshot: snap({ idle: 45 }), ...o });
-  it('raises above the floor when the CPU is free and the queue is longer than raiseQueueOver, bounded by the step', () => {
-    expect(cap()).toMatchObject({ cap: 10, raised: true });
-    expect(cap().reason).toMatch(/cpu idle 45% ≥ 30% and fix queue 7 > 5/);
+  const fixCap = { ...RESOURCE_GATE_STANDARD.fixCap, floor: 8, ceiling: 12, ceilingAboveFloor: 4, raiseQueueOver: 5, raiseStepPerPass: 2 };
+  const cap = (o) => decideFixCap({ fixCap, nowMs: NOW, liveAtPassStart: 8, queueLength: 7, heavyWaitMinutes: 5,
+    snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 20 }), ...o });
+  it('raises above the floor when memory and swap are healthy, the heavy-queue wait is short and the fix queue is long', () => {
+    expect(cap()).toMatchObject({ cap: 10, raised: true, memFreePct: 30, swapUsedPct: 20, heavyWaitMinutes: 5 });
+    expect(cap().reason).toMatch(/mem free 30% ≥ 10%, swap 20% ≤ 60%, heavy wait 5m ≤ 15m and fix queue 7 > 5/);
+  });
+  it('CPU is only a backstop: 23% idle (live 2026-10-10, held the cap at the floor) now raises; under 10% holds', () => {
+    expect(cap({ snapshot: snap({ idle: 23, freePct: 30, swapUsedPct: 20 }) })).toMatchObject({ cap: 10, raised: true });
+    const held = cap({ snapshot: snap({ idle: 9, freePct: 30, swapUsedPct: 20 }) });
+    expect(held).toMatchObject({ cap: 8, raised: false });
+    expect(held.reason).toMatch(/cpu idle 9% < 10% backstop/);
+  });
+  it.each([
+    ['swap nearly full (live 2026-10-10: 26.5 of 27.6 GB)', { snapshot: snap({ idle: 23, freePct: 30, swapUsedPct: 96 }) }, /swap 96% > 90%/],
+    ['free memory exhausted', { snapshot: snap({ idle: 50, freePct: 2, swapUsedPct: 20 }) }, /mem free 2% < 3%/],
+    ['the heavy queue is backed up', { heavyWaitMinutes: 60 }, /heavy wait 60m > 45m/],
+  ])('LOWERS below the floor: %s', (_, o, why) => {
+    const d = cap(o);
+    expect(d).toMatchObject({ cap: 4, raised: false, lowered: true });
+    expect(d.reason).toMatch(why);
+  });
+  it('never lowers below lowerMinimum', () => {
+    expect(decideFixCap({ fixCap: { ...fixCap, floor: 3 }, nowMs: NOW, liveAtPassStart: 3, queueLength: 7, heavyWaitMinutes: 90,
+      snapshot: snap({ freePct: 30, swapUsedPct: 20 }) })).toMatchObject({ cap: 2, lowered: true });
+  });
+  it.each([
+    ['swap above the raise threshold', { snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 70 }) }],
+    ['free memory under the raise threshold', { snapshot: snap({ idle: 45, freePct: 8, swapUsedPct: 20 }) }],
+    ['heavy wait over the raise threshold', { heavyWaitMinutes: 20 }],
+  ])('holds at the floor (no raise, no lower): %s', (_, o) => {
+    expect(cap(o)).toMatchObject({ cap: 8, raised: false, lowered: false });
+  });
+  it('an unknown memory / swap / heavy-wait reading never blocks a raise on its own, and is named in the reason', () => {
+    const d = cap({ snapshot: snap({ idle: 45 }), heavyWaitMinutes: null });
+    expect(d).toMatchObject({ cap: 10, raised: true });
+    expect(d.reason).toMatch(/mem free \?%/);
+    expect(d.reason).toMatch(/heavy wait \?m/);
   });
   it('never above the ceiling', () => {
     expect(cap({ liveAtPassStart: 11 })).toMatchObject({ cap: 12, raised: true });
@@ -153,7 +191,7 @@ describe('dynamic fixer cap', () => {
   it.each([
     ['queue at the threshold', { queueLength: 5 }],
     ['unknown queue', { queueLength: null }],
-    ['CPU just under the raise threshold', { snapshot: snap({ idle: 29.9 }) }],
+    ['CPU under the backstop', { snapshot: snap({ idle: 9.9, freePct: 30, swapUsedPct: 20 }) }],
     ['fix not admitted (memory critical)', { snapshot: snap({ idle: 90, pressure: 4 }) }],
     ['stale snapshot', { snapshot: snap({ idle: 90, ageMs: 600000 }) }],
     ['missing snapshot', { snapshot: null }],
@@ -164,7 +202,7 @@ describe('dynamic fixer cap', () => {
   it('the throttle admits a fixer above the old static cap when raised, then refuses at the computed cap', () => {
     const claims = Array.from({ length: 8 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const lines = [];
-    const t = createResourceFixThrottle({ listClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap: () => snap({ idle: 45 }),
+    const t = createResourceFixThrottle({ listClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
       nowMs: () => NOW, settings: { cutover: 'enforce', fixCap }, gate: () => ({ admit: true, note: 'admit() admitted' }),
       env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8' }, log: (l) => lines.push(l) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: true, aboveStaticCap: true });
@@ -173,11 +211,14 @@ describe('dynamic fixer cap', () => {
     expect(third).toMatchObject({ admit: false, kind: 'fix-cap' });
     expect(third.why).toContain('cap 10 (dynamic fixer cap: floor 8, ceiling 12');
     expect(lines[0]).toMatch(/^resource-gate fix-cap: old: static cap 8 \| new: cap 10 .* → using 10 \(enforce\)/);
+    // the log line names the new inputs and where each threshold came from
+    expect(lines[0]).toMatch(/inputs: mem free \?% · swap \?% · heavy wait 5m · cpu idle 45% · fix queue 7/);
+    expect(lines[0]).toMatch(/thresholds: .*raiseMaxSwapUsedPct=60 \(standard\)/);
   });
   it('shadow: the static cap decides; the computed cap is only logged', () => {
     const claims = Array.from({ length: 8 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
     const lines = [];
-    const t = createResourceFixThrottle({ listClaims: () => claims, alive: () => true, queueLength: 7, readSnap: () => snap({ idle: 45 }),
+    const t = createResourceFixThrottle({ listClaims: () => claims, alive: () => true, queueLength: 7, readSnap: () => snap({ idle: 45 }), readHeavyWait: () => 5,
       nowMs: () => NOW, settings: { cutover: 'shadow', fixCap }, gate: () => ({ admit: true }), env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '8' }, log: (l) => lines.push(l) });
     expect(t.tryAdmit('fix')).toMatchObject({ admit: false, kind: 'fix-cap' });
     expect(lines[0]).toContain('new: cap 10');
