@@ -74,3 +74,49 @@ export function loadFixPushPolicy({ env = process.env, platformPath = FIX_PUSH_P
   try { tool = readTool()?.fix ?? null; } catch { tool = null; }
   return resolveFixPushPolicy({ platform, tool, env });
 }
+
+// ── fix.selfReviewParallel (card xloi1c0; operator go 2026-10-10 ~11:40 ET) ─────────────────────────────────────
+// `selfReviewParallel: true`  — the fixer commits, requests verify and marks FIRST, then runs its step-5 self-review
+//                              concurrently with the verify gate (and the push-before-gate early push). A must-fix is a
+//                              new commit pushed under the same claim. The harness withholds the green resume, and
+//                              `fix-end` refuses a hand-back release, until verify is green AND the self-review returned.
+// `selfReviewParallel: false` — today's flow: the self-review runs to completion BEFORE the commit / verify request.
+// Same four layers and the same file locations as `pushBeforeGate` above; only the key and the env name differ.
+
+export const FIX_SELF_REVIEW_PARALLEL_ENV = 'WE_FIX_SELF_REVIEW_PARALLEL';
+/** Ship Evermore's declared default (the study: 2.0 min median blocked wait in 65% of fix rounds). */
+export const STANDARD_SELF_REVIEW_POLICY = Object.freeze({ selfReviewParallel: true });
+
+/**
+ * Resolve `fix.selfReviewParallel`. Pure.
+ * @returns {{selfReviewParallel:boolean, source:'standard'|'platform'|'tool'|'env', invalid:string[]}}
+ */
+export function resolveSelfReviewPolicy({ platform = null, tool = null, env = {} } = {}) {
+  let value = STANDARD_SELF_REVIEW_POLICY.selfReviewParallel;
+  let source = 'standard';
+  const invalid = [];
+  const layers = [['platform', platform?.selfReviewParallel], ['tool', tool?.selfReviewParallel], ['env', env?.[FIX_SELF_REVIEW_PARALLEL_ENV]]];
+  for (const [name, raw] of layers) {
+    if (raw === undefined || raw === null || raw === '') continue;
+    const parsed = parsePushBeforeGate(raw);
+    if (parsed === null) { invalid.push(`${name}.selfReviewParallel=${JSON.stringify(raw)}`); continue; }
+    value = parsed;
+    source = name;
+  }
+  return { selfReviewParallel: value, source, invalid };
+}
+
+/** One log line naming the effective value and the layer that set it. Pure. */
+export function formatSelfReviewPolicyLine(policy) {
+  const bad = policy?.invalid?.length ? `; ignored invalid ${policy.invalid.join(', ')}` : '';
+  return `fix-self-review-policy: selfReviewParallel=${policy?.selfReviewParallel} (${policy?.source ?? 'standard'})${bad}`;
+}
+
+/** Read the platform + tool layers and resolve `fix.selfReviewParallel`. Never throws. */
+export function loadSelfReviewPolicy({ env = process.env, platformPath = FIX_PUSH_PLATFORM_PREFERENCES_PATH, readTool = () => readSettings() } = {}) {
+  let platform = null;
+  try { platform = JSON.parse(readFileSync(platformPath, 'utf8'))?.fix ?? null; } catch { platform = null; }
+  let tool = null;
+  try { tool = readTool()?.fix ?? null; } catch { tool = null; }
+  return resolveSelfReviewPolicy({ platform, tool, env });
+}
