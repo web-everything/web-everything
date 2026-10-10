@@ -8,6 +8,7 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runBounded } from '../lib/bounded-child.mjs';
+import { resolveMergeMainBeforeRetry, logMergeMainSource, describeMergeMain, defaultMergeMain } from './load-flake-merge-main.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment, buildLoadFlakeRedispatchResolvedComment } from './stand-down.mjs';
 import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm, loadFlakeAttemptResults } from './load-flake-hold.mjs';
@@ -46,6 +47,8 @@ export function reverifyConfig(env = process.env, maxLoadPerCore) {
     maxAttempts: Math.max(1, Math.floor(positive(env.WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS, 3))),
     cooloffMs: positive(env.WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN, 30) * 60_000,
     mode: reverifyMode(env),
+    // #xg0rkxn — merge current main into the head before a quiet-host retry (policy-cascade shape, source logged).
+    mergeMainBeforeRetry: resolveMergeMainBeforeRetry({ env }).value,
   };
 }
 
@@ -158,9 +161,14 @@ export async function rearmPushedFixes({ prs = [], slug }, io) {
 
 async function reverifyCandidate({ candidate, key, slug, config, load, cores }, io) {
   const { pr, hold, attempts } = candidate;
-  const post = (result, detail = '') => io.comment(slug, pr.number, hold.redispatch
-    ? buildLoadFlakeRedispatchResolvedComment({ result, detail })
-    : buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
+  let mergeMain = null;
+  const post = (result, text = '') => {
+    // The merge note goes LAST: the comment builders keep the final 1500 characters.
+    const detail = [text, describeMergeMain(mergeMain)].filter(Boolean).join('\n\n');
+    return io.comment(slug, pr.number, hold.redispatch
+      ? buildLoadFlakeRedispatchResolvedComment({ result, detail })
+      : buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
+  };
   const check = async () => {
     const live = await io.readPr(slug, pr.number);
     if (live.state !== 'OPEN' || live.headRefName !== pr.headRefName || live.headRefOid !== pr.headRefOid) {
@@ -175,6 +183,12 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores }, 
   };
   let refusal = await check();
   if (refusal) return refusal;
+  // #xg0rkxn (live plateau #220): a re-dispatch on the old head re-runs without whatever main fixed meanwhile (#221, the
+  // very timing tests that flaked). Merge main into the head first; a conflict is left to the conflict-fix path.
+  if (hold.redispatch && attempts < config.maxAttempts && config.mergeMainBeforeRetry && typeof io.mergeMain === 'function') {
+    mergeMain = await io.mergeMain({ slug, branch: pr.headRefName, headSha: pr.headRefOid, base: pr.baseRefName || 'main' });
+    if (mergeMain?.result !== 'up-to-date') console.error(`load-flake reverify: ${slug}#${pr.number} main ${mergeMain?.result}${mergeMain?.sha ? ` → ${mergeMain.sha.slice(0, 9)}` : ''} before the retry`);
+  }
   if (hold.redispatch) {
     const result = attempts >= config.maxAttempts ? 'exhausted' : 'redispatched';
     await post(result, result === 'redispatched'
@@ -309,6 +323,8 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
     // off, and a plain refspec (no force) means a non-fast-forward is refused.
     push: (_laneCwd, sha, branch) => command('git', ['-c', 'core.hooksPath=/dev/null', 'push', '--no-verify', 'origin', `${sha}:refs/heads/${branch}`]),
     comment: (slug, pr, body) => command('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', body]),
+    // #xg0rkxn — merge main into the PR head in this daemon checkout (plumbing only, no force), see load-flake-merge-main.mjs.
+    mergeMain: (args) => defaultMergeMain(args, { run, cwd: root }),
   };
 }
 
@@ -317,10 +333,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
   const config = reverifyConfig(process.env, flags['max-load-per-core']);
+  const mergeMainPolicy = resolveMergeMainBeforeRetry();
+  logMergeMainSource(mergeMainPolicy);
   const repos = {};
   for (const repo of flags.repo ? [flags.repo] : REVERIFY_SWEEP_REPOS) {
     try { repos[repo] = await runLoadFlakeReverify({ repo, dryRun: !!flags['dry-run'], config }); }
     catch (e) { repos[repo] = { repo, error: String(e?.message ?? e) }; }
   }
-  process.stdout.write(`${JSON.stringify({ mode: config.mode, repos })}\n`);
+  process.stdout.write(`${JSON.stringify({ mode: config.mode, mergeMainBeforeRetry: { value: mergeMainPolicy.value, source: mergeMainPolicy.source }, repos })}\n`);
 }
