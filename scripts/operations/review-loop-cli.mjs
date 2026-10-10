@@ -449,10 +449,28 @@ export function chooseSecuritySeat(argv, { enabled = true, store = null, readCha
   return { securitySeat: plan.securitySeat, reason: plan.reason };
 }
 
+/**
+ * THE PATHS A PULL REQUEST'S FILE LIST TOUCHES, rename sources included. PURE. `gh pr view --json files` reports a
+ * renamed file under its NEW path only, so a code file moved to a prose path read as an all-prose PR; the REST file
+ * list (`pulls/N/files`) also carries `previous_filename`, and both paths count.
+ * @param {unknown} files - the parsed array of file entries.
+ * @returns {string[]} distinct paths, destination first then source, per entry.
+ */
+export function pathsWithRenameSources(files) {
+  const out = [];
+  for (const f of Array.isArray(files) ? files : []) {
+    for (const p of [f?.filename, f?.previous_filename]) if (typeof p === 'string' && p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
 function defaultReadChangedFiles({ pr, repo }) {
-  const out = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'files'],
+  // No repo, no REST path: throw, which `chooseSecuritySeat` answers with the full roster. 100 entries is one page and
+  // is the cap above, so a list that long is never trusted to buy prose.
+  if (!repo) throw new Error('no --repo: the file list with rename sources needs the repository');
+  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
-  return (Array.isArray(out?.files) ? out.files : []).map((f) => f?.path).filter((p) => typeof p === 'string' && p);
+  return pathsWithRenameSources(out);
 }
 
 /**
@@ -460,6 +478,12 @@ function defaultReadChangedFiles({ pr, repo }) {
  * pool the review job leases from, under its own session slug, with no wait and no pool growth — when none is free the
  * seat simply waits for the primary lane (`./parallel-judges.mjs`). Released when the batch settles; a crash leaves
  * the lease to the lane pool's own reaper, exactly like the review job's own lease.
+ *
+ * THE LANE'S TREE IS THE PRIMARY LANE'S TREE, ON PURPOSE. `review-job.mjs#acquireLane` leases the primary lane with
+ * the same `acquire --adopt` and NO `--base`, so a review juror's `cwd` is a lane reset to `origin/main`, never a
+ * checkout of the PR head: the diff the juror judges is stated in its mandate (the NET diff, pinned by `read`), and its
+ * tools read the repository around it. A seat lane that checked out something else would make the two tool-bearing
+ * seats read different trees. The arguments are pinned against the review job's by the seat-lane tests.
  * @param {{pr: number, repo: string, root?: string}} o
  */
 export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) {

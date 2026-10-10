@@ -1060,6 +1060,29 @@ const shapeStackBase = (s) => (s && Number.isInteger(s.pr) && typeof s.ref === '
   ? { pr: s.pr, ref: s.ref, head: pinnedSha(s.head), contained: pinnedSha(s.contained), tree: pinnedSha(s.tree), fingerprint: s.fingerprint }
   : null);
 
+/** git quotes a path with special bytes as `"…"` with C escapes; take it back to the plain path (best effort). */
+function unquoteGitPath(s) {
+  if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"')) return s;
+  try { return JSON.parse(s); } catch { return s.slice(1, -1); }
+}
+
+/**
+ * THE OLD PATH OF EVERY RENAME OR COPY IN A GIT DIFF TEXT. PURE. `git diff --name-only` lists only the destination of
+ * a rename, so a code file moved to a prose path is invisible to a path-only list; the diff text's extended header
+ * (`rename from <old>` / `copy from <old>`) is the one place the source is stated. Anything that is not a header line
+ * at the start of a line is ignored, so a file's own content cannot name a path (its lines start with ` `, `+` or `-`).
+ * @param {string} diffText
+ * @returns {string[]} the distinct source paths, in order of appearance.
+ */
+export function renameSourcePaths(diffText) {
+  const out = [];
+  for (const m of String(diffText ?? '').matchAll(/^(?:rename|copy) from (.+)$/gm)) {
+    const p = unquoteGitPath(m[1].replace(/\r$/, ''));
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
 export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
   if (!raw || typeof raw !== 'object') {
     throw new Error(`review-pr.read: the injected reader returned ${typeof raw}, not a PR context object`);
@@ -1142,7 +1165,12 @@ export function shapeReadFinding(raw, { pr, repo, careLevel } = {}) {
     );
   }
 
-  const netChangedFiles = Array.isArray(net.paths) ? net.paths.map(String) : [];
+  // `git diff --name-only` (the net list) names only the NEW path of a rename or copy; the diff TEXT carries the old one.
+  // Both belong in the list the roster and the care level are scored from, or a code file renamed into a prose path
+  // reads as an all-prose PR.
+  const netChangedFiles = Array.isArray(net.paths)
+    ? [...new Set([...net.paths.map(String), ...renameSourcePaths(diff.text)])]
+    : [];
   const degradedReason = net.scored === true ? '' : String(net.reason || 'unscored');
 
   // #xu2pp2m — A DEGRADED BASIS THAT ALSO PRODUCED NO DIFF AT ALL IS `unrun`, NOT A REVIEW. THROWS.
