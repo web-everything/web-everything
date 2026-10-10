@@ -115,38 +115,64 @@ describe('review: a GitHub-stacked top is judged against its base, and its accep
   });
 });
 
-describe('fixer: a stacked top fixes in parallel unless its findings can touch its base\'s files', () => {
+describe('fixer: a stacked top is held behind its base only while both are fixed on shared files', () => {
   beforeEach(() => resetHoldMemo());
   const pair = (extra = {}) => ({ top: 4770, bottom: 4759, bottomRef: 'lane/takeover-review-attempt', bottomHead: sha('b'), containedHead: sha('b'), heldFor: sha('b'), heldSince: null, topHead: sha('c'), bottomOpen: true, inSync: true, restackRounds: 0, ...extra });
-  it('a top whose own change touches none of the base files is dispatched in parallel', () => {
-    const out = applyStackOrder([{ pr: 4770 }], { pairs: [pair({ parallelFix: true })] }, { settings });
-    expect(out.planned).toEqual([{ pr: 4770 }]);
+  // `stackPolicy` + `bottomClaimed` are what markParallelFixPairs sets; the bottom is "busy" when it owes a fix this pass
+  // (it is in `planned`) or holds a live fix claim.
+  const busyBottom = { stackPolicy: true, bottomClaimed: true };
+  it('a top whose own change touches none of the base files is dispatched in parallel, even beside a busy bottom', () => {
+    const out = applyStackOrder([{ pr: 4759 }, { pr: 4770 }], { pairs: [pair({ ...busyBottom, parallelFix: true })] }, { settings });
+    expect(out.planned).toEqual([{ pr: 4759 }, { pr: 4770 }]);
     expect(out.refusals.map((r) => r.kind)).toEqual(['stacked-parallel-fix']);
     expect(out.stackAbove.get(4759).has(4770)).toBe(false);
   });
-  it('a top that touches base files (or unknown) keeps the bottom-first hold of #4655', () => {
-    for (const p of [pair({ parallelFix: false }), pair()]) {
+  it('bottom-first (#4655) holds only while BOTH are being fixed on shared (or unknown) files', () => {
+    for (const p of [pair({ ...busyBottom, parallelFix: false }), pair({ stackPolicy: true, bottomClaimed: null, parallelFix: false })]) {
       const out = applyStackOrder([{ pr: 4770 }], { pairs: [p] }, { settings });
       expect(out.planned).toEqual([]);
       expect(out.refusals.map((r) => r.kind)).toEqual(['stacked-above']);
     }
+    // bottom owes a fix this pass (planned) and shares files: held
+    const owed = applyStackOrder([{ pr: 4759 }, { pr: 4770 }], { pairs: [pair({ stackPolicy: true, bottomClaimed: false, parallelFix: false })] }, { settings });
+    expect(owed.planned).toEqual([{ pr: 4759 }]);
+    expect(owed.refusals.map((r) => r.kind)).toEqual(['stacked-above']);
+  });
+  it('setting off (no stackPolicy on the pair): the old hold is unchanged', () => {
+    const out = applyStackOrder([{ pr: 4770 }], { pairs: [pair({ parallelFix: true, bottomClaimed: false })] }, { settings });
+    expect(out.refusals.map((r) => r.kind)).toEqual(['stacked-above']);
+  });
+  it('live #4715 (2026-10-10 08:40→11:03 ET): bottom #4708 at its round cap, no fix owed, no claim → the top is dispatched, not held', () => {
+    const p = { top: 4715, bottom: 4708, bottomRef: 'lane/gh-merge-queue-gate', bottomHead: sha('a'), containedHead: sha('a'), heldFor: sha('a'), heldSince: null,
+      topHead: sha('d'), bottomOpen: true, inSync: true, restackRounds: 0, stackPolicy: true, bottomClaimed: false, parallelFix: false };
+    // #4708 is absent from `planned`: reconcile refused it `cap-exhausted` on every tick of the window.
+    const out = applyStackOrder([{ pr: 4715 }], { pairs: [p] }, { settings });
+    expect(out.planned).toEqual([{ pr: 4715 }]);
+    expect(out.refusals[0]).toEqual(expect.objectContaining({ kind: 'stacked-parallel-fix', why: expect.stringMatching(/owes no fix this pass and holds no fix claim/) }));
   });
   it('markParallelFixPairs: disjoint files → parallel; shared file or unreadable diff → held; setting off → untouched', () => {
     const files = { [`${sha('b')}...${sha('c')}`]: ['scripts/a.mjs'], [`origin/main...${sha('b')}`]: ['scripts/b.mjs'] };
     const readFiles = () => (a, b) => files[`${a}...${b}`] ?? null;
     const disjoint = { pairs: [pair()] };
-    markParallelFixPairs(disjoint, { root: '.', reviewWhileBaseOpen: () => true, readFiles });
-    expect(disjoint.pairs[0].parallelFix).toBe(true);
+    markParallelFixPairs(disjoint, { root: '.', reviewWhileBaseOpen: () => true, readFiles, readClaims: () => [{ meta: { pr: 4759 } }] });
+    expect(disjoint.pairs[0]).toEqual(expect.objectContaining({ parallelFix: true, stackPolicy: true, bottomClaimed: true }));
+    const noClaim = { pairs: [pair()] };
+    markParallelFixPairs(noClaim, { root: '.', reviewWhileBaseOpen: () => true, readFiles, readClaims: () => [] });
+    expect(noClaim.pairs[0].bottomClaimed).toBe(false);
+    const claimsUnreadable = { pairs: [pair()] };
+    markParallelFixPairs(claimsUnreadable, { root: '.', reviewWhileBaseOpen: () => true, readFiles, readClaims: () => { throw new Error('x'); } });
+    expect(claimsUnreadable.pairs[0].bottomClaimed).toBeNull();
     files[`origin/main...${sha('b')}`] = ['scripts/a.mjs'];
     const shared = { pairs: [pair()] };
-    markParallelFixPairs(shared, { root: '.', reviewWhileBaseOpen: () => true, readFiles });
+    markParallelFixPairs(shared, { root: '.', reviewWhileBaseOpen: () => true, readFiles, readClaims: () => [] });
     expect(shared.pairs[0].parallelFix).toBe(false);
     const unreadable = { pairs: [pair()] };
-    markParallelFixPairs(unreadable, { root: '.', reviewWhileBaseOpen: () => true, readFiles: () => () => null });
+    markParallelFixPairs(unreadable, { root: '.', reviewWhileBaseOpen: () => true, readFiles: () => () => null, readClaims: () => [] });
     expect(unreadable.pairs[0].parallelFix).toBe(false);
     const off = { pairs: [pair()] };
-    markParallelFixPairs(off, { root: '.', reviewWhileBaseOpen: () => false, readFiles });
+    markParallelFixPairs(off, { root: '.', reviewWhileBaseOpen: () => false, readFiles, readClaims: () => [] });
     expect(off.pairs[0].parallelFix).toBeUndefined();
+    expect(off.pairs[0].stackPolicy).toBeUndefined();
   });
   it('stackedTopMayFixInParallel fails closed on an unknown side', () => {
     expect(stackedTopMayFixInParallel({ topOwnFiles: null, bottomFiles: [] })).toEqual({ parallel: false, overlap: null });
