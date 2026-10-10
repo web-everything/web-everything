@@ -1,22 +1,21 @@
 ---
+bornAs: x00pirw
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md"]
+scope: ["we:scripts/lib/daemon-clone-registry.mjs", "we:scripts/lib/__tests__/daemon-clone-registry.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Add a check:standards rule that fails a card marked prepared (preparedDate set) when it has no no… (from web-everything/web-everything#4721 review)
+# Prevention — Invert the rule: treat seed roots as the only exceptions and refuse everything else under .lanes/… (from web-everything/web-everything#4719 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md:22` — Add a check:standards rule that fails a card marked prepared (`preparedDate` set) when it has no non-TODO `## Acceptance`/`## Done when` section.
-2. `we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md` — Implement the planned we:scripts/lib/__tests__/drain-followup-wiring.test.mjs case “long step is not killed” with a separate process ticking while one synchronous command remains blocked beyond staleMs, and assert the original handle remains running without a termination action.
-3. `we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md` — Add a planned “default settings keep follow-up inline” test in we:scripts/lib/__tests__/drain-followup-wiring.test.mjs using the real loader, no env override, a configured repo pin, and empty or missing settings; assert runInline executes once and enqueue and tick never execute.
+1. `we:scripts/lib/daemon-clone-registry.mjs:93` — Invert the rule: treat seed roots as the only exceptions and refuse everything else under `.lanes/`. That would make the fix just the new seed entry and drop the shape predicate. Alternatively, add a test that enumerates the real `.lanes/` layout (including `<repo>/frontierui` siblings) and asserts each is classified as intended.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4721@356cdbb20ef7c50cb1341b2e8cca4205734b3ebf
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4719@9783c0f659f2c8bcc004b6b5bc392bb65b4c8a4d
 
 ## Acceptance
 

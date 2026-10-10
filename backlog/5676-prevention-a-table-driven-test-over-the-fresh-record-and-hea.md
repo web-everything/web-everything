@@ -1,20 +1,21 @@
 ---
+bornAs: xnmvww4
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/daemon-clone-registry.mjs", "we:scripts/lib/__tests__/daemon-clone-registry.test.mjs"]
+scope: ["we:scripts/conveyor/prepare-failure-policy.mjs", "we:scripts/conveyor/__tests__/prepare-failure-policy.test.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — Invert the rule: treat seed roots as the only exceptions and refuse everything else under .lanes/… (from web-everything/web-everything#4719 review)
+# Prevention — A table-driven test over the fresh-record and heal paths that asserts every held, non-retrying ou… (from web-everything/web-everything#4643 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/daemon-clone-registry.mjs:93` — Invert the rule: treat seed roots as the only exceptions and refuse everything else under `.lanes/`. That would make the fix just the new seed entry and drop the shape predicate. Alternatively, add a test that enumerates the real `.lanes/` layout (including `<repo>/frontierui` siblings) and asserts each is classified as intended.
+1. `we:scripts/conveyor/prepare-failure-policy.mjs:253` — A table-driven test over the fresh-record and heal paths that asserts every held, non-retrying outcome carries a `holdReason` or a `retryAfter`. The soak break `prepare-lane-busy-burns-retry-budget` already has that judge for `lane-busy`. Extend it to `infra-transient` heals.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4719@9783c0f659f2c8bcc004b6b5bc392bb65b4c8a4d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4643@d0144f83347a80cbfdf2ad7617358cb513f0f126
 
 ## Acceptance
 

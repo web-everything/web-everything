@@ -1,20 +1,23 @@
 ---
+bornAs: x9cg6aw
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/prepare-failure-policy.mjs", "we:scripts/conveyor/__tests__/prepare-failure-policy.test.mjs"]
+scope: ["we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — A table-driven test over the fresh-record and heal paths that asserts every held, non-retrying ou… (from web-everything/web-everything#4643 review)
+# Prevention — Add a check:standards rule that fails a card marked prepared (preparedDate set) when it has no no… (from web-everything/web-everything#4721 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/prepare-failure-policy.mjs:253` — A table-driven test over the fresh-record and heal paths that asserts every held, non-retrying outcome carries a `holdReason` or a `retryAfter`. The soak break `prepare-lane-busy-burns-retry-budget` already has that judge for `lane-busy`. Extend it to `infra-transient` heals.
+1. `we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md:22` — Add a check:standards rule that fails a card marked prepared (`preparedDate` set) when it has no non-TODO `## Acceptance`/`## Done when` section.
+2. `we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md` — Implement the planned we:scripts/lib/__tests__/drain-followup-wiring.test.mjs case “long step is not killed” with a separate process ticking while one synchronous command remains blocked beyond staleMs, and assert the original handle remains running without a termination action.
+3. `we:backlog/4124-first-adopter-the-drain-s-post-merge-follow-up-becomes-a-dur.md` — Add a planned “default settings keep follow-up inline” test in we:scripts/lib/__tests__/drain-followup-wiring.test.mjs using the real loader, no env override, a configured repo pin, and empty or missing settings; assert runInline executes once and enqueue and tick never execute.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4643@d0144f83347a80cbfdf2ad7617358cb513f0f126
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4721@356cdbb20ef7c50cb1341b2e8cca4205734b3ebf
 
 ## Acceptance
 
