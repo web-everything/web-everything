@@ -288,6 +288,18 @@ describe('gatherPrFacts (injected exec)', () => {
     expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [{ diff: 'old body' }])]).bodyHistory).toMatchObject({ complete: true });
   });
 
+  it('never marks body history complete when an edit node has no readable diff (null/redacted/non-string)', () => {
+    // GraphQL UserContentEdit.diff is nullable: a deleted or redacted edit counts toward totalCount but carries no body,
+    // so the baseline would silently skip a version that may have held the manifest.
+    for (const node of [{ diff: null }, {}, null, { diff: 42 }, { diff: ['x'] }]) {
+      const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ diff: 'old body' }, node])]);
+      expect(facts.bodyHistory.complete, JSON.stringify(node)).toBe(false);
+      expect(evaluated(facts, 'manifest-baseline').status, JSON.stringify(node)).toBe('fail-closed');
+    }
+    // a fully readable history is still complete (the empty-string body is a real, readable version)
+    expect(gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(2, [{ diff: 'old body' }, { diff: '' }])]).bodyHistory.complete).toBe(true);
+  });
+
   it('falls back to the gh file list when git cannot score the diff, and test-gaming then fails closed', () => {
     const facts = gather([GH_PR, GH_MANIFEST_404, GH_HISTORY(1, [])]);
     expect(facts.netSignals).toMatchObject({ scored: false, fallbackFiles: true, changedFiles: ['docs/a.md'] });
