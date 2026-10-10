@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { newRunRecord, writeRun } from '../../operations/run-store.mjs';
+import { newRunRecord, tryReadRun, writeRun } from '../../operations/run-store.mjs';
 import { mandatoryReferralReviewer, mandatoryReferralState, normalizeFinding, referralFindingKey, renderReferralRecord } from '../../lib/jury-core.mjs';
 import { referralCardReadable } from '../../lib/referral-card-readable.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -122,6 +122,37 @@ describe('attempted mandatory referrals', () => {
     expect(hold(pr(), [{ ...evidence(), repo: 'frontier-ui/frontierui' }])).toBeNull();
     const unfinished = run(); unfinished.stepTimings.pop();
     expect(reviewRunEvidence(unfinished)).toBeNull();
+  });
+  // Live 2026-10-10: 3,303 review-pr records (0.8 GB) were re-read and JSON-parsed by EVERY reconcile-pass process —
+  // minutes under host load, which timed out the drain rebuild's reconcile/dispatch smoke checks. The projection
+  // persists on disk now, so a fresh process parses only records that changed.
+  it('a fresh process reuses the on-disk projection: unchanged records are never re-parsed', () => {
+    const dir = temp(); writeRun(run(), dir); writeRun(run({ id: 'review-pr-other', attempted: false }), dir);
+    const first = vi.fn(tryReadRun);
+    const before = readReviewRunEvidence({ dir, readRun: first, memo: new Map() });
+    expect(first).toHaveBeenCalledTimes(2);
+    const second = vi.fn(tryReadRun);
+    expect(readReviewRunEvidence({ dir, readRun: second, memo: new Map() })).toEqual(before);
+    expect(second).not.toHaveBeenCalled();
+    const done = run(); done.findings.referralVerdict = { verdict: 'accept', pendingReferrals: [] };
+    writeRun(done, dir);
+    const third = vi.fn(tryReadRun);
+    const after = readReviewRunEvidence({ dir, readRun: third, memo: new Map() });
+    expect(third).toHaveBeenCalledTimes(1);
+    expect(after.find(e => e.id === 'review-pr-parked').parked).toBe(false);
+    expect(readdirSync(dir).filter(n => n.endsWith('.json')).sort()).toEqual(['review-pr-other.json', 'review-pr-parked.json']);
+  });
+  it('a corrupt or foreign on-disk projection is ignored, never trusted', () => {
+    const dir = temp(); writeRun(run(), dir);
+    readReviewRunEvidence({ dir, memo: new Map() });
+    const cache = readdirSync(dir).find(n => !n.endsWith('.json'));
+    expect(cache).toBeTruthy();
+    for (const junk of ['{not json', JSON.stringify({ v: 1, code: 'some-older-projection', entries: { 'review-pr-parked.json': { key: 'x', evidence: null } } })]) {
+      writeFileSync(join(dir, cache), junk);
+      const spy = vi.fn(tryReadRun);
+      expect(readReviewRunEvidence({ dir, readRun: spy, memo: new Map() })).toHaveLength(1);
+      expect(spy).toHaveBeenCalledTimes(1);
+    }
   });
   it('the latest completed review supersedes an earlier park, including cache invalidation', () => {
     const dir = temp(); writeRun(run(), dir);
