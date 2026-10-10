@@ -231,7 +231,7 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   const isSettings = (f) => isResolvableSettingsFile(f, settingsPolicy);
   const keysBySide = { pr: new Set(), main: new Set() };
   const readersBySide = { pr: [], main: [] };
-  for (const [side, files] of [['main', mainCode0], ['pr', prRaw]]) {
+  for (const { side, files } of [{ side: 'main', files: mainCode0 }, { side: 'pr', files: prRaw }]) {
     for (const f of files.filter(isSettings)) {
       const r = typeof settingsReadersOf === 'function' ? settingsReadersOf(side, f) : null;
       if (!r || !Array.isArray(r.readers)) return done(true, [`settings-readers-unresolved:${f}${r?.why ? ` (${r.why})` : ''}`]);
