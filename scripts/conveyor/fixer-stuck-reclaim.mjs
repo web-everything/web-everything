@@ -36,6 +36,7 @@ import { listLiveFixClaims, fixEnd } from './fix-procedure.mjs';
 import { releaseSessionFixDispatchClaims } from './fix-dispatch-claim.mjs';
 import { readStoredAwaitVerify, clearStoredAwaitVerify, resolveAwaitVerifyTtlMs } from './await-verify.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
+import { runOrphanFixRoundPass, formatOrphanFixRoundLines } from './orphan-fix-round.mjs';
 
 const MINUTE = 60_000;
 export const RECLAIM_ACK_BY = 'fix-dispatch:stuck-fixer-reclaim';
@@ -206,7 +207,24 @@ export async function runFixerStuckReclaimPass({
   stopSession = null,
   endFix = (o) => fixEnd(o),
   releaseDispatch = releaseSessionFixDispatchClaims,
+  // Live #4715 (2026-10-10): a fix round that ENDED (not stuck) leaving `review:changes` with no owner. Runs after the
+  // reclaim below, so a round this pass just reclaimed is seen on a later tick, past the guard's grace. Off under a
+  // test run unless injected (the real pass reads GitHub).
+  orphanPass = process.env.VITEST ? null : runOrphanFixRoundPass,
 } = {}) {
+  const result = await runReclaim();
+  if (orphanPass) {
+    try {
+      const orphan = await orphanPass({ env, nowMs });
+      result.orphanRounds = orphan;
+      for (const r of orphan?.rows ?? []) result.rows.push({ ...r, kind: 'orphan-fix-round' });
+    } catch (e) {
+      result.rows.push({ kind: 'orphan-fix-round', decision: 'error', reason: String(e?.message ?? e).split('\n')[0] });
+    }
+  }
+  return result;
+
+  async function runReclaim() {
   const enabled = reclaimEnabled(env);
   let plan = [];
   try {
@@ -269,9 +287,10 @@ export async function runFixerStuckReclaimPass({
     }
   }
   return { enabled, rows };
+  }
 }
 
 /** One log line per acted-on or held event; quiet when nothing is pending. */
 export function formatFixerStuckReclaimLines(result) {
-  return (result?.rows ?? []).map((r) => `stuck-fixer-reclaim: ${r.repo ?? '?'} PR #${r.pr ?? '?'} ${r.session ?? ''} — ${r.decision}${r.result ? ` → ${r.result}` : ''} (${r.reason})${r.steps ? ` [${r.steps.join(', ')}]` : ''}`);
+  return (result?.rows ?? []).map((r) => (r.kind === 'orphan-fix-round' ? formatOrphanFixRoundLines({ rows: [r] })[0] : `stuck-fixer-reclaim: ${r.repo ?? '?'} PR #${r.pr ?? '?'} ${r.session ?? ''} — ${r.decision}${r.result ? ` → ${r.result}` : ''} (${r.reason})${r.steps ? ` [${r.steps.join(', ')}]` : ''}`));
 }
