@@ -124,8 +124,8 @@
  * defect class this item closes is a default that reads as "allow" when the answer is unknown.
  */
 import { describeIsolatedRetry } from './gate-timeout-retry.mjs';
-import { readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, existsSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
+import { join, sep } from 'node:path';
 import { constants } from 'node:os';
 import { boundFailureDetails } from './verify-failures.mjs';
 
@@ -144,6 +144,61 @@ export const VERIFY_FILENAME = '.lane-verify';
 
 /** #3751 — where a superseded terminal record for an earlier commit of the same lane is kept. */
 export const VERIFY_PREVIOUS_FILENAME = '.lane-verify.previous';
+
+/**
+ * #xgqwuq5 — the GREEN LEDGER: one tiny file per commit sha that a default-gate verify passed on with a CLEAN tree
+ * (`<dir>/<sha>.json`). The lane marker above is one-per-clone and is dropped when a lane is re-leased, so a fixer
+ * working the same PR in a different lane could never see the PR's earlier green; the ledger lives outside every lane
+ * (the coordination root) so `verify.selection: since-last-green` can find "this PR's last green" from any lane. It
+ * only ever NARROWS a local selection to `<green>..HEAD`; it never blesses a landing (the marker, keyed to the exact
+ * HEAD, still does that) and CI still runs the full required suite.
+ */
+export const VERIFY_GREEN_LEDGER_ENV = 'WE_VERIFY_GREEN_LEDGER_DIR';
+const SHA_RE = /^[0-9a-f]{40}$/;
+
+/** The ledger directory: the env override, else `<coordinationRoot>/verify-green`. Pure. */
+export function greenLedgerDir({ env = process.env, coordinationRoot }) {
+  const override = env?.[VERIFY_GREEN_LEDGER_ENV]?.trim();
+  return override || join(coordinationRoot, 'verify-green');
+}
+
+/** Does this run write the ledger? Only a real pool-lane clone (under `.lanes/`) or an explicit ledger override — a
+ *  throwaway test fixture never leaves records in the operator's coordination root. Pure. */
+export function greenLedgerWritable({ repo, env = process.env }) {
+  return !!env?.[VERIFY_GREEN_LEDGER_ENV]?.trim() || String(repo).includes(`${sep}.lanes${sep}`);
+}
+
+/** Should a finished verify record its sha in the ledger? Pure. A GREEN for the default gate (never an arbitrary
+ *  `--gate=` override, never a whole-gate admission fallback), whose tree held still (`treeHash` recorded) and had no
+ *  uncommitted change, so the green describes the COMMIT itself. A run that skipped its gate (`skipped`, e.g. the
+ *  card-only skip) executed nothing and vouches for nothing: never recorded. */
+export function shouldRecordGreen({ status, defaultGate, admissionFallback, treeHash, cleanTree, skipped }) {
+  return status === 'green' && defaultGate === true && !admissionFallback && !skipped && typeof treeHash === 'string' && treeHash !== '' && cleanTree === true;
+}
+
+/** Write one ledger record (atomic temp + rename). IO; best-effort — returns false on any failure, never throws. */
+export function recordGreenLedger({ dir, sha, record }) {
+  if (!SHA_RE.test(String(sha))) return false;
+  try {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `${sha}.json`);
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify({ ...record, sha }, null, 2)}\n`);
+    renameSync(tmp, file);
+    return true;
+  } catch { return false; }
+}
+
+/** Is `sha` vouched for by a ledger record (a parseable green record naming that same sha)? IO; any failure is false. */
+export function hasGreenLedger({ dir, sha }) {
+  if (!SHA_RE.test(String(sha))) return false;
+  try {
+    const rec = JSON.parse(readFileSync(join(dir, `${sha}.json`), 'utf8'));
+    // A record written by the earlier card-only-skip path (no gate ran; its `suites` is the no-op skip command) never vouches.
+    const gateLess = typeof rec?.suites === 'string' && rec.suites.includes('local gate skipped');
+    return !!rec && typeof rec === 'object' && rec.sha === sha && rec.status === 'green' && !rec.skipped && !gateLess;
+  } catch { return false; }
+}
 
 /** Normalize a JSON-parsed marker payload to the shape the gate expects. Pure. A parsed value that is not a
  *  plain object (an array, `null`, a string, a number — all VALID JSON) is NOT a verification record: fold it to
