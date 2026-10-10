@@ -60,17 +60,30 @@ const markerHead = (body, prefix) => {
   return m ? (m[1] === 'unknown' ? null : m[1]) : undefined; // undefined = not this kind of marker
 };
 
+/** How many voids one PR may be given back: a launch fault that outlasts this many retries stops posting comments and
+ *  the operator is asked (otherwise a persistent fault would post two comments per tick, forever). */
+export const TAKEOVER_MAX_VOIDS = 2;
+
+const trustedBodies = (comments) => (Array.isArray(comments) ? comments : [])
+  .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c));
+
+/** Trusted void markers on the thread (each one a takeover that never launched). */
+export function takeoverVoidCount(comments) {
+  return trustedBodies(comments).filter((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER) !== undefined).length;
+}
+
 /**
  * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
- * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing.
+ * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing,
+ * and only the first {@link TAKEOVER_MAX_VOIDS} voids on a PR are honoured.
  */
 export function takeoverMarkers(comments) {
-  const trusted = (Array.isArray(comments) ? comments : [])
-    .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c));
+  const trusted = trustedBodies(comments);
   const starts = trusted
     .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null }))
     .filter((m) => m.head !== undefined);
-  const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined);
+  const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined)
+    .slice(0, TAKEOVER_MAX_VOIDS);
   for (const h of voids) {
     // Cancel the latest start for this head (any start when the void names no head).
     const at = starts.map((m, i) => ({ m, i })).reverse().find(({ m }) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
@@ -111,7 +124,9 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr =
   const head = pr?.headRefOid ?? null;
   const sameHead = markers.some((m) => sameHeadSha(m.head, head));
   if (sameHead || markers.length >= Math.max(0, takeoverMaxPerPr)) {
-    return { ok: false, reason: 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
+    // `takeover-unlaunchable`: the voids ran out, so the bound is spent by launch faults, not by a takeover that ran.
+    const unlaunchable = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
+    return { ok: false, reason: unlaunchable ? 'takeover-unlaunchable' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
   }
   return { ok: true, ...takeoverRung(fixerLadder) };
 }
@@ -125,11 +140,12 @@ export function takeoverMarkerBody({ pr, head, attempts, cap, rung }) {
     + 'the operator is asked next. Ruling disputes always go to the operator.';
 }
 
-/** The void marker: the takeover whose marker was posted for `head` never launched, so it does not count. */
-export function takeoverVoidMarkerBody({ pr, head, reason }) {
+/** The void marker: the takeover whose marker was posted for `head` never launched, so it does not count. A fixed
+ *  phrase only: the spawn error (paths, stderr) is never copied onto the PR. */
+export function takeoverVoidMarkerBody({ pr, head }) {
   return `${FIX_TAKEOVER_VOID_MARKER} head=${head ?? 'unknown'} -->\n`
-    + `↩️ conveyor fix takeover — the takeover session for PR #${pr} did not start`
-    + `${reason ? ` (${String(reason).replace(/<!--|-->/g, '').replace(/\s+/g, ' ').slice(0, 200)})` : ''}; it does not count against the takeover bound, and the next pass retries.`;
+    + `↩️ conveyor fix takeover — the takeover session for PR #${pr} did not start; it does not count against the `
+    + `takeover bound, and the next pass retries (at most ${TAKEOVER_MAX_VOIDS} times per PR).`;
 }
 
 /**

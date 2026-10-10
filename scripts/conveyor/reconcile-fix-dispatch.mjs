@@ -1043,8 +1043,8 @@ export function postTakeoverMarker({ repo, pr, head, takeover, exec = execFileSy
 }
 
 /** Post the void marker: the takeover whose marker went up never launched, so it must not spend the bound. */
-export function postTakeoverVoid({ repo, pr, head, reason, exec = execFileSyncThrottled }) {
-  exec('gh', ['pr', 'comment', String(pr), '--repo', ghRepoSlug(repo), '--body', takeoverVoidMarkerBody({ pr, head, reason })],
+export function postTakeoverVoid({ repo, pr, head, exec = execFileSyncThrottled }) {
+  exec('gh', ['pr', 'comment', String(pr), '--repo', ghRepoSlug(repo), '--body', takeoverVoidMarkerBody({ pr, head })],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
   return true;
 }
@@ -1354,7 +1354,7 @@ export function dispatchFix(planned, {
     // retry reads `takeover-spent` and the operator is told a takeover "already ran" that never did. Best effort: if
     // the void cannot be posted the marker stands (the conservative side of the bound).
     if (takeoverMarked) {
-      try { postTakeoverVoidMark({ repo, pr: planned.pr, head: planned.headRefOid, reason: e?.message }); } catch { /* the bound stays spent */ }
+      try { postTakeoverVoidMark({ repo, pr: planned.pr, head: planned.headRefOid }); } catch { /* the bound stays spent */ }
     }
     // #3850 — the CLI's own stderr proves no agent started AND names a fault the dispatcher can heal (trust
     // the scratch root). Re-grant now and surface it as a transient environment fault, never a dispatch failure.

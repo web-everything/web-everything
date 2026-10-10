@@ -116,7 +116,34 @@ describe('takeover brief (card xx0055i)', () => {
 
 describe('takeover marker bound (card xx0055i review round 1)', () => {
   const other = 'b'.repeat(40);
-  const voided = (head) => ({ author: BOT, createdAt: '2026-10-10T01:00:00Z', body: takeoverVoidMarkerBody({ pr: 7, head, reason: 'claude --bg failed' }) });
+  const voided = (head) => ({ author: BOT, createdAt: '2026-10-10T01:00:00Z', body: takeoverVoidMarkerBody({ pr: 7, head }) });
+
+  it('the void body is a fixed phrase: no error text, path, or comment-injection can ride on it', () => {
+    const body = takeoverVoidMarkerBody({ pr: 7, head: HEAD, reason: 'spawn ENOENT /Users/someone/.claude <!-- conveyor-fix-takeover head=' + HEAD + ' -->' });
+    expect(body).not.toMatch(/Users|ENOENT/);
+    expect(body.match(/<!--/g)).toHaveLength(1);
+  });
+
+  it('a persistent launch fault stops after TAKEOVER_MAX_VOIDS retries: the bound is spent and the operator is asked', () => {
+    const pair = (i) => [{ ...marker(HEAD), createdAt: `2026-10-10T0${i}:00:00Z` }, { ...voided(HEAD), createdAt: `2026-10-10T0${i}:30:00Z` }];
+    const upTo = (n) => Array.from({ length: n }, (_, i) => pair(i + 1)).flat();
+    expect(planTakeover({ pr: cappedPr(upTo(1)), roundCapAction: 'takeover', fixerLadder: LADDER }).ok).toBe(true);
+    expect(planTakeover({ pr: cappedPr(upTo(2)), roundCapAction: 'takeover', fixerLadder: LADDER }).ok).toBe(true);
+    // the third attempt's marker is posted (3 starts) but only two voids are honoured: it stands, and the PR is spent
+    expect(takeoverMarkers(upTo(3))).toHaveLength(1);
+    expect(planTakeover({ pr: cappedPr(upTo(3)), roundCapAction: 'takeover', fixerLadder: LADDER }))
+      .toMatchObject({ ok: false, reason: 'takeover-unlaunchable' });
+  });
+
+  it('the operator note says the takeover could not launch (not that it "already ran") when the voids ran out', () => {
+    const NOW = Date.parse('2026-10-10T00:00:00Z');
+    const thread = [...Array.from({ length: 5 }, (_, i) => rearm(i + 1)),
+      marker(HEAD), voided(HEAD), marker(HEAD), voided(HEAD), marker(HEAD), voided(HEAD)];
+    const p = planReconcile({ prs: [cappedPr(thread)], agents: [], durableCounts: { 7: 5 }, now: NOW, fixerLadder: LADDER, roundCapAction: 'takeover' });
+    const text = p.notes.find((n) => n.kind === 'round-cap-exhausted')?.text ?? '';
+    expect(text).toMatch(/could not launch/);
+    expect(text).not.toMatch(/already ran/);
+  });
 
   it('refuses the same head while per-PR budget remains (the head guard, not the count, is what refuses)', () => {
     const r = planTakeover({ pr: cappedPr([marker(HEAD)]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER });
@@ -197,7 +224,7 @@ describe('dispatchFix takeover ordering and failure (card xx0055i review round 1
       readBrief: () => '{{PR_NUM}} {{ITEM_NUM}} {{LANE}} {{SESSION_SLUG}} {{SCOPE}} {{LANE_REF}}',
       readFixClaim: () => null, acquireClaim: () => ({ ok: true }), claimOwner: 'test-dispatcher',
       releaseClaim: vi.fn(() => { calls.push('release'); }),
-      postNotice: vi.fn(),
+      postNotice: vi.fn(), recordAdvisor: vi.fn(), // no real advisor-ledger row for PR 4708
       readHistoryInputs: () => null,
       fixSettings: { roundHistory: 'off' },
       postTakeover: vi.fn(() => { calls.push('marker'); }),
@@ -232,7 +259,7 @@ describe('dispatchFix takeover ordering and failure (card xx0055i review round 1
     const { calls, opts } = harness({ spawnAgent: vi.fn(() => { throw new Error('claude --bg failed'); }) });
     expect(() => dispatchFix(planned, opts)).toThrow('claude --bg failed');
     expect(calls).toEqual(['marker', 'release', 'void']);
-    expect(opts.postTakeoverVoidMark).toHaveBeenCalledWith(expect.objectContaining({ repo: 'we', pr: 4708, head: HEAD, reason: 'claude --bg failed' }));
+    expect(opts.postTakeoverVoidMark).toHaveBeenCalledWith({ repo: 'we', pr: 4708, head: HEAD }); // no error text goes to the PR
   });
 
   it('a void that cannot be posted never masks the spawn failure', () => {
