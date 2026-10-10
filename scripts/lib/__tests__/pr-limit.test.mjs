@@ -331,7 +331,9 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
       if (args[0] === 'api') return commitsPage([aiCommit]);
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
-    const r = countOpenPrsForRepo('we', { exec, env: {}, scope });
+    // the base row names `main` + an oid, so the real git transport would run (and fetch, in a checkout whose origin is the repo)
+    const git = () => { throw new Error('git unavailable'); };
+    const r = countOpenPrsForRepo('we', { exec, env: {}, scope, git });
     expect(r).toMatchObject({ count: 1, prNumbers: [6], stacked: 0, unresolved: 1, apiFetches: 2 });
     expect(calls.filter((a) => a[0] === 'api' && a.includes('number=9'))).toHaveLength(1);
   });
