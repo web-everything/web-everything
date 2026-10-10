@@ -1,0 +1,7 @@
+{
+  "$comment": "Repo override (operator go 2026-10-10): dedupe mechanical card filings before filing. cards.dedupe on = a finding already on an OPEN card (same target file, same defect class, claim similarity >= cards.similarity) becomes an 'Also raised by' line on that card instead of a new card. Cascade: standard default (off) -> platform preference (cards in scripts/lib/delivery-platform-preferences.json) -> this file -> env (WE_CARDS_DEDUPE, WE_CARDS_DEDUPE_SIMILARITY). See scripts/lib/card-dedupe.mjs; calibrate with scripts/operations/card-dedupe-replay.mjs.",
+  "cards": {
+    "dedupe": true,
+    "similarity": 0.3
+  }
+}
