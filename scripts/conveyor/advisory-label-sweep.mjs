@@ -18,8 +18,9 @@
  * put a PR in NEEDS YOU even before this sweep removes it.
  *
  * WHAT IT NEVER DOES: touch `review:human` / `review:changes` / `review:accepted`, add anything but an
- * `advisory:*` label, or post a comment. The ONE non-`advisory:*` label it may remove is `review:pending`, and
- * only in the repair path, where the advisory has demonstrably run (pinned by a test over every label mix). It
+ * `advisory:*` label, or post a comment. The ONLY non-`advisory:*` labels it may remove are `review:pending` and
+ * `review:awaiting-advisory` (#4722), and only in the repair path, where the advisory has demonstrably run on the
+ * live head (pinned by a test over every label mix). It
  * removes stale `advisory:*` labels (`planAdvisoryStaleLabels`) and, as the backstop for a missed `advise` label
  * write, REPAIRS a human-gated PR whose newest covering advisory disagrees with its labels
  * (`planAdvisoryRepairLabels`). BOTH plans read only advisory comments posted by a trusted principal (automation
@@ -129,7 +130,9 @@ if (IS_CLI) {
       for (const r of results) {
         const did = dryRun ? 'would' : r.error ? 'FAILED to' : 'did';
         const what = r.add ? `set ${r.add}${r.remove.length ? ` and remove ${r.remove.join(',')}` : ''} (advisory covers head, label missing)`
-          : `remove ${r.remove.join(',')} (head moved past the advisory)`;
+          // The stale plan only ever removes `advisory:*`; any other removed label is the repair path's.
+          : r.remove.some((l) => !l.startsWith('advisory:')) ? `remove ${r.remove.join(',')} (advisory covers head, label is stale)`
+            : `remove ${r.remove.join(',')} (head moved past the advisory)`;
         writeLineSync(2, `  ⚠ PR #${r.num}: ${did} ${what}${r.error ? ` (${r.error})` : ''}`);
       }
       writeAllSync(1, `${JSON.stringify({ checked: true, changed: results.length, results })}\n`);
