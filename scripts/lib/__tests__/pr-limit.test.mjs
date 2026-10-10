@@ -19,6 +19,7 @@ import {
   fetchOpenPrs, fetchPrCommits, countOpenPrsForRepo,
   createAuthorshipCache, countOpenPrsForDispatch, DISPATCH_PR_COUNT_API_CAP, AUTHORSHIP_FAILURE_COOLDOWN_MS,
   PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope,
+  authoriseAllow, runPrLimitCli, readLimitState,
 } from '../pr-limit.mjs';
 
 describe('resolvePrLimit', () => {
@@ -555,5 +556,80 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const r = countOpenPrsForDispatch('we', { exec: h.exec, readShared: h.readShared, env: {}, authorshipCache: cache });
     expect(h.graphql()).toBe(0);
     expect(r).toMatchObject({ fallback: true, count: DISPATCH_PR_COUNT_API_CAP, unresolved: 0 });
+  });
+});
+
+// xfaz7ho — `allow` is the operator's exception to grant. Twice on 2026-10-10 a worker ran
+// `pr-limit.mjs allow --branch=<its own branch>` and opened its PR past the limit (#4786, #4779).
+describe('allow is operator-only (xfaz7ho)', () => {
+  const QUOTE = 'ok, let 4786 open past the limit';
+  const operatorEnv = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'main-session' };
+  const primary = '/Users/op/workspace/webeverything';
+  const lane = '/Users/op/workspace/.lanes/web-everything/lane-7';
+  const tmpState = () => join(mkdtempSync(join(tmpdir(), 'pr-limit-allow-')), 'pr-limit.json');
+  const silent = () => ({ write: () => true });
+
+  it('refuses a dispatched worker session (WE_CONVEYOR_WORKER=1), even with a quote', () => {
+    const d = authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwdReal: primary });
+    expect(d.ok).toBe(false);
+    expect(d.channel).toBe('worker');
+    expect(d.refusal).toMatch(/stop and report/);
+  });
+
+  it('refuses an unrecognised worker marker (fail closed)', () => {
+    const d = authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: { ...operatorEnv, WE_CONVEYOR_WORKER: 'true' }, cwdReal: primary });
+    expect(d.ok).toBe(false);
+    expect(d.channel).toBe('unknown');
+  });
+
+  it('refuses an agent working inside a lane clone, even with a quote', () => {
+    const d = authoriseAllow({ branch: 'lane/other', operatorQuote: QUOTE, env: operatorEnv, cwdReal: lane });
+    expect(d.ok).toBe(false);
+    expect(d.channel).toBe('lane');
+  });
+
+  it("refuses allow-listing the caller's OWN checked-out branch", () => {
+    const d = authoriseAllow({ branch: '4786-x', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: 'origin/lane/4786-x' });
+    expect(d.ok).toBe(false);
+    expect(d.refusal).toMatch(/own branch/);
+  });
+
+  it('refuses a missing or blank --operator-quote', () => {
+    for (const q of [undefined, '', '   ', true]) {
+      const d = authoriseAllow({ branch: 'lane/x', operatorQuote: q, env: operatorEnv, cwdReal: primary });
+      expect(d.ok).toBe(false);
+      expect(d.refusal).toMatch(/--operator-quote/);
+    }
+  });
+
+  it('accepts the operator channel with a quote (orchestrator session or a bare terminal)', () => {
+    expect(authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary })).toMatchObject({ ok: true, channel: 'operator-session' });
+    expect(authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: {}, cwdReal: primary })).toMatchObject({ ok: true, channel: 'terminal' });
+  });
+
+  it('CLI: a worker session is refused with a non-zero exit, nothing allow-listed, and the refusal logged', () => {
+    const path = tmpState();
+    const code = runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=need it', `--operator-quote=${QUOTE}`],
+      { env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() });
+    expect(code).not.toBe(0);
+    const st = readLimitState(path);
+    expect(isBranchAllowedNow(st, 'lane/4786-x')).toBe(false);
+    expect(st.history.at(-1)).toMatchObject({ action: 'allow-refused', target: '4786-x' });
+  });
+
+  it('CLI: missing quote is refused; operator channel with a quote is accepted and records the quote verbatim', () => {
+    const path = tmpState();
+    const deps = { env: operatorEnv, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() };
+    expect(runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r'], deps)).not.toBe(0);
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/4786-x')).toBe(false);
+    expect(runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r', `--operator-quote=${QUOTE}`], deps)).toBe(0);
+    const st = readLimitState(path);
+    expect(isBranchAllowedNow(st, 'lane/4786-x')).toBe(true);
+    expect(st.branches['lane/4786-x']).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session' });
+  });
+
+  it('existing allow-list entries written before this rule (no quote, no channel) are still honoured', () => {
+    const legacy = parseLimitState(JSON.stringify({ branches: { '4779-y': { reason: 'old', by: 'nic', at: '2026-10-10T10:00:00.000Z', until: null } } }));
+    expect(isBranchAllowedNow(legacy, 'lane/4779-y')).toBe(true);
   });
 });

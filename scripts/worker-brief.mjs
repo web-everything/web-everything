@@ -89,6 +89,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
 6. **One PR.** Commit with a tight pathspec (your files only), verify with
    \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
+   If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.

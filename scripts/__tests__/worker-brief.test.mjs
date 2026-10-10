@@ -49,6 +49,10 @@ describe('renderWorkerBrief', () => {
     }
   });
 
+  it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
+    expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
+  });
+
   it('includes the optional edge section as the last numbered rule', () => {
     const brief = renderWorkerBrief({ ...params, edgeClone: '/tmp/edge' });
     expect(brief).toContain('8. **Edge.**');
