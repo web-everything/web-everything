@@ -79,7 +79,7 @@ export function formatLedgerReadSettings(s) {
 }
 
 function defaultExec(args, opts = {}) {
-  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024, ...opts });
 }
 
 /**
