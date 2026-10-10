@@ -1,18 +1,17 @@
 ---
+bornAs: xi0wo5b
 kind: story
 size: 3
 parent: "4131"
-status: active
-scaffoldedBy: "fix-4691"
-dateScaffolded: "2026-10-10"
-scope: ["we:scripts/conveyor/health-watch-core.mjs"]
+status: open
+scope: ["we:scripts/check-standards.mjs", "we:scripts/conveyor/health-watch.mjs"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Health state episode timestamps are trusted: a future openedAt or firstBreachAt delays reminders and escalation
+# Lint rule: flag Object.assign of parsed-file data into daemon tick state
 
-Found while sweeping PR 4691's defect class (untrusted file data parking a cadence). runHealthTick reads episode stamps (openedAt, firstBreachAt, lastBreachAt, flap opens) and probe-error streak counts back from the health daemon's user-writable state file. A future stamp makes the age negative, so reminders (reminderAfterMs) and escalation (escalateAfterMs) never fire; a non-numeric count turns a streak into NaN. Treat a future or non-finite stamp as absent, and a non-numeric streak count as 0, with a test per field.
+Review of PR 4691 (the health-daemon gh-probe job) found a job result sidecar merged into the tick with Object.assign and no key allowlist, no sampledAt bound and no size cap. A check:standards rule that flags Object.assign(<state>, <data parsed from a file>) inside we:scripts/conveyor/ ticks would catch the general class before review. Prevention item owed by the advisory comment.
 
 ## Acceptance
 
