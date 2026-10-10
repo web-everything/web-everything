@@ -33,6 +33,10 @@ import {
 
 const fx = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/accept-carry-forward-4535.json'), 'utf8'));
 const OTHER_FP = 'a'.repeat(64);
+// Marker-anchored fixtures come from the drain's OWN exported builders, never a hand-typed look-alike (PR #4631 round 4, F1):
+// `MECHANICAL_PARK_RE` / `TEST_GAMING_PARK_REASON_RE` anchor on this text, so a reworded drain park must redden the tests.
+const PARK_REASON = buildTestGamingParkReason(['1 test removed']);
+const parkBody = (reason) => buildDrainReasonComment('park', reason);
 const OLD = fx.acceptedHead;
 const NEW = fx.newHead;
 
@@ -151,7 +155,7 @@ describe('a later verdict or deliberate hold is never carried past (positive ide
   const after = (body, author = BOT) => [...fx.comments, { author, body, createdAt: '2026-10-09T15:00:00Z' }];
   // The REAL builder, never a hand-typed look-alike (PR #4631 round 4, F1): `MECHANICAL_PARK_RE` anchors on the marker and
   // heading, so a reworded drain park must redden these cases instead of silently never carrying.
-  const drainPark = (reason) => buildDrainReasonComment('park', reason);
+  const drainPark = parkBody;
   const verdict = (comments) => decideAcceptCarryForward({ setting: 'on', record: latestAcceptRecord(comments), headSha: NEW, headDiff: fx.netDiff[NEW] });
   const planned = (comments) => planAcceptCarry([{ number: 7, labels: ['review:human'], headRefOid: NEW, comments }], { setting: 'on' });
 
@@ -324,7 +328,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   // The live #4535 evidence shape: the drain ledgered its test-gaming park, then added the label 9 s later.
   const PARK_AT = '2026-10-09T14:36:41.318Z';
   const dRow = (over = {}) => ({ pr: 9, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: PARK_AT,
-    reason: 'test-gaming suspected — CI-green may be manufactured by tampering with tests', ...over });
+    reason: PARK_REASON, ...over });
   const labeledAt = (created_at, login = 'chalbert') => ({ event: 'labeled', created_at, label: { name: 'review:human' }, actor: { login } });
   const MECHANICAL = { ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] };
 
@@ -396,14 +400,14 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   });
 
   it('F2-F4: a later escalation-policy drain park makes the restamp refuse, with NO write', () => {
-    const later = { author: BOT, body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nreview escalation: blast-radius over threshold' };
+    const later = { author: BOT, body: parkBody('review escalation: blast-radius over threshold') };
     const r = restamp({ comments: [clearComment(), later] });
     expect(r.exitCode).not.toBe(0);
     expect(r.writes).toEqual({ setLabels: [], postComment: [] });
   });
 
   it('the #4535 shape: only a test-gaming drain park after the clear-human — the restamp still carries', () => {
-    const later = { author: BOT, body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\ntest-gaming suspected — CI-green may be manufactured' };
+    const later = { author: BOT, body: parkBody(PARK_REASON) };
     const r = restamp({ comments: [clearComment(), later] });
     expect(r.exitCode).toBe(0);
     expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
@@ -424,7 +428,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   });
 
   it('a held-park comment does not launder a deliberate hold (it is posted BECAUSE a hold stands, whoever put it there)', () => {
-    const held = { author: BOT, body: '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nheld — a review hold (review:human) stands on this PR' };
+    const held = { author: BOT, body: parkBody(buildHeldReviewHoldReason({ labels: ['review:human'], body: '' })) };
     const r = restamp({ comments: [clearComment(), held], ledger: [], events: [labeledAt('2026-10-09T15:00:00Z')] });
     expect(r.exitCode).not.toBe(0);
     expect(r.writes).toEqual(NO_WRITES);
@@ -606,7 +610,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
 describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
   const T = Date.parse('2026-10-09T14:36:41.318Z');
   const iso = (ms) => new Date(T + ms).toISOString();
-  const row = (over = {}) => ({ pr: 5, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: iso(0), reason: 'test-gaming suspected — x', ...over });
+  const row = (over = {}) => ({ pr: 5, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: iso(0), reason: PARK_REASON, ...over });
   const ev = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: 'review:human' } });
   const decide = (o) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows: [row()], events: [ev(9_000)], ...o });
 
@@ -679,7 +683,10 @@ describe('applyTestGamingParkLabel — only a live-absent label is attested as t
     expect(out).toMatchObject({ ledgered: true, added: true });
     expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(true);
   });
-  it('INTERLEAVING: the operator\'s review:human already stands at the drain\'s add -> no row, no add, the hold is never mechanical', () => {
+  // NARROWED, NOT CLOSED: if the operator's label lands AFTER this live read and before the drain's add (one `gh` round
+  // trip), the add is still a no-op and one event pairs with the row. GitHub has no compare-and-swap on labels and the
+  // drain shares the operator's login, so that gap is not closable from the client; it is disclosed on the card.
+  it('operator label already standing at the live read: no row, no add, so the hold is never mechanical', () => {
     const { out, log, rows } = run([{ name: LABEL }]);
     expect(log).toEqual([]);
     expect(out).toMatchObject({ ledgered: false, added: false });
@@ -742,7 +749,7 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
   });
   it('isKnownMachineBody: verdicts / re-arms / non-mechanical parks are never machine shapes', () => {
     for (const b of ['🔁 review — changes requested', '🔧 conveyor fix — re-armed for re-review', '🛑 conveyor fix — stood down', 'review paused: x',
-      '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nreview escalation: x', 'hello']) expect(isKnownMachineBody(b)).toBe(false);
+      parkBody('review escalation: x'), 'hello']) expect(isKnownMachineBody(b)).toBe(false);
     expect(isKnownMachineBody(undefined)).toBe(true);
     expect(isKnownMachineBody('  \n ')).toBe(true);
   });
