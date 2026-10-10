@@ -1,6 +1,6 @@
 ---
 kind: task
-parent: "x6woyws"
+parent: "5712"
 status: open
 scope: ["we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
 dateOpened: "2026-10-09"
