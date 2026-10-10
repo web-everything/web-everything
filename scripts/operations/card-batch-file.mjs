@@ -28,6 +28,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { admitCard, cardBatchStateDir } from './card-batch-io.mjs';
 import { bypassesBatch } from '../lib/card-batch-policy.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { effectiveCardBatchPolicy, formatCardBatchSettings, loadCardBatchSettings } from '../lib/card-batch-settings.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -80,7 +81,7 @@ export async function fileIntoBatch({
   const cardId = cardIdOf(cardPath);
   if (!cardId) return { batched: false, reason: `not a top-level backlog card: ${cardPath}` };
   try {
-    const repo = source.repo ?? 'web-everything/web-everything';
+    const repo = source.repo ?? CONSTELLATION_REPOS.we.slug;
     const base = baseSha ?? (() => {
       try { git(laneDir, ['fetch', '--no-tags', '-q', 'origin', 'main']); } catch { /* fall back to the lane's last fetch */ }
       return git(laneDir, ['rev-parse', 'origin/main^{commit}']);
