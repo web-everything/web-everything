@@ -67,6 +67,17 @@ export function planQueueFollowUps({ merged = [], followedUp = [] } = {}) {
     .map((p) => ({ num: Number(p.number), mergeSha: p.mergeCommit?.oid ?? null, mergedAt: p.mergedAt ?? null }));
 }
 
+/** The GitHub Actions app: a required check is only accepted when this app posted it (a status from anyone else cannot satisfy it). */
+export const GITHUB_ACTIONS_INTEGRATION_ID = 15368;
+
+/**
+ * Every workflow file that defines a required check. GitHub reads a workflow's YAML from the PR merge ref
+ * (`pull_request`) or the group commit (`merge_group`), so a PR could edit one to `exit 0`, or add a new workflow
+ * whose job carries a required check's name. The ruleset's `workflows` rule runs each of these from `main`
+ * instead; a test fails when a workflow defining a required check is missing here.
+ */
+export const REQUIRED_WORKFLOW_PATHS = ['.github/workflows/ci.yml', '.github/workflows/merge-gate.yml', '.github/workflows/soak-replay-gate.yml'];
+
 /** The ruleset the operator enables for a policy (GitHub reads the ruleset, never this file). Pure. */
 export function rulesetSuggestion(policy, requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate']) {
   return {
@@ -81,6 +92,8 @@ export function rulesetSuggestion(policy, requiredChecks = ['test', 'smoke', 'da
       checkResponseTimeoutMinutes: 60,
     },
     requiredStatusChecks: requiredChecks,
+    requiredStatusCheckIntegrationId: GITHUB_ACTIONS_INTEGRATION_ID,
+    requiredWorkflows: REQUIRED_WORKFLOW_PATHS.map((path) => ({ path, ref: 'refs/heads/main' })),
   };
 }
 

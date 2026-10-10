@@ -11,8 +11,13 @@
 # gate's SCRIPTS by editing them in its diff. The PR's body, labels, comments and diff are read as data.
 # WHAT IS NOT PINNED: this workflow YAML. GitHub reads the workflow file from the PR's merge ref for
 # `pull_request`, and from the group commit for `merge_group`, so a PR that edits this file (e.g. makes the job
-# `exit 0`) changes what the required check does. The defence for that is review escalation of any
-# .github/workflows/* diff (the blast-radius signal, pinned by merge-gate-ci.test.mjs), not this file.
+# `exit 0`) changes what the required check does. The defence is the ruleset, not this file:
+# rulesetSuggestion (scripts/lib/merge-queue-enqueue.mjs) puts every workflow that defines a required check in the
+# ruleset's `workflows` rule (requiredWorkflows) pinned to refs/heads/main, so GitHub runs them from main rather
+# than from the PR, and accepts the required checks only from the GitHub Actions app
+# (requiredStatusCheckIntegrationId). A test fails when a workflow defining a required check is not in that pin.
+# Until the operator applies that ruleset, the only guard is review escalation of any .github/workflows/* diff
+# (the blast-radius signal, pinned by merge-gate-ci.test.mjs); card xha9nns adds the human-required path.
 # BOOTSTRAP (true bootstrap only): until this lands, main has neither scripts/merge-gate-check.mjs nor this
 # workflow, so the check reports clear (the same bootstrap review-gate.yml documents); it is not required by the
 # ruleset until the operator adds it. The moment main has this workflow, a missing script FAILS CLOSED — a later
@@ -87,7 +92,10 @@ jobs:
           fi
           git config user.name merge-gate && git config user.email merge-gate@users.noreply.github.com
           if [ -n "$MG_HEAD_SHA" ]; then
-            git fetch origin "$MG_HEAD_SHA" "$MG_BASE_SHA"
+            for sha in "$MG_HEAD_SHA" "$MG_BASE_SHA"; do
+              [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-gate: merge group sha is not a 40-hex commit id — failing closed." >&2; exit 1; }
+            done
+            git fetch origin -- "$MG_HEAD_SHA" "$MG_BASE_SHA"
             GROUP_TREE="$RUNNER_TEMP/group-tree"
             mkdir -p "$GROUP_TREE"
             git archive "$MG_HEAD_SHA" backlog | tar -x -C "$GROUP_TREE"

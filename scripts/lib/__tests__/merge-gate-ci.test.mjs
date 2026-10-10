@@ -1,12 +1,13 @@
 // @vitest-environment node
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueuedPr } from '../merge-gate-ci.mjs';
 import { DRAIN_GATES } from '../merge-gate-inventory.mjs';
+import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 import { scoreEscalation } from '../review-escalation.mjs';
 import { MANIFEST_BODY_BEGIN, MANIFEST_BODY_END, extractManifestFromBody } from '../../readiness/lane-manifest.mjs';
 import { gatherPrFacts, readGroupPrs, readLedgerConfig, mergeEventOfFlags } from '../../merge-gate-check.mjs';
@@ -450,12 +451,29 @@ describe('merge-gate workflow structure', () => {
     expect(job.steps.indexOf(checkoutStep)).toBeLessThan(job.steps.indexOf(evaluate));
   });
 
+  it('validates the dispatch merge-group shas as 40-hex before git can read them as options', () => {
+    const run = evaluate.run;
+    expect(run).toMatch(/\[\[ "\$sha" =~ \^\[0-9a-f\]\{40\}\$ \]\][\s\S]*git fetch origin -- "\$MG_HEAD_SHA" "\$MG_BASE_SHA"/);
+    const guard = run.match(/for sha in [^\n]*; do[\s\S]*?\n\s*done/)[0].replace(/^\s+/gm, '');
+    const exits = (head, baseSha) => spawnSync('bash', ['-ec', guard], { env: { PATH: process.env.PATH, MG_HEAD_SHA: head, MG_BASE_SHA: baseSha }, encoding: 'utf8' }).status;
+    expect(exits('a'.repeat(40), 'b'.repeat(40))).toBe(0);
+    for (const bad of ['--upload-pack=touch /tmp/x', '-' + 'a'.repeat(39), 'a'.repeat(39), 'A'.repeat(40), 'a'.repeat(40) + '\n--upload-pack=x', '']) {
+      expect(exits(bad, 'b'.repeat(40)), JSON.stringify(bad)).not.toBe(0);
+      expect(exits('a'.repeat(40), bad), JSON.stringify(bad)).not.toBe(0);
+    }
+  });
+
   it('does not claim the YAML itself is pinned to main (only the scripts are)', () => {
     const header = readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8').split('\nname:')[0];
     expect(header).not.toMatch(/cannot neuter its\s+own gate/i);
     expect(header).toMatch(/not pinned[^\n]*workflow YAML/i);
     expect(header).toMatch(/workflow file from the PR's merge ref/i);
     expect(header).toMatch(/from the group commit/i);
+  });
+
+  it('names the ruleset required-workflow pin as the defence for the unpinned YAML, not only escalation', () => {
+    const header = readFileSync(new URL('../../../.github/workflows/merge-gate.yml', import.meta.url), 'utf8').split('\nname:')[0];
+    expect(header).toMatch(/rulesetSuggestion[\s\S]*requiredWorkflows|requiredWorkflows[\s\S]*refs\/heads\/main/);
   });
 
   describe('bootstrap shim', () => {
@@ -530,5 +548,25 @@ describe('a diff to the merge-gate workflow is escalated, not waved through', ()
   it('holds review-acceptance for that edit until an independent review accepts it', () => {
     const pending = facts({ ...edit, pr: { labels: labels('ready-to-merge', 'review:pending') }, acceptance: null });
     expect(evaluated(pending, 'review-acceptance'), JSON.stringify(evaluatePrGates(pending).blocking)).toMatchObject({ status: 'hold' });
+  });
+});
+
+// Class guard: every workflow file that defines a required check is run from main by the ruleset. A workflow added
+// later with a job named like a required check (the review's "add a new workflow with a job named merge-gate"
+// shape) fails here until it is listed, so the YAML pin cannot silently miss one.
+describe('every workflow defining a required check is in the ruleset required-workflow pin', () => {
+  const dir = new URL('../../../.github/workflows/', import.meta.url);
+  const required = rulesetSuggestion({}).requiredStatusChecks;
+  const pinned = new Set(rulesetSuggestion({}).requiredWorkflows.map((w) => w.path));
+
+  it('lists each such workflow file', () => {
+    const definers = [];
+    for (const file of readdirSync(dir).filter((f) => /\.ya?ml$/.test(f))) {
+      const wf = yaml.load(readFileSync(new URL(file, dir), 'utf8'));
+      const names = Object.entries(wf.jobs || {}).flatMap(([id, job]) => [id, job?.name].filter(Boolean).map(String));
+      if (names.some((n) => required.includes(n))) definers.push(`.github/workflows/${file}`);
+    }
+    expect(definers).toEqual(expect.arrayContaining(['.github/workflows/merge-gate.yml']));
+    expect(definers.filter((p) => !pinned.has(p)), 'workflow defines a required check but is not pinned to main').toEqual([]);
   });
 });
