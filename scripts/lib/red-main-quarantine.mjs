@@ -16,6 +16,7 @@
  *
  *   List file (`quarantine.json` on `ops/quarantine`):
  *     `{ version:1, entries:[{ test, brokenSha, owner, reason, addedAt, expiresAt, area? }] }`
+ *     plus optional `fixPrs:[n,..]` — the main-fix PR numbers CI runs the quarantined tests for (set by a writer only).
  *   Audit trail (`events.jsonl`, same commit): one `{type:'quarantine-added'|'quarantine-removed', ...}` per change.
  */
 
@@ -35,6 +36,7 @@ const SAFE_TEST = /^[\w./@-]+(?:::[^\n\r]{1,200})?$/; // a repo-relative test fi
 export function validateQuarantineList(list) {
   const errors = [];
   if (!list || typeof list !== 'object' || list.version !== 1 || !Array.isArray(list.entries)) return { ok: false, errors: ['not a v1 quarantine list'] };
+  if (list.fixPrs !== undefined && (!Array.isArray(list.fixPrs) || !list.fixPrs.every((n) => Number.isInteger(n) && n > 0))) errors.push('fixPrs: not a list of PR numbers');
   list.entries.forEach((e, i) => {
     if (!e || typeof e !== 'object') { errors.push(`entry ${i}: not an object`); return; }
     if (!isStr(e.test) || !SAFE_TEST.test(e.test) || e.test.includes('..')) errors.push(`entry ${i}: bad test id`);
@@ -81,7 +83,7 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
   }
-  const next = { version: 1, entries };
+  const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}) };
   const v = validateQuarantineList(next);
   if (!v.ok) return { ok: false, error: v.errors.join('; ') };
   return { ok: true, list: next, events };
@@ -99,7 +101,157 @@ export function pruneOnGreen(list, { mainGreen, now, actor = 'red-main-safety-ne
     if (why) events.push({ type: 'quarantine-removed', at: now, actor, test: e.test, brokenSha: e.brokenSha, why });
     else keep.push(e);
   }
-  return { list: { version: 1, entries: keep }, events };
+  // The main-fix PR set belongs to the red it fixes: it goes with the last entry (or on green).
+  const fixPrs = keep.length && mainGreen !== true && Array.isArray(list?.fixPrs) ? { fixPrs: list.fixPrs } : {};
+  if (!keep.length && list?.fixPrs?.length) events.push({ type: 'quarantine-fix-prs', at: now, actor, fixPrs: [] });
+  return { list: { version: 1, entries: keep, ...fixPrs }, events };
+}
+
+/**
+ * Record the main-fix PR numbers on the list, so CI (which reads ONLY the list's ops ref) can run the quarantined
+ * tests for them. Only a writer may set it; the numbers come from the safety net's owner-PR recognition
+ * (`main-ci-red-core.mjs#findOwnerPrs`), never from a PR's own tree. PURE.
+ */
+export function setFixPrs(list, { fixPrs, actor, now }) {
+  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+  const base = list && list.version === 1 ? list : { version: 1, entries: [] };
+  const nums = [...new Set((fixPrs ?? []).map(Number).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b);
+  const next = { ...base, version: 1, entries: [...base.entries], fixPrs: nums };
+  const v = validateQuarantineList(next);
+  if (!v.ok) return { ok: false, error: v.errors.join('; ') };
+  return { ok: true, list: next, events: [{ type: 'quarantine-fix-prs', at: now, actor, fixPrs: nums }] };
+}
+
+/** ANSI colour codes and the GitHub log timestamp prefix (`2026-10-10T18:51:42.3059106Z `). */
+const ANSI = /\x1b\[[0-9;]*m/g;
+const LOG_TS = /^\d{4}-\d\d-\d\dT[\d:.]+Z /;
+
+/**
+ * Failing vitest tests from one CI job's log (untrusted text). `complete` only when the run's own summary line
+ * (`Test Files  N failed | …`) names exactly as many failed files as were parsed — anything else (a crash before the
+ * summary, a cut-off log, a failure outside vitest) is NOT a known-failing-test case. PURE.
+ * @returns {{files:string[], tests:Array<{file:string,name:string|null}>, failedFiles:number|null, complete:boolean}}
+ */
+export function parseVitestFailures(logText) {
+  const tests = [];
+  let failedFiles = null;
+  for (const raw of String(logText ?? '').split('\n')) {
+    const line = raw.replace(LOG_TS, '').replace(ANSI, '').trimEnd();
+    const m = /^\s*FAIL\s+(\S+)(?:\s+\[[^\]]*\])?(?:\s+>\s+(.+))?$/.exec(line); // `FAIL file > a > b`, or `FAIL file [ file ]` (a suite that failed to load)
+    if (m && SAFE_TEST.test(m[1]) && !m[1].includes('..') && /\.test\.[cm]?[jt]sx?$/.test(m[1])) tests.push({ file: m[1], name: m[2] ? m[2].replace(/\s+>\s+/g, ' > ').slice(0, 200) : null });
+    const s = /^\s*Test Files\s+(\d+) failed\b/.exec(line);
+    if (s) failedFiles = Number(s[1]);
+  }
+  const files = [...new Set(tests.map((t) => t.file))];
+  return { files, tests, failedFiles, complete: failedFiles !== null && failedFiles === files.length && files.length > 0 };
+}
+
+/** Built-in (standard) knobs of the safety net; the IO resolves each through the policy cascade. */
+export const QUARANTINE_SAFETY_NET_DEFAULTS = Object.freeze({
+  /** A failed job matching this is a unit-test job: its log must name every failing test file. */
+  unitJobPattern: '^test-shard \\(\\d+\\)$',
+  /** Aggregator jobs that fail only because a unit job did (`test` gates on `needs.test-shard`). */
+  derivedJobs: Object.freeze(['test']),
+  /** More failing files than this is not "a known failing test": stay in STOP. */
+  maxTests: 5,
+  /** Entry lifetime (minutes); capped by QUARANTINE_MAX_TTL_MS. */
+  ttlMin: 360,
+});
+
+/**
+ * What the red-main safety net should do with the list this tick. PURE.
+ *   - main red, every failed job either a unit job whose log names its failing files completely or a derived
+ *     aggregator, and ≤ maxTests files ⇒ `add` the files (whole-file entries — the only kind CI can skip) not
+ *     already live for this red;
+ *   - main green ⇒ `prune` when the list has any entry; expired entries ⇒ `prune` (expired only);
+ *   - anything unknown ⇒ `none` (fail closed: STOP keeps holding).
+ * `fixPrs` differing from the list's ⇒ `setFixPrs` alongside.
+ * @param {{status:'red'|'green'|'unknown', firstRedSha?:string|null, failedJobs?:string[]|null,
+ *   jobFailures?:Record<string, ReturnType<typeof parseVitestFailures>|null>, list?:object|null, fixPrs?:number[],
+ *   addedForRed?:string[], now:number, settings?:object}} o  `addedForRed` = files already added for this first red
+ *   commit (the safety net's ledger) — never re-added after they expire.
+ * @returns {{action:'add'|'prune'|'none', tests?:string[], names?:string[], why:string, mainGreen?:boolean|null,
+ *   fixPrs?:number[]|null}}
+ */
+export function planSafetyNet({ status, firstRedSha = null, failedJobs = null, jobFailures = {}, list = null, fixPrs = [], addedForRed = [], now, settings = {} }) {
+  const s = { ...QUARANTINE_SAFETY_NET_DEFAULTS, ...settings };
+  const entries = list?.entries ?? [];
+  if (status === 'green') return entries.length ? { action: 'prune', mainGreen: true, why: 'main is green' } : { action: 'none', why: 'main is green; list empty' };
+  if (status !== 'red') return { action: 'none', why: 'main state unknown' };
+  // `fixPrs: null` = the fix-PR read is unknown this tick: leave the list's set as it is.
+  const wantFix = Array.isArray(fixPrs) ? [...new Set(fixPrs.map(Number).filter((n) => Number.isInteger(n) && n > 0))].sort((a, b) => a - b) : null;
+  const haveFix = [...(list?.fixPrs ?? [])].sort((a, b) => a - b);
+  const fixDelta = wantFix && JSON.stringify(wantFix) !== JSON.stringify(haveFix) ? wantFix : null;
+  const expired = entries.some((e) => !(now < e.expiresAt));
+  const live = activeEntries(list, { now });
+  // The fix-PR set is only worth a write while some entry is live (it exists to un-skip those entries for the fix PR).
+  const liveFix = live.length ? fixDelta : null;
+  const none = (why) => (expired ? { action: 'prune', mainGreen: null, why: `${why}; expired entries pruned`, fixPrs: liveFix } : { action: 'none', why, fixPrs: liveFix });
+  if (!isStr(firstRedSha) || !/^[0-9a-f]{7,40}$/.test(firstRedSha)) return none('first red commit unknown');
+  if (!Array.isArray(failedJobs) || !failedJobs.length) return none('failing jobs unknown');
+  let unitRe;
+  try { unitRe = new RegExp(s.unitJobPattern); } catch { return none('unitJobPattern invalid'); }
+  const derived = new Set(s.derivedJobs ?? []);
+  const files = [];
+  const names = [];
+  for (const job of failedJobs) {
+    if (unitRe.test(job)) {
+      const f = jobFailures?.[job];
+      if (!f?.complete) return none(`failing tests of ${job} unknown (not a known-failing-test red)`);
+      files.push(...f.files);
+      names.push(...f.tests.map((t) => (t.name ? `${t.file} > ${t.name}` : t.file)));
+    } else if (!derived.has(job)) return none(`job ${job} failed outside the unit suite (quarantine cannot skip it)`);
+  }
+  const uniq = [...new Set(files)];
+  if (!uniq.length) return none('no unit job failed');
+  if (uniq.length > s.maxTests) return none(`${uniq.length} failing test files > maxTests ${s.maxTests}`);
+  // A file quarantined once for THIS red is never re-added after it expires: the TTL bounds how long one break may be
+  // skipped, so a red that outlives it falls back to STOP instead of being quarantined forever (stale-entry guard).
+  const done = new Set(addedForRed ?? []);
+  const todo = uniq.filter((f) => !live.some((e) => e.test === f) && !done.has(f));
+  if (!todo.length) return none(uniq.some((f) => done.has(f) && !live.some((e) => e.test === f)) ? 'quarantine for this red expired — STOP until main is green' : 'failing tests already quarantined');
+  return { action: 'add', tests: todo, names: [...new Set(names)], firstRedSha, why: `main red since ${firstRedSha.slice(0, 9)} on ${todo.length} known failing test file(s)`, fixPrs: fixDelta };
+}
+
+/**
+ * Which PR (if any) a CI job is for, from the GitHub Actions context. `onMain` for a push to / dispatch on main
+ * (main skips nothing). A merge-queue group commit is for the PR at its head (`gh-readonly-queue/<base>/pr-<n>-<sha>`).
+ * Unknown context ⇒ `{prNumber:null, onMain:false, known:false}` (the caller then skips nothing). PURE.
+ */
+export function ciJobContext({ eventName, ref, event = null }) {
+  if (eventName === 'push' || eventName === 'workflow_dispatch' || eventName === 'schedule') return { onMain: ref === 'refs/heads/main', prNumber: null, known: ref === 'refs/heads/main' };
+  if (eventName === 'pull_request' || eventName === 'pull_request_target') {
+    const n = Number(event?.pull_request?.number ?? /^refs\/pull\/(\d+)\//.exec(String(ref ?? ''))?.[1]);
+    return Number.isInteger(n) && n > 0 ? { onMain: false, prNumber: n, known: true } : { onMain: false, prNumber: null, known: false };
+  }
+  if (eventName === 'merge_group') {
+    const n = Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(String(event?.merge_group?.head_ref ?? ref ?? ''))?.[1]);
+    return Number.isInteger(n) && n > 0 ? { onMain: false, prNumber: n, known: true } : { onMain: false, prNumber: null, known: false };
+  }
+  return { onMain: false, prNumber: null, known: false };
+}
+
+/**
+ * The CI skip decision for one job. Skips nothing when: the mode is not `quarantine`, the list is unreadable, the job
+ * context is unknown, it is main, or the PR is a recorded main-fix PR. A PR that CHANGES a quarantined test file
+ * also runs that file (it may be the real fix, or it may be hiding a further break in it). Changed files unknown ⇒
+ * every quarantined file runs. PURE.
+ * @returns {{skip:string[], why:string, unsupported?:string[]}}
+ */
+export function decideCiSkip({ mode, read, ctx, changedFiles = null, now }) {
+  if (mode !== 'quarantine') return { skip: [], why: `redMainMode is ${mode}` };
+  if (!read?.ok) return { skip: [], why: `quarantine list unreadable (${read?.error ?? 'unknown'}) — running everything` };
+  if (!ctx?.known) return { skip: [], why: 'job context unknown — running everything' };
+  const fixPrs = read.list.fixPrs ?? [];
+  const tests = testsToSkip({ list: read.list, now, prNumber: ctx.prNumber, fixPrs, onMain: ctx.onMain });
+  if (!tests.length) return { skip: [], why: ctx.onMain ? 'main runs every test' : fixPrs.includes(ctx.prNumber) ? `PR #${ctx.prNumber} is the main-fix PR — it runs the quarantined tests` : 'no live quarantine entry' };
+  if (!Array.isArray(changedFiles)) return { skip: [], why: 'this PR\'s changed files are unknown — running everything' };
+  const changed = new Set(changedFiles);
+  const touched = tests.filter((t) => changed.has(testFileOf(t)));
+  const rest = tests.filter((t) => !changed.has(testFileOf(t)));
+  const { args, unsupported } = vitestExcludeArgs(rest);
+  const skip = args.map((a) => a.slice('--exclude='.length));
+  return { skip, unsupported, why: `skipping ${skip.length} quarantined test file(s)${touched.length ? `; running ${touched.length} this PR changes` : ''}` };
 }
 
 /**

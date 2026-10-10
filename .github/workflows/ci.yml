@@ -183,7 +183,7 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit shard ${{ matrix.shard }}/4: ${#files[@]} files"
-          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
+          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 
       - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
         if: ${{ matrix.shard == 5 }}
@@ -195,7 +195,7 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit no-coverage group: ${#files[@]} files"
-          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
+          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 
       # Upload this shard's partial coverage for the `test` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
