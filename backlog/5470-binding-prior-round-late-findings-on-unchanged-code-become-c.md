@@ -7,7 +7,7 @@ parent: "5467"
 status: open
 blockedBy: ["5469"]
 relatedTo: ["5468", "5399"]
-scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/operations/review-pr.mjs"]
+scope: ["we:scripts/lib/review-loop-policy.mjs", "we:scripts/lib/review-settings.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs"]
 dateOpened: "2026-10-08"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "6e57185099f3dc66c49a7954e7722debdc55020f"
