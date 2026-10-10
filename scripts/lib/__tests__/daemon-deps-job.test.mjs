@@ -129,15 +129,15 @@ describe('job child — installStep', () => {
 
 describe('swapNodeModules', () => {
   it('replaces the live directory with a copy of the store and leaves no temp dirs', () => {
-    const root = mk('swap-root-');
-    mkdirSync(join(root, 'node_modules'));
-    writeFileSync(join(root, 'node_modules', 'old.txt'), 'old');
+    const clone = mk('swap-root-');
+    mkdirSync(join(clone, 'node_modules'));
+    writeFileSync(join(clone, 'node_modules', 'old.txt'), 'old');
     const store = mk('swap-store-');
     mkdirSync(join(store, 'node_modules'));
     writeFileSync(join(store, 'node_modules', 'new.txt'), 'new');
-    swapNodeModules({ root, storeDir: store });
-    expect(readdirSync(join(root, 'node_modules'))).toEqual(['new.txt']);
-    expect(readdirSync(root)).toEqual(['node_modules']);
+    swapNodeModules({ root: clone, storeDir: store });
+    expect(readdirSync(join(clone, 'node_modules'))).toEqual(['new.txt']);
+    expect(readdirSync(clone)).toEqual(['node_modules']);
     expect(existsSync(join(store, 'node_modules', 'new.txt'))).toBe(true); // the store is kept
   });
 });
