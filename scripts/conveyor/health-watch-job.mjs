@@ -28,7 +28,7 @@
  *       # live proof only: queue a gh-probe job whose worker blocks for --block-ms, then returns no probes
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
@@ -59,8 +59,8 @@ export const MAX_RESULT_AGE_MS = 30 * 60_000;
  *  the tick than this (clock skew allowance) is rejected, not stored: it would park the gh cadence behind it. */
 export const MAX_RESULT_FUTURE_SKEW_MS = 5 * 60_000;
 /** A sidecar over this size is never parsed. Live sidecars (2026-10-09) are ~34 MB, mostly the merged-PR list, so
- *  this leaves ~7x headroom for its growth while still bounding what a corrupt file can make the tick load. */
-export const MAX_RESULT_BYTES = 256 * 1024 * 1024;
+ *  this leaves ~3.7x headroom for its growth while keeping the string plus its parsed tree well inside the heap. */
+export const MAX_RESULT_BYTES = 128 * 1024 * 1024;
 /** Longest error text kept per probe. */
 const MAX_RESULT_ERROR_CHARS = 2_000;
 /** At most this many unexpected key names are reported back (as identifier-shaped text or `<invalid>`). */
@@ -329,11 +329,17 @@ function readHeadSha(sourceRoot) {
   return readGit(['-C', sourceRoot, 'rev-parse', 'HEAD'], { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
 }
 
+/** Read the sidecar through ONE descriptor: opened non-blocking (a FIFO in its place cannot hang the tick), checked
+ *  with `fstat` to be a regular file within the cap (a device or a size-0 special file never gets read), and read
+ *  from that same descriptor (no stat-then-read race). */
 function readResult(dir, id, maxBytes = MAX_RESULT_BYTES) {
-  const file = join(dir, `${id}${RESULT_SUFFIX}`);
-  const size = statSync(file).size;
-  if (size > maxBytes) throw new Error(`too large (${size} bytes, cap ${maxBytes})`);
-  return JSON.parse(readFileSync(file, 'utf8'));
+  const fd = openSync(join(dir, `${id}${RESULT_SUFFIX}`), fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error('not a regular file');
+    if (st.size > maxBytes) throw new Error(`too large (${st.size} bytes, cap ${maxBytes})`);
+    return JSON.parse(readFileSync(fd, 'utf8'));
+  } finally { closeSync(fd); }
 }
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -351,6 +357,11 @@ export function validateJobResult(res, { now, maxFutureSkewMs = MAX_RESULT_FUTUR
   if (res.sampledAt - now > maxFutureSkewMs) return { ok: false, reason: `invalid result (sampledAt ${Math.round((res.sampledAt - now) / 1000)}s in the future)` };
   if (res.probes !== undefined && !isPlainObject(res.probes)) return { ok: false, reason: 'invalid result (probes is not an object)' };
   if (res.errors !== undefined && !isPlainObject(res.errors)) return { ok: false, reason: 'invalid result (errors is not an object)' };
+  // `prs` and `agents` are what stamp the cadence (`probes.prs && probes.agents`) and what the smells iterate: a
+  // forged `true` must not pass for them, so a present value must be the list the probes really return.
+  for (const k of ['prs', 'agents']) {
+    if (res.probes?.[k] !== undefined && !Array.isArray(res.probes[k])) return { ok: false, reason: `invalid result (${k} is not a list)` };
+  }
   const allowed = new Set(GH_GROUP_PROBE_NAMES);
   const probes = {};
   const errors = {};

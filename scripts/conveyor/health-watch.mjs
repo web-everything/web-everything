@@ -109,6 +109,11 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
 export const GH_CADENCE_MS = 15 * MINUTE;
+/** PURE: is a cadence stamped `at` due at `now`? A missing, non-numeric or future stamp (a clock stepped back, or a
+ *  forged state.json) is due — it must never make a cadence wait out the offset. */
+export function cadenceDue(at, now) {
+  return typeof at !== 'number' || !Number.isFinite(at) || at <= 0 || at > now || now - at >= GH_CADENCE_MS;
+}
 export const CHILD_TIMEOUT_MS = 30_000;
 
 /**
@@ -1215,12 +1220,14 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   // #4066 `open-prs-over-limit` — fs/env only; pairs with the gh-cadenced `prs` read below.
   probes.prLimit = attempt('prLimit', () => probePrLimit());
 
-  const ghCache = prev.ghCache || {};
+  // state.json is a user-writable file: a non-object `ghCache` reads as empty, and every cadence stamp goes through
+  // `cadenceDue`, so a corrupt or future value can never park a cadence.
+  const ghCache = prev.ghCache && typeof prev.ghCache === 'object' && !Array.isArray(prev.ghCache) ? prev.ghCache : {};
   let jobsState = prev.jobs;
   let ghJob = null;
-  const ghDue = !flags['no-gh'] && (flags['force-gh'] || !ghCache.at || ghCache.at > now || now - ghCache.at >= GH_CADENCE_MS);
+  const ghDue = !flags['no-gh'] && (flags['force-gh'] || cadenceDue(ghCache.at, now));
   // Inventory has its own cadence stamp: unrelated GitHub failures cannot cause repeated log scans.
-  const inventoryDue = !flags['no-gh'] && (flags['force-gh'] || !prev.credentialInventoryAt || now - prev.credentialInventoryAt >= GH_CADENCE_MS);
+  const inventoryDue = !flags['no-gh'] && (flags['force-gh'] || cadenceDue(prev.credentialInventoryAt, now));
   if (flags['credential-inventory-fixture'] || inventoryDue) {
     try {
       probes.credentialInventory = normalizeInventory(flags['credential-inventory-fixture']

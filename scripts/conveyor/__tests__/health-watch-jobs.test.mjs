@@ -7,11 +7,12 @@
  *   fake (no child process) — the real detached child is health-watch-job.test.mjs.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, utimesSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { tick, collectGhProbes, GH_GROUP_PROBE_NAMES } from '../health-watch.mjs';
+import { tick, collectGhProbes, GH_GROUP_PROBE_NAMES, GH_CADENCE_MS, cadenceDue } from '../health-watch.mjs';
 import { healthDir } from '../health-watch-section.mjs';
 import {
   runGhProbeJobs, observeTickClock, resolveHealthJobSwitches, FINISHED_JOB_KEEP_MS, RESULT_SUFFIX,
@@ -86,7 +87,9 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
       const id = q.summary.enqueued;
       store.update(id, (r) => markLaunching(r, { at: iso(1_100_000) }));
       store.update(id, (r) => markClaimed(r, { at: iso(1_100_000), handle: `h:${process.pid}:x`, host: 'h', pid: process.pid, procStart: 'x' }));
-      writeFileSync(join(store.dir, `${id}${RESULT_SUFFIX}`), typeof body === 'string' ? body : JSON.stringify(body));
+      const path = join(store.dir, `${id}${RESULT_SUFFIX}`);
+      if (typeof body === 'function') body(path); // a non-regular file in the sidecar's place
+      else writeFileSync(path, typeof body === 'string' ? body : JSON.stringify(body));
       store.update(id, (r) => markSucceeded(r, { at: iso(1_100_000) }));
       return runGhProbeJobs({ ...base(store), now, due: true, state: q.state, ...over });
     }
@@ -149,6 +152,23 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
       }
       const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: [], agents: [] }, errors: { staleState: { not: 'text' } } });
       expect(out.result.errors).toEqual({});
+    });
+
+    it('rejects a prs/agents value that is not a list (a forged `true` would otherwise stamp the cadence)', async () => {
+      for (const probes of [{ prs: true, agents: true }, { prs: [], agents: 'x' }, { prs: {}, agents: [] }]) {
+        const out = await consumeRaw({ sampledAt: 1_100_000, probes, errors: {} });
+        expect(out.result).toBeNull();
+        expect(out.failure).toMatch(/invalid/);
+      }
+    });
+
+    it('never opens a FIFO or a device in the sidecar\'s place: it is not a regular file, and nothing blocks', async () => {
+      const fifo = await consumeRaw((p) => execFileSync('mkfifo', [p]));
+      expect(fifo.result).toBeNull();
+      expect(fifo.failure).toMatch(/not a regular file/);
+      const dev = await consumeRaw((p) => symlinkSync('/dev/zero', p));
+      expect(dev.result).toBeNull();
+      expect(dev.failure).toMatch(/not a regular file/);
     });
 
     it('refuses to parse a sidecar over the size cap', async () => {
@@ -253,6 +273,24 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     // The cadence is still due, so a fresh job is queued rather than waiting out the forged timestamp.
     expect(second.ghJob.enqueued).toBeTruthy();
   }, 30000);
+
+  it('cadenceDue: a missing, non-numeric, future or elapsed stamp is due; only a recent one waits', () => {
+    const now = 10_000_000;
+    for (const at of [undefined, null, 0, 'later', NaN, now + 1, now + 1e11, now - GH_CADENCE_MS]) expect(cadenceDue(at, now)).toBe(true);
+    expect(cadenceDue(now - GH_CADENCE_MS + 1, now)).toBe(false);
+    expect(cadenceDue(now, now)).toBe(false);
+  });
+
+  it('a corrupt ghCache in state.json (a string, or a non-numeric at) does not crash the tick or park the cadence', async () => {
+    for (const [i, ghCache] of ['oops', 42, { at: 'later' }].entries()) {
+      const { flags, hd } = setup(`corrupt-${i}`);
+      const store = createJobStore(join(dir, `jobs-corrupt-${i}`));
+      const deps = { collectGh: neverInline, ghJobs: { store, codeSha: 'abc123', reattach: fakeReattach(), evict: noEvict } };
+      writeFileSync(join(hd, 'state.json'), JSON.stringify({ ghCache }));
+      const out = await tick({ ...flags, now: iso(Date.parse('2026-10-09T12:00:00Z')) }, deps);
+      expect(out.ghJob.enqueued).toBeTruthy();
+    }
+  }, 60000);
 
   it('a ghCache.at already ahead of now (clock stepped back, or a forged state) reads as due, not parked', async () => {
     const { flags, hd } = setup('stale-future');
