@@ -9,7 +9,8 @@
  *
  * CLI (repo root as cwd):
  *   node scripts/lib/red-main-quarantine-io.mjs skip [--pr=<n>] [--fix-prs=<n,..>] [--on-main] [--format=json|vitest]
- *       CI job start: fetch the CURRENT list and print the tests to skip. Unreadable list ⇒ prints nothing to
+ *       Fetch the CURRENT list and print the tests to skip. Mode-gated like CI's step (scripts/ci/quarantine-skip.mjs):
+ *       only a list stamped `mode: quarantine` skips anything. Unreadable list / `stop` / no stamp ⇒ prints nothing to
  *       skip (CI runs everything — the safe direction). The main-fix PR / main always skip nothing.
  *   node scripts/lib/red-main-quarantine-io.mjs add --actor=<red-main-safety-net|operator> --broken-sha=<sha>
  *       --owner=<who> --reason=<why> --tests=<id,id> [--area=<dir/>] [--ttl-min=<n>]
@@ -191,7 +192,8 @@ export function runSafetyNet({
 } = {}) {
   if (!dir) return null;
   const ledgerPath = join(dir, SAFETY_NET_LEDGER);
-  const persist = () => { try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort */ } };
+  /** Write the ledger. Best effort for a bookkeeping write, but the caller learns whether it landed. */
+  const persist = () => { try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); return true; } catch { return false; } };
   const shadowPath = join(dir, SAFETY_NET_SHADOW_LOG);
   const ledger = readJson(ledgerPath) ?? { version: 1, reds: {}, shadowList: { version: 1, entries: [] } };
   ledger.reds ??= {};
@@ -287,7 +289,12 @@ export function runSafetyNet({
       // between the push and the ledger write must never let the entry be added again once it expires.
       const intended = plan.action === 'add' && rec ? plan.tests.filter((t) => !(rec.added ?? []).includes(t)) : [];
       if (intended.length) { rec.added = [...(rec.added ?? []), ...intended]; }
-      persist();
+      // No durable intent, no push: a push that lands with nothing on disk could be added again after it expires.
+      if (!persist() && intended.length) {
+        rec.added = rec.added.filter((t) => !intended.includes(t));
+        out.error = 'quarantine: ledger write failed — not adding (the "added for this red" record cannot be made durable)';
+        return out;
+      }
       let r;
       try {
         r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change });
@@ -337,6 +344,16 @@ function flagsOf(argv) {
   return f;
 }
 
+/**
+ * The files the `skip` command prints for a read of the list. Mode-gated exactly like CI's step
+ * (we:scripts/ci/quarantine-skip.mjs): only a list the safety net stamped `quarantine` skips anything; `stop`, no stamp
+ * or an unreadable list skip nothing. PURE.
+ */
+export function skipForList(r, { now, prNumber = null, fixPrs = [], onMain = false }) {
+  if (!r?.ok || r.list?.mode !== 'quarantine') return [];
+  return testsToSkip({ list: r.list, now, prNumber, fixPrs, onMain });
+}
+
 function cli(argv) {
   const cmd = argv[0];
   const f = flagsOf(argv.slice(1));
@@ -344,7 +361,7 @@ function cli(argv) {
   if (cmd === 'skip') {
     const r = readQuarantine();
     const fixPrs = String(f['fix-prs'] ?? '').split(',').filter(Boolean).map(Number);
-    const tests = r.ok ? testsToSkip({ list: r.list, now, prNumber: f.pr ?? null, fixPrs, onMain: !!f['on-main'] }) : [];
+    const tests = skipForList(r, { now, prNumber: f.pr ?? null, fixPrs, onMain: !!f['on-main'] });
     if (f.format === 'vitest') {
       const { args, unsupported } = vitestExcludeArgs(tests);
       if (unsupported.length) process.stderr.write(`red-main-quarantine: ${unsupported.length} name-qualified entr${unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file; CI runs them): ${unsupported.slice(0, 3).join(' | ')}\n`);

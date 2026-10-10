@@ -7,13 +7,13 @@
  * With `redMainMode: stop` (the shipped setting) it only logs what it WOULD do.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import * as quarantine from '../../lib/red-main-quarantine.mjs';
 const { parseVitestFailures, planSafetyNet, addEntries, pruneOnGreen, setMode, validateQuarantineList } = quarantine;
-import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
+import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, skipForList, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
 import smell, { defaultQuarantineSafetyNet } from '../health-smells/main-ci-red.mjs';
 import { healthDir } from '../health-watch-section.mjs';
 
@@ -313,6 +313,13 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
       net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('boom'); }, readList: () => (reads++ === 0 ? { ok: true, list: { version: 1, entries: [] } } : { ok: false, error: 'x' }) });
       expect(Object.values(ledger().reds)[0].added).toEqual([TEST_FILE]);
     });
+    it('no push is made when the intent cannot be made durable (a failed ledger write blocks the add)', () => {
+      mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // a directory where the ledger file must go: the atomic write fails
+      const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+      expect(calls.writes).toEqual([]);
+      expect(r.applied).toBe(false);
+      expect(r.error).toMatch(/ledger/);
+    });
     it('a push that never landed is retried on the next tick', () => {
       net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('rejected'); } });
       expect(Object.values(ledger().reds)[0].added).toEqual([]);
@@ -327,6 +334,15 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
       const later = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: at + 7 * 60 * MIN });
       expect(later.r.plan.why).toMatch(/expired — STOP/);
     });
+  });
+  it('the `skip` CLI path honours the published mode like CI does: stop, no stamp or an unreadable list skip nothing', () => {
+    const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at }).calls.writes[0].change({ version: 1, entries: [] }).list;
+    const skip = (r) => skipForList(r, { now: at + MIN, prNumber: 4990, fixPrs: [], onMain: false });
+    expect(skip({ ok: true, list: live })).toEqual([TEST_FILE]);
+    expect(skip({ ok: true, list: setMode(live, { mode: 'stop', actor: 'red-main-safety-net', now: at }).list })).toEqual([]);
+    const { mode: _drop, ...unstamped } = live;
+    expect(skip({ ok: true, list: unstamped })).toEqual([]);
+    expect(skip({ ok: false, error: 'x' })).toEqual([]);
   });
   it('a red window that has not been seen for 48h is forgotten', () => {
     net({ mainCiRuns: RUNS, now: at });
