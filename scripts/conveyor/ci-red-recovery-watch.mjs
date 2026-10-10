@@ -56,7 +56,6 @@
  * SAME requirement every other conveyor dispatcher in this directory already has, e.g.
  * `we:scripts/operations/dispatch-lane-io.mjs#REPO_ROOT`) — it fetches the lane ref and pushes the rebuilt tip.
  */
-import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
@@ -86,6 +85,7 @@ import {
 } from './reconcile-pass.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { rebaseDropManifest } from '../lib/rebase-drop-manifest.mjs';
+import { gitRun } from '../lib/git-run.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
@@ -834,13 +834,9 @@ export function clearStaleCheckingLabel(prNumber, { repo = null, exec = execFile
   return true;
 }
 
-function defaultFetchStackRef(ref, { root }) {
-  try {
-    execFileSync('git', ['-C', root, 'fetch', 'origin', ref], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
-    });
-    return { ok: true };
-  } catch (e) { return { ok: false, error: describeExecError(e) }; }
+function defaultFetchStackRef(ref, { root, run = gitRun }) {
+  const r = run('git', ['fetch', 'origin', ref], { cwd: root });
+  return r.status === 0 ? { ok: true } : { ok: false, error: `fetch ${ref} failed (${String(r.stderr || '').split('\n')[0]})` };
 }
 
 export function restackStackedPr(d, {
