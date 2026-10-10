@@ -87,6 +87,7 @@ import {
   buildApprovalPreventionRetraction, APPROVAL_PREVENTION_DIGEST_KEY_SEP, APPROVAL_PREVENTION_KEY_PREFIX,
 } from '../lib/approval-prevention-notice.mjs';
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import {
   loadCardDedupePolicy, formatCardDedupePolicy, planDedupe, readOpenCards, readPrHostedCards, appendMentions, filingSource,
   remainingAfter,
@@ -424,7 +425,7 @@ export async function landPreventionCard(input, {
           recorded.push(...asMatches);
         } else if (m.card.host?.pr) {
           try {
-            exec('gh', ['pr', 'comment', String(m.card.host.pr), '--body', buildPrMentionComment(m)], { cwd: lane });
+            exec('gh', ['pr', 'comment', String(m.card.host.pr), '--repo', CONSTELLATION_REPOS.we.slug, '--body', buildPrMentionComment(m)], { cwd: lane });
             recorded.push(...asMatches);
           } catch (e) {
             write(`land-prevention-card: mention comment on PR #${m.card.host.pr} failed, filing instead — ${String(e?.message || e).split('\n')[0]}\n`);

@@ -26,6 +26,8 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
+
 // ── Policy ───────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The standard default: off (today's behaviour). The repo override turns it on. */
@@ -389,9 +391,9 @@ const PR_CARD_CAP = 60;
  * Open cards that exist only in an open filing PR (bounded). Best-effort: any `gh` failure returns `[]` — a lookup
  * miss only means a duplicate may be filed, exactly as before this module existed.
  */
-export function readPrHostedCards({ exec, cwd }) {
+export function readPrHostedCards({ exec, cwd, repo = CONSTELLATION_REPOS.we.slug }) {
   try {
-    const prs = JSON.parse(exec('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--json', 'number,headRefName,files'], { cwd, encoding: 'utf8' }));
+    const prs = JSON.parse(exec('gh', ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json', 'number,headRefName,files'], { cwd, encoding: 'utf8' }));
     const out = [];
     for (const pr of Array.isArray(prs) ? prs : []) {
       if (!FILING_PR_REF_RE.test(String(pr.headRefName ?? ''))) continue;
@@ -400,7 +402,7 @@ export function readPrHostedCards({ exec, cwd }) {
         if (!/^backlog\/[^/]+\.md$/.test(String(f.path ?? ''))) continue;
         let text;
         try {
-          text = exec('gh', ['api', `repos/{owner}/{repo}/contents/${f.path}?ref=${encodeURIComponent(pr.headRefName)}`, '-H', 'Accept: application/vnd.github.raw'], { cwd, encoding: 'utf8' });
+          text = exec('gh', ['api', `repos/${repo}/contents/${f.path}?ref=${encodeURIComponent(pr.headRefName)}`, '-H', 'Accept: application/vnd.github.raw'], { cwd, encoding: 'utf8' });
         } catch { continue; }
         const card = cardFromText({ rel: f.path, text, host: { pr: pr.number } });
         if (card.status === 'open' && card.items.length) out.push(card);
