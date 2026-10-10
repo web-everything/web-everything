@@ -9,7 +9,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runGhSync, runGhCliPassthrough, ghThrottleLogPath, resolveGhJsonParseRetry, isRetryableGhJsonFailure } from '../gh-throttle.mjs';
+import { runGhSync, runGhCliPassthrough, ghThrottleLogPath, resolveGhJsonParseRetry, isRetryableGhJsonFailure, ghTransientRetryReason } from '../gh-throttle.mjs';
 
 const made = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'gh-json-retry-')); made.push(d); return d; };
@@ -61,6 +61,26 @@ describe('runGhSync — truncated JSON on a read', () => {
     calls = 0;
     expect(() => runGhSync(LIST, syncOpts(lockRoot, () => { calls += 1; throw ghFail(TRUNC); }, { WE_GH_JSON_RETRIES: '0' }))).toThrow();
     expect(calls).toBe(1);
+  });
+});
+
+// Live 2026-10-10 23:31Z: the same heavy read also came back `HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)`.
+describe('transient server errors on a read (same setting)', () => {
+  it('ghTransientRetryReason names the reason; writes and 4xx never qualify', () => {
+    expect(ghTransientRetryReason(LIST, TRUNC)).toBe('truncated-json');
+    expect(ghTransientRetryReason(LIST, 'HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)')).toBe('server-5xx');
+    expect(ghTransientRetryReason(LIST, 'HTTP 502: Bad Gateway')).toBe('server-5xx');
+    expect(ghTransientRetryReason(LIST, 'HTTP 503: Service Unavailable')).toBe('server-5xx');
+    expect(ghTransientRetryReason(LIST, 'GraphQL: Something went wrong while executing your query. This may be the result of a timeout')).toBe('server-5xx');
+    expect(ghTransientRetryReason(LIST, 'HTTP 500: Internal Server Error')).toBe(null);
+    expect(ghTransientRetryReason(LIST, 'HTTP 422: Unprocessable')).toBe(null);
+    expect(ghTransientRetryReason(['pr', 'merge', '7'], 'HTTP 504: 504 Gateway Timeout')).toBe(null);
+  });
+  it('runGhSync retries a 504 on a read once and logs reason server-5xx', () => {
+    const lockRoot = tmp(); let calls = 0;
+    const out = runGhSync(LIST, syncOpts(lockRoot, () => { calls += 1; if (calls === 1) throw ghFail('HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)\n'); return '[]'; }));
+    expect(out).toBe('[]');
+    expect(logLines(lockRoot).filter((l) => l.outcome === 'retry').map((l) => l.reason)).toEqual(['server-5xx']);
   });
 });
 

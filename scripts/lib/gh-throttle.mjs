@@ -1536,9 +1536,25 @@ export function resolveGhJsonParseRetry(env = process.env) {
     return { ...GH_JSON_RETRY_STANDARD, ...(r.value || {}), source: r.sources || {} };
   } catch { return { ...GH_JSON_RETRY_STANDARD, source: {} }; }
 }
-/** PURE: may this failed call be retried as a cut-off JSON response? Reads only. */
+// Live 2026-10-10 23:31Z: the same heavy read also came back `HTTP 504: 504 Gateway Timeout (…/graphql)` — GitHub
+// gave up on the query. Gateway/availability errors and GraphQL's own "may be the result of a timeout" are
+// transient server faults; a plain 500 is not assumed transient.
+export const GH_TRANSIENT_SERVER_PATTERNS = Object.freeze([
+  /HTTP 50[234]\b/,
+  /\b50[234] (Bad Gateway|Service Unavailable|Gateway Timeout)\b/i,
+  /GraphQL: Something went wrong while executing your query/i,
+]);
+/** PURE: why this failed READ may be retried (`'truncated-json'` | `'server-5xx'`), or null. Never a write. */
+export function ghTransientRetryReason(args, text) {
+  if (!classifyGhRead(args)) return null;
+  const s = String(text ?? '');
+  if (GH_JSON_PARSE_FAILURE_PATTERNS.some((re) => re.test(s))) return 'truncated-json';
+  if (GH_TRANSIENT_SERVER_PATTERNS.some((re) => re.test(s))) return 'server-5xx';
+  return null;
+}
+/** PURE: may this failed call be retried as a transient read failure? */
 export function isRetryableGhJsonFailure(args, text) {
-  return classifyGhRead(args) && GH_JSON_PARSE_FAILURE_PATTERNS.some((re) => re.test(String(text ?? '')));
+  return ghTransientRetryReason(args, text) !== null;
 }
 
 export function recordGhCallLogEntry(logPath, entry) {
@@ -1733,9 +1749,10 @@ export function runGhSync(args, opts = {}) {
       fallbackToOriginal(attempt);
       continue;
     }
-    if (jsonRetry.used < jsonRetry.retries && isRetryableGhJsonFailure(args, text)) {
+    const transient = jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(args, text) : null;
+    if (transient) {
       jsonRetry.used += 1;
-      recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: 'truncated-json', caller, w: isWrite, resource, id: identity, inv });
+      recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: transient, caller, w: isWrite, resource, id: identity, inv });
       sleep(jsonRetry.backoffMs);
       continue;
     }
@@ -1966,9 +1983,10 @@ export function runGhCliPassthrough(argv, { throttle = {}, spawn = spawnSync, bi
     if (stdoutOverflow) throw captureStdoutOverflow(bin, argv);
     if (!failed && isWrite) markPrSnapshotDirty({ repo: repoFromGhArgs(argv), env }); // #gh-graphql-budget
     // A nested call leaves the truncated-JSON retry to its outer runGhSync (one retry per logical call).
-    if (failed && !outer && jsonRetry.used < jsonRetry.retries && isRetryableGhJsonFailure(argv, stderrText)) {
+    const transient = failed && !outer && jsonRetry.used < jsonRetry.retries ? ghTransientRetryReason(argv, stderrText) : null;
+    if (transient) {
       jsonRetry.used += 1;
-      recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: 'truncated-json', caller, w: isWrite, resource, id: identity, inv });
+      recordGhCallLogEntry(logPath, { op: opLabel, attempt, points: 0, outcome: 'retry', reason: transient, caller, w: isWrite, resource, id: identity, inv });
       sleep(jsonRetry.backoffMs);
       continue;
     }
