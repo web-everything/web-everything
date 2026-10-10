@@ -402,13 +402,23 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
     const exec = vi.fn((cmd) => cmd === 'gh' ? JSON.stringify(acceptanceView()) : 'git result');
     readDrainAcceptance({ pr: 3432, repo: 'frontier-ui/frontierui', cwd: '/ws/frontierui', exec,
       netDiff: ({ exec: git, rev, fetchExtraRefs }) => {
-        expect(rev).toBe('lane/3432');
+        // PR #4631 round 7: the live read is AT the head SHA; the branch is only fetched for its objects.
+        expect(rev).toBe(REBASED);
         expect(fetchExtraRefs).toEqual(['lane/3432']);
         git('git', ['diff'], { encoding: 'utf8' });
-        return { scored: true, text: REVIEWED_DIFF };
+        return { scored: true, text: REVIEWED_DIFF, rev };
       },
     });
     expect(exec.mock.calls[1][2].cwd).toBe('/ws/frontierui');
+  });
+
+  it('PR #4631 round 7: a diff that was not read at the head SHA is a read miss, never coverage', () => {
+    const view = acceptanceView();
+    const netDiff = () => ({ scored: true, text: REVIEWED_DIFF, rev: 'origin/lane/3432' });
+    const evidence = readDrainAcceptance({ ...acceptanceOptions(view), netDiff });
+    expect(evidence.headDiff).toBe(null);
+    expect(evidence.headReadFailed).toBe(true);
+    expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, { ...acceptanceOptions(view), netDiff }).action).toBe('park');
   });
 
   it('a suppressed re-park is STILL not waivable by the relief valve — staleAcceptance carries it', () => {
@@ -534,7 +544,8 @@ function acceptanceView() {
 }
 function acceptanceOptions(view = acceptanceView()) {
   return { pr: 3432, repo: 'web-everything/web-everything', local: true,
-    exec: () => JSON.stringify(view), netDiff: () => ({ scored: true, text: REVIEWED_DIFF }) };
+    // `rev` echoes the commit asked for, as `computeNetDiffText` does: the read is bound to that SHA.
+    exec: () => JSON.stringify(view), netDiff: ({ rev }) => ({ scored: true, text: REVIEWED_DIFF, rev }) };
 }
 
 describe('PR #3432 — drain acceptance verification and pending reconciliation', () => {
@@ -599,8 +610,8 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
   it.each(['no markers', 'changed content', 'unreadable diff'])('does not clear pending without coverage: %s', (failure) => {
     const view = acceptanceView();
     if (failure === 'no markers') view.comments = [];
-    const options = { ...acceptanceOptions(view), netDiff: () => failure === 'unreadable diff'
-      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed') } };
+    const options = { ...acceptanceOptions(view), netDiff: ({ rev }) => failure === 'unreadable diff'
+      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed'), rev } };
     const spawn = vi.fn();
     expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(false);
     expect(spawn).not.toHaveBeenCalled();

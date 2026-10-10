@@ -82,7 +82,7 @@ import {
   // re-exported below for the same reason `REASONLESS_BOUNCE_REFUSAL` is: this file is the SINGLE label home
   // (#2644), so a reader looks HERE for what governs a label swap even though the pure decision itself lives
   // in the leaf module merge-ai-prs.mjs's own gh-free imports resolve against (avoiding the circular import
-  // that keeping it here would force — `review-set-label.mjs` already imports `computeNetDiffText` FROM
+  // that keeping it here would force — `review-set-label.mjs` already imports `readNetDiffAtHead` FROM
   // `merge-ai-prs.mjs`, so `merge-ai-prs.mjs` cannot import back from here).
   decideParkToHuman, findContradictoryReviewVerdicts,
   // #2766/#2767 follow-up — HEALING an existing contradictory pair (not just preventing a new one). Same
@@ -121,7 +121,7 @@ import { buildVerdictRecord, appendVerdict, verdictForLabelTarget, verdictClears
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
-import { computeNetDiffText } from './merge-ai-prs.mjs';
+import { readNetDiffAtHead } from './merge-ai-prs.mjs';
 import { parseDelegationMarker } from './lib/delegation-marker.mjs';
 import { readStore } from './conveyor/run-scorecard-store.mjs';
 import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
@@ -1262,12 +1262,15 @@ export function runReviewLabelCli({
       // For the NEXT caller: run this CLI from the named repo's checkout, or pin the child process to it. A
       // `cwd` on this one call would not be enough — the `--body-file` allowlist is rooted at `process.cwd()`
       // too, so the process's location is the contract, not any single read's.
-      const net = computeNetDiffText({
-        exec: execFileSyncThrottled,
-        rev: guardedRestamp ? expectedHead : headRefName,
-        fetchExtraRefs: guardedRestamp ? [] : headRefName ? [headRefName] : [],
-      });
-      diffScored = !!net?.scored && (!guardedRestamp || net.rev === expectedHead);
+      // PR #4631 round 7 (toctou-head-binding): the diff is read AT `headSha` — the commit this verdict stamps (for a
+      // guarded restamp `headSha === expectedHead`, checked above) — never at the branch name, which can point at
+      // another commit by the time it is fetched (a force-push between the PR read and this fetch would fingerprint
+      // one commit's diff onto another's `reviewed-sha`). See `readNetDiffAtHead`. No branch name on an unguarded
+      // read (the hermetic fake-gh suites) → no read at all, as before.
+      const net = guardedRestamp || headRefName
+        ? readNetDiffAtHead({ exec: execFileSyncThrottled, headSha, headRef: guardedRestamp ? null : headRefName })
+        : null;
+      diffScored = !!net?.scored;
       reviewedDiff = diffScored ? net.text : '';
     } catch { reviewedDiff = ''; /* miss → no marker → SHA-identity fallback (the stricter path) */ }
   }
@@ -1316,8 +1319,8 @@ export function runReviewLabelCli({
     let proofReadMissed = false;
     if (record && !record.diff && diffScored) {
       try {
-        const old = computeNetDiffText({ exec: execFileSyncThrottled, rev: record.sha, fetchExtraRefs: [record.sha] });
-        if (old?.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) }; else proofReadMissed = true;
+        const old = readNetDiffAtHead({ exec: execFileSyncThrottled, headSha: record.sha, headRef: record.sha });
+        if (old.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) }; else proofReadMissed = true;
       } catch { proofReadMissed = true; }
     }
     const humanCarry = decideAcceptCarryForward({

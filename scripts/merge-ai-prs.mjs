@@ -652,7 +652,8 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * decision is a pure, testable function next to `shouldReparkForTestTampering` rather than inline control flow). Live
  * #4535: the operator cleared head A, the merge queue moved it to B with a byte-identical net diff, and the gate re-parked
  * `review:human` for a second approval of the same bytes. The clearance (`humanClearedSha`) is rebound to the live head
- * only when ALL of: the setting is on; the net diff was SCORED (an empty / unscored text is never fingerprinted); the
+ * only when ALL of: the setting is on; the net diff was SCORED (an empty / unscored text is never fingerprinted) and read
+ * AT `headSha` (`netDiffText.rev === headSha`); `headSha` is the head the merge is pinned to (`pinnedHeadSha`); the
  * latest trusted accept record is a HUMAN clearance (`carry.human` — an agent accept never carries a human clearance) naming
  * exactly the `humanClearedSha` the gate already parsed (`carry.from`); its strict reviewed-diff equals the live head's; and
  * nothing after it stands against it (a later verdict, an unrecognised comment, a standing formal review — `reviews` is the
@@ -660,11 +661,17 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * Anything else returns `humanClearedSha` unchanged, so the caller's re-park still fires (fails closed).
  * @returns {{humanClearedSha: string|null, carried: boolean, reason: string}}
  */
-export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, netDiffText = null } = {}) {
+export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null } = {}) {
   const unchanged = (reason) => ({ humanClearedSha, carried: false, reason });
   if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
   if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
   if (!netDiffText?.scored || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven');
+  // PR #4631 round 7 (toctou-head-binding): the diff must be the live head's OWN — read at that SHA (`rev` is the commit
+  // `computeNetDiffText` actually diffed). A diff read at the branch name can describe another commit than `headSha`.
+  if (netDiffText.rev !== headSha) return unchanged('the net diff was not read at the live head; identity unproven');
+  // The merge is pinned to the pass-start head (`--match-head-commit`); a clearance carried onto any other head would
+  // let the pinned commit merge on another commit's proof.
+  if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven');
   const carry = decideAcceptCarryForward({
     setting, record: latestAcceptRecord(comments, Array.isArray(reviews) ? reviews : null),
     headSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
@@ -708,11 +715,11 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   if (moved && !evidence.acceptedDiff && !evidence.acceptedContribution && /^[0-9a-f]{40}$/i.test(evidence.acceptedSha)
     && (local || cwd) && (carrySetting ?? resolveAcceptCarryForward().value) === 'on') {
     try {
-      const old = netDiff({
+      const old = readNetDiffAtHead({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        rev: evidence.acceptedSha, fetchExtraRefs: [evidence.acceptedSha],
+        headSha: evidence.acceptedSha, headRef: evidence.acceptedSha, netDiff,
       });
-      const fp = old?.scored ? normalizeDiffFingerprint(old.text) : null;
+      const fp = old.scored ? normalizeDiffFingerprint(old.text) : null;
       if (fp) { evidence.acceptedDiff = fp; evidence.acceptedDiffDerived = true; }
     } catch { /* unreadable accepted head → no derived fingerprint → SHA identity, as today */ }
   }
@@ -720,11 +727,13 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha && moved);
   if (liveDiffReadOwed && d.headRefName && (local || cwd)) {
     try {
-      const net = netDiff({
+      // PR #4631 round 7 (toctou-head-binding): read AT `headSha`, the head this coverage is judged for (see
+      // `readNetDiffAtHead`); a diff read at the branch name could be another commit's.
+      const net = readNetDiffAtHead({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        rev: d.headRefName, fetchExtraRefs: [d.headRefName],
+        headSha, headRef: d.headRefName, netDiff,
       });
-      evidence.headDiff = net?.scored ? net.text : null;
+      evidence.headDiff = net.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
@@ -3616,6 +3625,27 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
 }
 
 /**
+ * PR #4631 round 7 (toctou-head-binding) — THE one net-diff read whose text is a specific COMMIT's, for every proof that
+ * stamps or carries a verdict onto a head SHA (the reviewed-diff marker, the accept-carry, the drain's coverage read).
+ * It diffs AT `headSha` — never at the branch name, which can point at another commit by the time it is fetched (a
+ * force-push between the PR read and the fetch would bind one commit's diff to another's SHA). `headRef` is only
+ * fetched so the commit's objects arrive. `computeNetDiffText` returns the candidate it actually diffed as `rev`, so
+ * the read counts only when `rev === headSha`; anything else (a malformed SHA, an absent commit, a throw) is unscored
+ * with a `reason`, which every caller already treats as "identity unproven" (fail closed).
+ * @param {{exec:Function, headSha:string, headRef?:string|null, netDiff?:Function}} o
+ * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:string}}
+ */
+export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = computeNetDiffText } = {}) {
+  const miss = (reason) => ({ text: '', base: null, rev: null, scored: false, reason });
+  if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)) return miss('head-unbound');
+  let net;
+  try { net = netDiff({ exec, rev: headSha, fetchExtraRefs: headRef ? [headRef] : [] }); } catch { return miss('diff-failed'); }
+  if (!net?.scored) return miss(net?.reason || 'unscored');
+  if (net.rev !== headSha) return miss('head-mismatch');
+  return net;
+}
+
+/**
  * #2890-review-r2 finding 3 — THE one place the escalation inputs for a ref are derived, and the only in-repo
  * caller of the `basis` sharing option. Both production call sites (`pr-land.mjs#applyReviewEscalationLabel`
  * and the drain's scoring loop) used to hand-assemble the same four steps — resolve the basis, changed-file
@@ -5092,8 +5122,11 @@ async function runCli() {
       // question does not arise: the `gh pr view --json files` fallback IS the PR's own file list (three-dot,
       // already narrowed by GitHub), and an unscored basis has no verdict to qualify.
       let basisNarrowed = true;
+      // The clone-pinned git runner, kept for the test-gaming carry's SHA-bound re-read below (null = no clone).
+      let diffExec = null;
       if (v.headRef && (isLocalRepo(v.repo) || escCwd)) {
         const exec = (cmd, args, opts) => execFileSync(cmd, args, { cwd: escCwd, ...opts });
+        diffExec = exec;
         const sig = computeNetDiffSignals({ exec, rev: v.headRef, baseRev: v.base, fetchExtraRefs: [v.headRef] });
         changedFiles = sig.changedFiles;
         diffLines = sig.diffLines;
@@ -5249,9 +5282,13 @@ async function runCli() {
               readComments: () => ghLines(GH_ARGV.readComments(slug, v.num)),
               readReviews: () => ghLines(GH_ARGV.readPrReviews(slug, v.num)),
             });
+            // PR #4631 round 7 (toctou-head-binding): the batch's `netDiffText` was read at the branch NAME, which may have
+            // pointed at another commit than `tamperHeadSha`; the carry needs the live head's own diff, read at its SHA.
+            const headBoundDiff = diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: tamperHeadSha, headRef: v.headRef })
+              : { text: '', scored: false, rev: null, reason: 'no-clone' };
             const carried = carryHumanClearanceOnIdenticalDiff({
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
-              humanClearedSha, headSha: tamperHeadSha, netDiffText,
+              humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null, netDiffText: headBoundDiff,
             });
             humanClearedSha = carried.humanClearedSha;
             if (carried.carried && !AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carried.reason}\n`);

@@ -18,7 +18,7 @@ import { buildVerdictRecord } from '../verdict-ledger.mjs';
 import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
 import {
   readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND,
-  buildTestGamingParkReason, buildHeldReviewHoldReason, applyTestGamingParkLabel,
+  buildTestGamingParkReason, buildHeldReviewHoldReason, applyTestGamingParkLabel, readNetDiffAtHead,
 } from '../../merge-ai-prs.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { REBASE_ONTO_MAIN_COMMENT_MARKER, MISSING_RUN_COMMENT_MARKER } from '../../conveyor/main-red-recovery.mjs';
@@ -324,8 +324,15 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     writeFileSync(join(dir, 'g.txt'), 'unrelated main work\n'); git('add', 'g.txt'); git('commit', '-q', '-m', 'main moves');
     git('checkout', '-q', 'lane/x');
     git('merge', '-q', '--no-edit', '--no-ff', 'main');
+    const head = git('rev-parse', 'HEAD');
+    // PR #4631 round 7: a commit with a DIFFERENT net diff that the branch does not point at (the H1 of the
+    // force-push race: the PR read names it, the branch has since moved to the identical-diff head).
+    git('checkout', '-q', '-b', 'other', cleared);
+    writeFileSync(join(dir, 'a.txt'), 'something else entirely\n'); git('add', 'a.txt'); git('commit', '-q', '-m', 'unreviewed');
+    const unreviewed = git('rev-parse', 'HEAD');
+    git('checkout', '-q', 'lane/x');
     git('remote', 'add', 'origin', dir);
-    heads = { cleared, head: git('rev-parse', 'HEAD') };
+    heads = { cleared, head, unreviewed };
   };
   beforeAll(build);
   afterAll(() => { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ } } });
@@ -340,7 +347,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   const MECHANICAL = { ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] };
 
   /** Drives the real CLI with a recording provider; returns what was written. `events: null` = timeline unreadable. */
-  const restamp = ({ comments, labels = ['review:human'], ledger = MECHANICAL.ledger, events = MECHANICAL.events, reviews = [], fullComments = null, setting = 'on' }) => {
+  const restamp = ({ comments, labels = ['review:human'], ledger = MECHANICAL.ledger, events = MECHANICAL.events, reviews = [], fullComments = null, setting = 'on', headRefOid = null }) => {
     const writes = { setLabels: [], postComment: [] };
     const reads = { reviews: 0, comments: 0 };
     const provider = {
@@ -348,7 +355,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
       readHoldLabelEvents: () => { if (events === null) throw new Error('gh api failed'); return events; },
       readPrReviews: () => { reads.reviews += 1; if (reviews === null) throw new Error('gh api failed'); return reviews; },
       readComments: () => { reads.comments += 1; if (fullComments === null) throw new Error('gh api failed'); return fullComments; },
-      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments, headRefOid: heads.head, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '', title: '' }),
+      readPrState: () => ({ labels: labels.map((name) => ({ name })), comments, headRefOid: headRefOid ?? heads.head, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '', title: '' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: (_r, _p, spec) => { writes.setLabels.push(spec); },
       postComment: (_r, _p, body) => { writes.postComment.push(body); },
@@ -612,6 +619,49 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(printed.refused).toBe(true);
     expect(printed.retryable).toBeUndefined();
   });
+
+  // PR #4631 round 7 (toctou-head-binding). The PR read names head H1 (a different diff); the branch, fetched later,
+  // points at the identical-diff head. The proof must be read AT H1, the commit the restamp stamps, never at the branch.
+  it('the head the PR read names is the head whose diff is proven: a branch now at an identical-diff head proves nothing for it, NO write', () => {
+    const r = restamp({ comments: [clearComment()], headRefOid: heads.unreviewed });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true });
+  });
+
+  it('a head whose commit is not in the clone after the fetch is unproven (never the branch\'s diff instead), NO write', () => {
+    const r = restamp({ comments: [clearComment()], headRefOid: 'f'.repeat(40) });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('plain restamp (no live hold): the cleared-human marker is never minted onto a head whose own diff was not read', () => {
+    const r = restamp({ comments: [clearComment()], labels: ['review:accepted'], headRefOid: heads.unreviewed });
+    for (const body of r.writes.postComment) expect(body).not.toContain('cleared-human');
+  });
+
+  // The shared SHA-bound read every proof site uses (review-set-label, the drain carry, readDrainAcceptance), real git.
+  describe('readNetDiffAtHead — the diff is the named commit\'s own, never the branch\'s', () => {
+    const exec = (cmd, args, opts) => execFileSync(cmd, args, { ...opts, cwd: dir, env: { ...process.env, GIT_DIR: undefined, GIT_WORK_TREE: undefined } });
+    it('reads at the SHA and binds `rev` to it', () => {
+      const net = readNetDiffAtHead({ exec, headSha: heads.head, headRef: 'lane/x' });
+      expect(net).toMatchObject({ scored: true, rev: heads.head });
+      expect(net.text).toContain('+feature');
+    });
+    it('a SHA the branch does not point at yields THAT commit\'s diff, not the branch tip\'s', () => {
+      const net = readNetDiffAtHead({ exec, headSha: heads.unreviewed, headRef: 'lane/x' });
+      expect(net).toMatchObject({ scored: true, rev: heads.unreviewed });
+      expect(net.text).toContain('+something else entirely');
+    });
+    it('an absent commit, a branch name in place of a SHA, or a read bound elsewhere is unscored', () => {
+      expect(readNetDiffAtHead({ exec, headSha: 'f'.repeat(40), headRef: 'lane/x' }).scored).toBe(false);
+      expect(readNetDiffAtHead({ exec, headSha: 'lane/x', headRef: 'lane/x' })).toMatchObject({ scored: false, reason: 'head-unbound' });
+      expect(readNetDiffAtHead({ exec, headSha: heads.head, netDiff: () => ({ scored: true, text: 'x', rev: 'origin/lane/x' }) }))
+        .toMatchObject({ scored: false, reason: 'head-mismatch' });
+      expect(readNetDiffAtHead({ exec, headSha: heads.head, netDiff: () => { throw new Error('git'); } }))
+        .toMatchObject({ scored: false, reason: 'diff-failed' });
+    });
+  });
 });
 
 describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
@@ -790,7 +840,7 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
   const clear = (over = '') => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z',
     body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->${over}\n<!-- cleared-human: chalbert -->` });
   const agentAccept = () => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->` });
-  const base = () => ({ setting: 'on', comments: [clear()], reviews: [], humanClearedSha: OLD, headSha: NEW, netDiffText: { scored: true, text: TEXT } });
+  const base = () => ({ setting: 'on', comments: [clear()], reviews: [], humanClearedSha: OLD, headSha: NEW, pinnedHeadSha: NEW, netDiffText: { scored: true, text: TEXT, rev: NEW } });
   const run = (over = {}) => carryHumanClearanceOnIdenticalDiff({ ...base(), ...over });
 
   it('the fixture\'s own fingerprint is what the live text fingerprints to (the positive control is real)', () => {
@@ -814,7 +864,18 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
     expect(run({ netDiffText: null })).toMatchObject({ carried: false, humanClearedSha: OLD });
   });
   it('a changed net diff is not carried', () => {
-    expect(run({ netDiffText: { scored: true, text: `${TEXT}+one more line\n` } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+    expect(run({ netDiffText: { scored: true, text: `${TEXT}+one more line\n`, rev: NEW } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  // PR #4631 round 7 (toctou-head-binding): the batch diff was read at the branch NAME; a push between that read and the
+  // live head read leaves an identical text that belongs to ANOTHER commit. Only a diff read at the live SHA proves it.
+  it('clause `netDiffText.rev === headSha`: an identical diff read at the branch name or at another commit does not carry', () => {
+    expect(run({ netDiffText: { scored: true, text: TEXT, rev: 'origin/lane/x' } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+    expect(run({ netDiffText: { scored: true, text: TEXT, rev: 'b'.repeat(40) } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+    expect(run({ netDiffText: { scored: true, text: TEXT } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  it('clause `pinnedHeadSha === headSha`: a live head other than the one this pass merges (pinned) does not carry', () => {
+    expect(run({ pinnedHeadSha: 'c'.repeat(40) })).toMatchObject({ carried: false, humanClearedSha: OLD });
+    expect(run({ pinnedHeadSha: null })).toMatchObject({ carried: false, humanClearedSha: OLD });
   });
   it('nothing to carry: no clearance, no head, or the clearance already names the head', () => {
     expect(run({ humanClearedSha: null }).carried).toBe(false);
@@ -963,26 +1024,33 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
     comments: [{ author: { login: 'web-everything[bot]' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
   const exec = (cmd) => { if (cmd === 'gh') return JSON.stringify(view); throw new Error('unexpected'); };
   const read = (texts, carrySetting = 'on') => readDrainAcceptance({ pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', exec, carrySetting,
-    netDiff: ({ rev }) => (texts[rev] == null ? { scored: false } : { scored: true, text: texts[rev] }) });
+    netDiff: ({ rev }) => (texts[rev] == null ? { scored: false } : { scored: true, text: texts[rev], rev }) });
+
+  // PR #4631 round 7 (toctou-head-binding): the live side is read AT the head SHA, never at the branch name.
+  it('the live read is keyed by the head SHA: a diff available only under the branch name proves nothing', () => {
+    const ev = read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF });
+    expect(ev.headReadFailed).toBe(true);
+    expect(acceptanceCoversHead(ev).covers).toBe(false);
+  });
 
   it('identical net diff on both heads: the accept covers the refreshed head (derived from git)', () => {
-    const ev = read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF });
+    const ev = read({ [OLD217]: DIFF, [NEW217]: DIFF });
     expect(ev.acceptedDiffDerived).toBe(true);
     expect(acceptanceCoversHead(ev).covers).toBe(true);
   });
 
   it('a changed net diff does not cover', () => {
-    const ev = read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF.replace('+b', '+c') });
+    const ev = read({ [OLD217]: DIFF, [NEW217]: DIFF.replace('+b', '+c') });
     expect(acceptanceCoversHead(ev).covers).toBe(false);
   });
 
   it('an unreadable accepted head leaves today\'s SHA identity (not covered)', () => {
-    const ev = read({ 'lane/xadunn9-wip-deeplinks': DIFF });
+    const ev = read({ [NEW217]: DIFF });
     expect(ev.acceptedDiff).toBeNull();
     expect(acceptanceCoversHead(ev).covers).toBe(false);
   });
 
   it('setting off = today', () => {
-    expect(acceptanceCoversHead(read({ [OLD217]: DIFF, 'lane/xadunn9-wip-deeplinks': DIFF }, 'off')).covers).toBe(false);
+    expect(acceptanceCoversHead(read({ [OLD217]: DIFF, [NEW217]: DIFF }, 'off')).covers).toBe(false);
   });
 });
