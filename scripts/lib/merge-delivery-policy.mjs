@@ -27,7 +27,12 @@
  *     - `batchSize`           GitHub merge-queue group size (max entries to build per group). Suggestion only
  *                             for the ruleset — GitHub reads it from the ruleset, not from here.
  *     - `maxGroupWaitMinutes` GitHub "wait time to meet minimum group size". Ruleset suggestion, same as above.
- *     - `mergeMethod`         'merge' | 'squash' | 'rebase' — the queue's merge method (the drain merges `--merge`).
+ *     - `mergeMethod`         'merge' only — the queue's merge method (the drain merges `--merge` too). The
+ *                             merge_group gate pins each PR to the SECOND PARENT of its queue merge commit
+ *                             (`groupHeadsOf` in merge-gate-check.mjs); a squash or rebase queue leaves no such
+ *                             parent, so every PR would fail closed and nothing would ever merge. 'squash' /
+ *                             'rebase' are refused (ignored → the standard 'merge') until non-merge-commit
+ *                             pinning exists; a test ties every accepted method to a pinnable group head.
  *     - `gatePlacement`       { <gate id>: 'merge-gate' | 'drain' | 'both' } — where a merge-time gate runs.
  *                             A placement may only drop the NON-merging side: under drain-direct the drain must
  *                             keep every gate (it is the merger), under github-merge-queue the merge-gate check
@@ -40,7 +45,7 @@ import { fileURLToPath } from 'node:url';
 
 export const MERGE_DELIVERY_POLICY = 'mergeDelivery';
 export const MERGE_DELIVERY_STRATEGIES = Object.freeze(['drain-direct', 'github-merge-queue']);
-export const MERGE_METHODS = Object.freeze(['merge', 'squash', 'rebase']);
+export const MERGE_METHODS = Object.freeze(['merge']);
 export const GATE_PLACEMENTS = Object.freeze(['merge-gate', 'drain', 'both']);
 
 /** Ship Evermore's declaration: the safe default for every knob. */
