@@ -77,12 +77,16 @@ export const PR_LIMIT_EXCLUDE_STACKED_ENV = 'WE_PR_LIMIT_EXCLUDE_STACKED_AWAITIN
 /** The label the review-status tagger puts on a draft whose base is another open PR (we:scripts/conveyor/review-status-tag.mjs). */
 export const AWAITING_BASE_LABEL = 'review-status:awaiting-base';
 
-/** Operator ruling 2026-10-10 (option c): a stacked draft waiting for its base PR (base is not the default branch AND
- *  it carries {@link AWAITING_BASE_LABEL}) is NOT counted — it cannot land before its base does, so it adds no review
- *  or merge load yet. Both signals are required (fail-closed: a stacked PR without the label still counts). PURE. */
-export function isStackedAwaitingBasePr(pr, defaultBranch = 'main') {
+/** Operator ruling 2026-10-10 (option c): a stacked draft waiting for its base PR (base is not the default branch, it
+ *  carries {@link AWAITING_BASE_LABEL}, AND its base branch is the head of another OPEN PR) is NOT counted — it cannot
+ *  land before that base does, so it adds no review or merge load yet. All three signals are required (fail-closed: a
+ *  stacked PR without the label, or a labelled one aimed at a branch no open PR owns — the label is hand-appliable and
+ *  the tagger puts it on any non-default base — still counts). `openHeadRefs` is the Set of every open PR's
+ *  `headRefName`; absent/not a Set → nothing is stacked. PURE. */
+export function isStackedAwaitingBasePr(pr, openHeadRefs, defaultBranch = 'main') {
   const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
-  return Boolean(base) && base !== defaultBranch && hasLabel(pr, AWAITING_BASE_LABEL);
+  if (!base || base === defaultBranch || !(openHeadRefs instanceof Set) || !openHeadRefs.has(base)) return false;
+  return hasLabel(pr, AWAITING_BASE_LABEL);
 }
 
 const parseBool = (v) => {
@@ -259,8 +263,9 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
   const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
   const cardOnlySet = new Set(cardOnlyPrs);
+  const openHeadRefs = new Set(prs.map((pr) => pr?.headRefName).filter((h) => typeof h === 'string' && h));
   const stackedPrs = excludeStacked
-    ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr) && isStackedAwaitingBasePr(pr))
+    ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr) && isStackedAwaitingBasePr(pr, openHeadRefs))
     : [];
   for (const pr of stackedPrs) cardOnlySet.add(pr); // excluded from the authorship lookup and the count alike
   // GitHub-call budget for the per-PR commits reads (git is tried first and is not counted); an exhausted budget
@@ -298,7 +303,7 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const counted = verdicts.filter((v) => v.ai === true).map((v) => v.pr);
   return {
     repoKey, slug: meta.slug, count: counted.length, prNumbers: counted.map((p) => p.number), limit, unavailable: false, unresolved, apiFetches,
-    cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number),
+    excludeCardOnly, cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number),
     stacked: stackedPrs.length, stackedPrNumbers: stackedPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
   };
 }
@@ -382,7 +387,7 @@ export function countOpenPrsAllRepos(o = {}) {
  */
 export function decideOpenPr({
   repoKey, limit, openCount, changedFiles = [], branch = null, branchAllowed = false, globalOff = false, forceOpen = false, forceReason = null,
-  cardOnlyExcluded = null, acceptedExcluded = null, stackedExcluded = null,
+  cardOnlyExcluded = null, acceptedExcluded = null, stackedExcluded = null, excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly,
 } = {}) {
   const split = cardOnlyExcluded == null && acceptedExcluded == null && stackedExcluded == null ? ''
     : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${stackedExcluded ?? 0} stacked awaiting-base excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
@@ -391,7 +396,8 @@ export function decideOpenPr({
   }
   // A card-only PR is never COUNTED (#4713), so refusing to OPEN one guards a count it cannot raise (xbxahvf; live
   // 2026-10-10 the first card-batch draft was refused at 17/15). `isCardOnlyDiff` is the one definition, fail-closed.
-  if (isCardOnlyDiff(changedFiles)) {
+  // Only while the count excludes them: with `excludeCardOnly` OFF a card-only PR IS counted, so it meets the cap too.
+  if (excludeCardOnly !== false && isCardOnlyDiff(changedFiles)) {
     return { allowed: true, reason: 'exempt: card-only changeset (not counted toward the limit)', exempt: true, overridden: false };
   }
   if (globalOff) {
