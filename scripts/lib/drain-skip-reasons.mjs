@@ -15,12 +15,13 @@ export const SKIP_KINDS = Object.freeze([
   'couple-held', 'blocked-by', 'overlap-yield', 'rebuilt-pending-ci', 'merge-failed', 'parked',
   // Former "other" bucket, now named: every skip says which rule held it.
   'not-certified', 'off-base', 'codeql-failed', 'empty-body', 'stale-read', 'escalated',
-  'partner-pending', 'ready-not-reached', 'unrecognized-reason',
+  'partner-pending', 'ready-not-reached', 'red-main-hold', 'unrecognized-reason',
 ]);
 
 /** Map a drain reason string to a stable kind. Order matters: the most specific signal wins. */
 export function classifySkipReason(reason) {
   const r = String(reason ?? '');
+  if (/^red-main-hold\b/.test(r)) return 'red-main-hold'; // we:scripts/lib/red-main-hold.mjs — main is red, only the fix PR lands
   if (/mergeable=UNKNOWN|merge state UNKNOWN/i.test(r)) return 'unknown-mergeability';
   if (/mergeable=CONFLICTING|DIRTY/.test(r) && !/BEHIND⇒/.test(r)) return 'conflicting';
   if (/\bBEHIND\b/.test(r)) return 'behind';

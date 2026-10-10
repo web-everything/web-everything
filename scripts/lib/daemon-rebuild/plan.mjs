@@ -82,6 +82,20 @@ function pinnedConflictSkippable(git, mainSha, ovSha, pinnedBy) {
   return { skippable: true, why: 'main-has-mechanism', paths: touched };
 }
 
+/** The conflicted paths `git merge-tree --write-tree` lists after its tree line (`<mode> <sha> <stage>\t<path>`). */
+function conflictFilesOf(stdout) {
+  return [...new Set(String(stdout ?? '').split('\n').slice(1)
+    .map((l) => l.split('\t')[1]).filter(Boolean))].sort();
+}
+
+/** Files an overlay changes relative to main (merge-base(main, tip)..tip); [] when git cannot answer. */
+function changedFiles(git, mainSha, sha) {
+  const mb = String(git(['merge-base', mainSha, sha]).stdout ?? '').trim();
+  if (!mb) return [];
+  const d = git(['diff', '--name-only', mb, sha]);
+  return d.status === 0 ? String(d.stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean) : [];
+}
+
 // ── planRebuild — pure over an injected git(args) runner ────────────────────────────────────────────────────
 
 /**
@@ -109,7 +123,22 @@ export async function planRebuild({
   const applied = [];
   let cur = mainSha;
 
-  const toProcess = mainOnly ? [] : overlays;
+  // x5059uu (live 2026-10-09 19:54:32Z) — an overlay whose tip is already in the running HEAD is ESTABLISHED: it is
+  // live and proven. A changed or newly added overlay is a NEWCOMER. Established overlays apply first (each group
+  // keeps list order), so when a newcomer conflicts with them it is the newcomer that is parked, never the proven
+  // ones. Before this, #4643 (registered first) pushed a conflicting commit and the rebuild conflict-dropped the
+  // live #4658/#4663 instead. With no newcomer (or no established overlay) the order is plain list order.
+  const isEstablished = (raw) => {
+    if (!headSha || !raw?.ref) return false;
+    const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
+    return !!sha && git(['merge-base', '--is-ancestor', sha, headSha]).status === 0;
+  };
+  const listed = mainOnly ? [] : overlays;
+  const establishedRefs = new Set(listed.filter(isEstablished).map((o) => o.ref));
+  const conflictFiles = new Map(); // ref → the files its conflict named (for the x5059uu alerts below)
+  const toProcess = [
+    ...listed.filter((o) => establishedRefs.has(o?.ref)), ...listed.filter((o) => !establishedRefs.has(o?.ref)),
+  ];
   if (mainOnly && overlays.length > 0) {
     alerts.push({ kind: 'overlays-refused-main-only', detail: { count: overlays.length } });
   }
@@ -198,6 +227,7 @@ export async function planRebuild({
           kind: 'overlay-conflict-unresolved',
           detail: { ref, pr, sha: ovSha, files: resolution.files, tried: resolution.tried },
         });
+        conflictFiles.set(ref, resolution?.files ?? conflictFilesOf(mt.stdout));
         const refused = dropOrRefuse('conflict', resolution ? { files: resolution.files } : {});
         if (refused) return refused;
         continue;
@@ -261,6 +291,39 @@ export async function planRebuild({
     d.action = 'apply';
     d.reason = 'applied-retry';
     alerts.push({ kind: 'overlay-conflict-retried', detail: { ref: d.ref, pr: d.pr, sha: d.sha } });
+  }
+
+  // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the
+  // alert names its conflicting files and the established overlays they collide with, so its author can merge
+  // those branches in. An established overlay that still drops (main itself moved onto it) is never silent.
+  for (const d of decisions) {
+    if (d.action !== 'drop' || d.reason !== 'conflict') continue;
+    const files = conflictFiles.get(d.ref) ?? [];
+    if (establishedRefs.has(d.ref)) {
+      alerts.push({
+        kind: 'established-overlay-dropped',
+        detail: {
+          ref: d.ref, pr: d.pr, sha: d.sha, files,
+          message: `LIVE overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} is in the running build but conflicts on ${files.join(', ') || '?'} — this rebuild drops it; rebase its branch onto main`,
+        },
+      });
+      continue;
+    }
+    const collidesWith = applied
+      .filter((a) => establishedRefs.has(a.ref))
+      .map((a) => ({ ref: a.ref, pr: a.pr, files: changedFiles(git, mainSha, a.sha).filter((p) => files.includes(p)) }))
+      .filter((c) => c.files.length > 0);
+    // A newcomer that only conflicts with main or with another newcomer is an ordinary conflict drop (reported as
+    // overlay-conflict-dropped); "parked" means it lost to the live set.
+    if (collidesWith.length === 0) continue;
+    alerts.push({
+      kind: 'overlay-newcomer-parked',
+      detail: {
+        ref: d.ref, pr: d.pr, sha: d.sha, files, collidesWith,
+        message: `parked ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''}: its new head conflicts on ${files.join(', ') || '?'}`
+          + ` with live overlay(s) ${collidesWith.map((c) => c.ref).join(', ')} — merge them into it`,
+      },
+    });
   }
 
   const inputsKey = createHash('sha256')

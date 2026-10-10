@@ -35,7 +35,7 @@ import {
   REFUSAL_KINDS, DISPATCH_KINDS, selectStatusCandidates, markSelfReportedDone, markHungSessions,
   markAuthExpiredSessions, markIdleFinishedSessions, markBgIsolationStalls, CI_HEAL_ROUND_CAP,
   CONFLICT_FIX_ROUND_CAP, ADVISORY_FIX_ROUND_CAP, CONFLICT_FIX_ABSOLUTE_CEILING, foldReviewRefusalInto,
-  ACCEPT_LABEL_GRACE_MS, acceptLabelDropped, CARD_BATCH_EXTRACT_WIRED,
+  ACCEPT_LABEL_GRACE_MS, acceptLabelDropped, CARD_BATCH_EXTRACT_WIRED, BLOCKED_CANCELLED_RERUN_CAP,
 } from '../reconcile-core.mjs';
 import {
   STAND_DOWN_MARKER, WATCHER_STAND_DOWN_ACTOR, SUPERSEDE_STAND_DOWN_MARKER, buildStandDownComment,
@@ -3806,5 +3806,58 @@ describe('xu1nixv — the red-main fix PR is first, never a waiting draft, never
     expect(first).toEqual([4522, 4600]);
     const expired = { ...priority(4522), expiresAt: NOW - 1 };
     expect(planReconcile({ prs: [a, fix], agents: [], now: NOW, mainRedPriority: expired }).dispatch.map((d) => d.prNumber)).toEqual([4600, 4522]);
+  });
+});
+
+
+describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
+  const head = 'c'.repeat(40);
+  const repo = 'o/r';
+  const url = (run, job) => `https://github.com/${repo}/actions/runs/${run}/job/${job}`;
+  const retry = { eligible: true, infraCancelled: true, repo, head, pr: 4651,
+    jobs: [{ repo, head, run: 200, job: 11, attempt: 1 }], signature: 's' };
+  const pr = (extra = {}) => pr1563({ number: 4651, headRefOid: head, isDraft: false,
+    labels: lbl('ready-to-merge'), comments: [], mergeStateStatus: 'BLOCKED',
+    statusCheckRollup: [
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: url(50, 1), completedAt: '2026-10-09T17:58:00Z' },
+      { name: 'soak-replay-gate', status: 'COMPLETED', conclusion: 'CANCELLED', detailsUrl: url(200, 11), completedAt: '2026-10-09T18:01:04Z' },
+      { name: 'soak-replay-gate', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: url(100, 12), completedAt: '2026-10-09T18:01:39Z' },
+    ],
+    timeoutRetry: retry, timeoutRetryBudget: { confirmed: 0, pending: false }, ...extra });
+  const plan = (extra = {}) => planReconcile({ prs: [pr(extra)], agents: [], durableCounts: {},
+    now: Date.parse('2026-10-09T19:20:00Z'), requiredChecks: ['test', 'soak-replay-gate'] });
+
+  it('dispatches one mechanical blocked-cancelled rerun capped at two per head', () => {
+    const result = plan();
+    expect(BLOCKED_CANCELLED_RERUN_CAP).toBe(2);
+    expect(result.dispatch).toEqual([expect.objectContaining({ kind: 'ci-timeout-rerun',
+      variant: 'blocked-cancelled', prNumber: 4651,
+      timeoutRetry: { ...retry, cap: BLOCKED_CANCELLED_RERUN_CAP } })]);
+  });
+
+  it('counts confirmed and rejected attempts toward the cap and surfaces exhaustion', () => {
+    const result = plan({ timeoutRetryBudget: { confirmed: 1, rejected: 1 } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', prNumber: 4651 }));
+    expect(result.notes).toContainEqual(expect.objectContaining({ kind: 'blocked-cancelled-rerun-exhausted',
+      prNumber: 4651, attempts: 2, cap: BLOCKED_CANCELLED_RERUN_CAP }));
+  });
+
+  it('refuses another rerun while one is in flight', () => {
+    const result = plan({ timeoutRetryBudget: { pending: true } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'ci-timeout-rerun-in-flight', prNumber: 4651 }));
+  });
+
+  it('owes nothing when the same green-by-completedAt PR is CLEAN', () => {
+    const result = plan({ mergeStateStatus: 'CLEAN' });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'nothing-owed', prNumber: 4651 }));
+  });
+
+  it('does not rerun evidence collected for a different head', () => {
+    const result = plan({ timeoutRetry: { ...retry, head: 'd'.repeat(40) } });
+    expect(result.dispatch).toEqual([]);
+    expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'nothing-owed', prNumber: 4651 }));
   });
 });

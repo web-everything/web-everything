@@ -2,6 +2,7 @@
 bornAs: xet6iu0
 kind: story
 size: 3
+priority: high
 parent: "5467"
 status: open
 scope: ["we:skills-src/conveyor/fix-agent-brief.md", "we:skills-src/conveyor/fix-agent-ci-brief.md", "we:scripts/lib/class-sweep-rule.mjs", "we:scripts/conveyor/class-sweep-check.mjs", "we:scripts/lib/review-fix-policy-settings.json"]
