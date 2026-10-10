@@ -138,19 +138,19 @@ import { isQuotaHeldShadow } from '../lib/review-shadow-agreement.mjs';
  *       pairwise distinct by construction — the same property #3050 was built to buy, obtained here without
  *       #3158's cost.
  *
- * WHAT THIS COSTS, HONESTLY. The two spawns are SEQUENTIAL, not parallel — `driveRun` awaits each judge before
- * it advances — so wall time roughly doubles (measured single-juror runs were 167-312s). A panel would have
- * been concurrent; that is the one thing option (b) buys that this does not, and it is a wall-clock cost, not a
- * verdict-quality one. The bill is the card's ~$0.29 per PR.
+ * WHAT THIS COSTS, HONESTLY. Driven sequentially, the spawns run one after another — `driveRun` awaits each judge
+ * before it advances — so wall time is the SUM of the seats (measured single-juror runs were 167-312s). Since
+ * `review.parallelSeats` (`we:scripts/operations/parallel-judges.mjs`) the review callers start every independent seat
+ * together and commit the answers in declared order, so wall time is the SLOWEST seat and the record is the same.
+ * The bill is the card's ~$0.29 per PR.
  *
- * WHAT THIS DOES NOT DO — the card's "on code PRs only" half. It is NOT implementable inside this declaration,
- * and the reason is structural rather than an omission: the step list is fixed at REGISTRATION, before any PR
- * is read, and the engine runs every declared step at its cursor. There is no conditional step and no "skip"
- * return — `advance`'s `judge` case REFUSES a request that is not `{mandate, input, shape}`-shaped, so a step
- * cannot decline to judge. An INPUT cannot gate it either, for the same reason: an input changes what a step
- * asks, never whether it runs. Gating therefore belongs to a CALLER that knows the touch-set before it starts
- * the run, or to a fifth thing the statute (#3031) forbids. So a docs-only PR pays for a security juror here.
- * That is stated rather than hidden, and it is the residual this slice leaves behind.
+ * THE CARD'S "on code PRs only" HALF lives at the CALLER (`review.seatsByTouchSet`). The step list is fixed at
+ * REGISTRATION, before any PR is read, and the engine runs every declared step at its cursor — there is no
+ * conditional step and no "skip" return, and an INPUT changes what a step asks, never whether it runs. So the seat
+ * list is chosen where the declaration is BUILT: the `securitySeat` registration flag, chosen by the review daemon's
+ * driver from the PR's touch-set before the run starts (`seatSecurityForTouchSet`, `we:scripts/operations/
+ * review-loop-cli.mjs#chooseSecuritySeat`) and read back off the saved run on any resume (`securitySeatFromRun`). An
+ * all-prose PR does not seat the security juror; every code PR keeps both mandatory seats.
  *
  * `MANDATORY_LENSES` IS NOT TOUCHED. It is #2310's ratified pair (`correctness`, `security`) and re-opening it
  * is #3314's decision, not this slice's. This file only ARRANGES to seat both of them; it re-declares nothing.
@@ -322,6 +322,51 @@ export const JUDGE_SEATS = Object.freeze([
  * {@link JUDGE_SEATS} since #3344 — the roster is the one place the seats are listed.
  */
 export const JUDGE_STEPS = Object.freeze(JUDGE_SEATS.map((seat) => seat.step));
+
+/** The security seat's step name (`review.seatsByTouchSet` drops exactly this seat on an all-prose touch-set). */
+export const SECURITY_SEAT_STEP = 'judgeSecurity';
+
+/**
+ * `review.seatsByTouchSet` — DOES THIS TOUCH-SET SEAT THE SECURITY JUROR? PURE. Decided by the CALLER, before the run
+ * starts, from the PR's changed-file list — the existing #3309 subject routing (`classifyReviewSubject`, via
+ * `buildShapePlan`), never a
+ * second taxonomy: a `code` subject keeps the ratified mandatory pair (correctness + security) unchanged; only a
+ * `prose` subject (every file inert text, nothing escalated on path kind — fail-closed to `code` on an unreadable or
+ * empty list) drops the security seat. The caller-chosen seat must itself be a mandatory lens, or the security seat
+ * stays: dropping it would leave no blocking lens at all (`assertMandatoryLensSeated` would refuse the run).
+ *
+ * WHY THE CALLER (#3031). The step list is fixed at registration and the engine has no conditional step, so the seat
+ * list is chosen where the declaration is built — the same registration-time roster flags the advisory seats already
+ * use (`codexAdvisory`, `seatSettings`) — never by a fifth step kind or a skip inside a step.
+ *
+ * @param {{changedFiles?: string[], lens?: string}} o
+ * @returns {{securitySeat: boolean, subject: string, reason: string}}
+ */
+export function seatSecurityForTouchSet({ changedFiles = [], lens = DEFAULT_LENS } = {}) {
+  // `buildShapePlan` (imported above for the care-level check) already carries #3309's `classifyReviewSubject` verdict.
+  const plan = buildShapePlan({ changedFiles });
+  const subject = plan.subject;
+  const trail = plan.trail[0] ?? '';
+  if (subject !== 'prose') return { securitySeat: true, subject, reason: trail };
+  if (!MANDATORY_LENSES.includes(lens)) {
+    return { securitySeat: true, subject, reason: `${trail} The caller-chosen seat (${lens}) is not mandatory, so the security seat stays.` };
+  }
+  return { securitySeat: false, subject, reason: `${trail} The security juror is not seated.` };
+}
+
+/**
+ * THE SECURITY SEAT A SAVED RUN WAS STARTED WITH, for a resume — read off the RUN, like `codexAdvisoryFromRun`, so a
+ * settings flip or a different touch-set read between start and resume cannot change the roster under it. A run
+ * whose first seat has answered seated security iff it holds a `judgeSecurity` finding; a run that has not got that
+ * far reads as the full roster (the default).
+ * @param {object|null|undefined} record
+ * @returns {boolean}
+ */
+export function securitySeatFromRun(record) {
+  const findings = record && typeof record === 'object' && record.findings && typeof record.findings === 'object' ? record.findings : null;
+  if (!findings || !Object.prototype.hasOwnProperty.call(findings, JUDGE_SEATS[0].step)) return true;
+  return Object.prototype.hasOwnProperty.call(findings, SECURITY_SEAT_STEP);
+}
 
 /**
  * #xqa9ttq — THE THIRD SEAT'S LENS, for the OPT-IN Codex panelist (see `reviewPrOperation`'s `codexAdvisory`
@@ -2100,6 +2145,10 @@ export function reviewPrOperation({
   // Card 84 — the resolved `review.*` seat settings (`we:scripts/lib/review-seat-provider.mjs`). `null` = every seat
   // on Claude and no agy seat, i.e. exactly the declaration before this card.
   seatSettings = null,
+  // `review.seatsByTouchSet` — whether this build seats the security juror. `true` (the default) is the declaration
+  // as it always was. Only a CALLER that has read the PR's touch-set before the run starts may pass `false` (see
+  // `seatSecurityForTouchSet`); a resume reads it off the saved run (`securitySeatFromRun`), never re-derives it.
+  securitySeat = true,
 } = {}) {
   const agyCorrectness = seatSettings?.agyCorrectnessAdvisory === true;
   if (agyCorrectness && (MANDATORY_LENSES.includes(AGY_CORRECTNESS_LENS) || PANEL_LENSES.includes(AGY_CORRECTNESS_LENS))) {
@@ -2167,7 +2216,7 @@ export function reviewPrOperation({
   // always has. The three opt-in seats are INDEPENDENT — any subset may be appended — and always in this fixed
   // order (third, then fourth, then fifth) so the declared `judge` steps below stay in the same order as this
   // array.
-  let seats = JUDGE_SEATS;
+  let seats = securitySeat === false ? JUDGE_SEATS.filter((seat) => seat.step !== SECURITY_SEAT_STEP) : JUDGE_SEATS;
   if (codexAdvisory) seats = [...seats, ADVISORY_JUDGE_SEAT];
   if (correctnessAdvisory) seats = [...seats, CORRECTNESS_ADVISORY_SEAT];
   if (antigravityReview) seats = [...seats, ANTIGRAVITY_REVIEW_SEAT];
@@ -2371,15 +2420,19 @@ export function reviewPrOperation({
     // in the run told less than the operator knows. `buildPanelMandate` already renders it as an UNVERIFIED
     // claim and instructs a juror to report the named defect absent when it is absent, so it cannot become
     // this seat's conclusion any more than it can the first's.
-    judgeSecurity: judgeStep({
-      reads: ['input.aim', 'findings.read'],
-      request: (view) => buildReviewJudgeRequest({
-        read: view.findings.read,
-        lens: SECURITY_LENS,
-        aim: typeof view.input.aim === 'string' ? view.input.aim : '',
-        seatProvider: directiveFor(SECURITY_LENS),
+    // `review.seatsByTouchSet` — DECLARED ONLY WHEN SEATED. A caller that read an all-prose touch-set before the run
+    // started registers this operation with `securitySeat: false`; every other build declares it exactly as before.
+    ...(securitySeat !== false ? {
+      judgeSecurity: judgeStep({
+        reads: ['input.aim', 'findings.read'],
+        request: (view) => buildReviewJudgeRequest({
+          read: view.findings.read,
+          lens: SECURITY_LENS,
+          aim: typeof view.input.aim === 'string' ? view.input.aim : '',
+          seatProvider: directiveFor(SECURITY_LENS),
+        }),
       }),
-    }),
+    } : {}),
 
     // ── (opt-in) judgeAdvisory ─────────────────────────────────────────────────────────────────────────────
     // #xqa9ttq — THE THIRD SEAT, DECLARED ONLY WHEN `codexAdvisory` IS TRUE (see `reviewPrOperation`'s param
@@ -2496,7 +2549,9 @@ export function reviewPrOperation({
     // table the write-up renders.
     reduce: compute({
       reads: [
-        'findings.read', 'findings.judge', 'findings.judgeSecurity', 'input.lens',
+        'findings.read', 'findings.judge', 'input.lens',
+        // `review.seatsByTouchSet` — only when the seat is declared (a step may only name a leaf that exists).
+        ...(securitySeat !== false ? ['findings.judgeSecurity'] : []),
         // #xqa9ttq — ONLY declared as a read when the seat itself is declared (`codexAdvisory`): a step may
         // only name a leaf that EXISTS at that point in the run (`op()`'s own registration-time check, above),
         // and `findings.judgeAdvisory` does not exist at all in the opted-out (default) declaration.
@@ -2518,7 +2573,7 @@ export function reviewPrOperation({
         // act on.
         const seats = [
           { step: JUDGE_STEPS[0], lens: view.input.lens, answer: view.findings.judge },
-          { step: JUDGE_STEPS[1], lens: SECURITY_LENS, answer: view.findings.judgeSecurity },
+          ...(securitySeat !== false ? [{ step: SECURITY_SEAT_STEP, lens: SECURITY_LENS, answer: view.findings.judgeSecurity }] : []),
           // #xqa9ttq — THE THIRD SEAT, ONLY WHEN SEATED. `ADVISORY_JUDGE_LENS` is a LITERAL here, exactly
           // like `SECURITY_LENS` above, for the same reason: it is not caller-negotiable. `provider: 'codex'`
           // is the SAME literal `buildReviewAdvisoryJudgeRequest` pins on this seat's actual judge request

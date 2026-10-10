@@ -79,6 +79,11 @@ import { findResumableParkedRun, readReviewRunEvidence } from '../conveyor/revie
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { readCompletePrComments } from '../conveyor/pr-comments-complete.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
+import { parallelSeatsEnabled, seatsByTouchSetEnabled } from '../lib/review-seat-settings.mjs';
+import { planReviewDispatch } from './review-dispatch.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
 // label.mjs#fileApprovalPreventionCard` was fixed for under #4317: `fileItemForPrevention` below drives
 // `file-item` IN PROCESS, against whatever checkout is running the review daemon (routinely a read-only clone,
@@ -399,6 +404,82 @@ export function defaultFindResumableRun({ repo, pr }, { readPr = defaultReadResu
   } catch { return null; }
 }
 
+/** Does this `review-pr` declaration seat the security juror? PURE. */
+export function declaresSecuritySeat(declaration) {
+  return Array.isArray(declaration?.steps) && declaration.steps.some((s) => s.name === SECURITY_SEAT_STEP);
+}
+
+/** The value of `--<name>=<v>` in an argv, or `undefined`. PURE. */
+function argvFlag(argv, name) {
+  const hit = (argv ?? []).find((a) => typeof a === 'string' && a.startsWith(`--${name}=`));
+  return hit === undefined ? undefined : hit.slice(name.length + 3);
+}
+
+/** GitHub caps `gh pr view --json files` at this many entries; a list that long may be cut, so it never buys prose. */
+export const TOUCH_SET_FILE_CAP = 100;
+
+/**
+ * `review.seatsByTouchSet` — CHOOSE THE SEAT LIST BEFORE THE RUN STARTS. Returns whether to seat the security juror,
+ * and why. A `--resume` reads it off the saved run (never re-derived). A fresh round reads the PR's changed files and
+ * asks {@link seatSecurityForTouchSet}. FAIL-CLOSED: the setting off, no `--pr`, an unreadable file list, or a list
+ * that may be truncated all keep the full roster.
+ * @param {string[]} argv
+ * @param {{enabled?: boolean, store?: {read: Function}, readChangedFiles?: (o: {pr: number, repo: string}) => string[]}} [o]
+ * @returns {{securitySeat: boolean, reason: string}}
+ */
+export function chooseSecuritySeat(argv, { enabled = true, store = null, readChangedFiles = defaultReadChangedFiles } = {}) {
+  const resumeId = argvFlag(argv, 'resume');
+  if (resumeId) {
+    try { return { securitySeat: securitySeatFromRun(store?.read(resumeId)), reason: `--resume ${resumeId}: roster read off the saved run` }; } catch {
+      return { securitySeat: true, reason: `--resume ${resumeId}: saved run unreadable — full roster` };
+    }
+  }
+  if (!enabled) return { securitySeat: true, reason: 'review.seatsByTouchSet is off — full roster' };
+  const pr = Number(argvFlag(argv, 'pr'));
+  const repo = argvFlag(argv, 'repo');
+  if (!Number.isInteger(pr) || pr <= 0) return { securitySeat: true, reason: 'no --pr — full roster' };
+  let files;
+  try { files = readChangedFiles({ pr, repo }); } catch (e) {
+    return { securitySeat: true, reason: `touch-set unreadable (${String(e?.message ?? e).slice(0, 200)}) — full roster` };
+  }
+  if (!Array.isArray(files) || files.length >= TOUCH_SET_FILE_CAP) {
+    return { securitySeat: true, reason: `touch-set ${Array.isArray(files) ? `has ${files.length} file(s), may be truncated` : 'unreadable'} — full roster` };
+  }
+  const plan = seatSecurityForTouchSet({ changedFiles: files, lens: argvFlag(argv, 'lens') || DEFAULT_LENS });
+  return { securitySeat: plan.securitySeat, reason: plan.reason };
+}
+
+function defaultReadChangedFiles({ pr, repo }) {
+  const out = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'files'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+  return (Array.isArray(out?.files) ? out.files : []).map((f) => f?.path).filter((p) => typeof p === 'string' && p);
+}
+
+/**
+ * THE REAL SEAT-LANE PROVIDER for `review.parallelSeats`: a further tool-bearing seat gets its own lane from the same
+ * pool the review job leases from, under its own session slug, with no wait and no pool growth — when none is free the
+ * seat simply waits for the primary lane (`./parallel-judges.mjs`). Released when the batch settles; a crash leaves
+ * the lease to the lane pool's own reaper, exactly like the review job's own lease.
+ * @param {{pr: number, repo: string, root?: string}} o
+ */
+export function createSeatLaneProvider({ pr, repo, root = SCAFFOLD_ROOT } = {}) {
+  const run = (args, timeout) => new Promise((done) => {
+    execFile(process.execPath, ['scripts/lane-pool.mjs', ...args], { cwd: root, encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout, stderr) => done({ error, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') }));
+  });
+  return {
+    acquire: async ({ step }) => {
+      let laneRepo;
+      try { laneRepo = planReviewDispatch({ pr, repo }).laneRepo; } catch { return null; }
+      const slug = `review-seat-${pr}-${String(step).replace(/[^A-Za-z0-9-]/g, '')}-${randomUUID().slice(0, 8)}`;
+      const r = await run(['acquire', `--repo=${laneRepo}`, '--purpose=review-loop-seat', `--session=${slug}`, '--wait-ms=0', '--growth-max-new=0', '--adopt'], 120_000);
+      const path = r.stdout.trim().split('\n').filter(Boolean).pop() ?? '';
+      if (r.error || !path.startsWith('/')) return null;
+      return { cwd: path, release: () => run(['release', '--all-pools', `--session=${slug}`], 120_000) };
+    },
+  };
+}
+
 function defaultReadResumePr({ repo, pr }) {
   const { headRefOid } = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []), '--json', 'headRefOid'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
@@ -439,8 +520,13 @@ export async function runReviewLoopOnce({
   appendLearning = appendEntry, session = 'review-loop', fileItem = fileItemForPreventionViaLandingJob,
   findFiledPrevention = findFiledPreventionCard, findResumableRun = () => null, now = () => new Date().toISOString(),
   findFiledRoundCards = findFiledRoundCardsCard,
+  // `review.parallelSeats` — start every independent juror seat at once (`./parallel-judges.mjs`); `seatLanes` gives a
+  // further tool-bearing seat a lane of its own. Both default to the sequential drive, so a caller that passes
+  // neither is unchanged; the CLI block below passes the resolved setting and the real lane provider.
+  parallelJudges = false, seatLanes = null,
 } = {}) {
   const parsed = parseOperationArgv(declaration, argv);
+  const drive = (o) => driveRun({ ...o, parallelJudges, seatLanes });
   if (parsed.control.help) {
     const { buildCliSpec } = await import('./cli-adapter.mjs');
     return { code: 0, lines: [buildCliSpec(declaration).usage], run: null, stopped: 'help' };
@@ -484,7 +570,11 @@ export async function runReviewLoopOnce({
       const unfinishedResume = Boolean(parked?.resumeOf) && !parked.stepTimings?.find((t) => t.step === 'advise')?.finishedAt;
       const attempts = unfinishedResume ? Number(parked.resumeOf.attempts) || 1 : 0;
       // A resume that keeps failing is bounded: after RESUME_MAX_ATTEMPTS the round falls back to a fresh review.
-      if (parked && parked.op === declaration.name && attempts < RESUME_MAX_ATTEMPTS
+      // `review.seatsByTouchSet` — a parked run is resumed only under the roster it was judged with; a declaration that
+      // seats the security juror differently would reason about a run shape that no longer exists, so that case
+      // starts a fresh review instead (same fallback as any other doubt here).
+      const rosterMatches = !parked || securitySeatFromRun(parked) === declaresSecuritySeat(declaration);
+      if (parked && parked.op === declaration.name && attempts < RESUME_MAX_ATTEMPTS && rosterMatches
         && (parked.pending?.kind === 'confirm' || unfinishedResume)) {
         rewound = rewindRunToStep(parked, { registry, step: RESUME_STEP, at: now() });
         // The rewind drops the parked verdict and the referral step, and the record is saved before the resumed pass
@@ -534,7 +624,7 @@ export async function runReviewLoopOnce({
   // THE ONE LINE THIS FILE ADDS TO THE DRIVE CALL: an UNATTENDED policy, and `attemptedBy: 'agent'` so a
   // reader of the run's own step-timing record can tell this pass apart from a human at a terminal — the same
   // distinction `applyPendingEffects`'s `attemptedBy` already threads for its effect rows.
-  const outcome = await driveRun({
+  const outcome = await drive({
     run, registry, store, sinks, judge: activeJudge, resume, autoConfirm, attemptedBy: 'agent',
   });
 
@@ -612,7 +702,7 @@ export async function runReviewLoopOnce({
     // THE CARD IS FILED AND TRACKED — resume THIS SAME run with the mechanical `accept` the policy itself
     // declined to answer, so the label swap + durable comment apply exactly as a clean accept's would.
     const acceptResume = { step: outcome.run.pending.step, value: 'accept' };
-    const acceptedOutcome = await driveRun({
+    const acceptedOutcome = await drive({
       run: outcome.run, registry, store, sinks, judge: activeJudge, resume: acceptResume, autoConfirm, attemptedBy: 'agent',
     });
     const rendered = renderOutcome({ outcome: acceptedOutcome, json: parsed.control.json, declaration });
@@ -701,7 +791,7 @@ export async function runReviewLoopOnce({
       input: { ...outcome.run.input, reason: roundCardsAcceptReason({ decision, filed: where }), roundCardsFiling: receipt },
     };
     store.write(accepting);
-    const acceptedOutcome = await driveRun({
+    const acceptedOutcome = await drive({
       run: accepting, registry, store, sinks, judge: activeJudge, resume: { step: outcome.run.pending.step, value: 'accept' },
       autoConfirm, attemptedBy: 'agent',
     });
@@ -857,18 +947,26 @@ if (IS_CLI) {
   // #xu2pp2m — `cwd` for the SAME pre-parse reason as `json` (see `cwdFlagValue`). THIS entry point is the
   // one a dispatched/mechanical review runs through, and it is ALWAYS given a lane, so before this the diff it
   // judged came from `REPO_ROOT` on every single unattended review ever run (PR #2122 merged on it).
+  // `review.seatsByTouchSet` — the seat list is chosen HERE, before the run starts, from the PR's touch-set (or, on a
+  // `--resume`, from the saved run), and handed to the declaration's registration. See `chooseSecuritySeat`.
+  const store = createFileRunStore();
+  const seating = chooseSecuritySeat(argv, { enabled: seatsByTouchSetEnabled(), store });
+  try { process.stderr.write(`review seats: security juror ${seating.securitySeat ? 'seated' : 'NOT seated'} — ${seating.reason}\n`); } catch { /* best effort */ }
   const { declaration, registry, sinks } = resolveOperation(
-    REVIEW_LOOP_OP, { json: hasJsonFlag(argv), cwd: cwdFlagValue(argv) },
+    REVIEW_LOOP_OP, { json: hasJsonFlag(argv), cwd: cwdFlagValue(argv), securitySeat: seating.securitySeat },
   );
+  const prFlag = Number(argvFlag(argv, 'pr'));
   runReviewLoopOnce({
     declaration,
     registry,
     argv,
-    store: createFileRunStore(),
+    store,
     sinks,
     makeJudge: createCliJudgeFactory(),
     mintRunId: () => newRunId(declaration.name),
     findResumableRun: defaultFindResumableRun,
+    parallelJudges: parallelSeatsEnabled(),
+    seatLanes: Number.isInteger(prFlag) && prFlag > 0 ? createSeatLaneProvider({ pr: prFlag, repo: argvFlag(argv, 'repo') }) : null,
   })
     .then(({ code, lines }) => {
       writeAllSync(1, `${lines.join('\n')}\n`);
