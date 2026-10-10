@@ -12,12 +12,12 @@ import { execFileSync } from 'node:child_process';
 import { runJob } from './lib/daemon-jobs-runtime.mjs';
 import { followupSteps } from './lib/drain-followup-job.mjs';
 import { numberPendingHashes, resolveLandedItem } from './lane-drain.mjs';
-import { planResolveOnLand, pushNumberingOnLand, regenDerivedOnLand } from './merge-ai-prs.mjs';
+import { planResolveOnLand, pushNumberingOnLand, regenDerivedOnLand, syncPrimaryOnLand } from './merge-ai-prs.mjs';
 import { withNumberingLock } from './readiness/drain-lock.mjs';
 
 const steps = followupSteps({
   cwd: process.cwd(), exec: execFileSync, numberPendingHashes, resolveLandedItem, planResolveOnLand,
-  pushNumberingOnLand, regenDerivedOnLand, withNumberingLock,
+  pushNumberingOnLand, regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand,
 });
 const out = await runJob({ steps });
 console.log(`${new Date().toISOString()} drain-followup pid=${process.pid} ${JSON.stringify(out)}`);
