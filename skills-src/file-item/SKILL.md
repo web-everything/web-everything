@@ -77,6 +77,20 @@ Land the new card the normal way, from the SAME lane:
 3. `node scripts/operations/run.mjs open-pr --ref=lane/<slug> --title="<title>" --bodyFile=<path> --json` —
    same as every other constellation-repo change (`we:.claude/skills/pr/SKILL.md`).
 
+**A card-only filing goes into the card batch instead (operator go 2026-10-10).** When the lane's only change is
+the one new card, skip steps 2–3 and run:
+
+```
+node scripts/operations/card-batch-file.mjs --lane=<this lane> --card=backlog/<the new file>.md \
+  [--source-pr=<the PR this came from>] [--note="<why it was filed>"] --json
+```
+
+Exit 0 means the card was appended (one commit) to the rolling `lane/card-batch-filing-<n>` PR, which seals at
+`cards.batchMaxCards` cards or `cards.batchMaxMinutes` minutes (settings cascade in
+`we:scripts/lib/card-batch-settings.mjs`). Release the lane; the card lands with the batch. Exit 3 means it was
+not batched (batching off, a high-priority card, `--batch=false`, `--actor=interactive`, or the batch refused it):
+run steps 2–3 as usual. An operator who wants the card alone passes `--batch=false`, or skips this step.
+
 ## If you find `file-item` is missing on your checkout
 
 `file-item` is live on `main` (#3548); if your checkout is missing it, it is behind — sync it first. If you

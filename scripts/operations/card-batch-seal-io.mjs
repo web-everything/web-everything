@@ -4,15 +4,16 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, atomicRecord, tokenOf } from './card-batch-io.mjs';
+import { acquireLease, atomicRecord, cardBatchStateDir, tokenOf } from './card-batch-io.mjs';
 import { planPublish, planSeal, renderBatchBody } from './card-batch-seal.mjs';
-import { loadCardBatchPolicy, CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
+import { CARD_BATCH_KINDS } from '../lib/card-batch-policy.mjs';
+import { effectiveCardBatchPolicy } from '../lib/card-batch-settings.mjs';
 import { readVerifyMarker, VERIFY_FILENAME } from '../lib/lane-verify.mjs';
 import { extractSubmitResult } from './open-pr.mjs';
 import { parseRunJsonTail } from './land-prevention-card.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
-export const CARD_BATCH_STATE_DIR = join(ROOT, '.operations/card-batch');
+export const CARD_BATCH_STATE_DIR = cardBatchStateDir();
 export const HOLD_LABEL = 'review-status:draft-withdrawn';
 /** Unrun verifies tolerated before the batch is held for a person; keeps a permanently broken verify from looping forever. */
 export const VERIFY_UNRUN_CAP = 3;
@@ -29,7 +30,7 @@ const kindOf = (state, path) => state.kind ?? CARD_BATCH_KINDS.find(kind => path
 /** Call after admission. All commands, including lane acquisition, pass through the injected runner. */
 export async function publishBatch(input, opts = {}) {
   const { stateDir = CARD_BATCH_STATE_DIR, exec = batchExec, clock = Date.now, remote = 'origin',
-    policy = loadCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt } = opts;
+    policy = effectiveCardBatchPolicy(), leaseMs = 3 * 60 * 60_000, crashAt } = opts;
   const now = () => new Date(clock()).getTime();
   const statePath = resolve(input.statePath ?? join(stateDir, `${input.source.repo.replaceAll('/', '-')}-${input.kind}.json`));
   mkdirSync(dirname(statePath), { recursive: true });
@@ -192,7 +193,7 @@ export async function publishBatch(input, opts = {}) {
 
 /** Tick only scans and launches; the detached worker owns verification and the admission lease. */
 export async function sealDueBatches({ now = Date.now(), stateDir = CARD_BATCH_STATE_DIR,
-  policy = loadCardBatchPolicy(), spawn = spawnChild } = {}) {
+  policy = effectiveCardBatchPolicy(), spawn = spawnChild } = {}) {
   let files;
   try { files = readdirSync(stateDir); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
   const jobs = [];
