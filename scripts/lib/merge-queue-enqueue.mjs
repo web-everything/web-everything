@@ -32,15 +32,81 @@ export function isAlreadyQueuedError(text) {
 }
 
 /**
- * Enqueue one PR. Never throws. `{ok:true, entry}` / `{ok:true, already:true}` / `{ok:false, error}`.
+ * Paths a queued PR may never touch. The required `merge-gate` check is a workflow, and GitHub reads a workflow's
+ * YAML from the PR merge ref (`pull_request`) or the group commit (`merge_group`), so a PR can edit one to
+ * `exit 0` (or add a new workflow with a job named like a required check) and turn the check green from inside its
+ * own diff. No check a PR can edit can defend against that, so the defence sits where the PR cannot reach: the
+ * drain, running from the daemon's own `main` checkout, refuses to enqueue such a PR at all. A human merges it.
+ */
+export const GATE_PATH_PREFIXES = ['.github/workflows/', '.github/actions/'];
+
+/** The REST `pulls/{n}/files` listing stops at 3000 files; a PR that reaches it has an unreadable tail. */
+export const MAX_LISTED_PR_FILES = 3000;
+
+/** A repo path reduced to the form the prefix test uses (separators, case, `./`, NFKC). Pure. */
+export function normalizeGatePath(p) {
+  return String(p ?? '').normalize('NFKC').replace(/\\/g, '/').toLowerCase().replace(/\/+/g, '/').replace(/^(?:\.?\/)+/, '');
+}
+
+/**
+ * Does this PR's change list let it be enqueued? Pure. A PR is held for a HUMAN (`humanOnly: true`, not an
+ * escalation an AI reviewer can accept) when any changed path, or any renamed-from path, is a workflow or action
+ * file; and it is held fail-closed but RETRYABLE (`humanOnly: false`) when the list cannot be trusted to be
+ * complete (a gh error or a stale count is transient, not a decision).
+ * @param {{files:Array<string|{filename:string, previous_filename?:string}>, expectedCount:number}} o
+ * @returns {{hold:false}|{hold:true, humanOnly:boolean, retryable?:boolean, reason:'workflow-edit'|'unreadable', paths:string[], error:string}}
+ */
+export function workflowEditHold({ files, expectedCount } = {}) {
+  const unreadable = (why) => ({ hold: true, humanOnly: false, retryable: true, reason: 'unreadable', paths: [], error: `changed files unreadable (${why}) — a PR is only enqueued when its whole change list is known not to touch workflow files` });
+  if (!Array.isArray(files)) return unreadable('no list');
+  if (!Number.isInteger(expectedCount) || expectedCount < 0) return unreadable('no file count');
+  if (files.length !== expectedCount) return unreadable(`listed ${files.length} of ${expectedCount}`);
+  if (expectedCount >= MAX_LISTED_PR_FILES) return unreadable(`${expectedCount} files reaches the ${MAX_LISTED_PR_FILES}-file listing limit`);
+  const hit = [];
+  for (const f of files) {
+    for (const raw of typeof f === 'string' ? [f] : [f?.filename, f?.previous_filename]) {
+      if (raw === undefined || raw === null || raw === '') continue;
+      const p = normalizeGatePath(raw);
+      if (p.split('/').includes('..') || GATE_PATH_PREFIXES.some((pre) => p.startsWith(pre))) hit.push(String(raw));
+    }
+    if (typeof f !== 'string' && !f?.filename) return unreadable('entry without a filename');
+  }
+  return hit.length
+    ? { hold: true, humanOnly: true, reason: 'workflow-edit', paths: [...new Set(hit)], error: `held for a human: the diff touches ${[...new Set(hit)].join(', ')} — workflow files decide the required checks, so only a person may land a change to them` }
+    : { hold: false };
+}
+
+/** The PR's full change list (paginated REST, filename + rename source), or `{error}`. */
+function readChangedFiles({ repo, num, exec }) {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo)) || !Number.isInteger(Number(num))) return { error: 'repo or PR number is malformed' };
+  try {
+    const out = exec('gh', ['api', '--paginate', `repos/${repo}/pulls/${num}/files?per_page=100`, '--jq', '.[] | [.filename, (.previous_filename // "")] | @json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
+    const files = String(out ?? '').split('\n').filter((l) => l.trim()).map((l) => {
+      const [filename, previous] = JSON.parse(l);
+      return { filename, previous_filename: previous || undefined };
+    });
+    return { files };
+  } catch (e) { return { error: errText(e) }; }
+}
+
+/**
+ * Enqueue one PR. Never throws. `{ok:true, entry}` / `{ok:true, already:true}` / `{ok:false, error}`; a PR whose
+ * diff touches a workflow file (or whose change list cannot be fully read) comes back `{ok:false, held:true,
+ * humanOnly:true, error}` and is never enqueued.
  * @param {{repo:string, num:number, headSha:string, exec?:Function}} o
  */
 export function enqueuePr({ repo, num, headSha, exec = execFileSync }) {
   let nodeId;
+  let changedFiles;
   try {
-    nodeId = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'id'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}')?.id;
+    const pr = JSON.parse(exec('gh', ['pr', 'view', String(num), '--repo', repo, '--json', 'id,changedFiles'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
+    nodeId = pr?.id;
+    changedFiles = pr?.changedFiles;
   } catch (e) { return { ok: false, error: `node id read failed: ${errText(e)}` }; }
   if (!nodeId) return { ok: false, error: 'node id missing' };
+  const read = readChangedFiles({ repo, num, exec });
+  const hold = workflowEditHold({ files: read.files, expectedCount: changedFiles });
+  if (hold.hold) return { ok: false, held: true, humanOnly: hold.humanOnly, retryable: hold.retryable === true, reason: hold.reason, paths: hold.paths, error: read.error ? `${hold.error}: ${read.error}` : hold.error };
   try {
     const out = JSON.parse(exec('gh', buildEnqueueArgs({ nodeId, headSha }), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}');
     const errs = out?.errors;

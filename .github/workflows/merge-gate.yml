@@ -16,8 +16,18 @@
 # ruleset's `workflows` rule (requiredWorkflows) pinned to refs/heads/main, so GitHub runs them from main rather
 # than from the PR, and accepts the required checks only from the GitHub Actions app
 # (requiredStatusCheckIntegrationId). A test fails when a workflow defining a required check is not in that pin.
-# Until the operator applies that ruleset, the only guard is review escalation of any .github/workflows/* diff
-# (the blast-radius signal, pinned by merge-gate-ci.test.mjs); card xha9nns adds the human-required path.
+# Until the operator applies that ruleset, the guard the repo itself provides is the ENQUEUE refusal, which no PR can
+# edit because it does not run in a workflow: enqueuePr (scripts/lib/merge-queue-enqueue.mjs) runs from the daemon's
+# own main checkout and refuses, for a HUMAN (humanOnly, not an escalation an AI reviewer can accept), any PR whose
+# full change list touches .github/workflows/** or .github/actions/** (either spelling, any case, both sides of a
+# rename); a change list it cannot read in full fails closed but stays retryable. enqueuePr is the ONLY code that
+# may send the enqueue mutation (a test fails if any other script does), and the drain's wiring of it is card
+# xtpxusq. HONEST LIMITS: (1) the drain does not call enqueuePr yet, so today nothing enqueues and this check is not
+# required, so this YAML decides no merge; (2) once the strategy is `github-merge-queue`, an entry added by hand
+# (the UI, `gh pr merge --auto`, a raw API call) bypasses enqueuePr: only the ruleset's `workflows` pin closes that,
+# so do not make `merge-gate` required, or flip the strategy, before the operator applies it. The review
+# escalation of a workflow diff (blast radius, pinned by merge-gate-ci.test.mjs) stays as a second layer; card
+# xha9nns adds CODEOWNERS / trust-chain human approval.
 # BOOTSTRAP (true bootstrap only): until this lands, main has neither scripts/merge-gate-check.mjs nor this
 # workflow, so the check reports clear (the same bootstrap review-gate.yml documents); it is not required by the
 # ruleset until the operator adds it. The moment main has this workflow, a missing script FAILS CLOSED — a later
