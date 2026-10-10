@@ -1328,11 +1328,11 @@ export function dispatchFix(planned, {
   // Hermetic under a test runner: a test that wants history injects its own reader.
   readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postTakeover = postTakeoverMarker,
-  // Takeover budget — the previous takeover's diff for a takeover 2+ brief. Hermetic under a test runner.
-  readTakeoverDiff = ({ repo: r, from, to }) => (isUnderTestEnv() ? null : readTakeoverDiffViaGh({ repo: r, from, to })),
-  postTakeoverVoidMark = postTakeoverVoid,
   // Card xrbu1bp — the fixer ladder, read only when a round reaches `fix.strongerModelFromRound`.
   loadLadder = () => loadFixerLadder(),
+  postTakeoverVoidMark = postTakeoverVoid,
+  // Takeover budget — the previous takeover's diff for a takeover 2+ brief. Hermetic under a test runner.
+  readTakeoverDiff = ({ repo: r, from, to }) => (isUnderTestEnv() ? null : readTakeoverDiffViaGh({ repo: r, from, to })),
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
   // `runReconcileFixDispatch` already refused a repo whose profile lacks the `fix` capability before this ever
