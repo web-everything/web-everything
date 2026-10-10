@@ -91,7 +91,6 @@ describe('ensure one sampler job', () => {
   it.each([
     ['interval', { ...args.input, intervalMs: 2500 }],
     ['root', { ...args.input, root: '/tmp/other-coordination' }],
-    ['checkout', { ...args.input, checkoutRoot: '/tmp/other-checkout' }],
   ])('applies a changed %s config on restart: retires the live job on the same sha and queues one with the new input', (_name, changed) => {
     const store = newStore(); const first = ensureSamplerJob({ store, ...args });
     const retired = [];
@@ -102,6 +101,29 @@ describe('ensure one sampler job', () => {
     expect(next).toMatchObject({ enqueued: true });
     expect(next.record.input).toEqual(changed);
     expect(next.record.job.codeSha).toBe(args.codeSha);
+  });
+  it('does not restart for a different checkout path at the same sha (two checkouts must not retire each other every tick)', () => {
+    const store = newStore(); const first = ensureSamplerJob({ store, ...args, input: { ...args.input, checkoutRoot: '/a' } });
+    const next = ensureSamplerJob({ store, ...args, input: { ...args.input, checkoutRoot: '/b' }, retire: () => { throw new Error('must not retire'); } });
+    expect(next).toMatchObject({ enqueued: false });
+    expect(next.record.id).toBe(first.record.id);
+  });
+  it('a retire that throws never loses the process: the handle stays on the failed record and the next call retires it', () => {
+    const store = newStore(); const first = ensureSamplerJob({ store, ...args, codeSha: 'b'.repeat(40) });
+    const at = new Date(args.now).toISOString();
+    const identity = { host: 'test-host', pid: 77, procStart: 'Fri Oct 9 18:31:02 2026' };
+    const handle = formatJobHandle(identity);
+    store.update(first.record.id, r => markClaimed(markLaunching(r, { at }), { at, ...identity, handle }));
+    expect(() => ensureSamplerJob({ store, ...args, retire: () => { throw new Error('ps timed out'); } })).toThrow(/ps timed out/);
+    expect(store.read(first.record.id).job).toMatchObject({ status: 'failed', handle: null, retiredHandle: handle });
+    const retired = [];
+    const next = ensureSamplerJob({ store, ...args, retire: (record) => retired.push(record.job.handle) });
+    expect(retired).toEqual([handle]);
+    expect(store.read(first.record.id).job.retiredHandle).toBeNull();
+    expect(next).toMatchObject({ enqueued: true });
+    retired.length = 0;
+    ensureSamplerJob({ store, ...args, retire: (record) => retired.push(record.job.handle) });
+    expect(retired).toEqual([]); // settled: not retried again
   });
   it('treats the same config with reordered keys as unchanged', () => {
     const store = newStore(); const first = ensureSamplerJob({ store, ...args });
