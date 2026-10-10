@@ -210,6 +210,8 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
     // start(07) → void(08) → retry start(10): the void belongs to the 07 start; the 10:00 retry stands
     const thread = [at(marker(HEAD), '07:00'), at(voided(HEAD), '08:00'), at(marker(HEAD), '10:00')];
     expect(takeoverMarkers(thread).map((m) => m.at)).toEqual(['2026-10-10T10:00:00Z']);
+    // the pairing follows `createdAt`, not the order the caller handed the array in
+    expect(takeoverMarkers([thread[2], thread[1], thread[0]]).map((m) => m.at)).toEqual(['2026-10-10T10:00:00Z']);
     // a void with no earlier start cancels nothing (it must not eat a later start)
     expect(takeoverMarkers([at(voided(HEAD), '08:00'), at(marker(HEAD), '10:00')])).toHaveLength(1);
     // an `unknown`-head void likewise only reaches an earlier `unknown` start

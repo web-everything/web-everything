@@ -121,6 +121,14 @@ export function takeoverVoidCount(comments) {
   return trustedBodies(comments).filter((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER) !== undefined).length;
 }
 
+/** Comments in thread order: by `createdAt` (stable) when every comment carries a valid one, else as given. The grant
+ *  reads `createdAt` too, so the pairing here must not depend on how the caller happened to order the array. */
+function inThreadOrder(list) {
+  const at = (c) => Date.parse(c?.createdAt ?? '');
+  if (!list.length || !list.every((c) => Number.isFinite(at(c)))) return list;
+  return [...list].sort((a, b) => at(a) - at(b));
+}
+
 /**
  * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
  * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing,
@@ -131,7 +139,7 @@ export function takeoverMarkers(comments) {
   let honoured = 0;
   // Walk the thread in order: a void gives back the launch it FOLLOWED, so it only reaches starts posted before it. A
   // void that searched every start would cancel a later retry's marker and keep the failed launch's instead.
-  for (const c of trustedBodies(comments)) {
+  for (const c of inThreadOrder(trustedBodies(comments))) {
     const startHead = markerHead(c.body, FIX_TAKEOVER_MARKER);
     if (startHead !== undefined) {
       starts.push({ head: startHead, at: c.createdAt ?? null, attempts: markerAttempts(c.body) });
