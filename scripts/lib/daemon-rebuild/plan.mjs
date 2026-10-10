@@ -308,6 +308,12 @@ export async function planRebuild({
       decisions.push({ ref, pr, action: 'remove', reason: 'ref-gone', sha: null });
       continue;
     }
+    const inMain = (sha) => {
+      if (git(['merge-base', '--is-ancestor', sha, mainSha]).status === 0) return true;
+      const m = git(['merge-tree', '--write-tree', '--no-messages', mainSha, sha]);
+      const t = String(m.stdout ?? '').split('\n')[0].trim();
+      return m.status === 0 && !!t && t === verifyRev(git, `${mainSha}^{tree}`);
+    };
     const dropOrRefuse = (reason, extra = {}) => {
       const p = pinnedStatus(git, raw, mainSha, ovSha);
       if (p.pinned) {
@@ -372,11 +378,12 @@ export async function planRebuild({
     //    compare against `cur` catches it regardless of history shape.
     const curTree = verifyRev(git, `${cur}^{tree}`);
     if (tree && curTree && tree === curTree) {
-      // A PINNED overlay whose tip an already-applied overlay contains (listed after its top) is live through that
-      // top, not in main: it stays registered (`skip`), so the top later leaving never loses it silently.
-      if (pinnedStatus(git, raw, mainSha, ovSha).pinned
-        && git(['merge-base', '--is-ancestor', ovSha, cur]).status === 0
-        && git(['merge-base', '--is-ancestor', ovSha, mainSha]).status !== 0) {
+      // A PINNED overlay is only `in-main` when MAIN has it (tip an ancestor of main, or merging it onto main changes
+      // nothing — the squash-merged shape). Content that only an already-applied overlay carries (listed after its
+      // top, whether or not its exact tip is an ancestor of `cur`: a rebased base keeps the old head's content in its
+      // top) is live through that top, not in main: it stays registered (`skip`), so the top later leaving never
+      // loses it silently. Fail closed: a git error answering "is it in main?" counts as not in main.
+      if (pinnedStatus(git, raw, mainSha, ovSha).pinned && !inMain(ovSha)) {
         decisions.push({ ref, pr, action: 'skip', reason: 'pinned-contained-in-applied', sha: ovSha });
         continue;
       }

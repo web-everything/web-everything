@@ -297,6 +297,35 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
   });
 
+  it('a pinned REBASED base listed after the top that carries its old head is skipped, never removed as in-main (list order cannot deregister it)', async () => {
+    const f = fixture();
+    const old = f.push('lane/rb-old', f.init, { [LADDER]: lines({ 3: 'rebased base' }) });
+    f.push('lane/rb-top', old, { [TAKEOVER]: lines({ 8: 'top' }) });
+    f.push('lane/rb-base', f.init, { [LADDER]: lines({ 3: 'rebased base' }) }); // same content, new head: not an ancestor of the top
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9102 ? ['lane/rb-base'] : []),
+      overlays: [{ ref: 'lane/rb-top', pr: 9102 }, { ref: 'lane/rb-base', pr: 9101, pinned: true }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/rb-top')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/rb-base')).toMatchObject({ action: 'skip', reason: 'pinned-contained-in-applied' });
+    expect(plan.decisions.some((d) => d.action === 'remove')).toBe(false);
+  });
+
+  it('a pinned base whose content main already has (squash-merged) is still removed as in-main', async () => {
+    const f = fixture();
+    f.push('lane/sq-base', f.init, { [LADDER]: lines({ 3: 'squashed' }) });
+    const m = f.push('lane/sq-main', f.init, { [LADDER]: lines({ 3: 'squashed' }) });
+    gitOk(f.author, ['push', '-q', '-f', 'origin', `${m}:refs/heads/main`]);
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: 'lane/sq-base', pinned: true }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/sq-base')).toMatchObject({ action: 'remove', reason: 'in-main' });
+  });
+
   it('addOverlay records only safe branch names as stackBases', async () => {
     const f = fixture();
     const { readOverlays } = await import('../daemon-overlays.mjs');
