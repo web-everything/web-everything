@@ -1,4 +1,5 @@
 ---
+bornAs: x5zjv3l
 kind: story
 size: 5
 status: open
@@ -9,7 +10,7 @@ tags: []
 
 # Split the drain's merge write step (we:scripts/merge-ai-prs.mjs) into per-feature hook modules so drain features stop colliding on the same lines
 
-Live 2026-10-09: PRs #4624 (lane/red-main-contain) and #4631 (lane/accept-carry-forward) both edit the merge write step in we:scripts/merge-ai-prs.mjs, and both went CONFLICTING with main after #4619 merged its own edits to the same lines (fix commits 425c1954f, bcc3abba1). The fix daemon's scope-overlap fence (net diff via we:scripts/conveyor/net-scope.mjs) saw both PRs on we:scripts/merge-ai-prs.mjs and we:backlog/xx7ckd6-drain-red-main-hold-while-main-is-red-only-the-main-fix-pr-l.md, so their fixes alternated ('refused scope-overlap ... waiting 2nd behind #4631', then the reverse) and each push made the other stale. Every drain feature appends to the same write-step block, so parallel drain features always collide. Split that step into an ordered list of per-feature hook modules under a new we:scripts/drain-hooks/ dir (one file per feature, discovered from disk, like we:scripts/settings/), so a new drain feature adds a file instead of editing shared lines. Same pattern as the per-feature settings split (PR #4563). Stacked-PR handling in the fixer (PR #4655) treats the symptom; this removes the shared hot spot.
+Live 2026-10-09: PRs #4624 (lane/red-main-contain) and #4631 (lane/accept-carry-forward) both edit the merge write step in we:scripts/merge-ai-prs.mjs, and both went CONFLICTING with main after #4619 merged its own edits to the same lines (fix commits 425c1954f, bcc3abba1). The fix daemon's scope-overlap fence (net diff via we:scripts/conveyor/net-scope.mjs) saw both PRs on we:scripts/merge-ai-prs.mjs and we:backlog/5685-drain-red-main-hold-while-main-is-red-only-the-main-fix-pr-l.md, so their fixes alternated ('refused scope-overlap ... waiting 2nd behind #4631', then the reverse) and each push made the other stale. Every drain feature appends to the same write-step block, so parallel drain features always collide. Split that step into an ordered list of per-feature hook modules under a new we:scripts/drain-hooks/ dir (one file per feature, discovered from disk, like we:scripts/settings/), so a new drain feature adds a file instead of editing shared lines. Same pattern as the per-feature settings split (PR #4563). Stacked-PR handling in the fixer (PR #4655) treats the symptom; this removes the shared hot spot.
 
 ## Acceptance
 

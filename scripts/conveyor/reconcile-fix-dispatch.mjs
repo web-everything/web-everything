@@ -111,7 +111,7 @@ import {
 } from './fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
-import { readStacksForPass, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, withRestackHint, nextRemembered, writeRemembered } from './pr-stack.mjs';
+import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
 import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
@@ -1404,16 +1404,21 @@ export function runReconcileFixDispatch({
   netScope = reconcile === runReconcilePass ? applyNetScopeToReconcile : null,
   prStack = reconcile === runReconcilePass ? readStacksForPass : null,
   prStackSettings = resolvePrStackSettings(),
+  // Where the remembered stacks are saved: the real memory file with the real stack reader, nowhere for an injected one.
+  writeStacks = prStack === readStacksForPass ? writeRemembered : null,
   readPrForRestack = prStack === readStacksForPass ? (pr) => {
     try {
       const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
       const data = JSON.parse(execFileSyncThrottled('gh', ['pr', 'view', String(pr), '--repo',
-        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body'],
+        CONSTELLATION_REPOS[repoKey].slug, '--json', 'number,headRefName,headRefOid,labels,body,isCrossRepository'],
       { cwd: root, encoding: 'utf8', timeout: 30e3 }));
       return { kind: 'fix', prNumber: data.number, headRefName: data.headRefName,
-        headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body };
+        headRefOid: data.headRefOid, labels: data.labels.map(label => label.name), body: data.body,
+        isCrossRepository: data.isCrossRepository !== false };
     } catch { return null; }
   } : null,
+  // Origin's lane/* tips, to verify an idle restack target at dispatch time (the push-capable step).
+  readLaneTips = readOriginLaneTips,
   resolveFallbackScope = (pr) => fetchPrDiffScope(pr, { root, repo }),
   // #xmtbdgs multi-repo slice 6 — the item-less diff read; UN-prefixed (see `planFixesFromReconcile`'s own
   // docblock for why this is a distinct binding from `resolveFallbackScope` above, which IS prefixed). #xcla4iv
@@ -1518,7 +1523,10 @@ export function runReconcileFixDispatch({
   });
   const stacks = prStack ? prStack({ root, repoKey, planned: plannedAll, openPrFiles: reconciled.openPrFiles, settings: prStackSettings }) : { pairs: [] };
   const stackOrder = applyStackOrder(plannedAll, stacks, { settings: prStackSettings, used: restackedHeads });
-  let restackMemoryChanged = false;
+  // A started stacked-above hold clock is memory too (written right after the idle pass below).
+  let restackMemoryChanged = stackOrder.holdChanged;
+  const heldTops = new Set(stackOrder.heldTops);
+  let idleLaneTips;
   for (const { top } of planIdleRestacks(stacks, {
     planned: plannedAll, reconcileRefusals: reconciled.refusals, fixClaims: claims,
     settings: prStackSettings, used: restackedHeads,
@@ -1526,15 +1534,26 @@ export function runReconcileFixDispatch({
     let synthetic;
     try { synthetic = readPrForRestack?.(top); } catch { continue; }
     if (!synthetic) continue;
+    // The agent pushes to this branch: only a same-repo PR whose head is the tip of its origin lane/* branch qualifies.
+    if (synthetic.isCrossRepository !== false || !/^lane\//.test(synthetic.headRefName ?? '')) continue;
+    idleLaneTips ??= readLaneTips(root);
+    if (!idleLaneTips || idleLaneTips.get(synthetic.headRefName) !== synthetic.headRefOid) continue;
     const idle = planFixesFromReconcile([synthetic], findItemFn, loadItems, resolveFallbackScope,
       repoKey, fetchItemlessDiffPaths, resolveCardScopeAtRef);
     planRefusals.push(...idle.refusals);
     const ordered = applyStackOrder(idle.planned, stacks, { settings: prStackSettings, used: restackedHeads });
-    stackOrder.refusals.push(...ordered.refusals);
+    // An idle top is only ever dispatched for its restack, so a release to ordinary dispatch is not one: say nothing of it.
+    stackOrder.refusals.push(...ordered.refusals.filter(r => r.kind !== 'stacked-above-aged'));
+    if (ordered.holdChanged) restackMemoryChanged = true;
+    for (const top of ordered.heldTops) heldTops.add(top);
     for (const entry of ordered.planned) {
       if (entry.restack) stackOrder.planned.push({ ...entry, restack: { ...entry.restack, idle: true } });
     }
   }
+  // The hold clock counts a CONTINUOUS hold. Write it now, before any lane pop or spawn below can throw or time out the pass:
+  // a clock saved only at the end of the pass restarts on every pass that dies early, and the hold never ages out.
+  if (clearUnheldHolds(stacks, heldTops)) restackMemoryChanged = true;
+  if (restackMemoryChanged && writeStacks) { writeStacks(root, nextRemembered(stacks)); restackMemoryChanged = false; }
   // Serialize against live claims and higher-ranked waiters, including blocked ones.
   let urgentPrs = new Set();
   try { urgentPrs = new Set(readOverlayConflictWakes(process.env).keys()); } catch { /* best-effort wake */ }
@@ -1636,8 +1655,9 @@ export function runReconcileFixDispatch({
       if (entry.restack) {
         markRestackUsed(entry, restackedHeads);
         const pair = stacks.pairs.find(pair => pair.top === entry.pr);
-        pair.restackedFor = entry.restack.bottomHead ?? 'main';
-        pair.restackRounds = (pair.restackRounds ?? 0) + 1;
+        // Launched, not succeeded: the pair keeps owing the restack until the top contains the bottom's head, so a
+        // launched agent that exits without pushing is retried (bounded by the round cap), and a live one is held off by its claim.
+        recordRestackAttempt(pair, entry.restack);
         restackMemoryChanged = true;
       }
       if (entry.overlapExempt && !entry.restack) markRebaseExemptUsed(entry, exemptRebaseHeads); // card xd1tvd0 — one per head
@@ -1646,7 +1666,7 @@ export function runReconcileFixDispatch({
     }
   }
 
-  if (restackMemoryChanged && prStack === readStacksForPass) writeRemembered(root, nextRemembered(stacks));
+  if (restackMemoryChanged && writeStacks) writeStacks(root, nextRemembered(stacks));
   return { dispatched, refusals: classifyEnvFaultRefusals(refusals), scopeRanks: scopeFilter.ranks, ...(priorityShadowResult ? { priorityShadow: priorityShadowResult } : {}), ...(terminalHoldsReleased.length ? { terminalHoldsReleased } : {}), reconcileRefusals: reconciled.refusals.length, reconcileRefusalDetails: reconciled.refusals };
 }
 

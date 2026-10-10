@@ -1,1 +1,1 @@
-{ "prStack": { "detect": "on", "bottomFirst": "on", "restack": "on", "restackMaxRounds": 3 } }
+{ "prStack": { "detect": "on", "bottomFirst": "on", "restack": "on", "restackMaxRounds": 3, "holdMaxAgeMs": 21600000 } }

@@ -1,15 +1,19 @@
 ---
+bornAs: x3mls27
 kind: story
 size: 2
+priority: high
+parent: "3007"
 status: open
-scope: ["we:scripts/operations/run.mjs", "we:scripts/operations/open-pr.mjs"]
+blockedBy: ["5355", "5371"]
+scope: ["we:scripts/conveyor/pr-label-mirror.mjs", "we:scripts/conveyor/__tests__/pr-label-mirror.test.mjs", "we:scripts/conveyor/ruling-needed-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/conveyor/__tests__/review-hold-reconcile.test.mjs", "we:scripts/operations/record-referral-ruling-io.mjs"]
 dateOpened: "2026-10-09"
 tags: []
 ---
 
-# open-pr reports complete and exits 0 when it refused to open the PR (soak-waiver missing)
+# Ledger plan slice G2: the label mirror is the one writer of advisory:ruling-needed
 
-Live 2026-10-09 ~14:21 ET: `node we:scripts/operations/run.mjs open-pr --ref=lane/stacked-pr-restack ... --json` exited 0 and printed stopped:'complete' with one applied effect, but its run record (run id open-pr-6a90a4b2-576d-4264-bea3-43e7a4b5de51) shows the submit effect's result was outcome:'refused', reason:'soak-declaration', pr:null — the soak precheck (WE_PR_OPEN_SOAK_PRECHECK) wanted a soak break scenario or a soak-waiver line. No PR existed; only a gh pr list showed it. An agent reading the exit code or the default render thinks the PR is open. Fix: when the open-pr submit effect's outcome is 'refused' (any reason), the operation's verdict must say refused with the reason and the CLI must exit non-zero; add a test over the open-pr operation (we:scripts/operations/open-pr.mjs) with a refused submit result. Prove on a live refused open-pr.
+Slice G2 of the verdict-ledger plan (#3007), D5 ruling: labels are the GitHub rendering of derived state and the mirror is their one writer. we:scripts/conveyor/pr-label-mirror.mjs moves from report mode (G1) to writing advisory:ruling-needed from derivePrState; we:scripts/conveyor/ruling-needed-sweep.mjs, we:scripts/conveyor/review-hold-reconcile.mjs and we:scripts/operations/record-referral-ruling-io.mjs stop writing it in the same PR. Done when a grep test shows no file but the mirror passes RULING_NEEDED_LABEL to setLabels, and the plateau-app #202 replay converges in one mirror pass. Depends on G1 (#5355), E1 and E2 (#5371), all delivered.
 
 ## Acceptance
 

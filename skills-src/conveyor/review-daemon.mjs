@@ -76,6 +76,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { hostname } from 'node:os';
 import { runReconcilePass, defaultReadPrs, defaultReadAgents } from '../../scripts/conveyor/reconcile-pass.mjs';
+import { promoteDraftsThenReplan, promoteDraftsGuarded } from '../../scripts/conveyor/review-tick-promote.mjs'; // card xemxk3h
 import { notifyReferralHold } from '../../scripts/conveyor/review-referral-hold.mjs';
 // card x29vm8a — a scope-bloated PR (stale base) is refreshed onto main through the SAME mechanical path the ci-red
 // recovery watch uses, once per head, before any review reads its diff.
@@ -292,6 +293,11 @@ export function runReviewTick({
   // it into every repo's own call.
   paused = false,
   pauseReason = null,
+  // card xemxk3h — `({repo, prNumbers}) => {rows}`: promote this pass's `promote-draft` rows through the fast
+  // promoter's guarded step, then re-plan so the review goes out THIS pass. `null` (the default) keeps every
+  // existing caller unchanged; the real daemon wires `promoteDraftsGuarded`. `notePromotions` reports the rows.
+  promoteDrafts = null,
+  notePromotions = null,
 } = {}) {
   // #x01u7az — runs FIRST and INDEPENDENTLY of `reconcile`'s own plan: it is a plain `gh pr list` + label read
   // over the whole repo, not scoped to whatever this tick's discovery found owed, so a `reconcile` failure
@@ -344,6 +350,16 @@ export function runReviewTick({
       reconcileError: String((e && e.message) || e).split('\n')[0],
       holdReconcile: holdReconcileResults, holdReconcileError,
     };
+  }
+  if (typeof promoteDrafts === 'function') {
+    const out = promoteDraftsThenReplan({
+      plan, rawPrs, repo, promote: promoteDrafts,
+      replan: (prs) => (sharedReads && prs
+        ? reconcile({ repo, defaultBranch, readPrs: () => prs, readAgents: () => rawAgents })
+        : reconcile({ repo, defaultBranch })),
+    });
+    ({ plan, rawPrs } = out);
+    if (out.promotions.length) { try { notePromotions?.({ repo, promotions: out.promotions, replanError: out.replanError }); } catch { /* report only */ } }
   }
   // Keyed by PR number so `tagRound`/`tagStatus` below can look up EACH PR's own already-fetched labels rather
   // than asking `gh` again — `undefined` (a PR the tick's own listing somehow missed, a rare open-PR-appeared-
@@ -884,6 +900,11 @@ export function buildCliDaemonEffects({
       poolExhaustion: DAEMON_POOL_EXHAUSTION,
       refreshScopeBloat: refreshScopeBloatedPr,
       postRefreshMarker: defaultPostRebaseComment,
+      promoteDrafts: promoteDraftsGuarded,
+      notePromotions: ({ repo, promotions, replanError }) => {
+        for (const r of promotions) log.error(`review-daemon: ${repo}#${r.pr} same-pass promote ${r.action} — ${String(r.why ?? '').replace(/\s+/g, ' ').slice(0, 300)}`);
+        if (replanError) log.error(`review-daemon: ${repo} same-pass re-plan failed (review goes out next pass): ${replanError}`);
+      },
       dispatch: (o) => dispatchReviewByMode({ ...o, ciGate: readReviewCiGateFactsFirst }),
       tagRound: (o) => tagReviewRound({ ...o, provider: factsProvider }),
       tagStatus: (o) => tagReviewStatus({ ...o, provider: factsProvider }),

@@ -29,7 +29,13 @@
  *
  * Usage:
  *   node scripts/review-ledger-check.mjs [--repo=<owner/name>] [--json] [--all] [--limit=<n>] [--store=<name>]
+ *   node scripts/review-ledger-check.mjs --history [--json] [--days=<n>] [--repos=<a,b>]
  *   `--all` includes PRs that agree; the default output lists only what needs attention plus the summary.
+ *   With no `--repo`, every constellation repo is checked, one run record each (#3930). With `--repo`, only that one.
+ *
+ * RUN HISTORY (#3930): `--history` reads the run records back and answers "how many consecutive clean days per
+ * label family?" (we:scripts/lib/review-ledger-history.mjs). It makes no `gh` call. Exit 0 when every family has
+ * 7 clean days across all constellation repos, 1 when any family is short, 2 on a usage error.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -46,6 +52,7 @@ import { LIFECYCLE_STATES } from './conveyor/pr-lifecycle.mjs';
 import { newRunRecord } from './operations/run-record.mjs';
 import { newRunId, writeRun } from './operations/run-store.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { DEFAULT_REPOS, REQUIRED_CLEAN_DAYS, cleanDaysPerFamily, readCheckRuns, renderCleanDays } from './lib/review-ledger-history.mjs';
 
 export const DEFAULT_REPO = 'web-everything/web-everything';
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
@@ -300,7 +307,7 @@ export function appendCheckRun({ repo, summary, phase1, at = new Date().toISOStr
 export function buildDerivedRows({ repo, prs, events, readFacts = readPrFacts, settings = {} }) {
   return prs.filter((p) => Number.isInteger(p?.number)).sort((a, b) => a.number - b.number).map((p) => {
     let facts = null;
-    try { facts = readFacts(p.number); } catch { facts = null; }
+    try { facts = readFacts(p.number, { repo }); } catch { facts = null; }
     return deriveRow({ pr: p.number, repo, events, facts, liveLabels: names(p.labels), settings });
   });
 }
@@ -320,7 +327,7 @@ function parseFlags(argv) {
 export async function runCheck({
   repo = DEFAULT_REPO, store, limit = 200, json = false, showAll = false, noRecord = false,
   readEvents = readLedgerEventsFromStore, listPrs = readOpenPrs,
-  readFacts = repo === DEFAULT_REPO ? undefined : () => null, appendRun = appendCheckRun,
+  readFacts = undefined, appendRun = appendCheckRun,
   stdout = (text) => writeAllSync(1, text), stderr = (text) => process.stderr.write(text),
 } = {}) {
   const ledger = await readEvents(repo, { store });
@@ -354,15 +361,62 @@ export async function runCheck({
   return { ...report, exitCode: summary.dangerous.length ? 1 : 0 };
 }
 
+/**
+ * Check every repo in turn (#3930: the constellation, not just WE). Each repo is its own `runCheck`, so each
+ * appends its own run record. Exit code is the worst of the runs. With `json`, the per-repo reports are printed
+ * as ONE document `{ repos: [...] }`, never as concatenated JSON.
+ */
+export async function runAllRepos({ repos = DEFAULT_REPOS, json = false, stdout = (text) => writeAllSync(1, text), run = runCheck, ...rest } = {}) {
+  const reports = [];
+  let exitCode = 0;
+  for (const repo of repos) {
+    let captured = '';
+    const result = await run({ ...rest, repo, json, stdout: json ? (t) => { captured += t; } : stdout });
+    if (!json) stdout('\n');
+    reports.push(json ? (captured.trim() ? JSON.parse(captured) : { repo, exitCode: result.exitCode }) : { repo, exitCode: result.exitCode });
+    exitCode = Math.max(exitCode, result.exitCode ?? 2);
+  }
+  if (json) stdout(`${JSON.stringify({ repos: reports }, null, 2)}\n`);
+  return { repos: reports, exitCode };
+}
+
+/**
+ * THE #3930 QUERY: read the run history and report clean days per label family. No `gh` call. Exit 0 only when
+ * every family that has ever been checked is `ready`; no history at all is not ready.
+ */
+export function runHistory({ repos = DEFAULT_REPOS, days = REQUIRED_CLEAN_DAYS, json = false, now = new Date(), read = readCheckRuns,
+  stdout = (text) => writeAllSync(1, text) } = {}) {
+  const { runs, corrupt } = read();
+  const query = cleanDaysPerFamily(runs, { repos, now, windowDays: days });
+  const fams = Object.values(query.families);
+  const ready = fams.length > 0 && fams.every((f) => f.ready);
+  if (json) stdout(`${JSON.stringify({ ...query, runCount: runs.length, corrupt, ready }, null, 2)}\n`);
+  else stdout(`${renderCleanDays(query, { corrupt, runCount: runs.length })}\n${ready ? 'ALL FAMILIES READY' : 'NOT READY'}\n`);
+  return { ...query, runCount: runs.length, corrupt, ready, exitCode: ready ? 0 : 1 };
+}
+
 async function main(argv) {
   const flags = parseFlags(argv);
-  const repo = typeof flags.repo === 'string' && flags.repo ? flags.repo : DEFAULT_REPO;
+  const json = !!flags.json;
+  const listFlag = (v) => String(v).split(',').map((x) => x.trim()).filter(Boolean);
+  if (flags.history) {
+    const repos = typeof flags.repos === 'string' ? listFlag(flags.repos) : DEFAULT_REPOS;
+    if (!repos.length || !repos.every((r) => REPO_RE.test(r))) {
+      process.stderr.write('review-ledger-check: --repos must be a comma list of <owner/name>\n');
+      return 2;
+    }
+    const days = Number.isInteger(Number(flags.days)) && Number(flags.days) > 0 ? Number(flags.days) : REQUIRED_CLEAN_DAYS;
+    return runHistory({ repos, days, json }).exitCode;
+  }
+  const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
+  const common = { store: flags.store, limit, json, showAll: flags.all === true, noRecord: flags['no-record'] === true };
+  if (typeof flags.repo !== 'string' || !flags.repo) return (await runAllRepos({ ...common })).exitCode;
+  const repo = flags.repo;
   if (!REPO_RE.test(repo)) {
     process.stderr.write('review-ledger-check: --repo must be <owner/name>\n');
     return 2;
   }
-  const limit = Number.isInteger(Number(flags.limit)) && Number(flags.limit) > 0 ? Number(flags.limit) : 200;
-  const result = await runCheck({ repo, store: flags.store, limit, json: !!flags.json, showAll: flags.all === true, noRecord: flags['no-record'] === true });
+  const result = await runCheck({ repo, ...common });
   return result.exitCode;
 }
 

@@ -3,8 +3,10 @@ bornAs: x7b0be5
 kind: story
 size: 5
 parent: "2405"
-status: open
+status: resolved
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
+graduatedTo: b40d36a9f18408da7f66af195962344570b2b101
 tags: []
 ---
 

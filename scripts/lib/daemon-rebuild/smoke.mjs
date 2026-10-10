@@ -167,10 +167,15 @@ async function resolveDispatchSmoke(opt, env) {
  *       {@link HARNESS_BROKEN_ADOPT_NOT_WORSE_ENV} set to '0', hold as `smoke-harness-broken` with a retry
  *       backoff (never sticky), including across main moves (see `prepareRebuild`). Never blocks.
  * `'transient'` (env noise that survived its retries) keeps today's rule — no reject record — and also holds.
+ *
+ * #4126 `readyOnly` (the rebuild JOB, `rebuild-job.mjs`): a passing build is recorded as the clone's ready
+ * candidate exactly as before, but the job never takes the finalize lock or moves `root` — it releases its build
+ * lease and returns `ready-recorded`. The daemon's next tick adopts the ready candidate through the existing
+ * `prepareRebuild` ready path (no re-smoke, same match rules), so the swap stays at the daemon's own tick boundary.
  */
 export async function smokeAndAdopt({
   root, env, stEnv, log, run, runSmoke, stateOpts, now, plan, prevHead, lease, overlaysBefore, prepAlerts, mainOnly,
-  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke,
+  finalLockOpts, finalizeLockOpts = finalLockOpts, dispatchSmoke, readyOnly = false,
 }) {
   /** Every state write here happens UNDER the write lock (PR #2731 review: an unlocked write could clobber a
    *  sibling's locked one). `release` also drops our build lease — done by the outcome that ENDS this build,
@@ -276,11 +281,18 @@ export async function smokeAndAdopt({
     removeCandidate({
       root, path: candidate.path, run, env,
     });
+    // x5059uu — per-step timings on EVERY smoke (live 2026-10-09: smokes took 421 s and 1,002 s), so a slow step is
+    // visible in the log before it crosses the smoke-slow line; the dispatch smoke counts as its own step.
+    const checks = [
+      ...(smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`),
+      ...(dispatch?.result?.ms != null ? [`dispatch-smoke:${dispatch.result.ms}ms`] : []),
+    ].join(' ');
+    log.error?.(`daemon-rebuild: smoke-timings ${JSON.stringify({ ms, ...(label ? { candidate: label } : {}), checks })}`);
     if (ms >= SLOW_SMOKE_ALERT_MS) {
       alert('smoke-slow', {
         ms,
         ...(label ? { candidate: label } : {}),
-        checks: (smokeResult?.smoke?.results || []).map((r) => `${r.name}:${r.skipped ? 'skipped' : `${r.ms}ms`}`).join(' '),
+        checks,
       });
     }
     if (!threw && smokeResult?.verdict === 'pass' && changedFiles === null && (!dispatch || dispatch.result.ok)
@@ -366,6 +378,22 @@ export async function smokeAndAdopt({
       host: hostname(),
       passedAt: nowIso(),
     }, stEnv);
+    if (readyOnly) {
+      // #4126: a fallback's suspect drop rides the ready record (`dropRefs`) and runs at adoption; any other
+      // post-adopt hook (the env-load backoff record) is a state note that is safe to write now.
+      if (onAdopted && readyMeta?.kind !== 'fallback') {
+        const r = await withWriteLock(root, () => onAdopted({ alert }), finalLockOpts);
+        if (!r.ok) log.error?.(`daemon-rebuild: could not take the write lock for ${p.finalSha}'s post-pass note (${r.reason}) — skipped`);
+      }
+      await locked(null, { release: true });
+      alert('ready-candidate-recorded', {
+        target: p.finalSha, kind: readyMeta?.kind ?? 'candidate',
+        message: 'smoke passed in the rebuild job — the daemon adopts it at its next tick boundary (#4126)',
+      });
+      return {
+        moved: false, reason: 'ready-recorded', readyRecorded: true, target: p.finalSha, plan: p, alerts: [...prepAlerts, ...alertsList],
+      };
+    }
     const fin = await withWriteLock(root, () => finalizeRebuild({
       root, env, log, run, stateOpts, now, plan: p, prevHead, lease, onAdopted,
     }), finalizeLockOpts);

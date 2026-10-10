@@ -29,6 +29,8 @@ import { readSharedOpenPrs } from './pr-snapshot.mjs';
 import { meteredPrCommits } from './gh-metered-reads.mjs';
 import { readGitPrCommits } from './git-pr-commits.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
+import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of card-only (backlog/ only, fail-closed) — never re-derived here
+import { readSettings } from './settings-files.mjs';
 
 // ── LIMITS (defaults + per-repo env override) ───────────────────────────────────────────────────────────
 
@@ -56,6 +58,47 @@ export function resolvePrLimit(repoKey, env = process.env) {
   const n = raw == null ? NaN : Number(raw);
   if (Number.isFinite(n) && n >= 0) return Math.floor(n);
   return Object.hasOwn(PR_LIMIT_DEFAULTS, repoKey) ? PR_LIMIT_DEFAULTS[repoKey] : Infinity;
+}
+
+// ── SCOPE — which open PRs the cap counts (operator ruling 2026-10-09 ~17:05 ET) ────────────────────────────
+
+/** Built-in default: a card-only PR (every changed file under `backlog/`) is NOT counted — it costs the review
+ *  system almost nothing (CI light path, no code review), so letting it fill the cap blocks real work for no gain. */
+export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true });
+
+/** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeCardOnly. */
+export const PR_LIMIT_EXCLUDE_CARD_ONLY_ENV = 'WE_PR_LIMIT_EXCLUDE_CARD_ONLY';
+
+const parseBool = (v) => {
+  if (typeof v === 'boolean') return v;
+  const t = String(v ?? '').trim().toLowerCase();
+  if (t === 'true' || t === '1') return true;
+  if (t === 'false' || t === '0') return false;
+  return null;
+};
+
+/** The policy cascade, PURE: default → tool layer (`scripts/settings/pr-limit.json` → `prLimit`) → env. A value
+ *  that is not a boolean (or a boolean-ish env string) is ignored at its layer, never coerced. */
+export function resolvePrLimitScope({ tool = {}, env = {} } = {}) {
+  let excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly;
+  let source = 'default';
+  if (typeof tool?.excludeCardOnly === 'boolean') { excludeCardOnly = tool.excludeCardOnly; source = 'tool'; }
+  const fromEnv = parseBool(env?.[PR_LIMIT_EXCLUDE_CARD_ONLY_ENV]);
+  if (fromEnv !== null) { excludeCardOnly = fromEnv; source = 'env'; }
+  return { excludeCardOnly, source: { excludeCardOnly: source } };
+}
+
+/** Read the live scope (the settings files + env). Never throws: unreadable settings fall back to the default. */
+export function readPrLimitScope({ env = process.env, read = readSettings } = {}) {
+  let tool = {};
+  try { tool = read()?.prLimit ?? {}; } catch { tool = {}; }
+  return resolvePrLimitScope({ tool, env });
+}
+
+/** Is this `gh pr list --json files` row card-only? A row with no file list is NOT (fail-closed: it counts). PURE. */
+export function isCardOnlyPr(pr) {
+  const files = Array.isArray(pr?.files) ? pr.files.map((f) => (typeof f === 'string' ? f : f?.path)).filter(Boolean) : null;
+  return isCardOnlyDiff(files);
 }
 
 // ── EXEMPT PATHS — conveyor/daemon infrastructure always gets through, even at/over the cap ───────────────
@@ -131,10 +174,10 @@ export function fetchOpenPrs(repoSlug, { exec = runGhSync, localOnly = false, re
   try {
     // #gh-graphql-budget — the host-shared open-PR snapshot first (null = not applicable → the direct read).
     // `readShared` is the test seam for that snapshot (a fake `exec` alone never reaches it).
-    if (readShared || exec === runGhSync) { const shared = (readShared ?? readSharedOpenPrs)({ repo: repoSlug, fields: 'number,labels,headRefName,headRefOid,baseRefName', cacheOnly: localOnly }); if (shared) return shared; }
+    if (readShared || exec === runGhSync) { const shared = (readShared ?? readSharedOpenPrs)({ repo: repoSlug, fields: 'number,labels,headRefName,headRefOid,baseRefName,files', cacheOnly: localOnly }); if (shared) return shared; }
     if (localOnly) return null;
     const out = exec(
-      ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--json', 'number,labels,headRefName,headRefOid,baseRefName', '--limit', '100'],
+      ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--json', 'number,labels,headRefName,headRefOid,baseRefName,files', '--limit', '100'],
       { throttle: { op: 'pr list (pr-limit)' }, encoding: 'utf8' },
     );
     const rows = JSON.parse(String(out ?? '[]'));
@@ -175,19 +218,24 @@ export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName
  *  `review:accepted` (an already-accepted PR is excluded from the count regardless of authorship, so its
  *  commits are never worth fetching) — see {@link fetchPrCommits} for why a bulk commits fetch is unsafe. A
  *  PR whose commits lookup fails is DROPPED from the count (unknown authorship is never assumed AI). */
-export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTable = CONSTELLATION_REPOS, git, cwd, localOnly = false, readShared, authorshipCache = null, maxApiFetches = Infinity, now = Date.now() } = {}) {
+export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTable = CONSTELLATION_REPOS, git, cwd, localOnly = false, readShared, authorshipCache = null, maxApiFetches = Infinity, now = Date.now(), scope } = {}) {
   const meta = reposTable[repoKey];
+  const { excludeCardOnly } = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
   const limit = resolvePrLimit(repoKey, env);
   if (!meta) return { repoKey, slug: null, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
   const prs = fetchOpenPrs(meta.slug, { exec, localOnly, readShared });
   if (prs === null) return { repoKey, slug: meta.slug, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
+  // Excluded BEFORE any commits read: an accepted or card-only PR never costs an authorship lookup.
+  const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
+  const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
+  const cardOnlySet = new Set(cardOnlyPrs);
   // GitHub-call budget for the per-PR commits reads (git is tried first and is not counted); an exhausted budget
   // leaves the PR UNRESOLVED rather than spending past it.
   let apiFetches = 0;
   const repoCwd = cwd ?? (meta.path ? meta.path.replace('$HOME', homedir()) : process.cwd());
   const liveKeys = new Set();
   const verdicts = prs
-    .filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted))
+    .filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr))
     .map((pr) => {
       // A verdict is immutable for a given head oid, so it is cached by (repo, PR, oid) — a head that moved is a miss.
       const key = pr.headRefOid ? `${meta.slug}#${pr.number}@${pr.headRefOid}` : null;
@@ -214,7 +262,10 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   // not absent: `unresolved` lets a caller tell an undercount from a true count instead of silently failing open.
   const unresolved = verdicts.filter((v) => v.ai === null).length;
   const counted = verdicts.filter((v) => v.ai === true).map((v) => v.pr);
-  return { repoKey, slug: meta.slug, count: counted.length, prNumbers: counted.map((p) => p.number), limit, unavailable: false, unresolved, apiFetches };
+  return {
+    repoKey, slug: meta.slug, count: counted.length, prNumbers: counted.map((p) => p.number), limit, unavailable: false, unresolved, apiFetches,
+    cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
+  };
 }
 
 // ── THE DISPATCHER'S PER-ROUND COUNT — local first, a cached + bounded networked fallback ───────────────────
@@ -296,7 +347,10 @@ export function countOpenPrsAllRepos(o = {}) {
  */
 export function decideOpenPr({
   repoKey, limit, openCount, changedFiles = [], branch = null, branchAllowed = false, globalOff = false, forceOpen = false, forceReason = null,
+  cardOnlyExcluded = null, acceptedExcluded = null,
 } = {}) {
+  const split = cardOnlyExcluded == null && acceptedExcluded == null ? ''
+    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
   if (isExemptChangeset(changedFiles)) {
     return { allowed: true, reason: 'exempt: conveyor/daemon infrastructure changeset (a fix to the review/land machinery itself always gets through)', exempt: true, overridden: false };
   }
@@ -319,10 +373,10 @@ export function decideOpenPr({
       allowed: false,
       exempt: false,
       overridden: false,
-      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted — land or review the existing ones first, or override (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=…\` / \`node scripts/operations/pr-limit.mjs off --reason=… [--for=2h]\` / \`pr-land --force-open --reason=…\`)`,
+      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first, or override (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=…\` / \`node scripts/operations/pr-limit.mjs off --reason=… [--for=2h]\` / \`pr-land --force-open --reason=…\`)`,
     };
   }
-  return { allowed: true, reason: `under limit (${openCount}/${limit})`, exempt: false, overridden: false };
+  return { allowed: true, reason: `under limit (${openCount}/${limit})${split}`, exempt: false, overridden: false };
 }
 
 // ── OVERRIDE STATE — pure parse/serialize + a thin, injectable fs shell ────────────────────────────────────
