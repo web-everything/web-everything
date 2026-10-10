@@ -467,9 +467,11 @@ export function pathsWithRenameSources(files) {
 function defaultReadChangedFiles({ pr, repo }) {
   // No repo, no REST path: throw, which `chooseSecuritySeat` answers with the full roster. 100 entries is one page and
   // is the cap above, so a list that long is never trusted to buy prose.
-  if (!repo) throw new Error('no --repo: the file list with rename sources needs the repository');
-  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`],
-    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+  if (!/^[\w.-]+\/[\w.-]+$/.test(String(repo ?? ''))) throw new Error('no valid --repo: the file list with rename sources needs <owner>/<name>');
+  // `--jq` drops each file's `patch`, which would otherwise make a documentation-heavy PR overflow the read buffer.
+  const out = JSON.parse(execFileSyncThrottled('gh', ['api', `repos/${repo}/pulls/${Number(pr)}/files?per_page=${TOUCH_SET_FILE_CAP}`,
+    '--jq', '[.[] | {filename, previous_filename}]'],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 16 * 1024 * 1024 }));
   return pathsWithRenameSources(out);
 }
 

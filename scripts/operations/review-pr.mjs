@@ -384,8 +384,18 @@ export function securitySeatFromRun(record) {
  *
  * @param {{declared: boolean, netChangedFiles?: string[], lens?: string, pr?: number|string, repo?: string}} o
  */
-export function assertRosterHolds({ declared, netChangedFiles, lens, pr, repo } = {}) {
-  if (declared || !Array.isArray(netChangedFiles) || netChangedFiles.length === 0) return;
+export function assertRosterHolds({ declared, netChangedFiles, lens, pr, repo, diffScored } = {}) {
+  if (declared) return;
+  // The rename sources come from the diff TEXT. When that text did not read (over the buffer, a git failure) the list
+  // above is path-only and cannot rule out a code file renamed into a prose path, so a prose roster is not proven.
+  if (diffScored === false) {
+    throw new Error(
+      `review-pr.read: this run's roster leaves the security juror out, but the net diff of ${repo}#${pr} did not read, `
+      + 'so a code file renamed into a prose path cannot be ruled out. Refusing before a juror is spawned; the next review '
+      + 'round chooses its roster from a fresh read.',
+    );
+  }
+  if (!Array.isArray(netChangedFiles) || netChangedFiles.length === 0) return;
   if (seatSecurityForTouchSet({ changedFiles: netChangedFiles, lens }).securitySeat) {
     throw new Error(
       `review-pr.read: this run's roster leaves the security juror out because ${repo}#${pr} touched only prose when its `
@@ -1076,8 +1086,10 @@ function unquoteGitPath(s) {
  */
 export function renameSourcePaths(diffText) {
   const out = [];
-  for (const m of String(diffText ?? '').matchAll(/^(?:rename|copy) from (.+)$/gm)) {
-    const p = unquoteGitPath(m[1].replace(/\r$/, ''));
+  // Anchored on `\n` alone, NOT the `m` flag: JS `^` also matches after a bare `\r`, U+2028 and U+2029, which a
+  // content line may hold (`+x\rrename from …`), but git ends a diff line at `\n` only.
+  for (const m of String(diffText ?? '').matchAll(/(?:^|\n)(?:rename|copy) from ([^\r\n]+)/g)) {
+    const p = unquoteGitPath(m[1]);
     if (p && !out.includes(p)) out.push(p);
   }
   return out;
@@ -2441,7 +2453,7 @@ export function reviewPrOperation({
         // The roster was chosen from a file list read BEFORE the run; the net list just computed is the ground truth.
         assertRosterHolds({
           declared: securitySeat !== false, netChangedFiles: [...finding.netChangedFiles, ...finding.netRenameSources],
-          lens: view.input.lens, pr: view.input.pr, repo: view.input.repo,
+          lens: view.input.lens, pr: view.input.pr, repo: view.input.repo, diffScored: finding.diffScored,
         });
         // THE ROSTER, RECORDED BY THE BUILD ITSELF (not an input a caller could name): a resume reads it back with
         // `securitySeatFromRun`, so a seat that failed or has not answered yet cannot change it.

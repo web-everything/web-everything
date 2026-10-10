@@ -36,7 +36,7 @@ import { resolveReviewSeatSetting } from '../../lib/review-seat-settings.mjs';
 
 const NET_PATHS = ['scripts/operations/review-pr.mjs'];
 
-function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n') {
+function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n', diffScored = true) {
   return ({ pr, repo }) => ({
     state: 'OPEN',
     clearerId: undefined,
@@ -50,16 +50,16 @@ function stubReader(paths = NET_PATHS, diffText = '--- a/x\n+++ b/x\n+one line\n
     headRefName: 'lane/thing',
     body: 'the PR description',
     net: { paths, base: 'abc123', rev: 'def456', scored: true },
-    diff: { text: diffText, scored: true },
+    diff: { text: diffText, scored: diffScored },
   });
 }
 
 const PROSE_PATHS = ['backlog/x-a-card.md'];
 
 /** `opts.netPaths` is the PR's net changed-file list the stub reader reports; a prose roster defaults to a prose PR. */
-function build({ netPaths, diffText, ...opts } = {}) {
+function build({ netPaths, diffText, diffScored, ...opts } = {}) {
   const paths = netPaths ?? (opts.securitySeat === false ? PROSE_PATHS : NET_PATHS);
-  const declaration = reviewPrOperation({ readPr: stubReader(paths, diffText), codexAdvisory: true, correctnessAdvisory: true, ...opts });
+  const declaration = reviewPrOperation({ readPr: stubReader(paths, diffText, diffScored), codexAdvisory: true, correctnessAdvisory: true, ...opts });
   const registry = createRegistry();
   registry.register(declaration);
   return { declaration, registry };
@@ -461,6 +461,21 @@ describe('review.seatsByTouchSet — a rename carries its source path (code move
     expect(renameSourcePaths('+rename from scripts/evil.mjs\n rename from scripts/evil2.mjs\n-copy from scripts/evil3.mjs\n')).toEqual([]);
     expect(renameSourcePaths(undefined)).toEqual([]);
     expect(renameSourcePaths('')).toEqual([]);
+    // git ends a line at `\n` only: a bare CR, U+2028 or U+2029 inside a content line does not start a header.
+    expect(renameSourcePaths('+x\rrename from scripts/evil.mjs\n+y copy from scripts/evil2.mjs\n+z rename from scripts/evil3.mjs\n')).toEqual([]);
+    // The first line of the text is a header too; a CRLF header does not carry the CR into the path.
+    expect(renameSourcePaths('rename from scripts/a.mjs\r\nrename to docs/a.md\r\n')).toEqual(['scripts/a.mjs']);
+  });
+
+  it('a prose roster refuses at `read` when the diff text did not read (rename sources cannot be ruled out)', async () => {
+    const judge = scriptedJudge();
+    const refused = await loop({ parallel: false, judge, runId: 'r-unscored', opts: { securitySeat: false, diffText: '', diffScored: false } });
+    expect(refused.out.code).toBe(1);
+    expect(JSON.stringify(refused.out)).toMatch(/did not read/);
+    expect(judge.calls).toHaveLength(0);
+    // The full roster has nothing to prove, so an unscored diff does not refuse it.
+    const full = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-unscored-full', opts: { diffText: '', diffScored: false } });
+    expect(full.run.findings).toHaveProperty(SECURITY_SEAT_STEP);
   });
 
   it('the touch-set read lists the source of a rename as well as its destination, and a prose destination alone no longer buys prose', () => {
