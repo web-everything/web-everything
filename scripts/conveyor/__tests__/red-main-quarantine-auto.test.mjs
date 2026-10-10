@@ -265,6 +265,26 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
     expect(wayLater.calls.writes.every((w) => w.change(entry).events?.every((e) => e.type !== 'quarantine-added'))).toBe(true);
     expect(wayLater.calls.logs).toBe(0); // the record (and its log cache) survived
   });
+  it('a truncated read whose first red slides to a newer commit keeps the window record (no re-add under the new sha)', () => {
+    const red = (n, sha, created) => ({ ...RED, databaseId: n, headSha: sha, createdAt: created, updatedAt: created });
+    const A = red(1, 'a'.repeat(40), '2026-10-10T18:44:51Z');
+    const B = red(2, 'b'.repeat(40), '2026-10-10T19:44:51Z');
+    const C = red(3, 'c'.repeat(40), '2026-10-10T20:44:51Z');
+    const win1 = { ...RUNS, runs: [A, B] }; // no green in the window: windowTruncated, first red = A
+    const win2 = { ...RUNS, runs: [B, C] }; // the window slid past A: first red = B
+    const t0 = at;
+    const first = net({ mode: QUARANTINE, mainCiRuns: win1, now: t0 });
+    const entry = first.calls.writes[0].change({ version: 1, entries: [] }).list;
+    expect(entry.entries).toHaveLength(1);
+    const slid = net({ mode: QUARANTINE, mainCiRuns: win2, list: entry, now: t0 + 7 * 60 * MIN }); // the entry has expired
+    expect(slid.r.plan.why).toMatch(/expired — STOP/);
+    expect(slid.calls.writes.every((w) => w.change(entry).events?.every((e) => e.type !== 'quarantine-added'))).toBe(true);
+    const reds = Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds);
+    expect(reds).toEqual(['a'.repeat(40)]); // still ONE window record; the slid sha did not fork a fresh one
+    // …and the record is exempt from eviction while ANY of the window's red commits is still in view.
+    net({ mode: QUARANTINE, mainCiRuns: win2, list: entry, now: t0 + 60 * 60 * MIN * 50 });
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds)).toEqual(['a'.repeat(40)]);
+  });
   it('a red window that has not been seen for 48h is forgotten', () => {
     net({ mainCiRuns: RUNS, now: at });
     net({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, now: at + 49 * 60 * MIN });

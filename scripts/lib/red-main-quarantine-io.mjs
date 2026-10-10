@@ -196,6 +196,7 @@ export function runSafetyNet({
   const state = mainRedState(mainCiRuns?.runs);
   const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false };
   let sha = null;
+  let windowShas = [];
   try {
     // Flipped back to `stop` after this daemon published `quarantine` on the list: withdraw the stamp so CI (which
     // reads the mode from the list) stops skipping at once, not at entry expiry. Nothing is written by a daemon
@@ -208,7 +209,11 @@ export function runSafetyNet({
       } catch (e) { out.demoteError = String(e?.message || e).split('\n')[0]; }
     }
     sha = state.status === 'red' ? String(state.firstRed?.sha ?? '') : null;
-    const rec = sha ? (ledger.reds[sha] ??= { at: now, added: [] }) : null;
+    // A truncated read (no green in the window) makes `firstRed` slide to a newer commit as the window moves: the
+    // window's record is found under ANY red commit still in view, so it is neither forked nor orphaned.
+    windowShas = sha ? [sha, ...(state.redShas ?? [])].filter(Boolean) : [];
+    const recKey = windowShas.find((k) => ledger.reds[k]) ?? sha;
+    const rec = sha ? (ledger.reds[recKey] ??= { at: now, added: [] }) : null;
     if (rec) rec.seenAt = now; // an active window is never evicted from the ledger, however long it runs
     let jobFailures = {};
     const failedJobs = state.status === 'red' ? (mainCiRuns?.failing?.jobs ?? null) : null;
@@ -294,7 +299,7 @@ export function runSafetyNet({
   } finally {
     // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window
     // that is red right now is never forgotten: its record is what keeps an expired entry from being re-added.
-    for (const [k, v] of Object.entries(ledger.reds)) if (k !== sha && now - (Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];
+    for (const [k, v] of Object.entries(ledger.reds)) if (!windowShas.includes(k) && now -(Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];
     try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort */ }
   }
 }
