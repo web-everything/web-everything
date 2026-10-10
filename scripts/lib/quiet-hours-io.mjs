@@ -34,7 +34,8 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isUnderTest } from './under-test.mjs';
-import { decideDelivery, isQuiet, mergeSettings, planDigest, sweepSkip } from './quiet-hours.mjs';
+import { DEFAULT_QUIET_SETTINGS, decideDelivery, isQuiet, mergeSettings, planDigest, sweepSkip } from './quiet-hours.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 
 export const SETTINGS_PATH = resolve(dirname(fileURLToPath(import.meta.url)), '../quiet-hours-settings.json');
 
@@ -51,9 +52,12 @@ function readJson(path) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
 }
 
-/** Settings merged over defaults; a missing or torn file yields the defaults. */
+/** Settings merged over defaults; a missing or torn file yields the defaults. The file is the tool layer over the
+ *  team's platform preference `quietHours` (shared policy cascade, we:scripts/lib/policy-cascade.mjs). */
 export function loadQuietSettings({ env = process.env } = {}) {
-  return mergeSettings(readJson(env.WE_QUIET_HOURS_SETTINGS || SETTINGS_PATH));
+  const tool = readJson(env.WE_QUIET_HOURS_SETTINGS || SETTINGS_PATH);
+  const c = cascadePolicy('quietHours', tool ?? undefined, { env, standard: DEFAULT_QUIET_SETTINGS });
+  return mergeSettings(c.layered ?? null);
 }
 
 /** The operator toggle (`{"on":bool,"until":iso|null}`), or null when absent/torn (= no override). */

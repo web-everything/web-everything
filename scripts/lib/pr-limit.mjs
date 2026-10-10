@@ -31,6 +31,7 @@ import { readGitPrCommits } from './git-pr-commits.mjs';
 import { writeAllSync } from './write-all-sync.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of card-only (backlog/ only, fail-closed) — never re-derived here
 import { readSettings } from './settings-files.mjs';
+import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 
 // ── LIMITS (defaults + per-repo env override) ───────────────────────────────────────────────────────────
 
@@ -77,11 +78,13 @@ const parseBool = (v) => {
   return null;
 };
 
-/** The policy cascade, PURE: default → tool layer (`scripts/settings/pr-limit.json` → `prLimit`) → env. A value
- *  that is not a boolean (or a boolean-ish env string) is ignored at its layer, never coerced. */
-export function resolvePrLimitScope({ tool = {}, env = {} } = {}) {
+/** The policy cascade, PURE: default → platform preference (`prLimit`, we:scripts/lib/policy-cascade.mjs) → tool
+ *  layer (`scripts/settings/pr-limit.json` → `prLimit`) → env. A value that is not a boolean (or a boolean-ish env
+ *  string) is ignored at its layer, never coerced. */
+export function resolvePrLimitScope({ platform = {}, tool = {}, env = {} } = {}) {
   let excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly;
   let source = 'default';
+  if (typeof platform?.excludeCardOnly === 'boolean') { excludeCardOnly = platform.excludeCardOnly; source = 'platform'; }
   if (typeof tool?.excludeCardOnly === 'boolean') { excludeCardOnly = tool.excludeCardOnly; source = 'tool'; }
   const fromEnv = parseBool(env?.[PR_LIMIT_EXCLUDE_CARD_ONLY_ENV]);
   if (fromEnv !== null) { excludeCardOnly = fromEnv; source = 'env'; }
@@ -92,7 +95,10 @@ export function resolvePrLimitScope({ tool = {}, env = {} } = {}) {
 export function readPrLimitScope({ env = process.env, read = readSettings } = {}) {
   let tool = {};
   try { tool = read()?.prLimit ?? {}; } catch { tool = {}; }
-  return resolvePrLimitScope({ tool, env });
+  const scope = resolvePrLimitScope({ platform: platformPreference('prLimit', { env }), tool, env });
+  const layer = scope.source.excludeCardOnly;
+  logCascadeSources('prLimit', { value: scope, sources: { excludeCardOnly: layer === 'default' ? 'standard' : layer } }, { env });
+  return scope;
 }
 
 /** Is this `gh pr list --json files` row card-only? A row with no file list is NOT (fail-closed: it counts). PURE. */
