@@ -32,11 +32,12 @@ import {
   createJobStore, createTickClock, enqueueJob, reattachTick, runJob,
 } from '../daemon-jobs-runtime.mjs';
 import {
-  ensureNodeModulesStore, evictSnapshots, lockfileKey, npmCiInstaller, snapshotsRoot,
+  ensureNodeModulesStore, evictSnapshots, lockfileKey, snapshotsRoot,
 } from '../daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES } from '../../operations/job-record.mjs';
 import { daemonJobsDir } from '../../operations/run-store.mjs';
 import { cloneKey } from '../daemon-overlays.mjs';
+import { NPM_INSTALL_TIMEOUT_MS } from '../bounded-child.mjs';
 import { readGit } from '../proc-read.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -45,6 +46,21 @@ const SETTINGS_PATH = resolve(SELF, '..', '..', 'daemon-rebuild-settings.json');
 export const DEPS_AS_JOB_ENV = 'WE_DAEMON_DEPS_AS_JOB';
 export const DEFAULT_DEPS_JOB_RETRY_MS = 5 * 60_000;
 const COMPLETE_MARKER = '.snapshot-complete';
+
+/**
+ * The ONE argv the install job runs `npm` with. `--ignore-scripts` is load-bearing: the daemon runs unattended with
+ * the operator's gh/git credentials, so a lockfile change that lands on main (possibly merged by the drain itself)
+ * must never execute npm lifecycle scripts. Exported so a caller (the drain) can refuse the job path when it is
+ * missing, and pinned by a test.
+ */
+export const DEPS_JOB_NPM_ARGS = Object.freeze(['ci', '--ignore-scripts', '--no-audit', '--no-fund']);
+
+/** The install job's installer: `npm <DEPS_JOB_NPM_ARGS>` in a directory holding only the manifest and lockfile. */
+export function depsJobInstaller({ timeoutMs = NPM_INSTALL_TIMEOUT_MS, exec = execFileSync } = {}) {
+  return (into) => {
+    exec('npm', [...DEPS_JOB_NPM_ARGS], { cwd: into, stdio: ['ignore', 'ignore', 'pipe'], timeout: timeoutMs });
+  };
+}
 
 export const DEPS_JOB_KIND = defineJobKind({
   kind: 'daemon-deps-install',
@@ -219,7 +235,7 @@ export async function refreshDepsAsJob({
 // ── job child ────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** The job's one step: build the lockfile-keyed store from the pinned snapshot's lockfile (idempotent). */
-export function installStep({ jobsDir, sourceDir, expectKey, install = npmCiInstaller() }) {
+export function installStep({ jobsDir, sourceDir, expectKey, install = depsJobInstaller() }) {
   const got = lockfileKey(readFileSync(join(sourceDir, 'package-lock.json'), 'utf8'));
   if (expectKey && got !== expectKey) throw new Error(`lockfile of the pinned commit is ${got}, not the requested ${expectKey}`);
   const { key, dir } = ensureNodeModulesStore({ jobsDir, sourceDir, install });
@@ -232,7 +248,7 @@ export function installStep({ jobsDir, sourceDir, expectKey, install = npmCiInst
  * @param {{env?: object, cwd?: string, install?: Function, run?: typeof runJob, write?: (s: string) => void}} [o]
  */
 export async function runDepsJob({
-  env = process.env, cwd = process.cwd(), install = npmCiInstaller(), run = runJob, write = (m) => process.stderr.write(m),
+  env = process.env, cwd = process.cwd(), install = depsJobInstaller(), run = runJob, write = (m) => process.stderr.write(m),
 } = {}) {
   const dir = env.OPERATION_RUNS_DIR;
   return run({

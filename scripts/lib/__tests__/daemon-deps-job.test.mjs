@@ -13,7 +13,7 @@ import { join } from 'node:path';
 
 import {
   refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
-  DEPS_JOB_KIND, DEPS_JOB_KINDS, DEPS_AS_JOB_ENV,
+  DEPS_JOB_KIND, DEPS_JOB_KINDS, DEPS_AS_JOB_ENV, DEPS_JOB_NPM_ARGS, depsJobInstaller,
 } from '../daemon-rebuild/deps-job.mjs';
 import {
   createJobStore, enqueueJob, JOB_ID_ENV, JOB_ATTEMPT_ENV,
@@ -111,6 +111,23 @@ describe('refreshDepsAsJob — the loop side never installs', () => {
     expect(r.reason).toBe('swap-failed');
     expect(f.installed.write).not.toHaveBeenCalled();
     expect(existsSync(join(f.root, 'node_modules', 'old.txt'))).toBe(true);
+  });
+});
+
+describe('job child — npm never runs lifecycle scripts (the daemon holds the operator\'s credentials)', () => {
+  it('the declared argv carries --ignore-scripts', () => {
+    expect(DEPS_JOB_NPM_ARGS[0]).toBe('ci');
+    expect(DEPS_JOB_NPM_ARGS).toContain('--ignore-scripts');
+    expect(Object.isFrozen(DEPS_JOB_NPM_ARGS)).toBe(true);
+  });
+  it('the installer the job uses by default runs exactly that argv, in the store dir', () => {
+    const exec = vi.fn();
+    depsJobInstaller({ exec })('/tmp/store-x');
+    expect(exec).toHaveBeenCalledTimes(1);
+    const [cmd, args, opts] = exec.mock.calls[0];
+    expect(cmd).toBe('npm');
+    expect(args).toEqual([...DEPS_JOB_NPM_ARGS]);
+    expect(opts.cwd).toBe('/tmp/store-x');
   });
 });
 
