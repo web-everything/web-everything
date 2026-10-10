@@ -1001,7 +1001,7 @@ function runCli() {
     {
       const repoKeyForLimit = repoKeyForSlug(originSlugOf(REPO)) || 'we';
       let changedFilesForLimit = [];
-      try { changedFilesForLimit = gitC(['diff', '--name-only', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
+      try { changedFilesForLimit = gitC(['diff', '--name-only', '--no-renames', `${REMOTE}/${BASE}...${refSha}`]).split('\n').filter(Boolean); } catch { /* --no-renames: both sides of a rename, as `isCardOnlyDiff` requires; best-effort — an unresolvable diff degrades to "not exempt", never blocks on its own */ }
       const { count: openCount, limit, cardOnly: cardOnlyExcluded, accepted: acceptedExcluded, stacked: stackedExcluded } = countOpenPrsForRepo(repoKeyForLimit);
       const limitDecision = decideOpenPr({
         repoKey: repoKeyForLimit, limit, openCount, cardOnlyExcluded, acceptedExcluded, stackedExcluded, changedFiles: changedFilesForLimit, branch: REF,

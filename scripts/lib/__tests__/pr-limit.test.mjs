@@ -6,9 +6,11 @@
  *   pure helpers (limit resolution, exemption matching, AI/label counting, override-state parse/expiry).
  */
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { isCardOnlyDiff } from '../../ci-card-only.mjs';
 import {
   PR_LIMIT_DEFAULTS, PR_LIMIT_ENV, resolvePrLimit,
   EXEMPT_PATH_PREFIXES, isExemptPath, isExemptChangeset,
@@ -631,5 +633,32 @@ describe('allow is operator-only (xfaz7ho)', () => {
   it('existing allow-list entries written before this rule (no quote, no channel) are still honoured', () => {
     const legacy = parseLimitState(JSON.stringify({ branches: { '4779-y': { reason: 'old', by: 'nic', at: '2026-10-10T10:00:00.000Z', until: null } } }));
     expect(isBranchAllowedNow(legacy, 'lane/4779-y')).toBe(true);
+  });
+});
+
+// The card-only open exemption (xbxahvf) is only as honest as its changed-file list: `isCardOnlyDiff` documents that it
+// needs the `--no-renames` list (both sides of a rename), or a code file moved into backlog/ reads as card-only.
+describe('pr-land card-only open exemption — the changed-file list keeps both sides of a rename', () => {
+  it('git’s default rename detection hides a code file moved into backlog/; --no-renames does not', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-limit-rename-'));
+    const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    mkdirSync(join(dir, 'scripts')); mkdirSync(join(dir, 'backlog'));
+    const body = Array.from({ length: 40 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n';
+    writeFileSync(join(dir, 'scripts', 'foo.mjs'), body);
+    git('add', '-A'); git('commit', '-qm', 'base');
+    const base = git('rev-parse', 'HEAD').trim();
+    git('mv', 'scripts/foo.mjs', 'backlog/foo.md'); git('commit', '-qm', 'move');
+    const list = (...flags) => git('diff', '--name-only', ...flags, `${base}...HEAD`).split('\n').filter(Boolean);
+    expect(isCardOnlyDiff(list())).toBe(true); // the hole: the default list shows only backlog/foo.md
+    expect(list('--no-renames').sort()).toEqual(['backlog/foo.md', 'scripts/foo.mjs']);
+    expect(isCardOnlyDiff(list('--no-renames'))).toBe(false);
+  });
+
+  it('pr-land builds the open-limit changed-file list with --no-renames (source-level pin)', () => {
+    const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+    const m = src.match(/changedFilesForLimit = gitC\((\[[^\]]*\])\)/);
+    expect(m, 'changedFilesForLimit git invocation not found').not.toBeNull();
+    expect(m[1]).toContain("'--no-renames'");
   });
 });
