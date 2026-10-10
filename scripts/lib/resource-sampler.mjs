@@ -32,7 +32,7 @@ export function cpuIdlePctFromTimes(prevCpus, nextCpus) {
 export function parseIoregDiskStats(text) {
   const sums = {};
   for (const key of ['Total Time (Read)', 'Total Time (Write)', 'Bytes (Read)', 'Bytes (Write)']) {
-    const escaped = key.replace(/[()]/g, '\\$&');
+    const escaped = key.replace(/[\\()]/g, '\\$&');
     const matches = [...String(text).matchAll(new RegExp('"' + escaped + '"\\s*=\\s*(\\d+)', 'g'))];
     if (!matches.length) return null;
     sums[key] = matches.reduce((sum, match) => sum + Number(match[1]), 0);
