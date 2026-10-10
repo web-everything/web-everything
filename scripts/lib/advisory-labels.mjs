@@ -51,6 +51,8 @@ export function labelForOutcome(outcome) {
 
 const REVIEW_HUMAN = 'review:human';
 const REVIEW_PENDING = 'review:pending';
+/** Added beside `review:human` by the opening/escalating paths until an advisory posts (`review-escalation.mjs`). */
+export const AWAITING_ADVISORY = 'review:awaiting-advisory';
 
 /** Normalise a `labels` array (`[{name}]` from `gh --json`, or bare strings) to plain names. */
 export function labelNames(labels) {
@@ -157,7 +159,8 @@ export function planAdvisoryStaleLabels({ currentLabels = [], comments = [], hea
  * older `advisory:changes` sat under an accept note). The comment is the truth; the label is a derived view, so
  * the sweep re-derives it. Refuses (empty plan) unless the PR still carries `review:human`, the head is known,
  * and the newest TRUSTED-author advisory (see {@link trustedAdvisoryComments}) both covers the head and states a
- * clearing/blocking outcome. Idempotent: labels that already show the outcome plan nothing.
+ * clearing/blocking outcome. It also drops a stale `review:awaiting-advisory` (the advisory demonstrably exists).
+ * Idempotent: labels that already show the outcome, with no stale awaiting label, plan nothing.
  *
  * @param {{currentLabels?: Array, comments?: Array, headRefOid?: string}} o
  * @returns {{add: string|null, remove: string[]}}
@@ -173,5 +176,9 @@ export function planAdvisoryRepairLabels({ currentLabels = [], comments = [], he
   if (!latest || !advisoryCoversHead(latest, headRefOid)) return none;
   const plan = planAdvisoryLabels({ outcome: latest.outcome, currentLabels: names });
   if (plan.reason) return none;
-  return { add: plan.add, remove: plan.remove };
+  // #4722 — `review:awaiting-advisory` is stale once a trusted advisory covers the live head. The `advise` step
+  // clears it beside its own note, but a PR escalated to `review:human` AFTER its head was already reviewed (the
+  // drain's escalation, live PR #4722) never gets a second `advise` run, so nothing else would ever clear it.
+  const remove = names.includes(AWAITING_ADVISORY) ? [...plan.remove, AWAITING_ADVISORY] : plan.remove;
+  return { add: plan.add, remove };
 }
