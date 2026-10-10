@@ -36,7 +36,11 @@
  *   computed path — card x0e6tik. This is the ACCEPTED BOUND (operator ruling 2026-10-10): closing it would re-test a
  *   large share of PRs and erase the speed gain, and tests still run on main and on the PR per settings, so a miss is
  *   caught eventually. The card stays open; closing it is card x0e6tik's remaining work.
- *   Changes under `nonCodePaths` (docs, backlog cards) never count, as in `any-code`.
+ *   PROSE under `nonCodePaths` (Markdown/text docs, backlog cards) never counts, as in `any-code`; a source or data file
+ *   there is code like any other ({@link isNonCodeFile}, shared with the hook). A prose-only main move answers
+ *   `main-gained-no-code` without reading any graph, so it never excuses the pass's age ({@link excusesPassAge}): it
+ *   is judged exactly as `any-code` judges it (a disjoint non-code move, inside `maxAgeMinutes`). A PR file that reads
+ *   changed prose (`fs`, a `?raw` import) is covered to that extent, no further.
  *
  * IO ({@link readAffectedFacts}): reads file contents with `git show <sha>:<path>` in the drain's own clone,
  *   fetching the two commits from `origin` when absent. Rule 5 reads the whole tip tree in ONE `git cat-file --batch`
@@ -83,7 +87,31 @@ export function isGateFile(path) {
   return GATE_PATTERNS.some((re) => re.test(p)) || isLocalFullSuiteTrigger(p);
 }
 
-const isNonCode = (file, patterns) => patterns.some((p) => (p.endsWith('/') ? file.startsWith(p) : file === p));
+/** Prose a merge never executes or loads as data: the only kind of file a `nonCodePaths` entry exempts. */
+const PROSE_RE = /\.(?:md|markdown|txt)$/i; // not `.mdx`: it compiles to JSX and can import modules
+
+/** The verdict reason of the no-IO shortcut: main gained only prose. No import graph was read to reach it. */
+export const NO_CODE_REASON = 'main-gained-no-code';
+
+/**
+ * PURE. Does this verdict excuse the pass's AGE? Only an `unaffected` verdict that walked the import graph does: the
+ * no-code shortcut read nothing, so it proves nothing about a PR file reading changed prose (`fs`, a `?raw` import).
+ * That move is then judged exactly as `any-code` judges it: a disjoint non-code move, excused inside the age window.
+ */
+export function excusesPassAge(verdict) {
+  return verdict?.affected === false && verdict.reasons?.[0] !== NO_CODE_REASON;
+}
+
+/**
+ * PURE. Is this changed path non-code: under a `nonCodePaths` entry (`dir/` = a prefix, else an exact path) AND prose?
+ * A source or data file under docs/ or backlog/ is code like any other: a PR file can import it, a test can read it.
+ * The ONE predicate for both this rule and the hook's `mainGainedCode` (we:scripts/lib/merge-queue-hook.mjs).
+ */
+export function isNonCodeFile(file, patterns) {
+  const f = String(file ?? '');
+  return !!f && PROSE_RE.test(f) && patterns.some((p) => (p.endsWith('/') ? f.startsWith(p) : f === p));
+}
+const isNonCode = isNonCodeFile;
 
 /**
  * PURE. Can main's delta affect the PR?
@@ -98,20 +126,22 @@ const isNonCode = (file, patterns) => patterns.some((p) => (p.endsWith('/') ? fi
 export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['backlog/', 'docs/'], importsOf, importersOf }) {
   const pr = [...new Set(prFiles.filter(Boolean))];
   const prSet = new Set(pr);
-  const mainCode = [...new Set(mainFiles.filter(Boolean))].filter((f) => !isNonCode(f, nonCodePaths));
+  const mainAll = [...new Set(mainFiles.filter(Boolean))];
+  const mainCode = mainAll.filter((f) => !isNonCode(f, nonCodePaths));
   const done = (affected, reasons) => ({ affected, reasons, mainCodeFiles: mainCode.length });
-  // The gate rule answers first, on BOTH sides: a PR that edits the gate must not be excused (its pass's age included) by
-  // a main move that gained no code. Only then may "main gained nothing that can matter" end the question.
-  const gate = [...mainCode, ...pr].find(isGateFile);
+  // The gate rule answers first, on BOTH sides and on EVERY changed file (a configured non-code entry never hides one):
+  // a PR that edits the gate must not be excused (its pass's age included) by a main move that gained no code. Only
+  // then may "main gained nothing that can matter" end the question — and only prose counts as nothing (isNonCodeFile).
+  const gate = [...mainAll, ...pr].find(isGateFile);
   if (gate) return done(true, [`gate-touched:${gate}`]);
-  if (!mainCode.length) return done(false, ['main-gained-no-code']);
+  if (!mainCode.length) return done(false, [NO_CODE_REASON]); // read nothing: never excuses age (excusesPassAge)
   const glob = [...mainCode, ...pr.filter((f) => !isNonCode(f, nonCodePaths))].find(hitsGlobEdge);
   if (glob) return done(true, [`glob-edge:${glob}`]);
   const same = mainCode.find((f) => prSet.has(f));
   if (same) return done(true, [`same-file:${same}`]);
   if (mainCode.length > MAX_GRAPH_FILES || pr.length > MAX_GRAPH_FILES) return done(true, ['too-many-files']);
-  // Targets include main's docs/backlog files too: a PR file that imports one is coupled to it. Only ROOTS skip non-code.
-  const mainSet = new Set(mainFiles.filter(Boolean));
+  // Targets include main's prose files too (a `?raw` import of a card): a PR file that imports one is coupled to it.
+  const mainSet = new Set(mainAll);
   // Forward closure: from every changed file on `side`, follow imports through UNCHANGED modules too (A → B → C is
   // coupling even when neither changed end imports the other). Each file is read once (`seen`), so cycles terminate;
   // a closure past MAX_CLOSURE_FILES or an unreadable import list fails closed.
@@ -289,7 +319,7 @@ export function readAffectedFacts({ root = process.cwd(), num = null, headSha, t
   const out = (r) => ({ ...r, ms: Date.now() - t0 });
   // Cheap first: no IO when the pure rule already answers without the graph.
   const pre = decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf: () => [], importersOf: () => [] });
-  if (pre.affected || pre.reasons[0] === 'main-gained-no-code') return out(pre);
+  if (pre.affected || pre.reasons[0] === NO_CODE_REASON) return out(pre);
   if (!headSha || !tipSha) return out({ ...pre, affected: true, reasons: ['shas-unknown'] });
   try {
     const missing = [headSha, tipSha].filter((s) => !hasCommit(git, s));

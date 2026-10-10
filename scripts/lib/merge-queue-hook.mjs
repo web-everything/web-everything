@@ -36,7 +36,7 @@ import { readMainRedPriority } from './main-red-priority.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { writeJsonAtomic } from './atomic-json-file.mjs';
-import { RETEST_MODES, DEFAULT_RETEST_MODE, readAffectedFacts } from './merge-queue-affected.mjs';
+import { RETEST_MODES, DEFAULT_RETEST_MODE, readAffectedFacts, isNonCodeFile, excusesPassAge } from './merge-queue-affected.mjs';
 import { isUnderTest } from './under-test.mjs';
 
 export const MERGE_QUEUE_OFF_ENV = 'WE_DRAIN_MERGE_QUEUE';
@@ -236,10 +236,10 @@ function firstLine(e) { return String(e?.stderr || e?.message || e).split('\n')[
  */
 export const DEFAULT_NON_CODE_PATHS = Object.freeze(['backlog/', 'docs/']);
 
-/** PURE. Is this changed path non-code under the configured patterns? */
+/** PURE. Is this changed path non-code under the configured patterns? Only PROSE there is (the `affected` rule's own
+ *  predicate, so both modes agree): a source or data file under docs/ is code a PR can import. */
 export function isNonCodePath(file, patterns = DEFAULT_NON_CODE_PATHS) {
-  const f = String(file ?? '');
-  return !!f && patterns.some((p) => (p.endsWith('/') ? f.startsWith(p) : f === p));
+  return isNonCodeFile(file, patterns);
 }
 
 /** PURE. Did main gain any code since the PR's base? (Unknown file lists are handled by the rule: fail closed.) */
@@ -257,7 +257,8 @@ export function decideMergeQueueAction({ key, num, facts, nowMs, refreshed = {},
   // `affected` mode, and the main delta provably cannot reach this PR: its passing run still proves its code. Main's
   // move is excused like a non-code move (file overlap still refreshes), and so is the pass's age — age only stood in
   // for "main may have changed under it", which the affected check now answers directly.
-  const unaffected = freshness.retestMode === 'affected' && facts.affected?.affected === false;
+  // A `main-gained-no-code` verdict read no graph: it falls through to the any-code rule (age counts), see excusesPassAge.
+  const unaffected = freshness.retestMode === 'affected' && excusesPassAge(facts.affected);
   const codeMoved = !unaffected && freshness.allowDisjointMainMoves && mainGainedCode(facts.main, freshness.nonCodePaths ?? DEFAULT_NON_CODE_PATHS);
   if (codeMoved) freshness.allowDisjointMainMoves = false; // disjointness only excuses non-code moves
   if (unaffected) { freshness.allowDisjointMainMoves = true; freshness.maxAgeMinutes = Infinity; }

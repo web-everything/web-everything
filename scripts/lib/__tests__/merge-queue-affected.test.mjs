@@ -564,10 +564,15 @@ describe('decideMergeQueueAction with the affected verdict', () => {
     f.main.filesChangedSinceBase = ['docs/x.md'];
     f.pr.files = ['scripts/lib/merge-queue-affected.mjs'];
     expect(decideMergeQueueAction({ key: 'k', num: 1, facts: f, nowMs: now, settings: LIVE }).action).toBe('refresh');
-    // the same old pass on a non-gate PR keeps the speed-up: nothing main gained can reach it
-    const ok = facts({ affected: false, reasons: ['main-gained-no-code'], mainCodeFiles: 0 }, 120);
-    ok.main.filesChangedSinceBase = ['docs/x.md'];
-    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: ok, nowMs: now, settings: LIVE }).action).toBe('merge');
+    // round 6: the same old pass on a non-gate PR is refreshed too — the no-code shortcut read no graph, so it excuses
+    // only what any-code excuses (a disjoint prose move inside the age window), never the pass's age
+    const old = facts({ affected: false, reasons: ['main-gained-no-code'], mainCodeFiles: 0 }, 120);
+    old.main.filesChangedSinceBase = ['docs/x.md'];
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: old, nowMs: now, settings: LIVE }).action).toBe('refresh');
+    // and a young pass against that prose-only move still merges, as in any-code
+    const young = facts({ affected: false, reasons: ['main-gained-no-code'], mainCodeFiles: 0 }, 5);
+    young.main.filesChangedSinceBase = ['docs/x.md'];
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: young, nowMs: now, settings: LIVE }).action).toBe('merge');
   });
   it('affected → refresh, naming why', () => {
     const r = decideMergeQueueAction({ key: 'k', num: 1, facts: facts({ affected: true, reasons: ['same-file:scripts/z.mjs'] }), nowMs: now, settings: LIVE });
@@ -590,6 +595,91 @@ describe('decideMergeQueueAction with the affected verdict', () => {
     const v = decideAffected({ prFiles: ['package.json', 'scripts/lib/hermetic-tests.mjs'], mainFiles: ['scripts/merge-ai-prs.mjs', 'scripts/conveyor/prep-review.mjs'], importsOf: none });
     expect(v.affected).toBe(true);
     expect(decideMergeQueueAction({ key: 'k', num: 4547, facts: facts(v), nowMs: now, settings: LIVE }).action).toBe('refresh');
+  });
+});
+
+// Review round 6 (rung 2): `nonCodePaths` exempted EVERY file under docs/ and backlog/, executable code included, so the
+// `main-gained-no-code` early return (and the hook's own `mainGainedCode`) excused a main move a PR file imports. The
+// exemption now covers prose only (Markdown, text); any other file there is code or data, judged like one anywhere else.
+describe('the non-code exemption covers prose only (review round 6: the no-code early return)', () => {
+  const HEAD = 'h'.repeat(40);
+  const TIP = 't'.repeat(40);
+  it.each([['docs/tool.mjs'], ['docs/data.json']])('main changed only %s, which a PR file imports → affected, not main-gained-no-code', (target) => {
+    const importsOf = (side, f) => (side === 'pr' && f === 'scripts/a.mjs' ? [target] : []);
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: [target], importsOf }))
+      .toMatchObject({ affected: true, reasons: [`pr-file-imports-main-file:scripts/a.mjs->${target}`], mainCodeFiles: 1 });
+  });
+  it('a source file main changed under backlog/ is code too (backlog/ is also a scanned fixture root → glob-edge)', () => {
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['backlog/tools/x.ts'], importsOf: none }))
+      .toMatchObject({ affected: true, reasons: ['glob-edge:backlog/tools/x.ts'], mainCodeFiles: 1 });
+  });
+  it('a docs/ source file main changed that reaches a PR file through an unchanged module → affected (it is a root)', () => {
+    const importsOf = (side, f) => (side === 'main' && f === 'docs/tool.mjs' ? ['scripts/mid.mjs'] : side === 'main' && f === 'scripts/mid.mjs' ? ['scripts/a.mjs'] : []);
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['docs/tool.mjs'], importsOf }).reasons)
+      .toEqual(['main-file-imports-pr-file:docs/tool.mjs->scripts/mid.mjs->scripts/a.mjs']);
+  });
+  it('an unchanged test importing a PR file and a docs/ source file main changed → shared-importer', () => {
+    const importersOf = (f) => (f === 'scripts/a.mjs' || f === 'docs/tool.mjs' ? ['scripts/__tests__/t.test.mjs'] : []);
+    expect(decideAffectedRule({ prFiles: ['scripts/a.mjs'], mainFiles: ['docs/tool.mjs'], importsOf: none, importersOf }).reasons)
+      .toEqual(['shared-importer:scripts/__tests__/t.test.mjs (pr:scripts/a.mjs, main:docs/tool.mjs)']);
+  });
+  it('a data file under docs/ that no import reaches is data read through fs, not prose → data-file-changed', () => {
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['docs/fixtures/cases.json'], importsOf: none }).reasons).toEqual(['data-file-changed:docs/fixtures/cases.json']);
+  });
+  it('a gate file under a configured nonCodePaths entry still trips the gate rule (the gate is checked on every main file)', () => {
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['.github/workflows/ci.yml'], nonCodePaths: ['docs/', '.github/'], importsOf: none }))
+      .toMatchObject({ affected: true, reasons: ['gate-touched:.github/workflows/ci.yml'] });
+  });
+  it('prose under docs/ and backlog/ still takes the no-IO shortcut', () => {
+    const git = () => { throw new Error('no IO expected'); };
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['docs/x.md', 'backlog/1-x.md', 'docs/notes.txt'], git }).reasons).toEqual(['main-gained-no-code']);
+  });
+  it('through git: main changed only docs/tool.mjs, the PR file imports it → affected (the shortcut no longer skips the read)', () => {
+    const { git } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': "import { t } from '../docs/tool.mjs';", 'docs/tool.mjs': 'export const t = 1;' },
+      [TIP]: { 'scripts/a.mjs': '', 'docs/tool.mjs': 'export const t = 2;' },
+    });
+    expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['docs/tool.mjs'], git }))
+      .toMatchObject({ affected: true, reasons: ['pr-file-imports-main-file:scripts/a.mjs->docs/tool.mjs'] });
+  });
+  it('end to end: a FRESH pass whose main move is only docs/tool.mjs (which the PR imports) is refreshed, not merged', () => {
+    const LIVE = loadMergeQueueSettings({ file: JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8')), env: {} });
+    const now = Date.parse('2026-10-10T14:00:00Z');
+    const { git } = fakeGit({
+      [HEAD]: { 'scripts/a.mjs': "import { t } from '../docs/tool.mjs';", 'docs/tool.mjs': 'export const t = 1;' },
+      [TIP]: { 'scripts/a.mjs': '', 'docs/tool.mjs': 'export const t = 2;' },
+    });
+    const affected = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['docs/tool.mjs'], git });
+    const facts = {
+      pr: { headSha: HEAD, baseSha: 'b', files: ['scripts/a.mjs'], filesComplete: true,
+        requiredCheck: { state: 'passed', headSha: HEAD, completedAtMs: now - 5 * 60_000, runId: '1', checkRunId: 1 } },
+      main: { tipSha: TIP, commitsSinceBase: 1, filesChangedSinceBase: ['docs/tool.mjs'], complete: true },
+      errors: [], affected,
+    };
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts, nowMs: now, settings: LIVE }).action).toBe('refresh');
+    // the same fresh pass against a prose-only main move still merges (the speed-up for docs/backlog moves stays)
+    const prose = { ...facts, main: { ...facts.main, filesChangedSinceBase: ['docs/x.md'] }, affected: readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['docs/x.md'], git }) };
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: prose, nowMs: now, settings: LIVE }).action).toBe('merge');
+  });
+  // The no-code shortcut never reads the graph, so it proves nothing about a PR file that reads changed prose (fs, `?raw`).
+  // It therefore excuses exactly what any-code excuses — a disjoint move inside the age window — and never the pass's age.
+  it('an OLD pass against a prose-only main move is refreshed for age (the no-code shortcut walked no graph: any-code parity)', () => {
+    const LIVE = loadMergeQueueSettings({ file: JSON.parse(readFileSync(join(SETTINGS_DIR, 'merge-queue.json'), 'utf8')), env: {} });
+    const now = Date.parse('2026-10-10T14:00:00Z');
+    const affected = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/a.mjs'], mainFiles: ['backlog/9999-new-card.md'], git: () => { throw new Error('no git'); } });
+    expect(affected).toMatchObject({ affected: false, reasons: ['main-gained-no-code'] });
+    const facts = (ageMin) => ({
+      pr: { headSha: HEAD, baseSha: 'b', files: ['scripts/a.mjs'], filesComplete: true,
+        requiredCheck: { state: 'passed', headSha: HEAD, completedAtMs: now - ageMin * 60_000, runId: '1', checkRunId: 1 } },
+      main: { tipSha: TIP, commitsSinceBase: 1, filesChangedSinceBase: ['backlog/9999-new-card.md'], complete: true },
+      errors: [], affected,
+    });
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: facts(180), nowMs: now, settings: LIVE }))
+      .toMatchObject({ action: 'refresh', reasons: expect.arrayContaining(['pass-too-old']) });
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: facts(5), nowMs: now, settings: LIVE }).action).toBe('merge');
+  });
+  it('`.mdx` is not prose: it compiles to JSX and can import modules', () => {
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['docs/page.mdx'], importsOf: none }).reasons).toEqual(['data-file-changed:docs/page.mdx']);
   });
 });
 
