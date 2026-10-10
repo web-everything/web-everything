@@ -30,11 +30,12 @@
  *     mutates `process.env`. Every effect is injectable for testing with no real GitHub App needed.
  */
 
-import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, mkdirSync, accessSync, readdirSync, constants as fsConstants } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { dirname } from 'node:path';
+import { dirname, basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { mintInstallationToken, getInstallationInfo } from './github-app-token.mjs';
+import { readGithubAuthPolicy } from './github-auth-policy.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { installationMap, installationForOwner, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
 
@@ -147,6 +148,94 @@ export function resolveGithubAppEnvConfig(env = process.env) {
   return { appId, installationId: remapLegacyInstallationId(installationId, env), privateKeyPath };
 }
 
+/** The three opt-in env vars, in the order {@link diagnoseGithubAppEnvConfig} reports them. */
+export const GITHUB_APP_ENV_KEYS = Object.freeze(['WE_GITHUB_APP_ID', 'WE_GITHUB_APP_INSTALLATION_ID', 'WE_GITHUB_APP_PRIVATE_KEY_PATH']);
+
+function defaultCanReadKey(path) {
+  try { accessSync(path, fsConstants.R_OK); return true; } catch { return false; }
+}
+
+/**
+ * Is App auth fully configured, absent, or HALF-configured? PURE apart from the injected key-readability check.
+ * Live-caught 2026-10-09: the drain's plist pinned an installation and a key path but no `WE_GITHUB_APP_ID`, so
+ * {@link resolveGithubAppEnvConfig} returned `null` and the drain ran on the operator's personal login with no
+ * trace anywhere — until that login's shared rate limit broke the drain's check at 13:21Z. Half-configured is never
+ * an intentional opt-out, so it must be reported, never treated like "absent".
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {{canReadKey?:(path:string)=>boolean}} [o]
+ * @returns {{state:'complete'|'absent'|'half', missing:string[], keyUnreadable:boolean}}
+ */
+export function diagnoseGithubAppEnvConfig(env = process.env, { canReadKey = defaultCanReadKey } = {}) {
+  const missing = GITHUB_APP_ENV_KEYS.filter((k) => !env?.[k]);
+  if (missing.length === GITHUB_APP_ENV_KEYS.length) return { state: 'absent', missing, keyUnreadable: false };
+  const keyPath = env?.WE_GITHUB_APP_PRIVATE_KEY_PATH;
+  const keyUnreadable = !!keyPath && !canReadKey(keyPath);
+  if (missing.length || keyUnreadable) return { state: 'half', missing, keyUnreadable };
+  return { state: 'complete', missing: [], keyUnreadable: false };
+}
+
+/** The plain-language warning for a {@link diagnoseGithubAppEnvConfig} result that is not `complete`. PURE. */
+export function formatGithubAppConfigWarning(diag, { caller = 'this process', daemon = false } = {}) {
+  if (!diag || diag.state === 'complete') return null;
+  if (diag.state === 'absent') {
+    return daemon
+      ? `github-app-auth-env: WARNING — ${caller} is a daemon and App login is the default (github.auth=app), but none of ${GITHUB_APP_ENV_KEYS.join(', ')} is set. It is running on the operator's PERSONAL gh login.`
+      : null;
+  }
+  const parts = [];
+  if (diag.missing.length) parts.push(`missing ${diag.missing.join(', ')}`);
+  if (diag.keyUnreadable) parts.push('the private key file is unreadable');
+  return `github-app-auth-env: WARNING — App auth is HALF-configured for ${caller} (${parts.join('; ')}). App login is SKIPPED and every gh call runs on the operator's PERSONAL login. Set the missing value(s) in the launchd plist and reload it (bootout + bootstrap).`;
+}
+
+/**
+ * A stable name for the process refreshing auth, for its per-caller status file. A pass-daemon runs one pass per
+ * process, so its `--pass=` value is part of the name (otherwise every pass-daemon would share one file).
+ */
+export function defaultAuthCaller(argv = process.argv, env = process.env) {
+  if (env?.WE_GITHUB_AUTH_CALLER) return String(env.WE_GITHUB_AUTH_CALLER);
+  const script = argv?.[1] ? basename(String(argv[1])) : 'unknown';
+  const pass = (argv ?? []).find((a) => typeof a === 'string' && a.startsWith('--pass='));
+  return pass ? `${script}:${pass.slice(7)}` : script;
+}
+
+/** One status file PER CALLER (no read-modify-write race between daemons), beside the shared status file. */
+export function defaultCallerStatusDir(home = homedir()) {
+  return `${home}/.claude/github-app-token/callers`;
+}
+
+function callerStatusFile(dir, caller) {
+  return join(dir, `${String(caller).replace(/[^A-Za-z0-9._-]+/g, '_')}.json`);
+}
+
+/**
+ * Every caller's last recorded auth outcome, newest first, dropping files older than `maxAgeMs` (a daemon that was
+ * removed stops refreshing its file; a live one rewrites it every tick). Never throws.
+ * @returns {{caller:string, applied:boolean, reason:string, missing?:string[], keyUnreadable?:boolean, checkedAt:string}[]}
+ */
+export function readGithubAppCallerStatuses({ dir = defaultCallerStatusDir(), now = Date.now(), maxAgeMs = 2 * 60 * 60 * 1000 } = {}) {
+  let names = [];
+  try { names = readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
+  const out = [];
+  for (const n of names) {
+    try {
+      const s = JSON.parse(readFileSync(join(dir, n), 'utf8'));
+      const at = Date.parse(s?.checkedAt ?? '');
+      if (!s || typeof s.caller !== 'string' || !Number.isFinite(at) || now - at > maxAgeMs) continue;
+      out.push(s);
+    } catch { /* torn/corrupt file: skip */ }
+  }
+  return out.sort((a, b) => Date.parse(b.checkedAt) - Date.parse(a.checkedAt));
+}
+
+const warnedOnce = new Set();
+/** Log `msg` once per process per key — the per-tick refresh must stay loud without flooding a daemon log. */
+function warnOnce(log, key, msg) {
+  if (!msg || warnedOnce.has(key)) return;
+  warnedOnce.add(key);
+  log?.error?.(msg);
+}
+
 /**
  * Stamped on every cache entry this module writes. Only an entry carrying the CURRENT version is trusted —
  * because a cache hit skips the access check, an entry written by an older, laxer version must never be
@@ -203,8 +292,14 @@ function writeStatusFile(path, status) {
  * @param {string} [path]
  * @returns {{applied:boolean, reason:string, missingPermissions?:string[], missingRepos?:string[], checkedAt:string}|null}
  */
-export function readGithubAppStatus(path = defaultStatusPath()) {
-  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; }
+export function readGithubAppStatus(path = defaultStatusPath(), { callerDir = join(dirname(path), 'callers'), now = Date.now() } = {}) {
+  let status = null;
+  try { status = JSON.parse(readFileSync(path, 'utf8')); } catch { status = null; }
+  // Per-caller outcomes (half-configured daemons, a daemon stuck on mint-failed): the shared file above is
+  // last-writer-wins, so one healthy daemon's `ok` would hide another's fallback. Attached only when present.
+  const callers = readGithubAppCallerStatuses({ dir: callerDir, now });
+  if (!callers.length) return status;
+  return { ...(status ?? {}), callers };
 }
 
 /**
@@ -262,8 +357,20 @@ export async function ensureFreshGithubAppEnv({
   extraInstallations = true,
   perOwner = false,
   installShim = defaultInstallOwnerShim,
+  daemon = false,
+  caller = defaultAuthCaller(process.argv, env),
+  policy,
+  canReadKey = mint === mintInstallationToken ? defaultCanReadKey : () => true,
+  callerStatusDir = join(dirname(statusPath), 'callers'),
+  // A test that injected `writeStatus` never wrote the real home dir; keep it that way for the per-caller file.
+  writeCallerStatus = writeStatus === writeStatusFile ? writeStatusFile : () => {},
 } = {}) {
-  const record = (result) => {
+  const recordCaller = (result, extra = {}) => {
+    writeCallerStatus(callerStatusFile(callerStatusDir, caller), { caller, daemon, ...result, ...extra, checkedAt: new Date(now).toISOString() });
+  };
+  const record = (result, { shared = true } = {}) => {
+    if (result.reason !== 'not-configured') recordCaller(result);
+    if (!shared) return result;
     // `not-configured` is skipped, deliberately (#x8mpubm follow-up): this shared file reports the FLEET's
     // installation state, and `not-configured` means only "THIS caller never opted in" — a fact about the
     // caller, not the installation. Recording it would let any incidental, unconfigured caller (a stray local
@@ -277,13 +384,46 @@ export async function ensureFreshGithubAppEnv({
     return result;
   };
 
+  // `github.auth: personal` is an explicit, host-wide choice — honoured, recorded, never a silent fallback.
+  const authPolicy = policy ?? readGithubAuthPolicy({ env });
+  if (authPolicy.auth === 'personal') {
+    warnOnce(log, `policy-personal:${caller}`, `github-app-auth-env: github.auth=personal (${authPolicy.source?.auth ?? '?'}) — ${caller} uses the operator's personal gh login by policy.`);
+    return record({ applied: false, reason: 'policy-personal' }, { shared: false });
+  }
+
+  // A HALF-configured App (some of the three vars set, or the key unreadable) is a misconfiguration, not an
+  // opt-out: warn loudly and record it, so the health smell names the daemon. Still falls back (fail-safe).
+  // Missing vars are checked every call; key readability only when a mint actually needs the key (below) — a
+  // cache hit never reads it.
+  const diag = diagnoseGithubAppEnvConfig(env, { canReadKey: () => true });
+  if (diag.state === 'half') {
+    warnOnce(log, `half:${caller}:${diag.missing.join(',')}:${diag.keyUnreadable}`, formatGithubAppConfigWarning(diag, { caller, daemon }));
+    // Caller file only: the shared status file reports the INSTALLATION (bad-credentials reads `applied:false`
+    // there), and this is a fact about one process's env, not about the installation.
+    return record({ applied: false, reason: 'half-configured', missing: diag.missing, keyUnreadable: diag.keyUnreadable }, { shared: false });
+  }
+
   const config = resolveGithubAppEnvConfig(env);
-  if (!config) return record({ applied: false, reason: 'not-configured' });
+  if (!config) {
+    // App is the default for DAEMONS: one with no App config at all is reported too (shared file untouched —
+    // see `record` — but its own caller file says so, and the smell reads that).
+    if (daemon) {
+      warnOnce(log, `absent:${caller}`, formatGithubAppConfigWarning(diag, { caller, daemon }));
+      recordCaller({ applied: false, reason: 'not-configured' });
+      return { applied: false, reason: 'not-configured' };
+    }
+    return record({ applied: false, reason: 'not-configured' });
+  }
 
   let cached = readCache(cachePath);
   let source = 'cache';
   if (!isCacheFresh(cached, now) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
     source = 'mint';
+    if (!canReadKey(config.privateKeyPath)) {
+      const keyDiag = { state: 'half', missing: [], keyUnreadable: true };
+      warnOnce(log, `half:${caller}::true`, formatGithubAppConfigWarning(keyDiag, { caller, daemon }));
+      return record({ applied: false, reason: 'half-configured', missing: [], keyUnreadable: true }, { shared: false });
+    }
     let minted;
     try {
       minted = await mint({ appId: config.appId, installationId: config.installationId, privateKeyPath: config.privateKeyPath, now });
@@ -444,9 +584,27 @@ export async function ensurePerInstallationCaches({ config, primary, env, cacheP
  * every call to another org fail with "Could not resolve to a Repository" (drain 2026-10-03; review daemon and
  * fix-dispatch daemon on plateauapp/plateau-app 2026-10-04). Daemons import this; none spell their own.
  */
-export const FLEET_APP_AUTH_OPTS = Object.freeze({ log: console, perOwner: true });
+export const FLEET_APP_AUTH_OPTS = Object.freeze({ log: console, perOwner: true, daemon: true });
+
+/**
+ * The START-UP check a daemon runs once, before its first tick: a half-configured App (or, for a daemon, no App
+ * config at all) is logged at once, so it is the first thing in the daemon's log — never discovered later from a
+ * personal rate-limit incident. Returns the diagnosis. Never throws.
+ */
+export function warnGithubAppConfigAtStart({ env = process.env, log = console, daemon = true, caller = defaultAuthCaller(process.argv, env), canReadKey = defaultCanReadKey, policy } = {}) {
+  let diag;
+  try {
+    const authPolicy = policy ?? readGithubAuthPolicy({ env });
+    if (authPolicy.auth === 'personal') return { state: 'policy-personal', missing: [], keyUnreadable: false };
+    diag = diagnoseGithubAppEnvConfig(env, { canReadKey });
+    const msg = formatGithubAppConfigWarning(diag, { caller, daemon });
+    if (msg) log?.error?.(msg);
+  } catch { /* diagnostic only */ }
+  return diag;
+}
 
 export function withGithubAppAuth(effects, opts = { log: console }) {
+  warnGithubAppConfigAtStart({ log: opts.log ?? console, daemon: opts.daemon ?? true, ...(opts.env ? { env: opts.env } : {}) });
   const tick = effects.tickOnce;
   return {
     ...effects,
