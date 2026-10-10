@@ -68,6 +68,7 @@ import {
   acquireFixDispatchClaim, releaseFixDispatchClaim, fixDispatchClaimOwner, stampBorrowedRunnerPid,
 } from '../conveyor/fix-dispatch-claim.mjs';
 import { readLiveFixClaim, withAltBranchHint } from '../conveyor/fix-procedure.mjs';
+import { briefWithContextPack } from '../conveyor/fix-context-pack.mjs'; // ci-heal context pack: failing checks + log staged in the brief
 import { codeqlBriefSection } from '../lib/codeql-gate.mjs';
 import { createCiHealReserve } from '../lib/ci-heal-reserve.mjs';
 import { listFixDispatchClaims } from '../conveyor/fix-claim-store.mjs';
@@ -136,7 +137,12 @@ export function routeAvailableCiHeal(p, { readHolds = readAgyHold, readScores = 
  */
 export async function dispatchCiHeal(planned, {
   root = REPO_ROOT, actions, repo = planned.repo ?? 'we', extraArgs = [],
-  readBrief = (r) => readFileSync(briefPath(r, 'ci-heal'), 'utf8'),
+  // CI-heal context pack (`fix.contextPack`, `fix.localTests`): the failing checks, failing tests and failed-log tail
+  // staged in front of the template (we:scripts/conveyor/fix-context-pack.mjs). A test that injects `readBrief` gets its own text.
+  readBrief = (r) => packCiBrief(readFileSync(briefPath(r, 'ci-heal'), 'utf8')),
+  packCiBrief = (template) => briefWithContextPack(template, {
+    kind: 'ci-heal', repo, toSlug: (k) => CONSTELLATION_REPOS[repoKeyForSlug(k) ?? k]?.slug ?? k, pr: planned.pr, exec: execFileSyncThrottled,
+  }),
   sinks = createDispatchSinks({ root, actions, repo, extraArgs }),
   // #3967 multi-repo slice 7 — mirrors `reconcile-fix-dispatch.mjs#dispatchFix`'s own seam exactly: threaded
   // straight through to `briefTokensForRepo`/`repoProfile`/`gateFor` (all three already accept them), never
