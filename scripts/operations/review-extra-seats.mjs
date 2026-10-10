@@ -1475,9 +1475,13 @@ export const RED_TEAM_DISCARD_DISPATCH_KIND = 'review-seat-speculative-discard';
 export function buildRedTeamDiscardRow({ pr, repo, pass = null, reserved = null, reason, now }) {
   const src = pass?.status === 'speculated' ? pass : reserved;
   if (!src?.callId) return null;
+  // The store's own contract (`run-scorecard-store.mjs#validateScorecard`): a stamped, unscored work-agent row —
+  // `criteriaEvaluated: 0` and `score: null`, so no reader can average a discarded call into anyone's score.
   return {
+    rubricVersion: RED_TEAM_RUBRIC, subjectClass: 'work-agent', criteriaEvaluated: 0, score: null, deductions: [],
+    item: null, handle: `review-${Number(pr)}`, outcome: null,
     dispatchKind: RED_TEAM_DISCARD_DISPATCH_KIND, seat: RED_TEAM_SEAT.seat, lens: RED_TEAM_SEAT.lens,
-    pr: Number(pr), repo, rev: src.rev ?? null, callId: src.callId, provider: src.provider ?? null, model: src.model ?? null,
+    pr: Number(pr), repo, rev: src.rev ?? null, callId: src.callId, provider: src.provider ?? 'unknown', model: src.model ?? 'unknown',
     effort: src.effort ?? null, completed: pass?.status === 'speculated', callStatus: pass?.call?.status ?? null,
     durationMs: pass?.durationMs ?? null, findingsCount: Array.isArray(pass?.findings) ? pass.findings.length : null,
     reason: String(reason ?? '').slice(0, 300), scoredAt: new Date(now).toISOString(),

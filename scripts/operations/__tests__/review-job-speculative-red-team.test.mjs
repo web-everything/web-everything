@@ -7,7 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { runReviewJob, settleSpeculativeRedTeam } from '../review-job.mjs';
 import {
   speculateRedTeam, finishSpeculativeRedTeam, runRedTeam, buildRedTeamDiscardRow, reserveSeatCalls,
-  RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint,
+  RED_TEAM_DISCARD_DISPATCH_KIND, redTeamReadFingerprint, recordDiscardedRedTeam,
 } from '../review-extra-seats.mjs';
 import { validateScorecard } from '../../conveyor/run-scorecard-store.mjs';
 
@@ -184,7 +184,7 @@ function seatsIo(over = {}) {
     },
     append: (row) => {
       const v = validateScorecard({ v: 1, scoredAt: new Date(NOW).toISOString(), ...row });
-      if (!v.ok && row.dispatchKind !== RED_TEAM_DISCARD_DISPATCH_KIND) throw new Error(v.errors.join('; '));
+      if (!v.ok) throw new Error(v.errors.join('; '));
       rows.push(row);
     },
     cliAvailable: (p) => p === 'codex',
@@ -254,6 +254,15 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
     expect(buildRedTeamDiscardRow({ pr: 5, repo: REPO, reserved: { callId: 'c9', provider: 'codex', rev: REV }, reason: 'killed', now: NOW }))
       .toMatchObject({ callId: 'c9', completed: false });
     expect(buildRedTeamDiscardRow({ pr: 5, repo: REPO, reason: 'nothing', now: NOW })).toBeNull();
+  });
+
+  it('the discard row is one the scorecard store accepts (live: the first discard was refused by its validator)', async () => {
+    const { io, rows } = seatsIo();
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, io);
+    expect(recordDiscardedRedTeam({ pr: 5, repo: REPO, pass, reason: 'changes' }, io)).toMatchObject({ status: 'recorded', completed: true });
+    expect(recordDiscardedRedTeam({ pr: 5, repo: REPO, reserved: { callId: 'c9', provider: 'codex', model: 'm', rev: REV }, reason: 'killed' }, io)).toMatchObject({ status: 'recorded', completed: false });
+    expect(rows.map((r) => r.dispatchKind)).toEqual([RED_TEAM_DISCARD_DISPATCH_KIND, RED_TEAM_DISCARD_DISPATCH_KIND]);
+    expect(rows.every((r) => r.score === null && r.criteriaEvaluated === 0)).toBe(true);
   });
 
   it('the read fingerprint changes with the head, the diff, the title, the body or the file list', () => {
