@@ -16,7 +16,10 @@
  *
  *   List file (`quarantine.json` on `ops/quarantine`):
  *     `{ version:1, entries:[{ test, brokenSha, owner, reason, addedAt, expiresAt, area? }] }`
- *     plus optional `fixPrs:[n,..]` — the main-fix PR numbers CI runs the quarantined tests for (set by a writer only).
+ *     plus optional `fixPrs:[n,..]` — the main-fix PR numbers CI runs the quarantined tests for (set by a writer only),
+ *     and optional `mode:'stop'|'quarantine'` — the red-main mode the safety net resolved when it last wrote
+ *     ({@link setMode}). CI reads it from here, as it reads the entries, so CI and the daemon use ONE switch (the
+ *     daemon's env/preference cascade is not visible to a CI job). No stamp ⇒ CI falls back to its own cascade.
  *   Audit trail (`events.jsonl`, same commit): one `{type:'quarantine-added'|'quarantine-removed', ...}` per change.
  */
 
@@ -37,6 +40,7 @@ export function validateQuarantineList(list) {
   const errors = [];
   if (!list || typeof list !== 'object' || list.version !== 1 || !Array.isArray(list.entries)) return { ok: false, errors: ['not a v1 quarantine list'] };
   if (list.fixPrs !== undefined && (!Array.isArray(list.fixPrs) || !list.fixPrs.every((n) => Number.isInteger(n) && n > 0))) errors.push('fixPrs: not a list of PR numbers');
+  if (list.mode !== undefined && !RED_MAIN_MODES.includes(list.mode)) errors.push('mode: not a red-main mode');
   list.entries.forEach((e, i) => {
     if (!e || typeof e !== 'object') { errors.push(`entry ${i}: not an object`); return; }
     if (!isStr(e.test) || !SAFE_TEST.test(e.test) || e.test.includes('..')) errors.push(`entry ${i}: bad test id`);
@@ -83,10 +87,23 @@ export function addEntries(list, { tests = [], brokenSha, owner, reason, actor, 
     entries.push(e);
     events.push({ type: 'quarantine-added', at: now, actor, ...e });
   }
-  const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}) };
+  const next = { version: 1, entries, ...(Array.isArray(base.fixPrs) ? { fixPrs: base.fixPrs } : {}), ...(base.mode !== undefined ? { mode: base.mode } : {}) };
   const v = validateQuarantineList(next);
   if (!v.ok) return { ok: false, error: v.errors.join('; ') };
   return { ok: true, list: next, events };
+}
+
+/**
+ * Publish the red-main mode the writer resolved on the list, so CI (which reads ONLY this list) applies the same mode
+ * as the daemon. Only a writer may set it. Unchanged ⇒ no event. PURE.
+ */
+export function setMode(list, { mode, actor, now }) {
+  if (!canWriteQuarantine(actor)) return { ok: false, error: `writer "${actor}" may not change the quarantine list (allowed: ${QUARANTINE_WRITERS.join(', ')})` };
+  if (!RED_MAIN_MODES.includes(mode)) return { ok: false, error: `mode "${mode}" is not a red-main mode` };
+  const base = list && list.version === 1 ? list : { version: 1, entries: [] };
+  if (base.mode === mode) return { ok: true, list: base, events: [] };
+  const next = { ...base, version: 1, entries: [...base.entries], mode };
+  return { ok: true, list: next, events: [{ type: 'quarantine-mode', at: now, actor, mode }] };
 }
 
 /**
@@ -104,7 +121,7 @@ export function pruneOnGreen(list, { mainGreen, now, actor = 'red-main-safety-ne
   // The main-fix PR set belongs to the red it fixes: it goes with the last entry (or on green).
   const fixPrs = keep.length && mainGreen !== true && Array.isArray(list?.fixPrs) ? { fixPrs: list.fixPrs } : {};
   if (!keep.length && list?.fixPrs?.length) events.push({ type: 'quarantine-fix-prs', at: now, actor, fixPrs: [] });
-  return { list: { version: 1, entries: keep, ...fixPrs }, events };
+  return { list: { version: 1, entries: keep, ...fixPrs, ...(list?.mode !== undefined ? { mode: list.mode } : {}) }, events };
 }
 
 /**

@@ -11,7 +11,8 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { parseVitestFailures, planSafetyNet, addEntries } from '../../lib/red-main-quarantine.mjs';
+import * as quarantine from '../../lib/red-main-quarantine.mjs';
+const { parseVitestFailures, planSafetyNet, addEntries, pruneOnGreen, setMode, validateQuarantineList } = quarantine;
 import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
 import smell, { defaultQuarantineSafetyNet } from '../health-smells/main-ci-red.mjs';
 
@@ -182,6 +183,97 @@ describe('runSafetyNet — replay of 2026-10-10 (first red 2cb94418d)', () => {
   });
   it('no dir ⇒ does nothing', () => {
     expect(runSafetyNet({ mainCiRuns: { runs: RED_RUNS, failing: FAILING } })).toBeNull();
+  });
+});
+
+describe('runSafetyNet — review round 1 (PR #4816)', () => {
+  const at = T('2026-10-10T18:56:00Z');
+  const RUNS = { runs: RED_RUNS, failing: FAILING, priority: null };
+  const flaky = (n) => { let left = n; return () => { if (left-- > 0) throw new Error('rate limited'); return parseVitestFailures(LOG); }; };
+
+  it('a failed log read is retried on a later tick (after its backoff), not cached for the red window', () => {
+    const first = net({ mainCiRuns: RUNS, now: at, readLog: flaky(1) });
+    expect(first.r.plan.action).toBe('none');
+    expect(first.r.plan.why).toMatch(/unknown/);
+    const early = net({ mainCiRuns: RUNS, now: at + 10_000 });
+    expect(early.calls.logs).toBe(0); // inside the backoff: no hammering of a rate-limited API
+    expect(early.r.plan.action).toBe('none');
+    const later = net({ mainCiRuns: RUNS, now: at + 2 * MIN });
+    expect(later.calls.logs).toBe(1);
+    expect(later.r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    // now it IS cached: a further tick reads nothing
+    expect(net({ mainCiRuns: RUNS, now: at + 3 * MIN }).calls.logs).toBe(0);
+  });
+  it('a failed jobs-list read is retried too', () => {
+    let throws = 1;
+    const readJobs = () => { if (throws-- > 0) throw new Error('timeout'); return JOBS; };
+    expect(net({ mainCiRuns: RUNS, now: at, readJobs }).r.plan.action).toBe('none');
+    expect(net({ mainCiRuns: RUNS, now: at + 2 * MIN, readJobs }).r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+  });
+  it('the retry backoff grows while reads keep failing', () => {
+    const bad = () => { throw new Error('rate limited'); };
+    net({ mainCiRuns: RUNS, now: at, readLog: bad });
+    net({ mainCiRuns: RUNS, now: at + 2 * MIN, readLog: bad });
+    expect(net({ mainCiRuns: RUNS, now: at + 3 * MIN }).calls.logs).toBe(0); // 2nd failure ⇒ 2 min backoff
+    expect(net({ mainCiRuns: RUNS, now: at + 5 * MIN }).calls.logs).toBe(1);
+  });
+
+  it('a shadow add does not stop the first LIVE add of the same red window (stop → quarantine)', () => {
+    const shadow = net({ mainCiRuns: RUNS, now: at });
+    expect(shadow.r.plan.action).toBe('add');
+    const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
+    expect(live.r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    expect(live.calls.writes).toHaveLength(1);
+  });
+
+  it('an active red stays non-renewable beyond the ledger retention (no re-add of an expired entry)', () => {
+    const t0 = at;
+    const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: t0 });
+    const entry = first.calls.writes[0].change({ version: 1, entries: [] }).list;
+    const afterTtl = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: t0 + 7 * 60 * MIN });
+    expect(afterTtl.r.plan.why).toMatch(/expired — STOP/);
+    net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: t0 + 49 * 60 * MIN }); // the tick that used to evict the live window's record
+    const wayLater = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: t0 + 50 * 60 * MIN });
+    expect(wayLater.r.plan.why).toMatch(/expired — STOP/);
+    expect(wayLater.calls.writes.every((w) => w.change(entry).events?.every((e) => e.type !== 'quarantine-added'))).toBe(true);
+    expect(wayLater.calls.logs).toBe(0); // the record (and its log cache) survived
+  });
+  it('a red window that has not been seen for 48h is forgotten', () => {
+    net({ mainCiRuns: RUNS, now: at });
+    net({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, now: at + 49 * 60 * MIN });
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds)).toEqual([]);
+  });
+
+  it('LIVE publishes the effective mode on the list, so CI reads the same switch as the daemon', () => {
+    const { calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+    expect(calls.writes[0].change({ version: 1, entries: [] }).list.mode).toBe('quarantine');
+  });
+  it('LIVE re-stamps the mode when live entries exist but the stamp is missing (stop → quarantine flip)', () => {
+    const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+    const unstamped = { ...first.calls.writes[0].change({ version: 1, entries: [] }).list };
+    delete unstamped.mode;
+    const { calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: unstamped, now: at + MIN });
+    expect(calls.writes).toHaveLength(1);
+    expect(calls.writes[0].change(unstamped).list.mode).toBe('quarantine');
+  });
+  it('flipping back to stop withdraws a stamp the daemon published; a daemon that never published writes nothing', () => {
+    const never = net({ mode: STOP, mainCiRuns: RUNS, now: at });
+    expect(never.calls.writes).toEqual([]);
+    expect(never.calls.reads).toBe(0);
+    const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
+    const stamped = live.calls.writes[0].change({ version: 1, entries: [] }).list;
+    const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
+    expect(stopped.calls.writes).toHaveLength(1);
+    expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+    expect(net({ mode: STOP, mainCiRuns: RUNS, list: { ...stamped, mode: 'stop' }, now: at + 3 * MIN }).calls.writes).toEqual([]);
+  });
+  it('an operator add or a prune keeps the published mode; a bad mode makes the list unreadable', () => {
+    const stamped = { ...addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list, mode: 'quarantine' };
+    expect(addEntries(stamped, { tests: ['a/b.test.mjs'], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list.mode).toBe('quarantine');
+    expect(pruneOnGreen(stamped, { mainGreen: null, now: at }).list.mode).toBe('quarantine');
+    expect(setMode(stamped, { mode: 'stop', actor: 'red-main-safety-net', now: at }).list.mode).toBe('stop');
+    expect(setMode(stamped, { mode: 'stop', actor: 'someone', now: at }).ok).toBe(false);
+    expect(validateQuarantineList({ ...stamped, mode: 'yolo' }).ok).toBe(false);
   });
 });
 

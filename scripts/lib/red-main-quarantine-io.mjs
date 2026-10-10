@@ -31,16 +31,18 @@ import { mainRedState } from '../conveyor/main-ci-red-core.mjs';
 import {
   QUARANTINE_BRANCH, QUARANTINE_REF, QUARANTINE_LIST_PATH, QUARANTINE_EVENTS_PATH,
   validateQuarantineList, addEntries, pruneOnGreen, testsToSkip, canWriteQuarantine, vitestExcludeArgs,
-  setFixPrs, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS,
+  setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS,
 } from './red-main-quarantine.mjs';
 
 const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+/** A READ of the ops ref (every CI job does one): bounded, so a hung fetch can never stall the step. */
+const gitRead = (args, opts) => git(args, { timeout: 60_000, killSignal: 'SIGKILL', ...opts });
 
 /**
  * Read the current list. `{ok:true, list}` (an absent branch/file = an empty list is NOT assumed: absent file on a
  * read tip ⇒ empty; unreachable branch ⇒ ok:false).
  */
-export function readQuarantine({ board = process.cwd(), run = git } = {}) {
+export function readQuarantine({ board = process.cwd(), run = gitRead } = {}) {
   try {
     const got = readFromTransportBranch({ board, branch: QUARANTINE_BRANCH, paths: [QUARANTINE_LIST_PATH], run });
     const text = got[QUARANTINE_LIST_PATH];
@@ -117,6 +119,11 @@ export function resolveQuarantineSettings({ env = process.env, file = RED_MAIN_H
 export const SAFETY_NET_LEDGER = 'red-main-quarantine.json';
 export const SAFETY_NET_SHADOW_LOG = 'red-main-quarantine-shadow.jsonl';
 
+/** A failed CI-log read is retried after 1 min, then 2, 4 … up to 15 min between attempts. */
+const JOB_READ_RETRY_BASE_MS = 60_000;
+const JOB_READ_RETRY_MAX_MS = 15 * 60_000;
+const LEDGER_RETENTION_MS = 48 * 60 * 60 * 1000;
+
 const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
 
 /** One CI run's failed jobs `{failed:[{id,name}]}` (`gh api …/runs/<id>/jobs`). Throws on an unreadable read. */
@@ -137,7 +144,7 @@ export function readJobFailures(jobId, { exec, repoSlug }) {
  * (`git ls-remote --exit-code` exit 2) is an empty list — the first add creates it. Any other failure stays
  * unreadable (the safety net then does nothing).
  */
-export function readListOrAbsent({ board = process.cwd(), run = git } = {}) {
+export function readListOrAbsent({ board = process.cwd(), run = gitRead } = {}) {
   const r = readQuarantine({ board, run });
   if (r.ok) return r;
   try { run(['ls-remote', '--exit-code', 'origin', QUARANTINE_REF], { cwd: board }); } catch (e) {
@@ -168,8 +175,9 @@ const composeChanges = (steps) => (cur) => {
  *
  * LIVE only when `redMainMode` is `quarantine` AND `live` is true; otherwise SHADOW: the same plan is applied to a
  * simulated list kept in the ledger, and every would-be change is appended to the shadow log (and returned) — the
- * evidence the red-team review reads while the mode stays `stop`. Job logs are read once per red window (cached in
- * the ledger by first red commit). Never throws.
+ * evidence the red-team review reads while the mode stays `stop`. Job logs are read until they succeed (failed reads
+ * retry with a growing backoff, never cached), then once per red window (cached in the ledger by first red commit). A
+ * live write also publishes the resolved mode on the list for CI ({@link setMode}). Never throws.
  * @returns {{mode:string, modeSource:string, shadow:boolean, plan:object, applied:boolean, error?:string}|null}
  */
 export function runSafetyNet({
@@ -187,26 +195,42 @@ export function runSafetyNet({
   const isLive = mode.value === 'quarantine' && live === true;
   const state = mainRedState(mainCiRuns?.runs);
   const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false };
+  let sha = null;
   try {
-    const sha = state.status === 'red' ? String(state.firstRed?.sha ?? '') : null;
+    // Flipped back to `stop` after this daemon published `quarantine` on the list: withdraw the stamp so CI (which
+    // reads the mode from the list) stops skipping at once, not at entry expiry. Nothing is written by a daemon
+    // that never published, and never by a replay tick.
+    if (!isLive && live === true && ledger.publishedMode === 'quarantine') {
+      try {
+        const cur = readList();
+        if (cur.ok && cur.list?.mode === 'quarantine') write({ actor: SAFETY_NET_ACTOR, message: `quarantine: mode → ${mode.value} (${mode.source})`, change: (list) => setMode(list, { mode: 'stop', actor: SAFETY_NET_ACTOR, now }) });
+        if (cur.ok) ledger.publishedMode = 'stop';
+      } catch (e) { out.demoteError = String(e?.message || e).split('\n')[0]; }
+    }
+    sha = state.status === 'red' ? String(state.firstRed?.sha ?? '') : null;
     const rec = sha ? (ledger.reds[sha] ??= { at: now, added: [] }) : null;
+    if (rec) rec.seenAt = now; // an active window is never evicted from the ledger, however long it runs
     let jobFailures = {};
     const failedJobs = state.status === 'red' ? (mainCiRuns?.failing?.jobs ?? null) : null;
     if (rec && Array.isArray(failedJobs) && failedJobs.length) {
-      // Read each failed unit job's log ONCE per red window (and again only if the failing run changed).
+      // Each failed unit job's log is read until it succeeds, then kept for the red window (re-read only if the
+      // failing run changed). A failed read is NEVER cached as an answer: it is retried with a growing backoff.
       const runId = mainCiRuns?.failing?.runId ?? null;
-      if (!rec.jobFailures || rec.runId !== runId) {
-        const unitRe = new RegExp(settings.value.unitJobPattern);
+      if (!rec.jobFailures || rec.runId !== runId) { rec.runId = runId; rec.jobFailures = {}; rec.readAttempts = 0; rec.readRetryAt = 0; }
+      const unitRe = new RegExp(settings.value.unitJobPattern);
+      const wanted = failedJobs.filter((n) => unitRe.test(n));
+      if (wanted.some((n) => rec.jobFailures[n] == null) && now >= (Number(rec.readRetryAt) || 0)) {
         let jobs = null;
         try { jobs = runId == null ? null : readJobs(runId); } catch { jobs = null; }
         const byName = new Map((jobs?.failed ?? []).map((j) => [j.name, j.id]));
-        const got = {};
-        for (const name of failedJobs.filter((n) => unitRe.test(n))) {
+        for (const name of wanted.filter((n) => rec.jobFailures[n] == null)) {
           const id = byName.get(name);
-          try { got[name] = id == null ? null : readLog(id); } catch { got[name] = null; }
+          try { const got = id == null ? null : readLog(id); if (got != null) rec.jobFailures[name] = got; } catch { /* retried next time */ }
         }
-        rec.runId = runId;
-        rec.jobFailures = got;
+        if (wanted.some((n) => rec.jobFailures[n] == null)) {
+          rec.readAttempts = (Number(rec.readAttempts) || 0) + 1;
+          rec.readRetryAt = now + Math.min(JOB_READ_RETRY_BASE_MS * 2 ** (rec.readAttempts - 1), JOB_READ_RETRY_MAX_MS);
+        } else { rec.readAttempts = 0; rec.readRetryAt = 0; }
       }
       jobFailures = rec.jobFailures;
     }
@@ -217,7 +241,7 @@ export function runSafetyNet({
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
       status: state.status, firstRedSha: sha, failedJobs, jobFailures, list: read.list, fixPrs,
-      addedForRed: rec?.added ?? [], now, settings: settings.value,
+      addedForRed: (isLive ? rec?.added : rec?.shadowAdded) ?? [], now, settings: settings.value,
     });
     out.plan = plan;
     const steps = [];
@@ -227,6 +251,11 @@ export function runSafetyNet({
     }
     if (plan.action === 'prune') steps.push((cur) => ({ ok: true, ...pruneOnGreen(cur, { mainGreen: plan.mainGreen, now, actor: SAFETY_NET_ACTOR }) }));
     if (plan.fixPrs) steps.push((cur) => setFixPrs(cur, { fixPrs: plan.fixPrs, actor: SAFETY_NET_ACTOR, now }));
+    // Publish the mode this daemon resolved (env / preference / settings) so CI applies the SAME one: a CI job cannot
+    // see the daemon's env. Stamped whenever entries are live or being added; withdrawn on a flip back to stop.
+    if (isLive && read.list?.mode !== 'quarantine' && (plan.action === 'add' || activeEntries(read.list, { now }).length)) {
+      steps.push((cur) => setMode(cur, { mode: 'quarantine', actor: SAFETY_NET_ACTOR, now }));
+    }
     if (!steps.length) return out;
     const change = composeChanges(steps);
     const what = [plan.action !== 'none' ? `${plan.action}${plan.tests ? ` ${plan.tests.join(', ')}` : ''}` : null, plan.fixPrs ? `fix PRs → [${plan.fixPrs.join(', ')}]` : null].filter(Boolean).join('; ');
@@ -234,6 +263,7 @@ export function runSafetyNet({
       const r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change });
       out.applied = true;
       out.events = r?.events ?? [];
+      if (steps.length) ledger.publishedMode = 'quarantine';
     } else {
       const r = change(ledger.shadowList ?? { version: 1, entries: [] });
       if (r.ok === false) { out.error = r.error; return out; }
@@ -244,14 +274,20 @@ export function runSafetyNet({
       appendFileSync(shadowPath, JSON.stringify(line) + '\n');
       log(`red-main-quarantine (shadow, redMainMode=${mode.value} from ${mode.source}): WOULD ${what} — ${plan.why}${plan.names?.length ? ` [${plan.names.slice(0, 3).join(' | ')}]` : ''}`);
     }
-    if (plan.action === 'add' && rec) rec.added = [...new Set([...(rec.added ?? []), ...plan.tests])];
+    // Live and shadow additions are tracked apart: a shadow "would add" must not block the first real add after a
+    // stop → quarantine flip within the same red window.
+    if (plan.action === 'add' && rec) {
+      const key = isLive ? 'added' : 'shadowAdded';
+      rec[key] = [...new Set([...(rec[key] ?? []), ...plan.tests])];
+    }
     return out;
   } catch (e) {
     out.error = String(e?.message || e).split('\n')[0];
     return out;
   } finally {
-    // Forget red windows that are long over (a day past their first sight), so the ledger stays small.
-    for (const [k, v] of Object.entries(ledger.reds)) if (now - (Number(v?.at) || 0) > 48 * 60 * 60 * 1000) delete ledger.reds[k];
+    // Forget red windows long over (two days since they were last seen red), so the ledger stays small. The window
+    // that is red right now is never forgotten: its record is what keeps an expired entry from being re-added.
+    for (const [k, v] of Object.entries(ledger.reds)) if (k !== sha && now - (Number(v?.seenAt ?? v?.at) || 0) > LEDGER_RETENTION_MS) delete ledger.reds[k];
     try { mkdirSync(dirname(ledgerPath), { recursive: true }); writeJsonAtomic(ledgerPath, ledger); } catch { /* best effort */ }
   }
 }

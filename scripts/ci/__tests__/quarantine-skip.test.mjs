@@ -92,6 +92,27 @@ describe('list guards', () => {
   });
 });
 
+describe('quarantine-skip — the mode is the one the daemon published on the list (PR #4816 review)', () => {
+  const stamped = (mode) => ({ ok: true, list: { ...LIST, mode } });
+  const asPr = (o) => run({ pr: 4990, event: prEvent(4990), mode: undefined, ...o });
+  it('daemon switched on by env/preference: the list says quarantine, the PR tree still says stop ⇒ CI skips', () => {
+    const r = asPr({ read: stamped('quarantine'), env: {} });
+    expect(r.line).toBe(`--exclude=${TEST_FILE}`);
+  });
+  it('the list says stop ⇒ nothing is skipped, whatever CI own env says', () => {
+    const r = asPr({ read: stamped('stop'), env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } });
+    expect(r.line).toBe('');
+    expect(r.why).toMatch(/redMainMode is stop/);
+  });
+  it('no stamp on the list: fall back to the local cascade', () => {
+    expect(asPr({ read: READ, env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } }).line).toBe(`--exclude=${TEST_FILE}`);
+    expect(asPr({ read: READ, env: { WE_DRAIN_RED_MAIN_MODE: 'stop' } }).line).toBe('');
+  });
+  it('an unreadable list still skips nothing', () => {
+    expect(asPr({ read: { ok: false, error: 'no ref' }, env: { WE_DRAIN_RED_MAIN_MODE: 'quarantine' } }).line).toBe('');
+  });
+});
+
 describe('ci.yml wiring', () => {
   const steps = yaml.load(readFileSync(new URL('../../../.github/workflows/ci.yml', import.meta.url), 'utf8')).jobs['test-shard'].steps;
   it.each(['Unit suite shard', 'Unit suite no-coverage group'])('%s appends the skip args to its vitest run', (prefix) => {
