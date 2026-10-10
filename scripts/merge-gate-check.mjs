@@ -182,10 +182,13 @@ export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'mai
 /**
  * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
  * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
- * queue merge; otherwise a pull_request run. `evaluatePrGates` may hand a gate to the drain only for the latter.
+ * queue merge. `'pull_request'` needs POSITIVE proof — the runner reporting exactly `pull_request` — because it is
+ * the only event where `evaluatePrGates` may hand a gate to the drain. An absent or unrecognised runner event (a
+ * local run, workflow_dispatch, odd casing, a future event name) is `null`: every gate is evaluated, none skipped.
  */
 export function mergeEventOfFlags(f, env = process.env) {
-  return f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group' ? 'merge_group' : 'pull_request';
+  if (f?.['merge-group'] || env?.GITHUB_EVENT_NAME === 'merge_group') return 'merge_group';
+  return env?.GITHUB_EVENT_NAME === 'pull_request' ? 'pull_request' : null;
 }
 
 async function main() {

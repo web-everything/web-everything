@@ -141,10 +141,34 @@ describe('evaluatePrGates', () => {
     expect(result.results.filter((row) => row.status === 'skipped-by-policy')).toEqual([]);
   });
 
-  it('threads the merge event from the CLI: --merge-group runs as merge_group, --pr as pull_request', () => {
+  it('threads the merge event from the CLI: --merge-group runs as merge_group, --pr as pull_request only on a pull_request runner', () => {
     expect(mergeEventOfFlags({ 'merge-group': true }, {})).toBe('merge_group');
-    expect(mergeEventOfFlags({ pr: '7' }, {})).toBe('pull_request');
+    expect(mergeEventOfFlags({ pr: '7' }, { GITHUB_EVENT_NAME: 'pull_request' })).toBe('pull_request');
     expect(mergeEventOfFlags({ pr: '7', 'merge-group': true }, {})).toBe('merge_group');
+  });
+
+  // A drain skip needs POSITIVE proof the event is a pull_request. An absent / unrecognised runner event (a local
+  // run, workflow_dispatch, a wrong-cased or future event name) must not read as one, or the queue could merge a
+  // PR that nothing re-checked.
+  it('never reads "pull_request" without proof: no runner event, workflow_dispatch or odd casing evaluates every gate', () => {
+    for (const env of [{}, { GITHUB_EVENT_NAME: '' }, { GITHUB_EVENT_NAME: 'workflow_dispatch' }, { GITHUB_EVENT_NAME: 'PULL_REQUEST' }, { GITHUB_EVENT_NAME: 'merge_queue' }, { GITHUB_EVENT_NAME: ' pull_request' }]) {
+      expect(mergeEventOfFlags({ pr: '7' }, env)).toBeNull();
+      expect(mergeEventOfFlags({}, env)).toBeNull();
+    }
+    const policy = { strategy: 'drain-direct', gatePlacement: { codeql: 'drain' } };
+    check(facts({ pr: { statusCheckRollup: codeql } }), 'codeql', 'hold', false, { policy, mergeEvent: mergeEventOfFlags({ pr: '7' }, {}) });
+  });
+
+  it('the live process.env is the default runner event, so a merge_group runner is never read as pull_request', () => {
+    const prev = process.env.GITHUB_EVENT_NAME;
+    try {
+      process.env.GITHUB_EVENT_NAME = 'merge_group';
+      expect(mergeEventOfFlags({ pr: '7' })).toBe('merge_group');
+      delete process.env.GITHUB_EVENT_NAME;
+      expect(mergeEventOfFlags({ pr: '7' })).toBeNull();
+    } finally {
+      if (prev === undefined) delete process.env.GITHUB_EVENT_NAME; else process.env.GITHUB_EVENT_NAME = prev;
+    }
   });
 
   it('a merge_group run without the group-tree duplicate scan fails duplicate-id-on-main closed; pull_request is unaffected', () => {
