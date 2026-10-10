@@ -751,7 +751,11 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   const certified = certifyLabel || aiGenerated || humanCleared; // #2195: the label OR every-commit-AI OR a human clear certifies
   const testGreen = isRequiredCheckGreen(pr, requiredCheck);
   const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
-  const offDefaultBase = typeof defaultBranch === 'string' && defaultBranch !== '' && base !== '' && base !== defaultBranch;
+  // stack.reviewWhileBaseOpen (2026-10-10): a stacked PR now runs CI and is reviewed while its base is open, so its `test`
+  // can be green and this arm is THE merge guard for it. A `lane/*` base is never a repo's default branch: held even when
+  // `defaultBranch` could not be resolved this pass (fail closed), so it lands only after its base merges and the drain
+  // retargets it to the default branch.
+  const offDefaultBase = base !== '' && ((typeof defaultBranch === 'string' && defaultBranch !== '' && base !== defaultBranch) || base.startsWith('lane/'));
   const state = String(pr?.mergeStateStatus || '').toUpperCase();
   const mergeable = String(pr?.mergeable || '').toUpperCase();
   const landableState = state === 'CLEAN' || state === 'UNSTABLE'; // UNSTABLE = mergeable, only non-required checks red
@@ -782,7 +786,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
-  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch} (${base})`; }
+  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
   else if (!testGreen) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }

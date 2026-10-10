@@ -448,7 +448,8 @@ describe('trust boundary and branch names for idle bottoms', () => {
     const refs = readOpenPrRefs('/repo', { run, repo: 'o/r' });
     expect(run.mock.calls[0][0].slice(0, 4)).toEqual(['pr', 'list', '--repo', 'o/r']);
     expect(run.mock.calls[0][0].join(' ')).toContain('author');
-    expect(refs.get(1)).toEqual({ headRefName: 'lane/a', headRefOid: 'x', isCrossRepository: false, author: null });
+    expect(refs.get(1)).toEqual({ headRefName: 'lane/a', headRefOid: 'x', baseRefName: null, isCrossRepository: false, author: null });
+    expect(run.mock.calls[0][0].join(' ')).toContain('baseRefName');
     expect(refs.get(2)).toMatchObject({ isCrossRepository: true, author: 'app/bot' });
     expect(readOpenPrRefs('/repo', { run: () => { throw Error('gh down'); } }).size).toBe(0);
     expect(readOpenPrRefs('/repo', { run: () => 'not json' }).size).toBe(0);
