@@ -409,12 +409,15 @@ A trivial, obviously-correct heal (a clean merge with no code change) may skip t
 
 **The class sweep (card xet6iu0).** When the heal changes code, treat each failing check you repaired as a finding:
 name its defect class and walk the four sibling paths (`family`, `callers`, `branches`, and `recovery` — the error
-and retry paths your heal itself added), each `fixed`, `checked` or `n/a` with a site and a reason. Write it to a
-file as one fenced `class-sweep` JSON block (the format is in
-[fix-agent-brief.md](fix-agent-brief.md) step 3) and record it:
+and retry paths your heal itself added), each `fixed`, `checked` or `n/a` with a site and a reason. Then look for
+the same class in every other file this PR changes, in the same pass (card 5536): each changed file must be named by
+a row, adding `"path":"pr"` rows (a `site` ending in `/` covers a directory; `backlog/` cards are exempt). Write it to
+a file as one fenced `class-sweep` JSON block (the format is in
+[fix-agent-brief.md](fix-agent-brief.md) step 3) and record it from your lane:
 
 ```bash
-node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<sweep-file> --kind=ci-heal --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}}
+BASE_REF=$(gh pr view {{PR_NUM}} --repo {{REPO}} --json baseRefName --jq .baseRefName)
+node "{{WE_ROOT}}/scripts/conveyor/class-sweep-check.mjs" --evidence-file=<sweep-file> --kind=ci-heal --repo={{REPO}} --pr={{PR_NUM}} --session={{SESSION_SLUG}} --checkout="$LANE" --base="origin/$BASE_REF"
 ```
 
 In `warn` mode it never blocks. A merge-only heal with no code change skips it.

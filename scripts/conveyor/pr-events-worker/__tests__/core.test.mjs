@@ -313,3 +313,41 @@ it('reads /prs with SQL lookups bounded by distinct SHAs, not PRs x checks', () 
   expect(prs).toHaveLength(40);
   expect(prs.every((p) => p.checks.length === 25)).toBe(true);
 });
+
+describe('advisory and operator-ruling PR comments', () => {
+  const advisory = '**Verdict:** changes requested\nNet basis: `abc123..def456`\nPRIVATE comment text';
+  const payload = (body, overrides = {}) => ({ action: 'created', repository: REPO,
+    issue: { number: 4624, pull_request: { url: 'https://example.invalid/pr/4624' } }, comment: { body }, ...overrides });
+
+  it('classifies only the advisory shape or ruling marker', async () => {
+    const { classifyPrComment, OPERATOR_RULING_COMMENT_MARKER } = await import('../core.mjs');
+    expect(OPERATOR_RULING_COMMENT_MARKER).toBe('mandatory-referral-operator-ruling-v1');
+    expect(classifyPrComment(advisory)).toBe('advisory');
+    expect(classifyPrComment(`<!-- ${OPERATOR_RULING_COMMENT_MARKER} -->`)).toBe('ruling');
+    for (const body of [null, undefined, 42, 'thanks', '**Verdict:** changes requested', 'Net basis: `abc..def`',
+      '**Verdict:** changes requested\nNet basis: `not-hex..def`']) expect(classifyPrComment(body)).toBeNull();
+  });
+
+  it.each([
+    ['advisory', advisory], ['ruling', '<!-- mandatory-referral-operator-ruling-v1 -->\nPRIVATE comment text'],
+  ])('keeps %s metadata without body and folds only the row sequence', async (kind, body) => {
+    const { foldObservation } = await import('../core.mjs');
+    const event = parseGithubEvent('issue_comment', payload(body), { deliveryId: 'comment-1', receivedAt: 0 });
+    expect(event).toEqual({ id: 'comment-1', at: '1970-01-01T00:00:00.000Z', type: 'issue_comment',
+      action: 'created', repo: REPO.full_name, prs: [4624], sha: null, kind });
+    expect(JSON.stringify(event)).not.toContain('PRIVATE');
+    expect(event).not.toHaveProperty('body');
+    const storage = createMemoryStorage();
+    foldObservation(storage, { type: 'pull_request', action: 'opened', repo: REPO.full_name, prs: [4624], sha: 'abc', labels: ['review:changes'], seq: 1 });
+    const key = JSON.stringify([REPO.full_name, 4624]);
+    const before = structuredClone(storage.getProjection('prs', key));
+    expect(() => foldObservation(storage, { ...event, seq: 2 })).not.toThrow();
+    expect(storage.getProjection('prs', key)).toEqual({ ...before, seq: 2 });
+  });
+
+  it('ignores ordinary comments, non-PR issues, and edits', () => {
+    expect(parseGithubEvent('issue_comment', payload('thanks'))).toBeNull();
+    expect(parseGithubEvent('issue_comment', payload(advisory, { issue: { number: 4624 } }))).toBeNull();
+    expect(parseGithubEvent('issue_comment', payload(advisory, { action: 'edited' }))).toBeNull();
+  });
+});

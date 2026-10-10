@@ -353,3 +353,27 @@ describe('decideRebuildGrace — bounded grace while a rebuild of the clone is r
     expect(rebuildGraceForClone({ root: '/x', env: {}, now, readState: () => { throw new Error('boom'); } }).grace).toBe(false);
   });
 });
+
+describe('fresh adoption between rebuilds — PR #4624 live replay', () => {
+  const head = '26442e4a'.padEnd(40, '0');
+  const nowMs = Date.parse('2026-10-09T19:18:00Z');
+  const options = {
+    headSha: head, state: { adopted: { head, at: '2026-10-09T19:09:36.000Z' } },
+    nowMs, maxAgeMs: DEFAULT_LAST_GOOD_MAX_AGE_MS, freshAdoptMs: 3_600_000,
+  };
+  it('accepts a just-adopted clean build with neither held nor building state', () => {
+    expect(decideLastGood(options)).toMatchObject({ onLastGood: true, held: null, ageMs: null, overAge: false });
+  });
+  it('keeps grace opt-in for the pure decision', () => {
+    expect(decideLastGood({ ...options, freshAdoptMs: 0 }).onLastGood).toBe(false);
+    expect(decideLastGood({ ...options, freshAdoptMs: undefined }).onLastGood).toBe(false);
+  });
+  it.each([
+    ['two-hour-old adoption', { state: { adopted: { head, at: '2026-10-09T17:18:00Z' } } }],
+    ['dirty tree', { dirty: true }],
+    ['different HEAD', { headSha: 'b'.repeat(40) }],
+    ['invalid adoption time', { state: { adopted: { head, at: 'invalid' } } }],
+  ])('refuses %s despite a one-hour grace', (_name, override) => {
+    expect(decideLastGood({ ...options, ...override }).onLastGood).toBe(false);
+  });
+});

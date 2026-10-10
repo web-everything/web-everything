@@ -932,6 +932,17 @@ export function runReviewLabelCli({
   // #xan09na — opt-in head-bound carry. Legacy drain callers remain a separate migration.
   const expectHeadFlag = argv.find((a) => a === '--expect-head' || a.startsWith('--expect-head='));
   const expectedHead = expectHeadFlag?.slice('--expect-head='.length).toLowerCase();
+  // Held item 177 — opt-in PINNED ACCEPT (`--to=accepted --expect-head=<sha> --expect-fingerprint=<sha256>`): the caller
+  // compared one commit's net diff to an accepted fingerprint and asks that exact pair, and nothing else, be accepted.
+  // The writer re-reads the PR itself, so without the pin a push between the caller's comparison and this read would get
+  // its (never compared) diff stamped. With it, a live head or a derived net diff that differs is refused BEFORE any write.
+  const expectFingerprintFlag = argv.find((a) => a === '--expect-fingerprint' || a.startsWith('--expect-fingerprint='));
+  const expectedFingerprint = expectFingerprintFlag?.slice('--expect-fingerprint='.length).toLowerCase();
+  const pinnedAccept = to === 'accepted' && (expectHeadFlag !== undefined || expectFingerprintFlag !== undefined);
+  if (expectFingerprintFlag !== undefined && to !== 'accepted') fail('--expect-fingerprint is only valid with --to=accepted');
+  if (pinnedAccept && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || !/^[0-9a-f]{64}$/.test(expectedFingerprint || '') || newHeadArg)) {
+    fail('a pinned accept requires BOTH --expect-head=<full 40-hex SHA> and --expect-fingerprint=<64-hex sha256> (and no --new-head)');
+  }
   const guardedRestamp = (to === 'restamp' && expectHeadFlag !== undefined) || (to === 'restamp' && channelArg === 'ci-heal');
   if (guardedRestamp && (to !== 'restamp' || !/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) {
     fail('guarded restamp requires --expect-head=<full 40-hex SHA> and cannot use --new-head');
@@ -953,7 +964,7 @@ export function runReviewLabelCli({
   if (onlyIf !== null && !['accepted', 'missing'].includes(onlyIf)) {
     fail("invalid --only-if — expected 'accepted' or 'missing'");
   }
-  if (expectHeadFlag !== undefined && !guardedRestamp && onlyIf !== 'missing') fail('--expect-head requires guarded restamp or missing re-arm');
+  if (expectHeadFlag !== undefined && !guardedRestamp && !pinnedAccept && onlyIf !== 'missing') fail('--expect-head requires guarded restamp, missing re-arm or a pinned accept');
   if (onlyIf === 'missing' && (!/^[0-9a-f]{40}$/.test(expectedHead || '') || newHeadArg)) fail('missing re-arm requires --expect-head=<full 40-hex SHA>');
   if (onlyIf !== null && to !== 'rearm') {
     fail('--only-if is only valid with the rearm target');
@@ -1075,7 +1086,7 @@ export function runReviewLabelCli({
     fail(ghErr(e, 'gh pr view failed'), 1);
   }
 
-  if ((guardedRestamp || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
+  if ((guardedRestamp || pinnedAccept || onlyIf === 'missing') && headSha !== expectedHead) fail('live head differs from --expect-head', 1);
 
   // #x9krtkb (bug 2) — THE OVERRIDE. `restamp` alone trusts an explicit `--new-head` over the `headRefOid` this
   // process just re-read, because for `restamp` alone that read can be racing the very push that produced the
@@ -1226,12 +1237,18 @@ export function runReviewLabelCli({
       // too, so the process's location is the contract, not any single read's.
       const net = computeNetDiffText({
         exec: execFileSyncThrottled,
-        rev: guardedRestamp ? expectedHead : headRefName,
-        fetchExtraRefs: guardedRestamp ? [] : headRefName ? [headRefName] : [],
+        rev: guardedRestamp || pinnedAccept ? expectedHead : headRefName,
+        fetchExtraRefs: guardedRestamp || pinnedAccept ? [] : headRefName ? [headRefName] : [],
       });
-      diffScored = !!net?.scored && (!guardedRestamp || net.rev === expectedHead);
+      diffScored = !!net?.scored && (!(guardedRestamp || pinnedAccept) || net.rev === expectedHead);
       reviewedDiff = diffScored ? net.text : '';
     } catch { reviewedDiff = ''; /* miss → no marker → SHA-identity fallback (the stricter path) */ }
+  }
+  // A pinned accept FAILS CLOSED, unlike the fail-soft stamp above: it exists to accept exactly the compared diff, so an
+  // unscored basis or a different net diff is a refusal (no label, no comment), never a fall-back to an unpinned accept.
+  if (pinnedAccept) {
+    if (!diffScored) fail('pinned accept unproven: the net diff of --expect-head is unscored', 1);
+    if (normalizeDiffFingerprint(reviewedDiff) !== expectedFingerprint) fail('net diff of --expect-head differs from --expect-fingerprint', 1);
   }
 
   const carryEvidence = (comments) => {
@@ -1336,6 +1353,13 @@ export function runReviewLabelCli({
       }
       assertMandatoryReferralsCleared(fresh, { repo, pr });
     } catch (e) { fail(ghErr(e, 'CI-heal carry state unreadable'), 1); }
+  }
+  // A pinned accept (held item 177) re-reads the head BEFORE the first durable write too — the shadow ledger row below
+  // is a write — so a push after the first read leaves no ledger row and no comment, not only no label.
+  if (pinnedAccept) {
+    let live = null;
+    try { live = provider.readPrState(repo, pr).headRefOid; } catch (e) { fail(ghErr(e, 'gh pr view failed'), 1); }
+    if (live !== expectedHead) fail('live head differs from --expect-head; nothing written', 1);
   }
 
   const ledgerVerdict = verdictForLabelTarget(to);
