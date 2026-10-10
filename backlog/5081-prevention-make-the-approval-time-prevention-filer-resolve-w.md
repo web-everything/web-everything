@@ -25,4 +25,4 @@ Hint: a card that loosens a refusal needs two Must lines — what happens on err
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#4811 (finding 1: `we:backlog/xss4m4n-prevention-a-checklist-or-review-bot-that-cross-references-e.md:4` — Have the approval-time prevention filer resolve each cited we:backlog/x… slug to its current numbered filename or drop paths that don't exist before writing scope: . Add a check:standards rule that every scope: entry of a backlog card must exist.)
+- Also raised by web-everything/web-everything#4811 (finding 1: `we:backlog/5786-prevention-a-checklist-or-review-bot-that-cross-references-e.md:4` — Have the approval-time prevention filer resolve each cited we:backlog/x… slug to its current numbered filename or drop paths that don't exist before writing scope: . Add a check:standards rule that every scope: entry of a backlog card must exist.)
