@@ -1,4 +1,4 @@
 {
-  "$comment": "Platform preference (card x4y74wj / #5671). drainFollowupJob on|off: on = a drain pass that lands a local PR records one detached drain-followup job (JIT numbering, resolve-on-land, push, derived regen, primary ff-sync) and returns; off = the pass runs that follow-up inline, as before. Tool override env WE_DRAIN_FOLLOWUP_JOB. See scripts/lib/drain-followup-job.mjs.",
+  "$comment-drainFollowupJob": "Platform preference (card x4y74wj / #5671). drainFollowupJob on|off: on = a drain pass that lands a local PR records one detached drain-followup job (JIT numbering, resolve-on-land, push, derived regen, primary ff-sync) and returns; off = the pass runs that follow-up inline, as before. Tool override env WE_DRAIN_FOLLOWUP_JOB. See scripts/lib/drain-followup-job.mjs.",
   "drainFollowupJob": "on"
 }
