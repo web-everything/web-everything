@@ -1,10 +1,12 @@
 // Card xx0055i — automatic takeover at the fix round cap.
 import { describe, it, expect, vi } from 'vitest';
 import {
-  resolveFixSettings, planTakeover, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
+  resolveFixSettings, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
   launchProvedNotStarted,
   FIX_SETTINGS_FILE,
 } from '../fix-takeover.mjs';
+// The planner moved to the takeover-budget module (fix.takeoverBudget, progress guard, gate holds).
+import { planTakeover } from '../takeover-budget.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { briefWithRoundContext, fixerTableFor, dispatchFix } from '../reconcile-fix-dispatch.mjs';
@@ -35,9 +37,10 @@ function cappedPr(extraComments = []) {
 }
 
 describe('fix settings cascade (card xx0055i)', () => {
-  it('built-in default is takeover + history on + one takeover per PR', () => {
+  it('built-in default is takeover + history on (the per-PR count is fix.takeoverBudget, takeover-budget.mjs)', () => {
     const s = resolveFixSettings({ env: {}, read: () => { throw new Error('no file'); } });
-    expect(s).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
+    expect(s).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on' });
+    expect(s).not.toHaveProperty('takeoverMaxPerPr');
   });
   it('the shipped platform preference is takeover + on', () => {
     expect(JSON.parse(readFileSync(FIX_SETTINGS_FILE, 'utf8'))).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on' });
@@ -60,8 +63,10 @@ describe('planTakeover (card xx0055i)', () => {
     expect(planTakeover({ pr: cappedPr(), roundCapAction: 'person', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'setting-person' });
     expect(planTakeover({ pr: { ...cappedPr(), ignoredRulings: { matches: [{}] } }, roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'ruling-dispute' });
     expect(planTakeover({ pr: cappedPr([marker(HEAD)]), roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-spent' });
-    expect(planTakeover({ pr: cappedPr([marker('b'.repeat(40))]), roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-spent' });
-    expect(planTakeover({ pr: cappedPr([marker('b'.repeat(40))]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER })).toMatchObject({ ok: true });
+    // A takeover that started on another head pushed this one, and no review judged it yet: its review is owed first,
+    // whatever the budget (takeover budget: a further takeover needs the previous one judged AND converging).
+    expect(planTakeover({ pr: cappedPr([marker('b'.repeat(40))]), roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+    expect(planTakeover({ pr: cappedPr([marker('b'.repeat(40))]), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
   });
   it('a forged marker from an untrusted login does not count', () => {
     const forged = { ...marker(HEAD), author: { login: 'mallory' } };
@@ -163,10 +168,10 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
   });
 
   it('refuses the same head while per-PR budget remains (the head guard, not the count, is what refuses)', () => {
-    const r = planTakeover({ pr: cappedPr([marker(HEAD)]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER });
+    const r = planTakeover({ pr: cappedPr([marker(HEAD)]), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER });
     expect(r).toMatchObject({ ok: false, reason: 'takeover-spent' });
     // and an abbreviated sha on the marker is the same head
-    expect(planTakeover({ pr: cappedPr([marker(HEAD.slice(0, 9))]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER }).ok).toBe(false);
+    expect(planTakeover({ pr: cappedPr([marker(HEAD.slice(0, 9))]), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER }).ok).toBe(false);
   });
 
   it('a void marker for the same head gives the takeover back; a void for another head, or from an untrusted login, does not', () => {

@@ -146,6 +146,8 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
 import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
 import { resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, launchProvedNotStarted, withTakeover } from './fix-takeover.mjs';
 import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
+// Takeover budget — takeover 2+ is briefed with the previous takeover's diff and the review that rejected it.
+import { renderPreviousTakeover } from './takeover-budget.mjs';
 // Card xrbu1bp — resume the previous round's fixer session; the stronger-model rung from round 3.
 import {
   buildRoundResumePrompt, planRoundEscalation, planRoundResume, readRoundResumeInputs, roundOf,
@@ -1150,24 +1152,44 @@ export function launchTableFor(planned, roundEscalation) {
  * `fix.roundHistory` is on and the PR has an earlier round, the bounded previous-rounds section. Best effort: an
  * unreadable thread leaves the brief as it was (a takeover still gets its section, telling it to read the thread).
  */
-export function briefWithRoundContext(prompt, planned, { repo, fixSettings, readHistoryInputs }) {
+export function briefWithRoundContext(prompt, planned, { repo, fixSettings, readHistoryInputs, readTakeoverDiff = () => null }) {
   const wantHistory = planned.takeover || fixSettings?.roundHistory !== 'off';
   let inputs = null;
   if (wantHistory) { try { inputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { inputs = null; } }
   const history = inputs ? buildRoundHistory(inputs) : null;
   if (planned.takeover) {
+    const previous = planned.takeover.previous ?? null;
+    let diffText = null;
+    if (previous?.startHead && previous?.reviewedHead) {
+      try { diffText = readTakeoverDiff({ repo, pr: planned.pr, from: previous.startHead, to: previous.reviewedHead }); } catch { diffText = null; }
+    }
     return withTakeover(prompt, planned.takeover, {
       allRoundsSection: history ? renderRoundHistory(history, { previousOnly: false, title: 'All rounds so far' }) : '',
+      previousTakeoverSection: renderPreviousTakeover({ previous, diffText }),
       baseRefName: inputs?.baseRefName ?? null, headRefName: inputs?.headRefName ?? planned.laneRef ?? null,
     });
   }
   return history ? withRoundHistory(prompt, renderRoundHistory(history)) : prompt;
 }
 
-/** Card xx0055i — post the takeover marker (the bound {@link planTakeover} reads back off the thread). */
+/**
+ * Takeover budget — IO: the previous takeover's diff (`from..to`, the head it started on to the head its review
+ * judged) from the GitHub compare API, as unified-diff text. Best effort: null on any failure (the brief then names
+ * the `git diff` command instead).
+ */
+export function readTakeoverDiffViaGh({ repo, from, to, exec = execFileSyncThrottled }) {
+  const ok = (s) => /^[0-9a-f]{7,40}$/.test(String(s ?? ''));
+  if (!ok(from) || !ok(to)) return null;
+  try {
+    return String(exec('gh', ['api', '-H', 'Accept: application/vnd.github.diff', `repos/${ghRepoSlug(repo)}/compare/${from}...${to}`],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 32 * 1024 * 1024 }) ?? '');
+  } catch { return null; }
+}
+
+/** Card xx0055i — post the takeover marker (the bound `takeover-budget.mjs#planTakeover` reads back off the thread). */
 export function postTakeoverMarker({ repo, pr, head, takeover, exec = execFileSyncThrottled }) {
   exec('gh', ['pr', 'comment', String(pr), '--repo', ghRepoSlug(repo), '--body',
-    takeoverMarkerBody({ pr, head, attempts: takeover?.attempts, cap: takeover?.cap, rung: takeover?.rung })],
+    takeoverMarkerBody({ pr, head, attempts: takeover?.attempts, cap: takeover?.cap, rung: takeover?.rung, n: takeover?.n ?? null, budget: takeover?.budget ?? null })],
   { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
   return true;
 }
@@ -1306,6 +1328,8 @@ export function dispatchFix(planned, {
   // Hermetic under a test runner: a test that wants history injects its own reader.
   readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postTakeover = postTakeoverMarker,
+  // Takeover budget — the previous takeover's diff for a takeover 2+ brief. Hermetic under a test runner.
+  readTakeoverDiff = ({ repo: r, from, to }) => (isUnderTestEnv() ? null : readTakeoverDiffViaGh({ repo: r, from, to })),
   postTakeoverVoidMark = postTakeoverVoid,
   // Card xrbu1bp — the fixer ladder, read only when a round reaches `fix.strongerModelFromRound`.
   loadLadder = () => loadFixerLadder(),
@@ -1364,7 +1388,7 @@ export function dispatchFix(planned, {
       ...tokens,
     }, BRIEF_REQUIRED_BY_KIND.fix, optionalNames, REPO_AWARE_VALUE_PATTERNS);
     // Card xx0055i — round N>1 carries the previous rounds; the takeover carries ALL rounds plus its own section.
-    const prompt = briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs });
+    const prompt = briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs, readTakeoverDiff });
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.
     // Card xrbu1bp — an ordinary round at or past `fix.strongerModelFromRound` runs on the stronger-model rung.
@@ -1389,7 +1413,7 @@ export function dispatchFix(planned, {
         throw new Error(`${DISPATCH_ENV_FAULT_PREFIX} takeover marker post failed for PR #${planned.pr}: ${describeSpawnFailure(e, { label: 'gh comment' })}`);
       }
       takeoverMarked = true;
-      console.error(`reconcile-fix-dispatch: PR #${planned.pr} takeover at the round cap (${planned.takeover.attempts}/${planned.takeover.cap}) rung=${planned.takeover.rung?.id} model=${ladderTable?.model ?? 'default-fix-route'}`);
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} takeover ${planned.takeover.n ?? 1} of ${planned.takeover.budget ?? 1} at the round cap (${planned.takeover.attempts}/${planned.takeover.cap}) rung=${planned.takeover.rung?.id} model=${ladderTable?.model ?? 'default-fix-route'}`);
     }
     if (planned.rulingNotAddressed?.rung) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);

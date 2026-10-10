@@ -73,7 +73,9 @@ describe('a conflict-watch bounce is not a review verdict', () => {
     const comments = [...spent, takeover, rearm(8), conflictBounce(9), mechMarker(10)];
     expect(takeoverReviewGrant({ pr: pr(comments), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0 });
     const p = plan(pr(comments, { mechanicalRound: facts({ priorHead: 'd'.repeat(40) }) }));
-    expect(row(p)).toMatchObject({ kind: 'review', takeoverReview: { ok: true } });
+    // With #4756's per-takeover review cap the takeover's re-arm is owed its final review on the ordinary path; either
+    // path, the takeover head is reviewed (never refused cap-exhausted).
+    expect(row(p)).toMatchObject({ kind: 'review' });
   });
 });
 

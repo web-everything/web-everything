@@ -67,7 +67,9 @@ describe('planReconcile with a takeover head over the cap', () => {
   });
   it('a takeover that re-armed to review:pending (6 rounds > cap 5) is still reviewed once', () => {
     const p = plan(pr(TAKE, [...spent, marker(OLD, 7), rearm(8)], ['review:pending']), { durableCounts: { 7: 6 } });
-    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review', takeoverReview: { ok: true } });
+    // The takeover's own re-arm (cap+1) is owed its final review on the ordinary path (card xx0055i's per-takeover
+    // review cap); either path, the takeover head is reviewed exactly once.
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
   });
   it('a second push after the takeover review is capped again (cap-exhausted, no dispatch)', () => {
     const p = plan(pr(NEXT, [...spent, marker(TAKE, 8), advisory(TAKE, 9), bounce(TAKE, 10)]), { durableCounts: { 7: 6 } });

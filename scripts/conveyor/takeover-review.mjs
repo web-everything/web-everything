@@ -6,7 +6,8 @@
  * tick and nothing ever judged the takeover's work (live: #4708, takeover head 7e29b95c4 at 5/5, stuck at
  * review:changes). Now a head pushed after a takeover gets exactly `review.takeoverReviewAttempts` (default 1)
  * review dispatches beyond the cap. Once a review verdict lands after the takeover, every later head is capped
- * again. The merge gate and the human ceremony are untouched: this only lets the REVIEW run; `review:human`
+ * again — until the NEXT takeover of the PR's `fix.takeoverBudget` (we:scripts/conveyor/takeover-budget.mjs), whose
+ * head earns its own review: the grant is anchored on the LATEST takeover. The merge gate and the human ceremony are untouched: this only lets the REVIEW run; `review:human`
  * still needs the operator.
  *
  * A takeover is identified by a TRUSTED comment only (automation or the operator, never a forgeable body):
@@ -15,21 +16,16 @@
  *
  * PURE: reads only the PR's own comment thread and head sha.
  */
-import { FIX_TAKEOVER_MARKER } from './fix-takeover.mjs';
-import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+// Takeover budget — each takeover is an EPISODE (its signals with no verdict between them); the grant is per episode.
+import { takeoverEpisodes, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
 import { isReviewVerdictComment as isVerdict } from './mechanical-round-cap.mjs';
 
-export const OPERATOR_TAKEOVER_PREFIX = '**Takeover (operator OK)';
+export { OPERATOR_TAKEOVER_PREFIX };
 
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
-
-function isTakeoverSignal(c) {
-  const lead = bodyOf(c).trimStart();
-  return (lead.startsWith(FIX_TAKEOVER_MARKER) || lead.startsWith(OPERATOR_TAKEOVER_PREFIX)) && isTrustedMarkerAuthor(c);
-}
 
 /**
  * PURE: may this PR's CURRENT head get a review although the round cap is spent?
@@ -43,14 +39,16 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const allowance = Number.isInteger(takeoverReviewAttempts) && takeoverReviewAttempts > 0 ? takeoverReviewAttempts : 0;
   if (!allowance) return { ok: false, reason: 'off' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const signals = comments.filter(isTakeoverSignal).map(timeOf).filter(Number.isFinite);
-  if (!signals.length) return { ok: false, reason: 'no-takeover' };
-  const anchor = Math.min(...signals);
+  // The LATEST takeover is the anchor (takeover budget: takeover 2 earns its own review, like takeover 1 did). A void
+  // marker cancels its start marker, so a takeover that never launched grants nothing.
+  const episodes = takeoverEpisodes(comments);
+  if (!episodes.length) return { ok: false, reason: 'no-takeover' };
+  const anchor = episodes.at(-1).end;
   const head = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reason: 'no-head' };
   const verdicts = comments.filter(isVerdict);
   if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head))) return { ok: false, reason: 'head-already-reviewed' };
   const used = verdicts.filter((c) => timeOf(c) > anchor).length;
   if (used >= allowance) return { ok: false, reason: 'takeover-review-spent', used, allowance };
-  return { ok: true, anchor: new Date(anchor).toISOString(), allowance, used };
+  return { ok: true, anchor: new Date(anchor).toISOString(), allowance, used, takeover: episodes.length };
 }
