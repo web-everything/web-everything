@@ -15,7 +15,7 @@
  *
  * PURE: reads only the PR's own comment thread and head sha.
  */
-import { FIX_TAKEOVER_MARKER } from './fix-takeover.mjs';
+import { takeoverMarkers } from './fix-takeover.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { REVIEWED_SHA_MARKER } from '../lib/review-escalation.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
@@ -27,9 +27,8 @@ const VERDICT_PREFIXES = Object.freeze([ADVISORY_NOTE_MARKER, '🔁 review — c
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
 
-function isTakeoverSignal(c) {
-  const lead = bodyOf(c).trimStart();
-  return (lead.startsWith(FIX_TAKEOVER_MARKER) || lead.startsWith(OPERATOR_TAKEOVER_PREFIX)) && isTrustedMarkerAuthor(c);
+function isOperatorTakeover(c) {
+  return bodyOf(c).trimStart().startsWith(OPERATOR_TAKEOVER_PREFIX) && isTrustedMarkerAuthor(c);
 }
 
 function isVerdict(c) {
@@ -51,7 +50,12 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const allowance = Number.isInteger(takeoverReviewAttempts) && takeoverReviewAttempts > 0 ? takeoverReviewAttempts : 0;
   if (!allowance) return { ok: false, reason: 'off' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const signals = comments.filter(isTakeoverSignal).map(timeOf).filter(Number.isFinite);
+  // The automatic marker is read through `takeoverMarkers`, which cancels a marker a trusted void marker covers: a
+  // takeover that never launched must not anchor a grant for whatever head arrives next.
+  const signals = [
+    ...comments.filter(isOperatorTakeover).map(timeOf),
+    ...takeoverMarkers(comments).map((m) => Date.parse(m.at ?? '')),
+  ].filter(Number.isFinite);
   if (!signals.length) return { ok: false, reason: 'no-takeover' };
   const anchor = Math.min(...signals);
   const head = String(pr?.headRefOid ?? '').trim().toLowerCase();
