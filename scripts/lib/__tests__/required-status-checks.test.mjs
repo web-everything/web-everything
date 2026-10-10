@@ -258,6 +258,7 @@ describe('defaultReadRequiredStatusChecks', () => {
 
   it('routes the protection read through the real throttle personal read path when enabled', () => {
     vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
+    vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads'); // github.auth=app keeps the route off unless 'reads' is listed
     vi.stubEnv('GH_TOKEN', 'ghs_test_fixture');
     execFileSync.mockReturnValueOnce('ghp_test_fixture');
     spawnSync.mockImplementationOnce((_bin, _args, opts) => {
@@ -273,6 +274,7 @@ describe('defaultReadRequiredStatusChecks', () => {
 
   it('preserves routed HTTP failures for declared-policy classification', () => {
     vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
+    vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads'); // github.auth=app keeps the route off unless 'reads' is listed
     spawnSync.mockReturnValue({ status: 1, stdout: Buffer.alloc(0), stderr: Buffer.from('Resource not accessible by integration (HTTP 403)') });
     expect(getRequiredStatusChecks({ repo: 'plateauapp/plateau-app', cachePath: join(dir, 'cache.json') }))
       .toEqual({ source: 'declared', checks: ['test', 'e2e'] });

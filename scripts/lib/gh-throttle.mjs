@@ -191,6 +191,7 @@ import { writeAllSync } from './write-all-sync.mjs';
 import { retryAfterMs } from '../readiness/model-proposer.mjs';
 import { createTelemetryRecorder } from '../operations/telemetry-store.mjs';
 import { isGhDeferred } from './gh-deferred.mjs';
+import { readGithubAuthPolicy, personalAllowed } from './github-auth-policy.mjs';
 export { isGhDeferred } from './gh-deferred.mjs';
 import { markPrSnapshotDirty, repoFromGhArgs } from './pr-snapshot-store.mjs';
 
@@ -1337,12 +1338,18 @@ export function looksLikePersonalAccessDenial(text) {
  * SCOPE (TOLERATED, not endorsed): opting in routes reads of ANY repo/search the operator's personal login can
  * reach onto that login — routing is not pinned to `-R/--repo` or the App's installation repos. The opt-in is
  * the only guard; tightening it is a tracked follow-up (pinned by a test so the change is a visible diff).
+ *
+ * GATED BY THE `github.auth` POLICY (operator ruling 2026-10-09 ~21:20 ET, `we:scripts/lib/github-auth-policy.mjs`):
+ * daemons use the App by default, so the env flag alone no longer turns the route on — the policy must also allow
+ * the `reads` personal exception (or be `auth: personal`). A plist that still carries the flag stays on the App.
  * @param {NodeJS.ProcessEnv} env
+ * @param {{policy?:{auth:string, personalExceptions:object}}} [o] - injected policy (tests); default reads the live one
  * @returns {boolean}
  */
-export function resolvePersonalRouteEnabled(env = process.env) {
+export function resolvePersonalRouteEnabled(env = process.env, { policy } = {}) {
   const v = String((env && env.WE_GH_THROTTLE_PERSONAL_ROUTE) ?? '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'on' || v === 'yes';
+  if (!(v === '1' || v === 'true' || v === 'on' || v === 'yes')) return false;
+  return personalAllowed(policy ?? readGithubAuthPolicy({ env: env ?? {} }), 'reads');
 }
 
 /** Shared read routing for both execution paths (including execFileSyncThrottled via runGhSync).
