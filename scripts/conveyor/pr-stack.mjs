@@ -9,6 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { readSettings } from '../lib/settings-files.mjs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 
 export const PR_STACK_DEFAULTS = Object.freeze({ detect: true, bottomFirst: true, restack: true, restackMaxRounds: 3, holdMaxAgeMs: 6 * 3600e3 });
@@ -30,6 +31,9 @@ const positiveAge = value => {
 export function resolvePrStackSettings(env = process.env, { read = readSettings } = {}) {
   let file;
   try { file = read()?.prStack; } catch { /* defaults */ }
+  // Platform preference under the tool block (shared policy cascade; logs each value's source once).
+  file = cascadePolicy('prStack', file, { env, standard: PR_STACK_DEFAULTS,
+    envValues: Object.fromEntries(Object.entries(PR_STACK_ENV).map(([k, n]) => [k, env?.[n] || undefined])) }).layered;
   const out = { ...PR_STACK_DEFAULTS };
   for (const key of ['detect', 'bottomFirst', 'restack']) {
     try { out[key] = parseSwitch(env?.[PR_STACK_ENV[key]]) ?? parseSwitch(file?.[key]) ?? out[key]; } catch { /* defaults */ }
