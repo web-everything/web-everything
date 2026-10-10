@@ -1717,7 +1717,7 @@ export function planReconcile({
         kind: 'round-cap-exhausted', prNumber, attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind,
         ...(extra.capKind === 'fix' ? { parkToHuman: true } : {}),
         text: roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
-          + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: fix.takeoverMaxPerPr is 0)' : '')
+          + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover limit — fix.takeoverMaxPerPr or env WE_FIX_TAKEOVER_MAX_PER_PR — is 0 or invalid)' : '')
           + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
           + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
       });

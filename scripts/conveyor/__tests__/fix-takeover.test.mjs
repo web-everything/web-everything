@@ -88,6 +88,20 @@ describe('planTakeover (card xx0055i)', () => {
     // the setting is read through the env layer as 0 too
     expect(resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: '0' }, read: () => '{}' }).takeoverMaxPerPr).toBe(0);
   });
+  it('a present but invalid takeover limit fails closed to 0 (file or env), never the built-in 1 (self-review)', () => {
+    for (const bad of [-1, 'off', 100, false, '1.5']) {
+      const file = () => JSON.stringify({ fix: { takeoverMaxPerPr: bad } });
+      expect(resolveFixSettings({ env: {}, read: file })).toMatchObject({ takeoverMaxPerPr: 0, sources: { takeoverMaxPerPr: 'settings-invalid' } });
+      const ok = () => JSON.stringify({ fix: { takeoverMaxPerPr: 2 } });
+      expect(resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: String(bad) }, read: ok })).toMatchObject({ takeoverMaxPerPr: 0, sources: { takeoverMaxPerPr: 'env-invalid' } });
+    }
+    // absent / blank layers still fall through
+    expect(resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: '  ' }, read: () => JSON.stringify({ fix: { takeoverMaxPerPr: 2 } }) }).takeoverMaxPerPr).toBe(2);
+    expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: {} }) }).takeoverMaxPerPr).toBe(1);
+    // and the resolved 0 reaches the planner as `setting-disabled`
+    const s = resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: 'off' }, read: () => '{}' });
+    expect(planTakeover({ pr: cappedPr(), roundCapAction: 'takeover', takeoverMaxPerPr: s.takeoverMaxPerPr, fixerLadder: LADDER })).toMatchObject({ reason: 'setting-disabled' });
+  });
   it('the operator note for a disabled takeover says it is turned off, not that it already ran', () => {
     const NOW = Date.parse('2026-10-10T00:00:00Z');
     const thread = Array.from({ length: 5 }, (_, i) => rearm(i + 1));

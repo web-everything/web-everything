@@ -32,7 +32,7 @@ const ONOFF = ['on', 'off'];
 /**
  * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, `WE_FIX_TAKEOVER_MAX_PER_PR`) > settings file > built-in.
  * The file layer is its `fix` object (a flat top-level key is not a setting). Unknown values fall through to the
- * next layer. Never throws.
+ * next layer, except the takeover limit, which fails closed to 0 (see below). Never throws.
  */
 export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
   let fromFile = {};
@@ -47,7 +47,15 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   };
   const action = pick(env.WE_FIX_ROUND_CAP_ACTION, fromFile.roundCapAction, (v) => ACTIONS.includes(v), FIX_SETTINGS_DEFAULTS.roundCapAction);
   const history = pick(env.WE_FIX_ROUND_HISTORY, fromFile.roundHistory, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.roundHistory);
-  const max = pick(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr));
+  // The takeover limit fails CLOSED: a value that is present but not a 0-99 count (`-1`, `off`, `100`) turns the
+  // takeover off (0) instead of falling through to the built-in 1, so a typo never silently enables a takeover.
+  const present = (v) => String(v ?? '').trim() !== '';
+  const maxOk = (v) => /^\d{1,2}$/.test(v);
+  const max = present(env.WE_FIX_TAKEOVER_MAX_PER_PR) && !maxOk(String(env.WE_FIX_TAKEOVER_MAX_PER_PR).trim())
+    ? { value: '0', source: 'env-invalid' }
+    : !present(env.WE_FIX_TAKEOVER_MAX_PER_PR) && present(fromFile.takeoverMaxPerPr) && !maxOk(String(fromFile.takeoverMaxPerPr).trim())
+      ? { value: '0', source: 'settings-invalid' }
+      : pick(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, maxOk, String(FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr));
   return {
     roundCapAction: action.value, roundHistory: history.value, takeoverMaxPerPr: Number(max.value),
     sources: { roundCapAction: action.source, roundHistory: history.source, takeoverMaxPerPr: max.source },
