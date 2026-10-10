@@ -155,6 +155,10 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
     }
     return origin;
   };
+  // What this reverse walk sees is import edges only. ACCEPTED BOUND (operator ruling 2026-10-10, card x0e6tik): a test
+  // that reads a changed SOURCE file through `fs` as text has no edge here and is not excused or re-tested by this rule;
+  // tests still run on main and on the PR per settings, so a miss is caught eventually. A cycle is NOT part of that
+  // bound: a closed cycle CI runs is caught below by `isEntryPoint`.
   const fromPr = reach(pr);
   if (typeof fromPr === 'string') return done(true, [fromPr]);
   const fromMain = reach(mainSet);
