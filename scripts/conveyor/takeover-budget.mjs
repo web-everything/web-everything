@@ -325,7 +325,9 @@ export function renderPreviousTakeover({ previous, diffText = null, maxChars = P
   const diff = String(diffText ?? '');
   if (diff.trim()) {
     const cut = diff.length > maxChars ? `${diff.slice(0, maxChars).replace(/\n[^\n]*$/, '')}\n… (diff cut at ${maxChars} chars: run the command below for the rest)` : diff;
-    lines.push('```diff', cut.replace(/```/g, '`​``'), '```');
+    // The fence is longer than any backtick run in the diff, so nothing inside can close it.
+    const fence = '`'.repeat(Math.max(3, ...[...cut.matchAll(/`+/g)].map((m) => m[0].length + 1)));
+    lines.push(`${fence}diff`, cut, fence);
   }
   lines.push(`Full diff: \`git diff ${from}..${to}\``, '');
   return `${lines.join('\n')}\n`;

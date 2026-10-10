@@ -210,7 +210,8 @@ describe('takeover 2+ brief', () => {
   it('the diff is bounded and a fence inside it cannot close the block', () => {
     const s = renderPreviousTakeover({ previous: { n: 1, startHead: R5, reviewedHead: T1, remaining: [] }, diffText: `${'x'.repeat(50)}\n\`\`\`\n${'y\n'.repeat(100)}`, maxChars: 80 });
     expect(s).toMatch(/diff cut at 80 chars/);
-    expect(s.match(/^```/gm)).toHaveLength(2);
+    expect(s).toMatch(/^````diff$/m); // the fence outruns the ``` inside the diff
+    expect(s.match(/^````$/gm)).toHaveLength(1);
   });
   it('takeover 1 keeps the plain section', () => {
     expect(withTakeover('BRIEF', { attempts: 5, cap: 5, n: 1, budget: 2 })).toMatch(/You are the takeover session for this head/);
