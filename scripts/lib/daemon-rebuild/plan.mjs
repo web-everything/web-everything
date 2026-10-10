@@ -96,6 +96,76 @@ function changedFiles(git, mainSha, sha) {
   return d.status === 0 ? String(d.stdout ?? '').split('\n').map((l) => l.trim()).filter(Boolean) : [];
 }
 
+// ── overlay stacks (held item 212) ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * PURE over `git` / `stateOf` / `prBaseChain`: group the registered overlays into stacks and pick what applies.
+ * Live 2026-10-10 (wev-fix-daemon): #4757 is stacked on #4756, and #4792/#4797 sit on a chain that reaches #4756
+ * and carries #4757. #4756 was rebased; its children still carry its OLD head. Applied as independent overlays,
+ * the children conflicted with the live #4756 every rebuild and were parked, so none of the stack's fixes went live.
+ *
+ * An overlay C is a CHILD of a registered overlay P when C's PR base chain names P's branch, or P's tip is an
+ * ancestor of C's tip (the fallback when gh cannot answer). A TOP has no registered child. Every non-top base P:
+ *   - is `stack-contained` when one of its tops contains P's current tip: it is live through that top;
+ *   - is `stack-base-moved` when none does (P was rebased; its children still carry the old head): set aside, the
+ *     children's tops kept until they are restacked. This deliberately overrides "live overlays win" for P. A
+ *     PINNED moved base is never set aside (it may carry mechanism the tops lack) — it stays an independent overlay.
+ * Overlays whose PR is MERGED/CLOSED or whose ref is gone take no part (the main loop removes them).
+ * @returns {Promise<{setAside:Map<string,{ref:string,pr:number|null,sha:string,reason:string,tops:Array<object>}>,
+ *   tops:Array<{ref:string,pr:number|null,sha:string}>}>} `tops` = the tops of stacks only, in list order.
+ */
+export async function planOverlayStacks({ git, mainSha, overlays, stateOf = async () => null, prBaseChain = null, isPinned = () => false }) {
+  void mainSha;
+  const nodes = [];
+  for (const raw of overlays) {
+    if (!raw?.ref || nodes.some((n) => n.ref === raw.ref)) continue;
+    const pr = raw.pr ?? null;
+    const st = await stateOf(pr);
+    if (st === 'MERGED' || st === 'CLOSED') continue;
+    const sha = verifyRev(git, `refs/remotes/origin/${raw.ref}^{commit}`);
+    if (!sha) continue;
+    let chain = null;
+    if (pr != null && typeof prBaseChain === 'function') {
+      try { chain = await prBaseChain(pr); } catch { chain = null; }
+    }
+    nodes.push({ raw, ref: raw.ref, pr, sha, chain: Array.isArray(chain) ? chain : [] });
+  }
+  const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
+  const children = new Map(nodes.map((n) => [n.ref, new Set()]));
+  for (const c of nodes) {
+    for (const p of nodes) {
+      if (p === c || p.sha === c.sha) continue;
+      if (c.chain.includes(p.ref) || anc(p.sha, c.sha)) children.get(p.ref).add(c.ref);
+    }
+  }
+  const byRef = new Map(nodes.map((n) => [n.ref, n]));
+  const descendants = (ref) => {
+    const seen = new Set();
+    const walk = (r) => { for (const k of children.get(r) ?? []) if (!seen.has(k) && k !== ref) { seen.add(k); walk(k); } };
+    walk(ref);
+    return seen;
+  };
+  const isTop = (ref) => (children.get(ref)?.size ?? 0) === 0;
+  const setAside = new Map();
+  const stackTops = new Set();
+  for (const p of nodes) {
+    if (isTop(p.ref)) continue;
+    const tops = nodes.filter((n) => descendants(p.ref).has(n.ref) && isTop(n.ref));
+    if (tops.length === 0) continue; // a cycle of equal tips — leave it to the plain loop
+    const containing = tops.filter((t) => anc(p.sha, t.sha));
+    if (containing.length > 0) {
+      setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-contained', tops: containing.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
+    } else if (!isPinned(p.raw, p.sha)) {
+      setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
+    } else continue;
+    for (const t of tops) stackTops.add(t.ref);
+  }
+  return {
+    setAside,
+    tops: nodes.filter((n) => stackTops.has(n.ref)).map(({ ref, pr, sha }) => ({ ref, pr, sha })),
+  };
+}
+
 // ── planRebuild — pure over an injected git(args) runner ────────────────────────────────────────────────────
 
 /**
@@ -104,9 +174,14 @@ function changedFiles(git, mainSha, sha) {
  * conflict-dropping ones that don't merge cleanly THIS pass without forgetting them), and return the resulting
  * final sha plus a full decision log. Never mutates the overlay list itself — {@link rebuildClone} does that
  * from the returned `decisions`.
+ * Held item 212 — in `stackMode: 'tops'` (default) stacked overlays are planned as stacks (see {@link planOverlayStacks}):
+ * only the tops apply, and a base contained in a top, or a base that moved away from its children, is SKIPPED (stays
+ * registered) and comes back on its own only if none of its tops could apply.
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
- *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean}} o
+ *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
+ *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null, stackMode?:'tops'|'independent',
+ *   stackModeSource?:string}} o
  * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
  *   applied:Array<{ref:string,pr:number|null,sha:string}>,
  *   decisions:Array<{ref:string,pr:number|null,action:'remove'|'drop'|'skip'|'apply',reason:string,sha:string|null}>,
@@ -114,6 +189,7 @@ function changedFiles(git, mainSha, sha) {
  */
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
+  prBaseChain = null, stackMode = 'tops', stackModeSource = 'standard',
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -160,15 +236,59 @@ export async function planRebuild({
     };
   };
 
+  // Each PR's state is read ONCE per plan (the stack pass below needs it before the main loop does).
+  const stateCache = new Map();
+  const stateOf = async (pr) => {
+    if (pr == null || !prState) return null;
+    if (!stateCache.has(pr)) stateCache.set(pr, await prState(pr));
+    return stateCache.get(pr);
+  };
+
+  // Held item 212 (live 2026-10-10) — stacked overlay PRs are one stack: apply only its tops. See planOverlayStacks.
+  const stacks = stackMode === 'tops' && listed.length > 1
+    ? await planOverlayStacks({ git, mainSha, overlays: listed, stateOf, prBaseChain, isPinned: (raw, sha) => pinnedStatus(git, raw, mainSha, sha).pinned })
+    : { setAside: new Map(), tops: [] };
+  if (stacks.setAside.size > 0) {
+    const label = (o) => (o.pr != null ? `#${o.pr}` : o.ref);
+    const asides = [...stacks.setAside.values()];
+    for (const a of asides.filter((x) => x.reason === 'stack-base-moved')) {
+      alerts.push({
+        kind: 'overlay-stack-base-moved',
+        detail: {
+          ref: a.ref, pr: a.pr, sha: a.sha, tops: a.tops.map((t) => t.ref),
+          message: `stack base moved: ${label(a)} set aside, tops ${a.tops.map(label).join(' ')} kept until restacked`,
+        },
+      });
+    }
+    const why = asides.map((a) => (a.reason === 'stack-base-moved'
+      ? `${label(a)} set aside (base moved; its children carry its old head)`
+      : `${label(a)} set aside (contained in ${a.tops.map(label).join(' ')})`));
+    alerts.push({
+      kind: 'overlay-stack-tops',
+      detail: {
+        mode: stackMode, source: stackModeSource, tops: stacks.tops.map(label),
+        setAside: asides.map((a) => ({ ref: a.ref, pr: a.pr, reason: a.reason, tops: a.tops.map((t) => t.ref) })),
+        message: `overlay stacks (overlay.stackMode=${stackMode}, ${stackModeSource}): tops ${stacks.tops.map(label).join(' ')}; ${why.join('; ')}`,
+      },
+    });
+  }
+
   for (const raw of toProcess) {
     const ref = raw?.ref;
     const pr = raw?.pr ?? null;
 
     // 1. PR state — MERGED/CLOSED means the overlay is moot; never call prState for a PR-less overlay.
-    const state = pr != null && prState ? await prState(pr) : null;
+    const state = await stateOf(pr);
     if (state === 'MERGED' || state === 'CLOSED') {
       if (state === 'CLOSED' && raw?.pinned === true) return refusePinned(ref, pr, null, 'pr-closed', 'flag');
       decisions.push({ ref, pr, action: 'remove', reason: state === 'MERGED' ? 'pr-merged' : 'pr-closed', sha: null });
+      continue;
+    }
+
+    // 1b. a stack base set aside for its tops (held item 212): skipped this pass, never dropped or removed.
+    const aside = stacks.setAside.get(ref);
+    if (aside) {
+      decisions.push({ ref, pr, action: 'skip', reason: aside.reason, sha: aside.sha, tops: aside.tops.map((t) => t.ref) });
       continue;
     }
 
@@ -291,6 +411,28 @@ export async function planRebuild({
     d.action = 'apply';
     d.reason = 'applied-retry';
     alerts.push({ kind: 'overlay-conflict-retried', detail: { ref: d.ref, pr: d.pr, sha: d.sha } });
+  }
+
+  // 7b. stack fallback (held item 212) — a base set aside for its tops comes back when NONE of those tops applied
+  //     (each was dropped for its own conflict): the stack never loses both the base and its tops.
+  const appliedRefs = () => new Set(applied.map((a) => a.ref));
+  for (const d of decisions) {
+    if (d.action !== 'skip' || !['stack-base-moved', 'stack-contained'].includes(d.reason) || !d.sha) continue;
+    if ((d.tops ?? []).some((t) => appliedRefs().has(t))) continue;
+    const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, d.sha]);
+    const tree = String(mt.stdout ?? '').split('\n')[0].trim();
+    if (mt.status !== 0 || !tree || tree === verifyRev(git, `${cur}^{tree}`)) continue;
+    const ct = git(['commit-tree', tree, '-p', cur, '-p', d.sha, '-m',
+      `daemon-rebuild: merge overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} onto ${cur} (stack base; its tops did not apply)`], {
+      env: rebuildCommitEnv(git, cur, d.sha),
+    });
+    const newSha = String(ct.stdout ?? '').trim();
+    if (ct.status !== 0 || !newSha) continue;
+    cur = newSha;
+    applied.push({ ref: d.ref, pr: d.pr, sha: d.sha });
+    d.action = 'apply';
+    d.reason = 'applied-stack-fallback';
+    alerts.push({ kind: 'overlay-stack-fallback', detail: { ref: d.ref, pr: d.pr, sha: d.sha, tops: d.tops } });
   }
 
   // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the
