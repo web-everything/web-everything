@@ -2855,6 +2855,8 @@ describe('runReviewLabelCli — restamp stamps the CALLER-asserted --new-head, n
         body: '', comments,
       }),
       readLabels: () => labels.map((name) => ({ name })),
+      // PR #4631 round 3: a human-cleared carry reads the PR's formal reviews (a real provider always has this).
+      readPrReviews: () => [],
       setLabels: () => { calls.push('setLabels'); },
       postComment: () => { calls.push('postComment'); },
     };

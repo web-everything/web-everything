@@ -11,11 +11,18 @@ import { fileURLToPath } from 'node:url';
 
 import {
   decideAcceptCarryForward, latestAcceptRecord, resolveAcceptCarryForward, ACCEPT_CARRY_FORWARD_SETTINGS_FILE, decideMechanicalHold,
+  laterReviewHold, isKnownMachineBody,
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
 import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
-import { readDrainAcceptance } from '../../merge-ai-prs.mjs';
-import { acceptanceCoversHead } from '../review-escalation.mjs';
+import { readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND } from '../../merge-ai-prs.mjs';
+import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
+import { REBASE_ONTO_MAIN_COMMENT_MARKER, MISSING_RUN_COMMENT_MARKER } from '../../conveyor/main-red-recovery.mjs';
+import { HUNG_CI_COMMENT_MARKER } from '../../conveyor/ci-red-recovery-watch.mjs';
+import { QUEUE_CAP_REFUSAL_MARKER } from '../../conveyor/queue-cap-refusal-count.mjs';
+import { REARM_DEFERRED_MARKER } from '../../conveyor/parked-pr-conflict-watch.mjs';
+import { STUCK_DISPATCH_MARKER } from '../../conveyor/stuck-pr-dispatch-marker.mjs';
+import { acceptanceCoversHead, normalizeDiffFingerprint } from '../review-escalation.mjs';
 import {
   planAcceptCarry, sweepAcceptCarry, _resetAcceptCarryMemo, defaultRunRestamp, defaultCloneDirFor,
   transientBackoffMs, TRANSIENT_BACKOFF_BASE_MS, TRANSIENT_BACKOFF_MAX_MS,
@@ -167,10 +174,75 @@ describe('a later verdict or deliberate hold is never carried past (positive ide
     });
   }
 
-  it('an untrusted commenter\'s verdict-shaped comment does not block (it cannot forge a hold either way)', () => {
+  // PR #4631 round 3: authorship cannot classify free text on this host (the drain posts under the operator's login), so
+  // the rule is inverted — ANY author's comment that is not a known machine shape is a possible hold. Failing closed
+  // costs a re-review (today's behaviour); an untrusted commenter can only ever force that, never lift a hold.
+  it('an untrusted commenter\'s comment is a possible hold too: it can force a re-review, never lift a hold', () => {
     const comments = after(BLOCKING['a changes verdict (review-set-label / review-pr)'], { login: 'someone-else' });
-    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
-    expect(verdict(comments).action).toBe('carry');
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+    expect(verdict(comments).action).toBe('none');
+  });
+
+  // Free text from the operator's own login, in every shape a person objects in (round 3, F2): none of these is a machine
+  // shape, so each supersedes the accept in the rule AND in the sweep plan. The list is deliberately not a phrase list.
+  const FREE_TEXT_HOLDS = ['hold, don\'t merge', 'Hold.', 'not yet', 'NACK', 'I have concerns about the restamp path', 'wait for the security pass',
+    '/hold', 'do not merge until #4700 lands', 'lgtm but let me look again', '🛑 stop', '👎'];
+  for (const text of FREE_TEXT_HOLDS) {
+    it(`operator free text ${JSON.stringify(text)} after the clear-human blocks the carry (rule + sweep plan)`, () => {
+      const comments = after(text, { login: 'chalbert' });
+      expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+      expect(verdict(comments).action).toBe('none');
+      expect(planned(comments)).toEqual([]);
+    });
+  }
+
+  // The machine shapes this very PR's thread carries after a clearance: they must NOT block, or the carry never fires.
+  const MACHINE_SHAPES = {
+    'fix claim': '🔒 conveyor fix-begin — fix claim held\n\n**Who:** `fix-4631`',
+    'fix claim released': '🔓 conveyor fix-end — fix claim released\n\n`fix-4631` released the claim',
+    'CI-heal note': '🩹 conveyor CI-heal — rebased & re-pushed\nreason: red-ci',
+    'fix evidence': '🔧 conveyor fix — merge conflict with `main` resolved (merge commit `40e703fa1`)',
+    'verify verdict': '✅ conveyor fix — verify GREEN for exactly `40e703fa1`',
+    'restack note': '🔧 conveyor restack — PR #4631 brought up to date with its base PR',
+    'conveyor note': '🔔 conveyor — needs your decision\n\nneeds your decision: a session is blocked',
+    'restamp note': '📌 review — acceptance re-stamped after a mechanical head move',
+    // The REAL builders / constants, not hand-typed look-alikes: a look-alike let the bold-marker mismatch through in round 3.
+    'advisory note (accept, real marker)': `${ADVISORY_NOTE_MARKER}\n\n**Advisory outcome:** \`accept\``,
+    'drain skip reason': buildDrainReasonComment('skip', 'required check `test` is pending'),
+    'drain land reason': buildDrainReasonComment('land', 'landed'),
+    'drain merge trace': buildDrainReasonComment(MERGE_TRACE_KIND, 'head abc'),
+    'drain review-coverage note': buildDrainReasonComment('review-coverage', 'not examined: x'),
+    'drain stacked-base-close note': buildDrainReasonComment('stacked-base-close', 'may be closed'),
+    'rebase-onto-main note': `${REBASE_ONTO_MAIN_COMMENT_MARKER}\n\nmain moved`,
+    'CI-hung-recovery note': `${HUNG_CI_COMMENT_MARKER}\n\nre-ran`,
+    'missing-run-recovery note': `${MISSING_RUN_COMMENT_MARKER}\n\nno run`,
+    'queue-cap refusal note': QUEUE_CAP_REFUSAL_MARKER,
+    'rearm-withheld note': REARM_DEFERRED_MARKER,
+    'stuck-PR inspection note': STUCK_DISPATCH_MARKER,
+    'empty body': '',
+  };
+  for (const [name, body] of Object.entries(MACHINE_SHAPES)) {
+    it(`a ${name} after the clear-human does not block`, () => {
+      const comments = after(body);
+      expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+      expect(verdict(comments).action).toBe('carry');
+    });
+  }
+
+  it('machine shapes are anchored on the LEADING line: the same text further down is free text and blocks', () => {
+    const comments = after(`hold on, I do not think this is right.\n\n${MACHINE_SHAPES['fix claim']}`, { login: 'chalbert' });
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+  });
+
+  it('a drain PARK that is not the mechanical shape stays a verdict even though other drain reason comments are chatter', () => {
+    const comments = after(buildDrainReasonComment('park', 'review escalation: blast-radius over threshold'));
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+  });
+
+  it('an advisory note whose outcome is `changes` is a finding, not chatter: it blocks', () => {
+    const comments = after(`${ADVISORY_NOTE_MARKER}\n\n**Advisory outcome:** \`changes\``);
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(true);
+    expect(verdict(comments).action).toBe('none');
   });
 
   it('the anti-test-gaming drain park (a function of the diff) does NOT block: the #4535 shape this card exists for', () => {
@@ -245,11 +317,14 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
   const MECHANICAL = { ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z')] };
 
   /** Drives the real CLI with a recording provider; returns what was written. `events: null` = timeline unreadable. */
-  const restamp = ({ comments, labels = ['review:human'], ledger = MECHANICAL.ledger, events = MECHANICAL.events }) => {
+  const restamp = ({ comments, labels = ['review:human'], ledger = MECHANICAL.ledger, events = MECHANICAL.events, reviews = [], fullComments = null, setting = 'on' }) => {
     const writes = { setLabels: [], postComment: [] };
+    const reads = { reviews: 0, comments: 0 };
     const provider = {
       name: 'stub', currentRepo: () => 'o/n',
       readHoldLabelEvents: () => { if (events === null) throw new Error('gh api failed'); return events; },
+      readPrReviews: () => { reads.reviews += 1; if (reviews === null) throw new Error('gh api failed'); return reviews; },
+      readComments: () => { reads.comments += 1; if (fullComments === null) throw new Error('gh api failed'); return fullComments; },
       readPrState: () => ({ labels: labels.map((name) => ({ name })), comments, headRefOid: heads.head, headRefName: 'lane/x', state: 'OPEN', isDraft: false, body: '', title: '' }),
       readLabels: () => labels.map((name) => ({ name })),
       setLabels: (_r, _p, spec) => { writes.setLabels.push(spec); },
@@ -260,7 +335,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     const prev = { GIT_DIR: process.env.GIT_DIR, WE_ACCEPT_CARRY_FORWARD: process.env.WE_ACCEPT_CARRY_FORWARD };
     process.exit = (code) => { const e = new Error('process.exit'); e.exitCode = code; throw e; };
     process.env.GIT_DIR = join(dir, '.git');
-    process.env.WE_ACCEPT_CARRY_FORWARD = 'on';
+    process.env.WE_ACCEPT_CARRY_FORWARD = setting;
     let exitCode = 0;
     try {
       runReviewLabelCli({
@@ -277,7 +352,7 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
       process.exit = realExit;
       for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     }
-    return { exitCode, writes, out: chunks.join('') };
+    return { exitCode, writes, reads, out: chunks.join('') };
   };
 
   it('F1: a clearance proven by re-derived git diff still stamps cleared-human on the NEW head', () => {
@@ -355,6 +430,122 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(r.writes).toEqual(NO_WRITES);
   });
 
+  // PR #4631 round 3 (F3, codex): a person's REMOVE + RE-ADD inside the 120 s window after the drain's own add. The latest add
+  // is then inside the window, so timing alone read it as the park's. Every one of these must write nothing.
+  const unlabeledAt = (created_at, login = 'chalbert') => ({ event: 'unlabeled', created_at, label: { name: 'review:human' }, actor: { login } });
+  it('a hold removed and re-added by hand INSIDE the window after the park is not the park\'s own add: NO write', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), unlabeledAt('2026-10-09T14:37:20Z'), labeledAt('2026-10-09T14:37:30Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(r.out).toMatch(/a person touched the hold/);
+  });
+
+  it('a hold removed by hand after the park (and not re-added) is a changed hold too: NO write', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), unlabeledAt('2026-10-09T14:37:20Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a second add by hand INSIDE the window (two adds, no removal logged) is not the park\'s own either: NO write', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), labeledAt('2026-10-09T14:37:30Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a label event with an unparseable time cannot be placed before the park, so it counts as a touch: NO write', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T14:36:50Z'), unlabeledAt('not-a-time')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a remove + re-add that happened BEFORE the park (the drain\'s add is then the only event since) still carries', () => {
+    const r = restamp({ comments: [clearComment()], ledger: [dRow()], events: [labeledAt('2026-10-09T13:00:00Z'), unlabeledAt('2026-10-09T13:10:00Z'), labeledAt('2026-10-09T14:36:50Z')] });
+    expect(r.exitCode).toBe(0);
+    expect(r.writes.setLabels[0].add).toBe('review:accepted');
+  });
+
+  // PR #4631 round 3 (F2, security): a formal GitHub review is not in `gh pr view --json comments`; it is read through its
+  // own paginated call and an unreadable one is a RETRYABLE miss, never "no review stands".
+  const review = (state, submitted_at = '2026-10-09T16:00:00Z') => ({ state, submitted_at, user: { login: 'rev' } });
+  it('a formal CHANGES_REQUESTED review after the clear-human makes the restamp refuse, with NO write', () => {
+    const r = restamp({ comments: [clearComment()], reviews: [review('CHANGES_REQUESTED')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true });
+  });
+
+  it('a review that only COMMENTS after the clear-human is a possible objection too: NO write', () => {
+    const r = restamp({ comments: [clearComment()], reviews: [review('COMMENTED')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('an APPROVED or DISMISSED review does not block, and neither does an empty review list', () => {
+    for (const reviews of [[], [review('APPROVED')], [review('DISMISSED')]]) {
+      const r = restamp({ comments: [clearComment()], reviews });
+      expect(r.exitCode).toBe(0);
+      expect(r.writes.setLabels[0].add).toBe('review:accepted');
+    }
+  });
+
+  it('unreadable formal reviews refuse as a RETRYABLE read miss, with NO write', () => {
+    const r = restamp({ comments: [clearComment()], reviews: null });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
+  });
+
+  // Truncated-read row: `gh pr view --json comments` stops at one page (100). A full page is re-read through the paginated
+  // comments call; a hold past comment 100 must be seen, and a failed re-read is a retryable miss, never "no hold".
+  const filler = (n) => Array.from({ length: n }, (_, i) => ({ author: BOT, body: `🔒 conveyor fix-begin — fix claim held #${i}` }));
+  it('a full 100-comment page is re-read in full: a hold past comment 100 refuses the restamp, with NO write', () => {
+    const page = [clearComment(), ...filler(99)];
+    const r = restamp({ comments: page, fullComments: [...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
+    expect(r.reads.comments).toBe(1);
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
+  it('a full page whose complete thread has nothing standing against the clearance still carries', () => {
+    const page = [clearComment(), ...filler(99)];
+    const r = restamp({ comments: page, fullComments: [...page, ...filler(5)] });
+    expect(r.exitCode).toBe(0);
+    expect(r.writes.setLabels[0].add).toBe('review:accepted');
+  });
+
+  it('a failed complete-thread re-read is a RETRYABLE miss, with NO write', () => {
+    const r = restamp({ comments: [clearComment(), ...filler(99)], fullComments: null });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
+  });
+
+  it('a short thread is not re-read (no extra gh hop)', () => {
+    const r = restamp({ comments: [clearComment()] });
+    expect(r.reads).toEqual({ reviews: 1, comments: 0 });
+  });
+
+  // Plain (no live hold) restamp of a review:accepted PR: an unreadable review list must not mint the accept WITHOUT its
+  // `cleared-human` marker (that would drop the operator's clearance for good on a mere read miss).
+  it('plain restamp: unreadable reviews refuse as RETRYABLE instead of minting an accept without the clearance marker', () => {
+    const r = restamp({ comments: [clearComment()], labels: ['review:accepted'], reviews: null });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
+  });
+
+  it('no extra reads when the setting is off or the accept is not a human clearance', () => {
+    const agent = { author: BOT, body: `✅ review — accepted\n<!-- reviewed-sha: ${heads.cleared} -->` };
+    expect(restamp({ comments: [agent], labels: ['review:accepted'] }).reads).toEqual({ reviews: 0, comments: 0 });
+    expect(restamp({ comments: [clearComment()], labels: ['review:accepted'], setting: 'off' }).reads).toEqual({ reviews: 0, comments: 0 });
+  });
+
+  it('operator free text "hold, don\'t merge" after the clear-human makes the restamp refuse, with NO write', () => {
+    const r = restamp({ comments: [clearComment(), { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+
   it('a sanctioned verdict ledgered after the drain park supersedes the clearance', () => {
     const later = dRow({ verdict: 'changes', source: 'review-set-label', actor: { declared: 'chalbert' }, reason: 'changes', at: '2026-10-09T14:40:00.000Z' });
     const r = restamp({ comments: [clearComment()], ledger: [dRow(), later] });
@@ -428,6 +619,144 @@ describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
   it('an unreadable timeline (null) is retryable; no proof is not', () => {
     expect(decide({ events: null })).toMatchObject({ mechanical: false, retryable: true });
     expect(decide({ rows: [] }).retryable).toBeUndefined();
+  });
+  // PR #4631 round 3 (F3): from the park row onward the timeline must hold exactly ONE review:human event, the drain's add.
+  const un = (ms, created_at = iso(ms)) => ({ event: 'unlabeled', created_at, label: { name: 'review:human' } });
+  it('a remove + re-add inside the late window is a person touching the hold, not the park', () => {
+    expect(decide({ events: [ev(9_000), un(30_000), ev(40_000)] }).mechanical).toBe(false);
+    expect(decide({ events: [ev(9_000), un(30_000), ev(40_000)] }).reason).toMatch(/changed 3 times/);
+    expect(decide({ events: [ev(9_000), un(30_000)] }).mechanical).toBe(false);
+    expect(decide({ events: [ev(9_000), ev(40_000)] }).mechanical).toBe(false);
+  });
+  it('events before the park row (incl. a removal) do not count; an unplaceable event does', () => {
+    expect(decide({ events: [ev(-600_000), un(-500_000), ev(9_000)] }).mechanical).toBe(true);
+    expect(decide({ events: [ev(9_000), un(0, 'garbage')] }).mechanical).toBe(false);
+    expect(decide({ events: [ev(9_000), un(0, undefined)] }).mechanical).toBe(false);
+  });
+  it('other labels on the timeline are ignored', () => {
+    const other = { event: 'unlabeled', created_at: iso(30_000), label: { name: 'ready-to-merge' } };
+    expect(decide({ events: [ev(9_000), other] }).mechanical).toBe(true);
+  });
+});
+
+// PR #4631 round 3 (F2): the thread reader's two new channels, pure.
+describe('later hold channels — free text and formal reviews (pure)', () => {
+  const rec = (reviews) => latestAcceptRecord(fx.comments, reviews);
+  const at = rec().at;
+  const rv = (state, submitted_at) => ({ state, submitted_at });
+  it('the fixture clearance has a time to order reviews against', () => { expect(at).toBe('2026-10-09T13:58:47Z'); });
+  it('CHANGES_REQUESTED / COMMENTED / PENDING after the accept stand against it; APPROVED / DISMISSED do not', () => {
+    for (const state of ['CHANGES_REQUESTED', 'COMMENTED', 'changes_requested']) expect(laterReviewHold([rv(state, '2026-10-09T15:00:00Z')], at)).toBe(true);
+    // PENDING is an unsubmitted draft (visible only to its author): nobody has objected yet.
+    for (const state of ['APPROVED', 'DISMISSED', 'PENDING']) expect(laterReviewHold([rv(state, '2026-10-09T15:00:00Z')], at)).toBe(false);
+  });
+  it('a review submitted BEFORE the accept is superseded by it; a missing / unparseable time or accept time fails closed', () => {
+    expect(laterReviewHold([rv('CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], at)).toBe(false);
+    expect(laterReviewHold([rv('CHANGES_REQUESTED', undefined)], at)).toBe(true);
+    expect(laterReviewHold([rv('CHANGES_REQUESTED', 'nope')], at)).toBe(true);
+    expect(laterReviewHold([rv('CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], null)).toBe(true);
+  });
+  it('the camelCase `submittedAt` shape (gh pr view --json reviews) is read too', () => {
+    expect(laterReviewHold([{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-09T15:00:00Z' }], at)).toBe(true);
+  });
+  it('the record carries the review fact into the rule: a standing review blocks, none carries, undefined = no channel', () => {
+    const decide = (record) => decideAcceptCarryForward({ setting: 'on', record, headSha: NEW, headDiff: fx.netDiff[NEW] });
+    expect(decide(rec([rv('CHANGES_REQUESTED', '2026-10-09T15:00:00Z')])).action).toBe('none');
+    expect(decide(rec([])).action).toBe('carry');
+    expect(decide(rec(undefined)).action).toBe('carry');
+  });
+  it('unreadable reviews (null) are a RETRYABLE refusal, not "no review stands against it"', () => {
+    expect(decideAcceptCarryForward({ setting: 'on', record: rec(null), headSha: NEW, headDiff: fx.netDiff[NEW] })).toMatchObject({ action: 'review-owed', retryable: true });
+  });
+  it('isKnownMachineBody: verdicts / re-arms / non-mechanical parks are never machine shapes', () => {
+    for (const b of ['🔁 review — changes requested', '🔧 conveyor fix — re-armed for re-review', '🛑 conveyor fix — stood down', 'review paused: x',
+      '<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\nreview escalation: x', 'hello']) expect(isKnownMachineBody(b)).toBe(false);
+    expect(isKnownMachineBody(undefined)).toBe(true);
+    expect(isKnownMachineBody('  \n ')).toBe(true);
+  });
+});
+
+// PR #4631 round 3 (F1/F3, test-coverage): the drain's anti-test-gaming carry used to be inline in `runCli`, so no test
+// reddened if a clause of it was deleted. It is now `carryHumanClearanceOnIdenticalDiff`; ONE test per clause, each of
+// which goes red if that clause is removed (the #4535 shape is the positive control).
+describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming carry step', () => {
+  const TEXT = 'diff --git a/a.txt b/a.txt\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+feature\n';
+  const FP = normalizeDiffFingerprint(TEXT);
+  const BOT = { login: 'web-everything' };
+  const clear = (over = '') => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z',
+    body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->${over}\n<!-- cleared-human: chalbert -->` });
+  const agentAccept = () => ({ author: BOT, createdAt: '2026-10-09T13:58:47Z', body: `✅ review — accepted\n<!-- reviewed-sha: ${OLD} -->\n<!-- reviewed-diff: ${FP} -->` });
+  const base = () => ({ setting: 'on', comments: [clear()], reviews: [], humanClearedSha: OLD, headSha: NEW, netDiffText: { scored: true, text: TEXT } });
+  const run = (over = {}) => carryHumanClearanceOnIdenticalDiff({ ...base(), ...over });
+
+  it('the fixture\'s own fingerprint is what the live text fingerprints to (the positive control is real)', () => {
+    expect(FP).toMatch(/^[0-9a-f]{64}$/);
+  });
+  it('#4535 shape: a human clearance at the old head + a byte-identical net diff rebinds the clearance to the live head', () => {
+    expect(run()).toMatchObject({ carried: true, humanClearedSha: NEW });
+  });
+  it('clause `carry.human`: an AGENT accept never carries a human clearance (the gate keeps re-parking)', () => {
+    expect(run({ comments: [agentAccept()] })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  it('clause `carry.from === humanClearedSha`: a record naming a different head than the parsed clearance does not carry', () => {
+    expect(run({ humanClearedSha: 'b'.repeat(40) })).toMatchObject({ carried: false, humanClearedSha: 'b'.repeat(40) });
+  });
+  it('clause setting: off = today, nothing carried', () => {
+    expect(run({ setting: 'off' })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  it('clause scored: an unscored or empty net diff is never fingerprinted (an empty text would fingerprint to something)', () => {
+    expect(run({ netDiffText: { scored: false, text: TEXT } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+    expect(run({ netDiffText: { scored: true, text: '' } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+    expect(run({ netDiffText: null })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  it('a changed net diff is not carried', () => {
+    expect(run({ netDiffText: { scored: true, text: `${TEXT}+one more line\n` } })).toMatchObject({ carried: false, humanClearedSha: OLD });
+  });
+  it('nothing to carry: no clearance, no head, or the clearance already names the head', () => {
+    expect(run({ humanClearedSha: null }).carried).toBe(false);
+    expect(run({ headSha: null }).carried).toBe(false);
+    expect(run({ humanClearedSha: NEW })).toMatchObject({ carried: false, humanClearedSha: NEW });
+  });
+  it('a later verdict, free-text hold, or standing formal review after the clearance each stop the carry', () => {
+    expect(run({ comments: [clear(), { author: BOT, body: '🔁 review — changes requested\n\nx' }] }).carried).toBe(false);
+    expect(run({ comments: [clear(), { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] }).carried).toBe(false);
+    expect(run({ reviews: [{ state: 'CHANGES_REQUESTED', submitted_at: '2026-10-09T15:00:00Z' }] }).carried).toBe(false);
+  });
+  it('unreadable reviews (null) or no review list at all fail closed to the re-park', () => {
+    expect(run({ reviews: null }).carried).toBe(false);
+    expect(run({ reviews: undefined }).carried).toBe(false);
+  });
+
+  // The call site's wiring (`readDrainCarryEvidence`): what runCli hands the carry. A regression that stopped passing
+  // `reviews` would fail closed forever, so the evidence function is pinned directly.
+  it('readDrainCarryEvidence: a short thread keeps its page and reads only the reviews', () => {
+    const calls = [];
+    const ev = readDrainCarryEvidence({ comments: [clear()], readComments: () => { calls.push('c'); return []; }, readReviews: () => { calls.push('r'); return [{ state: 'APPROVED' }]; } });
+    expect(calls).toEqual(['r']);
+    expect(ev.comments).toHaveLength(1);
+    expect(ev.reviews).toEqual([{ state: 'APPROVED' }]);
+  });
+  it('readDrainCarryEvidence: a full 100-comment page is replaced by the complete thread', () => {
+    const page = Array.from({ length: 100 }, () => ({ author: BOT, body: '🔒 conveyor fix-begin — x' }));
+    const full = [...page, { author: BOT, body: 'hold' }];
+    expect(readDrainCarryEvidence({ comments: page, readComments: () => full, readReviews: () => [] }).comments).toBe(full);
+  });
+  it('readDrainCarryEvidence: any read miss (thrown, non-array) yields reviews:null and never throws', () => {
+    const page = Array.from({ length: 100 }, () => ({ body: 'x' }));
+    expect(readDrainCarryEvidence({ comments: page, readComments: () => { throw new Error('gh'); }, readReviews: () => [] }).reviews).toBeNull();
+    expect(readDrainCarryEvidence({ comments: page, readComments: () => 'nope', readReviews: () => [] }).reviews).toBeNull();
+    expect(readDrainCarryEvidence({ comments: [], readComments: () => [], readReviews: () => { throw new Error('gh'); } }).reviews).toBeNull();
+    expect(readDrainCarryEvidence({ comments: [], readComments: () => [], readReviews: () => ({}) }).reviews).toBeNull();
+    expect(readDrainCarryEvidence({}).reviews).toBeNull();
+  });
+  it('end to end through the evidence: a hold past comment 100 stops the drain carry; a clean full thread still carries', () => {
+    const page = [clear(), ...Array.from({ length: 99 }, () => ({ author: BOT, body: '🔒 conveyor fix-begin — x' }))];
+    const carryWith = (full) => {
+      const ev = readDrainCarryEvidence({ comments: page, readComments: () => full, readReviews: () => [] });
+      return carryHumanClearanceOnIdenticalDiff({ ...base(), comments: ev.comments, reviews: ev.reviews }).carried;
+    };
+    expect(carryWith([...page, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }])).toBe(false);
+    expect(carryWith([...page, { author: BOT, body: '🔓 conveyor fix-end — released' }])).toBe(true);
   });
 });
 

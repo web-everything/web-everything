@@ -66,10 +66,13 @@ const BODY_DERIVED_HOLD_RE = /manifest baseline mismatch/i;
  *     escalation-policy park, a clearance-revocation park or any other reason is a decision about the PR, not the bytes.
  *   A label-only `review:human` re-add leaves no comment at all, so it is handled where the hold is crossed, not here:
  *   {@link decideMechanicalHold} (the restamp refuses unless the standing hold is the drain's own ledgered park).
- *   Not recognised (residual, filed as backlog card xqugnf2): free-text operator comments / ruling comments (the
- *   drain posts under the operator's own login on this host, so authorship cannot classify them), and a formal GitHub
- *   CHANGES_REQUESTED review (`--json comments` never returns it).
- * Everything else a bot posts (fix claims, CI-heal notes, advisory notes) says nothing about the clearance.
+ *   Free text cannot be classified by author (the drain posts under the operator's own login on this host), so the rule
+ *   is INVERTED (PR #4631 review round 3): a comment after the accept that is not positively recognised as a known
+ *   MACHINE shape ({@link isKnownMachineBody}: fix claims, CI-heal / restack notes, advisory notes that are not a
+ *   `changes` outcome, the drain's mechanical parks, this restamp's own note) is treated as a possible hold and
+ *   supersedes the accept, whoever wrote it. A miss on the machine list only refuses a carry (the operator re-reviews,
+ *   as today); a miss on a hold-phrase list would auto-accept over an objection.
+ *   A formal GitHub review is a separate channel (`gh --json comments` never returns it): {@link laterReviewHold}.
  */
 const LATER_VERDICT_HEADING_RE = /^\s*🔁\s+(?:human\s+)?review\s+[—-]\s+changes requested/i;
 const LATER_REARM_RE = /^\s*🔧 conveyor fix — re-armed for re-review/i; // `REARM_COMMENT_MARKER`, we:scripts/conveyor/rearm-review.mjs
@@ -94,15 +97,71 @@ export function isLaterVerdictBody(body) {
   return DRAIN_PARK_MARKER_RE.test(text) && !MECHANICAL_PARK_RE.test(text);
 }
 
+/**
+ * The MACHINE shapes that say nothing about the clearance, each anchored on the comment's leading line (a body that merely
+ * CONTAINS one of these strings further down is not one). Extending this list is the only way a new bot comment stops
+ * blocking a carry; leaving a shape off it fails safe (the carry is refused, the operator re-reviews).
+ */
+const KNOWN_MACHINE_SHAPE_RES = [
+  /^\s*🔒 conveyor fix-begin —/, /^\s*🔓 conveyor fix-end —/, // the fix claim (`fix-procedure.mjs`)
+  /^\s*🩹 conveyor CI-heal —/, // a CI repair note (a CI-heal ESCALATION / void verdict is `LATER_STANDING_HOLD_RE`, checked first)
+  /^\s*(?:🔧|✅) conveyor (?:fix|restack) —/, // fix / restack evidence (a re-arm is `LATER_REARM_RE`, checked first)
+  /^\s*🔔 conveyor —/, // a conveyor operator note
+  /^\s*📌 review — acceptance re-stamped/, // this restamp's own comment
+  // The drain's own reason comments (`buildDrainReasonComment`: skip / land / merge-trace / review-coverage / stacked-base-close).
+  // Posted on every final skip of an AI PR, so one always follows a clearance. NOT `drain-park-reason`: a park is a verdict
+  // unless it is the mechanical shape above, and `isLaterVerdictBody` has already claimed it by the time this list runs.
+  /^\s*<!--\s*drain-(?!park-)[a-z0-9-]+-reason\s*-->/,
+  /^\s*(?:🔀 conveyor rebase-onto-main|⏱️ conveyor CI-hung-recovery|🚦 conveyor missing-run-recovery|⏳ conveyor —|🔎 stuck-PR inspection)/, // conveyor recovery / queue notes
+];
+// The real note opens with the bold `ADVISORY_NOTE_MARKER` (`**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.**`).
+const ADVISORY_NOTE_RE = /^\s*\**\s*⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT\./;
+const ADVISORY_CHANGES_RE = /\*\*Advisory outcome:\*\*\s*`?changes`?/i;
+
+/**
+ * Pure: is this comment body (any author) a recognised machine shape that cannot be a hold? An empty body says nothing.
+ * Verdicts, re-arms, stand-downs and non-mechanical drain parks are NOT machine shapes (they supersede the accept).
+ */
+export function isKnownMachineBody(body) {
+  const text = typeof body === 'string' ? body : '';
+  if (!text.trim()) return true;
+  if (isLaterVerdictBody(text)) return false;
+  if (MECHANICAL_PARK_RE.test(text)) return true;
+  if (ADVISORY_NOTE_RE.test(text)) return !ADVISORY_CHANGES_RE.test(text);
+  return KNOWN_MACHINE_SHAPE_RES.some((re) => re.test(text));
+}
+
+/**
+ * Pure: did a formal GitHub review land after the accept that stands against it? `gh pr view --json comments` never
+ * returns reviews, so a "Request changes" review (or a review that only comments) was invisible to the thread reader
+ * (PR #4631 review round 3). Any review whose state is not APPROVED / DISMISSED / PENDING, submitted after the accept, counts; a
+ * review with a missing or unparseable `submitted_at` counts too (fail closed). `acceptAt` null = unknown → every
+ * such review counts.
+ * @param {Array<{state?:string, submitted_at?:string, submittedAt?:string}>} reviews
+ */
+export function laterReviewHold(reviews, acceptAt = null) {
+  const at = Date.parse(String(acceptAt ?? ''));
+  return (Array.isArray(reviews) ? reviews : []).some((r) => {
+    const state = String(r?.state ?? '').toUpperCase();
+    // PENDING = an unsubmitted draft (visible only to its author): not an objection anyone has made yet.
+    if (state === 'APPROVED' || state === 'DISMISSED' || state === 'PENDING') return false;
+    const t = Date.parse(String(r?.submitted_at ?? r?.submittedAt ?? ''));
+    return !Number.isFinite(at) || !Number.isFinite(t) || t > at;
+  });
+}
+
 const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while ((m = re.exec(body)) !== null) out = m[1].toLowerCase(); return out; };
 
 /**
  * The latest trusted accept record on a PR thread, and what was posted after it. Pure.
  * @param {Array<{body?:string, author?:object, createdAt?:string}>} comments
+ * @param {Array|null|undefined} reviews — the PR's formal reviews (`pulls/{n}/reviews`): an array = read; `null` =
+ *   UNREADABLE (the record is marked `reviewsUnreadable`, which {@link decideAcceptCarryForward} refuses as a retryable
+ *   read miss); `undefined` = the caller has no review channel (pure thread analysis, e.g. the sweep's planning pass).
  * @returns {{sha:string, diff:string|null, humanCleared:boolean, actor:string|null, index:number, at:string|null,
- *   laterBodyDerivedHold:boolean, laterVerdict:boolean}|null}
+ *   laterBodyDerivedHold:boolean, laterVerdict:boolean, reviewsUnreadable:boolean}|null}
  */
-export function latestAcceptRecord(comments) {
+export function latestAcceptRecord(comments, reviews = undefined) {
   const list = Array.isArray(comments) ? comments : [];
   let rec = null;
   list.forEach((c, index) => {
@@ -112,13 +171,16 @@ export function latestAcceptRecord(comments) {
     if (!sha) return;
     const human = CLEARED_HUMAN_RE.exec(body);
     rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index,
-      at: typeof c?.createdAt === 'string' ? c.createdAt : null };
+      at: typeof c?.createdAt === 'string' ? c.createdAt : (typeof c?.created_at === 'string' ? c.created_at : null) };
   });
   if (!rec) return null;
-  const later = list.slice(rec.index + 1).filter((c) => isTrustedMarkerAuthor(c));
-  const laterBodyDerivedHold = later.some((c) => BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
-  const laterVerdict = later.some((c) => isLaterVerdictBody(c?.body));
-  return { ...rec, laterBodyDerivedHold, laterVerdict };
+  const later = list.slice(rec.index + 1);
+  const laterBodyDerivedHold = later.filter((c) => isTrustedMarkerAuthor(c))
+    .some((c) => BODY_DERIVED_HOLD_RE.test(typeof c?.body === 'string' ? c.body : ''));
+  // ANY author: an unrecognised comment is a possible hold (see the file's "inverted rule" note), a recognised verdict
+  // shape is one. A formal review that stands against the accept is the other channel.
+  const laterVerdict = later.some((c) => !isKnownMachineBody(c?.body)) || (Array.isArray(reviews) && laterReviewHold(reviews, rec.at));
+  return { ...rec, laterBodyDerivedHold, laterVerdict, reviewsUnreadable: reviews === null };
 }
 
 /**
@@ -142,6 +204,8 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   // explicit fact is kept as an OR for a caller that knows something the comments do not.
   if (laterVerdict || record.laterVerdict) return { ...base, action: 'none', reason: 'a later verdict or deliberate hold supersedes the accept' };
   if (record.laterBodyDerivedHold) return { ...base, action: 'none', reason: 'a later hold is not derived from the diff (manifest tamper); an identical diff proves nothing about it' };
+  // Formal reviews are a read of their own; an unreadable one is a miss (retry), never "no review stands against it".
+  if (record.reviewsUnreadable) return { ...base, action: 'review-owed', reason: 'the PR\'s formal reviews could not be read; a standing changes-requested review is unproven absent', retryable: true };
   const accepted = typeof record.diff === 'string' ? record.diff.toLowerCase() : '';
   const live = typeof headDiff === 'string' ? headDiff.toLowerCase() : '';
   // A read miss (git/gh) is not a verdict about the PR: `retryable` tells the caller not to remember it as a refusal.
@@ -178,7 +242,10 @@ const isDrainTestGamingPark = (r) => r?.verdict === 'human' && r?.source === 'me
  *   2. no later ledger row of any other kind follows it (a sanctioned verdict after the park supersedes the clearance);
  *   3. the LATEST `labeled review:human` event on the PR timeline is that park's own label add (it follows the row by
  *      at most {@link HOLD_PAIR_LATE_MS}). A person re-adding the label — before or after the park — is a later or
- *      unpaired event, so a deliberate hold is never explained away by an earlier or unrelated drain row.
+ *      unpaired event, so a deliberate hold is never explained away by an earlier or unrelated drain row;
+ *   4. (round 3) from the park row onward that add is the ONLY `review:human` event on the timeline, adds AND removals: the
+ *      drain adds the label once, so a person's remove + re-add seconds later (both inside the late window) is another
+ *      event and refuses. An event with an unparseable time cannot be placed before the park, so it counts.
  * Only the test-gaming park counts. The drain restating an already-standing hold (`held — a review hold`) is posted
  * BECAUSE a hold stands, whoever put it there, so it proves nothing about origin (and writes no such ledger row).
  * Missing proof refuses (the hold stays); an unreadable timeline refuses as `retryable` (a read miss, not a decision).
@@ -203,13 +270,22 @@ export function decideMechanicalHold({ rows = [], events = null, pr, clearAt = n
   if (mine.some((r) => msOf(r.at) !== null && msOf(r.at) > parkMs && !isDrainTestGamingPark(r))) {
     return { mechanical: false, reason: 'a later ledgered verdict follows the drain park; the clearance does not cover it' };
   }
-  const labeled = events
-    .filter((e) => e?.event === 'labeled' && e?.label?.name === 'review:human' && msOf(e.created_at) !== null && (clearMs === null || msOf(e.created_at) > clearMs))
+  const holdEvents = events.filter((e) => (e?.event === 'labeled' || e?.event === 'unlabeled') && e?.label?.name === 'review:human');
+  const labeled = holdEvents
+    .filter((e) => e.event === 'labeled' && msOf(e.created_at) !== null && (clearMs === null || msOf(e.created_at) > clearMs))
     .map((e) => msOf(e.created_at));
   if (!labeled.length) return { mechanical: false, reason: 'no review:human label event since the clearance explains the hold' };
   const last = Math.max(...labeled);
   if (last < parkMs - HOLD_PAIR_EARLY_MS || last > parkMs + HOLD_PAIR_LATE_MS) {
     return { mechanical: false, reason: 'the latest review:human label add is not the drain park\'s own (a person re-held it); the clearance is not carried over it' };
+  }
+  // PR #4631 round 3: the window alone cannot tell the drain's add from a person's REMOVE + RE-ADD a few seconds later
+  // (same login, both inside the late window). The drain adds the label exactly once, so from its ledger row onward the
+  // timeline must hold exactly ONE `review:human` event and it must be that add; any further add or removal is a person
+  // touching the hold. An event with a missing / unparseable time cannot be placed before the park, so it counts.
+  const sincePark = holdEvents.filter((e) => { const t = msOf(e.created_at); return t === null || t >= parkMs - HOLD_PAIR_EARLY_MS; });
+  if (sincePark.length !== 1) {
+    return { mechanical: false, reason: `the review:human label changed ${sincePark.length} times since the drain park's ledger row (expected exactly its own add); a person touched the hold, so the clearance is not carried over it` };
   }
   return { mechanical: true, reason: 'the standing review:human is the drain\'s own test-gaming re-park (ledger row paired with its label add)' };
 }

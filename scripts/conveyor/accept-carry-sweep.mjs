@@ -44,6 +44,8 @@ export function planAcceptCarry(prs, { setting = 'off' } = {}) {
     const labels = names(pr?.labels);
     if (!labels.includes('review:human') || labels.includes('review:changes')) continue;
     const head = typeof pr?.headRefOid === 'string' ? pr.headRefOid.toLowerCase() : '';
+    // Planning reads the thread only (no `reviews` channel here: the list call has none); the restamp CLI it dispatches reads
+    // the PR's formal reviews itself and is the one authority on a standing review.
     const rec = latestAcceptRecord(pr?.comments);
     if (!rec || !rec.humanCleared || !head || rec.sha === head || rec.laterBodyDerivedHold || rec.laterVerdict) continue;
     out.push({ num: Number(pr.number), head, from: rec.sha });

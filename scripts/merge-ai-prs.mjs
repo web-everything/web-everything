@@ -132,6 +132,7 @@ export { isAiAuthor, isAiCommit, isMechanicalMergeCommit, isDrainBookkeepingComm
 export { isAiGeneratedPr, hasLabel };
 import { execFileSync, execFile, spawnSync } from 'node:child_process';
 import { readGit, readGh } from './lib/proc-read.mjs';
+import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, parseJsonLines } from './lib/review-label-provider.mjs'; // PR #4631 round 3 — the paginated reads the carry needs
 import { promisify } from 'node:util';
 import { existsSync, readFileSync, writeFileSync, realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -625,6 +626,53 @@ export function planCiLifecycleLabelUpdate({ currentLabels = [], desired, owned 
 export function hasStaleReviewPendingBesideAccept({ currentLabels = [] } = {}) {
   const has = (name) => hasLabel({ labels: currentLabels }, name);
   return has('review:accepted') && has('review:pending');
+}
+
+/**
+ * The evidence the drain's carry needs beyond the one page `gh pr view --json comments` returns (PR #4631 round 3): the
+ * COMPLETE thread when that page is full (a hold, or the clearance itself, past comment 100 would be invisible) and the
+ * PR's formal reviews. Any read miss yields `reviews: null`, which the carry refuses (fails closed to the re-park). Injected
+ * readers keep this testable; it never throws.
+ * @returns {{comments: Array, reviews: Array|null}}
+ */
+export function readDrainCarryEvidence({ comments = [], readComments, readReviews } = {}) {
+  try {
+    let thread = Array.isArray(comments) ? comments : [];
+    if (thread.length >= PR_COMMENTS_PAGE_SIZE) {
+      thread = readComments();
+      if (!Array.isArray(thread)) return { comments: Array.isArray(comments) ? comments : [], reviews: null };
+    }
+    const reviews = readReviews();
+    return { comments: thread, reviews: Array.isArray(reviews) ? reviews : null };
+  } catch { return { comments: Array.isArray(comments) ? comments : [], reviews: null }; }
+}
+
+/**
+ * The drain's anti-test-gaming gate, carry step (card xu7kxtt, #5472; extracted from `runCli` in PR #4631 round 3 so the
+ * decision is a pure, testable function next to `shouldReparkForTestTampering` rather than inline control flow). Live
+ * #4535: the operator cleared head A, the merge queue moved it to B with a byte-identical net diff, and the gate re-parked
+ * `review:human` for a second approval of the same bytes. The clearance (`humanClearedSha`) is rebound to the live head
+ * only when ALL of: the setting is on; the net diff was SCORED (an empty / unscored text is never fingerprinted); the
+ * latest trusted accept record is a HUMAN clearance (`carry.human` — an agent accept never carries a human clearance) naming
+ * exactly the `humanClearedSha` the gate already parsed (`carry.from`); its strict reviewed-diff equals the live head's; and
+ * nothing after it stands against it (a later verdict, an unrecognised comment, a standing formal review — `reviews` is the
+ * PR's formal reviews, `null` = unreadable, which refuses).
+ * Anything else returns `humanClearedSha` unchanged, so the caller's re-park still fires (fails closed).
+ * @returns {{humanClearedSha: string|null, carried: boolean, reason: string}}
+ */
+export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, netDiffText = null } = {}) {
+  const unchanged = (reason) => ({ humanClearedSha, carried: false, reason });
+  if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
+  if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
+  if (!netDiffText?.scored || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven');
+  const carry = decideAcceptCarryForward({
+    setting, record: latestAcceptRecord(comments, Array.isArray(reviews) ? reviews : null),
+    headSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
+  });
+  if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
+    return { humanClearedSha: headSha, carried: true, reason: carry.reason };
+  }
+  return unchanged(carry.reason);
 }
 
 /**
@@ -5133,14 +5181,21 @@ async function runCli() {
           // net diff is byte-identical to the one the human cleared: the clearance carries. Live #4535 (fcc29ce1 →
           // 143107a87, reviewed-diff b945d333… on both) was re-parked here and waited for a second approval.
           if (humanClearedSha && tamperHeadSha && humanClearedSha !== tamperHeadSha) {
-            const carry = decideAcceptCarryForward({
-              setting: resolveAcceptCarryForward().value, record: latestAcceptRecord(cd.comments || []),
-              headSha: tamperHeadSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
+            // The PR's formal reviews and (on a full page) its complete thread are separate reads (`gh pr view --json comments`
+            // stops at 100 and never returns reviews); a miss leaves `reviews` null, which the carry refuses.
+            const ghLines = (argv) => parseJsonLines(readGh(argv, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }));
+            const slug = v.repo || localSlug;
+            const evidence = readDrainCarryEvidence({
+              comments: cd.comments || [],
+              readComments: () => ghLines(GH_ARGV.readComments(slug, v.num)),
+              readReviews: () => ghLines(GH_ARGV.readPrReviews(slug, v.num)),
             });
-            if (carry.action === 'carry' && carry.human && carry.from === humanClearedSha) {
-              humanClearedSha = tamperHeadSha;
-              if (!AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carry.reason}\n`);
-            }
+            const carried = carryHumanClearanceOnIdenticalDiff({
+              setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
+              humanClearedSha, headSha: tamperHeadSha, netDiffText,
+            });
+            humanClearedSha = carried.humanClearedSha;
+            if (carried.carried && !AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carried.reason}\n`);
           }
         } catch { /* fetch miss → both stay null → shouldReparkForTestTampering fails closed (still true) */ }
       }

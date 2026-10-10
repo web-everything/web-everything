@@ -131,7 +131,7 @@ import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
 // its declared file scope), so the automatic session-delegation trial write below REFUSES to log one rather
 // than silently producing the row Fork 2 forbids.
 const FORBIDDEN_DELEGATION_TASK_TYPES = Object.freeze(['self-fix', 'other']);
-import { createGhProvider, writeOrder } from './lib/review-label-provider.mjs';
+import { createGhProvider, writeOrder, PR_COMMENTS_PAGE_SIZE } from './lib/review-label-provider.mjs';
 // #x01u7az — the advisory:* label pair `clear-human` must strip: an advisory only means something on a
 // `review:human` PR (its own header), so a gate-self clearance that drops `review:human` must drop whichever
 // advisory label is still riding along, or the label reads as if an independent advisory endorsed a head
@@ -1283,8 +1283,33 @@ export function runReviewLabelCli({
   let carriedHumanClearance = null;
   // The ONE derivation of the carry verdict, shared by the across-hold path below and the plain (no hold) restamp's
   // fallback further down, so the two can never disagree on what a clearance covers.
+  // The PR's formal reviews, read once and only for a carry (a plain accept never asks): `null` = unreadable, which the
+  // rule turns into a retryable refusal rather than "no review stands against it" (PR #4631 round 3).
+  // The carry's evidence beyond the one page `gh pr view --json comments` returns: the COMPLETE thread when that page is full
+  // (a hold or the clear-human past comment 100 would be invisible) and the formal reviews. Either read missing makes
+  // `reviews` null, which the rule refuses as a retryable miss. Read once, and only for a human-cleared record with the
+  // setting on, so a plain accept (or the setting off) pays no extra `gh` call.
+  let evidenceRead;
+  const readCarryEvidence = () => {
+    if (evidenceRead) return evidenceRead;
+    let comments = prComments;
+    let reviews = null;
+    try {
+      if (prComments.length >= PR_COMMENTS_PAGE_SIZE) {
+        comments = provider.readComments(repo, pr);
+        if (!Array.isArray(comments)) throw new Error('comments read returned no array');
+      }
+      reviews = provider.readPrReviews(repo, pr);
+      if (!Array.isArray(reviews)) reviews = null;
+    } catch { reviews = null; }
+    evidenceRead = { comments, reviews };
+    return evidenceRead;
+  };
+  const carryThread = () => (resolveAcceptCarryForward().value === 'on' && latestAcceptRecord(prComments)?.humanCleared
+    ? readCarryEvidence() : { comments: prComments, reviews: undefined });
   const deriveHumanCarry = () => {
-    let record = latestAcceptRecord(prComments);
+    const thread = carryThread();
+    let record = latestAcceptRecord(thread.comments, thread.reviews);
     // A clearance stamped without a diff fingerprint (cross-repo checkout, live plateau-app #217): re-derive the
     // cleared commit's own net diff from git. Unreadable → no proof → refused (and `retryable`: a git read miss is
     // not a verdict, so the sweep must not remember it as one).
@@ -1302,10 +1327,10 @@ export function runReviewLabelCli({
       headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
     });
     if (proofReadMissed && humanCarry.action === 'review-owed') humanCarry.retryable = true;
-    const clearer = parseOperatorClearance((Array.isArray(prComments) ? prComments : []).filter(isTrustedMarkerAuthor));
+    const clearer = parseOperatorClearance((Array.isArray(thread.comments) ? thread.comments : []).filter(isTrustedMarkerAuthor));
     const clearance = humanCarry.action === 'carry' && humanCarry.human === true
       ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
-    return { humanCarry, clearance };
+    return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable };
   };
   if (restampAcrossHold) {
     const derived = deriveHumanCarry();
@@ -1322,7 +1347,7 @@ export function runReviewLabelCli({
       let rows = null;
       try { rows = readLedgerRows(repo); } catch { rows = null; }
       const prov = Array.isArray(rows)
-        ? decideMechanicalHold({ rows, events, pr, clearAt: latestAcceptRecord(prComments)?.at ?? null })
+        ? decideMechanicalHold({ rows, events, pr, clearAt: latestAcceptRecord(carryThread().comments)?.at ?? null })
         : { mechanical: false, retryable: true, reason: 'the verdict ledger could not be read; the hold\'s origin is unproven' };
       if (!prov.mechanical) {
         humanCarry = { ...humanCarry, action: 'none', human: false, reason: prov.reason };
@@ -1373,7 +1398,16 @@ export function runReviewLabelCli({
   let humanClearance = null;
   if (to === 'restamp') {
     humanClearance = carriedHumanClearance ?? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff });
-    if (!humanClearance && !guardedRestamp && !restampAcrossHold) humanClearance = deriveHumanCarry().clearance;
+    if (!humanClearance && !guardedRestamp && !restampAcrossHold) {
+      const derived = deriveHumanCarry();
+      // An unreadable review / full-thread read must not mint this accept WITHOUT its `cleared-human` marker: that would drop
+      // the operator's clearance for good (the #4535 symptom) on what is only a read miss. Refuse, retryable, nothing written.
+      if (derived.reviewsUnreadable) {
+        emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason: derived.humanCarry.reason, retryable: true } }))}\n`);
+        process.exit(1);
+      }
+      humanClearance = derived.clearance;
+    }
   }
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
