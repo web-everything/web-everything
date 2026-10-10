@@ -88,8 +88,9 @@ export function defaultRunRestamp({ repo, num, head, from }, { spawn = spawnSync
 }
 
 /**
- * IO shell. @returns {Array<{num:number, carry:'carried'|'refused'|'retry', detail:string}>}
- *   `retry` = a read miss / crash: not remembered as a refusal, tried again next tick (bounded).
+ * IO shell. @returns {Array<{num:number, carry:'carried'|'refused'|'retry'|'would-try', detail:string}>}
+ *   `retry` = a read miss / crash: not remembered as a refusal, retried with backoff and never given up on (see the
+ *   file header). `would-try` = dry run.
  */
 export function sweepAcceptCarry({ prs, repo = null, dryRun = false, setting = resolveAcceptCarryForward().value, runRestamp = defaultRunRestamp, now = Date.now } = {}) {
   const results = [];

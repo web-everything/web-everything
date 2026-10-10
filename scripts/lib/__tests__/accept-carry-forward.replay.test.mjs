@@ -877,6 +877,21 @@ describe('carryHumanClearanceOnIdenticalDiff — the drain\'s anti-test-gaming c
     expect(run({ pinnedHeadSha: 'c'.repeat(40) })).toMatchObject({ carried: false, humanClearedSha: OLD });
     expect(run({ pinnedHeadSha: null })).toMatchObject({ carried: false, humanClearedSha: OLD });
   });
+  // The drain's call site hands `readHeadDiff` (readNetDiffAtHead in the PR's clone), never the batch text.
+  it('readHeadDiff: read at exactly the live head, only once a carry is otherwise possible; its result is what is proven', () => {
+    const calls = [];
+    const reader = (text, rev = undefined) => (sha) => { calls.push(sha); return { scored: true, text, rev: rev ?? sha }; };
+    expect(run({ netDiffText: null, readHeadDiff: reader(TEXT) })).toMatchObject({ carried: true, humanClearedSha: NEW });
+    expect(calls).toEqual([NEW]);
+    expect(run({ netDiffText: { scored: true, text: TEXT, rev: NEW }, readHeadDiff: reader(`${TEXT}+changed\n`) }).carried).toBe(false);
+    expect(run({ netDiffText: null, readHeadDiff: reader(TEXT, 'origin/lane/x') }).carried).toBe(false);
+    expect(run({ netDiffText: null, readHeadDiff: () => { throw new Error('git'); } }).carried).toBe(false);
+    expect(run({ netDiffText: null, readHeadDiff: () => null }).carried).toBe(false);
+    calls.length = 0;
+    run({ pinnedHeadSha: 'c'.repeat(40), readHeadDiff: reader(TEXT) });
+    run({ humanClearedSha: NEW, readHeadDiff: reader(TEXT) });
+    expect(calls).toEqual([]);
+  });
   it('nothing to carry: no clearance, no head, or the clearance already names the head', () => {
     expect(run({ humanClearedSha: null }).carried).toBe(false);
     expect(run({ headSha: null }).carried).toBe(false);
@@ -1023,8 +1038,35 @@ describe('plateau-app #217 replay — clearance stamped with reviewed-sha only (
   const view = { headRefOid: NEW217, headRefName: 'lane/xadunn9-wip-deeplinks',
     comments: [{ author: { login: 'web-everything[bot]' }, body: `✅ review — cleared\n<!-- reviewed-sha: ${OLD217} -->\n<!-- cleared-human: chalbert -->` }] };
   const exec = (cmd) => { if (cmd === 'gh') return JSON.stringify(view); throw new Error('unexpected'); };
-  const read = (texts, carrySetting = 'on') => readDrainAcceptance({ pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', exec, carrySetting,
+  const read = (texts, carrySetting = 'on', { comments = view.comments, readReviews = () => [] } = {}) => readDrainAcceptance({
+    pr: 217, repo: 'plateauapp/plateau-app', cwd: '/clone', carrySetting, readReviews,
+    exec: (cmd) => { if (cmd === 'gh') return JSON.stringify({ ...view, comments }); throw new Error('unexpected'); },
     netDiff: ({ rev }) => (texts[rev] == null ? { scored: false } : { scored: true, text: texts[rev], rev }) });
+
+  // PR #4631 round 7 (red-team): the derived fingerprint is only derived for an accept that still STANDS — the same
+  // later-objection rule the restamp path applies. Each objection shape, and each read miss, leaves SHA identity.
+  describe('a later objection, or an unprovable thread, means no derived fingerprint (not covered)', () => {
+    const both = { [OLD217]: DIFF, [NEW217]: DIFF };
+    const clearC = { ...view.comments[0], createdAt: '2026-10-09T10:00:00Z' };
+    const cases = [
+      ['a later changes verdict', { comments: [clearC, { author: { login: 'web-everything[bot]' }, body: '🔁 review — changes requested\n\nx' }] }],
+      ['operator free text after it', { comments: [clearC, { author: { login: 'chalbert' }, body: 'hold, don\'t merge' }] }],
+      ['a formal CHANGES_REQUESTED review after it', { comments: [clearC], readReviews: () => [{ state: 'CHANGES_REQUESTED', submitted_at: '2026-10-09T11:00:00Z' }] }],
+      ['unreadable formal reviews (throw)', { comments: [clearC], readReviews: () => { throw new Error('gh api failed'); } }],
+      ['unreadable formal reviews (non-array)', { comments: [clearC], readReviews: () => ({}) }],
+      ['a full first page of comments', { comments: [clearC, ...Array.from({ length: 99 }, () => ({ author: { login: 'web-everything[bot]' }, body: '🔒 conveyor fix-begin — x' }))] }],
+    ];
+    for (const [name, opts] of cases) {
+      it(name, () => {
+        const ev = read(both, 'on', opts);
+        expect(ev.acceptedDiff).toBeNull();
+        expect(acceptanceCoversHead(ev).covers).toBe(false);
+      });
+    }
+    it('positive control: the same accept with nothing after it and an empty review list still covers', () => {
+      expect(acceptanceCoversHead(read(both, 'on', { comments: [clearC] })).covers).toBe(true);
+    });
+  });
 
   // PR #4631 round 7 (toctou-head-binding): the live side is read AT the head SHA, never at the branch name.
   it('the live read is keyed by the head SHA: a diff available only under the branch name proves nothing', () => {

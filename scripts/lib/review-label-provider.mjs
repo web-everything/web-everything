@@ -203,8 +203,7 @@ export function createGhProvider({
     /** The `labeled` / `unlabeled review:human` events on the PR timeline, oldest first. Throws on a read miss (the
      *  caller treats that as unreadable, never as "no events"). */
     readHoldLabelEvents(repo, pr) {
-      const out = exec(GH_ARGV.readHoldLabelEvents(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
-      return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).map((l) => JSON.parse(l));
+      return parseJsonLines(exec(GH_ARGV.readHoldLabelEvents(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
     },
 
     /** The PR's formal reviews, every page. Throws on a read miss (the caller treats that as unreadable, never as

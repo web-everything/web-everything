@@ -249,7 +249,7 @@ const isDrainTestGamingPark = (r) => r?.verdict === 'human' && r?.source === 'me
  * comment, and on this host the drain runs under the operator's own credential (live #4535: every label event and the
  * park comment are `chalbert`), so neither the thread nor the actor can tell the two apart. The drain's verdict ledger
  * can: the drain appends a `human` row (source `merge-ai-prs`, declared actor `drain`, reason `test-gaming suspected
- * — …`) immediately before it adds the label, and nothing else writes that row. So the hold is mechanical only when ALL of:
+ * — …`) just after its own label add succeeds (round 4; older builds wrote it just before), and nothing else writes that row. So the hold is mechanical only when ALL of:
  *   1. the latest such ledger row for the PR is newer than the clearance;
  *   2. no later ledger row of any other kind follows it (a sanctioned verdict after the park supersedes the clearance);
  *   3. the LATEST `labeled review:human` event on the PR timeline is that park's own label add (it follows the row by

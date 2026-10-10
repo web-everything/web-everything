@@ -661,17 +661,22 @@ export function readDrainCarryEvidence({ comments = [], readComments, readReview
  * Anything else returns `humanClearedSha` unchanged, so the caller's re-park still fires (fails closed).
  * @returns {{humanClearedSha: string|null, carried: boolean, reason: string}}
  */
-export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null } = {}) {
+export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews = null, humanClearedSha = null, headSha = null, pinnedHeadSha = null, netDiffText = null, readHeadDiff = null } = {}) {
   const unchanged = (reason) => ({ humanClearedSha, carried: false, reason });
   if (!humanClearedSha || !headSha) return unchanged('no human clearance / live head to carry');
   if (humanClearedSha === headSha) return unchanged('the clearance already names the live head');
+  // The merge is pinned to the pass-start head (`--match-head-commit`); a clearance carried onto any other head would
+  // let the pinned commit merge on another commit's proof.
+  if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven');
+  // `readHeadDiff(headSha)` (the drain's call site: `readNetDiffAtHead` in the PR's clone) reads the live head's own diff,
+  // only once a carry is otherwise possible; `netDiffText` is the already-read form. A throw is an unscored read.
+  if (typeof readHeadDiff === 'function') {
+    try { netDiffText = readHeadDiff(headSha); } catch { netDiffText = null; }
+  }
   if (!netDiffText?.scored || typeof netDiffText.text !== 'string' || !netDiffText.text) return unchanged('the live net diff is unscored; identity unproven');
   // PR #4631 round 7 (toctou-head-binding): the diff must be the live head's OWN — read at that SHA (`rev` is the commit
   // `computeNetDiffText` actually diffed). A diff read at the branch name can describe another commit than `headSha`.
   if (netDiffText.rev !== headSha) return unchanged('the net diff was not read at the live head; identity unproven');
-  // The merge is pinned to the pass-start head (`--match-head-commit`); a clearance carried onto any other head would
-  // let the pinned commit merge on another commit's proof.
-  if (pinnedHeadSha !== headSha) return unchanged('the live head is not the head this pass will merge; identity unproven');
   const carry = decideAcceptCarryForward({
     setting, record: latestAcceptRecord(comments, Array.isArray(reviews) ? reviews : null),
     headSha, headDiff: normalizeDiffFingerprint(netDiffText.text),
@@ -683,11 +688,32 @@ export function carryHumanClearanceOnIdenticalDiff({ setting, comments, reviews 
 }
 
 /**
+ * May a marker-less accept's fingerprint be derived from git at all (PR #4631 round 7, red-team)? Only when that accept
+ * still stands: it is the latest trusted accept record, nothing after it on the thread is a verdict, a possible hold or a
+ * body-derived hold, and no formal review stands against it — the same rule the restamp path applies
+ * (`latestAcceptRecord` / `decideAcceptCarryForward`). A full first page (a later comment could be past it) or an
+ * unreadable review list is a miss, never "nothing stands against it": no derivation, so coverage falls back to SHA
+ * identity (the stricter path). Pure apart from the injected `readReviews`.
+ * @returns {boolean}
+ */
+export function acceptStandsUnsuperseded({ comments, acceptedSha, readReviews }) {
+  const list = Array.isArray(comments) ? comments : [];
+  if (list.length >= PR_COMMENTS_PAGE_SIZE) return false;
+  let reviews = null;
+  try { reviews = typeof readReviews === 'function' ? readReviews() : null; } catch { reviews = null; }
+  if (!Array.isArray(reviews)) return false;
+  const rec = latestAcceptRecord(list, reviews);
+  return !!rec && rec.sha === String(acceptedSha || '').toLowerCase()
+    && !rec.laterVerdict && !rec.laterBodyDerivedHold && !rec.reviewsUnreadable;
+}
+
+/**
  * Read the evidence used by BOTH drain review writers. A failed view is not missing review evidence:
  * let it throw so callers defer without changing labels. PR #3432 exceeded Node's default 1 MiB buffer.
  * Git reads must use the PR's own clone; an unavailable sibling clone cannot supply coverage proof.
+ * `readReviews` (injectable) reads the PR's formal reviews, only when a marker-less accept's fingerprint is derived.
  */
-export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText, carrySetting = null }) {
+export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execFileSync, netDiff = computeNetDiffText, carrySetting = null, readReviews = null }) {
   const d = JSON.parse(exec('gh', ['pr', 'view', String(pr), ...(repo ? ['--repo', repo] : []),
     '--json', 'headRefOid,headRefName,comments'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
@@ -713,7 +739,9 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   // no fingerprint → today's SHA-identity behaviour (fail closed). Only the STRICT digest is derived, never the
   // context-insensitive contribution digest.
   if (moved && !evidence.acceptedDiff && !evidence.acceptedContribution && /^[0-9a-f]{40}$/i.test(evidence.acceptedSha)
-    && (local || cwd) && (carrySetting ?? resolveAcceptCarryForward().value) === 'on') {
+    && (local || cwd) && (carrySetting ?? resolveAcceptCarryForward().value) === 'on'
+    && acceptStandsUnsuperseded({ comments: d.comments, acceptedSha: evidence.acceptedSha, readReviews: readReviews
+      ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }))) })) {
     try {
       const old = readNetDiffAtHead({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
@@ -5284,11 +5312,10 @@ async function runCli() {
             });
             // PR #4631 round 7 (toctou-head-binding): the batch's `netDiffText` was read at the branch NAME, which may have
             // pointed at another commit than `tamperHeadSha`; the carry needs the live head's own diff, read at its SHA.
-            const headBoundDiff = diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: tamperHeadSha, headRef: v.headRef })
-              : { text: '', scored: false, rev: null, reason: 'no-clone' };
             const carried = carryHumanClearanceOnIdenticalDiff({
               setting: resolveAcceptCarryForward().value, comments: evidence.comments, reviews: evidence.reviews,
-              humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null, netDiffText: headBoundDiff,
+              humanClearedSha, headSha: tamperHeadSha, pinnedHeadSha: v.listedHeadSha || v.headSha || null,
+              readHeadDiff: (sha) => (diffExec ? readNetDiffAtHead({ exec: diffExec, headSha: sha, headRef: v.headRef }) : null),
             });
             humanClearedSha = carried.humanClearedSha;
             if (carried.carried && !AS_JSON) process.stderr.write(`  ↪ ${repoTag(v.repo)}${v.num} human clearance carried: ${carried.reason}\n`);
@@ -5323,9 +5350,10 @@ async function runCli() {
           const keepHumanClearance = hasReviewLabel(v.prLabels, REVIEW_LABELS.accepted) && tamperHeadSha === null;
           const parkDecision = decideParkToHuman({ currentLabels: v.prLabels, keepHumanClearance });
           if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {
-            // E3 (#3929) — ledger row FIRST, additive and fail-soft (same posture as the ordinary park): a miss
-            // is reported and never changes the label write. PR #4631 round 4 (F2): the row is only written when a
-            // LIVE read shows the label absent, so it attests the add was the drain's (see applyTestGamingParkLabel).
+            // E3 (#3929) — the ledger row is additive and fail-soft (same posture as the ordinary park): a miss is
+            // reported and never changes the label write. PR #4631 round 4 (F2): unlike the ordinary park, the order
+            // here is live read → label add → row, and the row is only written when that read showed the label absent
+            // and the add succeeded, so it attests the add was the drain's (see applyTestGamingParkLabel).
             const parkedLabel = applyTestGamingParkLabel({
               repo: v.repo || localSlug, pr: v.num, label: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null,
               readLiveLabels: () => JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim() || '{}').labels ?? null,
