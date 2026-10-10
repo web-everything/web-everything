@@ -17,14 +17,19 @@
  *   done                           -> the normal card-only diff
  */
 
+import { redactSpawnText } from '../lib/describe-spawn-failure.mjs';
+
 export const PREPARE_OUTCOMES = Object.freeze(['done', 'no-change', 'blocked', 'not-applicable']);
 export const PREPARE_BLOCKER_KINDS = Object.freeze(['spec-defect', 'needs-ruling']);
 
-// A separator after the keyword: a colon, a dash, an em/en dash, or just whitespace.
-const SEP = String.raw`\s*(?:[:\-‒-―]|\s)\s*`;
+// A separator after the keyword: a colon, a dash, an em/en dash, a full stop, or just whitespace. Markdown emphasis
+// around the keyword is ignored: live 2026-10-09, `**could-not-prepare** — <policy choice>` (#4354, #4355, #4411,
+// #4488) and `→ could-not-prepare. I left no diff` (#4328) were not read as declines and sat held as failures.
+const SEP = String.raw`[*_\x60]*\s*(?:[:\-.‒-―]|\s)\s*`;
 const ALREADY_DONE_RE = new RegExp(String.raw`(?:^|\n|\b)already[- ]done\b${SEP}`, 'i');
 const COULD_NOT_RE = new RegExp(String.raw`(?:^|\n|\b)could[- ]not[- ]prepare\b${SEP}`, 'i');
-const COMMIT_RE = /\bcommit\s+`?([0-9a-f]{7,40})\b/i;
+// The sha may be quoted (`'10fedba…'`, live #4560) or back-ticked.
+const COMMIT_RE = /\bcommit\s+[`'"]?([0-9a-f]{7,40})\b/i;
 const BARE_SHA_RE = /\b([0-9a-f]{7,40})\b/;
 // "scope is wrong", "wrong scope", "scope: points at the 4309 card itself", "the scope is stale / names the wrong file".
 const SCOPE_DEFECT_RE = /\b(?:wrong|incorrect|stale|bad|invalid)\s+scope\b|\bscope:?`?\s*(?:(?:is|are|was|looks|seems)\s+(?:also\s+|clearly\s+|just\s+|[a-z]+ly\s+)?)?(?:wrong|incorrect|stale|invalid|bad|missing|empty|mismatch\w*)\b|\bscope:?`?\s+(?:points? (?:at|to)|names?|targets?|lists?)\b[^.;\n]{0,80}\b(?:itself|wrong|nothing to build|backlog card)/i;
@@ -126,8 +131,13 @@ export function replaceCardScope(raw, scope) {
 export function needsYouReason(kind, detail) {
   // The hold router scans hold reasons for its own phrases (already-done / superseded / not buildable) and routes
   // lane work on them; a needs-you reason must never trigger that, so those phrases are defused.
-  const clean = String(detail ?? '').replace(/[\p{Cc}`<>]+/gu, ' ')
+  // Strip and collapse FIRST, then defuse: a phrase split by `<`, a backtick or a control character
+  // (`already <done on main`) would otherwise collapse into the very phrase the router matches.
+  // The detail is raw WORKER text that lands in a hold reason, the findings ledger and the tick line, so a token-shaped
+  // string in it is redacted here, in the one shared sink every caller (daemon, ledger, runner) goes through - and BEFORE
+  // the truncation, so the cut can never leave a partial secret no pattern matches any more.
+  const clean = redactSpawnText(String(detail ?? '')).replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
     .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue').replace(/already done on main/gi, 'done elsewhere')
-    .replace(/^\s*worker-declined/i, 'declined').replace(/\s+/g, ' ').trim().slice(0, 300);
+    .replace(/^\s*worker-declined/i, 'declined').trim().slice(0, 300);
   return `needs-you: prepare blocked (${kind}) - ${clean || 'no detail'}; re-scope the card by hand or close it`;
 }

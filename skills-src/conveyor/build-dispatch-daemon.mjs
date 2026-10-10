@@ -32,7 +32,9 @@
  */
 
 import { retryTransientGit } from '../../scripts/lib/git-fetch-retry.mjs';
-import { PLANNING_SNAPSHOT_ENV } from '../../scripts/lib/planning-snapshot.mjs';
+import { PLANNING_SNAPSHOT_ENV, planningRead } from '../../scripts/lib/planning-snapshot.mjs';
+import { resolveChildTimeoutMs } from '../../scripts/lib/bounded-child.mjs';
+import { createFileRunStore } from '../../scripts/operations/run-store.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { readShaCache, writeShaCache } from '../../scripts/lib/pr-snapshot.mjs';
 import { createPhaseTimer } from '../../scripts/lib/phase-timer.mjs';
@@ -83,7 +85,7 @@ import { readMainRedState, resolveFreezeMainRed } from '../../scripts/lib/main-r
 import { mainRedBuildFreeze } from '../../scripts/conveyor/main-ci-red-core.mjs'; // card xu1nixv
 import { MAX_CONCURRENT_LANES_ENV } from '../../scripts/lib/lane-concurrency.mjs';
 
-import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
+import { classifyPrepareFailure, recordPrepareFailure, readFailureState, readPrepareReleases, releasedAttempt, completePrepareFailures, releaseDuePrepareRetries, takePrepareRouteHolds, requeuePrepareRouteHold, rearmFalseHolds, NOT_CONFIRMED_FIX_LANDED_AT } from '../../scripts/conveyor/prepare-failure-policy.mjs';
 import { CARD_REFUSAL_CODE } from '../../scripts/conveyor/retry-backoff.mjs';
 import { recordBuildFailure, clearBuildFailure, listBuildBackoffs, rearmBuildFailures } from '../../scripts/conveyor/build-dispatch-failures.mjs';
 import { redactSpawnText } from '../../scripts/lib/describe-spawn-failure.mjs';
@@ -331,15 +333,34 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       const due = effects.releaseDuePrepareRetries() ?? [];
       // Holds are keyed by card: only lift the PREPARE hold this ledger placed, never another hold on the card.
       if (due.length) releaseOwnPrepareHolds({ nums: due, holds: effects.listHolds?.() ?? [], release: effects.releasePrepareHold });
+      // Live 2026-10-09 — a held prepare whose worker reported already-done (with a commit) becomes an ordinary
+      // dispatch hold the hold router lands as a resolve (graduatedTo that commit), exactly as the runner does.
+      // Each route is already stamped as handed out, so one failed placement must not drop the rest: it is un-stamped
+      // again and handed out on the next tick. (A crash between the stamp and the placement only lets the card be
+      // prepared again, which re-reports it.)
+      for (const r of effects.takePrepareRouteHolds?.() ?? []) {
+        try { effects.placePrepareHold?.({ num: r.num, reason: r.reason }); }
+        catch (e) {
+          console.error(`build-dispatch-daemon: already-done route hold for #${r.num} not placed: ${String(e?.message || e).split('\n')[0]}`);
+          try { effects.requeuePrepareRouteHold?.(r.num, r.reason); } catch { /* the next tick's re-prepare still routes it */ }
+        }
+      }
     } catch (e) { console.error(`build-dispatch-daemon: prepare retry release failed: ${String(e?.message || e).split('\n')[0]}`); }
   }
-  let holds = effects.listHolds?.() ?? [];
+  // A held ledger failure that carries its own reason (a could-not-prepare: `needs-you: …`) is held UNDER that reason,
+  // never as a silent `prepare-unstamped`: the hold router records it and the tick lists it under `needsYou`.
+  const ledgerFailures = effects.listPrepareFailures?.() ?? [];
+  const ledgerHoldReason = new Map(ledgerFailures.filter(f => f.held && !f.completed && f.holdReason).map(f => [normNum(f.num), f.holdReason]));
+  let holds = (effects.listHolds?.() ?? []).map(h => (h.reason === LEDGER_HOLD_REASON && ledgerHoldReason.has(normNum(h.num))
+    ? { ...h, reason: ledgerHoldReason.get(normNum(h.num)), ledger: true } : h));
   const prepareRows = effects.listPrepareInFlight?.() ?? [];
   const prepareClaims = effects.listPrepareClaims?.() ?? [];
   const prepareIsLive = (r) => r.row?.entry?.live === true
     && !(r.row.entry.handle?.startsWith('pid:') && classifyClaimLiveness({ row: r.row,
       isPidAlive: effects.isPidAlive ?? defaultIsPidAlive }).status === 'dead');
-  const isPrepareHold = h => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
+  // `h.ledger`: a ledger hold remapped to its own `needs-you:` reason above is still the prepare-unstamped hold file
+  // underneath, so every prepare-hold check (tracking, stamped-on-main release, completion) must accept it too.
+  const isPrepareHold = h => h.ledger === true || ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason);
   // The stamp a prepare's claim recorded at spawn, kept on its hold too: the claim is released when the attempt ends
   // unstamped, and a later tick must still tell the stamp being replaced from a result.
   // `null` (the card was unstamped at spawn) is a recorded answer, distinct from `undefined` (nothing recorded).
@@ -370,6 +391,9 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
       completedPrepares.add(num);
       if (live && holds.some(h => normNum(h.num) === num && isPrepareHold(h))) effects.releasePrepareHold?.({ num });
+      // A ledger record that carries its own hold reason would otherwise stay held (and listed under `needsYou`)
+      // forever once the card is stamped on main by hand: the stamp is the observation that closes it.
+      if (live && holds.some(h => normNum(h.num) === num && h.ledger)) effects.completePrepareFailures?.(num);
     } catch (e) { prepareReadErrors.set(num, e); }
   }
   holds = holds.filter(h => !isPrepareHold(h) || !completedPrepares.has(normNum(h.num)));
@@ -377,7 +401,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     .filter(g => g.kind !== 'prepare-item' || !completedPrepares.has(normNum(g.num))) };
   const releases = effects.listPrepareReleases?.() ?? [];
   const allSettledPrepares = await effects.listSettledPrepares?.() ?? [];
-  const failureRecords = effects.listPrepareFailures?.() ?? [];
+  const failureRecords = ledgerFailures;
   const released = new Set();
   for (const row of allSettledPrepares) {
     if (releasedAttempt(releases, row.num, row.source)
@@ -388,10 +412,16 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   for (const failure of failureRecords) {
     if (releasedAttempt(releases, failure.num, failure.attempt)
       && !failureRecords.some(f => f.num === failure.num && f.held && !f.completed && !releasedAttempt(releases, f.num, f.attempt))
-      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) released.add(failure.num);
+      && !allSettledPrepares.some(r => r.num === failure.num && !releasedAttempt(releases, r.num, r.source))) {
+      released.add(failure.num);
+      // A reviewed release of an EXHAUSTED retry hold (lane-busy / infra-transient: the hold text tells the operator to
+      // clear it with a release) starts a fresh budget: left uncompleted, its record would still count against the next
+      // failure, which would be exhausted at once and go straight back to needs-you.
+      if (live && failure.holdReason && ['lane-busy', 'infra-transient'].includes(failure.cause)) effects.completePrepareFailures?.(failure.num);
+    }
   }
   holds = holds.filter(h => {
-    if (!released.has(normNum(h.num)) || !h.reason?.startsWith('prepare-')) return true;
+    if (!released.has(normNum(h.num)) || !(h.reason?.startsWith('prepare-') || h.ledger)) return true;
     if (live) effects.releasePrepareHold({ num: normNum(h.num) });
     return false;
   });
@@ -594,6 +624,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // a cooldown: the failure ledger withholds it at once, the card is HELD with the step and reason (the hold
   // router records it in the findings ledger), and it is listed under `needsYou` on the tick line for the operator.
   const needsYou = [];
+  for (const [num, reason] of ledgerHoldReason) if (!completedPrepares.has(num) && !released.has(normNum(num))) needsYou.push({ num, step: 'prepare', reason });
   const surfaceCardRefusal = (num, rec, outcome) => {
     if (!rec || rec.reasonCode !== CARD_REFUSAL_CODE) return;
     const step = outcome?.stepRefused?.step ?? null;
@@ -634,6 +665,22 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     costDecisions.push({ num: normNum(num), kind, ...admitLaunch({ kind: kind === 'prepare' ? 'prepare-item' : kind, settings: costSettings, legacy: gate }) });
     return gate;
   };
+  // Live 2026-10-09 (#4413 at 18:35Z) — dispatch-lane refuses to run from a clone behind origin/main on its code
+  // (#3439); the daemon launched anyway, the refusal released the claim, and the same card was re-launched (and
+  // refused) every few ticks. The daemon now runs that SAME check itself, once per tick, before its first launch:
+  // a refusal holds every launch of the tick (no claim, no failure record) and `cloneStale` asks self-sync for an
+  // immediate gated rebuild. The guard is unchanged; this only stops the daemon planning a launch it will refuse.
+  let cloneFresh;
+  const cloneGate = async (kind, num) => {
+    if (cloneFresh === undefined) {
+      try { cloneFresh = (await effects.dispatcherFresh?.()) ?? { fresh: true }; }
+      catch (e) { cloneFresh = { fresh: false, why: String(e?.message || e).split('\n')[0] }; }
+    }
+    if (cloneFresh.fresh) return true;
+    loadHolds.push({ num: normNum(num), kind, reason: 'clone-stale', why: cloneFresh.why });
+    console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} deferred (clone-stale): ${cloneFresh.why}`);
+    return false;
+  };
   // A LIGHT launch under the rule ON: its own budget / cap / CPU floor; the heavy host gate is not consulted.
   const lightGateFor = (kind, num, lightInFlight) => {
     const d = admitLaunch({ kind, settings: costSettings, facts: { ...readFacts(), lightInFlight } });
@@ -644,9 +691,10 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     } else console.error(`build-dispatch-daemon: ${kind} launch of #${normNum(num)} admitted: ${d.why}`);
     return d;
   };
-  if (live) {
+  const launchBuilds = async () => {
     for (const pick of plan.dispatch) {
       if (launchSlotBusy()) continue;
+      if (!(await cloneGate('build', pick.num))) continue;
       const gate = loadGateFor('build', pick.num);
       if (!gate.admit) continue;
       const claim = effects.acquireClaim({ num: pick.num, scope: pick.scope });
@@ -662,7 +710,11 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         failures.push({ num: pick.num, stage: 'dispatch', reason: res?.reason ?? 'not dispatched', ...(res?.stepRefused ? { step: res.stepRefused.step } : {}), ...(rec ? { reasonCode: rec.reasonCode, attempts: rec.attempts, retryAfter: rec.retryAfter, output: rec.output } : {}) });
       }
     }
-  }
+  };
+  // Live 2026-10-09 16:47–18:28Z: prepare.planned stayed non-empty with 6 free slots for 13 ticks
+  // while every slot went to a build; the slot alternates when both kinds want it.
+  const preparesFirst = launchSettlement.settled.length > 0 && launchSettlement.settled.every((s) => s.kind !== 'prepare-item');
+  if (live && !preparesFirst) await launchBuilds();
   // Separate durable claims use the existing lease primitive, without occupying build slots.
   // Run-store rows survive restarts; guards cover the interval before a dispatched lane is visible.
   const prepareSpawns = d.spawnPrepareItems ?? d.itemPrepareSpawns ?? [];
@@ -685,6 +737,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
   // Card x60i0ie — item prepares are LIGHT: with the rule ON they run under the light cap (else today's two workers).
   const prepareCap = lightCapFor('prepare-item', costSettings, 2);
   const prepare = { policyRoute: configuredPrepare, route: fallback ? 'prepare-route-fallback' : 'probation', enabled: prepareEnabled, cap: prepareCap, planned: [], launched: [], inFlight: [], failures: [], retired: [], held: [], handled: [], stamping: [] };
+  prepare.launchOrder = preparesFirst ? 'prepare-first' : 'build-first';
   prepare.routeFailures = probationRecords.filter(r => r.taskType === 'prepare' && !r.pr && r.launchOutcome !== 'opened-pr' && !PREPARE_HANDLED_OUTCOMES.includes(r.launchOutcome))
     .map(r => ({ item: r.item, attempt: `${r.handle}:${r.scoredAt}`, cause: classifyPrepareFailure(r.evidence), evidence: r.evidence ?? { reason: r.launchOutcome } }));
   const finishedPrepares = new Set(completedPrepares);
@@ -706,13 +759,24 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       : { ...input, cause: classifyPrepareFailure(evidence, stage), retry: false, held: true };
     prepare.failures.push({ num, stage, reason, cause: failure.cause, retry: failure.retry, prevention: failure.prevention });
     if (live && failure.held) effects.placePrepareHold({ num, reason: 'prepare-unstamped', ...holdStamp(num) });
-    if (failure.held) heldNums.add(num);
+    // An already-done report: the resolve route hold (the ledger hands it out once, stamped at record time).
+    // (Stamped at record time, so a failed placement is un-stamped again and handed out on the next tick, exactly like
+    // the retry-release placement above; without that the stamp would leave the route lost.)
+    if (live && failure.routeHold) {
+      try { effects.placePrepareHold({ num, reason: failure.routeHold }); }
+      catch (e) {
+        console.error(`build-dispatch-daemon: already-done route hold for #${num} not placed: ${String(e?.message || e).split('\n')[0]}`);
+        try { effects.requeuePrepareRouteHold?.(num, failure.routeHold); } catch { /* the next tick's re-prepare still routes it */ }
+      }
+    }
+    if (failure.held || failure.routeHold) heldNums.add(num);
+    if (failure.holdReason) needsYou.push({ num: normNum(num), step: 'prepare', reason: failure.holdReason });
     return failure;
   };
   const inspectNums = new Set([...prepareClaims.map((c) => normNum(c.meta.num)),
     ...prepareBusy, ...prepareSpawns.map((s) => normNum(s.num)),
     ...(bookkeeping.prepareGuards ?? []).filter((g) => g.kind === 'prepare-item').map((g) => normNum(g.num)),
-    ...holds.filter((h) => ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason)).map((h) => normNum(h.num))]);
+    ...holds.filter(isPrepareHold).map((h) => normNum(h.num))]);
   for (const f of deferredLaunchFailures) {
     if (f.isPrepare) await failPrepare(f.num, f.outcome?.refused ? 'dispatch-refused' : 'dispatch', f.outcome?.reason ?? 'not dispatched', f.outcome?.evidence ?? {}, f.attempt ?? new Date().toISOString());
     else {
@@ -730,7 +794,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     // settled by its own branch below, so it must not also be read as an unstamped prepare.
     const currentSettled = settled && settled.outcome !== 'prepare-session-dead'
       && (!claim?.meta?.claimedAt || settled.startedAt >= claim.meta.claimedAt);
-    const wasHeld = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+    const wasHeld = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
     const tracked = Boolean(claim) || prepareBusy.has(num);
     // A bare candidate (no claim, no in-flight row, no hold, no current settled attempt) has no evidence of a
     // prepare attempt: skip it, so old PRs/rows never place a hold and the per-tick probe stays bounded.
@@ -775,17 +839,20 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         if (deadUntimed || (worker?.entry?.handle?.startsWith('pid:') && workerLiveness?.status === 'dead')
           || (!worker && liveness.status === 'dead')) why = 'dead prepare owner past heartbeat TTL';
       }
-      const wasUnstamped = holds.some((h) => normNum(h.num) === num && ['prepare-unstamped', 'prepare-stamp-pending'].includes(h.reason));
+      const wasUnstamped = holds.some((h) => normNum(h.num) === num && isPrepareHold(h));
+      // Live 2026-10-09 (4435/4436/4648): 8 stamp spawns per tick, worker `already-stamped`, no PR.
+      // Sections of the replaced stamp are not a result of this re-prepare attempt.
+      const mainHasResult = Boolean(status?.hasSections) && !status?.replacedPreparedDate;
       // A dead session that left sections behind is a finished-but-unstamped run: route it to stamp recovery.
       const deadWithWork = why === 'prepare-session-dead' && status && !status.preparedDate
-        && (status.hasSections || (awaitingPr && status.pr.hasSections));
+        && (mainHasResult || (awaitingPr && status.pr.hasSections));
       const ended = prDone || why === 'dead prepare owner past heartbeat TTL' || wasUnstamped || deadWithWork
         || (currentSettled && !prepareBusy.has(num));
       // An open, stamped PR is a valid finished agent run awaiting landing; main is not stamped yet.
       let unstamped = status && !status.preparedDate && ended && !(awaitingPr && status.pr.preparedDate);
       const priorFailure = failureRecords.findLast(f => f.num === num && f.held && !f.completed && !releasedAttempt(releases, num, f.attempt));
       const failureHeld = Boolean(priorFailure);
-      const recoverable = !failureHeld && unstamped && (status.hasSections || (awaitingPr && status.pr.hasSections));
+      const recoverable = !failureHeld && unstamped && (mainHasResult || (awaitingPr && status.pr.hasSections));
       if (recoverable) {
         // Mechanical completion is separate from agent capacity; failures use the same evidence policy.
         if (live) effects.placePrepareHold({ num, reason: 'prepare-stamp-pending', ...holdStamp(num) });
@@ -825,14 +892,14 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
         // from re-preparing; here it is only surfaced.
         handledOutcome = currentSettled && PREPARE_HANDLED_OUTCOMES.includes(settled.outcome) && !priorFailure ? settled.outcome : null;
         if (handledOutcome) {
-          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: String(settled.evidence?.error ?? 'prepare needs you').slice(0, 300) });
+          if (handledOutcome === 'prepare-needs-you') needsYou.push({ num, step: 'prepare', reason: redactSpawnText(String(settled.evidence?.error ?? 'prepare needs you')).slice(0, 300) });
           prepare.handled.push({ num, outcome: handledOutcome });
           heldNums.add(num);
           why ??= handledOutcome;
         } else {
           const failure = priorFailure ?? await failPrepare(num, 'result', 'prepare-unstamped', evidence, attempt);
           if (priorFailure) prepare.failures.push({ ...priorFailure, reason: priorFailure.evidence?.reason ?? 'prepare-unstamped' });
-          if (failure.held) prepare.held.push({ num, reason: 'prepare-unstamped' });
+          if (failure.held) prepare.held.push({ num, reason: failure.holdReason ?? 'prepare-unstamped' });
           why ??= 'prepare-unstamped';
         }
       }
@@ -876,6 +943,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       prepare.planned.push({ ...pick, num });
       if (!live) { prepareBusy.add(num); continue; }
       if (launchSlotBusy()) continue;
+      if (!(await cloneGate('prepare', num))) continue;
       if (!(costOn ? lightGateFor('prepare-item', num, prepareBusy.size) : loadGateFor('prepare', num)).admit) continue;
       // Record the stamp this attempt starts from (`null` = unstamped), so a re-prepare's result is told from the
       // stamp it replaces by identity, not by how recent its date is. A failed read does NOT spawn: without the
@@ -911,6 +979,7 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
       }
     }
   }
+  if (live && preparesFirst) await launchBuilds();
   // #4348-open-pr-retry — ONE resume pass per LIVE tick, reusing #2659's own backoff/attempt-cap state machine
   // (`scripts/conveyor/infra-blocked.mjs retry`) wholesale rather than re-deriving it here: a `blocked-on-infra`
   // PR-open (the lane ref is already pushed; `deliver-item-wrapper.mjs` now settles this as `open-pending`,
@@ -940,6 +1009,8 @@ async function runTimedBuildDispatchTick({ bookkeeping = {}, live = false, polic
     dispatched,
     // 78b/#4139 — launches deferred by the host-load gate, and the detached-launch settlement this tick did.
     loadHolds,
+    // The stale-code refusal this tick's launches were held on (null when the clone was fresh or nothing launched).
+    cloneStale: cloneFresh && !cloneFresh.fresh ? cloneFresh.why : null,
     // Card x60i0ie — the one cost-class admission line for this tick (heavy vs light, admitted/refused and why).
     costAdmission: { ...summarizeCostAdmission(costDecisions, { settings: costSettings, facts: costOn ? readFacts() : (costFacts ?? {}) }), decisions: costDecisions },
     launchSettlement,
@@ -1020,18 +1091,91 @@ export const BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS = 10 * 60_000;
 
 // EXPORTED (#4464) so a test can assert the env override directly, against an injected `exec` — mirrors this
 // file's own established `{ exec = execFileSync }` seam (`cliRetryInfraBlocked`, below).
-export function cliPlanTick(payload, { exec = execFileSync, config = null } = {}) {
-  const snapshotDir = mkdtempSync(join(tmpdir(), 'builder-plan-'));
+export function cliPlanTick(payload, { exec = execFileSync, config = null, snapshotDir: roundDir = null } = {}) {
+  // #5322 — a round that already started its lane-pool read passes its own snapshot dir (and removes it itself).
+  const snapshotDir = roundDir ?? mkdtempSync(join(tmpdir(), 'builder-plan-'));
   try {
     const text = exec('node', [join(SCRIPTS, 'conveyor', 'tick-core.mjs')], {
       input: JSON.stringify({ bookkeeping: payload || {}, ...(config ? { config } : {}) }), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
-      env: { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE, [PLANNING_SNAPSHOT_ENV]: snapshotDir,
-        // Speed only (card xwn53th): this planning read re-proved every clean lane every tick (~50 s of the tick).
-        // A clean lane's verdict is reused while its stat fingerprint is unchanged and the entry is young.
-        [CLEAN_VERDICT_MEMO_ENV]: process.env[CLEAN_VERDICT_MEMO_ENV] ?? String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS) },
+      env: { ...planningChildEnv(), [PLANNING_SNAPSHOT_ENV]: snapshotDir },
     });
     return JSON.parse(text);
-  } finally { rmSync(snapshotDir, { recursive: true, force: true }); }
+  } finally { if (!roundDir) rmSync(snapshotDir, { recursive: true, force: true }); }
+}
+
+/** The environment of this daemon's planning children (tick-core, and the round's early lane-pool read). */
+function planningChildEnv() {
+  return { ...process.env, [MAX_CONCURRENT_LANES_ENV]: BUILD_DAEMON_LANE_CAP_EXEMPT_VALUE,
+    // Speed only (card xwn53th): this planning read re-proved every clean lane every tick (~50 s of the tick).
+    // A clean lane's verdict is reused while its stat fingerprint is unchanged and the entry is young.
+    [CLEAN_VERDICT_MEMO_ENV]: process.env[CLEAN_VERDICT_MEMO_ENV] ?? String(BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS) };
+}
+
+// #5322 — the exact read tick-core prefetches (`join(scripts/conveyor, '..', 'lane-pool.mjs')` normalises to this
+// path), so the snapshot key matches and tick-core and dispatch-plan find the result instead of scanning again.
+export const PLANNING_LANE_POOL_ARGS = [join(SCRIPTS, 'lane-pool.mjs'), 'list', '--acquirable', '--json'];
+
+function defaultReadLanePool() {
+  return new Promise((resolveRead, rejectRead) => {
+    execFile('node', PLANNING_LANE_POOL_ARGS, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: resolveChildTimeoutMs() * 2, killSignal: 'SIGKILL', env: planningChildEnv() },
+      (err, out) => { if (err) return rejectRead(err); try { resolveRead(JSON.parse(out)); } catch (e) { rejectRead(e); } });
+  });
+}
+
+/**
+ * #5322 (tick overrun) — one builder round's planning snapshot, with the slow lane-pool read (`list --acquirable`,
+ * 20-120 s on a busy pool) STARTED at the top of the round instead of inside tick-core. The read is the same
+ * command with the same environment tick-core would run; only its start time moves, so it overlaps the round's
+ * run-store and prepare reads. A successful result lands in the snapshot (planningRead), where tick-core and
+ * dispatch-plan find it. A failed read stores nothing, and the plan makes its own read exactly as before. If the
+ * plan starts while this read is still running, its own read waits on lane-pool's single-flight lock and takes
+ * this scan's result. `end()` waits for the read, then removes the snapshot.
+ */
+export function startPlanningRound({ readLanePool = defaultReadLanePool } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'builder-plan-'));
+  const prefetch = Promise.resolve()
+    .then(() => planningRead(PLANNING_LANE_POOL_ARGS, readLanePool, { env: { [PLANNING_SNAPSHOT_ENV]: dir } }))
+    .catch(() => null);
+  return {
+    dir,
+    prefetch,
+    end: async () => { await prefetch; rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+/**
+ * #5322 — the round's `planTick`: waits for the round's early lane-pool read, THEN plans inside the round snapshot.
+ * Without the wait, tick-core could start its own identical scan while the early one was still running (the
+ * snapshot has nothing yet), reading the pool twice in one round. The early read began at the top of the round, so
+ * it has overlapped the run-store and prepare reads; a failed read resolves to nothing and the plan reads for itself.
+ */
+export function createRoundPlanTick(round, { plan = cliPlanTick } = {}) {
+  return async (payload, { config } = {}) => {
+    await round.prefetch;
+    return plan(payload, { config, snapshotDir: round.dir });
+  };
+}
+
+/**
+ * #5322 — the backlog and routing inputs `cliPredictRoute` reads, loaded once per round instead of once per
+ * candidate (each backlog load parses every card: ~1.5-4 s, 8-9 candidates a tick). Same loaders, same values,
+ * passed through `cliPredictRoute`'s existing seams. If loading fails, each call falls back to its own read, so
+ * an error surfaces per candidate exactly as before.
+ */
+export async function loadRouteInputs(root = REPO_ROOT) {
+  const io = await import('../../scripts/operations/dispatch-lane-io.mjs');
+  const items = io.defaultLoadItems(root);
+  return { loadItems: () => items, scorecards: io.defaultReadScorecards(), sizePolicy: io.defaultReadSizePolicy({ root }), promotions: io.defaultReadPromotions({ root }) };
+}
+
+export function createRoundRoutePredictor({ predict = cliPredictRoute, loadInputs = () => loadRouteInputs() } = {}) {
+  let inputs;
+  return async (num, scope) => {
+    if (inputs === undefined) {
+      try { inputs = await loadInputs(); } catch { inputs = null; }
+    }
+    return inputs ? predict(num, scope, inputs) : predict(num, scope);
+  };
 }
 
 // #4351's own build-dispatch follow-up (guided by #4309 spend accounting) — this was the top GraphQL spender in the fleet (121
@@ -1052,19 +1196,30 @@ export async function cliFetchOpenPrs() {
   return out;
 }
 
+/**
+ * #5322 — every `dispatch-lane` run record, read once. The run store holds tens of thousands of records of every
+ * operation, so listing it is the expensive part; a round's back-to-back readers (`readBuildRuns`,
+ * `readSettledBuilds`, `readPrepareRuns`) share one read via their `records` option instead of listing it three
+ * times. An unreadable store is `[]` and an unreadable record is skipped — the readers' existing degrade rules.
+ * @returns {Array<{id: string, run: object|null}>}
+ */
+export function readDispatchLaneRunRecords({ store = createFileRunStore() } = {}) {
+  let ids = [];
+  try { ids = store.list().filter((id) => id.startsWith('dispatch-lane')); } catch { return []; }
+  const out = [];
+  for (const id of ids) {
+    try { out.push({ id, run: store.read(id) }); } catch { /* unreadable record: skipped, as before */ }
+  }
+  return out;
+}
+
 // xovjhwh converge round 2 — exported (was module-private) so a test can drive it against a real, broken
 // run-store directory the same way the sibling `cliListSettledBuilds` already is below, and pin the "degrades
 // to `[]`, never throws" claim `deriveDispatchedByBuilder`'s own docblock makes about this exact reader.
-export async function cliListRunStoreInFlight({ now = new Date(), launchKind = 'build', listAgents } = {}) {
-  const { createFileRunStore } = await import('../../scripts/operations/run-store.mjs');
+export async function cliListRunStoreInFlight({ now = new Date(), launchKind = 'build', listAgents, records = null } = {}) {
   const { DISPATCH_EFFECT, dispatchStillHolds } = await import('../../scripts/operations/dispatch-lane.mjs');
-  const store = createFileRunStore();
   const rows = [];
-  let ids = [];
-  try { ids = store.list().filter((id) => id.startsWith('dispatch-lane')); } catch { return rows; }
-  for (const id of ids) {
-    let run;
-    try { run = store.read(id); } catch { continue; }
+  for (const { id, run } of records ?? readDispatchLaneRunRecords()) {
     for (const e of run?.effects || []) {
       if (e?.status !== 'in-flight' || e.type !== DISPATCH_EFFECT || e.payload?.launchKind !== launchKind) continue;
       if (launchKind !== 'prepare-item' && !dispatchStillHolds(e, now.toISOString())) continue;
@@ -1099,16 +1254,10 @@ export async function cliListRunStoreInFlight({ now = new Date(), launchKind = '
  * attempt's own settle apart from an older, already-superseded one for the same item. EXPORTED so a test can
  * drive this against real on-disk run-store state, not just a hand-fed stub.
  */
-export async function cliListSettledBuilds({ launchKind = 'build' } = {}) {
-  const { createFileRunStore } = await import('../../scripts/operations/run-store.mjs');
+export async function cliListSettledBuilds({ launchKind = 'build', records = null } = {}) {
   const { DISPATCH_EFFECT } = await import('../../scripts/operations/dispatch-lane.mjs');
-  const store = createFileRunStore();
   const rows = [];
-  let ids = [];
-  try { ids = store.list().filter((id) => id.startsWith('dispatch-lane')); } catch { return rows; }
-  for (const id of ids) {
-    let run;
-    try { run = store.read(id); } catch { continue; }
+  for (const { id, run } of records ?? readDispatchLaneRunRecords()) {
     for (const e of run?.effects || []) {
       if (e.type !== DISPATCH_EFFECT || e.payload?.launchKind !== launchKind) continue;
       if (e.status !== 'applied' && e.status !== 'failed') continue;
@@ -1306,6 +1455,34 @@ export function cliHostLoadGate(kind = 'build', opts = {}) {
   const { env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample } = opts;
   try { return gateHost({ kind, env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); }
   catch { return { admit: true }; }
+}
+
+/**
+ * The clone-stale launch gate's real check: dispatch-lane's OWN freshness guard (`assertDispatcherFresh`, #3439),
+ * run in this process against this clone, so a launch it would refuse is never started. Only on a daemon-managed
+ * clone: elsewhere dispatch-lane fast-forwards a clean, behind checkout itself, so there is nothing to predict.
+ */
+export async function cliDispatcherFresh({ env = process.env, assertFresh = null, root = REPO_ROOT } = {}) {
+  if (env.WE_DAEMON_MANAGED_CLONE !== '1') return { fresh: true, skipped: 'not-managed' };
+  const check = assertFresh ?? (await import('../../scripts/operations/dispatch-lane-io.mjs')).assertDispatcherFresh;
+  try { check(root); return { fresh: true }; }
+  catch (e) { return { fresh: false, why: redactSpawnText(String(e?.message || e).split('\n')[0]).slice(0, 400) }; }
+}
+
+/**
+ * The newest origin/main commit that changed card `num`'s file after `since` — `{commit, at}` (the first-parent
+ * commit time: when it landed on main), or null. Releases a held could-not-prepare once the operator's ruling
+ * lands on the card (`releaseDuePrepareRetries`'s `cardChange`). Throws on a git failure (the caller keeps the hold).
+ */
+export function cliCardChangedSince(num, since, { root = REPO_ROOT, run = execFileSync } = {}) {
+  const git = (args) => String(run('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }));
+  const prefix = `backlog/${normNum(num)}-`;
+  const path = git(['ls-tree', '--name-only', 'origin/main', 'backlog/']).split('\n')
+    .find((p) => p.startsWith(prefix) && p.endsWith('.md'));
+  if (!path) return null;
+  const [commit, at] = git(['log', '-1', '--first-parent', '--format=%H %cI', 'origin/main', '--', path]).trim().split(' ');
+  if (!/^[0-9a-f]{40}$/.test(commit ?? '') || !(Date.parse(at) > Date.parse(since))) return null;
+  return { commit, at: new Date(Date.parse(at)).toISOString().replace('.000Z', 'Z') };
 }
 
 /** Card xu1nixv — the builder's `main-red` freeze from the health watch's published main-red record (TTL'd). */
@@ -1865,7 +2042,8 @@ function cliEffects() {
   let prepareReader;
   return {
     completePrepareFailures,
-    releaseDuePrepareRetries: () => releaseDuePrepareRetries(),
+    releaseDuePrepareRetries: () => releaseDuePrepareRetries({ cardChange: (num, since) => cliCardChangedSince(num, since) }),
+    dispatcherFresh: () => cliDispatcherFresh(),
     recordBuildFailure: (o) => recordBuildFailure(o),
     clearBuildFailure: ({ num }) => clearBuildFailure(num),
     listBuildBackoffs: () => listBuildBackoffs(),
@@ -1920,6 +2098,8 @@ function cliEffects() {
     listSettledBuilds: () => [],
     listHolds: () => [...cliListHolds(), ...Object.values(readFailureState().failures)
       .filter(f => f.held && !f.completed).map(f => ({ num: f.num, reason: 'prepare-unstamped' }))],
+    takePrepareRouteHolds: () => takePrepareRouteHolds(),
+    requeuePrepareRouteHold: (num, reason) => requeuePrepareRouteHold(num, reason),
     killSwitch: cliKillSwitch,
     mainRedFreeze: cliMainRedFreeze, // card xu1nixv
     dispatch: cliDispatchDetached,
@@ -2054,13 +2234,21 @@ async function dryRun(flags) {
   const timer = createPhaseTimer();
   const effects = cliEffects();
   const prepareEnabled = !flags['no-prepare'];
-  const runStoreRows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight());
+  // #5322 — the same round shape as a live tick: early lane-pool read, one run-store read, route inputs read once.
+  const round = startPlanningRound();
+  effects.planTick = createRoundPlanTick(round);
+  const predictRoute = createRoundRoutePredictor();
+  effects.predictRoute = predictRoute;
+  const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords());
+  const runStoreRows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));
   effects.listRunStoreInFlight = () => runStoreRows;
-  const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds()); // #4349
+  const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds({ records })); // #4349
   effects.listSettledBuilds = () => settledRows;
-  const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item' }));
+  const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item', records }));
   effects.listPrepareInFlight = () => prepareRows;
-  const tick = await runBuildDispatchTick({ bookkeeping: {}, live: false, policy, prepareEnabled, effects, timer });
+  let tick;
+  try { tick = await runBuildDispatchTick({ bookkeeping: {}, live: false, policy, prepareEnabled, effects, timer }); }
+  finally { await round.end(); }
   const core = tick.tickCore;
   const scopeByNum = new Map((core.queue || []).map((r) => [normNum(r.num), r.scope || []]));
   const heldByCore = new Map((core.held || []).map((h) => [normNum(h.num), h.reason]));
@@ -2081,7 +2269,7 @@ async function dryRun(flags) {
   const reportCandidates = [];
   for (const c of [...tick.plan.dispatch, ...tick.plan.hold, ...capacityOnly]) {
     const scope = c.scope || scopeByNum.get(normNum(c.num)) || [];
-    const route = await cliPredictRoute(c.num, scope);
+    const route = await predictRoute(c.num, scope);
     reportCandidates.push({ num: c.num, lane: c.lane, scope, route, executor: route.executor });
   }
   const ifFreed = planBuildDispatch({ candidates: reportCandidates, inFlight, openPrs: normalizeOpenPrs(openPrs), externalBuilding: core.building, killSwitch: cliKillSwitch(), policy, dispatchedByBuilder, fixInFlight: liveFixInFlight(), mainRedFreeze: cliMainRedFreeze() });
@@ -2097,7 +2285,7 @@ async function dryRun(flags) {
     const pick = ifFreed.dispatch.find((x) => x.num === num);
     const held = ifFreed.hold.find((x) => x.num === num);
     // A card only the hold list names needs no route read (it is not a dispatch candidate this tick).
-    const route = (pick || held || focus.includes(num)) ? await cliPredictRoute(num, scopeByNum.get(num) || []) : null;
+    const route = (pick || held || focus.includes(num)) ? await predictRoute(num, scopeByNum.get(num) || []) : null;
     rows.push({
       num,
       tickCore: coreWhy,
@@ -2182,21 +2370,29 @@ async function live(flags) {
   let bookkeeping = {};
   const rawTickOnce = async () => {
     const timer = createPhaseTimer();
-    const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight());
-    effects.listRunStoreInFlight = () => rows;
-    const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds()); // #4349
-    effects.listSettledBuilds = () => settledRows;
-    const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item' }));
-    effects.listPrepareInFlight = () => prepareRows;
-    const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
-    bookkeeping = r.nextBookkeeping;
-    return r;
+    // #5322 — start the lane-pool read now (it overlaps the reads below), and read route inputs once per round.
+    const round = startPlanningRound();
+    effects.planTick = createRoundPlanTick(round);
+    effects.predictRoute = createRoundRoutePredictor();
+    try {
+      const records = timer.measure('readRunStore', () => readDispatchLaneRunRecords()); // #5322 — one read for the three readers below
+      const rows = await timer.measure('readBuildRuns', () => cliListRunStoreInFlight({ records }));
+      effects.listRunStoreInFlight = () => rows;
+      const settledRows = await timer.measure('readSettledBuilds', () => cliListSettledBuilds({ records })); // #4349
+      effects.listSettledBuilds = () => settledRows;
+      const prepareRows = await timer.measure('readPrepareRuns', () => cliListRunStoreInFlight({ launchKind: 'prepare-item', records }));
+      effects.listPrepareInFlight = () => prepareRows;
+      const r = await runBuildDispatchTick({ bookkeeping, live: true, policy, prepareEnabled, effects, timer });
+      bookkeeping = r.nextBookkeeping;
+      return r;
+    } finally { await round.end(); }
   };
   const { wireSelfSyncAndAppAuth } = flags['self-sync'] === true ? await import('./runner.mjs') : {};
   const tickOnce = gatePausedTicks({
     tickOnce: rawTickOnce,
     wrapSync: flags['self-sync'] === true
-      ? (t) => wireSelfSyncAndAppAuth({ tickOnce: t, root: REPO_ROOT, selfSync: true, onRestart: () => { release(); process.exit(0); } })
+      // A tick whose launches were held clone-stale asks for the gated rebuild at once (#3383 bug 1's hook).
+      ? (t) => wireSelfSyncAndAppAuth({ tickOnce: t, root: REPO_ROOT, selfSync: true, hasStaleRefusal: (r) => Boolean(r?.cloneStale), onRestart: () => { release(); process.exit(0); } })
       : null,
     killSwitch: cliKillSwitch,
   });

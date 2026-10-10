@@ -2,9 +2,11 @@
 bornAs: xwn53th
 kind: story
 size: 3
-status: open
+priority: high
+status: resolved
 scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/lane-pool.mjs"]
 dateOpened: "2026-10-07"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
