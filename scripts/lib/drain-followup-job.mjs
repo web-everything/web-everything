@@ -26,10 +26,14 @@
  *    remote rejects throws, and the retry rebuilds on the new tip.
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, unlinkSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { defineJobKind } from './daemon-jobs.mjs';
+import { defineJobKind, kindRegistry } from './daemon-jobs.mjs';
+import { createJobStore, enqueueJob, reattachTick } from './daemon-jobs-runtime.mjs';
+import { daemonJobsDir, daemonJobsRoot } from '../operations/run-store.mjs';
 
 export const DRAIN_FOLLOWUP_KIND = 'drain-followup';
 /** Repo-relative entry, run inside the kind's own worktree (so it runs the code on `main`). */
@@ -62,8 +66,11 @@ export function defineDrainFollowupKind({ prepareWorktree, maxAttempts } = {}) {
  * @param {{passId?: string, landedLocal?: boolean, merged?: Array, landedItems?: Array, carriers?: Array,
  *   openHeadRefs?: Iterable}} o
  */
-export function buildFollowupInput({ passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [] } = {}) {
+export function buildFollowupInput({ passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false, passCwd = null } = {}) {
   return {
+    // The operator's primary checkout to ff-sync once main has the follow-up commits (absent = nothing to sync).
+    // `passCwd`: the pass's own checkout, which the pass already fast-forwards inline — the job must never pull it too.
+    ...(primary ? { primary: String(primary), primaryHinted: !!primaryHinted, ...(passCwd ? { passCwd: String(passCwd) } : {}) } : {}),
     passId: passId == null ? null : String(passId),
     landedLocal: !!landedLocal,
     merged: (Array.isArray(merged) ? merged : []).filter((m) => m && m.num != null)
@@ -143,7 +150,7 @@ function underNumberingLock(withNumberingLock, label, fn) {
 export function followupSteps(deps) {
   const {
     cwd, exec = execFileSync, numberPendingHashes, resolveLandedItem, planResolveOnLand, pushNumberingOnLand,
-    regenDerivedOnLand, withNumberingLock, now = () => new Date().toISOString(),
+    regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand = null, now = () => new Date().toISOString(),
   } = deps;
   return [
     {
@@ -189,5 +196,144 @@ export function followupSteps(deps) {
         return { derived: { baseSha, done: d.done, failed: d.failed, committed: !!d.committed, pushed: !!d.pushed, ...(d.warning ? { warning: d.warning } : {}), at: now() } };
       }),
     },
+    {
+      // x4y74wj — the operator's primary checkout ff-sync the pass used to do inline (its `postMergeSync`). It
+      // runs last, so the primary gets the numbering + regen commits too. Best-effort: a skip is recorded, never
+      // thrown (a dirty or diverged primary is the operator's to reconcile; retrying cannot help).
+      name: 'primary-sync',
+      run: ({ input }) => {
+        if (!input?.primary || typeof syncPrimaryOnLand !== 'function') return { primarySync: { synced: false, reason: 'not-located', at: now() } };
+        const gitAt = (a) => exec('git', a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+        // "Is this the cwd" means the job worktree OR the pass's checkout: a primary that IS the pass's cwd was
+        // already synced inline, and a second writer there would race the pass's own sweep and git index.
+        // `.native` folds case on a case-insensitive volume (APFS), so `/Users/Foo/x` and `/Users/foo/x` compare equal.
+        const isCwd = (p) => { try { const r = realpathSync.native(p); return r === realpathSync.native(cwd) || (!!input.passCwd && r === realpathSync.native(input.passCwd)); } catch { return false; } };
+        const r = syncPrimaryOnLand({ exec: gitAt, primary: input.primary, hinted: !!input.primaryHinted, isCwd });
+        return { primarySync: { synced: !!r.synced, reason: r.reason, at: now() } };
+      },
+    },
   ];
+}
+
+// ── wiring (x4y74wj): the pass hands its follow-up to a detached job ─────────────────────────────────────────
+
+/** Platform preference file for the switch (policy cascade, like `red-main-hold.json`). */
+export const DRAIN_FOLLOWUP_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'drain-followup-job.json');
+/** Tool override. */
+export const DRAIN_FOLLOWUP_ENV = 'WE_DRAIN_FOLLOWUP_JOB';
+
+const onOff = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
+
+/**
+ * Setting `drainFollowupJob` (`on` | `off`, built-in `on`). Policy cascade: built-in default → platform
+ * preference (`we:scripts/settings/drain-followup-job.json`) → tool override (env `WE_DRAIN_FOLLOWUP_JOB`).
+ * `off` = the pass runs numbering / resolve-on-land / push / derived regen / post-merge sync inline, as before.
+ */
+export function resolveDrainFollowupSetting({ env = process.env, file = DRAIN_FOLLOWUP_SETTINGS_FILE } = {}) {
+  const fromEnv = onOff(env?.[DRAIN_FOLLOWUP_ENV]);
+  if (fromEnv) return { value: fromEnv, source: 'env' };
+  try { const f = onOff(JSON.parse(readFileSync(file, 'utf8'))?.drainFollowupJob); if (f) return { value: f, source: 'settings' }; } catch { /* built-in */ }
+  return { value: 'on', source: 'default' };
+}
+
+/** The follow-up job folder. ONE per host: the kind is serial, so every drain (daemon or a lane's fast drain) queues behind one writer to main. */
+export function drainFollowupJobsDir(env = process.env) {
+  return daemonJobsDir(DRAIN_FOLLOWUP_KIND, env);
+}
+
+/**
+ * Where the job's worktree lives for a given launching clone: `<jobsRoot>/drain-followup-worktrees/<hash>/main`,
+ * outside every git tree (a daemon clone refresh `reset --hard` + `clean -fd`s its own tree). The worktree has no
+ * `node_modules`; a symlink beside it (`<hash>/node_modules` → the clone's) is found by Node's parent-directory
+ * lookup, so the real entry runs unmodified and the symlink never shows up as an untracked file in the worktree.
+ */
+export function followupWorktreeLayout({ repoDir, env = process.env }) {
+  let real = resolve(repoDir);
+  try { real = realpathSync(real); } catch { /* not created yet — the resolved path still keys it */ }
+  const base = join(daemonJobsRoot(env), 'drain-followup-worktrees', createHash('sha256').update(real).digest('hex').slice(0, 12));
+  return { base, worktreeDir: join(base, 'main'), depsLink: join(base, 'node_modules'), depsTarget: join(real, 'node_modules') };
+}
+
+/** Point `link` at `target` (re-pointing a stale link). No-op when the target does not exist. */
+export function ensureDepsLink({ link, target }) {
+  if (!existsSync(target)) return false;
+  let st = null;
+  try { st = lstatSync(link); } catch { /* absent */ }
+  if (st) {
+    if (!st.isSymbolicLink()) return true; // a real directory someone installed — leave it
+    if (readlinkSync(link) === target) return true;
+    unlinkSync(link);
+  }
+  mkdirSync(dirname(link), { recursive: true });
+  symlinkSync(target, link, 'dir');
+  return true;
+}
+
+const errLine = (e) => String((e && e.message) || e).split('\n')[0];
+
+/**
+ * THE HOOK merge-ai-prs calls at its follow-up point. With the setting on it records one `drain-followup` job
+ * for a pass that landed a local PR, then runs one reattach tick (which launches it detached, and resumes or
+ * fails a job a dead daemon left behind). It never waits on the job. Returns `handedOff: true` only when the
+ * job record exists and did not fail at launch — anything else (`off`, dry run, nothing landed, a setup or
+ * enqueue failure, a job the tick failed because its worktree could not be prepared) leaves the pass on its
+ * inline path, so a broken job layer can never drop the numbering.
+ * @param {{landed: boolean, dryRun?: boolean, buildInput: () => object, repoDir?: string, env?: object,
+ *   setting?: {value: string, source: string}, store?: object, reattach?: Function, prepareWorktree?: Function,
+ *   log?: Function, now?: () => number}} o
+ * @returns {Promise<{handedOff: boolean, mode: 'job'|'inline', reason?: string, job?: object|null, actions?: object[]}>}
+ */
+export async function handOffDrainFollowup({
+  landed, dryRun = false, buildInput, repoDir = process.cwd(), env = process.env,
+  setting = resolveDrainFollowupSetting({ env }), store, reattach = reattachTick, prepareWorktree, log = () => {}, now = () => Date.now(),
+} = {}) {
+  if (setting.value !== 'on') return { handedOff: false, mode: 'inline', reason: `setting off (${setting.source})` };
+  if (dryRun) return { handedOff: false, mode: 'inline', reason: 'dry-run' };
+  let jobStore;
+  let kinds;
+  try {
+    jobStore = store ?? createJobStore(drainFollowupJobsDir(env));
+    mkdirSync(jobStore.dir, { recursive: true });
+    const layout = followupWorktreeLayout({ repoDir, env });
+    const prep = prepareWorktree ?? (() => {
+      const dir = makeFollowupWorktreePreparer({ repoDir, worktreeDir: layout.worktreeDir })();
+      ensureDepsLink({ link: layout.depsLink, target: layout.depsTarget });
+      return dir;
+    });
+    kinds = kindRegistry([defineDrainFollowupKind({ prepareWorktree: prep })]);
+  } catch (e) {
+    log(`drain-followup: job layer unavailable (${errLine(e)}) — running the follow-up inline`);
+    return { handedOff: false, mode: 'inline', reason: `setup-failed: ${errLine(e)}` };
+  }
+  let queued = null;
+  if (landed) {
+    try {
+      queued = enqueueJob({ store: jobStore, kindDef: kinds.get(DRAIN_FOLLOWUP_KIND), input: buildInput(), now: now() });
+    } catch (e) {
+      log(`drain-followup: could not queue the job (${errLine(e)}) — running the follow-up inline`);
+      return { handedOff: false, mode: 'inline', reason: `enqueue-failed: ${errLine(e)}` };
+    }
+  }
+  let actions = [];
+  try {
+    actions = (await reattach({ store: jobStore, kinds, maxConcurrent: 1, log })).actions;
+  } catch (e) {
+    log(`drain-followup: reattach tick failed (${errLine(e)}) — the job stays queued; the next pass launches it`);
+  }
+  // A throwing read (a corrupt record) is the same as an unreadable one: nothing will run it, so the pass goes inline.
+  let rec = null;
+  if (queued) { try { rec = jobStore.read(queued.id); } catch { rec = null; } }
+  // The record, not the enqueue, decides: the reattach tick fails a job outright when its code cannot be prepared
+  // (a `git fetch` blip, a worktree conflict) and never retries it, so a `failed` record means nothing will run
+  // the follow-up — the pass must keep its inline path, or the numbering is dropped. (A `queued` record after a
+  // tick that threw is different: the next pass launches it, so that stays handed off.)
+  if (queued && (!rec || rec.job.status === 'failed')) {
+    const why = rec ? (rec.job.error || 'job failed at launch') : 'job record unreadable';
+    log(`drain-followup: the job did not start (${errLine(why)}) — running the follow-up inline`);
+    return { handedOff: false, mode: 'inline', reason: `launch-failed: ${errLine(why)}`, job: rec ? { id: rec.id, status: rec.job.status, attempts: rec.job.attempts } : null, actions };
+  }
+  return {
+    handedOff: !!queued, mode: 'job', ...(queued ? {} : { reason: 'nothing-landed' }),
+    job: rec ? { id: rec.id, status: rec.job.status, attempts: rec.job.attempts } : null, actions,
+  };
 }
