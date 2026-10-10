@@ -17,7 +17,7 @@
  * PURE: reads only the PR's own comment thread and head sha.
  */
 // Takeover budget — each takeover is an EPISODE (its signals with no verdict between them); the grant is per episode.
-import { takeoverEpisodes, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
+import { takeoverEpisodes, OPERATOR_TAKEOVER_PREFIX, isPausedReview } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
 import { isReviewVerdictComment as isVerdict } from './mechanical-round-cap.mjs';
@@ -47,6 +47,9 @@ export function escalationDispatches(comments) {
   ].filter((d) => Number.isFinite(d.at)).sort((a, b) => a.at - b.at);
 }
 
+/** How many paused reviews (referrals awaiting a ruling) one escalation head may take before its grant is spent. */
+export const PAUSED_REVIEW_LIMIT = 2;
+
 /**
  * PURE: may this PR's CURRENT head get a review although the round cap is spent?
  * `{ ok: true, anchor, allowance, used, via }` or `{ ok: false, reason }`. ANY fix the system itself dispatched past
@@ -69,10 +72,15 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const anchor = Number.isFinite(push) ? push : latest.at;
   const head = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reason: 'no-head' };
-  const verdicts = comments.filter(isVerdict);
+  // A review that only PAUSED on referrals awaiting a ruling neither reviews the head nor spends the grant: the
+  // ruling wakes it and the woken review is the one owed (live #4708, 483aab1e2 refused 6/5). Bounded: a head whose
+  // review paused PAUSED_REVIEW_LIMIT times has spent its grant.
+  const verdicts = comments.filter((c) => isVerdict(c) && !isPausedReview(c));
   if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head))) return { ok: false, reason: 'head-already-reviewed' };
   const used = verdicts.filter((c) => timeOf(c) > anchor).length;
   if (used >= allowance) return { ok: false, reason: 'takeover-review-spent', used, allowance };
+  const paused = comments.filter((c) => isPausedReview(c) && timeOf(c) > anchor).length;
+  if (paused >= PAUSED_REVIEW_LIMIT) return { ok: false, reason: 'takeover-review-spent', used, paused, allowance };
   return {
     ok: true, anchor: new Date(anchor).toISOString(), allowance, used, via: latest.via,
     takeover: takeoverEpisodes(comments).length,
