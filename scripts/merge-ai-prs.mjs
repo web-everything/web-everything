@@ -5561,7 +5561,7 @@ async function runCli() {
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
-  const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug }); // xtpxusq — logs strategy + source once per pass
+  const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -5953,7 +5953,8 @@ async function runCli() {
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
-          });
+          }, mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; a refused lock retries next pass
+          if (landLock.ran === false) { if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           if (landLock.contended && !AS_JSON) process.stderr.write(`  ⚠ merge-write mutex not acquired (held by ${landLock.heldBy || '?'}) — merged under the per-PR idempotency guard instead (#2683)\n`);
           if (landLock.result && landLock.result.skipped === 'already-merged') {
             // xvzc4v4 (merge-safety review, bug 2) — THIS BRANCH USED TO withhold the PR from `merged` on the
@@ -6033,7 +6034,7 @@ async function runCli() {
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);
     __t.add('mergeCascade', __t.mark() - __mergeCascadeT0);
   }
-  mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
+  const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
 
   // Sync the LOCAL main checkout to the just-advanced origin/main (a merged PR moved origin, not local) — local
   // main is KEPT UP TO DATE after each merge (user request 2026-07-03). `--autostash` is what makes this
@@ -6258,6 +6259,11 @@ async function runCli() {
       if (derived.warning) process.stderr.write(`  ⚠ ${derived.warning}\n`);
     }
   }
+
+  // xtpxusq — retire the queue-merged PRs' follow-ups only now that numbering, resolve-on-land and derived regen are
+  // done AND none of them reported a failure; otherwise they stay pending and the next pass reruns them (idempotent).
+  const queueFollowUpsClean = (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
+  mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
   // for the watch's idle accounting exactly like a rebase-drop rebuild — it lands on a later pass.

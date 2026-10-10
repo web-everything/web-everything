@@ -9,7 +9,7 @@ tags: []
 
 # merge-gate: read the drain enqueue clearance + retire the mergeQueue.strategy alias
 
-Follow-up of xtpxusq. The drain now stamps a we-drain-enqueue-clearance comment per judged head before it enqueues; the drain-merge-strategy lib exports readEnqueueClearance. Wire it into the merge-gate check's gatherPrFacts (replace the null enqueueClearance fact; read comments with author login) and choose the trusted author list (the drain's gh identity; fail closed when unset). Also retire or alias the drain-internal mergeQueue.strategy setting so the cascade has one strategy key. Deferred because the check script was held by red-main-freeze-shared and the settings file by PR 4689.
+Follow-up of xtpxusq. The drain now stamps a we-drain-enqueue-clearance comment per judged head before it enqueues; the drain-merge-strategy lib exports readEnqueueClearance. Wire it into the merge-gate check's gatherPrFacts (replace the null enqueueClearance fact; read comments with author login) and choose the trusted author list (the drain's gh identity; fail closed when unset). The trusted list MUST contain the exact login the drain stamps as (`gh api user --jq .login`, which `we:scripts/lib/drain-merge-strategy.mjs` also uses to decide whether its own stamp already exists); a bot/app login can differ in form (`app/x` vs `x[bot]`), so compare normalized logins and add a test that writer and reader agree. Also retire or alias the drain-internal mergeQueue.strategy setting so the cascade has one strategy key. Deferred because the check script was held by red-main-freeze-shared and the settings file by PR 4689.
 
 ## Acceptance
 

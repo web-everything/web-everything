@@ -18,6 +18,11 @@
  *     added to the pass's `merged` list and `landedThisPass` ONCE (`planQueueFollowUps` against the recorded
  *     followed-up set), so the drain's existing post-land path (local sync, JIT numbering, resolve-on-land, derived
  *     regen) runs for them. A queued PR closed without merging is dropped from the pending list with a log line.
+ *     A merged PR leaves `pending` only when `confirmQueueFollowUps` is called after that post-land work SUCCEEDED, so a
+ *     crash or failed step in between retries it next pass (the post-land steps are idempotent). Every write of the
+ *     state file re-reads it under the land lock (the one `enqueue` already runs inside), so no process's entry is lost.
+ *   - The enqueue-clearance stamp is skipped only when the DRAIN's own login already posted the marker for the head;
+ *     a marker from any other author never suppresses it (the reader trusts only listed authors).
  *
  *   Manifest strip before land (`needsManifestStripBeforeMerge`) needs no hook: the drain's rebase-drop step runs it
  *   for every landable manifest PR BEFORE the land cascade, whatever the strategy.
@@ -38,6 +43,7 @@ export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
 export const CLEARANCE_MARKER = 'we-drain-enqueue-clearance';
 const CLEARANCE_RE = new RegExp(`<!--\\s*${CLEARANCE_MARKER}\\s+head=([0-9a-f]{7,40})\\s*-->`, 'gi');
 const FOLLOWED_UP_CAP = 500;
+export const FOLLOW_UP_MAX_ATTEMPTS = 5;
 
 export function queueStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-merge-queue-followups.json'); }
 
@@ -80,8 +86,17 @@ export function readEnqueueClearance({ comments = [], headSha, trustedAuthors = 
   return { coversHead: false, reason: 'no trusted clearance for this head' };
 }
 
-/** Has a clearance for `headSha` already been posted (any author)? Pure; used only to avoid duplicate stamps. */
-export function hasClearanceFor(comments, headSha) {
+/**
+ * Has a TRUSTED clearance for `headSha` already been posted? Pure; used only to avoid duplicate stamps. It shares
+ * `readEnqueueClearance`'s trust rule on purpose: a marker from anyone else (a PR author planting the string first)
+ * must not make the drain skip its own stamp, or the reader would never find a trusted one for that head.
+ */
+export function hasClearanceFor(comments, headSha, trustedAuthors = []) {
+  return readEnqueueClearance({ comments, headSha, trustedAuthors }).coversHead;
+}
+
+/** Does ANY comment (any author) carry a clearance marker for `headSha`? Pure; only gates the drain-identity lookup. */
+function anyClearanceMarkerFor(comments, headSha) {
   return (Array.isArray(comments) ? comments : []).some((c) => {
     CLEARANCE_RE.lastIndex = 0;
     let m;
@@ -90,11 +105,17 @@ export function hasClearanceFor(comments, headSha) {
   });
 }
 
+const isEntry = (p) => !!p && typeof p === 'object' && p.num != null;
+
+/**
+ * Read the follow-up state. A MISSING file (ENOENT) is a normal empty state; any other read/parse failure is
+ * `unreadable:true` — callers must NOT write over it (an empty write would erase every pending follow-up).
+ */
 export function readQueueState(path, readFile = readFileSync) {
   try {
     const s = JSON.parse(readFile(path, 'utf8'));
-    return { pending: Array.isArray(s?.pending) ? s.pending : [], followedUp: Array.isArray(s?.followedUp) ? s.followedUp : [], exists: true };
-  } catch { return { pending: [], followedUp: [], exists: false }; }
+    return { pending: Array.isArray(s?.pending) ? s.pending.filter(isEntry) : [], followedUp: Array.isArray(s?.followedUp) ? s.followedUp.filter((k) => typeof k === 'string') : [], exists: true, unreadable: false };
+  } catch (e) { return { pending: [], followedUp: [], exists: false, unreadable: e?.code !== 'ENOENT' }; }
 }
 
 function writeQueueState(path, state) {
@@ -111,15 +132,41 @@ const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n')
  * The per-pass strategy object the drain's hooks call.
  * @param {{dryRun?:boolean, quiet?:boolean, isLocalRepo?:Function, localSlug?:string, exec?:Function,
  *   statePath?:string, resolved?:{policy:object, note:(string|null)}, log?:{write:Function},
- *   readFile?:Function, writeState?:Function}} o
+ *   readFile?:Function, writeState?:Function, withLock?:Function}} o
+ *   `withLock(fn)` runs `fn` under the drain's land-write mutex and returns `{ran, result}` (`ran:false` = refused).
+ *   `enqueue()` is itself called INSIDE that mutex by the drain, so it never takes it again; `collectQueueMerged` and
+ *   `confirmQueueFollowUps` run outside it and take it for their state write.
  */
 export function createDrainMergeStrategy({
   dryRun = false, quiet = false, isLocalRepo = () => true, localSlug = null, exec = execFileSync,
   statePath = queueStatePath(), resolved = resolveDrainMergePolicy({ dryRun }), log = process.stderr,
-  readFile = readFileSync, writeState = writeQueueState,
+  readFile = readFileSync, writeState = writeQueueState, withLock = (fn) => ({ ran: true, result: fn() }),
 } = {}) {
   const { policy, note } = resolved;
   const say = (line) => { if (!quiet) log.write(`${line}\n`); };
+  /**
+   * Read-modify-write of the shared follow-up state file: under the land lock, RE-READ the file (so an enqueue by
+   * another drain process that landed since this pass first read it is kept), apply `fn`, write. A refused lock
+   * writes nothing — the next pass redoes it, which every state change here tolerates.
+   */
+  const mutateState = (what, fn) => {
+    let unreadable = false;
+    const lock = withLock(() => {
+      const st = readQueueState(statePath, readFile);
+      if (st.unreadable) { unreadable = true; return false; }
+      fn(st); writeState(statePath, { pending: st.pending, followedUp: st.followedUp }); return true;
+    });
+    if (lock?.ran === false) { say(`  ⚠ merge-queue follow-up state lock not acquired — ${what} not recorded this pass; retried next pass`); return false; }
+    if (unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — ${what} not recorded (file left untouched); fix or remove it`); return false; }
+    return true;
+  };
+  let drainLoginMemo; // undefined = not looked up yet; null = the lookup failed (stay on the stamp-again side)
+  const drainLogin = () => {
+    if (drainLoginMemo !== undefined) return drainLoginMemo;
+    try { drainLoginMemo = String(exec('gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })).trim() || null; }
+    catch { drainLoginMemo = null; }
+    return drainLoginMemo;
+  };
   log.write(`  ${formatMergeDeliverySourcesLine(policy)}${dryRun ? ' [dry run]' : ''}\n`);
   if (note) log.write(`  ⚠ merge-delivery: ${note}\n`);
   const enqueueMode = mergeActionFor(policy) === 'enqueue';
@@ -154,7 +201,12 @@ export function createDrainMergeStrategy({
       if (!enqueues(c.repo)) throw new Error('enqueue called for a repo outside github-merge-queue');
       if (dryRun) throw new Error('enqueue refused in dry run');
       if (!headSha) throw new Error('github-merge-queue: no pinned head — refusing to enqueue (and NOT merging directly)');
-      if (!Array.isArray(comments) || !hasClearanceFor(comments, headSha)) {
+      // An unreadable state file would be overwritten with just this PR once enqueued, erasing every other pending follow-up.
+      if (readQueueState(statePath, readFile).unreadable) throw new Error(`github-merge-queue: follow-up state ${statePath} is unreadable — refusing to enqueue (and NOT merging directly); fix or remove it`);
+      // Skip the stamp only for a marker the DRAIN itself posted: a lookup of the drain's identity (made at most once
+      // per pass, and only when some marker for this head exists) that fails or finds no match stamps again.
+      const alreadyStamped = Array.isArray(comments) && anyClearanceMarkerFor(comments, headSha) && (() => { const me = drainLogin(); return !!me && hasClearanceFor(comments, headSha, [me]); })();
+      if (!alreadyStamped) {
         try { exec('gh', ['pr', 'comment', String(c.num), '--repo', slugOf(c.repo), '--body', buildClearanceComment(headSha)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { say(`  ⚠ ${keyOf(c.repo, c.num)} enqueue clearance stamp failed (${firstLine(e)}) — merge-gate's couple/blockedBy gates will fail closed for it`); }
       }
@@ -170,38 +222,70 @@ export function createDrainMergeStrategy({
     },
 
     /**
-     * Each pass: PRs GitHub's queue merged since the last follow-up join `merged` / `landedThisPass` exactly once.
+     * Each pass: PRs GitHub's queue merged and not yet confirmed join `merged` / `landedThisPass`, and are RETURNED.
+     * They STAY in the pending list: the caller runs the post-land work (numbering / resolve-on-land / regen) and
+     * then calls `confirmQueueFollowUps`, which is the only thing that retires them. A crash or a failed post-land
+     * step in between leaves them pending, so the next pass runs the (idempotent) follow-up again.
+     * Only a PR that left the queue CLOSED, or one already confirmed, is dropped here.
      * No state file → no `gh` call (drain-direct stays byte-identical).
      * @param {{merged:Array, landedThisPass:Set, landedIdsFor:Function}} o
+     * @returns {Array} the pending entries whose follow-up this pass must confirm
      */
     collectQueueMerged({ merged, landedThisPass, landedIdsFor = () => [] }) {
       const state = readQueueState(statePath, readFile);
+      if (state.unreadable) { say(`  ⚠ merge-queue follow-up state ${statePath} is unreadable — no queue follow-up this pass (file left untouched); fix or remove it`); return []; }
       if (!state.exists || !state.pending.length) return [];
       const facts = [];
-      const keep = [];
+      const drop = new Set(); // keys to retire from `pending`; everything else (open, read failure) stays
+      const followedUpKeys = new Set(state.followedUp);
       for (const p of state.pending) {
         let v;
         try { v = JSON.parse(exec('gh', ['pr', 'view', String(p.num), '--repo', slugOf(p.repo), '--json', 'number,state,mergedAt,mergeCommit'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '{}'); }
-        catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); keep.push(p); continue; }
-        if (v?.state === 'MERGED') facts.push({ p, v });
-        else if (v?.state === 'CLOSED') say(`  · ${keyOf(p.repo, p.num)} left the merge queue CLOSED without merging — dropped from the follow-up list`);
-        else keep.push(p);
+        catch (e) { say(`  ⚠ ${keyOf(p.repo, p.num)} queue follow-up read failed (${firstLine(e)}) — retried next pass`); continue; }
+        if (v?.state === 'MERGED') { if (followedUpKeys.has(keyOf(p.repo, p.num))) drop.add(keyOf(p.repo, p.num)); else facts.push({ p, v }); }
+        else if (v?.state === 'CLOSED') { drop.add(keyOf(p.repo, p.num)); say(`  · ${keyOf(p.repo, p.num)} left the merge queue CLOSED without merging — dropped from the follow-up list`); }
       }
-      const followedUpKeys = new Set(state.followedUp);
-      const plan = planQueueFollowUps({ merged: facts.filter((f) => !followedUpKeys.has(keyOf(f.p.repo, f.p.num))).map((f) => ({ number: f.p.num, mergedAt: f.v.mergedAt, mergeCommit: f.v.mergeCommit })) });
+      const plan = planQueueFollowUps({ merged: facts.map((f) => ({ number: f.p.num, mergedAt: f.v.mergedAt, mergeCommit: f.v.mergeCommit })) });
       const done = [];
+      const attempted = new Set(); // keys whose follow-up this pass starts: counted, so a persistent failure stops being retried
       for (const fu of plan) {
         const p = facts.find((f) => Number(f.p.num) === fu.num).p;
-        if (dryRun) { say(`  github-merge-queue: would run the post-land follow-up for ${keyOf(p.repo, p.num)} (merged by GitHub at ${fu.mergedAt})`); keep.push(p); continue; }
+        if (dryRun) { say(`  github-merge-queue: would run the post-land follow-up for ${keyOf(p.repo, p.num)} (merged by GitHub at ${fu.mergedAt})`); continue; }
+        if ((Number(p.followUpAttempts) || 0) >= FOLLOW_UP_MAX_ATTEMPTS) {
+          say(`  ✗ ${keyOf(p.repo, p.num)} merged by GitHub's merge queue but its post-land follow-up failed ${FOLLOW_UP_MAX_ATTEMPTS} passes in a row — STOPPED retrying (kept in ${statePath}); run its numbering/resolve/regen by hand, then remove it`);
+          continue;
+        }
+        attempted.add(keyOf(p.repo, p.num));
         merged.push({ num: p.num, repo: p.repo, headSha: p.headSha ?? null, mergedBy: 'github-merge-queue' });
         for (const id of landedIdsFor(p)) landedThisPass.add(id);
-        state.followedUp.push(keyOf(p.repo, p.num));
         done.push(p);
         say(`  ✓ ${keyOf(p.repo, p.num)} merged by GitHub's merge queue${fu.mergeSha ? ` (${String(fu.mergeSha).slice(0, 9)})` : ''} — running its numbering/resolve/regen follow-up this pass`);
       }
-      // A merged PR already followed up (a crash between the write and the follow-up) just leaves the pending list.
-      if (!dryRun) writeState(statePath, { pending: keep, followedUp: state.followedUp });
+      if (!dryRun && (drop.size || attempted.size)) {
+        mutateState('the closed/already-followed-up drop and attempt count', (st) => {
+          st.pending = st.pending.filter((p) => !drop.has(keyOf(p.repo, p.num)));
+          for (const p of st.pending) if (attempted.has(keyOf(p.repo, p.num))) p.followUpAttempts = (Number(p.followUpAttempts) || 0) + 1;
+        });
+      }
       return done;
+    },
+
+    /**
+     * Retire the follow-ups `collectQueueMerged` returned, once the post-land work for them is DONE: they leave
+     * `pending` and join `followedUp`. `complete:false` (a post-land step failed) keeps them pending so the next
+     * pass retries. Re-reads the state under the lock, so entries other processes added meanwhile survive.
+     * @param {Array} done the array `collectQueueMerged` returned
+     * @param {{complete?:boolean}} o
+     */
+    confirmQueueFollowUps(done = [], { complete = true } = {}) {
+      if (dryRun || !done.length) return { confirmed: 0 };
+      if (!complete) { say(`  ⚠ ${done.length} merge-queue follow-up(s) NOT confirmed (a post-land step failed): ${done.map((p) => keyOf(p.repo, p.num)).join(', ')} — they stay pending and rerun next pass`); return { confirmed: 0 }; }
+      const keys = new Set(done.map((p) => keyOf(p.repo, p.num)));
+      const ok = mutateState('the follow-up confirmation', (st) => {
+        st.pending = st.pending.filter((p) => !keys.has(keyOf(p.repo, p.num)));
+        for (const k of keys) if (!st.followedUp.includes(k)) st.followedUp.push(k);
+      });
+      return { confirmed: ok ? keys.size : 0 };
     },
   };
 }
