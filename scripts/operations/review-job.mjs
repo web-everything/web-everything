@@ -336,6 +336,20 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
       }
     },
+    // x1b8hlo — THE RED-TEAM GATE, its own process and wall, run only after the red team. It reads the red-team
+    // comment back for the LIVE head and acts under `redTeam.confirmedBreaks` (send back / card / advisory).
+    runRedTeamGate: ({ pr, repo }) => {
+      try {
+        const r = node(['scripts/operations/red-team-gate-apply.mjs', `--pr=${pr}`, `--repo=${repo}`], { timeoutMs: 10 * 60 * 1000 });
+        for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
+          writeLineSync(2, `  ${line}`);
+        }
+        const last = String(r.stdout ?? '').trim().split('\n').pop() ?? '';
+        try { return JSON.parse(last); } catch { return { status: 'error', reason: `red-team gate exit ${r.status}${r.signal ? ` (${r.signal})` : ''}, no result` }; }
+      } catch (e) {
+        return { status: 'error', reason: String(e?.message ?? e).slice(0, 300) };
+      }
+    },
     log: (line) => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
   };
 }
@@ -388,7 +402,10 @@ function tail(text, n = 400) {
  *   5. (#4194) only then, when the loop printed a finished review, run the ADDED non-Claude seats
  *      (`review-extra-seats.mjs`) and attach their summary as `extraSeats` — advisory, never read by any verdict;
  *   6. (x00g3tt) and, when that review ACCEPTED, the post-accept RED TEAM (`review-extra-seats.mjs red-team`),
- *      attached as `redTeam` — advisory in v1: one deduped comment + evidence rows, never a label or a merge.
+ *      attached as `redTeam` — one deduped comment + evidence rows, never a label or a merge itself;
+ *   7. (x1b8hlo) then the RED-TEAM GATE (`red-team-gate-apply.mjs`), attached as `redTeamGate`: a confirmed `broken`
+ *      break on the live head goes back to the fixer (review:changes via review-set-label, bounded by the round cap),
+ *      a confirmed `degraded` one becomes a follow-up card (setting `redTeam.confirmedBreaks`).
  * @param {{pr:number|string, repo:string, laneWaitMs?:number, loopTimeoutMs?:number}} o
  * @param {ReturnType<typeof createReviewJobIo>} [io]
  * @returns {{pr:number, repo:string, sessionSlug:string, outcome:string, verdict:(string|null),
@@ -425,6 +442,16 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
     io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
       + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
     out.redTeam = summarizeRedTeam(redTeam);
+    // x1b8hlo — THE RED-TEAM GATE: a confirmed `broken` break on the live head goes back to the fixer (review:changes
+    // through review-set-label, bounded by the round cap); a confirmed `degraded` one becomes a follow-up card. Same
+    // containment as above: a crash is a status in `redTeamGate`, and it never accepts or clears anything.
+    if (typeof io.runRedTeamGate === 'function') {
+      let gate;
+      try { gate = io.runRedTeamGate({ pr: out.pr, repo: out.repo }); } catch (e) { gate = { status: 'error', reason: tail(e?.message ?? e, 300) }; }
+      io.log(`review-job ${out.sessionSlug}: red-team gate — ${gate?.status ?? 'none'}${gate?.outcome ? ` → ${gate.outcome}` : ''}${gate?.reason ? ` (${gate.reason})` : ''}`);
+      out.redTeamGate = { status: gate?.status ?? null, outcome: gate?.outcome ?? null, ...(gate?.reason ? { reason: gate.reason } : {}),
+        ...(gate?.plan ? { sendBack: gate.plan.sendBack.length, card: gate.plan.card.length, advisory: gate.plan.advisory.length } : {}) };
+    }
   }
   return out;
 }
