@@ -1,4 +1,5 @@
 ---
+bornAs: x0m7a8x
 kind: story
 size: 3
 parent: "4075"
@@ -13,7 +14,7 @@ tags: []
 Slice 2 of #4126. Slice 1 (lane/jobmodel-4126) moved the shared clone rebuild + live smoke into a detached durable
 job (we:scripts/lib/daemon-rebuild/rebuild-job.mjs on the daemon-jobs runtime) for the drain, review,
 build-dispatch and fix daemons: the tick adopts only a smoke-passed ready candidate. Remaining:
-(1) the fix daemon still runs the pre-job x44lnnt builder process, which now only launches the rebuild job and
+(1) the fix daemon still runs the pre-job 5561 builder process, which now only launches the rebuild job and
 adopts its result — retire the bespoke builder record (we:scripts/lib/daemon-background-build.mjs) once the job
 covers its re-clone and swap-spacing rules;
 (2) the drain's refreshClone still runs `npm ci` on the data clone inline when the lockfile changes — run it as a

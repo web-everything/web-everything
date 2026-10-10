@@ -26,7 +26,7 @@ candidate or a skip-unrelated move, existing rules unchanged) and otherwise queu
 #4125 runtime; the job runs the unchanged build + live smoke + fallback/hold logic with `--ready-only` and records
 a passing build as the ready candidate without moving the clone. The swap is the daemon's next tick (a
 self-sync daemon restarts onto the adopted head as before). The rest (the drain's data-clone `npm ci`, the drain
-reloading on rebuild-code changes, retiring the x44lnnt builder process) is filed as x0m7a8x.
+reloading on rebuild-code changes, retiring the 5561 builder process) is filed as 5691.
 
 ## Done when
 
