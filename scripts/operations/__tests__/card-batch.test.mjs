@@ -22,7 +22,7 @@ describe('card batch planner', () => {
     ['unknown-kind', { input: { ...input, kind: 'bogus' } }],
     ['invalid-policy', { policy: {} }],
     ['invalid-policy', { policy: { ...policy, mystery: {} } }],
-    ['kind-disabled', { input: { ...input, kind: 'filing' } }],
+    ['kind-disabled', { input: { ...input, kind: 'prepare' } }],
     ['ineligible-change', { input: { ...input, cardPath: 'src/code.mjs' } }],
     ['ineligible-change', { input: { ...input, cardPath: 'backlog/sub/5192-card.md' } }],
     ['lease-held', { state, owner: 'bob' }],
