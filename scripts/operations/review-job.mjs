@@ -75,7 +75,7 @@ import { readReviewCiGate, formatReviewCiSkip } from '../lib/review-ci-gate-io.m
 
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,14 +94,32 @@ import { recorderFor, setActiveRecorder } from './telemetry-store.mjs';
 import { ACTOR_ENV } from '../lib/review-independence.mjs';
 import { INFRA_RETRY_COOLOFF_MS } from '../conveyor/reconcile-core.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
-import { extraSeatsEnabled, redTeamEnabled, resolveSeatTimeoutMs } from './review-extra-seats.mjs';
+import {
+  createRedTeamIo, extraSeatsEnabled, recordDiscardedRedTeam, redTeamEnabled, resolveSeatTimeoutMs,
+} from './review-extra-seats.mjs';
 import { redTeamRequired } from '../lib/jury-core.mjs';
+import {
+  decideSpeculativeOutcome, formatSpeculativeRedTeamSourceLine, loadSpeculativeRedTeam, READ_SINK_ENV,
+} from '../lib/speculative-red-team.mjs';
 import { decideStackDispatch, fingerprintOf, mainNetDiffText, readBottomLanded, readStackBase, readStackThread, resolveStackAwareReview, stackNetDiffText, liveStackMarkers } from '../conveyor/review-stack-base.mjs';
 import { UNATTENDED_REVIEW_ACTOR } from './review-loop-cli.mjs';
 import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { isUnderTest } from '../lib/under-test.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
+
+/** Card xbizuci — a blocking sleep for the job's (synchronous) waits on the speculative red team's process. */
+function sleepSync(ms) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+
+/** Card xbizuci — is the speculative red team still running? Our own detached child is never reaped while this
+ *  process blocks (no event loop turn), so an exited one lingers as a zombie that `kill(pid, 0)` still sees:
+ *  ask `ps` for its state and read a zombie (or no row) as gone. */
+function specAlive(pid) {
+  if (!pidAlive(pid)) return false;
+  const r = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 10_000 });
+  const stat = String(r.stdout ?? '').trim();
+  return r.status === 0 && stat !== '' && !stat.startsWith('Z');
+}
 
 // The job-record store, re-exported so a caller has one import for the whole review-job surface.
 export * from './review-job-store.mjs';
@@ -242,11 +260,11 @@ export function laneCooloffActive(record, nowMs, cooloffMs = INFRA_RETRY_COOLOFF
 
 /** The real effects, each one command. `root` is the checkout the arc runs from (the daemon's clone). */
 export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = reviewJobsDir(env, root) } = {}) {
-  const node = (args, { actorId, timeoutMs } = {}) => spawnSync(process.execPath, args, {
+  const node = (args, { actorId, timeoutMs, extraEnv = null } = {}) => spawnSync(process.execPath, args, {
     cwd: root,
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
-    env: { ...env, ...(actorId ? { [ACTOR_ENV]: actorId } : {}) },
+    env: { ...env, ...(actorId ? { [ACTOR_ENV]: actorId } : {}), ...(extraEnv ?? {}) },
     ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' } : {}),
   });
   return {
@@ -281,11 +299,11 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
       if (r.status === 0 && path.startsWith('/') && existsSync(path)) return { lanePath: path };
       return { lanePath: null, error: String(r.stderr || r.error?.message || `exit ${r.status}`).trim().split('\n').slice(-3).join(' | ').slice(0, 500) };
     },
-    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs }) => {
+    runLoop: ({ pr, repo, lanePath, actorId, timeoutMs, readSink = null }) => {
       const r = node([
         'scripts/operations/review-loop-cli.mjs', `--pr=${pr}`, `--repo=${repo}`, `--cwd=${lanePath}`,
         '--provider=claude', '--json',
-      ], { actorId, timeoutMs });
+      ], { actorId, timeoutMs, ...(readSink ? { extraEnv: { [READ_SINK_ENV]: readSink } } : {}) });
       return {
         status: r.status, signal: r.signal ?? null, stdout: String(r.stdout ?? ''), stderr: String(r.stderr ?? ''),
         timedOut: r.error?.code === 'ETIMEDOUT' || (r.signal === 'SIGKILL' && r.status === null),
@@ -350,8 +368,148 @@ export function createReviewJobIo({ root = REPO_ROOT, env = process.env, dir = r
         return { status: 'error', reason: String(e?.message ?? e).slice(0, 300) };
       }
     },
+    // Card xbizuci — `review.speculativeRedTeam` resolved through the policy cascade (see `../lib/speculative-red-team.mjs`).
+    speculativeRedTeamSetting: () => loadSpeculativeRedTeam({ env }),
+    // Card xbizuci — THE SPECULATIVE RED TEAM, its own detached process group so it runs WHILE the loop runs (the loop
+    // is a blocking spawnSync). It waits for the loop's read sink, makes the call, and writes its pass to `passFile`.
+    startSpeculativeRedTeam: ({ pr, repo, lanePath, slug, waitMs }) => {
+      if (!redTeamEnabled(env)) return null;
+      mkdirSync(dir, { recursive: true });
+      const base = join(dir, `${slug}.spec-red-team`);
+      const handle = { readSink: `${base}.read.json`, passFile: `${base}.pass.json`, reservedFile: `${base}.pass.json.reserved`, logFile: `${base}.log` };
+      for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* fresh */ } }
+      const fd = openSync(handle.logFile, 'w');
+      try {
+        const child = spawn(process.execPath, [
+          'scripts/operations/review-extra-seats.mjs', 'red-team-speculate', `--pr=${pr}`, `--repo=${repo}`, `--lane=${lanePath}`,
+          `--read-sink=${handle.readSink}`, `--out=${handle.passFile}`, `--wait-ms=${waitMs}`,
+        ], { cwd: root, env, stdio: ['ignore', fd, fd], detached: true });
+        child.unref();
+        if (!child.pid) return null;
+        return { ...handle, pid: child.pid, startedAt: Date.now() };
+      } finally { closeSync(fd); }
+    },
+    // Card xbizuci — wait (bounded) for the speculative pass of an ACCEPTED review. Returns the pass file's content,
+    // or null when the process died (or the wall ran out) without writing one.
+    awaitSpeculativeRedTeam: (handle, { timeoutMs }) => {
+      const t0 = Date.now();
+      const readPass = () => { try { return existsSync(handle.passFile) ? JSON.parse(readFileSync(handle.passFile, 'utf8')) : null; } catch { return null; } };
+      for (;;) {
+        const pass = readPass();
+        if (pass) return { spec: pass, waitedMs: Date.now() - t0 };
+        if (!specAlive(handle.pid)) return { spec: readPass(), waitedMs: Date.now() - t0 };
+        if (Date.now() - t0 >= timeoutMs) {
+          try { process.kill(-handle.pid, 'SIGTERM'); } catch { /* gone */ }
+          return { spec: null, waitedMs: Date.now() - t0, timedOut: true };
+        }
+        sleepSync(1000);
+      }
+    },
+    // Card xbizuci — call the speculative pass off (the review did not accept): SIGTERM its process group (its handler
+    // kills the seat CLI's own group), wait up to 30s, then SIGKILL. Returns what it had: the finished pass, or the
+    // reservation of a call still in flight — the spend to record as discarded.
+    cancelSpeculativeRedTeam: (handle) => {
+      if (specAlive(handle.pid)) {
+        try { process.kill(-handle.pid, 'SIGTERM'); } catch { /* gone */ }
+        const t0 = Date.now();
+        while (specAlive(handle.pid) && Date.now() - t0 < 30_000) sleepSync(250);
+        if (specAlive(handle.pid)) { try { process.kill(-handle.pid, 'SIGKILL'); } catch { /* gone */ } }
+      }
+      const readJson = (f) => { try { return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null; } catch { return null; } };
+      return { spec: readJson(handle.passFile), reserved: readJson(handle.reservedFile) };
+    },
+    // Card xbizuci — the second half of an accepted review's speculative pass, its own process and wall (same
+    // containment as `runRedTeam`).
+    finishSpeculativeRedTeam: ({ pr, repo, loopPayload, slug, handle }) => {
+      const loopFile = join(dir, `${slug}.red-team.loop.json`);
+      try {
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(loopFile, JSON.stringify(loopPayload));
+        const r = node([
+          'scripts/operations/review-extra-seats.mjs', 'red-team-finish', `--pr=${pr}`, `--repo=${repo}`, `--pass=${handle.passFile}`, `--loop-json=${loopFile}`,
+        ], { timeoutMs: 10 * 60 * 1000 });
+        for (const line of String(r.stderr ?? '').split('\n').filter((l) => l && !/DeprecationWarning|trace-deprecation/.test(l))) {
+          writeLineSync(2, `  ${line}`);
+        }
+        const last = String(r.stdout ?? '').trim().split('\n').pop() ?? '';
+        try { return JSON.parse(last); } catch { return { status: 'error', reason: `red-team finish exit ${r.status}${r.signal ? ` (${r.signal})` : ''}, no result` }; }
+      } catch (e) {
+        return { status: 'error', reason: String(e?.message ?? e).slice(0, 300) };
+      } finally {
+        try { rmSync(loopFile, { force: true }); } catch { /* best effort */ }
+      }
+    },
+    recordDiscardedRedTeam: (o) => recordDiscardedRedTeam(o, createRedTeamIo({ env })),
+    cleanupSpeculativeRedTeam: (handle) => {
+      for (const f of [handle.readSink, handle.passFile, handle.reservedFile]) { try { rmSync(f, { force: true }); } catch { /* best effort */ } }
+    },
     log: (line) => writeLineSync(2, `[${new Date().toISOString()}] ${line}`),
   };
+}
+
+/** Card xbizuci — the red team's own wall, measured from when the speculative pass STARTED (today's sequential wall). */
+export function speculativeRedTeamWallMs(env = process.env) {
+  return resolveSeatTimeoutMs(env) + 20 * 60 * 1000;
+}
+
+/**
+ * Card xbizuci — SETTLE THE SPECULATIVE RED TEAM once the review is over. Returns `{decision, ..., result}` where
+ * `result`, when set, IS the red team's result for this review (the caller treats it exactly like `runRedTeam`'s),
+ * and null means "run the sequential pass" (`sequential`, `stale`, `superseded`) or "nothing is owed" (`discard`).
+ *   - not accepted → `discard`: called off (killed if still running), nothing posted or routed, spend recorded;
+ *   - accepted + a model call in hand → `finish` (`red-team-finish` re-checks it judged the review's very read;
+ *     a different read is `stale`, a clean row that landed meanwhile is `superseded` — both record the call as
+ *     discarded and fall back to the sequential pass);
+ *   - accepted + the process died / errored / ran out its wall → `failed`: the red team's result is an `error`,
+ *     the same degraded result a crashed sequential pass gives (an unrun red team never folds to accept);
+ *   - accepted + no model call (disabled, skipped, a prior row to resume, no read sunk) → `sequential`.
+ * Never throws past its own `try` (the caller also contains it). Removes the pass's files when done.
+ */
+export function settleSpeculativeRedTeam({ spec, accepted, out, input }, io) {
+  const at = (ms) => (Number.isFinite(ms) && Number.isFinite(spec.startedAt) ? ms - spec.startedAt : null);
+  const timings = (pass) => ({
+    readAfterMs: at(pass?.timings?.readAt), finishedAfterMs: at(pass?.timings?.finishedAt), loopFinishedAfterMs: at(spec.loopFinishedAt),
+  });
+  const log = (line) => { try { io.log(`review-job ${out.sessionSlug}: red team (speculative) — ${line}`); } catch { /* best effort */ } };
+  try {
+    if (!accepted) {
+      const { spec: pass, reserved } = io.cancelSpeculativeRedTeam(spec);
+      const reason = `review ${out.outcome} with verdict ${out.verdict ?? 'none'} — not accept`;
+      const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reserved, reason });
+      log(`discarded (${reason}); pass ${pass?.status ?? (reserved ? 'in flight, killed' : 'not started')}; spend ${spend?.status ?? '-'}`);
+      return { decision: 'discard', passStatus: pass?.status ?? (reserved ? 'killed-in-flight' : 'not-started'), spend, timings: timings(pass), result: null };
+    }
+    const remaining = Math.max(60_000, speculativeRedTeamWallMs() - (Date.now() - spec.startedAt));
+    const waited = io.awaitSpeculativeRedTeam(spec, { timeoutMs: remaining });
+    const pass = waited.spec;
+    const decision = decideSpeculativeOutcome({ accepted: true, spec: waited.timedOut ? null : pass });
+    const base = { waitedMs: waited.waitedMs ?? null, timings: timings(pass) };
+    log(`${decision}; pass ${pass?.status ?? 'none'}; read at +${base.timings.readAfterMs ?? '?'}ms, pass done at +${base.timings.finishedAfterMs ?? '?'}ms, `
+      + `loop done at +${base.timings.loopFinishedAfterMs ?? '?'}ms; waited ${base.waitedMs ?? '?'}ms after the review`);
+    if (decision === 'finish') {
+      const result = io.finishSpeculativeRedTeam({ pr: out.pr, repo: out.repo, loopPayload: input.loopPayload, slug: out.sessionSlug, handle: spec });
+      if (result?.status === 'stale' || result?.status === 'superseded') {
+        const spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, pass, reason: `${result.status}: ${result.reason ?? ''}` });
+        log(`${result.status} (${result.reason ?? ''}) — sequential pass instead; spend ${spend?.status ?? '-'}`);
+        return { decision: result.status, reason: result.reason ?? null, spend, ...base, result: null };
+      }
+      return { decision: 'finish', ...base, result };
+    }
+    if (decision === 'failed') {
+      let spend = null;
+      if (!pass || waited.timedOut) {
+        const { reserved } = io.cancelSpeculativeRedTeam(spec);
+        if (reserved) spend = io.recordDiscardedRedTeam({ pr: out.pr, repo: out.repo, reserved, reason: 'speculative red team died or ran out its wall mid-call' });
+      }
+      const result = pass?.status === 'error' && !waited.timedOut
+        ? { status: 'error', reason: pass.reason ?? 'speculative red team error' }
+        : { status: 'error', reason: waited.timedOut ? 'speculative red team exceeded its wall' : 'speculative red team process died without a result' };
+      return { decision: 'failed', ...(spend ? { spend } : {}), ...base, result };
+    }
+    return { decision: 'sequential', passStatus: pass?.status ?? null, reason: pass?.reason ?? null, ...base, result: null };
+  } finally {
+    try { io.cleanupSpeculativeRedTeam?.(spec); } catch { /* best effort */ }
+  }
 }
 
 /** x00g3tt — the compact form of the red team's result the job prints (the full rows live in the store). */
@@ -414,6 +572,14 @@ function tail(text, n = 400) {
  */
 export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   const seatsBox = {};
+  // Card xbizuci — `review.speculativeRedTeam` (policy cascade; the layer that set it is logged). Off, or an io
+  // without the hook, is the sequential order: the red team starts only after the review accepts.
+  if (typeof io.speculativeRedTeamSetting === 'function') {
+    let setting;
+    try { setting = io.speculativeRedTeamSetting(); } catch { setting = null; }
+    seatsBox.speculativeEnabled = setting?.enabled === true;
+    if (setting) io.log(`review-job: ${formatSpeculativeRedTeamSourceLine(setting)}`);
+  }
   const out = runReviewArc(opts, io, seatsBox);
   // #4194 — THE ADDED NON-CLAUDE SEATS (advisory lenses + one extra juror on Codex/Gemini), beside Claude's
   // mandatory seats and strictly AFTER the arc is over: the verdict is labelled, `done` is reported, the lane is
@@ -432,13 +598,27 @@ export function runReviewJob(opts = {}, io = createReviewJobIo()) {
   }
   // x00g3tt — THE POST-ACCEPT RED TEAM: owed only when Claude's review ACCEPTED (`redTeamRequired`), and only after
   // everything above. Same containment as the seats: a crash is a status in `redTeam`, never a changed outcome.
-  if (seatsBox.input && redTeamRequired(out.verdict) && typeof io.runRedTeam === 'function') {
-    let redTeam;
+  // Card xbizuci — under `review.speculativeRedTeam` it was already started beside the loop (`seatsBox.speculative`):
+  // an accept finishes THAT pass (same rows, comment and gate as the sequential pass); anything else calls it off.
+  const spec = seatsBox.speculative ?? null;
+  const accepted = Boolean(seatsBox.input) && redTeamRequired(out.verdict);
+  if (spec) {
     try {
-      redTeam = io.runRedTeam(seatsBox.input);
+      out.redTeamSpeculative = settleSpeculativeRedTeam({ spec, accepted, out, input: seatsBox.input }, io);
     } catch (e) {
-      redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
+      out.redTeamSpeculative = { decision: 'error', reason: tail(e?.message ?? e, 300) };
     }
+  }
+  if (accepted && (out.redTeamSpeculative?.result || typeof io.runRedTeam === 'function')) {
+    let redTeam = out.redTeamSpeculative?.result ?? null;
+    if (!redTeam) {
+      try {
+        redTeam = io.runRedTeam(seatsBox.input);
+      } catch (e) {
+        redTeam = { status: 'error', reason: tail(e?.message ?? e, 300) };
+      }
+    }
+    if (out.redTeamSpeculative) delete out.redTeamSpeculative.result;
     io.log(`review-job ${out.sessionSlug}: red team — ${redTeam?.status ?? 'none'}${redTeam?.reason ? ` (${redTeam.reason})` : ''}`
       + `${redTeam?.status === 'ran' ? `: ${redTeam.findings?.length ?? 0} break(s), ${redTeam.confirmedMissCount ?? 0} confirmed, comment ${redTeam.comment?.status ?? '-'}` : ''}`);
     out.redTeam = summarizeRedTeam(redTeam);
@@ -517,10 +697,24 @@ function runReviewArc({
     lanePath = acq.lanePath;
     io.updateRecord({ ...record, cwd: lanePath, actorId });
 
+    // Card xbizuci — `review.speculativeRedTeam`: start the red team NOW, beside the loop. It waits for the loop's
+    // `read` (the sink below) and runs on exactly that head and diff while the jurors judge; `runReviewJob` keeps it
+    // only if the review accepts. Starting it can never fail the review: a failed start is the sequential order.
+    seatsBox.speculative = null;
+    if (seatsBox.speculativeEnabled && typeof io.startSpeculativeRedTeam === 'function') {
+      try {
+        seatsBox.speculative = io.startSpeculativeRedTeam({ pr: planned.pr, repo: planned.repo, lanePath, slug, waitMs: loopTimeoutMs });
+        if (seatsBox.speculative) io.log(`review-job ${slug}: red team started speculatively (pid ${seatsBox.speculative.pid}) beside the review loop`);
+      } catch (e) {
+        io.log(`review-job ${slug}: speculative red team did not start (${tail(e?.message ?? e, 200)}) — sequential order`);
+        seatsBox.speculative = null;
+      }
+    }
     io.log(`review-job ${slug}: running review-loop-cli in ${lanePath}`);
     const loopSpan = span('review.loop');
     const tL = io.now();
-    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs });
+    const loop = io.runLoop({ pr: planned.pr, repo: planned.repo, lanePath, actorId, timeoutMs: loopTimeoutMs, readSink: seatsBox.speculative?.readSink ?? null });
+    if (seatsBox.speculative) seatsBox.speculative.loopFinishedAt = io.now();
     timings.loopMs = io.now() - tL;
     const parsed = parseReviewLoopStdout(loop.stdout);
     if (loop.timedOut) {

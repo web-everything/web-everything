@@ -84,6 +84,7 @@ import { randomUUID } from 'node:crypto';
 import { DEFAULT_LENS, SECURITY_SEAT_STEP, seatSecurityForTouchSet, securitySeatFromRun } from './review-pr.mjs';
 import { parallelSeatsEnabled, seatsByTouchSetEnabled } from '../lib/review-seat-settings.mjs';
 import { planReviewDispatch } from './review-dispatch.mjs';
+import { READ_SINK_ENV, withReadSink } from '../lib/speculative-red-team.mjs';
 // #4493 — this file's own mechanized prevention filing had the SAME orphaned-card bug `we:scripts/review-set-
 // label.mjs#fileApprovalPreventionCard` was fixed for under #4317: `fileItemForPrevention` below drives
 // `file-item` IN PROCESS, against whatever checkout is running the review daemon (routinely a read-only clone,
@@ -949,7 +950,10 @@ if (IS_CLI) {
   // judged came from `REPO_ROOT` on every single unattended review ever run (PR #2122 merged on it).
   // `review.seatsByTouchSet` — the seat list is chosen HERE, before the run starts, from the PR's touch-set (or, on a
   // `--resume`, from the saved run), and handed to the declaration's registration. See `chooseSecuritySeat`.
-  const store = createFileRunStore();
+  // Card xbizuci — `review.speculativeRedTeam`: when the review job names a read sink, the run's `read` finding is
+  // also written there the moment the read step finishes, so the job's speculative red team can start beside the
+  // juror seats on exactly the head and net diff they judge. No sink named → the store is unchanged.
+  const store = withReadSink(createFileRunStore(), process.env[READ_SINK_ENV]);
   const seating = chooseSecuritySeat(argv, { enabled: seatsByTouchSetEnabled(), store });
   try { process.stderr.write(`review seats: security juror ${seating.securitySeat ? 'seated' : 'NOT seated'} — ${seating.reason}\n`); } catch { /* best effort */ }
   const { declaration, registry, sinks } = resolveOperation(
