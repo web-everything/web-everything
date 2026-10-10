@@ -15,7 +15,10 @@ import {
 } from '../accept-carry-forward.mjs';
 import { decideSetLabel, runReviewLabelCli, buildVerdictComment } from '../../review-set-label.mjs';
 import { parseLatestHumanClearedSha, parseOperatorClearance } from '../review-escalation.mjs';
-import { readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND } from '../../merge-ai-prs.mjs';
+import {
+  readDrainAcceptance, carryHumanClearanceOnIdenticalDiff, readDrainCarryEvidence, buildDrainReasonComment, MERGE_TRACE_KIND,
+  buildTestGamingParkReason, buildHeldReviewHoldReason, applyTestGamingParkLabel,
+} from '../../merge-ai-prs.mjs';
 import { ADVISORY_NOTE_MARKER } from '../../conveyor/advisory-round-count.mjs';
 import { REBASE_ONTO_MAIN_COMMENT_MARKER, MISSING_RUN_COMMENT_MARKER } from '../../conveyor/main-red-recovery.mjs';
 import { HUNG_CI_COMMENT_MARKER } from '../../conveyor/ci-red-recovery-watch.mjs';
@@ -146,7 +149,9 @@ describe('guards — anything but a proven-identical net diff falls back to toda
 describe('a later verdict or deliberate hold is never carried past (positive identification, every consumer)', () => {
   const BOT = { login: 'web-everything' };
   const after = (body, author = BOT) => [...fx.comments, { author, body, createdAt: '2026-10-09T15:00:00Z' }];
-  const drainPark = (reason) => `<!-- drain-park-reason -->\n⏸ **Parked for review by the drain**\n\n${reason}`;
+  // The REAL builder, never a hand-typed look-alike (PR #4631 round 4, F1): `MECHANICAL_PARK_RE` anchors on the marker and
+  // heading, so a reworded drain park must redden these cases instead of silently never carrying.
+  const drainPark = (reason) => buildDrainReasonComment('park', reason);
   const verdict = (comments) => decideAcceptCarryForward({ setting: 'on', record: latestAcceptRecord(comments), headSha: NEW, headDiff: fx.netDiff[NEW] });
   const planned = (comments) => planAcceptCarry([{ number: 7, labels: ['review:human'], headRefOid: NEW, comments }], { setting: 'on' });
 
@@ -246,14 +251,21 @@ describe('a later verdict or deliberate hold is never carried past (positive ide
   });
 
   it('the anti-test-gaming drain park (a function of the diff) does NOT block: the #4535 shape this card exists for', () => {
-    const comments = after(drainPark('test-gaming suspected — CI-green may be manufactured by tampering with tests: 1 test removed'));
+    // Both the reason (`buildTestGamingParkReason`, the text the drain writes into the comment AND the ledger row) and the
+    // comment (`buildDrainReasonComment`) come from the drain's own exported builders.
+    const comments = after(drainPark(buildTestGamingParkReason(['1 test removed'])));
     expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
     expect(verdict(comments)).toMatchObject({ action: 'carry', human: true });
     expect(planned(comments)).toEqual([{ num: 7, head: NEW, from: OLD }]);
   });
 
+  it('the stacked-base variant of the real test-gaming park reason is the same mechanical shape', () => {
+    const comments = after(drainPark(buildTestGamingParkReason(['1 test removed'], { sharedPaths: ['a.test.mjs'] }, 4600)));
+    expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
+  });
+
   it('the drain restating an already-standing hold (posted after the test-gaming re-park strips ready-to-merge) does NOT block', () => {
-    const comments = after(drainPark('held — a review hold (review:human) stands on this PR'));
+    const comments = after(drainPark(buildHeldReviewHoldReason({ labels: ['review:human'], body: '' })));
     expect(latestAcceptRecord(comments).laterVerdict).toBe(false);
     expect(planned(comments)).toEqual([{ num: 7, head: NEW, from: OLD }]);
   });
@@ -636,6 +648,66 @@ describe('decideMechanicalHold — the hold-origin rule (pure)', () => {
   it('other labels on the timeline are ignored', () => {
     const other = { event: 'unlabeled', created_at: iso(30_000), label: { name: 'ready-to-merge' } };
     expect(decide({ events: [ev(9_000), other] }).mechanical).toBe(true);
+  });
+});
+
+// PR #4631 round 4 (F2, CONFIRMED broken): the pure rule cannot tell the drain's label add from an operator's when both
+// are the same login and the drain's add was a no-op (the operator's `review:human` landed between the drain's ledger row
+// and its add, or in the batch before it): ONE label event pairs with the drain's row and the restamp erased the hold.
+// Attribution therefore lives in the WRITER: no ledger row unless a LIVE read shows the label absent just before the add.
+describe('applyTestGamingParkLabel — only a live-absent label is attested as the drain\'s own add', () => {
+  const T = Date.parse('2026-10-09T14:36:41.318Z');
+  const iso = (ms) => new Date(T + ms).toISOString();
+  const LABEL = 'review:human';
+  const operatorAdd = (ms) => ({ event: 'labeled', created_at: iso(ms), label: { name: LABEL } });
+  const run = (live) => {
+    const log = [];
+    const rows = [];
+    const out = applyTestGamingParkLabel({
+      repo: 'web-everything/web-everything', pr: 5, label: LABEL, reason: buildTestGamingParkReason(['1 test removed']), headSha: 'a'.repeat(40),
+      readLiveLabels: typeof live === 'function' ? live : () => live,
+      record: (o) => { log.push('record'); rows.push({ pr: o.pr, verdict: 'human', source: 'merge-ai-prs', actor: { declared: 'drain' }, at: iso(0), reason: o.reason }); return { ok: true, errors: [] }; },
+      addLabel: (l) => { log.push(`add:${l}`); },
+    });
+    return { out, log, rows };
+  };
+  const decide = (rows, events) => decideMechanicalHold({ pr: 5, clearAt: iso(-3_600_000), rows, events });
+
+  it('positive control (#4535): label absent live -> ledger row FIRST, then the add; the pairing is mechanical', () => {
+    const { out, log, rows } = run([{ name: 'ready-to-merge' }]);
+    expect(log).toEqual(['record', `add:${LABEL}`]);
+    expect(out).toMatchObject({ ledgered: true, added: true });
+    expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(true);
+  });
+  it('INTERLEAVING: the operator\'s review:human already stands at the drain\'s add -> no row, no add, the hold is never mechanical', () => {
+    const { out, log, rows } = run([{ name: LABEL }]);
+    expect(log).toEqual([]);
+    expect(out).toMatchObject({ ledgered: false, added: false });
+    // The lone label event on the timeline is the operator's; with no drain row to pair with it the restamp refuses.
+    expect(decide(rows, [operatorAdd(2_000)])).toMatchObject({ mechanical: false });
+    expect(decide(rows, [operatorAdd(2_000)]).reason).toMatch(/no drain test-gaming park is ledgered/);
+  });
+  it('labels as bare strings are read too (the gh label shape is not assumed)', () => {
+    expect(run([LABEL]).log).toEqual([]);
+  });
+  it('an unreadable live read (null, throw, non-array) still PLACES the hold but writes no row, so the origin is unattested', () => {
+    for (const live of [null, () => { throw new Error('gh down'); }, () => 'nope', undefined]) {
+      const { out, log, rows } = run(live);
+      expect(log).toEqual([`add:${LABEL}`]);
+      expect(out).toMatchObject({ ledgered: false, added: true });
+      expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(false);
+    }
+  });
+  it('a failing add is best-effort (the park comment and ledger still stand); a failing ledger append never blocks the add', () => {
+    const failingAdd = applyTestGamingParkLabel({ repo: 'a/b', pr: 5, label: LABEL, reason: 'r', readLiveLabels: () => [], addLabel: () => { throw new Error('x'); }, record: () => ({ ok: true, errors: [] }) });
+    expect(failingAdd).toMatchObject({ ledgered: true, added: false });
+    const failingRecord = applyTestGamingParkLabel({ repo: 'a/b', pr: 5, label: LABEL, reason: 'r', readLiveLabels: () => [], addLabel: () => {}, record: () => ({ ok: false, errors: ['disk full'] }) });
+    expect(failingRecord).toMatchObject({ ledgered: false, added: true, errors: ['disk full'] });
+  });
+  it('the reason it ledgers is the real builder\'s text, which TEST_GAMING_PARK_REASON_RE anchors on', () => {
+    const { rows } = run([]);
+    expect(rows[0].reason).toBe(buildTestGamingParkReason(['1 test removed']));
+    expect(decide(rows, [operatorAdd(9_000)]).mechanical).toBe(true);
   });
 });
 

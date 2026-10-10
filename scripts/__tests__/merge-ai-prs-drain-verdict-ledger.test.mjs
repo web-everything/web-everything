@@ -148,8 +148,21 @@ describe('merge-ai-prs — #3215 recordDrainVerdict: the drain\'s own holds, led
 describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE the `gh` label call', () => {
   const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'merge-ai-prs.mjs'), 'utf8');
 
-  it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper and test-gaming re-parks', () => {
-    expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(3);
+  it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper re-park; the test-gaming re-park goes through applyTestGamingParkLabel', () => {
+    expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(2);
+    // PR #4631 round 4 (F2): the test-gaming site writes its row only after a LIVE label read (the function's own
+    // default `record` is recordDrainVerdict), still ledger-before-label, and the runCli site hands it the live reader.
+    const site = src.indexOf('const parkedLabel = applyTestGamingParkLabel({');
+    expect(site).toBeGreaterThan(-1);
+    expect(src.indexOf("'--json', 'labels']", site)).toBeGreaterThan(site);
+    const fn = src.indexOf('export function applyTestGamingParkLabel(');
+    const read = src.indexOf('readLiveLabels()', fn);
+    const record = src.indexOf('record({ repo, pr, applyLabel: label', fn);
+    const add = src.indexOf('addLabel(label)', fn);
+    expect(fn).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(fn);
+    expect(record).toBeGreaterThan(read);
+    expect(add).toBeGreaterThan(record);
   });
 
   it('the call sits inside the shouldApplyReviewLabel guard, AHEAD of the `gh pr edit --add-label` transport call', () => {

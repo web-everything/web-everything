@@ -2739,6 +2739,57 @@ export function recordParkVerdict({ repo, pr, applyLabel, reason = '', headSha =
 }
 
 /**
+ * The drain's anti-test-gaming re-park reason, as the verdict-ledger row AND the park comment spell it. ONE builder so
+ * the text `MECHANICAL_PARK_RE` / `TEST_GAMING_PARK_REASON_RE` (`accept-carry-forward.mjs`) anchor on is the text the
+ * drain really writes, and a test can build it from here instead of hand-typing a look-alike (PR #4631 round 4, F1).
+ * @param {string[]} reasons — the gate's finding reasons
+ * @param {{sharedPaths: string[]}|null} [stackedOrigin] — `describeStackedTestGamingOrigin`, when the finding is inherited
+ * @param {number|string|null} [stackedBaseNum]
+ */
+export function buildTestGamingParkReason(reasons, stackedOrigin = null, stackedBaseNum = null) {
+  return `test-gaming suspected — CI-green may be manufactured by tampering with tests: ${(reasons || []).join('; ')}`
+    + (stackedOrigin
+      ? ` — inherited from stacked base #${stackedBaseNum} (${stackedOrigin.sharedPaths.join(', ')}); already `
+        + 'escalated for the same reason there — review once, on the base'
+      : '');
+}
+
+/**
+ * The drain's anti-test-gaming re-park, LABEL step (PR #4631 round 4, F2; extracted from `runCli` so the interleaving is
+ * testable). The ledger row this writes is the ONLY thing that lets `decideMechanicalHold` (`accept-carry-forward.mjs`)
+ * call the standing `review:human` mechanical and carry an operator's clearance across it. On this host the drain runs
+ * under the operator's own credential, so the row is only evidence that the label add was the DRAIN'S when the drain
+ * saw the label ABSENT immediately before it added it. `v.prLabels` is a snapshot from the start of the batch — far too
+ * old: an operator's own `review:human` (before OR after the batch read, up to the early pairing slack) would leave the
+ * drain's add a no-op, the lone label event would pair with the drain's row, and the restamp would erase the deliberate
+ * hold. So the labels are re-read LIVE here and:
+ *   - `review:human` already stands -> the drain's add changes nothing and attributes nothing: NO ledger row, no add;
+ *   - the live read failed -> the hold is still placed (placing it is the safe direction) but NO row is written, so the
+ *     origin is unattested and the restamp refuses (fails closed toward a human re-review);
+ *   - absent -> row first (the rule pairs the label event with it), then the add.
+ * The one window left is the gap between this live read and the add (one `gh` round trip); GitHub has no
+ * compare-and-swap on labels, so it cannot be closed from the client — it is narrowed from "the whole batch" to that.
+ * @param {{repo:string, pr:number|string, label:string, reason:string, headSha?:string|null,
+ *   readLiveLabels:() => Array<string|{name?:string}>|null, addLabel:(label:string) => void, record?:Function}} o
+ * @returns {{ledgered:boolean, added:boolean, errors:string[], note:string}}
+ */
+export function applyTestGamingParkLabel({ repo, pr, label, reason, headSha = null, readLiveLabels, addLabel, record = recordDrainVerdict } = {}) {
+  let live = null;
+  try { live = readLiveLabels(); } catch { live = null; }
+  if (Array.isArray(live) && hasReviewLabel(live, label)) {
+    return { ledgered: false, added: false, errors: [], note: `${label} already stood when the drain went to re-park; its add would be a no-op, so no ledger row claims that hold` };
+  }
+  let ledgered = { ok: false, errors: [] };
+  if (Array.isArray(live)) ledgered = record({ repo, pr, applyLabel: label, reason, headSha });
+  let added = false;
+  try { addLabel(label); added = true; } catch { /* label best-effort */ }
+  return {
+    ledgered: !!ledgered.ok, added, errors: ledgered.errors || [],
+    note: Array.isArray(live) ? 'live labels read; hold origin attested by the ledger row' : 'live labels unreadable; hold placed but its origin is not attested (no ledger row)',
+  };
+}
+
+/**
  * E3 (#3929, plan R8) — a stable, bounded code for a drain hold/skip reason, so "the reason changed" is a
  * comparison of codes and not of free text that embeds PR numbers, SHAs or counters. Lowercases, masks hex SHAs
  * and digit runs, and keeps the lead clause (up to the first `:`, ` — ` or ` [`). Pure.
@@ -5216,11 +5267,7 @@ async function runCli() {
           baseFiles: stackedBase.changedFiles,
           baseAlreadyEscalated: hasReviewLabel(stackedBase.prLabels, REVIEW_LABELS.human),
         }) : null;
-        v.reason = `test-gaming suspected — CI-green may be manufactured by tampering with tests: ${gaming.reasons.join('; ')}`
-          + (stackedOrigin
-            ? ` — inherited from stacked base #${stackedBase.num} (${stackedOrigin.sharedPaths.join(', ')}); already `
-              + 'escalated for the same reason there — review once, on the base'
-            : '');
+        v.reason = buildTestGamingParkReason(gaming.reasons, stackedOrigin, stackedBase?.num);
         if (!DRY_RUN) {
           // #2766/#2767 — MUTUAL EXCLUSIVITY. `keepHumanClearance` is `true` ONLY when the humanClearedSha
           // fetch above never ran/succeeded (`tamperHeadSha === null`, incl. a `gh` fetch miss) — the fail-
@@ -5232,10 +5279,14 @@ async function runCli() {
           const parkDecision = decideParkToHuman({ currentLabels: v.prLabels, keepHumanClearance });
           if (parkDecision.addLabel && shouldApplyReviewLabel(parkDecision.addLabel, v.prLabels)) {
             // E3 (#3929) — ledger row FIRST, additive and fail-soft (same posture as the ordinary park): a miss
-            // is reported and never changes the label write below.
-            const ledgered = recordDrainVerdict({ repo: v.repo || localSlug, pr: v.num, applyLabel: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null });
-            if (!ledgered.ok && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${ledgered.errors.join('; ')}\n`);
-            try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', parkDecision.addLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }
+            // is reported and never changes the label write. PR #4631 round 4 (F2): the row is only written when a
+            // LIVE read shows the label absent, so it attests the add was the drain's (see applyTestGamingParkLabel).
+            const parkedLabel = applyTestGamingParkLabel({
+              repo: v.repo || localSlug, pr: v.num, label: parkDecision.addLabel, reason: v.reason, headSha: v.headSha ?? null,
+              readLiveLabels: () => JSON.parse(readGh(['pr', 'view', String(v.num), ...repoFlag(v.repo), '--json', 'labels'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim() || '{}').labels ?? null,
+              addLabel: (l) => execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--add-label', l], { stdio: ['ignore', 'ignore', 'pipe'] }),
+            });
+            if ((parkedLabel.errors.length || !parkedLabel.ledgered) && !AS_JSON) process.stderr.write(`  ⚠ ${repoTag(v.repo)}${v.num} verdict-ledger append (E3 #3929, drain re-park, non-fatal) — ${parkedLabel.errors.join('; ') || parkedLabel.note}\n`);
           }
           for (const staleLabel of parkDecision.removeLabels.filter((l) => hasReviewLabel(v.prLabels, l))) {
             try { execFileSync('gh', ['pr', 'edit', String(v.num), ...repoFlag(v.repo), '--remove-label', staleLabel], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { /* label best-effort */ }

@@ -246,6 +246,10 @@ const isDrainTestGamingPark = (r) => r?.verdict === 'human' && r?.source === 'me
  *   4. (round 3) from the park row onward that add is the ONLY `review:human` event on the timeline, adds AND removals: the
  *      drain adds the label once, so a person's remove + re-add seconds later (both inside the late window) is another
  *      event and refuses. An event with an unparseable time cannot be placed before the park, so it counts.
+ *   0. (round 4) the row itself is attested by its WRITER: `applyTestGamingParkLabel` (`merge-ai-prs.mjs`) appends it only
+ *      after a LIVE read shows `review:human` absent, so a drain add that was a no-op because a person's label already
+ *      stood leaves NO row here. This rule cannot recover that on its own — same login, one label event, nothing to
+ *      pair or count against — which is why the proof is withheld at the writer and missing proof refuses below.
  * Only the test-gaming park counts. The drain restating an already-standing hold (`held — a review hold`) is posted
  * BECAUSE a hold stands, whoever put it there, so it proves nothing about origin (and writes no such ledger row).
  * Missing proof refuses (the hold stays); an unreadable timeline refuses as `retryable` (a read miss, not a decision).
