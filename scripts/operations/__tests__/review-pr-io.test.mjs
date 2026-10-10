@@ -2403,6 +2403,15 @@ describe('cards 5471 + 5470: the io read resolves the round settings and the led
     expect(resolveRoundBudget(null, { settings: () => { throw new Error('unreadable'); } })).toBe('off');
   });
 
+  it('an explicit off beats an enabled lower layer (the caller disables the budget); every valid value wins through the override path', () => {
+    const enabled = { settings: () => ({ roundBudget: 3 }) };
+    expect(resolveRoundBudget('off', enabled)).toBe('off');
+    for (const k of [1, 2, 3, 4, 50]) expect(resolveRoundBudget(k, { settings: () => ({ roundBudget: 'off' }) })).toBe(k);
+    for (const k of [1, 2, 4, 50]) expect(resolveRoundBudget(k, enabled)).toBe(k);
+    // An invalid explicit value is not an override: the lower layer still decides.
+    for (const bad of [0, 51, 2.5, '3', 'OFF', ' off', true, NaN]) expect(resolveRoundBudget(bad, enabled)).toBe(3);
+  });
+
   it('the scoped mode resolves on (card 5470)', () => {
     expect(resolveScopedRereviewMode('on')).toBe('on');
     expect(resolveScopedRereviewMode(null, { settings: () => ({ scopedRereview: 'on' }) })).toBe('on');

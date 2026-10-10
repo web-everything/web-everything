@@ -676,6 +676,26 @@ describe('cards 5471 + 5470: round budget and binding prior round', async () => 
       expect(roundBudgetDecision({ verdict: verdictOf([noImpact]), round: 4, budget: 3 }))
         .toMatchObject({ apply: false, reason: 'blocking-impact' });
     });
+    it('(b) PINNED POLICY (PR #4714 security review): a mandatory-lens (security) finding at K+1 is deferred like any other when it is non-broken — the ruling is impact-based, with no lens carve-out', () => {
+      // A security finding the juror labelled `degraded` is carded, whether PLAUSIBLE or CONFIRMED...
+      const secPlausible = { file: 'scripts/s.mjs', line: 3, category: 'security/trust-boundary', summary: 'plausible degraded', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' };
+      const secConfirmed = { ...secPlausible, line: 5, summary: 'confirmed degraded', verdict: 'CONFIRMED' };
+      for (const f of [secPlausible, secConfirmed]) {
+        expect(roundBudgetDecision({ verdict: verdictOf([f]), round: 4, budget: 3 }))
+          .toMatchObject({ apply: true, reason: 'over-budget', cards: [f] });
+      }
+      // ...but the same finding labelled `broken` or `unrecoverable` (or with no label) still blocks, so only the label can defer it,
+      // and a CONFIRMED broken security finding is a referral and blocks outright.
+      for (const impactIfUnfixed of ['broken', 'unrecoverable', undefined]) {
+        expect(roundBudgetDecision({ verdict: verdictOf([{ ...secPlausible, impactIfUnfixed }]), round: 4, budget: 3 }))
+          .toMatchObject({ apply: false, reason: 'blocking-impact' });
+      }
+      expect(roundBudgetDecision({ verdict: verdictOf([{ ...secConfirmed, impactIfUnfixed: 'broken' }]), round: 4, budget: 3 }))
+        .toMatchObject({ apply: false, reason: 'confirmed-broken' });
+      // The budget never acts inside the budget or at the cap, whatever the lens.
+      expect(roundBudgetDecision({ verdict: verdictOf([secPlausible]), round: 3, budget: 3 }).apply).toBe(false);
+      expect(roundBudgetDecision({ verdict: verdictOf([secPlausible]), round: 5, budget: 3 }).apply).toBe(false);
+    });
     it('(c) rounds 1..K behave as today', () => {
       for (const round of [1, 2, 3]) {
         expect(roundBudgetDecision({ verdict: verdictOf([degraded]), round, budget: 3 })).toMatchObject({ apply: false, reason: 'within-budget' });
@@ -703,6 +723,13 @@ describe('cards 5471 + 5470: round budget and binding prior round', async () => 
     });
     it('(b) a broken + CONFIRMED finding on unchanged code still blocks', () => {
       expect(bindingPriorRoundDecision({ verdict: verdictOf([degraded, confirmedBroken]), mode: 'on', shadow: avoided }))
+        .toMatchObject({ apply: false, reason: 'confirmed-broken' });
+    });
+    it('(b) PINNED POLICY (PR #4714 security review): like the budget, the binding rule has no lens carve-out — a non-referral security finding on unchanged code is carded; a CONFIRMED broken one still blocks', () => {
+      const sec = { file: 'scripts/s.mjs', line: 3, category: 'security/trust-boundary', summary: 'plausible degraded', verdict: 'PLAUSIBLE', impactIfUnfixed: 'degraded' };
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([sec]), mode: 'on', shadow: avoided }))
+        .toMatchObject({ apply: true, reason: 'unchanged-code', cards: [sec] });
+      expect(bindingPriorRoundDecision({ verdict: verdictOf([{ ...sec, verdict: 'CONFIRMED', impactIfUnfixed: 'broken' }]), mode: 'on', shadow: avoided }))
         .toMatchObject({ apply: false, reason: 'confirmed-broken' });
     });
     it('(c) a finding on changed code (the shadow still blocks) blocks as today', () => {

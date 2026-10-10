@@ -342,9 +342,12 @@ export function readReviewRound({ repo, pr, head, readLedgerRows = defaultReadLe
   } catch { return null; }
 }
 
-/** Card 5471 — the round budget: an explicit value, else the declared setting. Any doubt is `off`. */
+/**
+ * Card 5471 — the round budget: an explicit value, else the declared setting. Any doubt is `off`. An explicit `off` is
+ * an override too (a caller disabling the budget beats an enabled setting), same as `resolveScopedRereviewMode`.
+ */
 export function resolveRoundBudget(explicit = null, { settings = resolveReviewSettings } = {}) {
-  if (isValidRoundBudget(explicit)) return explicit;
+  if (explicit === ROUND_BUDGET_OFF || isValidRoundBudget(explicit)) return explicit;
   try {
     const k = settings().roundBudget;
     return isValidRoundBudget(k) ? k : ROUND_BUDGET_OFF;
