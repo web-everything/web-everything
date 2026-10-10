@@ -22,7 +22,7 @@ After card 5658 a promoted draft's review goes out in the same review-daemon pas
 
 ## Fix
 
-Turn on the existing background builder (x44lnnt, card 5572) for we:skills-src/conveyor/review-daemon.mjs in we:scripts/lib/daemon-background-build-settings.json. A restarted review daemon now ticks first; the next version builds and smokes in a detached builder; the swap stays between ticks, at most once per 10 min. No check is skipped: same gated rebuild, same smoke, same stale-main guard.
+Turn on the existing background builder (5561, card 5572) for we:skills-src/conveyor/review-daemon.mjs in we:scripts/lib/daemon-background-build-settings.json. A restarted review daemon now ticks first; the next version builds and smokes in a detached builder; the swap stays between ticks, at most once per 10 min. No check is skipped: same gated rebuild, same smoke, same stale-main guard.
 
 ## Acceptance
 
