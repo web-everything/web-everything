@@ -239,6 +239,16 @@ describe('followupSteps — primary-sync (the third step)', () => {
     expect(step({ exec }).run({ input: buildFollowupInput({ landedLocal: true, primary: clone }) }).primarySync).toMatchObject({ synced: true });
   });
 
+  // Only meaningful where the volume folds case (APFS default): a differently-cased spelling of the pass's own
+  // checkout must still be recognised, or the job becomes a second writer there.
+  it('a differently-cased spelling of the pass\'s own checkout is still recognised as it (case-insensitive volume)', () => {
+    if (clone.toUpperCase() === clone || !existsSync(clone.toUpperCase())) return; // case-sensitive volume: nothing to fold
+    const { calls, exec } = primaryExec();
+    const out = step({ exec }).run({ input: buildFollowupInput({ landedLocal: true, primary: clone.toUpperCase(), passCwd: clone }) });
+    expect(out.primarySync).toMatchObject({ synced: false, reason: 'from-primary' });
+    expect(calls).toEqual([]);
+  });
+
   it('a primary that IS the pass\'s own checkout (input.passCwd) is skipped — the pass already synced it inline, the job is not a second writer', () => {
     const { calls, exec } = primaryExec();
     const out = step({ exec }).run({ input: buildFollowupInput({ landedLocal: true, primary: clone, passCwd: clone }) });

@@ -186,6 +186,14 @@ describe('handOffDrainFollowup', () => {
     expect(store.list().records).toHaveLength(1); // terminal — nothing will run it, so no duplicate of the inline run
   });
 
+  it('a record that cannot be read back (the read throws) is NOT a hand-off: inline fallback, the pass does not crash', async () => {
+    const real = fresh();
+    const store = { ...real, dir: real.dir, read: () => { throw new Error('corrupt record'); } };
+    const out = await handOffDrainFollowup({ landed: true, buildInput: () => ({ landedLocal: true }), setting: on, store, reattach: noTick, prepareWorktree: () => '/x' });
+    expect(out).toMatchObject({ handedOff: false, mode: 'inline', job: null });
+    expect(out.reason).toMatch(/^launch-failed: job record unreadable/);
+  });
+
   it('a launched job (spawned by the tick) stays handed off', async () => {
     const store = fresh();
     const worktree = mkdtempSync(join(tmpdir(), 'fu-wt-'));

@@ -206,7 +206,8 @@ export function followupSteps(deps) {
         const gitAt = (a) => exec('git', a, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
         // "Is this the cwd" means the job worktree OR the pass's checkout: a primary that IS the pass's cwd was
         // already synced inline, and a second writer there would race the pass's own sweep and git index.
-        const isCwd = (p) => { try { const r = realpathSync(p); return r === realpathSync(cwd) || (!!input.passCwd && r === realpathSync(input.passCwd)); } catch { return false; } };
+        // `.native` folds case on a case-insensitive volume (APFS), so `/Users/Foo/x` and `/Users/foo/x` compare equal.
+        const isCwd = (p) => { try { const r = realpathSync.native(p); return r === realpathSync.native(cwd) || (!!input.passCwd && r === realpathSync.native(input.passCwd)); } catch { return false; } };
         const r = syncPrimaryOnLand({ exec: gitAt, primary: input.primary, hinted: !!input.primaryHinted, isCwd });
         return { primarySync: { synced: !!r.synced, reason: r.reason, at: now() } };
       },
@@ -319,7 +320,9 @@ export async function handOffDrainFollowup({
   } catch (e) {
     log(`drain-followup: reattach tick failed (${errLine(e)}) — the job stays queued; the next pass launches it`);
   }
-  const rec = queued ? jobStore.read(queued.id) : null;
+  // A throwing read (a corrupt record) is the same as an unreadable one: nothing will run it, so the pass goes inline.
+  let rec = null;
+  if (queued) { try { rec = jobStore.read(queued.id); } catch { rec = null; } }
   // The record, not the enqueue, decides: the reattach tick fails a job outright when its code cannot be prepared
   // (a `git fetch` blip, a worktree conflict) and never retries it, so a `failed` record means nothing will run
   // the follow-up — the pass must keep its inline path, or the numbering is dropped. (A `queued` record after a
