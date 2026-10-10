@@ -23,6 +23,15 @@
  * branches), `recovery` (the fix's own new recovery / error paths — the #4433 lesson). A path with nothing to check is
  * still listed, as `n/a` with a reason: a row nobody looked at is not `n/a`.
  *
+ * THE SAME CLASS ANYWHERE IN THE PR (card 5536). The four paths look outward from the fixed site; review rounds kept
+ * finding the same class in ANOTHER file of the same PR (#4624: round 1 swept the freeze-marker class in
+ * `red-main-remediation.mjs`; round 3 found the same "a manual freeze is silently not honoured" class in
+ * `red-main-hold.mjs`, a file of the same PR the sweep never named). So, given the PR's changed files, every finding's
+ * rows must name every changed file: a row's `site` names a file (`path/file.mjs#fn`) or a directory prefix ending
+ * in `/` (`scripts/lib/__tests__/`). The optional fifth path `pr` carries rows for files the four paths did not
+ * reach (`{"path":"pr","site":"scripts/lib/x.mjs","status":"checked","note":"no freeze read"}`). Cards under
+ * `backlog/` are exempt. A file no row names is `<finding>: pr-unswept-<n>`; the file list goes in the record only.
+ *
  * STANDARD SHAPE (protocol card 5468): pure functions over plain facts plus a declared setting; today's behaviour is
  * the setting's off value. No IO, no clock, no forge vocabulary. The text is UNTRUSTED (agent-written, may quote PR
  * content): it is only ever parsed as JSON, sizes are bounded before parsing, and no field of it is executed or used
@@ -32,13 +41,19 @@
 export const CLASS_SWEEP_MODES = Object.freeze(['off', 'warn', 'enforce']);
 /** The sibling paths every finding's sweep must cover. */
 export const SWEEP_PATHS = Object.freeze(['family', 'callers', 'branches', 'recovery']);
+/** Optional extra path: rows for the PR's other changed files (the same class anywhere in the PR, card 5536). */
+export const PR_PATH = 'pr';
+/** Changed files never needing a sweep row (backlog cards are prose, not code). */
+export const PR_EXEMPT_PREFIXES = Object.freeze(['backlog/']);
+/** At most this many changed files are checked; a longer list reads `pr-files-truncated` (never `complete`). */
+export const MAX_PR_FILES = 500;
 export const SWEEP_STATUSES = Object.freeze(['fixed', 'checked', 'n/a']);
 /** Bounds applied before any parsing. */
 export const MAX_EVIDENCE_BYTES = 256 * 1024;
 export const MAX_BLOCK_BYTES = 64 * 1024;
 const MAX_FIELD = 300;
 const MAX_FINDINGS = 50;
-const MAX_SIBLINGS = 40;
+const MAX_SIBLINGS = 80;
 
 const FENCE_RE = /(^|\n)[ \t]*(`{3,}|~{3,})[ \t]*class-sweep[ \t]*\n([\s\S]*?)\n[ \t]*\2[ \t]*(?=\n|$)/g;
 
@@ -49,7 +64,8 @@ const FENCE_RE = /(^|\n)[ \t]*(`{3,}|~{3,})[ \t]*class-sweep[ \t]*\n([\s\S]*?)\n
  */
 export function extractSweepBlocks(text) {
   const raw = typeof text === 'string' ? text : '';
-  const truncated = raw.length > MAX_EVIDENCE_BYTES;
+  // Bytes, not characters: the CLI reads the file by bytes, so a multibyte file decodes to fewer characters.
+  const truncated = raw.length > MAX_EVIDENCE_BYTES || new TextEncoder().encode(raw).length > MAX_EVIDENCE_BYTES;
   const bounded = truncated ? raw.slice(0, MAX_EVIDENCE_BYTES) : raw;
   return { blocks: [...bounded.matchAll(FENCE_RE)].map((m) => m[3]), truncated };
 }
@@ -87,7 +103,7 @@ export function checkSweep(blockText) {
       const site = str(s?.site);
       const note = str(s?.note);
       const where = `${id}.siblings[${j}]`;
-      if (!SWEEP_PATHS.includes(path)) { problems.push(`${where}: unknown-path`); return; }
+      if (!SWEEP_PATHS.includes(path) && path !== PR_PATH) { problems.push(`${where}: unknown-path`); return; }
       if (!SWEEP_STATUSES.includes(status)) { problems.push(`${where}: unknown-status`); return; }
       if (status !== 'n/a' && !site) problems.push(`${where}: no-site`);
       if (status !== 'fixed' && !note) problems.push(`${where}: no-reason`);
@@ -105,13 +121,47 @@ export function checkSweep(blockText) {
  * @param {{mode: string, changeKind: string|null, evidence: string|null}} facts
  *   `changeKind` — the session's role (`fix` / `ci-heal`); anything else is not a fix and is skipped.
  *   `evidence` — the evidence text, or null when none could be read.
+ *   `changedFiles` — the PR's changed files (card 5536): an array is checked, `null` (unreadable) fails closed,
+ *   undefined (not supplied) skips the PR-wide check.
  * @returns {{mode: string, status: 'skipped'|'complete'|'missing'|'malformed'|'incomplete', reason: string,
  *   blocking: boolean, problems: string[], sweep: object|null, findings: number, classes: string[]}}
  */
-export function classSweepVerdict({ mode, changeKind = null, evidence = null } = {}) {
+/**
+ * Which changed files of the PR a finding's rows never name. PURE.
+ * @param {{siblings: {site: string}[]}} finding a cleaned finding (from checkSweep).
+ * @param {string[]} changedFiles repo-relative paths.
+ * @returns {string[]} the unswept files, in input order.
+ */
+export function unsweptPrFiles(finding, changedFiles) {
+  // A site is free text, so a file is named only by a WHOLE path token of it (never a substring: `docs/README.md` does
+  // not name `README.md`, `a.mjs.orig` does not name `a.mjs`): split on separators, drop the `#symbol` and `:line`
+  // tails and a leading `./`, then compare equal paths; a token ending in `/` is a directory prefix.
+  // A token is a directory prefix or a file, decided on the RAW token (before any `#`/`:` tail is cut), so a tail can
+  // never turn a file spelling into a directory that covers everything under it (`scripts/#x/`, `scripts/:1`).
+  const tokens = (finding?.siblings ?? []).flatMap((r) => String(r.site ?? '').split(SITE_SEPARATORS))
+    .map((t) => normalizePath(t.replace(/^[*~]+|[*~.,:;!…]+$/g, ''))).filter((t) => t.length > 0);
+  const named = new Set();
+  const prefixes = [];
+  for (const t of tokens) {
+    if (t.endsWith('/')) { if (t.length > 1) prefixes.push(t); } else named.add(normalizePath(t.replace(/#.*$/, '').replace(/:.*$/, '').replace(/[.,;!…]+$/, '')));
+  }
+  return changedFiles.filter((raw) => {
+    const f = normalizePath(raw);
+    return !PR_EXEMPT_PREFIXES.some((p) => f.startsWith(p)) && !named.has(f) && !prefixes.some((p) => f.startsWith(p));
+  });
+}
+
+const SITE_SEPARATORS = /[\s,;+()`"'“”‘’<>[\]{}|]+/;
+
+/** The one spelling a path is compared in, for sites AND changed files: no leading `./`, no `we:` repo tag. PURE. */
+const normalizePath = (p) => String(p).trim().replace(/^we:/, '').replace(/^(\.\/)+/, '');
+
+const cleanFiles = (list) => [...new Set(list.filter((f) => typeof f === 'string').map((f) => normalizePath(f)).filter(Boolean))];
+
+export function classSweepVerdict({ mode, changeKind = null, evidence = null, changedFiles } = {}) {
   const m = CLASS_SWEEP_MODES.includes(mode) ? mode : 'off';
   const out = (status, reason, extra = {}) => ({
-    mode: m, status, reason, problems: [], sweep: null, findings: 0, classes: [], ...extra,
+    mode: m, status, reason, problems: [], sweep: null, findings: 0, classes: [], unswept: {}, ...extra,
     blocking: m === 'enforce' && !['skipped', 'complete'].includes(status),
   });
   if (m === 'off') return out('skipped', 'mode-off');
@@ -121,7 +171,28 @@ export function classSweepVerdict({ mode, changeKind = null, evidence = null } =
   if (blocks.length === 0) return out('missing', truncated ? 'evidence-truncated-before-block' : 'no-class-sweep-block');
   if (blocks.length > 1) return out('malformed', 'more-than-one-class-sweep-block');
   const checked = checkSweep(blocks[0]);
+  // Evidence cut at the bound can hide a second block (or anything else): it is never `complete`.
+  if (truncated && checked.sweep) checked.problems.push('evidence-truncated');
+  // The same class anywhere in the PR (card 5536). `changedFiles` undefined = a caller that does not know the PR's
+  // files (legacy facts): not checked. `null` = the files could not be read: fail closed.
+  const unswept = {};
+  if (checked.sweep && changedFiles !== undefined) {
+    if (!Array.isArray(changedFiles)) checked.problems.push('pr-files-unknown');
+    else if (changedFiles.length > MAX_PR_FILES) checked.problems.push('pr-files-truncated');
+    else if (cleanFiles(changedFiles).length === 0) {
+      // A PR under review changes at least one file: an empty list is a wrong or stale base, not "nothing to sweep".
+      checked.problems.push('pr-files-unknown');
+    } else {
+      const files = cleanFiles(changedFiles);
+      for (const f of checked.sweep.findings) {
+        const miss = unsweptPrFiles(f, files);
+        if (miss.length) { unswept[f.finding] = miss.slice(0, 100); checked.problems.push(`${f.finding}: pr-unswept-${miss.length}`); }
+      }
+    }
+  }
+  checked.ok = checked.problems.length === 0;
   const extra = {
+    unswept,
     problems: checked.problems, sweep: checked.sweep,
     findings: checked.sweep?.findings.length ?? 0,
     classes: [...new Set((checked.sweep?.findings ?? []).map((f) => f.class).filter(Boolean))],

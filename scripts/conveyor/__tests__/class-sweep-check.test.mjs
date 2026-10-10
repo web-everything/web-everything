@@ -2,11 +2,13 @@
  * Card xet6iu0 — the class-sweep check CLI, against a real temporary directory (the record it writes is the point).
  */
 import { afterEach, describe, expect, it } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { main, resolveClassSweepMode, defaultPolicySettingsPath } from '../class-sweep-check.mjs';
+import { main, resolveClassSweepMode, defaultPolicySettingsPath, readChangedFiles, readHeadBytes } from '../class-sweep-check.mjs';
+import { MAX_EVIDENCE_BYTES } from '../../lib/class-sweep-rule.mjs';
 
 const dirs = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
@@ -23,10 +25,12 @@ const SWEEP = { v: 1, findings: [{ finding: 'F1', class: 'truncated read', sibli
 ] }] };
 const evidence = (sweep) => `## fix evidence\n\n\`\`\`class-sweep\n${JSON.stringify(sweep)}\n\`\`\`\n`;
 
-function run({ text, mode = 'warn', args = [], settings } = {}) {
+function run({ text, mode = 'warn', args = [], settings, changed = ['a.mjs', 'b.mjs'] } = {}) {
   const d = scratch();
   const file = join(d, 'evidence.md');
   if (text !== undefined) writeFileSync(file, text);
+  const changedFile = join(d, 'changed.txt');
+  if (changed) { writeFileSync(changedFile, `${changed.join('\n')}\n`); args = [`--changed-files=${changedFile}`, ...args]; }
   const settingsPath = join(d, 'settings.json');
   writeFileSync(settingsPath, JSON.stringify(settings ?? { classSweep: { mode, since: '2026-10-08' } }));
   const lines = [];
@@ -69,6 +73,92 @@ describe('class-sweep-check', () => {
     const r = run({ text: evidence(SWEEP), args: ['--session=../../etc/x'] });
     expect(existsSync(join(r.root, 'class-sweep', 'log.jsonl'))).toBe(true);
     expect(JSON.parse(readFileSync(join(r.root, 'class-sweep', 'log.jsonl'), 'utf8')).session).toBe(null);
+  });
+
+  it('card 5536: a changed file of the PR no row names is flagged in the same pass and recorded', () => {
+    const r = run({ text: evidence(SWEEP), changed: ['a.mjs', 'b.mjs', 'c.mjs', 'backlog/1-card.md'] });
+    expect(r.lines[0]).toBe('class-sweep (warn): incomplete — F1: pr-unswept-1; 1 finding(s); first problem F1: pr-unswept-1');
+    const record = JSON.parse(readFileSync(join(r.root, 'class-sweep', 'fix-4481.json'), 'utf8'));
+    expect(record).toMatchObject({ unswept: { F1: ['c.mjs'] }, prFiles: 4 });
+  });
+
+  it('card 5536: with no PR file list the PR-wide check fails closed; enforce exits 2', () => {
+    expect(run({ text: evidence(SWEEP), changed: null }).verdict).toMatchObject({ status: 'incomplete', reason: 'pr-files-unknown' });
+    expect(run({ text: evidence(SWEEP), changed: null, mode: 'enforce' }).exitCode).toBe(2);
+  });
+
+  it('card 5536 (PR 4687): an empty PR file list is unknown, never complete — file, blank lines and empty git diff', () => {
+    expect(run({ text: evidence(SWEEP), changed: [] }).verdict).toMatchObject({ status: 'incomplete', reason: 'pr-files-unknown' });
+    expect(run({ text: evidence(SWEEP), changed: ['', '  '] }).verdict.reason).toBe('pr-files-unknown');
+    expect(run({ text: evidence(SWEEP), mode: 'enforce', changed: [] }).exitCode).toBe(2);
+    const repo = scratch();
+    const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    g('init', '-q', '-b', 'main');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base');
+    g('branch', 'base');
+    // HEAD equals base: the diff is empty, which is a wrong or stale base, not a PR with no files.
+    expect(run({ text: evidence(SWEEP), changed: null, args: [`--checkout=${repo}`, '--base=base'] }).verdict.reason).toBe('pr-files-unknown');
+  });
+
+  it('card 5536 (PR 4687): a valueless --changed-files is unknown and never falls through to --checkout; git lists raw non-ASCII names', () => {
+    const repo = scratch();
+    const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    g('init', '-q', '-b', 'main');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base');
+    g('branch', 'base');
+    writeFileSync(join(repo, 'café.mjs'), 'x\n');
+    g('add', '.');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'pr');
+    expect(run({ text: evidence(SWEEP), changed: null, args: ['--changed-files=', `--checkout=${repo}`, '--base=base'] }).verdict.reason).toBe('pr-files-unknown');
+    expect(run({ text: evidence(SWEEP), changed: null, args: [`--checkout=${repo}`, '--base=base'] }).verdict.unswept).toEqual({ F1: ['café.mjs'] });
+  });
+
+  it('card 5536 (PR 4687): changed-file reads stop at the byte bound', () => {
+    const d = scratch();
+    const big = join(d, 'big.txt');
+    writeFileSync(big, `${'a'.repeat(MAX_EVIDENCE_BYTES + 4096)}\n`);
+    const asked = [];
+    const readHead = (p, max) => { asked.push(max); return readHeadBytes(p, max); };
+    expect(readChangedFiles({ 'changed-files': big }, { readHead, git: () => '' })).toBeNull();
+    expect(asked).toEqual([MAX_EVIDENCE_BYTES + 1]);
+    // Through main: the oversized list is unknown and the whole file is never requested.
+    const r = run({ text: evidence(SWEEP), changed: null, args: [`--changed-files=${big}`] });
+    expect(r.verdict.reason).toBe('pr-files-unknown');
+    // A list exactly at the bound is still read whole.
+    const ok = join(d, 'ok.txt');
+    writeFileSync(ok, `a.mjs\n${'\n'.repeat(MAX_EVIDENCE_BYTES - 6)}`);
+    expect(statSync(ok).size).toBe(MAX_EVIDENCE_BYTES);
+    expect(readChangedFiles({ 'changed-files': ok }, { readHead: readHeadBytes, git: () => '' })).toEqual(['a.mjs']);
+  });
+
+  it('card 5536 (PR 4687): the evidence file read is bounded the same way (same resource-bounds class)', () => {
+    const d = scratch();
+    const evFile = join(d, 'ev.md');
+    writeFileSync(evFile, `${evidence(SWEEP)}${'z'.repeat(MAX_EVIDENCE_BYTES * 2)}`);
+    const asked = [];
+    const changedFile = join(d, 'changed.txt');
+    writeFileSync(changedFile, 'a.mjs\nb.mjs\n');
+    const settingsPath = join(d, 'settings.json');
+    writeFileSync(settingsPath, JSON.stringify({ classSweep: { mode: 'warn' } }));
+    const result = main([`--evidence-file=${evFile}`, `--changed-files=${changedFile}`, '--kind=fix', '--session=fix-4687'],
+      { env: {}, root: join(d, 'coord'), settingsPath, out: () => {}, readHead: (p, max) => { asked.push(max); return readHeadBytes(p, max); } });
+    expect(asked).toEqual([MAX_EVIDENCE_BYTES + 1, MAX_EVIDENCE_BYTES + 1]);
+    // The surviving block is not trusted past the cut: padding could hide a second block.
+    expect(result.verdict).toMatchObject({ status: 'incomplete', reason: 'evidence-truncated' });
+  });
+
+  it('card 5536: --checkout reads the PR files from the lane with git (base...HEAD); a bad base is unknown', () => {
+    const repo = scratch();
+    const g = (...a) => execFileSync('git', ['-C', repo, ...a], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    g('init', '-q', '-b', 'main');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'base');
+    g('branch', 'base');
+    for (const f of ['a.mjs', 'c.mjs']) writeFileSync(join(repo, f), 'x\n');
+    g('add', 'a.mjs', 'c.mjs');
+    g('-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'pr');
+    const r = run({ text: evidence(SWEEP), changed: null, args: [`--checkout=${repo}`, '--base=base'] });
+    expect(r.verdict.unswept).toEqual({ F1: ['c.mjs'] });
+    expect(run({ text: evidence(SWEEP), changed: null, args: [`--checkout=${repo}`, '--base=--output=/tmp/x'] }).verdict.reason).toBe('pr-files-unknown');
   });
 
   it('the mode is read from the RUNNING root\'s settings; env overrides; a bad value never loosens', () => {
