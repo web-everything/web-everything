@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -109,9 +110,14 @@ export function validateVerifySettings(raw) {
   return Object.freeze(config);
 }
 
-export function loadVerifySettingsFile(path = defaultVerifySettingsPath()) {
-  try { return validateVerifySettings(JSON.parse(readFileSync(path, 'utf8'))); }
-  catch { return validateVerifySettings(null); }
+/** The file is the tool layer over the team's platform preference `verify` (shared policy cascade,
+ *  we:scripts/lib/policy-cascade.mjs): a key the file leaves unset takes the platform value. */
+export function loadVerifySettingsFile(path = defaultVerifySettingsPath(), { env = process.env } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(path, 'utf8')); } catch { tool = undefined; }
+  const c = cascadePolicy('verify', tool, { env, standard: BUILT_IN_VERIFY_SETTINGS,
+    envValues: Object.fromEntries(Object.entries(envKeys).map(([k, n]) => [k, env?.[n] || undefined])) });
+  return validateVerifySettings(c.layered ?? null);
 }
 
 /** Environment overrides are per-key; invalid overrides retain the file/default value. */

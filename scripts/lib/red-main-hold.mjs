@@ -16,14 +16,15 @@
  *   It only ADDS a hold: an allowed fix PR still passes every merge gate the drain applies. PURE except
  *   {@link resolveRedMainHoldSetting} (reads the settings file).
  *
- *   Setting `redMainHold` (`on` | `off`, built-in `on`), policy cascade (card x5wnfcg): standard default (built-in
- *   `on`) → platform preference (`we:scripts/settings/red-main-hold.json`) → tool override (env
- *   `WE_DRAIN_RED_MAIN_HOLD`). `off` = before this card (a manual freeze stops the whole line; a published red
+ *   Setting `redMainHold` (`on` | `off`, built-in `on`), policy cascade (card x5wnfcg, we:scripts/lib/policy-cascade.mjs):
+ *   standard default (built-in `on`) → platform preference `redMainHold` → tool override
+ *   (`we:scripts/settings/red-main-hold.json`) → env `WE_DRAIN_RED_MAIN_HOLD`. `off` = before this card (a manual freeze stops the whole line; a published red
  *   alone holds nothing).
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { cascadePolicy } from './policy-cascade.mjs';
 
 export const RED_MAIN_HOLD_REASON = 'red-main-hold';
 export const RED_MAIN_HOLD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'red-main-hold.json');
@@ -32,10 +33,22 @@ const norm = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x =
 
 /** env `WE_DRAIN_RED_MAIN_HOLD` > settings file `redMainHold` > built-in `on`. Unknown values fall through. */
 export function resolveRedMainHoldSetting({ env = process.env, file = RED_MAIN_HOLD_SETTINGS_FILE } = {}) {
-  const fromEnv = norm(env?.WE_DRAIN_RED_MAIN_HOLD);
+  return resolveScalar('redMainHold', norm, 'on', env?.WE_DRAIN_RED_MAIN_HOLD, { env, file });
+}
+
+/** One scalar through the shared policy cascade (we:scripts/lib/policy-cascade.mjs): built-in → platform preference
+ *  `<key>` → settings file `<key>` → env. Same `{value, source}` shape as before (`settings` = the tool file layer,
+ *  `platform` = the team preference); logs the source once per process. */
+function resolveScalar(key, normalize, builtIn, envRaw, { env, file }) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(file, 'utf8'))?.[key]; } catch { /* built-in */ }
+  const fromEnv = normalize(envRaw);
+  const c = cascadePolicy(key, tool, { env, standard: builtIn, envValues: { '': fromEnv ?? undefined }, valid: (v) => normalize(v) !== null });
   if (fromEnv) return { value: fromEnv, source: 'env' };
-  try { const f = norm(JSON.parse(readFileSync(file, 'utf8'))?.redMainHold); if (f) return { value: f, source: 'settings' }; } catch { /* built-in */ }
-  return { value: 'on', source: 'default' };
+  const layer = c.sources[''];
+  if (layer === 'tool') return { value: normalize(c.value), source: 'settings' };
+  if (layer === 'platform') return { value: normalize(c.value), source: 'platform' };
+  return { value: builtIn, source: 'default' };
 }
 
 /**
@@ -45,10 +58,7 @@ export function resolveRedMainHoldSetting({ env = process.env, file = RED_MAIN_H
  */
 export function resolveRedMainMode({ env = process.env, file = RED_MAIN_HOLD_SETTINGS_FILE } = {}) {
   const m = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'stop' || x === 'quarantine' ? x : null; };
-  const fromEnv = m(env?.WE_DRAIN_RED_MAIN_MODE);
-  if (fromEnv) return { value: fromEnv, source: 'env' };
-  try { const f = m(JSON.parse(readFileSync(file, 'utf8'))?.redMainMode); if (f) return { value: f, source: 'settings' }; } catch { /* built-in */ }
-  return { value: 'stop', source: 'default' };
+  return resolveScalar('redMainMode', m, 'stop', env?.WE_DRAIN_RED_MAIN_MODE, { env, file });
 }
 
 const live = (r, now) => !!r && Number.isFinite(r.expiresAt) && now < r.expiresAt;
