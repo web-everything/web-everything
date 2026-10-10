@@ -29,10 +29,10 @@ describe('settings — off = today', () => {
     expect(BUILT_IN_BACKGROUND_BUILD_SETTINGS.enabled).toEqual({});
     expect(resolveBackgroundBuild({ entry: '/c/skills-src/conveyor/review-daemon.mjs' }).enabled).toBe(false);
   });
-  it('the committed file turns it on for the fix daemon only', () => {
+  it('the committed file turns it on for the fix and review daemons only (card 5673 added the review daemon)', () => {
     const s = loadBackgroundBuildSettings();
     expect(resolveBackgroundBuild({ entry: '/c/skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs', settings: s }).enabled).toBe(true);
-    expect(resolveBackgroundBuild({ entry: '/c/skills-src/conveyor/review-daemon.mjs', settings: s }).enabled).toBe(false);
+    expect(resolveBackgroundBuild({ entry: '/c/skills-src/conveyor/review-daemon.mjs', settings: s }).enabled).toBe(true);
     expect(resolveBackgroundBuild({ entry: '/c/skills-src/conveyor/pass-daemon.mjs', settings: s }).enabled).toBe(false);
   });
   it('env forces on/off and overrides numbers; malformed values keep the file/default', () => {
