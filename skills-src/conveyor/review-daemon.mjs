@@ -123,6 +123,7 @@ import {
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
+import { describeDispatchFailure } from '../../scripts/lib/describe-spawn-failure.mjs';
 import { warmReviewFacts, readReviewCiGateFactsFirst, withFactsLabels } from '../../scripts/lib/review-facts.mjs';
 import { createGhProvider } from '../../scripts/lib/review-label-provider.mjs';
 import { runPrepReviewTick, resolvePrepReviewMode } from '../../scripts/conveyor/prep-review.mjs';
@@ -232,6 +233,19 @@ export function explainPendingNotDispatched({ prs, plan, dispatchable = [], defe
     out.push({ prNumber: n, labels: held, reasons });
   }
   return out;
+}
+
+/**
+ * The one-line `reconcileError` for a reconcile/read throw. A failed `gh` child (execFileSync: `Command failed:
+ * <argv>\n<stderr>`) is described CAUSE-FIRST — `gh pr list failed (exit 1): <redacted stderr>` — instead of the
+ * message's first line, which is only the argv. Live 2026-10-09 22:43Z-00:00Z: the drain's self-sync smoke was
+ * rejected 3x on "Command failed: gh pr list ... --json <16 fields>" and the real gh error never reached a log
+ * (the held-state detail is then cut at 300 chars, so the cause has to come before the command). Any other
+ * error keeps its first message line. PURE.
+ */
+export function describeReconcileError(e) {
+  const m = /^Command failed:\s+(\S+(?:\s+[a-z][\w-]*){0,2})/.exec(String((e && e.message) || ''));
+  return describeDispatchFailure(e, m ? m[1] : 'reconcile read');
 }
 
 /**
@@ -347,7 +361,7 @@ export function runReviewTick({
   } catch (e) {
     return {
       reviewsOwed: 0, dispatched: [], failed: [], refusals: 0, deferredForLanes: 0,
-      reconcileError: String((e && e.message) || e).split('\n')[0],
+      reconcileError: describeReconcileError(e),
       holdReconcile: holdReconcileResults, holdReconcileError,
     };
   }
@@ -662,7 +676,7 @@ export async function runConvertAdvisoryTick({
   } catch (e) {
     return {
       convertAdvisoriesOwed: 0, posted: [], skipped: [], failed: [],
-      reconcileError: String((e && e.message) || e).split('\n')[0],
+      reconcileError: describeReconcileError(e),
     };
   }
   // Keyed by PR number so a fresh `gh` read is never needed when the tick already has this PR's comments/
