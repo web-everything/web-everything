@@ -194,7 +194,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, cardOnly: 0, cardOnlyPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, cardOnly: 0, cardOnlyPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -228,7 +228,7 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   };
 
   it('defaults to excluding card-only PRs; the tool layer and env override it, in that order', () => {
-    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true });
+    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true, excludeStackedAwaitingBase: true });
     expect(resolvePrLimitScope({})).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'default' } });
     expect(resolvePrLimitScope({ tool: { excludeCardOnly: false } })).toMatchObject({ excludeCardOnly: false, source: { excludeCardOnly: 'tool' } });
     expect(resolvePrLimitScope({ tool: { excludeCardOnly: 'no' } }).excludeCardOnly).toBe(true);
@@ -237,6 +237,23 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
 
   it('the shipped settings file states the ruling (excludeCardOnly: true)', () => {
     expect(readPrLimitScope({ env: {} })).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'tool' } });
+  });
+
+  it('excludeStackedAwaitingBase resolves through the same cascade, and the shipped file sets it (operator ruling option c)', () => {
+    expect(resolvePrLimitScope({ platform: { excludeStackedAwaitingBase: false } })).toMatchObject({
+      excludeStackedAwaitingBase: false, source: { excludeStackedAwaitingBase: 'platform' } });
+    expect(resolvePrLimitScope({ platform: { excludeStackedAwaitingBase: false }, env: { WE_PR_LIMIT_EXCLUDE_STACKED_AWAITING_BASE: '1' } }))
+      .toMatchObject({ excludeStackedAwaitingBase: true, source: { excludeStackedAwaitingBase: 'env' } });
+    expect(readPrLimitScope({ env: {} })).toMatchObject({ excludeStackedAwaitingBase: true, source: { excludeStackedAwaitingBase: 'tool' } });
+  });
+
+  it('a stacked draft awaiting its base PR is not counted; a stacked PR without the label, or on main, still is', () => {
+    const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
+    const rows = [awaiting(6, 'lane/settings-cascade-audit'), { ...code(7), baseRefName: 'lane/x' }, awaiting(8, 'main'), code(3)];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
+    expect(r).toMatchObject({ count: 3, stacked: 1, stackedPrNumbers: [6] });
+    const off = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: false } });
+    expect(off).toMatchObject({ count: 4, stacked: 0 });
   });
 
   it('fetchOpenPrs asks for files (the card-only test needs them)', () => {
@@ -263,12 +280,12 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   });
 
   it('the refusal reports "N counted (M card-only excluded, K accepted excluded)"', () => {
-    const d = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 15, cardOnlyExcluded: 6, acceptedExcluded: 2 });
+    const d = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 15, cardOnlyExcluded: 6, acceptedExcluded: 2, stackedExcluded: 3 });
     expect(d.allowed).toBe(false);
-    expect(d.reason).toContain('15 counted (6 card-only excluded, 2 accepted excluded)');
+    expect(d.reason).toContain('15 counted (6 card-only excluded, 3 stacked awaiting-base excluded, 2 accepted excluded)');
     const ok = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 9, cardOnlyExcluded: 6, acceptedExcluded: 0 });
     expect(ok.allowed).toBe(true);
-    expect(ok.reason).toContain('9 counted (6 card-only excluded, 0 accepted excluded)');
+    expect(ok.reason).toContain('9 counted (6 card-only excluded, 0 stacked awaiting-base excluded, 0 accepted excluded)');
   });
 });
 

@@ -65,10 +65,22 @@ export function resolvePrLimit(repoKey, env = process.env) {
 
 /** Built-in default: a card-only PR (every changed file under `backlog/`) is NOT counted — it costs the review
  *  system almost nothing (CI light path, no code review), so letting it fill the cap blocks real work for no gain. */
-export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true });
+export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true, excludeStackedAwaitingBase: true });
 
 /** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeCardOnly. */
 export const PR_LIMIT_EXCLUDE_CARD_ONLY_ENV = 'WE_PR_LIMIT_EXCLUDE_CARD_ONLY';
+/** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeStackedAwaitingBase. */
+export const PR_LIMIT_EXCLUDE_STACKED_ENV = 'WE_PR_LIMIT_EXCLUDE_STACKED_AWAITING_BASE';
+/** The label the review-status tagger puts on a draft whose base is another open PR (we:scripts/conveyor/review-status-tag.mjs). */
+export const AWAITING_BASE_LABEL = 'review-status:awaiting-base';
+
+/** Operator ruling 2026-10-10 (option c): a stacked draft waiting for its base PR (base is not the default branch AND
+ *  it carries {@link AWAITING_BASE_LABEL}) is NOT counted — it cannot land before its base does, so it adds no review
+ *  or merge load yet. Both signals are required (fail-closed: a stacked PR without the label still counts). PURE. */
+export function isStackedAwaitingBasePr(pr, defaultBranch = 'main') {
+  const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
+  return Boolean(base) && base !== defaultBranch && hasLabel(pr, AWAITING_BASE_LABEL);
+}
 
 const parseBool = (v) => {
   if (typeof v === 'boolean') return v;
@@ -82,13 +94,18 @@ const parseBool = (v) => {
  *  layer (`scripts/settings/pr-limit.json` → `prLimit`) → env. A value that is not a boolean (or a boolean-ish env
  *  string) is ignored at its layer, never coerced. */
 export function resolvePrLimitScope({ platform = {}, tool = {}, env = {} } = {}) {
-  let excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly;
-  let source = 'default';
-  if (typeof platform?.excludeCardOnly === 'boolean') { excludeCardOnly = platform.excludeCardOnly; source = 'platform'; }
-  if (typeof tool?.excludeCardOnly === 'boolean') { excludeCardOnly = tool.excludeCardOnly; source = 'tool'; }
-  const fromEnv = parseBool(env?.[PR_LIMIT_EXCLUDE_CARD_ONLY_ENV]);
-  if (fromEnv !== null) { excludeCardOnly = fromEnv; source = 'env'; }
-  return { excludeCardOnly, source: { excludeCardOnly: source } };
+  const resolveKey = (key, envName) => {
+    let value = PR_LIMIT_SCOPE_DEFAULTS[key];
+    let source = 'default';
+    if (typeof platform?.[key] === 'boolean') { value = platform[key]; source = 'platform'; }
+    if (typeof tool?.[key] === 'boolean') { value = tool[key]; source = 'tool'; }
+    const fromEnv = parseBool(env?.[envName]);
+    if (fromEnv !== null) { value = fromEnv; source = 'env'; }
+    return [value, source];
+  };
+  const [excludeCardOnly, cardSource] = resolveKey('excludeCardOnly', PR_LIMIT_EXCLUDE_CARD_ONLY_ENV);
+  const [excludeStackedAwaitingBase, stackedSource] = resolveKey('excludeStackedAwaitingBase', PR_LIMIT_EXCLUDE_STACKED_ENV);
+  return { excludeCardOnly, excludeStackedAwaitingBase, source: { excludeCardOnly: cardSource, excludeStackedAwaitingBase: stackedSource } };
 }
 
 /** Read the live scope (the settings files + env). Never throws: unreadable settings fall back to the default. */
@@ -96,8 +113,10 @@ export function readPrLimitScope({ env = process.env, read = readSettings } = {}
   let tool = {};
   try { tool = read()?.prLimit ?? {}; } catch { tool = {}; }
   const scope = resolvePrLimitScope({ platform: platformPreference('prLimit', { env }), tool, env });
-  const layer = scope.source.excludeCardOnly;
-  logCascadeSources('prLimit', { value: scope, sources: { excludeCardOnly: layer === 'default' ? 'standard' : layer } }, { env });
+  const std = (layer) => (layer === 'default' ? 'standard' : layer);
+  logCascadeSources('prLimit', { value: scope, sources: {
+    excludeCardOnly: std(scope.source.excludeCardOnly), excludeStackedAwaitingBase: std(scope.source.excludeStackedAwaitingBase),
+  } }, { env });
   return scope;
 }
 
@@ -226,7 +245,9 @@ export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName
  *  PR whose commits lookup fails is DROPPED from the count (unknown authorship is never assumed AI). */
 export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTable = CONSTELLATION_REPOS, git, cwd, localOnly = false, readShared, authorshipCache = null, maxApiFetches = Infinity, now = Date.now(), scope } = {}) {
   const meta = reposTable[repoKey];
-  const { excludeCardOnly } = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
+  const liveScope = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
+  const { excludeCardOnly } = liveScope;
+  const excludeStacked = liveScope.excludeStackedAwaitingBase ?? PR_LIMIT_SCOPE_DEFAULTS.excludeStackedAwaitingBase;
   const limit = resolvePrLimit(repoKey, env);
   if (!meta) return { repoKey, slug: null, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
   const prs = fetchOpenPrs(meta.slug, { exec, localOnly, readShared });
@@ -235,6 +256,10 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
   const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
   const cardOnlySet = new Set(cardOnlyPrs);
+  const stackedPrs = excludeStacked
+    ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr) && isStackedAwaitingBasePr(pr))
+    : [];
+  for (const pr of stackedPrs) cardOnlySet.add(pr); // excluded from the authorship lookup and the count alike
   // GitHub-call budget for the per-PR commits reads (git is tried first and is not counted); an exhausted budget
   // leaves the PR UNRESOLVED rather than spending past it.
   let apiFetches = 0;
@@ -270,7 +295,8 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const counted = verdicts.filter((v) => v.ai === true).map((v) => v.pr);
   return {
     repoKey, slug: meta.slug, count: counted.length, prNumbers: counted.map((p) => p.number), limit, unavailable: false, unresolved, apiFetches,
-    cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
+    cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number),
+    stacked: stackedPrs.length, stackedPrNumbers: stackedPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
   };
 }
 
@@ -353,10 +379,10 @@ export function countOpenPrsAllRepos(o = {}) {
  */
 export function decideOpenPr({
   repoKey, limit, openCount, changedFiles = [], branch = null, branchAllowed = false, globalOff = false, forceOpen = false, forceReason = null,
-  cardOnlyExcluded = null, acceptedExcluded = null,
+  cardOnlyExcluded = null, acceptedExcluded = null, stackedExcluded = null,
 } = {}) {
-  const split = cardOnlyExcluded == null && acceptedExcluded == null ? ''
-    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
+  const split = cardOnlyExcluded == null && acceptedExcluded == null && stackedExcluded == null ? ''
+    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${stackedExcluded ?? 0} stacked awaiting-base excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
   if (isExemptChangeset(changedFiles)) {
     return { allowed: true, reason: 'exempt: conveyor/daemon infrastructure changeset (a fix to the review/land machinery itself always gets through)', exempt: true, overridden: false };
   }
