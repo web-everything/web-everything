@@ -1,7 +1,7 @@
 // A head pushed by a takeover earns ONE review beyond the round cap (live: #4708, takeover head 7e29b95c4 refused 5/5).
 import { describe, it, expect } from 'vitest';
 import { takeoverReviewGrant, OPERATOR_TAKEOVER_PREFIX } from '../takeover-review.mjs';
-import { takeoverMarkerBody } from '../fix-takeover.mjs';
+import { takeoverMarkerBody, takeoverVoidMarkerBody } from '../fix-takeover.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 import { resolveReviewSettings, validateReviewSettings } from '../../lib/review-settings.mjs';
 
@@ -45,6 +45,11 @@ describe('takeoverReviewGrant', () => {
     const comments = [...spent, marker(TAKE, 8), advisory(TAKE, 9), bounce(TAKE, 10)];
     expect(takeoverReviewGrant({ pr: pr(NEXT, comments), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'takeover-review-spent' });
   });
+  it('a takeover that never launched (a void marker cancels its start marker) anchors no grant', () => {
+    const voidMarker = { author: BOT, createdAt: at(8), body: takeoverVoidMarkerBody({ pr: 7, head: OLD }) };
+    expect(takeoverReviewGrant({ pr: pr(NEXT, [...spent, marker(OLD, 7), voidMarker]), takeoverReviewAttempts: 1 }))
+      .toMatchObject({ ok: false, reason: 'no-takeover' });
+  });
   it('a non-takeover head, the setting off, or a forged marker grant nothing', () => {
     expect(takeoverReviewGrant({ pr: pr(TAKE, spent), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'no-takeover' });
     expect(takeoverReviewGrant({ pr: pr(TAKE, [...spent, marker(TAKE, 8)]), takeoverReviewAttempts: 0 })).toMatchObject({ ok: false, reason: 'off' });
@@ -66,8 +71,22 @@ describe('planReconcile with a takeover head over the cap', () => {
     expect(p.refusals.find((r) => r.prNumber === 7 && r.kind === 'cap-exhausted')).toBeUndefined();
   });
   it('a takeover that re-armed to review:pending (6 rounds > cap 5) is still reviewed once', () => {
+    // The base takeover work (fix-takeover.mjs#takeoverMarkers) already raises the review cap by one per started
+    // takeover, so this head is dispatched through the ordinary review path, not through the grant.
     const p = plan(pr(TAKE, [...spent, marker(OLD, 7), rearm(8)], ['review:pending']), { durableCounts: { 7: 6 } });
-    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review', takeoverReview: { ok: true } });
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
+    expect(p.refusals.find((r) => r.prNumber === 7 && r.kind === 'cap-exhausted')).toBeUndefined();
+  });
+  it('the operator send-back cap site opts out of takeover: no takeover-review dispatch replaces it', () => {
+    // Same shape as fix-takeover.test.mjs's send-back case (red CI, five rounds before the operator's verdict, grant
+    // spent), with the takeover signals added: the grant must honour `allowTakeover: false` and leave the note to a person.
+    const sendBack = { id: 'op-send-back', createdAt: at(6), author: { login: 'chalbert' },
+      body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' };
+    const red = [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', headSha: TAKE }];
+    const p = plan({ ...pr(TAKE, [rearm(1), rearm(2), rearm(3), rearm(4), rearm(5), sendBack, operatorTakeover(7), marker(TAKE, 8)]),
+      statusCheckRollup: red }, { durableCounts: { 7: 7 } });
+    expect(p.dispatch.filter((x) => x.prNumber === 7 && (x.takeoverReview || x.mode === 'takeover'))).toEqual([]);
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toMatchObject({ capKind: 'fix', parkToHuman: true });
   });
   it('a second push after the takeover review is capped again (cap-exhausted, no dispatch)', () => {
     const p = plan(pr(NEXT, [...spent, marker(TAKE, 8), advisory(TAKE, 9), bounce(TAKE, 10)]), { durableCounts: { 7: 6 } });
@@ -77,6 +96,12 @@ describe('planReconcile with a takeover head over the cap', () => {
   it('a non-takeover head over the cap stays capped (person setting: no takeover fix either)', () => {
     const p = plan(pr(TAKE, spent), { roundCapAction: 'person' });
     expect(p.dispatch.find((x) => x.prNumber === 7)).toBeUndefined();
+    expect(p.refusals.find((r) => r.prNumber === 7)?.kind).toBe('cap-exhausted');
+  });
+  it('block-ruled-referral site: a takeover head is owed the fix, never the grant\'s review', () => {
+    const referral = { key: 'k1', finding: { file: 'src/a.mjs', line: 1, summary: 'bad' }, ruling: 'block' };
+    const p = plan({ ...pr(TAKE, [...spent, operatorTakeover(7), marker(TAKE, 8)], ['review:human']), blockRuledReferrals: [referral] });
+    expect(p.dispatch.filter((x) => x.prNumber === 7 && x.takeoverReview)).toEqual([]);
     expect(p.refusals.find((r) => r.prNumber === 7)?.kind).toBe('cap-exhausted');
   });
   it('red CI still refuses the takeover review (the review gate is not weakened)', () => {

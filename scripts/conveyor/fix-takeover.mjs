@@ -51,11 +51,65 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   };
 }
 
-/** Takeovers already started on this PR, read off TRUSTED marker comments only: `[{ head }]`. */
+/** Posted when a takeover's session never started after its marker went up (a spawn fault): it voids ONE marker for
+ *  that head, so a fault in the launch does not burn the only takeover. */
+export const FIX_TAKEOVER_VOID_MARKER = '<!-- conveyor-fix-takeover-void';
+
+// Anchored at the start of the body (like the sibling counters): a trusted comment that merely QUOTES a marker
+// (a fixer's summary, say) is not one.
+const markerHead = (body, prefix) => {
+  const m = body.trimStart().match(new RegExp(`^${prefix} head=([0-9a-f]{7,40}|unknown)`));
+  return m ? (m[1] === 'unknown' ? null : m[1]) : undefined; // undefined = not this kind of marker
+};
+
+/**
+ * PURE: does a launch failure PROVE no agent session started? Only then may the takeover marker be voided. A launch
+ * that exited non-zero on its own, or never ran (`ENOENT`/`EACCES`), cannot have started a session. A timeout or a
+ * kill signal is indeterminate (the session may be live: `dispatch-lane-io.mjs#SPAWN_TIMEOUT_MS`), and so is an error
+ * with no exit information at all; for both the marker stands and the one-takeover bound holds.
+ */
+export function launchProvedNotStarted(error) {
+  if (!error || typeof error !== 'object') return false;
+  if (error.signal || error.killed || error.code === 'ETIMEDOUT') return false;
+  if (error.code === 'ENOENT' || error.code === 'EACCES') return true;
+  return Number.isInteger(error.status) && error.status !== 0;
+}
+
+/** How many voids one PR may be given back: a launch fault that outlasts this many retries stops posting comments and
+ *  the operator is asked (otherwise a persistent fault would post two comments per tick, forever). */
+export const TAKEOVER_MAX_VOIDS = 2;
+
+const trustedBodies = (comments) => (Array.isArray(comments) ? comments : [])
+  .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c));
+
+/** Trusted void markers on the thread (each one a takeover that never launched). */
+export function takeoverVoidCount(comments) {
+  return trustedBodies(comments).filter((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER) !== undefined).length;
+}
+
+/**
+ * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
+ * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing,
+ * and only the first {@link TAKEOVER_MAX_VOIDS} voids on a PR are honoured.
+ */
 export function takeoverMarkers(comments) {
-  return (Array.isArray(comments) ? comments : [])
-    .filter((c) => typeof c?.body === 'string' && c.body.includes(FIX_TAKEOVER_MARKER) && isTrustedMarkerAuthor(c))
-    .map((c) => ({ head: c.body.match(/<!-- conveyor-fix-takeover head=([0-9a-f]{7,40})/)?.[1] ?? null, at: c.createdAt ?? null }));
+  const trusted = trustedBodies(comments);
+  const starts = trusted
+    .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null }))
+    .filter((m) => m.head !== undefined);
+  const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined)
+    .slice(0, TAKEOVER_MAX_VOIDS);
+  for (const h of voids) {
+    // Cancel the latest start for this head (a void with an `unknown` head cancels only an `unknown` start).
+    const at = starts.map((m, i) => ({ m, i })).reverse().find(({ m }) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
+    if (at) starts.splice(at.i, 1);
+  }
+  return starts;
+}
+
+/** Two shas are the same head when one is a prefix of the other (a marker may carry an abbreviated sha). */
+export function sameHeadSha(a, b) {
+  return Boolean(a && b && (a.startsWith(b) || b.startsWith(a)));
 }
 
 /**
@@ -83,9 +137,12 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr =
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const markers = takeoverMarkers(pr?.comments);
   const head = pr?.headRefOid ?? null;
-  const sameHead = markers.some((m) => m.head && head && (head.startsWith(m.head) || m.head.startsWith(head)));
+  const sameHead = markers.some((m) => sameHeadSha(m.head, head));
   if (sameHead || markers.length >= Math.max(0, takeoverMaxPerPr)) {
-    return { ok: false, reason: 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
+    // `takeover-void-limit`: launch faults used up the void allowance, so the last start marker stands. Whether that
+    // last one ran is not knowable from the thread, so the note says only that faults were recorded.
+    const voidLimit = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
+    return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
   }
   return { ok: true, ...takeoverRung(fixerLadder) };
 }
@@ -97,6 +154,14 @@ export function takeoverMarkerBody({ pr, head, attempts, cap, rung }) {
     + `One takeover session was dispatched on head \`${String(head ?? '').slice(0, 9)}\` with the full round history, `
     + `on the \`${rung?.id ?? 'resend'}\` route${rung?.model ? ` (${rung.model})` : ''}. If it does not clear this PR, `
     + 'the operator is asked next. Ruling disputes always go to the operator.';
+}
+
+/** The void marker: the takeover whose marker was posted for `head` never launched, so it does not count. A fixed
+ *  phrase only: the spawn error (paths, stderr) is never copied onto the PR. */
+export function takeoverVoidMarkerBody({ pr, head }) {
+  return `${FIX_TAKEOVER_VOID_MARKER} head=${head ?? 'unknown'} -->\n`
+    + `↩️ conveyor fix takeover — the takeover session for PR #${pr} did not start; the next pass retries it `
+    + `(at most ${TAKEOVER_MAX_VOIDS} such retries per PR, after which the operator is asked).`;
 }
 
 /**
