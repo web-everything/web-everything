@@ -39,6 +39,87 @@ import {
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
 } from '../daemon-live-smoke.mjs';
 
+// Existing fixtures must never observe or write the host's resource state.
+vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
+beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
+afterEach(() => vi.unstubAllEnvs());
+
+describe('resource shadow observations', () => {
+  it.each([[63, 'admit', false], [3, 'wait', true]])('uses shadow admission at load %s', (load1, verdict, busy) => {
+    const env = {}; const shadow = vi.fn(() => ({ verdict })); const admit = vi.fn();
+    expect(hostLooksBusy(env, { load: () => load1, cores: () => 12, shadow, admit })).toBe(busy);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    expect(shadow).toHaveBeenCalledWith({
+      gate: 'rebuild-smoke.hostLooksBusy', kind: 'rebuild-smoke',
+      oldVerdict: load1 === 63 ? 'hold' : 'admit', oldReason: `load1 ${load1} vs 12×1`, env,
+    });
+    expect(admit).not.toHaveBeenCalled();
+  });
+  it('falls back from an absent shadow decision to admission', () => {
+    const env = {}; const admit = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 40% ≥ 5%' }));
+    expect(hostLooksBusy(env, { load: () => 63, cores: () => 12, shadow: () => {}, admit })).toBe(false);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledWith({ kind: 'rebuild-smoke', env });
+  });
+  it.each([63, 3])('falls back to legacy load %s when both admission probes throw', (load1) => {
+    const shadow = vi.fn(() => { throw Error('observer failed'); });
+    const admit = vi.fn(() => { throw Error('admission failed'); });
+    expect(hostLooksBusy({}, { load: () => load1, cores: () => 12, shadow, admit })).toBe(load1 === 63);
+    expect(shadow).toHaveBeenCalledTimes(1); expect(admit).toHaveBeenCalledTimes(1);
+  });
+  it('leaves admitted budgets unscaled despite high load', () => {
+    expect(resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } }))
+      .toEqual(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12 }));
+  });
+  it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
+    const host = { load: () => 0, cores: () => 12, admission: { verdict } };
+    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(360_000);
+  });
+  it('preserves disabled scaling and absolute per-check overrides under a hold', () => {
+    const host = { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } };
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, host))
+      .toEqual(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12 }));
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: '50000' }, host).dispatchDryRunMs).toBe(50_000);
+  });
+  it.each(['shadow', 'admit'])('feeds the %s decision into run budgets and reports admission', async (source) => {
+    const env = {};
+    const options = { root: '/x', env, load: () => 63, cores: () => 12,
+      clock: () => 0, changedFiles: [], closureOf: () => [], runChild: vi.fn(async () => '') };
+    await runLiveSmoke({ ...options, load: () => 0, shadow: () => {}, admit: () => undefined });
+    const calls = options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs);
+    expect(calls.length).toBeGreaterThan(0); options.runChild.mockClear();
+    const admission = { verdict: 'admit', reason: 'cpu idle 30% ≥ 5%' };
+    const shadow = vi.fn(() => source === 'shadow' ? admission : undefined);
+    const admit = vi.fn(() => admission);
+    const observed = await runLiveSmoke({ ...options, shadow, admit });
+    expect(options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs)).toEqual(calls);
+    expect(observed.admission).toEqual(admission);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    expect(shadow).toHaveBeenCalledWith({
+      gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke',
+      oldVerdict: 'hold', oldReason: 'timeouts scaled ×4 by load1 63/12 cores', env,
+    });
+    if (source === 'admit') {
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(admit).toHaveBeenCalledWith({ kind: 'rebuild-smoke', env });
+    } else expect(admit).not.toHaveBeenCalled();
+  });
+  it('survives a throwing shadow and absent admission with legacy budgets', async () => {
+    const env = {};
+    const options = { root: '/x', env, load: () => 63, cores: () => 12,
+      clock: () => 0, changedFiles: [], closureOf: () => [], runChild: vi.fn(async () => '') };
+    const baseline = await runLiveSmoke({ ...options, shadow: () => {}, admit: () => undefined });
+    const calls = options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs);
+    options.runChild.mockClear();
+    const admit = vi.fn(() => undefined);
+    const failed = await runLiveSmoke({ ...options, shadow: () => { throw Error('observer failed'); }, admit });
+    expect({ ...failed, sessionSlug: null }).toEqual({ ...baseline, sessionSlug: null });
+    expect(options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs)).toEqual(calls);
+    expect(admit).toHaveBeenCalledWith({ kind: 'rebuild-smoke', env });
+  });
+});
+
 /**
  * xp4lw2v (#4468 extended) — every pre-existing `runChild` fixture in this file predates the checks added since
  * (`dispatch-dry-run`/`tree-stays-clean`/`daemon-entries-boot`) and knows nothing about them. Wrapping a fixture
