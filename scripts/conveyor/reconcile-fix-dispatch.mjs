@@ -82,7 +82,7 @@ import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-s
 import { randomUUID } from 'node:crypto';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import matter from 'gray-matter';
 import { createQueueBudget } from '../readiness/heavy-queue-projection.mjs'; // card xkyw1x4 — queue-time admission
@@ -101,7 +101,8 @@ import {
 import { stopSession } from '../operations/dispatch-abort.mjs';
 import { launchWrappedClaudeWorker, workerWrapperEnabledFor } from '../operations/worker-wrapper-launch.mjs';
 import { assertMainNotStale } from '../operations/review-dispatch.mjs';
-import { armSelfReexecOnFastForward } from '../lib/main-staleness.mjs';
+import { armSelfReexecOnFastForward, isCodePath } from '../lib/main-staleness.mjs';
+import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
 import { BRIEF_REQUIRED_BY_KIND, OPTIONAL_BRIEF_PLACEHOLDERS, REPO_AWARE_VALUE_PATTERNS, fillBrief, sessionSlugFor } from '../operations/dispatch-lane.mjs';
 import { parseAuthorActorId } from '../lib/review-independence.mjs';
 import { laneRefItemNum } from './lease-reaper.mjs';
@@ -138,6 +139,36 @@ import { isolateDispatchSession } from '../lib/dispatch-bg-isolation.mjs';
 import { readOverlayConflictWakes } from '../lib/overlay-conflict-wake.mjs';
 // Card xjddimd — delivery priority class, SHADOW only: logged per pass, never changes order or dispatch.
 import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
+
+/** The label every fix-dispatch / ci-heal-dispatch stale-guard refusal carries (live 2026-10-09 19:18:51Z: the
+ *  guard ran with the `review-dispatch` default label, so the log blamed a review step that never ran). */
+export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
+const FIX_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+let fixClosureMemo;
+
+/** The static import closure of THIS file in the running tree (memoized), or `null` if unreadable: the code a
+ *  fix/ci-heal dispatch pass runs. A managed clone behind `origin/main` only outside it is not stale for it. */
+export function fixCodeClosure() {
+  if (fixClosureMemo === undefined) {
+    fixClosureMemo = collectImportClosure({ root: FIX_CODE_ROOT, entries: ['scripts/conveyor/reconcile-fix-dispatch.mjs'] });
+  }
+  return fixClosureMemo;
+}
+
+/** Is `path` (repo-relative) on the fix-dispatch code path? Live 2026-10-09 19:18:51Z (PR #4624): the fix
+ *  daemon's managed clone was 12 commits behind, the guard had no dispatch path, and it refused EVERY repo's
+ *  fix pass — #4624's block-ruled fix waited a further tick. Passing this as `dispatchPath` gives the fix pass
+ *  the same #4387 off-path tolerance and rebuild grace the review and promote passes already have. An unknown
+ *  or incomplete closure fails closed (every code file counts, the plain #4044 rule). */
+export function isFixCodePath(path, { closure = fixCodeClosure() } = {}) {
+  const p = String(path || '');
+  if (!p) return false;
+  if (!closure || !closure.complete) return isCodePath(p);
+  return closureHits({ closure, changedFiles: [p] }).length > 0;
+}
+
+/** The narrowing both fix-side passes hand `assertMainNotStale`. */
+export const FIX_STALE_GUARD_OPTS = Object.freeze({ label: FIX_DISPATCH_STALE_LABEL, dispatchPath: (p) => isFixCodePath(p) });
 
 /** The template `we:skills-src/conveyor/fix-agent-brief.md` — the SAME brief `dispatch-lane.mjs`'s own
  *  tick-core-driven fix dispatch fills, read fresh per dispatch so an edit takes effect with no restart. */
@@ -1429,7 +1460,7 @@ export function runReconcileFixDispatch({
   // was therefore the wrong condition — it let a stale WE checkout record foreign-repo unsupported rows (and
   // will, once fix dispatch is turned on for that repo, dispatch fixes) from code that had already been proven
   // stale. Run it for every repo.
-  assertMainNotStale(root, checkStaleness);
+  assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciledRaw = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const reconciled = netScope ? netScope(reconciledRaw, { root, repoKey }) : reconciledRaw;
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
@@ -1789,7 +1820,7 @@ export function planFixDispatchClaimStatus({
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
-  assertMainNotStale(root, checkStaleness);
+  assertMainNotStale(root, checkStaleness, FIX_STALE_GUARD_OPTS);
   const reconciled = reconcile({ repo, ...(prsFile ? { readPrs: () => readPrsFromFile(prsFile) } : {}) });
   const dispatchEntries = Array.isArray(reconciled.dispatch) ? reconciled.dispatch : [];
   const profile = resolveProfile(repoKey);
