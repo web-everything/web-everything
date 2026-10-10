@@ -71,7 +71,7 @@ const rules = {
   revertRed: value => ['off', 'warn', 'enforce'].includes(value),
   revertRedSince: value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)),
   revertRedMaxFiles: value => Number.isSafeInteger(value) && value >= 1 && value <= 200,
-  selection: value => ['pr', 'since-last-green'].includes(value),
+  selection: value => ['since-last-green', 'pr'].includes(value),
   alwaysRunTests: value => Array.isArray(value) && value.length <= 50
     // Each entry becomes a vitest file argument: it must start with a word character (never `-`, so `-u` / `--bail`
     // cannot become a vitest option), be a test file, and stay inside the repo.
