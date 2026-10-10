@@ -34,7 +34,7 @@ import {
   setFixPrs, setMode, activeEntries, parseVitestFailures, planSafetyNet, QUARANTINE_SAFETY_NET_DEFAULTS,
 } from './red-main-quarantine.mjs';
 
-const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], ...opts });
+const git = (args, opts) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, killSignal: 'SIGKILL', ...opts });
 /** A READ of the ops ref (every CI job does one): bounded, so a hung fetch can never stall the step. */
 const gitRead = (args, opts) => git(args, { timeout: 60_000, killSignal: 'SIGKILL', ...opts });
 
@@ -216,7 +216,10 @@ export function runSafetyNet({
       // Each failed unit job's log is read until it succeeds, then kept for the red window (re-read only if the
       // failing run changed). A failed read is NEVER cached as an answer: it is retried with a growing backoff.
       const runId = mainCiRuns?.failing?.runId ?? null;
-      if (!rec.jobFailures || rec.runId !== runId) { rec.runId = runId; rec.jobFailures = {}; rec.readAttempts = 0; rec.readRetryAt = 0; }
+      // A re-run of the same workflow run keeps its id but gets a new `updatedAt`: key the cache on both, so a shard
+      // that fails differently on attempt 2 is read again.
+      const runKey = `${runId}@${(mainCiRuns?.runs ?? []).find((r) => r?.databaseId === runId)?.updatedAt ?? ''}`;
+      if (!rec.jobFailures || rec.runKey !== runKey) { rec.runId = runId; rec.runKey = runKey; rec.jobFailures = {}; rec.readAttempts = 0; rec.readRetryAt = 0; }
       const unitRe = new RegExp(settings.value.unitJobPattern);
       const wanted = failedJobs.filter((n) => unitRe.test(n));
       if (wanted.some((n) => rec.jobFailures[n] == null) && now >= (Number(rec.readRetryAt) || 0)) {
@@ -225,7 +228,8 @@ export function runSafetyNet({
         const byName = new Map((jobs?.failed ?? []).map((j) => [j.name, j.id]));
         for (const name of wanted.filter((n) => rec.jobFailures[n] == null)) {
           const id = byName.get(name);
-          try { const got = id == null ? null : readLog(id); if (got != null) rec.jobFailures[name] = got; } catch { /* retried next time */ }
+          // Only a COMPLETE parse is an answer; a cut-off / still-uploading log (`complete:false`) is retried like a failed read.
+          try { const got = id == null ? null : readLog(id); if (got?.complete === true) rec.jobFailures[name] = got; } catch { /* retried next time */ }
         }
         if (wanted.some((n) => rec.jobFailures[n] == null)) {
           rec.readAttempts = (Number(rec.readAttempts) || 0) + 1;
@@ -253,17 +257,20 @@ export function runSafetyNet({
     if (plan.fixPrs) steps.push((cur) => setFixPrs(cur, { fixPrs: plan.fixPrs, actor: SAFETY_NET_ACTOR, now }));
     // Publish the mode this daemon resolved (env / preference / settings) so CI applies the SAME one: a CI job cannot
     // see the daemon's env. Stamped whenever entries are live or being added; withdrawn on a flip back to stop.
-    if (isLive && read.list?.mode !== 'quarantine' && (plan.action === 'add' || activeEntries(read.list, { now }).length)) {
+    let stamping = false;
+    if (isLive && read.list?.mode !== 'quarantine' && !(plan.action === 'prune' && plan.mainGreen === true) && (plan.action === 'add' || activeEntries(read.list, { now }).length)) {
+      stamping = true;
       steps.push((cur) => setMode(cur, { mode: 'quarantine', actor: SAFETY_NET_ACTOR, now }));
     }
     if (!steps.length) return out;
     const change = composeChanges(steps);
     const what = [plan.action !== 'none' ? `${plan.action}${plan.tests ? ` ${plan.tests.join(', ')}` : ''}` : null, plan.fixPrs ? `fix PRs → [${plan.fixPrs.join(', ')}]` : null].filter(Boolean).join('; ');
     if (isLive) {
+      // Record the intent BEFORE the push: a push that lands but throws must still be withdrawable on a flip to stop.
+      if (stamping || read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine';
       const r = write({ actor: SAFETY_NET_ACTOR, message: `quarantine: ${what} (${plan.why})`, change });
       out.applied = true;
       out.events = r?.events ?? [];
-      if (steps.length) ledger.publishedMode = 'quarantine';
     } else {
       const r = change(ledger.shadowList ?? { version: 1, entries: [] });
       if (r.ok === false) { out.error = r.error; return out; }

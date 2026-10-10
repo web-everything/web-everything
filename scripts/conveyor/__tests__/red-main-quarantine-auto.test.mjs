@@ -218,6 +218,33 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
     expect(net({ mainCiRuns: RUNS, now: at + 5 * MIN }).calls.logs).toBe(1);
   });
 
+  it('an incomplete parse (cut-off / still-uploading log) is retried, not cached as the answer', () => {
+    const partial = parseVitestFailures(LOG.split('\n').slice(0, 3).join('\n'));
+    expect(partial.complete).toBe(false);
+    expect(net({ mainCiRuns: RUNS, now: at, readLog: () => partial }).r.plan.action).toBe('none');
+    expect(net({ mainCiRuns: RUNS, now: at + 2 * MIN }).r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+  });
+  it('a re-run of the same run id (new updatedAt) is read again', () => {
+    expect(net({ mainCiRuns: RUNS, now: at }).calls.logs).toBe(1);
+    const rerun = { ...RUNS, runs: RED_RUNS.map((r) => (r === RED ? { ...RED, updatedAt: '2026-10-10T19:30:00Z' } : r)) };
+    expect(net({ mainCiRuns: rerun, now: at + MIN }).calls.logs).toBe(1);
+    expect(net({ mainCiRuns: rerun, now: at + 2 * MIN }).calls.logs).toBe(0);
+  });
+  it('a live push that throws after landing is still withdrawable on a flip back to stop', () => {
+    const boom = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('push timed out'); } });
+    expect(boom.r.error).toMatch(/push timed out/);
+    const stamped = { version: 1, entries: [], mode: 'quarantine' };
+    const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + MIN });
+    expect(stopped.calls.writes).toHaveLength(1);
+    expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+  });
+  it('a prune-only live write does not mark the mode as published', () => {
+    const list = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list; // unstamped
+    const g = net({ mode: QUARANTINE, mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, list, now: at + MIN });
+    expect(g.r.plan.action).toBe('prune');
+    expect(net({ mode: STOP, mainCiRuns: RUNS, list: { version: 1, entries: [], mode: 'quarantine' }, now: at + 2 * MIN }).calls.reads).toBe(0);
+  });
+
   it('a shadow add does not stop the first LIVE add of the same red window (stop → quarantine)', () => {
     const shadow = net({ mainCiRuns: RUNS, now: at });
     expect(shadow.r.plan.action).toBe('add');
