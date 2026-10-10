@@ -87,11 +87,15 @@ describe('classifyPr — base is not the default branch: held with a named reaso
     expect(onMain.reason).toBe('base is not trunk (main)');
   });
 
-  it('base is not <default>: a PR on the default branch is unaffected, and an unresolved default leaves the arm inert', () => {
+  it('base is not <default>: a PR on the default branch is unaffected; an unresolved default still holds a lane/* base', () => {
     const onDefault = verdictFor(ghPr(12, 'main'), () => 'main');
     expect(onDefault.decision).toBe('merge');
     expect(onDefault.reason).toBe(classifyPr(ghPr(12, 'main')).reason);
-    expect(verdictFor(ghPr(13, 'lane/mechanical-dispatcher'), () => null).decision).toBe('merge');
+    // stack.reviewWhileBaseOpen (2026-10-10): a stacked lane PR now runs CI, so its `test` can be green. A failed
+    // default-branch read must not let it land into its lane base: a lane/* base is held fail-closed.
+    const stacked = verdictFor(ghPr(13, 'lane/mechanical-dispatcher'), () => null);
+    expect(stacked.decision).toBe('skip');
+    expect(stacked.reason).toBe('base is not the default branch (lane/mechanical-dispatcher)');
   });
 
   it('base is not <default>: the held PR is never a rebase-drop candidate (the rebase pass would re-flip it to merge)', () => {

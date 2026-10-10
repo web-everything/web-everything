@@ -22,3 +22,7 @@ Idempotency key (do not edit): approval-prevention-key:web-everything/web-everyt
 1. **Executable** — TODO: a command that fails before this item lands and passes after.
 
 Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#4811 (finding 1: `we:backlog/xss4m4n-prevention-a-checklist-or-review-bot-that-cross-references-e.md:4` — Have the approval-time prevention filer resolve each cited we:backlog/x… slug to its current numbered filename or drop paths that don't exist before writing scope: . Add a check:standards rule that every scope: entry of a backlog card must exist.)

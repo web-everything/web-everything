@@ -22,7 +22,7 @@
  */
 
 import { spawn, execFileSync } from 'node:child_process';
-import { closeSync, openSync } from 'node:fs';
+import { closeSync, openSync, readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -90,6 +90,17 @@ export function selfHandle({ host = hostName(), readStart = readProcStart, pid =
 }
 
 /**
+ * Is this `.json` in a jobs folder well-formed JSON that is not a job record at all (an array, a primitive, or
+ * an object with no `job` block)? A torn write never parses, and a record-shaped object with a bad `job` block
+ * is still a record — both stay corrupt.
+ */
+function isForeignJson(path) {
+  let v;
+  try { v = JSON.parse(readFileSync(path, 'utf8')); } catch { return false; }
+  return v === null || typeof v !== 'object' || Array.isArray(v) || !('job' in v);
+}
+
+/**
  * The job record store for one daemon's jobs folder.
  * `update(id, fn)` runs `fn(freshRecord)` under the record's lock; `fn` returns the new record, or `null` to
  * leave it unchanged. Returns what was written (or `null`).
@@ -117,7 +128,11 @@ export function createJobStore(dir) {
         return next;
       });
     },
-    /** Every job record, plus the ids whose record would not parse (never treated as absent). */
+    /**
+     * Every job record, plus the ids whose record would not parse (never treated as absent). A `.json` that
+     * parses but is not a job record at all — a kind's own sidecar, e.g. the rebuild job's `consumed.json`
+     * array — is skipped, not reported: only a torn or invalid RECORD is corrupt.
+     */
     list() {
       const records = [];
       const corrupt = [];
@@ -126,7 +141,7 @@ export function createJobStore(dir) {
           const r = tryReadRun(id, dir);
           if (r && isJobRecord(r)) records.push(r);
         } catch {
-          corrupt.push(id);
+          if (!isForeignJson(runPath(id, dir))) corrupt.push(id);
         }
       }
       return { records, corrupt };

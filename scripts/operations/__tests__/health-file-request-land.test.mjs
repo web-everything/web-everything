@@ -223,6 +223,43 @@ describe('landPending — the whole pass over a real ledger dir', () => {
     expect(ledger[0].pr).toBe(3);
   });
 
+  it('a card admitted to the card batch is landed with its batch ref: no per-card push, verify or open-pr', () => {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ fileDispatch: true }));
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({ episodes: {} }));
+    writeLedger(dir, recordRequested([], { key: 'a::b', smell: 'a', subject: 'b', episodeId: 'e1', title: 'T', digest: 'D', scope: [], size: '3' }, 100));
+    const { runFn, calls } = fakeRunner(({ args }) => {
+      if (args.includes('acquire')) return JSON.stringify({ path: LANE_PATH, lane: 41, holder: 'h' });
+      if (args.some((a) => a.includes('file-item'))) return JSON.stringify({ verdict: { num: 99, rel: 'backlog/99-x.md' } });
+      if (args.some((a) => String(a).endsWith('card-batch-file.mjs'))) return `${JSON.stringify({ batched: true, batchRef: 'lane/card-batch-filing-4' })}\n`;
+      return '';
+    });
+    const { results } = landPending({ dir, now: 200, runFn });
+    expect(results[0].status).toBe('landed');
+    const batchCall = calls.find((c) => c.args.some((a) => String(a).endsWith('card-batch-file.mjs')));
+    expect(batchCall.args).toEqual(expect.arrayContaining([`--lane=${LANE_PATH}`, '--card=backlog/99-x.md', '--json']));
+    expect(batchCall.args[0]).toBe(join(REPO_ROOT, 'scripts', 'operations', 'card-batch-file.mjs'));
+    expect(calls.some((c) => c.args[0] === 'push' || c.args.includes('verify') || c.args.some((a) => a.includes('open-pr')))).toBe(false);
+    expect(calls.some((c) => c.args.includes('release'))).toBe(true);
+    expect(readLedgerStrict(dir)[0]).toMatchObject({ status: 'landed', card: 99, pr: null, batchRef: 'lane/card-batch-filing-4' });
+  });
+
+  it('a card the batch refuses (exit 3) takes the per-card PR path unchanged', () => {
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ fileDispatch: true }));
+    writeFileSync(join(dir, 'state.json'), JSON.stringify({ episodes: {} }));
+    writeLedger(dir, recordRequested([], { key: 'a::b', smell: 'a', subject: 'b', episodeId: 'e1', title: 'T', digest: 'D', scope: [], size: '3' }, 100));
+    const { runFn, calls } = fakeRunner(({ args }) => {
+      if (args.includes('acquire')) return JSON.stringify({ path: LANE_PATH, lane: 41, holder: 'h' });
+      if (args.some((a) => a.includes('file-item'))) return JSON.stringify({ verdict: { num: 99, rel: 'backlog/99-x.md' } });
+      if (args.some((a) => String(a).endsWith('card-batch-file.mjs'))) throw Object.assign(new Error('exit 3'), { status: 3 });
+      if (args.some((a) => a.includes('open-pr'))) return fakeOpenPrResult(3, 'u');
+      return '';
+    });
+    landPending({ dir, now: 200, runFn });
+    expect(calls.some((c) => c.args[0] === 'push')).toBe(true);
+    expect(readLedgerStrict(dir)[0]).toMatchObject({ status: 'landed', pr: 3 });
+    expect(readLedgerStrict(dir)[0].batchRef).toBeUndefined();
+  });
+
   it('an already-landed entry (pr set) is never repeated — a fresh pass with no runFn calls stays a no-op', () => {
     writeFileSync(join(dir, 'config.json'), JSON.stringify({ fileDispatch: true }));
     writeFileSync(join(dir, 'state.json'), JSON.stringify({ episodes: {} }));

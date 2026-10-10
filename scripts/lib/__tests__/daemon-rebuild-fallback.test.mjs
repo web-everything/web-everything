@@ -22,6 +22,7 @@ import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
+import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
@@ -693,5 +694,86 @@ describe('load-shaped smoke failure: an overlay is blamed only by a same-run dif
     });
     expect(result.reason).toBe('fallback-plain-main');
     expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ── rebuild smoke budget (live 2026-10-10): A failed, then a FULL plain-main smoke ran past the job's 60-min limit ──
+// The overlay smoke took ~10 min, the plain-main fallback ~22 min more, and the rebuild child was killed (SIGTERM, no
+// result) on both job attempts — the drain clone could never adopt new code. The fallback stages now run only within
+// what is left of one total budget, and a check that failed on A stops B the moment it fails on plain main too.
+describe('rebuild smoke budget and fail-fast', () => {
+  const codeFail = (name = 'reconcile-dry-run') => ({ verdict: 'code', attempts: 1, smoke: { results: [{ ok: false, name, detail: 'timed out' }] } });
+
+  it('skips the plain-main and last-good smokes when A used up the budget: holds on last-good with a budget alert', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    env.WE_REBUILD_SMOKE_TOTAL_MS = String(30 * 60_000);
+    env.WE_REBUILD_SMOKE_FALLBACK_MIN_MS = String(5 * 60_000);
+    const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+    pushBranch(originDir, 'lane/slow', (dir) => writeFile(dir, 'slow.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/slow' }, { env });
+    let t = 1_000_000;
+    const runSmoke = vi.fn(async () => { t += 27 * 60_000; return codeFail(); });
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, now: () => t,
+    });
+    expect(runSmoke).toHaveBeenCalledTimes(1); // A only
+    expect(result.moved).toBe(false);
+    expect(result.reason).toBe('smoke-rejected');
+    expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(prevHead);
+    const budget = result.alerts.filter((a) => a.kind === 'smoke-budget-exhausted').map((a) => a.detail.stage);
+    expect(budget).toEqual(['plain-main', 'last-good']);
+    expect(result.alerts.find((a) => a.kind === 'smoke-budget-exhausted').detail).toMatchObject({ totalMs: 30 * 60_000, source: { totalMs: 'env' } });
+  });
+
+  it('hands every smoke a budgeted runChild, and plain main a fail-fast one keyed by the checks A failed', async () => {
+    const { originDir, cloneDir, env } = makeFixture();
+    advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'y\n'));
+    pushBranch(originDir, 'lane/bad2', (dir) => writeFile(dir, 'bad2.txt', 'x\n'));
+    addOverlay(cloneDir, { ref: 'lane/bad2' }, { env });
+    const seen = [];
+    const runSmoke = vi.fn(async ({ root, runChild }) => {
+      seen.push({ bad: existsSync(join(root, 'bad2.txt')), failFast: [...(runChild?.failFast ?? [])], deadline: runChild?.deadline });
+      return existsSync(join(root, 'bad2.txt')) ? codeFail('dispatch-dry-run') : { verdict: 'pass', attempts: 1, smoke: { results: [] } };
+    });
+    const result = await rebuildClone({ root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS });
+    expect(result.reason).toBe('fallback-plain-main');
+    expect(seen.map((s) => s.failFast)).toEqual([[], ['dispatch-dry-run']]);
+    expect(seen.every((s) => Number.isFinite(s.deadline) && s.deadline === seen[0].deadline)).toBe(true);
+  });
+});
+
+describe('budgetedRunChild', () => {
+  it('caps each child timeout at the time left, and refuses to start one once the budget is spent', async () => {
+    let t = 0;
+    const base = vi.fn(async (_cmd, _args, opts) => opts.timeoutMs);
+    const run = budgetedRunChild({ runChild: base, deadline: 100_000, now: () => t });
+    expect(await run('git', ['status'], { timeoutMs: 500_000 })).toBe(100_000);
+    t = 90_000;
+    expect(await run('git', ['status'], { timeoutMs: 5_000 })).toBe(5_000);
+    expect(await run('git', ['status'], { timeoutMs: 50_000 })).toBe(10_000);
+    t = 99_900;
+    await expect(run('git', ['status'], { timeoutMs: 5_000 })).rejects.toThrow(/smoke budget exhausted/);
+    expect(base).toHaveBeenCalledTimes(3);
+  });
+
+  it('fail-fast: once a listed check fails, every later child is refused without running', async () => {
+    const base = vi.fn(async (cmd, args) => {
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') throw new Error('timed out after 185024ms (process group killed)');
+      return 'ok';
+    });
+    const run = budgetedRunChild({ runChild: base, deadline: Infinity, now: () => 0, failFast: ['reconcile-dry-run'] });
+    expect(await run('git', ['status', '--porcelain'], {})).toBe('ok');
+    await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs', '--repo=a/b', '--json'], {})).rejects.toThrow(/timed out/);
+    await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs', '--repo=c/d', '--json'], {})).rejects.toThrow(/fail-fast/);
+    await expect(run('node', ['--input-type=module', '-e', 'x'], {})).rejects.toThrow(/fail-fast/);
+    expect(base).toHaveBeenCalledTimes(2);
+  });
+
+  it('a check not on the fail-fast list failing does not stop the smoke', async () => {
+    const base = vi.fn(async (cmd, args) => { if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') throw new Error('boom'); return 'ok'; });
+    const run = budgetedRunChild({ runChild: base, deadline: Infinity, now: () => 0, failFast: ['dispatch-dry-run'] });
+    await expect(run('node', ['scripts/conveyor/reconcile-pass.mjs'], {})).rejects.toThrow('boom');
+    expect(await run('git', ['status'], {})).toBe('ok');
   });
 });

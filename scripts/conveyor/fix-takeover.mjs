@@ -38,7 +38,8 @@ const ONOFF = ['on', 'off'];
 /**
  * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, `WE_FIX_TAKEOVER_MAX_PER_PR`) > settings file > built-in.
  * The file layer is its `fix` object (a flat top-level key is not a setting). Unknown values fall through to the
- * next layer, except the takeover limit, which fails closed to 0 (see below). Never throws.
+ * next layer, except `roundCapAction` and the takeover limit, which fail closed to `person` / 0 (see below). Never
+ * throws.
  */
 export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
   let fromFile = {};
@@ -51,22 +52,37 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
     if (ok(f)) return { value: f, source: 'settings' };
     return { value: dflt, source: 'built-in' };
   };
-  const action = pick(env.WE_FIX_ROUND_CAP_ACTION, fromFile.roundCapAction, (v) => ACTIONS.includes(v), FIX_SETTINGS_DEFAULTS.roundCapAction);
+  // The two settings that can START a takeover fail CLOSED: the first layer that is present (a non-blank env var, or
+  // a file key that is not null) decides, and a present value that does not parse turns the takeover off (`person`,
+  // limit 0) instead of falling through to the built-in `takeover` / 1 — so a typo meant to stop it never enables it.
+  // Types are checked, not stringified: `[3]`, `""` or `false` in the file is invalid, not 3 / absent / "false".
+  const failClosed = (envVal, fileVal, parse, closed, dflt) => {
+    if (typeof envVal === 'string' && envVal.trim() !== '') {
+      const v = parse(envVal);
+      return v === undefined ? { value: closed, source: 'env-invalid' } : { value: v, source: 'env' };
+    }
+    if (fileVal !== undefined && fileVal !== null) {
+      const v = parse(fileVal);
+      return v === undefined ? { value: closed, source: 'settings-invalid' } : { value: v, source: 'settings' };
+    }
+    return { value: dflt, source: 'built-in' };
+  };
+  const parseAction = (v) => {
+    const s = typeof v === 'string' ? v.trim().toLowerCase() : null;
+    return ACTIONS.includes(s) ? s : undefined;
+  };
+  const parseMax = (v) => {
+    if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 99 ? v : undefined;
+    return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : undefined;
+  };
+  const action = failClosed(env.WE_FIX_ROUND_CAP_ACTION, fromFile.roundCapAction, parseAction, 'person', FIX_SETTINGS_DEFAULTS.roundCapAction);
   const history = pick(env.WE_FIX_ROUND_HISTORY, fromFile.roundHistory, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.roundHistory);
-  // The takeover limit fails CLOSED: a value that is present but not a 0-99 count (`-1`, `off`, `100`) turns the
-  // takeover off (0) instead of falling through to the built-in 1, so a typo never silently enables a takeover.
-  const present = (v) => String(v ?? '').trim() !== '';
-  const maxOk = (v) => /^\d{1,2}$/.test(v);
-  const max = present(env.WE_FIX_TAKEOVER_MAX_PER_PR) && !maxOk(String(env.WE_FIX_TAKEOVER_MAX_PER_PR).trim())
-    ? { value: '0', source: 'env-invalid' }
-    : !present(env.WE_FIX_TAKEOVER_MAX_PER_PR) && present(fromFile.takeoverMaxPerPr) && !maxOk(String(fromFile.takeoverMaxPerPr).trim())
-      ? { value: '0', source: 'settings-invalid' }
-      : pick(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, maxOk, String(FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr));
+  const max = failClosed(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, parseMax, 0, FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr);
   // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
   const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
   const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
   return {
-    roundCapAction: action.value, roundHistory: history.value, takeoverMaxPerPr: Number(max.value),
+    roundCapAction: action.value, roundHistory: history.value, takeoverMaxPerPr: max.value,
     resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
     sources: {
       roundCapAction: action.source, roundHistory: history.source, takeoverMaxPerPr: max.source,

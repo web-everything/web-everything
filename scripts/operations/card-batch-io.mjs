@@ -10,9 +10,20 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { setImmediate } from 'node:timers/promises';
 import { mergeMembers, planAdmit } from './card-batch.mjs';
+import { automationStateRoot } from '../lib/automation-home.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+/**
+ * Batch state is SHARED by every clone that files cards (review, fix, health, build daemons and lanes): a
+ * per-clone directory would give each clone its own idea of the open batch, and two clones would then race the
+ * same `lane/card-batch-<kind>-<n>` ref. So it lives in the automation state home, outside every git tree
+ * (`WE_CARD_BATCH_STATE_DIR` overrides it).
+ */
+export function cardBatchStateDir(env = process.env) {
+  return env?.WE_CARD_BATCH_STATE_DIR || join(automationStateRoot(env), 'card-batch');
+}
 const MARKER = 'Card-Batch: ';
+export const AI_TRAILER = 'Co-Authored-By: Claude <noreply@anthropic.com>';
 const refuse = reason => ({ action: 'refuse', reason });
 const readJSON = path => {
   try { return JSON.parse(readFileSync(path, 'utf8')); }
@@ -87,7 +98,7 @@ export function atomicRecord(path, state) {
 
 /** Returns admission/dedupe/refusal; injected crashes throw CARD_BATCH_CRASH at the named boundary. */
 export async function admitCard(input, {
-  stateDir = join(ROOT, '.operations/card-batch'), remote = 'origin', clock = Date.now,
+  stateDir = cardBatchStateDir(), remote = 'origin', clock = Date.now,
   owner = `${process.pid}:${randomUUID()}`, policy, leaseMs = 60_000, crashAt, hook,
 } = {}) {
   const now = () => ms(clock());
@@ -200,7 +211,8 @@ export async function admitCard(input, {
     const admittedAt = new Date(now()).toISOString();
     const metadata = { cardPath: input.cardPath, cardId: input.cardId, idemKey: input.idemKey,
       source: input.source, kind: input.kind, batchRef: state.batchRef, admittedAt };
-    const message = `Admit card ${JSON.stringify(input.cardId)} (idemKey ${JSON.stringify(input.idemKey)})\n\n${MARKER}${JSON.stringify(metadata)}\n`;
+    // The trailer marks the commit as AI-authored, so the drain's AI-generated gate can land the batch PR.
+    const message = `Admit card ${JSON.stringify(input.cardId)} (idemKey ${JSON.stringify(input.idemKey)})\n\n${MARKER}${JSON.stringify(metadata)}\n\n${AI_TRAILER}\n`;
     const commitSha = git(['commit-tree', tree, '-p', state.headSha], { input: message }).trim();
     crash('after-commit');
     if (!stillHeld()) return refuse('lease-held');

@@ -10,6 +10,7 @@
     "enabled": true,
     "maxAgeMinutes": 30,
     "allowDisjointMainMoves": true,
+    "retestMode": "affected",
     "nonCodePaths": ["backlog/", "docs/"]
   }
 }

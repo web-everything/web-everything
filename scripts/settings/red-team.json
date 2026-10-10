@@ -1,0 +1,9 @@
+{
+  "redTeam": {
+    "confirmedBreaks": {
+      "broken": "send-back",
+      "degraded": "card",
+      "unconfirmed": "advisory"
+    }
+  }
+}
