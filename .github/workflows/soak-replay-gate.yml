@@ -35,7 +35,7 @@ name: Soak replay gate
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, 'lane/**']  # lane/**: a GitHub-stacked PR runs its own required checks while its base is open (stack.reviewWhileBaseOpen)
     types: [opened, synchronize, reopened, edited]
 
 permissions:

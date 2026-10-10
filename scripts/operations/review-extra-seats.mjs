@@ -71,6 +71,7 @@ import { scrubPublish } from '../lib/secret-scrub.mjs';
 import { parseDelegationMarker } from '../lib/delegation-marker.mjs';
 import { logDelegationTrial } from '../conveyor/log-delegation-trial.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { RED_TEAM_COMMENT_MARKER, RED_TEAM_CONFIRMED_TAG, RED_TEAM_UNCONFIRMED_TAG, redTeamMarker } from '../lib/red-team-gate.mjs';
 
 const THIS_FILE = fileURLToPath(import.meta.url);
 const REPO_ROOT = resolve(dirname(THIS_FILE), '..', '..');
@@ -835,7 +836,9 @@ export function createExtraSeatsIo({ env = process.env, root = REPO_ROOT, storeP
 // Gemini, picked by `selectReviewSeatProvider` under the `red-team` lens, through the same direct-task CLIs in
 // their read-only `--review` mode) tries to BREAK the change: a failing input, a missed edge case, a security hole.
 //
-// v1 POLICY — ADVISORY, NEVER BLOCKING. Nothing here touches a label, a merge or a verdict. The pass:
+// v1 POLICY — THIS PASS IS ADVISORY. Nothing here touches a label, a merge or a verdict. (Card x1b8hlo: the separate
+// red-team GATE, `red-team-gate-apply.mjs`, reads this pass's comment back and sends a confirmed `broken` break to the
+// fixer under the setting `redTeam.confirmedBreaks` — the comment format below is its input.) The pass:
 //   1. writes ONE `review-seat` evidence row (seat `red-team`, lens `red-team`) — counted in the SAME daily call
 //      cap as the other added seats (it reserves through the same ledger) and read by the same quota hold;
 //   2. has every break it reports RE-CHECKED by a fresh, tool-free Claude juror (`judge-spawn.mjs#judgeSpawn`). A
@@ -877,17 +880,14 @@ const CLAUDE_SEAT_LENS = Object.freeze({ judge: 'correctness', judgeSecurity: 's
 export const RED_TEAM_CATEGORIES = Object.freeze(['failing-input', 'edge-case', 'security']);
 /** Delegation taskTypes no dispatch path may log (#3801 Fork 2) — the same refusal `review-set-label.mjs` makes. */
 const FORBIDDEN_TRIAL_TASK_TYPES = Object.freeze(['self-fix', 'other']);
-export const RED_TEAM_COMMENT_MARKER = '<!-- we:red-team-advisory';
+// Card x1b8hlo — the marker and the finding tags are single-sourced in the light gate module, whose parser reads this
+// comment back (a confirmed `broken` break goes back to the fixer); re-exported so existing importers keep working.
+export { RED_TEAM_COMMENT_MARKER, redTeamMarker };
 
 /** @returns {boolean} false when either kill switch is thrown. PURE. */
 export function redTeamEnabled(env = process.env) {
   const raw = String(env?.[RED_TEAM_ENV] ?? '').trim().toLowerCase();
   return extraSeatsEnabled(env) && !['0', 'off', 'false', 'no'].includes(raw);
-}
-
-/** The dedup marker line for one reviewed head. PURE. */
-export function redTeamMarker(pr, rev) {
-  return `${RED_TEAM_COMMENT_MARKER} pr=${Number(pr)} rev=${String(rev)} -->`;
 }
 
 /** Did a TRUSTED principal already post this head's red-team comment? A marker from any other login never counts. PURE. */
@@ -1072,6 +1072,10 @@ export function buildMissRows({ pr, repo, rev, runCallId, redTeamProvider, redTe
   return rows;
 }
 
+const BT = String.fromCharCode(96);
+const WHITESPACE_RUN = new RegExp('\\s+', 'g');
+const CLASS_UNSAFE = new RegExp('[(),]', 'g');
+
 /** The ONE advisory comment. PURE. Starts with the dedup marker line. */
 export function renderRedTeamComment({ pr, rev, provider, model, findings, recheckStatus, foldedVerdict }) {
   const confirmed = findings.filter((f) => f.confirmedByRecheck);
@@ -1079,16 +1083,22 @@ export function renderRedTeamComment({ pr, rev, provider, model, findings, reche
     redTeamMarker(pr, rev),
     `### Post-accept red team — ${findings.length ? `${findings.length} possible break(s), ${confirmed.length} confirmed by Claude's re-check` : 'no break found'}`,
     '',
-    `Advisory only: this pass never blocks or unblocks the merge. Head \`${String(rev).slice(0, 12)}\` · red team ${provider}/${model}`
+    `Advisory only: this comment changes no label itself; the red-team gate (setting \`redTeam.confirmedBreaks\`) sends a confirmed broken break back to the fixer. Head \`${String(rev).slice(0, 12)}\` · red team ${provider}/${model}`
       + `${findings.length ? ` · re-check ${recheckStatus}` : ''} · recorded verdict \`${foldedVerdict}\`.`,
   ];
   if (!findings.length) return [...head, '', 'The red team tried to break this change and reported nothing.'].join('\n');
+  // Card x1b8hlo — every field is ONE line: the red-team gate parses this comment, and a model-written field carrying a
+  // newline could otherwise forge a `[**confirmed**]` finding line of its own (each field is untrusted model text).
+  const one = (v) => String(v ?? '').replace(WHITESPACE_RUN, ' ').trim();
   const lines = findings.map((f, i) => {
-    const tag = f.confirmedByRecheck ? '**confirmed**' : 'not confirmed';
-    const where = f.file ? ` \`${f.file}${f.line ? `:${f.line}` : ''}\`` : '';
-    return `${i + 1}. [${tag}] (${f.category ?? 'uncategorised'}, ${f.impactIfUnfixed ?? 'impact?'})${where} — ${publishable(f.summary)}`
-      + `${f.failure_scenario ? `\n   - Scenario: ${publishable(f.failure_scenario)}` : ''}`
-      + `${f.recheckReason ? `\n   - Re-check: ${publishable(f.recheckReason)}` : ''}`;
+    const tag = f.confirmedByRecheck ? RED_TEAM_CONFIRMED_TAG : RED_TEAM_UNCONFIRMED_TAG;
+    const file = one(f.file).replaceAll(String.fromCharCode(96), String.fromCharCode(39));
+    const at = Number.isInteger(f.line) ? ':' + f.line : '';
+    const where = f.file ? ' ' + BT + file + at + BT : '';
+    const cls = (v, fallback) => one(v).replace(CLASS_UNSAFE, ' ').trim() || fallback;
+    return `${i + 1}. [${tag}] (${cls(f.category, 'uncategorised')}, ${cls(f.impactIfUnfixed, 'impact?')})${where} — ${one(publishable(f.summary))}`
+      + `${f.failure_scenario ? `\n   - Scenario: ${one(publishable(f.failure_scenario))}` : ''}`
+      + `${f.recheckReason ? `\n   - Re-check: ${one(publishable(f.recheckReason))}` : ''}`;
   });
   return [...head, '', ...lines, '', 'A confirmed break is recorded as a miss for the accepting review and for the builder\'s model.'].join('\n');
 }

@@ -69,6 +69,7 @@ import { reduceCheckState } from './pr-status.mjs';
 import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { applyReviewStatus } from '../conveyor/review-status-tag.mjs';
 import { CLOSE_SUPERSEDED_MARKER } from '../conveyor/stand-down-answer-core.mjs';
+import { isGithubStacked, stackReviewWhileBaseOpen } from '../lib/stack-review-while-open.mjs';
 
 const THIS_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 let promoteClosureMemo;
@@ -163,11 +164,12 @@ export function defaultClosePr({ repoSlug, prNumber, comment, runGh = runGhSync 
 /**
  * #3850 — the PR's backlog cards that ALREADY exist on the default branch. Closing the PR discards a card the PR
  * itself introduced; a card that is on main would stay open and needs a backlog edit (there is no sanctioned
- * "superseded" status in `backlog.mjs`), so the executor refuses rather than closing half the ruling. Fails
- * closed: any read error throws and the caller refuses.
+ * "superseded" status in `backlog.mjs`), so the executor refuses rather than closing half the ruling. Only the PR's
+ * OWN cards ({@link ownedCards}) that main does not already show `resolved` count (live #4734). Fails closed: any
+ * read error throws and the caller refuses.
  */
 export function defaultReadCardsOnMain({ repoSlug, prNumber, base = 'main', runGh = runGhSync } = {}) {
-  const view = JSON.parse(runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', 'files'], {
+  const view = JSON.parse(runGh(['pr', 'view', String(prNumber), '--repo', repoSlug, '--json', 'files,headRefName,title'], {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-files', repo: repoSlug },
   }));
   // `--json files` is capped at 100 entries and does not error when it truncates: a list at the cap may be missing
@@ -175,19 +177,47 @@ export function defaultReadCardsOnMain({ repoSlug, prNumber, base = 'main', runG
   if ((view?.files ?? []).length >= PR_FILES_JSON_CAP) {
     throw new Error(`pr files list is at the ${PR_FILES_JSON_CAP}-entry gh cap — cannot prove no card is already on ${base}`);
   }
-  const cards = (view?.files ?? []).map((f) => f?.path).filter((p) => /^backlog\/[^/]+\.md$/.test(String(p)));
+  const cards = ownedCards((view?.files ?? []).map((f) => f?.path).filter((p) => /^backlog\/[^/]+\.md$/.test(String(p))), view);
   const onMain = [];
   for (const path of cards) {
+    let text;
     try {
-      runGh(['api', `repos/${repoSlug}/contents/${path}?ref=${base}`, '--silent'], {
+      text = String(runGh(['api', `repos/${repoSlug}/contents/${path}?ref=${base}`, '-H', 'Accept: application/vnd.github.raw'], {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'contents', repo: repoSlug },
-      });
-      onMain.push(path);
+      }) ?? '');
     } catch (e) {
       if (!/404|Not Found/i.test(String(e?.stderr ?? e?.message ?? e))) throw e;
+      continue;
     }
+    // Live #4734 (2026-10-10): a card already RESOLVED on main needs no backlog edit — closing the PR strands
+    // nothing. Only a card main still shows as live work blocks the close. Unreadable status → blocks (fail closed).
+    if (cardStatus(text) !== 'resolved') onMain.push(path);
   }
   return onMain;
+}
+
+/** The `status:` field of a backlog card's frontmatter, or null. */
+function cardStatus(text) {
+  const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(text))?.[1] ?? '';
+  return /^status:\s*['"]?([\w-]+)/m.exec(front)?.[1] ?? null;
+}
+
+/**
+ * The PR's OWN item cards: those whose number the head branch (`lane/<NNN>-…`) or the title (`WE #<NNN>`) names.
+ * Live #4734: a long-lived lane that merged other lanes shows their cards in its diff (26 of them); those cards
+ * landed on main through their own PRs, and closing this one does not strand them. When the PR names no card
+ * number, every card counts as its own (fail closed — the pre-#4734 behaviour).
+ * @param {string[]} cards - `backlog/<file>.md` paths from the PR's file list.
+ * @param {{headRefName?: string, title?: string}} view
+ * @returns {string[]}
+ */
+export function ownedCards(cards, view = {}) {
+  const ids = new Set();
+  const branch = /^lane\/(\d+)-/.exec(String(view?.headRefName ?? ''))?.[1];
+  if (branch) ids.add(Number(branch));
+  for (const m of String(view?.title ?? '').matchAll(/\bWE #(\d+)\b/g)) ids.add(Number(m[1]));
+  if (!ids.size) return cards;
+  return cards.filter((p) => ids.has(Number(/^backlog\/(\d+)-/.exec(p)?.[1])));
 }
 
 /**
@@ -234,6 +264,9 @@ export function runReconcilePromoteDraftDispatch({
   // #3850 — the close-superseded disposition's two IO seams (a test injects both).
   closePr = defaultClosePr,
   readCardsOnMain = defaultReadCardsOnMain,
+  // `stack.reviewWhileBaseOpen` (operator go 2026-10-10): a GitHub-stacked draft (base = another lane branch) is
+  // promoted on its OWN green checks while its base is open. Off, it is refused here and waits for its base to land.
+  reviewWhileBaseOpen = undefined,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`promote-draft-pr-dispatch: --repo ${repo} is not a constellation repo`);
@@ -265,8 +298,17 @@ export function runReconcilePromoteDraftDispatch({
       why: `draft left as is: its required checks read ${r.check ?? 'unknown'}, not green, in this tick's plan — nothing to promote yet`,
     });
   }
+  let stackPolicy;
   for (const entry of entries) {
     const sha = entry.headRefOid;
+    const stacked = isGithubStacked(entry);
+    if (stacked && !(stackPolicy ??= reviewWhileBaseOpen ?? stackReviewWhileBaseOpen())) {
+      refusals.push({
+        pr: entry.prNumber, kind: 'stacked-awaiting-base', headSha: sha,
+        why: `stacked on ${entry.baseRefName} — stack.reviewWhileBaseOpen is off, so it is promoted once its base lands and the drain retargets it`,
+      });
+      continue;
+    }
     // #2811 — re-verify EVERY required check for the EXACT head sha immediately before the one write this file
     // makes. The plan's own `withPhase.check === 'green'` (see `reconcile-core.mjs`'s `promote-draft` branch) is
     // already stale by the time control reaches here — this is the second, authoritative read.
@@ -310,7 +352,7 @@ export function runReconcilePromoteDraftDispatch({
     }
     try {
       ghProvider.ready(entry.prNumber);
-      dispatched.push({ pr: entry.prNumber, kind: 'promote-draft' });
+      dispatched.push({ pr: entry.prNumber, kind: 'promote-draft', ...(stacked ? { stackedOn: entry.baseRefName } : {}) });
       try {
         clearAwaitingCi({ pr: entry.prNumber, repo: repoSlug, state: null });
       } catch {
@@ -393,7 +435,9 @@ if (IS_CLI) {
       process.stdout.write(`${JSON.stringify(result)}\n`);
     } else {
       const lines = [`promote-draft-pr-dispatch — ${result.dispatched.length} promoted, ${result.refusals.length} refusal(s)`];
-      for (const p of result.dispatched) lines.push(`  → promoted PR #${p.pr} to ready-for-review (required checks green)`);
+      // Name what was actually done: a close-superseded entry once printed "promoted … to ready-for-review" (live #4734).
+      const done = { 'close-superseded': 'closed PR #%s as superseded (operator disposition)', 'restore-review-label': 'restored the review label on PR #%s' };
+      for (const p of result.dispatched) lines.push(`  → ${(done[p.kind] ?? (p.stackedOn ? `promoted stacked PR #%s to ready-for-review while its base ${p.stackedOn} is open (own required checks green)` : 'promoted PR #%s to ready-for-review (required checks green)')).replace('%s', p.pr)}`);
       for (const r of result.refusals) lines.push(`  ✗ ${r.kind} PR #${r.pr} — ${r.why}`);
       process.stdout.write(`${lines.join('\n')}\n`);
     }

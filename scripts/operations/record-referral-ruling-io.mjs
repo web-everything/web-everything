@@ -18,6 +18,7 @@ import { readOperatorRulings } from '../lib/jury-core.mjs';
 import { currentActorId } from '../lib/review-independence.mjs';
 import { referralCardReadable } from '../review-set-label.mjs';
 import { CARD_REF_RE } from '../lib/referral-card-readable.mjs';
+import { CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { EVENT_TYPES, appendVerdictAsync, buildLedgerEvent } from '../lib/verdict-ledger.mjs';
 import '../lib/verdict-ledger-io.mjs'; // registers the `git` store `appendVerdictAsync` writes to
 import { ledgerFindingKey } from '../lib/pr-state/referrals.mjs';
@@ -39,39 +40,88 @@ export function readPrThread(repo, pr, { readJson = ghJson } = {}) {
   return v;
 }
 
+const git = (root, args) => execFileSync('git', ['-C', root, ...args],
+  { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, maxBuffer: 64 * 1024 * 1024 });
+
+/**
+ * The backlog as it stands on the ruled PR's head, read-only (never a checkout): fetch `refs/pull/<N>/head` so the
+ * head's objects are local, confirm the exact head sha the plan read is present, then list and `git show` the
+ * `backlog/` files at THAT sha. Only the WE repo's PRs carry WE cards. Throws on any failure (the caller treats it
+ * as "not found there").
+ */
+export function openPrHeadBacklog({ repo, pr, head, root = REPO_ROOT, run = git } = {}) {
+  if (repo !== CONSTELLATION_REPOS.we.slug) throw new Error(`${repo} is not the backlog repo`);
+  if (!/^[1-9]\d{0,8}$/.test(String(pr)) || !/^[a-f0-9]{40}$/.test(head ?? '')) throw new Error('needs a PR number and a head sha');
+  run(root, ['fetch', '--no-tags', '--quiet', 'origin', `refs/pull/${pr}/head`]);
+  run(root, ['cat-file', '-e', `${head}^{commit}`]);
+  return {
+    list: () => run(root, ['ls-tree', '--name-only', `${head}:backlog`]).split('\n').filter(Boolean),
+    read: (file) => run(root, ['show', `${head}:backlog/${file}`]),
+  };
+}
+
+const findCard = (padded, files, readText) => {
+  let hits = files.filter((f) => f.startsWith(`${padded}-`));
+  if (!hits.length && /^x/.test(padded)) {
+    hits = files.filter((f) => {
+      try { return new RegExp(`^bornAs:[ \\t]*["']?${padded}["']?[ \\t]*$`, 'm').test(readText(f)); }
+      catch { return false; }
+    });
+  }
+  return hits;
+};
+
 /**
  * Resolve `--card` to a `we:backlog/<file>.md` reference: a full reference, a numeric id, or a provisional
  * `x…` id (also found through a landed card's `bornAs:`). Readability uses the gate's own check.
+ * A card the ruled PR files for its own follow-up is not on main yet: when `pr` + `prHead` are given and the card
+ * is not in this checkout, it is looked up on that PR's head the same way and cited `we:backlog/<file>.md@pr<N>`
+ * (the form the gate reads at the PR's head). `foundIn` records where it was found: `main` or `pr-head`.
  */
 export function resolveCardRef(requested, { root = REPO_ROOT, listFiles = (d) => readdirSync(d),
-  readText = (p) => readFileSync(p, 'utf8'), readable = referralCardReadable } = {}) {
+  readText = (p) => readFileSync(p, 'utf8'), readable = referralCardReadable, pr = null, prHead = null } = {}) {
   if (requested === undefined || requested === null || requested === '') return null;
   const ask = String(requested).trim();
+  const onPr = pr !== null && pr !== undefined && prHead ? String(pr) : null;
+  const prFiles = () => { try { return prHead.list().filter((f) => f.endsWith('.md')); } catch { return []; } };
+  const prRead = (f) => prHead.read(f) ?? '';
   let ref = null;
-  if (CARD_REF_RE.test(ask)) ref = ask;
-  else {
+  let foundIn = 'main';
+  if (CARD_REF_RE.test(ask)) {
+    ref = ask;
+    if (/@pr\d+$/.test(ask)) foundIn = 'pr-head';
+    else if (onPr && !readable(ask, root)) {
+      const file = ask.slice('we:backlog/'.length);
+      if (prFiles().includes(file)) { ref = `${ask}@pr${onPr}`; foundIn = 'pr-head'; }
+    }
+  } else {
     const id = idFromName(ask);
     const files = (() => { try { return listFiles(join(root, 'backlog')).filter((f) => f.endsWith('.md')); } catch { return []; } })();
     if (id) {
       const padded = normalizeId(id);
-      let hits = files.filter((f) => f.startsWith(`${padded}-`));
-      if (!hits.length && /^x/.test(padded)) {
-        hits = files.filter((f) => {
-          try { return new RegExp(`^bornAs:[ \\t]*["']?${padded}["']?[ \\t]*$`, 'm').test(readText(join(root, 'backlog', f))); }
-          catch { return false; }
-        });
+      let hits = findCard(padded, files, (f) => readText(join(root, 'backlog', f)));
+      if (!hits.length && onPr) {
+        hits = findCard(padded, prFiles(), prRead).map((f) => `${f}@pr${onPr}`);
+        if (hits.length) foundIn = 'pr-head';
       }
       if (hits.length === 1) ref = `we:backlog/${hits[0]}`;
-      else return { requested: ask, ref: null, readable: false, reason: hits.length ? 'ambiguous id' : 'no backlog card with that id (has it landed on main? fetch and retry)' };
+      else return { requested: ask, ref: null, readable: false, reason: hits.length ? 'ambiguous id' : `no backlog card with that id on main${onPr ? ` or on PR #${onPr}'s head` : ''} (has it landed on main? fetch and retry)` };
     }
   }
   if (!ref) return { requested: ask, ref: null, readable: false, reason: 'not a card id or we:backlog/<file>.md[@pr<N>] reference' };
   const ok = readable(ref, root);
-  return { requested: ask, ref, readable: ok, reason: ok ? 'readable' : 'card file is missing or has no frontmatter (a card only on an open PR: cite it as we:backlog/<file>.md@pr<N>)' };
+  return { requested: ask, ref, readable: ok, foundIn, reason: ok ? 'readable' : 'card file is missing or has no frontmatter (a card only on an open PR: cite it as we:backlog/<file>.md@pr<N>)' };
 }
 
+/** Opens the PR head (a fetch) only when the card is not on main, and at most once. */
+const lazyPrHead = (open) => {
+  let h;
+  const get = () => (h ??= open());
+  return { list: () => get().list(), read: (f) => get().read(f) };
+};
+
 export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = ghJson, now = () => new Date().toISOString(),
-  env = process.env, readable = referralCardReadable,
+  env = process.env, readable = referralCardReadable, openPrHead = openPrHeadBacklog,
   // Item 113 — the ruling is judged with THIS checkout's code; refuse from a stale one (see `assertOperatorCliFresh`).
   assertFresh = () => assertOperatorCliFresh(REPO_ROOT, { label: 'record-referral-ruling', env }) } = {}) {
   return ({ repo, pr, card }) => {
@@ -82,7 +132,7 @@ export function createRecordReferralRulingReader({ root = REPO_ROOT, readJson = 
       body: typeof thread.body === 'string' ? thread.body : '', createdAt: thread.createdAt, cardReadable });
     return {
       head: thread.headRefOid, open: open.open, ruled: open.ruled, disputed: open.disputed, malformed: open.malformed,
-      card: resolveCardRef(card, { root, readable }),
+      card: resolveCardRef(card, { root, readable, pr, prHead: lazyPrHead(() => openPrHead({ repo, pr, head: thread.headRefOid })) }),
       followUpEnabled: env.WE_REFERRAL_RULING_FOLLOW_UP !== '0',
       now: now(), clearerId: currentActorId(env),
     };

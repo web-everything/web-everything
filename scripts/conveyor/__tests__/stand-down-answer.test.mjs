@@ -132,8 +132,9 @@ else {
     expect(runStandDownAnswer(argv, { gh })).toBe('posted');
     expect(gh.mock.calls.filter(([args]) => args[1] === 'comment')).toHaveLength(1);
     expect(parseOperatorAnswer(comments.at(-1))).toEqual({ ...record, standDownId: 'IC_latest' });
-    // A distinct older escalation is deliberately not silently cleared by this answer.
-    expect(countUnresolvedStandDowns(comments)).toBe(1);
+    // NEWEST WINS (live plateau #220, 2026-10-10): answering the latest stop also clears every older one — an
+    // older record left standing refused the PR `stood-down` forever after the operator had answered.
+    expect(countUnresolvedStandDowns(comments)).toBe(0);
     const single = [stop];
     const once = (args) => {
       if (args[1] === 'view') return JSON.stringify({ comments: single });
