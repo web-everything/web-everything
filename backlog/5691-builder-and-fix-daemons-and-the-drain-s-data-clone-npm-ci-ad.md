@@ -3,10 +3,11 @@ bornAs: x0m7a8x
 kind: story
 size: 3
 parent: "4075"
-status: active
+status: resolved
 scope: ["we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-rebuild/deps-job.mjs", "we:scripts/lib/daemon-rebuild-settings.json", "we:scripts/lib/__tests__/daemon-background-build.test.mjs", "we:scripts/lib/__tests__/review-daemon-first-pass.test.mjs", "we:scripts/lib/__tests__/daemon-deps-job.test.mjs", "plateau-app:tools/drain-daemon/daemon.mjs", "plateau-app:tools/drain-daemon/lib.mjs", "plateau-app:tools/drain-daemon/lib.test.mjs"]
 dateOpened: "2026-10-09"
 dateStarted: "2026-10-10"
+dateResolved: "2026-10-10"
 tags: []
 ---
 
