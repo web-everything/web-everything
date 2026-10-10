@@ -37,3 +37,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#4820 (finding 1: `we:backlog/x7hljd1-merger-github-app-only-the-drain-can-merge-to-main-ruleset-e.md:17` — Add a deterministic card-readiness gate requiring a named planned test or executable verification procedure, including observable assertions, for each behavioral guarantee.)
