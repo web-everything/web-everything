@@ -36,7 +36,7 @@ import {
   isDraftOwedPromotion, isPromotionCandidate, promotionStepDue, resolveDraftPromotionSettings,
 } from './draft-promotion-rule.mjs';
 
-export const DRAFT_LIST_FIELDS = 'number,state,isDraft,headRefName,headRefOid,labels,isCrossRepository';
+export const DRAFT_LIST_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,isCrossRepository';
 /** The one fresh read per candidate: everything the tick's pre-`promote-draft` refusals and the rule decide on. */
 export const PR_VIEW_FIELDS = 'number,state,isDraft,headRefName,headRefOid,baseRefName,labels,comments,body,statusCheckRollup,mergeStateStatus,isCrossRepository';
 
@@ -116,7 +116,7 @@ export function runDraftPromotionStep({
       if (!view || typeof view !== 'object') { row('error', 'pr view: no record returned'); continue; }
       if (view.headRefOid !== pr.headRefOid) { row('skip', `head moved since the check read (${String(pr.headRefOid).slice(0, 9)} → ${String(view.headRefOid).slice(0, 9)}) — the next step re-reads it`); continue; }
       const fresh = isDraftOwedPromotion({
-        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, labels: view.labels, isCrossRepository: view.isCrossRepository },
+        pr: { ...pr, state: view.state, isDraft: view.isDraft, headRefName: view.headRefName, baseRefName: view.baseRefName, labels: view.labels, isCrossRepository: view.isCrossRepository },
         checks,
       });
       if (!fresh.owed) { row('skip', `${fresh.why} (re-read just before the write)`); continue; }
