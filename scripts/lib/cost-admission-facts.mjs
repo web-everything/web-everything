@@ -19,6 +19,7 @@ import { resolveMemFreeMinPct } from './dispatch-throttle.mjs';
 import { readSettings } from './settings-files.mjs';
 import { sampleHost } from './host-sample.mjs';
 import { resolveCostAdmissionSettings } from './cost-admission.mjs';
+import { cutoverDecision, loadResourceGateSettings } from './resource-gate.mjs';
 import { resolveCollectorRoot, etDayKeyOnly, utcDayKey } from '../operations/telemetry-summary-io.mjs';
 
 export const COST_FACTS_TIMEZONE = 'America/New_York';
@@ -84,14 +85,34 @@ export function readClaudeUsdToday({ now = Date.now(), env = process.env, root =
  * Every fact the rule needs except the per-tick in-flight count (the caller knows that). Never throws.
  * @returns {{cpuIdlePct:number|null, memFreePct:number|null, minMemFreePct:number, claudeUsdToday:number|null}}
  */
-export function readCostFacts({ env = process.env, sample = () => sampleHost(), now = Date.now() } = {}) {
+export function readCostFacts({ env = process.env, sample = () => sampleHost(), now = Date.now(), resource = lightResourceDecision } = {}) {
   let s = null;
   try { s = sample(); } catch { s = null; }
   const ok = s?.ok && Number.isFinite(s.idlePct);
-  return {
+  const facts = {
     cpuIdlePct: ok ? s.idlePct : null,
     memFreePct: ok && Number.isFinite(s.memFreePct) ? s.memFreePct : null,
     minMemFreePct: resolveMemFreeMinPct({ env }),
     claudeUsdToday: readClaudeUsdToday({ now, env }),
   };
+  // x6nuodj — the light host check (CPU floor + free memory) decides through admit({kind:'light'}); the legacy
+  // floor is its logged comparison. `null` (no decision) leaves the legacy checks in admitLaunch.
+  let decision = null;
+  try { decision = resource?.({ env, facts, now }) ?? null; } catch { decision = null; }
+  return decision ? { ...facts, resource: decision } : facts;
+}
+
+/** IO: the shared `light` decision with the legacy light floor (`WE_MIN_CPU_IDLE_PCT_LIGHT` + free memory) logged
+ *  next to it. Never throws. */
+export function lightResourceDecision({ env = process.env, facts = {}, now = Date.now(), settings, gateSettings } = {}) {
+  const cost = settings ?? readCostAdmissionSettings({ env });
+  let legacy = { admit: true, note: 'light floor met' };
+  if (Number.isFinite(facts.cpuIdlePct) && facts.cpuIdlePct < cost.lightCpuIdleMinPct) {
+    legacy = { admit: false, kind: 'light-cpu-floor', why: `cpu idle ${facts.cpuIdlePct.toFixed(1)}% < light floor ${cost.lightCpuIdleMinPct}%` };
+  } else if (Number.isFinite(facts.memFreePct) && Number.isFinite(facts.minMemFreePct) && facts.memFreePct < facts.minMemFreePct) {
+    legacy = { admit: false, kind: 'mem-free', why: `${facts.memFreePct}% memory free < ${facts.minMemFreePct}%` };
+  }
+  let mode = 'enforce';
+  try { mode = (gateSettings ?? loadResourceGateSettings({ env }).settings).cutover; } catch { /* the standard */ }
+  return cutoverDecision({ gate: 'cost-admission.light', kind: 'light', legacy, mode, env, nowMs: now });
 }
