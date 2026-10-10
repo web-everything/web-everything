@@ -45,6 +45,7 @@ export const BUILT_IN_VERIFY_SETTINGS = Object.freeze({
   // this PR has a clean-tree default-gate green in the green ledger AND that range holds only the PR's own commits (an
   // ancestor of HEAD, no merge commits, merge-base with origin/main unchanged); anything else falls back to 'pr'.
   // CI still runs the full required suite; the merge gate and the exact-HEAD marker binding are unchanged.
+  // The ledger lives at `<coordination root>/verify-green/<sha>.json` (override: WE_VERIFY_GREEN_LEDGER_DIR).
   selection: 'since-last-green',
 });
 
