@@ -10,7 +10,8 @@
  *
  * THE RULE (pure, {@link decideAffected}). Re-test (affected) when ANY of these hold, else not affected:
  *   1. a gate file is touched on either side — the merge path, the queue rules, CI workflows, test infra, package
- *      and config files ({@link isGateFile}). A change to the gate itself is never trusted to judge itself;
+ *      and config files ({@link isGateFile}). A change to the gate itself is never trusted to judge itself, so this is
+ *      checked FIRST: even a main move that gained no code (docs, backlog) does not excuse a PR that edits the gate;
  *   2. a changed code file sits under a directory-discovered fixture root (`hitsGlobEdge`): those edges are not
  *      imports, so the import graph cannot see them;
  *   3. main changed a file the PR also changed;
@@ -97,9 +98,11 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   const prSet = new Set(pr);
   const mainCode = [...new Set(mainFiles.filter(Boolean))].filter((f) => !isNonCode(f, nonCodePaths));
   const done = (affected, reasons) => ({ affected, reasons, mainCodeFiles: mainCode.length });
-  if (!mainCode.length) return done(false, ['main-gained-no-code']);
+  // The gate rule answers first, on BOTH sides: a PR that edits the gate must not be excused (its pass's age included) by
+  // a main move that gained no code. Only then may "main gained nothing that can matter" end the question.
   const gate = [...mainCode, ...pr].find(isGateFile);
   if (gate) return done(true, [`gate-touched:${gate}`]);
+  if (!mainCode.length) return done(false, ['main-gained-no-code']);
   const glob = [...mainCode, ...pr.filter((f) => !isNonCode(f, nonCodePaths))].find(hitsGlobEdge);
   if (glob) return done(true, [`glob-edge:${glob}`]);
   const same = mainCode.find((f) => prSet.has(f));

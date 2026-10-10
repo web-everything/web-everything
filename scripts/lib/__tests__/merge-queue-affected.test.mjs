@@ -24,6 +24,22 @@ describe('decideAffected (pure)', () => {
     const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['docs/x.md', 'backlog/1-x.md'], importsOf: () => { throw new Error('no IO'); } });
     expect(r).toEqual({ affected: false, reasons: ['main-gained-no-code'], mainCodeFiles: 0 });
   });
+  // Review round 5: the no-code shortcut answered before the gate rule, so a PR that edits the gate was "unaffected" by a
+  // docs-only main move and its pass's age was excused. A change to the gate is never trusted to judge itself.
+  it.each([
+    'scripts/merge-ai-prs.mjs', 'scripts/lib/merge-queue-affected.mjs', 'scripts/settings/merge-queue.json', '.github/workflows/ci.yml',
+    'package.json', 'vitest.config.ts', 'scripts/ci/shard-assign.mjs',
+  ])('a PR that edits the gate (%s) re-tests even when main gained only docs/backlog', (gate) => {
+    const r = decideAffected({ prFiles: ['scripts/a.mjs', gate], mainFiles: ['docs/x.md', 'backlog/1-x.md'], importsOf: () => { throw new Error('no IO'); } });
+    expect(r).toEqual({ affected: true, reasons: [`gate-touched:${gate}`], mainCodeFiles: 0 });
+  });
+  it('a gate-editing PR re-tests when main\'s file list is empty too (no shortcut around the gate rule)', () => {
+    expect(decideAffected({ prFiles: ['scripts/merge-ai-prs.mjs'], mainFiles: [], importsOf: none }))
+      .toEqual({ affected: true, reasons: ['gate-touched:scripts/merge-ai-prs.mjs'], mainCodeFiles: 0 });
+  });
+  it('a PR\'s own docs/backlog files are not the gate: docs-only main + docs-only PR stays unaffected', () => {
+    expect(decideAffected({ prFiles: ['docs/y.md', 'backlog/2-y.md'], mainFiles: ['docs/x.md'], importsOf: none }).reasons).toEqual(['main-gained-no-code']);
+  });
   it('unrelated code on main → not affected', () => {
     const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: ['scripts/z.mjs'], importsOf: none });
     expect(r).toMatchObject({ affected: false, reasons: ['main-delta-unaffected'], mainCodeFiles: 1 });
@@ -533,6 +549,18 @@ describe('decideMergeQueueAction with the affected verdict', () => {
   });
   it('unaffected also excuses an old pass (age only stood in for "main moved")', () => {
     expect(decideMergeQueueAction({ key: 'k', num: 1, facts: facts(UNAFFECTED, 120), nowMs: now, settings: LIVE }).action).toBe('merge');
+  });
+  it('a gate-editing PR with an OLD pass and a docs-only main move is not excused: the verdict is affected, so age still counts (round 5)', () => {
+    const v = readAffectedFacts({ headSha: 'h', tipSha: 't', prFiles: ['scripts/lib/merge-queue-affected.mjs'], mainFiles: ['docs/x.md'], git: () => { throw new Error('no git'); } });
+    expect(v).toMatchObject({ affected: true, reasons: ['gate-touched:scripts/lib/merge-queue-affected.mjs'] });
+    const f = facts(v, 120);
+    f.main.filesChangedSinceBase = ['docs/x.md'];
+    f.pr.files = ['scripts/lib/merge-queue-affected.mjs'];
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: f, nowMs: now, settings: LIVE }).action).toBe('refresh');
+    // the same old pass on a non-gate PR keeps the speed-up: nothing main gained can reach it
+    const ok = facts({ affected: false, reasons: ['main-gained-no-code'], mainCodeFiles: 0 }, 120);
+    ok.main.filesChangedSinceBase = ['docs/x.md'];
+    expect(decideMergeQueueAction({ key: 'k', num: 1, facts: ok, nowMs: now, settings: LIVE }).action).toBe('merge');
   });
   it('affected → refresh, naming why', () => {
     const r = decideMergeQueueAction({ key: 'k', num: 1, facts: facts({ affected: true, reasons: ['same-file:scripts/z.mjs'] }), nowMs: now, settings: LIVE });
