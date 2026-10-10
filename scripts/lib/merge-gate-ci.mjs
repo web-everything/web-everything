@@ -71,6 +71,13 @@ export function manifestHistoryTamper({ repo, num, bodies = [], live }) {
   return { tampered: reasons.length > 0, reasons: [...new Set(reasons)] };
 }
 
+/** One duplicate-id entry as text: findDuplicateIds' `{num, names}`, or a legacy `{id}` / string. Pure. */
+export function duplicateIdText(d) {
+  if (d && typeof d === 'object' && d.num != null) return `#${d.num} (${(Array.isArray(d.names) ? d.names : []).join(' + ')})`;
+  if (d && typeof d === 'object' && d.id != null) return String(d.id);
+  return typeof d === 'string' ? d : JSON.stringify(d);
+}
+
 const r = (id, status, reason) => ({ id, status, reason });
 
 /**
@@ -179,7 +186,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     set('duplicate-id-on-main', 'fail-closed', 'merge_group run without the group-tree duplicate-id scan (--group-tree missing)');
   } else {
     const ids = [...(dup.main || []), ...(dup.group || [])];
-    set('duplicate-id-on-main', ids.length ? 'hold' : 'pass', ids.length ? `duplicate backlog ids: ${ids.map((d) => d.id ?? d).join(', ')}` : 'no duplicate ids');
+    set('duplicate-id-on-main', ids.length ? 'hold' : 'pass', ids.length ? `duplicate backlog ids: ${ids.map(duplicateIdText).join(', ')}` : 'no duplicate ids');
   }
 
   // couple-whole / blocked-by — vacuous without a manifest (the drain's "no manifest, always ready").

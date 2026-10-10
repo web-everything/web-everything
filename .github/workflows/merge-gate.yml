@@ -8,14 +8,24 @@
 # re-evaluated against the group's commit right before GitHub merges it). `workflow_dispatch` is the dry run.
 #
 # SCRIPTS COME FROM MAIN, NEVER FROM THE PR (same rule and reasoning as review-gate.yml): a PR cannot neuter the
-# gate's SCRIPTS by editing them in its diff. The PR's body, labels, comments and diff are read as data.
-# WHAT IS NOT PINNED: this workflow YAML. GitHub reads the workflow file from the PR's merge ref for
-# `pull_request`, and from the group commit for `merge_group`, so a PR that edits this file (e.g. makes the job
-# `exit 0`) changes what the required check does. The defence is the ruleset, not this file:
-# rulesetSuggestion (scripts/lib/merge-queue-enqueue.mjs) puts every workflow that defines a required check in the
-# ruleset's `workflows` rule (requiredWorkflows) pinned to refs/heads/main, so GitHub runs them from main rather
-# than from the PR, and accepts the required checks only from the GitHub Actions app
-# (requiredStatusCheckIntegrationId). A test fails when a workflow defining a required check is not in that pin.
+# gate's SCRIPTS by editing them in its diff. The PR's body, labels, comments and diff are read as data, and every
+# git read is pinned to the PR's exact head SHA (the event's `pull_request.head.sha`, or for `merge_group` each PR's
+# sha inside the group commit) — never the branch name; an unfetchable sha or a head that moved fails closed.
+# No secret is exposed: the job has only the read-scoped GITHUB_TOKEN and never executes PR code.
+# WHAT IS NOT PINNED BY THIS FILE: this workflow YAML. GitHub reads the workflow file from the PR's merge ref for
+# `pull_request`, and from the group commit for `merge_group`, so a PR that edits this file changes what the
+# required check does. Two layers:
+#   (1) SELF-CHECK (in this repo): the evaluator (scripts from main) refuses to pass unless the RUNNING workflow
+#       file (GITHUB_WORKFLOW_REF @ GITHUB_WORKFLOW_SHA) is byte-identical to main's — fail closed
+#       (verifyRunningWorkflow in scripts/merge-gate-check.mjs). It cannot catch an edit that never reaches the
+#       evaluator (the job made `exit 0`, or a new workflow whose job is named `merge-gate`).
+#   (2) THE RULESET (the only defence for (1)'s gap — required before `merge-gate` is made required): the
+#       ruleset's `workflows` rule pins every workflow that defines a required check to refs/heads/main
+#       (rulesetSuggestion.requiredWorkflows in scripts/lib/merge-queue-enqueue.mjs), so GitHub runs them from main
+#       rather than from the PR, and the required status checks are restricted to the GitHub Actions integration id
+#       (requiredStatusCheckIntegrationId 15368) so no other app/token can post a green `merge-gate`. Print the
+#       exact ruleset with `node scripts/merge-gate-check.mjs --print-ruleset`. A test fails when a workflow
+#       defining a required check is not in that pin.
 # Until the operator applies that ruleset, the guard the repo itself provides is the ENQUEUE refusal, which no PR can
 # edit because it does not run in a workflow: enqueuePr (scripts/lib/merge-queue-enqueue.mjs) runs from the daemon's
 # own main checkout and refuses, for a HUMAN (humanOnly, not an escalation an AI reviewer can accept), any PR whose
@@ -26,7 +36,7 @@
 # required, so this YAML decides no merge; (2) once the strategy is `github-merge-queue`, an entry added by hand
 # (the UI, `gh pr merge --auto`, a raw API call) bypasses enqueuePr: only the ruleset's `workflows` pin closes that,
 # so do not make `merge-gate` required, or flip the strategy, before the operator applies it. The review
-# escalation of a workflow diff (blast radius, pinned by merge-gate-ci.test.mjs) stays as a second layer; card
+# escalation of a workflow diff (blast radius, pinned by merge-gate-ci.test.mjs) stays as a further layer; card
 # xha9nns adds CODEOWNERS / trust-chain human approval.
 # BOOTSTRAP (true bootstrap only): until this lands, main has neither scripts/merge-gate-check.mjs nor this
 # workflow, so the check reports clear (the same bootstrap review-gate.yml documents); it is not required by the
@@ -87,6 +97,7 @@ jobs:
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MG_HEAD_SHA: ${{ github.event.merge_group.head_sha || inputs.merge_group_head_sha }}
           MG_BASE_SHA: ${{ github.event.merge_group.base_sha || inputs.merge_group_base_sha }}
           MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
@@ -111,7 +122,8 @@ jobs:
             git archive "$MG_HEAD_SHA" backlog | tar -x -C "$GROUP_TREE"
             node scripts/merge-gate-check.mjs --repo="$REPO" --merge-group --head-sha="$MG_HEAD_SHA" --base-sha="$MG_BASE_SHA" --head-ref="$MG_HEAD_REF" --group-tree="$GROUP_TREE"
           elif [ -n "$PR_NUMBER" ]; then
-            node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$PR_NUMBER"
+            [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-gate: pull_request head sha is not a 40-hex commit id — failing closed." >&2; exit 1; }
+            node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$PR_NUMBER" --expect-head="$PR_HEAD_SHA"
           elif [ -n "$DISPATCH_PRS" ]; then
             node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$DISPATCH_PRS"
           else
