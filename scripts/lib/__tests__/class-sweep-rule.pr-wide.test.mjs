@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { classSweepVerdict, unsweptPrFiles, MAX_PR_FILES } from '../class-sweep-rule.mjs';
+import { classSweepVerdict, unsweptPrFiles, MAX_PR_FILES, MAX_EVIDENCE_BYTES } from '../class-sweep-rule.mjs';
 
 const FX = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'fixtures/class-sweep-replay-4624.json'), 'utf8'));
 const LATER = FX.laterFindings[0].file;
@@ -80,5 +80,69 @@ describe('class sweep — PR file list edge cases', () => {
   it('an unknown path is still refused; `pr` is the one extra path', () => {
     const bad = evidence.replace('"family"', '"elsewhere"');
     expect(classSweepVerdict({ mode: 'warn', changeKind: 'fix', evidence: bad }).problems[0]).toMatch(/unknown-path/);
+  });
+});
+
+describe('class sweep — review round 2 (PR 4687): file identity is a whole path token, an empty list is unknown', () => {
+  const swept = (site, files) => unsweptPrFiles({ siblings: [{ site }] }, files);
+
+  it('file coverage requires a complete path token (a different file sharing a suffix is never swept)', () => {
+    expect(swept('test/a.mjs#f', ['a.mjs'])).toEqual(['a.mjs']);
+    expect(swept('docs/README.md#x', ['README.md'])).toEqual(['README.md']);
+    expect(swept('packages/x/package.json#deps', ['package.json'])).toEqual(['package.json']);
+    expect(swept('scripts/lib/a.mjs.orig', ['scripts/lib/a.mjs'])).toEqual(['scripts/lib/a.mjs']);
+    expect(swept('src/index.mjs', ['index.mjs'])).toEqual(['index.mjs']);
+    expect(swept('Makefile.bak', ['Makefile'])).toEqual(['Makefile']);
+    expect(swept('xa.mjs#f', ['a.mjs'])).toEqual(['a.mjs']);
+    // A file merely mentioned inside a longer free-text token is not named either.
+    expect(swept('see-a.mjs-note', ['a.mjs'])).toEqual(['a.mjs']);
+  });
+
+  it('a site still names its file in every honest spelling', () => {
+    expect(swept('a.mjs#f/g', ['a.mjs'])).toEqual([]);
+    expect(swept('./a.mjs', ['a.mjs'])).toEqual([]);
+    expect(swept('a.mjs:12', ['a.mjs'])).toEqual([]);
+    expect(swept('a.mjs:12-30', ['a.mjs'])).toEqual([]);
+    expect(swept('lib/a.mjs#f + lib/b.mjs#g, lib/c.mjs; (lib/d.mjs)', ['lib/a.mjs', 'lib/b.mjs', 'lib/c.mjs', 'lib/d.mjs'])).toEqual([]);
+    expect(swept('`lib/a.mjs`#f', ['lib/a.mjs'])).toEqual([]);
+    expect(swept('./lib/', ['lib/x.mjs'])).toEqual([]);
+  });
+
+  it('a `#` or `:` tail never turns a file spelling into a directory prefix', () => {
+    const files = ['scripts/a.mjs', 'scripts/b.mjs'];
+    for (const site of ['scripts/#x/', 'scripts/:1', 'scripts/#/', 'x/ scripts/#', 'scripts/#x']) expect(swept(site, files)).toEqual(files);
+    expect(swept('scripts/', files)).toEqual([]);
+  });
+
+  it('honest spellings (we: tag, trailing punctuation, markdown, :line:col, ::fn) name the file; both sides are normalized alike', () => {
+    for (const site of ['we:scripts/a.mjs', 'scripts/a.mjs.', 'scripts/a.mjs,', '*scripts/a.mjs*', '“scripts/a.mjs”', 'scripts/a.mjs:12:5', 'scripts/a.mjs:L12', 'scripts/a.mjs::fn', 'scripts/a.mjs:fn()']) {
+      expect(swept(site, ['scripts/a.mjs'])).toEqual([]);
+    }
+    expect(swept('scripts/a.mjs', ['./scripts/a.mjs', 'we:scripts/a.mjs'])).toEqual([]);
+    // Different case or a different directory stays a different file.
+    expect(swept('Scripts/a.mjs', ['scripts/a.mjs'])).toEqual(['scripts/a.mjs']);
+  });
+
+  it('truncated evidence is never complete, even when one block survives (padding hides a second block)', () => {
+    const block = '```class-sweep\n' + JSON.stringify({ v: 1, findings: [{ finding: 'F1', class: 'c', siblings: ['family', 'callers', 'branches', 'recovery'].map((path) => ({ path, site: 'a.mjs#f', status: 'checked', note: 'ok' })) }] }) + '\n```\n';
+    const padded = `${block}${'z'.repeat(MAX_EVIDENCE_BYTES)}\n${block}`;
+    expect(classSweepVerdict({ mode: 'enforce', changeKind: 'fix', evidence: padded })).toMatchObject({ status: 'incomplete', reason: 'evidence-truncated', blocking: true });
+    // Multibyte: fewer characters than the bound, more bytes than it.
+    const wide = `${block}${'é'.repeat(MAX_EVIDENCE_BYTES / 2)}x`;
+    expect(classSweepVerdict({ mode: 'warn', changeKind: 'fix', evidence: wide }).reason).toBe('evidence-truncated');
+    expect(classSweepVerdict({ mode: 'warn', changeKind: 'fix', evidence: block }).status).toBe('complete');
+  });
+
+  it('an empty changed-file list is unknown, never complete (even for enforce)', () => {
+    const evidence = '```class-sweep\n' + JSON.stringify({ v: 1, findings: [{ finding: 'F1', class: 'c', siblings: [
+      { path: 'family', site: 'a.mjs#f', status: 'fixed', note: '' },
+      { path: 'callers', site: 'a.mjs#g', status: 'checked', note: 'ok' },
+      { path: 'branches', site: '', status: 'n/a', note: 'none' },
+      { path: 'recovery', site: '', status: 'n/a', note: 'none' }] }] }) + '\n```';
+    expect(classSweepVerdict({ mode: 'enforce', changeKind: 'fix', evidence, changedFiles: [] })).toMatchObject({ status: 'incomplete', reason: 'pr-files-unknown', blocking: true });
+    // Only blank / non-string entries are as good as empty.
+    expect(classSweepVerdict({ mode: 'warn', changeKind: 'fix', evidence, changedFiles: ['', '  ', 7] }).reason).toBe('pr-files-unknown');
+    // Only backlog cards changed: the list is known and nothing needs a row.
+    expect(classSweepVerdict({ mode: 'warn', changeKind: 'fix', evidence, changedFiles: ['backlog/1-x.md'] }).status).toBe('complete');
   });
 });

@@ -10,7 +10,8 @@
  *   THE SAME CLASS ANYWHERE IN THE PR (card 5536): the PR's changed files are read from the lane
  *   (`git -C <lane> diff --name-only <base>...HEAD`, argv array, no shell, bounded buffer) or from
  *   `--changed-files=<file>` (one path per line). Every finding's rows must name each of them; with neither flag, or an
- *   unreadable list, the PR-wide check fails closed (`pr-files-unknown`).
+ *   unreadable, oversized or EMPTY list, the PR-wide check fails closed (`pr-files-unknown`). The list and the evidence
+ *   file are read with a byte bound (`readHeadBytes`), never whole.
  *
  *   It reads the ```class-sweep block (grammar: `../lib/class-sweep-rule.mjs`), prints one line, and RECORDS the
  *   structured sweep — the classes and every sibling path checked — under the coordination root:
@@ -25,7 +26,7 @@
  * IMPURE: reads one file, writes the record. Every decision is in the pure rule.
  */
 import { execFileSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -60,30 +61,58 @@ function parseFlags(argv) {
   return flags;
 }
 
-/** Read at most MAX_EVIDENCE_BYTES + 1 characters' worth; a missing file is `null` (→ `missing`, never `complete`). */
-function readEvidence(path, read) {
+/**
+ * Read at most `maxBytes` bytes of a file — never the whole of an oversized one (PR 4687: a `readFileSync` of an
+ * unbounded input allocates it all before any size check). Returns the decoded head; the caller treats a result that
+ * could not have fit (`bytes > maxBytes - 1`) as oversized. IMPURE.
+ * @param {string} path
+ * @param {number} maxBytes the most bytes to request from the file (the caller passes the bound plus one).
+ * @returns {string}
+ */
+export function readHeadBytes(path, maxBytes) {
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    let got = 0;
+    while (got < maxBytes) {
+      const n = readSync(fd, buf, got, maxBytes - got, got);
+      if (n === 0) break;
+      got += n;
+    }
+    return buf.subarray(0, got).toString('utf8');
+  } finally { closeSync(fd); }
+}
+
+/** Read at most MAX_EVIDENCE_BYTES + 1 bytes; a missing file is `null` (→ `missing`, never `complete`). */
+function readEvidence(path, readHead) {
   if (typeof path !== 'string' || !path) return null;
   try {
-    const text = read(path);
-    return typeof text === 'string' ? text.slice(0, MAX_EVIDENCE_BYTES + 1) : null;
+    const text = readHead(path, MAX_EVIDENCE_BYTES + 1);
+    return typeof text === 'string' ? text : null;
   } catch { return null; }
 }
 
 const BASE_RE = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,200}$/;
 
-/** The PR's changed files, or null when they cannot be read (→ `pr-files-unknown`, never `complete`). */
-export function readChangedFiles(flags, { read, git }) {
+/**
+ * The PR's changed files, or null when they cannot be read (→ `pr-files-unknown`, never `complete`): unreadable,
+ * oversized, or EMPTY — a PR under review always changes a file, so an empty diff is a wrong or stale base.
+ */
+export function readChangedFiles(flags, { readHead, git }) {
   let text = null;
-  if (typeof flags['changed-files'] === 'string' && flags['changed-files']) {
-    try { text = read(flags['changed-files']); } catch { return null; }
+  if ('changed-files' in flags) {
+    // Present but empty / valueless is an unreadable list, not a cue to fall through to --checkout.
+    if (typeof flags['changed-files'] !== 'string' || !flags['changed-files']) return null;
+    try { text = readHead(flags['changed-files'], MAX_EVIDENCE_BYTES + 1); } catch { return null; }
   } else if (typeof flags.checkout === 'string' && flags.checkout) {
     const base = typeof flags.base === 'string' ? flags.base : 'origin/main';
     if (!BASE_RE.test(base) || base.includes('..')) return null;
-    try { text = git(['-C', flags.checkout, 'diff', '--name-only', `${base}...HEAD`]); } catch { return null; }
+    try { text = git(['-C', flags.checkout, '-c', 'core.quotepath=off', 'diff', '--name-only', '--no-renames', `${base}...HEAD`]); } catch { return null; }
   }
   // A list past the bound is never cut short (a cut list could read `complete`): it is unknown.
-  if (typeof text !== 'string' || text.length > MAX_EVIDENCE_BYTES) return null;
-  return text.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > MAX_EVIDENCE_BYTES) return null;
+  const files = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  return files.length > 0 ? files : null;
 }
 
 const defaultGit = (args) => execFileSync('git', args, { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'] });
@@ -96,12 +125,13 @@ export function main(argv = process.argv.slice(2), {
   env = process.env, read = (p) => readFileSync(p, 'utf8'), now = () => new Date().toISOString(),
   root = resolveCoordinationRoot({ env }), write = writeFileSync, rename = renameSync, append = appendFileSync, mkdir = mkdirSync,
   settingsPath = defaultPolicySettingsPath(), out = (s) => process.stdout.write(`${s}\n`), git = defaultGit,
+  readHead = readHeadBytes,
 } = {}) {
   const flags = parseFlags(argv);
   const { mode, source, since } = resolveClassSweepMode({ env, read, path: settingsPath });
   const kind = typeof flags.kind === 'string' ? flags.kind : 'fix';
-  const changedFiles = mode === 'off' ? undefined : readChangedFiles(flags, { read, git });
-  const verdict = classSweepVerdict({ mode, changeKind: kind, evidence: readEvidence(flags['evidence-file'], read), changedFiles });
+  const changedFiles = mode === 'off' ? undefined : readChangedFiles(flags, { readHead, git });
+  const verdict = classSweepVerdict({ mode, changeKind: kind, evidence: readEvidence(flags['evidence-file'], readHead), changedFiles });
   const line = formatClassSweep(verdict);
   let recorded = false;
   const session = typeof flags.session === 'string' && SESSION_RE.test(flags.session) ? flags.session : null;
