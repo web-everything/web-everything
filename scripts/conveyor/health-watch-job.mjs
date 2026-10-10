@@ -28,7 +28,7 @@
  *       # live proof only: queue a gh-probe job whose worker blocks for --block-ms, then returns no probes
  */
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
@@ -338,9 +338,18 @@ function readResult(dir, id, maxBytes = MAX_RESULT_BYTES) {
     const st = fstatSync(fd);
     if (!st.isFile()) throw new Error('not a regular file');
     if (st.size > maxBytes) throw new Error(`too large (${st.size} bytes, cap ${maxBytes})`);
-    return JSON.parse(readFileSync(fd, 'utf8'));
+    // The cap holds for the read itself, not only the fstat: a file still growing is read at most one byte past
+    // the cap and then refused, never to end of file.
+    const buf = Buffer.allocUnsafe(Math.min(st.size, maxBytes) + 1);
+    let len = 0;
+    for (let n; len < buf.length && (n = readSync(fd, buf, len, buf.length - len, null)) > 0;) len += n;
+    if (len > maxBytes) throw new Error(`too large (grew past the cap of ${maxBytes} bytes while being read)`);
+    return JSON.parse(buf.toString('utf8', 0, len));
   } finally { closeSync(fd); }
 }
+
+/** Untrusted text from a job's files: the first line only (any line break, incl. CR and U+2028/9), bounded. */
+const firstLine = (s, max = MAX_RESULT_ERROR_CHARS) => String(s).split(/[\r\n\p{Zl}\p{Zp}]/u)[0].slice(0, max);
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -372,7 +381,7 @@ export function validateJobResult(res, { now, maxFutureSkewMs = MAX_RESULT_FUTUR
   for (const k of Object.keys(res.errors || {})) {
     if (!allowed.has(k)) { unexpected.add(k); continue; }
     // As the inline path does: first line only, credential-shaped text redacted.
-    if (typeof res.errors[k] === 'string') errors[k] = scrubText(res.errors[k].split('\n')[0]).slice(0, MAX_RESULT_ERROR_CHARS);
+    if (typeof res.errors[k] === 'string') errors[k] = scrubText(firstLine(res.errors[k]));
   }
   // Key names are untrusted text: only identifier-shaped ones are ever echoed, and only a handful of them.
   const dropped = [...unexpected].slice(0, MAX_DROPPED_KEYS_REPORTED).map((k) => (/^[A-Za-z0-9_$]{1,64}$/.test(k) ? k : '<invalid>'));
@@ -406,26 +415,31 @@ export async function runGhProbeJobs({
 }) {
   const kind = HEALTH_GH_PROBE_KIND.kind;
   mkdirSync(store.dir, { recursive: true });
-  const consumed = new Set(state?.consumed || []);
+  // `state` is read back from state.json (user-writable): a non-list `consumed` reads as empty instead of throwing
+  // on every tick, which would wedge the gh group with job mode on.
+  const consumed = new Set(Array.isArray(state?.consumed) ? state.consumed.filter((id) => typeof id === 'string') : []);
+  // A job record's `finishedAt` is file data too: garbage or a future value counts as "finished long ago".
+  const finishedMs = (r) => { const t = Date.parse(r.job.finishedAt ?? ''); return Number.isFinite(t) && t <= now ? t : 0; };
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
 
-  // 1. Consume every finished job not consumed yet — oldest first, so the NEWEST success is the one kept.
+  // 1. Consume every finished job not consumed yet. The NEWEST sample is the one kept, judged by its validated
+  //    `sampledAt` (never by the record's own `finishedAt`, which is file data).
   let result = null;
   const failures = [];
   const stale = [];
   const dropped = [];
   const finished = mine().filter((r) => TERMINAL_JOB_STATUSES.includes(r.job.status) && !consumed.has(r.id))
-    .sort((a, b) => Date.parse(a.job.finishedAt || 0) - Date.parse(b.job.finishedAt || 0));
+    .sort((a, b) => finishedMs(a) - finishedMs(b));
   for (const r of finished) {
     consumed.add(r.id);
-    if (r.job.status === 'failed') { failures.push(`job ${r.id} failed: ${r.job.error ?? 'unknown'}`); continue; }
+    if (r.job.status === 'failed') { failures.push(`job ${r.id} failed: ${scrubText(firstLine(r.job.error ?? 'unknown'))}`); continue; }
     try {
       const res = validateJobResult(readResult(store.dir, r.id, maxResultBytes), { now });
       if (!res.ok) { failures.push(`job ${r.id} ${res.reason}`); continue; }
       if (res.dropped.length) { dropped.push(...res.dropped.filter((k) => !dropped.includes(k))); log(`health-jobs: job ${r.id} result carried unexpected keys, dropped ${res.dropped.length}: ${res.dropped.join(', ')}`); }
       if (now - res.sampledAt > maxResultAgeMs) { stale.push(r.id); continue; }
-      result = { jobId: r.id, sampledAt: res.sampledAt, probes: res.probes, errors: res.errors };
-    } catch (e) { failures.push(`job ${r.id} result unreadable: ${String(e?.message || e).split('\n')[0]}`); }
+      if (!result || res.sampledAt >= result.sampledAt) result = { jobId: r.id, sampledAt: res.sampledAt, probes: res.probes, errors: res.errors };
+    } catch (e) { failures.push(`job ${r.id} result unreadable: ${scrubText(firstLine(e?.message || e))}`); }
   }
 
   // 2. Queue one when the cadence is due, nothing is in flight and nothing fresh was just consumed.
@@ -452,7 +466,7 @@ export async function runGhProbeJobs({
   const pruned = [];
   for (const r of after) {
     if (r.job.kind !== kind || !TERMINAL_JOB_STATUSES.includes(r.job.status) || !consumed.has(r.id)) continue;
-    if (!drain && now - Date.parse(r.job.finishedAt || 0) < FINISHED_JOB_KEEP_MS) continue;
+    if (!drain && now - finishedMs(r) < FINISHED_JOB_KEEP_MS) continue;
     try { removeJobFiles(store.dir, r.id); pruned.push(r.id); consumed.delete(r.id); } catch { /* next tick */ }
   }
   const left = store.list().records;

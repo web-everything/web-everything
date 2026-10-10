@@ -12,16 +12,16 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { tick, collectGhProbes, GH_GROUP_PROBE_NAMES, GH_CADENCE_MS, cadenceDue } from '../health-watch.mjs';
+import { tick, collectGhProbes, GH_GROUP_PROBE_NAMES, GH_CADENCE_MS, cadenceDue, probeSessionWatchdog } from '../health-watch.mjs';
 import { healthDir } from '../health-watch-section.mjs';
 import {
   runGhProbeJobs, observeTickClock, resolveHealthJobSwitches, FINISHED_JOB_KEEP_MS, RESULT_SUFFIX,
   prewarmSnapshots, prewarmMain, requestPrewarm, snapshotWarm, createWarmGate, evictToTrash, sweepTrash, isSafeCodeSha,
   PREWARM_MAX_MS, PREWARM_BACKOFF_BASE_MS, PREWARM_MAX_ATTEMPTS, PREWARM_FAILED_HOLD_MS,
 } from '../health-watch-job.mjs';
-import { createJobStore } from '../../lib/daemon-jobs-runtime.mjs';
+import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
 import { markClaimed, markLaunching, markSucceeded, markFailed, markRequeued } from '../../lib/daemon-jobs.mjs';
-import { HEALTH_WATCH_JOB_KINDS, HEALTH_WATCH_JOB_CAP } from '../../../skills-src/conveyor/daemon-manifest.mjs';
+import { HEALTH_WATCH_JOB_KINDS, HEALTH_WATCH_JOB_CAP, HEALTH_GH_PROBE_KIND } from '../../../skills-src/conveyor/daemon-manifest.mjs';
 
 let dir;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'health-jobs-')); });
@@ -176,6 +176,52 @@ describe('runGhProbeJobs — tick side of the health-gh-probe job', () => {
       expect(out.result).toBeNull();
       expect(out.failure).toMatch(/too large/);
     });
+
+    it('cuts error text at ANY line break (CR, U+2028), not only \\n', async () => {
+      for (const brk of ['\r', String.fromCharCode(0x2028), String.fromCharCode(0x2029)]) {
+        const out = await consumeRaw({ sampledAt: 1_100_000, probes: { prs: [], agents: [] }, errors: { staleState: `first${brk}FORGED second line` } });
+        expect(out.result.errors.staleState).toBe('first');
+      }
+    });
+  });
+
+  describe('job state and records are file data too', () => {
+    it('a corrupt persisted `consumed` (a number, an object, a list with junk) reads as empty instead of throwing', async () => {
+      for (const consumed of [5, {}, 'x', [1, null, {}]]) {
+        const store = createJobStore(join(dir, `consumed-${JSON.stringify(consumed)}`));
+        const out = await runGhProbeJobs({ ...base(store), now: 1_000_000, due: true, state: { consumed } });
+        expect(out.summary.enqueued).toBeTruthy();
+        expect(out.state.consumed).toEqual([]);
+      }
+    });
+
+    it('a failed record\'s error text is cut to its first line and scrubbed before it reaches the probe error', async () => {
+      const store = createJobStore(join(dir, 'failed-text'));
+      const q = await runGhProbeJobs({ ...base(store), now: 1_000_000, due: true });
+      store.update(q.summary.enqueued, (r) => markFailed(r, { at: iso(1_100_000), reason: `boom${String.fromCharCode(0x2028)}FORGED\nmore` }));
+      const out = await runGhProbeJobs({ ...base(store), now: 1_200_000, due: false, state: q.state });
+      expect(out.failure).toMatch(/failed: boom$/);
+    });
+
+    it('the newest SAMPLE wins, whatever the records\' finishedAt says; a future finishedAt is prunable, never kept forever', async () => {
+      const store = createJobStore(join(dir, 'two-results'));
+      mkdirSync(store.dir, { recursive: true });
+      const now = 2 * FINISHED_JOB_KEEP_MS;
+      const make = (sampledAt, finishedAt) => {
+        const rec = enqueueJob({ store, kindDef: HEALTH_GH_PROBE_KIND, codeSha: 'abc123', now: 1_000_000, input: { sourceRoot: dir } });
+        store.update(rec.id, (r) => markLaunching(r, { at: iso(1_000_000) }));
+        store.update(rec.id, (r) => markClaimed(r, { at: iso(1_000_000), handle: `h:${process.pid}:x`, host: 'h', pid: process.pid, procStart: 'x' }));
+        writeFileSync(join(store.dir, `${rec.id}${RESULT_SUFFIX}`), JSON.stringify({ jobId: rec.id, sampledAt, probes: { prs: [String(sampledAt)], agents: [] }, errors: {} }));
+        store.update(rec.id, (r) => markSucceeded(r, { at: finishedAt }));
+        return rec.id;
+      };
+      const older = make(now - 2000, iso(now + 1e11)); // forged future finishedAt would sort it last
+      const newer = make(now - 1000, iso(now - 500));
+      const out = await runGhProbeJobs({ ...base(store), now, due: false, state: {} });
+      expect(out.result.jobId).toBe(newer);
+      expect(out.summary.pruned).toContain(older);
+      expect(out.summary.pruned).not.toContain(newer);
+    });
   });
 
   it('prunes consumed finished records older than the keep window, with their result sidecar', async () => {
@@ -302,6 +348,35 @@ describe('tick — the gh cadence as a job never blocks the tick', () => {
     const next = await tick({ ...flags, now: iso(t0) }, deps);
     expect(next.ghJob.enqueued).toBeTruthy(); // due, not waiting out a 1e11 ms offset
   }, 30000);
+
+  it('a future tmpSweep / claudeJobsArchive completedAt in state.json reads as due, not parked (same class as ghCache.at)', async () => {
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    expect(cadenceDue(t0 - 1000, t0, 24 * 3_600_000)).toBe(false);
+    expect(cadenceDue(t0 + 1e11, t0, 24 * 3_600_000)).toBe(true);
+    const { flags, hd } = setup('future-daily');
+    const tmpRoot = join(dir, 'tmp-root'); mkdirSync(tmpRoot);
+    const jobsRoot = join(dir, 'claude-jobs'); mkdirSync(jobsRoot);
+    writeFileSync(join(hd, 'state.json'), JSON.stringify({
+      tmpSweep: { completedAt: t0 + 1e11, complete: true }, claudeJobsArchive: { completedAt: t0 + 1e11, complete: true },
+    }));
+    const out = await tick({ ...flags, 'no-gh': true, now: iso(t0), 'tmp-sweep-root': tmpRoot,
+      'claude-jobs-root': jobsRoot, 'claude-jobs-archive-root': join(dir, 'archive') }, { tmpSweepRun: () => 'p1\nn/unrelated\n' });
+    expect(out.probeErrors.tmpSweep).toBeUndefined();
+    expect(out.tmpSweep).toMatchObject({ complete: true });
+    expect(out.probeErrors.claudeJobsArchive).toBeUndefined();
+    expect(out.claudeJobsArchive).toMatchObject({ complete: true });
+  }, 30000);
+
+  it('a session-watchdog cache stamped in the future is stale, so the pass runs instead of being skipped', () => {
+    const wdDir = join(dir, 'watchdog'); mkdirSync(wdDir);
+    const t0 = Date.parse('2026-10-09T12:00:00Z');
+    writeFileSync(join(wdDir, 'session-watchdog.json'), JSON.stringify({ at: iso(t0 + 1e11), rows: [] }));
+    const runs = [];
+    const out = probeSessionWatchdog({ dir: wdDir, now: t0, flags: { 'state-root': join(dir, 'wd-state') },
+      runPass: (o) => { runs.push(o); return { at: iso(o.nowMs), rows: [], findings: [], actions: [], events: [], acked: [] }; } });
+    expect(runs).toHaveLength(1);
+    expect(out.cached).toBe(false);
+  });
 
   it('a failed job is a probe error, and the gh cadence stays due', async () => {
     const { flags } = setup('fail');

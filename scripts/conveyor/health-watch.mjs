@@ -109,10 +109,10 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const BOOTSTRAP_TAIL_BYTES = 512 * 1024;
 export const MAX_READ_BYTES = 2 * 1024 * 1024;
 export const GH_CADENCE_MS = 15 * MINUTE;
-/** PURE: is a cadence stamped `at` due at `now`? A missing, non-numeric or future stamp (a clock stepped back, or a
- *  forged state.json) is due — it must never make a cadence wait out the offset. */
-export function cadenceDue(at, now) {
-  return typeof at !== 'number' || !Number.isFinite(at) || at <= 0 || at > now || now - at >= GH_CADENCE_MS;
+/** PURE: is a cadence stamped `at` due at `now`, every `everyMs`? A missing, non-numeric or future stamp (a clock
+ *  stepped back, or a forged state.json) is due — it must never make a cadence wait out the offset. */
+export function cadenceDue(at, now, everyMs = GH_CADENCE_MS) {
+  return typeof at !== 'number' || !Number.isFinite(at) || at <= 0 || at > now || now - at >= everyMs;
 }
 export const CHILD_TIMEOUT_MS = 30_000;
 
@@ -887,8 +887,9 @@ export function probeSessionWatchdog({
   const isolated = anyFixture || scoped;
   const prev = anyFixture ? null : readJson(cachePath, null);
   const prevAt = Date.parse(prev?.at ?? '');
-  // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass.
-  if (prev && Number.isFinite(prevAt) && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
+  // 30 s of slack so a 5-minute tick that lands a few seconds early still runs a 5-minute pass. A cached `at` in
+  // the future (a clock stepped back, or a forged cache file) is stale, never a reason to skip the pass.
+  if (prev && Number.isFinite(prevAt) && prevAt <= now && now - prevAt < cfg.intervalMinutes * MINUTE - 30_000) {
     return { ...prev, cached: true, configError };
   }
   const readFix = (k) => JSON.parse(readFileSync(flags[k], 'utf8'));
@@ -1093,8 +1094,9 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
     try { const value = fn(); return value?.then ? value.catch(failed) : value; } catch (e) { return failed(e); }
   };
   const sweepAllowed = flags['tmp-sweep-root'] || (!flags['state-root'] && !flags['dry-run']);
-  const sweepDue = config.tmpSweepEnabled && (!prev.tmpSweep?.completedAt
-    || now - prev.tmpSweep.completedAt >= config.tmpSweepEveryMs || prev.tmpSweep.complete === false);
+  // Both daily stamps come from state.json, so they go through `cadenceDue`: a future one must not park the sweep.
+  const sweepDue = config.tmpSweepEnabled && (prev.tmpSweep?.complete === false
+    || cadenceDue(prev.tmpSweep?.completedAt, now, config.tmpSweepEveryMs));
   const tmpSweep = sweepAllowed && sweepDue
     ? await attempt('tmpSweep', () => sweepOurTmp(sweepOptions(config, flags['tmp-sweep-root'] || tmpdir(), !!flags['dry-run'], now, tmpSweepRun, prev.tmpSweep?.nextCursor)))
     : null;
@@ -1102,8 +1104,8 @@ export async function tick(flags = {}, { collectInventory = collectCredentialInv
   if (!flags['state-root'] && !flags['dry-run']) await attempt('cardBatchSeal', () => sealDueBatches({ now }));
 
   const archiveAllowed = flags['claude-jobs-root'] || (!flags['state-root'] && !flags['dry-run']);
-  const archiveDue = config.claudeJobsArchiveEnabled && (!prev.claudeJobsArchive?.completedAt
-    || now - prev.claudeJobsArchive.completedAt >= config.claudeJobsArchiveEveryMs || prev.claudeJobsArchive.complete === false);
+  const archiveDue = config.claudeJobsArchiveEnabled && (prev.claudeJobsArchive?.complete === false
+    || cadenceDue(prev.claudeJobsArchive?.completedAt, now, config.claudeJobsArchiveEveryMs));
   const claudeJobsArchive = archiveAllowed && archiveDue
     ? await attempt('claudeJobsArchive', () => archiveClaudeJobs(archiveOptions(config, flags, now)))
     : null;
