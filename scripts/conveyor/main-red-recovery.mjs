@@ -47,6 +47,8 @@
  * actually let finish and CONCLUDE failed, never one merely superseded by the next push.
  * @see we:docs/agent/platform-decisions.md#deterministic-core-thin-judgment
  */
+import { readFileSync } from 'node:fs';
+import { cascadePolicy } from '../lib/policy-cascade.mjs';
 import { mainBreakEscalationForHead, mainDefectEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { latestRequiredCheck, isRequiredCheckFailed } from '../merge-ai-prs.mjs';
@@ -68,6 +70,18 @@ export const DEFAULT_MAIN_WORKFLOW_NAME = 'CI';
 /** The required status check this module reasons about, by default — SAME default `we:scripts/merge-ai-prs.mjs`
  *  already uses everywhere else in this repo (`requiredCheck = 'test'`), reused rather than re-declared. */
 export const DEFAULT_REQUIRED_CHECK = 'test';
+
+/** Latest decisive main result; cancelled and infra-only runs prove nothing. */
+export function currentMainGreen(mainRuns) {
+  const run = (Array.isArray(mainRuns) ? mainRuns : [])
+    .filter(r => r && String(r.status).toLowerCase() === 'completed' && r.infraCancelledOnly !== true)
+    .filter(r => ['success', ...MAIN_RED_CONCLUSIONS].includes(String(r.conclusion).toLowerCase()))
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+  if (!run) return null;
+  return String(run.conclusion).toLowerCase() === 'success'
+    ? { red: false, sha: run.headSha ?? null, at: run.updatedAt }
+    : { red: true, sha: null, at: null };
+}
 
 /**
  * we:scripts/conveyor/main-red-recovery.mjs#computeMainRedWindows — reduce `main`'s own chronological run
@@ -737,10 +751,27 @@ export function planMainRedRebases({
  *  absorbing and hand to a `ci-heal` agent instead. */
 export const DEFAULT_MAX_REBASE_RETRIES_PER_SHA = 2;
 
-/** xo7mr6l — refreshes per head for a PR whose escalation blamed main's own defect; env knob, default 1. */
+/** Per-head recovery budgets through the shared policy cascade. */
+export function resolveRecoveryCaps({ env = process.env, file = new URL('../settings/ci-red-recovery.json', import.meta.url) } = {}) {
+  let tool;
+  try { tool = JSON.parse(readFileSync(file, 'utf8'))?.ciRedRecoveryCaps; } catch { /* optional */ }
+  const standard = { rebaseRetriesPerSha: 2, missingRunRetriesPerSha: 2, mainDefectRebasesPerSha: 1 };
+  // Unset or empty env = layer not set (an empty string must never become cap 0); garbage is named invalid.
+  const fromEnv = (k) => { const s = String(env?.[k] ?? '').trim(); return s === '' ? undefined : (/^\d+$/.test(s) ? Number(s) : s); };
+  const envValues = {
+    rebaseRetriesPerSha: fromEnv('WE_REBASE_RETRIES_PER_SHA'),
+    missingRunRetriesPerSha: fromEnv('WE_MISSING_RUN_RETRIES_PER_SHA'),
+    mainDefectRebasesPerSha: fromEnv('WE_MAIN_DEFECT_REBASES_PER_SHA'),
+  };
+  const c = cascadePolicy('ciRedRecoveryCaps', tool, {
+    env, standard, envValues, valid: v => Number.isInteger(v) && v >= 0,
+  });
+  return { ...c.value, sources: c.sources };
+}
+
+/** Preserve the existing main-defect env parser and default. */
 export function resolveMainDefectRebaseCap(env = process.env) {
-  const n = Number.parseInt(env.WE_MAIN_DEFECT_REBASES_PER_SHA, 10);
-  return Number.isInteger(n) && n >= 0 ? n : 1;
+  return resolveRecoveryCaps({ env }).mainDefectRebasesPerSha;
 }
 
 /** we:scripts/conveyor/main-red-recovery.mjs#REBASE_ONTO_MAIN_COMMENT_MARKER — the stable FIRST LINE of the
@@ -760,6 +791,21 @@ function bodyHasExactLine(body, line) {
   return body.split('\n').some((l) => l === line);
 }
 
+// 2026-10-10 live: #4784 claim-held refusals burned the cap.
+function recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen) {
+  if (body.includes('holds the fix claim')) return true;
+  const state = body.match(/^main-state: (.*)$/m);
+  if (state?.[1] === 'red') return true;
+  const at = Date.parse(c?.createdAt);
+  if (!state && isWithinRedWindow(at, mainRedWindows)) return true;
+  if (mainGreen && !mainGreen.red && mainGreen.sha) {
+    const sha = body.match(/^main-green-sha: (.*)$/m);
+    if (sha && sha[1] !== mainGreen.sha) return true;
+    if (!sha && Number.isFinite(at) && at < Date.parse(mainGreen.at)) return true;
+  }
+  return false;
+}
+
 /**
  * we:scripts/conveyor/main-red-recovery.mjs#countRebaseOntoMainComments — the DURABLE, restart-surviving
  * rebase-onto-main attempt count for ONE head sha (see {@link DEFAULT_MAX_REBASE_RETRIES_PER_SHA}'s own
@@ -770,7 +816,7 @@ function bodyHasExactLine(body, line) {
  * @param {string|null} [headSha] - when given, only a marker whose body names THIS sha counts.
  * @returns {number}
  */
-export function countRebaseOntoMainComments(comments, headSha = null) {
+export function countRebaseOntoMainComments(comments, headSha = null, { mainRedWindows = [], mainGreen = null } = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (const c of comments) {
@@ -778,6 +824,7 @@ export function countRebaseOntoMainComments(comments, headSha = null) {
     if (typeof body !== 'string' || !body.trimStart().startsWith(REBASE_ONTO_MAIN_COMMENT_MARKER)) continue;
     if (!isTrustedMarkerAuthor(c)) continue; // a forged marker from an untrusted login must never inflate this cap.
     if (headSha && !bodyHasExactLine(body, `sha: ${headSha}`)) continue;
+    if (recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen)) continue;
     n += 1;
   }
   return n;
@@ -793,7 +840,7 @@ export function countRebaseOntoMainComments(comments, headSha = null) {
  * @returns {string}
  */
 export function buildRebaseOntoMainComment({
-  headRefName = null, headSha = null, ok = true, action = 'rebased', error = null,
+  headRefName = null, headSha = null, mainGreen = null, ok = true, action = 'rebased', error = null,
   attribution = null, attributedWindow = null,
 } = {}) {
   const outcome = ok
@@ -806,6 +853,7 @@ export function buildRebaseOntoMainComment({
     '',
     `branch: ${headRefName ?? '(unknown)'}`,
     `sha: ${headSha ?? '(unknown)'}`,
+    ...(mainGreen ? [`main-state: ${mainGreen.red ? 'red' : 'green'}`, `main-green-sha: ${mainGreen.sha ?? 'none'}`] : []),
     ...(attribution === 'main-fixed-signature' && attributedWindow ? [
       'attribution: main-fixed-signature',
       `attributed-window: ${attributedWindow.from} ${attributedWindow.to}`,
@@ -1307,29 +1355,27 @@ const MISSING_RUN_STACKED_REFUSAL_PREFIX = 'PR is stacked or from a fork (base '
  * @param {{baseRefName?:(string|null)}} [o] - the PR's CURRENT base; stacked-refusal markers from another base are stale
  * @returns {number}
  */
-export function countMissingRunComments(comments, headSha = null, { baseRefName = null } = {}) {
+export function countMissingRunComments(comments, headSha = null, { baseRefName = null, mainRedWindows = [], mainGreen = null, defaultBranch = 'main' } = {}) {
   if (!Array.isArray(comments)) return 0;
   let n = 0;
   for (const c of comments) {
     const body = typeof c === 'string' ? c : c?.body;
     if (typeof body !== 'string' || !body.trimStart().startsWith(MISSING_RUN_COMMENT_MARKER)) continue;
     if (!isTrustedMarkerAuthor(c)) continue;
+    // A stacked refusal never pushed anything (stacks now restack instead); a fork-on-default-branch refusal still counts.
+    if (body.includes(MISSING_RUN_STACKED_REFUSAL_PREFIX)
+      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${defaultBranch}, head repo `)) continue;
     // Old dispatch attempts cannot produce evaluated PR checks; do not let their
     // exhausted budget prevent the corrected recovery method from running.
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
     // xgq539z — legacy wrong-owner credential refusals (see MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL) are not counted.
     if (body.includes(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL)) continue;
-    // A "stacked" refusal is bound to the base it was posted under. Once the drain retargets the PR (base changed,
-    // head sha unchanged), that refusal is stale: it said nothing about whether a push can start CI on the NEW
-    // base. Counting it burned the cap before the PR could ever be recovered (plateau-app #217, 2026-10-08).
-    // Compare the base EXACTLY — never parse it back out of prose: git ref names may hold `,` and `)`, so a parsed
-    // base is truncated and a still-stacked refusal would read as stale (cap bypass). `, head repo ` terminates the
-    // writer's base (`missing-run-push.mjs`) unambiguously because a ref name cannot contain a space. A refusal that
-    // recorded no base (`base ?`) cannot be proven stale, so it still counts.
+    // Legacy base comparison remains harmless after the blanket refusal refund.
     if (baseRefName && body.includes(MISSING_RUN_STACKED_REFUSAL_PREFIX)
       && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}?, head repo `)
       && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${baseRefName}, head repo `)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
+    if (recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen)) continue;
     n += 1;
   }
   return n;
@@ -1343,7 +1389,7 @@ export function countMissingRunComments(comments, headSha = null, { baseRefName 
  * @returns {string}
  */
 export function buildMissingRunComment({
-  headRefName = null, headSha = null, ok = true, action = 'pull-request-push', error = null,
+  headRefName = null, headSha = null, mainGreen = null, ok = true, action = 'pull-request-push', error = null,
   refresh = null, refreshError = null, newHeadSha = null,
 } = {}) {
   // Preserve refresh details when rendering historical attempts.
@@ -1358,6 +1404,7 @@ export function buildMissingRunComment({
     '',
     `branch: ${headRefName ?? '(unknown)'}`,
     `sha: ${headSha ?? '(unknown)'}`,
+    ...(mainGreen ? [`main-state: ${mainGreen.red ? 'red' : 'green'}`, `main-green-sha: ${mainGreen.sha ?? 'none'}`] : []),
     ...(newHeadSha ? [`recovery-sha: ${newHeadSha}`] : []),
     `conveyor missing-run-recovery ${outcome}`,
   ].join('\n');

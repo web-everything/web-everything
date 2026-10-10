@@ -56,6 +56,7 @@
  * SAME requirement every other conveyor dispatcher in this directory already has, e.g.
  * `we:scripts/operations/dispatch-lane-io.mjs#REPO_ROOT`) — it fetches the lane ref and pushes the rebuilt tip.
  */
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { pushMissingRunCommit } from './missing-run-push.mjs';
 import { DECLARED_REQUIRED_STATUS_CHECKS } from '../lib/required-status-checks.mjs';
@@ -69,7 +70,7 @@ import { latestRequiredCheck, isRequiredCheckFailed, collapseRollupToLatestPerNa
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
 import { spawnCiHealRearm } from './ci-heal-mark.mjs';
 import {
-  computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
+  currentMainGreen, resolveRecoveryCaps, computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
   buildHungCandidates, planHungCiRecoveries, DEFAULT_HUNG_THRESHOLD_MS, DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   classifyCiFailureAttribution, countRebaseOntoMainComments, buildRebaseOntoMainComment,
   DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
@@ -83,6 +84,7 @@ import {
   defaultReadMainRuns, defaultReadAheadBy, defaultReadMainLatestCheckRuns, defaultReadMainGreenFixFacts,
   defaultReadMainFixedSignatureFacts,
 } from './reconcile-pass.mjs';
+import { pushRefusal } from './fix-procedure.mjs';
 import { rebaseDropManifest } from '../lib/rebase-drop-manifest.mjs';
 import { REPO_ROOT } from '../operations/dispatch-lane-io.mjs';
 import { resolveLanePoolRepoPath } from './lane-pool-health-watch.mjs';
@@ -183,11 +185,11 @@ export function refreshOntoMain(laneRef, { root = REPO_ROOT, base = 'origin/main
  *   ok?:boolean, action?:string, error?:(string|null)}} [o]
  */
 export function defaultPostRebaseComment(prNumber, {
-  exec = execFileSyncThrottled, repo = null, headRefName = null, headSha = null, ok = true, action = 'rebased', error = null,
+  exec = execFileSyncThrottled, repo = null, headRefName = null, headSha = null, mainGreen = null, ok = true, action = 'rebased', error = null,
   attribution = null, attributedWindow = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildRebaseOntoMainComment({
-    headRefName, headSha, ok, action, error, attribution, attributedWindow,
+    headRefName, headSha, mainGreen, ok, action, error, attribution, attributedWindow,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -214,7 +216,7 @@ export function sweepCiRedRecovery({
   readMainLatestCheckRuns = defaultReadMainLatestCheckRuns, readMainGreenFixFacts = defaultReadMainGreenFixFacts,
   readMainFixedSignatureFacts = defaultReadMainFixedSignatureFacts,
   readComments = defaultReadPrComments, refresh = refreshOntoMain, postComment = defaultPostRebaseComment,
-  maxRebaseRetriesPerSha = DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
+  maxRebaseRetriesPerSha = resolveRecoveryCaps().rebaseRetriesPerSha, checkClaim = pushRefusal,
   // #2811 — injectable so a test can pin the restamp-first/rearm-fallback chain with no `gh`/child-process.
   reconcileAcceptance = reconcileAcceptanceAfterRebase,
   // Card xu1nixv — the published red-main priority record (WE only); hermetic (null) inside a test run.
@@ -232,6 +234,7 @@ export function sweepCiRedRecovery({
   // judge against it — mirrors `reconcile-pass.mjs#enrichPrsWithMainRedFacts`'s own "pay for it only when needed".
   const needWindows = prList.some((pr) => isAnyRequiredCheckFailed(pr, checks));
   const mainRuns = needWindows ? readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME }) : [];
+  const mainGreen = currentMainGreen(mainRuns);
   const mainRedWindows = needWindows ? computeMainRedWindows(mainRuns) : [];
   // landing-freeze fix (2026-09-27) — same "pay only when needed" gate as `mainRedWindows` above: `main`'s own
   // latest completed run's per-check conclusions, the retrospection-independent fact `isMainLatestCheckGreen`
@@ -273,7 +276,7 @@ export function sweepCiRedRecovery({
       }
     }
     comments ??= readComments(c.prNumber, { repo });
-    return { ...withFacts, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha) };
+    return { ...withFacts, rebaseAttemptsForSha: countRebaseOntoMainComments(comments, c.headSha, { mainRedWindows, mainGreen }) };
   });
   // xd3dkzx — mainRuns (with per-check verdicts) so recovery is judged on the PR's own failing check.
   // Card xu1nixv — the red-main fix PRs (published priority record) are never told to wait for main.
@@ -296,12 +299,19 @@ export function sweepCiRedRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
-      const result = refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot });
+      const held = checkClaim({ repo, branch: d.headRefName });
+      const result = held ? { ok: false, error: held.message }
+        : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot });
+      // 2026-10-10 live: #4784 claim-held refusals burned the cap.
+      if (held || String(result.error ?? '').includes('holds the fix claim')) {
+        applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, error: result.error });
+        continue;
+      }
       // Posted on EVERY attempt, success or failure — mirrors `sweepHungCiRecovery`'s own discipline: a
       // permanently-failing refresh must still trip {@link DEFAULT_MAX_REBASE_RETRIES_PER_SHA}'s cap, not
       // retry forever silently.
       postComment(d.prNumber, {
-        repo, headRefName: d.headRefName, headSha: d.headSha, ok: result.ok, action: result.action, error: result.error ?? null,
+        repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen, ok: result.ok, action: result.action, error: result.error ?? null,
         ...(d.attribution ? { attribution: d.attribution, attributedWindow: d.attributedWindow } : {}),
       });
       // #2811 — the ONE new step: this rebase just moved the head (`action === 'rebased'` — never on
@@ -315,7 +325,7 @@ export function sweepCiRedRecovery({
       applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ...result, acceptance });
     }
   }
-  return { ...plan, applied, mainRedWindows, mainLatestCheckRuns };
+  return { ...plan, applied, mainRedWindows, mainLatestCheckRuns, mainRuns };
 }
 
 // ── HUNG-CI-RUN RECOVERY (we:backlog/xd1sfms-*.md, parent #4075/#3383) ─────────────────────────────────────────
@@ -789,11 +799,11 @@ export function triggerCiForPr(d, options = {}) {
  *   ok?:boolean, action?:string, error?:(string|null)}} [o]
  */
 export function defaultPostMissingRunComment(prNumber, {
-  exec = execFileSyncThrottled, repo = null, headRefName = null, headSha = null, ok = true, action = 'pull-request-push', error = null,
+  exec = execFileSyncThrottled, repo = null, headRefName = null, headSha = null, mainGreen = null, ok = true, action = 'pull-request-push', error = null,
   refresh = null, refreshError = null, newHeadSha = null,
 } = {}) {
   const argv = ['pr', 'comment', String(prNumber), '--body', buildMissingRunComment({
-    headRefName, headSha, ok, action, error, refresh, refreshError, newHeadSha,
+    headRefName, headSha, mainGreen, ok, action, error, refresh, refreshError, newHeadSha,
   })];
   if (repo) argv.push('--repo', repo);
   exec('gh', argv, {
@@ -824,6 +834,60 @@ export function clearStaleCheckingLabel(prNumber, { repo = null, exec = execFile
   return true;
 }
 
+function defaultFetchStackRef(ref, { root }) {
+  try {
+    execFileSync('git', ['-C', root, 'fetch', 'origin', ref], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    return { ok: true };
+  } catch (e) { return { ok: false, error: describeExecError(e) }; }
+}
+
+export function restackStackedPr(d, {
+  prs, repo, defaultBranch = 'main', root = REPO_ROOT, refresh = refreshOntoMain,
+  fetchRef = defaultFetchStackRef, checkClaim = pushRefusal,
+} = {}) {
+  const action = 'stack-restack';
+  const chain = [];
+  const seen = new Set();
+  let link = d;
+  while (link) {
+    const ref = link.baseRefName;
+    if (seen.has(link.headRefName) || chain.length >= 10) {
+      return { ok: false, action, error: `stack base ${ref} is not an open PR head; cannot restack` };
+    }
+    seen.add(link.headRefName);
+    chain.push(link);
+    if (ref === defaultBranch) break;
+    link = (Array.isArray(prs) ? prs : []).find(pr => pr.headRefName === ref);
+    if (!link) return { ok: false, action, error: `stack base ${ref} is not an open PR head; cannot restack` };
+  }
+  const failed = error => ({ ok: false, action, error,
+    ...(String(error).includes('holds the fix claim') ? { deferred: true } : {}),
+  });
+  for (const pr of chain) {
+    const held = checkClaim({ repo, branch: pr.headRefName });
+    if (held) return { ok: false, action, deferred: true, error: held.message };
+  }
+  const steps = [];
+  for (const [index, pr] of chain.reverse().entries()) {
+    try {
+      if (index > 0) {
+        const fetched = fetchRef(pr.baseRefName, { root });
+        if (!fetched.ok) return failed(fetched.error);
+      }
+      const result = refresh(pr.headRefName, { base: `origin/${pr.baseRefName}`, root });
+      if (!result.ok) return failed(result.error);
+      steps.push({ prNumber: pr.prNumber ?? pr.number, headRefName: pr.headRefName, action: result.action, newCommit: result.newCommit });
+    } catch (e) { return failed(describeExecError(e)); }
+  }
+  if (steps.every(step => step.action === 'current')) {
+    return failed('stack already current with main; CI still absent — needs a human look');
+  }
+  const last = steps.at(-1);
+  return { ok: true, action, steps, newHeadSha: last?.action === 'rebased' ? last.newCommit ?? null : null };
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#sweepMissingRunRecovery — THE IO SHELL for the missing-run pass
  * (xi4od2p, #4075/#3383). Mirrors {@link sweepCiRedRecovery}/{@link sweepHungCiRecovery}'s own read/plan/act
@@ -837,11 +901,12 @@ export function clearStaleCheckingLabel(prNumber, { repo = null, exec = execFile
  */
 export function sweepMissingRunRecovery({
   repo = null, apply = false, defaultBranch = 'main',
+  mainRuns = null, readMainRuns = defaultReadMainRuns, restack = restackStackedPr,
   readOpenPrs = defaultReadOpenPrs, readRequiredContexts = defaultReadRequiredContexts,
   readHeadCommittedAt = defaultReadHeadCommittedAt, readDeclaredContexts = defaultReadDeclaredContexts,
   readComments = defaultReadPrComments, trigger = triggerCiForPr, postComment = defaultPostMissingRunComment,
   clearLabel = clearStaleCheckingLabel, thresholdMs = DEFAULT_MISSING_RUN_THRESHOLD_MS,
-  maxRetriesPerSha = DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA, now = Date.now(),
+  maxRetriesPerSha = resolveRecoveryCaps().missingRunRetriesPerSha, now = Date.now(),
 } = {}) {
   // #2793 — `mergeable` added so {@link buildMissingRunCandidates} can exclude a real merge conflict (never a
   // "missing run", a conflicting PR can produce no `pull_request` run at all — see that function's own docblock).
@@ -855,6 +920,12 @@ export function sweepMissingRunRecovery({
   // used ONLY for that check, never to widen the all-absent test (PR #2740 review).
   const stalledPartialContexts = requiredContexts ?? readDeclaredContexts({ repo });
   const rawCandidates = buildMissingRunCandidates(prs, { requiredContexts: requiredContexts ?? null, stalledPartialContexts });
+  if (rawCandidates.length && mainRuns === null) {
+    try { mainRuns = readMainRuns({ repo, branch: defaultBranch, workflowName: DEFAULT_MAIN_WORKFLOW_NAME }); }
+    catch { mainRuns = []; }
+  }
+  const mainRedWindows = computeMainRedWindows(mainRuns);
+  const mainGreen = currentMainGreen(mainRuns);
   const prByNumber = new Map((Array.isArray(prs) ? prs : []).map((pr) => [Number(pr?.number), pr]));
   // Every per-candidate extra read below only runs for a PR {@link buildMissingRunCandidates} already narrowed
   // to (zero required-check rollup entries at all) — mirrors {@link sweepCiRedRecovery}/{@link sweepHungCiRecovery}'s
@@ -863,7 +934,7 @@ export function sweepMissingRunRecovery({
     const headCommittedAt = readHeadCommittedAt(c.headSha, { repo });
     const comments = readComments(c.prNumber, { repo });
     return {
-      ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName }),
+      ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen }),
     };
   });
   const plan = planMissingRunRecoveries({
@@ -873,7 +944,12 @@ export function sweepMissingRunRecovery({
   const applied = [];
   if (apply) {
     for (const d of plan.dispatch) {
-      const result = trigger(d, { repo, defaultBranch });
+      // 2026-10-10 live (#4759…#4797): a stacked PR gets no run because its merge commit's ci.yml predates the
+      // `lane/**` trigger — an empty push cannot fix that; restacking the chain onto main can.
+      const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
+      const result = stacked
+        ? restack(d, { prs, repo, defaultBranch, root: resolveLanePoolRepoPath(repo) ?? REPO_ROOT })
+        : trigger(d, { repo, defaultBranch });
       // Unknown mergeability, a moving head or a held claim is not an attempt.
       if (result.deferred) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why, labelCleared: false, ...result });
@@ -882,7 +958,7 @@ export function sweepMissingRunRecovery({
       // Posted on EVERY attempt, success or failure — same discipline as every sibling durable marker in this
       // file: a permanently-failing trigger must still trip {@link DEFAULT_MAX_MISSING_RUN_RETRIES_PER_SHA}'s cap.
       postComment(d.prNumber, {
-        repo, headRefName: d.headRefName, headSha: d.headSha, ok: result.ok, action: result.action, error: result.error ?? null,
+        repo, headRefName: d.headRefName, headSha: d.headSha, mainGreen, ok: result.ok, action: result.action, error: result.error ?? null,
         refresh: result.refresh ?? null, refreshError: result.refreshError ?? null,
         newHeadSha: result.newHeadSha ?? null,
       });
@@ -907,7 +983,7 @@ export function formatMissingRunReport({ dispatch = [], refusals = [], applied =
   const lines = [`ci-red-recovery-watch (missing-run) — ${dispatch.length} owed a trigger, ${refusals.length} refusal(s), ${applied.length} applied`];
   for (const d of dispatch) lines.push(`  → trigger-ci PR #${d.prNumber} (${d.headRefName ?? '?'}) — ${d.why}`);
   for (const r of refusals) if (r.kind !== 'not-overdue') lines.push(`  ✗ ${r.kind} PR #${r.prNumber} — ${r.why}`);
-  for (const a of applied) lines.push(a.ok ? `  ✓ applied: ${a.action} PR #${a.prNumber}${a.labelCleared ? ' (cleared stale checking label)' : ''} — ${a.why ?? '(no reason recorded)'}` : `  ✗ apply ${a.action} PR #${a.prNumber} — ${a.error} (reason it was attempted: ${a.why ?? '(none)'})`);
+  for (const a of applied) lines.push(a.deferred ? `  … deferred PR #${a.prNumber} — ${a.error}` : a.ok ? `  ✓ applied: ${a.action} PR #${a.prNumber}${a.labelCleared ? ' (cleared stale checking label)' : ''} — ${a.why ?? '(no reason recorded)'}` : `  ✗ apply ${a.action} PR #${a.prNumber} — ${a.error} (reason it was attempted: ${a.why ?? '(none)'})`);
   return lines.join('\n');
 }
 
@@ -931,7 +1007,7 @@ export function formatReport({ dispatch = [], refusals = [], applied = [] } = {}
   const lines = [`ci-red-recovery-watch — ${dispatch.length} owed a refresh, ${refusals.length} refusal(s), ${applied.length} applied`];
   for (const d of dispatch) lines.push(`  → rebase-onto-main PR #${d.prNumber} (${d.headRefName ?? '?'}) — ${d.why}`);
   for (const r of refusals) lines.push(`  ✗ ${r.kind} PR #${r.prNumber} — ${r.why}`);
-  for (const a of applied) lines.push(a.ok ? `  ✓ applied: ${a.action} ${a.headRefName ?? '?'} onto main (PR #${a.prNumber})` : `  ✗ apply ${a.action} PR #${a.prNumber} ${a.headRefName ?? '?'} — ${a.error}`);
+  for (const a of applied) lines.push(a.deferred ? `  … deferred PR #${a.prNumber} ${a.headRefName ?? '?'} — ${a.error}` : a.ok ? `  ✓ applied: ${a.action} ${a.headRefName ?? '?'} onto main (PR #${a.prNumber})` : `  ✗ apply ${a.action} PR #${a.prNumber} ${a.headRefName ?? '?'} — ${a.error}`);
   return lines.join('\n');
 }
 
@@ -960,7 +1036,7 @@ async function main(argv) {
   // reason the hung-run pass was folded in above rather than given a second CLI verb: both watch the same
   // open-PR listing for the same reason (a PR wrongly stuck on `checking`), and the daemon-manifest entry that
   // already schedules this script gets the missing-run fix for free rather than needing a third entry.
-  const missingRunResult = sweepMissingRunRecovery({ repo: repoFlag, apply: !!flags.apply });
+  const missingRunResult = sweepMissingRunRecovery({ repo: repoFlag, apply: !!flags.apply, mainRuns: result.mainRuns?.length ? result.mainRuns : null });
   if (flags.json) {
     writeAllSync(1, `${JSON.stringify({ mainRedRecovery: result, hungRecovery: hungResult, missingRunRecovery: missingRunResult })}\n`);
   } else {
