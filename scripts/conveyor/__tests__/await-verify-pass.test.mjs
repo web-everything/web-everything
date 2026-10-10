@@ -45,10 +45,10 @@ describe('classifyAwaitVerdict — the policy table', () => {
     expect(classify({ marker: marker('red') })).toMatchObject({ action: 'resume', resume: 'red' });
     expect(classify({ marker: marker('red'), record: rec({ attempt: 3 }) })).toMatchObject({ action: 'resume', resume: 'escalate' });
   });
-  it('load-only red → load-flake in WE, a plain red elsewhere', () => {
+  it('load-only red → load-flake in WE, redispatch elsewhere', () => {
     const flaky = marker('red', { retriedFailures: [{ file: 'a.test.mjs', kind: 'timeout' }], isolatedRetry: 'still-red', failureDetails: { tests: [{ file: 'a.test.mjs', name: 'x' }] } });
     expect(classify({ marker: flaky })).toMatchObject({ action: 'resume', resume: 'load-flake' });
-    expect(classify({ marker: flaky, record: rec({ repo: 'plateauapp/plateau-app' }) })).toMatchObject({ resume: 'red' });
+    expect(classify({ marker: flaky, record: rec({ repo: 'plateauapp/plateau-app' }) })).toMatchObject({ resume: 'load-flake-redispatch' });
   });
   it('infrastructure failure / absent / corrupt → re-request, then infra after the retry budget', () => {
     for (const m of [marker('infrastructure-failure'), null, { corrupt: true }]) {

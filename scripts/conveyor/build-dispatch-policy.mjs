@@ -37,6 +37,7 @@
  * we:scripts/conveyor/__tests__/build-dispatch-policy.test.mjs.
  */
 
+import { OPEN_PR_CAP_SCOPE_DEFAULTS, readOpenPrCapScope, countOpenPrsForCap, formatOpenPrCap } from '../lib/open-pr-cap-scope.mjs';
 import { normNum } from './queue-store.mjs';
 import { parseScopeEntry, pathsOverlap, firstScopeOverlap, overlapsInFlight } from '../readiness/overlap-chain.mjs';
 
@@ -46,6 +47,8 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   maxConcurrentBuilds: 1, // --max-concurrent: Claude, including unknown legacy executors
   maxConcurrentExternalBuilds: 4, // Codex + Antigravity together
   maxOpenPrs: 12,
+  // Operator ruling 2026-10-09: accepted and card-only PRs do not consume the landing cap.
+  openPrCapScope: readOpenPrCapScope(),
   // #4353 — open items from build start until MERGE (durable in-flight ∪ delivered-by-open-PR), a tighter,
   // separate cap from `maxConcurrentBuilds` (which only bounds builds actually running right now). Unmeasured
   // starting point per the operator's own framing — see `planBuildDispatch`'s `wip-cap` rule below.
@@ -78,7 +81,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
   rules: Object.freeze([
     { id: 'cap', text: 'at most maxConcurrentBuilds Claude and maxConcurrentExternalBuilds external builds in flight', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'wip-cap', text: 'at most maxOpenItems items open from build start until merge (durable in-flight ∪ delivered-by-open-PR)', enforcedBy: 'build-dispatch-policy.mjs' },
-    { id: 'landing-freeze', text: 'no new build while open PRs > maxOpenPrs or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
+    { id: 'landing-freeze', text: 'no new build while counted open PRs > maxOpenPrs (card-only and review:accepted PRs are not counted) or any open PR carries a freeze label', enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'main-red', text: "no new build while main's CI is red (setting freeze.mainRed; prepares and the main-fix owner exempt)", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'scope-vs-open-prs', text: "a build whose scope overlaps an open PR's files waits for that PR", enforcedBy: 'build-dispatch-policy.mjs' },
     { id: 'hot-file', text: 'no two in-flight builds on the same file', enforcedBy: 'build-dispatch-policy.mjs' },
@@ -91,7 +94,7 @@ export const BUILD_DISPATCH_POLICY = Object.freeze({
     // this row is DOCUMENTATION PARITY (every operator rule visible here, per this file's own header) — no
     // logic in this planner changes for it.
     { id: 'needs-prepare', text: 'a candidate carrying no truthful preparedDate is never built — held for a prepare pass first', enforcedBy: 'readiness/dispatch-plan.mjs' },
-    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (pinned first) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
+    { id: 'prepare-ahead-window', text: 'only the next prepareAheadWindow cards to build (highest delivery class first, preserving classified queue order) are prepared', enforcedBy: 'conveyor/tick-core.mjs (prepareAheadNums)' },
     { id: 'prepare-stale', text: 'a stamp older than preparedMaxAgeDays, or whose scope files changed since preparedAgainstSha, is re-prepared before build', enforcedBy: 'readiness/dispatch-plan.mjs' },
   ]),
 });
@@ -199,6 +202,7 @@ function executorClass(executor) {
  *   default) keeps the OLD, unfiltered union — every existing caller/test that predates this card sees no
  *   change; the real daemon always passes its own set.
  * @returns {{freeze:{frozen:boolean, reasons:string[]}, slots:number, dispatch:Array<object>, hold:Array<object>,
+ *   openPrCap:{total:number, counted:number, cardOnly:number, accepted:number, countedPrs:string[], cardOnlyPrs:string[], acceptedPrs:string[], cap:number},
  *   openItems:{count:number, cap:number, nums:string[]}}} `openItems` is the PRE-TICK union
  *   (`{inFlight} ∪ {delivered-by-open-PR ∩ dispatchedByBuilder}`), #4353/xovjhwh — the value the `wip-cap` rule
  *   below checks and decrements.
@@ -218,7 +222,8 @@ export function planBuildDispatch({
   // tell an open-PR-count freeze (a build-WIP limit) from a kill switch or a freeze label (hold everything).
   const freezeKinds = new Set();
   if (killSwitch?.engaged) { freezeReasons.push(`kill switch engaged${killSwitch.reason ? ` (${killSwitch.reason})` : ''}`); freezeKinds.add('kill-switch'); }
-  if (openPrs.length > policy.maxOpenPrs) { freezeReasons.push(`${openPrs.length} open PRs > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
+  const openPrCap = countOpenPrsForCap(openPrs, policy.openPrCapScope ?? OPEN_PR_CAP_SCOPE_DEFAULTS);
+  if (openPrCap.counted > policy.maxOpenPrs) { freezeReasons.push(`${formatOpenPrCap(openPrCap)} > maxOpenPrs ${policy.maxOpenPrs}`); freezeKinds.add('open-prs'); }
   // GLOBAL freeze set — `blocked:daemon-bug` only (#3383 continuation, live incident 2026-09-28). A per-PR
   // `*-stalled` label never reaches this set any more; it is still an ordinary open PR below, so the
   // `scope-vs-open-prs` loop still holds any candidate whose scope overlaps ITS files. Falls back to the full
@@ -330,6 +335,7 @@ export function planBuildDispatch({
     // the tick core passed in, visible to a dry-run/status line even though this cap no longer reads it.
     externalBuilding: Number(externalBuilding) || 0,
     mainRedFreeze: { frozen: mainRedFreeze?.frozen === true, ...(mainRedFreeze?.frozen ? { reason: mainRedFreeze.reason } : {}) }, // card xu1nixv
+    openPrCap: { ...openPrCap, cap: policy.maxOpenPrs },
     openItems: { count: openItemsInitial.size, cap: maxOpenItems, nums: [...openItemsInitial].sort() },
   };
 }
@@ -352,8 +358,10 @@ const BUILD_BOUND_REASONS = new Set([
 const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps lane-/.test(String(reason));
 
 /**
- * Card 80 (a) — the items within the next `window` to build: the cleared queue in build order (pinned tier
- * first, then the queue's own rank order), keeping only items that are launching now or held for a reason that
+ * Card 80 (a) — the items within the next `window` to build: the cleared queue in build order (highest delivery
+ * class first, then queue order; pinned first only when either row has no class, preserving legacy queues;
+ * missing or unknown classes count as P3), keeping only items
+ * that are launching now or held for a reason that
  * clears on its own (see {@link BUILD_BOUND_REASONS}). A prepare is spent only on these, so a card is prepared
  * shortly before its build — never days ahead, when its scope may drift. Pure.
  *
@@ -362,7 +370,7 @@ const isBuildBound = (reason) => BUILD_BOUND_REASONS.has(reason) || /^overlaps l
  * never takes a window slot: the window is the next `window` cards that CAN move. Before, two failure-held cards
  * at the head of the pinned tier filled half of the 4-slot window every tick, and with the other two starved
  * behind them nothing was ever prepared, so nothing ever became build-ready.
- * @param {{queue?:Array<{num:*, tier?:string|null}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number, skip?:Iterable<*>}} o
+ * @param {{queue?:Array<{num:*, tier?:string|null, priorityClass?:string|null}>, launch?:Array<{num:*}>, held?:Array<{num:*, reason:string}>, window?:number, skip?:Iterable<*>}} o
  * @returns {Set<string>|null} the in-window nums (normalized), or `null` when the window is off (not a finite number ≥ 0)
  */
 export function prepareAheadNums({ queue = [], launch = [], held = [], window = Infinity, skip = [] } = {}) {
@@ -371,8 +379,11 @@ export function prepareAheadNums({ queue = [], launch = [], held = [], window = 
   const launching = new Set((Array.isArray(launch) ? launch : []).map((l) => normNum(l?.num)));
   const reasonOf = new Map((Array.isArray(held) ? held : []).map((h) => [normNum(h?.num), h?.reason]));
   const rows = (Array.isArray(queue) ? queue : []).filter((r) => r && r.num != null)
-    .map((r, i) => ({ num: normNum(r.num), pinned: r.tier === 'pinned', i }))
-    .sort((a, b) => (b.pinned - a.pinned) || (a.i - b.i));
+    .map((r, i) => {
+      const classIndex = ['P0', 'P1', 'P2', 'P3', 'P4'].indexOf(r.priorityClass);
+      return { num: normNum(r.num), priority: classIndex < 0 ? 3 : classIndex, hasClass: !!r.priorityClass, pinned: r.tier === 'pinned', i };
+    })
+    .sort((a, b) => (a.priority - b.priority) || ((!a.hasClass || !b.hasClass) ? b.pinned - a.pinned : 0) || (a.i - b.i));
   const out = new Set();
   for (const r of rows) {
     if (out.size >= window) break;

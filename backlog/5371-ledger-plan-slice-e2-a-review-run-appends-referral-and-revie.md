@@ -3,11 +3,13 @@ bornAs: xe33dut
 kind: story
 size: 3
 parent: "2405"
-status: active
+status: resolved
 scaffoldedBy: "ledger-e2"
 dateScaffolded: "2026-10-08"
 scope: ["we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs"]
 dateOpened: "2026-10-08"
+dateResolved: "2026-10-09"
+graduatedTo: 2848bc36d4a07bb646f59988bd340c5e29ac3efd
 tags: []
 ---
 

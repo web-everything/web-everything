@@ -401,6 +401,8 @@ export const CI_HEAL_ROUND_CAP = 3;
 
 /** How long a requested-but-unobserved CI re-run may be held quietly before it becomes an operator escalation. */
 export const TIMEOUT_RETRY_PENDING_ESCALATE_MS = 30 * 60 * 1000;
+/** Max mechanical re-runs per head for a queued PR GitHub holds BLOCKED on a cancelled required check (PR #4651). */
+export const BLOCKED_CANCELLED_RERUN_CAP = 2;
 
 /**
  * we:scripts/conveyor/reconcile-core.mjs#CONFLICT_FIX_ROUND_CAP — the durable cap a MECHANICAL
@@ -2043,6 +2045,38 @@ export function planReconcile({
     // carried on the row for the brief. `pr.codeqlFailure` exists ONLY when the drain gate is on, so turning the
     // gate off turns this off with it. Bounded by the SAME durable ci-heal cap and head-scoped escalation as a red
     // required check; every cap/escalation outcome is a logged refusal, never a silent skip.
+    // ── BLOCKED ON A CANCELLED REQUIRED CHECK — LIVE 2026-10-09, PR #4651: a re-run of an OLDER `soak-replay-gate` run
+    // cancelled the NEWER run on the same head through its concurrency group. GitHub judges a check by its newest check
+    // suite, so it held the PR `BLOCKED`; the rollup collapse picks the latest `completedAt` (the green re-run), so the PR
+    // read `queued` → `nothing-owed`, and the drain skipped it as "owned by the ci-heal / review daemons". Nobody owned
+    // the re-run. A queued PR GitHub holds BLOCKED whose only red is an infra-cancelled newest-suite run (the evidence
+    // reader judges `authoritativeCheckRuns` and refuses while any run is still in flight) gets a mechanical re-run,
+    // bounded to {@link BLOCKED_CANCELLED_RERUN_CAP} per head; past the cap it is a surfaced note, never a silent skip.
+    if (!ciRepairOwed && phase === 'queued' && String(pr?.mergeStateStatus ?? '').toUpperCase() === 'BLOCKED'
+        && pr?.timeoutRetry?.eligible && pr.timeoutRetry.infraCancelled
+        && pr.timeoutRetry.head === pr.headRefOid && pr.timeoutRetry.pr === prNumber) {
+      const budget = pr.timeoutRetryBudget;
+      if (budget?.pending) {
+        refuse('ci-timeout-rerun-in-flight', { ...withPhase,
+          why: `PR #${prNumber}: GitHub holds it BLOCKED on a cancelled required check; a re-run was already requested and its result is not observed yet` });
+        continue;
+      }
+      const spent = budget?.confirmed === undefined ? undefined : budget.confirmed + (budget.rejected ?? 0);
+      if (spent !== undefined && spent < BLOCKED_CANCELLED_RERUN_CAP) {
+        dispatch.push({ ...base, ...withPhase, kind: 'ci-timeout-rerun', variant: 'blocked-cancelled',
+          timeoutRetry: { ...pr.timeoutRetry, cap: BLOCKED_CANCELLED_RERUN_CAP },
+          why: `GitHub holds this queued PR BLOCKED on a required check whose newest run on head \`${String(pr.headRefOid).slice(0, 8)}\` is CANCELLED`
+            + ` (no newer run in flight) — mechanical re-run ${spent + 1}/${BLOCKED_CANCELLED_RERUN_CAP}, no heal budget` });
+        continue;
+      }
+      if (spent !== undefined) {
+        const text = `PR #${prNumber}: GitHub still holds it BLOCKED on a cancelled required check after ${spent}/${BLOCKED_CANCELLED_RERUN_CAP} re-runs on this head — a person must look`;
+        refuse('cap-exhausted', { ...withPhase, attempts: spent, cap: BLOCKED_CANCELLED_RERUN_CAP, why: text });
+        notes.push({ kind: 'blocked-cancelled-rerun-exhausted', prNumber, attempts: spent, cap: BLOCKED_CANCELLED_RERUN_CAP, text });
+        continue;
+      }
+    }
+
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
       const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
       const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });

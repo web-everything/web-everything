@@ -12,7 +12,7 @@
  *                                        then resumes the SAME session to finish its hand-back
  *   - no verdict (absent, infrastructure failure, unproven tree, overdue) → re-request, up to `maxRetries`,
  *                                        then resume with the blocked-on-infra exit
- *   - red only on timeouts the gate already re-ran alone (load-flake), WE only → resume with the load-flake exit
+ *   - red only on timeouts the gate already re-ran alone → resume with a saved-fix hold in WE, a re-dispatch hold elsewhere
  *                                        (the existing quiet-host reverify pass then owns the saved fix)
  *   - red on attempt `maxReds`         → resume with the gate-red exit (the escalation ladder counts it)
  *   - any other red                    → resume the SAME session with the failing tests attached
@@ -105,6 +105,7 @@ export function classifyAwaitVerdict({ record, marker, lane, nowMs, ttlMs, limit
   }
   if (v.status === 'red') {
     if (!isNoPushRecord(record) && AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake' };
+    if (!isNoPushRecord(record) && !AWAIT_LOAD_FLAKE_REPO_KEYS.includes(repoKeyOrNull(record.repo)) && isLoadFlakeRed(marker)) return { action: 'resume', reason: 'red-load-flake', resume: 'load-flake-redispatch' };
     if ((record.attempt ?? 1) >= limits.maxReds) return { action: 'resume', reason: `red on attempt ${record.attempt}`, resume: 'escalate' };
     return { action: 'resume', reason: 'red', resume: 'red' };
   }
@@ -167,6 +168,8 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       return `${head}\n\nVerify is GREEN, but the harness did NOT push ${record.sha} to ${record.ref}: ${detail}. This is not a moved branch, so rebasing or re-marking cannot help and you must not retry or push ${record.ref} yourself. Take your ${brief(record)}'s blocked-on-infra exit with that reason as the evidence, then fix-end.`;
     case 'red':
       return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in your lane (same scope rules), commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} If the red is only timeouts that pass alone under host load, take the brief's load-flake exit instead.`;
+    case 'load-flake-redispatch':
+      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit. No reverify worker can push a saved fix in this repo. Record the re-dispatch hold (\`--head\` is the PR's own head, never your repair sha — a mismatched head ends the hold at once): \`node "${ROOT}/scripts/conveyor/stand-down.mjs" ${record.pr} --repo=${record.repo} --who=${record.who} --reason=load-flake --head="$(git rev-parse origin/${record.ref})" --detail="verify red only on host-load timeouts the gate re-ran alone"\`, then \`node "${ROOT}/scripts/operations/completion-cli.mjs" report --repo=${record.repo} --pr=${record.pr} --session=${record.who} --kind=${record.kind} --status=done --outcome=blocked-on-load-flake\` and \`node "${ROOT}/scripts/conveyor/fix-procedure.mjs" fix-end ${record.pr} --repo=${record.repo} --who=${record.who}\`. The quiet-host pass ends the hold so the fix loop re-dispatches a fixer against the same review findings.`;
     case 'load-flake':
       return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit with --alt-sha=${record.sha} (push this sha to the alt branch named there, never to ${record.ref}), then report blocked-on-load-flake and fix-end. The quiet-host reverify pass retries it.`;
     case 'escalate':

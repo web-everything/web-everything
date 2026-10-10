@@ -109,6 +109,13 @@ describe('re-scope probe', () => {
 });
 
 describe('needsYouReason', () => {
+  it('redacts a token-shaped string in the worker text at the shared sink, before the truncation (review of #4643)', () => {
+    const token = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';
+    expect(needsYouReason('spec-defect', `leaked ${token} here`)).not.toContain(token);
+    // A token straddling the 300-char cut must not leave a prefix behind either.
+    const cut = needsYouReason('spec-defect', `${'x '.repeat(145)}${token}`);
+    expect(cut).not.toContain('ghp_');
+  });
   it('is plain, names the way out, and can never steer the hold router into lane work', () => {
     const r = needsYouReason('spec-defect', 'worker-declined: spec already done on main: commit abcdef1 `x` <b>');
     expect(r).toMatch(/^needs-you: prepare blocked \(spec-defect\)/);
@@ -120,5 +127,18 @@ describe('needsYouReason', () => {
 describe('classifyPrepareReport - adverb before the defect word (PR #4323 review)', () => {
   it('reads "the scope is entirely wrong" as spec-defect', () => {
     expect(classifyPrepareReport('could-not-prepare: the scope is entirely wrong')).toMatchObject({ blocker: { kind: 'spec-defect' } });
+  });
+});
+
+describe('classifyPrepareReport - the live 2026-10-09 held reports (markdown emphasis, quotes, a full stop)', () => {
+  it.each([
+    '**could-not-prepare** — a worker-tracking design choice remains unresolved: durable registration or a best-effort inventory',
+    '**could-not-prepare** — #4355 leaves a genuine policy choice unresolved: boost within the tier, or pin?',
+    '#4328 prepare-item → could-not-prepare. I left no diff and opened no PR.',
+  ])('reads %j as blocked', (msg) => expect(classifyPrepareReport(msg)).toMatchObject({ outcome: 'blocked' }));
+  it("reads the live #4560 quoted sha as the delivering commit", () => {
+    const sha = '10fedba67afc9550fb9a6592282603117284c0c2';
+    expect(classifyPrepareReport(`already-done — delivered by commit '${sha}', which explicitly references this card`))
+      .toMatchObject({ outcome: 'no-change', commit: sha });
   });
 });

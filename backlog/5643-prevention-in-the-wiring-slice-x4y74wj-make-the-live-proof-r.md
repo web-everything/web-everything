@@ -9,11 +9,11 @@ dateOpened: "2026-10-09"
 tags: []
 ---
 
-# Prevention — In the wiring slice (x4y74wj), make the live proof run the real entry unmodified in the prepared… (from web-everything/web-everything#4679 review)
+# Prevention — In the wiring slice (5671), make the live proof run the real entry unmodified in the prepared… (from web-everything/web-everything#4679 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/drain-followup-job.mjs:103` — In the wiring slice (x4y74wj), make the live proof run the real entry unmodified in the prepared worktree. Have the preparer symlink or install node_modules, and add a smoke test that imports the entry's dependency graph from a bare worktree.
+1. `we:scripts/lib/drain-followup-job.mjs:103` — In the wiring slice (5671), make the live proof run the real entry unmodified in the prepared worktree. Have the preparer symlink or install node_modules, and add a smoke test that imports the entry's dependency graph from a bare worktree.
 2. `we:scripts/lib/drain-followup-job.mjs:150` — Pass a short `waitMs` so contention throws quickly and the retry handles it. Alternatively, have the step's `heartbeat` callback also write the job record heartbeat. Add a runtime test with a step that blocks past `staleMs`.
 3. `we:scripts/lib/drain-followup-job.mjs:152` — Make the step helper wrap the heartbeat so that a false return throws, and assert that behaviour in a test. If a lint exists for discarded return values of fenced primitives, use that instead.
 4. `we:scripts/lib/__tests__/drain-followup-job.test.mjs:173` — Add a parameterized regression test over both steps that asserts reset-before-effects and primary-clone refusal; run it in the unit-test gate.
