@@ -123,9 +123,10 @@ export function buildOrphanGuardComment({ decision, reason, prNumber }) {
 const ghOpts = () => ({ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024 });
 
 export function defaultListBounced(slug, { exec = execFileSync } = {}) {
-  const out = exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--label', 'review:changes', '--limit', '100',
+  // Filtered here, not with `--label` (search-backed, rate-limited on its own budget — #no-label-search).
+  const out = exec('gh', ['pr', 'list', '--repo', slug, '--state', 'open', '--limit', '200',
     '--json', 'number,labels,headRefOid,isDraft'], ghOpts());
-  return JSON.parse(String(out || '[]'));
+  return JSON.parse(String(out || '[]')).filter((p) => labelNames(p.labels).includes('review:changes'));
 }
 
 async function defaultReadComments(number, slug) {
