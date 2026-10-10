@@ -1352,7 +1352,7 @@ const MISSING_RUN_STACKED_REFUSAL_PREFIX = 'PR is stacked or from a fork (base '
  * EVERY attempt marker regardless of outcome — a permanently-failing trigger must still trip the cap. PURE.
  * @param {Array<{body?:string}|string>|null|undefined} comments
  * @param {string|null} [headSha]
- * @param {{baseRefName?:(string|null)}} [o] - the PR's CURRENT base; stacked-refusal markers from another base are stale
+ * @param {{baseRefName?:(string|null), defaultBranch?:string}} [o] - the PR's CURRENT base (stacked-refusal markers from another base are stale) and the repo's default branch (the fork-refusal carve-out; the sweep forwards its own)
  * @returns {number}
  */
 export function countMissingRunComments(comments, headSha = null, { baseRefName = null, mainRedWindows = [], mainGreen = null, defaultBranch = 'main' } = {}) {

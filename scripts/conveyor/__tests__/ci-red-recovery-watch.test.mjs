@@ -1285,7 +1285,7 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
   });
   it('restacks #4759 root first, fetching its refreshed base before the child', () => {
     const calls = [];
-    const result = watch.restackStackedPr({ ...stack[1], prNumber: 4759 }, { prs: stack, repo: 'web-everything/web-everything', root: '/tmp/repo', checkClaim: () => null,
+    const result = watch.restackStackedPr({ ...stack[1], prNumber: 4759 }, { prs: stack, repo: 'web-everything/web-everything', root: '/tmp/repo', checkClaim: () => null, readIsCrossRepository: () => false,
       fetchRef: (ref) => { calls.push(['fetch', ref]); return { ok: true }; },
       refresh: (ref, opts) => { calls.push([ref, opts.base]); return { ok: true, action: 'rebased', newCommit: ref }; } });
     expect(calls).toEqual([[stack[0].headRefName, 'origin/main'], ['fetch', stack[0].headRefName], [stack[1].headRefName, `origin/${stack[0].headRefName}`]]);
@@ -1293,7 +1293,7 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
   });
   it('checks the entire chain before mutation and rejects unknown parents', () => {
     const refresh = vi.fn();
-    expect(watch.restackStackedPr(stack[1], { prs: stack, checkClaim: () => ({ message: refusal }), refresh })).toMatchObject({ deferred: true, error: refusal });
+    expect(watch.restackStackedPr(stack[1], { prs: stack, checkClaim: () => ({ message: refusal }), readIsCrossRepository: () => false, refresh })).toMatchObject({ deferred: true, error: refusal });
     expect(refresh).not.toHaveBeenCalled();
     expect(watch.restackStackedPr(stack[1], { prs: [stack[1]], refresh })).toMatchObject({ ok: false, error: 'stack base lane/fixer-history-takeover is not an open PR head; cannot restack' });
   });
@@ -1331,7 +1331,7 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
       prs = Array.from({ length: 11 }, (_, i) => ({ number: i, headRefName: `lane/depth-${i}`, baseRefName: i === 10 ? 'main' : `lane/depth-${i + 1}` }));
       d = prs[0];
     }
-    const result = watch.restackStackedPr(d, { prs, checkClaim: () => null, refresh,
+    const result = watch.restackStackedPr(d, { prs, checkClaim: () => null, readIsCrossRepository: () => false, refresh,
       fetchRef: kind === 'fetch-error' ? fetchRef : () => ({ ok: true }) });
     expect(result.ok).toBe(false);
     expect(result.deferred === true).toBe(kind === 'race');
@@ -1365,6 +1365,54 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     expect(restack).toHaveBeenCalledTimes(1);
     const fork = { viewerDidAuthor: true, body: `🚦 conveyor missing-run-recovery\n\nsha: ${sha}\nPR is stacked or from a fork (base main, head repo someone/web-everything); missing-run push recovery only handles same-repo PRs on main` };
     expect(core.countMissingRunComments([fork], sha)).toBe(1);
+  });
+
+  // PR #4825 review: a stacked fork PR (or a fork PR whose head name shadows a lane in the chain) must never be rebased/force-pushed.
+  describe('restack refuses fork or unverifiable chain links before any mutation', () => {
+    const repo = 'web-everything/web-everything';
+    const same = () => false;
+    it.each([
+      ['the candidate itself is a fork', (n) => n === 4759],
+      ['a base link is a fork', (n) => n === 4756],
+      ['a link repo cannot be verified (null)', () => null],
+      ['a link repo read throws', () => { throw new Error('gh down'); }],
+    ])('%s', (_name, readIsCrossRepository) => {
+      const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'new' }));
+      const fetchRef = vi.fn(() => ({ ok: true }));
+      const result = watch.restackStackedPr({ ...stack[1], prNumber: 4759 }, { prs: stack, repo, checkClaim: () => null, readIsCrossRepository, refresh, fetchRef });
+      expect(result).toMatchObject({ ok: false, action: 'stack-restack' });
+      expect(result.deferred).toBeUndefined(); // counted, so the per-sha cap bounds it
+      expect(result.error).toMatch(/fork|verif/);
+      expect(refresh).not.toHaveBeenCalled();
+      expect(fetchRef).not.toHaveBeenCalled();
+      expect(core.countMissingRunComments([{ viewerDidAuthor: true, body: `🚦 conveyor missing-run-recovery\n\nsha: ${sha}\n${result.error}` }], sha, { baseRefName: stack[1].baseRefName })).toBe(1);
+    });
+    it('a same-repo chain still restacks, reading each link once', () => {
+      const read = vi.fn(same);
+      const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'new' }));
+      expect(watch.restackStackedPr({ ...stack[1], prNumber: 4759 }, { prs: stack, repo, checkClaim: () => null, readIsCrossRepository: read, refresh, fetchRef: () => ({ ok: true }) }).ok).toBe(true);
+      expect(read.mock.calls.map(c => c[0])).toEqual([4759, 4756]);
+    });
+    it('sweep: a stacked fork candidate reaches no refresh and posts a counted failure marker', () => {
+      const refresh = vi.fn();
+      const postComment = vi.fn();
+      const prs = [{ ...stack[0], statusCheckRollup: [greenCheck] }, stack[1]];
+      sweepMissingRunRecovery({ apply: true, repo, readOpenPrs: () => prs, mainRuns: runs, readRequiredContexts: () => ['test'],
+        readHeadCommittedAt: () => '2026-10-10T12:00:00Z', readComments: () => [], now: Date.parse('2026-10-10T21:00:00Z'),
+        restack: (d, o) => watch.restackStackedPr(d, { ...o, checkClaim: () => null, readIsCrossRepository: (n) => n === 4759, refresh }),
+        trigger: vi.fn(), postComment, clearLabel: () => false });
+      expect(refresh).not.toHaveBeenCalled();
+      expect(postComment).toHaveBeenCalledWith(4759, expect.objectContaining({ ok: false, action: 'stack-restack' }));
+    });
+  });
+
+  it('sweep honours a non-main defaultBranch when counting fork refusals (PR #3253 loop)', () => {
+    const forkRefusal = { viewerDidAuthor: true, body: `🚦 conveyor missing-run-recovery\n\nsha: ${sha}\nPR is stacked or from a fork (base master, head repo someone/web-everything); missing-run push recovery only handles same-repo PRs on master` };
+    const result = sweepMissingRunRecovery({ repo: 'web-everything/web-everything', defaultBranch: 'master', maxRetriesPerSha: 1,
+      readOpenPrs: () => [{ number: 7, headRefName: 'lane/fork-on-master', baseRefName: 'master', headRefOid: sha, statusCheckRollup: [] }],
+      mainRuns: runs, readRequiredContexts: () => ['test'], readHeadCommittedAt: () => '2026-10-10T12:00:00Z',
+      readComments: () => [forkRefusal], now: Date.parse('2026-10-10T21:00:00Z') });
+    expect(result.refusals).toEqual([expect.objectContaining({ prNumber: 7, kind: 'missing-run-cap-exhausted', attempts: 1 })]);
   });
 
 });

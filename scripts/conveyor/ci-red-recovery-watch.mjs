@@ -839,9 +839,31 @@ function defaultFetchStackRef(ref, { root, run = gitRun }) {
   return r.status === 0 ? { ok: true } : { ok: false, error: `fetch ${ref} failed (${String(r.stderr || '').split('\n')[0]})` };
 }
 
+/**
+ * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadIsCrossRepository — whether PR `prNumber`'s head lives
+ * in a fork. A per-PR read (the shared open-PR snapshot carries no head-repo field), paid only for a stacked
+ * candidate's chain. Returns `true`/`false`, or `null` when it cannot be read — callers treat anything but
+ * `false` as "not provably same-repo" and refuse.
+ * @param {number} prNumber
+ * @param {{repo?:string|null, exec?:Function}} [o]
+ * @returns {boolean|null}
+ */
+export function defaultReadIsCrossRepository(prNumber, { repo = null, exec = execFileSyncThrottled } = {}) {
+  if (!repo || !Number.isSafeInteger(prNumber)) return null;
+  try {
+    const out = exec('gh', ['pr', 'view', String(prNumber), '--repo', repo, '--json', 'isCrossRepository', '--jq', '.isCrossRepository'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
+    });
+    const v = String(out || '').trim();
+    return v === 'true' ? true : v === 'false' ? false : null;
+  } catch {
+    return null;
+  }
+}
+
 export function restackStackedPr(d, {
   prs, repo, defaultBranch = 'main', root = REPO_ROOT, refresh = refreshOntoMain,
-  fetchRef = defaultFetchStackRef, checkClaim = pushRefusal,
+  fetchRef = defaultFetchStackRef, checkClaim = pushRefusal, readIsCrossRepository = defaultReadIsCrossRepository,
 } = {}) {
   const action = 'stack-restack';
   const chain = [];
@@ -861,6 +883,17 @@ export function restackStackedPr(d, {
   const failed = error => ({ ok: false, action, error,
     ...(String(error).includes('holds the fix claim') ? { deferred: true } : {}),
   });
+  // refreshOntoMain rebases and force-pushes `origin/<headRefName>`: a fork PR (or one whose head name merely
+  // shadows a same-repo lane in the chain) must never reach it. The open-PR listing carries no head-repo field, so
+  // verify every link — fail closed, and as a COUNTED failure so the per-sha cap bounds it. Refuse before any mutation.
+  for (const pr of chain) {
+    const n = pr.prNumber ?? pr.number;
+    let cross = null;
+    try { cross = readIsCrossRepository(n, { repo }); } catch { cross = null; }
+    if (cross !== false) {
+      return { ok: false, action, error: `stack link PR #${n} (${pr.headRefName}) ${cross === true ? 'is from a fork' : 'could not be verified as same-repo'}; refusing to restack` };
+    }
+  }
   for (const pr of chain) {
     const held = checkClaim({ repo, branch: pr.headRefName });
     if (held) return { ok: false, action, deferred: true, error: held.message };
@@ -930,7 +963,7 @@ export function sweepMissingRunRecovery({
     const headCommittedAt = readHeadCommittedAt(c.headSha, { repo });
     const comments = readComments(c.prNumber, { repo });
     return {
-      ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen }),
+      ...c, headCommittedAt, triggerAttemptsForSha: countMissingRunComments(comments, c.headSha, { baseRefName: c.baseRefName, mainRedWindows, mainGreen, defaultBranch }),
     };
   });
   const plan = planMissingRunRecoveries({
