@@ -244,12 +244,22 @@ export function openDefects(comments) {
  * `takeoverBudget` defaults to 1 here so the pure core stays byte-identical for a caller that passes nothing; the
  * IO shell passes the resolved cascade value (standard 2).
  */
-export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1, fixerLadder, defaultBranch = 'main' } = {}) {
+export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1, fixerLadder, defaultBranch = 'main', capKind = 'fix' } = {}) {
   const budget = Number.isInteger(takeoverBudget) && takeoverBudget > 0 ? takeoverBudget : 0;
   if (roundCapAction !== 'takeover') return { ok: false, reason: 'setting-person' };
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const comments = pr?.comments;
   const defects = openDefects(comments);
+  // The REVIEW round cap leads to a takeover too (one rule for both caps), but only once the current work is judged:
+  // the latest review round came after the latest fixer push and left open defects. An unjudged head is owed a
+  // review, not a takeover on top of code nobody has looked at.
+  if (capKind === 'review') {
+    const latest = reviewRounds(comments).at(-1) ?? null;
+    const lastPush = (Array.isArray(comments) ? comments : [])
+      .filter((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)).map(timeOf).filter(Number.isFinite);
+    const pushedAt = lastPush.length ? Math.max(...lastPush) : -Infinity;
+    if (!latest || latest.at < pushedAt || !defects || defects.count === 0) return { ok: false, reason: 'review-cap-unjudged' };
+  }
   if (defects && defects.count === 0) {
     const hold = gateHoldReason(pr, { defaultBranch });
     if (hold) return { ok: false, reason: 'gate-hold', hold };

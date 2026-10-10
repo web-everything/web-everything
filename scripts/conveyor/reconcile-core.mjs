@@ -1713,7 +1713,7 @@ export function planReconcile({
       // refused 5/5 every tick, so the takeover could never be reviewed). Only the FIX/REVIEW round caps, only a head
       // pushed after a trusted takeover signal that no verdict names yet, and only `takeoverReviewAttempts` reviews.
       // The review still needs green CI and no referral hold; review:human still needs the operator.
-      if (extra.capKind === 'fix' || extra.capKind === 'review') {
+      if (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') {
         const grant = takeoverReviewGrant({ pr, takeoverReviewAttempts });
         if (grant.ok) {
           if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
@@ -1762,8 +1762,11 @@ export function planReconcile({
       // (we:scripts/conveyor/takeover-budget.mjs). A ruling dispute, the `person` setting, a spent budget or a takeover
       // that did not converge reaches the operator. A call site passes `allowTakeover: false` when the row it would
       // replace carries an instruction a takeover brief cannot hold (the operator send-back's must-fix body).
-      const takeover = extra.capKind === 'fix' && allowTakeover
-        ? planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch })
+      // Every round cap — fix, advisory-fix (a review:human PR's advisory repair) or review — leads to a takeover
+      // within the budget (the review cap only once the current head is judged with open defects; planTakeover's
+      // `capKind`).
+      const takeover = ['fix', 'review', 'advisory-fix'].includes(extra.capKind) && allowTakeover
+        ? planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch, capKind: extra.capKind })
         : null;
       if (takeover?.ok) {
         dispatch.push({

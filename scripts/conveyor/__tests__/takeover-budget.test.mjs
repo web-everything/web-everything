@@ -211,6 +211,17 @@ describe('any escalation dispatch past the cap earns one review for the head it 
   });
 });
 
+describe('one rule for every round cap', () => {
+  it('the review cap leads to a takeover once the head is judged with open defects; an unjudged head does not', () => {
+    const judged = [...rounds5, rearm(7), review(T1, 8, FOUR)];
+    expect(planTakeover({ pr: pr(T1, judged), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' }))
+      .toMatchObject({ ok: true, n: 1 });
+    const unjudged = [...rounds5, rearm(7)];
+    expect(planTakeover({ pr: pr(T1, unjudged), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' }))
+      .toMatchObject({ ok: false, reason: 'review-cap-unjudged' });
+  });
+});
+
 describe('takeover 2+ brief', () => {
   it('carries the previous takeover diff and the review that rejected it', () => {
     const p = plan(pr(T1, [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR)]));
