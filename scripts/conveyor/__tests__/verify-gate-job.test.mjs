@@ -179,6 +179,21 @@ describe('createVerifyGateJobs — the daemon side over a real job store', () =>
     expect(failures).toHaveLength(1); // the failure is still reported exactly once
   });
 
+  it('when the job owning a lane\'s entry ends, another finished job\'s surviving gate takes the lane over in the same sync (PR 4764 round 6)', async () => {
+    // A: finished, its gate survives. B: the lane's registry entry (it was live last tick), now finished with no gate.
+    const a = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, runId: 'run-a' }, codeSha: 'c0de' });
+    store.update(a.id, (r) => markFailed(r, { at: AT, reason: 'handle dead; 2/2 attempts used' }));
+    writeFileSync(gatePath(dir, a.id), JSON.stringify({ pid: 910, handle: 'h:910:x', runId: 'run-a' }));
+    const b = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, runId: 'run-b' }, codeSha: 'c0de' });
+    store.update(b.id, (r) => markFailed(r, { at: AT, reason: 'refused beside a survivor' }));
+    const kill = vi.fn();
+    const jobs = mk({ kill, probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false });
+    const inFlight = new Map([[INPUT.dir, { pool: 'we', lane: 3, dir: INPUT.dir, runId: 'run-b', jobId: b.id, pid: null, startedMs: 1 }]]);
+    await jobs.sync(inFlight);
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: a.id, runId: 'run-a', pid: 910 }); // never an unheld lane
+    expect(inFlight.get(INPUT.dir).startedMs).not.toBe(1); // its own entry, not B's
+  });
+
   it('once that gate is gone the lane is released', async () => {
     const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
     store.update(q.id, (r) => markSucceeded(markClaimed(markLaunching(r, { at: AT }), { at: AT, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' }), { at: AT }));

@@ -300,6 +300,13 @@ export function createVerifyGateJobs({
       }
       const records = mine();
       const live = new Set();
+      // Every live job and held survivor of each lane, whichever entry the registry shows: when the job owning a lane's
+      // entry ends, another holder takes the lane over in this same sync, never one tick later (a dispatch in between,
+      // e.g. a rollback's in-process gate, would start beside it).
+      const holders = new Map();
+      const holdLane = (dir, r, pid, prev) => {
+        if (!holders.has(dir)) holders.set(dir, entryFor(r, pid, prev?.jobId === r.id ? prev : undefined));
+      };
       const consumed = readConsumed();
       const settled = [];
       for (const r of records) {
@@ -310,6 +317,7 @@ export function createVerifyGateJobs({
           // A probe that throws (ps timeout) must not abort the whole sync: treat the gate as not yet seen this tick.
           const { gate, alive } = liveGate(store.dir, r.id, { probe, pidExists, scan, groupExists }); // a throwing probe reads as `unknown`, not an abort
           const prev = inFlight.get(input.dir);
+          holdLane(input.dir, r, alive ? gatePid(gate) : null, prev);
           if (prev && prev.jobId !== r.id && !prev.jobId) continue; // a legacy (adopted) run still owns this lane
           inFlight.set(input.dir, entryFor(r, alive ? gatePid(gate) : null, prev));
           if (gate?.gateStartedAt && alive && !startLogged.has(r.id)) {
@@ -334,6 +342,7 @@ export function createVerifyGateJobs({
             log(`verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} is finished but its gate pid ${survivor.gate.pid} may still be alive (${survivor.state}) — lane held${killed ? ', killing it each tick' : ', NOT killed (no trustworthy pid / unprobeable)'}`);
           }
           const prev = inFlight.get(input.dir);
+          holdLane(input.dir, r, pid, prev);
           if (!prev || prev.jobId === r.id) inFlight.set(input.dir, entryFor(r, pid, prev));
         }
         if (consumed.has(r.id)) continue;
@@ -356,10 +365,14 @@ export function createVerifyGateJobs({
         settled.push({ id: r.id, ...input, outcome: res?.outcome ?? r.job.status });
         if (failure) { try { onSettled(failure); } catch {} }
       }
-      // Drop registry entries whose job is no longer live (finished, consumed, or removed by hand).
+      // Drop registry entries whose job is no longer live (finished, consumed, or removed by hand) — unless another live
+      // job or survivor still holds that lane, which takes the entry over.
       for (const [dir, entry] of inFlight) {
-        if (entry.jobId && !live.has(entry.jobId)) inFlight.delete(dir);
+        if (!entry.jobId || live.has(entry.jobId)) continue;
+        if (holders.has(dir)) inFlight.set(dir, holders.get(dir));
+        else inFlight.delete(dir);
       }
+      for (const [dir, entry] of holders) if (!inFlight.has(dir)) inFlight.set(dir, entry);
       // Housekeeping: prune consumed jobs past the keep window; evict snapshots no live job references.
       for (const r of records) {
         if (!TERMINAL_JOB_STATUSES.includes(r.job.status) || !consumed.has(r.id) || live.has(r.id)) continue;

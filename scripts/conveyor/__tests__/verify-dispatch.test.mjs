@@ -17,8 +17,9 @@ import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolve
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
-import { createVerifyGateJobs, VERIFY_GATE_JOB_KIND } from '../verify-gate-job.mjs';
+import { createVerifyGateJobs, VERIFY_GATE_JOB_KIND, gatePath } from '../verify-gate-job.mjs';
 import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
+import { markFailed } from '../../lib/daemon-jobs.mjs';
 
 describe('laneNeedsVerifyDispatch — the pure dispatch decision', () => {
   it('dispatches a running marker for the lane\'s own current HEAD', () => {
@@ -1189,5 +1190,31 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
     expect(spawnGate).not.toHaveBeenCalled();
     expect(result.dispatched).toEqual([]);
     expect(effects.inFlight.get(laneDir)).toMatchObject({ runId: 'job-run' });
+  });
+
+  it('rollback end to end: when the job holding the lane ends, another job\'s surviving gate keeps it held — no in-process gate beside it', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    mkdirSync(join(base, 'jobs'), { recursive: true });
+    const store = createJobStore(join(base, 'jobs'));
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const input = { pool: 'flagtest', lane: 1, dir: laneDir, headSha, suites: 'true', treeHash: null, requestStartedAt: null };
+    const at = new Date().toISOString();
+    const a = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de', input: { ...input, runId: 'run-a' } });
+    store.update(a.id, (r) => markFailed(r, { at, reason: 'handle dead; 2/2 attempts used' }));
+    writeFileSync(gatePath(store.dir, a.id), JSON.stringify({ pid: 910, handle: 'h:910:x', runId: 'run-a' })); // A's gate survives
+    const b = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de', input: { ...input, runId: 'run-b' } });
+    store.update(b.id, (r) => markFailed(r, { at, reason: 'refused beside a survivor' }));
+    const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, () => createVerifyGateJobs({ store,
+      reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, evict: () => {}, snapshot: {},
+      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {} }));
+    const spawnGate = vi.fn(() => new Promise(() => {}));
+    const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
+      runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate }) });
+    // B held the lane last tick (it was live then); this tick B is finished and A's gate still runs.
+    effects.inFlight.set(laneDir, { pool: 'flagtest', lane: 1, dir: laneDir, runId: 'run-b', jobId: b.id, pid: null, startedMs: Date.now() });
+    const result = await effects.tickOnce();
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(effects.inFlight.get(laneDir)).toMatchObject({ jobId: a.id });
   });
 });
