@@ -213,6 +213,9 @@ export function createDrainMergeStrategy({
       const r = enqueuePr({ repo: slugOf(c.repo), num: c.num, headSha, exec });
       if (!r.ok) throw new Error(`github-merge-queue enqueue FAILED (${r.error}) — NOT merged directly; retried next pass`);
       const state = readQueueState(statePath, readFile);
+      // The file can break between the pre-check above and here. Writing over it would erase every other pending
+      // follow-up, so throw instead: the PR is already queued, and the next pass (file fixed) sees `already` and records it.
+      if (state.unreadable) throw new Error(`github-merge-queue: ${keyOf(c.repo, c.num)} is ENQUEUED but follow-up state ${statePath} became unreadable — not recorded (file left untouched), retried next pass; fix or remove the file`);
       if (!state.pending.some((p) => keyOf(p.repo, p.num) === keyOf(c.repo, c.num))) {
         state.pending.push({ num: c.num, repo: c.repo ?? null, headSha, item: c.item ?? null, hasManifest: !!c.hasManifest, headRef: c.headRef ?? null, title: c.title ?? null, enqueuedAt: new Date().toISOString() });
         writeState(statePath, state);

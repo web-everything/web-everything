@@ -234,6 +234,41 @@ describe('drain merge strategy — github-merge-queue', () => {
     expect(bad.logs.join('')).toMatch(/unreadable/);
   });
 
+  it('a state file that turns UNREADABLE after the enqueue is never overwritten; the PR is recorded on the next pass (review: unreadable second read)', () => {
+    const existing = { pending: [{ num: 9, repo: null, headSha: HEAD }], followedUp: [] };
+    let stored = existing;
+    let broken = false;
+    let writes = 0;
+    const exec = (cmd, args) => {
+      if (args[0] === 'pr' && args[1] === 'comment') return '';
+      if (args[0] === 'pr' && args[1] === 'view') return '{"id":"PR_NODE","changedFiles":1}';
+      if (args[0] === 'api' && args.includes('--paginate')) return '["scripts/x.mjs",""]\n';
+      if (args[0] === 'api' && args[1] === 'graphql') { broken = true; return JSON.stringify({ data: { enqueuePullRequest: { mergeQueueEntry: { id: 'E', position: 1, state: 'QUEUED' } } } }); }
+      throw new Error(`unexpected ${cmd} ${args.join(' ')}`);
+    };
+    const logs = [];
+    const s = createDrainMergeStrategy({
+      isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec,
+      log: { write: (l) => logs.push(l) },
+      readFile: () => { if (broken) return '{"pending": ['; return JSON.stringify(stored); },
+      writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },
+    });
+    expect(() => s.enqueue({ num: 1, repo: null }, HEAD, { comments: stampedBy(DRAIN) })).toThrow(/unreadable .*not recorded .*retried next pass/);
+    expect(writes).toBe(0);
+    expect(stored).toEqual(existing); // the unrelated pending follow-up (#9) survives
+
+    // the file is fixed; the next pass finds the PR already queued and records it, keeping #9
+    broken = false;
+    const exec2 = (cmd, args) => (args[0] === 'api' && args[1] === 'graphql' ? JSON.stringify({ errors: [{ message: 'Pull request is already in the merge queue' }] }) : exec(cmd, args));
+    const s2 = createDrainMergeStrategy({
+      isLocalRepo: () => true, localSlug: LOCAL, statePath: '/x/state.json', resolved: policyOf('github-merge-queue'), exec: exec2,
+      log: { write: (l) => logs.push(l) }, readFile: () => JSON.stringify(stored),
+      writeState: (_p, st) => { writes++; stored = JSON.parse(JSON.stringify(st)); },
+    });
+    expect(s2.enqueue({ num: 1, repo: null }, HEAD, { comments: stampedBy(DRAIN) })).toEqual({ enqueued: true, already: true });
+    expect(stored.pending.map((p) => p.num).sort()).toEqual([1, 9]);
+  });
+
   it('a missing file (ENOENT) is a normal empty state; malformed entries are ignored, not fatal', () => {
     expect(readQueueState('/x', () => { const e = new Error('nope'); e.code = 'ENOENT'; throw e; })).toEqual({ pending: [], followedUp: [], exists: false, unreadable: false });
     const s = readQueueState('/x', () => JSON.stringify({ pending: [null, 7, { num: 3 }], followedUp: ['cwd#1', 4, null] }));
