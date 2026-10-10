@@ -129,7 +129,8 @@ import {
   loadBackgroundBuildSettings, resolveBackgroundBuild, tickStarvedSmell, BACKGROUND_BUILD_ENV,
   BUILT_IN_BACKGROUND_BUILD_SETTINGS, makeTickProgressStore, readCloneIdentity,
 } from './daemon-background-build.mjs';
-import { resolveRebuildAsJob } from './daemon-rebuild/rebuild-job.mjs';
+import { resolveRebuildAsJob, rebuildJobsDir, REBUILD_JOB_KIND } from './daemon-rebuild/rebuild-job.mjs';
+import { createJobStore } from './daemon-jobs-runtime.mjs';
 import { cloneKey } from './daemon-overlays.mjs';
 import { daemonStateDir } from './daemon-last-good.mjs';
 
@@ -538,6 +539,23 @@ export function resultReportsReclone(result) {
 }
 
 /**
+ * Every rebuild job id in this clone's job store — the store is per CLONE, shared by every daemon on it (siblings,
+ * and this daemon's own earlier processes). Read when a re-clone marker is written: every job that exists then was
+ * queued on the OLD tree (the adopt pass that re-clones runs only with no job in flight, and a job queued later is
+ * created after the marker), so its finish proves nothing about the fresh checkout. Corrupt records count too (their
+ * kind is unknown, so they are treated as rebuild jobs). Throws when the store cannot be listed — the caller fails
+ * closed on that.
+ * @returns {string[]}
+ */
+export function listRebuildJobIds(root, env = process.env, { store = createJobStore(rebuildJobsDir(root, env)) } = {}) {
+  const { records, corrupt } = store.list();
+  return [
+    ...records.filter((r) => r?.job?.kind === REBUILD_JOB_KIND.kind).map((r) => r.id),
+    ...(corrupt || []),
+  ].filter((id) => typeof id === 'string' && id);
+}
+
+/**
  * A rebuild JOB that ended `failed` because its rebuild child crashed after it started ("rebuild child exited N with
  * no JSON result"). It RAN on the checkout, so — parity with the retired builder, whose record counted a rebuild that
  * threw as a finished run — it concludes a re-clone. A job that never started (`could not prepare code`, `spawn
@@ -568,8 +586,11 @@ export function resolveSelfSyncRebuildAsJob({ entries, env = process.env, resolv
  * - `asJob: true`, or unknown (`undefined` fails closed to the job rule): only a rebuild JOB that RAN on this checkout
  *   concludes — `succeeded` (its child produced a verdict, a rejected smoke included) or `failed` because its rebuild
  *   crashed after starting ({@link REBUILD_JOB_CRASHED_RE}). A job that failed to launch, one that itself re-cloned
- *   again, or one the marker names in `staleJobIds` (in flight before the re-clone, so it ran on the OLD tree) does
- *   not count. Nothing else does either: a spaced / started / running / queue-failed answer keeps it blocked.
+ *   again, or one the marker names in `staleJobIds` (it existed in the clone's shared job store — or was seen in
+ *   flight by this process — when the re-clone was noticed, so it ran on the OLD tree) does not count. A marker whose
+ *   job store could not be listed (`staleJobsUnknown`) treats EVERY finished job as possibly stale: only adoption,
+ *   a HEAD move or `up-to-date` conclude it. Nothing else does either: a spaced / started / running / queue-failed
+ *   answer keeps it blocked.
  * @param {object|null} result @param {object|null} marker @param {string|null} headNow
  * @param {{asJob?: boolean}} [mode]
  */
@@ -579,6 +600,7 @@ export function recloneConcluded(result, marker, headNow, { asJob } = {}) {
   if (marker.head && headNow && headNow !== marker.head) return true;
   if (result?.reason === 'up-to-date') return true;
   if (asJob === false) return !!result && typeof result === 'object'; // inline verdict
+  if (marker.staleJobsUnknown) return false; // fail closed: no finished job can be told apart from an old-tree one
   const stale = new Set(marker.staleJobIds || []);
   return (Array.isArray(result?.finishedJobs) ? result.finishedJobs : []).some((j) => j?.reason !== 'clone-recloned' && !stale.has(j?.id)
     && (j?.status === 'succeeded' || (j?.status === 'failed' && REBUILD_JOB_CRASHED_RE.test(String(j?.reason ?? '')))));
@@ -644,7 +666,8 @@ export function withSelfSync(effects, {
   // (`swapMinIntervalMs`, for the daemons the file lists) and the tick-starved smell threshold. `tickProgress` /
   // `recloneMarker` are IO (injectable); they default to the real files only when `rebuild` is the real one, so a
   // test never writes real daemon state.
-  background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity,
+  // `rebuildJobIds`: the clone's shared rebuild job ids (see listRebuildJobIds) — IO, real only when `realIo`.
+  background, tickProgress, recloneMarker, cloneIdentity = readCloneIdentity, rebuildJobIds,
   // x0m7a8x — the declared rebuild path (see resolveSelfSyncRebuildAsJob); undefined resolves it once, here.
   rebuildAsJob: rebuildAsJobOpt,
 }) {
@@ -661,6 +684,7 @@ export function withSelfSync(effects, {
   const swapSpaced = !!bg?.enabled;
   const progress = tickProgress ?? (realIo ? makeTickProgressStore({ root, entry: entries?.[0], env }) : null);
   const marker = recloneMarker ?? (realIo ? makeRecloneMarkerStore({ root, env, log }) : memoryRecloneMarkerStore());
+  const listJobIds = rebuildJobIds ?? (realIo ? () => listRebuildJobIds(root, env) : () => []);
   const vctx = resolvePocSyncBranch({ pocBranch, env }) ? null : (versions === undefined ? resolveVersionedContext({ root, env }) : versions);
   const resolvedPocBranch = resolvePocSyncBranch({ pocBranch, env });
   const syncOpts = () => ({ root, ...(timeoutMs != null ? { timeoutMs } : {}) });
@@ -798,7 +822,9 @@ export function withSelfSync(effects, {
   // tick's rebuild call and its read lock (a replacement needs the write lock, so under the read lock it is stable).
   let knownIdentity = cloneIdentity(root);
   // The last rebuild job this process saw in flight BEFORE a re-clone. It ran on the old tree, so when it finishes
-  // `succeeded` it proves nothing about the fresh checkout (`staleJobIds`, see recloneConcluded).
+  // `succeeded` it proves nothing about the fresh checkout (`staleJobIds`, see recloneConcluded). The clone's SHARED
+  // job store is listed too (listRebuildJobIds): a job a sibling daemon, or this daemon before a restart, queued on
+  // the old tree is just as stale, and this process never saw it in flight.
   let lastJobInFlight = null;
   const noteJobs = (result) => {
     if (result?.job?.id && /^rebuild-job-(started|running)$/.test(String(result.reason))) lastJobInFlight = result.job.id;
@@ -807,9 +833,16 @@ export function withSelfSync(effects, {
     const idNow = cloneIdentity(root);
     const cur = marker.read();
     if (cur && !cur.concluded && cur.identity === idNow && idNow != null) return;
+    let listed = null;
+    try {
+      const ids = listJobIds();
+      if (Array.isArray(ids)) listed = ids;
+    } catch { /* fail closed below */ }
+    if (listed === null) log.error?.('daemon-self-sync: could not list the clone\'s rebuild jobs — no finished job will conclude this re-clone; only an adopted build, a HEAD move or an up-to-date rebuild will (x0m7a8x)');
+    const staleJobIds = [...new Set([...(lastJobInFlight ? [lastJobInFlight] : []), ...(listed || [])])];
     marker.write({
       identity: idNow, head: readHead(syncOpts()), at: new Date(now()).toISOString(), concluded: false, why,
-      staleJobIds: lastJobInFlight ? [lastJobInFlight] : [],
+      staleJobIds, ...(listed === null ? { staleJobsUnknown: true } : {}),
     });
   };
   /** Must this tick run no children because the checkout is a re-clone no rebuild has concluded on? */

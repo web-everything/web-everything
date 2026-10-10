@@ -12,10 +12,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, DEPS_JOB_KIND, DEPS_AS_JOB_ENV,
+  refreshDepsAsJob, resolveDepsAsJob, installStep, swapNodeModules, depsStore, runDepsJob,
+  DEPS_JOB_KIND, DEPS_JOB_KINDS, DEPS_AS_JOB_ENV,
 } from '../daemon-rebuild/deps-job.mjs';
-import { createJobStore } from '../daemon-jobs-runtime.mjs';
-import { markFailed } from '../daemon-jobs.mjs';
+import {
+  createJobStore, enqueueJob, JOB_ID_ENV, JOB_ATTEMPT_ENV,
+} from '../daemon-jobs-runtime.mjs';
+import { defineJobKind, markFailed, markLaunching } from '../daemon-jobs.mjs';
 import { lockfileKey } from '../daemon-job-snapshots.mjs';
 
 const tmp = [];
@@ -124,6 +127,37 @@ describe('job child — installStep', () => {
   it('refuses when the pinned commit\'s lockfile is not the one requested', () => {
     const f = fixture();
     expect(() => installStep({ jobsDir: f.jobs, sourceDir: f.root, expectKey: 'deadbeefdeadbeef', install: vi.fn() })).toThrow(/not the requested/);
+  });
+});
+
+describe('job child — the kind and the entry the runtime spawns', () => {
+  it('DEPS_JOB_KIND is a valid kind, registered, pointing at this file, and needs no node_modules of its own', () => {
+    expect(defineJobKind({ ...DEPS_JOB_KIND })).toEqual(DEPS_JOB_KIND);
+    expect(DEPS_JOB_KINDS.get(DEPS_JOB_KIND.kind)).toBe(DEPS_JOB_KIND);
+    expect(DEPS_JOB_KIND).toMatchObject({
+      entry: 'scripts/lib/daemon-rebuild/deps-job.mjs', codeMode: 'readonly-tree', serial: true, nodeModules: false,
+    });
+    expect(existsSync(join(process.cwd(), DEPS_JOB_KIND.entry))).toBe(true);
+  });
+
+  it('runDepsJob claims a launching job from OPERATION_RUNS_DIR, builds the store from its cwd lockfile, and succeeds', async () => {
+    const f = fixture();
+    const queued = enqueueJob({ store: f.store, kindDef: DEPS_JOB_KIND, codeSha: SHA, input: { key: f.key } });
+    f.store.update(queued.id, (r) => markLaunching(r, { at: new Date().toISOString() }));
+    const install = vi.fn((into) => { mkdirSync(join(into, 'node_modules')); writeFileSync(join(into, 'node_modules', 'pkg.txt'), 'p'); });
+    const out = await runDepsJob({
+      env: { [JOB_ID_ENV]: queued.id, [JOB_ATTEMPT_ENV]: '1', OPERATION_RUNS_DIR: f.jobs }, cwd: f.root, install, write: () => {},
+    });
+    expect(out).toEqual({ outcome: 'succeeded' });
+    expect(install).toHaveBeenCalledTimes(1);
+    expect(depsStore(f.jobs, f.key).complete).toBe(true);
+    expect(f.store.read(queued.id).job.status).toBe('succeeded');
+  });
+
+  it('runDepsJob refuses without the runtime env (never installs)', async () => {
+    const install = vi.fn();
+    expect(await runDepsJob({ env: {}, cwd: mk('deps-cwd-'), install, write: () => {} })).toMatchObject({ outcome: 'refused', code: 'no-job-env' });
+    expect(install).not.toHaveBeenCalled();
   });
 });
 

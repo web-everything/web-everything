@@ -41,7 +41,9 @@ each daemon, from the timestamped log.
    Inline: any rebuild verdict concludes (as the pre-job inline path did). Job: only a job that ran on the fresh
    checkout concludes — `succeeded` (a rejected smoke included) or `failed` because its rebuild child crashed after
    starting (the retired builder counted a thrown rebuild as a finished run); never a job that could not launch, one
-   in flight before the re-clone, or a spaced / started / running answer. Both: an adoption or `up-to-date`. The
+   queued before the re-clone (every rebuild job in the clone's SHARED job store when the marker is written, so a
+   sibling daemon's or a pre-restart process's job counts too; a store that cannot be listed means no finished job
+   concludes), or a spaced / started / running answer. Both: an adoption or `up-to-date`. The
    conclusion is written only if the marker is still the one read (a sibling daemon's newer re-clone marker is
    never overwritten). A corrupt marker file blocks; an unwritable state dir keeps the marker in memory and logs it.
    `WE_DAEMON_BACKGROUND_BUILD=1` now selects the rebuild job (off the tick path) for an unlisted daemon plus the swap

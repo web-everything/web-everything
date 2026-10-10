@@ -18,7 +18,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadBackgroundBuildSettings, resolveBackgroundBuild } from '../daemon-background-build.mjs';
 import { resolveRebuildAsJob } from '../daemon-rebuild/rebuild-job.mjs';
-import { withSelfSync } from '../daemon-self-sync.mjs';
+import { withSelfSync, resolveSelfSyncRebuildAsJob } from '../daemon-self-sync.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURE = JSON.parse(readFileSync(join(HERE, 'fixtures/background-build/review-daemon-2026-10-09.json'), 'utf8'));
@@ -57,7 +57,8 @@ describe('settings — the review daemon builds off the tick path (x0m7a8x: via 
     expect(r).toMatchObject({ enabled: true, source: 'file', swapMinIntervalMs: 10 * MIN });
   });
 
-  it('WE_DAEMON_BACKGROUND_BUILD=1 spawns nothing: every tick runs the job tick side, then the tick', async () => {
+  it('WE_DAEMON_BACKGROUND_BUILD=1 selects the rebuild JOB path: every tick runs the job tick side, then the tick', async () => {
+    expect(resolveSelfSyncRebuildAsJob({ entries: ['/clone/x-unlisted.mjs'], env: { WE_DAEMON_BACKGROUND_BUILD: '1' } })).toBe(true);
     const rebuild = vi.fn(async () => ({ moved: false, reason: 'rebuild-job-running', job: { id: 'j1' }, finishedJobs: [] }));
     const tick = vi.fn(async () => ({ repos: [] }));
     const w = withSelfSync({ tickOnce: tick }, {
@@ -69,6 +70,20 @@ describe('settings — the review daemon builds off the tick path (x0m7a8x: via 
     await w.tickOnce();
     expect(rebuild).toHaveBeenCalledTimes(2);
     expect(tick).toHaveBeenCalledTimes(2);
+  });
+
+  // The guard for "the builder process is retired": the injected-rebuild test above cannot see a spawn behind the
+  // real-IO path, so this pins the source instead — withSelfSync's module imports no builder helper and no
+  // child_process (it can spawn nothing itself; the rebuild job is launched by the job runtime inside rebuildClone).
+  it('daemon-self-sync.mjs can spawn no builder: it imports no builder helper, no builder script and no child_process', () => {
+    const src = readFileSync(join(HERE, '..', 'daemon-self-sync.mjs'), 'utf8');
+    const imports = src.match(/^import[\s\S]*?from\s+'[^']+';$/gm) || [];
+    expect(imports.length).toBeGreaterThan(5);
+    const all = imports.join('\n');
+    for (const name of ['spawnBuilder', 'makeBuilderApi', 'decideBuilderStart', 'builderIsAlive', 'BUILDER_SCRIPT', 'daemon-rebuild-builder', 'child_process']) {
+      expect(all).not.toContain(name);
+    }
+    expect(src).not.toMatch(/\bspawnBuilder\s*\(|\bmakeBuilderApi\s*\(/);
   });
 
   // The operator rollback: env 0/1 still selects the swap spacing (env beats the committed file).

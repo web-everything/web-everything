@@ -190,9 +190,10 @@ export async function refreshDepsAsJob({
   const live = mine().find((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status));
   if (live) {
     await pass();
+    // A job that finished during the pass still answers `deps-job-running` (with its terminal status): the next call
+    // swaps its store in, or spaces a retry.
     const cur = store.read(live.id);
-    if (cur && !TERMINAL_JOB_STATUSES.includes(cur.job.status)) return { reason: 'deps-job-running', key, job: { id: cur.id, status: cur.job.status } };
-    return { reason: 'deps-job-running', key, job: { id: live.id, status: cur?.job.status ?? 'gone' } }; // finished in the pass: next call swaps
+    return { reason: 'deps-job-running', key, job: { id: live.id, status: cur?.job.status ?? 'gone' } };
   }
 
   // 3. The last job for this lockfile finished without a store (failed): retry at most once per `retryMs`.
@@ -225,19 +226,31 @@ export function installStep({ jobsDir, sourceDir, expectKey, install = npmCiInst
   return { key, dir };
 }
 
-async function jobMain() {
-  const dir = process.env.OPERATION_RUNS_DIR;
-  const out = await runJob({
+/**
+ * The job child's whole run, injectable for tests: the runtime spawns this file with `OPERATION_RUNS_DIR` = the
+ * clone's deps jobs dir (where the store is built) and its cwd = the pinned code snapshot (whose lockfile it installs).
+ * @param {{env?: object, cwd?: string, install?: Function, run?: typeof runJob, write?: (s: string) => void}} [o]
+ */
+export async function runDepsJob({
+  env = process.env, cwd = process.cwd(), install = npmCiInstaller(), run = runJob, write = (m) => process.stderr.write(m),
+} = {}) {
+  const dir = env.OPERATION_RUNS_DIR;
+  return run({
+    env,
     steps: [{
       name: 'npm-ci',
       run: async ({ jobId, input }) => {
-        process.stderr.write(`[deps-job ${jobId}] ${new Date().toISOString()} npm ci for lockfile ${input.key}\n`);
-        const r = installStep({ jobsDir: dir, sourceDir: process.cwd(), expectKey: input.key });
-        process.stderr.write(`[deps-job ${jobId}] ${new Date().toISOString()} store ready: ${r.dir}\n`);
+        write(`[deps-job ${jobId}] ${new Date().toISOString()} npm ci for lockfile ${input.key}\n`);
+        const r = installStep({ jobsDir: dir, sourceDir: cwd, expectKey: input.key, install });
+        write(`[deps-job ${jobId}] ${new Date().toISOString()} store ready: ${r.dir}\n`);
         return { key: r.key };
       },
     }],
   });
+}
+
+async function jobMain() {
+  const out = await runDepsJob();
   process.stderr.write(`[deps-job] outcome ${out.outcome}${out.error ? `: ${out.error}` : ''}\n`);
   process.exit(out.outcome === 'succeeded' ? 0 : 1);
 }
