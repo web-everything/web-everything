@@ -34,5 +34,5 @@ Live #4708: takeover 2 pushed 483aab1e2 with the takeover budget spent. Its revi
 3. **Shared state files** — n/a: no state files.
 4. **Fail closed** — an operator takeover with no reviewed head before it reads as never pushed (the old one-per-head bound), never as an endless grant.
 5. **Identity scoping** — the grant stays per PR and per latest escalation anchor; paused notes are counted after that anchor only.
-6. **State over time** — a paused review followed by a ruling re-opens the owed review once; a second pause spends it.
+6. **State over time** — a paused review followed by a ruling re-opens the owed review once; a second pause spends it, and the block rulings then judge the head, so the PR reaches the operator instead of hanging at the round limit (live #4708: the woken review at 17:44Z paused again on the same referrals).
 7. **Who wrote it** — trusted markers only (`isTrustedMarkerAuthor`), as before.

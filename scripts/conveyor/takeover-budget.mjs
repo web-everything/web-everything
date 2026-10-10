@@ -186,7 +186,12 @@ export function reviewRounds(comments) {
     if (FIXER_TURN.test(c.body.split('\n')[0]) || isOperatorTakeover(raw)) { items.push({ t, boundary: true }); continue; }
     if (isPausedReview(raw)) continue;
     const ev = classifyEvent(c);
-    if (ev && (ev.type === 'round' || ev.type === 'review')) items.push({ t, ev, concluded: isConcludedVerdict(raw) });
+    // A block ruling on a paused review's referrals concludes that review too (the policy or the operator ruled it):
+    // otherwise a review that pauses on the same referrals every run would leave the takeover unjudged forever
+    // (live #4708, 17:44Z: the woken review paused again on the referrals already ruled block).
+    if (ev && (ev.type === 'round' || ev.type === 'review')) {
+      items.push({ t, ev, concluded: isConcludedVerdict(raw) || (ev.type === 'round' && /send-back|referral-block/.test(String(ev.trigger ?? ''))) });
+    }
   }
   for (const t of boundaries) items.push({ t, boundary: true });
   items.sort((a, b) => a.t - b.t || (a.boundary ? -1 : 1));
