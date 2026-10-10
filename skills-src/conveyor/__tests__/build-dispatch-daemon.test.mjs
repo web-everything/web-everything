@@ -47,6 +47,8 @@ import {
   // card xwn53th — tick-overrun speedups
   CLEAN_VERDICT_MEMO_ENV, BUILD_DAEMON_CLEAN_VERDICT_MEMO_MS, clearPrepareEvidenceCache,
   EVIDENCE_CACHE_MAX_ENTRIES, prepareEvidenceCacheSizes,
+  // ruled-hold-release — the card-change reader and the clone-stale launch gate
+  cliCardChangedSince, cliDispatcherFresh,
 } from '../build-dispatch-daemon.mjs';
 import { listHoldFindings } from '../../../scripts/conveyor/build-dispatch-hold-router.mjs';
 import { MAX_CONCURRENT_LANES_ENV } from '../../../scripts/lib/lane-concurrency.mjs';
@@ -3072,5 +3074,119 @@ describe('x87v3ed — the daemon launch asks dispatch-lane to reserve the lane f
     const exec = (_cmd, _argv, opts) => { seen = opts.env; return JSON.stringify({ steps: [] }); };
     cliDispatch({ num: '5189', bookkeeping: {} }, { exec });
     expect(seen?.WE_DISPATCH_RESERVE_LANE).toBe('1');
+  });
+});
+
+// Live 2026-10-09 18:35Z: the build launch of #4413 was refused by dispatch-lane's stale-code guard (#3439) because
+// this daemon's clone was 1 commit behind origin/main, and #4413/#4420 were re-launched (and refused) every few
+// ticks. The guard stays as it is; the daemon runs the SAME check itself before launching and holds every launch
+// of the tick when it would refuse — no claim, no failure record — and asks self-sync for an immediate rebuild.
+describe('clone-stale launch gate (#4413 refused as stale-code, re-dispatched every few ticks)', () => {
+  let lockRoot;
+  beforeEach(() => { lockRoot = mkdtempSync(join(tmpdir(), 'bdd-stale-')); });
+  afterEach(() => { rmSync(lockRoot, { recursive: true, force: true }); });
+  const staleWhy = 'dispatch-lane: the dispatching checkout is 1 commit(s) behind origin/main — refusing to dispatch a review that would run STALE code from this checkout\'s own import path (#3439).';
+
+  it('a stale clone launches nothing, takes no claim, records no failure, and says why', async () => {
+    const dispatches = [];
+    let checks = 0;
+    const eff = { ...effectsFor({ lockRoot, pid: 1, dispatches }), dispatcherFresh: async () => { checks += 1; return { fresh: false, why: staleWhy }; } };
+    const r = await runBuildDispatchTick({ live: true, effects: eff });
+    expect(dispatches).toEqual([]);
+    expect(r.failures).toEqual([]);
+    expect(listBuildDispatchClaims({ lockRoot })).toEqual([]);
+    expect(r.loadHolds).toContainEqual(expect.objectContaining({ num: '3827', kind: 'build', reason: 'clone-stale', why: staleWhy }));
+    expect(r.cloneStale).toBe(staleWhy);
+    expect(checks).toBe(1);
+  });
+
+  it('a fresh clone launches as before; the check runs once per tick', async () => {
+    const dispatches = [];
+    let checks = 0;
+    const eff = { ...effectsFor({ lockRoot, pid: 1, dispatches }), dispatcherFresh: async () => { checks += 1; return { fresh: true }; } };
+    const r = await runBuildDispatchTick({ live: true, effects: eff });
+    expect(dispatches.map((d) => d.num)).toEqual(['3827']);
+    expect(r.cloneStale).toBeNull();
+    expect(checks).toBe(1);
+  });
+
+  it('a throwing check holds the launches too (fail closed)', async () => {
+    const dispatches = [];
+    const eff = { ...effectsFor({ lockRoot, pid: 1, dispatches }), dispatcherFresh: async () => { throw new Error('boom\nmore'); } };
+    const r = await runBuildDispatchTick({ live: true, effects: eff });
+    expect(dispatches).toEqual([]);
+    expect(r.cloneStale).toBe('boom');
+  });
+
+  it('cliDispatcherFresh runs dispatch-lane\'s own check only on a managed clone, and reports its refusal', async () => {
+    let called = 0;
+    const assertFresh = () => { called += 1; throw new Error(`${staleWhy}\nmore`); };
+    expect(await cliDispatcherFresh({ env: {}, assertFresh })).toEqual({ fresh: true, skipped: 'not-managed' });
+    expect(called).toBe(0);
+    expect(await cliDispatcherFresh({ env: { WE_DAEMON_MANAGED_CLONE: '1' }, assertFresh })).toEqual({ fresh: false, why: staleWhy });
+    expect(await cliDispatcherFresh({ env: { WE_DAEMON_MANAGED_CLONE: '1' }, assertFresh: () => ({ ok: true }) })).toEqual({ fresh: true });
+  });
+
+  it('the live loop hands self-sync the stale signal, and runner.mjs forwards it', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(resolve(here, '..', 'build-dispatch-daemon.mjs'), 'utf8');
+    expect(src).toMatch(/wireSelfSyncAndAppAuth\(\{[^}]*hasStaleRefusal: \(r\) => Boolean\(r\?\.cloneStale\)/);
+    const runner = readFileSync(resolve(here, '..', 'runner.mjs'), 'utf8');
+    expect(runner).toMatch(/\.\.\.\(hasStaleRefusal \? \{ hasStaleRefusal \} : \{\}\)/);
+  });
+});
+
+// Live 2026-10-09: the ruling on each held card landed on main as a card edit. The reader names the newest
+// origin/main commit (first-parent: the landing time) that changed the card AFTER the hold.
+describe('cliCardChangedSince', () => {
+  let repo;
+  const git = (...a) => execFileSync('git', a, { cwd: repo, encoding: 'utf8' }).trim();
+  const commitAt = (iso, msg) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qam', msg],
+    { cwd: repo, env: { ...process.env, GIT_COMMITTER_DATE: iso, GIT_AUTHOR_DATE: iso } });
+  beforeEach(() => {
+    repo = mkdtempSync(join(tmpdir(), 'bdd-card-'));
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+    mkdirSync(join(repo, 'backlog'));
+    writeFileSync(join(repo, 'backlog/4354-survive-a-switch.md'), 'card\n');
+    writeFileSync(join(repo, 'backlog/43540-other.md'), 'other\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    commitAt('2026-09-28T16:10:03Z', 'file');
+  });
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it('names the ruling commit made after the hold, and nothing for an untouched card', () => {
+    writeFileSync(join(repo, 'backlog/43540-other.md'), 'other edit\n');
+    commitAt('2026-10-09T17:30:00Z', 'other card');
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
+    expect(cliCardChangedSince('4354', '2026-10-09T00:35:58.789Z', { root: repo })).toBeNull();
+    writeFileSync(join(repo, 'backlog/4354-survive-a-switch.md'), 'card\n\n## Ruling\nrecord + resume\n');
+    commitAt('2026-10-09T17:00:32Z', 'ruling');
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
+    const sha = git('rev-parse', 'HEAD');
+    expect(cliCardChangedSince('4354', '2026-10-09T00:35:58.789Z', { root: repo })).toEqual({ commit: sha, at: '2026-10-09T17:00:32Z' });
+    expect(cliCardChangedSince('4354', '2026-10-09T18:00:00Z', { root: repo })).toBeNull();
+    expect(cliCardChangedSince('9999', '2026-10-09T00:00:00Z', { root: repo })).toBeNull();
+  });
+
+  // Review of #4663: the linear fixture above cannot tell `--first-parent` from plain history. A ruling committed on a
+  // branch BEFORE the hold and merged to main AFTER it landed on main after the hold: the merge commit's time counts.
+  it('releases a hold for a card edit merged after the hold despite an older branch commit', () => {
+    const mainBranch = git('branch', '--show-current');
+    git('checkout', '-q', '-b', 'ruling');
+    writeFileSync(join(repo, 'backlog/4354-survive-a-switch.md'), 'card\n\n## Ruling\nrecord + resume\n');
+    commitAt('2026-10-09T06:00:00Z', 'ruling on branch');
+    const branchSha = git('rev-parse', 'HEAD');
+    git('checkout', '-q', mainBranch);
+    writeFileSync(join(repo, 'backlog/43540-other.md'), 'other edit\n');
+    commitAt('2026-10-09T09:00:00Z', 'main moves on');
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'merge', '--no-ff', '-q', '-m', 'Merge ruling', 'ruling'],
+      { cwd: repo, env: { ...process.env, GIT_COMMITTER_DATE: '2026-10-09T17:00:00Z', GIT_AUTHOR_DATE: '2026-10-09T17:00:00Z' } });
+    execFileSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
+    const mergeSha = git('rev-parse', 'HEAD');
+    expect(mergeSha).not.toBe(branchSha);
+    // The hold was recorded at 12:00, after the branch commit (06:00) but before the merge (17:00).
+    expect(cliCardChangedSince('4354', '2026-10-09T12:00:00Z', { root: repo })).toEqual({ commit: mergeSha, at: '2026-10-09T17:00:00Z' });
+    // A hold recorded after the merge is not released by it.
+    expect(cliCardChangedSince('4354', '2026-10-09T18:00:00Z', { root: repo })).toBeNull();
   });
 });
