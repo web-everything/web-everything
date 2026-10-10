@@ -494,3 +494,144 @@ describe('installation-bound cache provenance (#4652)', () => {
     expect(env.WE_GH_AUTH_TOKEN_HASH).toMatch(/^[a-f0-9]{64}$/);
   });
 });
+
+import { afterEach } from 'vitest';
+import {
+  diagnoseGithubAppEnvConfig, defaultAuthCaller, readGithubAppCallerStatuses,
+  warnGithubAppConfigAtStart, GITHUB_APP_ENV_KEYS,
+} from '../github-app-auth-env.mjs';
+
+describe('half-configured App auth (2026-10-09 drain incident)', () => {
+  const NOW = Date.parse('2026-10-09T13:21:00Z');
+  const policy = { auth: 'app', personalExceptions: {} };
+  const halfEnv = { WE_GITHUB_APP_INSTALLATION_ID: '555000111', WE_GITHUB_APP_PRIVATE_KEY_PATH: '/synthetic/key.pem' };
+  const fullEnv = { ...halfEnv, WE_GITHUB_APP_ID: '5037855' };
+  const dirs = [];
+  const scratch = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-app-half-config-'));
+    dirs.push(dir);
+    return dir;
+  };
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  const options = (caller, env) => ({
+    caller, env, policy, now: NOW, callerStatusDir: scratch(),
+    readCache: vi.fn(() => null), writeCache: vi.fn(), setEnv: vi.fn(),
+    mint: vi.fn(), writeStatus: vi.fn(), writeCallerStatus: vi.fn(), log: { error: vi.fn() },
+    canReadKey: vi.fn(() => true),
+  });
+
+  it.each([
+    ['absent', {}, true, [...GITHUB_APP_ENV_KEYS], false],
+    ['half', halfEnv, true, ['WE_GITHUB_APP_ID'], false],
+    ['half', fullEnv, false, [], true],
+    ['complete', fullEnv, true, [], false],
+  ])('diagnoses %s with env %j and key readability %s', (state, env, readable, missing, keyUnreadable) => {
+    expect(diagnoseGithubAppEnvConfig(env, { canReadKey: () => readable }))
+      .toEqual({ state, missing, keyUnreadable });
+  });
+
+  it('records the half-configured drain only in its caller file and warns once across refreshes', async () => {
+    const opts = options('merge-ai-prs.mjs', halfEnv);
+    const result = { applied: false, reason: 'half-configured', missing: ['WE_GITHUB_APP_ID'], keyUnreadable: false };
+    expect(await ensureFreshGithubAppEnv(opts)).toEqual(result);
+    expect(opts.mint).not.toHaveBeenCalled();
+    expect(opts.writeStatus).not.toHaveBeenCalled();
+    expect(opts.writeCallerStatus).toHaveBeenCalledOnce();
+    expect(opts.writeCallerStatus).toHaveBeenCalledWith(
+      join(opts.callerStatusDir, 'merge-ai-prs.mjs.json'),
+      { caller: opts.caller, daemon: false, ...result, checkedAt: new Date(NOW).toISOString() },
+    );
+    expect(opts.log.error).toHaveBeenCalledWith(expect.stringContaining('HALF-configured'));
+    expect(opts.log.error).toHaveBeenCalledWith(expect.stringContaining('WE_GITHUB_APP_ID'));
+    await ensureFreshGithubAppEnv(opts);
+    expect(opts.log.error).toHaveBeenCalledOnce();
+    expect(opts.mint).not.toHaveBeenCalled();
+    expect(opts.writeStatus).not.toHaveBeenCalled();
+  });
+
+  it('records explicit personal policy without minting or replacing shared status', async () => {
+    const opts = { ...options('personal-policy-test.mjs', fullEnv), policy: { auth: 'personal' } };
+    const result = { applied: false, reason: 'policy-personal' };
+    expect(await ensureFreshGithubAppEnv(opts)).toEqual(result);
+    expect(opts.mint).not.toHaveBeenCalled();
+    expect(opts.writeStatus).not.toHaveBeenCalled();
+    expect(opts.writeCallerStatus).toHaveBeenCalledOnce();
+    expect(opts.writeCallerStatus).toHaveBeenCalledWith(
+      join(opts.callerStatusDir, 'personal-policy-test.mjs.json'),
+      expect.objectContaining({ caller: opts.caller, ...result, checkedAt: new Date(NOW).toISOString() }),
+    );
+  });
+
+  it.each([true, false])('reports absent configuration only for a daemon (daemon=%s)', async (daemon) => {
+    const opts = { ...options(`absent-config-${daemon}.mjs`, {}), daemon };
+    expect(await ensureFreshGithubAppEnv(opts)).toEqual({ applied: false, reason: 'not-configured' });
+    expect(opts.mint).not.toHaveBeenCalled();
+    expect(opts.writeStatus).not.toHaveBeenCalled();
+    if (daemon) {
+      expect(opts.writeCallerStatus).toHaveBeenCalledOnce();
+      expect(opts.writeCallerStatus).toHaveBeenCalledWith(
+        join(opts.callerStatusDir, `${opts.caller}.json`),
+        expect.objectContaining({ caller: opts.caller, daemon: true, reason: 'not-configured' }),
+      );
+      expect(opts.log.error).toHaveBeenCalledWith(expect.stringContaining('daemon'));
+    } else {
+      expect(opts.writeCallerStatus).not.toHaveBeenCalled();
+      expect(opts.log.error).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses to mint on a cache miss when the configured key is unreadable', async () => {
+    const opts = { ...options('unreadable-key-test.mjs', fullEnv), canReadKey: vi.fn(() => false) };
+    expect(await ensureFreshGithubAppEnv(opts)).toEqual({
+      applied: false, reason: 'half-configured', missing: [], keyUnreadable: true,
+    });
+    expect(opts.readCache).toHaveBeenCalledOnce();
+    expect(opts.canReadKey).toHaveBeenCalledWith(fullEnv.WE_GITHUB_APP_PRIVATE_KEY_PATH);
+    expect(opts.mint).not.toHaveBeenCalled();
+    expect(opts.writeStatus).not.toHaveBeenCalled();
+  });
+
+  it('identifies a pass daemon, an explicit caller override, and a plain script', () => {
+    const argv = ['node', '/x/pass-daemon.mjs', '--pass=lease-reaper'];
+    expect(defaultAuthCaller(argv, {})).toBe('pass-daemon.mjs:lease-reaper');
+    expect(defaultAuthCaller(argv, { WE_GITHUB_AUTH_CALLER: 'custom-caller' })).toBe('custom-caller');
+    expect(defaultAuthCaller(['node', '/x/plain-script.mjs'], {})).toBe('plain-script.mjs');
+  });
+
+  it('reads fresh caller files newest-first, excluding expired and corrupt files', () => {
+    const dir = scratch();
+    const entry = (caller, age) => ({ caller, applied: true, reason: 'ok', checkedAt: new Date(NOW - age).toISOString() });
+    const older = entry('older.mjs', 500);
+    const newer = entry('newer.mjs', 100);
+    const expired = entry('expired.mjs', 1001);
+    for (const [name, value] of [['a', older], ['b', expired], ['c', newer]]) {
+      writeFileSync(join(dir, `${name}.json`), JSON.stringify(value));
+    }
+    writeFileSync(join(dir, 'corrupt.json'), '{');
+    expect(readGithubAppCallerStatuses({ dir, now: NOW, maxAgeMs: 1000 })).toEqual([newer, older]);
+  });
+
+  it('warns once on startup for half config', () => {
+    const log = { error: vi.fn() };
+    expect(warnGithubAppConfigAtStart({ env: halfEnv, policy, log, caller: 'startup-half-test.mjs', canReadKey: () => true }))
+      .toEqual({ state: 'half', missing: ['WE_GITHUB_APP_ID'], keyUnreadable: false });
+    expect(log.error).toHaveBeenCalledOnce();
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('HALF-configured'));
+  });
+
+  it('does not warn on startup for complete config', () => {
+    const log = { error: vi.fn() };
+    expect(warnGithubAppConfigAtStart({ env: fullEnv, policy, log, caller: 'startup-complete-test.mjs', canReadKey: () => true }).state)
+      .toBe('complete');
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it('does not warn on startup when personal auth is explicitly selected', () => {
+    const log = { error: vi.fn() };
+    expect(warnGithubAppConfigAtStart({ env: halfEnv, policy: { auth: 'personal' }, log, caller: 'startup-personal-test.mjs' }).state)
+      .toBe('policy-personal');
+    expect(log.error).not.toHaveBeenCalled();
+  });
+});
