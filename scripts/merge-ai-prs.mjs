@@ -1404,12 +1404,17 @@ export function resolveIdsForLandedPass(o = {}) {
  * `log`/`asJson` make this fully unit-testable without touching real fs/git/locks or running the rest of this
  * 5000+-line module.
  *
- * @param {{dryRun?:boolean, asJson?:boolean, sweepFn?:function, lockFn?:function, syncFn?:function, pushFn?:function, log?:function}} [o]
+ * `redMainHeld` (red-main-hold, PR #4624): while main is red only the main-fix PR writes to main, so the step
+ * previews but never applies — the flip is not urgent and the next green pass resolves it. The old freeze stop
+ * exited before this step ran; with the hold ON the pass runs, so the step must hold itself.
+ *
+ * @param {{dryRun?:boolean, asJson?:boolean, redMainHeld?:boolean, sweepFn?:function, lockFn?:function, syncFn?:function, pushFn?:function, log?:function}} [o]
  * @returns {{ok:boolean, ran:boolean, autoResolvable:Array, applied:Array, error:(string|null), skipped?:string, pushed?:boolean, pushWarning?:string}}
  */
 export function runStrandedSweepStep({
   dryRun = false,
   asJson = false,
+  redMainHeld = false,
   sweepFn = autoStrandedSweepPass,
   lockFn = withLandWriteLock,
   syncFn = defaultStrandedSweepSync,
@@ -1429,6 +1434,10 @@ export function runStrandedSweepStep({
     return errored(e);
   }
   let push = null;
+  if (redMainHeld && report && typeof report === 'object' && report.ok && (report.autoResolvable || []).length) {
+    if (!asJson) log(`  · stranded-sweep${dryRun ? ' DRY-RUN' : ''}: main is red (${RED_MAIN_HOLD_REASON}) — not resolving ${report.autoResolvable.map((h) => `#${h.id}`).join(', ')} this pass; only the main-fix PR writes to main until it is green\n`);
+    return { ok: true, ran: false, autoResolvable: report.autoResolvable, applied: [], error: null, skipped: RED_MAIN_HOLD_REASON };
+  }
   if (!dryRun && report && typeof report === 'object' && report.ok && !report.mainLogUnavailable && (report.autoResolvable || []).length) {
     let lock;
     try {
@@ -5415,11 +5424,20 @@ async function runCli() {
   // `red-main-hold`. Applied AFTER every other decision and BEFORE the couple join, so it only ever ADDS a hold
   // (a fix PR still passes every gate above) and a held WE carrier defers its impl half the usual way. Lifts by
   // itself when main is green (the health watch removes its record; both records also expire on their TTL).
+  // `redMainHeld` also holds this pass's other main writes (the stranded-card sweep below): only the fix PR writes.
+  // Setting OFF: the freeze stop ran before this pass, but a freeze raised (or the setting switched OFF) since then
+  // would reach no hold at all — so a manual freeze seen HERE holds every PR, the fix PR too, as the OFF stop does.
+  let redMainHeld = false;
   {
     const holdSetting = resolveRedMainHoldSetting();
-    if (!redMainBypass && holdSetting.value === 'on') {
-      const sig = redMainSignal({ mainRedState: readMainRedState(), priority: readMainRedPriority(), manualFreeze: readFreeze(), now: Date.now() });
+    const holdOn = holdSetting.value === 'on';
+    const manualFreeze = redMainBypass ? null : readFreeze();
+    if (!redMainBypass && (holdOn || manualFreeze)) {
+      const sig = holdOn
+        ? redMainSignal({ mainRedState: readMainRedState(), priority: readMainRedPriority(), manualFreeze, now: Date.now() })
+        : redMainSignal({ manualFreeze, now: Date.now() }); // OFF: no fix-PR exemption, nothing lands
       if (sig.red) {
+        redMainHeld = true;
         let held = 0;
         // Mode `quarantine`: hold only PRs overlapping the fix PR's files or a quarantined test's area; no live
         // quarantine entry (or an unreadable list) ⇒ every PR falls back to STOP inside decideQuarantineHold.
@@ -5440,7 +5458,7 @@ async function runCli() {
           if (v.decision !== 'merge') continue;
           const d = quarantine && isLocalRepo(v.repo)
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
-            : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: holdSetting.value });
+            : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
           if (d.hold) { v.decision = 'skip'; v.reason = d.reason; v.redMainHold = true; held++; }
         }
         if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
@@ -6230,7 +6248,7 @@ async function runCli() {
   // exactly what a real pass would resolve, without writing anything. `runStrandedSweepStep` never throws —
   // any failure (an unreadable `backlog/`, `git log` unavailable, a thrown resolve) is logged and this pass
   // continues exactly as if the sweep found nothing.
-  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN, asJson: AS_JSON });
+  const strandedSweep = runStrandedSweepStep({ dryRun: DRY_RUN, asJson: AS_JSON, redMainHeld });
 
   // #2318 — POST-LAND DUPLICATE-NNN TRIPWIRE (LOUD-ONLY, #xsyia6k). JIT numbering (#2288) makes two lanes racing
   // to one birth-NNN structurally rare, but a bug on ANY land path could still put two files at one numeric id on
@@ -6336,19 +6354,21 @@ async function runCli() {
     for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0)); // → triggers the exit handler → frees the lease
   }
 
-  // ── RED-MAIN dispatch-freeze (#2681) — the sole writer STOPS THE LINE while main is red ─────────────────────
+  // ── RED-MAIN dispatch-freeze (#2681) — while main is red, nothing but the main-fix PR writes to main ─────────
   // Diff-driven shrink (#2681) can let a PR land green while a test outside its selected set is red against the
   // merged tree; the post-land full-suite backstop then reds main. Under the sole writer that is a GLOBAL red —
-  // every subsequent land builds on a broken tree. So before landing anything, consult the durable red-main
-  // freeze marker (raised by red-main-remediation.mjs on a post-land red). A live freeze ⇒ refuse to land and
-  // surface the stop-the-line, symmetric to the duplicate-id-on-main hard stop below. `--no-red-main-freeze`
-  // (or WE_MERGE_BREAK_GLASS) is the documented admin bypass. Absent marker ⇒ this is a no-op (the default, and
-  // the ONLY state while the shrink flag is off), so it changes nothing about today's landing behaviour.
-  // Consulted BEFORE the one-shot land AND at the top of every WATCH pass (a freeze can be raised MID-watch, so
-  // like the dup-id stop below it must be re-checked each pass — reading `redMainFreezeStop()` per pass).
+  // every subsequent land builds on a broken tree. So consult the durable red-main freeze marker (raised by
+  // red-main-remediation.mjs on a post-land red) before landing anything, and again at the top of every WATCH pass
+  // (a freeze can be raised MID-watch). `--no-red-main-freeze` (or WE_MERGE_BREAK_GLASS) is the admin bypass.
+  // Two shapes, by the red-main-hold setting (scripts/settings/red-main-hold.json):
+  //   - OFF: the old stop-the-line — exit 5 before the pass, so nothing in it runs. A freeze that appears after this
+  //     check is still caught by the hold block in `sweepOnce`, which then holds every PR (the fix PR too).
+  //   - ON (default): the pass runs, so `sweepOnce` must hold every write to main itself — every PR except the
+  //     published main-fix PR(s) is skipped `red-main-hold` (a manual freeze is always stop mode, never quarantine),
+  //     and the stranded-card sweep does not push (`redMainHeld`). The real CLI is defended in
+  //     merge-ai-prs-red-main-hold-wiring.test.mjs, which runs WITHOUT the bypass and asserts both the
+  //     `gh pr merge` calls and every `git push` to main.
   const redMainBypass = !!flags['no-red-main-freeze'] || process.env.WE_MERGE_BREAK_GLASS === '1';
-  // red-main-hold (contain): with the hold ON, a manual freeze no longer stops the whole line — it feeds the
-  // per-PR hold in `sweepOnce`, which still holds EVERY PR except the published main-fix PR(s). OFF = the old stop.
   const redMainFreezeStop = () => {
     if (redMainBypass) return null;
     // A freeze raised before the marker moved to the coordination root is carried across once, so rollout never drops it.
