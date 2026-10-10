@@ -502,15 +502,16 @@ describe('stopping gate jobs (restartInFlight: kill) and the supervisor stop han
     expect(exit).toHaveBeenCalledWith(143);
     // The sidecar write after the spawn fails (the path is now a non-empty directory) — the handler still knows the pid.
     const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
-    let writeFailed = false;
-    await runGateStep({ jobId: 'sig', input: INPUT, jobsDir: dir, log: () => {}, laneState: () => ({ marker: running, headSha: 'abc12345' }),
-      readStart: () => 's', onGate: (p) => { pid = p; },
+    const gateKill = vi.fn(); // the step's own kill of a gate it could not record (round 5) — never a real signal here
+    const out = await runGateStep({ jobId: 'sig', input: INPUT, jobsDir: dir, log: () => {}, laneState: () => ({ marker: running, headSha: 'abc12345' }),
+      readStart: () => 's', onGate: (p) => { pid = p; }, kill: gateKill, scanLane: () => [],
       runGate: async (o) => {
         rmSync(gatePath(dir, 'sig'), { force: true });
         mkdirSync(join(gatePath(dir, 'sig'), 'blocker'), { recursive: true });
-        try { o.onSpawn(4243); } catch { writeFailed = true; }
+        try { o.onSpawn(4243); } catch {}
       } });
-    expect(writeFailed).toBe(true);
+    expect(out.outcome).toBe('failed'); // the write failed
+    expect(gateKill).toHaveBeenCalledWith(-4243, 'SIGKILL');
     handler();
     expect(kill).toHaveBeenCalledWith(-4243, 'SIGKILL');
     pid = 1;
@@ -650,12 +651,16 @@ describe('no gate record is ever missing or reduced while its gate runs, and no 
 
   it('findLaneGatePidsDefault finds a real gate by its exact --repo token (with a --run-id), and nothing else', async () => {
     const lane = join(dir, 'lane 7'); // a space in the path must still match exactly
-    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', `--repo=${lane}`, '--json', '--run-id=r-x'], { stdio: 'ignore' });
-    const decoy = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', `--repo=${lane}`, 'request'], { stdio: 'ignore' });
+    // `--` ends node's own options: without it node rejects `--repo=` as a bad flag and exits at once.
+    const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', '--', `--repo=${lane}`, '--json', '--run-id=r-x'], { stdio: 'ignore' });
+    const decoy = spawn(process.execPath, ['-e', 'setTimeout(()=>{},30000)', '--', `--repo=${lane}`, 'request'], { stdio: 'ignore' });
     try {
-      for (let i = 0; i < 50 && !gateJob.findLaneGatePidsDefault(lane).includes(child.pid); i += 1) await new Promise((r) => setTimeout(r, 50));
+      // Bounded by time, not by a poll count: under host load a `ps` alone can take seconds.
+      for (const end = Date.now() + 20_000; Date.now() < end && !gateJob.findLaneGatePidsDefault(lane).includes(child.pid);) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
       expect(gateJob.findLaneGatePidsDefault(lane)).toEqual([child.pid]); // the decoy carries no --run-id: not a dispatched gate
       expect(gateJob.findLaneGatePidsDefault(`${lane}x`)).toEqual([]);
     } finally { child.kill('SIGKILL'); decoy.kill('SIGKILL'); }
-  });
+  }, 60_000);
 });
