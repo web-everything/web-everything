@@ -3,7 +3,7 @@ kind: story
 size: 5
 status: resolved
 priority: high
-scope: ["we:scripts/conveyor/takeover-budget.mjs", "we:scripts/conveyor/__tests__/takeover-budget.test.mjs", "we:scripts/conveyor/fix-takeover.mjs", "we:scripts/conveyor/takeover-review.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/settings/fix.json"]
+scope: ["we:scripts/conveyor/takeover-budget.mjs", "we:scripts/conveyor/__tests__/takeover-budget.test.mjs", "we:scripts/conveyor/fix-takeover.mjs", "we:scripts/conveyor/takeover-review.mjs", "we:scripts/conveyor/reconcile-core.mjs", "we:scripts/conveyor/reconcile-pass.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/settings/fix.json", "we:scripts/conveyor/pr-status-label.mjs", "we:scripts/conveyor/review-status-tag.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
 dateOpened: "2026-10-10"
 dateStarted: "2026-10-10"
 dateResolved: "2026-10-10"
@@ -18,6 +18,8 @@ Live: #4708 got one automatic takeover (#4756); round 6 still asked for changes 
 
 - [A1] **Executable** — `npm run test:unit -- we:scripts/conveyor/__tests__/takeover-budget.test.mjs`: a second takeover is dispatched when takeover 1 reduced the open findings; no progress escalates with a "takeover not converging" note listing the open findings; a spent budget goes to the operator; a gate that holds the PR itself (stacked base, awaiting-base, review:human, merge-gate hold) with no open defect never triggers a takeover. The module does not exist before this item, so the file is red before and green after.
 - [A2] Replay (dry run, nothing posted): #4708's thread at round 6 plans takeover 2 of 2 on the top rung (open findings 7 to 4, weight 18 to 12). On the live thread, the head pushed by the second takeover (483aab1e2) is granted its own review (`takeover-review-spent` before this change).
+- [A5] Every escalation dispatch past the cap (a takeover OR a fixer-escalation ladder rung) earns one review for the head it pushes, anchored on the latest dispatch's first push (live #4689 head 6e0d241df: `no-takeover` before, granted after). Every round cap (fix, advisory-fix, and review once the head is judged) leads to a takeover within the budget.
+- [A6] One `status:*` label per PR (we:scripts/conveyor/pr-status-label.mjs: needs-you, takeover-running, fixing, at-round-limit, awaiting-base, awaiting-ci, awaiting-review, ready-to-merge), written by the existing review-status writer (we:scripts/conveyor/review-status-tag.mjs) every review-daemon tick; `npm run test:unit -- we:scripts/conveyor/__tests__/pr-status-label.test.mjs`.
 - [A3] Must refuse on error: an unreadable thread, a takeover nobody judged yet, or a judged takeover with no measurable before-round is never read as progress: no further takeover runs.
 - [A4] Must stay cautious: a ruling dispute always goes to the operator at once; the review gate and review:human ceremony are unchanged (a grant only lets a review run).
 
