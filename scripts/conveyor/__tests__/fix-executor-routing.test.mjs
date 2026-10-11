@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveFixExecutorSetting, chooseFixExecutor, formatFixExecutorLog } from '../../lib/fix-slot-borrow.mjs';
-import { dispatchFix } from '../reconcile-fix-dispatch.mjs';
+import { dispatchFix, roundEscalationFor } from '../reconcile-fix-dispatch.mjs';
 
 const setting = { value: 'codex-first', source: 'default' };
 describe('fix.executor cascade', () => {
@@ -25,6 +25,53 @@ describe('fix executor decision', () => {
     [{ setting: { value: 'provider-routing', source: 'repo' } }, 'claude'],
   ])('routes %j to %s', (input, executor) => {
     expect(chooseFixExecutor({ setting, launcherAvailable: true, ...input }).executor).toBe(executor);
+  });
+  // Review finding (PR #4897 round 2, reconcile-fix-dispatch.mjs:1364): every source `launchTableFor` can pick a
+  // stronger Claude model from must route to Claude. Codex ignores the ladder table, so the rung would be logged but
+  // never applied. Walks the real planned-entry shapes through the real `roundEscalationFor` -> `chooseFixExecutor`
+  // composition both call sites (`dispatchFix` and the daemon's `fixExecutorRoute`) use.
+  describe('every launch-table source routes to Claude', () => {
+    const claudeRoute = { provider: 'claude', model: 'opus', effort: 'high' };
+    const rung = { id: 'opus-high', at: 1 };
+    const fixSettings = { strongerModelFromRound: 3 };
+    const loadLadder = () => ({ rungs: [{ id: 'opus-high', from: 3, provider: 'claude', model: 'opus', effort: 'high' }] });
+    const routeAsCallSitesDo = (planned) => chooseFixExecutor({
+      setting, launcherAvailable: true, ...planned, round: planned.round ?? 1,
+      strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
+    });
+    it.each([
+      ['ruling-not-addressed send-back with a rung (round 1)', { rulingNotAddressed: { rung, route: claudeRoute, matches: [1] } }],
+      ['ruling-not-addressed send-back with a rung (round 2)', { round: 2, rulingNotAddressed: { rung, route: claudeRoute } }],
+      ['ruling-not-addressed send-back whose rung routes to codex (dispatch only wires claude)', { rulingNotAddressed: { rung, route: { provider: 'codex' } } }],
+      ['ruling-not-addressed send-back with no routed rung', { rulingNotAddressed: { matches: [1], route: null } }],
+      ['takeover', { takeover: { rung, route: claudeRoute, attempts: 5, cap: 5 } }],
+      ['round-escalation rung (round 3)', { round: 3 }],
+    ])('%s', (_name, planned) => {
+      expect(routeAsCallSitesDo(planned).executor).toBe('claude');
+    });
+    it('still sends an ordinary round 1 and round 2 repair to codex', () => {
+      expect(routeAsCallSitesDo({ round: 1 }).executor).toBe('codex');
+      expect(routeAsCallSitesDo({ round: 2 }).executor).toBe('codex');
+    });
+    it('dispatchFix launches a ruling-not-addressed send-back on Claude with the ladder model, never the codex launcher', () => {
+      const spawnBorrowed = vi.fn(() => 'pid:1');
+      const spawnAgent = vi.fn(() => 'backgrounded · 2be0905c · fix-42\n');
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        dispatchFix({ pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'],
+          rulingNotAddressed: { rung, route: claudeRoute,
+            matches: [{ finding: { file: 'scripts/x.mjs', line: 1, summary: 's' }, ruling: 'block', misses: 1 }] } }, {
+          root: '/repo', readBrief: () => '{{PR_NUM}} {{LANE_REF}} {{LANE}} {{SCOPE}} {{SESSION_SLUG}}',
+          readFixClaim: () => null, acquireClaim: () => ({ ok: true }), stampExecutor: vi.fn(), stampRunner: vi.fn(),
+          postNotice: vi.fn(), fixExecutorRoute: (planned) => chooseFixExecutor({ setting, launcherAvailable: true, ...planned }),
+          writeBorrowedPrompt: () => '/tmp/fix-42.md', spawnBorrowed, spawnAgent,
+        });
+        expect(spawnBorrowed).not.toHaveBeenCalled();
+        expect(spawnAgent).toHaveBeenCalledTimes(1);
+        expect(spawnAgent.mock.calls[0][0]).toEqual(expect.arrayContaining(['--model']));
+        expect(spawnAgent.mock.calls[0][0].join(' ')).toContain('opus');
+      } finally { log.mockRestore(); }
+    });
   });
   it('explains fallback and formats the exact log line', () => {
     expect(chooseFixExecutor({ setting, launcherAvailable: false }).reason).toMatch(/unavailable.*fallback/);

@@ -47,12 +47,14 @@ export function resolveFixExecutorSetting({ env = process.env, platform = platfo
 
 /** Pure; provider-routing leaves existing provider/borrow selection in control. */
 export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, round = 1,
-  takeover = false, mainFix = false, strongerModel = false, launcherAvailable = false } = {}) {
+  takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false, launcherAvailable = false } = {}) {
   const source = setting.source ?? 'default';
   const claude = (reason) => ({ executor: 'claude', reason, source });
   if (setting.value === 'claude') return claude('fix.executor=claude');
   if (setting.value === 'provider-routing') return claude('existing provider routing');
   if (takeover) return claude('takeover round');
+  // A ruling-not-addressed send-back runs on its own ladder rung (`launchTableFor`); only `claude --bg` applies that table.
+  if (rulingNotAddressed) return claude('ruling-not-addressed send-back');
   if (mainFix) return claude('main-fix');
   if (strongerModel || round >= 3) return claude('stronger-model rung');
   if (!launcherAvailable) return claude('codex launcher unavailable, fallback');
