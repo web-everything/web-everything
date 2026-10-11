@@ -198,7 +198,7 @@ import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
-import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -739,6 +739,18 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   };
   const headSha = evidence.headSha;
   const moved = !!evidence.acceptedSha && !headSha.startsWith(evidence.acceptedSha) && !evidence.acceptedSha.startsWith(headSha);
+  // The PR's formal reviews, read at most once per call and only when a moved head would be covered by diff identity.
+  // A failed or malformed read THROWS: the callers defer the pass (`decideDrainReviewGate`) or skip the re-accept
+  // (`reconcileDrainReviewPending`) without a label write, never "no review stands against it".
+  let formalReviews;
+  const readFormalReviews = () => {
+    if (formalReviews === undefined) {
+      const r = (readReviews ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }))))();
+      if (!Array.isArray(r)) throw new Error('formal reviews read returned no array');
+      formalReviews = r;
+    }
+    return formalReviews;
+  };
   // card xu7kxtt (#5472) — an accept stamped WITHOUT a diff fingerprint (live plateau-app #217: the clear-human ran
   // from a checkout that could not read that repo's net diff, so only `reviewed-sha` was recorded). The accepted
   // commit is immutable and named by a trusted marker, so its net diff vs its own merge-base can be re-derived from
@@ -747,8 +759,7 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   // context-insensitive contribution digest.
   if (moved && !evidence.acceptedDiff && !evidence.acceptedContribution && /^[0-9a-f]{40}$/i.test(evidence.acceptedSha)
     && (local || cwd) && (carrySetting ?? resolveAcceptCarryForward().value) === 'on'
-    && acceptStandsUnsuperseded({ comments: d.comments, acceptedSha: evidence.acceptedSha, readReviews: readReviews
-      ?? (() => parseJsonLines(exec('gh', GH_ARGV.readPrReviews(repo || '{owner}/{repo}', pr), { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }))) })) {
+    && acceptStandsUnsuperseded({ comments: d.comments, acceptedSha: evidence.acceptedSha, readReviews: readFormalReviews })) {
     try {
       const old = readNetDiffAtHead({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
@@ -757,6 +768,21 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
       const fp = old.scored ? normalizeDiffFingerprint(old.text) : null;
       if (fp) { evidence.acceptedDiff = fp; evidence.acceptedDiffDerived = true; }
     } catch { /* unreadable accepted head → no derived fingerprint → SHA identity, as today */ }
+  }
+  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): a native GitHub CHANGES_REQUESTED review, from any reviewer
+  // identity (plateau-reviewer[bot], the operator), stops accept carry-forward. Covering a MOVED head by an identical net
+  // diff is a carry (of an agent accept or an operator clearance alike), and the restamp's own refusal leaves the old
+  // diff markers in place, so this read must refuse it too: a standing review (`laterReviewHold`, the latest formal
+  // review state) drops the diff markers, so coverage falls back to SHA identity (the moved head is not covered; a
+  // review is owed). Unreadable reviews throw (see `readFormalReviews`).
+  if (moved && (evidence.acceptedDiff || evidence.acceptedContribution)) {
+    const reviews = readFormalReviews();
+    if (laterReviewHold(reviews, latestAcceptRecord(d.comments, reviews)?.at ?? null)) {
+      evidence.acceptedDiff = null;
+      evidence.acceptedContribution = null;
+      evidence.acceptedDiffDerived = false;
+      evidence.standingChangesRequested = true;
+    }
   }
   const { acceptedSha, acceptedDiff, acceptedContribution } = evidence;
   const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha && moved);
