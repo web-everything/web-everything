@@ -457,10 +457,41 @@ describe('a thread cut at the list cap grants no takeover and no takeover review
     expect(takeoverReviewGrant({ pr: pr(T1, [...filler(GH_LIST_COMMENT_CAP), ...lead]), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0 });
   });
 
-  it('planReconcile: a cut thread at the cap dispatches nothing and names why on the cap note', () => {
+  it('planReconcile: a possibly-cut thread decides nothing for the PR (one refusal, no note)', () => {
     const p = plan(pr(R5, [...filler(GH_LIST_COMMENT_CAP - rounds5.length), ...rounds5]));
     expect(p.dispatch.filter((x) => x.prNumber === 7)).toEqual([]);
-    expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', takeover: 'thread-truncated' });
-    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')?.text).toMatch(/first 100 comments/);
+    expect(p.refusals.filter((r) => r.prNumber === 7).map((r) => r.kind)).toEqual(['thread-truncated']);
+    expect(p.notes.filter((n) => n.prNumber === 7 && n.kind === 'round-cap-exhausted')).toEqual([]);
+  });
+
+  // Self-review on ae21303e0: every other counter the planner reads off the thread fails OPEN on a cut list — the
+  // rearm count reads low (an ordinary fixer is dispatched past the cap), a stand-down past comment 100 is not seen
+  // (work is dispatched at a PR a fixer deliberately stood down). One per-PR check covers them all.
+  it('planReconcile: a cut list that hides the rearm comments does not read the round cap as unspent', () => {
+    const full = [...filler(GH_LIST_COMMENT_CAP), ...rounds5];
+    expect(plan(pr(R5, cut(full)), { durableCounts: {} }).dispatch.filter((x) => x.prNumber === 7)).toEqual([]);
+    expect(plan(pr(R5, cut(full)), { durableCounts: {} }).refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'thread-truncated' });
+  });
+
+  it('planReconcile: a cut list that hides a stand-down dispatches nothing at the stood-down PR', async () => {
+    const { buildStandDownComment } = await import('../stand-down.mjs');
+    const standDown = { author: BOT, createdAt: at(2), body: buildStandDownComment({ reason: 'needs-judgment' }) };
+    const full = [...filler(GH_LIST_COMMENT_CAP), rearm(1), standDown];
+    const complete = plan(pr(R5, full, { commentsComplete: true }), { durableCounts: {} });
+    expect(complete.dispatch.filter((x) => x.prNumber === 7)).toEqual([]); // control: seen in full, it is terminal
+    const p = plan(pr(R5, cut(full)), { durableCounts: {} });
+    expect(p.dispatch.filter((x) => x.prNumber === 7)).toEqual([]);
+    expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'thread-truncated' });
+  });
+
+  // The completeness fact comes from the reader that fetched the list, not from its length: a complete re-read of
+  // exactly 100 comments is marked and decided normally (no false "possibly cut" refusal or note).
+  it('a complete thread of exactly the cap, re-read in full, gets the normal decision', async () => {
+    const { enrichPrsWithCompleteComments } = await import('../pr-comments-complete.mjs');
+    const thread = [...filler(GH_LIST_COMMENT_CAP - rounds5.length), ...rounds5];
+    const [read] = enrichPrsWithCompleteComments([pr(R5, thread)], { readComments: () => thread });
+    expect(read.commentsComplete).toBe(true);
+    expect(planTakeover({ pr: read, roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER })).toMatchObject({ ok: true, n: 1 });
+    expect(plan(read).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', takeover: { n: 1 } });
   });
 });

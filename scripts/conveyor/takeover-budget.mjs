@@ -38,7 +38,7 @@ import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mj
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
-import { GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
+import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 
 export const TAKEOVER_BUDGET_SETTING = 'takeoverBudget';
 export const TAKEOVER_BUDGET_ENV = 'WE_FIX_TAKEOVER_BUDGET';
@@ -58,15 +58,17 @@ const parseBudget = (v) => {
   return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : undefined;
 };
 /**
- * PURE: may this comment list be a CUT one? `gh pr list --json comments` stops at {@link GH_LIST_COMMENT_CAP}, so a
- * list of exactly that length may be missing every takeover marker, void and verdict after comment 100. The reconcile
- * pass re-reads such a thread in full (`pr-comments-complete.mjs`), which is longer than the cap; any other path can
- * still hand a planner the cut list. Every past-cap grant that counts markers or verdicts off the thread refuses a
- * possibly-cut one (fail closed): `planTakeover`, `takeover-review.mjs#takeoverReviewGrant` and
- * `reconcile-core.mjs#operatorRulingRound`.
+ * PURE: may this PR's comment list be a CUT one? `gh pr list --json comments` stops at
+ * {@link LIST_COMMENTS_PAGE_SIZE}, so a list of exactly that length may be missing every takeover marker, void,
+ * stand-down and verdict after comment 100. The reconcile pass's readers re-read such a thread in full
+ * (`pr-comments-complete.mjs#enrichPrsWithCompleteComments`) and mark it `commentsComplete: true` — that mark, never the
+ * length, says a list is complete (a complete thread can be exactly 100 long). An unmarked list of exactly the page
+ * size may be cut: `reconcile-core.mjs#planReconcile` decides nothing for that PR (every counter it reads off the thread
+ * would fail open), and the direct entry points `planTakeover` and `takeover-review.mjs#takeoverReviewGrant` refuse it.
+ * @param {{comments?:Array<object>, commentsComplete?:boolean}} pr
  */
-export function threadMayBeTruncated(comments) {
-  return Array.isArray(comments) && comments.length === GH_LIST_COMMENT_CAP;
+export function threadMayBeTruncated(pr) {
+  return pr?.commentsComplete !== true && Array.isArray(pr?.comments) && pr.comments.length === LIST_COMMENTS_PAGE_SIZE;
 }
 
 /** The first PRESENT value among the named keys of a settings object (`undefined` when none is present). */
@@ -388,7 +390,7 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const comments = pr?.comments;
   // A cut thread hides the markers and verdicts after comment 100: a spent takeover would read as unspent.
-  if (threadMayBeTruncated(comments)) return { ok: false, reason: 'thread-truncated' };
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
   const defects = openDefects(comments, pr?.headRefOid ?? null);
   // The REVIEW round cap leads to a takeover too (one rule for both caps), but only once the current work is judged:
   // the latest review round came after the latest fixer push and left open defects. An unjudged head is owed a
