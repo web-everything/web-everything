@@ -5,13 +5,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { join } from 'node:path';
 import {
-  baseRebasedUnder, buildRoundResumePrompt, findSessionLane, jobModel, laneFromJournal, latestSessionRow,
-  planRoundEscalation, planRoundResume, roundOf,
+  baseRebasedUnder, buildRoundResumePrompt, findSessionLane, isScratchSessionDir, jobModel, JOURNAL_TAIL_BYTES, laneFromJournal,
+  latestSessionRow, planRoundEscalation, planRoundResume, prFirstParent, readJournalTail, readRoundResumeInputs, roundOf,
 } from '../fix-resume.mjs';
 import { resolveFixSettings } from '../fix-takeover.mjs';
 import {
-  dispatchFix, launchTableFor, roundEscalationFor, runReconcileFixDispatch, tryResumeRoundFix,
+  dispatchFix, formatReplay, launchTableFor, replayFixLaunch, roundEscalationFor, runReconcileFixDispatch, tryResumeRoundFix,
 } from '../reconcile-fix-dispatch.mjs';
+import { dispatchScratchRoot } from '../../operations/dispatch-lane-io.mjs';
 import { DEFAULT_FIXER_ESCALATION } from '../../lib/fixer-escalation-policy.mjs';
 
 const HEAD = 'a'.repeat(40);
@@ -30,7 +31,7 @@ const prior = { id: '11111111', sessionId: SID, name: 'fix-77', state: 'done', c
 const job = { template: 'bg', respawnFlags: ['-n', 'fix-77', '--model', 'sonnet'] };
 const freeLane = { lane: 4, path: '/lanes/we/lane-4', held: 'free', head: HEAD, sessionHead: HEAD };
 const planned = (o = {}) => ({ pr: 77, itemNum: null, laneRef: 'lane/x', headRefOid: HEAD, baseRefName: 'main', attempts: 1, scope: ['we:x'], ...o });
-const resumable = (o = {}) => ({ planned: planned(), settings: SETTINGS, prior, job, transcript: true, lane: freeLane, base: { rebased: false }, ...o });
+const resumable = (o = {}) => ({ planned: planned(), settings: SETTINGS, prior, job, transcript: true, lane: freeLane, base: { rebased: false }, scratchRoot: '/scratch', ...o });
 
 describe('fix settings cascade — card xrbu1bp keys', () => {
   const noFile = () => { throw new Error('no file'); };
@@ -123,6 +124,8 @@ describe('planRoundResume — declined (cold start, with the reason)', () => {
     ['job-record-gone', { job: null }],
     ['not-a-bg-session', { job: { ...job, template: 'p' } }],
     ['transcript-gone', { transcript: false }],
+    ['prior-cwd-not-scratch', { prior: { ...prior, cwd: '/lanes/we/lane-4' } }],
+    ['prior-cwd-not-scratch', { scratchRoot: null }],
     ['model-escalated', { desiredModel: 'opus' }],
     ['lane-not-found', { lane: null }],
     ['session-head-unknown', { lane: { ...freeLane, held: 'taken', sessionHead: null } }],
@@ -181,6 +184,69 @@ describe('the previous session and its lane', () => {
     expect(baseRebasedUnder({ baseRefName: 'lane/b', firstParent: null, repoSlug: 'o/r', ghApi: () => 'ahead' }).rebased).toBeNull();
     expect(baseRebasedUnder({ baseRefName: 'lane/../x', firstParent: P, repoSlug: 'o/r', ghApi: () => 'ahead' }).rebased).toBeNull();
   });
+  it('readJournalTail reads at most JOURNAL_TAIL_BYTES from the file tail and drops the torn first line', () => {
+    const tailBytes = 64;
+    const tail = `n":1}\n${JSON.stringify({ action: 'acquire', lane: 3 })}\n${JSON.stringify({ action: 'release', lane: 3 })}\n`;
+    const size = 2 * tailBytes + 17;
+    const calls = [];
+    const readAt = (fd, buf, off, len, pos) => { calls.push({ len, pos }); buf.write(tail.padStart(len, 'x').slice(-len), off); return len; };
+    const io = { open: () => 9, fstat: () => ({ size }), readAt, close: () => {} };
+    const events = readJournalTail('/pool/.lane-journal.jsonl', { tailBytes, ...io });
+    expect(calls).toEqual([{ len: tailBytes, pos: size - tailBytes }]);
+    expect(events).toEqual([{ action: 'acquire', lane: 3 }, { action: 'release', lane: 3 }]);
+    // a file within the bound is read whole from 0, and its first line is kept
+    const small = `${JSON.stringify({ action: 'acquire', lane: 1 })}\n`;
+    const smallCalls = [];
+    const smallIo = { ...io, fstat: () => ({ size: small.length }), readAt: (fd, buf, off, len, pos) => { smallCalls.push({ len, pos }); buf.write(small, off); return len; } };
+    expect(readJournalTail('/f', { tailBytes, ...smallIo })).toEqual([{ action: 'acquire', lane: 1 }]);
+    expect(smallCalls).toEqual([{ len: small.length, pos: 0 }]);
+    expect(JOURNAL_TAIL_BYTES).toBe(4 * 1024 * 1024);
+  });
+  // `gh pr view --json commits` (captured live, PR #4757): its commits carry no `parents` at all.
+  const PR_VIEW_COMMITS = JSON.stringify({ commits: [{
+    authoredDate: '2026-10-10T12:39:12Z', authors: [{ login: 'x' }], committedDate: '2026-10-10T12:39:12Z',
+    messageBody: '', messageHeadline: 'conveyor fix: resume', oid: 'a99c637a41a14b9137da9c1d6856e4ec425d75b8',
+  }] });
+  // `gh api repos/{o}/{r}/pulls/{n}/commits?per_page=1` (captured live, PR #4757, trimmed): oldest commit first, with parents.
+  const PULL_COMMITS = JSON.stringify([{
+    sha: 'a99c637a41a14b9137da9c1d6856e4ec425d75b8',
+    commit: { committer: { name: 'test', date: '2026-10-10T12:39:12Z' } },
+    parents: [{ sha: '1be5affcd252f21798e3242eeb64b1d7e02e7016', url: 'https://api.github.com/repos/web-everything/web-everything/commits/1be5affcd252f21798e3242eeb64b1d7e02e7016' }],
+  }]);
+  /** An `exec` that answers like gh does for each read shape, and records what was asked. */
+  const ghExec = (calls = [], { compare = 'ahead' } = {}) => (cmd, args) => {
+    calls.push(args);
+    if (args[0] === 'pr' && args[1] === 'view') return args.includes('--jq') ? '\n' : PR_VIEW_COMMITS; // no parents field to read
+    if (args[0] === 'api' && /^repos\/[^/]+\/[^/]+\/pulls\/\d+\/commits/.test(args[1])) return PULL_COMMITS;
+    if (args[0] === 'api' && /\/compare\//.test(args[1])) return `${compare}\n`;
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  it('prFirstParent reads the first commit\'s parent from the pull-commits list (the pr-view payload has none)', () => {
+    const calls = [];
+    expect(prFirstParent({ pr: 4757, repoSlug: 'web-everything/web-everything', exec: ghExec(calls) })).toBe('1be5affcd252f21798e3242eeb64b1d7e02e7016');
+    expect(calls).toEqual([['api', 'repos/web-everything/web-everything/pulls/4757/commits?per_page=1']]);
+    expect(prFirstParent({ pr: 4757, repoSlug: 'o/r', exec: () => '[]' })).toBeNull();
+    expect(prFirstParent({ pr: 4757, repoSlug: 'o/r', exec: () => 'not json' })).toBeNull();
+    expect(prFirstParent({ pr: 4757, repoSlug: 'o/r', exec: () => { throw new Error('502'); } })).toBeNull();
+    expect(prFirstParent({ pr: '1/../2', repoSlug: 'o/r', exec: ghExec() })).toBeNull();
+  });
+  it('readRoundResumeInputs: a stacked PR whose base only moved forward reads as not rebased (end to end over gh)', () => {
+    const calls = [];
+    const inputs = readRoundResumeInputs({
+      planned: planned({ pr: 4757, baseRefName: 'lane/fixer-history-takeover' }), slug: 'fix-77', root: '/repo', repoSlug: 'web-everything/web-everything',
+      listAgentsAll: () => [prior], readJob: () => job, home: '/home', poolRoot: '/nowhere', git: () => HEAD, exec: ghExec(calls),
+    });
+    expect(inputs.base).toEqual({ rebased: false });
+    expect(calls.map((a) => a[1])).toEqual([
+      'repos/web-everything/web-everything/pulls/4757/commits?per_page=1',
+      'repos/web-everything/web-everything/compare/1be5affcd252f21798e3242eeb64b1d7e02e7016...lane%2Ffixer-history-takeover',
+    ]);
+    const diverged = readRoundResumeInputs({
+      planned: planned({ pr: 4757, baseRefName: 'lane/b' }), slug: 'fix-77', root: '/repo', repoSlug: 'o/r',
+      listAgentsAll: () => [prior], readJob: () => job, home: '/home', poolRoot: '/nowhere', git: () => HEAD, exec: ghExec([], { compare: 'diverged' }),
+    });
+    expect(diverged.base).toEqual({ rebased: true });
+  });
   it('the resume prompt names the lane to re-take (free) or a fresh acquire (taken), and carries the history', () => {
     const free = buildRoundResumePrompt({ pr: 77, round: 2, lane: freeLane, headRefOid: HEAD, history: '# All rounds so far' });
     expect(free).toContain('--lane=4 --no-reset');
@@ -191,11 +257,57 @@ describe('the previous session and its lane', () => {
   });
 });
 
+describe('the resume trigger starts only in a dispatch scratch directory (#4174)', () => {
+  it('isScratchSessionDir: a direct child of the scratch root, nothing else', () => {
+    expect(isScratchSessionDir('/ws/.operations/dispatch/83fd9579-1e17-4ec2', '/ws/.operations/dispatch')).toBe(true);
+    expect(isScratchSessionDir('/ws/.operations/dispatch/x/', '/ws/.operations/dispatch/')).toBe(true);
+    for (const cwd of [
+      '/ws/.lanes/web-everything/lane-8', // the lane the fixer cd'd into
+      '/ws/.operations/dispatch', // the root itself
+      '/ws/.operations/dispatch/a/b', // deeper than one segment
+      '/ws/.operations/dispatch/../../.lanes/we/lane-8', // `..` out of the root
+      '/ws/.operations/dispatch-x/a', // a prefix sibling
+      'dispatch/a', '', null, undefined, 42, // relative or not a path
+      '/ws/.operations/dispatch/.hidden', '/ws/.operations/dispatch/a\nb',
+    ]) expect(isScratchSessionDir(cwd, '/ws/.operations/dispatch')).toBe(false);
+    expect(isScratchSessionDir('/ws/.operations/dispatch/a', null)).toBe(false);
+    expect(isScratchSessionDir('/ws/.operations/dispatch/a', 'relative/root')).toBe(false);
+  });
+  it('a symlink in the scratch root that resolves into a lane is refused (realpath is compared)', () => {
+    const realpath = (p) => (p === '/ws/.operations/dispatch/evil' ? '/ws/.lanes/we/lane-8' : p);
+    expect(isScratchSessionDir('/ws/.operations/dispatch/evil', '/ws/.operations/dispatch', realpath)).toBe(false);
+    const throwing = () => { throw new Error('ENOENT'); };
+    expect(isScratchSessionDir('/ws/.operations/dispatch/gone', '/ws/.operations/dispatch', throwing)).toBe(true);
+  });
+});
+
 describe('tryResumeRoundFix', () => {
   const base = {
     root: '/repo', fixSettings: SETTINGS, wrapFix: false, loadLadder: () => LADDER, listAgentsAll: () => [],
-    postNotice: () => false, readHistoryInputs: () => null,
+    postNotice: () => false, readHistoryInputs: () => null, scratchRoot: '/scratch', realpath: (p) => p,
   };
+  it('a prior session whose listing cwd is a lane checkout is never resumed there (cold start, no trigger spawned)', () => {
+    const resume = vi.fn();
+    const inLane = { ...prior, cwd: '/lanes/we/lane-4' };
+    const r = tryResumeRoundFix(planned(), { ...base, readInputs: () => ({ prior: inLane, job, transcript: true, lane: freeLane, base: { rebased: false } }), resume });
+    expect(r.resumed).toBe(false);
+    expect(r.resumeAttempt).toMatchObject({ attempted: false, refused: 'prior-cwd-not-scratch' });
+    expect(resume).not.toHaveBeenCalled();
+  });
+  it('the default scratch root is the dispatcher\'s own, and resumeOptions cannot move the trigger cwd', () => {
+    const resume = vi.fn(() => ({ resumed: true, result: { sessionId: SID } }));
+    const root = '/ws/webeverything';
+    const scratch = dispatchScratchRoot({ root });
+    const inScratch = { ...prior, cwd: join(scratch, 'abc-123') };
+    const { scratchRoot: _omit, ...noRoot } = base;
+    tryResumeRoundFix(planned(), {
+      ...noRoot, root, readInputs: () => ({ prior: inScratch, job, transcript: true, lane: freeLane, base: { rebased: false } }), resume,
+      resumeOptions: { sessionCwdFor: () => '/lanes/we/lane-4' },
+    });
+    const [, opts] = resume.mock.calls[0];
+    expect(opts.sessionCwdFor()).toBe(join(scratch, 'abc-123'));
+    expect(isScratchSessionDir(opts.sessionCwdFor(), scratch)).toBe(true);
+  });
   it('chosen: resumes the recorded session with the round prompt, no cold start', () => {
     const resume = vi.fn(() => ({ resumed: true, result: { sessionId: SID, pr: 77, lane: null, resumed: true } }));
     const r = tryResumeRoundFix(planned(), { ...base, readInputs: () => ({ prior, job, transcript: true, lane: freeLane, base: { rebased: false } }), resume });
@@ -266,5 +378,41 @@ describe('runReconcileFixDispatch — the round resume runs before the lane pop'
     const { dispatchCalls, result } = run(() => { throw new Error('listing failed'); });
     expect(dispatchCalls).toHaveLength(1);
     expect(result.refusals).toEqual([]);
+  });
+});
+
+describe('replayFixLaunch / formatReplay — the read-only replay of the next fix launch', () => {
+  const view = (o = {}) => JSON.stringify({ number: 4757, headRefName: 'lane/fixer-resume-ladder', headRefOid: HEAD, baseRefName: 'lane/b', labels: [{ name: 'review:changes' }], state: 'OPEN', ...o });
+  const exec = (o) => (cmd, args) => {
+    expect(args.slice(0, 2)).toEqual(['pr', 'view']);
+    return view(o);
+  };
+  it('a given round: stronger-model route from round 3, and a resume decision passed through dry-run', () => {
+    const resumeRound = vi.fn(() => ({ resumed: false, dryRun: true, decision: { resume: true, sessionId: SID, lane: { lane: 4, path: '/lanes/we/lane-4', held: 'free' } } }));
+    const readComments = vi.fn();
+    const r = replayFixLaunch({ pr: 4757, round: 6, exec: exec(), readComments, fixSettings: SETTINGS, resumeRound, loadLadder: () => LADDER });
+    expect(readComments).not.toHaveBeenCalled();
+    expect(resumeRound).toHaveBeenCalledWith(expect.objectContaining({ pr: 4757, attempts: 5, baseRefName: 'lane/b', headRefOid: HEAD }), expect.objectContaining({ dryRun: true }));
+    expect(r).toMatchObject({ pr: 4757, round: 6, attempts: 5, roundOverride: true, route: { rung: 'stronger-model', cliModel: 'opus', fromRound: 3 } });
+    expect(r.launch).toEqual({ mode: 'resume', sessionId: SID, lane: 4, lanePath: '/lanes/we/lane-4', held: 'free' });
+    const text = formatReplay(r);
+    expect(text).toContain('next fix would be round 6 (round given)');
+    expect(text).toContain('stronger-model route — claude-opus-5 (--model opus), from round 3');
+    expect(text).toContain(`resume ${SID} — no cold start; checkout: re-take its untouched lane-4 (--no-reset)`);
+    expect(text).toContain('dry run: nothing claimed, posted, spawned or resumed');
+  });
+  it('no round given: counted from the thread; a declined resume replays as a cold start with its reason', () => {
+    const resumeRound = () => ({ resumed: false, decision: { resume: false, reason: 'base-unknown', why: 'gh down' } });
+    const r = replayFixLaunch({ pr: 4757, exec: exec({ labels: [] }), readComments: () => [], fixSettings: SETTINGS, resumeRound, loadLadder: () => LADDER });
+    expect(r).toMatchObject({ round: 1, attempts: 0, roundOverride: false, route: { rung: 'ordinary', why: 'round 1 < fix.strongerModelFromRound=3' } });
+    expect(r.launch).toEqual({ mode: 'cold-start', reason: 'base-unknown', why: 'gh down' });
+    expect(formatReplay(r)).toContain('cold start with the round-history brief — base-unknown: gh down');
+    expect(formatReplay(r)).toContain('(0 round(s) spent)');
+  });
+  it('a conflict round stays on the ordinary route; a taken lane replays as a fresh acquire', () => {
+    const resumeRound = () => ({ resumed: false, decision: { resume: true, sessionId: SID, lane: { lane: 5, held: 'taken' } } });
+    const r = replayFixLaunch({ pr: 4757, round: 4, exec: exec({ labels: [{ name: 'merge-status:conflicting' }] }), readComments: () => [], fixSettings: SETTINGS, resumeRound, loadLadder: () => LADDER });
+    expect(r.route).toMatchObject({ rung: 'ordinary', why: 'a conflict round stays on the ordinary route' });
+    expect(formatReplay(r)).toContain('its lane-5 was reused since, so a fresh lane at the PR ref');
   });
 });

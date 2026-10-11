@@ -30,7 +30,7 @@
 import { execFileSync } from 'node:child_process';
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { isLeaseStale, LEASE_FILENAME } from '../lib/lane-lease.mjs';
 import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 
@@ -92,8 +92,11 @@ export function latestSessionRow(agentsAll, slug) {
  * @param {?object} o.lane            {@link findSessionLane}'s answer (`{ lane, path, held, head, sessionHead }`), null when none
  * @param {?object} o.base            `{ rebased: boolean|null }`
  * @param {?string} [o.desiredModel]  the `--model` this round must run on (null = the ordinary fix route: any)
+ * @param {?string} [o.scratchRoot]   the dispatch scratch root (`dispatch-lane-io.mjs#dispatchScratchRoot`): the
+ *   resume trigger starts in the previous session's cwd, so that cwd must be one of its direct children
+ * @param {(p:string)=>string} [o.realpath] resolves symlinks (identity by default; the IO caller passes the real one)
  */
-export function planRoundResume({ planned, settings, prior, job, transcript, lane, base, desiredModel = null } = {}) {
+export function planRoundResume({ planned, settings, prior, job, transcript, lane, base, desiredModel = null, scratchRoot = null, realpath = (p) => p } = {}) {
   const no = (reason, why) => ({ resume: false, reason, why });
   if (settings?.resumeAcrossRounds === 'off') return no('setting-off', 'fix.resumeAcrossRounds is off');
   const round = roundOf(planned);
@@ -108,6 +111,9 @@ export function planRoundResume({ planned, settings, prior, job, transcript, lan
   if (!job) return no('job-record-gone', `no job record for ${prior.id ?? prior.sessionId}`);
   if (job.template && job.template !== 'bg') return no('not-a-bg-session', `job template ${job.template}`);
   if (!transcript) return no('transcript-gone', `the transcript of ${prior.sessionId} is gone`);
+  if (!isScratchSessionDir(prior.cwd, scratchRoot, realpath)) {
+    return no('prior-cwd-not-scratch', `the earlier session's cwd is not a dispatch scratch directory (a lane checkout would load its project settings and hooks, #4174)`);
+  }
   const had = jobModel(job);
   if (desiredModel && had !== desiredModel) {
     return no('model-escalated', `this round runs on ${desiredModel}; the earlier session ran on ${had ?? 'the default route'}`);
@@ -121,6 +127,20 @@ export function planRoundResume({ planned, settings, prior, job, transcript, lan
   if (base?.rebased === true) return no('base-rebased', `the base branch ${planned?.baseRefName ?? ''} was rewritten under the PR`);
   if (base?.rebased !== false) return no('base-unknown', `could not prove the base was not rebased${base?.why ? ` (${base.why})` : ''}`);
   return { resume: true, sessionId: prior.sessionId, id: prior.id ?? null, lane, round };
+}
+
+/**
+ * PURE (given `realpath`): is `cwd` a direct child of the dispatch scratch root, named like a dispatch id? The round
+ * resume starts its `claude --bg --resume` trigger in the previous session's listing cwd (where its transcript is
+ * filed), and that cwd is trusted on the way in; a cwd anywhere else (a lane checkout the session `cd`'d into, a
+ * sibling `dispatch-x`, `..`) is refused, never launched in. A path that cannot be resolved compares as given.
+ */
+export function isScratchSessionDir(cwd, scratchRoot, realpath = (p) => p) {
+  if (typeof cwd !== 'string' || !cwd || typeof scratchRoot !== 'string' || !scratchRoot) return false;
+  if (!isAbsolute(cwd) || !isAbsolute(scratchRoot)) return false;
+  const real = (p) => { try { return realpath(p) || p; } catch { return p; } };
+  const rel = relative(real(resolve(scratchRoot)), real(resolve(cwd)));
+  return /^[0-9a-zA-Z][0-9a-zA-Z_-]{0,79}$/.test(rel);
 }
 
 /**
@@ -280,12 +300,17 @@ export function baseRebasedUnder({ baseRefName, firstParent, repoSlug, defaultBr
   }
 }
 
-/** The parent of the PR's first own commit (`gh pr view --json commits`), or null. */
+/**
+ * The parent of the PR's first own commit, or null. Read from the REST pull-commits list (oldest first), whose
+ * entries carry `parents`; `gh pr view --json commits` does not (its commits have only oid, dates, authors and
+ * message), so a parent read there is always empty. Parsed here, not with `--jq`, so a test can feed the real payload.
+ */
 export function prFirstParent({ pr, repoSlug, exec }) {
+  if (!Number.isSafeInteger(Number(pr)) || Number(pr) <= 0) return null;
   try {
-    const out = exec('gh', ['pr', 'view', String(pr), '--repo', repoSlug, '--json', 'commits', '--jq', '.commits[0].parents[0].oid'],
+    const out = exec('gh', ['api', `repos/${repoSlug}/pulls/${Number(pr)}/commits?per_page=1`],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 });
-    const sha = String(out ?? '').trim();
+    const sha = String(JSON.parse(String(out ?? ''))?.[0]?.parents?.[0]?.sha ?? '').trim();
     return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
   } catch { return null; }
 }

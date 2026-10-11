@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveFixSettings, planTakeover, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
-  launchProvedNotStarted,
+  launchProvedNotStarted, takeoverReviewCap,
   FIX_SETTINGS_FILE,
 } from '../fix-takeover.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -250,6 +250,18 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
     expect(takeoverMarkers([marker(HEAD), marker(other), voided(HEAD)]).map((m) => m.head)).toEqual([other]);
     // a void on its own is not a start marker
     expect(takeoverMarkers([voided(HEAD)])).toEqual([]);
+  });
+
+  it('a void cancels only a preceding start and preserves the retry launch count', () => {
+    const startAt = (attempts) => ({ author: BOT, createdAt: '2026-10-10T00:00:00Z', body: takeoverMarkerBody({ pr: 7, head: HEAD, attempts, cap: 5, rung: { id: 'stronger-model' } }) });
+    // the launch at 5 failed and was voided; the retry launched at 6 and ran: its count is what the review is owed at
+    const thread = [startAt(5), voided(HEAD), startAt(6)];
+    expect(takeoverMarkers(thread)).toMatchObject([{ head: HEAD, attempts: 6 }]);
+    expect(takeoverReviewCap(thread, 5)).toBe(7);
+    // a void posted before any start cancels nothing that comes after it
+    expect(takeoverMarkers([voided(HEAD), startAt(6)])).toMatchObject([{ attempts: 6 }]);
+    // a second void after a single start has nothing left to cancel, and does not reach forward to a later start
+    expect(takeoverMarkers([startAt(5), voided(HEAD), voided(HEAD), startAt(6)])).toMatchObject([{ attempts: 6 }]);
   });
 });
 

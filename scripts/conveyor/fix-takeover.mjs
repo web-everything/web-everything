@@ -136,20 +136,27 @@ export function takeoverVoidCount(comments) {
 
 /**
  * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
- * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing,
- * and only the first {@link TAKEOVER_MAX_VOIDS} voids on a PR are honoured.
+ * marker for the same head cancels the latest start marker posted BEFORE it (that session never launched); an
+ * unmatched void, or one before any start, cancels nothing, and only the first {@link TAKEOVER_MAX_VOIDS} voids on a
+ * PR are honoured.
  */
 export function takeoverMarkers(comments) {
-  const trusted = trustedBodies(comments);
-  const starts = trusted
-    .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null, attempts: markerAttempts(c.body) }))
-    .filter((m) => m.head !== undefined);
-  const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined)
-    .slice(0, TAKEOVER_MAX_VOIDS);
-  for (const h of voids) {
-    // Cancel the latest start for this head (a void with an `unknown` head cancels only an `unknown` start).
-    const at = starts.map((m, i) => ({ m, i })).reverse().find(({ m }) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
-    if (at) starts.splice(at.i, 1);
+  // One pass in thread order (GitHub lists comments oldest first): a void is posted right after the launch it voids
+  // failed, so it cancels the latest start seen BEFORE it, never a later retry's start (whose launch count is the one
+  // the review allowance must keep). A void with no earlier start cancels nothing.
+  const starts = [];
+  let voids = 0;
+  for (const c of trustedBodies(comments)) {
+    const head = markerHead(c.body, FIX_TAKEOVER_MARKER);
+    if (head !== undefined) { starts.push({ head, at: c.createdAt ?? null, attempts: markerAttempts(c.body) }); continue; }
+    const h = markerHead(c.body, FIX_TAKEOVER_VOID_MARKER);
+    if (h === undefined || voids >= TAKEOVER_MAX_VOIDS) continue;
+    voids += 1;
+    // The latest earlier start for this head (a void with an `unknown` head cancels only an `unknown` start).
+    for (let i = starts.length - 1; i >= 0; i -= 1) {
+      const m = starts[i];
+      if (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)) { starts.splice(i, 1); break; }
+    }
   }
   return starts;
 }
