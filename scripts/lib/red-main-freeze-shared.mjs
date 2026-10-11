@@ -41,10 +41,12 @@ export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 export const PUBLISH_ATTEMPTS = 4;
 /** Per-git-call ceiling: a hung fetch/push FAILS (writer: reported + exit 1; reader: `{error}`, fail closed). */
 export const GIT_TIMEOUT_MS = 20_000;
+/** Captured git output cap: the freeze doc is a few hundred bytes; anything near this is not our file (fail). */
+const GIT_MAX_BUFFER = 4 * 1024 * 1024;
 
 /** The transport's git runner, with a hard timeout (the transport's own default has none). */
 export function timedGit(timeoutMs = GIT_TIMEOUT_MS) {
-  return (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGTERM', ...opts }); // SIGTERM, not SIGKILL: git then removes its ref/packed-refs locks, so a timeout never wedges the next run
+  return (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER, timeout: timeoutMs, killSignal: 'SIGTERM', ...opts }); // SIGTERM, not SIGKILL: git then removes its ref/packed-refs locks, so a timeout never wedges the next run
 }
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
