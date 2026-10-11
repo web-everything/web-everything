@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup, dispatchedRunState, killAdoptedGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -1251,6 +1251,23 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
     // A probe that cannot answer (EPERM): fail closed, no kill.
     expect(killOrphanGroup(703, { kill: (pid, sig) => { if (sig === 0 && pid > 0) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); return true; } })).toBe(false);
     expect(killOrphanGroup(1)).toBe(false);
+  });
+
+  it('PR 4764 round 9: dispatchedRunState re-proves an adopted pid by argv — ours, gone, other, or unknown (never guessed)', () => {
+    expect(dispatchedRunState(700, 'r1', () => 'node /x/scripts/verify-lane.mjs --repo=/l --json --run-id=r1')).toBe('ours');
+    expect(dispatchedRunState(700, 'r1', () => 'node /x/scripts/verify-lane.mjs --repo=/l --json --run-id=r2')).toBe('other');
+    expect(dispatchedRunState(700, 'r1', () => '/usr/sbin/cron')).toBe('other');
+    expect(dispatchedRunState(700, 'r1', () => { throw Object.assign(new Error('ps: exit 1'), { status: 1 }); })).toBe('gone');
+    expect(dispatchedRunState(700, 'r1', () => { throw Object.assign(new Error('timeout'), { code: 'timeout' }); })).toBe('unknown');
+    expect(dispatchedRunState(1, 'r1', () => 'verify-lane.mjs --run-id=r1')).toBe('unknown');
+    // The kill only follows fresh proof.
+    const calls = [];
+    const kill = (p, s) => { calls.push([p, s]); return true; };
+    expect(killAdoptedGroup({ pid: 701, runId: 'r' }, { kill, identify: () => 'unknown' })).toBe(false);
+    expect(killAdoptedGroup({ pid: 702, runId: 'r' }, { kill, identify: () => 'other' })).toBe(false); // that pid exists: not ours
+    expect(calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    expect(killAdoptedGroup({ pid: 703, runId: 'r' }, { kill, identify: () => 'ours' })).toBe(true);
+    expect(calls).toContainEqual([-703, 'SIGKILL']);
   });
 
   it('PR 4764 round 8: a superseded in-process entry whose leader settled is killed only as an orphan group, never by a reused pid', async () => {

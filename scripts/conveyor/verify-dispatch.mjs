@@ -125,7 +125,7 @@
  * lets #3878's standalone `we:skills-src/conveyor/verify-daemon.mjs` tick it directly. `main()` below is now a
  * thin CLI shell over it.
  */
-import { readGit } from '../lib/proc-read.mjs';
+import { readGit, execRead } from '../lib/proc-read.mjs';
 import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync, openSync, closeSync, readSync } from 'node:fs';
 import { StringDecoder } from 'node:string_decoder';
 import { spawn } from 'node:child_process';
@@ -572,6 +572,33 @@ export function killOrphanGroup(pid, { kill = process.kill.bind(process) } = {})
 }
 
 /**
+ * Is `pid` still the exact dispatched gate leader of run `runId` — re-proven right now, by its argv? For a pid this
+ * process did not spawn (an ADOPTED run: init reaps it the moment it exits, so its pid may be handed out again at any
+ * time). `'ours'` (verify-lane carrying `--run-id=<runId>`), `'gone'` (no such process), `'other'` (a different
+ * process now has that pid), or `'unknown'` (ps did not answer) — and every caller kills nothing on `'unknown'`.
+ */
+export function dispatchedRunState(pid, runId, readCommand = (p) => execRead('ps', ['-ww', '-o', 'command=', '-p', String(p)],
+  { timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'] })) {
+  if (!Number.isInteger(pid) || pid <= 1) return 'unknown';
+  let command;
+  try { command = String(readCommand(pid) ?? ''); } catch (e) { return e?.status === 1 ? 'gone' : 'unknown'; }
+  if (!command.trim()) return 'gone';
+  return command.includes('verify-lane.mjs') && command.includes(`--run-id=${runId}`) ? 'ours' : 'other';
+}
+
+/**
+ * SIGKILL an ADOPTED run's group only on fresh proof it is still that run: `'ours'` kills its group; a leader that is
+ * gone (or whose pid now belongs to another process) falls to {@link killOrphanGroup}; `'unknown'` kills nothing.
+ * @returns {boolean} whether a kill was sent
+ */
+export function killAdoptedGroup({ pid, runId }, { kill = process.kill.bind(process), identify = dispatchedRunState } = {}) {
+  const who = identify(pid, runId);
+  if (who === 'ours') { try { kill(-pid, 'SIGKILL'); return true; } catch { return false; } }
+  if (who === 'gone' || who === 'other') return killOrphanGroup(pid, { kill });
+  return false;
+}
+
+/**
  * Run ONE lane's gate to settlement: spawn `verify-lane.mjs` under both ceilings ({@link spawnGateBounded}) and,
  * when the run was killed (a ceiling, a signal), stamp the infrastructure failure on the still-owned marker
  * ({@link recordKilledVerification}). Resolves on a clean exit; rejects with the spawn error otherwise (exit 2 =
@@ -706,10 +733,13 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
             // A settled leader's pid may already belong to another process: its group is ours only while that pid
             // exists nowhere (a pid is never handed out while a live group carries it).
             else if (entry.leaderSettled) killed = killOrphanGroup(entry.pid);
+            // An adopted run is not our child: its pid is re-proven to be that run right now, never trusted from adoption.
+            else if (entry.adopted) killed = killAdoptedGroup(entry);
             else if (entry.pid > 1) process.kill(-entry.pid, 'SIGKILL');
           } catch {}
           log(`  ✂ ${pool}/lane-${lane}: in-flight run ${String(entry.runId).slice(0, 8)} superseded by a newer request — ${killed
-            ? 'killed' : `gate job ${entry.jobId} not signalled (its gate is not proven alive right now)`}`);
+            ? 'killed' : entry.jobId ? `gate job ${entry.jobId} not signalled (its gate is not proven alive right now)`
+              : `pid ${entry.pid} not signalled (not proven to be that run right now)`}`);
           superseded.push({ pool, lane, runId: entry.runId });
         }
         continue;

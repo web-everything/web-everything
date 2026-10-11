@@ -869,7 +869,7 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
       ['fresh', { pool: 'p', lane: 3, runId: 'r3', pid: 33, startedMs: 9_000, adopted: true }],
     ]);
     const { orphaned } = reconcileInFlight(inFlight, { isAlive: (pid) => pid !== 11, groupAlive: (p) => !killed.has(p), killGroup,
-      nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log });
+      nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log, identify: () => 'ours' });
     expect(orphaned.map(o => o.reason)).toEqual(['pid-gone', 'adopted-ceiling']);
     expect(settleKilled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'r2' }), 5_000);
     expect(killGroup).toHaveBeenCalledWith(-22);
@@ -882,7 +882,8 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     const killGroup = vi.fn();
     let alive = true;
     const inFlight = new Map([['hung', { pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true }]]);
-    const opts = { isAlive: () => alive, groupAlive: () => true, killGroup, nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log: () => {} };
+    const opts = { isAlive: () => alive, groupAlive: () => true, killGroup, nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log: () => {},
+      identify: () => 'ours' };
     reconcileInFlight(inFlight, opts);
     reconcileInFlight(inFlight, opts);
     expect(inFlight.has('hung')).toBe(true);
@@ -892,6 +893,40 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     const { orphaned } = reconcileInFlight(inFlight, { ...opts, groupAlive: () => false });
     expect(inFlight.size).toBe(0);
     expect(orphaned).toEqual([]); // already reported when the ceiling killed it
+  });
+
+  it('PR 4764 round 9: an adopted pid is re-proven by argv every tick — a reused pid is released unsignalled, a ps that cannot answer kills nothing', () => {
+    const entry = () => ({ pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true });
+    const killGroup = vi.fn(); const settleKilled = vi.fn(); const log = vi.fn();
+    const base = { isAlive: () => true, groupAlive: () => true, killGroup, nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log };
+    // Past its ceiling, but pid 22 now belongs to another process: released, never killed, never settled as ours.
+    const reused = new Map([['a', entry()]]);
+    reconcileInFlight(reused, { ...base, identify: () => 'other' });
+    expect(reused.size).toBe(0);
+    expect(killGroup).not.toHaveBeenCalled();
+    expect(settleKilled).not.toHaveBeenCalled();
+    expect(log.mock.calls.flat().join('\n')).toMatch(/now belongs to another process\) — released, nothing signalled/);
+    // ps did not answer: held, nothing signalled.
+    const unknown = new Map([['b', entry()]]);
+    reconcileInFlight(unknown, { ...base, identify: () => 'unknown' });
+    expect(unknown.size).toBe(1);
+    expect(killGroup).not.toHaveBeenCalled();
+    // A ceiling-killed adopted run whose pid is later reused: the per-tick retry kill stops.
+    const retried = new Map([['c', { ...entry(), ceilingKilled: true }]]);
+    reconcileInFlight(retried, { ...base, identify: () => 'other' });
+    expect(killGroup).not.toHaveBeenCalled();
+    expect(retried.size).toBe(0);
+  });
+
+  it('PR 4764 round 9: killInFlight and the dispatcher re-prove an adopted pid before signalling it', () => {
+    const calls = [];
+    const kill = (p, s) => { calls.push([p, s]); return true; };
+    killInFlight(new Map([['a', { pid: 22, runId: 'r2', adopted: true }]]), kill, { identify: () => 'other' });
+    expect(calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]); // reused pid (it exists): no kill
+    killInFlight(new Map([['a', { pid: 23, runId: 'r3', adopted: true }]]), kill, { identify: () => 'unknown' });
+    expect(calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    killInFlight(new Map([['a', { pid: 24, runId: 'r4', adopted: true }]]), kill, { identify: () => 'ours' });
+    expect(calls).toContainEqual([-24, 'SIGKILL']);
   });
 });
 

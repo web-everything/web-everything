@@ -68,7 +68,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runVerifyDispatch, recordKilledVerification, killOrphanGroup } from '../../scripts/conveyor/verify-dispatch.mjs';
+import { runVerifyDispatch, recordKilledVerification, killOrphanGroup, killAdoptedGroup, dispatchedRunState } from '../../scripts/conveyor/verify-dispatch.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
@@ -268,7 +268,7 @@ export function processGroupAlive(pid) {
 export function reconcileInFlight(inFlight, {
   isAlive = pidAlive, groupAlive = processGroupAlive, nowMs = Date.now(), spawnGraceMs = 120_000,
   killGroup = (group) => process.kill(group, 'SIGKILL'), log = console.error,
-  adoptedCeilingMs = DEFAULT_ADOPTED_CEILING_MS, settleKilled = settleKilledAdopted,
+  adoptedCeilingMs = DEFAULT_ADOPTED_CEILING_MS, settleKilled = settleKilledAdopted, identify = dispatchedRunState,
 } = {}) {
   const orphaned = [];
   for (const [dir, entry] of inFlight) {
@@ -290,6 +290,21 @@ export function reconcileInFlight(inFlight, {
         log(`verify-daemon: ${pool}/lane-${lane} run ${String(runId).slice(0, 8)}: its settled leader's process group is gone (pid ${pid} since reused) — released`);
         continue;
       }
+    }
+    // PR 4764 round 9 — an ADOPTED leader is not our child: init reaps it the moment it exits, so a live pid proves
+    // nothing. It is re-proven to be that run (argv) before anything below may signal it. Another process on that pid
+    // means ours exited and its group is gone (a pid is never reused while a live group carries it): released, no kill.
+    // A check that cannot answer holds the lane and kills nothing this tick.
+    if (entry.adopted && !entry.leaderSettled && pid > 0) {
+      let alive = true;
+      try { alive = isAlive(pid); } catch {}
+      const who = alive ? identify(pid, runId) : 'gone';
+      if (who === 'other') {
+        inFlight.delete(dir);
+        log(`verify-daemon: ${pool}/lane-${lane} adopted run ${String(runId).slice(0, 8)} finished (pid ${pid} now belongs to another process) — released, nothing signalled`);
+        continue;
+      }
+      if (who === 'unknown') continue;
     }
     if (entry.adopted && pid > 0 && !entry.ceilingKilled && isAlive(pid) && nowMs - startedMs > adoptedCeilingMs) {
       try { if (groupAlive(pid)) killGroup(-pid); } catch {}
@@ -488,11 +503,13 @@ export function adoptInFlight(inFlight, { path = VERIFY_DAEMON_INFLIGHT_FILE, is
  *  and every loop exit, so no path can leave a gate running under a daemon that no longer holds the lease
  *  (a successor would then double-dispatch the same lane). An entry without a pid has not spawned yet; a pid
  *  that already exited throws and is skipped. `kill` is injectable for tests. */
-export function killInFlight(inFlight, kill = process.kill.bind(process)) {
-  for (const { pid, leaderSettled } of inFlight.values()) {
+export function killInFlight(inFlight, kill = process.kill.bind(process), { identify = dispatchedRunState } = {}) {
+  for (const { pid, runId, leaderSettled, adopted } of inFlight.values()) {
     // PR 4764 — a settled leader's pid may already belong to an unrelated process: its group is killed only while that
     // pid exists nowhere and the group still has members (the same rule as reconcile and the supersede path).
     if (leaderSettled) { killOrphanGroup(pid, { kill }); continue; }
+    // An adopted run is not our child (its pid can be reused the moment it exits): re-proven by argv before the kill.
+    if (adopted) { killAdoptedGroup({ pid, runId }, { kill, identify }); continue; }
     try { if (pid > 0) kill(-pid, 'SIGKILL'); } catch {}
   }
 }

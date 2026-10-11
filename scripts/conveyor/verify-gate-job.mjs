@@ -636,6 +636,14 @@ export function createVerifyGateJobs({
         survivorLogged.delete(r.id);
         startLogged.delete(r.id);
       }
+      // A gone-proof only ever describes its job's sidecar: once that sidecar is gone (pruned — a crash between the two
+      // removals above — or removed by hand), the proof applies to nothing and is removed too.
+      try {
+        for (const n of readdirSync(store.dir)) {
+          const at = n.indexOf(GONE_SUFFIX);
+          if (at > 0 && !existsSync(gatePath(store.dir, n.slice(0, at)))) rmSync(join(store.dir, n), { force: true });
+        }
+      } catch {}
       try { writeJson(consumedPath, [...consumed]); } catch {}
       const referenced = records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []);
       try { evict({ jobsDir: store.dir, referenced }); } catch (e) { log(`verify-daemon: snapshot eviction failed: ${e.message}`); }
@@ -909,20 +917,21 @@ export function releaseLaneByOperator({ jobsDir, dir, who = 'operator', deps = {
   }
   const claim = cur.seq > 0 && !cur.released && releaseLaneClaim(jobsDir, cur, { by: who, why: 'release-lane' }) ? cur.seq : null;
   const setAside = [];
+  const stillHeld = [];
   for (const { id, gate, state } of states) {
     if (state !== 'unknown') continue;
     // Released by proof file, keyed by the exact record the operator judged ({@link goneProofPath}) — the sidecar is
     // never rewritten: a supervisor relaunched since this read records a new gate there, which this release never touches.
     if (gate?.unreadable) {
       // Keyed by the exact bytes judged unreadable; a file that could not be read at all has none, so it stays held.
-      if (!gate.textHash) continue;
+      if (!gate.textHash) { stillHeld.push({ id, why: `its gate record cannot be read at all (${gate.unreadable}) — fix the file's access, then retry` }); continue; }
       try { createExclusive(join(jobsDir, `${id}${GONE_SUFFIX}raw-${gate.textHash}`), { goneAt: new Date().toISOString(), releasedBy: who }); } catch { continue; }
     } else {
       try { createExclusive(goneProofPath(jobsDir, id, gate), { goneAt: new Date().toISOString(), releasedBy: who }); } catch { continue; }
     }
     setAside.push(id);
   }
-  return { claim, setAside };
+  return { claim, setAside, stillHeld };
 }
 
 /**
@@ -968,7 +977,9 @@ function releaseLaneMain(argv) {
   const out = releaseLaneByOperator({ jobsDir: arg('jobs-dir') || verifyJobsDir(), dir, who: `operator (pid ${process.pid})` });
   process.stdout.write(`${JSON.stringify({ dir, ...out })}\n`);
   if (out.refused) { process.exitCode = 1; return; }
-  if (out.claim == null && !out.setAside.length) process.stderr.write(`release-lane: nothing held on ${JSON.stringify(dir)} (no unreleased claim, no unknown gate record)\n`);
+  for (const h of out.stillHeld || []) process.stderr.write(`release-lane: job ${h.id} still holds ${JSON.stringify(dir)} — ${h.why}\n`);
+  if (out.stillHeld?.length) process.exitCode = 1;
+  if (out.claim == null && !out.setAside.length && !out.stillHeld?.length) process.stderr.write(`release-lane: nothing held on ${JSON.stringify(dir)} (no unreleased claim, no unknown gate record)\n`);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === SELF && existsSync(SELF) && process.argv[2] === 'release-lane') {

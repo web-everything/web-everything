@@ -1043,6 +1043,26 @@ describe('round 8 self-review: a leftover process group is the gate\'s, and no d
     expect(gateState(gateJob.readGate(dir, q.id))).toBe('unknown');
   });
 
+  it('PR 4764 round 9 — a gone-proof whose sidecar is gone is swept; one whose sidecar exists is kept', async () => {
+    writeFileSync(gatePath(dir, 'kept'), JSON.stringify({ pid: 5200, handle: 'h:5200:s', runId: 'r' }));
+    gateJob.markGone(dir, 'kept', gateJob.readGate(dir, 'kept'));
+    writeFileSync(join(dir, `orphan${gateJob.GONE_SUFFIX}abc`), '{}');
+    await mk().sync(new Map());
+    const { readdirSync } = await import('node:fs');
+    const names = readdirSync(dir);
+    expect(names.some((n) => n.startsWith(`kept${gateJob.GONE_SUFFIX}`))).toBe(true);
+    expect(names.some((n) => n.startsWith(`orphan${gateJob.GONE_SUFFIX}`))).toBe(false);
+  });
+
+  it('PR 4764 round 9 — release-lane reports a record it cannot read at all as still holding the lane', () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markFailed(r, { at: AT, reason: 'x' }));
+    mkdirSync(gatePath(dir, q.id)); // EISDIR: no bytes to key a release by
+    const out = gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps: { probe: () => 'dead' } });
+    expect(out.setAside).toEqual([]);
+    expect(out.stillHeld).toEqual([expect.objectContaining({ id: q.id, why: expect.stringMatching(/cannot be read at all/) })]);
+  });
+
   it('PR 4764 round 9 — a supervisor stopped after its gate leader exited kills only a leftover group, never a reused pid', () => {
     const exit = vi.fn();
     const calls = [];
