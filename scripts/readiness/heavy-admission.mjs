@@ -766,7 +766,7 @@ export function tryAcquireSlot({ lockRoot, cap, owner, nowMs, nowIso, pid = null
  * where an operator's fresh invocation is by definition a different process than whichever one is stuck.
  * @param {number|null} [pid]  defaults to `process.pid`; pass `null` for an owner-only manual release.
  */
-export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fastSlots = resolveSlotSpan(loadAdmissionPolicy({ env: process.env }).settings) - cap }) {
+export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
   const selfPid = Number.isInteger(pid) ? pid : null;
   let ownerOnlyFallback = null;
   // Card xkyw1x4 — also scan the fast-lane slots after the heavy ones (a short job may hold one). Scanning an
