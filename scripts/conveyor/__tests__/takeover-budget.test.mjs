@@ -2,7 +2,7 @@
 // findings; gate holds never trigger one. Live: #4708 needed a second, operator-approved takeover by hand.
 import { describe, it, expect } from 'vitest';
 import {
-  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight,
+  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight, openDefects, reviewRounds,
   notConvergingText, renderPreviousTakeover, OPERATOR_TAKEOVER_PREFIX, TAKEOVER_BUDGET_STANDARD_DEFAULT, isPausedReview,
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
@@ -277,6 +277,102 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
     expect(plain(T1, [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
     // The takeover head's own verdict then judges it as usual.
     expect(plain(T1, [...late, rearm(9), review(T1, 10, FOUR.slice(1))])).toMatchObject({ ok: true, n: 2 });
+  });
+  it('the review grant and the progress guard agree: a delayed old-head review after the push spends no grant (no stall)', () => {
+    const thread = [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FOUR)];
+    expect(takeoverReviewGrant({ pr: pr(T1, thread), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0 });
+    // The takeover head T1 is owed its review, dispatched now — not a silent `takeover-awaiting-review` forever.
+    expect(plan(pr(T1, thread, { labels: [{ name: 'review:changes' }] })).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
+  });
+  it('a manual takeover whose marker names the head it pushed (#4708) still earns a second takeover once judged', () => {
+    const thread = [...rounds5, operatorTakeover(7), marker(T1, 8), review(T1, 9, FOUR)];
+    expect(plain(T1, thread)).toMatchObject({ ok: true, n: 2 });
+  });
+  it('no parseable head before the takeover: the automatic marker\'s start head still marks a delayed review as old', () => {
+    const headless = [rearm(1), rearm(2), rearm(3), rearm(4), rearm(5), { ...review(R5, 6, FIVE), body: review(R5, 6, FIVE).body.replace(/Net basis:[^\n]*/, '') }];
+    // After the push, a delayed review of R5 judges nothing.
+    expect(plain(T1, [...headless, marker(R5, 7), rearm(8), review(R5, 9, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+    // No push yet and the PR still on R5: the one-per-head bound holds even though a verdict landed.
+    expect(plain(R5, [...headless, marker(R5, 7), review(R5, 8, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('a late old-head review after the takeover\'s own review neither hides it (no stall) nor merges into it', () => {
+    // P1: the takeover head T1 is reviewed, then a late review of R5 lands — T1's round still judges the takeover.
+    const p1 = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR), review(R5, 10, FIVE)];
+    expect(plain(T1, p1)).toMatchObject({ ok: true, n: 2, previous: { after: { count: 4 } } });
+    // P2: the late R5 review lands first; its findings do not merge into T1's round.
+    const p2 = [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FIVE), review(T1, 10, FOUR)];
+    expect(plain(T1, p2)).toMatchObject({ ok: true, n: 2, previous: { after: { count: 4 } } });
+  });
+  it('the open defects are the current head\'s round, never a late old-head round after it', () => {
+    const clean = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, [])];
+    const late = [...clean, review(R5, 10, FIVE)];
+    expect(openDefects(late, T1)).toMatchObject({ count: 0 });
+    // A late old-head review changes nothing: the plan matches the thread without it.
+    const strip = (r) => JSON.parse(JSON.stringify(r));
+    expect(strip(plain(T1, late))).toEqual(strip(plain(T1, clean)));
+    expect(planTakeover({ pr: pr(T1, late), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' }))
+      .toMatchObject({ ok: false, reason: 'review-cap-unjudged' });
+  });
+  it('an old-head review in the middle of the current head\'s round never splits it: each head keeps one round', () => {
+    const interleaved = [rearm(1), review(R5, 2, FIVE), rearm(7), review(T1, 8, FOUR), { ...review(R5, 8, [['src/z.mjs', 1, 'cosmetic']]), createdAt: at(8, 20) },
+      { ...review(T1, 8, [['src/d.mjs', 7, 'cosmetic']]), createdAt: at(8, 40) }];
+    expect(openDefects(interleaved, T1)).toMatchObject({ count: 4 });
+    const rounds = reviewRounds(interleaved);
+    expect(rounds.map((r) => [r.head, r.findings.length, r.stale])).toEqual([[R5.slice(0, 9), 5, false], [T1.slice(0, 9), 4, false], [R5.slice(0, 9), 1, true]]);
+    // In a takeover thread the takeover's round is judged whole (4 open, not the last fragment's 1).
+    const thread = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR), { ...review(R5, 9, FIVE), createdAt: at(9, 20) },
+      { ...review(T1, 9, [['src/d.mjs', 7, 'cosmetic']]), createdAt: at(9, 40) }];
+    expect(plain(T1, thread)).toMatchObject({ ok: true, previous: { after: { count: 4 } } });
+  });
+  it('a late re-review of older post-takeover code never outranks the fresh round that judges the takeover', () => {
+    const T3 = H('9');
+    const TWO = FOUR.slice(2);
+    const thread = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR), rearm(10), review(T3, 11, TWO), { ...review(T1, 11, SIX), createdAt: at(11, 30) }];
+    expect(plain(T3, thread)).toMatchObject({ ok: true, n: 2, previous: { reviewedHead: T3.slice(0, 9), after: { count: 2 } } });
+  });
+  it('a headless review never counts as the first review a manual takeover\'s push check compares against', () => {
+    const R6 = H('7');
+    const headless = { author: BOT, createdAt: at(6, 40), body: '🔁 review — changes requested\n\nRecorded by auto-policy\n\n### Findings\n\n**correctness/logic** (1)\n- `src/q.mjs:1` — bad' };
+    const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, headless, { ...review(R5, 6, FIVE), createdAt: at(6, 45) },
+      operatorTakeover(7), marker(R6, 8), review(R6, 9, FOUR)];
+    expect(plain(R6, thread)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('out-of-order reviews and a reset to an older head never wedge the current head\'s round', () => {
+    const R6 = H('7');
+    // R6 reviewed, then R5's first-ever review lands late; a rearm; R6 re-reviewed with one finding.
+    const late = [rearm(1), review(R6, 2, FOUR), review(R5, 3, FIVE), rearm(4), review(R6, 5, [['src/d.mjs', 7, 'cosmetic']])];
+    expect(openDefects(late, R6)).toMatchObject({ count: 1 });
+    expect(planTakeover({ pr: pr(R6, late), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' })).toMatchObject({ ok: true });
+    // R5, then R6, then the head reset back to R5 and re-reviewed: R5's latest round is current.
+    const reset = [rearm(1), review(R5, 2, FIVE), rearm(3), review(R6, 4, FOUR), rearm(5), review(R5, 6, [['src/d.mjs', 7, 'cosmetic']])];
+    expect(openDefects(reset, R5)).toMatchObject({ count: 1 });
+    expect(planTakeover({ pr: pr(R5, reset), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' })).toMatchObject({ ok: true });
+  });
+  it('a late old-head review before a manual takeover does not hide the push that made its start head unreviewed', () => {
+    const R6 = H('7');
+    const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, { ...review(R5, 6, FIVE), createdAt: at(6, 45) },
+      operatorTakeover(7), marker(R6, 8), review(R6, 9, FOUR)];
+    expect(plain(R6, thread)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('the review cap: a PR head no round names was never reviewed, whatever older round came last', () => {
+    const R6 = H('7');
+    const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, review(R5, 7, FOUR)];
+    expect(planTakeover({ pr: pr(R6, thread), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' }))
+      .toMatchObject({ ok: false, reason: 'review-cap-unjudged' });
+    // A head moved with no fixer-turn comment (a rebase) and no review of it: unjudged too.
+    expect(planTakeover({ pr: pr(R6, [...rounds5, review(R5, 7, FOUR)]), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' }))
+      .toMatchObject({ ok: false, reason: 'review-cap-unjudged' });
+  });
+  it('a manual takeover started on an unreviewed pushed head and never pushed is spent, judged or not', () => {
+    const R6 = H('7');
+    // A fixer pushed R6 at 06:30, after round 5's review of R5; the operator then took over on R6.
+    const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, operatorTakeover(7), marker(R6, 8), review(R6, 9, FOUR)];
+    expect(plain(R6, thread)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('a delayed review of an even older head (reviewed before the takeover) judges nothing either', () => {
+    const R4 = H('4');
+    const thread = [rearm(1), rearm(2), rearm(3), review(R4, 4, SIX), rearm(5), review(R5, 6, FIVE), marker(R5, 7), rearm(8), review(R4, 9, FOUR)];
+    expect(plain(T1, thread)).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
   });
   it('a judged takeover whose PR head is still the start head reads as never pushed', () => {
     // A verdict naming another head, but the PR never moved off the head the takeover started from.

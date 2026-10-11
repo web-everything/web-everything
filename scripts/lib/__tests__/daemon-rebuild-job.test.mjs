@@ -21,7 +21,10 @@ import {
 import {
   resolveRebuildAsJob, rebuildCloneAsJob, rebuildChildArgs, parseRebuildChildOutput, REBUILD_JOB_KIND, RESULT_SUFFIX,
 } from '../daemon-rebuild/rebuild-job.mjs';
+import { readRebuildStarvation, writeRebuildStarvation } from '../daemon-rebuild/lease.mjs';
+import * as rebuildLease from '../daemon-rebuild/lease.mjs';
 import { createJobStore, enqueueJob } from '../daemon-jobs-runtime.mjs';
+import { acquireRead, releaseRead } from '../daemon-clone-lock.mjs';
 import { markSucceeded } from '../daemon-jobs.mjs';
 
 const tempDirs = [];
@@ -130,12 +133,14 @@ describe('the job records a passed build; the tick adopts it without re-smoking'
     expect(readReadyCandidate(cloneDir, env)?.adopt.finalSha).toBe(target);
     expect(readRebuildState(cloneDir, env).building ?? null).toBeNull();
 
+    writeRebuildStarvation(cloneDir, 3, env);
     const noSmoke = vi.fn(async () => PASS);
     const tick = await rebuildClone({
       root: cloneDir, env, runSmoke: noSmoke, prState: async () => null, lockOpts: LOCK_OPTS, adoptOnly: true, log: quietLog,
     });
     expect(noSmoke).not.toHaveBeenCalled();
     expect(tick.adopted).toBe(true);
+    expect(readRebuildStarvation(cloneDir, env)).toBe(0);
     expect(tick.reason).toBe('ready-adopted');
     expect(head(cloneDir)).toBe(target);
   });
@@ -144,14 +149,18 @@ describe('the job records a passed build; the tick adopts it without re-smoking'
     const { originDir, cloneDir, env } = makeFixture();
     const before = head(cloneDir);
     advanceMain(originDir, (dir) => writeFile(dir, 'd.txt', 'd\n'));
+    const stateOpts = { env: { WE_DAEMON_STATE_DIR: mktemp('we-rebuild-job-starve-') } };
+    writeRebuildStarvation(cloneDir, 3, stateOpts.env);
+    expect(readRebuildStarvation(cloneDir, stateOpts.env)).toBe(3);
     const runSmoke = vi.fn(async () => PASS);
     const r = await rebuildClone({
-      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, adoptOnly: true, log: quietLog,
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS, adoptOnly: true, stateOpts, log: quietLog,
     });
+    expect(readRebuildStarvation(cloneDir, stateOpts.env)).toBe(3);
     expect(runSmoke).not.toHaveBeenCalled();
     expect(r.reason).toBe('needs-build');
     expect(head(cloneDir)).toBe(before);
-    expect(readRebuildState(cloneDir, env).building ?? null).toBeNull();
+    expect(readRebuildState(cloneDir, { ...env, ...stateOpts.env }).building ?? null).toBeNull();
   });
 
   it('a candidate failing its smoke (last-good passing) records no ready candidate and never moves the clone', async () => {
@@ -238,5 +247,51 @@ describe('opt-in and child plumbing', () => {
     expect(parseRebuildChildOutput('noise\n{"reason":"x"}\n{"reason":"ready-recorded","readyRecorded":true}\n'))
       .toEqual({ reason: 'ready-recorded', readyRecorded: true });
     expect(parseRebuildChildOutput('no json')).toBeNull();
+  });
+});
+
+// live 2026-10-11 rebuild-job livelock.
+describe('detached rebuild lock wait', () => {
+  it.each([undefined, 42])('uses the job wait at prepare and finalize, with caller override %s', async (waitMs) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    advanceMain(originDir, (dir) => writeFile(dir, 'wait.txt', 'wait\n'));
+    const before = head(cloneDir);
+    let clock = Date.now();
+    const reader = { owner: 'sibling', lockRoot: env.WE_DAEMON_CLONE_LOCK_ROOT };
+    const startTick = () => expect(acquireRead(cloneDir, { ...reader, nowMs: clock }).ok).toBe(true);
+    startTick();
+    const waits = [];
+    const r = await rebuildClone({
+      root: cloneDir, env, readyOnly: true, log: quietLog,
+      now: () => clock,
+      sleep: async (ms) => { clock += ms; releaseRead(cloneDir, reader); },
+      lockOpts: {
+        pollMs: 1, ...(waitMs === undefined ? {} : { waitMs }),
+        onBlocked: ({ waitMs: actual }) => waits.push(actual),
+      },
+      runSmoke: async () => { startTick(); return PASS; },
+      prState: async () => null,
+    });
+    expect(waits).toEqual([waitMs ?? 900_000, waitMs ?? 900_000]);
+    expect(r.reason).toBe('ready-recorded');
+    expect(head(cloneDir)).toBe(before);
+  });
+
+  it('allows fifteen minutes for the job without changing foreground waits', () => {
+    expect(rebuildLease.REBUILD_JOB_LOCK_WAIT_ENV).toBe('WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS');
+    expect(rebuildLease.DEFAULT_REBUILD_JOB_LOCK_WAIT_MS).toBe(15 * 60_000);
+    expect(rebuildLease.rebuildLockWaitMs({ env: {}, readyOnly: true })).toBe(900_000);
+    expect(rebuildLease.rebuildLockWaitMs({ env: {} })).toBe(60_000);
+    expect(rebuildLease.rebuildLockWaitMs({ env: {}, starvedCount: 3 })).toBe(180_000);
+  });
+
+  it('honours positive overrides and never shortens the normal computed wait', () => {
+    const wait = (env) => rebuildLease.rebuildLockWaitMs({ env, readyOnly: true, starvedCount: 3 });
+    expect(wait({ WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS: '1200000' })).toBe(1_200_000);
+    expect(wait({ WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS: '1' })).toBe(180_000);
+    expect(wait({ WE_DAEMON_REBUILD_LOCK_WAIT_MS: '1500000' })).toBe(1_500_000);
+    for (const value of ['0', '-1', 'invalid']) {
+      expect(wait({ WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS: value })).toBe(900_000);
+    }
   });
 });

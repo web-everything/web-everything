@@ -65,3 +65,17 @@ it('persists delivery state outside a real checkout without dirtying it', async 
     expect(git(['status', '--porcelain'])).toBe('');
   });
 });
+
+it('keeps the ready rows of a partial queue read: exit 1 with incomplete JSON is not a total failure', () => {
+  const report = { ready: [{ repo: 'x/y', number: 1, title: 'ready' }], errors: ['x/z: 404'], incomplete: true };
+  const spawnSyncFn = vi.fn(() => ({ status: 1, stdout: JSON.stringify(report), stderr: 'ERROR x/z: 404' }));
+  expect(readQueue({ spawnSyncFn })).toEqual(report);
+});
+it.each([
+  { status: 1, stdout: JSON.stringify({ ready: [], errors: [] }), stderr: 'boom' },
+  { status: 1, stdout: 'not json', stderr: 'boom' },
+  { status: 2, stdout: JSON.stringify({ ready: [], incomplete: false }), stderr: 'boom' },
+  { status: null, error: Error('ETIMEDOUT'), stdout: JSON.stringify({ ready: [], incomplete: true }), stderr: 'boom' },
+])('still throws on a non-zero exit without incomplete:true JSON: %j', (result) => {
+  expect(() => readQueue({ spawnSyncFn: () => result })).toThrow(/boom|ETIMEDOUT/);
+});

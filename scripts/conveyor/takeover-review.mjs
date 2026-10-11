@@ -17,7 +17,7 @@
  * PURE: reads only the PR's own comment thread and head sha.
  */
 // Takeover budget — each takeover is an EPISODE (its signals with no verdict between them); the grant is per episode.
-import { takeoverEpisodes, OPERATOR_TAKEOVER_PREFIX, isPausedReview } from './takeover-budget.mjs';
+import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, OPERATOR_TAKEOVER_PREFIX, isPausedReview } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
 import { isReviewVerdictComment as isVerdict, verdictJudged } from './mechanical-round-cap.mjs';
@@ -29,8 +29,6 @@ import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
-/** A trusted fixer turn that pushed work (a re-arm, an advisory fix). */
-const isFixerTurn = (c) => /^🔧 conveyor fix —/.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c);
 /** A trusted escalation-ladder dispatch notice (`reconcile-fix-dispatch.mjs#postRulingNotice`): the system itself sent
  *  a fixer past the cap on a rung of the fixer-escalation ladder (live: #4689 round 6, rung 2, head 6e0d241df). */
 export const isEscalationDispatch = (c) => bodyOf(c).trimStart().startsWith(RULING_NOT_ADDRESSED_MARKER) && isTrustedMarkerAuthor(c);
@@ -42,8 +40,10 @@ export const isEscalationDispatch = (c) => bodyOf(c).trimStart().startsWith(RULI
 export function escalationDispatches(comments) {
   const list = Array.isArray(comments) ? comments : [];
   return [
-    ...takeoverEpisodes(list).map((e) => ({ at: e.end, via: 'takeover' })),
-    ...list.filter(isEscalationDispatch).map((c) => ({ at: timeOf(c), via: 'escalation-rung' })),
+    ...takeoverEpisodes(list).map((e) => ({ at: e.end, start: e.start, via: 'takeover',
+      // An automatic-only takeover's marker names the head it started from (takeover-budget.mjs#dispatchJudgeRule).
+      startHead: e.kinds.length === 1 && e.kinds[0] === 'marker' ? e.head ?? null : null })),
+    ...list.filter(isEscalationDispatch).map((c) => ({ at: timeOf(c), start: timeOf(c), via: 'escalation-rung', startHead: null })),
   ].filter((d) => Number.isFinite(d.at)).sort((a, b) => a.at - b.at);
 }
 
@@ -68,8 +68,10 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const dispatches = escalationDispatches(comments);
   if (!dispatches.length) return { ok: false, reason: 'no-takeover' };
   const latest = dispatches.at(-1);
-  const push = comments.filter(isFixerTurn).map(timeOf).filter((t) => Number.isFinite(t) && t > latest.at).sort((a, b) => a - b)[0];
-  const anchor = Number.isFinite(push) ? push : latest.at;
+  // The same rule the takeover budget's progress guard uses: a delayed review of the old code spends nothing, so the
+  // grant and the guard never disagree about whether the dispatch's own head was reviewed.
+  const rule = dispatchJudgeRule(comments, { start: latest.start, end: latest.at, startHead: latest.startHead });
+  const anchor = rule.anchor;
   const head = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reason: 'no-head' };
   // A review that only PAUSED on referrals awaiting a ruling neither reviews the head nor spends the grant: the
@@ -77,7 +79,7 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   // review paused PAUSED_REVIEW_LIMIT times has spent its grant.
   const verdicts = comments.filter((c) => isVerdict(c) && !isPausedReview(c));
   if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head) || verdictJudged(c, head))) return { ok: false, reason: 'head-already-reviewed' };
-  const used = verdicts.filter((c) => timeOf(c) > anchor).length;
+  const used = verdicts.filter((c) => rule.judges(timeOf(c), verdictHeads(c))).length;
   if (used >= allowance) return { ok: false, reason: 'takeover-review-spent', used, allowance };
   const paused = comments.filter((c) => isPausedReview(c) && timeOf(c) > anchor).length;
   if (paused >= PAUSED_REVIEW_LIMIT) return { ok: false, reason: 'takeover-review-spent', used, paused, allowance };
