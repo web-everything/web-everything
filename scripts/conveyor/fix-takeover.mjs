@@ -11,11 +11,14 @@
  *   - the setting is `person`.
  *
  * Settings (policy cascade, like `we:scripts/lib/red-main-hold.mjs`): env > `we:scripts/settings/fix.json` >
- * built-in. `fix.roundCapAction` person|takeover (built-in takeover), `fix.roundHistory` on|off (built-in on),
- * `fix.takeoverMaxPerPr` (built-in 1; 0 turns the takeover off). The file keeps them under a `fix` object, so the
- * merged settings view (`we:scripts/lib/settings-files.mjs`) carries the same `fix.*` paths the docs name.
+ * built-in. `fix.roundCapAction` person|takeover (built-in takeover), `fix.roundHistory` on|off (built-in on), and
+ * (card xrbu1bp, `we:scripts/conveyor/fix-resume.mjs`) `fix.resumeAcrossRounds` on|off (built-in on) and
+ * `fix.strongerModelFromRound` (built-in 3, 0 = off). The file keeps them under a `fix` object, so the merged settings
+ * view (`we:scripts/lib/settings-files.mjs`) carries the same `fix.*` paths the docs name.
  *
- * The planner half ({@link planTakeover}) is PURE; the marker post and the settings read are the only IO.
+ * How MANY takeovers a PR gets, and when a further one is owed (the budget, the progress guard, gate holds), lives in
+ * `we:scripts/conveyor/takeover-budget.mjs` (`fix.takeoverBudget`, default 2) — this module holds the marker, the
+ * rung and the brief section. The marker post and the settings read are the only IO.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -23,17 +26,21 @@ import { fileURLToPath } from 'node:url';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export const FIX_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'fix.json');
-export const FIX_SETTINGS_DEFAULTS = Object.freeze({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
+export const FIX_SETTINGS_DEFAULTS = Object.freeze({
+  roundCapAction: 'takeover', roundHistory: 'on',
+  // Card xrbu1bp — see `we:scripts/conveyor/fix-resume.mjs`.
+  resumeAcrossRounds: 'on', strongerModelFromRound: 3,
+});
 export const FIX_TAKEOVER_MARKER = '<!-- conveyor-fix-takeover';
 
 const ACTIONS = ['person', 'takeover'];
 const ONOFF = ['on', 'off'];
 
 /**
- * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, `WE_FIX_TAKEOVER_MAX_PER_PR`) > settings file > built-in.
+ * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, …) > settings file > built-in. (`fix.takeoverBudget` has its
+ * own four-layer cascade: `takeover-budget.mjs#resolveTakeoverBudget`.)
  * The file layer is its `fix` object (a flat top-level key is not a setting). Unknown values fall through to the
- * next layer, except `roundCapAction` and the takeover limit, which fail closed to `person` / 0 (see below). Never
- * throws.
+ * next layer, except `roundCapAction`, which fails closed to `person` (see below). Never throws.
  */
 export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
   let fromFile = {};
@@ -46,9 +53,10 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
     if (ok(f)) return { value: f, source: 'settings' };
     return { value: dflt, source: 'built-in' };
   };
-  // The two settings that can START a takeover fail CLOSED: the first layer that is present (a non-blank env var, or
-  // a file key that is not null) decides, and a present value that does not parse turns the takeover off (`person`,
-  // limit 0) instead of falling through to the built-in `takeover` / 1 — so a typo meant to stop it never enables it.
+  // The setting that can START a takeover fails CLOSED: the first layer that is present (a non-blank env var, or a
+  // file key that is not null) decides, and a present value that does not parse turns the takeover off (`person`)
+  // instead of falling through to the built-in `takeover` — so a typo meant to stop it never enables it. (The per-PR
+  // count, `fix.takeoverBudget`, fails closed the same way: `takeover-budget.mjs#resolveTakeoverBudget`.)
   // Types are checked, not stringified: `[3]`, `""` or `false` in the file is invalid, not 3 / absent / "false".
   const failClosed = (envVal, fileVal, parse, closed, dflt) => {
     if (typeof envVal === 'string' && envVal.trim() !== '') {
@@ -65,16 +73,18 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
     const s = typeof v === 'string' ? v.trim().toLowerCase() : null;
     return ACTIONS.includes(s) ? s : undefined;
   };
-  const parseMax = (v) => {
-    if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 99 ? v : undefined;
-    return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : undefined;
-  };
   const action = failClosed(env.WE_FIX_ROUND_CAP_ACTION, fromFile.roundCapAction, parseAction, 'person', FIX_SETTINGS_DEFAULTS.roundCapAction);
   const history = pick(env.WE_FIX_ROUND_HISTORY, fromFile.roundHistory, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.roundHistory);
-  const max = failClosed(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, parseMax, 0, FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr);
+  // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
+  const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
+  const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
   return {
-    roundCapAction: action.value, roundHistory: history.value, takeoverMaxPerPr: max.value,
-    sources: { roundCapAction: action.source, roundHistory: history.source, takeoverMaxPerPr: max.source },
+    roundCapAction: action.value, roundHistory: history.value,
+    resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
+    sources: {
+      roundCapAction: action.source, roundHistory: history.source,
+      resumeAcrossRounds: resume.source, strongerModelFromRound: from.source,
+    },
   };
 }
 
@@ -188,40 +198,19 @@ export function takeoverRung(fixerLadder) {
     : { rung: { id: 'resend', at: 0, label: 'ordinary fix route', taskType: null, model: null }, route: null };
 }
 
-/**
- * PURE: is a takeover owed instead of the round-cap note? `{ ok: true, rung, route }` or `{ ok: false, reason }`.
- * Reasons: `setting-person`, `setting-disabled` (`takeoverMaxPerPr` is 0, or not a number: no takeover ever runs),
- * `ruling-dispute`, `takeover-spent` (a takeover already ran for this PR/head), `takeover-void-limit`.
- */
-export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr = 1, fixerLadder } = {}) {
-  if (roundCapAction !== 'takeover') return { ok: false, reason: 'setting-person' };
-  // Checked before the markers: with a budget of 0 nothing ran, so "spent" would tell the operator a takeover ran.
-  // A value that is not a number fails closed (no takeover) rather than comparing as NaN (always false = take over).
-  const max = takeoverMaxPerPr === null || takeoverMaxPerPr === '' ? Number.NaN : Number(takeoverMaxPerPr);
-  if (!Number.isFinite(max) || max <= 0) return { ok: false, reason: 'setting-disabled' };
-  if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
-  const markers = takeoverMarkers(pr?.comments);
-  const head = pr?.headRefOid ?? null;
-  const sameHead = markers.some((m) => sameHeadSha(m.head, head));
-  if (sameHead || markers.length >= max) {
-    // `takeover-void-limit`: launch faults used up the void allowance, so the last start marker stands. Whether that
-    // last one ran is not knowable from the thread, so the note says only that faults were recorded.
-    const voidLimit = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
-    return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
-  }
-  return { ok: true, ...takeoverRung(fixerLadder) };
-}
-
-/** The durable marker comment, posted before the takeover session starts (the one-per-PR/head bound). */
-export function takeoverMarkerBody({ pr, head, attempts, cap, rung }) {
+/** The durable marker comment, posted before the takeover session starts (the per-head bound; each one is one
+ *  takeover of the PR's `fix.takeoverBudget`). `n`/`budget` are optional: absent, the text names no count. */
+export function takeoverMarkerBody({ pr, head, attempts, cap, rung, n = null, budget = null }) {
+  const which = Number.isInteger(n) && Number.isInteger(budget) ? `Takeover ${n} of ${budget}` : 'One takeover session';
   // `attempts=N` is the count the takeover launched at: its own re-arm lands at N+1, and that is what the review
   // allowance is measured from (a takeover can start above the cap when several counts ran ahead of the rearm count).
   const launchCount = Number.isSafeInteger(attempts) && attempts >= 0 ? ` attempts=${attempts}` : '';
   return `${FIX_TAKEOVER_MARKER} head=${head ?? 'unknown'}${launchCount} -->\n`
     + `🛟 conveyor fix takeover — PR #${pr} spent its fix rounds (${attempts}/${cap})\n\n`
-    + `One takeover session was dispatched on head \`${String(head ?? '').slice(0, 9)}\` with the full round history, `
-    + `on the \`${rung?.id ?? 'resend'}\` route${rung?.model ? ` (${rung.model})` : ''}. If it does not clear this PR, `
-    + 'the operator is asked next. Ruling disputes always go to the operator.';
+    + `${which} was dispatched on head \`${String(head ?? '').slice(0, 9)}\` with the full round history, `
+    + `on the \`${rung?.id ?? 'resend'}\` route${rung?.model ? ` (${rung.model})` : ''}. Its head earns one review; `
+    + 'another takeover runs only if that review shows fewer or lighter open findings and the budget allows, '
+    + 'otherwise the operator is asked. Ruling disputes always go to the operator.';
 }
 
 /** The void marker: the takeover whose marker was posted for `head` never launched, so it does not count. A fixed
@@ -234,14 +223,18 @@ export function takeoverVoidMarkerBody({ pr, head }) {
 
 /**
  * The takeover section put in front of the fix brief: what is different about this run, then ALL rounds (not
- * just the previous ones — the takeover owns the whole PR), then the brief.
+ * just the previous ones — the takeover owns the whole PR), then — for takeover 2+ — what the previous takeover
+ * changed and the review that rejected it, then the brief.
  */
-export function withTakeover(prompt, takeover, { allRoundsSection = '', baseRefName = null, headRefName = null } = {}) {
+export function withTakeover(prompt, takeover, { allRoundsSection = '', previousTakeoverSection = '', baseRefName = null, headRefName = null } = {}) {
   if (!takeover) return prompt;
   const stacked = baseRefName && baseRefName !== 'main' ? `This PR is stacked on \`${baseRefName}\`: read that PR too.` : 'This PR targets `main` directly.';
+  const which = Number.isInteger(takeover.n) && Number.isInteger(takeover.budget) && takeover.n > 1
+    ? `You are takeover ${takeover.n} of ${takeover.budget} for this PR. Takeover ${takeover.n - 1} reduced the open findings but the review still asked for changes: start from its work, do not redo it. `
+    : 'You are the takeover session for this head. ';
   return '# Takeover — this PR spent its automatic fix rounds, read this first\n\n'
     + `The ordinary fixer ran ${takeover.attempts ?? '?'} of ${takeover.cap ?? '?'} rounds and the reviewer kept finding problems. `
-    + 'You are the ONE takeover session for this head. Work like a focused worker who owns the whole PR:\n\n'
+    + which + 'Work like a focused worker who owns the whole PR:\n\n'
     + '1. Read the card and every design doc it links, end to end, before touching code.\n'
     + `2. Read related PRs. ${stacked} List PRs stacked above this one with \`gh pr list --base ${headRefName ?? '<this branch>'}\`.\n`
     + '3. Read every round below. For each finding that was raised again, find the defect CLASS, not the one line, and fix every site of it.\n'
@@ -249,5 +242,6 @@ export function withTakeover(prompt, takeover, { allRoundsSection = '', baseRefN
     + 'If you believe a block ruling is wrong, do not work around it — say so on the PR and stop; the operator rules on disputes.\n'
     + '5. Then follow the ordinary fix brief below (reproduce, fix, verify, evidence, re-arm). Never touch review:human.\n\n'
     + (allRoundsSection || '(no round history could be read for this PR — read the PR thread yourself first)\n\n')
+    + (previousTakeoverSection ? `${previousTakeoverSection}\n` : '')
     + prompt;
 }
