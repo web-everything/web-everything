@@ -29,20 +29,44 @@ export const FIX_TAKEOVER_MARKER = '<!-- conveyor-fix-takeover';
 const ACTIONS = ['person', 'takeover'];
 const ONOFF = ['on', 'off'];
 
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** Stands in for every leaf of a file layer that is present but malformed (see {@link resolveFixSettings}). */
+const INVALID_LAYER = Symbol('invalid fix settings layer');
+
+/**
+ * The file layer: its `fix` object, `{}` when there is none (no file, no `fix` key, `fix: null`), or
+ * {@link INVALID_LAYER} when the file is there but malformed — not JSON, not an object at the top, or a `fix` that is
+ * not an object (`false`, `"off"`, `[]`). A malformed layer must not read as an absent one: absent falls to the
+ * built-in `takeover`, so an operator's `"fix": false` would turn the takeover ON.
+ */
+function readFileLayer(file, read) {
+  let raw;
+  // Only a MISSING file is no layer. Any other read error (EACCES, EISDIR, EIO) is a file that is there but unusable.
+  try { raw = read(file); } catch (e) { return e?.code === 'ENOENT' ? {} : INVALID_LAYER; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return INVALID_LAYER; }
+  if (parsed === null) return {};
+  if (!isPlainObject(parsed)) return INVALID_LAYER;
+  if (parsed.fix === undefined || parsed.fix === null) return {};
+  return isPlainObject(parsed.fix) ? parsed.fix : INVALID_LAYER;
+}
+
 /**
  * env (`WE_FIX_ROUND_CAP_ACTION`, `WE_FIX_ROUND_HISTORY`, `WE_FIX_TAKEOVER_MAX_PER_PR`) > settings file > built-in.
  * The file layer is its `fix` object (a flat top-level key is not a setting). Unknown values fall through to the
- * next layer, except `roundCapAction` and the takeover limit, which fail closed to `person` / 0 (see below). Never
- * throws.
+ * next layer, except `roundCapAction` and the takeover limit, which fail closed to `person` / 0 (see below) — for a
+ * bad leaf and for a malformed file or `fix` container alike. Never throws.
  */
 export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE, read = (f) => readFileSync(f, 'utf8') } = {}) {
-  let fromFile = {};
-  try { fromFile = JSON.parse(read(file))?.fix ?? {}; } catch { fromFile = {}; }
-  if (!fromFile || typeof fromFile !== 'object') fromFile = {};
+  const layer = readFileLayer(file, read);
+  const fromFile = layer === INVALID_LAYER
+    ? { roundCapAction: INVALID_LAYER, roundHistory: undefined, takeoverMaxPerPr: INVALID_LAYER }
+    : layer;
   const pick = (envVal, fileVal, ok, dflt) => {
     const e = String(envVal ?? '').trim().toLowerCase();
     if (ok(e)) return { value: e, source: 'env' };
-    const f = String(fileVal ?? '').trim().toLowerCase();
+    const f = typeof fileVal === 'string' ? fileVal.trim().toLowerCase() : '';
     if (ok(f)) return { value: f, source: 'settings' };
     return { value: dflt, source: 'built-in' };
   };
@@ -116,42 +140,47 @@ export const TAKEOVER_MAX_VOIDS = 2;
 const trustedBodies = (comments) => (Array.isArray(comments) ? comments : [])
   .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c));
 
-/** Trusted void markers on the thread (each one a takeover that never launched). */
-export function takeoverVoidCount(comments) {
-  return trustedBodies(comments).filter((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER) !== undefined).length;
-}
+/** Trusted comments in thread order: by `createdAt` when every one carries a parseable time (ties keep the read
+ *  order), else the read order as given (gh lists a thread oldest first). */
+const inThreadOrder = (comments) => {
+  const times = comments.map((c) => Date.parse(c.createdAt ?? ''));
+  if (times.some((t) => !Number.isFinite(t))) return comments;
+  return comments.map((c, i) => ({ c, t: times[i], i })).sort((a, b) => a.t - b.t || a.i - b.i).map(({ c }) => c);
+};
 
-/** Comments in thread order: by `createdAt` (stable) when every comment carries a valid one, else as given. The grant
- *  reads `createdAt` too, so the pairing here must not depend on how the caller happened to order the array. */
-function inThreadOrder(list) {
-  const at = (c) => Date.parse(c?.createdAt ?? '');
-  if (!list.length || !list.every((c) => Number.isFinite(at(c)))) return list;
-  return [...list].sort((a, b) => at(a) - at(b));
+/**
+ * PURE: replay the takeover markers in thread order. A trusted void cancels the latest EARLIER start for its head that
+ * is still standing (the launch it reports on came before it); a void with no such start cancels nothing. At most
+ * {@link TAKEOVER_MAX_VOIDS} voids are honoured per PR: a matching void past that allowance is REFUSED, and its start
+ * stands. `{ starts: [{ head, at, attempts }], refusedVoid }` — `refusedVoid` is true when the LATEST standing start
+ * (the most recent takeover) is one a launch fault was reported for, so "the takeover ran" is not known for it. An
+ * older refused start on another head does not mislabel a later takeover that launched cleanly.
+ */
+function takeoverLedger(comments) {
+  const starts = [];
+  let honoured = 0;
+  // a void with an `unknown` head matches only an `unknown` start
+  const matches = (m, h) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h));
+  for (const c of inThreadOrder(trustedBodies(comments))) {
+    const voidHead = markerHead(c.body, FIX_TAKEOVER_VOID_MARKER);
+    if (voidHead !== undefined) {
+      const i = starts.findLastIndex((m) => !m.voidRefused && matches(m, voidHead));
+      if (i < 0) continue;
+      if (honoured < TAKEOVER_MAX_VOIDS) { starts.splice(i, 1); honoured += 1; } else starts[i].voidRefused = true;
+      continue;
+    }
+    const head = markerHead(c.body, FIX_TAKEOVER_MARKER);
+    if (head !== undefined) starts.push({ head, at: c.createdAt ?? null, attempts: markerAttempts(c.body), voidRefused: false });
+  }
+  return { starts: starts.map(({ head, at, attempts }) => ({ head, at, attempts })), refusedVoid: Boolean(starts.at(-1)?.voidRefused) };
 }
 
 /**
- * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
- * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing,
- * and only the first {@link TAKEOVER_MAX_VOIDS} voids on a PR are honoured.
+ * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head, at, attempts }]`.
+ * See {@link takeoverLedger}: voids apply in thread order, each to the latest earlier start for its head.
  */
 export function takeoverMarkers(comments) {
-  const starts = [];
-  let honoured = 0;
-  // Walk the thread in order: a void gives back the launch it FOLLOWED, so it only reaches starts posted before it. A
-  // void that searched every start would cancel a later retry's marker and keep the failed launch's instead.
-  for (const c of inThreadOrder(trustedBodies(comments))) {
-    const startHead = markerHead(c.body, FIX_TAKEOVER_MARKER);
-    if (startHead !== undefined) {
-      starts.push({ head: startHead, at: c.createdAt ?? null, attempts: markerAttempts(c.body) });
-      continue;
-    }
-    const h = markerHead(c.body, FIX_TAKEOVER_VOID_MARKER);
-    if (h === undefined || honoured++ >= TAKEOVER_MAX_VOIDS) continue;
-    // Cancel the latest EARLIER start for this head (a void with an `unknown` head cancels only an `unknown` start).
-    const idx = starts.findLastIndex((m) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
-    if (idx >= 0) starts.splice(idx, 1);
-  }
-  return starts;
+  return takeoverLedger(comments).starts;
 }
 
 /**
@@ -200,14 +229,14 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverMaxPerPr =
   const max = takeoverMaxPerPr === null || takeoverMaxPerPr === '' ? Number.NaN : Number(takeoverMaxPerPr);
   if (!Number.isFinite(max) || max <= 0) return { ok: false, reason: 'setting-disabled' };
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
-  const markers = takeoverMarkers(pr?.comments);
+  const { starts: markers, refusedVoid } = takeoverLedger(pr?.comments);
   const head = pr?.headRefOid ?? null;
   const sameHead = markers.some((m) => sameHeadSha(m.head, head));
   if (sameHead || markers.length >= max) {
-    // `takeover-void-limit`: launch faults used up the void allowance, so the last start marker stands. Whether that
-    // last one ran is not knowable from the thread, so the note says only that faults were recorded.
-    const voidLimit = takeoverVoidCount(pr?.comments) >= TAKEOVER_MAX_VOIDS;
-    return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
+    // `takeover-void-limit`: a launch fault was reported for a start that still stands, because the void allowance was
+    // already used. A takeover that launched cleanly after earlier voided faults posts no void of its own, so it reads
+    // as `takeover-spent` ("already ran"), which is what happened.
+    return { ok: false, reason: refusedVoid ? 'takeover-void-limit' : 'takeover-spent', heads: markers.map((m) => m.head).filter(Boolean) };
   }
   return { ok: true, ...takeoverRung(fixerLadder) };
 }
