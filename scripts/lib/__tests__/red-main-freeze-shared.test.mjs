@@ -10,6 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { hostname, tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import yaml from 'js-yaml';
 import {
   PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit,
 } from '../red-main-freeze-shared.mjs';
@@ -697,6 +698,14 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
     expect(seen.args).toEqual(expect.arrayContaining(['run', 'list', '--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'trunk', '--event', 'push']));
     expect(seen.args[seen.args.indexOf('--json') + 1]).toMatch(/\bevent\b.*\battempt\b/);
     expect(seen.opts).toMatchObject({ timeout: expect.any(Number), maxBuffer: expect.any(Number) });
+  });
+
+  // PR 4715 (ruled block): `gh run list` needs `actions: read` on the workflow's GITHUB_TOKEN. Without it every run
+  // reads main's CI as unreadable and the gate holds every PR. The set is pinned EXACTLY: read-only, nothing more.
+  it('merge-gate.yml grants `actions: read` so readMainCiFact can list main\'s CI runs — and nothing beyond read', () => {
+    const wf = yaml.load(readFileSync(resolve(HERE, '..', '..', '..', '.github', 'workflows', 'merge-gate.yml'), 'utf8'));
+    expect(wf.permissions).toEqual({ contents: 'read', 'pull-requests': 'read', checks: 'read', statuses: 'read', actions: 'read' });
+    expect(wf.jobs['merge-gate'].permissions).toBeUndefined();
   });
 
   describe('main CI is RE-READ right before the verdict too', () => {
