@@ -28,7 +28,8 @@ function pr(comments = [advisory(OLD)], overrides = {}) {
     ...overrides,
   };
 }
-const plan = (p) => planReconcile({ prs: [p], agents: [], durableCounts: { 4764: 7 },
+const OPEN_BASE = { number: 4897, headRefName: 'lane/base', baseRefName: 'main', labels: [], comments: [], files: [] };
+const plan = (p, others = []) => planReconcile({ prs: [p, ...others], agents: [], durableCounts: { 4764: 7 },
   now: Date.parse(at(12)), requiredChecks: ['test'], roundCapAction: 'takeover', takeoverBudget: 2,
 });
 const noteFor = p => p.notes.find(n => ['gate-hold-needs-operator', 'stacked-awaiting-base'].includes(n.kind) && n.prNumber === 4764);
@@ -66,7 +67,7 @@ describe('gate-held advisory at the repair cap', () => {
     expect(p.refusals).toContainEqual(expect.objectContaining({ prNumber: 4764, kind: 'review-ci', why: expect.stringContaining('test') }));
   });
   it('notes a stacked-base hold without dispatching an advisory', () => {
-    expectNote(plan(pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] })), 'stacked-base-unmerged');
+    expectNote(plan(pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] }), [OPEN_BASE]), 'stacked-base-unmerged');
   });
   it('owes an advisory even when none has ever been posted', () => {
     expectReview(plan(pr([])));
@@ -117,14 +118,31 @@ describe('gate-held advisory shares the review pre-gates and never goes silent',
   });
   it('keeps a self-clearing base hold status-only and a person-owned hold escalated', () => {
     const cases = [
-      [pr(undefined, { labels: ['review:changes', 'review-status:awaiting-base'].map(name => ({ name })) }), 'awaiting-base', true],
-      [pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] }), 'stacked-base-unmerged', true],
-      [pr([advisory(HEAD)]), 'review-human-hold', false],
+      [pr(undefined, { labels: ['review:changes', 'review-status:awaiting-base'].map(name => ({ name })) }), [], 'awaiting-base', true],
+      [pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] }), [OPEN_BASE], 'stacked-base-unmerged', true],
+      [pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] }), [], 'stacked-base-unmerged', false],
+      [pr([advisory(HEAD)]), [], 'review-human-hold', false],
     ];
-    for (const [p, hold, statusOnly] of cases) {
-      const note = noteFor(plan(p));
+    for (const [p, others, hold, statusOnly] of cases) {
+      const note = noteFor(plan(p, others));
       expect(note).toMatchObject({ hold });
       expect(isStatusOnlyNote(note)).toBe(statusOnly);
     }
+  });
+  it('escalates a stacked hold whose base has no open PR (it never clears on its own)', () => {
+    const p = plan(pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] }));
+    expect(noteFor(p)).toMatchObject({ kind: 'gate-hold-needs-operator', hold: 'stacked-base-unmerged' });
+    expect(noteFor(p).text).toMatch(/no open PR/);
+  });
+  it('does not re-dispatch every tick after an advisory posted without a pinned basis', () => {
+    const degraded = { author: BOT, createdAt: at(10),
+      body: `${ADVISORY_NOTE_MARKER}\n\n**Verdict:** Accept\n\n⚠️ DEGRADED BASIS — no net diff was computed.` };
+    const p = plan(pr([advisory(OLD), degraded]));
+    expect(p.dispatch.filter(d => d.kind === 'review')).toEqual([]);
+    expect(noteFor(p).text).toMatch(/without a pinned basis/);
+  });
+  it('names the refusal in the note when a draft or scope-bloated diff blocks the owed advisory', () => {
+    const p = plan(pr(undefined, { scopeBloat: { why: 'diff mostly not this PR', stale: false } }));
+    expect(noteFor(p).text).toContain('scope-bloat');
   });
 });
