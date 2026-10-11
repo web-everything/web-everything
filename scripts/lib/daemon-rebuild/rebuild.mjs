@@ -8,7 +8,7 @@ import { runLiveSmokeWithRetry } from '../daemon-live-smoke.mjs';
 import { withWriteLock } from '../daemon-clone-lock.mjs';
 import { defaultPrState } from './edge-fetch.mjs';
 import {
-  REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, starvationLockWaitMs,
+  REBUILD_LOCK_WAIT_ENV, DEFAULT_REBUILD_LOCK_WAIT_MS, readRebuildStarvation, rebuildLockWaitMs,
   FINALIZE_LOCK_WAIT_ENV, DEFAULT_FINALIZE_LOCK_WAIT_MS, writeRebuildStarvation, releaseBuildLease,
   ACTIVE_BUILD_TOKENS,
 } from './lease.mjs';
@@ -71,8 +71,10 @@ export async function rebuildClone({
   // (default 60s), says so when it starts waiting, and records the give-up.
   const baseWaitMs = Number(env?.[REBUILD_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_LOCK_WAIT_MS;
   const starvedCount = readRebuildStarvation(root, { ...env, ...(stateOpts?.env || {}) });
-  const waitMs = starvationLockWaitMs(baseWaitMs, starvedCount, env);
-  if (waitMs > baseWaitMs) log.error?.(`daemon-rebuild: starved for ${starvedCount} consecutive attempt(s) — waiting up to ${Math.round(waitMs / 1000)}s for in-flight ticks this time`);
+  const waitMs = rebuildLockWaitMs({ env, starvedCount, readyOnly });
+  if (readyOnly) {
+    log.error?.(`daemon-rebuild: detached rebuild job — waiting up to ${Math.round((lockOpts.waitMs ?? waitMs) / 1000)}s for in-flight ticks to drain (writer reservation refuses new reads meanwhile)`);
+  } else if (waitMs > baseWaitMs) log.error?.(`daemon-rebuild: starved for ${starvedCount} consecutive attempt(s) — waiting up to ${Math.round(waitMs / 1000)}s for in-flight ticks this time`);
   const finalLockOpts = {
     ...(lockRootFromEnv ? { lockRoot: lockRootFromEnv } : {}),
     now,
@@ -101,7 +103,10 @@ export async function rebuildClone({
   }), readyOnHead ? finalizeLockOpts : finalLockOpts);
 
   if (prep.ok) {
-    if (starvedCount > 0) writeRebuildStarvation(root, 0, stEnv);
+    // live 2026-10-11 rebuild-job livelock: an adopt-only needs-build did not make progress.
+    if (starvedCount > 0 && (!adoptOnly || (prep.value.terminal && prep.value.result?.moved))) {
+      writeRebuildStarvation(root, 0, stEnv);
+    }
   } else if (prep.reason === 'tick-in-progress') writeRebuildStarvation(root, starvedCount + 1, stEnv);
   if (!prep.ok) {
     if (prep.reason === 'tick-in-progress') {

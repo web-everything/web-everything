@@ -82,9 +82,18 @@ export function classifyEvent(c) {
   if (/^Mandatory review owner:/.test(first)) {
     const rulings = parseRulings(b);
     const encoded = b.match(/<!-- mandatory-referrals-v1: (\S+)/)?.[1];
-    let refHead = null;
-    try { refHead = JSON.parse(decodeURIComponent(encoded ?? ''))?.head ?? null; } catch { refHead = decodeURIComponent(encoded ?? '').match(/"head":"([0-9a-f]{40})"/)?.[1] ?? null; }
+    let refHead = null, record = null, decoded = '';
+    try { decoded = decodeURIComponent(encoded ?? ''); record = JSON.parse(decoded); refHead = record?.head ?? null; } catch { refHead = decoded.match(/"head":"([0-9a-f]{40})"/)?.[1] ?? null; }
     const blocks = rulings.filter((r) => r.result === 'block');
+    // #4770: carried operator blocks remain open findings even without a recorded attempt.
+    for (const entry of Array.isArray(record?.carried) ? record.carried : []) {
+      if (entry?.result !== 'block') continue;
+      let key = [];
+      try { key = JSON.parse(entry.key); } catch { continue; }
+      if (!Array.isArray(key)) continue;
+      const finding = { file: typeof key[1] === 'string' ? key[1] : null, line: Number.isFinite(key[2]) ? key[2] : null, claim: clip(key[3] ?? '', 220), lens: 'referral', result: 'block' };
+      if (!blocks.some((r) => r.file === finding.file && r.line === finding.line && r.claim === finding.claim)) blocks.push(finding);
+    }
     return blocks.length ? { type: 'round', trigger: 'referral-block', at: c.at, head: refHead, findings: blocks.map((r) => ({ ...r, ruling: 'block' })), rulings } : rulings.length ? { type: 'rulings', at: c.at, head: refHead, rulings } : null;
   }
   if (/^## (?:Operator|Automatic policy) ruling on mandatory referrals/.test(first)) {
