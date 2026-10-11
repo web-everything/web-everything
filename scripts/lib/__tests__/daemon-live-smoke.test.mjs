@@ -37,6 +37,7 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
+  resolveIoBoundLoadScale,
 } from '../daemon-live-smoke.mjs';
 
 // Existing fixtures must never observe or write the host's resource state.
@@ -82,9 +83,25 @@ describe('resource shadow observations', () => {
     expect(hostLooksBusy({}, { load: () => load1, cores: () => 12, shadow, admit })).toBe(load1 === 63);
     expect(shadow).toHaveBeenCalledTimes(1); expect(admit).toHaveBeenCalledTimes(1);
   });
-  it('leaves admitted budgets unscaled despite high load', () => {
-    expect(resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } }))
-      .toEqual(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12 }));
+  it('leaves admitted CPU-bound budgets unscaled despite high load', () => {
+    const { reconcileMs, dispatchDryRunMs, ...rest } = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
+    const { reconcileMs: r0, dispatchDryRunMs: d0, ...rest0 } = resolveSmokeBudgets({}, { load: () => 0, cores: () => 12 });
+    expect(rest).toEqual(rest0);
+  });
+  // Live 2026-10-10 (wev-fix-daemon): admit at load 30–46/12 left reconcile/dispatch at 120s/180s; both wait on gh/git
+  // children (not CPU) and were killed, so main, every overlay and last-good all failed the smoke.
+  it('keeps load scaling for the I/O-bound checks even when admitted (smokeIoBoundLoadScale, standard on)', () => {
+    const b = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
+    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 720_000, ghApiMs: 30_000 });
+    expect(resolveIoBoundLoadScale({})).toMatchObject({ enabled: true, source: 'standard' });
+  });
+  it('the I/O-bound rule never lowers a non-admit factor, and honours the env layer and absolute overrides', () => {
+    expect(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } }).reconcileMs).toBe(480_000);
+    const admit48 = { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } };
+    expect(resolveSmokeBudgets({ WE_SMOKE_IO_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(120_000);
+    expect(resolveIoBoundLoadScale({ WE_SMOKE_IO_LOAD_SCALE: '0' })).toMatchObject({ enabled: false, source: 'env' });
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(120_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_RECONCILE_MS: '50000' }, admit48).reconcileMs).toBe(50_000);
   });
   it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict } };
@@ -98,7 +115,7 @@ describe('resource shadow observations', () => {
     expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: '50000' }, host).dispatchDryRunMs).toBe(50_000);
   });
   it.each(['shadow', 'admit'])('feeds the %s decision into run budgets and reports admission', async (source) => {
-    const env = {};
+    const env = { WE_SMOKE_IO_LOAD_SCALE: '0' }; // the I/O-bound rule has its own tests above
     const options = { root: '/x', env, load: () => 63, cores: () => 12,
       clock: () => 0, changedFiles: [], closureOf: () => [], runChild: vi.fn(async () => '') };
     await runLiveSmoke({ ...options, load: () => 0, shadow: () => {}, admit: () => undefined });
@@ -1465,6 +1482,37 @@ describe('a check that ran out of TIME under load is environment, never code (li
     const r = await runLiveSmokeWithRetry({ root: '/x', env: {}, runChild, clock: () => t, sleep: async () => {}, refreshAuth: noAuth });
     expect(r.verdict).toBe('code');
     expect(r.attempts).toBe(1);
+  });
+
+  // Live 2026-10-10 (wev-fix-daemon): `reconcile-pass dry-run failed for 1/3 repo(s): <slug>: timed out after 120000ms
+  // (process group killed)` matched no env-timeout signature, so a load kill was rejected as code on every candidate.
+  const reconcileRow = async (perRepo) => {
+    let t = 0;
+    const runChild = withNewCheckDefaults(async (cmd, args) => {
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+        const err = perRepo[String(args[1]).slice('--repo='.length)];
+        if (err) { t += 120_005; throw new Error(err); }
+        return '{}';
+      }
+      if (args[1] === 'acquire') return JSON.stringify({ lane: 1 });
+      return '';
+    });
+    const r = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild, clock: () => t });
+    return r.results.find((x) => x.name === 'reconcile-dry-run');
+  };
+  it('reconcile-dry-run: every failing repo killed at its own cap → one env-timeout-shaped row', async () => {
+    const row = await reconcileRow({ 'web-everything/web-everything': 'timed out after 120000ms (process group killed)' });
+    expect(row.ok).toBe(false);
+    expect(row.detail).toBe('reconcile-pass dry-run (1/3 repo(s) — web-everything/web-everything) failed: timed out after 120000ms (process group killed)');
+    expect(isEnvTimeoutRow(row)).toBe(true);
+  });
+  it('reconcile-dry-run: a timeout next to a real error keeps the per-repo detail (code, never env-timeout)', async () => {
+    const row = await reconcileRow({
+      'web-everything/web-everything': 'timed out after 120000ms (process group killed)',
+      'frontier-ui/frontierui': 'exited 1: TypeError: x is not a function',
+    });
+    expect(row.detail).toMatch(/^reconcile-pass dry-run failed for 2\/3 repo\(s\): /);
+    expect(isEnvTimeoutRow(row)).toBe(false);
   });
 
   it("runBounded's own hard-timeout kill counts too (external), a timeout that fails fast does not", () => {
