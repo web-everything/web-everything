@@ -259,14 +259,25 @@ export function isDispatchFrozen(path = FREEZE_MARKER_PATH) {
  * @returns {object} the written marker
  */
 export function freezeDispatch(meta = {}, path = FREEZE_MARKER_PATH) {
-  const marker = {
+  return writeFreezeMarker(buildFreezeMarker(meta), path);
+}
+
+/** The marker a freeze would write (pure) — the CLI builds it once so the local write and the shared publish carry the same marker. */
+export function buildFreezeMarker(meta = {}) {
+  return {
     frozen: true,
     at: meta.at || new Date().toISOString(),
     reason: meta.reason || REMEDIATION_SPEC.trigger,
     redRef: meta.redRef || 'main',
     mergeSha: meta.mergeSha || null,
     revertAuthority: true,
+    // `auto`: raised by `decide --apply` on a red post-land result — main's own CI already says so to the merge-gate.
+    // `manual`: the operator's stop-the-line (`freeze`) — the only kind the shared copy carries (ruling 2026-10-11).
+    kind: meta.kind === 'auto' ? 'auto' : 'manual',
   };
+}
+
+function writeFreezeMarker(marker, path) {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(marker, null, 2) + '\n');
@@ -297,15 +308,44 @@ function parseFlags(argv) {
   return flags;
 }
 
-function runCli(argv) {
+async function runCli(argv) {
   const cmd = argv[0];
   const flags = parseFlags(argv.slice(1));
+  // xyd06qo: the shared ops/* copy CI's merge-gate reads — MANUAL freezes only (`freeze`; `decide --apply` is automatic
+  // and stays local). A RAISE writes the local marker FIRST (the drain stops at once,
+  // whatever the publish does), then publishes; a local write error never skips the publish. A failed publish exits 1
+  // with the retry named. Only an explicit CLEAR (`unfreeze`) may publish frozen:false —
+  // "no marker here" (a clone without the gitignored file, or a corrupt one) is never a clear.
+  const shared = () => import('../lib/red-main-freeze-shared.mjs');
+  const raise = async (meta) => {
+    const marker = buildFreezeMarker(meta);
+    // LOCAL FIRST: the drain stops on this file, so no publish (slow, hung, retried) may ever delay it. A local write
+    // error is held, never allowed to skip the publish: the shared copy still goes frozen, then the error surfaces.
+    let written = null;
+    let writeError = null;
+    try { written = freezeDispatch(marker); } catch (e) { writeError = e; }
+    try { await (await shared()).publishFreezeFromCli({ marker }); }
+    catch (e) { process.stderr.write(`red-main freeze: ✗ the SHARED copy was NOT published (${String(e?.message || e).split('\n')[0].slice(0, 300)}); the local marker is ${written ? 'written' : 'NOT written'}. Retry: node scripts/readiness/red-main-remediation.mjs publish\n`); process.exitCode = 1; }
+    if (writeError) throw writeError;
+    return written;
+  };
   if (cmd === 'freeze') {
-    const m = freezeDispatch({ reason: flags.reason, redRef: flags['red-ref'], mergeSha: flags['merge-sha'] });
+    const m = await raise({ reason: flags.reason, redRef: flags['red-ref'], mergeSha: flags['merge-sha'] });
     process.stdout.write(JSON.stringify(m, null, 2) + '\n');
   } else if (cmd === 'unfreeze') {
+    // The freeze this clear lifts: the shared clear refuses to wipe a DIFFERENT freeze it finds on the tip.
+    const lifted = readFreeze();
     unfreezeDispatch();
+    // The clear is published only once the local freeze is really gone: unfreezeDispatch swallows rm errors, and a
+    // surviving (or legacy, migrate-back) marker means the drain is still frozen — clearing CI then would split the two.
+    const legacyLeft = process.env.WE_RED_MAIN_FREEZE ? [] : pendingLegacyFreezeMarkers().filter((p) => resolve(p) !== resolve(FREEZE_MARKER_PATH));
+    if (isDispatchFrozen() || legacyLeft.length) {
+      process.stderr.write(`red-main freeze: ✗ unfreeze did not clear the local marker (${isDispatchFrozen() ? FREEZE_MARKER_PATH : legacyLeft[0]} still present); the SHARED copy is unchanged. Remove it, then re-run: node scripts/readiness/red-main-remediation.mjs unfreeze\n`);
+      process.exitCode = 1;
+      return;
+    }
     writeAllSync(1, JSON.stringify({ frozen: false }, null, 2) + '\n');
+    await (await shared()).publishFreezeFromCli({ marker: null, clear: true, ...(lifted ? { lifted } : {}) });
   } else if (cmd === 'status') {
     // Read-only: report a not-yet-migrated legacy marker instead of moving it (the next drain pass migrates it).
     const legacyPending = process.env.WE_RED_MAIN_FREEZE ? [] : pendingLegacyFreezeMarkers().filter((p) => resolve(p) !== resolve(FREEZE_MARKER_PATH));
@@ -313,9 +353,30 @@ function runCli(argv) {
   } else if (cmd === 'decide') {
     const d = decidePostLand({ trigger: flags.trigger, ref: flags.ref, result: flags.result, mergeSha: flags['merge-sha'] });
     writeAllSync(1, JSON.stringify(d, null, 2) + '\n');
-    if (d.action === 'stop-the-line' && flags.apply) freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'] });
+    // An AUTOMATIC freeze: the local marker stops the drain, but nothing is published — the shared copy carries manual
+    // freezes only, and main's own CI already tells the merge-gate that main is red (operator ruling 2026-10-11). A
+    // published copy would read as a manual stop and hold even the main-fix PR. A `proceed` decision raises nothing.
+    // A standing MANUAL marker is never downgraded: overwriting it with `auto` would make `publish` refuse it, and an
+    // operator's stop that has not yet reached CI would then never reach it.
+    if (d.action === 'stop-the-line' && flags.apply) {
+      // Same kind rule as `publish` and the writer (`freezeKindOf`): a kind-less marker left by the old `decide --apply`
+      // is automatic and gets re-stamped; any other kind-less marker is an operator stop and is kept.
+      const standing = readFreeze();
+      if (standing && (await shared()).freezeKindOf(standing) !== 'auto') process.stderr.write(`red-main freeze: a MANUAL freeze is already standing (${String(standing.reason ?? 'frozen').slice(0, 120)}); kept as is — the drain stays stopped.\n`);
+      else freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'], kind: 'auto' });
+    }
+  } else if (cmd === 'publish') {
+    // Republish the current local MANUAL freeze — the retry after a failed `freeze`. No valid marker → refused; an
+    // automatic one → refused too (it is never published: see `decide`).
+    const local = readFreeze();
+    if (local && (await shared()).freezeKindOf(local) === 'auto') {
+      process.stderr.write('red-main freeze: ✗ the local freeze is AUTOMATIC (decide --apply) and is not published — main\'s own CI is the merge-gate\'s authority for a red main. To stop everything by hand, run: node scripts/readiness/red-main-remediation.mjs freeze --reason=<why>\n');
+      process.exitCode = 1;
+      return;
+    }
+    await (await shared()).publishFreezeFromCli({ marker: local });
   } else {
-    process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide> [--flags]\n');
+    process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide|publish> [--flags]\n');
     process.exit(2);
   }
 }
