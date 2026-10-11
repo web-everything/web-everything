@@ -1,4 +1,5 @@
 ---
+bornAs: xlt0z05
 kind: story
 size: 2
 status: open
