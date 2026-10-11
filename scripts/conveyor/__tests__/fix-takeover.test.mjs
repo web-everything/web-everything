@@ -57,7 +57,10 @@ describe('fix settings cascade (card xx0055i)', () => {
       sources: { roundCapAction: 'settings', roundHistory: 'settings', takeoverMaxPerPr: 'settings' },
     });
     const flat = () => JSON.stringify({ roundCapAction: 'person', roundHistory: 'off', takeoverMaxPerPr: 3 });
-    expect(resolveFixSettings({ env: {}, read: flat }).sources).toEqual({ roundCapAction: 'built-in', roundHistory: 'built-in', takeoverMaxPerPr: 'built-in' });
+    expect(resolveFixSettings({ env: {}, read: flat }).sources).toEqual({
+      roundCapAction: 'built-in', roundHistory: 'built-in', takeoverMaxPerPr: 'built-in',
+      resumeAcrossRounds: 'built-in', strongerModelFromRound: 'built-in',
+    });
   });
   it('env beats the settings file; an unknown roundHistory falls through', () => {
     const read = () => JSON.stringify({ fix: { roundCapAction: 'takeover', roundHistory: 'on' } });

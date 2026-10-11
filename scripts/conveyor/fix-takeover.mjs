@@ -12,8 +12,10 @@
  *
  * Settings (policy cascade, like `we:scripts/lib/red-main-hold.mjs`): env > `we:scripts/settings/fix.json` >
  * built-in. `fix.roundCapAction` person|takeover (built-in takeover), `fix.roundHistory` on|off (built-in on),
- * `fix.takeoverMaxPerPr` (built-in 1; 0 turns the takeover off). The file keeps them under a `fix` object, so the
- * merged settings view (`we:scripts/lib/settings-files.mjs`) carries the same `fix.*` paths the docs name.
+ * `fix.takeoverMaxPerPr` (built-in 1; 0 turns the takeover off), and (card xrbu1bp, `we:scripts/conveyor/fix-resume.mjs`)
+ * `fix.resumeAcrossRounds` on|off (built-in on) and `fix.strongerModelFromRound` (built-in 3, 0 = off). The file keeps
+ * them under a `fix` object, so the merged settings view (`we:scripts/lib/settings-files.mjs`) carries the same
+ * `fix.*` paths the docs name.
  *
  * The planner half ({@link planTakeover}) is PURE; the marker post and the settings read are the only IO.
  */
@@ -23,7 +25,11 @@ import { fileURLToPath } from 'node:url';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export const FIX_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'fix.json');
-export const FIX_SETTINGS_DEFAULTS = Object.freeze({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
+export const FIX_SETTINGS_DEFAULTS = Object.freeze({
+  roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1,
+  // Card xrbu1bp — see `we:scripts/conveyor/fix-resume.mjs`.
+  resumeAcrossRounds: 'on', strongerModelFromRound: 3,
+});
 export const FIX_TAKEOVER_MARKER = '<!-- conveyor-fix-takeover';
 
 const ACTIONS = ['person', 'takeover'];
@@ -72,9 +78,16 @@ export function resolveFixSettings({ env = process.env, file = FIX_SETTINGS_FILE
   const action = failClosed(env.WE_FIX_ROUND_CAP_ACTION, fromFile.roundCapAction, parseAction, 'person', FIX_SETTINGS_DEFAULTS.roundCapAction);
   const history = pick(env.WE_FIX_ROUND_HISTORY, fromFile.roundHistory, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.roundHistory);
   const max = failClosed(env.WE_FIX_TAKEOVER_MAX_PER_PR, fromFile.takeoverMaxPerPr, parseMax, 0, FIX_SETTINGS_DEFAULTS.takeoverMaxPerPr);
+  // Card xrbu1bp — resume the previous round's session (on|off) and the round the stronger-model rung starts at (0 = off).
+  const resume = pick(env.WE_FIX_RESUME_ACROSS_ROUNDS, fromFile.resumeAcrossRounds, (v) => ONOFF.includes(v), FIX_SETTINGS_DEFAULTS.resumeAcrossRounds);
+  const from = pick(env.WE_FIX_STRONGER_MODEL_FROM_ROUND, fromFile.strongerModelFromRound, (v) => /^\d{1,2}$/.test(v), String(FIX_SETTINGS_DEFAULTS.strongerModelFromRound));
   return {
     roundCapAction: action.value, roundHistory: history.value, takeoverMaxPerPr: max.value,
-    sources: { roundCapAction: action.source, roundHistory: history.source, takeoverMaxPerPr: max.source },
+    resumeAcrossRounds: resume.value, strongerModelFromRound: Number(from.value),
+    sources: {
+      roundCapAction: action.source, roundHistory: history.source, takeoverMaxPerPr: max.source,
+      resumeAcrossRounds: resume.source, strongerModelFromRound: from.source,
+    },
   };
 }
 

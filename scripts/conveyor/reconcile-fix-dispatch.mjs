@@ -147,6 +147,15 @@ import { logFixPassPriorityShadow } from './delivery-priority-shadow.mjs';
 import { buildRoundHistory, renderRoundHistory, withRoundHistory, readRoundHistoryInputs } from './fix-round-history.mjs';
 import { resolveFixSettings, takeoverMarkerBody, takeoverVoidMarkerBody, launchProvedNotStarted, withTakeover } from './fix-takeover.mjs';
 import { isUnderTest as isUnderTestEnv } from '../lib/under-test.mjs';
+// Card xrbu1bp — resume the previous round's fixer session; the stronger-model rung from round 3.
+import {
+  buildRoundResumePrompt, planRoundEscalation, planRoundResume, readRoundResumeInputs, roundOf,
+} from './fix-resume.mjs';
+import { loadFixerLadder } from './fixer-ladder.mjs';
+import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
+import { countRearmComments } from './rearm-review.mjs';
+import { countAdvisoryComments } from './advisory-round-count.mjs';
+import { readCompletePrComments } from './pr-comments-complete.mjs';
 
 export const FIX_DISPATCH_STALE_LABEL = 'reconcile-fix-dispatch';
 const FIX_CODE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -345,6 +354,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
         ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
+        ...roundFields(entry), // card xrbu1bp — the round (resume + stronger model) and the base (resume bound).
       });
       continue;
     }
@@ -463,9 +473,19 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
       ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
+      ...roundFields(entry), // card xrbu1bp — the round (resume + stronger model) and the base (resume bound).
     });
   }
   return { planned, refusals };
+}
+
+/** Card xrbu1bp — the planner's spent-round count and the PR's base ref, carried onto a planned fix. */
+function roundFields(entry) {
+  return {
+    ...(Number.isFinite(Number(entry.attempts)) && entry.attempts != null ? { attempts: Number(entry.attempts) } : {}),
+    ...(Number.isFinite(Number(entry.cap)) && entry.cap != null ? { cap: Number(entry.cap) } : {}),
+    ...(entry.baseRefName ? { baseRefName: entry.baseRefName } : {}),
+  };
 }
 
 // `isSafeFallbackScopeEntry` MOVED to `pr-work-unit.mjs` (web-everything/web-everything#2573 review findings —
@@ -881,6 +901,26 @@ export function tryResumeFix(planned, {
     };
   }
 
+  return resumeBgSession(planned, {
+    candidate,
+    prompt: withOperatorAnswer(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned.operatorAnswer),
+    repo, spawnAgent, listAgentsAll, stop, wait, claimOwner, acquireClaim, releaseClaim, claimRoot, sessionCwdFor, ensureSessionCwd,
+  });
+}
+
+/**
+ * The bare `claude --bg --resume <candidate>` attempt shared by the conflict resume ({@link tryResumeFix}) and the
+ * round resume ({@link tryResumeRoundFix}, card xrbu1bp): take the fix-dispatch claim, spawn the resume with
+ * `prompt`, confirm it against fresh listings (bounded retry), and on anything but a confirmed resume stop the
+ * forked copy and release the claim so the caller's fresh dispatch can take it. The caller has already decided the
+ * candidate is this PR's own session; this function only performs the attempt.
+ */
+export function resumeBgSession(planned, {
+  candidate, prompt, repo = 'we', spawnAgent = defaultSpawnAgent, listAgentsAll = () => defaultListAgents({ all: true }),
+  stop = stopSession, wait = defaultConfirmWait, claimOwner = fixDispatchClaimOwner(), acquireClaim = acquireFixDispatchClaim,
+  releaseClaim = releaseFixDispatchClaim, claimRoot, sessionCwdFor = (id) => dispatchSessionCwd(id, { root: REPO_ROOT }),
+  ensureSessionCwd = ensureDispatchSessionCwd,
+} = {}) {
   // #x0jphk5 — TAKE THE CLAIM before ever issuing `--resume`. Ownership is confirmed above (both HEAD-sha and
   // name), so what remains is a genuine race: two dispatchers reading the same stale listing could BOTH reach
   // this point for the SAME candidate and both fire `--resume <id>` at once. The claim is released in every
@@ -907,7 +947,7 @@ export function tryResumeFix(planned, {
   const releaseOurClaim = () => releaseClaim({ repo, pr: planned.pr, kind: 'fix', owner: claimOwner, lockRoot: claimRoot });
 
   const resumeArgv = buildAgentArgv({
-    payload: { prompt: withOperatorAnswer(buildResumePrompt({ pr: planned.pr, itemNum: planned.itemNum, cwd: candidateCwd }), planned.operatorAnswer) },
+    payload: { prompt },
     resumeSessionId: candidate,
   });
   // #4174 — same "never `root` itself" cwd as the fresh-dispatch spawn below; see this function's own new
@@ -959,6 +999,71 @@ export function tryResumeFix(planned, {
       ...(outcome.anomaly ? { anomaly: outcome.anomaly } : {}),
     },
   };
+}
+
+/**
+ * Card xrbu1bp — the ROUND resume: round N>1 of an ordinary fix resumes the previous round's `fix-<pr>` session with
+ * this round's findings and the round history, instead of a cold start. LANE-FREE like {@link tryResumeFix} (the
+ * session keeps its own lane), so the caller asks this BEFORE popping a lane.
+ *
+ * The decision is {@link planRoundResume} (pure, `we:scripts/conveyor/fix-resume.mjs`) over
+ * {@link readRoundResumeInputs}: the session is listed and not running, its job record and transcript exist, it runs
+ * on the model this round needs (a round that escalates to the stronger model cold-starts on it), and the lane it
+ * acquired (its lease, or the pool journal once the lease is reaped) left exactly the PR head, with the base not
+ * rebased under it. The attempt
+ * itself is {@link resumeBgSession} (claim, bare `--bg --resume`, confirmed against fresh listings, a fork stopped).
+ * Any declined or failed resume returns `{ resumed: false, resumeAttempt }` and the caller cold-starts with the
+ * history brief. Never for a takeover, a conflict, a restack, a borrowed slot or a wrapped (`claude -p`) launch.
+ * @returns {{resumed:boolean, result?:object, resumeAttempt?:object|null, decision?:object}}
+ */
+export function tryResumeRoundFix(planned, {
+  repo = 'we', root = REPO_ROOT,
+  fixSettings = resolveFixSettings(),
+  wrapFix = workerWrapperEnabledFor('fix'),
+  listAgentsAll = () => defaultListAgents({ all: true }),
+  readInputs = readRoundResumeInputs,
+  loadLadder = () => loadFixerLadder(),
+  readHistoryInputs = ({ repo: r, pr }) => readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled }),
+  postNotice = postRulingNotice,
+  resume = resumeBgSession,
+  resumeOptions = {},
+  dryRun = false,
+} = {}) {
+  if (!dryRun) assertNotALaneCheckout(root);
+  const slug = sessionSlugFor(planned.itemNum, 'fix', planned.pr, '', repo);
+  const declined = (decision) => ({ resumed: false, decision, resumeAttempt: { attempted: false, round: roundOf(planned), refused: decision.reason, why: decision.why } });
+  if (fixSettings?.resumeAcrossRounds === 'off') return declined({ resume: false, reason: 'setting-off', why: 'fix.resumeAcrossRounds is off' });
+  if (roundOf(planned) < 2) return declined({ resume: false, reason: 'first-round', why: 'round 1 has no earlier fixer session' });
+  if (wrapFix) return declined({ resume: false, reason: 'wrapped-launch', why: 'the wrapped (claude -p) fix launch has no round resume yet' });
+  const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
+  const table = launchTableFor(planned, roundEscalation);
+  const desiredModel = table?.model ? claudeSpawnAlias(String(table.model)) : null;
+  const defaultBranch = 'main'; // every constellation repo's default branch (reconcile-pass assumes the same)
+  const inputs = readInputs({ planned, slug, root, listAgentsAll, defaultBranch, repoSlug: ghRepoSlug(repo) });
+  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, ...inputs });
+  if (!decision.resume) return declined(decision);
+  if (dryRun) return { resumed: false, decision, dryRun: true, roundEscalation };
+  let historyInputs = null;
+  try { historyInputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { historyInputs = null; }
+  const history = historyInputs ? renderRoundHistory(buildRoundHistory(historyInputs), { previousOnly: false, title: 'All rounds so far' }) : '';
+  // The durable ruling notice first, exactly as a fresh launch does (once per head and rung; a failed post throws).
+  postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
+  const prompt = withPlannedContext(buildRoundResumePrompt({
+    pr: planned.pr, itemNum: planned.itemNum, round: decision.round, cap: planned.cap ?? null,
+    lane: decision.lane, headRefOid: planned.headRefOid, history,
+  }), planned);
+  const priorCwd = inputs.prior?.cwd || null;
+  const attempt = resume(planned, {
+    candidate: decision.sessionId, prompt, repo,
+    listAgentsAll,
+    ...(priorCwd ? { sessionCwdFor: () => priorCwd } : {}),
+    ...resumeOptions,
+  });
+  if (attempt.resumed) {
+    console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${decision.round} resumed ${decision.sessionId} in lane-${decision.lane.lane} (no cold start)`);
+    return { ...attempt, result: { ...attempt.result, lane: decision.lane.lane, round: decision.round, roundResume: true }, decision };
+  }
+  return { ...attempt, resumeAttempt: { ...(attempt.resumeAttempt ?? {}), round: decision.round, roundResume: true }, decision };
 }
 
 /**
@@ -1014,6 +1119,31 @@ export function fixerTableFor(ruling) {
     throw new Error(`fixer-escalation: rung ${ruling.rung?.id} routes to ${route.provider}, which the fix dispatch cannot launch (only claude --bg is wired)`);
   }
   return { model: route.model, effort: route.effort, reason: `fixer-escalation rung ${ruling.rung?.id ?? '?'}` };
+}
+
+/** Every per-entry section a fix prompt carries in front of the brief (fresh launch, borrowed launch and round resume alike). */
+export function withPlannedContext(prompt, planned) {
+  return withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack);
+}
+
+/**
+ * Card xrbu1bp — the stronger-model route an ORDINARY fix round gets from `fix.strongerModelFromRound` (default 3), or
+ * null. A takeover and a ruling-not-addressed send-back have their own rung; a conflict or restack round is mechanical
+ * and stays on the ordinary route. The ladder is only read when the round reaches the setting.
+ */
+export function roundEscalationFor(planned, { fixSettings, loadLadder = () => loadFixerLadder() } = {}) {
+  if (planned?.takeover || planned?.rulingNotAddressed || planned?.isConflict || planned?.restack) return null;
+  const fromRound = Number(fixSettings?.strongerModelFromRound);
+  const round = roundOf(planned);
+  if (!Number.isInteger(fromRound) || fromRound < 1 || round < fromRound) return null;
+  let fixerLadder = null;
+  try { fixerLadder = loadLadder(); } catch { fixerLadder = null; }
+  return planRoundEscalation({ round, fromRound, fixerLadder });
+}
+
+/** Card xrbu1bp — the routing table this fix launch runs on: the ruling rung, the takeover rung, or the round rung. */
+export function launchTableFor(planned, roundEscalation) {
+  return fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
 }
 
 /**
@@ -1181,6 +1311,8 @@ export function dispatchFix(planned, {
   // Hermetic under a test runner: a test that wants history injects its own reader.
   readHistoryInputs = ({ repo: r, pr }) => (isUnderTestEnv() ? null : readRoundHistoryInputs({ pr, repoSlug: ghRepoSlug(r), exec: execFileSyncThrottled })),
   postTakeover = postTakeoverMarker,
+  // Card xrbu1bp — the fixer ladder, read only when a round reaches `fix.strongerModelFromRound`.
+  loadLadder = () => loadFixerLadder(),
   postTakeoverVoidMark = postTakeoverVoid,
 } = {}) {
   // #x33jgwt multi-repo slice 5 — no repo gate HERE any more (see {@link tryResumeFix}'s own docblock for why):
@@ -1240,7 +1372,12 @@ export function dispatchFix(planned, {
     const prompt = briefWithRoundContext(filledBrief, planned, { repo, fixSettings, readHistoryInputs });
     // The durable notice FIRST: a fixer that reads the thread must find the ruling there. A failed post throws, the
     // claim is released below, and the next tick retries; nothing has been spawned.
-    const ladderTable = fixerTableFor(planned.rulingNotAddressed ?? planned.takeover); // may refuse before anything is posted
+    // Card xrbu1bp — an ordinary round at or past `fix.strongerModelFromRound` runs on the stronger-model rung.
+    const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
+    const ladderTable = launchTableFor(planned, roundEscalation); // may refuse before anything is posted
+    if (roundEscalation) {
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${roundEscalation.round} on the ${roundEscalation.rung.id} route (fix.strongerModelFromRound=${roundEscalation.fromRound}) model=${ladderTable?.model ?? 'default-fix-route'}`);
+    }
     try {
       postNotice({ repo, pr: planned.pr, ruling: planned.rulingNotAddressed });
     } catch (e) {
@@ -1264,7 +1401,7 @@ export function dispatchFix(planned, {
     }
     if (borrowed && borrowed.executor !== 'claude') {
       // Card 87 — the borrowed slot belongs to a non-Claude executor: same claim and brief, other launcher.
-      const promptFile = writeBorrowedPrompt(sessionSlug, withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack));
+      const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
       let handle;
       try {
         launchAttempted = true;
@@ -1312,7 +1449,7 @@ export function dispatchFix(planned, {
       advisor,
       // fix procedure — a re-armed concurrent-author pause hands the next fixer the saved alt branch to start from.
       ...(ladderTable ? { table: ladderTable } : {}),
-      payload: { prompt: withRestackHint(withAltBranchHint(withSalvageHint(withOperatorSendBack(withScopeBloat(withBlockRuledReferrals(withRulingNotAddressed(withOperatorAnswer(prompt, planned.operatorAnswer), planned.rulingNotAddressed), planned.blockRuledReferrals), planned.scopeBloat), planned.operatorSendBack), { cards: [planned.itemNum], prs: [planned.pr] }), planned.altBranch), planned.restack), sessionSlug, launchKind: 'fix' },
+      payload: { prompt: withPlannedContext(prompt, planned), sessionSlug, launchKind: 'fix' },
       // #3606 — see this function's own docblock: without this the fix agent reads a correctly-filled brief as an
       // unfilled template and self-aborts (3/3 live).
       systemPromptFile: DISPATCHED_AGENT_SYSTEM_PROMPT_FILE,
@@ -1477,6 +1614,8 @@ export function runReconcileFixDispatch({
   loadItems = () => defaultLoadItems(root),
   pickFreeLanes = null,
   tryResume = tryResumeFix,
+  // Card xrbu1bp — the round resume. Off under a test runner unless injected (it reads the live agent listing).
+  tryResumeRound = isUnderTestEnv() ? null : tryResumeRoundFix,
   dispatch = dispatchFix,
   reconcile = runReconcilePass,
   // Card xd1tvd0 — rewrite the scope-overlap fences to each PR's git net diff vs current main (the `fixOverlap`
@@ -1711,6 +1850,25 @@ export function runReconcileFixDispatch({
       }
       resumeAttempt = attempt.resumeAttempt;
     }
+    // Card xrbu1bp — round N>1 of an ordinary fix: resume the previous round's own session first (lane-free, like the
+    // conflict resume above). A declined or failed resume falls through to the cold start with the history brief; a
+    // throw here never aborts the pass, it only means a cold start.
+    if (tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
+      let attempt = null;
+      try {
+        attempt = tryResumeRound(entry, { root, repo: repoKey });
+      } catch (e) {
+        attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
+      }
+      if (attempt?.resumed) {
+        dispatched.push(attempt.result);
+        continue; // no lane ever popped for this entry
+      }
+      if (attempt?.resumeAttempt) {
+        resumeAttempt = attempt.resumeAttempt;
+        console.error(`reconcile-fix-dispatch: PR #${entry.pr} round ${roundOf(entry)} cold start (no resume: ${attempt.resumeAttempt.refused ?? (attempt.resumeAttempt.forked ? 'forked' : 'unconfirmed')}${attempt.resumeAttempt.why ? ` — ${attempt.resumeAttempt.why}` : ''})`);
+      }
+    }
 
     if (lanes.length === 0) {
       refusals.push({ pr: entry.pr, kind: 'no-lane', why: `no free lane to dispatch a fix agent for PR #${entry.pr}` });
@@ -1913,6 +2071,69 @@ export function planFixDispatchClaimStatus({
   return { repo: repoKey, entries };
 }
 
+/**
+ * Card xrbu1bp — READ-ONLY replay of the NEXT fix launch for one live PR: which round it would be, which model route
+ * it would run on, and whether it would resume the previous round's session or cold-start (and why). It never claims,
+ * posts, spawns, resumes or fetches. `round` overrides the round the PR's own thread counts (rearm + advisory rounds,
+ * the planner's own counters). Used as `reconcile-fix-dispatch.mjs --dry-run --replay-pr=<n> [--round=<r>]`.
+ */
+export function replayFixLaunch({
+  pr, round = null, repo = 'we', root = REPO_ROOT, exec = execFileSyncThrottled,
+  readComments = (n, slug) => readCompletePrComments(n, { repo: slug }),
+  fixSettings = resolveFixSettings(), resumeRound = tryResumeRoundFix, loadLadder = () => loadFixerLadder(),
+} = {}) {
+  const slug = ghRepoSlug(repo);
+  const view = JSON.parse(exec('gh', ['pr', 'view', String(pr), '--repo', slug, '--json', 'number,headRefName,headRefOid,baseRefName,labels,state'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }));
+  let attempts;
+  if (Number.isInteger(round) && round >= 1) attempts = round - 1;
+  else {
+    const comments = readComments(Number(pr), slug) ?? [];
+    attempts = Math.max(countRearmComments(comments), countAdvisoryComments(comments));
+  }
+  const labels = (view.labels ?? []).map((l) => l.name);
+  const planned = {
+    pr: Number(view.number), itemNum: laneRefItemNum(view.headRefName) ?? null, laneRef: view.headRefName,
+    headRefOid: view.headRefOid, baseRefName: view.baseRefName, attempts, isConflict: labels.includes(CONFLICT_LABEL),
+  };
+  const roundEscalation = roundEscalationFor(planned, { fixSettings, loadLadder });
+  const table = launchTableFor(planned, roundEscalation);
+  const launch = resumeRound(planned, { repo, root, fixSettings, loadLadder, dryRun: true });
+  return {
+    pr: planned.pr, state: view.state ?? null, round: roundOf(planned), attempts, roundOverride: Number.isInteger(round),
+    head: planned.headRefOid, base: planned.baseRefName,
+    route: roundEscalation
+      ? { rung: roundEscalation.rung.id, model: table?.model ?? null, cliModel: table?.model ? claudeSpawnAlias(String(table.model)) : null, fromRound: roundEscalation.fromRound }
+      : { rung: 'ordinary', model: null, cliModel: null, fromRound: fixSettings?.strongerModelFromRound ?? null,
+        why: planned.isConflict ? 'a conflict round stays on the ordinary route'
+          : !(Number(fixSettings?.strongerModelFromRound) >= 1) ? 'fix.strongerModelFromRound is off'
+          : roundOf(planned) < Number(fixSettings?.strongerModelFromRound) ? `round ${roundOf(planned)} < fix.strongerModelFromRound=${fixSettings?.strongerModelFromRound}`
+          : 'no launchable stronger rung on the fixer ladder' },
+    launch: launch.decision?.resume
+      ? { mode: 'resume', sessionId: launch.decision.sessionId, lane: launch.decision.lane?.lane ?? null, lanePath: launch.decision.lane?.path ?? null, held: launch.decision.lane?.held ?? null }
+      : { mode: 'cold-start', reason: launch.decision?.reason ?? launch.resumeAttempt?.refused ?? 'unknown', why: launch.decision?.why ?? launch.resumeAttempt?.why ?? null },
+    settings: { resumeAcrossRounds: fixSettings?.resumeAcrossRounds, strongerModelFromRound: fixSettings?.strongerModelFromRound },
+  };
+}
+
+/** One readable block for {@link replayFixLaunch}'s result. */
+export function formatReplay(r) {
+  const route = r.route.rung === 'ordinary'
+    ? `ordinary fix route (${r.route.why})`
+    : `${r.route.rung} route — ${r.route.model} (--model ${r.route.cliModel}), from round ${r.route.fromRound}`;
+  const launch = r.launch.mode === 'resume'
+    ? `resume ${r.launch.sessionId} — no cold start; checkout: ${r.launch.held === 'own' ? `its own lane-${r.launch.lane}`
+      : r.launch.held === 'free' ? `re-take its untouched lane-${r.launch.lane} (--no-reset)`
+        : `its lane-${r.launch.lane} was reused since, so a fresh lane at the PR ref (the PR head is what it left)`}`
+    : `cold start with the round-history brief — ${r.launch.reason}${r.launch.why ? `: ${r.launch.why}` : ''}`;
+  return [
+    `replay PR #${r.pr} (${r.state ?? '?'}) — next fix would be round ${r.round}${r.roundOverride ? ' (round given)' : ` (${r.attempts} round(s) spent)`}, head ${String(r.head).slice(0, 9)}, base ${r.base}`,
+    `  route:  ${route}`,
+    `  launch: ${launch}`,
+    '  (dry run: nothing claimed, posted, spawned or resumed)',
+  ].join('\n');
+}
+
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI) {
   // xgqz204 — this CLI may fast-forward its own checkout (#3474); re-execute rather than dispatch on old code.
@@ -1923,6 +2144,20 @@ if (IS_CLI) {
     const eq = a.indexOf('=');
     if (eq === -1) flags[a.slice(2)] = true;
     else flags[a.slice(2, eq)] = a.slice(eq + 1);
+  }
+  if (flags['dry-run'] && flags['replay-pr']) {
+    // Card xrbu1bp — read-only replay of one PR's next fix launch (round, model route, resume or cold start).
+    try {
+      const r = replayFixLaunch({
+        pr: Number(flags['replay-pr']), round: flags.round ? Number(flags.round) : null,
+        repo: typeof flags.repo === 'string' ? (repoKeyForSlug(flags.repo) ?? flags.repo) : 'we',
+      });
+      writeLineSync(1, flags.json ? JSON.stringify(r) : formatReplay(r));
+      process.exit(0);
+    } catch (e) {
+      process.stderr.write(`✗ reconcile-fix-dispatch --dry-run --replay-pr failed: ${String((e && e.message) || e).split('\n')[0]}\n`);
+      process.exit(1);
+    }
   }
   if (flags['dry-run']) {
     // #x0jphk5 — read-only: reports claim status, never dispatches/resumes/acquires/releases anything.
