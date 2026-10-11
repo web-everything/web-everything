@@ -24,8 +24,9 @@
  *
  *   A REJECTED push (a raced writer, a refusing hook, a transient blip) is retried, re-fetching the tip each time
  *   ({@link PUBLISH_ATTEMPTS}, within a total deadline), so a transient rejection no longer leaves CI reading a stale
- *   clear. Every git call carries a timeout ({@link GIT_TIMEOUT_MS}), so a hung push or fetch fails instead of
- *   blocking; the reader turns a timeout into `{error}` (fail closed). A
+ *   clear. Every git call carries a timeout ({@link GIT_TIMEOUT_MS}), capped by the time left before the publish deadline,
+ *   so a hung push or fetch — the first one included — fails by the deadline instead of blocking; the reader turns a
+ *   timeout into `{error}` (fail closed). A
  *   clear is computed against the fresh tip and refuses to wipe a DIFFERENT freeze (another writer's, pushed meanwhile). The
  *   residual is EVERY attempt failing, for any reason (origin unreachable, a push policy that refuses each time): the
  *   local marker stays (the drain still stops) and the CLI exits non-zero with a loud line naming the retry
@@ -49,9 +50,19 @@ export const GIT_TIMEOUT_MS = 20_000;
 /** Captured git output cap: the freeze doc is a few hundred bytes; anything near this is not our file (fail). */
 const GIT_MAX_BUFFER = 4 * 1024 * 1024;
 
-/** The transport's git runner, with a hard timeout (the transport's own default has none). */
-export function timedGit(timeoutMs = GIT_TIMEOUT_MS) {
-  return (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER, timeout: timeoutMs, killSignal: 'SIGTERM', ...opts }); // SIGTERM, not SIGKILL: git then removes its ref/packed-refs locks, so a timeout never wedges the next run
+/**
+ * The transport's git runner, with a hard timeout (the transport's own default has none). `deadlineAt` (epoch ms, the
+ * publish's total deadline) caps each call at the time LEFT, so even a hung FIRST call ends at the deadline, and a call
+ * that would start past it throws at once. `worktree prune` (local cleanup in the transport's `finally`) keeps the plain
+ * per-call timeout: skipping it would leave a stale worktree registration for the next run.
+ */
+export function timedGit(timeoutMs = GIT_TIMEOUT_MS, { deadlineAt = null, now = Date.now, exec = execFileSync } = {}) {
+  return (args, opts = {}) => {
+    const cleanup = args[0] === 'worktree' && args[1] === 'prune';
+    const left = deadlineAt == null || cleanup ? timeoutMs : Math.min(timeoutMs, deadlineAt - now());
+    if (left <= 0) throw new Error(`red-main-freeze-shared: publish deadline reached before git ${String(args[0])}`);
+    return exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: GIT_MAX_BUFFER, killSignal: 'SIGTERM', ...opts, timeout: left }); // SIGTERM, not SIGKILL: git then removes its ref/packed-refs locks, so a timeout never wedges the next run
+  };
 }
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -96,7 +107,7 @@ export function flatText(v, max = 200) {
  * overwrite would wipe while that writer's local marker stays frozen. `lifted` absent ⇒ an operator clear from a clone
  * with no marker: nothing to compare, so it clears (it is explicit).
  */
-export function publishSharedFreeze({ marker, clear = false, lifted, board = REPO_ROOT, branch = resolveFreezeBranch(), gitTimeoutMs = GIT_TIMEOUT_MS, run = timedGit(gitTimeoutMs), now, host, transport = {} } = {}) {
+export function publishSharedFreeze({ marker, clear = false, lifted, board = REPO_ROOT, branch = resolveFreezeBranch(), gitTimeoutMs = GIT_TIMEOUT_MS, deadlineAt = null, run = timedGit(gitTimeoutMs, { deadlineAt }), now, host, transport = {} } = {}) {
   if (!/^ops\/[a-z0-9][a-z0-9-]{0,63}$/.test(String(branch))) throw refusal(`red-main-freeze-shared: refusing to publish to "${branch}" — only an ops/<slug> branch`);
   // "No marker" is NOT "cleared": a clone without the gitignored local marker (or one holding a corrupt file) reads
   // `null`, and mirroring that would silently clear a standing freeze. Only an explicit clear may publish frozen:false.
@@ -147,19 +158,22 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
   }
   // A REJECTED raise (a raced writer, a refusing hook, a blip) must not leave CI reading a stale clear: every attempt
   // re-fetches the tip and re-stages onto it, so a non-fast-forward resolves itself. Bounded by count AND by a total
-  // deadline checked between attempts (each git call is separately capped by GIT_TIMEOUT_MS). A deterministic refusal is never retried. A CLEAR is tried once: a
+  // deadline: checked between attempts, AND passed down as `deadlineAt` so each git call is capped at the time left
+  // (min of that and GIT_TIMEOUT_MS) — a hung first call ends at the deadline too. A deterministic refusal is never retried. A CLEAR is tried once: a
   // rejected clear leaves CI frozen (fail closed), and a clear never overwrites a different freeze (see `lifted`).
   const tries = clear === true ? 1 : Math.max(1, attempts);
   const envMs = (name) => { const n = Number(env[name]); return Number.isInteger(n) && n > 0 ? n : null; };
   const gitTimeoutMs = envMs('WE_RED_MAIN_FREEZE_SHARED_GIT_TIMEOUT_MS') ?? GIT_TIMEOUT_MS;
   deadlineMs = envMs('WE_RED_MAIN_FREEZE_SHARED_DEADLINE_MS') ?? deadlineMs;
   const started = nowMs();
+  // The git calls run on the wall clock: their cap is the deadline in real time, so a hung FIRST call ends there too.
+  const deadlineAt = Date.now() + deadlineMs;
   let error;
   let attempt = 0;
   while (attempt < tries) {
     attempt += 1;
     try {
-      const r = publish({ marker, gitTimeoutMs, ...(clear === true ? { clear: true, ...(lifted != null ? { lifted } : {}) } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
+      const r = publish({ marker, gitTimeoutMs, deadlineAt, ...(clear === true ? { clear: true, ...(lifted != null ? { lifted } : {}) } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
       stderr(`red-main freeze: shared copy ${r.pushed ? 'published' : 'already current'} on ${r.branch} (frozen=${r.doc.frozen})${attempt > 1 ? ` after ${attempt} attempts` : ''}\n`);
       return { ok: true, branch: r.branch, pushed: r.pushed, attempts: attempt };
     } catch (e) {

@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch,
+  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch, timedGit,
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
@@ -121,6 +121,40 @@ describe('shared red-main freeze (xyd06qo)', () => {
     expect(calls).toBe(1);
     expect(r).toMatchObject({ ok: false, attempts: 1 });
     expect(lines.join('')).toMatch(/deadline \(1000ms\) reached/);
+  });
+
+  it('CLI hook: passes an absolute deadlineAt to the writer, so each git call can be capped at the time left (shared:130)', async () => {
+    const seen = [];
+    const before = Date.now();
+    await publishFreezeFromCli({
+      marker: { reason: 'red' }, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: () => {}, setExitCode: () => {}, deadlineMs: 5000,
+      publish: (o) => { seen.push(o); return { pushed: true, branch: BRANCH, doc: { frozen: true } }; },
+    });
+    expect(seen[0].deadlineAt).toBeGreaterThanOrEqual(before + 5000);
+    expect(seen[0].deadlineAt).toBeLessThanOrEqual(Date.now() + 5000);
+  });
+
+  it('timedGit: each call\'s timeout is min(per-call, time left); past the deadline a call throws without running git; `worktree prune` cleanup is never cut', () => {
+    const calls = [];
+    const exec = (cmd, args, opts) => { calls.push({ args, timeout: opts.timeout }); return ''; };
+    let t = 1000;
+    const run = timedGit(15_000, { deadlineAt: 3000, now: () => t, exec });
+    run(['fetch', 'origin']);
+    expect(calls.at(-1).timeout).toBe(2000);
+    t = 3000;
+    expect(() => run(['push', 'origin'])).toThrow(/deadline reached before git push/);
+    expect(calls).toHaveLength(1);
+    run(['worktree', 'prune'], { cwd: '/b' });
+    expect(calls.at(-1)).toMatchObject({ args: ['worktree', 'prune'], timeout: 15_000 });
+    t = 2500;
+    run(['fetch'], { timeout: 99_999 }); // a caller's own timeout never lifts the cap
+    expect(calls.at(-1).timeout).toBe(500);
+  });
+
+  it('timedGit: no deadline → the plain per-call timeout', () => {
+    const calls = [];
+    timedGit(7000, { exec: (c, a, o) => { calls.push(o.timeout); return ''; } })(['fetch']);
+    expect(calls).toEqual([7000]);
   });
 
   it('CLI hook: a deterministic refusal from the writer is reported once and never retried', async () => {
@@ -407,6 +441,39 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/NOT published/);
     expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ frozen: true, reason: 'red' });
+  });
+
+  it('the publish DEADLINE caps a hung FIRST git call too — the per-call timeout never outlives the deadline (PR 4715 ruling, shared:130)', () => {
+    const hook = join(fx.root, 'remote.git', 'hooks', 'pre-receive');
+    writeFileSync(hook, '#!/bin/sh\nsleep 30\nexit 0\n');
+    chmodSync(hook, 0o755);
+    const t0 = Date.now();
+    // Per-call timeout far ABOVE the deadline: before the fix the first push ran the full 15s, the deadline only being checked between attempts.
+    const r = fx.run(['freeze', '--reason=red'], { WE_RED_MAIN_FREEZE_SHARED_GIT_TIMEOUT_MS: '15000', WE_RED_MAIN_FREEZE_SHARED_DEADLINE_MS: '1000' });
+    expect(Date.now() - t0).toBeLessThan(8_000);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/NOT published/);
+    expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ frozen: true, reason: 'red' });
+  });
+
+  it('every freeze push rejected over a standing shared CLEAR still cannot hide a red main: the gate reads main CI and HOLDS (shared:95, shared:151, remediation:322)', () => {
+    expect(fx.run(['freeze', '--reason=old']).status).toBe(0);
+    expect(fx.run(['unfreeze']).status).toBe(0);
+    expect(fx.shared()).toMatchObject({ frozen: false });
+    fx.rejectNextPushes(100);
+    const r = fx.run(['freeze', '--reason=red'], { WE_RED_MAIN_FREEZE_SHARED_DEADLINE_MS: '5000' });
+    expect(r.status).toBe(1);
+    expect(fx.shared()).toMatchObject({ frozen: false }); // exhausted: the stale clear stands on the shared branch
+    expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ frozen: true }); // the drain (sole merger) is stopped
+    const freeze = readSharedFreeze({ board: fx.board, branch: BRANCH });
+    expect(freeze).toMatchObject({ frozen: false });
+    const redRuns = [
+      { databaseId: 1, status: 'completed', conclusion: 'success', createdAt: '2026-10-11T00:00:00Z', updatedAt: '2026-10-11T00:00:00Z', headSha: 'a'.repeat(40) },
+      { databaseId: 2, status: 'completed', conclusion: 'failure', createdAt: '2026-10-11T01:00:00Z', updatedAt: '2026-10-11T01:00:00Z', headSha: 'b'.repeat(40) },
+    ];
+    const mainCi = readMainCiFact({ repo: 'o/r', defaultBranch: 'main', exec: () => JSON.stringify(redRuns) });
+    expect(combineRedMain(freeze, mainCi, PR)).toMatchObject({ frozen: true, reason: expect.stringMatching(/main CI red/) });
+    expect(gate(combineRedMain(freeze, mainCi, PR))).toMatchObject({ status: 'hold' });
   });
 
   it('a local write failure still publishes the shared freeze (it can never leave the shared copy clear)', () => {
