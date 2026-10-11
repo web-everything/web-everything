@@ -42,3 +42,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#4759 (finding 2: `we:scripts/conveyor/takeover-review.mjs:59` — Add a multi-takeover case to we:takeover-review.test.mjs and anchor on the latest signal. The test should cover an automatic takeover, its verdict, then an operator takeover and a new head.)

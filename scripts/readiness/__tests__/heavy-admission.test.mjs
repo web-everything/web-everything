@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSyn
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
   ADMISSION_LEASE_MINUTES, resolveCap, resolveTimeoutMs, resolveCeilingMs, isAdmissionOff, slotPath,
@@ -30,6 +31,7 @@ import {
 import {
   ADMISSION_DEFERRED_EXIT, ADMISSION_POLICY_STANDARD, resolveAdmissionPolicy, formatAdmissionPolicy,
   resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy, privateAdmissionPool,
+  classifyWaiterPriority, slotOrderFor, recordHoldDuration, readHoldDurations, validRepairPatterns, DEFAULT_REPAIR_PATTERNS,
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
@@ -1437,7 +1439,7 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
 describe('resolveAdmissionPolicy — the one cascade every process reads (standard → platform → tool → env)', () => {
   it('the standard: cap 2, 1 fast slot, a queue timeout DEFERS, no fast-lane scaling', () => {
     const p = resolveAdmissionPolicy({});
-    expect(p.settings).toEqual({ cap: 2, fastSlots: 1, onTimeout: 'defer',
+    expect(p.settings).toMatchObject({ cap: 2, fastSlots: 1, onTimeout: 'defer',
       fastScale: { maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 } });
     expect(p.settings).toEqual(ADMISSION_POLICY_STANDARD);
     expect(p.sources).toMatchObject({ cap: 'standard', fastSlots: 'standard', onTimeout: 'standard' });
@@ -1730,4 +1732,227 @@ describe('runUnderAdmission + the CLI — a deferred admission does NOT run the 
     expect(r.status).toBe(75);
     expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: false, deferred: true });
   }, 30_000);
+});
+
+// ── main-fix-queue-priority: a red-main repair waiter is admitted ahead of every other waiter ──────────────────
+// Live 2026-10-10 19:08Z: main was red (record-referral-ruling.test.mjs), the drain's red-main hold had stopped every
+// merge, and the main-fix job's gate (lane 7, `main-fix-2cb94418d`, kind files) sat 4.6 min in the heavy queue
+// behind ordinary conveyor-fix waiters. While main is red nothing lands, so the repair is the most valuable job on
+// the host. The class reuses the delivery-priority scale (P0 = owns the fix for an open main-red episode).
+describe('main-fix queue priority — red-main repair waiters are class P0 (delivery-priority scale)', () => {
+  const policyWith = (priority) => ({ settings: { ...ADMISSION_POLICY_STANDARD, priority: { ...ADMISSION_POLICY_STANDARD.priority, ...priority } },
+    sources: { 'priority.mode': 'tool' }, invalid: [], ignored: [] });
+  const lease = (purpose, holder, session = 'Mac:1') => ({ purpose, holder, session, acquiredAt: iso(T0 - 60 * 60_000), ttlMinutes: 240, host: 'Mac' });
+
+  it('the standard: priority enforced, repair patterns match main-fix-<sha>, main-fix-combine-<pr> and revert-red-<sha|pr>', () => {
+    expect(ADMISSION_POLICY_STANDARD.priority.mode).toBe('enforce');
+    const p = ADMISSION_POLICY_STANDARD.priority;
+    const cls = (purpose, holder = null) => classifyWaiterPriority({ purpose, holder }, p).class;
+    expect(cls('main-fix-2cb94418d')).toBe('P0');
+    expect(cls(null, 'main-fix-2cb94418d-lane-7-ba602393')).toBe('P0');
+    expect(cls('main-fix-combine-4512')).toBe('P0');
+    expect(cls('revert-red-4979')).toBe('P0');
+    // Ordinary work stays P3 — including a lane whose purpose merely STARTS with main-fix- (this very card's lane).
+    expect(cls('conveyor-fix', 'conveyor-fix-lane-1-be67c548')).toBe('P3');
+    expect(cls('main-fix-queue-priority', 'main-fix-queue-priority-lane-3-3abb1db8')).toBe('P3');
+    expect(cls('revert-red-check')).toBe('P3');
+    expect(cls(null)).toBe('P3');
+  });
+
+  it('classifyWaiterPriority names the matched field, value and pattern, and the delivery-priority reason', () => {
+    const r = classifyWaiterPriority({ purpose: 'main-fix-2cb94418d' }, ADMISSION_POLICY_STANDARD.priority);
+    expect(r).toMatchObject({ class: 'P0', matched: { field: 'purpose', value: 'main-fix-2cb94418d' } });
+    expect(r.reason).toMatch(/main-red/);
+    expect(classifyWaiterPriority({ purpose: 'main-fix-2cb94418d' }, { ...ADMISSION_POLICY_STANDARD.priority, mode: 'off' }).class).toBe('P3');
+  });
+
+  // Resource bounds: an operator-set repair pattern is matched on the admission path BEFORE the queue / ceiling checks,
+  // so one catastrophic pattern must never be able to stall a caller (reproduced: ^(main-fix-)?([a-z]+)+$ on 60 a's).
+  const probe = (patterns, value) => {
+    const script = `
+      import { acquireSlotBlocking, ADMISSION_POLICY_STANDARD, classifyWaiterPriority } from ${JSON.stringify(pathToFileURL(CLI).href)};
+      const priority = { mode: 'enforce', repairPatterns: ${JSON.stringify(patterns)} };
+      const t0 = Date.now();
+      const cls = classifyWaiterPriority({ purpose: ${JSON.stringify(value)} }, priority);
+      const r = await acquireSlotBlocking({ lockRoot: ${JSON.stringify(lockRoot)}, cap: 1, owner: 'MF', kind: 'files', pollMs: 10, ceilingMs: 1000, canDefer: true,
+        policy: { settings: { ...ADMISSION_POLICY_STANDARD, priority }, sources: {}, invalid: [], ignored: [] },
+        readLease: () => ({ purpose: ${JSON.stringify(value)}, holder: null, session: null }), log: () => {}, env: {} });
+      console.log(JSON.stringify({ cls: cls.class, ok: r.ok, ms: Date.now() - t0 }));`;
+    const res = spawnSync(process.execPath, ['--input-type=module', '-e', script],
+      { encoding: 'utf8', timeout: 8000, env: { ...process.env, WE_RESOURCE_SHADOW: 'off', WE_RESOURCE_CUTOVER: 'shadow' } });
+    return { timedOut: res.error?.code === 'ETIMEDOUT', out: res.stdout.trim() ? JSON.parse(res.stdout.trim().split('\n').pop()) : null, stderr: res.stderr };
+  };
+
+  it('validRepairPatterns rejects a nested quantifier, a backreference, and an over-long pattern; accepts the standard patterns', () => {
+    for (const bad of ['^(main-fix-)?([a-z]+)+$', '^(a+)+$', '^(a*)*$', '^((ab)+)+x$', '^(a|b+)+$', '^(?:a{1,5}){2,}$', '^(a+){2}$', '^([a-z]+)\\1$', '^(?<n>a)\\k<n>$', `^${'a'.repeat(300)}$`]) {
+      expect(validRepairPatterns([bad]), bad).toBe(false);
+    }
+    for (const ok of [...DEFAULT_REPAIR_PATTERNS, '^hotfix-', '^b-{2,3}', '^(?:a|b)+$', '^(abc)+$', '^[a-z]+-\\d+$', '^x(?=y)', '^((ab)+)?x+$', '^\\(a+\\)+$']) {
+      expect(validRepairPatterns([ok]), ok).toBe(true);
+    }
+  });
+
+  it('a catastrophic pattern in the policy is reported invalid and the standard patterns still decide', () => {
+    const p = resolveAdmissionPolicy({ platform: { priority: { repairPatterns: ['^(main-fix-)?([a-z]+)+$'] } } });
+    expect(p.invalid.join('\n')).toMatch(/platform\.priority\.repairPatterns/);
+    expect(p.settings.priority.repairPatterns).toEqual([...DEFAULT_REPAIR_PATTERNS]);
+  });
+
+  it('classifyWaiterPriority never stalls: an unsafe pattern handed straight to it is bounded and falls to P3', () => {
+    const r = probe(['^(main-fix-)?([a-z]+)+$'], 'a'.repeat(60) + '-1');
+    expect(r.timedOut, r.stderr).toBe(false);
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out.ms).toBeLessThan(4000);
+  });
+
+  it('the matcher has a hard time bound: overlapping alternation (not caught by validation) is cut off, other patterns still match', () => {
+    expect(validRepairPatterns(['^(a|aa)+$'])).toBe(true); // star-height 1: only the time bound can stop it
+    const r = probe(['^(a|aa)+$', '^a+-1$'], 'a'.repeat(70) + 'b');
+    expect(r.timedOut, r.stderr).toBe(false);
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out.ms).toBeLessThan(4000);
+    const hit = probe(['^(a|aa)+$', '^a+b$'], 'a'.repeat(70) + 'b'); // the second pattern is still honoured after the first is cut off
+    expect(hit.timedOut, hit.stderr).toBe(false);
+    expect(hit.out.cls).toBe('P0');
+  });
+
+  it('the pattern list is count-capped and one classification has a total time budget', () => {
+    expect(validRepairPatterns(Array.from({ length: 16 }, (_, i) => `^p${i}-`))).toBe(true);
+    expect(validRepairPatterns(Array.from({ length: 17 }, (_, i) => `^p${i}-`))).toBe(false);
+    // 16 distinct patterns that each blow the 50ms bound: the budget (150ms) ends the whole call, not 16 x 50ms x 4 fields.
+    const slow = Array.from({ length: 16 }, (_, i) => `^(?:a|a?)+x${i}$`);
+    const r = probe(slow, 'a'.repeat(70) + 'b');
+    expect(r.timedOut, r.stderr).toBe(false);
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out.ms).toBeLessThan(1500);
+  });
+
+  it('an over-long identity value is not matched at all (it is no repair slug)', () => {
+    const custom = { mode: 'enforce', repairPatterns: ['^hotfix-'] };
+    expect(classifyWaiterPriority({ purpose: 'hotfix-1' }, custom).class).toBe('P0');
+    expect(classifyWaiterPriority({ purpose: 'hotfix-'.padEnd(400, 'x') }, custom).class).toBe('P3');
+    expect(classifyWaiterPriority({ purpose: 'main-fix-2cb94418d' }, ADMISSION_POLICY_STANDARD.priority).class).toBe('P0');
+  });
+
+  it('cascade: standard → platform → tool → env, each leaf named with its source; invalid values never override', () => {
+    expect(resolveAdmissionPolicy({}).sources).toMatchObject({ 'priority.mode': 'standard', 'priority.repairPatterns': 'standard' });
+    const p = resolveAdmissionPolicy({ platform: { priority: { mode: 'off' } }, tool: { priority: { repairPatterns: ['^hotfix-'] } } });
+    expect(p.settings.priority).toEqual({ mode: 'off', repairPatterns: ['^hotfix-'] });
+    expect(p.sources).toMatchObject({ 'priority.mode': 'platform', 'priority.repairPatterns': 'tool' });
+    const e = resolveAdmissionPolicy({ platform: { priority: { mode: 'off' } },
+      env: { WE_HEAVY_ADMISSION_PRIORITY: 'enforce', WE_HEAVY_ADMISSION_REPAIR_PATTERNS: '["^a-","^b-{2,3}"]' } });
+    expect(e.settings.priority).toEqual({ mode: 'enforce', repairPatterns: ['^a-', '^b-{2,3}'] });
+    expect(e.sources['priority.mode']).toBe('env WE_HEAVY_ADMISSION_PRIORITY');
+    expect(e.ignored).toEqual([]); // per-caller behaviour, like onTimeout: honoured on the shared pool
+    const bad = resolveAdmissionPolicy({ tool: { priority: { mode: 'sometimes', repairPatterns: ['(unclosed'] } } });
+    expect(bad.settings.priority).toEqual(ADMISSION_POLICY_STANDARD.priority);
+    expect(bad.invalid.join('\n')).toMatch(/tool\.priority\.mode/);
+    expect(bad.invalid.join('\n')).toMatch(/tool\.priority\.repairPatterns/);
+    expect(formatAdmissionPolicy(p)).toMatch(/priority\.mode=off \(platform\)/);
+  });
+
+  it('slotOrderFor: a P0 job may take ANY free slot, heavy or fast; other jobs keep their lane rule', () => {
+    expect(slotOrderFor('FULL', 2, 1)).toEqual([0, 1]);
+    expect(slotOrderFor('FULL', 2, 1, 'P0')).toEqual([0, 1, 2]);
+    expect(slotOrderFor('files', 2, 1, 'P0')).toEqual([2, 0, 1]);
+  });
+
+  it('isOldestLiveWaiter: a P0 marker ranks ahead of every older P3 waiter in BOTH lanes; FCFS holds within each class', () => {
+    markWaiting({ lockRoot, owner: 'FIX-OLD', kind: 'files', nowIso: iso(T0) });
+    markWaiting({ lockRoot, owner: 'FULL-OLD', kind: 'FULL', nowIso: iso(T0 + 1000) });
+    markWaiting({ lockRoot, owner: 'REPAIR-2', kind: 'files', priority: 'P0', nowIso: iso(T0 + 3000) });
+    markWaiting({ lockRoot, owner: 'REPAIR-1', kind: 'FULL', priority: 'P0', nowIso: iso(T0 + 2000) });
+    const at = (owner, kind) => isOldestLiveWaiter({ lockRoot, owner, kind, nowMs: T0 + 5000 });
+    expect(at('REPAIR-1', 'FULL')).toBe(true);   // oldest P0, across lanes
+    expect(at('REPAIR-2', 'files')).toBe(false); // second P0 waits its turn (FCFS within the class)
+    expect(at('FIX-OLD', 'files')).toBe(false);  // the oldest P3 yields while a P0 waits
+    expect(at('FULL-OLD', 'FULL')).toBe(false);
+    // Priority off at the ranker: today's FCFS, markers' class ignored.
+    expect(isOldestLiveWaiter({ lockRoot, owner: 'FIX-OLD', kind: 'files', nowMs: T0 + 5000, priorityMode: 'off' })).toBe(true);
+  });
+
+  it('a P0 waiter never preempts a running holder: with every slot held it waits, then takes the next free slot', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0), slots: [0] });
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER-FAST', nowMs: T0, nowIso: iso(T0), slots: [1] });
+    const repo = join(lockRoot, 'web-everything', 'lane-7');
+    mkdirSync(join(repo, '.git'), { recursive: true });
+    let clock = T0; let polls = 0; const logs = [];
+    const sleep = async (ms) => {
+      clock += ms; polls += 1;
+      if (polls === 1) {
+        expect(heldSlots({ lockRoot, cap: 1, fastSlots: 1 }).map((h) => h.owner).sort()).toEqual(['HOLDER', 'HOLDER-FAST']);
+        expect(listWaiting(lockRoot)[0]).toMatchObject({ priority: 'P0' });
+      }
+      if (polls === 3) releaseOwnedSlot({ lockRoot, cap: 1, owner: 'HOLDER', fastSlots: 1 });
+    };
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: `${repo}#1`, repo, kind: 'files', pollMs: 1000, ceilingMs: 60_000,
+      policy: policyWith({}), readLease: () => lease('main-fix-2cb94418d', 'main-fix-2cb94418d-lane-7-ba602393'),
+      log: (m) => logs.push(m), now: () => clock, sleep, env: {} });
+    expect(r).toMatchObject({ ok: true, slot: 0 }); // the HEAVY slot, though it is a files job: next free slot wins
+    expect(logs.join('')).toMatch(/P0/);
+    expect(logs.join('')).toMatch(/purpose=main-fix-2cb94418d/);
+    expect(logs.join('')).toMatch(/priority\.mode=enforce \(tool\)/);
+    expect(readLockEntry(lockRoot, slotPath(0))?.meta).toMatchObject({ priority: 'P0' });
+  });
+
+  it('REPLAY 2026-10-10 19:08Z: the main-fix waiter is admitted first, ahead of the older conveyor-fix waiters', async () => {
+    // The live pool at 19:08Z: cap 2 heavy + 1 fast, every slot held by conveyor-fix gates; the main-fix gate
+    // (lane 7, kind files) queued behind conveyor-fix `files` waiters that arrived before it.
+    const Z = Date.parse('2026-10-10T19:08:00.000Z');
+    const pool = join(lockRoot, 'web-everything');
+    const leases = {
+      'lane-9': lease('conveyor-fix', 'conveyor-fix-lane-9-4a4b7813', 'fix-4790'),
+      'lane-8': lease('conveyor-fix', 'conveyor-fix-lane-8-e007b4ac', 'fix-4788'),
+      'lane-1': lease('conveyor-fix', 'conveyor-fix-lane-1-be67c548', 'fix-4763'),
+      'lane-7': lease('main-fix-2cb94418d', 'main-fix-2cb94418d-lane-7-ba602393', 'Mac:14962'),
+    };
+    const readLease = (repo) => leases[String(repo).split('/').pop()] ?? null;
+    tryAcquireSlot({ lockRoot, cap: 2, owner: join(pool, 'lane-5'), nowMs: Z - 9 * 60_000, nowIso: iso(Z - 9 * 60_000), slots: [0] });
+    tryAcquireSlot({ lockRoot, cap: 2, owner: join(pool, 'lane-10'), nowMs: Z - 2 * 60_000, nowIso: iso(Z - 2 * 60_000), slots: [1] });
+    tryAcquireSlot({ lockRoot, cap: 2, owner: join(pool, 'lane-2'), nowMs: Z - 3 * 60_000, nowIso: iso(Z - 3 * 60_000), slots: [2] });
+    markWaiting({ lockRoot, owner: join(pool, 'lane-9'), lane: '9', kind: 'files', nowIso: iso(Z - 5 * 60_000) });
+    markWaiting({ lockRoot, owner: join(pool, 'lane-8'), lane: '8', kind: 'files', nowIso: iso(Z - 3.5 * 60_000) });
+    markWaiting({ lockRoot, owner: join(pool, 'lane-1'), lane: '1', kind: 'files', nowIso: iso(Z - 2 * 60_000) });
+    const policy = policyWith({});
+    // BEFORE (priority off — today's FCFS): lane 9's conveyor-fix is next, the main-fix is fourth in line.
+    const mainFix = join(pool, 'lane-7');
+    markWaiting({ lockRoot, owner: mainFix, lane: '7', kind: 'files', nowIso: iso(Z - 60_000) });
+    const next = (priorityMode) => ['lane-9', 'lane-8', 'lane-1', 'lane-7']
+      .find((l) => isOldestLiveWaiter({ lockRoot, owner: join(pool, l), kind: 'files', nowMs: Z, priorityMode, readLease }));
+    expect(next('off')).toBe('lane-9');
+    clearWaiting({ lockRoot, owner: mainFix });
+    // AFTER: the main-fix waiter marks itself P0 (from its lane lease) and takes the first slot that frees.
+    let clock = Z; let polls = 0; const logs = [];
+    const sleep = async (ms) => {
+      clock += ms; polls += 1;
+      if (polls === 1) expect(next('enforce')).toBe('lane-7'); // every conveyor-fix waiter yields to it
+      if (polls === 2) releaseOwnedSlot({ lockRoot, cap: 2, owner: join(pool, 'lane-2'), fastSlots: 1 });
+    };
+    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: mainFix, lane: '7', kind: 'files', pollMs: 2000, ceilingMs: 60 * 60_000,
+      policy, readLease, log: (m) => logs.push(m), now: () => clock, sleep, env: {} });
+    expect(r).toMatchObject({ ok: true, slot: 2 });
+    expect(r.waitedMs).toBeLessThanOrEqual(4000); // admitted at the first free slot, not after the 3 older waiters
+    expect(logs.join('')).toMatch(/red-main repair.*P0/);
+    // The conveyor-fix waiters are still queued, in their own FCFS order.
+    expect(next('enforce')).toBe('lane-9');
+  });
+
+  it('priority off (any layer): the marker carries no class and FCFS is exactly as before', async () => {
+    markWaiting({ lockRoot, owner: 'OLDER', kind: 'files', nowIso: iso(T0 - 1000) });
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0), slots: [0] });
+    let clock = T0; let polls = 0;
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'MF', kind: 'files', pollMs: 1000, ceilingMs: 3000, canDefer: true,
+      policy: policyWith({ mode: 'off' }), readLease: () => lease('main-fix-2cb94418d', 'main-fix-2cb94418d-lane-7-x'),
+      log: () => {}, now: () => clock, env: {},
+      sleep: async (ms) => { clock += ms; polls += 1; if (polls === 1) expect(listWaiting(lockRoot).find((m) => m.owner === 'MF').priority).toBeUndefined(); } });
+    expect(r).toMatchObject({ ok: false, deferred: true }); // OLDER is ahead; MF never cut in
+  });
+
+  it('the hold record keeps the class, so the admission log shows which holds were red-main repairs', () => {
+    recordHoldDuration({ lockRoot, kind: 'files', ms: 9748, priority: 'P0' });
+    recordHoldDuration({ lockRoot, kind: 'files', ms: 1000 });
+    const rows = readHoldDurations(lockRoot);
+    expect(rows[0]).toMatchObject({ priority: 'P0' });
+    expect(rows[1].priority).toBeUndefined();
+  });
 });
