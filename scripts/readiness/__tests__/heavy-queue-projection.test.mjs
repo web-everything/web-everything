@@ -6,12 +6,57 @@
  *   slot rules. No fs, no clock, no env beyond plain objects.
  */
 import { describe, it, expect } from 'vitest';
+import { BOUNDED_RUN_SHIM } from '../../operations/mutation-check-io.mjs';
 import {
   classifyCommandKind, queueLaneOf, typicalMinutes, DEFAULT_STANDARD_MINUTES, TYPICAL_MIN_SAMPLES,
   classifyDispatchKind, dispatchDemandMinutes, queueBacklog, projectedWaitMinutes, createQueueBudget,
   refineKind, holderLabel, holdBreakdown, HEAVY_KINDS, FAST_LANE_KINDS,
   resolvePrepareAdmission, typicalDispatchMinutes, PREPARE_DISPATCH_KINDS, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, laneProjection,
 } from '../heavy-queue-projection.mjs';
+
+describe('targeted heavy command regression', () => {
+  const classify = (command, env) => classifyCommandKind(command, env);
+  const files = (n) => Array.from({ length: n }, (_, i) => `case-${i}.test.mjs`).join(' ');
+  const shim = (argv) => `node -e '${BOUNDED_RUN_SHIM}' '${JSON.stringify({ argv, ms: 600000 })}'`;
+
+  it.each([
+    [shim(['npx', 'vitest', 'run', 'a.test.mjs', '--reporter=basic']), 'files'],
+    [shim(['npx', 'vitest', 'run']), 'FULL'],
+    [`vitest run ${files(7)}`, 'files'],
+    [`vitest run ${files(30)}`, 'files'],
+    [`vitest run ${files(31)}`, 'FULL'],
+    ['npx vitest run a.test.mjs', 'files'],
+    ['npm run test:unit -- a.test.mjs b.test.mjs', 'files'],
+    ['npm test -- a.test.mjs', 'files'],
+    ['npm run test -- a.test.mjs', 'files'],
+    [`npm run test:unit -- ${files(31)}`, 'FULL'],
+    ['vitest run', 'FULL'],
+    ['npx vitest run', 'FULL'],
+    ['npm test', 'FULL'],
+    ['npm run test:unit', 'FULL'],
+    ['npm run test:unit -- --reporter=dot', 'FULL'],
+    ['npm run test:unit -- --config config.mjs', 'FULL'],
+    ['npm run test:unit -- a.test.mjs && npm test', 'FULL'],
+    ['npm run test:coverage', 'coverage'],
+    ['vitest run a.test.mjs --coverage', 'coverage'],
+    [shim(['npx', 'vitest', 'run', 'a.test.mjs', '--coverage']), 'coverage'],
+    ['npm run test:unit -- a.test.mjs && npm run check:standards', 'selected'],
+    ['vitest run a.test.mjs && npm run check:standards', 'selected'],
+    ['vitest related a.test.mjs --run', 'files'],
+    [`node -e 'shim' '{"argv":["npx","vitest", invalid]}'`, 'FULL'],
+    [`node -e 'shim' '{"argv":"vitest"}'`, 'FULL'],
+  ])('%s → %s', (command, expected) => {
+    expect(classify(command)).toBe(expected);
+  });
+
+  it('keeps the configurable file cap for direct, npm and bounded runs', () => {
+    const env = { WE_HEAVY_ADMISSION_FAST_MAX_FILES: '2' };
+    for (const command of [`vitest run ${files(3)}`, `npm test -- ${files(3)}`,
+      shim(['npx', 'vitest', 'run', ...files(3).split(' ')])]) {
+      expect(classify(command, env), command).toBe('FULL');
+    }
+  });
+});
 
 describe('classifyCommandKind — the gate / wrapped command line → heavy kind', () => {
   it('the verify-lane diff-driven gate (vitest related && check:standards --local) is `selected`', () => {
@@ -37,9 +82,9 @@ describe('classifyCommandKind — the gate / wrapped command line → heavy kind
       'npx vitest run a.test.mjs && npx vitest run', "npx vitest run\nnode scripts/x.mjs"]) expect(classifyCommandKind(cmd), cmd).toBe('FULL');
     expect(classifyCommandKind('npx vitest run --config c.ts a.test.mjs --passWithNoTests')).toBe('files');
   });
-  it('x1ds37v — a bare run of <=5 test files is `files` (fast lane); more is `FULL`; the cap is env-tunable', () => {
+  it('x1ds37v — a bare run of <=30 test files is `files` (fast lane); more is `FULL`; the cap is env-tunable', () => {
     expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs')).toBe('files');
-    expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs f.test.mjs')).toBe('FULL');
+    expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs f.test.mjs')).toBe('files');
     expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs', { WE_HEAVY_ADMISSION_FAST_MAX_FILES: '1' })).toBe('FULL');
     // the chained verify gate is never demoted by the count
     expect(classifyCommandKind('vitest run a.test.mjs b.test.mjs c.test.mjs d.test.mjs e.test.mjs f.test.mjs && npm run check:standards')).toBe('selected');

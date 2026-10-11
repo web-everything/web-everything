@@ -127,9 +127,10 @@ function vitestRunSegmentsNameFiles(cmd) {
 }
 
 /** x1ds37v — a fixer's single-test debug run (`npm run test:unit -- <files>`, no chained standards) rides the fast
- *  lane only while its target list is small; more files than this is a real suite and stays `FULL`. */
+ *  lane only while its target list is small. Live targeted runs of 7–15 files were held as FULL at a
+ *  ~13 s median, corrupting the FULL wait estimate; allow up to 30 while retaining a tunable cap. */
 export const FAST_FILES_ENV = 'WE_HEAVY_ADMISSION_FAST_MAX_FILES';
-export const DEFAULT_FAST_MAX_FILES = 5;
+export const DEFAULT_FAST_MAX_FILES = 30;
 export function resolveFastMaxFiles(env = {}) {
   const n = Number(env?.[FAST_FILES_ENV]);
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_FAST_MAX_FILES;
@@ -155,16 +156,34 @@ function countVitestRunFileTargets(cmd) {
   return max;
 }
 
+/** Read the bounded mutation-check shim's JSON argv without executing its JavaScript. */
+function unwrapCommandArgv(cmd) {
+  for (const match of cmd.matchAll(/\{\s*"argv"\s*:\s*(\[(?:[^\]"\\]|"(?:\\.|[^"\\])*")*\])/g)) {
+    try {
+      const argv = JSON.parse(match[1]);
+      if (Array.isArray(argv) && argv.length && argv.every((word) => typeof word === 'string')) {
+        return argv.join(' ');
+      }
+    } catch {
+      // Malformed payloads fall through to ordinary command classification.
+    }
+  }
+  return cmd;
+}
+
 /**
  * Classify a heavy command line into a {@link HEAVY_KINDS} kind. Pure. The order matters: an unconditional full
  * suite (`test:unit`, `test:coverage`, a bare `vitest run`) wins over everything else in the same chain; a
  * `vitest related` run chained with check:standards is the verify-lane `selected` gate.
  * @param {string|null|undefined} command
- * @returns {'selected'|'FULL'|'standards'|'files'|'other'}
+ * @param {object} [env] Admission policy overrides.
+ * @returns {'selected'|'FULL'|'standards'|'files'|'verify'|'soak'|'coverage'|'build'|'agent'|'other'}
  */
 export function classifyCommandKind(command, env = {}) {
-  const cmd = String(command || '').trim();
+  let cmd = unwrapCommandArgv(String(command || '').trim());
   if (!cmd) return 'other';
+  // Forwarded npm test arguments use the same file detection and cap as direct Vitest runs.
+  cmd = cmd.replace(/\bnpm\s+(?:run\s+)?test(?::unit)?\s+--(?=\s|$)/g, 'vitest run');
   const standards = /check[-:]standards/.test(cmd);
   if (/\btest:coverage\b|\bvitest\b[^\n]*--coverage\b/.test(cmd)) return 'coverage';
   if (/vitest\.soak\.config|conveyor\/soak\//.test(cmd)) return 'soak';
