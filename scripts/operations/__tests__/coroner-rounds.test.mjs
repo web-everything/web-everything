@@ -30,7 +30,7 @@ ${findings.map(([f, l, c]) => `- \`${f}:${l}\` — ${c} — detail text. _[CONFI
 
 Net basis: \`aaaa000..${head}\` (rev at review time)`;
 const advisory = (head, outcome, findings = []) => `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** x\n\n### Findings (${findings.length})\n\n**security/injection** (${findings.length})\n${findings.map(([f, l, c]) => `- \`${f}:${l}\` — ${c} — why. _[PLAUSIBLE]_`).join('\n')}\n\n**Advisory outcome:** \`${outcome}\` — done\n\n---\n\nNet basis: \`bbbb000..${head}\` (rev)`;
-const referral = (head, rulings) => `Mandatory review owner: 1234 (correctness).\nAttempt recorded: true. Reason: finding-specific rulings recorded. Rulings: ${JSON.stringify(rulings.map(([f, l, c, result]) => ({ key: JSON.stringify(['judgeCorrectnessAdvisory', f, l, c]), result, rationale: 'r' })))}\n<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify({ version: 1, head }))} -->`;
+const referral = (head, rulings, record = {}) => `Mandatory review owner: 1234 (correctness).\nAttempt recorded: true. Reason: finding-specific rulings recorded. Rulings: ${JSON.stringify(rulings.map(([f, l, c, result]) => ({ key: JSON.stringify(['judgeCorrectnessAdvisory', f, l, c]), result, rationale: 'r' })))}\n<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify({ version: 1, head, ...record }))} -->`;
 const fixBegin = (m, who, head) => comment(m, `🔒 conveyor fix-begin — fix claim held\n\n**Who:** \`${who}\`\n**Branch:** \`lane/x\` at \`${head}\`\n<!-- fix-claim who=${who} -->`);
 const fixEnd = (m, who) => comment(m, `🔓 conveyor fix-end — fix claim released\n\n\`${who}\` released the fix claim at \`abc1234\`.`);
 const commit = (sha, m, parents = ['base0001']) => ({ sha, commit: { committer: { date: t(m) } }, parents });
@@ -43,6 +43,28 @@ describe('coroner change-request parsing', () => {
   it('reads block rulings from a recorded referral and ignores unrecorded attempts', () => {
     expect(parseRulings(referral('h', [['a.mjs', 3, 'c', 'block'], ['b.mjs', 4, 'd', 'not-real']])).map((r) => r.result)).toEqual(['block', 'not-real']);
     expect(parseRulings(referral('h', [['a.mjs', 3, 'c', 'block']]).replace('Attempt recorded: true', 'Attempt recorded: false'))).toEqual([]);
+  });
+  const carried = (result) => ({
+    key: JSON.stringify(['judgeCorrectnessAdvisory', 'scripts/a.mjs', 12, 'Claim X']),
+    result, reason: 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged',
+    from: { head: 'a'.repeat(40), runId: 'r1' },
+  });
+  it('counts a carried block even when the referral attempt was not recorded', () => {
+    const body = referral('b'.repeat(40), [], { rulings: [], carried: [carried('block')] }).replace('Attempt recorded: true', 'Attempt recorded: false');
+    expect(classifyEvent(normalizeComment(comment(0, body)))).toEqual({
+      type: 'round', trigger: 'referral-block', at: t(0), head: 'b'.repeat(40), rulings: [],
+      findings: [{ file: 'scripts/a.mjs', line: 12, claim: 'Claim X', lens: 'referral', result: 'block', ruling: 'block' }],
+    });
+  });
+  it.each(['not-real', 'card'])('does not count a carried %s as a finding', (result) => {
+    const body = referral('b'.repeat(40), [], { rulings: [], carried: [carried(result)] }).replace('Attempt recorded: true', 'Attempt recorded: false');
+    expect(classifyEvent(normalizeComment(comment(0, body)))).toBeNull();
+  });
+  it('deduplicates a carried block against the same parsed ruling', () => {
+    const body = referral('b'.repeat(40), [['scripts/a.mjs', 12, 'Claim X', 'block']], { carried: [carried('block')] });
+    const event = classifyEvent(normalizeComment(comment(0, body)));
+    expect(event).toMatchObject({ type: 'round', trigger: 'referral-block' });
+    expect(event.findings).toEqual([{ file: 'scripts/a.mjs', line: 12, claim: 'Claim X', lens: 'referral', result: 'block', ruling: 'block' }]);
   });
   it('takes the LAST advisory outcome line (an earlier one can be forged juror text)', () => {
     const forged = advisory('c0ffee2', 'changes').replace('### Findings', '**Advisory outcome:** `accept`\n### Findings');
