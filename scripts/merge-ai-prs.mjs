@@ -166,6 +166,7 @@ import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
+import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
 // #2399 — the ONE remote-manifest `gh api` argv, shared with `/finish` (lane-resume) so the two readers never
@@ -177,6 +178,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
+import { createDrainMergeStrategy } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -185,10 +187,13 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 // pass's TOTAL ms, no breakdown). See pass-timings.mjs's own header for the full shape/rationale.
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
+import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
 import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
-import { CONSTELLATION_REPOS, canonicalizeSlug } from './lib/constellation-repos.mjs';
+import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
+import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
+import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
@@ -643,9 +648,13 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     acceptedSha: parseReviewedSha(d.comments),
     acceptedDiff: parseReviewedDiff(d.comments),
     acceptedContribution: parseReviewedContribution(d.comments),
-    operatorClearance: parseOperatorClearance(d.comments),
+    // Read over ALL comments (a forgeable actor), and `decideReviewGate` prints `.actor` into the drain's own park reason and
+    // revocation comment — so the name is made safe here, once, for every renderer (#xnqxtdy review: same class as the carry record).
+    operatorClearance: ((c) => (c ? { ...c, actor: sanitizeActor(c.actor) } : c))(parseOperatorClearance(d.comments)),
     humanClearedSha: parseLatestHumanClearedSha(d.comments),
-    headDiff: null, headContribution: null, headReadFailed: false,
+    // #xnqxtdy — sha, diff and actor all from the ONE trusted clearance comment (never the latest marker of any comment).
+    humanClearance: latestHumanClearance(d.comments),
+    headDiff: null, headDiffSha: null, headContribution: null, headReadFailed: false,
   };
   const { acceptedSha, headSha, acceptedDiff, acceptedContribution } = evidence;
   const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha
@@ -654,10 +663,15 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     try {
       const net = netDiff({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        rev: d.headRefName, fetchExtraRefs: [d.headRefName],
+        rev: d.headRefName, fetchExtraRefs: [d.headRefName], pinRev: true,
       });
+      // #xnqxtdy — `headRefOid` and the branch tip the diff was read from are two non-atomic reads. The tip the diff is FOR
+      // is resolved to one sha BEFORE the diff and the diff is taken from that sha (`pinRev`), so the carry can refuse a
+      // diff that belongs to a different push than the head it would stamp. A scored read that names no sha leaves
+      // `headDiffSha` null (the carry refuses it) — it is never labelled by a second, later lookup of a ref that can move.
       evidence.headDiff = net?.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
+      evidence.headDiffSha = net?.scored && typeof net.revSha === 'string' && net.revSha ? net.revSha : null;
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
@@ -683,7 +697,14 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
         reason: `review acceptance verification unreadable — merge deferred this pass: ${error.message || error}` };
     }
   }
-  return decideReviewGate({ ...gateInputs, labels, ...evidence });
+  // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
+  // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
+  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
+    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun, ...readOptions?.carry });
+  if (carry?.action === 'defer') return carry;
+  if (carry?.carried) evidence = { ...evidence, humanClearedSha: evidence.headSha };
+  const gate = decideReviewGate({ ...gateInputs, labels, ...evidence });
+  return carry?.carried ? { ...gate, carriedClearance: carry.carried } : gate;
 }
 
 /** Label coexistence alone cannot clear pending: require the merge gate's coverage proof first. */
@@ -699,6 +720,20 @@ export function reconcileDrainReviewPending({ currentLabels, dryRun = false, ...
   } catch (error) {
     return { ok: false, reason: `review acceptance verification unreadable: ${error.message || error}` };
   }
+}
+
+/**
+ * Attach the LIVE fix claim to a merge-site re-read (`data.fixClaim`), so `classifyPr` refuses a PR a fixer still
+ * holds. The reader is injected (production: `readLiveFixClaim`). An unreadable claim store fails CLOSED — a
+ * placeholder claim is attached so this merge is refused and the next pass re-reads — like draft promotion.
+ * A readable-but-unclaimed PR gets no `fixClaim`. Mutates and returns `data`.
+ */
+export function attachLiveFixClaim(data, { claimKey, readClaim }) {
+  try {
+    const claim = claimKey ? readClaim({ repo: claimKey, pr: data.number }) : null;
+    if (claim?.meta?.who) data.fixClaim = { who: claim.meta.who, claimedAt: claim.meta.claimedAt ?? null };
+  } catch { data.fixClaim = { who: '(fix-claim store unreadable)' }; }
+  return data;
 }
 
 /**
@@ -750,7 +785,11 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   const certified = certifyLabel || aiGenerated || humanCleared; // #2195: the label OR every-commit-AI OR a human clear certifies
   const testGreen = isRequiredCheckGreen(pr, requiredCheck);
   const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
-  const offDefaultBase = typeof defaultBranch === 'string' && defaultBranch !== '' && base !== '' && base !== defaultBranch;
+  // stack.reviewWhileBaseOpen (2026-10-10): a stacked PR now runs CI and is reviewed while its base is open, so its `test`
+  // can be green and this arm is THE merge guard for it. A `lane/*` base is never a repo's default branch: held even when
+  // `defaultBranch` could not be resolved this pass (fail closed), so it lands only after its base merges and the drain
+  // retargets it to the default branch.
+  const offDefaultBase = base !== '' && ((typeof defaultBranch === 'string' && defaultBranch !== '' && base !== defaultBranch) || base.startsWith('lane/'));
   const state = String(pr?.mergeStateStatus || '').toUpperCase();
   const mergeable = String(pr?.mergeable || '').toUpperCase();
   const landableState = state === 'CLEAN' || state === 'UNSTABLE'; // UNSTABLE = mergeable, only non-required checks red
@@ -778,10 +817,14 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       ? 'human-cleared (review:accepted), required check green, cleanly mergeable'
       : 'AI-generated, required check green, cleanly mergeable';
   if (pr?.requiredCheckReadError) { decision = 'skip'; reason = pr.requiredCheckReadError; }
+  // fix.pushBeforeGate (2026-10-10) — a fixer now pushes BEFORE its local gate is green, so a claimed PR's head may be
+  // an unverified intermediate commit. The live fix claim (attached by the caller as `pr.fixClaim`) is the lock: never
+  // land while it is held, whatever the labels or CI say. Released on the fixer's green hand-back.
+  else if (pr?.fixClaim?.who) { decision = 'skip'; reason = `fix claim held by ${pr.fixClaim.who} — the head may be an unverified intermediate push; lands only after its fix-end`; }
   else if (!certified) { decision = 'skip'; reason = `not AI-generated (a commit lacks the Co-Authored-By: Claude trailer), no "${trustLabel}" label, and not human-cleared (review:accepted)`; }
   // #3674 — ahead of the required-check arm, so a non-default base is held with its real reason (even when `test`
   // is green) instead of waiting on a check that never runs there.
-  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch} (${base})`; }
+  else if (offDefaultBase) { decision = 'skip'; reason = `base is not ${defaultBranch || 'the default branch'} (${base})`; }
   else if (!testGreen) { decision = 'skip'; reason = `required check "${requiredCheck}" is not green`; }
   else if (blockOnCodeQL && isCodeQLFailed(pr)) { decision = 'skip'; codeqlBlocked = true; reason = `CodeQL check failed (new code-scanning alerts in the changed code) — refusing to land; fix the alert and re-push (drainBlocksOnCodeQL)`; }
   else if (mergeable !== 'MERGEABLE') { decision = 'skip'; reason = `not mergeable (mergeable=${mergeable || 'UNKNOWN'})`; }
@@ -3458,7 +3501,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
-export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -3469,7 +3512,28 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   // candidate probe, shared with `computeNetDiffChangedFiles`); otherwise resolve our own exactly as before.
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
-  const { diffBase, candidate } = basis;
+  let { diffBase, candidate } = basis;
+  // #xnqxtdy — `pinRev`: a caller that STAMPS the tip next to this text (the human-clearance carry) cannot read the
+  // tip in a second step: a concurrent fetch can move the tracking ref between the two reads and label an old diff with
+  // a newer sha. Resolve the tip to ONE commit sha first, then take the fork point AND the text from that sha only, and
+  // hand the sha back as `revSha` — the diff and its label can no longer disagree. Any failure is unscored (fail closed).
+  let revSha;
+  if (pinRev) {
+    try {
+      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
+      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
+      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
+      if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
+      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
+      candidate = revSha;
+    } catch (err) {
+      return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
+    }
+  }
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
@@ -3481,7 +3545,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
     const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
-    return { text, base: diffBase, rev: candidate, scored: true };
+    return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
@@ -4103,7 +4167,9 @@ async function runCli() {
         'number,title,body,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,labels,commits'],
         { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
       const data = JSON.parse(raw || '{}');
-      return data && data.number != null ? await resolveChecks(repo, data) : null;
+      if (!data || data.number == null) return null;
+      attachLiveFixClaim(data, { claimKey: repoKeyForSlug(repo ?? localSlug), readClaim: readLiveFixClaim });
+      return await resolveChecks(repo, data);
     } catch { return null; }
   };
   // Live 2026-10-09 — a transient UNKNOWN (GitHub recomputing after this cascade's own previous merge) is
@@ -5191,7 +5257,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -5560,6 +5626,7 @@ async function runCli() {
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
+  const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -5574,6 +5641,7 @@ async function runCli() {
   const couplePins = new Map(); // mqKey → {head, tip} the pre-check judged `merge`
   const mergeQueueGate = async (cand, headSha, { precheck = false } = {}) => {
     if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
+    if (mergeStrategy.queueOwnsFreshness(cand.repo)) return true; // xtpxusq — GitHub's merge queue re-tests on its own tip
     const mqKey = `${cand.repo || localSlug || 'cwd'}#${cand.num}`;
     // A carrier with several impl halves is pre-checked once per half; each pre-check honours the pin the first one set.
     const pin = couplePins.get(mqKey);
@@ -5631,6 +5699,7 @@ async function runCli() {
       // fix-couple-split — show the order the live cascade would actually use (couples contiguous, split-risk held).
       const step = planCoupleCascadeStep(plan.ready, { candidates: verdicts, mergedKeys: new Set(), openSiblingRefs: openSiblingRefSet(openPrContext.prsByRepo, new Set(), repoKeyOfSlug), repoKeyOf: repoKeyOfVerdict });
       process.stderr.write(`  merge order: ${step.ordered.map((c) => repoTag(c.repo) + c.num + (c.item ? `→${c.item}` : '')).join(' → ') || '(none ready)'}\n`);
+      mergeStrategy.reportDryRun(step.ordered); // xtpxusq — github-merge-queue: which PRs it would enqueue
       for (const h of step.held) process.stderr.write(`  ⛓ ${repoTag(h.repo)}${h.num} couple held (${h.role}): ${h.reason}\n`);
       coupleHeld.push(...step.held);
       if (deferred.length) process.stderr.write(`  deferred (blockedBy unlanded): ${deferred.map((d) => `#${d.num}→[${d.waitOn.join(',')}]`).join(', ')}\n`);
@@ -5944,11 +6013,13 @@ async function runCli() {
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
+            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
-          });
+          }, mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; a refused lock retries next pass
+          if (landLock.ran === false) { if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           if (landLock.contended && !AS_JSON) process.stderr.write(`  ⚠ merge-write mutex not acquired (held by ${landLock.heldBy || '?'}) — merged under the per-PR idempotency guard instead (#2683)\n`);
           if (landLock.result && landLock.result.skipped === 'already-merged') {
             // xvzc4v4 (merge-safety review, bug 2) — THIS BRANCH USED TO withhold the PR from `merged` on the
@@ -5971,6 +6042,7 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} already merged (by us, a concurrent lander, or out-of-band, e.g. the GitHub UI) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
+          if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
@@ -6027,6 +6099,7 @@ async function runCli() {
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);
     __t.add('mergeCascade', __t.mark() - __mergeCascadeT0);
   }
+  const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
 
   // Sync the LOCAL main checkout to the just-advanced origin/main (a merged PR moved origin, not local) — local
   // main is KEPT UP TO DATE after each merge (user request 2026-07-03). `--autostash` is what makes this
@@ -6041,10 +6114,22 @@ async function runCli() {
   // repo merge advanced that repo's origin, which this clone doesn't track).
   // x2e120n — "postMergeSync": local-checkout pull + the detached-cwd resync + the operator's primary-checkout
   // ff-sync below, all pure git housekeeping after a land, none of it per-PR (all three run at most once a pass).
+  // x4y74wj — the follow-up point. With `drainFollowupJob` on (we:scripts/settings/drain-followup-job.json) a
+  // pass that landed a local PR records ONE detached `drain-followup` job (numbering, resolve-on-land, push,
+  // derived regen, primary ff-sync) and skips all of that below; `handedOff:false` keeps today's inline path.
+  const followup = await handOffDrainFollowup({
+    landed: !DRY_RUN && merged.some((m) => isLocalRepo(m.repo)), dryRun: DRY_RUN, log: (m) => process.stderr.write(`  ${m}\n`),
+    buildInput: () => buildFollowupInput({ landedLocal: true, merged, landedItems: [...landedThisPass], openHeadRefs: liveOpenHeadRefs({ verdicts, merged, prsByRepo: openPrContext.prsByRepo }).openHeadRefs, primary: resolvePrimaryPath(process.cwd(), { flag: flags.primary, env: process.env.WE_PRIMARY }), passCwd: process.cwd(), primaryHinted: !!((typeof flags.primary === 'string' && flags.primary.trim()) || (typeof process.env.WE_PRIMARY === 'string' && process.env.WE_PRIMARY.trim())), carriers: verdicts.filter((v) => v && v.hasManifest && v.item != null).map((v) => ({ item: v.item, repo: v.repo || null, isWe: isLocalRepo(v.repo), headRef: v.headRef, manifestRefs: v.manifestRefs })) }),
+  });
+  if (followup.handedOff) process.stderr.write(`merge-ai-prs · follow-up handed to job ${followup.job?.id} (${followup.job?.status}) — numbering/resolve/push/derived regen/primary sync run detached (x4y74wj)\n`);
   const __postMergeSyncT0 = __t.mark();
   let localSynced = false;
-  const landedLocal = !DRY_RUN && merged.some((m) => isLocalRepo(m.repo));
-  if (landedLocal) {
+  const landedLocalAny = !DRY_RUN && merged.some((m) => isLocalRepo(m.repo));
+  const landedLocal = landedLocalAny && !followup.handedOff;
+  // The pass's OWN checkout is refreshed inline even when the job takes the rest (cheap, and the duplicate-id
+  // tripwire below reads this tree): the job only syncs a separate `primary`, so skipping this left a
+  // single-checkout run (no --primary) permanently behind and the tripwire scanning a pre-land backlog.
+  if (landedLocalAny) {
     try { readGit(['pull', '--ff-only', '--autostash'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); localSynced = true; }
     catch { localSynced = false; }
     if (!AS_JSON) process.stderr.write(localSynced ? `  ✓ local main fast-forwarded to origin (autostash preserved local edits)\n` : `  · local main NOT fast-forwarded (diverged, or a reapplied local edit conflicts) — reconcile by hand\n`);
@@ -6057,7 +6142,7 @@ async function runCli() {
   // doc for the full story — this is how #2347/#2418 stranded a hash on main). Best-effort, non-fatal — a
   // skip/failure is reported and the numbering/regen steps below simply see whatever tree cwd already has
   // (their existing best-effort contract, unchanged).
-  const detachedResync = resyncDetachedCwdForLand({ exec: execFileSync, landedLocal, localSynced });
+  const detachedResync = resyncDetachedCwdForLand({ exec: execFileSync, landedLocal: landedLocalAny, localSynced });
   if (detachedResync.resynced) {
     localSynced = true;
     if (!AS_JSON) process.stderr.write(`  ✓ cwd resynced to origin/main for JIT numbering + derived regen (#2348/#2419)\n`);
@@ -6252,6 +6337,11 @@ async function runCli() {
     }
   }
 
+  // xtpxusq — retire the queue-merged PRs' follow-ups only now that numbering, resolve-on-land and derived regen are
+  // done AND none of them reported a failure; otherwise they stay pending and the next pass reruns them (idempotent).
+  const queueFollowUpsClean = (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
+  mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
+
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
   // for the watch's idle accounting exactly like a rebase-drop rebuild — it lands on a later pass.
   const pendingAll = [...pendingRebased, ...healed];
@@ -6274,11 +6364,16 @@ async function runCli() {
   // per-pass log cadence). `timingSteps` (never `timings`, which already carries its OWN `total` key) is what
   // goes to the formatter — it computes+appends the trailing `total=` itself; passing `timings` here would
   // print `total=` twice (once as an ordinary step, once as the formatter's own).
+  // #5444 — SHADOW ONLY: the pure ledger gate beside the label gate for every considered PR, journaled as one run
+  // record. Never throws, never mutates a verdict; it runs after every merge decision of this pass is final.
+  const ledgerShadow = await runLedgerShadow({ verdicts, localSlug, dryRun: DRY_RUN });
+  process.stderr.write(`${formatShadowLine(ledgerShadow)}\n`);
   const skipReasons = buildSkipReasons({ verdicts, merged, failedMerges, revalidationAborted, pendingRebased, coupleHeld, deferred, parked });
   process.stderr.write(`merge-ai-prs · pass timings: ${formatTimingsSummary(timingSteps, { total: passTotalMs, order: PASS_STEP_ORDER })} (considered ${verdicts.length}, merged ${merged.length}, ${formatSkipSummary(skipReasons)})\n`);
   // Card 122 slice 1 — logging only: the machine-readable twin of the summary above (coroner / perf-snapshot read it).
   process.stderr.write(`${formatSkipReasonsLine(skipReasons)}\n`);
   const result = { ok: duplicateIdsOnMain.length === 0, dryRun: DRY_RUN, label, repos: REPOS.map((r) => r || localSlug || 'cwd'), considered: verdicts.length, heldCoupleMembers, skipReasons, ...(overlapYieldSkips.length ? { overlapYieldSkips } : {}), toMerge: toMerge.map((v) => ({ num: v.num, repo: v.repo || localSlug, headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), merged, failed: failedMerges, ...(revalidationAborted.length ? { revalidationAborted } : {}), ...(coupleHeld.length ? { coupleHeld } : {}), ...(coupleSplit.length ? { coupleSplit } : {}), rebased, pendingRebased, healed, deferred, localSynced, ...(primarySynced !== null ? { primarySynced } : {}), ...(numbered.assigned.length ? { jitNumbered: numbered.assigned } : {}), ...(numbered.warning ? { numberingWarning: numbered.warning } : {}), ...(resolveOnLandReport.resolved.length || resolveOnLandReport.deferred.length || resolveOnLandReport.failed.length || resolveOnLandReport.alreadyResolved.length ? { resolveOnLand: resolveOnLandReport } : {}), ...((strandedSweep.autoResolvable.length || strandedSweep.applied.length || !strandedSweep.ok) ? { strandedSweep } : {}), ...(duplicateIdsOnMain.length ? { duplicateIdsOnMain } : {}), derivedRegenerated: derived.done, derivedFailed: derived.failed, ...(derived.warning ? { derivedWarning: derived.warning } : {}), reconciledLabels, ...(failedListings.length ? { failedRepos: failedListings.map((l) => ({ repo: l.repo || localSlug, kind: l.err.kind, text: l.err.text })) } : {}), parked, skipped: skipped.map((v) => ({ num: v.num, repo: v.repo || localSlug, reason: v.reason, ...(v.escalated ? { escalated: v.escalated } : {}), ...(v.humanRequired ? { humanRequired: true } : {}), headSha: v.headSha ?? null, ...(v.resolutionBasis ? { resolutionBasis: v.resolutionBasis } : {}) })), timings };
+  if (followup.mode === 'job' || followup.job) result.followupJob = { handedOff: followup.handedOff, job: followup.job ?? null, actions: followup.actions ?? [], ...(followup.handedOff ? {} : { reason: followup.reason }) }; // x4y74wj — a launch-failed job rides along (handedOff:false) so the fallback to inline is visible
   return { result, merged, failedMerges, pendingRebased: pendingAll, deferred, duplicateIdsOnMain };
   }; // end sweepOnce
 

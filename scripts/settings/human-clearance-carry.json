@@ -1,0 +1,6 @@
+{
+  "$comment": "Card xnqxtdy. review.humanClearanceCarryForward true|false: a recorded human clearance (clear-human) carries to a new head when the move is a merge of main AND the PR's net diff is byte-identical to the cleared one; otherwise a human re-approves. Tool override env WE_REVIEW_HUMAN_CLEARANCE_CARRY. See scripts/lib/human-clearance-carry.mjs.",
+  "review": {
+    "humanClearanceCarryForward": true
+  }
+}

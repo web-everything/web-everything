@@ -25,6 +25,8 @@ describe('derivePrStatusLabel', () => {
   });
   it('a spent budget, a non-converging takeover or a ruling dispute is the operator\'s: needs-you', () => {
     expect(derive({ pr: pr(['review:changes']), rows: [{ kind: 'cap-exhausted', takeover: 'takeover-budget-spent' }] })).toBe('needs-you');
+    // a takeover switched off (budget 0 or invalid) asks the operator too: it is not "a takeover is planned"
+    expect(derive({ pr: pr(['review:changes']), rows: [{ kind: 'cap-exhausted', takeover: 'setting-disabled' }] })).toBe('needs-you');
     expect(derive({ pr: pr(['review:changes']), rows: [{ kind: 'cap-exhausted', takeover: 'takeover-not-converging' }] })).toBe('needs-you');
     expect(derive({ pr: pr([]), rows: [{ kind: 'ruling-dispute' }] })).toBe('needs-you');
   });

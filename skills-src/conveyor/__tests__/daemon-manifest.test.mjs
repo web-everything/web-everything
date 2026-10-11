@@ -243,3 +243,18 @@ describe('load-flake hold repositories have a reverify worker (PR #3945 advisory
     expect(LOAD_FLAKE_REVERIFY_REPOS).toEqual([REVERIFY_DEFAULT_REPO]);
   });
 });
+
+describe('#4131 — the health watch job kinds', () => {
+  it('declares health-gh-probe as a pinned-snapshot read job whose entry exists, with cap 2 and a boolean rollout switch', async () => {
+    const m = await import('../daemon-manifest.mjs');
+    const kind = m.HEALTH_WATCH_JOB_KINDS.get('health-gh-probe');
+    expect(kind).toBe(m.HEALTH_GH_PROBE_KIND);
+    expect(kind).toMatchObject({ codeMode: 'readonly-tree', nodeModules: true, serial: false, entry: 'scripts/conveyor/health-watch-job.mjs' });
+    expect(existsSync(join(REPO_ROOT, kind.entry))).toBe(true);
+    expect(m.HEALTH_WATCH_JOB_CAP).toBe(2);
+    expect(m.HEALTH_WATCH_JOB_DAEMON).toBe('health-watch');
+    expect(DAEMON_MANIFEST[m.HEALTH_WATCH_JOB_DAEMON]).toBeTruthy();
+    expect(typeof m.HEALTH_WATCH_JOB_SWITCHES.ghProbes).toBe('boolean');
+    expect(Object.isFrozen(m.HEALTH_WATCH_JOB_SWITCHES)).toBe(true);
+  });
+});

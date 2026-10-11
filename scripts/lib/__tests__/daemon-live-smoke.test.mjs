@@ -37,7 +37,149 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
+  resolveIoBoundLoadScale,
 } from '../daemon-live-smoke.mjs';
+
+// Existing fixtures must never observe or write the host's resource state.
+vi.mock('../resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn() }));
+beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
+afterEach(() => vi.unstubAllEnvs());
+
+describe('resource shadow observations', () => {
+  it.each([[63, 'admit', false], [3, 'wait', true]])('uses shadow admission at load %s', (load1, verdict, busy) => {
+    const env = {}; const shadow = vi.fn(() => ({ verdict })); const admit = vi.fn();
+    expect(hostLooksBusy(env, { load: () => load1, cores: () => 12, shadow, admit })).toBe(busy);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    expect(shadow).toHaveBeenCalledWith({
+      gate: 'rebuild-smoke.hostLooksBusy', kind: 'rebuild-smoke',
+      oldVerdict: load1 === 63 ? 'hold' : 'admit', oldReason: `load1 ${load1} vs 12×1`, env,
+    });
+    expect(admit).not.toHaveBeenCalled();
+  });
+  it('busyPoolSkip stands (null) when the only busy signal is an unknown hold on a quiet host', () => {
+    const unknown = { verdict: 'hold', unknown: true };
+    const detail = 'lane-pool list failed: timed out after 60000ms (process group killed)';
+    const hostBusy = () => hostLooksBusy({}, { load: () => 1, cores: () => 12, shadow: () => unknown, admit: () => unknown });
+    expect(busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: 60_000, capMs: 60_000, ctx: { env: {}, hostBusy } })).toBeNull();
+  });
+  // WE_RESOURCE_CUTOVER=shadow is the rollback switch: the shared decision is only logged, the legacy load rule decides.
+  it.each([[60, true], [3, false]])('keeps the legacy load rule at load %s under WE_RESOURCE_CUTOVER=shadow', (load1, busy) => {
+    const env = { WE_RESOURCE_CUTOVER: 'shadow' };
+    const shadow = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 50%' })); const admit = vi.fn(() => ({ verdict: 'admit' }));
+    expect(hostLooksBusy(env, { load: () => load1, cores: () => 12, shadow, admit })).toBe(busy);
+    expect(shadow).toHaveBeenCalledTimes(1); expect(admit).not.toHaveBeenCalled();
+  });
+  it('keeps legacy load-scaled budgets and reports no admission under WE_RESOURCE_CUTOVER=shadow', async () => {
+    const run = async (env) => {
+      const runChild = vi.fn(async () => '');
+      const out = await runLiveSmoke({ root: '/x', env, load: () => 63, cores: () => 12, clock: () => 0, changedFiles: [], closureOf: () => [],
+        runChild, shadow: () => ({ verdict: 'admit', reason: 'cpu idle 50%' }), admit: () => ({ verdict: 'admit' }) });
+      return { out, timeouts: runChild.mock.calls.map(([, , opts]) => opts.timeoutMs) };
+    };
+    const enforced = await run({ WE_RESOURCE_CUTOVER: 'enforce' });
+    const shadowed = await run({ WE_RESOURCE_CUTOVER: 'shadow' });
+    const legacy = await run({ WE_RESOURCE_CUTOVER: 'shadow', WE_SMOKE_LOAD_SCALE: undefined });
+    expect(shadowed.out.admission).toBeUndefined();
+    expect(shadowed.timeouts.length).toBeGreaterThan(0);
+    // load 63 on 12 cores: the legacy rule scales every budget up, the enforced admit decision does not.
+    expect(shadowed.timeouts.some((ms, i) => ms > enforced.timeouts[i])).toBe(true);
+    expect(legacy.timeouts).toEqual(shadowed.timeouts);
+  });
+  // Every decision shape: busy ⇔ a KNOWN non-admit. An unknown hold (sampler down: snapshot-missing/stale) is no
+  // evidence about the host, so the legacy load rule decides — never "busy" (that would launder a hung probe into a skip).
+  it.each([
+    ['admit', false, 63, false], ['wait', false, 3, true], ['hold', false, 3, true],
+    ['hold', true, 3, false], ['hold', true, 63, true], ['wait', true, 63, true],
+  ])('decision %s (unknown=%s) at load %s → busy=%s', (verdict, unknown, load1, busy) => {
+    const shadow = vi.fn(() => ({ verdict, unknown, reason: unknown ? 'snapshot-stale (age 900s)' : 'x' }));
+    expect(hostLooksBusy({}, { load: () => load1, cores: () => 12, shadow, admit: vi.fn() })).toBe(busy);
+  });
+  it('an unknown decision honours WE_SMOKE_BUSY_LOAD_RATIO', () => {
+    const shadow = () => ({ verdict: 'hold', unknown: true, reason: 'snapshot-missing' });
+    const host = { load: () => 25, cores: () => 10, shadow, admit: vi.fn() };
+    expect(hostLooksBusy({}, host)).toBe(true);
+    expect(hostLooksBusy({ WE_SMOKE_BUSY_LOAD_RATIO: '4' }, host)).toBe(false);
+  });
+  it('falls back from an absent shadow decision to admission', () => {
+    const env = {}; const admit = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 40% ≥ 5%' }));
+    expect(hostLooksBusy(env, { load: () => 63, cores: () => 12, shadow: () => {}, admit })).toBe(false);
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledWith({ kind: 'rebuild-smoke', env });
+  });
+  it.each([63, 3])('falls back to legacy load %s when both admission probes throw', (load1) => {
+    const shadow = vi.fn(() => { throw Error('observer failed'); });
+    const admit = vi.fn(() => { throw Error('admission failed'); });
+    expect(hostLooksBusy({}, { load: () => load1, cores: () => 12, shadow, admit })).toBe(load1 === 63);
+    expect(shadow).toHaveBeenCalledTimes(1); expect(admit).toHaveBeenCalledTimes(1);
+  });
+  it('leaves admitted CPU-bound budgets unscaled despite high load', () => {
+    const { reconcileMs, dispatchDryRunMs, ...rest } = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
+    const { reconcileMs: r0, dispatchDryRunMs: d0, ...rest0 } = resolveSmokeBudgets({}, { load: () => 0, cores: () => 12 });
+    expect(rest).toEqual(rest0);
+  });
+  // Live 2026-10-10 (wev-fix-daemon): admit at load 30–46/12 left reconcile/dispatch at 120s/180s; both wait on gh/git
+  // children (not CPU) and were killed, so main, every overlay and last-good all failed the smoke.
+  it('keeps load scaling for the I/O-bound checks even when admitted (smokeIoBoundLoadScale, standard on)', () => {
+    const b = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
+    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 720_000, ghApiMs: 30_000 });
+    expect(resolveIoBoundLoadScale({})).toMatchObject({ enabled: true, source: 'standard' });
+  });
+  it('the I/O-bound rule never lowers a non-admit factor, and honours the env layer and absolute overrides', () => {
+    expect(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } }).reconcileMs).toBe(480_000);
+    const admit48 = { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } };
+    expect(resolveSmokeBudgets({ WE_SMOKE_IO_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(120_000);
+    expect(resolveIoBoundLoadScale({ WE_SMOKE_IO_LOAD_SCALE: '0' })).toMatchObject({ enabled: false, source: 'env' });
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, admit48).reconcileMs).toBe(120_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_RECONCILE_MS: '50000' }, admit48).reconcileMs).toBe(50_000);
+  });
+  it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
+    const host = { load: () => 0, cores: () => 12, admission: { verdict } };
+    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(360_000);
+  });
+  it('preserves disabled scaling and absolute per-check overrides under a hold', () => {
+    const host = { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } };
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE: '0' }, host))
+      .toEqual(resolveSmokeBudgets({}, { load: () => 0, cores: () => 12 }));
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: '50000' }, host).dispatchDryRunMs).toBe(50_000);
+  });
+  it.each(['shadow', 'admit'])('feeds the %s decision into run budgets and reports admission', async (source) => {
+    const env = { WE_SMOKE_IO_LOAD_SCALE: '0' }; // the I/O-bound rule has its own tests above
+    const options = { root: '/x', env, load: () => 63, cores: () => 12,
+      clock: () => 0, changedFiles: [], closureOf: () => [], runChild: vi.fn(async () => '') };
+    await runLiveSmoke({ ...options, load: () => 0, shadow: () => {}, admit: () => undefined });
+    const calls = options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs);
+    expect(calls.length).toBeGreaterThan(0); options.runChild.mockClear();
+    const admission = { verdict: 'admit', reason: 'cpu idle 30% ≥ 5%' };
+    const shadow = vi.fn(() => source === 'shadow' ? admission : undefined);
+    const admit = vi.fn(() => admission);
+    const observed = await runLiveSmoke({ ...options, shadow, admit });
+    expect(options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs)).toEqual(calls);
+    expect(observed.admission).toEqual(admission);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    expect(shadow).toHaveBeenCalledWith({
+      gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke',
+      oldVerdict: 'hold', oldReason: 'timeouts scaled ×4 by load1 63/12 cores', env,
+    });
+    if (source === 'admit') {
+      expect(admit).toHaveBeenCalledTimes(1);
+      expect(admit).toHaveBeenCalledWith({ kind: 'rebuild-smoke', env });
+    } else expect(admit).not.toHaveBeenCalled();
+  });
+  it('survives a throwing shadow and absent admission with legacy budgets', async () => {
+    const env = {};
+    const options = { root: '/x', env, load: () => 63, cores: () => 12,
+      clock: () => 0, changedFiles: [], closureOf: () => [], runChild: vi.fn(async () => '') };
+    const baseline = await runLiveSmoke({ ...options, shadow: () => {}, admit: () => undefined });
+    const calls = options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs);
+    options.runChild.mockClear();
+    const admit = vi.fn(() => undefined);
+    const failed = await runLiveSmoke({ ...options, shadow: () => { throw Error('observer failed'); }, admit });
+    expect({ ...failed, sessionSlug: null }).toEqual({ ...baseline, sessionSlug: null });
+    expect(options.runChild.mock.calls.map(([, , opts]) => opts.timeoutMs)).toEqual(calls);
+    expect(admit).toHaveBeenCalledWith({ kind: 'rebuild-smoke', env });
+  });
+});
 
 /**
  * xp4lw2v (#4468 extended) — every pre-existing `runChild` fixture in this file predates the checks added since
@@ -1369,6 +1511,37 @@ describe('a check that ran out of TIME under load is environment, never code (li
     const r = await runLiveSmokeWithRetry({ root: '/x', env: {}, runChild, clock: () => t, sleep: async () => {}, refreshAuth: noAuth });
     expect(r.verdict).toBe('code');
     expect(r.attempts).toBe(1);
+  });
+
+  // Live 2026-10-10 (wev-fix-daemon): `reconcile-pass dry-run failed for 1/3 repo(s): <slug>: timed out after 120000ms
+  // (process group killed)` matched no env-timeout signature, so a load kill was rejected as code on every candidate.
+  const reconcileRow = async (perRepo) => {
+    let t = 0;
+    const runChild = withNewCheckDefaults(async (cmd, args) => {
+      if (args[0] === 'scripts/conveyor/reconcile-pass.mjs') {
+        const err = perRepo[String(args[1]).slice('--repo='.length)];
+        if (err) { t += 120_005; throw new Error(err); }
+        return '{}';
+      }
+      if (args[1] === 'acquire') return JSON.stringify({ lane: 1 });
+      return '';
+    });
+    const r = await runLiveSmoke({ root: '/x', env: { WE_SMOKE_BUSY_LOAD_RATIO: '1e9' }, runChild, clock: () => t });
+    return r.results.find((x) => x.name === 'reconcile-dry-run');
+  };
+  it('reconcile-dry-run: every failing repo killed at its own cap → one env-timeout-shaped row', async () => {
+    const row = await reconcileRow({ 'web-everything/web-everything': 'timed out after 120000ms (process group killed)' });
+    expect(row.ok).toBe(false);
+    expect(row.detail).toBe('reconcile-pass dry-run (1/3 repo(s) — web-everything/web-everything) failed: timed out after 120000ms (process group killed)');
+    expect(isEnvTimeoutRow(row)).toBe(true);
+  });
+  it('reconcile-dry-run: a timeout next to a real error keeps the per-repo detail (code, never env-timeout)', async () => {
+    const row = await reconcileRow({
+      'web-everything/web-everything': 'timed out after 120000ms (process group killed)',
+      'frontier-ui/frontierui': 'exited 1: TypeError: x is not a function',
+    });
+    expect(row.detail).toMatch(/^reconcile-pass dry-run failed for 2\/3 repo\(s\): /);
+    expect(isEnvTimeoutRow(row)).toBe(false);
   });
 
   it("runBounded's own hard-timeout kill counts too (external), a timeout that fails fast does not", () => {

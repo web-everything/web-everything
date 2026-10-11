@@ -11,7 +11,7 @@
  */
 import { loadFlakeHolds as readHolds, loadFlakeHoldState as readHoldState, isStandDownSuperseded, loadFlakeResults } from './stand-down.mjs';
 import { isAdvisoryMechanismStandDownSuperseded } from './advisory-fix-mark.mjs';
-import { isOperatorAnswerStandDownSuperseded } from './stand-down-answer-core.mjs';
+import { isOperatorAnswerStandDownSuperseded, latestOperatorAnswerAt } from './stand-down-answer-core.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export function isLegacyLoadFlakeHoldSuperseded(comments, index) {
@@ -23,6 +23,18 @@ export function isLegacyLoadFlakeHoldSuperseded(comments, index) {
 export const loadFlakeHolds = (comments) => readHolds(comments, isLegacyLoadFlakeHoldSuperseded);
 
 export const loadFlakeHoldState = (args) => readHoldState({ ...args, isSuperseded: isLegacyLoadFlakeHoldSuperseded });
+
+/**
+ * The load-flake results that count toward the reverify retry cap: only those posted AFTER the latest operator
+ * answer (`stand-down-answer-core.mjs#latestOperatorAnswerAt`). The cap's "exhausted" result asks a human to step
+ * in; once one has answered, the count restarts (live plateau #220: the answered re-dispatch was declared exhausted
+ * on attempts made before the answer). With no answer this is every result, exactly as before.
+ */
+export function loadFlakeAttemptResults(comments) {
+  const at = Date.parse(latestOperatorAnswerAt(comments) ?? '');
+  const all = loadFlakeResults(comments);
+  return Number.isFinite(at) ? all.filter((r) => Date.parse(r.createdAt) > at) : all;
+}
 
 /** Leading lines that close a review round after a push: a re-arm, a bounce, an accept, or an advisory review. Literal
  *  copies (not imports) keep this file import-light; each is the stable first line its writer posts. */

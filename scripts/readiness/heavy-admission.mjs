@@ -142,6 +142,8 @@ import { hostname } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { shadowAdmission } from '../lib/resource-admission.mjs';
+import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
 import { defaultPoolRoot, guardedPoolRoot } from '../lib/lane-pool-paths.mjs';
@@ -502,10 +504,10 @@ export function readLatestLoad({ root = resolveHostRoot(), now = new Date(), win
  * `--min-idle-pct=`/etc. overrides were fixed for (#4343 review). Routing a param through a COPY of `env` under
  * its real var name, then calling the one resolver that already owns that clamp, means there is exactly one
  * place per knob that decides what counts as valid, for BOTH an env var and a direct JS caller's param.
- * @param {{env?:NodeJS.ProcessEnv, minIdlePct?:number, minPressureLevel?:number, backstopPerCore?:number, window?:number, root?:string, now?:Date}} [o]
+ * @param {{env?:NodeJS.ProcessEnv, minIdlePct?:number, minPressureLevel?:number, backstopPerCore?:number, window?:number, root?:string, now?:Date, kind?:string, shadow?:Function}} [o]
  * @returns {{held:boolean, idlePct:number|null, minIdlePct:number, pressureLevel:number|null, minPressureLevel:number, load1:number|null, cores:number|null, perCore:number|null, backstopPerCore:number, reason?:string, bypassed?:string}}
  */
-export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressureLevel, backstopPerCore, window, root, now = new Date() } = {}) {
+export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressureLevel, backstopPerCore, window, root, now = new Date(), kind = 'build', shadow = shadowAdmission, mode, admitFn } = {}) {
   const effectiveEnv = { ...env };
   if (minIdlePct !== undefined) effectiveEnv[LOAD_ADMISSION_MIN_IDLE_PCT_ENV] = String(minIdlePct);
   if (minPressureLevel !== undefined) effectiveEnv[LOAD_ADMISSION_MIN_PRESSURE_LEVEL_ENV] = String(minPressureLevel);
@@ -525,7 +527,19 @@ export function resolveLoadAdmission({ env = process.env, minIdlePct, minPressur
   if (isLoadAdmissionOff(env)) return bypassed('off');
   if (/^(?:true|1)$/i.test(String(env.CI || ''))) return bypassed('ci');
   const { idlePctSamples, pressureLevel, load1, cores } = readLatestLoad(root != null ? { root, now, window: win } : { now, window: win });
-  return loadAdmissionDecision({ idlePctSamples, pressureLevel, load1, cores, minIdlePct: minIdle, minPressureLevel: minPressure, backstopPerCore: backstop });
+  const decision = loadAdmissionDecision({ idlePctSamples, pressureLevel, load1, cores, minIdlePct: minIdle, minPressureLevel: minPressure, backstopPerCore: backstop });
+  // x6nuodj (slice 3): the shared decision for `kind` DECIDES (`resourceGate.cutover` enforce, the default); the
+  // telemetry rule above is the logged comparison. `shadow` mode keeps it deciding. Stale/missing snapshot = admit()'s
+  // own rule (hold a heavy kind). The JSON contract keeps every field; `resourceAdmission` names what decided.
+  let cutoverMode = mode;
+  if (cutoverMode === undefined) { try { cutoverMode = loadResourceGateSettings({ env }).settings.cutover; } catch { cutoverMode = 'enforce'; } }
+  const legacy = { admit: !decision.held, ...(decision.held ? { why: decision.reason } : { note: `admitted (idle ${decision.idlePct}%, load1 ${decision.load1})` }) };
+  const cut = cutoverDecision({ gate: 'heavy-admission.load-status', kind, legacy, mode: cutoverMode, env, nowMs: now.getTime(),
+    shadow: (args) => shadow({ gate: args.gate, kind: args.kind, oldVerdict: args.oldVerdict, oldReason: args.oldReason, env }),
+    ...(admitFn ? { admitFn } : {}) });
+  if (cut.decidedBy !== 'admit') return decision;
+  return { ...decision, held: !cut.admit, reason: cut.admit ? undefined : `resource-admission: ${cut.admission.verdict} — ${cut.admission.reason}`,
+    resourceAdmission: { ...cut.admission, decidedBy: 'admit', legacyHeld: decision.held } };
 }
 
 /** The host-shared lock root for a checkout (lane or primary) — a sibling of every lane clone, never inside
@@ -1409,6 +1423,7 @@ async function main(argv) {
       backstopPerCore: numOrUndef('max-per-core'),
       window: numOrUndef('window'),
       root: loadRoot,
+      kind: typeof flags.kind === 'string' ? flags.kind : undefined,
     });
     if (asJson) { emit(decision); return; }
     // Plain-text fallback (no `--json`) when `decision.reason` is absent (an ADMITTED tick has none — see

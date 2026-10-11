@@ -77,6 +77,9 @@ import { randomUUID, createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
+import { resolveCutoverMode } from './resource-gate.mjs';
+import { cascadePolicy } from './policy-cascade.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
@@ -150,10 +153,39 @@ function envNonNegInt(env, key, fallback) {
   return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
+/** A well-formed decision from the shared resource service (we:scripts/lib/resource-admission.mjs). */
+const isDecision = (d) => d !== null && typeof d === 'object' && typeof d.verdict === 'string';
+
+/** x9xkupj: the budget factor from the shared `rebuild-smoke` decision — admitted ⇒ unscaled; wait/hold (CPU saturated,
+ *  memory critical, or snapshot stale/missing) ⇒ the max factor. Load average is not consulted: macOS counts disk
+ *  waits in it, and 1261 sampler snapshots (2026-10-09) scaled every smoke ×1.2–×4 at load 15–101 with the CPU
+ *  14–49% idle. `WE_SMOKE_LOAD_SCALE=0` still disables scaling. */
+export function admissionLoadFactor(env, admission) {
+  if (env?.[SMOKE_LOAD_SCALE_ENV] === '0') return 1;
+  return admission.verdict === 'admit' ? 1 : envMs(env, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX);
+}
+
+/** The shared decision for kind `rebuild-smoke`: the shadow call's own answer (it logs the old/new pair), else a
+ *  direct admit() (shadow switched off). `undefined` when both fail — callers then keep the legacy load rule — and
+ *  under the `shadow` cut-over (WE_RESOURCE_CUTOVER, the rollback switch): the pair is still logged, but the legacy
+ *  load rule keeps deciding, as it does for every other gate (`resource-gate.mjs#cutoverDecision`). */
+function rebuildSmokeAdmission({ shadow, admit, shadowArgs, env }) {
+  let decision;
+  try { decision = shadow(shadowArgs); } catch { /* Observation failure falls through to a direct admit(). */ }
+  if (resolveCutoverMode(env) !== 'enforce') return undefined;
+  if (isDecision(decision)) return decision;
+  try { decision = admit({ kind: 'rebuild-smoke', env }); } catch { decision = undefined; }
+  return isDecision(decision) ? decision : undefined;
+}
+
 /** Resolve every check's budget from env, falling back to a sane default (or to `bounded-child.mjs`'s own
- *  budgets, the single source for the generic/acquire timeouts). @returns {Record<string, number>} */
-export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length } = {}) {
-  const factor = smokeLoadFactor(env, { load, cores });
+ *  budgets, the single source for the generic/acquire timeouts). `admission` (x9xkupj) decides the scale factor;
+ *  without one the legacy load factor applies. @returns {Record<string, number>} */
+export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length, admission } = {}) {
+  const factor = isDecision(admission) ? admissionLoadFactor(env, admission) : smokeLoadFactor(env, { load, cores });
+  // Admission judges CPU; the I/O-bound checks still get the load factor (never lower than `factor`).
+  const ioFactor = isDecision(admission) && resolveIoBoundLoadScale(env).enabled
+    ? Math.max(factor, smokeLoadFactor(env, { load, cores })) : factor;
   const budgets = {
     lanePoolListMs: envMs(env, SMOKE_BUDGET_ENV.lanePoolListMs, resolveChildTimeoutMs(env)),
     laneAcquireMs: envMs(env, SMOKE_BUDGET_ENV.laneAcquireMs, resolveLaneAcquireTimeoutMs(env)),
@@ -173,9 +205,28 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
   };
   for (const key of Object.keys(budgets)) {
     if (key === 'lanePoolBusyCapMs' || key === 'laneAcquireBusyCapMs' || key === 'laneAcquireWaitMs') continue;
-    if (envMs(env, SMOKE_BUDGET_ENV[key], null) === null) budgets[key] = Math.round(budgets[key] * factor);
+    if (envMs(env, SMOKE_BUDGET_ENV[key], null) === null) budgets[key] = Math.round(budgets[key] * (IO_BOUND_BUDGET_KEYS.has(key) ? ioFactor : factor));
   }
   return budgets;
+}
+
+// Live 2026-10-10 (wev-fix-daemon): with x9xkupj's admission, `admit` (CPU 16–28% idle) left reconcile/dispatch at
+// 120s/180s at load 30–46 on 12 cores. Both wait on gh/git children, so CPU idle says nothing about them: they were
+// killed, and plain main and last-good failed identically. These two keep the load factor through the cascade.
+const IO_BOUND_BUDGET_KEYS = new Set(['reconcileMs', 'dispatchDryRunMs']);
+export const SMOKE_IO_LOAD_SCALE_ENV = 'WE_SMOKE_IO_LOAD_SCALE';
+/** Policy `smokeIoBoundLoadScale` (platform / env `WE_SMOKE_IO_LOAD_SCALE` 0|1 over standard `{enabled:true}`).
+ *  @returns {{enabled:boolean, source:string}} */
+export function resolveIoBoundLoadScale(env = process.env) {
+  const v = env?.[SMOKE_IO_LOAD_SCALE_ENV];
+  try {
+    const r = cascadePolicy('smokeIoBoundLoadScale', undefined, {
+      env, standard: { enabled: true },
+      envValues: { enabled: v === '0' ? false : v === '1' ? true : undefined },
+      valid: { enabled: (x) => typeof x === 'boolean' },
+    });
+    return { enabled: r.value?.enabled !== false, source: r.sources?.enabled ?? 'standard' };
+  } catch { return { enabled: true, source: 'standard' }; }
 }
 
 const firstLine = (e) => String((e && e.message) || e).split('\n')[0];
@@ -205,7 +256,9 @@ const failureLine = (e) => {
 // NO LAUNDERING (the rule `mayBeTransient:false` exists for): the tree's own text can print "no free lane", and
 // a hung tree can simply sleep. So a skip needs ALL of: (1) a time-out/exhaustion signature, (2) the gate's own
 // clock shows the probe really spent >= 90% of its cap, and (3) evidence from OUTSIDE the tree that the host is
-// busy (1-minute load average >= CPU count, `WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
+// busy: a KNOWN non-admit from the shared `rebuild-smoke` resource decision. An `unknown` decision (sampler down:
+// snapshot missing/stale) is no evidence, so the 1-minute load average >= CPU count rule decides instead
+// (`WE_SMOKE_BUSY_LOAD_RATIO` scales it). The rest of the smoke
 // (reconcile, dispatch dry-run, daemon boot, tree-stays-clean) still gates adoption.
 /** lane-pool's own "another acquire still held the shared scan lock" refusal (#xj2k2pp). It names a DIFFERENT
  *  caller's work, never the tree under test, so it is busy-pool on its own — no host-load check needed. Live
@@ -222,11 +275,21 @@ export const BUSY_POOL_SIGNATURES = Object.freeze([
 export const SMOKE_BUSY_LOAD_RATIO_ENV = 'WE_SMOKE_BUSY_LOAD_RATIO';
 
 /** Is the host busy, judged from outside the tree under test? Injectable via `ctx.hostBusy`. */
-export function hostLooksBusy(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length } = {}) {
+export function hostLooksBusy(env = process.env, { load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource } = {}) {
+  let busy = false;
+  let load1, coreCount, ratio;
   try {
-    const ratio = envMs(env, SMOKE_BUSY_LOAD_RATIO_ENV, 1);
-    return load() >= Math.max(1, cores()) * ratio;
-  } catch { return false; }
+    ratio = envMs(env, SMOKE_BUSY_LOAD_RATIO_ENV, 1);
+    load1 = load();
+    coreCount = Math.max(1, cores());
+    busy = load1 >= coreCount * ratio;
+  } catch { /* Unavailable host probes retain the existing false result. */ }
+  // x9xkupj: the shared `rebuild-smoke` decision decides (busy ⇔ not admitted); the load rule above is the logged comparison.
+  const decision = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs: { gate: 'rebuild-smoke.hostLooksBusy', kind: 'rebuild-smoke',
+    oldVerdict: busy ? 'hold' : 'admit', oldReason: `load1 ${load1} vs ${coreCount}×${ratio}`, env } });
+  // Busy ⇔ a KNOWN non-admit. An `unknown` decision (snapshot missing/stale — the sampler is down) is no evidence about
+  // the host, so it must not count as outside busy evidence (NO LAUNDERING): the load rule above decides instead.
+  return decision && !decision.unknown ? decision.verdict !== 'admit' : busy;
 }
 
 /** PURE-ish: the `skipped: busy pool` result for a failed probe, or `null` when the failure must stand. */
@@ -377,6 +440,11 @@ async function checkReconcileDryRun({ root, repos, budgets, runChild, env }) {
     } catch (e) {
       failures.push(`${slug}: ${firstLine(e)}`);
     }
+  }
+  // Every failure a runBounded kill at its own cap → one row shaped like dispatch's, so ENV_TIMEOUT_PATTERNS sees it.
+  const kills = failures.map((f) => /^([^:]+): (timed out after \d+ms \(process group killed\))$/.exec(f));
+  if (failures.length && kills.every(Boolean)) {
+    return { ok: false, detail: `reconcile-pass dry-run (${failures.length}/${repos.length} repo(s) — ${kills.map((m) => m[1]).join(', ')}) failed: ${kills[0][2]}` };
   }
   if (failures.length) {
     return { ok: false, detail: `reconcile-pass dry-run failed for ${failures.length}/${repos.length} repo(s): ${failures.join('; ')}` };
@@ -716,9 +784,27 @@ export async function runLiveSmoke({
   root, env = process.env, repos = Object.values(CONSTELLATION_REPOS).map((r) => r.slug),
   runChild = runBounded, now = Date.now(), changedFiles = null, closureOf = collectImportClosure,
   clock = Date.now, hostBusy = undefined,
+  load = () => loadavg()[0], cores = () => cpus().length, shadow = shadowAdmission, admit = admitResource,
 } = {}) {
   if (isSmokeGateDisabled(env)) return { pass: true, disabled: true, results: [], sessionSlug: null };
-  const budgets = resolveSmokeBudgets(env);
+  // One shared `rebuild-smoke` decision per run sets the budgets (x9xkupj); the legacy load factor is its logged comparison.
+  let load1, coreCount;
+  const host = { load: () => load1 ??= load(), cores: () => coreCount ??= cores() };
+  let shadowArgs;
+  try {
+    const factor = smokeLoadFactor(env, host);
+    shadowArgs = { gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke',
+      oldVerdict: factor > 1 ? 'hold' : 'admit',
+      oldReason: `timeouts scaled ×${factor} by load1 ${host.load()}/${host.cores()} cores`, env };
+  } catch { shadowArgs = { gate: 'rebuild-smoke.loadScaledBudgets', kind: 'rebuild-smoke', oldVerdict: null, oldReason: 'load probe failed', env }; }
+  const admission = rebuildSmokeAdmission({ shadow, admit, env, shadowArgs });
+  const budgets = resolveSmokeBudgets(env, { ...host, admission });
+  try { // The I/O-bound rule's source, once per smoke, next to the shadow line (silent under test).
+    if (isDecision(admission) && !process.env.VITEST) {
+      const io = resolveIoBoundLoadScale(env);
+      console.error(`daemon-live-smoke: io-bound-load-scale ${JSON.stringify({ ...io, verdict: admission.verdict, reconcileMs: budgets.reconcileMs, dispatchDryRunMs: budgets.dispatchDryRunMs })}`);
+    }
+  } catch { /* logging never changes the smoke */ }
   const sessionSlug = `smoke-${now}-${randomUUID().slice(0, 8)}`;
   const ghChildEnv = ghDispatchedSessionEnv(env);
   // xp4lw2v — the porcelain snapshot BEFORE any check below runs, best-effort (never throws, never blocks the
@@ -751,7 +837,8 @@ export async function runLiveSmoke({
     }
     results.push({ name: check.name, ms: clock() - startedAt, ...result, mayBeTransient: check.mayBeTransient !== false });
   }
-  return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug };
+  return { pass: decideSmokeVerdict(results), disabled: false, results, sessionSlug,
+    ...(admission ? { admission: { verdict: admission.verdict, reason: admission.reason } } : {}) };
 }
 
 // ── Transient vs. code classification (Module D) — see the file header for the full rationale. ──

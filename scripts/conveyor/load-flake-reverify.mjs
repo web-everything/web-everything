@@ -8,12 +8,15 @@ import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runBounded } from '../lib/bounded-child.mjs';
+import { resolveMergeMainBeforeRetry, logMergeMainSource, describeMergeMain, defaultMergeMain } from './load-flake-merge-main.mjs';
 import { pushRefusal } from './fix-procedure.mjs';
 import { loadFlakeResults, buildLoadFlakeResolvedComment, buildLoadFlakeRedispatchResolvedComment } from './stand-down.mjs';
-import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm } from './load-flake-hold.mjs';
+import { loadFlakeHoldState, pushedLoadFlakeFixOwedRearm, loadFlakeAttemptResults } from './load-flake-hold.mjs';
 import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
+import { admit, shadowAdmission } from '../lib/resource-admission.mjs';
+import { resolveCutoverMode } from '../lib/resource-gate.mjs';
 
 export const VERIFY_ENV_ALLOWLIST = Object.freeze([
   'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'CI', 'NODE_ENV', 'NODE_OPTIONS', 'FORCE_COLOR', 'NO_COLOR',
@@ -46,6 +49,8 @@ export function reverifyConfig(env = process.env, maxLoadPerCore) {
     maxAttempts: Math.max(1, Math.floor(positive(env.WE_LOAD_FLAKE_REVERIFY_MAX_ATTEMPTS, 3))),
     cooloffMs: positive(env.WE_LOAD_FLAKE_REVERIFY_COOLOFF_MIN, 30) * 60_000,
     mode: reverifyMode(env),
+    // #xg0rkxn — merge current main into the head before a quiet-host retry (policy-cascade shape, source logged).
+    mergeMainBeforeRetry: resolveMergeMainBeforeRetry({ env }).value,
   };
 }
 
@@ -56,8 +61,19 @@ function reverifyMode(env) {
   return mode;
 }
 
-export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}) }) {
-  const quiet = cores > 0 && load.length >= 2 && load.slice(0, 2).every((n) => Number.isFinite(n) && n / cores <= config.maxLoadPerCore);
+/** The pre-x9xkupj rule (both load averages per core ≤ maxLoadPerCore). Load average is NOT a CPU signal on this host:
+ *  macOS counts disk waits in it — 1261 sampler snapshots (2026-10-09) never read load ≤ 9 while the CPU sat 20–45% idle,
+ *  so plateau #220's re-arm waited all night. Kept only as the logged comparison and for callers with no admission. */
+export function legacyLoadQuiet(load, cores, config) {
+  return cores > 0 && load.length >= 2 && load.slice(0, 2).every((n) => Number.isFinite(n) && n / cores <= config.maxLoadPerCore);
+}
+
+/** A well-formed decision from the shared resource service (we:scripts/lib/resource-admission.mjs). */
+const isDecision = (d) => d !== null && typeof d === 'object' && typeof d.verdict === 'string';
+
+/** `admission` (x9xkupj): the shared decision for kind `load-flake-rearm` decides quiet; absent → the legacy load rule. */
+export function planLoadFlakeReverify({ prs = [], load, cores, now, config = reverifyConfig({}), admission }) {
+  const quiet = isDecision(admission) ? admission.verdict === 'admit' : legacyLoadQuiet(load, cores, config);
   let loadDeferred = false;
   if (config.mode !== 'ci' && !quiet) {
     return { deferred: 'host-load' };
@@ -67,9 +83,9 @@ export function planLoadFlakeReverify({ prs = [], load, cores, now, config = rev
     if (!state.live) return [];
     if (state.hold.redispatch) {
       if (!quiet) { loadDeferred = true; return []; }
-      return [{ pr, ...state, attempts: loadFlakeResults(pr.comments).filter((r) => r.redispatch && r.result === 'redispatched').length }];
+      return [{ pr, ...state, attempts: loadFlakeAttemptResults(pr.comments).filter((r) => r.redispatch && r.result === 'redispatched').length }];
     }
-    const reds = loadFlakeResults(pr.comments).filter((r) => r.sha === state.hold.alt.sha && r.result === 'red-again');
+    const reds = loadFlakeAttemptResults(pr.comments).filter((r) => r.sha === state.hold.alt.sha && r.result === 'red-again');
     if (reds.length && now - Date.parse(reds.at(-1).createdAt) < config.cooloffMs) return [];
     return [{ pr, ...state, attempts: reds.length }];
   }).sort((a, b) => Date.parse(a.hold.createdAt) - Date.parse(b.hold.createdAt));
@@ -88,13 +104,18 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   if (!key) throw new Error(`unknown repo: ${repo}`);
   const slug = CONSTELLATION_REPOS[key].slug;
   const prs = await io.listPrs(slug);
+  // One shared decision per run (x9xkupj). An admission probe that throws or answers nothing leaves the legacy rule.
+  let admission;
+  try { admission = typeof io.admission === 'function' ? io.admission({ load, cores, config }) : undefined; } catch { admission = undefined; }
+  if (!isDecision(admission)) admission = undefined;
   // A pushed fix is a finished fix round: re-arm it before anything else (needs no verify, so host load cannot defer it).
   const rearmed = dryRun ? [] : await rearmPushedFixes({ prs, slug }, io);
-  const plan = { ...planLoadFlakeReverify({ prs, load, cores, now, config }), ...(rearmed.length ? { rearmed } : {}) };
+  const plan = { ...planLoadFlakeReverify({ prs, load, cores, now, config, admission }), ...(rearmed.length ? { rearmed } : {}) };
   // Holding is the common case: name every PR it holds and the load it saw, so the log proves the pass is
   // evaluating them (a bare "host-load" line cannot be told apart from a pass that sees no holds). Read-only.
   if (plan.deferred === 'host-load') {
-    return { ...plan, load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
+    return { ...plan, ...(admission ? { admission: admissionSummary(admission) } : {}),
+      load: load.slice(0, 2).map((n) => Math.round(n * 100) / 100), cores, maxLoadPerCore: config.maxLoadPerCore,
       holds: prs.flatMap((pr) => {
         const state = loadFlakeHoldState({ comments: pr.comments, headRefOid: pr.headRefOid, now });
         return state.live ? [{ pr: pr.number, alt: state.hold.alt.branch, altSha: state.hold.alt.sha, ...(state.hold.redispatch ? { redispatch: true } : {}) }] : [];
@@ -111,7 +132,7 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   // Cheap redispatches all run first; then the saved-fix path still stops after one progress outcome.
   for (const candidate of plan.candidates.filter((c) => c.hold.redispatch)) {
     try {
-      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores }, io) });
+      redispatched.push({ pr: candidate.pr.number, ...await reverifyCandidate({ candidate, key, slug, config, load, cores, admission }, io) });
     } catch (e) {
       redispatched.push({ pr: candidate.pr.number, error: String(e?.message ?? e) });
     }
@@ -129,6 +150,8 @@ export async function runLoadFlakeReverify({ repo = REVERIFY_DEFAULT_REPO, dryRu
   if (redispatched.length) return finish(firstError ? { error: String(firstError.message ?? firstError) } : {});
   throw firstError;
 }
+
+const admissionSummary = (d) => ({ verdict: d.verdict, reason: d.reason, snapshotAge: d.snapshotAge ?? null });
 
 /** Deferrals that leave the hold live and unchanged: the next candidate is tried instead of stopping here. */
 const NON_PROGRESS = new Set(['fix-claimed', 'hold-ended', 'hold-changed']);
@@ -156,11 +179,16 @@ export async function rearmPushedFixes({ prs = [], slug }, io) {
   return out;
 }
 
-async function reverifyCandidate({ candidate, key, slug, config, load, cores }, io) {
+async function reverifyCandidate({ candidate, key, slug, config, load, cores, admission }, io) {
   const { pr, hold, attempts } = candidate;
-  const post = (result, detail = '') => io.comment(slug, pr.number, hold.redispatch
-    ? buildLoadFlakeRedispatchResolvedComment({ result, detail })
-    : buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
+  let mergeMain = null;
+  const post = (result, text = '') => {
+    // The merge note goes LAST: the comment builders keep the final 1500 characters.
+    const detail = [text, describeMergeMain(mergeMain)].filter(Boolean).join('\n\n');
+    return io.comment(slug, pr.number, hold.redispatch
+      ? buildLoadFlakeRedispatchResolvedComment({ result, detail })
+      : buildLoadFlakeResolvedComment({ altSha: hold.alt.sha, result, detail }));
+  };
   const check = async () => {
     const live = await io.readPr(slug, pr.number);
     if (live.state !== 'OPEN' || live.headRefName !== pr.headRefName || live.headRefOid !== pr.headRefOid) {
@@ -175,10 +203,20 @@ async function reverifyCandidate({ candidate, key, slug, config, load, cores }, 
   };
   let refusal = await check();
   if (refusal) return refusal;
+  // #xg0rkxn (live plateau #220): a re-dispatch on the old head re-runs without whatever main fixed meanwhile (#221, the
+  // very timing tests that flaked). Merge main into the head first; a conflict is left to the conflict-fix path.
+  if (hold.redispatch && attempts < config.maxAttempts && config.mergeMainBeforeRetry && typeof io.mergeMain === 'function') {
+    mergeMain = await io.mergeMain({ slug, branch: pr.headRefName, headSha: pr.headRefOid, base: pr.baseRefName || 'main' });
+    if (mergeMain?.result !== 'up-to-date') console.error(`load-flake reverify: ${slug}#${pr.number} main ${mergeMain?.result}${mergeMain?.sha ? ` → ${mergeMain.sha.slice(0, 9)}` : ''} before the retry`);
+  }
   if (hold.redispatch) {
     const result = attempts >= config.maxAttempts ? 'exhausted' : 'redispatched';
+    const loadText = `${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores`;
+    const why = admission
+      ? `resource admission ${admission.verdict} (${admission.reason}); load ${loadText} is comparison only`
+      : `host load ${loadText} ≤ ${config.maxLoadPerCore}/core`;
     await post(result, result === 'redispatched'
-      ? `host load ${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores ≤ ${config.maxLoadPerCore}/core; the fix loop re-dispatches a fixer against the same review findings (attempt ${attempts + 1} of ${config.maxAttempts})` : '');
+      ? `${why}; the fix loop re-dispatches a fixer against the same review findings (attempt ${attempts + 1} of ${config.maxAttempts})` : '');
     return { result, pr: pr.number };
   }
   if (attempts >= config.maxAttempts) { await post('exhausted'); return { result: 'exhausted' }; }
@@ -255,12 +293,24 @@ export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home
   return clean;
 }
 
-export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
+export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
+  shadow = shadowAdmission, admitFn = admit, env = process.env } = {}) {
   const command = (bin, args, opts = {}) => run(bin, args, { cwd: root, encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts });
   const gh = (args) => JSON.parse(command('gh', args));
   const lanePool = (...args) => command(process.execPath, [resolve(root, 'scripts/lane-pool.mjs'), ...args]);
   return {
     now: Date.now, loadavg: os.loadavg, cpuCount: () => os.cpus().length,
+    // x9xkupj: the shared resource service decides kind `load-flake-rearm` (stale/missing snapshot = hold). The old
+    // load rule rides along as the logged comparison (shadow.jsonl + a stderr line in the pass log). With
+    // WE_RESOURCE_SHADOW=off the comparison is skipped but the decision still comes from admit(). Under the rollback
+    // switch WE_RESOURCE_CUTOVER=shadow the pair is only logged and no decision is returned (the legacy rule decides).
+    admission: ({ load, cores, config }) => {
+      const quiet = legacyLoadQuiet(load, cores, config);
+      const observed = shadow({ gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: quiet ? 'admit' : 'hold',
+        oldReason: `load ${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores vs ${config.maxLoadPerCore}/core` });
+      if (resolveCutoverMode(env) !== 'enforce') return undefined;
+      return observed ?? admitFn({ kind: 'load-flake-rearm' });
+    },
     // `gh pr list --json comments` stops at 100: a hold past that was invisible here while fix-dispatch (which reads the
     // complete thread) kept refusing the PR as `load-flake-hold` (live #4017, 286 comments). Same complete reader as fix-dispatch.
     listPrs: (slug) => enrichPrsWithCompleteComments(
@@ -309,6 +359,8 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
     // off, and a plain refspec (no force) means a non-fast-forward is refused.
     push: (_laneCwd, sha, branch) => command('git', ['-c', 'core.hooksPath=/dev/null', 'push', '--no-verify', 'origin', `${sha}:refs/heads/${branch}`]),
     comment: (slug, pr, body) => command('gh', ['pr', 'comment', String(pr), '--repo', slug, '--body', body]),
+    // #xg0rkxn — merge main into the PR head in this daemon checkout (plumbing only, no force), see load-flake-merge-main.mjs.
+    mergeMain: (args) => defaultMergeMain(args, { run, cwd: root }),
   };
 }
 
@@ -317,10 +369,12 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   if (action !== 'sweep') throw new Error('usage: load-flake-reverify.mjs sweep [--repo=we] [--dry-run] [--max-load-per-core=N] [--json]');
   const flags = Object.fromEntries(args.map((a) => { const [k, ...v] = a.replace(/^--/, '').split('='); return [k, v.length ? v.join('=') : true]; }));
   const config = reverifyConfig(process.env, flags['max-load-per-core']);
+  const mergeMainPolicy = resolveMergeMainBeforeRetry();
+  logMergeMainSource(mergeMainPolicy);
   const repos = {};
   for (const repo of flags.repo ? [flags.repo] : REVERIFY_SWEEP_REPOS) {
     try { repos[repo] = await runLoadFlakeReverify({ repo, dryRun: !!flags['dry-run'], config }); }
     catch (e) { repos[repo] = { repo, error: String(e?.message ?? e) }; }
   }
-  process.stdout.write(`${JSON.stringify({ mode: config.mode, repos })}\n`);
+  process.stdout.write(`${JSON.stringify({ mode: config.mode, mergeMainBeforeRetry: { value: mergeMainPolicy.value, source: mergeMainPolicy.source }, repos })}\n`);
 }

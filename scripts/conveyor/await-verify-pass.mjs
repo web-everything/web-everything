@@ -29,6 +29,7 @@ import { fileURLToPath } from 'node:url';
 import {
   listStoredAwaitVerify, writeStoredAwaitVerify, clearStoredAwaitVerify, clearAwaitVerifyRecord,
   resolveAwaitVerifyTtlMs, AWAIT_VERIFY_REF_RE, AWAIT_VERIFY_KINDS, AWAIT_VERIFY_NO_PUSH_KINDS,
+  readSelfReview, selfReviewHold, selfReviewStoreDir, selfReviewBelongsTo,
 } from './await-verify.mjs';
 import { readVerifyMarker, verifyGateDecision } from '../lib/lane-verify.mjs';
 import { computeWorkingTreeHash } from '../lib/verify-lane-gate.mjs';
@@ -38,12 +39,13 @@ import { defaultPoolRoot } from '../lib/lane-pool-paths.mjs';
 import { readFixDispatchClaim } from './fix-claim-store.mjs';
 import { listWrappedWorkerAgents, requestWrappedResume } from '../operations/worker-wrapper-launch.mjs';
 import { AGENT_GONE_STATES } from './lease-reaper.mjs';
+import { loadFixPushPolicy, formatFixPushPolicyLine } from '../lib/fix-push-policy.mjs';
 import { listSalvage, writeSalvage, clearSalvage, planSalvage, resolveSalvageTuning, salvageKey, stashCommit, salvageStoreDir } from './verified-push-salvage.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** Policy limits. `maxReds` counts the record's own `attempt` (the fixer bumps it on each re-mark). */
-export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3 });
+export const AWAIT_VERIFY_LIMITS = Object.freeze({ maxReds: 3, maxRetries: 2, maxResumeFailures: 3, selfReviewMaxMs: 30 * 60_000 });
 /** Repo keys with a quiet-host reverify worker (mirrors stand-down.mjs#LOAD_FLAKE_REVERIFY_REPOS). */
 export const AWAIT_LOAD_FLAKE_REPO_KEYS = Object.freeze(['we']);
 const repoKeyOrNull = (slug) => { try { return repoKeyForSlug(slug) ?? null; } catch { return null; } };
@@ -149,6 +151,10 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
   const subject = isNoPushRecord(record) ? `item #${record.item} (${record.repo})` : `PR #${record.pr} (${record.repo})`;
   const head = `[harness verify verdict — #5137] ${subject}, sha ${record.sha}, attempt ${record.attempt ?? 1}.`;
   const next = `Re-mark with --attempt=${(record.attempt ?? 1) + 1} after committing and re-requesting, then end your turn again.`;
+  // fix.pushBeforeGate: this red sha is ALREADY on the PR branch. The claim is still yours and must stay held until a green.
+  const earlyRed = record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha)
+    ? `\n\nThis sha is already on ${record.ref} (pushed before the gate, push-before-gate). You still hold the fix claim: keep it. Repair with a NEW commit on top (never amend, rebase or force), and the harness pushes that one too. Never hand back, re-arm review or fix-end on a red head except through the gate-red / load-flake exits.`
+    : '';
   if (isNoPushRecord(record) && ['green', 'red', 'escalate', 'infra', 'void'].includes(kind)) return buildNoPushResumePrompt({ kind, record, marker, detail, head, next });
   switch (kind) {
     case 'green': {
@@ -156,7 +162,9 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
       // The two briefs end differently: a CI-heal's only PR write is the restart-surviving tally comment (no evidence comment, no hand-back).
       return isCiHeal(record)
         ? `${head}\n\n${pushed} Continue your ${brief(record)} at step 7: post the durable CI-heal comment (\`ci-heal-mark.mjs\` — the attempt tally that survives restarts), then its completion report (\`--outcome=no-change|healed\`) and fix-end. Touch no label.`
-        : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
+        : record.pendingResume?.selfReviewOverdue
+          ? `${head}\n\n${pushed} BUT your parallel self-review has not reported (${record.pendingResume.selfReviewOverdue}). Do not hand back yet: if it is still running, wait for its report; if it was lost, run it again now (blocking). Record its verdict with \`node "${ROOT}/scripts/conveyor/await-verify.mjs" self-review clean|must-fix --repo=${record.repo} --pr=${record.pr} --who=${record.who}\`. must-fix → repair with a NEW commit, \`verify-lane.mjs request\`, mark again (same --attempt) and end your turn. clean → continue your ${brief(record)} from the step after the push. fix-end refuses a hand-back release while the self-review is open.`
+          : `${head}\n\n${pushed} Continue your ${brief(record)} from the step after the push: post the before/after evidence comment (cite this green verdict), then the hand-back and the closing completion report + fix-end.`;
     }
     case 'push-rejected':
       return isCiHeal(record)
@@ -167,13 +175,13 @@ export function buildAwaitVerifyResumePrompt({ kind, record, marker = null, deta
     case 'push-refused':
       return `${head}\n\nVerify is GREEN, but the harness did NOT push ${record.sha} to ${record.ref}: ${detail}. This is not a moved branch, so rebasing or re-marking cannot help and you must not retry or push ${record.ref} yourself. Take your ${brief(record)}'s blocked-on-infra exit with that reason as the evidence, then fix-end.`;
     case 'red':
-      return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in your lane (same scope rules), commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} If the red is only timeouts that pass alone under host load, take the brief's load-flake exit instead.`;
+      return `${head}\n\nVerify is RED for this sha. Failing tests:\n${failureLines(marker)}\n\nRepair the failure in your lane (same scope rules), commit, run \`verify-lane.mjs request\`, then ${next.charAt(0).toLowerCase()}${next.slice(1)} If the red is only timeouts that pass alone under host load, take the brief's load-flake exit instead.${earlyRed}`;
     case 'load-flake-redispatch':
-      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit. No reverify worker can push a saved fix in this repo. Record the re-dispatch hold (\`--head\` is the PR's own head, never your repair sha — a mismatched head ends the hold at once): \`node "${ROOT}/scripts/conveyor/stand-down.mjs" ${record.pr} --repo=${record.repo} --who=${record.who} --reason=load-flake --head="$(git rev-parse origin/${record.ref})" --detail="verify red only on host-load timeouts the gate re-ran alone"\`, then \`node "${ROOT}/scripts/operations/completion-cli.mjs" report --repo=${record.repo} --pr=${record.pr} --session=${record.who} --kind=${record.kind} --status=done --outcome=blocked-on-load-flake\` and \`node "${ROOT}/scripts/conveyor/fix-procedure.mjs" fix-end ${record.pr} --repo=${record.repo} --who=${record.who}\`. The quiet-host pass ends the hold so the fix loop re-dispatches a fixer against the same review findings.`;
+      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit. No reverify worker can push a saved fix in this repo. Record the re-dispatch hold (\`--head\` is the PR's own head, never your repair sha — a mismatched head ends the hold at once): \`node "${ROOT}/scripts/conveyor/stand-down.mjs" ${record.pr} --repo=${record.repo} --who=${record.who} --reason=load-flake --head=${earlyRed ? record.sha : `"$(git rev-parse origin/${record.ref})"`} --detail="verify red only on host-load timeouts the gate re-ran alone"\`, then \`node "${ROOT}/scripts/operations/completion-cli.mjs" report --repo=${record.repo} --pr=${record.pr} --session=${record.who} --kind=${record.kind} --status=done --outcome=blocked-on-load-flake\` and \`node "${ROOT}/scripts/conveyor/fix-procedure.mjs" fix-end ${record.pr} --repo=${record.repo} --who=${record.who}\`. The quiet-host pass ends the hold so the fix loop re-dispatches a fixer against the same review findings.`;
     case 'load-flake':
-      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit with --alt-sha=${record.sha} (push this sha to the alt branch named there, never to ${record.ref}), then report blocked-on-load-flake and fix-end. The quiet-host reverify pass retries it.`;
+      return `${head}\n\nVerify is RED only on timeouts the gate already re-ran alone (load-flake):\n${failureLines(marker)}\n\nTake your ${brief(record)}'s load-flake exit with --alt-sha=${record.sha} (push this sha to the alt branch named there, never to ${record.ref}), then report blocked-on-load-flake and fix-end. The quiet-host reverify pass retries it.${earlyRed ? ` This sha is ALREADY the PR head (push-before-gate): pass --head=${record.sha} (never a local \`git rev-parse origin/...\`, which is stale after the harness push).` : ''}`;
     case 'escalate':
-      return `${head}\n\nVerify is RED again (attempt ${record.attempt}; limit ${AWAIT_VERIFY_LIMITS.maxReds}). Do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing check below, completion report, fix-end).\n\n${failureLines(marker)}`;
+      return `${head}\n\nVerify is RED again (attempt ${record.attempt}; limit ${AWAIT_VERIFY_LIMITS.maxReds}). Do not attempt another repair. Take your ${brief(record)}'s gate-red exit (stand-down --reason=gate-red with the failing check below, completion report, fix-end).\n\n${failureLines(marker)}${earlyRed ? `\n\nThis red sha is already on ${record.ref} (push-before-gate): the gate-red stand-down keeps the PR held; do not re-arm review.` : ''}`;
     case 'infra':
       return `${head}\n\nThe verify gate produced no verdict after ${record.retries ?? 0} harness re-requests (${detail || 'no verdict'}). Do not re-request. Take your ${brief(record)}'s blocked-on-infra exit with that evidence, then fix-end.`;
     case 'void':
@@ -241,8 +249,74 @@ export function isSessionBusy(session) {
   if (status) return status !== 'idle';
   return BUSY.has(String(session?.state ?? '').toLowerCase());
 }
+/**
+ * fix.pushBeforeGate — is the harness owed an EARLY push of this record's sha (before any verify verdict)? Only a `fix`
+ * wait, only while no verdict exists yet (`wait`, or `rerequest` with the lane still at the recorded sha and clean — the
+ * classifier answers `resume` for a moved or dirty lane before either), and only until that sha's early push is done or
+ * its transient retries are spent. A known red is never pushed early: a red verdict classifies `resume`. Pure.
+ */
+export function isEarlyPushOwed({ record, decision, policy, limits = AWAIT_VERIFY_LIMITS }) {
+  if (policy?.pushBeforeGate !== true) return false;
+  if (!isHarnessRecord(record) || record.kind !== 'fix' || record.pendingResume) return false;
+  if (decision?.action !== 'wait' && decision?.action !== 'rerequest') return false;
+  const ep = record.earlyPush;
+  if (!ep || lower(ep.sha) !== lower(record.sha)) return true;
+  return !ep.done && (ep.attempts ?? 0) <= limits.maxRetries;
+}
+
+/**
+ * Push the recorded sha now, through the SAME port (and so the same claim/ref/PR bindings, never --force) as the
+ * green push. The fix claim is untouched: it stays held until the green verdict's hand-back, so review, ci-heal,
+ * draft promotion and the drain keep refusing the PR meanwhile. Returns the log row, or null when nothing was tried.
+ */
+function runEarlyPush({ io, record, nowMs, policy, persist }) {
+  const base = { action: 'early-push', reason: `push-before-gate (${policy?.source ?? 'standard'})` };
+  let session;
+  try { session = lookupAwaitSession(record, io.listSessions()); } catch (e) { return { ...base, result: `deferred: ${String(e?.message ?? e).split('\n')[0]}` }; }
+  if (!session) return null; // the main flow below handles a gone session; nothing is pushed for it
+  const prior = record.earlyPush && lower(record.earlyPush.sha) === lower(record.sha) ? record.earlyPush : null;
+  const attempts = (prior?.attempts ?? 0) + 1;
+  if (!persist({ ...record, earlyPush: { sha: record.sha, attempts, done: false } })) return { ...base, result: 'persist-failed; not sent' };
+  const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId }) ?? {};
+  const at = new Date(nowMs).toISOString();
+  // A non-transient refusal is not retried early: the green push re-tries it and routes the outcome as it does today.
+  const done = !!pushed.ok || !pushed.transient;
+  persist({ ...record, earlyPush: { sha: record.sha, attempts, done, ok: !!pushed.ok, at: pushed.ok ? at : null, ...(pushed.ok ? {} : { reason: String(pushed.reason ?? 'push failed').slice(0, 300) }) } });
+  return pushed.ok
+    ? { ...base, result: `sent ${String(record.sha).slice(0, 8)} to ${record.ref} at ${at}, before the verify verdict; fix claim still held` }
+    : { ...base, result: `not sent (${pushed.reason ?? 'push failed'})${done ? '' : '; retry next tick'}` };
+}
+
+/**
+ * fix.selfReviewParallel (card xloi1c0) — this record's self-review standing: `hold` (why a green must wait), `overdue`
+ * (the hold, once past `selfReviewMaxMs` or with an unparsable time), `note` (a returned review's window, for the log).
+ */
+export function selfReviewGate({ io, record, nowMs, limits = AWAIT_VERIFY_LIMITS }) {
+  const sr = record?.kind === 'fix' && typeof io?.readSelfReview === 'function' ? io.readSelfReview(record) : null;
+  const owner = { sessionId: record?.sessionId ?? null, who: record?.who ?? null };
+  const hold = selfReviewHold(sr, owner);
+  let overdue = null;
+  if (hold) {
+    const since = Date.parse(sr.state === 'pending' ? sr.startedAt : (sr.returnedAt ?? sr.startedAt));
+    const maxMs = limits.selfReviewMaxMs ?? AWAIT_VERIFY_LIMITS.selfReviewMaxMs;
+    if (!Number.isFinite(since) || nowMs - since > maxMs) overdue = hold;
+  }
+  const note = sr && !hold && sr.returnedAt && selfReviewBelongsTo(sr, owner)
+    ? `self-review ${sr.state} (started ${sr.startedAt}, returned ${sr.returnedAt})` : null;
+  return { sr, hold, overdue, note };
+}
+/** Log the first hold of a green (once per record), then wait quietly. */
+function holdGreen(row, record, gate, persist, nowMs) {
+  if (!record.selfReviewHeldAt) {
+    if (!persist({ ...record, selfReviewHeldAt: new Date(nowMs).toISOString() })) return;
+    Object.assign(row, { action: 'self-review-hold', reason: gate.hold, result: 'verify green; push + resume withheld until the self-review returns (fix claim still held)' });
+  } else Object.assign(row, { action: 'wait', reason: `green; ${gate.hold}` });
+}
+
 /** Records already acted on to completion whose store entry could not be deleted (see `clearOrNote`). */
 const UNCLEARABLE_DONE = new Set();
+/** The last fix-push-policy line this process logged (see runAwaitVerifyPass). */
+const LOGGED_POLICY_LINE = { value: null };
 
 /**
  * Apply the policy to every stored record once. Every effect is an injected port, so the whole pass replays
@@ -251,7 +325,7 @@ const UNCLEARABLE_DONE = new Set();
  */
 export async function runAwaitVerifyPass({
   io, nowMs = Date.now(), ttlMs = resolveAwaitVerifyTtlMs(), limits = AWAIT_VERIFY_LIMITS, allowResume = true,
-  resumedUnclearable = UNCLEARABLE_DONE,
+  resumedUnclearable = UNCLEARABLE_DONE, pushPolicy = null, loggedPolicyLine = LOGGED_POLICY_LINE,
 } = {}) {
   const rows = [];
   /** Clear a finished record. One that cannot be removed would stay actionable (another push / resume next tick), so it is
@@ -261,6 +335,8 @@ export async function runAwaitVerifyPass({
     if (!cleared) resumedUnclearable.add(`${key}|${record.requestedAt}`);
     return cleared;
   };
+  // fix.pushBeforeGate (we:scripts/lib/fix-push-policy.mjs): an injected policy wins; else the IO's own; else OFF (today's flow).
+  const policy = pushPolicy ?? (typeof io.pushPolicy === 'function' ? io.pushPolicy() : null);
   for (const { key, record: stored } of io.listRecords()) {
     let record = stored;
     const row = { key, pr: record?.pr ?? null, repo: record?.repo ?? null, sha: record?.sha ?? null };
@@ -269,7 +345,6 @@ export async function runAwaitVerifyPass({
       const marker = lane ? io.readMarker(record.lane) : null;
       const d = classifyAwaitVerdict({ record, marker, lane: record.pendingResume ? { head: record.sha } : lane, nowMs, ttlMs, limits });
       Object.assign(row, { action: d.action, reason: d.reason });
-      if (d.action === 'skip' || d.action === 'wait') { rows.push(row); continue; }
       // Every counter that bounds an effect is persisted BEFORE the effect, and a failed write skips the effect: a store that
       // went unwritable would otherwise reload the old counters every tick and repeat the request / push / resume forever.
       const persist = (next) => {
@@ -277,6 +352,12 @@ export async function runAwaitVerifyPass({
         row.result = `${row.result ? `${row.result}; ` : ''}persist-failed`;
         return false;
       };
+      if (isEarlyPushOwed({ record, decision: d, policy, limits })) {
+        const early = runEarlyPush({ io, record, nowMs, policy, persist: (next) => (io.writeRecord(next)?.ok === true ? ((record = next), true) : false) });
+        // `record` now carries `earlyPush`; the rest of this record's handling (re-request, resume) keeps it.
+        if (early) rows.push({ key, pr: record.pr, repo: record.repo, sha: record.sha, ...early });
+      }
+      if (d.action === 'skip' || d.action === 'wait') { rows.push(row); continue; }
       if (d.action === 'rerequest') {
         if (!persist({ ...record, retries: (record.retries ?? 0) + 1, requestedAt: new Date(nowMs).toISOString(), lastRetry: d.reason })) { rows.push(row); continue; }
         const r = io.rerequest(record.lane);
@@ -292,6 +373,14 @@ export async function runAwaitVerifyPass({
           row.result = 'session-gone; not pushed';
           rows.push(row); continue;
         }
+        // fix.selfReviewParallel (card xloi1c0): a green verdict is NOT handed back while this session's self-review is still
+        // out (or returned must-fix with no repair marked since). The verdict marker stays valid for the sha, so the next
+        // tick re-decides; nothing is pushed or resumed meanwhile. Bounded: past `selfReviewMaxMs` (or an unparsable
+        // time) the green proceeds with an instruction to finish the review, and fix-end still refuses a hand-back.
+        const gate = selfReviewGate({ io, record, nowMs, limits });
+        if (gate.hold && !gate.overdue) { holdGreen(row, record, gate, persist, nowMs); rows.push(row); continue; }
+        const srOverdue = gate.overdue;
+        const srNote = gate.note;
         const attempt = record.pushRetries ?? 0;
         if (!persist({ ...record, pushRetries: attempt + 1 })) { rows.push(row); continue; }
         const pushed = io.push({ lane: record.lane, sha: record.sha, ref: record.ref, repo: record.repo, pr: record.pr, who: record.who, sessionId: record.sessionId });
@@ -305,11 +394,13 @@ export async function runAwaitVerifyPass({
         const transientGone = !pushed?.ok && pushed?.transient;
         const salvaged = transientGone ? io.saveSalvage?.({ record, nowMs, reason: pushed.reason }) : null;
         pending = pushed?.ok
-          ? { kind: 'green', detail: `pushed at ${new Date(nowMs).toISOString()}` }
+          ? { kind: 'green', detail: record.earlyPush?.ok && lower(record.earlyPush.sha) === lower(record.sha) ? `on ${record.ref} since ${record.earlyPush.at} (push-before-gate), verified at ${new Date(nowMs).toISOString()}` : `pushed at ${new Date(nowMs).toISOString()}`, ...(srOverdue ? { selfReviewOverdue: srOverdue } : {}) }
           : transientGone
             ? { kind: 'push-transient', detail: `${pushed.reason}${salvaged?.ok ? ' (the verified commit is saved; the harness keeps retrying the push)' : ''}` }
             : { kind: pushed?.moved ? 'push-rejected' : 'push-refused', detail: pushed?.reason ?? 'push failed' };
         row.result = pushed?.ok ? 'pushed' : (transientGone ? `push-transient${salvaged?.ok ? '; salvaged' : ''}` : (pushed?.moved ? 'push-rejected' : 'push-refused'));
+        if (pushed?.ok && srNote) row.result += `; ${srNote}`;
+        if (pushed?.ok && srOverdue) row.result += `; ${srOverdue} — OVERDUE, resumed with finish-the-review`;
       } else if (!pending) {
         pending = { kind: d.resume, detail: d.reason };
       }
@@ -319,6 +410,11 @@ export async function runAwaitVerifyPass({
         if (!persist({ ...record, pendingResume: { ...pending, ...(marker ? { marker: { failureDetails: marker.failureDetails ?? null } } : {}) } })) { rows.push(row); continue; }
       }
       if (!allowResume) { row.result = row.result ?? 'resume-paused'; rows.push(row); continue; }
+      if (record.pendingResume?.kind === 'green' && !record.pendingResume.selfReviewOverdue && d.action !== 'push') {
+        const gate = selfReviewGate({ io, record, nowMs, limits });
+        if (gate.hold && !gate.overdue) { holdGreen(row, record, gate, persist, nowMs); rows.push(row); continue; }
+        if (gate.overdue && !persist({ ...record, pendingResume: { ...record.pendingResume, selfReviewOverdue: gate.overdue } })) { rows.push(row); continue; }
+      }
       const session = lookupAwaitSession(record, io.listSessions());
       if (!session) {
         clearOrNote(key, record);
@@ -348,6 +444,10 @@ export async function runAwaitVerifyPass({
     rows.push(row);
   }
   if (io.listSalvage) rows.push(...runSalvagePhase({ io, nowMs }));
+  // Name the layer that set fix.pushBeforeGate: once per process, and again whenever the effective value changes.
+  const policyLine = policy ? formatFixPushPolicyLine(policy) : null;
+  // A row (not a result field) so the slot-aware wrapper in await-verify-loop.mjs, which rebuilds the result, keeps it.
+  if (policyLine && policyLine !== loggedPolicyLine.value) { loggedPolicyLine.value = policyLine; rows.unshift({ key: null, action: 'policy', result: policyLine }); }
   return { rows };
 }
 
@@ -381,7 +481,7 @@ export function formatAwaitVerifyLines(result) {
   const rows = result?.rows ?? [];
   const waiting = rows.filter((r) => r.action === 'wait').length;
   const lines = rows.filter((r) => r.action !== 'wait' && r.action !== 'skip')
-    .map((r) => `await-verify: ${r.repo} PR #${r.pr} @ ${String(r.sha ?? '').slice(0, 8)} — ${r.action} (${r.reason})${r.result ? ` → ${r.result}` : ''}`);
+    .map((r) => r.action === 'policy' ? `await-verify: ${r.result}` : `await-verify: ${r.repo} PR #${r.pr} @ ${String(r.sha ?? '').slice(0, 8)} — ${r.action} (${r.reason})${r.result ? ` → ${r.result}` : ''}`);
   if (waiting) lines.push(`await-verify: ${waiting} session(s) awaiting a verdict`);
   return lines;
 }
@@ -555,6 +655,10 @@ export async function defaultAwaitVerifyIo({
     } catch { return null; }
   };
   return {
+    // fix.pushBeforeGate through the policy cascade, re-read every pass so a settings flip applies without a restart.
+    pushPolicy: () => loadFixPushPolicy({ env }),
+    // fix.selfReviewParallel (card xloi1c0): the PR's self-review record, read fresh every pass.
+    readSelfReview: (record) => readSelfReview({ repo: record.repo, pr: record.pr }, { dir: selfReviewStoreDir(env) }),
     listRecords: () => listStoredAwaitVerify(),
     writeRecord: (record) => writeStoredAwaitVerify(record),
     clearRecord: (key, record) => {

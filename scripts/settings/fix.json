@@ -1,8 +1,10 @@
 {
-  "$comment": "Platform preference (card xx0055i). roundCapAction person|takeover: at the fix round cap, takeover = dispatch ONE takeover fix (full round history, top claude rung of the fixer ladder) before asking the operator; person = ask the operator at once (tool override env WE_FIX_ROUND_CAP_ACTION). roundHistory on|off: a round N>1 fix brief carries the previous-rounds section (env WE_FIX_ROUND_HISTORY). takeoverBudget: how many automatic takeovers one PR may get; a further one runs only when the previous one reduced the open findings, else the operator gets a takeover-not-converging note; gate holds (stacked base, review:human hold) never trigger one (cascade: standard 2 -> platform preference scripts/lib/delivery-platform-preferences.json fix.takeoverBudget -> this file -> env WE_FIX_TAKEOVER_BUDGET; see scripts/conveyor/takeover-budget.mjs). Ruling disputes always go to the operator. Card xrbu1bp: resumeAcrossRounds on|off: round N>1 resumes the previous round's fixer session when it is still resumable and its lane is still at the PR head (else a cold start with the history brief; env WE_FIX_RESUME_ACROSS_ROUNDS). strongerModelFromRound: from this round an ordinary fix runs on the fixer ladder's stronger-model rung, 0 = off (env WE_FIX_STRONGER_MODEL_FROM_ROUND). See scripts/conveyor/fix-takeover.mjs, scripts/conveyor/fix-round-history.mjs and scripts/conveyor/fix-resume.mjs.",
-  "roundCapAction": "takeover",
-  "roundHistory": "on",
-  "takeoverBudget": 2,
-  "resumeAcrossRounds": "on",
-  "strongerModelFromRound": 3
+  "$comment": "Platform preference (card xx0055i). fix.roundCapAction person|takeover: at the fix round cap, takeover = dispatch ONE takeover fix (full round history, top claude rung of the fixer ladder) before asking the operator; person = ask the operator at once (tool override env WE_FIX_ROUND_CAP_ACTION). fix.roundHistory on|off: a round N>1 fix brief carries the previous-rounds section (env WE_FIX_ROUND_HISTORY). fix.takeoverBudget: how many automatic takeovers one PR may get, 0 turns the takeover off, an invalid value fails closed to 0; a further one runs only when the previous one reduced the open findings, else the operator gets a takeover-not-converging note; gate holds (stacked base, review:human hold) never trigger one (cascade: standard 2 -> platform preference scripts/lib/delivery-platform-preferences.json fix.takeoverBudget -> this file -> env WE_FIX_TAKEOVER_BUDGET; see scripts/conveyor/takeover-budget.mjs). Ruling disputes always go to the operator. Card xrbu1bp: fix.resumeAcrossRounds on|off: round N>1 resumes the previous round's fixer session when it is still resumable and its lane is still at the PR head (else a cold start with the history brief; env WE_FIX_RESUME_ACROSS_ROUNDS). fix.strongerModelFromRound: from this round an ordinary fix runs on the fixer ladder's stronger-model rung, 0 = off (env WE_FIX_STRONGER_MODEL_FROM_ROUND). See scripts/conveyor/fix-takeover.mjs, scripts/conveyor/fix-round-history.mjs and scripts/conveyor/fix-resume.mjs.",
+  "fix": {
+    "roundCapAction": "takeover",
+    "roundHistory": "on",
+    "takeoverBudget": 2,
+    "resumeAcrossRounds": "on",
+    "strongerModelFromRound": 3
+  }
 }

@@ -305,6 +305,12 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // an owed PR "never dispatched". Pinned wide open; dispatch-throttle.test.mjs owns the throttle itself.
     WE_FIX_DISPATCH_MAX_CONCURRENT: '1000',
     WE_MAX_LOAD_PER_CORE: '1000',
+    // x6nuodj: the launch gates now DECIDE through admit() (cutover=enforce), which holds every heavy kind
+    // (ci-heal, fix, review) when no fresh sampler snapshot exists — always the case on a CI runner — so owed PRs
+    // read as "never dispatched". Keep the legacy (pinned-open) verdict deciding and skip the shadow log row, which
+    // would otherwise land in the operator's real ~/.claude; resource-gate.test.mjs owns the cut-over itself.
+    WE_RESOURCE_CUTOVER: 'shadow',
+    WE_RESOURCE_SHADOW: 'off',
   };
   delete env.WE_GITHUB_APP_ID;
   delete env.WE_GITHUB_APP_INSTALLATION_ID;

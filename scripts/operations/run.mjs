@@ -35,7 +35,7 @@ import {
   createDefaultJudge, runOperationCli, buildCliSpec, cwdFlagValue, hasJsonFlag,
 } from './cli-adapter.mjs';
 import {
-  reviewPrOperation, REVIEW_PR_OP, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
+  reviewPrOperation, REVIEW_PR_OP, securitySeatFromRun, codexAdvisoryFromEnv, correctnessAdvisoryFromEnv, antigravityReviewFromEnv,
 } from './review-pr.mjs';
 import { createReviewPrReader, createReviewPrSinks, PR_VIEW_FIELDS, prViewFileName } from './review-pr-io.mjs';
 import { stagePrViewOperation, STAGE_PR_VIEW_OP } from './stage-pr-view.mjs';
@@ -65,6 +65,8 @@ import { daemonStatusOperation, DAEMON_STATUS_OP } from './daemon-status.mjs';
 import { collectDaemonStatus } from './daemon-status-io.mjs';
 import { heavyQueueOperation, HEAVY_QUEUE_OP } from './heavy-queue.mjs';
 import { collectHeavyQueue } from './heavy-queue-io.mjs';
+import { resourceStatusOperation, RESOURCE_STATUS_OP, finishResourceStatus } from './resource-status.mjs';
+import { readSnapshot, loadResourcePolicy } from '../lib/resource-admission.mjs';
 import { prePrCheckOperation, PRE_PR_CHECK_OP, finishPrePrCheckOutcome } from './pre-pr-check.mjs';
 import { createPrePrCheckReader } from './pre-pr-check-io.mjs';
 import { maintenanceOperation, MAINTENANCE_OP } from './maintenance.mjs';
@@ -174,8 +176,11 @@ export const OPERATIONS = Object.freeze({
   // reader used to be built with NO arguments, so `--cwd=<lane>` steered the jurors' working tree while the
   // DIFF still came from `REPO_ROOT`. `createReviewPrReader`'s own `cwd` default is `REPO_ROOT`, so an
   // invocation with no `--cwd` is byte-identical to before.
-  [REVIEW_PR_OP]: ({ json = false, cwd = null } = {}) => ({
+  // `review.seatsByTouchSet` — `securitySeat` is the CALLER's choice, made before the run starts (the review
+  // daemon's `review-loop-cli.mjs#chooseSecuritySeat`) or read off a saved run on `--resume` (below); default: seated.
+  [REVIEW_PR_OP]: ({ json = false, cwd = null, securitySeat = true } = {}) => ({
     declaration: reviewPrOperation({
+      securitySeat,
       readPr: createReviewPrReader(cwd ? { cwd } : {}),
       codexAdvisory: codexAdvisoryFromEnv(),
       correctnessAdvisory: correctnessAdvisoryFromEnv(),
@@ -333,6 +338,12 @@ export const OPERATIONS = Object.freeze({
   [HEAVY_QUEUE_OP]: () => ({
     declaration: heavyQueueOperation({ collect: collectHeavyQueue }),
     sinks: {},
+  }),
+  // Card xkuflno — read-only resource snapshot and shadow admission verdicts; IO bound here.
+  [RESOURCE_STATUS_OP]: () => ({
+    declaration: resourceStatusOperation({ collect: () => ({ snapshot: readSnapshot(), ...loadResourcePolicy(), nowMs: Date.now() }) }),
+    sinks: {},
+    finish: finishResourceStatus,
   }),
   // xcbwt4r — "is this lane's head gated by the pre-PR review, and what do I run?". Read-only (every step is
   // `compute`, so no sinks); the real `checkPrePrReview` read is bound here, and ONLY here.
@@ -632,7 +643,11 @@ if (IS_CLI) {
     // a full `parseOperationArgv` pass cannot run yet at this point.
     // #xu2pp2m — `cwd` rides alongside `json` for the SAME pre-parse reason (see `cwdFlagValue`): the
     // review-pr reader is built here, before the operation's own argv is parsed.
-    resolved = resolveOperation(name, { json: hasJsonFlag(rest), cwd: cwdFlagValue(rest) });
+    // `review.seatsByTouchSet` — a `--resume` of a `review-pr` run is registered with the roster the run STARTED with.
+    const resumeId = name === REVIEW_PR_OP ? rest.find((a) => a.startsWith('--resume='))?.slice('--resume='.length) : undefined;
+    let securitySeat = true;
+    if (resumeId) { try { securitySeat = securitySeatFromRun(createFileRunStore().read(resumeId)); } catch { securitySeat = true; } }
+    resolved = resolveOperation(name, { json: hasJsonFlag(rest), cwd: cwdFlagValue(rest), securitySeat });
   } catch (e) {
     writeAllSync(1, `error: ${String(e.message ?? e)}\n\n${rootUsage()}\n`);
     process.exit(2);

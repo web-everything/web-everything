@@ -20,7 +20,7 @@
 import { takeoverEpisodes, OPERATOR_TAKEOVER_PREFIX, isPausedReview } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
-import { isReviewVerdictComment as isVerdict } from './mechanical-round-cap.mjs';
+import { isReviewVerdictComment as isVerdict, verdictJudged } from './mechanical-round-cap.mjs';
 
 export { OPERATOR_TAKEOVER_PREFIX };
 
@@ -76,7 +76,7 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   // ruling wakes it and the woken review is the one owed (live #4708, 483aab1e2 refused 6/5). Bounded: a head whose
   // review paused PAUSED_REVIEW_LIMIT times has spent its grant.
   const verdicts = comments.filter((c) => isVerdict(c) && !isPausedReview(c));
-  if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head))) return { ok: false, reason: 'head-already-reviewed' };
+  if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head) || verdictJudged(c, head))) return { ok: false, reason: 'head-already-reviewed' };
   const used = verdicts.filter((c) => timeOf(c) > anchor).length;
   if (used >= allowance) return { ok: false, reason: 'takeover-review-spent', used, allowance };
   const paused = comments.filter((c) => isPausedReview(c) && timeOf(c) > anchor).length;
