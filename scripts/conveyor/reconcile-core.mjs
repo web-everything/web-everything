@@ -456,7 +456,8 @@ const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
  * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
  * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
  * every round except one proven mechanical (its window holds only upstream merges, drain rebases included; a merge
- * flagged `mergesPrWork` brought a repair branch in and is real). A round with no commit at all is spent, never refunded.
+ * flagged `mergesPrWork` brought a repair branch in, or carries content git's clean merge of its parents does not, and
+ * is real). A round with no commit at all is spent, never refunded.
  */
 export function countRealFixRounds(pr) {
   const facts = pr?.roundCommits;
@@ -499,7 +500,8 @@ export function countRealFixRounds(pr) {
     const first = begins.find((b) => time(b) > previous && time(b) <= end);
     const start = first ? time(first) : previous;
     const inWindow = facts.commits.filter((commit) => Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end);
-    // A merge that brings the PR's own work in off the line (a repair branch merged --no-ff) is real, like a fix commit.
+    // A merge that brings the PR's own work in (a repair branch merged --no-ff, or an edit folded into the merge
+    // itself) is real, like a fix commit.
     // A single-parent commit is always real: the drain's rebase is a two-parent commit-tree, so a single-parent
     // `drain: rebase …` subject is only ever a fix commit borrowing the name.
     const shas = inWindow.filter((commit) => commit.parents.length === 1 || commit.mergesPrWork)

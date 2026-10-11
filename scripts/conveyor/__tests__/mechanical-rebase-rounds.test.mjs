@@ -1,6 +1,11 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterAll } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { countRealFixRounds, planReconcile, resolveRoundCap } from '../reconcile-core.mjs';
-import { readRoundCommits, enrichPrsWithMechanicalRound, BOUNCE_PREFIX } from '../mechanical-round-cap.mjs';
+import { readRoundCommits, enrichPrsWithMechanicalRound, BOUNCE_PREFIX, LANE_MANIFEST } from '../mechanical-round-cap.mjs';
+import { LANE_MANIFEST as DRAIN_MANIFEST } from '../../lib/rebase-drop-manifest.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { FIX_BEGIN_MARKER } from '../fix-procedure.mjs';
 
@@ -23,6 +28,15 @@ const history = [
   ['a99c637a41a14b9137da9c1d6856e4ec425d75b8', '1be5affcd252f21798e3242eeb64b1d7e02e7016', '10T12:39:12', 'conveyor fix: resume the previous round’s fixer session + stronger model from round 3'],
 ];
 const at = (s) => `2026-10-${s}Z`;
+// A git double: `log` lists the commits (a commit's tree defaults to its reversed sha), `merge-tree` answers git's
+// clean merge of a merge commit's parents as that commit's own tree, and `diff` lists nothing.
+const treeOf = (c) => c.tree ?? [...c.sha].reverse().join('');
+const gitDouble = (list) => (_bin, args) => {
+  if (args[0] === 'fetch') return '';
+  if (args[0] === 'merge-tree') return `${treeOf(list.find((c) => c.parents.join(' ') === args.slice(-2).join(' ')))}\0`;
+  if (args[0] === 'diff') return '';
+  return list.map((c) => [c.sha, c.parents.join(' '), treeOf(c), c.authoredAt, c.subject].join('\0')).join('\n');
+};
 // Every #4757 merge pulled in upstream history (its base lane or main), never the PR's own work.
 const commits = history.map(([sha, parents, date, subject]) => ({ sha, parents: parents.split(' '), authoredAt: at(date), subject,
   ...(parents.includes(' ') ? { mergesPrWork: false } : {}) }));
@@ -116,8 +130,7 @@ describe('mechanical re-arm rounds', () => {
       expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [{ ...commits[0], parents: [] }] } })).toMatchObject({ ok: false });
     });
     it('readRoundCommits fails closed when the walk ends on a parentless boundary commit', () => {
-      const exec = (_bin, args) => (args[0] === 'fetch' ? '' : shallow.map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n'));
-      expect(readRoundCommits({ pr, exec })).toMatchObject({ head, ok: false, reason: 'truncated-history' });
+      expect(readRoundCommits({ pr, exec: gitDouble(shallow) })).toMatchObject({ head, ok: false, reason: 'truncated-history' });
     });
     it('a shallow boundary stops the planner replacing the durable count with zero', () => {
       const result = plan({ ...pr, roundCommits: { head, commits: shallow } });
@@ -137,8 +150,7 @@ describe('mechanical re-arm rounds', () => {
       cycles.push(begin(`11T0${i}:00:00`, 'fix-7'), comment(`11T0${i}:10:00`, REARM_COMMENT_MARKER));
     }
     const repairPr = { ...pr, number: 4914, headRefOid: line[0].sha, headRefName: 'lane/repair', baseRefName: 'main', comments: cycles };
-    const log = (list) => list.map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n');
-    const exec = (_bin, args) => (args[0] === 'fetch' ? '' : log([...line, ...fixes]));
+    const exec = gitDouble([...line, ...fixes]);
     it('readRoundCommits marks a merge whose merged side is not upstream as bringing PR work', () => {
       const facts = readRoundCommits({ pr: repairPr, exec });
       expect(facts.commits.map((c) => c.sha)).toEqual(line.map((c) => c.sha));
@@ -159,8 +171,7 @@ describe('mechanical re-arm rounds', () => {
     });
     it('a merge of upstream main (merged side not in the PR range) is still refunded', () => {
       const upstream = line.map((m, i) => ({ ...m, parents: [m.parents[0], sha(0x4000 + i)], subject: 'Merge origin/main' }));
-      const upstreamExec = (_bin, args) => (args[0] === 'fetch' ? '' : log(upstream));
-      const facts = readRoundCommits({ pr: { ...repairPr, headRefOid: upstream[0].sha }, exec: upstreamExec });
+      const facts = readRoundCommits({ pr: { ...repairPr, headRefOid: upstream[0].sha }, exec: gitDouble(upstream) });
       expect(facts.commits.every((c) => c.mergesPrWork === false)).toBe(true);
       expect(countRealFixRounds({ ...repairPr, headRefOid: upstream[0].sha, roundCommits: facts })).toMatchObject({ ok: true, real: 0, total: 6 });
     });
@@ -170,14 +181,69 @@ describe('mechanical re-arm rounds', () => {
       expect(countRealFixRounds({ ...repairPr, roundCommits: stripped })).toMatchObject({ ok: false });
     });
   });
+  describe('repairs folded into upstream merges (real git)', () => {
+    // Six rounds: fix-begin, merge a newer origin/main with --no-commit, maybe edit, commit the merge, re-arm.
+    // Built with plumbing in a throwaway repo so merge-tree and the tree reads run against real git.
+    const dirs = [];
+    afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); });
+    const build = (variant) => {
+      const cwd = mkdtempSync(join(tmpdir(), 'round-merge-')); dirs.push(cwd);
+      const run = (args, { input, date } = {}) => execFileSync('git', args, { cwd, input, encoding: 'utf8',
+        env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't',
+          GIT_COMMITTER_EMAIL: 't@t', ...(date ? { GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : {}) } }).trim();
+      run(['init', '-q']);
+      const blob = (text) => run(['hash-object', '-w', '--stdin'], { input: text });
+      const tree = (files) => run(['mktree'], { input: Object.entries(files).sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([path, text]) => `100644 blob ${blob(text)}\t${path}\n`).join('') });
+      const commit = (files, parents, subject, date) => run(['commit-tree', tree(files), ...parents.flatMap((p) => ['-p', p]), '-m', subject], { date });
+      const baseFiles = { 'a.txt': 'base\n' };
+      let upstream = commit(baseFiles, [], 'base', at('10T00:00:00'));
+      let upstreamFiles = { ...baseFiles };
+      let prFiles = { ...baseFiles, 'pr.txt': 'pr\n', [LANE_MANIFEST]: '{}\n' };
+      let prev = commit(prFiles, [upstream], 'PR #4914: build', at('10T01:00:00'));
+      const cycles = [];
+      for (let i = 1; i <= 6; i += 1) {
+        upstreamFiles = { ...upstreamFiles, [`u${i}.txt`]: `upstream ${i}\n` };
+        upstream = commit(upstreamFiles, [upstream], `main ${i}`, at(`11T0${i}:01:00`));
+        const merged = { ...prFiles, ...upstreamFiles };
+        const date = at(`11T0${i}:05:00`);
+        if (variant === 'drain') {
+          // The drain rebase: main first, the branch last, and the transient lane manifest dropped.
+          delete merged[LANE_MANIFEST];
+          prev = commit(merged, [upstream, prev], 'drain: rebase lane/x onto origin/main, drop transient .lane-manifest.json', date);
+        } else {
+          if (variant === 'repair') merged[`scripts/fix-${i}.mjs`] = `export const fix = ${i};\n`;
+          if (variant === 'revert-upstream') delete merged[`u${i}.txt`];
+          prev = commit(merged, [prev, upstream], 'Merge origin/main', date);
+        }
+        prFiles = merged;
+        cycles.push(begin(`11T0${i}:00:00`, 'fix-7'), comment(`11T0${i}:10:00`, REARM_COMMENT_MARKER));
+      }
+      run(['update-ref', 'refs/remotes/origin/main', upstream]);
+      const exec = (bin, args, opts) => (args[0] === 'fetch' ? '' : execFileSync(bin, args, { ...opts, cwd }));
+      const mergePr = { ...pr, number: 4914, headRefOid: prev, headRefName: 'lane/x', baseRefName: 'main', comments: cycles };
+      return { mergePr, roundCommits: readRoundCommits({ pr: mergePr, exec }) };
+    };
+    it.each([['repair', 6], ['revert-upstream', 6], ['clean', 0], ['drain', 0]])('a %s merge of origin/main counts %i spent rounds', (variant, real) => {
+      const { mergePr, roundCommits } = build(variant);
+      expect(roundCommits.commits.filter((c) => c.parents.length > 1).every((c) => c.mergesPrWork === (real > 0))).toBe(true);
+      expect(countRealFixRounds({ ...mergePr, roundCommits })).toMatchObject({ ok: true, real, total: 6 });
+    });
+    it('the planner keeps the durable six attempts when every merge carried a repair', () => {
+      const { mergePr, roundCommits } = build('repair');
+      const result = planReconcile({ prs: [{ ...mergePr, roundCommits }], agents: [],
+        durableCounts: { 4914: 6 }, requiredChecks: ['test'], now: Date.parse(at('11T07:00:00')) });
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 6 }));
+    });
+    it('pins the dropped manifest to the drain rebase', () => { expect(LANE_MANIFEST).toBe(DRAIN_MANIFEST); });
+  });
   it('walks the drain merge last parent, skips base-side commits, and uses author dates', () => {
     // The drain rebased this stacked PR onto main: main's tip is outside main..head but inside the stacked base range.
     const extra = { ...commits[0], sha: commits[7].parents[0], subject: 'base-only fix' };
-    const exec = (_bin, args) => {
-      if (args[0] === 'fetch') return '';
-      expect(args).toContain('--format=%H%x00%P%x00%aI%x00%s');
-      const list = args.at(-1).startsWith('origin/main..') ? commits : [...commits, extra];
-      return list.map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n');
+    const exec = (bin, args) => {
+      if (args[0] !== 'log') return gitDouble(commits)(bin, args);
+      expect(args).toContain('--format=%H%x00%P%x00%T%x00%aI%x00%s');
+      return gitDouble(args.at(-1).startsWith('origin/main..') ? commits : [...commits, extra])(bin, args);
     };
     expect(readRoundCommits({ pr, exec })).toEqual(facts);
     expect(readRoundCommits({ pr, exec: () => { throw new Error('offline'); } })).toMatchObject({ head, ok: false });

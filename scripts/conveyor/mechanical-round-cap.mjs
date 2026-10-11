@@ -299,6 +299,9 @@ export function fileSectionFingerprints(diffText) {
 const pathOfHeader = (h) => { const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(h); return m ? m[2] : h; };
 
 const SAFE_REF = /^[A-Za-z0-9._/-]+$/;
+// Keep in sync with lib/rebase-drop-manifest.mjs#LANE_MANIFEST (the drain rebase drops it); importing it here would
+// pull fix-procedure into this module. Pinned by mechanical-rebase-rounds.test.mjs.
+export const LANE_MANIFEST = '.lane-manifest.json';
 
 /**
  * IO: the git evidence for {@link mechanicalRoundGrant}. Never throws; any read failure is `proven: false`.
@@ -348,7 +351,10 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
  * A drain rebase merge puts main first and the branch LAST; ordinary merges keep the branch first.
  * Every merge on the line carries `mergesPrWork`: true when a merged-in parent is reachable from neither the base
  * nor the default branch (a repair branch merged --no-ff), so its fix commits off the line are never read as a
- * mechanical round. Missing/malformed git data and a truncated walk fail closed, never returning a partial proof.
+ * mechanical round. It is also true when the merge's own tree is not git's clean merge of its parents: a repair
+ * folded into an upstream merge (`--no-commit`, then edit), a conflict resolution, a reverted upstream hunk, or an
+ * octopus merge all carry content no parent brought, so only a merge git reproduces exactly (bar the drain's dropped
+ * lane manifest) is mechanical. Missing/malformed git data and a truncated walk fail closed, never a partial proof.
  */
 export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin', exec = execFileSync } = {}) {
   const head = lc(pr?.headRefOid);
@@ -359,17 +365,34 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
   if ([base, remote, defaultBranch, ...(headRef ? [headRef] : [])].some((ref) => !SAFE_REF.test(ref) || ref.startsWith('-'))) return fail('unsafe-ref');
   const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 256 * 1024 * 1024 }) ?? '');
   const readRange = (upstream) => {
-    const text = git(['log', '--format=%H%x00%P%x00%aI%x00%s', '--end-of-options', `${remote}/${upstream}..${head}`]);
+    const text = git(['log', '--format=%H%x00%P%x00%T%x00%aI%x00%s', '--end-of-options', `${remote}/${upstream}..${head}`]);
     const map = new Map();
     for (const line of text.split('\n').filter(Boolean)) {
       const fields = line.split('\0');
-      if (fields.length !== 4) return null;
-      const [sha, parentText, authoredAt, subject] = fields;
+      if (fields.length !== 5) return null;
+      const [sha, parentText, tree, authoredAt, subject] = fields;
       const parents = parentText ? parentText.split(' ') : [];
-      if (!SHA40.test(sha) || parents.some((p) => !SHA40.test(p)) || !Number.isFinite(Date.parse(authoredAt)) || map.has(sha)) return null;
-      map.set(sha, { sha, parents, authoredAt, subject });
+      if (!SHA40.test(sha) || parents.some((p) => !SHA40.test(p)) || !SHA40.test(tree)
+        || !Number.isFinite(Date.parse(authoredAt)) || map.has(sha)) return null;
+      map.set(sha, { sha, parents, tree, authoredAt, subject });
     }
     return map;
+  };
+  // A merge is mechanical only when its tree is what git itself makes of its two parents: a clean `merge-tree`
+  // (no conflict) whose result differs from the commit at most by the drain's dropped lane manifest. Anything else
+  // (a conflict, an edit folded into the merge, an upstream hunk reverted, three or more parents, an unreadable
+  // result) carries content no parent brought, so it is the PR's own work. Never throws.
+  const reproducesCleanMerge = (commit) => {
+    if (commit.parents.length !== 2) return false;
+    try {
+      const out = git(['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', '--end-of-options', ...commit.parents]);
+      const [tree, ...conflicted] = out.split('\0');
+      if (!SHA40.test(tree) || conflicted.some(Boolean)) return false;
+      if (tree === commit.tree) return true;
+      const changed = git(['diff', '--no-ext-diff', '--name-only', '--no-renames', '-z', '--end-of-options', tree, commit.tree])
+        .split('\0').filter(Boolean);
+      return changed.length > 0 && changed.every((path) => path === LANE_MANIFEST);
+    } catch { return false; } // merge-tree exits 1 on a conflict: not a clean merge
   };
   try {
     git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
@@ -387,11 +410,12 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
     while (map.has(sha)) {
       if (commits.length >= 500 || seen.has(sha)) return fail('walk-limit');
       seen.add(sha);
-      const commit = map.get(sha);
+      const { tree, ...commit } = map.get(sha);
       const lineParent = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
         ? commit.parents.at(-1) : commit.parents[0];
       commits.push(commit.parents.length > 1
-        ? { ...commit, mergesPrWork: commit.parents.some((p) => p !== lineParent && map.has(p) && onDefault.has(p)) }
+        ? { ...commit, mergesPrWork: commit.parents.some((p) => p !== lineParent && map.has(p) && onDefault.has(p))
+          || !reproducesCleanMerge({ ...commit, tree }) }
         : commit);
       sha = lineParent;
     }
