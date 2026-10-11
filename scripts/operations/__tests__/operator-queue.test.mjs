@@ -36,6 +36,12 @@ const standDown = { id: 'SD1', body: `${STAND_DOWN_MARKER}\nNeed a ruling`, auth
 const answer = { id: 'A1', body: buildOperatorAnswer({ standDownId: 'SD1', reason: 'Proceed', actor: 'chalbert', channel: 'console' }), author: { login: 'web-everything' }, createdAt: '2026-10-11T11:00:00Z' };
 const pr = (number, comments) => ({ number, title: `PR ${number}`, labels: [], comments, mergeable: 'MERGEABLE' });
 
+// Match gh api's @tsv output, including multiline bodies and the GraphQL comment id.
+const commentTsv = (comments) => comments.map((comment) => [
+  comment.body, comment.createdAt, comment.author?.login, comment.id,
+].map((field) => String(field ?? '').replaceAll('\\', '\\\\').replaceAll('\t', '\\t')
+  .replaceAll('\n', '\\n').replaceAll('\r', '\\r')).join('\t')).join('\n');
+
 describe('operator queue read safety', () => {
   it.each([
     'Could not resolve to a Repository with the name o/n', 'HTTP 404: Not Found',
@@ -138,7 +144,7 @@ describe('operator queue read safety', () => {
     execFileSync.mockImplementation((_cmd, args) => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       if (args[1] === 'list') return JSON.stringify([pr(1)]);
-      return JSON.stringify({ comments: [standDown] });
+      return commentTsv([standDown]);
     });
     run(['--json']);
     const report = JSON.parse(stdout());
@@ -146,19 +152,64 @@ describe('operator queue read safety', () => {
     expect(report.errors).toEqual([]);
     expect(report.stoodDown[0].number).toBe(1);
     expect(execFileSync).toHaveBeenCalledTimes(4);
+    expect(execFileSync).toHaveBeenLastCalledWith('gh', [
+      'api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/1/comments',
+      '--jq', '.[] | [.body, .created_at, .user.login, .node_id] | @tsv',
+    ], expect.objectContaining({ encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
     expect(process.exitCode).toBeUndefined();
+  });
+
+  it('retries the complete thread and sees an answer beyond the first 100 comments', () => {
+    let commentAttempts = 0;
+    const comments = [standDown, ...Array.from({ length: 99 }, () => ({
+      body: 'discussion', createdAt: standDown.createdAt, author: { login: 'web-everything' },
+    })), answer];
+    execFileSync.mockImplementation((_cmd, args) => {
+      if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
+      if (args[1] === 'list') return JSON.stringify([pr(1)]);
+      commentAttempts += 1;
+      if (commentAttempts === 1) throw Object.assign(new Error('HTTP 502'), { stdout: commentTsv([standDown]) });
+      return commentTsv(comments);
+    });
+    run(['--json']);
+    const report = JSON.parse(stdout());
+    expect(report.incomplete).not.toBe(true);
+    expect(report.stoodDown).toEqual([]);
+    expect(report.standDownAnswered).toEqual([expect.objectContaining({ number: 1, answeredAt: answer.createdAt })]);
+    expect(commentAttempts).toBe(2);
+    expect(sleep.mock.calls).toEqual([[500], [500]]);
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('does not retry a permanent comment failure and retains the next PR', () => {
+    execFileSync.mockImplementation((_cmd, args) => {
+      if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
+      if (args[1] === 'list') return JSON.stringify([pr(1), pr(2)]);
+      if (args.includes('repos/o/n/issues/1/comments')) throw new Error('HTTP 404: Not Found');
+      return commentTsv([standDown]);
+    });
+    run(['--json']);
+    expect(JSON.parse(stdout())).toMatchObject({
+      incomplete: true, errors: ['o/n#1: HTTP 404: Not Found'],
+      stoodDown: [expect.objectContaining({ number: 2 })],
+    });
+    expect(execFileSync.mock.calls.filter(([, args]) => args.includes('repos/o/n/issues/1/comments'))).toHaveLength(1);
+    expect(sleep.mock.calls).toEqual([[500]]);
+    expect(process.exitCode).toBe(1);
   });
 
   it('keeps other PR rows and appends UNKNOWN when one comment read fails', () => {
     execFileSync.mockImplementation((_cmd, args) => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
       if (args[1] === 'list') return JSON.stringify([pr(1), pr(2)]);
-      if (args[2] === '1') return '{';
-      return JSON.stringify({ comments: [standDown] });
+      if (args.includes('repos/o/n/issues/1/comments')) throw new Error('HTTP 502: later page failed');
+      return commentTsv([standDown]);
     });
     run();
     expect(stdout().split('\n')[0]).toContain('INCOMPLETE');
-    expect(stdout()).toContain('o/n#1:');
+    expect(stdout()).toContain('o/n#1: HTTP 502: later page failed');
+    expect(execFileSync.mock.calls.filter(([, args]) => args.includes('repos/o/n/issues/1/comments'))).toHaveLength(2);
+    expect(sleep.mock.calls).toEqual([[500], [500]]);
     expect(stdout()).toMatch(/o\/n#2  PR 2[^\n]*\nUNKNOWN — reads failed, re-run/);
     expect(stdout()).not.toContain('(none)');
     expect(process.exitCode).toBe(1);

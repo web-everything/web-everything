@@ -61,6 +61,12 @@ try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rul
 // The effective ladder says where a twice-ignored finding becomes the operator's; absent, the platform default stands.
 let rulingHumanAt;
 try { rulingHumanAt = (await import('../conveyor/fixer-ladder.mjs')).loadFixerLadder().humanAt; } catch { /* default */ }
+// Staged CLI copies may omit the complete reader. Only the split fallback needs it;
+// an unavailable reader must fail that read, never substitute an empty comment thread.
+let readCompletePrComments;
+let completeCommentsImportError;
+try { ({ readCompletePrComments } = await import('../conveyor/pr-comments-complete.mjs')); }
+catch (error) { completeCommentsImportError = error; }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
 /**
@@ -360,23 +366,12 @@ function permanentPrReadFailure(error) {
 }
 
 /** Retry transient transport/JSON failures with at most four seconds of backoff per read. */
-function readPrJson(args, { attempts, sleep, valid }) {
+function retryPrRead(read, { attempts, sleep }) {
   let lastError;
   let backoffMs = 0;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const response = execFileSync('gh', args, {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER,
-      });
-      if (typeof response !== 'string') {
-        // Preserve the preceding transport diagnostic when no response follows it.
-        throw Object.assign(new Error(lastError?.message ?? 'invalid PR read response: expected a string'), {
-          code: 'INVALID_PR_RESPONSE', stderr: lastError?.stderr,
-        });
-      }
-      const value = JSON.parse(response);
-      if (!valid(value)) throw new Error('invalid PR read response');
-      return value;
+      return read(lastError);
     } catch (error) {
       if (permanentPrReadFailure(error) || attempt === attempts - 1 || backoffMs >= 4000) throw error;
       lastError = error;
@@ -385,6 +380,23 @@ function readPrJson(args, { attempts, sleep, valid }) {
       backoffMs += delayMs;
     }
   }
+}
+
+function readPrJson(args, { attempts, sleep, valid }) {
+  return retryPrRead((lastError) => {
+    const response = execFileSync('gh', args, {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER,
+    });
+    if (typeof response !== 'string') {
+      // Preserve the preceding transport diagnostic when no response follows it.
+      throw Object.assign(new Error(lastError?.message ?? 'invalid PR read response: expected a string'), {
+        code: 'INVALID_PR_RESPONSE', stderr: lastError?.stderr,
+      });
+    }
+    const value = JSON.parse(response);
+    if (!valid(value)) throw new Error('invalid PR read response');
+    return value;
+  }, { attempts, sleep });
 }
 
 export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath } = {}) {
@@ -441,8 +453,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         const complete = [];
         for (const pr of prs) {
           try {
-            const { comments } = read(['pr', 'view', String(pr.number), '--repo', repo, '--json', 'comments'],
-              (value) => Array.isArray(value?.comments));
+            const comments = retryPrRead(() => {
+              if (!readCompletePrComments) throw completeCommentsImportError;
+              return readCompletePrComments(pr.number, { repo, exec: execFileSync });
+            }, { attempts: readAttempts.value, sleep });
             complete.push({ ...pr, comments });
           } catch (error) {
             failedRead(`${repo}#${pr.number}`, error);
