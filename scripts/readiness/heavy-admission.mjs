@@ -48,7 +48,7 @@
  * SAME `defaultPoolRoot` a lane's own `verify-lane.mjs` already uses to find its sibling leases.
  *
  * THE CAP IS A FIXED NUMBER, conservative by design (Bazel-style near-full-utilization is explicitly rejected
- * by #3456) — `DEFAULT_ADMISSION_CAP`, overridable per machine via `WE_HEAVY_ADMISSION_CAP`. A NAMED RESIDUAL
+ * by #3456) — `DEFAULT_ADMISSION_CAP`, overridable through the host-wide heavyAdmission policy. A NAMED RESIDUAL
  * RISK (#3456, stated plainly per its own Done-when): a fixed cap alone REDUCES but does not FULLY ELIMINATE
  * #3383's finding-4 contention failure mode — a burst of requests can still all queue behind a saturated cap
  * for a while. v1 does not claim to solve that; it only bounds concurrency and makes the wait OBSERVABLE (the
@@ -93,23 +93,12 @@
  * Stale `waiting` markers (owner gone, older than {@link WAITING_TTL_MINUTES}) are reaped by the next
  * admission attempt; `reap` previews them and `reap --apply` removes them.
  *
- * A WAITER NEVER RUNS UNSLOTTED WHILE A HOLDER IS ALIVE (xhlriy2, #3383). Observed 2026-09-23: with test runs
- * taking 25-40 minutes under load and several lanes waiting, `DEFAULT_TIMEOUT_MS`'s old 20-minute elapsed-time
- * give-up let waiters fail open and run TOGETHER — the cap stopped holding exactly when it mattered most.
- * {@link acquireSlotBlocking} no longer gives up purely on elapsed time: it keeps polling — logging a periodic
- * "still waiting" line every {@link STILL_WAITING_LOG_MS} — for as long as {@link tryAcquireSlot} keeps losing,
- * which (via the PID-liveness + lease-TTL reclaim above) can only happen while every held slot's holder is
- * still alive with an unexpired lease; the moment every holder is provably dead or lease-expired, the very next
- * `tryAcquireSlot` attempt reclaims a real slot rather than the caller running unslotted. The one remaining
- * escape from an indefinite wait is {@link DEFAULT_ADMISSION_CEILING_MS} (default 120 minutes, comfortably past
- * any realistic gate run, overridable via `WE_HEAVY_ADMISSION_CEILING_MS`) — a hard ceiling so a genuinely
- * wedged holder cannot strand a lane forever; crossing it still fails OPEN (runs unslotted) but with a LOUD
- * warning naming the ceiling. `DEFAULT_TIMEOUT_MS`/`resolveTimeoutMs` are UNCHANGED and still read by
- * `verify-lane.mjs`/the CLI's legacy `--timeout-ms` fallback, but no longer decide when `acquireSlotBlocking`
- * gives up — see their own doc comments. `WE_HEAVY_ADMISSION=off` ({@link isAdmissionOff}) — the SAME switch
- * {@link admissionBypassReason} already reads for the `run` wrapper — is now ALSO checked directly at the top
- * of {@link acquireSlotBlocking} itself, before it ever touches the lock root, so any direct caller of the
- * blocking primitive (not just `run`) gets the escape hatch too.
+ * A WAITER NEVER RUNS UNSLOTTED WHILE A HOLDER IS ALIVE by default. At the ceiling, admission DEFERS
+ * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
+ * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
+ * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
+ * Cap, fastSlots and fastScale use one host-wide resolver (standard → platform preferences); their env and
+ * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
  * hosts, gating NEW DISPATCHED SESSIONS (not heavy commands) by the host's ACTUAL capacity — CPU idle% and
@@ -129,37 +118,37 @@
  *     the standard time of every live waiter, and the expected demand of sessions dispatched in the last few
  *     minutes that have not reached the slots yet (read from their lane leases) — which `tick-core.mjs#planTick`
  *     and the fix / ci-heal daemons feed to `createQueueBudget` to admit or hold (`queue-cap`) new dispatches;
- *   • THE FAST LANE: a caller now passes its command KIND to {@link acquireSlotBlocking}. The short kinds
- *     (selected / files / standards) rank first-come-first-served only among themselves — never behind a
- *     full-suite waiter — and get `WE_HEAVY_ADMISSION_FAST_SLOTS` (default 1) EXTRA slots ADDED ON TOP of the
- *     cap (operator decision on PR #2707): `WE_HEAVY_ADMISSION_CAP` stays the number of HEAVY slots (slot-0 …
- *     slot-<cap-1>), the fast slots follow them (slot-<cap> …). A short job may also take a free heavy slot; a
- *     full suite never takes a fast slot. Default 2 heavy + 1 fast.
+ *   • THE FAST LANE: short kinds (selected / files / standards) rank first-come-first-served among themselves.
+ *     The fastSlots setting adds capacity above cap (default 2 heavy + 1 fast); short jobs can also take heavy
+ *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
+ *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { hostname } from 'node:os';
+import { hostname, homedir, userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { shadowAdmission } from '../lib/resource-admission.mjs';
+import { shadowAdmission, readSnapshot } from '../lib/resource-admission.mjs';
+import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-files.mjs';
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
-import { defaultPoolRoot, guardedPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
 import {
   classifyCommandKind, refineKind, holderLabel, holdBreakdown, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
-  queueBacklog, laneProjection, resolveFastSlots, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
+  queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 export * from './heavy-queue-projection.mjs';
 
 /** Conservative default — below measured host capacity, not near-full-utilization (#3456 explicit ruling).
- *  Overridable per machine via `WE_HEAVY_ADMISSION_CAP`. */
+ *  Overridable through the heavyAdmission policy cascade. */
 export const DEFAULT_ADMISSION_CAP = 2;
 
 /** How often a blocking waiter re-polls for a free slot. */
@@ -169,15 +158,12 @@ export const DEFAULT_POLL_MS = 2000;
  *  bug — a waiter fails open and runs UNSLOTTED after this elapses even while a slot holder is still alive,
  *  which under real load let waiters time out and run together, breaking the cap). Still read via
  *  {@link resolveTimeoutMs} (the CLI's legacy `--timeout-ms` fallback), but {@link acquireSlotBlocking} itself
- *  now gives up only at {@link DEFAULT_ADMISSION_CEILING_MS}. Overridable via `WE_HEAVY_ADMISSION_TIMEOUT_MS`
+ *  now applies its timeout policy at {@link DEFAULT_ADMISSION_CEILING_MS}. Overridable via `WE_HEAVY_ADMISSION_TIMEOUT_MS`
  *  (mirroring {@link resolveCap}). */
 export const DEFAULT_TIMEOUT_MS = 20 * 60_000;
 
-/** THE HARD CEILING (xhlriy2, #3383) — far above a normal run, so a wedged holder cannot strand a lane forever.
- *  A waiter now keeps polling (logging a periodic "still waiting" line, see {@link STILL_WAITING_LOG_MS}) for as
- *  long as a slot holder is provably alive with an unexpired lease; it gives up and proceeds unslotted only once
- *  this ceiling elapses, with a loud warning. Overridable via `WE_HEAVY_ADMISSION_CEILING_MS`
- *  ({@link resolveCeilingMs}). */
+/** The ceiling defers a capable caller by default; other callers keep waiting. Only explicit onTimeout=run
+ *  permits an unslotted run. Overridable via WE_HEAVY_ADMISSION_CEILING_MS ({@link resolveCeilingMs}). */
 export const DEFAULT_ADMISSION_CEILING_MS = 120 * 60_000;
 
 /** How often, while blocked, {@link acquireSlotBlocking} logs a "still waiting" line (xhlriy2) — observability
@@ -214,11 +200,177 @@ const SUBDIR = join('.admission', 'heavy');
 const WAITING_SUBDIR = 'waiting';
 const REAP_LOG = 'reaped.jsonl';
 
-/** Resolve the admission cap from env, clamped to a sane minimum of 1 (a cap of 0 would wedge every caller
- *  forever, which is a config bug, not a valid "admit nothing" policy). */
-export function resolveCap(env = process.env) {
-  const n = Number(env.WE_HEAVY_ADMISSION_CAP);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : DEFAULT_ADMISSION_CAP;
+export const ADMISSION_DEFERRED_EXIT = 75; // EX_TEMPFAIL: re-queue; the command did not run.
+export const ADMISSION_POLICY_STANDARD = Object.freeze({
+  cap: DEFAULT_ADMISSION_CAP, fastSlots: 1, onTimeout: 'defer',
+  fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
+});
+
+/** Upper bound on any slot count: a typo like `cap: 1e9` would otherwise make every scan walk a billion lock entries. */
+const ADMISSION_MAX_SLOTS = 256;
+const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
+const ADMISSION_VALID = {
+  cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
+  'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
+  'fastScale.minShortWaiters': admissionInt(1),
+  'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
+  'fastScale.minCpuIdlePct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
+  'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
+};
+const ADMISSION_ENV = { cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT' };
+const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const admissionLeaf = (block, path) => path.split('.').reduce((v, key) => admissionObject(v) && Object.hasOwn(v, key) ? v[key] : undefined, block);
+const ADMISSION_MODULE_ROOT = (() => { try { return fileURLToPath(new URL('../../', import.meta.url)); } catch { return process.cwd(); } })();
+/** Canonical form of a path that may not exist yet: real-path (native, so case-insensitive volumes report their true case)
+ *  the longest existing ancestor, then re-append the rest — `/var/x` and `/private/var/x` agree either way. */
+export function canonicalPath(p) {
+  let head = resolve(p); const rest = [];
+  for (;;) {
+    try { return join(realpathSync.native(head), ...rest); } catch { /* walk up */ }
+    const parent = dirname(head);
+    if (parent === head) return resolve(p);
+    rest.unshift(basename(head)); head = parent;
+  }
+}
+/** The real user's home, independent of a caller's `$HOME` (a sandboxed or launchd caller may carry another one). */
+const realHomeDir = () => { try { return userInfo().homedir || homedir(); } catch { return homedir(); } };
+const oneLine = (v) => String(v).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
+
+/**
+ * A pool is PRIVATE only when `LANE_POOL_ROOT` points somewhere other than the host-shared pool the checkout
+ * would use with no override (`<workspace>/.lanes`). Setting the variable to the host pool's own path (any
+ * spelling: trailing slash, `.`/`..`, symlink) names the SHARED pool, so it earns no per-process capacity.
+ */
+export function privateAdmissionPool(env, checkoutRoot) {
+  const raw = env?.LANE_POOL_ROOT;
+  if (typeof raw !== 'string' || raw.trim() === '') return false;
+  const named = canonicalPath(defaultPoolRoot(ADMISSION_MODULE_ROOT, env));
+  // Every host pool this process could mean: the caller's checkout, this module's checkout (a pinned snapshot
+  // outside the workspace has none of its own), the real user's `~/workspace/.lanes`, and the cwd's workspace.
+  const hostPools = [checkoutRoot, ADMISSION_MODULE_ROOT, process.cwd()]
+    .filter((root) => typeof root === 'string' && root !== '')
+    .map((root) => canonicalPath(join(workspaceFor(root), '.lanes')));
+  // The real user's pool is already a pool path: running it through workspaceFor would treat `~/workspace` as a
+  // checkout and resolve to `~/.lanes` — wrong on any host whose checkouts do not live under a `.lanes` path.
+  hostPools.push(canonicalPath(join(realHomeDir(), 'workspace', '.lanes')));
+  return !hostPools.includes(named);
+}
+
+/**
+ * PURE: valid leaves override standard → platform → tool → env. Capacity leaves (everything but onTimeout) of
+ * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
+ * give two callers of one pool different caps. A private pool (see {@link privateAdmissionPool}) keeps both.
+ */
+export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
+  const isPrivate = privateAdmissionPool(env, checkoutRoot);
+  const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale } };
+  const sources = {}; const invalid = []; const ignored = [];
+  for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
+    let value = admissionLeaf(settings, leaf);
+    sources[leaf] = 'standard';
+    for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
+      const v = admissionLeaf(block, leaf);
+      if (v === undefined) continue;
+      if (layer === 'tool' && leaf !== 'onTimeout' && !isPrivate) {
+        ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
+        continue;
+      }
+      if (valid(v)) { value = v; sources[leaf] = layer; }
+      else invalid.push(`${layer}.${leaf}=${JSON.stringify(v)}`);
+    }
+    const name = ADMISSION_ENV[leaf];
+    const raw = name ? env[name] : undefined;
+    if (raw !== undefined) {
+      if (leaf !== 'onTimeout' && !isPrivate) {
+        ignored.push(`env ${name}=${oneLine(raw)} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
+      } else {
+        const s = String(raw).trim();
+        const v = leaf === 'onTimeout' ? s.toLowerCase() : (s === '' ? NaN : Number(s));
+        if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
+        else invalid.push(`env ${name}=${JSON.stringify(raw)}`);
+      }
+    }
+    if (leaf.startsWith('fastScale.')) settings.fastScale[leaf.slice('fastScale.'.length)] = value;
+    else settings[leaf] = value;
+  }
+  return { settings, sources, invalid, ignored };
+}
+
+const admissionPolicyCache = new Map();
+const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
+const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+/**
+ * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
+ * On the shared host pool the platform file is the ONE capacity source, so every caller must read the SAME file:
+ * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
+ * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test). A read that fails keeps the last
+ * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
+ */
+export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
+  let platform; let tool; let path; const errors = []; let readFailed = false;
+  try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
+  catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
+  checkoutRoot ??= repoRoot;
+  const overrideOk = privateAdmissionPool(env, checkoutRoot) || isUnderTest(env) || isUnderTest(process.env);
+  try { path = (overrideOk && env.WE_PLATFORM_PREFERENCES) || join(home ?? realHomeDir(), '.claude', 'platform-preferences.json'); }
+  catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
+  const key = JSON.stringify([path, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const nowMs = Date.now();
+  const cached = admissionPolicyCache.get(key);
+  if (cached && nowMs < cached.expiresAt) return cached.policy;
+  if (path) try {
+    if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
+    const file = JSON.parse(readFileSync(path, 'utf8'));
+    if (admissionObject(file) && Object.hasOwn(file, 'heavyAdmission')) platform = file.heavyAdmission;
+    platformLastGood.set(path, platform);
+  } catch (e) {
+    if (e?.code !== 'ENOENT') {
+      readFailed = true;
+      errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`);
+      if (platformLastGood.has(path)) platform = platformLastGood.get(path);
+    } else platformLastGood.delete(path);
+  }
+  if (repoRoot) try {
+    const settingsDir = join(repoRoot, 'scripts', 'settings');
+    const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
+    if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
+  } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
+  const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
+  policy.invalid.push(...errors);
+  for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);
+  if (!readFailed) admissionPolicyCache.set(key, { policy, expiresAt: nowMs + 10_000 });
+  return policy;
+}
+
+export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
+  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots']
+    .map((leaf) => `${leaf}=${admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
+  return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
+}
+
+/** PURE: scale short-job capacity only with enough demand and a fresh, healthy resource snapshot. */
+export function resolveEffectiveFastSlots({ policy, waiting = [], snapshot = null, nowMs = Date.now() }) {
+  const { fastSlots, fastScale } = policy;
+  if (!Number.isFinite(fastScale?.maxSlots) || fastScale.maxSlots <= fastSlots) return fastSlots;
+  const short = waiting.filter((w) => queueLaneOf(w.kind) === 'fast').length;
+  if (short < fastScale.minShortWaiters || !(short / waiting.length >= fastScale.minShortShare)
+    || !(nowMs <= Date.parse(snapshot?.freshUntil))
+    || !Number.isFinite(snapshot?.cpu?.idlePct) || snapshot.cpu.idlePct < fastScale.minCpuIdlePct
+    || !Number.isFinite(snapshot?.memory?.pressureLevel) || snapshot.memory.pressureLevel > fastScale.maxMemPressureLevel) return fastSlots;
+  return Math.max(fastSlots, fastScale.maxSlots);
+}
+
+export function resolveSlotSpan(settings) {
+  return settings.cap + Math.max(settings.fastSlots, settings.fastScale?.maxSlots ?? 0);
+}
+
+/** Host-wide capacity; process overrides are only allowed for private pools. */
+export function resolveCap(env = process.env, checkoutRoot) {
+  return loadAdmissionPolicy({ env, checkoutRoot }).settings.cap;
+}
+
+export function resolveFastSlots(env = process.env, checkoutRoot) {
+  return loadAdmissionPolicy({ env, checkoutRoot }).settings.fastSlots;
 }
 
 /** Resolve the wait-then-give-up timeout from env, mirroring {@link resolveCap}. Clamped to a sane minimum of
@@ -614,7 +766,7 @@ export function tryAcquireSlot({ lockRoot, cap, owner, nowMs, nowIso, pid = null
  * where an operator's fresh invocation is by definition a different process than whichever one is stuck.
  * @param {number|null} [pid]  defaults to `process.pid`; pass `null` for an owner-only manual release.
  */
-export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fastSlots = resolveFastSlots(process.env) }) {
+export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
   const selfPid = Number.isInteger(pid) ? pid : null;
   let ownerOnlyFallback = null;
   // Card xkyw1x4 — also scan the fast-lane slots after the heavy ones (a short job may hold one). Scanning an
@@ -894,6 +1046,8 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
 
 // ── the blocking wait primitive a heavy-command call site uses ─────────────────────────────────────────
 
+let admissionPolicyLogged = false;
+
 /**
  * Poll for a free slot until one is won or the hard `ceilingMs` elapses (xhlriy2, #3383). A waiter never runs
  * unslotted merely because time has passed while a slot holder is alive: each failed {@link tryAcquireSlot}
@@ -901,10 +1055,9 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
  * fast-path + lease-TTL floor above), so as long as this loop keeps losing, at least one holder is still alive
  * with an unexpired lease. While blocked it logs a periodic "still waiting" line every {@link
  * STILL_WAITING_LOG_MS} — plain observability, not a give-up signal. Only `ceilingMs` (default {@link
- * DEFAULT_ADMISSION_CEILING_MS}) FAILS OPEN — `{ ok:false, timedOut:true, ceilingHit:true }`, with a loud
- * warning — never throwing and never blocking truly forever: a wedged holder must not strand a lane's whole
- * delivery arc. `WE_HEAVY_ADMISSION=off` ({@link isAdmissionOff}) is the explicit escape hatch — checked FIRST,
- * before this function ever touches the lock root, so it is a pure pass-through (`{ ok:false, disabled:true }`).
+ * DEFAULT_ADMISSION_CEILING_MS}) defers callers that support re-queuing; others keep waiting. Explicit
+ * onTimeout=run permits an unslotted run. FCFS ranking still applies at the ceiling.
+ * WE_HEAVY_ADMISSION=off is checked before touching the lock root and returns a disabled pass-through.
  * @param {object} opts
  * @param {string} opts.lockRoot
  * @param {number} opts.cap
@@ -918,24 +1071,29 @@ export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL
  * @param {object} [opts.env]              defaults to `process.env` — injectable for tests
  * @param {() => number} [opts.now]         defaults to Date.now
  * @param {(ms:number) => Promise<void>} [opts.sleep]  defaults to a real timer
- * @returns {Promise<{ ok:boolean, slot:number|null, timedOut:boolean, waitedMs:number, disabled?:boolean, ceilingHit?:boolean }>}
+ * @returns {Promise<{ ok:boolean, slot:number|null, timedOut:boolean, waitedMs:number, disabled?:boolean, ceilingHit?:boolean, deferred?:boolean }>}
  */
 export async function acquireSlotBlocking({
   lockRoot, cap, owner, lane = null, num = null, repo = null, kind = null, command = null, holder = holderLabel(process.argv),
   pollMs = DEFAULT_POLL_MS, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   stillWaitingLogMs = STILL_WAITING_LOG_MS,
   pid = process.pid, now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  log = (m) => process.stderr.write(m), env = process.env, ...seams
+  log = (m) => process.stderr.write(m), env = process.env,
+  policy = loadAdmissionPolicy({ env }), canDefer = false, readResourceSnapshot = readSnapshot, ...seams
 }) {
   if (isAdmissionOff(env)) return { ok: false, slot: null, timedOut: false, disabled: true, waitedMs: 0 };
 
+  if (!admissionPolicyLogged && (policy.ignored?.length || policy.invalid?.length)) {
+    admissionPolicyLogged = true;
+    log(formatAdmissionPolicy(policy) + '\n');
+  }
+  const { onTimeout } = policy.settings;
+  const src = `onTimeout=${onTimeout} (${policy.sources.onTimeout ?? 'standard'})`;
   const startedAt = now();
   // Card xkyw1x4 — the command KIND decides the queue lane and which slots may be taken (fast lane).
   // Item 100 — a missing / `other` kind is re-derived from the command or the acquiring script; `other` that
   // survives is a truly unknown command, and the command / holder are recorded with the hold.
   const jobKind = refineKind(kind, { command, holder, env });
-  const fastSlots = resolveFastSlots(env);
-  const slotOrder = slotOrderFor(jobKind, cap, fastSlots);
   // xaipsbs — every admission attempt first clears stale waiters, so debris never outlives the next caller.
   reapStaleWaiters({ lockRoot, nowMs: startedAt, apply: true, ...seams });
   // MECHANICAL FAIRNESS (#3383 card xb0iuxq) — mark BEFORE the first attempt, not only after it fails, so
@@ -946,14 +1104,20 @@ export async function acquireSlotBlocking({
   // against) on its very first check.
   markWaiting({ lockRoot, owner, lane, num, pid, repo, kind: jobKind, nowIso: new Date(startedAt).toISOString() });
   let lastLoggedAt = startedAt;
+  let ceilingChecked = false;
   try {
     for (;;) {
       const attempt = now();
       reapStaleWaiters({ lockRoot, nowMs: attempt, apply: true, ...seams });
-      if (attempt - startedAt >= ceilingMs) {
-        log(`⚠⚠ heavy-command admission: HARD CEILING of ${Math.round(ceilingMs / 60_000)}m exceeded waiting for capacity (cap=${cap}) — a slot holder may be wedged; proceeding unslotted. Escape hatch: WE_HEAVY_ADMISSION=off.\n`);
-        return { ok: false, slot: null, timedOut: true, ceilingHit: true, waitedMs: attempt - startedAt };
+      let snapshot = null;
+      if (policy.settings.fastScale?.maxSlots > policy.settings.fastSlots) {
+        try { snapshot = readResourceSnapshot(); } catch { snapshot = null; }
       }
+      const fastSlots = resolveEffectiveFastSlots({ policy: policy.settings, waiting: listWaiting(lockRoot), snapshot, nowMs: attempt });
+      const slotOrder = slotOrderFor(jobKind, cap, fastSlots);
+      const atCeiling = !ceilingChecked && attempt - startedAt >= ceilingMs;
+      // Fairness holds at the ceiling too: only the oldest live waiter of its lane tries (a dead or lease-expired
+      // holder is reclaimed by that attempt, so the ceiling never needs an unranked grab that cuts the queue).
       if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
@@ -964,8 +1128,22 @@ export async function acquireSlotBlocking({
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
         if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
       }
+      if (atCeiling) {
+        ceilingChecked = true;
+        const m = Math.round(ceilingMs / 60_000);
+        const result = { ok: false, slot: null, timedOut: true, ceilingHit: true, waitedMs: attempt - startedAt };
+        if (onTimeout === 'run') {
+          log(`⚠⚠ heavy-command admission: HARD CEILING of ${m}m exceeded waiting for capacity (cap=${cap}) — a slot holder may be wedged; proceeding unslotted. Escape hatch: WE_HEAVY_ADMISSION=off. [${src}]\n`);
+          return result;
+        }
+        if (canDefer) {
+          log(`⚠ heavy-command admission-deferred: no slot after ${m}m (cap=${cap}, every holder alive) — NOT running unslotted; the caller re-queues (exit ${ADMISSION_DEFERRED_EXIT}) [${src}]\n`);
+          return { ...result, deferred: true };
+        }
+        log(`heavy-command admission: still queued past the ${m}m ceiling (cap=${cap}) — this caller cannot defer, so it keeps waiting; never runs unslotted [${src}]\n`);
+      }
       if (attempt - lastLoggedAt >= stillWaitingLogMs) {
-        log(`heavy-command admission: still waiting for a free slot (cap=${cap}) after ${Math.round((attempt - startedAt) / 60_000)}m — every held slot's holder still appears alive; will proceed unslotted at the ${Math.round(ceilingMs / 60_000)}m ceiling.\n`);
+        log(`heavy-command admission: still waiting for a free slot (cap=${cap}) after ${Math.round((attempt - startedAt) / 60_000)}m — every held slot's holder still appears alive; will ${onTimeout === 'run' ? 'proceed unslotted' : 'defer'} at the ${Math.round(ceilingMs / 60_000)}m ceiling.\n`);
         lastLoggedAt = attempt;
       }
       await sleep(pollMs);
@@ -1139,10 +1317,11 @@ export function readPoolLeases(poolRoot) {
  */
 export function resolveQueueBaseline({
   lockRoot, cap, nowMs = Date.now(), env = process.env, arrivalWindowMinutes = DEFAULT_ARRIVAL_WINDOW_MINUTES,
-  readLeases = readPoolLeases, isLiveWaiter = isRankableWaiter,
+  readLeases = readPoolLeases, isLiveWaiter = isRankableWaiter, checkoutRoot,
 }) {
   const maxWaitMinutes = resolveQueueMaxWaitMinutes(env);
-  const fastSlots = resolveFastSlots(env);
+  const settings = loadAdmissionPolicy({ env, checkoutRoot }).settings;
+  const fastSlots = settings.fastSlots;
   const base = { slots: cap + fastSlots, heavySlots: cap, fastSlots, maxWaitMinutes, arrivalWindowMinutes, observedAt: new Date(nowMs).toISOString() };
   if (isQueueAdmissionOff(env)) return { ...base, bypassed: 'off' };
   if (/^(?:true|1)$/i.test(String(env?.CI || ''))) return { ...base, bypassed: 'ci' };
@@ -1151,7 +1330,7 @@ export function resolveQueueBaseline({
   const durations = readHoldDurations(lockRoot);
   const { minutes: dispatchMinutes, source: dispatchSource } = typicalDispatchMinutes(durations);
   const prepareAdmission = resolvePrepareAdmission(env);
-  const held = heldSlots({ lockRoot, cap, fastSlots }).map((h) => {
+  const held = heldSlots({ lockRoot, cap, fastSlots: resolveSlotSpan({ ...settings, cap }) - cap }).map((h) => {
     const startedIso = h.meta?.acquiredAt || h.heartbeatAt;
     const started = Date.parse(startedIso);
     return {
@@ -1205,13 +1384,13 @@ export function resolveQueueBaseline({
 
 /**
  * The one-call live baseline for a checkout (the fix / ci-heal daemons and the tick IO shell use this): lock root
- * + cap from env, then {@link resolveQueueBaseline}. FAILS OPEN — any read error returns `{bypassed:'error'}`.
+ * + cap from the admission policy, then {@link resolveQueueBaseline}. FAILS OPEN — any read error returns `{bypassed:'error'}`.
  * The pool root is `guardedPoolRoot`'s: inside a vitest worker with no `LANE_POOL_ROOT` override it throws, so a
  * test that forgot to inject a baseline admits everything instead of reading the real host queue.
  */
 export function resolveLiveQueueBaseline({ checkoutRoot = process.cwd(), env = process.env, nowMs = Date.now() } = {}) {
   try {
-    return resolveQueueBaseline({ lockRoot: join(guardedPoolRoot(checkoutRoot, env), SUBDIR), cap: resolveCap(env), nowMs, env });
+    return resolveQueueBaseline({ lockRoot: join(guardedPoolRoot(checkoutRoot, env), SUBDIR), cap: resolveCap(env, checkoutRoot), nowMs, env, checkoutRoot });
   } catch (e) {
     return { bypassed: 'error', error: String((e && e.message) || e).split('\n')[0] };
   }
@@ -1271,9 +1450,8 @@ export function poolRootOf(lockRoot) {
 
 /**
  * Run `command` synchronously in the FOREGROUND, admitted through the SAME capacity semaphore this module's
- * `acquire`/`release` CLI modes already use. FAILS OPEN on a queuing timeout (mirrors `acquireSlotBlocking`
- * itself): `command` still runs, unslotted, with a stderr warning, rather than being refused — a queuing
- * timeout must never strand an otherwise-healthy caller.
+ * `acquire`/`release` CLI modes already use. A queue timeout defers by default: exit 75 without executing.
+ * Explicit onTimeout=run permits an unslotted command with a warning.
  * @param {object} opts
  * @param {string} opts.lockRoot
  * @param {number} opts.cap
@@ -1296,7 +1474,7 @@ export async function runUnderAdmission({
   lockRoot, cap, owner, lane = null, num = null, repo = null, ceilingMs = DEFAULT_ADMISSION_CEILING_MS, leaseMinutes = ADMISSION_LEASE_MINUTES,
   kind = null, command, cwd = process.cwd(), exec = (cmd, o) => execSync(cmd, o), log = (m) => process.stderr.write(m),
   now = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  bypass = null, env = process.env,
+  bypass = null, env = process.env, policy = loadAdmissionPolicy({ env }),
 }) {
   // The child always runs with the re-entrancy flag, so anything it runs that is itself wrapped passes through.
   const childEnv = { ...env, [ADMISSION_HELD_ENV]: '1' };
@@ -1311,7 +1489,8 @@ export async function runUnderAdmission({
   // `WE_HEAVY_ADMISSION=off` check apply to the `run` wrapper's wait too, not just this function's own messages.
   // Card xkyw1x4 — the kind is read off the wrapped command itself unless the caller names it.
   const runKind = kind ?? classifyCommandKind(command, env);
-  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env });
+  const admission = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, repo, kind: runKind, command, ceilingMs, leaseMinutes, now, sleep, log, env, policy, canDefer: true });
+  if (admission.deferred) return { exitCode: ADMISSION_DEFERRED_EXIT, admission };
   if (admission.timedOut) {
     log(`⚠ heavy-command admission: timed out after ${admission.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted.\n`);
   } else if (admission.waitedMs > 0) {
@@ -1327,7 +1506,7 @@ export async function runUnderAdmission({
     exitCode = Number.isFinite(e && e.status) ? e.status : 1;
     if (e && e.code === 'ETIMEDOUT') { exitCode = 124; log(`⚠ heavy-command admission: single-test run exceeded ${resolveFastRunTimeoutMs(env)}ms and was stopped.\n`); }
   } finally {
-    if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveFastSlots(env) });
+    if (admission.ok) releaseOwnedSlot({ lockRoot, cap, owner, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
   }
   return { exitCode, admission };
 }
@@ -1378,7 +1557,12 @@ async function main(argv) {
   const { flags, positionals } = parseFlags(preArgv);
   // Resolve before lock-root derivation so relative --repo uses the same shared pool and execution cwd.
   const repo = resolve(typeof flags.repo === 'string' ? flags.repo : process.cwd());
-  const cap = flags.cap != null ? Number(flags.cap) : resolveCap(process.env);
+  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo });
+  const privatePool = privateAdmissionPool(process.env, repo);
+  const cap = flags.cap != null && privatePool ? Number(flags.cap) : policy.settings.cap;
+  if (flags.cap != null && !privatePool) {
+    process.stderr.write(`heavy-admission: --cap=${flags.cap} ignored on the shared host pool (cap=${cap} from ${policy.sources.cap})\n`);
+  }
   const lockRoot = admissionLockRoot(repo, process.env);
   // `run` gets a PER-PROCESS owner (xaipsbs): two wrapped commands typed in the same checkout must be two
   // owners, or the second would "re-acquire" the first one's slot (own-slot refresh) and break the cap —
@@ -1391,9 +1575,11 @@ async function main(argv) {
   const mode = positionals[0] || 'status';
 
   if (mode === 'status') {
-    const fastSlots = resolveFastSlots(process.env);
+    const fastSlots = policy.settings.fastSlots;
     if (!existsSync(lockRoot)) { emit({ cap, fastSlots, heldCount: 0, freeCount: cap + fastSlots, heavyFreeCount: cap, fastFreeCount: fastSlots, held: [], waiting: [], staleWaiting: 0, reaped: { count: 0, last: null } }); return; }
-    emit(admissionStatus({ lockRoot, cap, fastSlots }));
+    const status = admissionStatus({ lockRoot, cap, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
+    emit({ ...status, fastSlots, freeCount: Math.max(0, cap + fastSlots - status.heldCount),
+      fastFreeCount: Math.max(0, fastSlots - status.held.filter((h) => h.slot >= cap).length) });
     return;
   }
   if (mode === 'load-status') {
@@ -1446,7 +1632,7 @@ async function main(argv) {
   if (mode === 'queue-status') {
     // Card xkyw1x4 — the queue baseline (backlog in slot-minutes, standard times per kind, pending dispatched
     // sessions) that `tick-core.mjs`'s IO shell feeds to planTick's `queue-cap` gate. Read-only.
-    const b = resolveQueueBaseline({ lockRoot, cap });
+    const b = resolveQueueBaseline({ lockRoot, cap, checkoutRoot: repo });
     if (asJson) { emit(b); return; }
     if (b.bypassed) { process.stdout.write(`queue admission bypassed (${b.bypassed})\n`); return; }
     process.stdout.write(`projected wait if you start now: ~${b.projectedWaitMinutes}m for a dispatch's short checks (max ${b.maxWaitMinutes}m), ~${b.heavyWaitMinutes}m for a full suite — `
@@ -1469,7 +1655,7 @@ async function main(argv) {
     // A fresh CLI invocation is, by definition, a different real process than whichever one is stuck holding
     // the slot — pid: null opts into the loose owner-only match (#3383's deliberate manual/operator escape
     // hatch; see releaseOwnedSlot's own docstring).
-    const r = releaseOwnedSlot({ lockRoot, cap, owner, pid: null });
+    const r = releaseOwnedSlot({ lockRoot, cap, owner, pid: null, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
     if (asJson) emit(r); else process.stderr.write(r.released ? `released slot-${r.slot} for ${owner}\n` : `${owner} held no slot\n`);
     return;
   }
@@ -1481,10 +1667,10 @@ async function main(argv) {
     const ceilingMs = flags['ceiling-ms'] != null ? Number(flags['ceiling-ms'])
       : flags['timeout-ms'] != null ? Number(flags['timeout-ms'])
       : resolveCeilingMs(process.env);
-    const r = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, ceilingMs, kind: typeof flags.kind === 'string' ? flags.kind : null });
+    const r = await acquireSlotBlocking({ lockRoot, cap, owner, lane, num, ceilingMs, policy, canDefer: true, kind: typeof flags.kind === 'string' ? flags.kind : null });
     if (asJson) emit(r);
-    else process.stderr.write(r.ok ? `acquired slot-${r.slot} (waited ${r.waitedMs}ms)\n` : `timed out after ${r.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted\n`);
-    process.exit(0); // fail-open: a queuing timeout is not a usage error, the caller proceeds regardless
+    else if (!r.deferred) process.stderr.write(r.ok ? `acquired slot-${r.slot} (waited ${r.waitedMs}ms)\n` : `timed out after ${r.waitedMs}ms waiting for capacity (cap=${cap}) — proceeding unslotted\n`);
+    process.exit(r.deferred ? ADMISSION_DEFERRED_EXIT : 0);
   }
   if (mode === 'run') {
     if (dashDashIdx === -1 || dashDashIdx === argv.length - 1) {
@@ -1531,7 +1717,7 @@ async function main(argv) {
       process.exit(1);
     }
     const bypass = admissionBypassReason({ env: process.env, poolExists: existsSync(poolRootOf(lockRoot)) });
-    const runOpts = { lockRoot, cap, owner, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null };
+    const runOpts = { lockRoot, cap, owner, policy, lane: lane ?? (/lane-(\d+)/.exec(repo) || [])[1] ?? null, num, repo, ceilingMs, command, cwd: repo, bypass, kind: typeof flags.kind === 'string' ? flags.kind : null };
     if (useContainer) runOpts.exec = (cmd, o) => execContainerized(cmd, { ...o, nodeModulesVolume: useNodeModulesVolume });
     const { exitCode } = await runUnderAdmission(runOpts);
     process.exit(exitCode);

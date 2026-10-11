@@ -66,11 +66,20 @@ export function memoryPressureLevel(text) {
   const value = String(text).trim();
   return /^(1|2|4)$/.test(value) ? Number(value) : null;
 }
-export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
+/** Swap use in percent from `sysctl -n vm.swapusage` ("total = 27648.00M  used = 26500.00M  free = …"); null when
+ *  unparseable, 0 with no swap configured. A fix-cap signal (operator 2026-10-10: swap, not CPU, hurt throughput). */
+export function swapUsedPct(text) {
+  const m = /total\s*=\s*([\d.]+)M\s+used\s*=\s*([\d.]+)M/.exec(String(text));
+  if (!m) return null;
+  const total = Number(m[1]); const used = Number(m[2]);
+  if (!Number.isFinite(total) || !Number.isFinite(used)) return null;
+  return total > 0 ? round(used / total * 100) : 0;
+}
+export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, loadAvg, memPressureLevel, memFreePct, swapUsedPct: swapPct, disk, fseventsdCpuPct, heavySlots, agentSessions, laneCount, errors = [] }) {
   return { schema: 'resource-snapshot/1', sampledAt: new Date(sampledAtMs).toISOString(),
     freshUntil: new Date(sampledAtMs + 3 * intervalMs).toISOString(), intervalMs,
     cpu: { idlePct: finite(cpuIdlePct), cores: finite(cores), loadAvg: [0, 1, 2].map(i => finite(loadAvg?.[i])) },
-    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct) },
+    memory: { pressureLevel: finite(memPressureLevel), freePct: finite(memFreePct), swapUsedPct: finite(swapPct) },
     disk: { busyPct: finite(disk?.busyPct), ioDepth: finite(disk?.ioDepth), readMBps: finite(disk?.readMBps), writeMBps: finite(disk?.writeMBps) },
     // macOS exposes no public fsevents backlog counter.
     fsevents: { fseventsdCpuPct: finite(fseventsdCpuPct), backlog: null },
@@ -81,7 +90,7 @@ export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, load
 // runs from a pinned code snapshot outside the workspace, where neither the lane pool nor the slot locks live.
 function defaultHeavySlots(checkoutRoot = repoRoot()) {
   // Reuse we:scripts/readiness/heavy-admission.mjs; heavy capacity excludes its separate fast lane.
-  const cap = resolveCap();
+  const cap = resolveCap(process.env, checkoutRoot);
   const status = admissionStatus({ lockRoot: admissionLockRoot(checkoutRoot), cap });
   return { held: status.heldCount, cap };
 }
@@ -119,9 +128,13 @@ export function createSampler({ exec = execFileSync, cpus = os.cpus, loadavg = o
       if (!Number.isFinite(free) || !Number.isFinite(total) || total <= 0) throw Error('invalid memory totals');
       return round(free / total * 100);
     });
+    const swapPct = probe('swapUsedPct', () => {
+      const value = swapUsedPct(run('sysctl', ['-n', 'vm.swapusage']));
+      if (value === null) throw Error('unrecognized swap usage'); return value;
+    });
     const procs = probe('ps', () => parsePsCpu(run('ps', ['-A', '-o', 'pid=,pcpu=,comm='])));
     const snapshot = buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores: nextCpus?.length,
-      loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, disk,
+      loadAvg: probe('loadavg', loadavg), memPressureLevel, memFreePct, swapUsedPct: swapPct, disk,
       fseventsdCpuPct: procs === null ? null : fseventsCpuPct(procs),
       agentSessions: procs === null ? null : countAgentSessions(procs),
       heavySlots: probe('heavySlots', readHeavySlots), laneCount: probe('laneCount', countLanes), errors });

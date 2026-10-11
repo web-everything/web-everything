@@ -6,9 +6,9 @@
  *   discipline of proving the atomic fs layer for real, not just its pure decision logic).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, realpathSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
@@ -27,6 +27,10 @@ import {
   resolveLoadAdmissionMinPressureLevel,
   isLoadAdmissionOff, loadAdmissionDecision, readLatestLoad, resolveLoadAdmission,
 } from '../heavy-admission.mjs';
+import {
+  ADMISSION_DEFERRED_EXIT, ADMISSION_POLICY_STANDARD, resolveAdmissionPolicy, formatAdmissionPolicy,
+  resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy, privateAdmissionPool,
+} from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
 
@@ -35,6 +39,8 @@ vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), a
 // x6nuodj — the legacy telemetry rule's tests run with the shared decision observing only (`shadow`); the cut-over
 // (admit() deciding) has its own describe below with an explicit `mode`.
 beforeEach(() => { vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); });
+// admission-no-fail-open — hermetic: the admission policy's platform layer never reads the operator's real file.
+beforeEach(() => { vi.stubEnv('WE_PLATFORM_PREFERENCES', join(tmpdir(), 'heavy-admission-test-no-such-platform-preferences.json')); });
 afterEach(() => vi.unstubAllEnvs());
 
 describe('load admission shadow observation', () => {
@@ -134,12 +140,14 @@ describe('CLI relative --repo', () => {
   });
 });
 
-describe('resolveCap — env override, clamped sane', () => {
+describe('resolveCap — env override (private pools only), clamped sane', () => {
+  const priv = (cap) => ({ LANE_POOL_ROOT: '/tmp/private-pool', WE_HEAVY_ADMISSION_CAP: cap });
   it('defaults when unset', () => expect(resolveCap({})).toBe(DEFAULT_ADMISSION_CAP));
-  it('reads WE_HEAVY_ADMISSION_CAP', () => expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '5' })).toBe(5));
+  it('reads WE_HEAVY_ADMISSION_CAP for a private pool', () => expect(resolveCap(priv('5'))).toBe(5));
+  it('ignores WE_HEAVY_ADMISSION_CAP on the shared host pool', () => expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '5' })).toBe(DEFAULT_ADMISSION_CAP));
   it('falls back on a non-finite or sub-1 value', () => {
-    expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: 'nope' })).toBe(DEFAULT_ADMISSION_CAP);
-    expect(resolveCap({ WE_HEAVY_ADMISSION_CAP: '0' })).toBe(DEFAULT_ADMISSION_CAP);
+    expect(resolveCap(priv('nope'))).toBe(DEFAULT_ADMISSION_CAP);
+    expect(resolveCap(priv('0'))).toBe(DEFAULT_ADMISSION_CAP);
   });
 });
 
@@ -198,6 +206,18 @@ describe('tryAcquireSlot / releaseOwnedSlot / heldSlots — cap independent slot
     releaseOwnedSlot({ lockRoot, cap, owner: 'A' });
     expect(heldSlots({ lockRoot, cap })).toHaveLength(0);
     expect(tryAcquireSlot({ lockRoot, cap, owner: 'B', nowMs: T0, nowIso: iso(T0) }).ok).toBe(true);
+  });
+
+  it('releaseOwnedSlot with no fastSlots still scans the CALLER\'s whole cap, even one larger than the policy span (gh-throttle\'s cap-6 pool)', () => {
+    const cap = 8; // well above the default policy span (cap 2 + 1 fast slot)
+    const owners = Array.from({ length: cap }, (_, i) => `O${i}`);
+    const got = owners.map((owner) => tryAcquireSlot({ lockRoot, cap, owner, nowMs: T0, nowIso: iso(T0), pid: process.pid }));
+    expect(got.every((g) => g.ok)).toBe(true);
+    // The owner that won the LAST slot is released by a caller that passes no fastSlots.
+    const last = got[cap - 1];
+    expect(last.slot).toBe(cap - 1);
+    expect(releaseOwnedSlot({ lockRoot, cap, owner: owners[cap - 1] })).toEqual({ released: true, slot: cap - 1 });
+    expect(heldSlots({ lockRoot, cap })).toHaveLength(cap - 1);
   });
 
   it('re-acquiring your own held slot is a no-op success (heartbeat refresh), not a second slot', () => {
@@ -426,7 +446,7 @@ describe('acquireSlotBlocking — polls until free, marks/clears waiting, FAILS 
     tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
     let clock = T0;
     const r = await acquireSlotBlocking({
-      lockRoot, cap: 1, owner: 'B', pollMs: 60_000, ceilingMs: 40 * 60_000, // ceiling well past the old timeout
+      lockRoot, cap: 1, owner: 'B', pollMs: 60_000, ceilingMs: 40 * 60_000, canDefer: true, // ceiling well past the old timeout
       now: () => clock, sleep: async (ms) => { clock += ms; },
     });
     // Never acquires (the holder never frees or dies) — but must have polled well past DEFAULT_TIMEOUT_MS
@@ -437,12 +457,12 @@ describe('acquireSlotBlocking — polls until free, marks/clears waiting, FAILS 
     expect(listWaiting(lockRoot)).toHaveLength(0); // marker cleared even on give-up (the `finally`)
   });
 
-  it('gives up and reports timedOut/ceilingHit only once the hard ceiling elapses — fails OPEN, never throws, with a loud warning', async () => {
+  it('with onTimeout=run, gives up and reports timedOut/ceilingHit only once the hard ceiling elapses — fails OPEN, never throws, with a loud warning', async () => {
     tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
     let clock = T0;
     const logs = [];
     const r = await acquireSlotBlocking({
-      lockRoot, cap: 1, owner: 'B', pollMs: 1000, ceilingMs: 3000, log: (m) => logs.push(m),
+      lockRoot, cap: 1, owner: 'B', pollMs: 1000, ceilingMs: 3000, log: (m) => logs.push(m), canDefer: true, policy: { settings: { ...ADMISSION_POLICY_STANDARD, onTimeout: 'run' }, sources: { onTimeout: 'tool' }, invalid: [], ignored: [] }, 
       now: () => clock, sleep: async (ms) => { clock += ms; },
     });
     expect(r).toMatchObject({ ok: false, slot: null, timedOut: true, ceilingHit: true });
@@ -606,12 +626,12 @@ describe('runUnderAdmission — acquire → exec → release, the #3621 containe
     expect(seen).toEqual(['container:node scripts/check-standards.mjs']);
   });
 
-  it('still fails open on a queuing timeout — runs unslotted rather than refusing', async () => {
+  it('with onTimeout=run, still fails open on a queuing timeout — runs unslotted rather than refusing', async () => {
     tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
     let clock = T0;
     const calls = [];
     const r = await runUnderAdmission({
-      lockRoot, cap: 1, owner: 'B', command: 'echo hi', ceilingMs: 3000,
+      lockRoot, cap: 1, owner: 'B', command: 'echo hi', ceilingMs: 3000, policy: { settings: { ...ADMISSION_POLICY_STANDARD, onTimeout: 'run' }, sources: { onTimeout: 'tool' }, invalid: [], ignored: [] }, 
       exec: (cmd) => calls.push(cmd), now: () => clock, sleep: async (ms) => { clock += ms; },
     });
     expect(r.admission.timedOut).toBe(true);
@@ -1407,4 +1427,307 @@ describe('the `load-status` CLI mode as a real process (#4343)', () => {
       rmSync(telemetryRoot, { recursive: true, force: true });
     }
   });
+});
+
+// ── admission-no-fail-open: one cap source, a queue timeout DEFERS, a demand-scaled fast lane ───────────────
+// Live 2026-10-10 13:30 ET: 6 `node (vitest)` processes against "cap 2 + 1 fast". The verify daemon's plist set
+// WE_HEAVY_ADMISSION_CAP=4 / FAST_SLOTS=2 (six slots), every agent session read 2 + 1 (three slots): each side
+// scanned a different slot range, so the daemon's slot-3…5 holders were invisible to the rest of the host.
+
+describe('resolveAdmissionPolicy — the one cascade every process reads (standard → platform → tool → env)', () => {
+  it('the standard: cap 2, 1 fast slot, a queue timeout DEFERS, no fast-lane scaling', () => {
+    const p = resolveAdmissionPolicy({});
+    expect(p.settings).toEqual({ cap: 2, fastSlots: 1, onTimeout: 'defer',
+      fastScale: { maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 } });
+    expect(p.settings).toEqual(ADMISSION_POLICY_STANDARD);
+    expect(p.sources).toMatchObject({ cap: 'standard', fastSlots: 'standard', onTimeout: 'standard' });
+  });
+
+  it('layers platform under tool (private pool), and names each leaf\'s source', () => {
+    const p = resolveAdmissionPolicy({ platform: { cap: 3, onTimeout: 'run' }, tool: { cap: 4, fastScale: { maxSlots: 3 } }, env: { LANE_POOL_ROOT: '/tmp/private-pool' } });
+    expect(p.settings).toMatchObject({ cap: 4, fastSlots: 1, onTimeout: 'run', fastScale: { maxSlots: 3 } });
+    expect(p.sources).toMatchObject({ cap: 'tool', onTimeout: 'platform', 'fastScale.maxSlots': 'tool', fastSlots: 'standard' });
+  });
+
+  it('IGNORES a per-process cap / fast-slot env on the shared host pool and names the divergence', () => {
+    const p = resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_CAP: '4', WE_HEAVY_ADMISSION_FAST_SLOTS: '2' } });
+    expect(p.settings).toMatchObject({ cap: 2, fastSlots: 1 });
+    expect(p.ignored.join('\n')).toMatch(/WE_HEAVY_ADMISSION_CAP=4/);
+    expect(p.ignored.join('\n')).toMatch(/WE_HEAVY_ADMISSION_FAST_SLOTS=2/);
+  });
+
+  it('honours the cap env for a PRIVATE pool (LANE_POOL_ROOT set: a test or soak sandbox no other process shares)', () => {
+    const p = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: '/tmp/private-pool', WE_HEAVY_ADMISSION_CAP: '5', WE_HEAVY_ADMISSION_FAST_SLOTS: '0' } });
+    expect(p.settings).toMatchObject({ cap: 5, fastSlots: 0 });
+    expect(p.sources.cap).toBe('env WE_HEAVY_ADMISSION_CAP');
+    expect(p.ignored).toEqual([]);
+  });
+
+  it('onTimeout is per-caller behaviour, so its env is honoured anywhere; an invalid value never overrides', () => {
+    expect(resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_ON_TIMEOUT: 'run' } }).settings.onTimeout).toBe('run');
+    const bad = resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_ON_TIMEOUT: 'maybe' }, platform: { cap: 0 } });
+    expect(bad.settings).toMatchObject({ onTimeout: 'defer', cap: 2 });
+    expect(bad.invalid.join('\n')).toMatch(/WE_HEAVY_ADMISSION_ON_TIMEOUT/);
+    expect(bad.invalid.join('\n')).toMatch(/platform\.cap/);
+  });
+
+  it('formatAdmissionPolicy names every value with its source (the logged line)', () => {
+    const line = formatAdmissionPolicy(resolveAdmissionPolicy({ env: { WE_HEAVY_ADMISSION_CAP: '4' } }));
+    expect(line).toMatch(/cap=2 \(standard\)/);
+    expect(line).toMatch(/onTimeout=defer \(standard\)/);
+    expect(line).toMatch(/ignored: .*WE_HEAVY_ADMISSION_CAP=4/);
+  });
+});
+
+describe('resolveCap / resolveFastSlots — every process on the host pool agrees (the live divergence)', () => {
+  let prefs;
+  beforeEach(() => { prefs = join(lockRoot, 'platform-preferences.json'); });
+  const daemonEnv = () => ({ WE_PLATFORM_PREFERENCES: prefs, WE_HEAVY_ADMISSION_CAP: '4', WE_HEAVY_ADMISSION_FAST_SLOTS: '2' });
+  const sessionEnv = () => ({ WE_PLATFORM_PREFERENCES: prefs, WE_HEAVY_ADMISSION_CAP: '2' });
+
+  it('a daemon with the plist env and an agent session resolve the SAME cap and fast slots', () => {
+    expect(resolveCap(daemonEnv())).toBe(resolveCap(sessionEnv()));
+    expect(resolveFastSlots(daemonEnv())).toBe(resolveFastSlots(sessionEnv()));
+    expect(resolveCap(daemonEnv())).toBe(DEFAULT_ADMISSION_CAP);
+  });
+
+  it('the host-wide platform preference moves every process together', () => {
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3, fastSlots: 2 } }));
+    expect([resolveCap(daemonEnv()), resolveCap(sessionEnv())]).toEqual([3, 3]);
+    expect([resolveFastSlots(daemonEnv()), resolveFastSlots(sessionEnv())]).toEqual([2, 2]);
+  });
+
+  it('a private pool keeps its own env cap (tests and soak sandboxes)', () => {
+    expect(resolveCap({ WE_PLATFORM_PREFERENCES: prefs, LANE_POOL_ROOT: lockRoot, WE_HEAVY_ADMISSION_CAP: '5' })).toBe(5);
+  });
+});
+
+describe('shared-pool capacity — naming the host pool explicitly, or a checkout-local settings file, never makes a caller private', () => {
+  const CAPS = { WE_HEAVY_ADMISSION_CAP: '4', WE_HEAVY_ADMISSION_FAST_SLOTS: '2' };
+  const caps = (p) => [p.settings.cap, p.settings.fastSlots];
+
+  it.each([
+    ['the exact host pool path', '/workspace/.lanes'],
+    ['a trailing slash', '/workspace/.lanes/'],
+    ['a dot segment', '/workspace/./.lanes'],
+    ['a .. segment', '/workspace/other/../.lanes'],
+  ])('LANE_POOL_ROOT naming the host pool (%s) resolves the same cap / fast slots as no override', (_why, pool) => {
+    const checkoutRoot = '/workspace/web-everything';
+    const plain = resolveAdmissionPolicy({ env: {}, checkoutRoot });
+    const named = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: pool, ...CAPS }, checkoutRoot });
+    expect(caps(named)).toEqual(caps(plain));
+    expect(caps(named)).toEqual([2, 1]);
+    expect(named.ignored.join('\n')).toMatch(/WE_HEAVY_ADMISSION_CAP=4/);
+  });
+
+  it('a lane clone of the same workspace sees the same host pool', () => {
+    const p = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: '/workspace/.lanes', ...CAPS }, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
+    expect(caps(p)).toEqual([2, 1]);
+  });
+
+  it('a pool that is genuinely elsewhere stays private and honours the env', () => {
+    const p = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: '/tmp/sandbox-pool', ...CAPS }, checkoutRoot: '/workspace/web-everything' });
+    expect(caps(p)).toEqual([4, 2]);
+  });
+
+  it('the tool layer (checkout-local settings) is ignored for shared capacity but still applies on a private pool', () => {
+    const tool = { cap: 4, fastSlots: 2, fastScale: { maxSlots: 5 }, onTimeout: 'run' };
+    const shared = resolveAdmissionPolicy({ platform: { cap: 2, fastSlots: 1 }, tool, env: {}, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
+    expect(caps(shared)).toEqual([2, 1]);
+    expect(shared.settings.fastScale.maxSlots).toBeNull();
+    expect(shared.settings.onTimeout).toBe('run');
+    expect(shared.ignored.join('\n')).toMatch(/tool\.cap=4/);
+    const priv = resolveAdmissionPolicy({ platform: { cap: 2, fastSlots: 1 }, tool, env: { LANE_POOL_ROOT: '/tmp/sandbox-pool' }, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
+    expect(caps(priv)).toEqual([4, 2]);
+    expect(priv.settings.fastScale.maxSlots).toBe(5);
+  });
+
+  it('a pinned snapshot outside the workspace (no checkout hint) still treats the real host pool as shared', () => {
+    const hostPool = join(userInfo().homedir, 'workspace', '.lanes');
+    expect(resolveCap({ LANE_POOL_ROOT: hostPool, ...CAPS })).toBe(resolveCap({}));
+    expect(resolveFastSlots({ LANE_POOL_ROOT: `${hostPool}/`, ...CAPS })).toBe(resolveFastSlots({}));
+    expect(resolveCap({ LANE_POOL_ROOT: hostPool, ...CAPS }, join(lockRoot, 'elsewhere', 'web-everything'))).toBe(resolveCap({}));
+  });
+
+  it('a symlink to the host pool, and a not-yet-created host pool spelled through a symlinked ancestor, are both shared', () => {
+    const ws = join(lockRoot, 'ws'); mkdirSync(join(ws, '.lanes'), { recursive: true });
+    const link = join(lockRoot, 'link'); symlinkSync(join(ws, '.lanes'), link);
+    const checkout = join(ws, 'web-everything');
+    expect(privateAdmissionPool({ LANE_POOL_ROOT: link }, checkout)).toBe(false);
+    expect(privateAdmissionPool({ LANE_POOL_ROOT: join(realpathSync(lockRoot), 'ws2', '.lanes') }, join(lockRoot, 'ws2', 'web-everything'))).toBe(false);
+    expect(privateAdmissionPool({ LANE_POOL_ROOT: join(lockRoot, 'elsewhere') }, checkout)).toBe(true);
+  });
+
+  it('a caller $HOME never selects a different platform file for the shared pool', () => {
+    const fakeHome = join(lockRoot, 'home'); mkdirSync(join(fakeHome, '.claude'), { recursive: true });
+    writeFileSync(join(fakeHome, '.claude', 'platform-preferences.json'), JSON.stringify({ heavyAdmission: { cap: 7 } }));
+    expect(loadAdmissionPolicy({ env: { HOME: fakeHome } }).settings.cap).toBe(loadAdmissionPolicy({ env: {} }).settings.cap);
+    expect(loadAdmissionPolicy({ env: { HOME: fakeHome } }).settings.cap).not.toBe(7);
+  });
+
+  it('a torn platform-preferences write keeps the last good value and is not cached', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const prefs = join(lockRoot, 'torn.json'); const env = { WE_PLATFORM_PREFERENCES: prefs };
+      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3 } }));
+      expect(loadAdmissionPolicy({ env }).settings.cap).toBe(3);
+      vi.setSystemTime(Date.now() + 11_000);
+      writeFileSync(prefs, '{"heavyAdmission": {"cap"');
+      const torn = loadAdmissionPolicy({ env });
+      expect(torn.settings.cap).toBe(3);
+      expect(torn.invalid.join('\n')).toMatch(/platform:/);
+      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 5 } }));
+      expect(loadAdmissionPolicy({ env }).settings.cap).toBe(5);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a runaway slot count is invalid, not a billion-entry scan', () => {
+    const p = resolveAdmissionPolicy({ platform: { cap: 1e9, fastSlots: 5000, fastScale: { maxSlots: 1e6 } } });
+    expect(p.settings).toMatchObject({ cap: 2, fastSlots: 1 });
+    expect(p.settings.fastScale.maxSlots).toBeNull();
+    expect(p.invalid.length).toBe(3);
+  });
+
+  it('two checkouts sharing one pool, only one carrying a heavy-admission settings file, resolve identical capacity', () => {
+    const home = join(lockRoot, 'home');
+    const prefs = join(lockRoot, 'prefs.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 2, fastSlots: 1 } }));
+    const mk = (n, heavyAdmission) => {
+      const root = join(lockRoot, 'workspace', '.lanes', 'web-everything', `lane-${n}`);
+      mkdirSync(join(root, 'scripts', 'settings'), { recursive: true });
+      if (heavyAdmission) writeFileSync(join(root, 'scripts', 'settings', 'heavy-admission.json'), JSON.stringify({ heavyAdmission }));
+      return root;
+    };
+    const env = { WE_PLATFORM_PREFERENCES: prefs };
+    const one = loadAdmissionPolicy({ env, repoRoot: mk(1), home });
+    const two = loadAdmissionPolicy({ env, repoRoot: mk(2, { cap: 4, fastSlots: 2 }), home });
+    expect(caps(two)).toEqual(caps(one));
+    expect(caps(two)).toEqual([2, 1]);
+  });
+});
+
+describe('resolveEffectiveFastSlots — the fast lane scales with short-kind demand when the resource service allows', () => {
+  const NOW = T0;
+  const fresh = (idlePct, pressureLevel = 1) => ({ sampledAt: iso(NOW - 5_000), freshUntil: iso(NOW + 25_000), cpu: { idlePct }, memory: { pressureLevel } });
+  const waiters = (files, full) => [...Array(files).fill({ kind: 'files' }), ...Array(full).fill({ kind: 'full' })];
+  const scaled = (over = {}) => ({ ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale, maxSlots: 3, ...over } });
+
+  it('no scaling by default (maxSlots null): the configured fast slots', () => {
+    expect(resolveEffectiveFastSlots({ policy: ADMISSION_POLICY_STANDARD, waiting: waiters(10, 0), snapshot: fresh(90), nowMs: NOW })).toBe(1);
+  });
+  it('scales up to maxSlots when short waiters dominate and CPU / memory allow', () => {
+    expect(resolveEffectiveFastSlots({ policy: scaled(), waiting: waiters(4, 1), snapshot: fresh(50), nowMs: NOW })).toBe(3);
+  });
+  it.each([
+    ['CPU too busy', waiters(4, 1), fresh(10)],
+    ['memory pressure', waiters(4, 1), fresh(50, 2)],
+    ['short waiters do not dominate', waiters(2, 3), fresh(50)],
+    ['too few short waiters', waiters(2, 0), fresh(50)],
+    ['no resource snapshot', waiters(4, 1), null],
+    ['a stale resource snapshot', waiters(4, 1), { ...fresh(50), freshUntil: iso(NOW - 1) }],
+  ])('stays at the configured fast slots: %s', (_why, waiting, snapshot) => {
+    expect(resolveEffectiveFastSlots({ policy: scaled(), waiting, snapshot, nowMs: NOW })).toBe(1);
+  });
+  it('resolveSlotSpan covers every slot a scaled fast lane may hand out (what status / release must scan)', () => {
+    expect(resolveSlotSpan(ADMISSION_POLICY_STANDARD)).toBe(3);
+    expect(resolveSlotSpan(scaled())).toBe(5);
+  });
+});
+
+describe('acquireSlotBlocking — a queue timeout DEFERS, never runs unslotted (admission-no-fail-open)', () => {
+  const holdLive = () => tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+  const policy = (onTimeout) => ({ settings: { ...ADMISSION_POLICY_STANDARD, onTimeout }, sources: { onTimeout: 'tool' }, invalid: [], ignored: [] });
+
+  it('a caller that can defer gets {deferred:true} at the ceiling, with a logged reason and no "proceeding unslotted"', async () => {
+    holdLive();
+    let clock = T0; const logs = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', pollMs: 1000, ceilingMs: 3000, canDefer: true, policy: policy('defer'),
+      log: (m) => logs.push(m), now: () => clock, sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: false, slot: null, timedOut: true, ceilingHit: true, deferred: true });
+    expect(logs.join('')).toMatch(/admission-deferred/);
+    expect(logs.join('')).toMatch(/onTimeout=defer \(tool\)/);
+    expect(logs.join('')).not.toMatch(/proceeding unslotted/);
+    expect(listWaiting(lockRoot)).toHaveLength(0);
+  });
+
+  it('a caller that cannot defer (no deferred handling yet) keeps WAITING past the ceiling and then gets a real slot', async () => {
+    holdLive();
+    let clock = T0; let polls = 0; const logs = [];
+    const sleep = async (ms) => { clock += ms; polls += 1; if (polls === 8) releaseOwnedSlot({ lockRoot, cap: 1, owner: 'HOLDER' }); };
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', pollMs: 1000, ceilingMs: 3000, policy: policy('defer'),
+      log: (m) => logs.push(m), now: () => clock, sleep });
+    expect(r).toMatchObject({ ok: true, slot: 0 });
+    expect(r.waitedMs).toBeGreaterThan(3000);
+    expect(logs.join('')).not.toMatch(/proceeding unslotted/);
+    expect(logs.join('')).toMatch(/still queued past the .* ceiling/);
+  });
+
+  it('onTimeout=run keeps the old fail-open, naming the setting\'s source', async () => {
+    holdLive();
+    let clock = T0; const logs = [];
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', pollMs: 1000, ceilingMs: 3000, canDefer: true, policy: policy('run'),
+      log: (m) => logs.push(m), now: () => clock, sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: false, timedOut: true, ceilingHit: true });
+    expect(r.deferred).toBeUndefined();
+    expect(logs.join('')).toMatch(/proceeding unslotted.*onTimeout=run \(tool\)/s);
+  });
+
+  it('a provably dead holder at the ceiling is RECLAIMED — a real slot, not a deferral', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0), pid: 999999 });
+    let clock = T0 + 10_000;
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', pollMs: 1000, ceilingMs: 0, canDefer: true, policy: policy('defer'),
+      now: () => clock, sleep: async (ms) => { clock += ms; } });
+    expect(r).toMatchObject({ ok: true, slot: 0 });
+  });
+
+  it('takes a demand-scaled fast slot when the resource service allows it, and release finds it', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'H0', nowMs: T0, nowIso: iso(T0), slots: [0] });
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'H1', nowMs: T0, nowIso: iso(T0), slots: [1] });
+    const scaledPolicy = { settings: { ...ADMISSION_POLICY_STANDARD, cap: 1, fastSlots: 1,
+      fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale, maxSlots: 2, minShortWaiters: 1, minShortShare: 0.5 } }, sources: {}, invalid: [], ignored: [] };
+    const snapshot = { sampledAt: iso(T0), freshUntil: iso(T0 + 30_000), cpu: { idlePct: 80 }, memory: { pressureLevel: 1 } };
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'B', kind: 'files', pollMs: 1000, ceilingMs: 60_000, canDefer: true,
+      policy: scaledPolicy, readResourceSnapshot: () => snapshot, now: () => T0, sleep: async () => { throw new Error('must not wait'); } });
+    expect(r).toMatchObject({ ok: true, slot: 2 });
+    expect(releaseOwnedSlot({ lockRoot, cap: 1, owner: 'B', fastSlots: resolveSlotSpan(scaledPolicy.settings) - 1 })).toMatchObject({ released: true, slot: 2 });
+  });
+});
+
+describe('runUnderAdmission + the CLI — a deferred admission does NOT run the command', () => {
+  it('runUnderAdmission returns ADMISSION_DEFERRED_EXIT and never execs on a deferral', async () => {
+    tryAcquireSlot({ lockRoot, cap: 1, owner: 'HOLDER', nowMs: T0, nowIso: iso(T0) });
+    let clock = T0; const calls = []; const logs = [];
+    const r = await runUnderAdmission({ lockRoot, cap: 1, owner: 'B', command: 'echo hi', ceilingMs: 3000,
+      policy: { settings: { ...ADMISSION_POLICY_STANDARD }, sources: { onTimeout: 'standard' }, invalid: [], ignored: [] },
+      exec: (cmd) => calls.push(cmd), log: (m) => logs.push(m), now: () => clock, sleep: async (ms) => { clock += ms; } });
+    expect(ADMISSION_DEFERRED_EXIT).toBe(75);
+    expect(r.exitCode).toBe(ADMISSION_DEFERRED_EXIT);
+    expect(r.admission.deferred).toBe(true);
+    expect(calls).toEqual([]);
+    expect(logs.join('')).not.toMatch(/proceeding unslotted/);
+  });
+
+  it('the `run` CLI exits 75 without running the command when the queue times out behind a live holder', () => {
+    const pool = join(lockRoot, '.lanes');
+    const root = join(pool, '.admission', 'heavy');
+    mkdirSync(root, { recursive: true });
+    tryAcquireSlot({ lockRoot: root, cap: 1, owner: 'HOLDER', nowMs: Date.now(), nowIso: new Date().toISOString() }); // this live test process
+    const r = spawnSync(process.execPath, [CLI, 'run', '--cap=1', '--ceiling-ms=1500', '--', process.execPath, '-e', 'process.stdout.write("ran")'],
+      { cwd: lockRoot, env: cliEnv(pool, { WE_HEAVY_ADMISSION_FAST_SLOTS: '0' }), encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(75);
+    expect(r.stdout).not.toMatch(/ran/);
+    expect(r.stderr).toMatch(/admission-deferred/);
+    expect(r.stderr).not.toMatch(/proceeding unslotted/);
+  }, 30_000);
+
+  it('the `acquire` CLI exits 75 on a deferral (it no longer reports success-to-proceed)', () => {
+    const pool = join(lockRoot, '.lanes');
+    const root = join(pool, '.admission', 'heavy');
+    mkdirSync(root, { recursive: true });
+    tryAcquireSlot({ lockRoot: root, cap: 1, owner: 'HOLDER', nowMs: Date.now(), nowIso: new Date().toISOString() });
+    const r = spawnSync(process.execPath, [CLI, 'acquire', '--cap=1', '--ceiling-ms=1500', '--owner=B', '--json'],
+      { cwd: lockRoot, env: cliEnv(pool, { WE_HEAVY_ADMISSION_FAST_SLOTS: '0' }), encoding: 'utf8', timeout: 30_000 });
+    expect(r.status).toBe(75);
+    expect(JSON.parse(r.stdout.trim())).toMatchObject({ ok: false, deferred: true });
+  }, 30_000);
 });
