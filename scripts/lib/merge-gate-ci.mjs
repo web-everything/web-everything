@@ -15,6 +15,10 @@
  *
  *   NEVER WEAKER THAN THE DRAIN: the operator relief valve (`--no-review-escalation`) is never applied; every
  *   unreadable input is a fail-closed, never a pass; the ledger mode is the drain's own default.
+ *
+ *   MODE (`mergeGate.mode`, shadow | enforce — bottom of this file): shadow reports every verdict exactly as
+ *   enforce but exits 0 on a HOLD. The only IO in this file is `loadMergeGateMode` and the `--run-gate` CLI the
+ *   workflow calls around merge-gate-check.mjs; everything else stays pure.
  */
 import { hasLabel, isAiGeneratedPr } from './ai-pr-authorship.mjs';
 import {
@@ -28,8 +32,13 @@ import { emptyBaselineState, recordBaseline, getBaseline, diffBaseline } from '.
 import { extractManifestFromBody } from '../readiness/lane-manifest.mjs';
 import { classifyPr, buildDrainVerdicts, drainGateInputs, isCodeQLFailed } from '../merge-ai-prs.mjs';
 import { DRAIN_GATES } from './merge-gate-inventory.mjs';
-import { placementOf } from './merge-delivery-policy.mjs';
+import { placementOf, PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
+import { readFileSync, appendFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const TRUST_LABEL = 'ready-to-merge';
 export const REQUIRED_CHECK = 'test';
@@ -330,4 +339,120 @@ export function formatPrResult(p) {
   const lines = [`#${p.num}: ${p.ok ? 'PASS' : 'HOLD'}`];
   for (const x of p.results) lines.push(`  ${x.status.padEnd(17)} ${x.id.padEnd(22)} ${x.reason}`);
   return lines.join('\n');
+}
+
+// ── mergeGate.mode: shadow | enforce ───────────────────────────────────────────────────────────────────────────
+// Operator-approved 2026-10-10: the check runs in SHADOW until a shared red-main freeze source exists (#4715,
+// card 5805). Shadow evaluates every rule exactly as enforce and reports the same table; it changes ONLY the exit
+// code of a HOLD verdict (0 instead of 1). It never changes a rule's verdict, and it never masks a run that
+// produced no verdict (a crash, a usage error, unparsable output). The ruleset step (making `merge-gate`
+// required) needs enforce.
+//
+// Resolved through the policy cascade, each layer overriding the one below (agent-memory 151):
+//   1. standard default            STANDARD_MERGE_GATE_MODE ('shadow' for now)
+//   2. platform preference         we:scripts/lib/delivery-platform-preferences.json  `mergeGate.mode`
+//   3. repo setting                declared settings (we:scripts/settings/*.json)    `mergeGate.mode`
+//   4. env                         MERGE_GATE_MODE (the workflow passes the `MERGE_GATE_MODE` repository variable)
+// FAIL CLOSED: an invalid value at any layer, or a layer that cannot be read, resolves to `enforce` — a skipped or
+// typo'd layer could be the one that said enforce, so it must never fall through to shadow.
+
+export const MERGE_GATE_MODES = Object.freeze(['shadow', 'enforce']);
+export const STANDARD_MERGE_GATE_MODE = 'shadow';
+export const MERGE_GATE_MODE_ENV = 'MERGE_GATE_MODE';
+
+/**
+ * Resolve the mode from raw layer values. `undefined`, `null` and `''` mean "layer not set". Pure.
+ * @returns {{mode:'shadow'|'enforce', source:string, invalid:string[]}}
+ */
+export function resolveMergeGateMode({ platform, repo, env, readErrors = [] } = {}) {
+  let mode = STANDARD_MERGE_GATE_MODE;
+  let source = 'standard';
+  const invalid = [...readErrors];
+  for (const [name, v] of [['platform', platform], ['repo', repo], ['env', env]]) {
+    if (v === undefined || v === null || v === '') continue;
+    if (!MERGE_GATE_MODES.includes(v)) { invalid.push(`${name}=${JSON.stringify(v)}`); continue; }
+    mode = v;
+    source = name;
+  }
+  if (invalid.length) return { mode: 'enforce', source: `fail-closed (${invalid.join('; ')})`, invalid };
+  return { mode, source, invalid };
+}
+
+/** IO: read the three configurable layers and resolve. Never throws. */
+export function loadMergeGateMode({ env = process.env, platformPath = PLATFORM_PREFERENCES_PATH, readFile = readFileSync, readDeclared = readDeclaredSettings } = {}) {
+  const readErrors = [];
+  const modeOf = (block, name) => {
+    if (block === undefined) return undefined;
+    if (block === null || typeof block !== 'object' || Array.isArray(block)) { readErrors.push(`${name} mergeGate block is not an object`); return undefined; }
+    return block.mode;
+  };
+  let platform;
+  try { platform = modeOf(JSON.parse(readFile(platformPath, 'utf8'))?.mergeGate, 'platform'); }
+  catch (e) { if (e?.code !== 'ENOENT') readErrors.push(`platform file unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
+  let repo;
+  try {
+    const { settings, errors, duplicates } = readDeclared();
+    if (errors?.length) readErrors.push(`repo settings unreadable: ${errors.map((x) => `${x.source}: ${x.error}`).join('; ')}`);
+    const dup = (duplicates || []).find((d) => /^mergeGate(\.|$)/.test(String(d?.path)));
+    if (dup) readErrors.push(`mergeGate set by more than one settings file (${(dup.sources || []).join(', ')})`);
+    repo = modeOf(settings?.mergeGate, 'repo');
+  } catch (e) { readErrors.push(`repo settings unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
+  return resolveMergeGateMode({ platform, repo, env: env?.[MERGE_GATE_MODE_ENV], readErrors });
+}
+
+/**
+ * Apply the mode to one merge-gate-check.mjs run. `report` is its parsed `--json` output (or null), `childStatus`
+ * its exit code. A verdict is trusted only when the report is well-formed AND agrees with the exit code (ok ↔ 0,
+ * hold ↔ 1); anything else is "no verdict" and its non-zero exit passes through in both modes. Pure.
+ * @returns {{exitCode:number, text:string, summary:string, holds:string[]}}
+ */
+export function applyGateMode({ mode, source, childStatus, report }) {
+  const head = `merge-gate mode: ${mode} (source: ${source})`;
+  const wellFormed = report && typeof report.ok === 'boolean' && Array.isArray(report.prs);
+  const consistent = wellFormed && ((report.ok && childStatus === 0) || (!report.ok && childStatus === 1));
+  if (!consistent) {
+    const exitCode = childStatus === 0 ? 1 : (Number.isInteger(childStatus) ? childStatus : 1);
+    const line = `merge-gate: no verdict (exit ${childStatus}, ${wellFormed ? 'verdict disagrees with exit code' : 'no parsable --json report'}) — not masked in any mode; failing closed`;
+    return { exitCode, holds: [], text: `${head}\n${line}\n`, summary: `### merge-gate\n\n${head}\n\n**${line}**\n` };
+  }
+  const table = [...report.prs.map(formatPrResult), `merge-gate: ${report.ok ? 'PASS' : 'HOLD'} — ${report.reason ?? ''}`].join('\n');
+  const holds = [...new Set(report.prs.flatMap((p) => (p.results || []).filter((x) => BLOCKING.has(x.status)).map((x) => x.id)))];
+  const shadowLine = !report.ok && mode === 'shadow' ? `SHADOW: would HOLD on ${holds.length ? holds.join(', ') : report.reason}` : null;
+  const exitCode = report.ok || shadowLine ? 0 : 1;
+  const text = `${head}\n${table}\n${shadowLine ? `${shadowLine}\n` : ''}`;
+  const summary = `### merge-gate\n\n${head}\n\n${shadowLine ? `**${shadowLine}** (shadow mode: exit 0; enforce would fail this check)\n\n` : ''}\`\`\`\n${table}\n\`\`\`\n`;
+  return { exitCode, holds, text, summary };
+}
+
+const GATE_SCRIPT = fileURLToPath(new URL('../merge-gate-check.mjs', import.meta.url));
+
+/**
+ * The workflow wrapper: `node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs <args>`.
+ * Runs exactly merge-gate-check.mjs (anything else is a usage error, exit 3) with `--json` appended, then applies
+ * the resolved mode. Returns the exit code; IO is injected.
+ */
+export function runGate({ argv = [], modeInfo, spawn = spawnSync, write = (s) => process.stdout.write(s), warn = (s) => process.stderr.write(s), appendSummary = null, cwd = process.cwd() } = {}) {
+  const i = argv.indexOf('--');
+  const [target, ...args] = i === -1 ? [] : argv.slice(i + 1);
+  if (!target || (resolve(cwd, target) !== GATE_SCRIPT && resolve(target) !== GATE_SCRIPT)) {
+    warn('merge-gate-ci --run-gate: usage: --run-gate -- scripts/merge-gate-check.mjs <args>\n');
+    return 3;
+  }
+  const child = spawn(process.execPath, [GATE_SCRIPT, ...args, '--json'], { stdio: ['ignore', 'pipe', 'inherit'], encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+  let report = null;
+  try { report = JSON.parse(String(child?.stdout ?? '')); } catch { if (child?.stdout) write(String(child.stdout)); }
+  const status = Number.isInteger(child?.status) ? child.status : 1;
+  const out = applyGateMode({ mode: modeInfo.mode, source: modeInfo.source, childStatus: status, report });
+  write(out.text);
+  if (appendSummary) { try { appendSummary(out.summary); } catch (e) { warn(`merge-gate: step summary not written: ${e?.message ?? e}\n`); } }
+  return out.exitCode;
+}
+
+const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
+if (IS_CLI && process.argv.includes('--run-gate')) {
+  const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+  process.exit(runGate({
+    argv: process.argv.slice(2), modeInfo: loadMergeGateMode(),
+    appendSummary: summaryPath ? (s) => appendFileSync(summaryPath, s) : null,
+  }));
 }
