@@ -2318,6 +2318,12 @@ export function assertMandatoryReferralsCleared(state, { repo, pr, cardReadable 
     const older = result.records.filter(r => r.head !== head && (!repo || !pr || (r.repo === repo && r.pr === Number(pr))));
     const held = older.flatMap(r => { const s = referralRecordState(r, { ...context, head: r.head, records: result.records, operatorRulings: result.operatorRulings }); return [...s.pending, ...s.blocked]; });
     if (held.length) {
+      // PR #4857 — the carry re-evaluates only the EARLIER head, so a hold the CURRENT head itself carries (a malformed
+      // or untrusted record-shaped comment, a malformed operator ruling) would never be consulted again once the
+      // carry returned. `result` was read for this head: anything it holds refuses before any evidence is carried.
+      if (result.pending.length || result.blocked.length) {
+        throw new Error(`mandatory referral hold: ${[...result.pending, ...result.blocked].join(', ')}; record finding-specific mandatory rulings before acceptance`);
+      }
       // #4708 — a head move that changed nothing (the drain's rebase; strict net diff byte-identical) carries the
       // latest earlier head's completed CLEAN review as this head's evidence. Not a pass: that head's own verdict is
       // re-evaluated live (its records, rulings and persistence check), so a hold standing on it still refuses.

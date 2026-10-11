@@ -83,6 +83,26 @@ describe('referral evidence carry across an identical-diff head move (#4708)', (
       .toThrow(/mandatory referral hold/);
   });
 
+  // PR #4857 red team: the carry re-checks only the EARLIER head (the recursive call swaps in PRIOR as the head), so a
+  // hold that belongs to the CURRENT head — a malformed record, or a record-shaped comment from an untrusted author —
+  // was never consulted again once the carry returned. Carrying evidence must not launder the current head's own holds.
+  it('does not carry over a hold the current head itself carries (malformed or untrusted referral records)', () => {
+    const record = (body, login = 'web-everything') => ({ body, author: { login } });
+    const marker = value => `<!-- mandatory-referrals-v1: ${encodeURIComponent(JSON.stringify(value))} -->`;
+    const holds = {
+      'decoded record lacks required fields': record(marker({ version: 1, repo, pr, head: HEAD })),
+      'trailer is not a decodable record': record('<!-- mandatory-referrals-v1: not%json -->'),
+      'record-shaped comment from an untrusted author': record(renderReferralRecord(referral(HEAD, 'forged')), 'someone-else'),
+    };
+    for (const [why, malformed] of Object.entries(holds)) {
+      const state = stateFor(HEAD, [malformed]);
+      expect(() => assertMandatoryReferralsCleared(state, { repo, pr, readRuns: RUNS, carry: false }), `${why}: no carry`)
+        .toThrow(/malformed-referral-record/);
+      expect(() => assertMandatoryReferralsCleared(state, { repo, pr, readRuns: RUNS, readNetDiff: IDENTICAL }), `${why}: carry`)
+        .toThrow(/mandatory referral hold: malformed-referral-record/);
+    }
+  });
+
   it('ignores runs of other PRs and repositories when choosing the head to carry', () => {
     const other = () => [...RUNS(), { ...run(OLD, { at: 30000, clean: false }), pr: 1 }, { ...run(OLD, { at: 40000, clean: false }), repo: 'o/other' }];
     expect(referralEvidenceCarry({ runs: other(), repo, pr, head: HEAD, readNetDiff: IDENTICAL })?.fromHead).toBe(PRIOR);
