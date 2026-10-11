@@ -200,18 +200,31 @@ const tally = (findings) => {
 /**
  * PURE: did the takeover `episode` reduce the open findings? Compares the last review round BEFORE it with the
  * latest review round AFTER it. Progress = fewer findings with no heavier total, or a lighter total with no more
- * findings. `{ judged:false }` when no review round landed after the takeover yet.
+ * findings. `{ judged:false, startHeads }` when no review round of the takeover's work landed yet. `startHeads` are
+ * the heads the takeover may have started from: the head the last review before it judged, and the head its marker
+ * named (a marker may name either end of a manual takeover, so neither alone is proof).
+ *
+ * Only a review of the takeover's OWN work judges it (the same anchor `takeover-review.mjs` uses): a round that lands
+ * before the takeover's first push, or that names the head reviewed before the takeover, judged the old code (a
+ * delayed review of the old head). Counting it would let a stale verdict authorize another takeover with nothing of
+ * the takeover's work reviewed.
  */
 export function takeoverProgress(comments, episode) {
   const rounds = reviewRounds(comments);
   const before = rounds.filter((r) => r.end < episode.start).at(-1) ?? null;
-  const after = rounds.filter((r) => r.at > episode.end).at(-1) ?? null;
-  if (!after) return { judged: false };
+  const startHeads = [before?.head, episode.head].filter(Boolean);
+  const push = (Array.isArray(comments) ? comments : [])
+    .filter((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)).map(timeOf)
+    .filter((t) => Number.isFinite(t) && t > episode.end).sort((x, y) => x - y)[0];
+  const anchor = Number.isFinite(push) ? push : episode.end;
+  const oldHead = before?.head ?? null;
+  const after = rounds.filter((r) => r.at > anchor && !(oldHead && sameHeadSha(r.head, oldHead))).at(-1) ?? null;
+  if (!after) return { judged: false, startHeads };
   const b = tally(before?.findings ?? []);
   const a = tally(after.findings);
   const progress = before !== null && ((a.count < b.count && a.weight <= b.weight) || (a.weight < b.weight && a.count <= b.count));
   return {
-    judged: true, progress,
+    judged: true, progress, startHeads,
     before: { head: before?.head ?? null, count: b.count, weight: b.weight },
     after: { head: after.head, count: a.count, weight: a.weight },
     remaining: a.findings,
@@ -285,16 +298,16 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
   const markerHeads = takeoverMarkers(comments).map((m) => m.head).filter(Boolean);
   if (latest) {
     const progress = takeoverProgress(comments, latest);
-    if (!progress.judged) {
-      // The latest takeover has not been judged. Still on the head it started from = it never pushed (or never ran):
-      // the old one-per-head bound. Otherwise its head is waiting for its review (`takeover-review.mjs` grants it).
-      const neverPushed = !latest.head || sameHeadSha(latest.head, head);
-      if (neverPushed) {
-        const voidLimit = takeoverVoidRefused(comments);
-        return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markerHeads, n: episodes.length, budget };
-      }
-      return { ok: false, reason: 'takeover-awaiting-review', heads: markerHeads, n: episodes.length, budget };
+    // Still on a head it may have started from = it never pushed (or never ran): the one-per-head bound, judged or
+    // not — a verdict cannot authorize a further takeover on the head the last one already had. An unknown start
+    // head (no marker head, no reviewed round before it) reads as never pushed: it fails closed.
+    const neverPushed = !progress.startHeads.length || progress.startHeads.some((h) => sameHeadSha(h, head));
+    if (neverPushed) {
+      const voidLimit = takeoverVoidRefused(comments);
+      return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markerHeads, n: episodes.length, budget };
     }
+    // It pushed and no review of its work has landed: its head is waiting for its review (`takeover-review.mjs` grants it).
+    if (!progress.judged) return { ok: false, reason: 'takeover-awaiting-review', heads: markerHeads, n: episodes.length, budget };
     if (episodes.length >= budget) return { ok: false, reason: 'takeover-budget-spent', n: episodes.length, budget, progress };
     if (!progress.progress) return { ok: false, reason: 'takeover-not-converging', n: episodes.length, budget, progress };
     return {
