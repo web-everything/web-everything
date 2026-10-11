@@ -510,11 +510,17 @@ export async function acquireWrite(root, opts = {}) {
   }
 
   const deadline = startMs + waitMs;
+  let lastHeartbeatMs = startMs;
   let lastBlockers = [];
   let reportedBlocked = false;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     const nowMsN = now();
+    // live 2026-10-11 rebuild-job livelock: keep the reservation live through a long drain.
+    if (nowMsN - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+      heartbeat(writerRoot, WRITER_KEY, owner, new Date(nowMsN).toISOString(), pid);
+      lastHeartbeatMs = nowMsN;
+    }
     const blockers = [];
     for (const entry of listReaderEntries(readersRoot)) {
       if (entry.owner === owner) continue;
