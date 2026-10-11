@@ -2,7 +2,7 @@
 // Root cause: the codex sandbox has no network, the brief tells the agent to `gh pr view` the reviewer's finding, and the
 // launcher never supplied it -> codex answered "the finding was omitted", committed nothing, exit 0 "no-change". The claim
 // was never released, the dead runner kept a fixer-cap slot, and the gate kept borrowing for the same PR forever.
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,12 @@ import { countLiveFixSessions, createDispatchThrottle, isBorrowedRunnerDead } fr
 import {
   acquireFixDispatchClaim, readFixDispatchClaim, refreshLiveFixDispatchClaims, releaseSessionFixDispatchClaims, stampBorrowedRunnerPid,
 } from '../../conveyor/fix-dispatch-claim.mjs';
+
+// x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
+// cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
+beforeEach(() => { vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); });
+afterEach(() => vi.unstubAllEnvs());
+
 
 const PR = { title: 'T', body: 'B', comments: [
   { createdAt: '2026-01-01T00:00:00Z', body: '🔁 review — changes requested\nOLD ask' },
