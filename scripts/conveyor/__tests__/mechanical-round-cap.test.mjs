@@ -15,7 +15,7 @@ import { renderConvertedAdvisoryNote, REVIEW_PR_CHANNEL } from '../../lib/review
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
 import { takeoverReviewGrant, OPERATOR_TAKEOVER_PREFIX } from '../takeover-review.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile, REFUSAL_KINDS } from '../reconcile-core.mjs';
 
 const BOT = { login: 'web-everything' };
 const PRIOR = 'a'.repeat(40);  // the head the mechanical round merged main into
@@ -105,6 +105,8 @@ describe('mechanical round vs the review round cap', () => {
     const p = plan(pr([...spent.slice(0, 5), acceptOn(PRIOR, 6), rearm(7), mechMarker(8)], { mechanicalRound: facts({ netDiffIdentical: true }) }));
     expect(row(p)).toBeUndefined();
     expect(refusal(p)).toMatchObject({ kind: 'mechanical-carry-forward', mechanicalRound: { action: 'carry', verdict: 'accept' } });
+    // Registered, so formatReport prints it and land-advance's reconcileHolds keeps it (both key on REFUSAL_KINDS).
+    expect(REFUSAL_KINDS).toContain(refusal(p).kind);
     expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
   });
   it('identical net diff after a changes verdict carries the bounce: still capped, no review', () => {
@@ -465,6 +467,104 @@ describe('readMechanicalRoundFacts (real git)', () => {
       r.write('c.txt', 'more\n'); r.g('add', 'c.txt'); r.g('commit', '-qm', 'more');
       expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec: r.exec }))
         .toMatchObject({ proven: false, reason: 'not-a-merge' });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  // The merged parent must already be on the PR's base: a merge of anything else is new code, not a catch-up.
+  it('a merged parent that is not on the base (a side branch merged in) is refused', () => {
+    const r = repo();
+    try {
+      r.g('checkout', '-qb', 'side', 'main~1'); r.write('d.txt', 'side\n'); r.g('add', 'd.txt'); r.g('commit', '-qm', 'side work');
+      r.g('checkout', '-q', 'lane/x'); r.g('merge', '-q', '--no-edit', 'side');
+      const f = readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec: r.exec });
+      expect(f).toMatchObject({ proven: false, reason: 'merged-parent-not-on-base', priorHead: r.g('rev-parse', 'HEAD^1') });
+      expect(f.changedFiles).toBeUndefined();
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('a merged parent outside the PR\'s own base branch is refused, though it is on main', () => {
+    const r = repo();
+    try {
+      // `release` forks before main moves, so the commit the lane merged (main's tip) is on main but not on release.
+      r.g('branch', 'release', 'main~1');
+      const pr = (baseRefName) => ({ headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName });
+      expect(readMechanicalRoundFacts({ pr: pr('release'), exec: r.exec })).toMatchObject({ proven: false, reason: 'merged-parent-not-on-base' });
+      expect(readMechanicalRoundFacts({ pr: pr('main'), exec: r.exec })).toMatchObject({ proven: true }); // control
+      // No baseRefName on the PR: the default branch passed in is the base, so the same rule holds there.
+      expect(readMechanicalRoundFacts({ pr: { ...pr('main'), baseRefName: undefined }, defaultBranch: 'release', exec: r.exec }))
+        .toMatchObject({ proven: false, reason: 'merged-parent-not-on-base' });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+
+  // Ref names reach git argv; one outside the safe pattern is refused before ANY git call runs.
+  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main x', 'main`id`', "ma'in", 'mäin'];
+  it.each(UNSAFE)('an unsafe base ref %j is refused with no git call', (bad) => {
+    let calls = 0;
+    const exec = () => { calls++; return ''; };
+    expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: 'lane/x', baseRefName: bad }, exec }))
+      .toMatchObject({ proven: false, reason: 'unsafe-ref' });
+    expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: 'lane/x' }, defaultBranch: bad, exec }))
+      .toMatchObject({ proven: false, reason: 'unsafe-ref' });
+    expect(calls).toBe(0);
+  });
+  it.each(UNSAFE)('an unsafe head ref %j is refused with no git call', (bad) => {
+    let calls = 0;
+    const exec = () => { calls++; return ''; };
+    expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: bad, baseRefName: 'main' }, exec }))
+      .toMatchObject({ proven: false, reason: 'unsafe-ref' });
+    expect(calls).toBe(0);
+  });
+  it('a head that is not a full sha is refused before any git call', () => {
+    let calls = 0;
+    const exec = () => { calls++; return ''; };
+    for (const headRefOid of [undefined, '', 'b'.repeat(39), `-${'b'.repeat(39)}`, 'HEAD', `${HEAD}b`, `${'b'.repeat(20)} ${'b'.repeat(19)}`]) {
+      expect(readMechanicalRoundFacts({ pr: { headRefOid, headRefName: 'lane/x', baseRefName: 'main' }, exec }), String(headRefOid))
+        .toMatchObject({ proven: false, reason: 'no-head' });
+    }
+    expect(calls).toBe(0);
+  });
+
+  // A git read that fails never proves a round mechanical (fail closed); only the fetch may fail, as it falls back to
+  // the cached refs the reads then probe.
+  it('every git call failing is git-read-failed, never proven', () => {
+    const exec = () => { throw new Error('fatal: not a git repository\nmore'); };
+    expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+      .toMatchObject({ proven: false, reason: 'git-read-failed', error: 'fatal: not a git repository' });
+  });
+  it.each(['rev-list', 'diff'])('a failed `git %s` on a real conflict-resolution merge is git-read-failed, never proven', (cmd) => {
+    const r = repo();
+    try {
+      const exec = (c, args, opts) => { if (args[0] === cmd) throw new Error(`${cmd} died`); return r.exec(c, args, opts); };
+      expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+        .toMatchObject({ proven: false, reason: 'git-read-failed', error: `${cmd} died` });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('a failed `git merge-base` read is refused, never proven', () => {
+    const r = repo();
+    try {
+      const exec = (c, args, opts) => { if (args[0] === 'merge-base') throw new Error('merge-base died'); return r.exec(c, args, opts); };
+      expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+        .toMatchObject({ proven: false });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('empty git output (a read that returned nothing) is not proven', () => {
+    expect(readMechanicalRoundFacts({ pr: { headRefOid: HEAD, headRefName: 'lane/x', baseRefName: 'main' }, exec: () => undefined }))
+      .toMatchObject({ proven: false, reason: 'not-a-merge' });
+  });
+  it('a failed fetch alone falls back to the cached refs and still proves a real conflict-resolution merge', () => {
+    const r = repo();
+    try {
+      const exec = (c, args, opts) => { if (args[0] === 'fetch') throw new Error('network down'); return r.exec(c, args, opts); };
+      r.g('fetch', '-q', 'origin', '+main:refs/remotes/origin/main');
+      expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+        .toMatchObject({ proven: true, changedFiles: ['a.txt'] });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('a failed fetch with no cached base ref is refused, never proven', () => {
+    const r = repo();
+    try {
+      const exec = (c, args, opts) => { if (args[0] === 'fetch') throw new Error('network down'); return r.exec(c, args, opts); };
+      expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+        .toMatchObject({ proven: false });
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
 });
