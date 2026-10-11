@@ -243,6 +243,8 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   // are resolved BEFORE "main gained no code" may answer: a docs-only main move must not excuse a PR whose settings
   // change is read by the gate.
   const isSettings = (f) => isResolvableSettingsFile(f, settingsPolicy);
+  const settingsCount = new Set([...mainCode0, ...prRaw].filter(isSettings)).size;
+  if (settingsCount > MAX_SETTINGS_FILES) return done(true, [`too-many-settings-files:${settingsCount}`]);
   const keysBySide = { pr: new Set(), main: new Set() };
   const readersBySide = { pr: [], main: [] };
   for (const { side, files } of [{ side: 'main', files: mainCode0 }, { side: 'pr', files: prRaw }]) {
@@ -432,7 +434,11 @@ export const MAX_SETTINGS_READERS = 200;
 export const MAX_SETTINGS_KEYS = 40;
 const DATA_HIT_RE = /\.(?:json|jsonl|snap|md|markdown|txt|csv|svg|html?|css|lock)$/i; // cannot read a setting: text or data
 const YAML_RE = /\.ya?ml$/i;
-const escapeEre = (s) => String(s).replace(/[.+?^${}()|[\]\\*]/g, '\\$&');
+/** A settings key or file name that may be put into a search pattern: plain identifier characters only. */
+const SAFE_SEARCH_TERM_RE = /^[A-Za-z0-9_$][A-Za-z0-9_$.-]*$/;
+/** More changed non-gate settings files than this on both sides together ⇒ not resolved one by one (a search per key each); re-test. */
+export const MAX_SETTINGS_FILES = 20;
+const escapeEre =(s) => String(s).replace(/[.+?^${}()|[\]\\*]/g, '\\$&');
 
 /**
  * IO. The readers of one changed settings file, across the trees at `shas` (the main tip and the PR head: together
@@ -440,10 +446,14 @@ const escapeEre = (s) => String(s).replace(/[.+?^${}()|[\]\\*]/g, '\\$&');
  * `{readers, keys, gateReader}` or `{why}` when it cannot be resolved (→ the rule re-tests).
  *   - keys: the top-level keys whose value differs between the versions (a `$comment…` key is documentation, not a setting);
  *   - readers: the SOURCE files under SETTINGS_READER_DIRS naming the file (its base name) or a changed key as a whole
- *     word (`git grep -w`-like, deliberately wide: a destructured `{ key }` still counts), other settings files excluded;
+ *     word (`git grep -w`-like, deliberately wide: a destructured `{ key }` still counts), other settings files excluded.
+ *     Every changed key needs a reader of its OWN (one search per key): a file that only names the settings file, or
+ *     another key's reader, is still a reader but resolves no key;
  *   - gateReader: the first hit that is the gate itself (a gate YAML counts).
+ * A key or file name that is not a plain identifier/file name is never spliced into a search pattern: re-test.
+ * `deadline` (epoch ms) bounds the total search time: past it the answer is unresolved.
  */
-export function readSettingsReaders({ git, file, shas, policy = DEFAULT_SETTINGS_POLICY }) {
+export function readSettingsReaders({ git, file, shas, policy = DEFAULT_SETTINGS_POLICY, deadline }) {
   const versions = [];
   for (const sha of [...new Set(shas)]) {
     let text;
@@ -460,6 +470,10 @@ export function readSettingsReaders({ git, file, shas, policy = DEFAULT_SETTINGS
   const keys = all.filter((k) => new Set(versions.map((v) => JSON.stringify(v[k]))).size > 1);
   const name = file.slice(file.lastIndexOf('/') + 1);
   if (keys.length > MAX_SETTINGS_KEYS) return { why: `too many changed keys (${keys.length})` };
+  // A key comes from PR-authored JSON and a name from a PR path: spliced into `git grep -E -e <pattern>`, a newline
+  // would split it into a second alternate that any harmless file matches (resolving an orphan key). Plain names only.
+  const unsafe = [name, ...keys].find((s) => !SAFE_SEARCH_TERM_RE.test(s));
+  if (unsafe !== undefined) return { why: `unsafe name ${JSON.stringify(unsafe).slice(0, 60)}` };
   // One search per pattern, so a hit is attributed to the key it names: a key with no reader of its own cannot hide
   // behind another key's reader, or behind a file that merely names the settings file.
   const namePattern = `(^|[^A-Za-z0-9_.-])${escapeEre(name)}`;
@@ -467,6 +481,7 @@ export function readSettingsReaders({ git, file, shas, policy = DEFAULT_SETTINGS
   const grepHits = (pattern) => {
     const hits = new Set();
     for (const sha of [...new Set(shas)]) {
+      if (deadline !== undefined && Date.now() > deadline) return { why: 'graph-budget-exceeded' }; // one spawn per key per side: bounded by the PR's graph budget
       let outText;
       try {
         outText = String(git(['grep', '-l', '-z', '-I', '-E', '-e', pattern, sha, '--', ...SETTINGS_READER_DIRS]));
@@ -591,7 +606,7 @@ export function readAffectedFacts({ root = process.cwd(), num = null, headSha, t
     };
     const settingsMemo = new Map(); // one resolution per settings file: it reads both trees, whichever side changed it
     const settingsReadersOf = (_side, file) => {
-      if (!settingsMemo.has(file)) settingsMemo.set(file, readSettingsReaders({ git, file, shas: [tipSha, headSha], policy }));
+      if (!settingsMemo.has(file)) settingsMemo.set(file, readSettingsReaders({ git, file, shas: [tipSha, headSha], policy, deadline }));
       return settingsMemo.get(file);
     };
     const verdict = decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf, importersOf, settingsReadersOf, settingsPolicy: policy });

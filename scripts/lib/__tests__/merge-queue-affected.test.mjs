@@ -8,7 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { decideAffected as decideAffectedRule, readAffectedFacts, isGateFile, DEFAULT_RETEST_MODE, MAX_GRAPH_FILES, MAX_CLOSURE_FILES,
-  resolveSettingsPolicy, readSettingsReaders, logPolicyOnce, MAX_SETTINGS_KEYS, MAX_SETTINGS_READERS, SETTINGS_DIRECTORY_CONSUMERS, SETTINGS_READER_MODE_ENV, SETTINGS_GATE_FILES_ENV, DEFAULT_SETTINGS_GATE_FILES } from '../merge-queue-affected.mjs';
+  resolveSettingsPolicy, readSettingsReaders, logPolicyOnce, MAX_SETTINGS_KEYS, MAX_SETTINGS_READERS, MAX_SETTINGS_FILES, SETTINGS_DIRECTORY_CONSUMERS, SETTINGS_READER_MODE_ENV, SETTINGS_GATE_FILES_ENV, DEFAULT_SETTINGS_GATE_FILES } from '../merge-queue-affected.mjs';
 import { relativeSpecifierBases, resolvedImportsOf, specifierBasesResolvingTo } from '../related-test-selection.mjs';
 
 /** The rule with no unchanged importers anywhere (the forward-walk cases below); a case that needs some passes `importersOf`. */
@@ -852,6 +852,33 @@ describe('declared settings: only the gate\'s own settings are the gate; the res
         const { git } = fakeGit(treesFor({}, { [MIXED]: wide }));
         expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: `too many changed keys (${MAX_SETTINGS_KEYS + 1})` });
       });
+      it('a key that is not a plain identifier is never spliced into a search: a newline cannot add a second alternate that resolves an orphan', () => {
+        const sneaky = 'orphanKey\nbystander';
+        const { git, calls } = fakeGit(treesFor({}, { [MIXED]: JSON.stringify({ [sneaky]: 1 }), 'scripts/lib/harmless.mjs': 'const bystander = 1;' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] }).why).toMatch(/^unsafe name /);
+        expect(calls.filter((c) => c.startsWith('grep'))).toEqual([]); // nothing was searched
+        expect(resolve(git).affected).toBe(true);
+        for (const bad of ['a b', 'a|b', '-x', '', 'a\rb', 'é']) {
+          const { git: g } = fakeGit(treesFor({}, { [MIXED]: JSON.stringify({ [bad]: 1 }), 'scripts/lib/harmless.mjs': 's.x' }));
+          expect(readSettingsReaders({ git: g, file: MIXED, shas: [TIP, HEAD] }).why, JSON.stringify(bad)).toMatch(/^unsafe name /);
+        }
+        const { git: g2 } = fakeGit(treesFor({}, { 'scripts/settings/we ird.json': '{"k":1}' }));
+        expect(readSettingsReaders({ git: g2, file: 'scripts/settings/we ird.json', shas: [TIP, HEAD] }).why).toMatch(/^unsafe name /);
+      });
+      it('the search is bounded: past the graph deadline it is unresolved, and a pile of settings files is not resolved one by one', () => {
+        const { git, calls } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD], deadline: Date.now() - 1 })).toEqual({ why: 'graph-budget-exceeded' });
+        expect(calls.filter((c) => c.startsWith('grep'))).toEqual([]);
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD], deadline: Date.now() + 60_000 }).readers).toEqual(['scripts/lib/x.mjs']);
+        const files = Array.from({ length: MAX_SETTINGS_FILES + 1 }, (_, i) => `scripts/settings/f${i}.json`);
+        const boom = () => { throw new Error('no resolution expected'); };
+        expect(decideAffected({ prFiles: ['scripts/other/a.mjs'], mainFiles: files, importsOf: none, settingsReadersOf: boom }).reasons[0]).toBe(`too-many-settings-files:${MAX_SETTINGS_FILES + 1}`);
+        expect(decideAffected({ prFiles: files.slice(0, MAX_SETTINGS_FILES), mainFiles: ['scripts/other/a.mjs'], importsOf: none, settingsReadersOf: () => ({ readers: [], keys: [] }) }).reasons[0]).not.toMatch(/^too-many-settings-files/);
+      });
+      it('the loader consumer list names real files, the first being where the whole-folder loader lives', () => {
+        for (const f of SETTINGS_DIRECTORY_CONSUMERS) expect(() => readFileSync(join(SETTINGS_DIR, '..', '..', f), 'utf8'), f).not.toThrow();
+        expect(readFileSync(join(SETTINGS_DIR, '..', '..', SETTINGS_DIRECTORY_CONSUMERS[0]), 'utf8')).toMatch(/export function readDeclaredSettings/);
+      });
       it('a shell script reading the setting re-tests (non-source reader)', () => {
         const { git } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', 'scripts/run.sh': 'jq .k scripts/settings/mixed.json' }));
         expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: 'non-source reader scripts/run.sh' });
@@ -886,7 +913,7 @@ describe('declared settings: only the gate\'s own settings are the gate; the res
         const pure = decideAffected({ prFiles: [MIXED], mainFiles: ['docs/b.md'], importsOf: none, settingsReadersOf: () => ({ readers: [], keys: ['gatedKey'], gateReader: 'scripts/merge-ai-prs.mjs' }) });
         expect(pure.reasons[0]).toBe(`gate-touched:${MIXED} (read by scripts/merge-ai-prs.mjs)`);
       });
-      it('a docs-only main move with an unread PR settings change stays unaffected, and a PR with no settings reads no graph', () => {
+      it('a docs-only main move with a PR settings change no gate reads stays unaffected, and a PR with no settings reads no graph', () => {
         const { git } = fakeGit(treesFor({ [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }, {}));
         const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: [MIXED], mainFiles: ['docs/b.md'], git, settingsPolicy: POLICY });
         expect(r).toMatchObject({ affected: false });
