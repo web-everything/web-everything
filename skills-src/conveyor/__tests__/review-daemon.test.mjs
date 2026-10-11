@@ -48,6 +48,10 @@ const noPrepReview = () => null;
 // #3383 bug 1 — wired into withSelfSync's `hasStaleRefusal` option in main(); tested here in isolation
 // (pure, no IO) against the exact shapes `runReviewTickAllRepos` returns (`failed[]` per-PR, `repos[].error`
 // whole-repo).
+/** The `review-status:*` writes only (the same writer also keeps the one `status:*` label, pr-status-label.mjs). */
+const reviewStatusCalls = (calls) => calls.filter((c) => !(String(c.spec?.add ?? '').startsWith('status:')
+  || (!c.spec?.add && (c.spec?.remove ?? []).length && c.spec.remove.every((r) => r.startsWith('status:')))));
+
 describe('hasStaleMainRefusal', () => {
   const staleMessage = () => {
     let message = null;
@@ -267,7 +271,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     });
     expect(out.reviewsOwed).toBe(0);
     expect(out.dispatched).toEqual([]);
-    expect(setLabelsCalls).toEqual([
+    expect(reviewStatusCalls(setLabelsCalls)).toEqual([
       { repo: 'web-everything/web-everything', pr: 2711, spec: { add: undefined, remove: ['review-status:reviewing'] } },
     ]);
   });
@@ -306,7 +310,7 @@ describe('runReviewTick — the per-tick sequence', () => {
     });
     expect(out.reviewsOwed).toBe(0);
     expect(out.dispatched).toEqual([]);
-    expect(setLabelsCalls).toEqual([
+    expect(reviewStatusCalls(setLabelsCalls)).toEqual([
       { repo: 'web-everything/web-everything', pr: 2742, spec: { add: undefined, remove: ['review-status:fixing'] } },
     ]);
   });
@@ -334,7 +338,7 @@ describe('runReviewTick — the per-tick sequence', () => {
       dispatch: () => { throw new Error('runReviewTick never dispatches a ci-heal itself'); },
       tagRound: () => { throw new Error('no round tag on a non-review dispatch'); },
     });
-    expect(setLabelsCalls).toEqual([
+    expect(reviewStatusCalls(setLabelsCalls)).toEqual([
       { repo: 'web-everything/web-everything', pr: 2742, spec: { add: 'review-status:healing-ci', remove: ['review-status:fixing'] } },
     ]);
   });
@@ -364,7 +368,7 @@ describe('runReviewTick — the per-tick sequence', () => {
       tagRound: () => { throw new Error('no round tag on a non-dispatched PR'); },
     });
     expect(out.dispatched).toEqual([]);
-    expect(setLabelsCalls).toEqual([
+    expect(reviewStatusCalls(setLabelsCalls)).toEqual([
       { repo: 'web-everything/web-everything', pr: 3001, spec: { add: 'review-status:awaiting-ci', remove: [] } },
     ]);
   });
