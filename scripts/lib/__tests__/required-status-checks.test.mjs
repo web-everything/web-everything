@@ -275,18 +275,58 @@ describe('defaultReadRequiredStatusChecks', () => {
   });
   afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it('reads rules first and never reads protection after a nonempty result', () => {
-    const gh = vi.fn(() => JSON.stringify([requiredRule('test', 'smoke', 'test')]));
-    expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', branch: 'release', gh })).toEqual(['test', 'smoke']);
-    expect(gh.mock.calls).toEqual([[['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/release?per_page=100']]]);
+  // GitHub enforces rulesets AND classic protection together, so the required set is their union (PR #4924).
+  const bothSources = (rules, protection) => vi.fn(args => {
+    const reply = args.some(a => a.includes('/rules/')) ? rules : protection;
+    if (reply instanceof Error) throw reply;
+    return reply;
+  });
+  const NOT_PROTECTED = new Error('gh: Branch not protected (HTTP 404)');
+
+  it('unions ruleset and classic-protection checks: a classic-only check is never dropped', () => {
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke', 'test')]]), '["test","classic-only"]');
+    expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', branch: 'release', gh })).toEqual(['smoke', 'test', 'classic-only']);
+    expect(gh.mock.calls).toEqual([
+      [['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/release?per_page=100']],
+      [['api', 'repos/owner/repo/branches/release/protection', '--jq', '.required_status_checks.contexts']],
+    ]);
+  });
+
+  it.each([
+    ['no classic protection on the branch', NOT_PROTECTED],
+    ['classic protection unreadable by this token', new Error('HTTP 403: Resource not accessible by integration')],
+  ])('keeps the ruleset set alone when %s', (_label, protectionError) => {
+    const gh = bothSources(JSON.stringify([[requiredRule('test', 'smoke', 'test')]]), protectionError);
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['test', 'smoke']);
+  });
+
+  it.each([
+    ['a transient failure', new Error('HTTP 502')],
+    ['a rate-limit 403', new Error('HTTP 403: API rate limit exceeded')],
+    ['a blank body', ''],
+    ['a non-array body', '{"message":"x"}'],
+  ])('a nonempty ruleset never stands alone as live when classic protection hits %s', (_label, protection) => {
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke')]]), protection);
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('keeps an expired live cache when rules succeed but classic protection fails transiently', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['smoke', 'classic-only'] });
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke')]]), new Error('HTTP 502'));
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    })).toMatchObject({ checks: ['smoke', 'classic-only'], source: 'stale-cache' });
   });
 
   it('reads EVERY rules page: a required check on page two is not dropped', () => {
     const page1 = [requiredRule('test'), ...Array.from({ length: 29 }, () => ({ type: 'deletion' }))];
     const page2 = [requiredRule('security-scan')];
-    const gh = vi.fn(() => JSON.stringify([page1, page2])); // `gh api --paginate --slurp` prints one array of pages
+    // `gh api --paginate --slurp` prints one array of pages
+    const gh = bothSources(JSON.stringify([page1, page2]), NOT_PROTECTED);
     expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', gh })).toEqual(['test', 'security-scan']);
-    expect(gh.mock.calls).toEqual([[['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/main?per_page=100']]]);
+    expect(gh.mock.calls[0]).toEqual([['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/main?per_page=100']]);
   });
 
   it('treats a blank rules response as a failed read, never as "no rules"', () => {
@@ -349,14 +389,14 @@ describe('defaultReadRequiredStatusChecks', () => {
     const cachePath = join(dir, 'cache.json');
     const repo = 'web-everything/web-everything';
     getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['old-check'] });
-    const gh = vi.fn(() => JSON.stringify([requiredRule(...FALLBACK_REQUIRED_STATUS_CHECKS)]));
+    const gh = bothSources(JSON.stringify([[requiredRule(...FALLBACK_REQUIRED_STATUS_CHECKS)]]), NOT_PROTECTED);
     expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
       readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
     })).toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live' });
     expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
       checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live', fetchedAtMs: 90_000_000,
     });
-    expect(gh).toHaveBeenCalledTimes(1);
+    expect(gh).toHaveBeenCalledTimes(2);
   });
 
   it('propagates a transient rules failure even when classic protection succeeds', () => {
@@ -391,14 +431,17 @@ describe('defaultReadRequiredStatusChecks', () => {
     vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads'); // github.auth=app keeps the route off unless 'reads' is listed
     vi.stubEnv('GH_TOKEN', 'ghs_test_fixture');
     execFileSync.mockReturnValueOnce('ghp_test_fixture');
-    spawnSync.mockImplementationOnce((_bin, _args, opts) => {
+    const routed = (_bin, args, opts) => {
       expect(opts.env.GH_TOKEN === 'ghp_test_fixture').toBe(true);
       expect(opts.timeout).toBe(15_000);
-      return { status: 0, stdout: Buffer.from(JSON.stringify([requiredRule('personal-check')])), stderr: Buffer.alloc(0) };
-    });
-    expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check']);
+      const body = args.some(a => a.includes('/rules/')) ? [[requiredRule('personal-check')]] : ['classic-check'];
+      return { status: 0, stdout: Buffer.from(JSON.stringify(body)), stderr: Buffer.alloc(0) };
+    };
+    spawnSync.mockImplementationOnce(routed).mockImplementationOnce(routed);
+    expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check', 'classic-check']);
     expect(execFileSync).toHaveBeenCalledWith('gh', ['auth', 'token'], expect.any(Object));
     expect(spawnSync.mock.calls[0][1]).toEqual(['api', '--paginate', '--slurp', 'repos/web-everything/web-everything/rules/branches/main?per_page=100']);
+    expect(spawnSync.mock.calls[1][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts']);
     expect(process.env.GH_TOKEN === 'ghs_test_fixture').toBe(true);
   });
 

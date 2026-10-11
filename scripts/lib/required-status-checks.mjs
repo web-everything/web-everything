@@ -11,8 +11,8 @@
  * list — an advisory workflow's mere EXISTENCE was enough to cause a false red, and the same will be true of
  * the NEXT one someone adds, forever, unless something closes the gap structurally.
  *
- * THE FIX: invert the question. Read branch rulesets first (App-token readable), then classic branch
- * protection, to learn which checks are ACTUALLY required to merge. Asking "did a REQUIRED check fail"
+ * THE FIX: invert the question. Read branch rulesets (App-token readable) AND classic branch protection, and
+ * take their union — GitHub enforces both — to learn which checks are ACTUALLY required to merge. Asking "did a REQUIRED check fail"
  * cannot be fooled by a new advisory check: it only counts once explicitly required by repository policy.
  *
  * THIS FILE OWNS THE IO (`gh api …`, cached to a sidecar file — same convention as `we:scripts/progress-
@@ -132,17 +132,19 @@ function readRequiredChecksGh(args) {
  */
 export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = readRequiredChecksGh } = {}) {
   const base = `repos/${repo || '{owner}/{repo}'}`;
+  let rulesChecks = [];
   let rulesError;
   try {
     // The rules endpoint pages at 30: read every page (`--slurp` → one array of pages) so a required check on a
     // later page is never dropped. A blank body is a failed read, not "no rules" (JSON.parse('') throws).
     const out = gh(['api', '--paginate', '--slurp', `${base}/rules/branches/${branch}?per_page=100`]);
-    const checks = requiredChecksFromRules(flattenRulePages(JSON.parse(out.trim())));
-    if (checks.length) return checks;
+    rulesChecks = requiredChecksFromRules(flattenRulePages(JSON.parse(out.trim())));
   } catch (error) {
     rulesError = error;
   }
 
+  // GitHub enforces rulesets AND classic protection together, so classic protection is always read too and the
+  // required set is their UNION — a check only classic protection requires must never be dropped (PR #4924).
   let checks;
   try {
     const out = gh(['api', `${base}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts']);
@@ -150,9 +152,14 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
     checks = parsed.map(String);
   } catch (error) {
+    // Rules read fine: a protection DENIAL (no classic protection on the branch — 404 — or a token that cannot
+    // read it — 403) leaves the ruleset set as the whole answer. Any other protection failure throws, so a
+    // ruleset-only partial set is never reported live; the caller's stale-cache handling keeps the last real set.
+    if (!rulesError && rulesChecks.length && protectionAccessDenied(error)) return rulesChecks;
     // A transient rules failure must not become a denial just because protection is inaccessible.
     throw rulesError && !protectionAccessDenied(rulesError) ? rulesError : error;
   }
+  if (!rulesError) return [...new Set([...rulesChecks, ...checks])];
   // Rulesets can require checks classic protection lacks, so a partial classic set after a TRANSIENT rules
   // failure must not be returned as live: throw so the caller's stale-cache handling keeps the last real set.
   // Only a rules ACCESS denial lets a non-empty classic set stand (the rules API is simply unreadable here).
