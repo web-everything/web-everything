@@ -110,7 +110,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { parseOperatorRulingComment, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
-import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
+import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
@@ -1989,8 +1989,39 @@ export function planReconcile({
       // The PR's own gate holds it (a stacked base not merged yet, a review:human hold, a hold-gate check) and no
       // defect is open: that is the gate working, not a defect — no takeover and no "a person must take it over".
       if (takeover?.reason === 'gate-hold') {
+        // Live #4764: spent repair rounds still owe a current advisory, or a visible operator handoff.
+        const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+        const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
+        const latest = headSha ? latestAdvisory(trustedComments) : undefined;
+        const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
+        const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
+          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+        if (takeover.hold === 'review-human-hold' && headSha && !advisoryIsCurrent && !alreadyReviewed) {
+          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
+          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
+          dispatch.push({
+            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments),
+            advisoryReview: { head: headSha, reason: 'gate-hold-advisory' },
+            why: `the repair rounds are spent (${extra.attempts}/${extra.cap}), but an advisory review is not a repair round;`
+              + ` the newest advisory is on \`${latest?.head ?? 'none'}\`, not the live head \`${headSha}\`,`
+              + ' so one advisory review runs on the live head so the operator has a current advisory',
+          });
+          return;
+        }
         refuseFn('gate-hold', { ...extra, takeover: 'gate-hold', hold: takeover.hold,
           why: `held by its own gate (${takeover.hold}) with no open defect finding — the gate is doing its job; no takeover` });
+        const reason = takeover.hold !== 'review-human-hold'
+          ? `a person must resolve the gate dependency (${takeover.hold}) before this PR can advance`
+          : advisoryIsCurrent
+            ? `the advisory on the live head \`${headSha.slice(0, 9)}\` is in — a person must rule (review it, or send it back with a ruling)`
+            : alreadyReviewed
+              ? `the live head \`${headSha.slice(0, 9)}\` was already reviewed but has no current trusted advisory — a person must check the review and supply a ruling`
+              : 'the live head is unavailable — a person must check the PR before an advisory can run';
+        notes.push({
+          kind: 'gate-hold-needs-operator', prNumber, hold: takeover.hold,
+          attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind, head: headSha,
+          text: `PR #${prNumber}: held by its own gate (${takeover.hold}) at the repair cap (${extra.attempts}/${extra.cap}, ${extra.capKind}); ${reason}`,
+        });
         return;
       }
       // The latest takeover pushed and no review has judged its head yet: its one review is owed (the grant above
