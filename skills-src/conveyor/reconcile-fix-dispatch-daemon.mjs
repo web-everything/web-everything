@@ -53,20 +53,24 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runReconcileFixDispatch } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
+import { runReconcileFixDispatch, writePrivateBorrowedPrompt, roundEscalationFor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
 import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
 import { runFixerStuckReclaimPass, formatFixerStuckReclaimLines } from '../../scripts/conveyor/fixer-stuck-reclaim.mjs'; // card xccgzu5
-import { runReconcileCiHealDispatch } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
+import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operations/ci-heal-pr-dispatch.mjs';
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
-import { createFixBorrowGate } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
+import { createDispatchSinks, defaultClaudeProvider } from '../../scripts/operations/dispatch-lane-io.mjs';
+import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
+import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
+import { unlinkSync } from 'node:fs';
+import { createFixBorrowGate, resolveFixExecutorSetting, chooseFixExecutor, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
-import { fixLauncherAvailable } from '../../scripts/operations/dispatch-providers/fix.mjs';
+import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
 import { refreshLiveFixDispatchClaims } from '../../scripts/conveyor/fix-dispatch-claim.mjs'; // dup-heal-dispatch
 import { planNoteComment, postNoteComment } from '../../scripts/conveyor/reconcile-note-comment.mjs'; // #4191
@@ -735,10 +739,34 @@ export async function runTickAllRepos({
     listBuildClaims: () => listBuildDispatchClaims(), listFixClaims: () => listFixDispatchClaims(undefined, { liveOnly: true }),
     launcherAvailable: (executor) => fixLauncherAvailable(executor),
   }) : null;
+  const executorSetting = resolveFixExecutorSetting();
+  const fixSettings = resolveFixSettings();
+  const fixExecutorRoute = (planned) => chooseFixExecutor({
+    setting: executorSetting, ...planned, round: planned.round ?? (Number(planned.attempts) || 0) + 1,
+    mainFix: planned.mainFix || planned.kind === 'main-fix',
+    strongerModel: planned.strongerModel || !!roundEscalationFor(planned, { fixSettings }),
+    launcherAvailable: fixLauncherAvailable('codex'),
+  });
+  const routedCiHealTick = (options) => {
+    let entries = [];
+    return runReconcileCiHealDispatch({ ...options,
+      reconcile: (input) => {
+        const plan = runReconcilePass(input);
+        entries = plan.dispatch ?? [];
+        return plan;
+      },
+      dispatch: createRoutedCiHealDispatch({ dispatch: dispatchCiHeal,
+        route: (planned) => fixExecutorRoute({ ...entries.find((e) => e.kind === 'ci-heal' && e.prNumber === planned.pr), ...planned }),
+        createSinks: createDispatchSinks, launchCodex: fixDetachedProvider, launchClaude: defaultClaudeProvider,
+        writePrompt: writePrivateBorrowedPrompt, removePrompt: (file) => { try { unlinkSync(file); } catch {} },
+        profileFor: repoProfile,
+      }),
+    });
+  };
   const fix = timed('fix', () => (authGate.paused ? pausedDispatchResult()
-    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate }) })));
+    : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate, fixExecutorRoute }) })));
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
-    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission, dispatchThrottle }) })));
+    : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { tick: routedCiHealTick, queueAdmission, dispatchThrottle }) })));
   if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = timed('hung-ci', () => runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) }));
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see

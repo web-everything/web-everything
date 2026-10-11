@@ -114,7 +114,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
-import { BORROW_REASON } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, chooseFixExecutor, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -1281,6 +1281,9 @@ export function dispatchFix(planned, {
   // Card 87 — `{executor, reason}` when this fix runs in a borrowed builder slot: recorded on the claim, and a
   // non-Claude executor launches through the fix run script instead of `claude --bg` (same brief, same review).
   borrowed = null,
+  fixExecutorRoute = null,
+  executorDecision = null,
+  stampExecutor = stampFixExecutor,
   spawnBorrowed = (request) => fixDetachedProvider(request),
   // Stamp the runner pid onto the claim so a dead borrowed fix stops counting against the cap (see `stampBorrowedRunnerPid`).
   stampRunner = stampBorrowedRunnerPid,
@@ -1357,6 +1360,9 @@ export function dispatchFix(planned, {
       pr: planned.pr, itemNum: planned.itemNum, lane: planned.lane,
     };
   }
+  const decision = borrowed ? { ...borrowed, source: 'borrow' } : executorDecision ?? fixExecutorRoute?.({
+    ...planned, round: roundOf(planned), strongerModel: !!roundEscalationFor(planned, { fixSettings, loadLadder }),
+  }) ?? chooseFixExecutor({ setting: { value: 'provider-routing', source: 'default' } });
   const claim = acquireClaim({
     repo, pr: planned.pr, kind: 'fix', headSha: planned.headRefOid, scope: planned.overlapScope ?? planned.scope, owner: claimOwner, lockRoot: claimRoot,
     ...(borrowed ? { borrowed } : {}),
@@ -1423,8 +1429,10 @@ export function dispatchFix(planned, {
     if (planned.rulingNotAddressed?.rung) {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ruling-not-addressed rung ${planned.rulingNotAddressed.rung.at} (${planned.rulingNotAddressed.rung.id}) model=${ladderTable?.model ?? 'default-fix-route'}`);
     }
-    if (borrowed && borrowed.executor !== 'claude') {
-      // Card 87 — the borrowed slot belongs to a non-Claude executor: same claim and brief, other launcher.
+    console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
+    if (!borrowed && decision.executor === 'codex') stampExecutor({ repo, pr: planned.pr, owner: claimOwner, lockRoot: claimRoot, decision });
+    if (decision.executor !== 'claude') {
+      // Routed and borrowed non-Claude repairs share the same claim/brief/launcher path.
       const promptFile = writeBorrowedPrompt(sessionSlug, withPlannedContext(prompt, planned));
       let handle;
       try {
@@ -1433,7 +1441,7 @@ export function dispatchFix(planned, {
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
-          policyRoute: { provider: borrowed.executor === 'codex' ? 'codex' : 'antigravity-claude' },
+          policyRoute: { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });
       } catch (e) {
         removePromptFile(promptFile); // the launcher never started, so nothing else will delete the brief
@@ -1694,6 +1702,7 @@ export function runReconcileFixDispatch({
   dispatchThrottle = null,
   // Card 87 — `createFixBorrowGate`: a fix held ONLY by the fixer cap may borrow a free builder slot. null = never.
   borrowGate = null,
+  fixExecutorRoute = null,
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
@@ -1858,9 +1867,10 @@ export function runReconcileFixDispatch({
     // OTHER planned entry in this tick, including unrelated ordinary dispatches that would have succeeded)
     // rather than refusing just this one entry — the same per-entry isolation `dispatch(...)` below already
     // gets, now extended to cover this earlier call site too.
+    const executorDecision = !borrowed && fixExecutorRoute ? fixExecutorRoute({ ...entry, round: roundOf(entry) }) : null;
     let resumeAttempt = null;
     // A resume continues an existing Claude session and claim; a borrowed fix always starts fresh so its claim records the slot.
-    if (entry.isConflict && !borrowed && !entry.restack) {
+    if (entry.isConflict && !borrowed && executorDecision?.executor !== 'codex' && !entry.restack) {
       let attempt;
       try {
         attempt = tryResume(entry, { root, repo: repoKey });
@@ -1869,6 +1879,7 @@ export function runReconcileFixDispatch({
         continue;
       }
       if (attempt.resumed) {
+        console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
         continue; // no lane ever popped for this entry
       }
@@ -1877,7 +1888,7 @@ export function runReconcileFixDispatch({
     // Card xrbu1bp — round N>1 of an ordinary fix: resume the previous round's own session first (lane-free, like the
     // conflict resume above). A declined or failed resume falls through to the cold start with the history brief; a
     // throw here never aborts the pass, it only means a cold start.
-    if (tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
+    if (executorDecision?.executor !== 'codex' && tryResumeRound && !entry.isConflict && !borrowed && !entry.restack && !entry.takeover && roundOf(entry) >= 2) {
       let attempt = null;
       try {
         attempt = tryResumeRound(entry, { root, repo: repoKey });
@@ -1885,6 +1896,7 @@ export function runReconcileFixDispatch({
         attempt = { resumed: false, resumeAttempt: { attempted: false, roundResume: true, refused: 'error', why: describeDispatchFailure(e) } };
       }
       if (attempt?.resumed) {
+        console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${formatFixExecutorLog(executorDecision ?? { executor: 'claude', reason: 'resuming existing session', source: 'default' })}`);
         dispatched.push(attempt.result);
         continue; // no lane ever popped for this entry
       }
@@ -1900,7 +1912,7 @@ export function runReconcileFixDispatch({
     }
     const lane = lanes.shift();
     try {
-      const result = dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(borrowed ? { borrowed } : {}) });
+      const result = dispatch({ ...entry, lane }, { root, repo: repoKey, extraArgs: agentArgsFromEnv(), resumeAttempt, ...(executorDecision ? { executorDecision } : {}), ...(borrowed ? { borrowed } : {}) });
       if (result?.held) {
         // #x0jphk5 — a `(repo, pr, headRefOid)` claim already held elsewhere: nothing was spawned, so the lane
         // this iteration popped went unused — return it to the pool for the NEXT entry, exactly as a
