@@ -1,11 +1,17 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import os from 'node:os';
+import { admit, shadowAdmission } from '../../lib/resource-admission.mjs';
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { runBounded } from '../../lib/bounded-child.mjs';
 import { RUNNER_LOCK_ROOT } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { runLoadFlakeReverify, planLoadFlakeReverify, defaultReverifyIo, reverifyConfig, VERIFY_ENV_ALLOWLIST } from '../load-flake-reverify.mjs';
 import { buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+// Pass-through spies: the suite never observes or writes the host's resource state unless a test stubs a decision.
+vi.mock('../../lib/resource-admission.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, admit: vi.fn(actual.admit), shadowAdmission: vi.fn(actual.shadowAdmission) };
+});
 const now = Date.parse('2026-10-04T22:00:00Z');
 const comment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: { login: 'web-everything' } });
 const hold = comment(buildLoadFlakeHoldComment({ head: 'aaa1111', alt: 'lane/fix-alt', altSha: 'bbb2222' }));
@@ -489,5 +495,46 @@ describe('resource-admission cut-over (x9xkupj)', () => {
     expect(out?.verdict).toBe(expected);
     expect(shadow).toHaveBeenCalledTimes(1);
     if (mode === 'shadow') expect(admitFn).not.toHaveBeenCalled();
+  });
+  // The pass must outlive a broken admission probe: throw / nothing / a malformed answer all leave the legacy load rule,
+  // and the result carries no `admission` summary (there was no decision to summarise).
+  it.each([
+    ['throws', () => { throw new Error('probe exploded'); }],
+    ['answers undefined', () => undefined],
+    ['answers null', () => null],
+    ['answers a verdict-less object', () => ({ reason: 'no verdict' })],
+    ['answers a non-string verdict', () => ({ verdict: true })],
+  ])('falls back to the legacy load rule when the admission probe %s', async (_name, probe) => {
+    const config = reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'local' });
+    const noisy = fixture(); noisy.io.loadavg = () => [20, 20]; noisy.io.admission = vi.fn(probe);
+    const deferred = await runLoadFlakeReverify({ config }, noisy.io);
+    expect(deferred).toMatchObject({ deferred: 'host-load', load: [20, 20] });
+    expect(deferred).not.toHaveProperty('admission');
+    expect(noisy.io.admission).toHaveBeenCalledTimes(1);
+    expect(noisy.io.acquire).not.toHaveBeenCalled();
+    const quiet = fixture(); quiet.io.loadavg = () => [1, 1]; quiet.io.admission = vi.fn(probe);
+    expect(await runLoadFlakeReverify({ config }, quiet.io)).toMatchObject({ result: 'pushed' });
+  });
+});
+
+// defaultReverifyIo().admission: the shadow call's own decision when shadowing is on; a direct admit() when it is off.
+describe('defaultReverifyIo admission decision source (x9xkupj)', () => {
+  const decision = (verdict) => ({ kind: 'load-flake-rearm', verdict, reason: 'stub', snapshotAge: 1, unknown: false });
+  const args = () => ({ load: [50, 50], cores: 12, config: reverifyConfig({}) });
+  afterEach(() => { vi.unstubAllEnvs(); vi.mocked(admit).mockReset(); vi.mocked(shadowAdmission).mockReset(); });
+  it('WE_RESOURCE_SHADOW=off: shadowAdmission answers nothing, so the decision comes from admit()', () => {
+    vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
+    vi.mocked(shadowAdmission).mockReturnValue(undefined);
+    vi.mocked(admit).mockReturnValue(decision('admit'));
+    expect(defaultReverifyIo().admission(args())).toEqual(decision('admit'));
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledWith({ kind: 'load-flake-rearm' });
+  });
+  it('shadowing on: the shadow decision is used and admit() is not called again', () => {
+    vi.mocked(shadowAdmission).mockReturnValue(decision('wait'));
+    expect(defaultReverifyIo().admission(args())).toEqual(decision('wait'));
+    expect(admit).not.toHaveBeenCalled();
+    expect(shadowAdmission).toHaveBeenCalledWith(expect.objectContaining({
+      gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: 'hold' }));
   });
 });

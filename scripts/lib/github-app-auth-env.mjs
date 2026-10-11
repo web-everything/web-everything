@@ -34,10 +34,11 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync, accessSync, readdir
 import { createHash } from 'node:crypto';
 import { dirname, basename, join } from 'node:path';
 import { homedir } from 'node:os';
-import { mintInstallationToken, getInstallationInfo } from './github-app-token.mjs';
+import { mintInstallationToken, getInstallationInfo, readPrivateKeyRef, canReadPrivateKeyRef } from './github-app-token.mjs';
+import { readDeliveryIdentity, resolveRequestedRole, buildIdentityChain, ROLE_ENV, LEGACY_ROLE } from './github-app-identity.mjs';
 import { readGithubAuthPolicy } from './github-auth-policy.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
-import { installationMap, installationForOwner, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
+import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
 
 /**
  * What the fleet's `gh` calls actually need, as GitHub App permission levels. Live-caught 2026-09-23: the
@@ -228,6 +229,9 @@ export function readGithubAppCallerStatuses({ dir = defaultCallerStatusDir(), no
   return out.sort((a, b) => Date.parse(b.checkedAt) - Date.parse(a.checkedAt));
 }
 
+/** Marks an outcome recorded in the caller file only (never the shared status file). */
+const LOCAL_RESULT = Symbol('local-result');
+
 const warnedOnce = new Set();
 /** Log `msg` once per process per key — the per-tick refresh must stay loud without flooding a daemon log. */
 function warnOnce(log, key, msg) {
@@ -364,6 +368,12 @@ export async function ensureFreshGithubAppEnv({
   callerStatusDir = join(dirname(statusPath), 'callers'),
   // A test that injected `writeStatus` never wrote the real home dir; keep it that way for the per-caller file.
   writeCallerStatus = writeStatus === writeStatusFile ? writeStatusFile : () => {},
+  // Per-role identity (we:scripts/lib/github-app-identity.mjs): the role this process plays (else WE_GITHUB_APP_ROLE,
+  // else the caller map, else worker) and the resolved delivery.identity setting (else read live).
+  role: roleOpt,
+  identity: identityOpt,
+  readKeyRef = readPrivateKeyRef,
+  canReadKeyRef = mint === mintInstallationToken ? (ref) => canReadPrivateKeyRef(ref) : () => true,
 } = {}) {
   const recordCaller = (result, extra = {}) => {
     writeCallerStatus(callerStatusFile(callerStatusDir, caller), { caller, daemon, ...result, ...extra, checkedAt: new Date(now).toISOString() });
@@ -391,6 +401,151 @@ export async function ensureFreshGithubAppEnv({
     return record({ applied: false, reason: 'policy-personal' }, { shared: false });
   }
 
+  // PER-ROLE IDENTITY (we:scripts/lib/github-app-identity.mjs). With no role configured the chain is only today's
+  // App and everything below behaves exactly as before. Once ANY role is configured, this process's role App is
+  // tried first, then the worker App, then today's App, and every step down is logged and recorded loudly (the
+  // github-app-config smell reads the caller file) — never a silent fallback.
+  const identity = identityOpt ?? readDeliveryIdentity({ env });
+  const requested = resolveRequestedRole({ role: roleOpt, env, caller, callerRoles: identity.callerRoles });
+  const chain = buildIdentityChain({ requestedRole: requested.role, identity, env, cachePath });
+  if (chain.loud) env[ROLE_ENV] = requested.role; // the gh shim and every child process pick the App by it
+  const fallbackFrom = [];
+  const label = (role) => (role === LEGACY_ROLE ? "today's App" : `the ${role} App`);
+  const withRole = (result, role) => {
+    if (!chain.loud) return result;
+    const fellBack = role !== requested.role;
+    if (fellBack) {
+      warnOnce(log, `role-fallback:${caller}:${role}:${JSON.stringify(fallbackFrom)}:${result.applied}`,
+        `github-app-auth-env: WARNING — ${caller} plays the ${requested.role} role, but ${fallbackFrom.map((f) => `${label(f.role)} (${f.reason})`).join(', ')} is not usable — FALLING BACK to ${label(role)}${result.applied ? '' : ', which did not apply either'}. Fill in or fix delivery.identity.${requested.role} (scripts/settings/delivery-identity.json).`);
+    }
+    return { ...result, role, requestedRole: requested.role, ...(fellBack ? { fallback: true, fallbackFrom: [...fallbackFrom] } : {}) };
+  };
+  const legacyRecord = (result, opts) => record(withRole(result, LEGACY_ROLE), opts);
+
+  // ONE App, end to end: cached-or-minted token, access check, per-owner caches, then GH_TOKEN or the shim.
+  // Returns the outcome WITHOUT recording it; the caller records (today's App) or falls through (a role App).
+  const attempt = async ({ appId, installationId, privateKeyPath, keyRef, installations, cachePath: candCache, required: candRequired }) => {
+    const config = { appId, installationId, privateKeyPath };
+    const keyOpts = keyRef?.keychain ? { readKey: () => readKeyRef(keyRef) } : {};
+    let cached = readCache(candCache);
+    let source = 'cache';
+    if (!isCacheFresh(cached, now) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
+      source = 'mint';
+      if (!(keyRef?.keychain ? canReadKeyRef(keyRef) : canReadKey(config.privateKeyPath))) {
+        const keyDiag = { state: 'half', missing: [], keyUnreadable: true };
+        warnOnce(log, `half:${caller}::true`, formatGithubAppConfigWarning(keyDiag, { caller, daemon }));
+        return { applied: false, reason: 'half-configured', missing: [], keyUnreadable: true, [LOCAL_RESULT]: true };
+      }
+      let minted;
+      try {
+        minted = await mint({ appId: config.appId, installationId: config.installationId, privateKeyPath: config.privateKeyPath, now, ...keyOpts });
+      } catch (e) {
+        // Never echo a partial token or the private key path's contents — only the API's own error message,
+        // already scrubbed of secrets by github-app-token.mjs's own mint failure path.
+        log.error?.(`github-app-auth-env: mint failed (falling back to personal auth): ${String((e && e.message) || e)}`);
+        return ({ applied: false, reason: 'mint-failed' });
+      }
+
+      // Read `repository_selection` off the installation resource itself FIRST (never subject to the listing
+      // endpoint's own lag — see this function's own docblock). A failure here is not fatal by itself: it just
+      // means we don't yet know whether this is an 'all' installation, so we fall through to the enumeration
+      // check exactly as before.
+      let repositorySelection = null;
+      try {
+        ({ repositorySelection } = await getInstallationInfoFn({ appId: config.appId, installationId: config.installationId, privateKeyPath: config.privateKeyPath, now, ...keyOpts }));
+      } catch (e) {
+        log.error?.(`github-app-auth-env: could not read the installation's repository_selection (falling back to enumeration): ${String((e && e.message) || e)}`);
+      }
+
+      // `repositorySelection === 'all'` needs no enumeration at all — every repo is covered by definition, and
+      // `listRepos` is never even called (never subject to its own lag). Anything else falls back to the
+      // enumeration this function has always done.
+      let repos = [];
+      let listFailed = false;
+      if (repositorySelection !== 'all') {
+        try {
+          repos = await listRepos(minted.token);
+        } catch (e) {
+          listFailed = true;
+          log.error?.(`github-app-auth-env: could not list the installation's repositories: ${String((e && e.message) || e)}`);
+        }
+      }
+
+      // A verification failure is never reported as "every repo is missing" — that would mislead an operator
+      // into granting access that was never actually absent. It is its own, distinct outcome (live-caught
+      // 2026-09-26): we know the mint itself succeeded (this token IS good), we simply could not confirm repo
+      // access one way or the other this tick — `repositorySelection` came back unknown/not-'all', AND the one
+      // remaining source of truth (enumeration) also failed — so the next tick tries again rather than trusting
+      // an empty `repos` list as a confirmed gap.
+      if (repositorySelection !== 'all' && listFailed) {
+        log.error?.('github-app-auth-env: could not verify the App installation\'s repository access this tick — NOT applying it, staying on personal auth. Retrying next tick.');
+        return ({ applied: false, reason: 'access-check-failed' });
+      }
+
+      // An installation covers ONE owner, so it is only required to cover the constellation repos that owner holds.
+      const ownRepos = REQUIRED_APP_REPOS.filter((r) => installations[String(ownerOfSlug(r) ?? '').toLowerCase()] === String(config.installationId));
+      const requiredBase = required ?? (candRequired ? { permissions: candRequired } : undefined);
+      const requiredForThis = requiredBase?.repos ? requiredBase : { ...(requiredBase ?? {}), repos: ownRepos.length ? ownRepos : REQUIRED_APP_REPOS };
+      const { missingPermissions, missingRepos } = findInstallationGaps({ permissions: minted.permissions, repos, repositorySelection }, requiredForThis);
+      if (missingPermissions.length || missingRepos.length) {
+        log.error?.(
+          'github-app-auth-env: App installation is missing access the fleet needs — NOT applying it, staying on personal auth. '
+          + (missingPermissions.length ? `Grant repository permissions: ${missingPermissions.join(', ')}. ` : '')
+          + (missingRepos.length ? `Add repositories to the installation: ${missingRepos.join(', ')}.` : ''),
+        );
+        return ({ applied: false, reason: 'insufficient-access', missingPermissions, missingRepos });
+      }
+      cached = { v: CACHE_VERSION, appId: config.appId, installationId: config.installationId, token: minted.token, expiresAt: minted.expiresAt };
+      writeCache(candCache, cached);
+    }
+
+    // Per-installation caches: the daemon's own GH_TOKEN covers ONE owner, so also keep a fresh token for EVERY
+    // mapped installation in its own cache file, which the gh shim picks by the target repo's owner.
+    // Best-effort: a failure here never affects the primary token applied below.
+    if (extraInstallations && !perOwner && Object.values(installations).includes(String(config.installationId))) {
+      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts });
+    }
+
+    // MULTI-REPO CALLERS (the drain sweeps web-everything + frontier-ui + plateauapp in one process): one pinned
+    // `GH_TOKEN` belongs to ONE org's installation, so every `--repo` outside that org failed with "Could not
+    // resolve to a Repository" and the whole pass died (live 2026-10-03 23:17Z). With `perOwner`, GH_TOKEN is NOT
+    // set; every owner's token is kept fresh in its own cache (above) and `gh` is routed through the shim, which
+    // picks the token by each call's target repo owner and falls back to personal auth, with a warning, for an
+    // owner that has no installation.
+    if (perOwner) {
+      if (!Object.values(installations).includes(String(config.installationId))) {
+        log.error?.('github-app-auth-env: this installation is not in the owner map - per-owner routing needs it; staying on personal auth.');
+        return ({ applied: false, reason: 'owner-map-missing' });
+      }
+      // The per-owner caches must be fresh for EVERY owner even when the primary came from the cache.
+      await ensurePerInstallationCaches({ config, primary: cached, env, cachePath: candCache, now, readCache, writeCache, mint, log, installations, mintExtra: keyOpts });
+      let shim;
+      try { shim = await installShim(env, { cachePath, identity }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
+      if (!shim || !shim.ok) {
+        log.error?.(`github-app-auth-env: could not install the per-owner gh shim (${shim && shim.reason}) - staying on personal auth.`);
+        return ({ applied: false, reason: 'shim-failed' });
+      }
+      return ({ applied: true, reason: 'ok', perOwner: true });
+    }
+
+    setEnv(cached.token);
+    // Bind provenance to the credential actually applied; inherited metadata cannot label a fallback token.
+    env.WE_GH_AUTH_SOURCE = source;
+    env.WE_GH_AUTH_INSTALLATION = String(cached.installationId);
+    env.WE_GH_AUTH_TOKEN_HASH = createHash('sha256').update(cached.token).digest('hex');
+    return ({ applied: true, reason: 'ok' });
+  };
+
+  for (const { candidate: cand, skip } of chain.steps) {
+    if (skip) { fallbackFrom.push(skip); continue; }
+    const readable = cand.keyRef.file ? canReadKey(cand.keyRef.file) : canReadKeyRef(cand.keyRef);
+    if (!readable) { fallbackFrom.push({ role: cand.role, reason: 'key-unreadable' }); continue; }
+    const { [LOCAL_RESULT]: _local, ...r } = await attempt(cand);
+    // A role App's outcome goes to the caller file only: the shared status file reports today's installation.
+    if (r.applied) return record(withRole({ ...r, appId: cand.appId }, cand.role), { shared: false });
+    fallbackFrom.push({ role: cand.role, reason: r.reason, ...(r.missingPermissions?.length ? { missingPermissions: r.missingPermissions } : {}) });
+  }
+
   // A HALF-configured App (some of the three vars set, or the key unreadable) is a misconfiguration, not an
   // opt-out: warn loudly and record it, so the health smell names the daemon. Still falls back (fail-safe).
   // Missing vars are checked every call; key readability only when a mint actually needs the key (below) — a
@@ -400,7 +555,7 @@ export async function ensureFreshGithubAppEnv({
     warnOnce(log, `half:${caller}:${diag.missing.join(',')}:${diag.keyUnreadable}`, formatGithubAppConfigWarning(diag, { caller, daemon }));
     // Caller file only: the shared status file reports the INSTALLATION (bad-credentials reads `applied:false`
     // there), and this is a fact about one process's env, not about the installation.
-    return record({ applied: false, reason: 'half-configured', missing: diag.missing, keyUnreadable: diag.keyUnreadable }, { shared: false });
+    return legacyRecord({ applied: false, reason: 'half-configured', missing: diag.missing, keyUnreadable: diag.keyUnreadable }, { shared: false });
   }
 
   const config = resolveGithubAppEnvConfig(env);
@@ -409,127 +564,24 @@ export async function ensureFreshGithubAppEnv({
     // see `record` — but its own caller file says so, and the smell reads that).
     if (daemon) {
       warnOnce(log, `absent:${caller}`, formatGithubAppConfigWarning(diag, { caller, daemon }));
-      recordCaller({ applied: false, reason: 'not-configured' });
-      return { applied: false, reason: 'not-configured' };
+      const out = withRole({ applied: false, reason: 'not-configured' }, LEGACY_ROLE);
+      recordCaller(out);
+      return out;
     }
-    return record({ applied: false, reason: 'not-configured' });
+    return legacyRecord({ applied: false, reason: 'not-configured' });
   }
 
-  let cached = readCache(cachePath);
-  let source = 'cache';
-  if (!isCacheFresh(cached, now) || typeof cached.token !== 'string' || !cached.token || cached.installationId !== config.installationId || cached.appId !== config.appId) {
-    source = 'mint';
-    if (!canReadKey(config.privateKeyPath)) {
-      const keyDiag = { state: 'half', missing: [], keyUnreadable: true };
-      warnOnce(log, `half:${caller}::true`, formatGithubAppConfigWarning(keyDiag, { caller, daemon }));
-      return record({ applied: false, reason: 'half-configured', missing: [], keyUnreadable: true }, { shared: false });
-    }
-    let minted;
-    try {
-      minted = await mint({ appId: config.appId, installationId: config.installationId, privateKeyPath: config.privateKeyPath, now });
-    } catch (e) {
-      // Never echo a partial token or the private key path's contents — only the API's own error message,
-      // already scrubbed of secrets by github-app-token.mjs's own mint failure path.
-      log.error?.(`github-app-auth-env: mint failed (falling back to personal auth): ${String((e && e.message) || e)}`);
-      return record({ applied: false, reason: 'mint-failed' });
-    }
-
-    // Read `repository_selection` off the installation resource itself FIRST (never subject to the listing
-    // endpoint's own lag — see this function's own docblock). A failure here is not fatal by itself: it just
-    // means we don't yet know whether this is an 'all' installation, so we fall through to the enumeration
-    // check exactly as before.
-    let repositorySelection = null;
-    try {
-      ({ repositorySelection } = await getInstallationInfoFn({ appId: config.appId, installationId: config.installationId, privateKeyPath: config.privateKeyPath, now }));
-    } catch (e) {
-      log.error?.(`github-app-auth-env: could not read the installation's repository_selection (falling back to enumeration): ${String((e && e.message) || e)}`);
-    }
-
-    // `repositorySelection === 'all'` needs no enumeration at all — every repo is covered by definition, and
-    // `listRepos` is never even called (never subject to its own lag). Anything else falls back to the
-    // enumeration this function has always done.
-    let repos = [];
-    let listFailed = false;
-    if (repositorySelection !== 'all') {
-      try {
-        repos = await listRepos(minted.token);
-      } catch (e) {
-        listFailed = true;
-        log.error?.(`github-app-auth-env: could not list the installation's repositories: ${String((e && e.message) || e)}`);
-      }
-    }
-
-    // A verification failure is never reported as "every repo is missing" — that would mislead an operator
-    // into granting access that was never actually absent. It is its own, distinct outcome (live-caught
-    // 2026-09-26): we know the mint itself succeeded (this token IS good), we simply could not confirm repo
-    // access one way or the other this tick — `repositorySelection` came back unknown/not-'all', AND the one
-    // remaining source of truth (enumeration) also failed — so the next tick tries again rather than trusting
-    // an empty `repos` list as a confirmed gap.
-    if (repositorySelection !== 'all' && listFailed) {
-      log.error?.('github-app-auth-env: could not verify the App installation\'s repository access this tick — NOT applying it, staying on personal auth. Retrying next tick.');
-      return record({ applied: false, reason: 'access-check-failed' });
-    }
-
-    // An installation covers ONE owner, so it is only required to cover the constellation repos that owner holds.
-    const ownRepos = REQUIRED_APP_REPOS.filter((r) => installationForOwner(ownerOfSlug(r), env) === String(config.installationId));
-    const requiredForThis = required?.repos ? required : { ...(required ?? {}), repos: ownRepos.length ? ownRepos : REQUIRED_APP_REPOS };
-    const { missingPermissions, missingRepos } = findInstallationGaps({ permissions: minted.permissions, repos, repositorySelection }, requiredForThis);
-    if (missingPermissions.length || missingRepos.length) {
-      log.error?.(
-        'github-app-auth-env: App installation is missing access the fleet needs — NOT applying it, staying on personal auth. '
-        + (missingPermissions.length ? `Grant repository permissions: ${missingPermissions.join(', ')}. ` : '')
-        + (missingRepos.length ? `Add repositories to the installation: ${missingRepos.join(', ')}.` : ''),
-      );
-      return record({ applied: false, reason: 'insufficient-access', missingPermissions, missingRepos });
-    }
-    cached = { v: CACHE_VERSION, appId: config.appId, installationId: config.installationId, token: minted.token, expiresAt: minted.expiresAt };
-    writeCache(cachePath, cached);
-  }
-
-  // Per-installation caches: the daemon's own GH_TOKEN covers ONE owner, so also keep a fresh token for EVERY
-  // mapped installation in its own cache file, which the gh shim picks by the target repo's owner.
-  // Best-effort: a failure here never affects the primary token applied below.
-  if (extraInstallations && !perOwner && Object.values(installationMap(env)).includes(String(config.installationId))) {
-    await ensurePerInstallationCaches({ config, primary: cached, env, cachePath, now, readCache, writeCache, mint, log });
-  }
-
-  // MULTI-REPO CALLERS (the drain sweeps web-everything + frontier-ui + plateauapp in one process): one pinned
-  // `GH_TOKEN` belongs to ONE org's installation, so every `--repo` outside that org failed with "Could not
-  // resolve to a Repository" and the whole pass died (live 2026-10-03 23:17Z). With `perOwner`, GH_TOKEN is NOT
-  // set; every owner's token is kept fresh in its own cache (above) and `gh` is routed through the shim, which
-  // picks the token by each call's target repo owner and falls back to personal auth, with a warning, for an
-  // owner that has no installation.
-  if (perOwner) {
-    if (!Object.values(installationMap(env)).includes(String(config.installationId))) {
-      log.error?.('github-app-auth-env: this installation is not in the owner map - per-owner routing needs it; staying on personal auth.');
-      return record({ applied: false, reason: 'owner-map-missing' });
-    }
-    // The per-owner caches must be fresh for EVERY owner even when the primary came from the cache.
-    await ensurePerInstallationCaches({ config, primary: cached, env, cachePath, now, readCache, writeCache, mint, log });
-    let shim;
-    try { shim = await installShim(env, { cachePath }); } catch (e) { shim = { ok: false, reason: String((e && e.message) || e) }; }
-    if (!shim || !shim.ok) {
-      log.error?.(`github-app-auth-env: could not install the per-owner gh shim (${shim && shim.reason}) - staying on personal auth.`);
-      return record({ applied: false, reason: 'shim-failed' });
-    }
-    return record({ applied: true, reason: 'ok', perOwner: true });
-  }
-
-  setEnv(cached.token);
-  // Bind provenance to the credential actually applied; inherited metadata cannot label a fallback token.
-  env.WE_GH_AUTH_SOURCE = source;
-  env.WE_GH_AUTH_INSTALLATION = String(cached.installationId);
-  env.WE_GH_AUTH_TOKEN_HASH = createHash('sha256').update(cached.token).digest('hex');
-  return record({ applied: true, reason: 'ok' });
+  const { [LOCAL_RESULT]: local, ...outcome } = await attempt(chain.candidates.at(-1));
+  return legacyRecord(outcome, { shared: !local });
 }
 
 /**
  * Default per-owner routing: write this checkout's `gh` shim and prepend its dir to `env.PATH` (idempotent).
  * Dynamic import: `gh-app-shim.mjs` imports this module.
  */
-async function defaultInstallOwnerShim(env, { cachePath }) {
+async function defaultInstallOwnerShim(env, { cachePath, identity }) {
   const { buildGhShimSettingsEnv } = await import('./gh-app-shim.mjs');
-  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath });
+  const settings = buildGhShimSettingsEnv({ env, pathEnv: env.PATH || '', cachePath, identity });
   if (!settings || !settings.PATH) return { ok: false, reason: 'no-real-gh-or-write-failed' };
   const dir = settings.PATH.split(':')[0];
   if (!(env.PATH || '').split(':').includes(dir)) env.PATH = settings.PATH;
@@ -555,9 +607,9 @@ async function defaultInstallOwnerShim(env, { cachePath }) {
  * Keep one fresh token cache per mapped installation (`web-everything.<installationId>.json` beside the legacy
  * cache). The primary installation's already-fresh token is reused, not re-minted. Never throws.
  */
-export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log }) {
+export async function ensurePerInstallationCaches({ config, primary, env, cachePath, now, readCache, writeCache, mint, log, installations = installationMap(env), mintExtra = {} }) {
   const done = {};
-  const entries = Object.entries(installationMap(env));
+  const entries = Object.entries(installations);
   for (const [owner, installationId] of entries) {
     if (done[installationId]) continue;
     done[installationId] = true;
@@ -569,7 +621,7 @@ export async function ensurePerInstallationCaches({ config, primary, env, cacheP
       }
       const have = readCache(path);
       if (isCacheFresh(have, now) && have.token && String(have.installationId) === String(installationId) && have.appId === config.appId) continue;
-      const minted = await mint({ appId: config.appId, installationId, privateKeyPath: config.privateKeyPath, now });
+      const minted = await mint({ appId: config.appId, installationId, privateKeyPath: config.privateKeyPath, now, ...mintExtra });
       writeCache(path, { v: CACHE_VERSION, appId: config.appId, installationId: String(installationId), token: minted.token, expiresAt: minted.expiresAt });
     } catch (e) {
       log.error?.(`github-app-auth-env: could not refresh the token cache for owner ${owner} (installation ${installationId}); that owner falls back to personal auth: ${String((e && e.message) || e)}`);

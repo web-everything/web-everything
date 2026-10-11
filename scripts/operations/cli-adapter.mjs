@@ -50,6 +50,7 @@ import { describeSubmit, extractSubmitResult } from './open-pr.mjs';
 import { advance, runStatus, startRun } from './engine.mjs';
 import { applyPendingEffects, inFlightEntries } from './effect-executor.mjs';
 import { normalizeJudgeTelemetry, totalJudgeSpend, withStepFinish, withStepStart } from './run-record.mjs';
+import { planJudgeBatch, runJudgeBatch, sameJudgeRequest } from './parallel-judges.mjs';
 import { isReadOnlyOperation, validateInput } from './registry.mjs';
 import { assertNoForbiddenArgv, EFFORT_LEVELS, judgeSpawn } from '../lib/judge-spawn.mjs';
 // #xqa9ttq — `requireAllProperties` comes from `codex-judge-spawn.mjs`, NOT `../lib/jury-core.mjs`, and that
@@ -780,7 +781,7 @@ function judgeTelemetryFrom(outcome, effective) {
  *   process streams.
  */
 export function createDefaultJudge({
-  provider, providerName: factoryProviderName, cwd, model, operation = 'judge', resolveProvider = resolveJudgeProvider,
+  provider, providerName: factoryProviderName, cwd: factoryCwd, model, operation = 'judge', resolveProvider = resolveJudgeProvider,
   checkProviderHold = defaultProviderQuotaHold,
   now = () => Date.now(),
   logGracefulOutcome = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
@@ -789,7 +790,10 @@ export function createDefaultJudge({
   seatRunner = async (...args) => (await import('./review-seat-runner.mjs')).runSeatWithProvider(...args),
 } = {}) {
   const providerName = factoryProviderName ?? 'claude';
-  const judge = async (request) => {
+  // `opts.cwd` — a seat given a lane of its OWN by a concurrent batch (`./parallel-judges.mjs`) runs there instead of
+  // in the factory's lane. Absent, the factory's `cwd` applies exactly as before.
+  const judge = async (request, opts = null) => {
+    const cwd = opts?.cwd || factoryCwd;
     // #xqa9ttq — A REQUEST MAY PIN ITS OWN PROVIDER (`request.providerName`), overriding this factory's. This
     // is what lets ONE run seat a tool-free Codex juror (`review-pr`'s opt-in `judgeAdvisory` seat) while its
     // OTHER judge steps stay on the factory's own provider (`claude` by default, or whatever `--provider`
@@ -919,9 +923,10 @@ export function createDefaultJudge({
   // Card 84 — a request carrying a `seatProvider` directive (`review.seatProvider.<lens>` = agy | shadow, or the
   // advisory agy seat) runs through the seat runner, which calls `judge` above for every Claude juror it needs.
   // A DYNAMIC import, like `defaultProviderQuotaHold`'s: this file is loaded by lightweight CLIs that never seat one.
-  return async (request) => {
-    if (request?.seatProvider == null) return judge(request);
-    return seatRunner(request, { claudeJudge: judge, unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: cwd ?? null });
+  return async (request, opts = null) => {
+    if (request?.seatProvider == null) return judge(request, opts);
+    const laneCwd = opts?.cwd || factoryCwd;
+    return seatRunner(request, { claudeJudge: (r) => judge(r, opts), unwrap: unwrapJudgeOutcome, wrap: judgeOutcome, cwd: laneCwd ?? null });
   };
 }
 
@@ -944,6 +949,23 @@ function findPriorConfirm(declaration, run, stepIndex) {
     }
   }
   return null;
+}
+
+/**
+ * MOVE AN OPEN STEP-TIMING ROW'S START to when the step really started (`review.parallelSeats`). PURE. A seat run in
+ * a concurrent batch started when the batch launched it, which is earlier than when the engine reaches it to commit
+ * its answer. No open row for `stepIndex` → `run` unchanged, the same no-fabrication rule as `withStepFinish`.
+ * @param {object} run
+ * @param {number} stepIndex
+ * @param {string} at - ISO instant.
+ * @returns {object}
+ */
+export function restampStepStart(run, stepIndex, at) {
+  const timings = Array.isArray(run.stepTimings) ? run.stepTimings : [];
+  const i = timings.findIndex((t) => t.stepIndex === stepIndex && t.finishedAt === undefined);
+  if (i === -1 || Number.isNaN(Date.parse(at))) return run;
+  const row = Object.freeze({ step: timings[i].step, stepIndex: timings[i].stepIndex, startedAt: at });
+  return { ...run, stepTimings: [...timings.slice(0, i), row, ...timings.slice(i + 1)] };
 }
 
 /**
@@ -984,10 +1006,30 @@ function stampFinish(run, stepIndex, clock) {
  *   `priorConfirm` ride only on `step-refused`, because that is the one stop `renderOutcome` cannot describe
  *   from `{run, stopped, error, applied}` alone — see the file header and #3063 for why.
  */
-export async function driveRun({ run, registry, store, sinks, judge, resume = null, maxTurns = 64, autoConfirm = null, attemptedBy = 'unknown', clock = () => Date.now() } = {}) {
+export async function driveRun({
+  run, registry, store, sinks, judge, resume = null, maxTurns = 64, autoConfirm = null, attemptedBy = 'unknown', clock = () => Date.now(),
+  // `review.parallelSeats` — see `./parallel-judges.mjs`. OFF by default so every caller that does not ask keeps the
+  // sequential drive; the review callers pass the resolved setting. `seatLanes` gives a further tool-bearing seat a
+  // lane of its own (absent: it waits for the primary lane). `log` reports seat starts/ends (stderr by default).
+  parallelJudges = false, seatLanes = null, log = (line) => { try { process.stderr.write(`${line}\n`); } catch { /* best effort */ } },
+} = {}) {
   let current = run;
   let pendingResume = resume;
   const applied = [];
+  // Answers a concurrent batch already produced, keyed by step name, consumed as the engine reaches each seat.
+  const prefilled = new Map();
+  // A seat that ran (and cost something) but whose answer can never be committed — an earlier seat failed, or its
+  // request changed — still has its spend recorded, so the run's cost is the cost of every spawn that happened.
+  const recordSpentSeats = (rec) => {
+    let next = rec;
+    for (const seat of prefilled.values()) {
+      const telemetry = seat.ok ? unwrapJudgeOutcome(seat.value).telemetry : seat.error?.telemetry;
+      if (!telemetry) continue;
+      next = { ...next, telemetry: [...(next.telemetry ?? []), normalizeJudgeTelemetry({ step: seat.step, stepIndex: seat.stepIndex, telemetry: { ...telemetry, lens: seat.request?.lens, model: telemetry.servedModel || telemetry.model || seat.request?.model, effort: seat.request?.effort } })] };
+    }
+    prefilled.clear();
+    return next;
+  };
 
   for (let turn = 0; turn < maxTurns; turn += 1) {
     const status = runStatus(current, { registry });
@@ -1020,20 +1062,58 @@ export async function driveRun({ run, registry, store, sinks, judge, resume = nu
       // THE SPAWN, in the caller, between two `advance` calls — the declaration declared it and did not act.
       // Its cost rides back on the resume; `advance` stamps the row with the request's own lens/model/effort.
       const stepIndex = current.cursor;
-      let returned;
-      try { returned = await judge(current.pending.request); } catch (e) {
-        if (e?.telemetry) {
-          current = { ...current, telemetry: [...(current.telemetry ?? []), normalizeJudgeTelemetry({ step: current.pending.step, stepIndex, telemetry: { ...e.telemetry, model: e.telemetry.servedModel, lens: current.pending.request?.lens } })] };
-          store.write(current);
+      const stepName = current.pending.step;
+      // `review.parallelSeats` — start this seat AND every following independent seat together (`./parallel-judges.mjs`).
+      // Their answers wait in `prefilled` and are committed below one at a time, in declared order, through the SAME
+      // resume as a sequential spawn, so the record differs only in its step timings (which show the real overlap).
+      if (parallelJudges && !prefilled.has(stepName)) {
+        const batch = planJudgeBatch(current, { registry });
+        if (batch.length > 1) {
+          log(`parallel seats: run ${current.id} starting ${batch.length} seats together (${batch.map((s) => s.step).join(', ')})`);
+          for (const seat of await runJudgeBatch({ batch, judge, clock, seatLanes, log })) prefilled.set(seat.step, seat);
         }
-        throw e;
+      }
+      const pre = prefilled.get(stepName);
+      prefilled.delete(stepName);
+      let returned;
+      let finishedAt = null;
+      if (pre && sameJudgeRequest(pre.request, current.pending.request)) {
+        // The seat really started when the batch launched it, not when the engine reached it.
+        current = restampStepStart(current, stepIndex, new Date(pre.startedAt).toISOString());
+        finishedAt = new Date(pre.finishedAt).toISOString();
+        if (!pre.ok) {
+          const e = pre.error;
+          if (e?.telemetry) {
+            current = { ...current, telemetry: [...(current.telemetry ?? []), normalizeJudgeTelemetry({ step: stepName, stepIndex, telemetry: { ...e.telemetry, model: e.telemetry.servedModel, lens: current.pending.request?.lens } })] };
+          }
+          current = recordSpentSeats(current);
+          store.write(current);
+          throw e;
+        }
+        returned = pre.value;
+      } else {
+        if (pre) {
+          // Never committed: the request the engine asked for now is not the one the batch answered. Spend recorded,
+          // answer discarded, seat spawned again — the safe fallback (see `./parallel-judges.mjs`).
+          prefilled.set(stepName, pre);
+          current = recordSpentSeats(current);
+        }
+        try { returned = await judge(current.pending.request); } catch (e) {
+          if (e?.telemetry) {
+            current = { ...current, telemetry: [...(current.telemetry ?? []), normalizeJudgeTelemetry({ step: current.pending.step, stepIndex, telemetry: { ...e.telemetry, model: e.telemetry.servedModel, lens: current.pending.request?.lens } })] };
+            store.write(current);
+          }
+          throw e;
+        }
       }
       const { value, telemetry } = unwrapJudgeOutcome(returned);
       current = advance(current, {
         registry,
         resume: { step: current.pending.step, value, ...(telemetry ? { telemetry } : {}) },
       });
-      current = stampFinish(current, stepIndex, clock);
+      current = finishedAt
+        ? (current.cursor > stepIndex ? withStepFinish(current, { stepIndex, at: finishedAt }) : current)
+        : stampFinish(current, stepIndex, clock);
       store.write(current);
       continue;
     }
