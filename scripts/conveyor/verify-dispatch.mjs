@@ -553,6 +553,11 @@ export function spawnGateBounded(args, { queueCeilingMs, gateCeilingMs, onGateSt
   });
 }
 
+/** May process group `pgid` still have a member? Fails closed: only a definite ESRCH says no. */
+export function processGroupMayExist(pgid) {
+  try { process.kill(-pgid, 0); return true; } catch (e) { return e?.code !== 'ESRCH'; }
+}
+
 /**
  * Run ONE lane's gate to settlement: spawn `verify-lane.mjs` under both ceilings ({@link spawnGateBounded}) and,
  * when the run was killed (a ceiling, a signal), stamp the infrastructure failure on the still-owned marker
@@ -759,7 +764,12 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
       // Settlement (including marker reads/logging) must never leave an unhandled rejection.
       try { log(`  ⚠ ${pool}/lane-${lane}: settlement failed (non-fatal): ${error.message}`); } catch {}
     }).finally(() => {
-      if (inFlight?.get(dir) === entry) inFlight.delete(dir);
+      if (inFlight?.get(dir) !== entry) return;
+      // PR 4764 round 7 — the leader settling is not the gate gone: its test runners share its process group and can
+      // outlive it. While that group may still exist the entry stays (the daemon's reconcile kills the group and drops
+      // the entry once it is CONFIRMED gone), so no second gate starts beside the survivors.
+      if (entry.pid > 1 && processGroupMayExist(entry.pid)) { entry.leaderSettled = true; return; }
+      inFlight.delete(dir);
     });
   });
 

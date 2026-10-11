@@ -5,7 +5,7 @@
  *   store-backed registry (re-attach, consume-once, failure reporting) against a REAL job store in a temp dir.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -630,7 +630,7 @@ describe('no gate record is ever missing or reduced while its gate runs, and no 
       writeFileSync(gatePath(dir, peer.id), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-p', dir: INPUT.dir, at }));
       expect((await runGateStep({ jobId: `c${at.slice(0, 4)}`, input: INPUT, jobsDir: dir, runGate, ...quiet })).outcome).toBe('failed');
     }
-    expect(JSON.parse(readFileSync(gatePath(dir, 'c2000'), 'utf8'))).toMatchObject({ none: true, pid: null }); // nobody waits on a refused job
+    expect(existsSync(gatePath(dir, 'c2000'))).toBe(false); // refused before it recorded anything: nobody waits on it
     expect(gateJob.readLaneClaim(dir, INPUT.dir)).toMatchObject({ released: true });
     store.update(peer.id, (r) => markFailed(r, { at: AT, reason: 'gave up' }));
     expect((await runGateStep({ jobId: 'c3', input: INPUT, jobsDir: dir, runGate, ...quiet })).outcome).toBe('failed'); // finished: still no pid, never proven gone
@@ -793,6 +793,111 @@ describe('a new gate starts on a lane only once the previous one is CONFIRMED go
       release();
       await b;
     } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('round 7 self-review: proof kept, rollback orphans stopped, release guarded, one lane spelling (PR 4764)', () => {
+  const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
+  const laneState = () => ({ marker: running, headSha: 'abc12345' });
+  const noReattach = async () => ({ actions: [] });
+  const mk = (extra = {}) => createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
+    probe: () => 'dead', evict: () => {}, snapshot: {}, pidExists: () => false, groupExists: () => false, kill: vi.fn(), ...extra });
+
+  it('M1 — a gate once proven gone stays gone when its pid is later reused (the proof is written down)', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markFailed(r, { at: AT, reason: 'x' }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 4321, handle: null, runId: 'run-1' })); // start time was unreadable
+    let reused = false;
+    const soon = () => Date.parse(AT) + 60_000; // inside the keep window: the finished job's files are not pruned yet
+    const jobs = mk({ pidExists: () => reused, now: soon });
+    const inFlight = new Map();
+    await jobs.sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(false);
+    expect(JSON.parse(readFileSync(gatePath(dir, q.id), 'utf8'))).toMatchObject({ pid: 4321, gone: true });
+    reused = true; // pid 4321 now belongs to an unrelated process
+    await mk({ pidExists: () => reused, now: soon }).sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(false);
+    // ...and a new job on the lane is not refused by that record either.
+    expect((await runGateStep({ jobId: 'n1', input: INPUT, jobsDir: dir, runGate: vi.fn(async () => {}), log: () => {}, laneState,
+      scanLane: () => [], pidExists: () => true, groupExists: () => false, supervisorHandle: () => 'h:77:s', probe: () => 'dead' })).outcome).toBe('green');
+  });
+
+  it('M2 — rollback: a requeued job (its supervisor died) whose gate still runs holds the lane and that gate is killed each tick', async () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' }); // queued, attempt 1 gone
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: 990, handle: 'h:990:s', runId: 'run-1' }));
+    let state = 'alive';
+    const kill = vi.fn();
+    const jobs = mk({ launchJobs: false, kill, probe: () => state });
+    const inFlight = new Map();
+    await jobs.sync(inFlight);
+    await jobs.sync(inFlight);
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: q.id, pid: 990 });
+    expect(kill).toHaveBeenCalledTimes(2);
+    state = 'dead';
+    await jobs.sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(false); // a queued job with no running gate holds nothing in rollback
+  });
+
+  it('M3 — a refusal by the backstop records no pending gate (the slow scan runs before the record)', async () => {
+    let seenDuringScan;
+    const out = await runGateStep({ jobId: 's1', input: INPUT, jobsDir: dir, runGate: vi.fn(), log: () => {}, laneState,
+      supervisorHandle: () => 'h:77:s', scanLane: () => { seenDuringScan = existsSync(gatePath(dir, 's1')); return [6001]; } });
+    expect(out.outcome).toBe('failed');
+    expect(seenDuringScan).toBe(false);
+    expect(existsSync(gatePath(dir, 's1'))).toBe(false);
+    expect(gateJob.readLaneClaim(dir, INPUT.dir)).toMatchObject({ released: true });
+  });
+
+  it('M4 — release-lane never overrides proof: it refuses while the claim\'s supervisor or a gate is proven alive, and sets aside only unknown records', () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    gateJob.claimLane({ jobsDir: dir, dir: INPUT.dir, holder: { jobId: q.id, runId: 'run-1', dir: INPUT.dir, supervisor: 'h:5:s' }, holderGone: () => true });
+    writeFileSync(gatePath(dir, q.id), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-1', dir: INPUT.dir }));
+    const alive = gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps: { probe: () => 'alive' } });
+    expect(alive.refused).toMatch(/supervisor is running/);
+    expect(gateJob.readLaneClaim(dir, INPUT.dir).released).toBe(false);
+    const other = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, runId: 'run-2' }, codeSha: 'c0de' });
+    writeFileSync(gatePath(dir, other.id), JSON.stringify({ pid: 800, handle: 'h:800:s', runId: 'run-2' }));
+    const probe = (h) => (h === 'h:800:s' ? 'alive' : 'dead');
+    expect(gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps: { probe } }).refused).toMatch(/proven alive/);
+    expect(JSON.parse(readFileSync(gatePath(dir, other.id), 'utf8')).handle).toBe('h:800:s'); // untouched
+    const ok = gateJob.releaseLaneByOperator({ jobsDir: dir, dir: `${INPUT.dir}/`, deps: { probe: () => 'dead', pidExists: () => false, groupExists: () => false } });
+    expect(ok).toMatchObject({ claim: 1, setAside: [q.id] });
+  });
+
+  it('M6 — two spellings of one lane (a symlink, a trailing slash) are one lane: one claim, one peer check', async () => {
+    const real = join(dir, 'pool', 'lane-3');
+    mkdirSync(real, { recursive: true });
+    const link = join(dir, 'pool-link');
+    symlinkSync(join(dir, 'pool'), link);
+    const alias = join(link, 'lane-3');
+    expect(gateJob.laneKey(alias)).toBe(gateJob.laneKey(real));
+    expect(gateJob.laneKey(`${real}/`)).toBe(gateJob.laneKey(real));
+    // A peer job recorded under the real spelling holds the lane for a job dispatched under the symlinked one.
+    const peer = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, dir: real, runId: 'run-p' }, codeSha: 'c0de' });
+    store.update(peer.id, (r) => markFailed(r, { at: AT, reason: 'x' }));
+    writeFileSync(gatePath(dir, peer.id), JSON.stringify({ pid: 4000, handle: 'h:4000:s', runId: 'run-p', dir: real }));
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'al', input: { ...INPUT, dir: alias }, jobsDir: dir, runGate, log: () => {}, laneState,
+      scanLane: () => [], supervisorHandle: () => 'h:77:s', probe: (h) => (h === 'h:4000:s' ? 'alive' : 'dead') });
+    expect(out.outcome).toBe('failed');
+    expect(runGate).not.toHaveBeenCalled();
+  });
+
+  it('claimLane: a create that loses the race (EEXIST) judges the winner\'s claim instead of overwriting it', () => {
+    const key = gateJob.laneKey(INPUT.dir);
+    let calls = 0;
+    const holderGone = () => {
+      calls += 1;
+      if (calls === 1) { // between our read and our create, another job takes the next number
+        writeFileSync(join(dir, gateJob.LANE_CLAIM_DIR, `${key}.00000002.claim`), JSON.stringify({ jobId: 'winner', supervisor: 'h:9:s' }));
+        return true;
+      }
+      return 'the winner holds it';
+    };
+    gateJob.claimLane({ jobsDir: dir, dir: INPUT.dir, holder: { jobId: 'first', supervisor: 'h:1:s' }, holderGone: () => true });
+    const out = gateJob.claimLane({ jobsDir: dir, dir: INPUT.dir, holder: { jobId: 'loser', supervisor: 'h:2:s' }, holderGone });
+    expect(out).toEqual({ ok: false, why: 'the winner holds it' });
+    expect(gateJob.readLaneClaim(dir, INPUT.dir)).toMatchObject({ seq: 2, claim: { jobId: 'winner' } });
   });
 });
 

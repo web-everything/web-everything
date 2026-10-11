@@ -277,24 +277,39 @@ export function reconcileInFlight(inFlight, {
     const { pool, lane, runId, pid, startedMs } = entry;
     // #65 — an ADOPTED gate (left running by a predecessor daemon) has no spawn promise here, so its ceilings are
     // not armed: bound its total age instead, and settle its marker like any ceiling kill.
-    if (entry.adopted && pid > 0 && isAlive(pid) && nowMs - startedMs > adoptedCeilingMs) {
+    // PR 4764 round 7 — a lane passes on only once its gate's process GROUP is confirmed gone: re-checked after the
+    // kill, and a group still there (or a check that fails) keeps the entry for the next tick to retry.
+    const groupGone = () => { try { return !groupAlive(pid); } catch { return false; } };
+    if (entry.adopted && pid > 0 && !entry.ceilingKilled && isAlive(pid) && nowMs - startedMs > adoptedCeilingMs) {
       try { if (groupAlive(pid)) killGroup(-pid); } catch {}
-      inFlight.delete(dir);
+      entry.ceilingKilled = true;
       try { settleKilled(entry, adoptedCeilingMs); } catch {}
       log(`verify-daemon: ${pool}/lane-${lane} adopted run ${String(runId).slice(0, 8)} exceeded ${adoptedCeilingMs}ms — killed`);
       orphaned.push({ pool, lane, runId, pid, reason: 'adopted-ceiling' });
+      if (groupGone()) inFlight.delete(dir);
       continue;
     }
     const reason = pid > 0
       ? (!isAlive(pid) ? 'pid-gone' : null)
       : ((pid == null || pid === 0) && nowMs - startedMs > spawnGraceMs ? 'never-spawned' : null);
-    if (!reason) continue;
+    if (!reason) {
+      if (entry.ceilingKilled && pid > 0) { try { if (groupAlive(pid)) killGroup(-pid); } catch {} } // retry until it dies
+      continue;
+    }
     // The leader is gone. A pid is not reused while a process group still carries it, so a group that still has
     // members is ours (the stuck stdio holders). An empty one means the pid may already belong to an unrelated
     // process that became its own group leader, so kill nothing. (Narrows the window; a group that empties and a
     // pid recycled between two ticks is not detectable here.)
     try { if (pid > 0 && groupAlive(pid)) killGroup(-pid); } catch {}
+    if (pid > 0 && !groupGone()) {
+      if (!entry.groupHeldLogged) {
+        entry.groupHeldLogged = true;
+        log(`verify-daemon: ${pool}/lane-${lane} run ${String(runId).slice(0, 8)}: leader pid ${pid} gone but its process group is not confirmed gone — lane held, killing it each tick`);
+      }
+      continue;
+    }
     inFlight.delete(dir);
+    if (entry.ceilingKilled) continue; // already settled and reported when the ceiling killed it
     // An adopted run that exited wrote its own terminal marker; only a run that died unsettled is re-queued.
     log(entry.adopted
       ? `verify-daemon: ${pool}/lane-${lane} adopted run ${String(runId).slice(0, 8)} finished (pid ${pid} gone) — released`
