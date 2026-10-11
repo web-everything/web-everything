@@ -119,7 +119,14 @@ export function renderRoundHistory(history, { previousOnly = true, maxChars = RO
   const assemble = () => header + (dropped() ? `(${dropped()} earlier round(s) left out to fit the size cap)\n\n` : '') + blocks.join('') + rulingsBlock;
   while (blocks.length > 1 && assemble().length > maxChars) blocks = blocks.slice(1);
   let text = assemble();
-  if (text.length > maxChars) text = `${text.slice(0, maxChars - 60).replace(/\n[^\n]*$/, '')}\n… (round history cut at ${maxChars} chars)\n\n`;
+  if (text.length > maxChars) {
+    // One round alone is over the cap: cut the ROUND text, never the current rulings at the tail (they matter most).
+    const lead = header + (dropped() ? `(${dropped()} earlier round(s) left out to fit the size cap)\n\n` : '');
+    const room = maxChars - lead.length - rulingsBlock.length - 60;
+    text = room > 0
+      ? `${lead}${blocks.join('').slice(0, room).replace(/\n[^\n]*$/, '')}\n… (round history cut at ${maxChars} chars)\n\n${rulingsBlock}`
+      : `${text.slice(0, maxChars - 60).replace(/\n[^\n]*$/, '')}\n… (round history cut at ${maxChars} chars)\n\n`;
+  }
   return text;
 }
 

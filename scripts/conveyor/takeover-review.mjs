@@ -17,7 +17,7 @@
  * PURE: reads only the PR's own comment thread and head sha.
  */
 // Takeover budget — each takeover is an EPISODE (its signals with no verdict between them); the grant is per episode.
-import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
+import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, threadMayBeTruncated, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
 import { isReviewVerdictComment as isVerdict, verdictJudged } from './mechanical-round-cap.mjs';
@@ -54,7 +54,8 @@ export function escalationDispatches(comments) {
  * `takeoverReviewAttempts` review(s) for the head it pushes. The anchor is the LATEST such dispatch, moved to the
  * first fixer push after it (a verdict on the OLD head that lands between the dispatch and the push spends nothing).
  * How many dispatches run at all stays bounded by the takeover budget/progress guard and the ladder's own human rung.
- * Reasons: `off` (setting 0), `no-takeover` (no escalation dispatch), `head-already-reviewed` (a verdict names this
+ * Reasons: `off` (setting 0), `thread-truncated` (the comment list may be cut at the list cap:
+ * `takeover-budget.mjs#threadMayBeTruncated`), `no-takeover` (no escalation dispatch), `head-already-reviewed` (a verdict names this
  * head), `takeover-review-spent` (verdicts after the anchor already used the allowance).
  * @param {{pr:{headRefOid?:string, comments?:Array<object>}, takeoverReviewAttempts?:number}} o
  */
@@ -62,6 +63,8 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const allowance = Number.isInteger(takeoverReviewAttempts) && takeoverReviewAttempts > 0 ? takeoverReviewAttempts : 0;
   if (!allowance) return { ok: false, reason: 'off' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  // A cut thread hides the verdicts after comment 100: a head already judged would read as owed its review.
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
   const dispatches = escalationDispatches(comments);
   if (!dispatches.length) return { ok: false, reason: 'no-takeover' };
   const latest = dispatches.at(-1);
