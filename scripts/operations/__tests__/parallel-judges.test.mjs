@@ -24,8 +24,8 @@ import { createRegistry, op } from '../registry.mjs';
 import { compute, judge as judgeStep } from '../step-kinds.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { startRun, advance, rewindRunToStep } from '../engine.mjs';
-import { driveRun, judgeOutcome, restampStepStart } from '../cli-adapter.mjs';
-import { planJudgeBatch, readsAnyStep, runJudgeBatch } from '../parallel-judges.mjs';
+import { createDefaultJudge, driveRun, judgeOutcome, restampStepStart, unwrapJudgeOutcome } from '../cli-adapter.mjs';
+import { planJudgeBatch, readsAnyStep, runJudgeBatch, seatFailureEvidence } from '../parallel-judges.mjs';
 import {
   REVIEW_EFFECTS, reviewPrOperation, renameSourcePaths, seatSecurityForTouchSet, securitySeatFromRun, SECURITY_SEAT_STEP,
 } from '../review-pr.mjs';
@@ -177,6 +177,56 @@ describe('review.parallelSeats — one seat fails', () => {
     expect(resumed.run.findings.reduce).toEqual(clean.run.findings.reduce);
     expect(resumed.run.findings.judgeSecurity).toEqual(clean.run.findings.judgeSecurity);
   });
+
+  // Held item 223 (item 4): the seats that ran BESIDE the failed one and answered are not thrown away. Their answers
+  // are saved on the run (`prefilledSeats`), and a resume commits them instead of paying for them again.
+  it('saves the later seats\' answers on the run when a seat fails', async () => {
+    const store = createMemoryRunStore();
+    await expect(loop({ parallel: true, judge: scriptedJudge({ fail: (l) => l === 'security' }), seatLanes: lanes().provider, runId: 'r-save', store })).rejects.toThrow();
+    const run = store.read('r-save');
+    expect(run.pending?.step).toBe(SECURITY_SEAT_STEP);
+    const saved = run.prefilledSeats ?? [];
+    expect(saved.map((s) => s.step).sort()).toEqual(['judgeAdvisory', 'judgeCorrectnessAdvisory']);
+    for (const s of saved) {
+      expect(s.value).toEqual(answerFor(s.request.lens));
+      expect(Number.isInteger(s.stepIndex)).toBe(true);
+      expect(typeof s.startedAt).toBe('string');
+      expect(typeof s.finishedAt).toBe('string');
+      // Their spend is already on the record (see the test above), so a resume must not record it twice.
+      expect(s.telemetryRecorded).toBe(true);
+    }
+  });
+
+  it('a resume reuses the saved answers: only the failed seat is spawned again, and no spend is counted twice', async () => {
+    const store = createMemoryRunStore();
+    await expect(loop({ parallel: true, judge: scriptedJudge({ fail: (l) => l === 'security' }), seatLanes: lanes().provider, runId: 'r-reuse', store })).rejects.toThrow();
+    const again = scriptedJudge();
+    const resumed = await loop({ parallel: true, judge: again, seatLanes: lanes().provider, runId: 'r-reuse', store, argv: ['--resume=r-reuse', '--json'] });
+    expect(again.calls.map((c) => c.lens)).toEqual(['security']);
+    const clean = await loop({ parallel: false, judge: scriptedJudge(), runId: 'r-reuse-clean' });
+    expect(resumed.run.cursor).toBe(clean.run.cursor);
+    expect(resumed.run.findings.judgeAdvisory).toEqual(clean.run.findings.judgeAdvisory);
+    expect(resumed.run.findings.judgeCorrectnessAdvisory).toEqual(clean.run.findings.judgeCorrectnessAdvisory);
+    expect(resumed.run.findings.reduce).toEqual(clean.run.findings.reduce);
+    expect(resumed.run.prefilledSeats ?? []).toEqual([]);
+    const rows = (step) => resumed.run.telemetry.filter((t) => t.step === step).length;
+    expect(rows('judgeAdvisory')).toBe(1);
+    expect(rows('judgeCorrectnessAdvisory')).toBe(1);
+  });
+
+  it('a saved answer whose request no longer matches is discarded and the seat spawned again (spend not re-recorded)', async () => {
+    const store = createMemoryRunStore();
+    await expect(loop({ parallel: true, judge: scriptedJudge({ fail: (l) => l === 'security' }), seatLanes: lanes().provider, runId: 'r-stale', store })).rejects.toThrow();
+    const run = store.read('r-stale');
+    const stale = run.prefilledSeats.find((s) => s.step === 'judgeAdvisory');
+    store.write({ ...run, prefilledSeats: run.prefilledSeats.map((s) => (s === stale ? { ...s, request: { ...s.request, mandate: 'a different request' } } : s)) });
+    const again = scriptedJudge();
+    const resumed = await loop({ parallel: true, judge: again, seatLanes: lanes().provider, runId: 'r-stale', store, argv: ['--resume=r-stale', '--json'] });
+    expect(again.calls.map((c) => c.lens).sort()).toEqual(['security', stale.request.lens].sort());
+    // One row from the first spawn (recorded at the failure), one from the respawn — never a third.
+    expect(resumed.run.telemetry.filter((t) => t.step === 'judgeAdvisory').length).toBe(2);
+    expect(resumed.run.telemetry.filter((t) => t.step === 'judgeCorrectnessAdvisory').length).toBe(1);
+  });
 });
 
 describe('review.parallelSeats — one lane per tool-bearing seat', () => {
@@ -238,6 +288,37 @@ describe('planJudgeBatch — only independent judge steps are batched', () => {
       judge: async (r) => { if (r.lens === 'b') throw new Error('no'); return 1; },
     });
     expect(results.map((r) => r.ok)).toEqual([true, false]);
+  });
+
+  // Held item 223: a failed seat says WHY — exit code, signal, attempts and a stderr tail — on the seat result and in
+  // the log line, instead of a bare "failed after N ms" that left the cause unrecoverable.
+  it('a failed seat carries its spawn evidence on the result and in the log line', async () => {
+    const lines = [];
+    const spawnErr = Object.assign(new Error('judge-spawn: the juror did not emit parseable JSON on stdout (attempt 2/2, exit 1, signal none, stdout 0 bytes).'), {
+      exitCode: 1, signal: null, attempts: 2, stderrTail: 'boom: socket hang up',
+    });
+    const results = await runJudgeBatch({
+      batch: [{ step: 'a', stepIndex: 1, request: { lens: 'a' } }, { step: 'judgeSecurity', stepIndex: 2, request: { lens: 'security' } }],
+      judge: async (r) => { if (r.lens === 'security') throw spawnErr; return 1; },
+      log: (l) => lines.push(l),
+    });
+    expect(results[1].ok).toBe(false);
+    expect(results[1].failure).toEqual({ exitCode: 1, signal: null, attempts: 2, stderrTail: 'boom: socket hang up' });
+    expect(results[0].failure).toBeUndefined();
+    const line = lines.find((l) => l.includes('judgeSecurity failed'));
+    expect(line).toMatch(/exit 1/);
+    expect(line).toMatch(/signal none/);
+    expect(line).toMatch(/2 attempts/);
+    expect(line).toMatch(/socket hang up/);
+  });
+
+  it('seatFailureEvidence is null for an error with no spawn evidence, and bounds the stderr tail', () => {
+    expect(seatFailureEvidence(new Error('plain'))).toBe(null);
+    expect(seatFailureEvidence(null)).toBe(null);
+    const ev = seatFailureEvidence(Object.assign(new Error('x'), { exitCode: 2, stderrTail: 'y'.repeat(5000) }));
+    expect(ev.exitCode).toBe(2);
+    expect(ev.signal).toBe(null);
+    expect(ev.stderrTail.length).toBeLessThanOrEqual(1000);
   });
 });
 
@@ -559,5 +640,14 @@ describe('review seat settings — the policy cascade', () => {
     expect(resolveReviewSeatSetting('parallelSeats', { env: { WE_REVIEW_PARALLEL_SEATS: 'on' }, file })).toEqual({ value: 'on', source: 'env' });
     expect(resolveReviewSeatSetting('seatsByTouchSet', { env: {}, file })).toEqual({ value: 'on', source: 'default' });
     expect(resolveReviewSeatSetting('seatsByTouchSet', { env: { WE_REVIEW_SEATS_BY_TOUCH_SET: '0' }, file: join(dir, 'missing.json') })).toEqual({ value: 'off', source: 'env' });
+  });
+});
+
+describe('createDefaultJudge — a retried seat says so on its telemetry (held item 223)', () => {
+  it('carries the provider\'s `attempts` onto the telemetry the run record keeps', async () => {
+    const provider = async () => ({ value: { summary: 'ok', findings: [] }, sessionId: 's2', costUsd: 0.2, wallMs: 30_000, attempts: 2 });
+    const judge = createDefaultJudge({ provider });
+    const { telemetry } = unwrapJudgeOutcome(await judge({ mandate: 'm', input: 'i', shape: { type: 'object' }, lens: 'x', effort: 'low', budget: null }));
+    expect(telemetry.attempts).toBe(2);
   });
 });
