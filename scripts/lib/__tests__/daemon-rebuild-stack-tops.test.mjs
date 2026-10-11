@@ -374,6 +374,8 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
     f.fetch();
     const plan = await planRebuild({
       git: f.runGit, headSha: live.finalSha, mainRef: 'origin/main', prBaseChain,
+      // hard evidence the base moved under its top (the operator ruling: no look-alike evidence sets a base aside)
+      prForcePushes: async (pr) => (pr === 4756 ? [{ before: f.bOld, after: bNew }] : []),
       overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }, { ref: 'lane/newcomer', pr: 9301 }],
     });
     expect(plan.ok).toBe(true);
