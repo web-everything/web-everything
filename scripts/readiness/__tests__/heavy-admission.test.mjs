@@ -6,9 +6,9 @@
  *   discipline of proving the atomic fs layer for real, not just its pure decision logic).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, realpathSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
+import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
@@ -29,7 +29,7 @@ import {
 } from '../heavy-admission.mjs';
 import {
   ADMISSION_DEFERRED_EXIT, ADMISSION_POLICY_STANDARD, resolveAdmissionPolicy, formatAdmissionPolicy,
-  resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy,
+  resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy, privateAdmissionPool,
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
@@ -1528,6 +1528,52 @@ describe('shared-pool capacity — naming the host pool explicitly, or a checkou
     const priv = resolveAdmissionPolicy({ platform: { cap: 2, fastSlots: 1 }, tool, env: { LANE_POOL_ROOT: '/tmp/sandbox-pool' }, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
     expect(caps(priv)).toEqual([4, 2]);
     expect(priv.settings.fastScale.maxSlots).toBe(5);
+  });
+
+  it('a pinned snapshot outside the workspace (no checkout hint) still treats the real host pool as shared', () => {
+    const hostPool = join(userInfo().homedir, 'workspace', '.lanes');
+    expect(resolveCap({ LANE_POOL_ROOT: hostPool, ...CAPS })).toBe(resolveCap({}));
+    expect(resolveFastSlots({ LANE_POOL_ROOT: `${hostPool}/`, ...CAPS })).toBe(resolveFastSlots({}));
+    expect(resolveCap({ LANE_POOL_ROOT: hostPool, ...CAPS }, join(lockRoot, 'elsewhere', 'web-everything'))).toBe(resolveCap({}));
+  });
+
+  it('a symlink to the host pool, and a not-yet-created host pool spelled through a symlinked ancestor, are both shared', () => {
+    const ws = join(lockRoot, 'ws'); mkdirSync(join(ws, '.lanes'), { recursive: true });
+    const link = join(lockRoot, 'link'); symlinkSync(join(ws, '.lanes'), link);
+    const checkout = join(ws, 'web-everything');
+    expect(privateAdmissionPool({ LANE_POOL_ROOT: link }, checkout)).toBe(false);
+    expect(privateAdmissionPool({ LANE_POOL_ROOT: join(realpathSync(lockRoot), 'ws2', '.lanes') }, join(lockRoot, 'ws2', 'web-everything'))).toBe(false);
+    expect(privateAdmissionPool({ LANE_POOL_ROOT: join(lockRoot, 'elsewhere') }, checkout)).toBe(true);
+  });
+
+  it('a caller $HOME never selects a different platform file for the shared pool', () => {
+    const fakeHome = join(lockRoot, 'home'); mkdirSync(join(fakeHome, '.claude'), { recursive: true });
+    writeFileSync(join(fakeHome, '.claude', 'platform-preferences.json'), JSON.stringify({ heavyAdmission: { cap: 7 } }));
+    expect(loadAdmissionPolicy({ env: { HOME: fakeHome } }).settings.cap).toBe(loadAdmissionPolicy({ env: {} }).settings.cap);
+    expect(loadAdmissionPolicy({ env: { HOME: fakeHome } }).settings.cap).not.toBe(7);
+  });
+
+  it('a torn platform-preferences write keeps the last good value and is not cached', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const prefs = join(lockRoot, 'torn.json'); const env = { WE_PLATFORM_PREFERENCES: prefs };
+      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 3 } }));
+      expect(loadAdmissionPolicy({ env }).settings.cap).toBe(3);
+      vi.setSystemTime(Date.now() + 11_000);
+      writeFileSync(prefs, '{"heavyAdmission": {"cap"');
+      const torn = loadAdmissionPolicy({ env });
+      expect(torn.settings.cap).toBe(3);
+      expect(torn.invalid.join('\n')).toMatch(/platform:/);
+      writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 5 } }));
+      expect(loadAdmissionPolicy({ env }).settings.cap).toBe(5);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a runaway slot count is invalid, not a billion-entry scan', () => {
+    const p = resolveAdmissionPolicy({ platform: { cap: 1e9, fastSlots: 5000, fastScale: { maxSlots: 1e6 } } });
+    expect(p.settings).toMatchObject({ cap: 2, fastSlots: 1 });
+    expect(p.settings.fastScale.maxSlots).toBeNull();
+    expect(p.invalid.length).toBe(3);
   });
 
   it('two checkouts sharing one pool, only one carrying a heavy-admission settings file, resolve identical capacity', () => {

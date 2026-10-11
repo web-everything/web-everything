@@ -90,7 +90,7 @@ export function buildSnapshot({ sampledAtMs, intervalMs, cpuIdlePct, cores, load
 // runs from a pinned code snapshot outside the workspace, where neither the lane pool nor the slot locks live.
 function defaultHeavySlots(checkoutRoot = repoRoot()) {
   // Reuse we:scripts/readiness/heavy-admission.mjs; heavy capacity excludes its separate fast lane.
-  const cap = resolveCap();
+  const cap = resolveCap(process.env, checkoutRoot);
   const status = admissionStatus({ lockRoot: admissionLockRoot(checkoutRoot), cap });
   return { held: status.heldCount, cap };
 }

@@ -123,9 +123,9 @@
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { hostname, homedir } from 'node:os';
+import { hostname, homedir, userInfo } from 'node:os';
 import { createHash } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -136,6 +136,7 @@ import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
 import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
+import { isUnderTest } from '../lib/under-test.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
 import { latestValue, median } from '../lib/telemetry-machine.mjs'; // #4076/#4343 — the SAME "latest sample wins" reducer + median telemetry-machine.mjs already uses/exports — never a second implementation
@@ -205,7 +206,9 @@ export const ADMISSION_POLICY_STANDARD = Object.freeze({
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
 });
 
-const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min;
+/** Upper bound on any slot count: a typo like `cap: 1e9` would otherwise make every scan walk a billion lock entries. */
+const ADMISSION_MAX_SLOTS = 256;
+const admissionInt = (min) => (v) => Number.isInteger(v) && v >= min && v <= ADMISSION_MAX_SLOTS;
 const ADMISSION_VALID = {
   cap: admissionInt(1), fastSlots: admissionInt(0), onTimeout: (v) => v === 'defer' || v === 'run',
   'fastScale.maxSlots': (v) => v === null || admissionInt(0)(v),
@@ -218,19 +221,36 @@ const ADMISSION_ENV = { cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMI
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const admissionLeaf = (block, path) => path.split('.').reduce((v, key) => admissionObject(v) && Object.hasOwn(v, key) ? v[key] : undefined, block);
 const ADMISSION_MODULE_ROOT = (() => { try { return fileURLToPath(new URL('../../', import.meta.url)); } catch { return process.cwd(); } })();
-const canonicalPath = (p) => { const abs = resolve(p); try { return realpathSync(abs); } catch { return abs; } };
+/** Canonical form of a path that may not exist yet: real-path (native, so case-insensitive volumes report their true case)
+ *  the longest existing ancestor, then re-append the rest — `/var/x` and `/private/var/x` agree either way. */
+export function canonicalPath(p) {
+  let head = resolve(p); const rest = [];
+  for (;;) {
+    try { return join(realpathSync.native(head), ...rest); } catch { /* walk up */ }
+    const parent = dirname(head);
+    if (parent === head) return resolve(p);
+    rest.unshift(basename(head)); head = parent;
+  }
+}
+/** The real user's home, independent of a caller's `$HOME` (a sandboxed or launchd caller may carry another one). */
+const realHomeDir = () => { try { return userInfo().homedir || homedir(); } catch { return homedir(); } };
+const oneLine = (v) => String(v).replace(/[^\x20-\x7e]/g, '?').slice(0, 80);
 
 /**
  * A pool is PRIVATE only when `LANE_POOL_ROOT` points somewhere other than the host-shared pool the checkout
  * would use with no override (`<workspace>/.lanes`). Setting the variable to the host pool's own path (any
  * spelling: trailing slash, `.`/`..`, symlink) names the SHARED pool, so it earns no per-process capacity.
  */
-export function privateAdmissionPool(env, checkoutRoot = ADMISSION_MODULE_ROOT) {
+export function privateAdmissionPool(env, checkoutRoot) {
   const raw = env?.LANE_POOL_ROOT;
   if (typeof raw !== 'string' || raw.trim() === '') return false;
-  const named = canonicalPath(defaultPoolRoot(checkoutRoot, env));
-  const hostPool = canonicalPath(join(workspaceFor(checkoutRoot), '.lanes'));
-  return named !== hostPool;
+  const named = canonicalPath(defaultPoolRoot(ADMISSION_MODULE_ROOT, env));
+  // Every host pool this process could mean: the caller's checkout, this module's checkout (a pinned snapshot
+  // outside the workspace has none of its own), the real user's `~/workspace/.lanes`, and the cwd's workspace.
+  const hostPools = [checkoutRoot, ADMISSION_MODULE_ROOT, join(realHomeDir(), 'workspace'), process.cwd()]
+    .filter((root) => typeof root === 'string' && root !== '')
+    .map((root) => canonicalPath(join(workspaceFor(root), '.lanes')));
+  return !hostPools.includes(named);
 }
 
 /**
@@ -249,7 +269,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
       const v = admissionLeaf(block, leaf);
       if (v === undefined) continue;
       if (layer === 'tool' && leaf !== 'onTimeout' && !isPrivate) {
-        ignored.push(`tool.${leaf}=${JSON.stringify(v)} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
+        ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
         continue;
       }
       if (valid(v)) { value = v; sources[leaf] = layer; }
@@ -259,7 +279,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     const raw = name ? env[name] : undefined;
     if (raw !== undefined) {
       if (leaf !== 'onTimeout' && !isPrivate) {
-        ignored.push(`env ${name}=${raw} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
+        ignored.push(`env ${name}=${oneLine(raw)} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
       } else {
         const s = String(raw).trim();
         const v = leaf === 'onTimeout' ? s.toLowerCase() : (s === '' ? NaN : Number(s));
@@ -274,22 +294,39 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
 }
 
 const admissionPolicyCache = new Map();
-/** IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws. */
-export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home = homedir() } = {}) {
-  let platform; let tool; let path; const errors = [];
+const platformLastGood = new Map(); // path → last successfully parsed heavyAdmission block (survives a torn write)
+const PLATFORM_FILE_MAX_BYTES = 256 * 1024;
+/**
+ * IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws.
+ * On the shared host pool the platform file is the ONE capacity source, so every caller must read the SAME file:
+ * the real user's `~/.claude/platform-preferences.json`, never a path derived from the caller's `$HOME`, and
+ * `WE_PLATFORM_PREFERENCES` is honoured only for a private pool (or under test). A read that fails keeps the last
+ * good value and is not cached, so a torn write is retried by the next caller instead of pinning the standard.
+ */
+export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home } = {}) {
+  let platform; let tool; let path; const errors = []; let readFailed = false;
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
   checkoutRoot ??= repoRoot;
-  try { path = env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'); }
+  const overrideOk = privateAdmissionPool(env, checkoutRoot) || isUnderTest(env) || isUnderTest(process.env);
+  try { path = (overrideOk && env.WE_PLATFORM_PREFERENCES) || join(home ?? realHomeDir(), '.claude', 'platform-preferences.json'); }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, repoRoot, checkoutRoot, env.LANE_POOL_ROOT,...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, repoRoot, checkoutRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
   if (path) try {
+    if (statSync(path).size > PLATFORM_FILE_MAX_BYTES) throw new Error(`file larger than ${PLATFORM_FILE_MAX_BYTES} bytes`);
     const file = JSON.parse(readFileSync(path, 'utf8'));
     if (admissionObject(file) && Object.hasOwn(file, 'heavyAdmission')) platform = file.heavyAdmission;
-  } catch (e) { if (e?.code !== 'ENOENT') errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
+    platformLastGood.set(path, platform);
+  } catch (e) {
+    if (e?.code !== 'ENOENT') {
+      readFailed = true;
+      errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`);
+      if (platformLastGood.has(path)) platform = platformLastGood.get(path);
+    } else platformLastGood.delete(path);
+  }
   if (repoRoot) try {
     const settingsDir = join(repoRoot, 'scripts', 'settings');
     const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
@@ -298,7 +335,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
   const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);
-  admissionPolicyCache.set(key, { policy, expiresAt: nowMs + 10_000 });
+  if (!readFailed) admissionPolicyCache.set(key, { policy, expiresAt: nowMs + 10_000 });
   return policy;
 }
 
@@ -325,12 +362,12 @@ export function resolveSlotSpan(settings) {
 }
 
 /** Host-wide capacity; process overrides are only allowed for private pools. */
-export function resolveCap(env = process.env) {
-  return loadAdmissionPolicy({ env }).settings.cap;
+export function resolveCap(env = process.env, checkoutRoot) {
+  return loadAdmissionPolicy({ env, checkoutRoot }).settings.cap;
 }
 
-export function resolveFastSlots(env = process.env) {
-  return loadAdmissionPolicy({ env }).settings.fastSlots;
+export function resolveFastSlots(env = process.env, checkoutRoot) {
+  return loadAdmissionPolicy({ env, checkoutRoot }).settings.fastSlots;
 }
 
 /** Resolve the wait-then-give-up timeout from env, mirroring {@link resolveCap}. Clamped to a sane minimum of
@@ -1277,10 +1314,10 @@ export function readPoolLeases(poolRoot) {
  */
 export function resolveQueueBaseline({
   lockRoot, cap, nowMs = Date.now(), env = process.env, arrivalWindowMinutes = DEFAULT_ARRIVAL_WINDOW_MINUTES,
-  readLeases = readPoolLeases, isLiveWaiter = isRankableWaiter,
+  readLeases = readPoolLeases, isLiveWaiter = isRankableWaiter, checkoutRoot,
 }) {
   const maxWaitMinutes = resolveQueueMaxWaitMinutes(env);
-  const settings = loadAdmissionPolicy({ env }).settings;
+  const settings = loadAdmissionPolicy({ env, checkoutRoot }).settings;
   const fastSlots = settings.fastSlots;
   const base = { slots: cap + fastSlots, heavySlots: cap, fastSlots, maxWaitMinutes, arrivalWindowMinutes, observedAt: new Date(nowMs).toISOString() };
   if (isQueueAdmissionOff(env)) return { ...base, bypassed: 'off' };
@@ -1350,7 +1387,7 @@ export function resolveQueueBaseline({
  */
 export function resolveLiveQueueBaseline({ checkoutRoot = process.cwd(), env = process.env, nowMs = Date.now() } = {}) {
   try {
-    return resolveQueueBaseline({ lockRoot: join(guardedPoolRoot(checkoutRoot, env), SUBDIR), cap: resolveCap(env), nowMs, env });
+    return resolveQueueBaseline({ lockRoot: join(guardedPoolRoot(checkoutRoot, env), SUBDIR), cap: resolveCap(env, checkoutRoot), nowMs, env, checkoutRoot });
   } catch (e) {
     return { bypassed: 'error', error: String((e && e.message) || e).split('\n')[0] };
   }
@@ -1592,7 +1629,7 @@ async function main(argv) {
   if (mode === 'queue-status') {
     // Card xkyw1x4 — the queue baseline (backlog in slot-minutes, standard times per kind, pending dispatched
     // sessions) that `tick-core.mjs`'s IO shell feeds to planTick's `queue-cap` gate. Read-only.
-    const b = resolveQueueBaseline({ lockRoot, cap });
+    const b = resolveQueueBaseline({ lockRoot, cap, checkoutRoot: repo });
     if (asJson) { emit(b); return; }
     if (b.bypassed) { process.stdout.write(`queue admission bypassed (${b.bypassed})\n`); return; }
     process.stdout.write(`projected wait if you start now: ~${b.projectedWaitMinutes}m for a dispatch's short checks (max ${b.maxWaitMinutes}m), ~${b.heavyWaitMinutes}m for a full suite — `
