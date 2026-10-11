@@ -719,7 +719,7 @@ describe('allow is operator-only (xfaz7ho)', () => {
   // was stripped — so a branch tracking another branch, or tracking a remote not named origin, slipped through.
   describe('CLI on a real checkout: the checked-out branch is refused whatever it tracks', () => {
     const gitIn = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'init.defaultBranch=main', ...args], { cwd, stdio: 'pipe' });
-    const checkout = (remoteName, upstreamBranch) => {
+    const checkout = (remoteName, upstreamBranch, localBranch = 'lane/child', { fetch = true } = {}) => {
       const root = mkdtempSync(join(tmpdir(), 'pr-limit-own-'));
       const bare = join(root, 'remote.git');
       const work = join(root, 'work');
@@ -728,10 +728,15 @@ describe('allow is operator-only (xfaz7ho)', () => {
       gitIn(work, 'init', '-q');
       gitIn(work, 'commit', '-q', '--allow-empty', '-m', 'base');
       gitIn(work, 'remote', 'add', remoteName, bare);
-      gitIn(work, 'push', '-q', remoteName, `HEAD:refs/heads/${upstreamBranch}`);
-      gitIn(work, 'fetch', '-q', remoteName);
-      gitIn(work, 'checkout', '-q', '-b', 'lane/child');
-      gitIn(work, 'branch', '-q', `--set-upstream-to=${remoteName}/${upstreamBranch}`);
+      gitIn(work, 'checkout', '-q', '-b', localBranch);
+      if (fetch) {
+        gitIn(work, 'push', '-q', remoteName, `HEAD:refs/heads/${upstreamBranch}`);
+        gitIn(work, 'fetch', '-q', remoteName);
+        gitIn(work, 'branch', '-q', `--set-upstream-to=${remoteName}/${upstreamBranch}`);
+      } else { // upstream configured, but its remote-tracking ref was never fetched — `@{u}` cannot resolve
+        gitIn(work, 'config', `branch.${localBranch}.remote`, remoteName);
+        gitIn(work, 'config', `branch.${localBranch}.merge`, `refs/heads/${upstreamBranch}`);
+      }
       return work;
     };
     const allowFrom = (cwd) => {
@@ -755,6 +760,22 @@ describe('allow is operator-only (xfaz7ho)', () => {
 
     it('a remote whose name contains a slash is stripped whole (fork/x tracking fork/x/lane/child is refused)', () => {
       const { code, st } = allowFrom(checkout('fork/x', 'lane/child'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    // The UPSTREAM read on its own (the checked-out branch is named differently, so HEAD alone cannot refuse it):
+    // remote prefixes are stripped by the checkout's remote list, a slash-named remote whole.
+    for (const remote of ['origin', 'upstream', 'fork/x']) {
+      it(`a local branch named otherwise but tracking ${remote}/lane/child is refused lane/child`, () => {
+        const { code, st } = allowFrom(checkout(remote, 'lane/child', 'work'));
+        expect(code).not.toBe(0);
+        expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+      });
+    }
+
+    it('an upstream configured but never fetched (branch.<b>.merge only) is still refused', () => {
+      const { code, st } = allowFrom(checkout('upstream', 'lane/child', 'work', { fetch: false }));
       expect(code).not.toBe(0);
       expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
     });
