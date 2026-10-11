@@ -56,6 +56,35 @@ describe('resource shadow observations', () => {
     });
     expect(admit).not.toHaveBeenCalled();
   });
+  it('busyPoolSkip stands (null) when the only busy signal is an unknown hold on a quiet host', () => {
+    const unknown = { verdict: 'hold', unknown: true };
+    const detail = 'lane-pool list failed: timed out after 60000ms (process group killed)';
+    const hostBusy = () => hostLooksBusy({}, { load: () => 1, cores: () => 12, shadow: () => unknown, admit: () => unknown });
+    expect(busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: 60_000, capMs: 60_000, ctx: { env: {}, hostBusy } })).toBeNull();
+  });
+  // WE_RESOURCE_CUTOVER=shadow is the rollback switch: the shared decision is only logged, the legacy load rule decides.
+  it.each([[60, true], [3, false]])('keeps the legacy load rule at load %s under WE_RESOURCE_CUTOVER=shadow', (load1, busy) => {
+    const env = { WE_RESOURCE_CUTOVER: 'shadow' };
+    const shadow = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 50%' })); const admit = vi.fn(() => ({ verdict: 'admit' }));
+    expect(hostLooksBusy(env, { load: () => load1, cores: () => 12, shadow, admit })).toBe(busy);
+    expect(shadow).toHaveBeenCalledTimes(1); expect(admit).not.toHaveBeenCalled();
+  });
+  it('keeps legacy load-scaled budgets and reports no admission under WE_RESOURCE_CUTOVER=shadow', async () => {
+    const run = async (env) => {
+      const runChild = vi.fn(async () => '');
+      const out = await runLiveSmoke({ root: '/x', env, load: () => 63, cores: () => 12, clock: () => 0, changedFiles: [], closureOf: () => [],
+        runChild, shadow: () => ({ verdict: 'admit', reason: 'cpu idle 50%' }), admit: () => ({ verdict: 'admit' }) });
+      return { out, timeouts: runChild.mock.calls.map(([, , opts]) => opts.timeoutMs) };
+    };
+    const enforced = await run({ WE_RESOURCE_CUTOVER: 'enforce' });
+    const shadowed = await run({ WE_RESOURCE_CUTOVER: 'shadow' });
+    const legacy = await run({ WE_RESOURCE_CUTOVER: 'shadow', WE_SMOKE_LOAD_SCALE: undefined });
+    expect(shadowed.out.admission).toBeUndefined();
+    expect(shadowed.timeouts.length).toBeGreaterThan(0);
+    // load 63 on 12 cores: the legacy rule scales every budget up, the enforced admit decision does not.
+    expect(shadowed.timeouts.some((ms, i) => ms > enforced.timeouts[i])).toBe(true);
+    expect(legacy.timeouts).toEqual(shadowed.timeouts);
+  });
   // Every decision shape: busy ⇔ a KNOWN non-admit. An unknown hold (sampler down: snapshot-missing/stale) is no
   // evidence about the host, so the legacy load rule decides — never "busy" (that would launder a hung probe into a skip).
   it.each([
@@ -92,7 +121,7 @@ describe('resource shadow observations', () => {
   // children (not CPU) and were killed, so main, every overlay and last-good all failed the smoke.
   it('keeps load scaling for the I/O-bound checks even when admitted (smokeIoBoundLoadScale, standard on)', () => {
     const b = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
-    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 720_000, ghApiMs: 30_000 });
+    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 1_200_000, ghApiMs: 30_000 });
     expect(resolveIoBoundLoadScale({})).toMatchObject({ enabled: true, source: 'standard' });
   });
   it('the I/O-bound rule never lowers a non-admit factor, and honours the env layer and absolute overrides', () => {
@@ -105,8 +134,8 @@ describe('resource shadow observations', () => {
   });
   it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict } };
-    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(720_000);
-    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(360_000);
+    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(1_200_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(600_000);
   });
   it('preserves disabled scaling and absolute per-check overrides under a hold', () => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } };
@@ -221,17 +250,17 @@ describe('load-aware smoke budgets', () => {
       lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
       laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
       ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 120_000,
-      dispatchDryRunMs: 180_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
+      dispatchDryRunMs: 300_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
     });
   });
 
   it('load 48 on 12 cores scales dispatch and reconcile by four', () => {
-    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 720_000, reconcileMs: 480_000 });
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 1_200_000, reconcileMs: 480_000 });
   });
 
   it('load 100 on 12 cores is capped at four times the defaults', () => {
     expect(resolveSmokeBudgets({}, host(100))).toEqual(resolveSmokeBudgets({}, host()));
-    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(1_200_000);
   });
 
   it('an explicit operator budget stays absolute under load', () => {
@@ -250,7 +279,7 @@ describe('load-aware smoke budgets', () => {
 
   it('WE_SMOKE_LOAD_SCALE_MAX=2 caps scaling at twice the defaults', () => {
     expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host())).toMatchObject({
-      dispatchDryRunMs: 360_000, reconcileMs: 240_000,
+      dispatchDryRunMs: 600_000, reconcileMs: 240_000,
     });
   });
 
@@ -259,7 +288,7 @@ describe('load-aware smoke budgets', () => {
   });
 
   it.each(['0', '-1', 'invalid', 'Infinity'])('invalid budget override %s still scales the default', (value) => {
-    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(1_200_000);
   });
 
   it('exports the knobs and a pure factor with a one-core floor', () => {
@@ -284,7 +313,7 @@ describe('load-aware smoke budgets', () => {
     const widened = widenSmokeBudgetsEnv({ ...env, WE_SMOKE_LOAD_SCALE: '0' });
     delete widened.WE_SMOKE_LOAD_SCALE;
     const retry = resolveSmokeBudgets(widened, host());
-    expect(retry.dispatchDryRunMs).toBe(1_800_000);
+    expect(retry.dispatchDryRunMs).toBe(3_000_000);
     expect(retry.reconcileMs).toBe(1_200_000);
   });
 });

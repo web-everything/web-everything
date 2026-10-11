@@ -9,6 +9,13 @@ const defaultProof = 'Prove the change on the live case with before/after eviden
 const io = () => ({ stdout: { write: vi.fn() }, stderr: { write: vi.fn() }, writeFile: vi.fn(), newOwner: () => 'tok12345' });
 
 describe('renderWorkerBrief', () => {
+  it('keeps the main-based lane and overlap-only stacking instructions in step 3', () => {
+    const brief = renderWorkerBrief(params);
+    const lane = brief.slice(brief.indexOf('3. **Lane.**'), brief.indexOf('4. **Codex'));
+    for (const text of ['origin/main', 'gh pr view <N> --json files', 'edge-loaded',
+      'ONLY when your declared files overlap', 'No overlap', '--files']) expect(lane).toContain(text);
+  });
+
   it('renders every standard section in order and the qualified scope in commands', () => {
     const brief = renderWorkerBrief(params);
     const sections = ['## Standard worker rules', '**Scope.**', '1. **Free-scope pre-check.**',
@@ -38,7 +45,7 @@ describe('renderWorkerBrief', () => {
       'no history rewrite', 'no `git add -A`', 'America/New_York (ET)', 'at most 8 lines',
     ]) expect(brief).toContain(text);
     expect(brief).not.toContain('8. **Edge.**');
-    expect(brief).not.toContain('daemon-overlay');
+    expect(brief).not.toContain('daemon-overlay.mjs add --clone=');
     // An UNKNOWN verdict (exit 2) is never free: both checks must say to stop on it, not only on OCCUPIED.
     const section = (from, to) => brief.slice(brief.indexOf(from), brief.indexOf(to));
     for (const text of [section('1. **Free-scope pre-check.**', '2. **Register'),
@@ -47,6 +54,10 @@ describe('renderWorkerBrief', () => {
       expect(text).toMatch(/UNKNOWN/);
       expect(text).toMatch(/exit(?:s)? 2/);
     }
+  });
+
+  it('tells the worker to stop and report when open-pr is refused by the PR limit, never to self-allow (xfaz7ho)', () => {
+    expect(renderWorkerBrief(params)).toContain('If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.');
   });
 
   it('includes the optional edge section as the last numbered rule', () => {

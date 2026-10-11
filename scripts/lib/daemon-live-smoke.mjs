@@ -78,6 +78,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
+import { resolveCutoverMode } from './resource-gate.mjs';
 import { cascadePolicy } from './policy-cascade.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
@@ -165,10 +166,13 @@ export function admissionLoadFactor(env, admission) {
 }
 
 /** The shared decision for kind `rebuild-smoke`: the shadow call's own answer (it logs the old/new pair), else a
- *  direct admit() (shadow switched off). `undefined` only when both fail — callers then keep the legacy load rule. */
+ *  direct admit() (shadow switched off). `undefined` when both fail — callers then keep the legacy load rule — and
+ *  under the `shadow` cut-over (WE_RESOURCE_CUTOVER, the rollback switch): the pair is still logged, but the legacy
+ *  load rule keeps deciding, as it does for every other gate (`resource-gate.mjs#cutoverDecision`). */
 function rebuildSmokeAdmission({ shadow, admit, shadowArgs, env }) {
   let decision;
   try { decision = shadow(shadowArgs); } catch { /* Observation failure falls through to a direct admit(). */ }
+  if (resolveCutoverMode(env) !== 'enforce') return undefined;
   if (isDecision(decision)) return decision;
   try { decision = admit({ kind: 'rebuild-smoke', env }); } catch { decision = undefined; }
   return isDecision(decision) ? decision : undefined;
@@ -195,7 +199,9 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
     // waiting on gh/git children — the cost grows with the open-PR count, not with load. 45s/60s held every
     // daemon clone off main (`smoke-env-timeout`). Generous defaults, still load-scaled below.
     reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 120_000),
-    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 180_000),
+    // Live 2026-10-11 on plain main, quiet host: three passes took 168s (fix 61s, ci-heal 92s,
+    // review 11s), leaving little margin under 180s. Allow 300s before the load scaling below.
+    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 300_000),
     treeStaysCleanMs: envMs(env, SMOKE_BUDGET_ENV.treeStaysCleanMs, 10_000),
     daemonBootMs: envMs(env, SMOKE_BUDGET_ENV.daemonBootMs, DEFAULT_DAEMON_BOOT_MS),
   };

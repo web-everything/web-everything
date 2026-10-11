@@ -33,6 +33,8 @@ import { fileURLToPath } from 'node:url';
 import { listAgentsWithReviewJobs } from '../operations/review-job-store.mjs';
 import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
+// The ONE `status:*` label (what the PR waits on) — written here, by the same owner, never a second writer (D5).
+import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_DESCRIPTIONS } from './pr-status-label.mjs';
 
 /** Matches this module's own label shape, and only this shape.
  *
@@ -230,6 +232,9 @@ export function tagReviewStatus({
   mergeConflicted = false,
   // fix procedure — the live fix-claim read (a local file read, no `gh`); injectable so a test stays hermetic.
   readFixClaim = ({ repo: r, pr: p }) => readLiveFixClaim({ repo: r, pr: p }),
+  // This tick's planner rows for the PR (dispatch rows, refusals, notes) — what the `status:*` label renders.
+  // `null` (a standalone CLI call) leaves any `status:*` label untouched: without the plan it cannot be derived.
+  planRows = null,
 } = {}) {
   const repoKey = repo === undefined ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`review-status-tag: --repo ${repo} is not a constellation repo`);
@@ -247,9 +252,23 @@ export function tagReviewStatus({
   // #4967 — the single plain state, returned for a viewer to show instead of the raw, possibly contradictory
   // labels. The labels themselves are untouched; rendering it is Plateau's follow-up.
   const reviewState = describeReviewState({ labels: currentLabels, status });
+  // The `status:*` label: one per PR, kept current every tick from the same facts plus the plan rows.
+  let prStatus;
+  const applyPrStatus = () => {
+    if (!Array.isArray(planRows)) return;
+    const state = derivePrStatusLabel({ pr: { ...(subject ?? {}), labels: currentLabels }, labels: currentLabels, reviewStatus: status, rows: planRows, defaultBranch });
+    const sp = planPrStatusLabel({ state, currentLabels });
+    prStatus = state ? `status:${state}` : null;
+    if (sp.add || sp.remove.length) {
+      if (sp.add) provider.ensureLabel(repo, sp.add, { color: 'fbca04', description: PR_STATUS_DESCRIPTIONS[state] ?? 'auto-managed PR status' });
+      provider.setLabels(repo, pr, { add: sp.add ?? undefined, remove: sp.remove });
+    }
+  };
+  const withStatus = (o) => (prStatus === undefined ? o : { ...o, prStatus });
   if (!plan.add && plan.remove.length === 0) {
-    return { changed: false, label: currentLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'review-status:draft-withdrawn')
-      ? 'review-status:draft-withdrawn' : status ? `review-status:${status.state}` : null, removed: [], reviewState };
+    applyPrStatus();
+    return withStatus({ changed: false, label: currentLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'review-status:draft-withdrawn')
+      ? 'review-status:draft-withdrawn' : status ? `review-status:${status.state}` : null, removed: [], reviewState });
   }
   // `review-status:*` is a small fixed enum, but a repo that has never carried one yet still needs it created
   // before `gh pr edit --add-label` will accept it — same reasoning as `review-round-tag.mjs`'s own ensure.
@@ -259,7 +278,8 @@ export function tagReviewStatus({
   // `add` is optional on the shared port (#2026-09-01 extension) precisely for this remove-only case: nothing
   // is live, so there is no replacement label — only the stale one comes off.
   provider.setLabels(repo, pr, { add: plan.add ?? undefined, remove: plan.remove });
-  return { changed: true, label: plan.add, removed: plan.remove, reviewState };
+  applyPrStatus();
+  return withStatus({ changed: true, label: plan.add, removed: plan.remove, reviewState });
 }
 
 /**

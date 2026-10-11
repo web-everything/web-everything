@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
-import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueuedPr } from '../merge-gate-ci.mjs';
+import { evaluatePrGates, evaluateGroup, groupPrNumbers, groupMembership, asQueuedPr, resolveMergeGateMode, loadMergeGateMode, applyGateMode, runGate, STANDARD_MERGE_GATE_MODE } from '../merge-gate-ci.mjs';
 import { DRAIN_GATES } from '../merge-gate-inventory.mjs';
 import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 import { scoreEscalation } from '../review-escalation.mjs';
@@ -970,5 +970,174 @@ process.stderr.write('fake gh: unexpected ' + a + '\\n'); process.exit(1);
     mkdirSync(join(tree, 'backlog'), { recursive: true });
     const withTree = run(ctx, [...args, `--group-tree=${tree}`], { pr: { headRefOid: g.prHead } });
     expect(dupOf(withTree.stdout)).toMatchObject({ status: 'pass' });
+  });
+});
+
+// ── mergeGate.mode: shadow | enforce (operator-approved 2026-10-10: shadow until the red-main source, #4715) ──
+// Shadow changes ONLY the exit code: every rule is evaluated and reported exactly as in enforce.
+
+describe('mergeGate.mode resolves through the policy cascade', () => {
+  it('defaults to the standard value, shadow, with its source named', () => {
+    expect(resolveMergeGateMode({})).toMatchObject({ mode: 'shadow', source: 'standard' });
+    expect(STANDARD_MERGE_GATE_MODE).toBe('shadow');
+  });
+
+  it('each higher layer wins: standard < platform < repo < env', () => {
+    expect(resolveMergeGateMode({ platform: 'enforce' })).toMatchObject({ mode: 'enforce', source: 'platform' });
+    expect(resolveMergeGateMode({ platform: 'enforce', repo: 'shadow' })).toMatchObject({ mode: 'shadow', source: 'repo' });
+    expect(resolveMergeGateMode({ platform: 'shadow', repo: 'enforce' })).toMatchObject({ mode: 'enforce', source: 'repo' });
+    expect(resolveMergeGateMode({ repo: 'enforce', env: 'shadow' })).toMatchObject({ mode: 'shadow', source: 'env' });
+  });
+
+  it('an empty env value (an unset repository variable) is "not set", not an override', () => {
+    expect(resolveMergeGateMode({ repo: 'enforce', env: '' })).toMatchObject({ mode: 'enforce', source: 'repo' });
+  });
+
+  it('an invalid value at any layer fails closed to enforce, never silently to shadow', () => {
+    for (const layers of [{ env: 'off' }, { repo: 'Shadow' }, { platform: 7 }, { repo: 'enforce', env: 'shadw' }]) {
+      const r = resolveMergeGateMode(layers);
+      expect(r.mode, JSON.stringify(layers)).toBe('enforce');
+      expect(r.source).toMatch(/fail-closed/);
+    }
+  });
+
+  it('loadMergeGateMode reads platform file, declared repo settings and the env', () => {
+    const readFile = () => JSON.stringify({ mergeGate: { mode: 'enforce' } });
+    const read = (repoMode) => () => ({ settings: repoMode ? { mergeGate: { mode: repoMode } } : {}, errors: [], duplicates: [] });
+    expect(loadMergeGateMode({ env: {}, readFile, readDeclared: read(null) })).toMatchObject({ mode: 'enforce', source: 'platform' });
+    expect(loadMergeGateMode({ env: {}, readFile, readDeclared: read('shadow') })).toMatchObject({ mode: 'shadow', source: 'repo' });
+    expect(loadMergeGateMode({ env: { MERGE_GATE_MODE: 'enforce' }, readFile, readDeclared: read('shadow') })).toMatchObject({ mode: 'enforce', source: 'env' });
+    const enoent = () => { throw Object.assign(new Error('nope'), { code: 'ENOENT' }); };
+    expect(loadMergeGateMode({ env: {}, readFile: enoent, readDeclared: read(null) })).toMatchObject({ mode: 'shadow', source: 'standard' });
+  });
+
+  it('an unreadable layer fails closed to enforce (a skipped file could be the one that says enforce)', () => {
+    const ok = () => ({ settings: {}, errors: [], duplicates: [] });
+    const bad = () => { throw new Error('EACCES'); };
+    expect(loadMergeGateMode({ env: {}, readFile: bad, readDeclared: ok })).toMatchObject({ mode: 'enforce', source: expect.stringMatching(/fail-closed/) });
+    const errs = () => ({ settings: {}, errors: [{ source: 'x.json', error: 'bad json' }], duplicates: [] });
+    expect(loadMergeGateMode({ env: {}, readFile: () => '{}', readDeclared: errs })).toMatchObject({ mode: 'enforce' });
+    const dup = () => ({ settings: { mergeGate: { mode: 'shadow' } }, errors: [], duplicates: [{ path: 'mergeGate.mode', sources: ['a.json', 'b.json'] }] });
+    expect(loadMergeGateMode({ env: {}, readFile: () => '{}', readDeclared: dup })).toMatchObject({ mode: 'enforce' });
+  });
+});
+
+describe('applyGateMode changes only the exit code', () => {
+  const held = evaluatePrGates(facts({ redMain: { source: null } }), {});
+  const passing = evaluatePrGates(facts(), {});
+  const report = (prs) => ({ ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs });
+
+  it('shadow: a HOLD verdict exits 0 and names the holding rules', () => {
+    expect(held.ok).toBe(false);
+    const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: report([held]) });
+    expect(out.exitCode).toBe(0);
+    expect(out.text).toMatch(/SHADOW: would HOLD on red-main-freeze/);
+    expect(out.text).toMatch(/fail-closed\s+red-main-freeze\s+no shared red-main freeze source yet/);
+    expect(out.text).toMatch(/merge-gate: HOLD/);
+    expect(out.summary).toMatch(/SHADOW: would HOLD on red-main-freeze/);
+    expect(out.summary).toMatch(/mode: shadow \(source: standard\)/);
+  });
+
+  it('enforce: the same HOLD exits 1 with the same table (today\'s behaviour)', () => {
+    const s = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: report([held]) });
+    const e = applyGateMode({ mode: 'enforce', source: 'repo', childStatus: 1, report: report([held]) });
+    expect(e.exitCode).toBe(1);
+    expect(e.text).not.toMatch(/SHADOW/);
+    const table = (t) => t.split('\n').filter((l) => /^(#\d+:|\s{2}\S)/.test(l)).join('\n');
+    expect(table(e.text)).toBe(table(s.text));
+  });
+
+  it('a pass is a pass in both modes', () => {
+    for (const mode of ['shadow', 'enforce']) {
+      const out = applyGateMode({ mode, source: 'standard', childStatus: 0, report: report([passing]) });
+      expect(out.exitCode).toBe(0);
+      expect(out.text).not.toMatch(/would HOLD/);
+    }
+  });
+
+  it('a hold that is not one rule (workflow self-check) is still named in shadow', () => {
+    const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus: 1, report: { ok: false, reason: 'workflow self-check failed — fail closed: x', prs: [passing] } });
+    expect(out.exitCode).toBe(0);
+    expect(out.text).toMatch(/SHADOW: would HOLD on workflow self-check failed/);
+  });
+
+  it('no verdict (crash, usage error, unparsable or inconsistent output) is never masked, even in shadow', () => {
+    for (const [childStatus, rep] of [[1, null], [3, null], [1, { ok: true, prs: [] }], [0, { ok: false, prs: [held] }], [1, { prs: [] }]]) {
+      const out = applyGateMode({ mode: 'shadow', source: 'standard', childStatus, report: rep });
+      expect(out.exitCode, JSON.stringify([childStatus, rep])).toBe(childStatus === 0 ? 1 : childStatus);
+      expect(out.text).toMatch(/no verdict/);
+    }
+  });
+});
+
+describe('runGate (the workflow wrapper around merge-gate-check.mjs)', () => {
+  const script = join(new URL('../../', import.meta.url).pathname, 'merge-gate-check.mjs');
+  const heldReport = () => {
+    const p = evaluatePrGates(facts({ redMain: { source: null } }), {});
+    return JSON.stringify({ ok: false, reason: 'held', prs: [p] });
+  };
+  const harness = (stdout, status) => {
+    const calls = [];
+    const written = [];
+    const summary = [];
+    return {
+      calls, written, summary,
+      deps: {
+        spawn: (cmd, args) => { calls.push([cmd, ...args]); return { status, stdout }; },
+        write: (s) => written.push(s), warn: (s) => written.push(s), appendSummary: (s) => summary.push(s),
+      },
+    };
+  };
+
+  it('runs merge-gate-check.mjs with --json, logs the mode source, and exits 0 in shadow on a hold', () => {
+    const h = harness(heldReport(), 1);
+    const code = runGate({ argv: ['--', 'scripts/merge-gate-check.mjs', '--repo=o/r', '--pr=5'], modeInfo: { mode: 'shadow', source: 'standard' }, ...h.deps });
+    expect(code).toBe(0);
+    expect(h.calls[0].slice(1)).toEqual([script, '--repo=o/r', '--pr=5', '--json']);
+    expect(h.written.join('')).toMatch(/merge-gate mode: shadow \(source: standard\)/);
+    expect(h.summary.join('')).toMatch(/SHADOW: would HOLD on red-main-freeze/);
+  });
+
+  it('enforce passes the hold through as exit 1', () => {
+    const h = harness(heldReport(), 1);
+    expect(runGate({ argv: ['--', 'scripts/merge-gate-check.mjs', '--pr=5'], modeInfo: { mode: 'enforce', source: 'repo' }, ...h.deps })).toBe(1);
+  });
+
+  it('refuses to wrap anything but merge-gate-check.mjs (usage error, exit 3)', () => {
+    for (const argv of [[], ['--'], ['--', 'scripts/evil.mjs', '--pr=5'], ['scripts/merge-gate-check.mjs']]) {
+      const h = harness('', 0);
+      expect(runGate({ argv, modeInfo: { mode: 'shadow', source: 'standard' }, ...h.deps }), JSON.stringify(argv)).toBe(3);
+      expect(h.calls).toEqual([]);
+    }
+  });
+});
+
+describe('merge-gate workflow: mode wiring and trigger hygiene', () => {
+  const wf = workflowOf('merge-gate.yml');
+  const job = wf.jobs['merge-gate'];
+  const evaluate = job.steps.find((s) => /merge-gate-check\.mjs/.test(s.run || ''));
+  const UNWATCHED = "(github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:')";
+
+  it('every merge-gate-check.mjs call goes through the mode wrapper, and the env layer comes from a repo variable', () => {
+    const calls = evaluate.run.split('\n').filter((l) => /node [^\n]*merge-gate-check\.mjs/.test(l));
+    expect(calls.length).toBeGreaterThanOrEqual(3);
+    for (const l of calls) expect(l).toMatch(/node scripts\/lib\/merge-gate-ci\.mjs --run-gate -- scripts\/merge-gate-check\.mjs /);
+    expect(evaluate.env.MERGE_GATE_MODE).toBe('${{ vars.MERGE_GATE_MODE }}');
+  });
+
+  it('runs on head changes and label changes only (no edited / ready_for_review)', () => {
+    expect(triggersOf(wf).pull_request_target.types).toEqual(['opened', 'synchronize', 'reopened', 'labeled', 'unlabeled']);
+    expect(Object.keys(triggersOf(wf))).toContain('merge_group');
+  });
+
+  it('skips unwatched label events under a DIFFERENT check name, so a skipped run never stands in for merge-gate', () => {
+    // A skipped job reports as passing for a required check: the skipped run must not be named `merge-gate`.
+    expect(job.if).toBe(`\${{ !(${UNWATCHED}) }}`);
+    expect(job.name).toBe(`\${{ ${UNWATCHED} && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}`);
+  });
+
+  it('one live run per PR, superseded runs cancelled, and an unwatched-label run can never cancel a real one', () => {
+    expect(wf.concurrency['cancel-in-progress']).toBe(true);
+    expect(wf.concurrency.group).toBe(`merge-gate-\${{ ${UNWATCHED} && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}`);
   });
 });

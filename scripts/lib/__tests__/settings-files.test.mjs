@@ -36,6 +36,16 @@ describe('mergeSettingsLayers — pure', () => {
     expect(duplicates).toEqual([{ path: 'x.y', sources: ['settings/a.json', 'settings/b.json'] }]);
   });
 
+  it('a top-level $comment is documentation: two feature files each carrying one is not a duplicate leaf', () => {
+    const { duplicates, owners } = mergeSettingsLayers([
+      { source: 'settings/a.json', data: { $comment: 'about a', a: 1 } },
+      { source: 'settings/b.json', data: { $comment: 'about b', b: 2 } },
+    ]);
+    expect(duplicates).toEqual([]);
+    expect(Object.keys(owners).sort()).toEqual(['a', 'b']);
+    expect(settingsLeaves({ $comment: 'x', n: { $comment: 'y' } })).toEqual(['n.$comment']);
+  });
+
   it('never lets a settings file write onto Object.prototype (__proto__ / constructor / prototype keys)', () => {
     const data = JSON.parse('{"__proto__":{"polluted":"yes"},"constructor":{"prototype":{"polluted2":"yes"}},"ok":{"v":1}}');
     const { settings, owners } = mergeSettingsLayers([{ source: 'settings/x.json', data }]);

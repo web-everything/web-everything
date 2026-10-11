@@ -144,13 +144,27 @@ describe('fetch classification', () => {
 
 describe('shims (real sh processes)', () => {
   const box = () => realpathSync(mkdtempSync(join(tmpdir(), 'hermetic-shim-')));
+  // A shim is written and exec'd moments later in a multi-threaded vitest worker. On Linux a sibling thread's
+  // fork can briefly hold the just-written file open for writing, so exec fails ETXTBSY and the shim never runs
+  // (main c12db238f: the multi-line test then read a violations.tsv nothing wrote). Retry that kernel race, and
+  // fail loudly on any other spawn error instead of letting the assertions read a missing log.
+  const spawnShim = (cmd, args, opts) => {
+    let r;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      r = spawnSync(cmd, args, opts);
+      if (r.error?.code !== 'ETXTBSY') break;
+      spawnSync('sleep', ['0.05']);
+    }
+    if (r.error) throw r.error;
+    return r;
+  };
 
   it('fake gh records the call against the running test and fails with the live-access message', () => {
     const dir = box();
     try {
       writeFileSync(join(dir, 'gh'), fakeGhScript()); chmodSync(join(dir, 'gh'), 0o755);
       const viol = join(dir, 'v');
-      const r = spawnSync(join(dir, 'gh'), ['pr', 'list'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't1', [TEST_NAME_ENV]: 'a > b' } });
+      const r = spawnShim(join(dir, 'gh'), ['pr', 'list'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't1', [TEST_NAME_ENV]: 'a > b' } });
       expect(r.status).toBe(1);
       expect(r.stderr).toContain(LIVE_ACCESS_MESSAGE);
       expect(r.stderr).toContain('a > b');
@@ -163,7 +177,7 @@ describe('shims (real sh processes)', () => {
     try {
       writeFileSync(join(dir, 'gh'), fakeGhScript()); chmodSync(join(dir, 'gh'), 0o755);
       const viol = join(dir, 'v');
-      const r = spawnSync(join(dir, 'gh'), ['auth', 'status'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [GH_FIXTURE_ENV]: 'unauthenticated' } });
+      const r = spawnShim(join(dir, 'gh'), ['auth', 'status'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [GH_FIXTURE_ENV]: 'unauthenticated' } });
       expect(r.status).toBe(1);
       expect(r.stderr).toContain('gh auth login');
       expect(existsSync(join(viol, VIOLATIONS_FILE))).toBe(false);
@@ -175,7 +189,8 @@ describe('shims (real sh processes)', () => {
     try {
       writeFileSync(join(dir, 'gh'), fakeGhScript()); chmodSync(join(dir, 'gh'), 0o755);
       const viol = join(dir, 'v');
-      spawnSync(join(dir, 'gh'), ['api', 'graphql', '-f', 'query=query {\n  viewer\t{ login }\n}'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't2' } });
+      const r = spawnShim(join(dir, 'gh'), ['api', 'graphql', '-f', 'query=query {\n  viewer\t{ login }\n}'], { encoding: 'utf8', env: { PATH: process.env.PATH, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't2' } });
+      expect(r.status).toBe(1);
       const rows = parseViolationLog(readFileSync(join(viol, VIOLATIONS_FILE), 'utf8'));
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({ testId: 't2', kind: 'gh' });
@@ -192,9 +207,9 @@ describe('shims (real sh processes)', () => {
       const repo = join(dir, 'repo'); mkdirSync(repo);
       const other = join(dir, 'other'); mkdirSync(other);
       const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: repo, [VIOLATIONS_DIR_ENV]: join(dir, 'v') };
-      const r = spawnSync(join(dir, 'git'), ['--git-dir', other, 'rev-parse', 'origin/main'], { cwd: repo, encoding: 'utf8', env });
+      const r = spawnShim(join(dir, 'git'), ['--git-dir', other, 'rev-parse', 'origin/main'], { cwd: repo, encoding: 'utf8', env });
       expect(r.stdout).toContain('PASSED-THROUGH');
-      const r2 = spawnSync(join(dir, 'git'), [`--git-dir=${repo}`, 'rev-parse', 'origin/main'], { cwd: other, encoding: 'utf8', env });
+      const r2 = spawnShim(join(dir, 'git'), [`--git-dir=${repo}`, 'rev-parse', 'origin/main'], { cwd: other, encoding: 'utf8', env });
       expect(r2.status).toBe(128);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -229,7 +244,7 @@ describe('shims (real sh processes)', () => {
       writeFileSync(join(dir, 'git'), gitShimScript({ realGit })); chmodSync(join(dir, 'git'), 0o755);
       const { args, env: extra } = build(repo, other);
       const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: repo, [VIOLATIONS_DIR_ENV]: join(dir, 'v'), [TEST_ID_ENV]: 't5', ...extra };
-      const r = spawnSync(join(dir, 'git'), args, { cwd: where === 'repo' ? repo : other, encoding: 'utf8', env });
+      const r = spawnShim(join(dir, 'git'), args, { cwd: where === 'repo' ? repo : other, encoding: 'utf8', env });
       if (refused) expect(r.status).toBe(128);
       else expect(r.stdout).toContain('PASSED-THROUGH');
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -253,7 +268,7 @@ describe('shims (real sh processes)', () => {
       const repo = join(dir, 'repo'); mkdirSync(repo);
       const viol = join(dir, 'v');
       const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: repo, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't7', ...extra };
-      const r = spawnSync(join(dir, 'git'), ['fetch', 'origin'], { cwd: repo, encoding: 'utf8', env });
+      const r = spawnShim(join(dir, 'git'), ['fetch', 'origin'], { cwd: repo, encoding: 'utf8', env });
       expect(r.status).toBe(0);
       expect(r.stdout).toContain('PASSED-THROUGH');
       expect(parseViolationLog(readFileSync(join(viol, VIOLATIONS_FILE), 'utf8'))[0]).toMatchObject({ testId: 't7', kind: 'git' });
@@ -269,7 +284,7 @@ describe('shims (real sh processes)', () => {
       const repo = join(dir, 'repo'); mkdirSync(repo);
       const viol = join(dir, 'v');
       const env = { PATH: process.env.PATH, [REAL_REPOS_ENV]: `/nowhere:${repo}`, [VIOLATIONS_DIR_ENV]: viol, [TEST_ID_ENV]: 't9' };
-      const r = spawnSync(join(dir, 'git'), args, { cwd: repo, encoding: 'utf8', env });
+      const r = spawnShim(join(dir, 'git'), args, { cwd: repo, encoding: 'utf8', env });
       if (hit) {
         expect(r.status).toBe(128);
         expect(r.stderr).toContain(LIVE_ACCESS_MESSAGE);
@@ -279,7 +294,7 @@ describe('shims (real sh processes)', () => {
         expect(r.stdout).toContain('PASSED-THROUGH');
       }
       // Outside every real checkout (a fixture repo in tmp) the same command always passes through.
-      const elsewhere = spawnSync(join(dir, 'git'), args, { cwd: dir, encoding: 'utf8', env });
+      const elsewhere = spawnShim(join(dir, 'git'), args, { cwd: dir, encoding: 'utf8', env });
       expect(elsewhere.stdout).toContain('PASSED-THROUGH');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

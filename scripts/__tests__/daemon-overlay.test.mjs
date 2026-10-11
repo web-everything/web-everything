@@ -9,13 +9,13 @@
  *   refuse by default, `--allow-conflict --reason=` overrides and prints what it overrode, `--check` never
  *   mutates the overlay state file either way).
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { withAddGuardLock } from '../daemon-overlay.mjs';
+import { withAddGuardLock, stackAwareOverlayCheck, findStackBases } from '../daemon-overlay.mjs';
 import { overlayFilePath } from '../lib/daemon-overlays.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -74,7 +74,7 @@ function makeFixture() {
   gitOk(cloneDir, ['push', '-q', '-u', 'origin', 'main']);
   gitOk(cloneDir, ['fetch', '-q', 'origin']);
   const overlayDir = mktemp('we-overlay-cli-state-');
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir };
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
   return { originDir, cloneDir, overlayDir, env };
 }
 
@@ -336,7 +336,7 @@ function deadPid() {
 
 function lockFixture(waitMs) {
   const overlayDir = mktemp('we-overlay-lock-');
-  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir };
+  const env = { ...process.env, WE_DAEMON_OVERLAY_DIR: overlayDir, WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
   if (waitMs) env.WE_DAEMON_OVERLAY_ADD_GUARD_WAIT_MS = String(waitMs);
   const root = mktemp('we-overlay-lock-root-');
   const lockDir = `${overlayFilePath(root, env)}.add-guard.lock`;
@@ -462,5 +462,192 @@ describe('withAddGuardLock', () => {
 
     gateB.resolve();
     await expect(Promise.all([b, old])).resolves.toEqual([undefined, 'old']);
+  });
+});
+
+
+function forceMoveBase(originDir, ref) {
+  const dir = makeAuthorClone(originDir);
+  gitOk(dir, ['checkout', '-q', '-B', ref, 'origin/main']);
+  writeFile(dir, 'shared.txt', 'b2\n');
+  gitOk(dir, ['add', 'shared.txt']);
+  gitOk(dir, ['commit', '-q', '-m', 'move base']);
+  gitOk(dir, ['push', '-q', 'origin', `+HEAD:refs/heads/${ref}`]);
+}
+
+describe('daemon-overlay.mjs add — stack-aware guard (#4914/#4915 live 2026-10-11)', () => {
+  function fixture({ moved = true, other = false, chain = true } = {}) {
+    const f = makeFixture();
+    advanceMain(f.originDir, dir => {
+      writeFile(dir, 'shared.txt', 'main\n');
+      writeFile(dir, 'other.txt', 'main\n');
+    });
+    const add = (ref, ...flags) => runCli(['add', `--clone=${f.cloneDir}`, `--ref=${ref}`, '--pr=4915', ...flags], f.env);
+    pushBranch(f.originDir, 'lane/b', dir => writeFile(dir, 'shared.txt', 'b1\n'));
+    expect(add('lane/b').status).toBe(0);
+    if (other) {
+      pushBranch(f.originDir, 'lane/d', dir => writeFile(dir, 'other.txt', 'd\n'));
+      expect(add('lane/d').status).toBe(0);
+    }
+    pushBranch(f.originDir, 'lane/c', dir => {
+      writeFile(dir, 'c.txt', 'c\n');
+      if (other) writeFile(dir, 'other.txt', 'c\n');
+    }, { base: 'origin/lane/b' });
+    if (moved) forceMoveBase(f.originDir, 'lane/b');
+    f.env.WE_DAEMON_OVERLAY_STACK_BASES = JSON.stringify(chain ? { 'lane/c': 'lane/b' } : {});
+    return { ...f, add, state: () => overlayStateFile(f.overlayDir, f.cloneDir) };
+  }
+
+  it('accepts a moved base conflict in check and real add, with human output and audit evidence', () => {
+    const f = fixture();
+    const before = f.state();
+    const check = f.add('lane/c', '--check', '--json');
+    expect(check.status, check.stderr).toBe(0);
+    const result = JSON.parse(check.stdout);
+    expect(result.wouldRegister).toBe(true);
+    expect(result.check.stackBases).toEqual(['lane/b']);
+    expect(result.check.stackConflictIgnored.files).toContain('shared.txt');
+    expect(f.state()).toEqual(before);
+    const human = f.add('lane/c', '--check');
+    expect(human.status).toBe(0);
+    expect(human.stderr).toContain('stack-aware — lane/c conflicts only with its own stack base(s) lane/b');
+    const added = f.add('lane/c');
+    expect(added.status, added.stderr).toBe(0);
+    expect(added.stderr).toContain('stack-aware — lane/c');
+    expect(f.state().overlays.map(o => o.ref)).toEqual(['lane/b', 'lane/c']);
+    const eventFile = readdirSync(f.overlayDir).find(n => n.endsWith('.events.jsonl'));
+    const events = readFileSync(join(f.overlayDir, eventFile), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(events.at(-1)).toMatchObject({
+      kind: 'added', stackBases: ['lane/b'],
+      stackConflictIgnored: { files: expect.arrayContaining(['shared.txt']) },
+    });
+  });
+
+  it('refuses the same moved base without chain evidence', () => {
+    const f = fixture({ chain: false });
+    const before = f.state();
+    const result = f.add('lane/c');
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('lane/b');
+    expect(f.state()).toEqual(before);
+  });
+
+  it('still refuses a genuine conflict and attributes only the non-stack overlay', () => {
+    const f = fixture({ other: true });
+    const before = f.state();
+    const result = f.add('lane/c');
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('lane/d');
+    expect(result.stderr).not.toContain('lane/b');
+    expect(f.state()).toEqual(before);
+  });
+
+  it('discovers the current base by ancestry without a PR chain', () => {
+    const f = fixture({ moved: false, chain: false });
+    // Seed objects as a daemon rebuild would; the guard itself must never fetch.
+    gitOk(f.cloneDir, ['fetch', '-q', 'origin']);
+    const refs = gitOk(f.cloneDir, ['show-ref']);
+    const result = f.add('lane/c', '--check', '--json');
+    expect(result.status, result.stderr).toBe(0);
+    const { check } = JSON.parse(result.stdout);
+    expect(check.stackBases).toContain('lane/b');
+    expect(check.stackVia.ancestry).toContain('lane/b');
+    expect(gitOk(f.cloneDir, ['show-ref'])).toBe(refs);
+  });
+});
+
+describe('stackAwareOverlayCheck', () => {
+  const existingOverlays = [{ ref: 'lane/b' }, { ref: 'lane/d' }];
+  const full = { ok: true, clean: false, files: ['shared.txt'], conflicting: [existingOverlays[0]] };
+  const via = { chain: ['lane/b'], ancestry: [] };
+  const options = { root: '/unused', ref: 'lane/c', pr: 4915, existingOverlays, env: {}, originUrl: '/origin' };
+
+  it('runs only one preview with no bases', async () => {
+    const preview = vi.fn().mockResolvedValue(full);
+    const stackBases = vi.fn().mockReturnValue({ bases: [], via });
+    expect(await stackAwareOverlayCheck({ ...options, preview, stackBases })).toEqual({ ...full, stackBases: [], stackVia: via });
+    expect(preview).toHaveBeenCalledTimes(1);
+    expect(preview).toHaveBeenCalledWith(options);
+    expect(stackBases).toHaveBeenCalledTimes(1);
+    expect(stackBases).toHaveBeenCalledWith(options);
+  });
+
+  it.each([
+    [{ ok: true, clean: true }, 'accepted'],
+    [{ ok: true, clean: false, files: ['other.txt'], conflicting: [existingOverlays[1]] }, 'conflicting'],
+    [{ ok: false, reason: 'unavailable' }, 'failed'],
+  ])('handles the set-aside preview: %s (%s)', async (second, outcome) => {
+    const preview = vi.fn().mockResolvedValueOnce(full).mockResolvedValueOnce(second);
+    const result = await stackAwareOverlayCheck({
+      ...options, preview, stackBases: () => ({ bases: ['lane/b'], via }),
+    });
+    expect(preview).toHaveBeenCalledTimes(2);
+    expect(preview).toHaveBeenNthCalledWith(2, { ...options, existingOverlays: [existingOverlays[1]] });
+    expect(result).toEqual({
+      ...(outcome === 'failed' ? full : second), stackBases: ['lane/b'], stackVia: via,
+      ...(outcome === 'accepted' ? { stackConflictIgnored: { files: full.files, conflicting: full.conflicting } } : {}),
+    });
+  });
+});
+
+
+describe('findStackBases', () => {
+  const options = { root: '/clone', ref: 'lane/c', pr: 4915,
+    existingOverlays: [{ ref: 'lane/a' }, { ref: 'lane/b' }, { ref: 'lane/c' }, { ref: 'lane/b' }] };
+
+  it('walks unregistered links, stops cycles, and returns unique bases in registry order', () => {
+    const run = vi.fn(() => { throw new Error('offline'); });
+    const result = findStackBases({ ...options, run, env: {
+      WE_DAEMON_OVERLAY_STACK_BASES: JSON.stringify({
+        'lane/c': 'lane/b', 'lane/b': 'bridge', bridge: 'lane/a', 'lane/a': 'lane/c',
+      }),
+    } });
+    expect(result).toEqual({ bases: ['lane/a', 'lane/b'],
+      via: { chain: ['lane/b', 'bridge', 'lane/a'], ancestry: [] } });
+    expect(run.mock.calls.every(([cmd]) => cmd === 'git')).toBe(true);
+  });
+
+  it.each(['{', 'null', '{}'])('never calls gh for an invalid or empty map: %s', map => {
+    const run = vi.fn(() => ({ status: 1 }));
+    expect(findStackBases({ ...options, run, env: { WE_DAEMON_OVERLAY_STACK_BASES: map } }).bases).toEqual([]);
+    expect(run.mock.calls.every(([cmd]) => cmd === 'git')).toBe(true);
+  });
+
+  it.each([4915, null])('uses the PR number or head query first, then head queries (%s)', pr => {
+    const run = vi.fn((cmd, args) => cmd === 'gh'
+      ? { status: 0, stdout: args.includes('lane/b') ? 'main\n' : 'lane/b\n' }
+      : { status: 1 });
+    const result = findStackBases({ ...options, pr, env: {}, run });
+    expect(result.bases).toEqual(['lane/b']);
+    const calls = run.mock.calls.filter(([cmd]) => cmd === 'gh');
+    expect(calls[0][1]).toEqual(pr == null
+      ? ['pr', 'list', '--head', 'lane/c', '--state', 'open', '--json', 'baseRefName', '--jq', '.[0].baseRefName']
+      : ['pr', 'view', '4915', '--json', 'baseRefName', '--jq', '.baseRefName']);
+    expect(calls[1][1]).toEqual(['pr', 'list', '--head', 'lane/b', '--state', 'open', '--json', 'baseRefName', '--jq', '.[0].baseRefName']);
+    expect(calls).toHaveLength(2);
+    expect(calls[0][2]).toMatchObject({ cwd: '/clone', timeout: 15000, encoding: 'utf8' });
+  });
+
+  it('caps chain walks at twelve hops', () => {
+    const run = vi.fn((cmd) => ({ status: cmd === 'gh' ? 0 : 1, stdout: `base-${run.mock.calls.length}` }));
+    expect(findStackBases({ ...options, env: {}, run }).via.chain).toHaveLength(12);
+  });
+
+  it('checks remote tips once, tolerates missing objects, and never fetches or writes refs', () => {
+    const sha = n => String(n).repeat(40);
+    const run = vi.fn((cmd, args) => {
+      if (args[0] === 'ls-remote') return { status: 0, stdout:
+        `${sha(1)}\trefs/heads/lane/c\n${sha(2)}\trefs/heads/lane/a\n${sha(3)}\trefs/heads/lane/b\n` };
+      return { status: args[2] === sha(2) ? 0 : 128 };
+    });
+    expect(findStackBases({ ...options, originUrl: '/origin', env: { WE_DAEMON_OVERLAY_STACK_BASES: '{}' }, run }))
+      .toEqual({ bases: ['lane/a'], via: { chain: [], ancestry: ['lane/a'] } });
+    expect(run.mock.calls[0][1]).toEqual(['ls-remote', '/origin',
+      'refs/heads/lane/c', 'refs/heads/lane/a', 'refs/heads/lane/b']);
+    expect(run.mock.calls).toHaveLength(3);
+    for (const [cmd, , opts] of run.mock.calls) {
+      expect(cmd).toBe('git');
+      expect(opts).toMatchObject({ cwd: '/clone', env: { GIT_OPTIONAL_LOCKS: '0' } });
+    }
   });
 });

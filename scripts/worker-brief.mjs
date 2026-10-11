@@ -78,6 +78,10 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
    shares your slug. Stop and report; never release or overwrite their entry.
    Release it when you finish, succeed or fail: \`node scripts/operations/free-scope-cli.mjs release --agent=${purpose} --owner=${owner}\`.
 3. **Lane.** \`node scripts/lane-pool.mjs acquire --purpose=${purpose} --adopt${laneRepo}\` (for plateau-app add \`--repo=<plateau-app checkout>\`).
+   Base the lane on origin/main (what acquire gives you). Do not base it on another open PR.
+   Stack on an unmerged PR ONLY when your declared files overlap that PR's changed files. Check first:
+   \`gh pr view <N> --json files --jq '.files[].path'\` and compare with your --files list. No overlap => base on origin/main.
+   Never stack just to get edge-loaded: daemon-overlay add is stack-aware and a main-based lane loads on its own.
    Work only in the lane path it prints. Never branch or edit the primary checkout. Release the lane at the end:
    \`node scripts/lane-pool.mjs release --lane=<N> --session=<holder slug it printed>\`.
 4. **Codex for scoped coding.** Well-scoped coding sub-tasks (tests, mechanical edits, a single-file fix with clear
@@ -89,6 +93,7 @@ cannot collide, and free-scope never counts other PRs' new cards against \`backl
 6. **One PR.** Commit with a tight pathspec (your files only), verify with
    \`node scripts/operations/run.mjs verify --checkout=<lane>\`, then open exactly one PR:
    \`node scripts/operations/run.mjs open-pr --ref=lane/${purpose} --title="<title>" --bodyFile=<path> --json\`.
+   If open-pr is refused by the PR limit, stop and report — never run pr-limit allow yourself.
 7. **Pre-push recheck.** Right before open-pr, re-run the free-scope check excluding yourself:
    \`node scripts/operations/free-scope-cli.mjs check --files=${commaList} --exclude-agent=${purpose} --exclude-owner=${owner}\`.
    If something new holds your files (OCCUPIED), or the verdict is UNKNOWN (exit 2), stop and report instead of pushing.
