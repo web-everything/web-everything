@@ -21,11 +21,8 @@
  * drain cannot land it first. The carry applies only on a byte-identical fingerprint of the net diff vs main, which
  * `review-set-label.mjs` then re-derives and stamps itself.
  *
- * Detection reuses `pr-stack.mjs#detectStacks` with a widened containment predicate: a bottom counts as "below" a top
- * when the top contains the bottom's head OR an older commit of the bottom's own first-parent line that is not on
- * main (the bottom moved after the top merged it — the live #4631/#4624 shape, where #4631 holds 704c02f and #4624 is
- * at dea2666). Trust boundary as in `pr-stack.mjs`: only non-fork PRs whose head is the tip of the origin `lane/*`
- * branch GitHub names for them take part.
+ * Stack relations come only from GitHub's baseRefName naming an open, trusted lane PR's head branch. Ancestry
+ * refines the contained commit but never establishes or reverses the relation; cyclic waits are dropped.
  *
  * SETTING `stackAwareReview` (`on` | `off`), policy cascade (we:scripts/lib/policy-cascade.mjs): built-in default
  * `on` → platform preference `stackAwareReview` → tool override (`we:scripts/settings/stack-aware-review.json`) → env
@@ -113,22 +110,54 @@ export function stackAnswers(sets) {
 
 /**
  * Every stacked top among the open PRs, with its base. PURE: reuses `pr-stack.mjs#detectStacks` (the fix daemon's
- * detector) with the widened containment answers.
- * @param {Array<{pr:number, headRefName:string|null, headRefOid:string|null, untrusted?:boolean}>} prs open PRs
+ * detector), restricted to GitHub-declared bases with widened containment answers.
+ * @param {Array<{pr:number, headRefName:string|null, headRefOid:string|null, baseRefName?:string|null, untrusted?:boolean}>} prs open PRs
  * @param {OffMainSets} sets
- * @param {{allowPair?:Function}} [o] `allowPair` — the ownership rule for a pair; by default the SAME one the fix daemon
+ * @param {{allowPair?:Function, log?:Function}} [o] `allowPair` — the ownership rule for a pair; by default the SAME one the fix daemon
  *   applies (`pr-stack.mjs#sameStackActor`: both PRs by the same, known actor), so a stack never forms between authors.
  * @returns {Map<number, {pr:number, ref:string, head:string, contained:string}>} top PR → its stack base
  */
-export function findStackBases(prs, sets, { allowPair = sameStackActor } = {}) {
+export function findStackBases(prs, sets, { allowPair = sameStackActor, log = (m) => process.stderr.write(m + '\n') } = {}) {
   const { isAncestor, onMain } = stackAnswers(sets);
   const stacks = detectStacks(prs, { isAncestor, onMain, remembered: [], allowPair });
   const out = new Map();
   for (const pair of stacks.pairs) {
     if (!pair.bottomOpen || !pair.bottomHead || !LANE_REF.test(String(pair.bottomRef ?? ''))) continue;
     const top = prs.find((p) => p.pr === pair.top);
+    if (!LANE_REF.test(String(top?.baseRefName ?? '')) || top.baseRefName !== pair.bottomRef) continue;
     const contained = top?.headRefOid ? containedCommit(sets, pair.bottomHead, top.headRefOid) : null;
     if (contained && SHA.test(contained)) out.set(pair.top, { pr: pair.bottom, ref: pair.bottomRef, head: pair.bottomHead, contained });
+  }
+  // A declared base wins even if ancestry found a different bottom or could not order the candidates.
+  const trusted = prs.filter((p) => !p.untrusted && p.headRefOid);
+  const byHeadRef = new Map(trusted.filter((p) => LANE_REF.test(String(p.headRefName ?? ''))).map((p) => [p.headRefName, p]));
+  for (const top of trusted) {
+    const bottom = LANE_REF.test(String(top.baseRefName ?? '')) ? byHeadRef.get(top.baseRefName) : null;
+    if (!bottom || bottom.pr === top.pr || !allowPair(top, bottom)) continue;
+    const contained = containedCommit(sets, bottom.headRefOid, top.headRefOid);
+    if (contained && SHA.test(contained)) {
+      out.set(top.pr, { pr: bottom.pr, ref: bottom.headRefName, head: bottom.headRefOid, contained });
+    }
+  }
+
+  // Remove every member of a loop, while retaining dependents outside it. Visit each chain only once.
+  const visited = new Set();
+  for (const start of out.keys()) {
+    const chain = [];
+    const positions = new Map();
+    let pr = start;
+    while (out.has(pr) && !visited.has(pr)) {
+      if (positions.has(pr)) {
+        const loop = chain.slice(positions.get(pr));
+        for (const member of loop) out.delete(member);
+        log(`review-stack-base: stack cycle broken: ${[...loop, pr].map((n) => `#${n}`).join(' -> ')}`);
+        break;
+      }
+      positions.set(pr, chain.length);
+      chain.push(pr);
+      pr = out.get(pr).pr;
+    }
+    for (const member of chain) visited.add(member);
   }
   return out;
 }
@@ -210,7 +239,7 @@ export function decideStackDispatch({ pr, stack, comments, stackFingerprint = nu
   const latest = markers.at(-1);
   if (!latest) return { action: 'review' };
   if (stack) {
-    if (stackFingerprint && stackFingerprint === latest.fingerprint) {
+    if (stack.pr === latest.bottom && stackFingerprint && stackFingerprint === latest.fingerprint) {
       return { action: 'held', marker: latest,
         why: `stacked-accept-held: accepted against #${latest.bottom} (${latest.bottomRef}@${String(latest.contained).slice(0, 9)}); `
           + `the merge waits for #${stack.pr} to land, then the accept carries forward on an identical net diff` };
@@ -397,21 +426,22 @@ export function readBottomLanded({ marker, repo, root = ROOT, run = gitRun(root)
  * @returns {Map<number, {pr:number, ref:string, head:string, contained:string, tree:string, topHead:string}>}
  */
 export function readStackBases({ root = ROOT, env = process.env, prs = null, readRefs = readOpenPrRefs,
-  readLanes = readOriginLaneTips, run = gitRun(root), settingOn = resolveStackAwareReview(env) } = {}) {
+  readLanes = readOriginLaneTips, run = gitRun(root), settingOn = resolveStackAwareReview(env),
+  log = (m) => process.stderr.write(m + '\n') } = {}) {
   const out = new Map();
   try {
     if (!settingOn) return out;
     const tips = readLanes(root);
     if (!tips) return out;
     // Trust boundary: the SAME rule as the fix daemon's `pr-stack.mjs#readStacksForPass` (shared helpers, not a copy).
-    // Fork status and AUTHOR always come from GitHub's own open-PR record, never from the caller's list (which may
+    // Base ref, fork status and AUTHOR always come from GitHub's own open-PR record, never from the caller's list (which may
     // lack them): a PR with no record is a fork, and a pair needs one known actor on both sides (`sameStackActor`,
     // applied by `findStackBases`). The caller's list only says which PRs, at which head, to look at.
     const refs = readRefs(root);
     const listed = Array.isArray(prs)
       ? prs.map((p) => ({ pr: Number(p.number), headRefName: p.headRefName ?? null, headRefOid: p.headRefOid ?? null }))
       : [...refs.entries()].map(([n, r]) => ({ pr: n, headRefName: r.headRefName, headRefOid: r.headRefOid }));
-    const rows = listed.map((r) => ({ ...r, ...stackRowFlags(refs.get(r.pr)) }));
+    const rows = listed.map((r) => ({ ...r, baseRefName: refs.get(r.pr)?.baseRefName ?? null, ...stackRowFlags(refs.get(r.pr)) }));
     const trusted = flagUntrustedStackRows(rows, tips)
       .filter((r) => Number.isInteger(r.pr) && !r.untrusted && LANE_REF.test(r.headRefName));
     const missing = trusted.filter((r) => { try { run(['cat-file', '-e', `${r.headRefOid}^{commit}`]); return false; } catch { return true; } });
@@ -419,7 +449,7 @@ export function readStackBases({ root = ROOT, env = process.env, prs = null, rea
       try { run(['fetch', '-q', '--end-of-options', 'origin', ...missing.map((r) => r.headRefName)]); } catch { /* left unknown */ }
     }
     const sets = readOffMainSets(trusted.map((r) => r.headRefOid), { root, run });
-    for (const [top, base] of findStackBases(trusted, sets)) {
+    for (const [top, base] of findStackBases(trusted, sets, { log })) {
       const topHead = trusted.find((r) => r.pr === top).headRefOid;
       const tree = stackBaseTree({ contained: base.contained, topHead, root, run });
       if (tree) out.set(top, { ...base, tree, topHead });
