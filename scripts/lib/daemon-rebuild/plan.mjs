@@ -124,7 +124,9 @@ function changedFiles(git, mainSha, sha) {
  *     head of P, so it never evicts P (it is reported in `unconfirmed` and parked by the plain conflict rule).
  *   - with no fresh proof — the force-push read is UNKNOWN (gh unreachable; reported in `unknown`), or the proof aged
  *     out of the reflog — the last adopted build decides: P keeps what it had there — set aside if HEAD merged a
- *     clashing top but not P, else live. Never a fresh eviction.
+ *     clashing top but not P, and that top still holds the head HEAD merged, else live. Never a fresh eviction. When
+ *     HEAD holds a proven old head of P that no clashing top carries any more, the top that replaced P is gone (closed
+ *     or rewritten): P is live again, never kept aside for an unrelated clashing top the build also merged.
  * A PINNED base (flag or mechanism), contained or moved, is never set aside — it stays an independent overlay, so
  * its pin refuses a conflicting build rather than the build silently going without it. A registered overlay whose
  * tip is already an ancestor of main takes no part either (the main loop removes it as `in-main`).
@@ -211,18 +213,24 @@ export async function planOverlayStacks({
   // Hard evidence that P moved away from a head one of `clashing` was built on: `{evidence, carriers}`, where
   // `carriers` are the clashing tops that contain a proven old head of P — adopted OR force-pushed away, together (the
   // tops that replace P) — or `{evidence:null}` when it cannot be known.
+  // `heads` = every proven old head of P known this pass (not in main), for the no-proof rule below.
   const movedEvidence = async (p, clashing) => {
     // A head already in main is everyone's history, not P's: never evidence.
     const ownHeads = (heads) => heads.filter((s) => s !== p.sha && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0);
     const carriersOf = (heads) => clashing.filter((t) => heads.some((s) => anc(s, t.sha)));
-    const adopted = carriersOf(ownHeads([...adoptedHeads(p)]));
-    if (adopted.length === clashing.length) return { evidence: 'adopted-head', carriers: adopted };
+    const adoptedOwn = ownHeads([...adoptedHeads(p)]);
+    const adopted = carriersOf(adoptedOwn);
+    if (adopted.length === clashing.length) return { evidence: 'adopted-head', carriers: adopted, heads: adoptedOwn };
     const before = await forcePushedHeads(p.pr);
-    if (before == null) return adopted.length > 0 ? { evidence: 'adopted-head', carriers: adopted } : { evidence: null, carriers: [] };
-    const pushed = carriersOf(ownHeads(before));
+    if (before == null) {
+      return adopted.length > 0 ? { evidence: 'adopted-head', carriers: adopted, heads: adoptedOwn } : { evidence: null, carriers: [], heads: adoptedOwn };
+    }
+    const pushedOwn = ownHeads(before);
+    const pushed = carriersOf(pushedOwn);
     const carriers = clashing.filter((t) => adopted.includes(t) || pushed.includes(t));
-    if (carriers.length === 0) return { evidence: 'none', carriers };
-    return { evidence: adopted.length > 0 ? 'adopted-head' : 'force-pushed', carriers };
+    const heads = [...adoptedOwn, ...pushedOwn];
+    if (carriers.length === 0) return { evidence: 'none', carriers, heads };
+    return { evidence: adopted.length > 0 ? 'adopted-head' : 'force-pushed', carriers, heads };
   };
   const unconfirmed = [];
   const unknown = [];
@@ -259,19 +267,23 @@ export async function planOverlayStacks({
       if (clashing.length === 0) continue;
       // Only the tops that replace P are recorded on the set-aside entry: the 7b fallback brings P back unless one of
       // THEM applied, so an unrelated top (one that carries no head of P, or merges cleanly with P) never suppresses it.
-      let { evidence, carriers } = await movedEvidence(p, clashing);
+      let { evidence, carriers, heads } = await movedEvidence(p, clashing);
       if (evidence == null || evidence === 'none') {
         // No fresh proof (unknown, or the proof aged out of the reflog): keep what the last adopted build did with P —
         // set aside if it merged a clashing top but not P, else live. Never a fresh eviction.
         // P's tip already in HEAD (merged directly, or through a top that contained it) means P is live: never set aside.
+        // A carrier here is a clashing top the last build merged that still holds the head it merged (a top rewritten
+        // since carries nothing of what replaced P). And when the last build holds a proven old head of P that no
+        // clashing top carries any more, the top that replaced P is gone: P is not kept aside for the others.
         const last = mergedBy(headSha);
         const pLive = !!headSha && git(['merge-base', '--is-ancestor', p.sha, headSha]).status === 0;
-        const keptAside = !pLive && !last.some((m) => sameOverlay(m, p)) && clashing.some((t) => last.some((m) => sameOverlay(m, t)));
+        const lastHeldOldHead = !!headSha && heads.some((s) => anc(s, headSha));
+        carriers = lastHeldOldHead ? [] : clashing.filter((t) => last.some((m) => sameOverlay(m, t) && (m.sha === t.sha || anc(m.sha, t.sha))));
+        const keptAside = !pLive && !last.some((m) => sameOverlay(m, p)) && carriers.length > 0;
         if (evidence == null) unknown.push({ ref: p.ref, pr: p.pr, kept: keptAside ? 'set-aside' : 'live', tops: clashing.map((t) => t.ref) });
         else if (!keptAside) for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
         if (!keptAside) continue;
         evidence = 'last-adopted';
-        carriers = clashing.filter((t) => last.some((m) => sameOverlay(m, t)));
       }
       setAside.set(p.ref, {
         ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', evidence, tops: carriers.map(({ ref, pr, sha }) => ({ ref, pr, sha })),

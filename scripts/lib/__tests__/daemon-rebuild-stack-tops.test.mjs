@@ -711,6 +711,41 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply' });
       expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases[0]).toMatchObject({ kept: 'set-aside' });
     });
+
+    it('the top that replaced the base is gone: the last build is no reason to keep it aside for an unrelated top', async () => {
+      // The last build ran T (built on P1) and U (a sibling retargeted onto P); P was force-pushed to P2 and T's PR left.
+      const f = fixture();
+      const p1 = f.push('lane/ff-p', f.init, { [TAKEOVER]: lines({ 2: 'p1' }) });
+      f.push('lane/ff-t', p1, { [TAKEOVER]: lines({ 2: 'p1' }), [LADDER]: lines({ 9: 't' }) });
+      f.push('lane/ff-u', f.init, { [TAKEOVER]: lines({ 6: 'u' }) }); // clashes with P2 (not T), carries no head of P
+      f.fetch();
+      const last = await f.build([{ ref: 'lane/ff-t', pr: 9703 }, { ref: 'lane/ff-u', pr: 9704 }], f.init);
+      expect(isAncestor(f.clone, p1, last)).toBe(true);
+      const p2 = f.push('lane/ff-p', f.init, { [TAKEOVER]: lines({ 2: 'p2', 6: 'p2' }) });
+      f.fetch();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: last, mainRef: 'origin/main',
+        overlays: [{ ref: 'lane/ff-p', pr: 9701 }, { ref: 'lane/ff-u', pr: 9704 }],
+        prBaseChain: async (pr) => (pr === 9704 ? ['lane/ff-p'] : []),
+        prForcePushes: async (pr) => (pr === 9701 ? [{ before: p1, after: p2 }] : []),
+      });
+      // P is an ordinary overlay again: the live U wins the clash and P is parked LOUDLY, never set aside behind U.
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-u')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+      expect(plan.alerts.map((a) => a.kind)).toEqual(expect.arrayContaining(['overlay-stack-claim-unconfirmed', 'overlay-newcomer-parked']));
+    });
+
+    it('unknown evidence: a top rewritten since the last build (it no longer holds what replaced the base) does not keep it aside', async () => {
+      const { f } = await ffMove({ adoptOld: false });
+      const last = await f.build([{ ref: 'lane/ff-c', pr: 9702 }], f.init); // the last build ran C on P's old head
+      f.push('lane/ff-c', f.init, { [LADDER]: lines({ 8: 'c rewritten off p' }) }); // C rebased off P, still clashing with it
+      f.fetch();
+      const plan = await ffPlan(f, { headSha: last, prForcePushes: async () => null });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases[0]).toMatchObject({ kept: 'live' });
+    });
   });
 
   describe('makePrBaseChain gh budget', () => {
