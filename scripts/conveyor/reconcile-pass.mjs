@@ -111,6 +111,7 @@ import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { resolveFixSettings } from './fix-takeover.mjs';
+import { resolveTakeoverBudget } from './takeover-budget.mjs';
 import { resolveReviewSettings } from '../lib/review-settings.mjs';
 import { enrichPrsWithMechanicalRound, resolveMechanicalRoundsSetting } from './mechanical-round-cap.mjs';
 
@@ -131,9 +132,22 @@ function takeoverReviewSetting(load, env) {
   try { const n = load({ env }).takeoverReviewAttempts; return Number.isInteger(n) ? { takeoverReviewAttempts: n } : {}; } catch { return {}; }
 }
 
-/** Card xx0055i — the round-cap action + takeover bound for `planReconcile`; an unreadable setting keeps `person`. */
-function fixCapSettings(load, env) {
-  try { const s = load({ env }); return { roundCapAction: s.roundCapAction, takeoverMaxPerPr: s.takeoverMaxPerPr }; } catch { return {}; }
+/** The last logged `fix.takeoverBudget` resolution, so a daemon logs the layer once per change. */
+let loggedTakeoverBudget = '';
+/** Card xx0055i + takeover budget — the round-cap action and `fix.takeoverBudget` (logged with its cascade layer) for
+ *  `planReconcile`; an unreadable setting keeps the pure core's defaults (`person`, budget 1). */
+function fixCapSettings(load, env, resolveBudget = resolveTakeoverBudget, log = (line) => console.error(line)) {
+  const out = {};
+  try { out.roundCapAction = load({ env }).roundCapAction; } catch { /* keep the pure default */ }
+  try {
+    const b = resolveBudget({ env });
+    if (Number.isInteger(b?.value)) {
+      out.takeoverBudget = b.value;
+      const line = `fix-takeover: fix.takeoverBudget=${b.value} (source: ${b.source})`;
+      if (line !== loggedTakeoverBudget) { loggedTakeoverBudget = line; log(line); }
+    }
+  } catch { /* keep the pure default */ }
+  return out;
 }
 
 /** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
@@ -1314,6 +1328,8 @@ export function runReconcilePass({
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
   loadFixSettings = resolveFixSettings,
+  // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
+  loadTakeoverBudget = resolveTakeoverBudget,
   // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
   loadReviewSettings = resolveReviewSettings,
   // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
@@ -1383,7 +1399,7 @@ export function runReconcilePass({
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
-    ...fixCapSettings(loadFixSettings, env),
+    ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
     ...takeoverReviewSetting(loadReviewSettings, env),
     ...mechanicalSetting,
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
