@@ -49,21 +49,18 @@ export const STANDARD_MINUTES_BY_KIND = DEFAULT_STANDARD_MINUTES;
  * Classify a heavy-admission holder/waiter's KIND from the LIVE command line of the pid it acquired under.
  * Pure — `command` and `isSelectedBase` are already read by the IO layer. `null`/empty `command` (the pid is
  * gone, or `ps` could not be read) classifies `other` rather than guessing.
- * @param {{command:string|null, isSelectedBase?:boolean|null}} o
- * @returns {'selected'|'FULL'|'standards'|'files'|'other'}
+ * @param {{command:string|null, isSelectedBase?:boolean|null, kind?:string|null}} o
+ * @param {object} [env] Admission policy overrides passed to the shared classifier.
+ * @returns {'selected'|'FULL'|'standards'|'files'|'verify'|'soak'|'coverage'|'build'|'agent'|'other'}
  */
-export function classifyHeavyJobKind({ command, isSelectedBase = null, kind = null } = {}) {
+export function classifyHeavyJobKind({ command, isSelectedBase = null, kind = null } = {}, env = {}) {
   // Card xkyw1x4 — a holder / waiter written by the new admission code RECORDS its kind (slot `meta.kind`, the
   // waiting marker's `kind`); that recorded kind wins over re-deriving it from the command line.
   if (HEAVY_KINDS.includes(kind)) return kind;
   const cmd = String(command || '').trim();
   if (!cmd) return 'other';
   if (/verify-lane\.mjs/.test(cmd)) return isSelectedBase ? 'selected' : 'FULL';
-  if (/check[-:]standards/.test(cmd)) return 'standards';
-  if (/\bvitest\s+related\b/.test(cmd)) return 'files';
-  if (/\bvitest\s+run\b/.test(cmd)) return 'FULL';
-  if (/\bnpm\s+(?:run\s+)?test(?::unit)?\b/.test(cmd)) return 'FULL';
-  return classifyCommandKind(cmd); // item 100 — soak / coverage / build / agent / verify, else a truly unknown `other`
+  return classifyCommandKind(cmd, env);
 }
 
 /** Minutes between two ISO timestamps (or `null` when either is unparseable), rounded to one decimal. */
