@@ -1,4 +1,5 @@
 ---
+bornAs: xx0055i
 kind: story
 size: 5
 status: resolved

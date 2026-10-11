@@ -40,8 +40,8 @@ export async function replay(root = REPO_ROOT) {
 export default {
   id: 'takeover-void-cancels-later-retry',
   title: 'a takeover void cancelled the later successful retry instead of the failed launch, so the retry head was refused its review',
-  card: 'PR 4759 red-team finding (card xx0055i)',
-  fixedBy: { sha: '0bbb7ee9e', where: 'lane/takeover-review-attempt', paths: [TAKEOVER] },
+  card: 'PR 4759 red-team finding (card 5851)',
+  fixedBy: { sha: 'uncommitted', where: 'lane/takeover-review-attempt', paths: [TAKEOVER] },
   fixPresent(root) { return readFileSync(join(root, TAKEOVER), 'utf8').includes('findLastIndex'); },
   async run({ log } = {}) {
     try {

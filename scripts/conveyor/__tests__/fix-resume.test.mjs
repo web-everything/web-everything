@@ -192,6 +192,23 @@ describe('the previous session and its lane', () => {
     expect(taken).not.toContain('--no-reset');
     expect(taken).toContain('acquire a fresh lane exactly as step 1');
   });
+  it('an expired own lease requires reacquisition before resume work (PR #4779 review round 5)', () => {
+    const files = { '/pool/we/lane-4/.git/.lane-lease': JSON.stringify({ session: 'fix-77', ownerSession: SID, acquiredAt: '2026-01-01T00:00:00Z', ttlMinutes: 1 }) };
+    const lane = findSessionLane({
+      slug: 'fix-77', sessionId: SID, poolRoot: '/pool', readJournal: () => [], headOf: () => HEAD,
+      list: (d) => ({ '/pool': ['we'], [join('/pool', 'we')]: ['lane-4'] })[d] ?? (() => { throw new Error('ENOENT'); })(),
+      read: (f) => { if (!(f in files)) throw new Error('ENOENT'); return files[f]; },
+    });
+    expect(lane).toMatchObject({ lane: 4, held: 'own', leaseLive: false });
+    const expired = buildRoundResumePrompt({ pr: 77, round: 2, lane, headRefOid: HEAD });
+    expect(expired).not.toContain('You still hold');
+    expect(expired).toContain('--lane=4 --no-reset');
+    expect(expired).toMatch(/lease on it has expired/);
+    // A lease that is still live keeps the lane in hand.
+    expect(buildRoundResumePrompt({ pr: 77, round: 2, lane: { ...lane, leaseLive: true }, headRefOid: HEAD })).toContain('You still hold lane-4');
+    // Expired and the lane head moved: a fresh acquire, never a re-take.
+    expect(buildRoundResumePrompt({ pr: 77, round: 2, lane: { ...lane, head: OTHER }, headRefOid: HEAD })).toContain('acquire a fresh lane exactly as step 1');
+  });
 });
 
 describe('tryResumeRoundFix', () => {
