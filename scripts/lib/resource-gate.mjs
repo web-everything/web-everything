@@ -218,7 +218,10 @@ export function gateLaunch({ kind = 'fix', gate, env = process.env, settings, le
  */
 export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, heavyWaitMinutes = null, snapshot = null, nowMs = Date.now(), policy } = {}) {
   const f = { ...RESOURCE_GATE_STANDARD.fixCap, ...fixCap };
-  const { floor, ceiling, raiseQueueOver, raiseStepPerPass } = f;
+  const { floor, raiseQueueOver, raiseStepPerPass } = f;
+  // The settings loader raises a ceiling under the floor to the floor; callers handing settings in directly skip
+  // that, so normalise here too — the cap never exceeds the ceiling, and the floor wins a conflict.
+  const ceiling = Math.max(f.ceiling, floor);
   const d = decideAdmission({ kind: 'fix', snapshot, nowMs, ...(policy ? { policy } : {}) });
   const num = (v) => (Number.isFinite(v) ? v : null);
   const cpu = d.inputs?.cpuIdlePct ?? null;
@@ -235,7 +238,8 @@ export function decideFixCap({ fixCap, liveAtPassStart = 0, queueLength = null, 
     wait !== null && wait > f.lowerAboveHeavyWaitMinutes ? `heavy wait ${wait}m > ${f.lowerAboveHeavyWaitMinutes}m` : null,
   ].filter(Boolean);
   if (lowerWhy.length) {
-    const cap = Math.max(f.lowerMinimum, Math.min(floor, floor - f.lowerBy));
+    // Lowering can only ever LOWER: the minimum is clamped under the floor (a floor of 1 stays 1), never lifted above it.
+    const cap = Math.min(floor, Math.max(f.lowerMinimum, floor - f.lowerBy));
     return { ...base, cap, lowered: cap < floor, reason: `lowered: ${lowerWhy.join(', ')} → floor ${floor} - ${f.lowerBy}, minimum ${f.lowerMinimum}` };
   }
   if (d.unknown) return { ...base, reason: `floor: ${d.reason} (never raise on an unknown snapshot)` };

@@ -181,6 +181,20 @@ describe('dynamic fixer cap', () => {
     expect(decideFixCap({ fixCap: { ...fixCap, floor: 3 }, nowMs: NOW, liveAtPassStart: 3, queueLength: 7, heavyWaitMinutes: 90,
       snapshot: snap({ freePct: 30, swapUsedPct: 20 }) })).toMatchObject({ cap: 2, lowered: true });
   });
+  it('a ceiling under the floor handed in directly is normalised to the floor, never exceeded', () => {
+    const d = decideFixCap({ fixCap: { ...fixCap, floor: 3, ceiling: 2 }, nowMs: NOW, liveAtPassStart: 3, queueLength: 7, heavyWaitMinutes: 5,
+      snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 20 }) });
+    expect(d).toMatchObject({ cap: 3, ceiling: 3, raised: false });
+  });
+  it.each([
+    [1, 1], [1, 3], [2, 2], [3, 3],
+  ])('lowering never lifts the cap above the floor (floor %i, ceiling %i, lowerMinimum 2)', (floor, ceiling) => {
+    const d = decideFixCap({ fixCap: { ...fixCap, floor, ceiling }, nowMs: NOW, liveAtPassStart: floor, queueLength: 7, heavyWaitMinutes: 90,
+      snapshot: snap({ freePct: 30, swapUsedPct: 96 }) });
+    expect(d.cap).toBeLessThanOrEqual(floor);
+    expect(d.cap).toBeLessThanOrEqual(ceiling);
+    expect(d.lowered).toBe(d.cap < floor);
+  });
   it.each([
     ['swap above the raise threshold', { snapshot: snap({ idle: 45, freePct: 30, swapUsedPct: 70 }) }],
     ['free memory under the raise threshold', { snapshot: snap({ idle: 45, freePct: 8, swapUsedPct: 20 }) }],

@@ -209,6 +209,18 @@ describe('tryAcquireSlot / releaseOwnedSlot / heldSlots — cap independent slot
     expect(tryAcquireSlot({ lockRoot, cap, owner: 'B', nowMs: T0, nowIso: iso(T0) }).ok).toBe(true);
   });
 
+  it('releaseOwnedSlot with no fastSlots still scans the CALLER\'s whole cap, even one larger than the policy span (gh-throttle\'s cap-6 pool)', () => {
+    const cap = 8; // well above the default policy span (cap 2 + 1 fast slot)
+    const owners = Array.from({ length: cap }, (_, i) => `O${i}`);
+    const got = owners.map((owner) => tryAcquireSlot({ lockRoot, cap, owner, nowMs: T0, nowIso: iso(T0), pid: process.pid }));
+    expect(got.every((g) => g.ok)).toBe(true);
+    // The owner that won the LAST slot is released by a caller that passes no fastSlots.
+    const last = got[cap - 1];
+    expect(last.slot).toBe(cap - 1);
+    expect(releaseOwnedSlot({ lockRoot, cap, owner: owners[cap - 1] })).toEqual({ released: true, slot: cap - 1 });
+    expect(heldSlots({ lockRoot, cap })).toHaveLength(cap - 1);
+  });
+
   it('re-acquiring your own held slot is a no-op success (heartbeat refresh), not a second slot', () => {
     const cap = 1;
     tryAcquireSlot({ lockRoot, cap, owner: 'A', nowMs: T0, nowIso: iso(T0) });

@@ -791,7 +791,7 @@ export function tryAcquireSlot({ lockRoot, cap, owner, nowMs, nowIso, pid = null
  * where an operator's fresh invocation is by definition a different process than whichever one is stuck.
  * @param {number|null} [pid]  defaults to `process.pid`; pass `null` for an owner-only manual release.
  */
-export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fastSlots = resolveSlotSpan(loadAdmissionPolicy({ env: process.env }).settings) - cap }) {
+export function releaseOwnedSlot({ lockRoot, cap, owner, pid = process.pid, fastSlots = resolveSlotSpan({ ...loadAdmissionPolicy({ env: process.env }).settings, cap }) - cap }) {
   const selfPid = Number.isInteger(pid) ? pid : null;
   let ownerOnlyFallback = null;
   // Card xkyw1x4 — also scan the fast-lane slots after the heavy ones (a short job may hold one). Scanning an
@@ -1720,7 +1720,7 @@ async function main(argv) {
     // A fresh CLI invocation is, by definition, a different real process than whichever one is stuck holding
     // the slot — pid: null opts into the loose owner-only match (#3383's deliberate manual/operator escape
     // hatch; see releaseOwnedSlot's own docstring).
-    const r = releaseOwnedSlot({ lockRoot, cap, owner, pid: null });
+    const r = releaseOwnedSlot({ lockRoot, cap, owner, pid: null, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
     if (asJson) emit(r); else process.stderr.write(r.released ? `released slot-${r.slot} for ${owner}\n` : `${owner} held no slot\n`);
     return;
   }
