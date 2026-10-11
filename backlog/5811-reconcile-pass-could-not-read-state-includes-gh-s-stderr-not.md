@@ -1,15 +1,15 @@
 ---
+bornAs: xukt5wy
 kind: task
-parent: "5712"
 status: open
-scope: ["we:skills-src/conveyor/daemon-manifest.mjs", "we:skills-src/conveyor/__tests__/daemon-manifest.test.mjs"]
-dateOpened: "2026-10-09"
+scope: ["we:scripts/conveyor/reconcile-pass.mjs"]
+dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Resource service: register the sampler supervisor as a managed daemon in daemon-manifest
+# reconcile-pass: 'could not read state' includes gh's stderr, not just the first error line
 
-Split out of x9xkupj: the sampler (com.we.resource-sampler, PR #4722) runs as a hand-loaded launchd agent; register it in we:skills-src/conveyor/daemon-manifest.mjs so daemon-status/self-sync manage it. Deferred from slice 2 because PR #4691 (review:changes/human) holds both manifest files.
+we:scripts/conveyor/reconcile-pass.mjs prints only the first line of a failed gh call's error ('Command failed: gh pr list ...'), dropping gh's stderr such as 'unexpected end of JSON input'. Live 2026-10-10 the wev-fix-daemon rebuild smoke rejected every build on this line with the cause hidden. Append the gh stderr (first non-empty line) to the message. Deferred from PR #4851 because that file is held by the takeover stack.
 
 ## Acceptance
 
