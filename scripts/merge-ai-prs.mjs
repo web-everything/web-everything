@@ -178,6 +178,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
+import { createDrainMergeStrategy } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -192,6 +193,7 @@ import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/con
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
+import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
@@ -646,9 +648,13 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     acceptedSha: parseReviewedSha(d.comments),
     acceptedDiff: parseReviewedDiff(d.comments),
     acceptedContribution: parseReviewedContribution(d.comments),
-    operatorClearance: parseOperatorClearance(d.comments),
+    // Read over ALL comments (a forgeable actor), and `decideReviewGate` prints `.actor` into the drain's own park reason and
+    // revocation comment — so the name is made safe here, once, for every renderer (#xnqxtdy review: same class as the carry record).
+    operatorClearance: ((c) => (c ? { ...c, actor: sanitizeActor(c.actor) } : c))(parseOperatorClearance(d.comments)),
     humanClearedSha: parseLatestHumanClearedSha(d.comments),
-    headDiff: null, headContribution: null, headReadFailed: false,
+    // #xnqxtdy — sha, diff and actor all from the ONE trusted clearance comment (never the latest marker of any comment).
+    humanClearance: latestHumanClearance(d.comments),
+    headDiff: null, headDiffSha: null, headContribution: null, headReadFailed: false,
   };
   const { acceptedSha, headSha, acceptedDiff, acceptedContribution } = evidence;
   const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha
@@ -657,10 +663,15 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     try {
       const net = netDiff({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        rev: d.headRefName, fetchExtraRefs: [d.headRefName],
+        rev: d.headRefName, fetchExtraRefs: [d.headRefName], pinRev: true,
       });
+      // #xnqxtdy — `headRefOid` and the branch tip the diff was read from are two non-atomic reads. The tip the diff is FOR
+      // is resolved to one sha BEFORE the diff and the diff is taken from that sha (`pinRev`), so the carry can refuse a
+      // diff that belongs to a different push than the head it would stamp. A scored read that names no sha leaves
+      // `headDiffSha` null (the carry refuses it) — it is never labelled by a second, later lookup of a ref that can move.
       evidence.headDiff = net?.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
+      evidence.headDiffSha = net?.scored && typeof net.revSha === 'string' && net.revSha ? net.revSha : null;
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
@@ -686,7 +697,14 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
         reason: `review acceptance verification unreadable — merge deferred this pass: ${error.message || error}` };
     }
   }
-  return decideReviewGate({ ...gateInputs, labels, ...evidence });
+  // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
+  // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
+  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
+    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun, ...readOptions?.carry });
+  if (carry?.action === 'defer') return carry;
+  if (carry?.carried) evidence = { ...evidence, humanClearedSha: evidence.headSha };
+  const gate = decideReviewGate({ ...gateInputs, labels, ...evidence });
+  return carry?.carried ? { ...gate, carriedClearance: carry.carried } : gate;
 }
 
 /** Label coexistence alone cannot clear pending: require the merge gate's coverage proof first. */
@@ -3483,7 +3501,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
-export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -3494,7 +3512,28 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   // candidate probe, shared with `computeNetDiffChangedFiles`); otherwise resolve our own exactly as before.
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
-  const { diffBase, candidate } = basis;
+  let { diffBase, candidate } = basis;
+  // #xnqxtdy — `pinRev`: a caller that STAMPS the tip next to this text (the human-clearance carry) cannot read the
+  // tip in a second step: a concurrent fetch can move the tracking ref between the two reads and label an old diff with
+  // a newer sha. Resolve the tip to ONE commit sha first, then take the fork point AND the text from that sha only, and
+  // hand the sha back as `revSha` — the diff and its label can no longer disagree. Any failure is unscored (fail closed).
+  let revSha;
+  if (pinRev) {
+    try {
+      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
+      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
+      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
+      if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
+      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
+      candidate = revSha;
+    } catch (err) {
+      return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
+    }
+  }
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
@@ -3506,7 +3545,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
     const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
-    return { text, base: diffBase, rev: candidate, scored: true };
+    return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
@@ -5218,7 +5257,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -5587,6 +5626,7 @@ async function runCli() {
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
+  const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -5601,6 +5641,7 @@ async function runCli() {
   const couplePins = new Map(); // mqKey → {head, tip} the pre-check judged `merge`
   const mergeQueueGate = async (cand, headSha, { precheck = false } = {}) => {
     if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
+    if (mergeStrategy.queueOwnsFreshness(cand.repo)) return true; // xtpxusq — GitHub's merge queue re-tests on its own tip
     const mqKey = `${cand.repo || localSlug || 'cwd'}#${cand.num}`;
     // A carrier with several impl halves is pre-checked once per half; each pre-check honours the pin the first one set.
     const pin = couplePins.get(mqKey);
@@ -5658,6 +5699,7 @@ async function runCli() {
       // fix-couple-split — show the order the live cascade would actually use (couples contiguous, split-risk held).
       const step = planCoupleCascadeStep(plan.ready, { candidates: verdicts, mergedKeys: new Set(), openSiblingRefs: openSiblingRefSet(openPrContext.prsByRepo, new Set(), repoKeyOfSlug), repoKeyOf: repoKeyOfVerdict });
       process.stderr.write(`  merge order: ${step.ordered.map((c) => repoTag(c.repo) + c.num + (c.item ? `→${c.item}` : '')).join(' → ') || '(none ready)'}\n`);
+      mergeStrategy.reportDryRun(step.ordered); // xtpxusq — github-merge-queue: which PRs it would enqueue
       for (const h of step.held) process.stderr.write(`  ⛓ ${repoTag(h.repo)}${h.num} couple held (${h.role}): ${h.reason}\n`);
       coupleHeld.push(...step.held);
       if (deferred.length) process.stderr.write(`  deferred (blockedBy unlanded): ${deferred.map((d) => `#${d.num}→[${d.waitOn.join(',')}]`).join(', ')}\n`);
@@ -5971,11 +6013,13 @@ async function runCli() {
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
+            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
-          });
+          }, mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; a refused lock retries next pass
+          if (landLock.ran === false) { if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           if (landLock.contended && !AS_JSON) process.stderr.write(`  ⚠ merge-write mutex not acquired (held by ${landLock.heldBy || '?'}) — merged under the per-PR idempotency guard instead (#2683)\n`);
           if (landLock.result && landLock.result.skipped === 'already-merged') {
             // xvzc4v4 (merge-safety review, bug 2) — THIS BRANCH USED TO withhold the PR from `merged` on the
@@ -5998,6 +6042,7 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} already merged (by us, a concurrent lander, or out-of-band, e.g. the GitHub UI) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
+          if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
@@ -6054,6 +6099,7 @@ async function runCli() {
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);
     __t.add('mergeCascade', __t.mark() - __mergeCascadeT0);
   }
+  const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
 
   // Sync the LOCAL main checkout to the just-advanced origin/main (a merged PR moved origin, not local) — local
   // main is KEPT UP TO DATE after each merge (user request 2026-07-03). `--autostash` is what makes this
@@ -6290,6 +6336,11 @@ async function runCli() {
       if (derived.warning) process.stderr.write(`  ⚠ ${derived.warning}\n`);
     }
   }
+
+  // xtpxusq — retire the queue-merged PRs' follow-ups only now that numbering, resolve-on-land and derived regen are
+  // done AND none of them reported a failure; otherwise they stay pending and the next pass reruns them (idempotent).
+  const queueFollowUpsClean = (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
+  mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
   // for the watch's idle accounting exactly like a rebase-drop rebuild — it lands on a later pass.
