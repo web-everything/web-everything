@@ -203,10 +203,12 @@ export function runSafetyNet({
   let sha = null;
   let activeKey = null;
   try {
-    // Flipped back to `stop` after this daemon published `quarantine` on the list: withdraw the stamp so CI (which
-    // reads the mode from the list) stops skipping at once, not at entry expiry. Nothing is written by a daemon
-    // that never published, and never by a replay tick.
-    if (!isLive && live === true && ledger.publishedMode === 'quarantine') {
+    // In `stop`, unless the ledger KNOWS the list carries no `quarantine` stamp: read the list and withdraw a live
+    // stamp, so CI (which reads the mode from the list) stops skipping at once, not at entry expiry. That covers a
+    // flip back to `stop` after this daemon published, and a fresh, lost or reset ledger (the stamp is then unknown,
+    // so it is read once, then recorded). A failed read or withdraw leaves it unknown: retried next tick. Nothing is
+    // written when the list is unstamped, and a replay tick never reads or writes.
+    if (!isLive && live === true && ledger.publishedMode !== 'stop') {
       try {
         const cur = readList();
         if (cur.ok && cur.list?.mode === 'quarantine') write({ actor: SAFETY_NET_ACTOR, message: `quarantine: mode → ${mode.value} (${mode.source})`, change: (list) => setMode(list, { mode: 'stop', actor: SAFETY_NET_ACTOR, now }) });
@@ -258,6 +260,9 @@ export function runSafetyNet({
     // An entry on the shared list that was added for this red counts as "added for this red" whether or not this
     // ledger recorded it (a push that landed but threw, a lost ledger): it must not be re-added once it expires.
     if (isLive && rec) for (const e of read.list?.entries ?? []) if (rec.shas?.includes(e.brokenSha) && e.test) rec.added = [...new Set([...(rec.added ?? []), e.test])];
+    // Likewise the stamp: a live stamp is recorded whatever this tick then does (even nothing), so a recovered ledger
+    // still withdraws it on a flip to stop. An unstamped list is recorded only when the ledger knew nothing yet.
+    if (isLive) { if (read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine'; else ledger.publishedMode ??= 'stop'; }
     const pri = mainCiRuns?.priority;
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
@@ -284,7 +289,7 @@ export function runSafetyNet({
     const what = [plan.action !== 'none' ? `${plan.action}${plan.tests ? ` ${plan.tests.join(', ')}` : ''}` : null, plan.fixPrs ? `fix PRs → [${plan.fixPrs.join(', ')}]` : null].filter(Boolean).join('; ');
     if (isLive) {
       // Record the intent BEFORE the push: a push that lands but throws must still be withdrawable on a flip to stop.
-      if (stamping || read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine';
+      if (stamping) ledger.publishedMode = 'quarantine';
       // Record "added for this red" BEFORE the push, on disk: a push that lands but throws (ack lost) or a crash
       // between the push and the ledger write must never let the entry be added again once it expires.
       const intended = plan.action === 'add' && rec ? plan.tests.filter((t) => !(rec.added ?? []).includes(t)) : [];

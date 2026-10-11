@@ -128,7 +128,10 @@ describe('runSafetyNet — replay of 2026-10-10 (first red 2cb94418d)', () => {
     expect(r).toMatchObject({ mode: 'stop', shadow: true, applied: false });
     expect(r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
     expect(calls.writes).toEqual([]);
-    expect(calls.reads).toBe(0); // shadow never even reads the live list
+    // Shadow plans on its simulated list. The live list is read once, only to learn whether a stamp is live (a fresh
+    // ledger cannot know); once that is recorded, later shadow ticks never read it.
+    expect(calls.reads).toBe(1);
+    expect(net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at + MIN }).calls.reads).toBe(0);
     const lines = shadowLines();
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({ wouldDo: 'add', tests: [TEST_FILE], firstRedSha: FIRST_RED, mode: 'stop', modeSource: 'settings' });
@@ -365,13 +368,57 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
   it('flipping back to stop withdraws a stamp the daemon published; a daemon that never published writes nothing', () => {
     const never = net({ mode: STOP, mainCiRuns: RUNS, now: at });
     expect(never.calls.writes).toEqual([]);
-    expect(never.calls.reads).toBe(0);
+    expect(never.calls.reads).toBe(1); // a fresh ledger reads once to learn the list is unstamped …
+    expect(net({ mode: STOP, mainCiRuns: RUNS, now: at + MIN / 2 }).calls.reads).toBe(0); // … then knows
     const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
     const stamped = live.calls.writes[0].change({ version: 1, entries: [] }).list;
     const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
     expect(stopped.calls.writes).toHaveLength(1);
     expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
     expect(net({ mode: STOP, mainCiRuns: RUNS, list: { ...stamped, mode: 'stop' }, now: at + 3 * MIN }).calls.writes).toEqual([]);
+  });
+  describe('the stamp is withdrawn even when the ledger was lost (PR #4816 review round 3)', () => {
+    const publishThenLose = () => {
+      const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+      const stamped = live.calls.writes[0].change({ version: 1, entries: [] }).list;
+      rmSync(join(dir, SAFETY_NET_LEDGER)); // the ledger was lost (crash, reset)
+      return stamped;
+    };
+    it('a recovered ledger learns the stamp from a quiet quarantine tick, so a flip to stop still withdraws it', () => {
+      const stamped = publishThenLose();
+      const quiet = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: stamped, now: at + MIN });
+      expect(quiet.calls.writes).toEqual([]); // nothing to change on the list: the tick returns early
+      const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
+      expect(stopped.calls.writes).toHaveLength(1);
+      expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+    });
+    it('a lost ledger followed straight by a flip to stop still withdraws the stamp, then reads no more', () => {
+      const stamped = publishThenLose();
+      const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + MIN });
+      expect(stopped.calls.writes).toHaveLength(1);
+      expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+      const next = net({ mode: STOP, mainCiRuns: RUNS, list: { ...stamped, mode: 'stop' }, now: at + 2 * MIN });
+      expect(next.calls.reads).toBe(0);
+      expect(next.calls.writes).toEqual([]);
+    });
+    it('a withdraw that fails is retried on the next stop tick', () => {
+      const stamped = publishThenLose();
+      const fail = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + MIN, write: () => { throw new Error('push rejected'); } });
+      expect(fail.r.demoteError).toMatch(/push rejected/);
+      const retry = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
+      expect(retry.calls.writes).toHaveLength(1);
+    });
+    it('an unreadable list leaves the stamp unknown, so the next stop tick reads it again', () => {
+      publishThenLose();
+      const blind = net({ mode: STOP, mainCiRuns: RUNS, now: at + MIN, readList: () => ({ ok: false, error: 'fetch failed' }) });
+      expect(blind.calls.writes).toEqual([]);
+      expect(net({ mode: STOP, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: at + 2 * MIN }).calls.reads).toBe(1);
+    });
+    it('a replay tick (`live:false`) never reads or writes the live list, even with no ledger', () => {
+      const { calls } = net({ mode: STOP, live: false, mainCiRuns: RUNS, list: { version: 1, entries: [], mode: 'quarantine' }, now: at });
+      expect(calls.reads).toBe(0);
+      expect(calls.writes).toEqual([]);
+    });
   });
   it('an operator add or a prune keeps the published mode; a bad mode makes the list unreadable', () => {
     const stamped = { ...addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list, mode: 'quarantine' };
