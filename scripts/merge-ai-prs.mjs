@@ -795,18 +795,17 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
   if (liveDiffReadOwed && d.headRefName && (local || cwd)) {
     try {
       // PR #4631 round 7 (toctou-head-binding): read AT `headSha`, the head this coverage is judged for (see
-      // `readNetDiffAtHead`); a diff read at the branch name could be another commit's.
+      // `readNetDiffAtHead`); a diff read at the branch name could be another commit's. #xnqxtdy: `pinRev` also resolves
+      // that sha once BEFORE the diff and diffs from the resolved sha (and its fork point), and names it as `revSha`.
       const net = readNetDiffAtHead({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        headSha, headRef: d.headRefName, netDiff,
+        headSha, headRef: d.headRefName, netDiff, pinRev: true,
       });
-      // #xnqxtdy — the carry refuses a diff that belongs to a different push than the head it would stamp. The diff here is
-      // read AT `headSha` (never the branch name) and `readNetDiffAtHead` scores it only when the sha it diffed IS `headSha`,
-      // so that sha is the one `headDiffSha` names. A scored read that names no sha leaves `headDiffSha` null (the carry
-      // refuses it) — it is never labelled by a second, later lookup of a ref that can move.
-      evidence.headDiff = net?.scored ? net.text : null;
+      // The carry still refuses a diff whose named sha is not the head it would stamp. A scored read that names no sha leaves
+      // `headDiffSha` null (the carry refuses it) — it is never labelled by a second, later lookup of a ref that can move.
+      evidence.headDiff = net.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
-      evidence.headDiffSha = net?.scored ? [net.revSha, net.rev].find((s) => typeof s === 'string' && s) ?? null : null;
+      evidence.headDiffSha = net.scored && typeof net.revSha === 'string' && net.revSha ? net.revSha : null;
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
@@ -3739,14 +3738,15 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
  * fetched so the commit's objects arrive. `computeNetDiffText` returns the candidate it actually diffed as `rev`, so
  * the read counts only when `rev === headSha`; anything else (a malformed SHA, an absent commit, a throw) is unscored
  * with a `reason`, which every caller already treats as "identity unproven" (fail closed).
- * @param {{exec:Function, headSha:string, headRef?:string|null, netDiff?:Function}} o
+ * `pinRev` (#xnqxtdy, the human-clearance carry) additionally resolves the sha once before the diff and returns it as `revSha`.
+ * @param {{exec:Function, headSha:string, headRef?:string|null, netDiff?:Function, pinRev?:boolean}} o
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:string}}
  */
-export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = computeNetDiffText } = {}) {
+export function readNetDiffAtHead({ exec, headSha, headRef = null, netDiff = computeNetDiffText, pinRev = false } = {}) {
   const miss = (reason) => ({ text: '', base: null, rev: null, scored: false, reason });
   if (typeof headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(headSha)) return miss('head-unbound');
   let net;
-  try { net = netDiff({ exec, rev: headSha, fetchExtraRefs: headRef ? [headRef] : [] }); } catch { return miss('diff-failed'); }
+  try { net = netDiff({ exec, rev: headSha, fetchExtraRefs: headRef ? [headRef] : [], ...(pinRev ? { pinRev: true } : {}) }); } catch { return miss('diff-failed'); }
   if (!net?.scored) return miss(net?.reason || 'unscored');
   if (net.rev !== headSha) return miss('head-mismatch');
   return net;
