@@ -178,6 +178,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // leaf so plateau-app's drain-daemon guard can mirror it (and a cross-repo contract test can pin the mirror
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
+import { createDrainMergeStrategy } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -5587,6 +5588,7 @@ async function runCli() {
   if (MERGE_QUEUE.errors.length) process.stderr.write(`  ⚠ merge-queue settings: ${MERGE_QUEUE.errors.join('; ')} (fell back to defaults)\n`);
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
+  const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -5601,6 +5603,7 @@ async function runCli() {
   const couplePins = new Map(); // mqKey → {head, tip} the pre-check judged `merge`
   const mergeQueueGate = async (cand, headSha, { precheck = false } = {}) => {
     if (!mergeQueueHookEnabled(MERGE_QUEUE)) return true;
+    if (mergeStrategy.queueOwnsFreshness(cand.repo)) return true; // xtpxusq — GitHub's merge queue re-tests on its own tip
     const mqKey = `${cand.repo || localSlug || 'cwd'}#${cand.num}`;
     // A carrier with several impl halves is pre-checked once per half; each pre-check honours the pin the first one set.
     const pin = couplePins.get(mqKey);
@@ -5658,6 +5661,7 @@ async function runCli() {
       // fix-couple-split — show the order the live cascade would actually use (couples contiguous, split-risk held).
       const step = planCoupleCascadeStep(plan.ready, { candidates: verdicts, mergedKeys: new Set(), openSiblingRefs: openSiblingRefSet(openPrContext.prsByRepo, new Set(), repoKeyOfSlug), repoKeyOf: repoKeyOfVerdict });
       process.stderr.write(`  merge order: ${step.ordered.map((c) => repoTag(c.repo) + c.num + (c.item ? `→${c.item}` : '')).join(' → ') || '(none ready)'}\n`);
+      mergeStrategy.reportDryRun(step.ordered); // xtpxusq — github-merge-queue: which PRs it would enqueue
       for (const h of step.held) process.stderr.write(`  ⛓ ${repoTag(h.repo)}${h.num} couple held (${h.role}): ${h.reason}\n`);
       coupleHeld.push(...step.held);
       if (deferred.length) process.stderr.write(`  deferred (blockedBy unlanded): ${deferred.map((d) => `#${d.num}→[${d.waitOn.join(',')}]`).join(', ')}\n`);
@@ -5971,11 +5975,13 @@ async function runCli() {
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
           const landLock = withLandWriteLock(() => {
             if (isPrAlreadyMerged(c.repo, c.num)) return { skipped: 'already-merged' };
+            if (mergeStrategy.enqueues(c.repo)) return mergeStrategy.enqueue(c, traceHeadSha, { comments: preread.read ? preread.comments : null }); // xtpxusq — never the merge API; throws on failure
             // x2e120n — the actual `gh pr merge` round-trip, timed on its own (a sub-component of the wider
             // "mergeCascade" step below, which also covers the pre-merge stamps/retarget for every candidate).
             __t.time('mergeCall', () => mergePr({ pr: c.num, repo: c.repo, method: 'merge', matchHeadCommit: traceHeadSha, caller: 'drain' }));
             return { merged: true };
-          });
+          }, mergeStrategy.enqueues(c.repo) ? { runUnlockedOnContention: false } : {}); // xtpxusq — the enqueue's state write must never run unserialized; a refused lock retries next pass
+          if (landLock.ran === false) { if (!AS_JSON) process.stderr.write(`  ⚠ ${repoTag(c.repo)}${c.num} enqueue skipped: merge-write mutex held by ${landLock.heldBy || '?'} — retried next pass\n`); const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           if (landLock.contended && !AS_JSON) process.stderr.write(`  ⚠ merge-write mutex not acquired (held by ${landLock.heldBy || '?'}) — merged under the per-PR idempotency guard instead (#2683)\n`);
           if (landLock.result && landLock.result.skipped === 'already-merged') {
             // xvzc4v4 (merge-safety review, bug 2) — THIS BRANCH USED TO withhold the PR from `merged` on the
@@ -5998,6 +6004,7 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} already merged (by us, a concurrent lander, or out-of-band, e.g. the GitHub UI) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
+          if (mergeStrategy.enqueues(c.repo)) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; } // xtpxusq — queued, not merged: keeps blocking dependents until GitHub merges it
           merged.push({ num: c.num, repo: c.repo, headSha: c.headSha ?? null }); progressed = true;
           remaining = remaining.filter((x) => !sameCand(x, c)); // merged → item leaves the open set (frees dependents)
           postMergeTrace(); // #xngv3vn — the merge write above is CONFIRMED to have succeeded; safe to claim "landed" now
@@ -6054,6 +6061,7 @@ async function runCli() {
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);
     __t.add('mergeCascade', __t.mark() - __mergeCascadeT0);
   }
+  const queueFollowUps = mergeStrategy.collectQueueMerged({ merged, landedThisPass, landedIdsFor: (p) => landedIdsForCandidate(p, { isLocalRepo, openPrNums: otherOpenPrNums(p.repo, p.num) }) }); // xtpxusq — GitHub-merged PRs get the post-land follow-up once
 
   // Sync the LOCAL main checkout to the just-advanced origin/main (a merged PR moved origin, not local) — local
   // main is KEPT UP TO DATE after each merge (user request 2026-07-03). `--autostash` is what makes this
@@ -6290,6 +6298,11 @@ async function runCli() {
       if (derived.warning) process.stderr.write(`  ⚠ ${derived.warning}\n`);
     }
   }
+
+  // xtpxusq — retire the queue-merged PRs' follow-ups only now that numbering, resolve-on-land and derived regen are
+  // done AND none of them reported a failure; otherwise they stay pending and the next pass reruns them (idempotent).
+  const queueFollowUpsClean = (!landedLocal || localSynced) && !numbered?.warning &&!(resolveOnLandReport.failed || []).length && !derived.warning && !(derived.failed || []).length;
+  mergeStrategy.confirmQueueFollowUps(queueFollowUps, { complete: queueFollowUpsClean });
 
   // #2222 — a healed tip is a PENDING rebuild (CI re-running on the renumbered tree), so it counts as progress
   // for the watch's idle accounting exactly like a rebase-drop rebuild — it lands on a later pass.
