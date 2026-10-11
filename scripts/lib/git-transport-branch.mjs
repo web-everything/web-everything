@@ -11,9 +11,11 @@
  *     work, and checking a transport branch out over that lane destroys it. That is not hypothetical: it was
  *     done by hand in the session that wrote `record-verdict-io.mjs`, and it disrupted a running juror
  *     mid-review. The worktree gives the transport branch its own directory and leaves the caller's tree alone.
- *   · THE WORKTREE IS ALWAYS REMOVED, and the registration always pruned, in that order and in a `finally`.
- *     A stranded worktree makes the NEXT `worktree add` on the same branch fail, which turns one bad run into
- *     every subsequent one failing.
+ *   · EXISTING BRANCHES STAY DETACHED. The live 2026-10-09/10-11 wedge began when a killed writer left a
+ *     worktree holding the shared local branch and an unpushed commit. Detached writers cannot block each
+ *     other's checkout or move each other's branch ref; push races remain normal non-fast-forward refusals.
+ *     Cleanup runs in finally; later writers also reclaim stale clean worktrees, saving unpushed HEADs first.
+ *     Dirty worktrees are left for an operator, never discarded.
  *   · EVERY SIDE EFFECT IS INJECTED — `git` AND the three filesystem calls. `git` alone was not enough and CI
  *     caught it: a suite that injected only `run` still executed the real `mkdirSync` against its fixture root
  *     of `/repo`. Running as root that SUCCEEDED, creating a directory at the filesystem root and leaving the
@@ -31,8 +33,8 @@
  */
 import { retryTransientGit } from './git-fetch-retry.mjs';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 
 /**
  * The env every git call INSIDE the transport worktree runs with (live 2026-10-09 06:52 ET: the review daemon's
@@ -99,6 +101,79 @@ export function assertPushRef(branch, allowRef = null) {
   return `refs/heads/${b}`;
 }
 
+
+/** Keep git's actual diagnostic on the first line, which callers retain in their write-miss messages. */
+const wrappedRunners = new WeakSet();
+function withGitError(run) {
+  if (wrappedRunners.has(run)) return run;
+  const wrapped = (args, opts) => {
+    try { return run(args, opts); } catch (cause) {
+      const lines = String(cause?.stderr ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const reason = lines.filter((line) => /^(fatal:|error:)/.test(line)).at(-1)
+        || lines.at(-1) || String(cause?.message ?? cause).split('\n')[0];
+      const error = new Error(`git ${args.join(' ')} failed: ${reason}`, { cause });
+      error.status = cause?.status;
+      error.stderr = cause?.stderr;
+      throw error;
+    }
+  };
+  wrappedRunners.add(wrapped);
+  return wrapped;
+}
+
+const stderrLog = (line) => process.stderr.write(`${line}\n`);
+
+/**
+ * Best-effort recovery of killed writers. Only old wt-<milliseconds> directories directly in the transport
+ * root qualify. Save a clean HEAD not known to be on origin BEFORE removing its worktree; dirty or broken
+ * worktrees stay put. All git and filesystem probes are injectable, just like the staging path.
+ * @param {object} o
+ * @param {string} o.board
+ * @param {string} o.branch
+ * @param {string} [o.exclude] the worktree this writer is about to create
+ */
+export function reclaimStrandedTransportWorktrees({
+  board, branch, run = defaultGit, now = () => Date.now(), staleMs = 10 * 60_000,
+  log = stderrLog, exists = existsSync, exclude = null,
+} = {}) {
+  run = withGitError(run);
+  // Even an unavailable logging sink must not turn maintenance into a write failure.
+  const warn = (line) => { try { log(line.replace(/[\r\n]+/g, ' ')); } catch { /* best effort */ } };
+  try {
+    const root = resolve(board, '.operations', 'transport');
+    const listed = run(['worktree', 'list', '--porcelain'], { cwd: board });
+    for (const entry of listed.split(/\r?\n\r?\n/)) {
+      const path = entry.split(/\r?\n/).find((line) => line.startsWith('worktree '))?.slice(9);
+      // Quoted/unrecognised paths are deliberately left alone rather than guessed.
+      if (!path || dirname(resolve(path)) !== root || (exclude && resolve(path) === resolve(exclude))) continue;
+      const name = basename(path);
+      const match = /^wt-(\d+)$/.exec(name);
+      if (!match || now() - Number(match[1]) < staleMs) continue;
+      try {
+        if (!exists(path)) continue; // finally's prune handles missing directories
+        const wtOpts = { cwd: path, env: worktreeGitEnv(path) };
+        if (run(['status', '--porcelain'], wtOpts).trim()) {
+          warn(`git-transport-branch: WARNING dirty stranded worktree ${path}; left untouched`);
+          continue;
+        }
+        const sha = run(['rev-parse', 'HEAD'], wtOpts).trim();
+        let backup = null;
+        try { run(['merge-base', '--is-ancestor', sha, `origin/${branch}`], { cwd: board }); }
+        catch {
+          backup = `refs/transport-stranded/${name}`;
+          run(['update-ref', backup, sha], { cwd: board });
+        }
+        run(['worktree', 'remove', '--force', path], { cwd: board });
+        warn(`git-transport-branch: reclaimed ${path}${backup ? `; preserved at ${backup}` : ''}`);
+      } catch (e) {
+        warn(`git-transport-branch: stranded worktree sweep failed for ${path}: ${e.message}`);
+      }
+    }
+  } catch (e) {
+    warn(`git-transport-branch: stranded worktree sweep failed: ${e.message}`);
+  }
+}
+
 export function stageOnTransportBranch({
   board,
   branch,
@@ -110,7 +185,9 @@ export function stageOnTransportBranch({
   read = readExisting,
   rm = rmSync,
   now = () => Date.now(),
-  // A caller-specific check run INSIDE the worktree, after `checkout -B` and BEFORE anything is written.
+  log = stderrLog,
+  exists = existsSync,
+  // A caller-specific check run INSIDE the worktree, after worktree creation and BEFORE anything is written.
   // `record-verdict` passes `assertApplierRidesBoard` here (#3264): a board whose tree lacks the applier
   // workflow accepts the push and applies nothing, and the board's own tree is the only place that question
   // can be asked — which is only possible once the worktree exists. It throws to refuse; the `finally` below
@@ -131,6 +208,7 @@ export function stageOnTransportBranch({
   assertPushRef(branch, allowRef);
   if (!files.length) throw new TypeError('git-transport-branch: nothing to stage — `files` is empty');
 
+  run = withGitError(run);
   const wt = join(board, '.operations', 'transport', `wt-${now()}`);
   mkdir(dirname(wt), { recursive: true });
   // EVERY call with `cwd: wt` goes through this: it can only ever act on the worktree, never the board above it.
@@ -139,6 +217,7 @@ export function stageOnTransportBranch({
   const created = createIfAbsent
     && !run(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], { cwd: board }).trim();
   try {
+    reclaimStrandedTransportWorktrees({ board, branch, run, now, log, exists, exclude: wt });
     if (created) {
       // An orphan WITHOUT a checkout: `--no-checkout` keeps the board's files out of the worktree, the
       // symbolic-ref points HEAD at the unborn branch, and `read-tree --empty` drops the index the add seeded
@@ -161,12 +240,13 @@ export function stageOnTransportBranch({
     // `--force` on the worktree add is about the DIRECTORY, not the branch: a leftover registration from a
     // killed run must not stop this one. The branch itself is taken from the freshly fetched remote tip.
     run(['worktree', 'add', '--force', '--detach', wt, `origin/${branch}`], { cwd: board });
-    runWt(['checkout', '-B', branch, `origin/${branch}`]);
+    // Stay detached: the 2026-10-09/10-11 stranded branch holder must never wedge a new writer.
+    // Concurrent writers also need independent HEADs; the remote arbitrates their non-forced pushes.
 
     return writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, branch, created, assertReady, board, allowRef });
   } finally {
-    // ALWAYS, and in this order: remove the directory, then prune the registration. Dropping either one leaves
-    // the next run on this branch wedged.
+    // Remove this run's directory, then prune its registration. A killed run misses finally entirely;
+    // the next writer's best-effort sweep handles its stale worktree without discarding unpushed work.
     try { rm(wt, { recursive: true, force: true }); } catch { /* already gone */ }
     // PRUNED IN `board`, not in whatever directory the driver happens to be: the worktree was registered in the
     // board's checkout, so pruning elsewhere leaves a stale registration in the repo that will need it (#3261).
@@ -195,7 +275,7 @@ function writeCommitPush({ run, runWt, mkdir, write, read, wt, files, message, b
 
   runWt(['commit', '--quiet', '-m', message]);
   // A FULL refname: on a created branch the remote has no `<branch>` for a short name to resolve against.
-  runWt(['push', '--quiet', 'origin', created || allowRef ? `HEAD:refs/heads/${branch}` : `HEAD:${branch}`]);
+  runWt(['push', '--quiet', 'origin', `HEAD:refs/heads/${branch}`]);
   return { paths: files.map((f) => f.path), pushed: true, ...(created ? { created: true } : {}) };
 }
 
@@ -225,5 +305,5 @@ export function readFromTransportBranch({ board, branch, paths = [], run = defau
 }
 
 function defaultGit(args, opts) {
-  return execFileSync('git', args, { encoding: 'utf8', ...opts });
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts });
 }

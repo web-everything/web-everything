@@ -8,7 +8,7 @@
  * second caller must not be able to lose them by construction.
  */
 import { describe, it, expect } from 'vitest';
-import { stageOnTransportBranch } from '../git-transport-branch.mjs';
+import { stageOnTransportBranch, reclaimStrandedTransportWorktrees } from '../git-transport-branch.mjs';
 
 /** Every side effect stubbed, filesystem included. See the header of the module under test for why. */
 const stub = ({ diff = 'ops/x/a.json', onRun } = {}) => {
@@ -39,12 +39,11 @@ describe('it never checks the transport branch out over the caller\'s tree', () 
    * The caller is standing in a lane with uncommitted work. Checking a transport branch out over that lane
    * destroys it — done by hand once, and it disrupted a running juror mid-review.
    */
-  it('runs every checkout inside its own worktree, never in the board root', () => {
+  it('stays detached without claiming the shared local branch', () => {
     const s = stub();
     stage(s);
     const checkouts = s.calls.filter((c) => c.args?.[0] === 'checkout');
-    expect(checkouts.length).toBeGreaterThan(0);
-    for (const c of checkouts) expect(c.cwd).not.toBe('/board');
+    expect(checkouts).toEqual([]);
   });
 
   it('writes only under the worktree it created', () => {
@@ -77,7 +76,7 @@ describe('what it pushes, and when it does not', () => {
   it('pushes to the branch CI actually watches', () => {
     const s = stub();
     expect(stage(s).pushed).toBe(true);
-    expect(s.calls.find((c) => c.args?.[0] === 'push').args).toContain('HEAD:ops/x');
+    expect(s.calls.find((c) => c.args?.[0] === 'push').args).toContain('HEAD:refs/heads/ops/x');
   });
 
   // Identical bytes already staged is what `idempotent: true` promises on replay, not a failure to report.
@@ -154,5 +153,86 @@ describe('a broken worktree can never fall through to the board (live 2026-10-09
     expect(existsSync(j(board, 'skills-src/daemon.mjs'))).toBe(true);
     expect(git(['status', '--porcelain', '--untracked-files=no'], board).trim()).toBe('');
     rmf(root, { recursive: true, force: true });
+  });
+});
+
+describe('stranded transport safety and useful git errors', () => {
+  it.each([
+    ['fresh', '/board/.operations/transport/wt-599999'],
+    ['outside transport', '/board/other/wt-1'],
+    ['prefix sibling', '/board/.operations/transport-other/wt-1'],
+    ['not a transport name', '/board/.operations/transport/manual'],
+    ['current run', '/board/.operations/transport/wt-1'],
+  ])('never touches a %s worktree', (_label, path) => {
+    const calls = [];
+    reclaimStrandedTransportWorktrees({
+      board: '/board', branch: 'ops/x', now: () => 600001,
+      exclude: '/board/.operations/transport/wt-1',
+      run: (args) => { calls.push(args); return 'worktree ' + path + '\nHEAD abc\ndetached\n\n'; },
+    });
+    expect(calls).toEqual([['worktree', 'list', '--porcelain']]);
+  });
+
+  it.each(['fetch', 'commit'])('puts git stderr on the first line for %s failures', (command) => {
+    const original = Object.assign(new Error('Command failed: git ' + command), {
+      status: 128, stderr: Buffer.from("hint: context\nfatal: 'x' is already used by worktree at '/b'\nhint: trailing advice\n"),
+    });
+    const s = stub({ onRun: (args) => { if (args[0] === command) throw original; } });
+    let caught;
+    try { stage(s); } catch (e) { caught = e; }
+    expect(caught.message.split('\n')[0]).toMatch(/^git .* failed: fatal: 'x' is already used by worktree at '\/b'$/);
+    expect(caught.cause).toBe(original);
+    expect(caught.status).toBe(128);
+    expect(caught.stderr).toBe(original.stderr);
+  });
+});
+
+describe('recovery preserves before removing and fails safely', () => {
+  const path = '/board/.operations/transport/wt-1';
+  const recover = ({ dirty = false, ancestor = false, fail } = {}) => {
+    const calls = []; const logs = [];
+    reclaimStrandedTransportWorktrees({
+      board: '/board', branch: 'ops/x', now: () => 600001, exists: () => true,
+      log: (line) => logs.push(line),
+      run: (args, opts) => {
+        calls.push({ args, ...opts });
+        if (args[0] === fail) throw new Error('probe failed');
+        if (args[0] === 'worktree' && args[1] === 'list') return 'worktree ' + path + '\nHEAD abc\n\n';
+        if (args[0] === 'status') return dirty ? '?? uncommitted.txt\n' : '';
+        if (args[0] === 'rev-parse') return 'abc\n';
+        if (args[0] === 'merge-base' && !ancestor) throw Object.assign(new Error('not ancestor'), { status: 1 });
+        return '';
+      },
+    });
+    return { calls, logs };
+  };
+  it('guards worktree probes and saves the commit before removal', () => {
+    const { calls, logs } = recover();
+    expect(calls.map((c) => c.args[0])).toEqual(['worktree', 'status', 'rev-parse', 'merge-base', 'update-ref', 'worktree']);
+    expect(calls[4]).toMatchObject({ cwd: '/board', args: ['update-ref', 'refs/transport-stranded/wt-1', 'abc'] });
+    expect(calls[5].args).toEqual(['worktree', 'remove', '--force', path]);
+    for (const c of calls.filter((c) => c.cwd === path)) {
+      expect(c.env.GIT_CEILING_DIRECTORIES).toBe('/board/.operations/transport');
+      expect(c.env.GIT_DIR).toBeUndefined();
+    }
+    expect(logs[0]).toContain('refs/transport-stranded/wt-1');
+  });
+  it('needs no backup when origin already contains the commit', () => {
+    const { calls } = recover({ ancestor: true });
+    expect(calls.some((c) => c.args[0] === 'update-ref')).toBe(false);
+    expect(calls.at(-1).args).toEqual(['worktree', 'remove', '--force', path]);
+  });
+  it.each([{ dirty: true }, { fail: 'status' }, { fail: 'rev-parse' }, { fail: 'update-ref' }])('leaves work untouched when unsafe: %j', (opts) => {
+    const { calls, logs } = recover(opts);
+    expect(calls.some((c) => c.args[1] === 'remove')).toBe(false);
+    expect(logs.join()).toContain(path);
+  });
+  it('a failed sweep never fails the write', () => {
+    const logs = [];
+    const s = stub({ onRun: (args) => {
+      if (args[0] === 'worktree' && args[1] === 'list') throw new Error('listing failed');
+    } });
+    expect(stage(s, { log: (line) => logs.push(line) }).pushed).toBe(true);
+    expect(logs.join()).toContain('listing failed');
   });
 });
