@@ -208,7 +208,7 @@ describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
       const view = { headRefOid: PR4722.head, headRefName: 'lane/resource-usage-service', comments };
       const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
       const opts = { pr: 4722, repo: 'web-everything/web-everything', local: true, exec,
-        netDiff: () => ({ scored: true, text: PR4722.fp, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } };
+        netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } };
       const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true }, opts);
       expect(gate.action).toBe('merge');
       expect(gate.carriedClearance).toMatchObject({ fromSha: from, toSha: PR4722.head, fingerprint: PR4722.fp, recorded: true });
@@ -235,7 +235,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp)] };
     const exec = graphExec({ parents: over.parents || pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: over.diff || PR4722.fp, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } });
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: over.diff || PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     return { gate, posted };
   };
   it('a changed net diff re-parks review:human, no record', () => {
@@ -255,9 +255,10 @@ describe('drain gate: what does NOT carry', () => {
   ])('a net diff read from a different tip than the stamped head does not carry (no record): %s', (_n, { tip }) => {
     const posted = [];
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp)] };
-    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view, tip });
+    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
+    // the net diff names the sha it was pinned to (`revSha`); a different tip, or none, must not bind to the stamped head
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } });
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: tip || 'origin/lane/x', revSha: tip || undefined }), carry: { setting: ON, log: quiet } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
     expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
@@ -283,7 +284,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), forged] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } });
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     expect(gate.action).toBe('merge');
     expect(gate.carriedClearance.actor).toBe('chalbert');
     expect(posted[0]).toContain('<!-- cleared-human: chalbert -->');
