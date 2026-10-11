@@ -455,9 +455,10 @@ const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
  * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
  * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
  * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
- * every round except one proven mechanical (its window holds only upstream merges, drain rebases included; a merge
- * flagged `mergesPrWork` brought a repair branch in, or carries content git's clean merge of its parents does not, and
- * is real). A round with no commit at all is spent, never refunded.
+ * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
+ * rebases included; a merge flagged `mergesPrWork` brought a repair branch in, or carries content git's clean merge of
+ * its parents does not, and is real, so a drain rebase that auto-resolved a conflict or renumbered a card is spent too).
+ * A round with no commit at all is spent, never refunded.
  */
 export function countRealFixRounds(pr) {
   const facts = pr?.roundCommits;
