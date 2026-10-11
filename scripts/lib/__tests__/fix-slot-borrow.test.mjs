@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,12 @@ import { runReconcileFixDispatch } from '../../conveyor/reconcile-fix-dispatch.m
 import { acquireFixDispatchClaim, releaseFixDispatchClaim } from '../../conveyor/fix-dispatch-claim.mjs';
 import { planBuildDispatch, BUILD_DISPATCH_POLICY } from '../../conveyor/build-dispatch-policy.mjs';
 import { liveBorrowedFixInFlight } from '../../../skills-src/conveyor/build-dispatch-daemon.mjs';
+
+// x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
+// cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
+beforeEach(() => { vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); });
+afterEach(() => vi.unstubAllEnvs());
+
 
 const claim = (kind, pr, extra = {}) => ({ owner: 'o', meta: { kind, pr, repo: 'we', ...extra } });
 const memLedger = () => { let v = {}; return { read: () => v, write: (x) => { v = x; } }; };
