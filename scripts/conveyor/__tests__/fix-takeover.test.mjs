@@ -37,8 +37,14 @@ function cappedPr(extraComments = []) {
 
 describe('fix settings cascade (card xx0055i)', () => {
   it('built-in default is takeover + history on + one takeover per PR', () => {
-    const s = resolveFixSettings({ env: {}, read: () => { throw new Error('no file'); } });
+    const s = resolveFixSettings({ env: {}, read: () => { throw Object.assign(new Error('no file'), { code: 'ENOENT' }); } });
     expect(s).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
+  });
+  it('a settings file that is there but unreadable (not a missing file) fails closed to person / 0 (self-review, round 6)', () => {
+    for (const code of ['EACCES', 'EISDIR', 'EIO', undefined]) {
+      const s = resolveFixSettings({ env: {}, read: () => { throw Object.assign(new Error('read failed'), { code }); } });
+      expect(s).toMatchObject({ roundCapAction: 'person', takeoverMaxPerPr: 0, sources: { roundCapAction: 'settings-invalid', takeoverMaxPerPr: 'settings-invalid' } });
+    }
   });
   it('the shipped platform preference is takeover + on, under the `fix` namespace', () => {
     expect(JSON.parse(readFileSync(FIX_SETTINGS_FILE, 'utf8'))).toMatchObject({ fix: { roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 } });
@@ -299,6 +305,18 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
       const text = p.notes.find((n) => n.kind === 'round-cap-exhausted')?.text ?? '';
       expect(text).toMatch(/already ran/);
       expect(text).not.toMatch(/launch faults/);
+    });
+
+    it('a refused void on an OLDER head does not mislabel a later clean takeover on a new head (self-review, round 6)', () => {
+      const h1 = 'c'.repeat(40);
+      const startOn = (head, t) => at({ author: BOT, body: takeoverMarkerBody({ pr: 7, head, attempts: 5, cap: 5, rung: { id: 'stronger-model' } }) }, t);
+      const faulted = [startOn(h1, '01:00'), at(voided(h1), '01:01'), startOn(h1, '02:00'), at(voided(h1), '02:01'), startOn(h1, '03:00'), at(voided(h1), '03:01')];
+      // on h1 alone the last fault was refused: void-limit
+      expect(planTakeover({ pr: { ...cappedPr(faulted), headRefOid: h1 }, roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER }))
+        .toMatchObject({ ok: false, reason: 'takeover-void-limit' });
+      // then a clean takeover on HEAD (no void of its own): that one ran, so the PR is spent, not void-limited
+      expect(planTakeover({ pr: cappedPr([...faulted, startOn(HEAD, '04:00')]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER }))
+        .toMatchObject({ ok: false, reason: 'takeover-spent' });
     });
   });
 });

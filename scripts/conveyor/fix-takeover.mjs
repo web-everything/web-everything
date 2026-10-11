@@ -42,7 +42,8 @@ const INVALID_LAYER = Symbol('invalid fix settings layer');
  */
 function readFileLayer(file, read) {
   let raw;
-  try { raw = read(file); } catch { return {}; } // no file: no layer
+  // Only a MISSING file is no layer. Any other read error (EACCES, EISDIR, EIO) is a file that is there but unusable.
+  try { raw = read(file); } catch (e) { return e?.code === 'ENOENT' ? {} : INVALID_LAYER; }
   let parsed;
   try { parsed = JSON.parse(raw); } catch { return INVALID_LAYER; }
   if (parsed === null) return {};
@@ -151,13 +152,13 @@ const inThreadOrder = (comments) => {
  * PURE: replay the takeover markers in thread order. A trusted void cancels the latest EARLIER start for its head that
  * is still standing (the launch it reports on came before it); a void with no such start cancels nothing. At most
  * {@link TAKEOVER_MAX_VOIDS} voids are honoured per PR: a matching void past that allowance is REFUSED, and its start
- * stands. `{ starts: [{ head, at, attempts }], refusedVoid }` — `refusedVoid` is true when a standing start is one a
- * launch fault was reported for (so "the takeover ran" is not known for it).
+ * stands. `{ starts: [{ head, at, attempts }], refusedVoid }` — `refusedVoid` is true when the LATEST standing start
+ * (the most recent takeover) is one a launch fault was reported for, so "the takeover ran" is not known for it. An
+ * older refused start on another head does not mislabel a later takeover that launched cleanly.
  */
 function takeoverLedger(comments) {
   const starts = [];
   let honoured = 0;
-  let refusedVoid = false;
   // a void with an `unknown` head matches only an `unknown` start
   const matches = (m, h) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h));
   for (const c of inThreadOrder(trustedBodies(comments))) {
@@ -165,13 +166,13 @@ function takeoverLedger(comments) {
     if (voidHead !== undefined) {
       const i = starts.findLastIndex((m) => !m.voidRefused && matches(m, voidHead));
       if (i < 0) continue;
-      if (honoured < TAKEOVER_MAX_VOIDS) { starts.splice(i, 1); honoured += 1; } else { starts[i].voidRefused = true; refusedVoid = true; }
+      if (honoured < TAKEOVER_MAX_VOIDS) { starts.splice(i, 1); honoured += 1; } else starts[i].voidRefused = true;
       continue;
     }
     const head = markerHead(c.body, FIX_TAKEOVER_MARKER);
     if (head !== undefined) starts.push({ head, at: c.createdAt ?? null, attempts: markerAttempts(c.body), voidRefused: false });
   }
-  return { starts: starts.map(({ head, at, attempts }) => ({ head, at, attempts })), refusedVoid };
+  return { starts: starts.map(({ head, at, attempts }) => ({ head, at, attempts })), refusedVoid: Boolean(starts.at(-1)?.voidRefused) };
 }
 
 /**
