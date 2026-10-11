@@ -11,6 +11,7 @@ import {
 } from '../mechanical-round-cap.mjs';
 import { RECONCILE_FINDING_BANNER } from '../reconcile-finding.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
+import { renderConvertedAdvisoryNote } from '../../lib/review-escalation.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
 import { takeoverReviewGrant, OPERATOR_TAKEOVER_PREFIX } from '../takeover-review.mjs';
@@ -166,6 +167,22 @@ describe('mechanical round vs the review round cap', () => {
       const body = `✅ review — accepted\n\n\`\`\`\nNet basis: \`${z}..${OTHER}\`\n\`\`\`\n\nNet basis: \`${z}..${PRIOR}\`\n<!-- reviewed-sha: ${PRIOR} -->`;
       expect(reviewedHeadsOf(body)).toEqual([PRIOR]);
       expect(grant({ author: BOT, createdAt: at(6), body })).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
+    });
+    it('a converted advisory note quoting the prior accept is advisory, never a carried accept', () => {
+      const accept = acceptOn(PRIOR, 5);
+      const note = { author: BOT, createdAt: at(6), body: renderConvertedAdvisoryNote({ repo: 'o/r', pr: 7, headSha: PRIOR,
+        acceptComment: accept, escalation: { kind: 'size', reasonText: 'big' }, targetedCheckAnswer: { verdict: 'changes', note: 'bad' } }) };
+      expect(reviewedHeadsOf(note)).toEqual([PRIOR]);
+      const p = pr([rearm(4), accept, note, rearm(7), mechMarker(8)], { mechanicalRound: identical });
+      expect(mechanicalRoundGrant({ pr: p })).toMatchObject({ ok: true, action: 'carry', verdict: 'advisory' });
+      // a trusted verdict-shaped comment whose only reviewed-sha stamp is quoted is not an accept either
+      const quotedOnly = { author: BOT, createdAt: at(6), body: `📝 note\n\n> <!-- reviewed-sha: ${PRIOR} -->\n\nNet basis: \`${'0'.repeat(40)}..${PRIOR}\`` };
+      expect(grant(quotedOnly)).toMatchObject({ ok: true, action: 'carry', verdict: 'advisory' });
+    });
+    it('only a Markdown fence hides a footer: inline triple backticks and a 4-space indent do not open one', () => {
+      expect(reviewedHeadsOf(`✅ review — accepted\n\n\`\`\`a\`\`\` is inline\n\n<!-- reviewed-sha: ${PRIOR} -->`)).toEqual([PRIOR]);
+      expect(reviewedHeadsOf(`✅ review — accepted\n\n    \`\`\`\n\n<!-- reviewed-sha: ${PRIOR} -->`)).toEqual([PRIOR]);
+      expect(reviewedHeadsOf(`✅ review — accepted\n\n   \`\`\`\n<!-- reviewed-sha: ${OTHER} -->\n   \`\`\`\n<!-- reviewed-sha: ${PRIOR} -->`)).toEqual([PRIOR]);
     });
     it('a verdict naming the CURRENT head by an abbreviated structured sha (before the round marker) is head-already-reviewed', () => {
       const v = { author: BOT, createdAt: at(6), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${HEAD.slice(0, 12)} -->` };

@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { CONFLICT_FIX_COMMENT_MARKER } from './conflict-fix-round-count.mjs';
 import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { REVIEWED_SHA_MARKER, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
+import { REVIEWED_SHA_MARKER, CONVERTED_ADVISORY_NOTE_MARKER, normalizeDiffFingerprint } from '../lib/review-escalation.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 
 export const MECHANICAL_ROUNDS_SETTING = 'mechanicalRoundsCountTowardCap';
@@ -87,54 +87,78 @@ export function isMechanicalBounce(c) {
   return body.trimStart().startsWith(BOUNCE_PREFIX) && body.includes(MECHANICAL_BOUNCE_PHRASE);
 }
 
-/**
- * A trusted REVIEW verdict on the thread: an advisory panel note, a review bounce, or an accept (reviewed-sha
- * marker). A mechanical bounce is not one. Shared with we:scripts/conveyor/takeover-review.mjs.
- */
-export function isReviewVerdictComment(c) {
-  const body = bodyOf(c);
-  const lead = body.trimStart();
-  const shaped = lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(BOUNCE_PREFIX) || body.includes(`<!-- ${REVIEWED_SHA_MARKER}:`);
-  return shaped && !isMechanicalBounce(c) && isTrustedMarkerAuthor(c);
-}
-
-/** `accept` | `changes` | `advisory` for a review verdict comment. */
-export function verdictKind(c) {
-  const body = bodyOf(c);
-  if (body.trimStart().startsWith(BOUNCE_PREFIX)) return 'changes';
-  if (body.trimStart().startsWith(ADVISORY_NOTE_MARKER)) return 'advisory';
-  return 'accept';
-}
-
 // Both formats must fill a whole line at column 0, as the producers write them (we:scripts/lib/review-escalation.mjs
 // #buildReviewedShaMarker, the review-pr `Net basis:` line): a marker mid-line, indented or after `>` is a quote.
 const REVIEWED_MARKER_LINE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->\\s*$`, 'i');
 const NET_BASIS_LINE = /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`/i;
-const FENCE_LINE = /^\s*(`{3,}|~{3,})(.*)$/;
+// A Markdown fence: at most 3 spaces of indent; a backtick fence's info string holds no backtick (```a``` is inline code).
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+// Any spelling of the marker, quoted or not: only the loose "is this verdict-shaped" check reads it (fail closed).
+const ANY_REVIEWED_MARKER = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:`, 'i');
 
 /**
- * The commit a trusted verdict comment says it JUDGED: the head of its LAST structured footer line, of either format
- * (`<!-- reviewed-sha: <sha> -->` or `Net basis: <base>..<head>`, 7-40 hex, lower-cased) — the producers append it as
- * the footer, so a quoted earlier one never wins. One head, never one per format: a quoted `Net basis` naming the
- * parent must not ride along with a real `reviewed-sha` footer for another commit. Quoted text never counts — fenced
- * code (an unclosed fence runs to the end, so it fails closed), a blockquote, an indented or mid-line marker, or a
- * line joined by U+2028 (only `\n` ends a line). A sha merely mentioned in prose is never returned. Pure.
+ * The structured marker lines of a comment, in order, that are NOT quoted: fenced code (an unclosed fence runs to the
+ * end), a blockquote, an indented or mid-line marker, or a line joined by U+2028 (only `\n` ends a line) never count.
+ * @returns {{kind:'reviewed-sha'|'net-basis', sha:string}[]}
+ */
+function structuredMarkerLines(body) {
+  const out = [];
+  let fence = null;
+  for (const raw of body.split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    const f = FENCE_LINE.exec(line);
+    const isFence = f && !(f[1][0] === '`' && f[2].includes('`'));
+    if (fence) {
+      if (isFence && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
+      continue;
+    }
+    if (isFence) { fence = f[1]; continue; }
+    const s = REVIEWED_MARKER_LINE.exec(line);
+    const n = s ? null : NET_BASIS_LINE.exec(line);
+    if (s) out.push({ kind: 'reviewed-sha', sha: s[1].toLowerCase() });
+    else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase() });
+  }
+  return out;
+}
+
+/**
+ * A trusted REVIEW verdict on the thread: an advisory panel note (or a converted advisory note), a review bounce, or
+ * an accept (reviewed-sha marker). A mechanical bounce is not one. Shared with we:scripts/conveyor/takeover-review.mjs.
+ * The shape check is deliberately loose (a quoted marker still makes it verdict-shaped, so it spends a round); what
+ * the verdict judged and which kind it is are read from unquoted structure only ({@link reviewedHeadsOf}, {@link verdictKind}).
+ */
+export function isReviewVerdictComment(c) {
+  const body = bodyOf(c);
+  const lead = body.trimStart();
+  const shaped = lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(CONVERTED_ADVISORY_NOTE_MARKER)
+    || lead.startsWith(BOUNCE_PREFIX) || ANY_REVIEWED_MARKER.test(body);
+  return shaped && !isMechanicalBounce(c) && isTrustedMarkerAuthor(c);
+}
+
+/**
+ * `accept` | `changes` | `advisory` for a review verdict comment. `accept` needs the accept stamp itself — an
+ * UNQUOTED `reviewed-sha` marker line: a converted advisory note quotes the prior accept verbatim (`> <!-- reviewed-sha
+ * … -->`) and may report blocking findings, so a quoted stamp is never an accept.
+ */
+export function verdictKind(c) {
+  const body = bodyOf(c);
+  const lead = body.trimStart();
+  if (lead.startsWith(BOUNCE_PREFIX)) return 'changes';
+  if (lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(CONVERTED_ADVISORY_NOTE_MARKER)) return 'advisory';
+  return structuredMarkerLines(body).some((m) => m.kind === 'reviewed-sha') ? 'accept' : 'advisory';
+}
+
+/**
+ * The commit a trusted verdict comment says it JUDGED: the head of its LAST unquoted structured marker line, of either
+ * format (`<!-- reviewed-sha: <sha> -->` or `Net basis: <base>..<head>`, 7-40 hex, lower-cased). It relies on every
+ * producer appending that footer LAST, after any quoted text, so a quoted earlier one never wins. One head, never one
+ * per format: a quoted `Net basis` naming the parent must not ride along with a real `reviewed-sha` footer for another
+ * commit. A sha merely mentioned in prose is never returned. Pure.
  * @returns {string[]} zero or one head
  */
 export function reviewedHeadsOf(c) {
-  let fence = null; let last = null;
-  for (const raw of bodyOf(c).split('\n')) {
-    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
-    const f = FENCE_LINE.exec(line);
-    if (fence) {
-      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
-      continue;
-    }
-    if (f) { fence = f[1]; continue; }
-    const m = REVIEWED_MARKER_LINE.exec(line) ?? NET_BASIS_LINE.exec(line);
-    if (m) last = m[1].toLowerCase();
-  }
-  return last ? [last] : [];
+  const last = structuredMarkerLines(bodyOf(c)).at(-1);
+  return last ? [last.sha] : [];
 }
 
 /** Did this verdict judge `sha` (a full 40-hex head)? Matches a full or abbreviated structured sha, never prose. */
