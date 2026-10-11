@@ -633,10 +633,26 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(JSON.parse(r.out.trim().split('\n').pop())).toMatchObject({ refused: true, retryable: true });
   });
 
-  it('no extra reads when the setting is off or the accept is not a human clearance', () => {
+  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): every restamp is a carry, so every restamp reads the formal
+  // reviews once (it replaces the earlier "a plain accept pays no extra gh call" pin). The full-thread read stays reserved
+  // to a human-cleared carry on a short thread.
+  it('every restamp reads the formal reviews exactly once; the full thread only for a human carry', () => {
     const agent = { author: BOT, body: `✅ review — accepted\n<!-- reviewed-sha: ${heads.cleared} -->` };
-    expect(restamp({ comments: [agent], labels: ['review:accepted'] }).reads).toEqual({ reviews: 0, comments: 0 });
-    expect(restamp({ comments: [clearComment()], labels: ['review:accepted'], setting: 'off' }).reads).toEqual({ reviews: 0, comments: 0 });
+    expect(restamp({ comments: [agent], labels: ['review:accepted'] }).reads).toEqual({ reviews: 1, comments: 0 });
+    expect(restamp({ comments: [clearComment()], labels: ['review:accepted'], setting: 'off' }).reads).toEqual({ reviews: 1, comments: 0 });
+  });
+  it('ROUND 11: a restamp of a plain AGENT accept refuses past a standing CHANGES_REQUESTED review (any setting): NO write', () => {
+    const agent = { author: BOT, body: `✅ review — accepted\n<!-- reviewed-sha: ${heads.cleared} -->` };
+    for (const setting of ['on', 'off']) {
+      const r = restamp({ comments: [agent], labels: ['review:accepted'], setting, reviews: [{ state: 'CHANGES_REQUESTED', submitted_at: '2020-01-01T00:00:00Z', user: { login: 'plateau-reviewer[bot]' } }] });
+      expect(r.exitCode).not.toBe(0);
+      expect(r.writes).toEqual(NO_WRITES);
+      expect(printedOf(r).error).toMatch(/the accept is not carried/);
+      expect(printedOf(r).retryable).toBeUndefined();
+    }
+    const unread = restamp({ comments: [agent], labels: ['review:accepted'], reviews: null });
+    expect(unread.writes).toEqual(NO_WRITES);
+    expect(printedOf(unread)).toMatchObject({ refused: true, retryable: true });
   });
 
   it('operator free text "hold, don\'t merge" after the clear-human refuses the carry (no accept)', () => {
