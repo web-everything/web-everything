@@ -84,5 +84,5 @@ Slice of decision 4120 (daemon job model); audit we:reports/2026-09-24-daemon-bl
 - **Supervisor `kill -9` (fixture lane, real detached job).** The dead supervisor was requeued, the new daemon did
   not re-dispatch the lane (`dispatched=0`), the orphaned gate settled green itself, and attempt 2 found the marker
   settled and ran nothing (`settled: stale — marker green`); the gate ran once.
-- **Residuals** filed as x8ordg8: the first snapshot build per clone HEAD blocks one tick (28 s live), a relaunch
+- **Residuals** filed as 5860: the first snapshot build per clone HEAD blocks one tick (28 s live), a relaunch
   kills a surviving gate instead of re-attaching to it, and verify-lane notice lines now land in the job log.
