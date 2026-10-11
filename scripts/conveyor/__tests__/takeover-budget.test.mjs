@@ -3,7 +3,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight,
-  notConvergingText, renderPreviousTakeover, OPERATOR_TAKEOVER_PREFIX, TAKEOVER_BUDGET_STANDARD_DEFAULT,
+  notConvergingText, renderPreviousTakeover, OPERATOR_TAKEOVER_PREFIX, TAKEOVER_BUDGET_STANDARD_DEFAULT, isPausedReview,
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
 import { takeoverReviewGrant } from '../takeover-review.mjs';
@@ -265,5 +265,81 @@ describe('gateHoldReason', () => {
     expect(gateHoldReason(pr(R5, []))).toBeNull();
     expect(gateHoldReason(pr(R5, [], { statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }, { name: 'merge-gate', conclusion: 'FAILURE' }] }))).toBeNull();
     expect(gateHoldReason(pr(R5, [], { statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE' }] }))).toBe('review-gate-hold');
+  });
+});
+
+// The LAST takeover's head always earns its one review before the PR goes to the operator (live #4708: takeover 2
+// pushed 483aab1e2 with the budget spent; its review PAUSED on two mandatory referrals, the planner read that pause
+// as a verdict, told the operator "a person must take it over" and refused the woken re-review as cap-exhausted 6/5).
+describe('the last takeover head earns its review even when the budget is spent', () => {
+  /** The paused advisory: the review stopped on mandatory referrals awaiting a ruling (no outcome line). */
+  const paused = (head, h) => ({ author: BOT, createdAt: at(h),
+    body: `${ADVISORY_NOTE_MARKER} Pending: 2 mandatory referral(s) await a ruling\n\n### Awaiting a ruling\n\n1. \`src/a.mjs:40\` (judgeSecurity) — still bad\n\n`
+      + `**Verdict:** 🚦 human review required\n\n**Advisory outcome:** \`pending-referral\` — mandatory referrals still need a ruling\n\nNet basis: \`${H('0')}..${head}\`` });
+  /** The policy's block ruling on the paused review's referrals (no verdict by itself). */
+  const policyRuling = (head, h) => ({ author: BOT, createdAt: at(h),
+    body: `## Automatic policy ruling on mandatory referrals\n\nRecorded by policy, for head \`${head}\`.\n\n1. **block** — still bad (run \`review-pr-x\`)` });
+  // #4708's shape: takeover 1 (marker) judged with progress, then takeover 2 is an OPERATOR takeover (no marker,
+  // so its episode names no head) that pushed T2. Budget 2 is spent.
+  const thread = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR), operatorTakeover(10)];
+
+  it('budget spent + last takeover head unreviewed → its review is dispatched (no needs-you note)', () => {
+    const p = plan(pr(T2, thread, { labels: [{ name: 'review:changes' }, { name: 'review:human' }] }), { durableCounts: { 7: 6 } });
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review', takeoverReview: { ok: true } });
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
+    // and the takeover planner itself says the head is awaiting its review, not that the budget is spent
+    expect(planTakeover({ pr: pr(T2, thread), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER }))
+      .toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+  });
+
+  it('a review that only PAUSED on referrals is not that head\'s review: once ruled, the woken review is dispatched', () => {
+    const ruled = [...thread, paused(T2, 11), policyRuling(T2, 12)];
+    expect(takeoverReviewGrant({ pr: pr(T2, ruled), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0 });
+    const p = plan(pr(T2, ruled, { labels: [{ name: 'review:changes' }, { name: 'review:human' }] }), { durableCounts: { 7: 6 } });
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
+    // the block rulings already judge the head for the takeover planner, but the grant runs first: the woken review goes
+    expect(planTakeover({ pr: pr(T2, ruled), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER }))
+      .toMatchObject({ ok: false, reason: 'takeover-budget-spent' });
+  });
+
+  it('a paused note is recognised by its outcome line, or by its Pending lead when it has none; a forged one is not', () => {
+    expect(isPausedReview(paused(T2, 11))).toBe(true);
+    expect(isPausedReview({ ...paused(T2, 11), body: paused(T2, 11).body.replace(/\*\*Advisory outcome:\*\*[^\n]*\n/, '') })).toBe(true);
+    expect(isPausedReview({ ...paused(T2, 11), body: `${paused(T2, 11).body}\n**Advisory outcome:** \`changes\`` })).toBe(false);
+    expect(isPausedReview({ ...paused(T2, 11), author: { login: 'mallory' } })).toBe(false);
+    expect(isPausedReview(review(T2, 11, FOUR))).toBe(false);
+  });
+
+  it('bounded: a head whose review paused twice has spent its grant', () => {
+    const twice = [...thread, paused(T2, 11), policyRuling(T2, 12), paused(T2, 13)];
+    expect(takeoverReviewGrant({ pr: pr(T2, twice), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'takeover-review-spent' });
+    // …and the PR then reaches the operator (the block rulings judged the head), never hangs at the round limit
+    const p = plan(pr(T2, twice), { durableCounts: { 7: 7 } });
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toBeUndefined();
+    expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', takeover: 'takeover-budget-spent' });
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toMatchObject({ parkToHuman: true });
+  });
+
+  it('after that review returns changes → the operator (needs-you)', () => {
+    const judged = [...thread, paused(T2, 11), policyRuling(T2, 12), review(T2, 13, FOUR.slice(1))];
+    expect(takeoverReviewGrant({ pr: pr(T2, judged), takeoverReviewAttempts: 1 }).ok).toBe(false);
+    const p = plan(pr(T2, judged), { durableCounts: { 7: 6 } });
+    expect(p.dispatch.find((x) => x.prNumber === 7)).toBeUndefined();
+    expect(p.refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', takeover: 'takeover-budget-spent' });
+    const note = p.notes.find((n) => n.kind === 'round-cap-exhausted');
+    expect(note.text).toMatch(/takeover budget is spent: 2 of 2/);
+    expect(note.parkToHuman).toBe(true);
+  });
+
+  it('after that review accepts → the normal human ceremony: no takeover, no extra review, no needs-you note', () => {
+    const accept = { author: BOT, createdAt: at(11), body: `${ADVISORY_NOTE_MARKER} Accept: no blocking findings on this head\n\n**Advisory outcome:** \`accept\`\n\nNet basis: \`${H('0')}..${T2}\`` };
+    const accepted = [...thread, accept];
+    const p = plan(pr(T2, accepted, { labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }] }), { durableCounts: { 7: 6 } });
+    // nothing escalates: no takeover and no takeover-review grant (the parked-PR review path is the ordinary one)
+    expect(p.dispatch.filter((x) => x.prNumber === 7 && (x.mode === 'takeover' || x.takeoverReview))).toEqual([]);
+    expect(p.refusals.filter((r) => r.prNumber === 7 && r.kind === 'cap-exhausted')).toEqual([]);
+    expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
+    expect(takeoverReviewGrant({ pr: pr(T2, accepted), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'head-already-reviewed' });
   });
 });

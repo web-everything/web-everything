@@ -60,3 +60,14 @@ describe('tagReviewStatus writes the status label in the same pass (one writer)'
     expect(r.prStatus).toBe('status:fixing');
   });
 });
+
+describe('a paused review does not judge the takeover (live #4708)', () => {
+  const paused = (h) => ({ author: BOT, createdAt: at(h), body: `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** Pending: 2 mandatory referral(s) await a ruling\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`` });
+  it('a live fixer after a takeover whose review only paused is still a running takeover', () => {
+    expect(derive({ pr: pr([], [marker(1), paused(2)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('takeover-running');
+    expect(derive({ pr: pr([], [marker(1), advisory(2)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('fixing');
+  });
+  it('the last takeover head\'s owed review is at-round-limit, not needs-you', () => {
+    expect(derive({ pr: pr([], [marker(1), paused(2)]), rows: [{ kind: 'review', takeoverReview: { ok: true } }] })).toBe('at-round-limit');
+  });
+});
