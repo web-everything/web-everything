@@ -103,12 +103,12 @@
 import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
+import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
@@ -1467,9 +1467,9 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
   if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  // The PR list read stops at GH_LIST_COMMENT_CAP comments, so a thread of exactly that length may be cut before a
-  // later withdrawal or takeover marker. A full re-read runs longer than the cap; a cut list grants nothing.
-  if (comments.length === GH_LIST_COMMENT_CAP) return { ok: false, reason: 'thread-truncated' };
+  // A cut list (exactly the list cap) may hide a later withdrawal or takeover marker: it grants nothing. The same
+  // check guards every past-cap grant (`takeover-budget.mjs#threadMayBeTruncated`).
+  if (threadMayBeTruncated(comments)) return { ok: false, reason: 'thread-truncated' };
   const rulings = decidingOperatorBlocks(pr, head, blocked);
   if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
@@ -1944,7 +1944,8 @@ export function planReconcile({
             + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover budget — fix.takeoverBudget or env WE_FIX_TAKEOVER_BUDGET — is 0 or invalid)' : '')
             + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
             + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
-            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
+            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : '')
+            + (takeover?.reason === 'thread-truncated' ? ' (no automatic takeover: the PR comment list was read only up to its first 100 comments, so the takeover markers and reviews after them could not be counted)' : ''),
       });
     };
     const refuseCapExhausted = capExhaustedVia(refuse);

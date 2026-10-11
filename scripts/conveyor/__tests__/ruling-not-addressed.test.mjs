@@ -242,6 +242,23 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
     expect(planOn([...ruled, marker(90), rulingOn(recA, { min: 100 }), rulingOn(recB, { min: 101 })]).dispatch.map((d) => d.operatorRulingRound?.used)).toEqual([0]);
   });
 
+  // Operator `block` ruling (PR #4797): a historical void marker cancels the start it FOLLOWED, never a later one. The
+  // spent-round count here reads `takeoverMarkers`, so a void left over from an earlier failed launch must not give
+  // the ruling's round back once a later takeover actually started.
+  it('a void cancels only the start before it: an earlier void never un-spends the ruling\'s round', () => {
+    const ruled = [...base, rulingOn(recA, { min: 80 }), rulingOn(recB, { min: 81 })];
+    const voided = (min) => trusted(takeoverVoidMarkerBody({ pr: 3794, head: H4 }), min);
+    const directed = (comments) => planOn(comments).dispatch.filter((d) => d.operatorRulingRound);
+    // a stray void before the ruling (no start precedes it) does not eat the start after the ruling
+    expect(directed([voided(75), ...ruled, marker(90)])).toEqual([]);
+    // an older failed launch (start + its void) before the ruling leaves the later start standing
+    expect(directed([marker(70), voided(72), ...ruled, marker(90)])).toEqual([]);
+    // the ruling's own failed launch is given back once; the retry after it spends the round
+    expect(directed([...ruled, marker(90), voided(92), marker(95)])).toEqual([]);
+    // control: the failed launch alone (start + void, no retry yet) leaves the round unspent
+    expect(directed([...ruled, marker(90), voided(92)]).map((d) => d.operatorRulingRound.used)).toEqual([0]);
+  });
+
   it('a new head with the findings still blocked goes back to the operator (the ruling bound the old head)', () => {
     const p = planReconcile({ repo: 'we', agents: [], now: Date.parse('2026-10-04T12:00:00Z'), requiredChecks: ['test'], fixerLadder: ladder, durableCounts: { 3794: 7 },
       prs: [{ ...basePr('e'.repeat(40), [...base, rulingOn(recA), rulingOn(recB), marker(90)]), blockRuledReferrals: blocked }] });
