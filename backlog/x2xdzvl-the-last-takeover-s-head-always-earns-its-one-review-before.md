@@ -1,7 +1,7 @@
 ---
 kind: story
 size: 3
-parent: "xyr5c8u"
+parent: "5894"
 status: resolved
 priority: high
 scaffoldedBy: "last-takeover-review"

@@ -1,7 +1,7 @@
 ---
 kind: story
 size: 5
-parent: "xyr5c8u"
+parent: "5894"
 status: open
 scope: ["we:scripts/conveyor/pr-status-label.mjs", "we:scripts/conveyor/review-status-tag.mjs"]
 dateOpened: "2026-10-10"
