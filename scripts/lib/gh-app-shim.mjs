@@ -602,7 +602,7 @@ if (!token) {
  */
 export function ensureGhShim({
   dir = defaultShimDir(), realGhPath, cachePath = defaultCachePath(), ghThrottleCliPath = defaultGhThrottleCliPath(),
-  writeFile = writeFileSync, chmod = chmodSync, mkdir = mkdirSync, roleTable = {},
+  writeFile = writeFileSync, chmod = chmodSync, mkdir = mkdirSync, roleTable = {}, callerRoles = DEFAULT_CALLER_ROLES,
   // #4044: the real write is ATOMIC (temp file + rename) — this one file is rewritten on every dispatch while
   // other processes exec it, and an in-place truncate-then-write could hand a concurrent `gh` a torn script.
   // An injected `writeFile` (tests) with no injected `rename` keeps the direct single write they assert on.
@@ -612,7 +612,7 @@ export function ensureGhShim({
   try {
     mkdir(dir, { recursive: true });
     const path = shimGhPath(dir);
-    const src = renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath, roleTable });
+    const src = renderGhShimScript({ realGhPath, cachePath, ghThrottleCliPath, roleTable, callerRoles });
     if (rename) {
       const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
       writeFile(tmp, src, 'utf8');
@@ -813,7 +813,7 @@ export function buildGhShimSettingsEnv({
   const dir = dirOpt ?? checkoutShimDir({ ghThrottleCliPath });
   const realGhPath = resolveRealGhBinary({ pathEnv, shimDir: dir, exists });
   if (!realGhPath) return null;
-  const written = ensureGhShim({ dir, realGhPath, cachePath, ghThrottleCliPath, writeFile, chmod, mkdir, roleTable });
+  const written = ensureGhShim({ dir, realGhPath, cachePath, ghThrottleCliPath, writeFile, chmod, mkdir, roleTable, callerRoles: id?.callerRoles });
   if (!written.ok) return null;
   const settingsEnv = { PATH: ghShimPathOverride({ dir, currentPath: pathEnv }) };
   // A dispatched session plays its dispatcher's role (a review session = reviewer) — only once roles are configured.
