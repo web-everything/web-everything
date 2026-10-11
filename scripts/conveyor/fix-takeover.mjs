@@ -121,22 +121,35 @@ export function takeoverVoidCount(comments) {
   return trustedBodies(comments).filter((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER) !== undefined).length;
 }
 
+/** Comments in thread order: by `createdAt` (stable) when every comment carries a valid one, else as given. The grant
+ *  reads `createdAt` too, so the pairing here must not depend on how the caller happened to order the array. */
+function inThreadOrder(list) {
+  const at = (c) => Date.parse(c?.createdAt ?? '');
+  if (!list.length || !list.every((c) => Number.isFinite(at(c)))) return list;
+  return [...list].sort((a, b) => at(a) - at(b));
+}
+
 /**
  * Takeovers that actually started on this PR, read off TRUSTED marker comments only: `[{ head }]`. A trusted void
  * marker for the same head cancels one start marker (the session never launched); an unmatched void cancels nothing,
  * and only the first {@link TAKEOVER_MAX_VOIDS} voids on a PR are honoured.
  */
 export function takeoverMarkers(comments) {
-  const trusted = trustedBodies(comments);
-  const starts = trusted
-    .map((c) => ({ head: markerHead(c.body, FIX_TAKEOVER_MARKER), at: c.createdAt ?? null, attempts: markerAttempts(c.body) }))
-    .filter((m) => m.head !== undefined);
-  const voids = trusted.map((c) => markerHead(c.body, FIX_TAKEOVER_VOID_MARKER)).filter((h) => h !== undefined)
-    .slice(0, TAKEOVER_MAX_VOIDS);
-  for (const h of voids) {
-    // Cancel the latest start for this head (a void with an `unknown` head cancels only an `unknown` start).
-    const at = starts.map((m, i) => ({ m, i })).reverse().find(({ m }) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
-    if (at) starts.splice(at.i, 1);
+  const starts = [];
+  let honoured = 0;
+  // Walk the thread in order: a void gives back the launch it FOLLOWED, so it only reaches starts posted before it. A
+  // void that searched every start would cancel a later retry's marker and keep the failed launch's instead.
+  for (const c of inThreadOrder(trustedBodies(comments))) {
+    const startHead = markerHead(c.body, FIX_TAKEOVER_MARKER);
+    if (startHead !== undefined) {
+      starts.push({ head: startHead, at: c.createdAt ?? null, attempts: markerAttempts(c.body) });
+      continue;
+    }
+    const h = markerHead(c.body, FIX_TAKEOVER_VOID_MARKER);
+    if (h === undefined || honoured++ >= TAKEOVER_MAX_VOIDS) continue;
+    // Cancel the latest EARLIER start for this head (a void with an `unknown` head cancels only an `unknown` start).
+    const idx = starts.findLastIndex((m) => (h === null || m.head === null ? m.head === h : sameHeadSha(m.head, h)));
+    if (idx >= 0) starts.splice(idx, 1);
   }
   return starts;
 }
