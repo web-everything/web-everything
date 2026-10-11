@@ -80,7 +80,7 @@ import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
 import { execFileSync } from 'node:child_process';
 import { describeDispatchFailure, describeSpawnFailure } from '../lib/describe-spawn-failure.mjs';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -94,7 +94,7 @@ import {
   // #4174 — the SAME "never spawn into `root` itself" fix `dispatch-lane-io.mjs#createDispatchSinks` applies;
   // this file is a SEPARATE fresh-dispatch call site (see `dispatchFix`'s own docblock), so it needs the same
   // two seams wired in here rather than inheriting them for free.
-  dispatchSessionCwd, ensureDispatchSessionCwd,
+  dispatchScratchRoot, dispatchSessionCwd, ensureDispatchSessionCwd,
   // #3850 — a "Workspace not trusted" spawn refusal is an ENVIRONMENT fault the dispatcher heals itself.
   isTrustRefusal, grantDispatchTrust,
 } from '../operations/dispatch-lane-io.mjs';
@@ -1029,6 +1029,9 @@ export function tryResumeRoundFix(planned, {
   postNotice = postRulingNotice,
   resume = resumeBgSession,
   resumeOptions = {},
+  scratchRoot = dispatchScratchRoot({ root }),
+  realpath = realpathSync,
+  isolateSession = isolateDispatchSession,
   dryRun = false,
 } = {}) {
   if (!dryRun) assertNotALaneCheckout(root);
@@ -1042,9 +1045,19 @@ export function tryResumeRoundFix(planned, {
   const desiredModel = table?.model ? claudeSpawnAlias(String(table.model)) : null;
   const defaultBranch = 'main'; // every constellation repo's default branch (reconcile-pass assumes the same)
   const inputs = readInputs({ planned, slug, root, listAgentsAll, defaultBranch, repoSlug: ghRepoSlug(repo) });
-  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, ...inputs });
+  const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, scratchRoot, realpath, ...inputs });
   if (!decision.resume) return declined(decision);
   if (dryRun) return { resumed: false, decision, dryRun: true, roundEscalation };
+  // The resumed session reloads `<cwd>/.claude/settings.local.json`, whose guard hooks were written at its first
+  // launch with absolute paths into the dispatcher's checkout of that time (a self-sync candidate dir may be gone
+  // since: a missing hook script is a non-blocking error, so the guards would silently not run). Re-write them for
+  // THIS dispatcher before resuming, exactly as a fresh dispatch does; if that write fails, cold-start instead.
+  let isolation = null;
+  try { isolation = isolateSession(inputs.prior.cwd); } catch (e) { isolation = { hooks: { ok: false, reason: describeDispatchFailure(e) } }; }
+  if (isolation?.hooks?.ok !== true || isolation?.write?.ok === false) {
+    const why = isolation?.hooks?.reason ?? isolation?.write?.reason ?? 'no result';
+    return declined({ resume: false, reason: 'guard-hooks-unwritten', why: `could not re-write the guard hooks in the earlier session's cwd (${why})` });
+  }
   let historyInputs = null;
   try { historyInputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { historyInputs = null; }
   const history = historyInputs ? renderRoundHistory(buildRoundHistory(historyInputs), { previousOnly: false, title: 'All rounds so far' }) : '';
@@ -1054,12 +1067,15 @@ export function tryResumeRoundFix(planned, {
     pr: planned.pr, itemNum: planned.itemNum, round: decision.round, cap: planned.cap ?? null,
     lane: decision.lane, headRefOid: planned.headRefOid, history,
   }), planned);
-  const priorCwd = inputs.prior?.cwd || null;
+  // The trigger starts where the earlier session's transcript is filed: its listing cwd, which planRoundResume
+  // already proved is a direct child of the dispatch scratch root (never a lane checkout, #4174). `resumeOptions`
+  // cannot override it.
+  const priorCwd = inputs.prior.cwd;
   const attempt = resume(planned, {
+    ...resumeOptions,
     candidate: decision.sessionId, prompt, repo,
     listAgentsAll,
-    ...(priorCwd ? { sessionCwdFor: () => priorCwd } : {}),
-    ...resumeOptions,
+    sessionCwdFor: () => priorCwd,
   });
   if (attempt.resumed) {
     console.error(`reconcile-fix-dispatch: PR #${planned.pr} round ${decision.round} resumed ${decision.sessionId} in lane-${decision.lane.lane} (no cold start)`);

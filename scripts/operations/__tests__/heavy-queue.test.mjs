@@ -5,10 +5,55 @@
  *   process/clock — every input is a plain object, mirroring `daemon-status.test.mjs`'s own pure-core suite.
  */
 import { describe, it, expect } from 'vitest';
+import { BOUNDED_RUN_SHIM } from '../mutation-check-io.mjs';
 import {
   classifyHeavyJobKind, assessHeavyQueueRow, projectedWaitMinutesForNewJob, assessHeavyQueue,
   heavyQueueOperation, HEAVY_QUEUE_OP, SELECTED_GATE_MERGE_SHA, STANDARD_MINUTES_BY_KIND,
 } from '../heavy-queue.mjs';
+
+describe('targeted heavy command regression', () => {
+  const classify = (command, env) => classifyHeavyJobKind({ command }, env);
+  const files = (n) => Array.from({ length: n }, (_, i) => `case-${i}.test.mjs`).join(' ');
+  const shim = (argv) => `node -e '${BOUNDED_RUN_SHIM}' '${JSON.stringify({ argv, ms: 600000 })}'`;
+
+  it.each([
+    [shim(['npx', 'vitest', 'run', 'a.test.mjs', '--reporter=basic']), 'files'],
+    [shim(['npx', 'vitest', 'run']), 'FULL'],
+    [`vitest run ${files(7)}`, 'files'],
+    [`vitest run ${files(30)}`, 'files'],
+    [`vitest run ${files(31)}`, 'FULL'],
+    ['npx vitest run a.test.mjs', 'files'],
+    ['npm run test:unit -- a.test.mjs b.test.mjs', 'files'],
+    ['npm test -- a.test.mjs', 'files'],
+    ['npm run test -- a.test.mjs', 'files'],
+    [`npm run test:unit -- ${files(31)}`, 'FULL'],
+    ['vitest run', 'FULL'],
+    ['npx vitest run', 'FULL'],
+    ['npm test', 'FULL'],
+    ['npm run test:unit', 'FULL'],
+    ['npm run test:unit -- --reporter=dot', 'FULL'],
+    ['npm run test:unit -- --config config.mjs', 'FULL'],
+    ['npm run test:unit -- a.test.mjs && npm test', 'FULL'],
+    ['npm run test:coverage', 'coverage'],
+    ['vitest run a.test.mjs --coverage', 'coverage'],
+    [shim(['npx', 'vitest', 'run', 'a.test.mjs', '--coverage']), 'coverage'],
+    ['npm run test:unit -- a.test.mjs && npm run check:standards', 'selected'],
+    ['vitest run a.test.mjs && npm run check:standards', 'selected'],
+    ['vitest related a.test.mjs --run', 'files'],
+    [`node -e 'shim' '{"argv":["npx","vitest", invalid]}'`, 'FULL'],
+    [`node -e 'shim' '{"argv":"vitest"}'`, 'FULL'],
+  ])('%s → %s', (command, expected) => {
+    expect(classify(command)).toBe(expected);
+  });
+
+  it('keeps the configurable file cap for direct, npm and bounded runs', () => {
+    const env = { WE_HEAVY_ADMISSION_FAST_MAX_FILES: '2' };
+    for (const command of [`vitest run ${files(3)}`, `npm test -- ${files(3)}`,
+      shim(['npx', 'vitest', 'run', ...files(3).split(' ')])]) {
+      expect(classify(command, env), command).toBe('FULL');
+    }
+  });
+});
 
 describe('classifyHeavyJobKind — from the LIVE command line, never a stored field', () => {
   it('a verify-lane.mjs holder on a base that already has PR #2680 is "selected"', () => {

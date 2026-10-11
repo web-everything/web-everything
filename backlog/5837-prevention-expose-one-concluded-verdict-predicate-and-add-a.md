@@ -47,3 +47,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#4779 (finding 3: `we:scripts/conveyor/takeover-budget.mjs` — Add a deterministic table-driven test covering every supported impact value and asserting that worsening any impact cannot authorize progress.)

@@ -150,6 +150,16 @@ describe('merge-ai-prs — #3215 wiring: the park site writes the ledger BEFORE 
 
   it('recordDrainVerdict is called at the ordinary park site plus (E3 #3929) the manifest-tamper and test-gaming re-parks', () => {
     expect(src.match(/recordDrainVerdict\(\{ repo:/g) || []).toHaveLength(3);
+    // PR #4631 (ruling a): the test-gaming site ledgers a `review:human` park, BEFORE its label add, and writes no row
+    // for the drain's own `review:held-mechanical` park (no VERDICTS member maps it; the label is its own record).
+    const site = src.indexOf('const parkDecision = decideTestGamingPark({');
+    expect(site).toBeGreaterThan(-1);
+    const guard = src.indexOf('if (!mechanicalPark) {', site);
+    const row = src.indexOf('recordDrainVerdict({ repo:', site);
+    const add = src.indexOf("'--add-label', parkDecision.addLabel]", site);
+    expect(guard).toBeGreaterThan(site);
+    expect(row).toBeGreaterThan(guard);
+    expect(add).toBeGreaterThan(row);
   });
 
   it('the call sits inside the shouldApplyReviewLabel guard, AHEAD of the `gh pr edit --add-label` transport call', () => {
