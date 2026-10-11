@@ -15,24 +15,21 @@ Self-review of PR 4791 found the own-branch refusal in authoriseAllow keys on th
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/pr-limit.test.mjs`: a new case where the allow-list entry for `lane/x` records `session: S` and the over-limit open check runs as session `S` stays refused; the same entry checked as a different session is honoured. Red before, green after.
+- [A2] An entry with no recorded `session` (written before xfaz7ho) is honoured as today.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] Making the grant unforgeable — an agent with a shell can still change its own session env; this only removes the cwd/ref evasions.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the session id is compared as an exact string after trim; an empty id never matches.
+2. **Truncated reads** — n/a: the store is one small JSON file read whole.
+3. **Shared state files** — n/a: read-only at land time; writes stay with the existing atomic writer.
+4. **Fail closed** — an unreadable caller session id refuses the self-grant match only when the entry's session is set; a missing store keeps today's fail-open-to-enforcement behaviour.
+5. **Identity scoping** — the match is per session id, so the operator's own grant for a worker's branch is honoured.
+6. **State over time** — expiry (`until`) is unchanged and checked first.
+7. **Who wrote it** — this is the point: the entry's recorded session is the writer, and a writer may not use its own grant.
