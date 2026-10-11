@@ -95,6 +95,45 @@ describe('shared red-main freeze (xyd06qo)', () => {
     expect(lines.join('')).toMatch(/attempt 1\/4 failed.*retrying.*published on ops\/red-main-freeze \(frozen=true\) after 3 attempts/s);
   });
 
+  it('CLI hook: onFailedAttempt runs after the FIRST failure, before any wait, and its throw never stops the retries', async () => {
+    const order = [];
+    let calls = 0;
+    const r = await publishFreezeFromCli({
+      marker: { reason: 'red' }, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: () => {}, setExitCode: () => {},
+      sleep: async (ms) => { order.push(`sleep ${ms}`); },
+      onFailedAttempt: ({ attempt }) => { order.push(`failed ${attempt}`); if (attempt === 1) throw new Error('disk full'); },
+      publish: () => { calls += 1; order.push(`publish ${calls}`); if (calls < 2) throw new Error('rejected'); return { branch: BRANCH, pushed: true, doc: { frozen: true } }; },
+    });
+    expect(r).toMatchObject({ ok: true, attempts: 2 });
+    expect(order).toEqual(['publish 1', 'failed 1', 'sleep 250', 'publish 2']);
+  });
+
+  it('CLI hook: retries stop at the total deadline (git has no timeout of its own)', async () => {
+    let t = 0;
+    let calls = 0;
+    const lines = [];
+    const r = await publishFreezeFromCli({
+      marker: { reason: 'red' }, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: (s) => lines.push(s), setExitCode: () => {},
+      deadlineMs: 1000, nowMs: () => t, sleep: async () => {},
+      publish: () => { calls += 1; t += 900; throw new Error('slow reject'); },
+    });
+    expect(calls).toBe(1);
+    expect(r).toMatchObject({ ok: false, attempts: 1 });
+    expect(lines.join('')).toMatch(/deadline \(1000ms\) reached/);
+  });
+
+  it('CLI hook: a deterministic refusal from the writer is reported once and never retried', async () => {
+    let calls = 0;
+    let code = 0;
+    const r = await publishFreezeFromCli({
+      marker: { reason: 'red' }, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: () => {}, setExitCode: (c) => { code = c; }, sleep: async () => {},
+      publish: () => { calls += 1; throw Object.assign(new Error('refusing to publish to "main"'), { refusal: true }); },
+    });
+    expect(calls).toBe(1);
+    expect(code).toBe(1);
+    expect(r).toMatchObject({ ok: false, refused: 'refusal' });
+  });
+
   it('CLI hook: a refusal (no marker, no clear) is never retried — publish is not called at all', async () => {
     let calls = 0;
     const r = await publishFreezeFromCli({ marker: null, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: () => {}, setExitCode: () => {}, sleep: async () => {}, publish: () => { calls += 1; } });
@@ -299,6 +338,20 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     expect(r.status).toBe(1);
     expect(rejectsLeft()).toBe(1); // exactly one attempt
     expect(gate(readSharedFreeze({ board: fx.board, branch: BRANCH }))).toMatchObject({ status: 'hold' });
+  });
+
+  it('`unfreeze` never wipes a DIFFERENT freeze another writer pushed after this host froze — CI keeps holding', () => {
+    expect(fx.run(['freeze', '--reason=mine']).status).toBe(0);
+    // Another writer (its own marker) raises after us: the shared tip now carries ITS freeze, not ours.
+    expect(fx.run(['freeze', '--reason=theirs'], { WE_RED_MAIN_FREEZE: join(fx.root, 'other-marker.json') }).status).toBe(0);
+    const r = fx.run(['unfreeze']);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/refusing to clear .*DIFFERENT freeze.*theirs/);
+    expect(fx.shared()).toMatchObject({ frozen: true, reason: 'theirs' });
+    expect(gate(readSharedFreeze({ board: fx.board, branch: BRANCH }))).toMatchObject({ status: 'hold' });
+    // An explicit second unfreeze (no local marker left to compare) is the operator's deliberate clear.
+    expect(fx.run(['unfreeze']).status).toBe(0);
+    expect(fx.shared()).toMatchObject({ frozen: false });
   });
 
   it('a failed publish on `unfreeze` retries with `unfreeze` (publish would refuse: no marker) and leaves the shared freeze standing', () => {

@@ -315,15 +315,24 @@ async function runCli(argv) {
   const shared = () => import('../lib/red-main-freeze-shared.mjs');
   const raise = async (meta) => {
     const marker = buildFreezeMarker(meta);
+    // Once one publish attempt has failed, "shared first" is already lost: write the local marker at once, so the
+    // hook's retries never keep the drain unfrozen while main is red. A local write error there is kept for the end.
+    let written = null;
+    let writeError = null;
+    const writeLocal = () => { if (written) return; try { written = freezeDispatch(marker); writeError = null; } catch (e) { writeError = e; } };
     // Whatever goes wrong publishing (even loading the module), the local marker MUST still be written: the drain stops on it.
-    try { await (await shared()).publishFreezeFromCli({ marker }); }
+    try { await (await shared()).publishFreezeFromCli({ marker, onFailedAttempt: writeLocal }); }
     catch (e) { process.stderr.write(`red-main freeze: ✗ the SHARED copy was NOT published (${String(e?.message || e).split('\n')[0].slice(0, 300)}); writing the local marker anyway. Retry: node scripts/readiness/red-main-remediation.mjs publish\n`); process.exitCode = 1; }
+    if (written) return written;
+    if (writeError) throw writeError;
     return freezeDispatch(marker);
   };
   if (cmd === 'freeze') {
     const m = await raise({ reason: flags.reason, redRef: flags['red-ref'], mergeSha: flags['merge-sha'] });
     process.stdout.write(JSON.stringify(m, null, 2) + '\n');
   } else if (cmd === 'unfreeze') {
+    // The freeze this clear lifts: the shared clear refuses to wipe a DIFFERENT freeze it finds on the tip.
+    const lifted = readFreeze();
     unfreezeDispatch();
     // The clear is published only once the local freeze is really gone: unfreezeDispatch swallows rm errors, and a
     // surviving (or legacy, migrate-back) marker means the drain is still frozen — clearing CI then would split the two.
@@ -334,7 +343,7 @@ async function runCli(argv) {
       return;
     }
     writeAllSync(1, JSON.stringify({ frozen: false }, null, 2) + '\n');
-    await (await shared()).publishFreezeFromCli({ marker: null, clear: true });
+    await (await shared()).publishFreezeFromCli({ marker: null, clear: true, ...(lifted ? { lifted } : {}) });
   } else if (cmd === 'status') {
     // Read-only: report a not-yet-migrated legacy marker instead of moving it (the next drain pass migrates it).
     const legacyPending = process.env.WE_RED_MAIN_FREEZE ? [] : pendingLegacyFreezeMarkers().filter((p) => resolve(p) !== resolve(FREEZE_MARKER_PATH));
