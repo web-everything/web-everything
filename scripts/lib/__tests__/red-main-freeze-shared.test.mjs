@@ -15,7 +15,7 @@ import {
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
-import { applyFreezeRecheck, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
+import { applyFreezeRecheck, combineRedMain, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
 import { isTrustedPrAuthor } from '../../conveyor/main-ci-red-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -417,11 +417,32 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     expect(fx.shared()).toMatchObject({ frozen: true, reason: 'red' });
   });
 
-  it('`decide --apply` on a stop-the-line result freezes and publishes frozen:true', () => {
+  it('`decide --apply` (an AUTOMATIC red-main freeze) stops the drain locally but publishes NOTHING — the shared copy is for manual freezes only; main CI is the authority', () => {
+    expect(fx.run(['freeze', '--reason=old']).status).toBe(0);
+    expect(fx.run(['unfreeze']).status).toBe(0);
     const r = fx.run(['decide', '--trigger=push', '--ref=main', '--result=red', '--merge-sha=abc', '--apply']);
     expect(r.status).toBe(0);
-    expect(fx.shared()).toMatchObject({ frozen: true, mergeSha: 'abc' });
-    expect(existsSync(fx.marker)).toBe(true);
+    expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ frozen: true, kind: 'auto', mergeSha: 'abc' });
+    expect(fx.shared()).toMatchObject({ frozen: false });
+    // so a trusted main-fix PR keeps its exemption while main CI is red (it is not mistaken for a manual stop)
+    const freeze = readSharedFreeze({ board: fx.board, branch: BRANCH });
+    const red = { source: 'ci.yml@main', red: true, firstRedSha: 'b'.repeat(40), redShas: ['b'.repeat(40)] };
+    const fixPr = { ...PR, headRefName: 'lane/main-fix-bbbbbbbbb', isCrossRepository: false, author: { login: 'app/web-everything' } };
+    expect(gate(combineRedMain(freeze, red, fixPr))).toMatchObject({ status: 'pass' });
+    expect(gate(combineRedMain(freeze, red, { ...PR, headRefName: 'lane/x' }))).toMatchObject({ status: 'hold' });
+  });
+
+  it('`publish` refuses to republish an AUTOMATIC local freeze (it would become a manual stop that blocks the main-fix PR)', () => {
+    fx.run(['decide', '--trigger=push', '--ref=main', '--result=red', '--apply']);
+    const r = fx.run(['publish']);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toMatch(/automatic.*not published/i);
+    expect(fx.shared()).toBeNull();
+  });
+
+  it('`freeze` (the operator\'s stop-the-line) publishes a MANUAL freeze', () => {
+    expect(fx.run(['freeze', '--reason=hold everything']).status).toBe(0);
+    expect(fx.shared()).toMatchObject({ frozen: true, kind: 'manual', reason: 'hold everything' });
   });
 
   it('`decide --apply` on a PROCEED result changes nothing and publishes nothing (it must not clear the shared freeze)', () => {
@@ -524,6 +545,24 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
     expect(isMainFixPr(FIX_PR, [RED_SHA])).toBe(true);
     expect(isMainFixPr(FIX_PR, [])).toBe(false);
     expect(isMainFixPr({ ...FIX_PR, headRefName: 'lane/main-fix-bbbb' }, [RED_SHA])).toBe(false);
+  });
+
+  it('a shared doc with NO kind (or junk) reads as MANUAL — fail closed; only an explicit "auto" is automatic', () => {
+    for (const kind of [undefined, 'MANUAL', 'nope', 1]) {
+      expect(readSharedFreeze({ board: '/b', branch: BRANCH, run: reader({ text: JSON.stringify({ frozen: true, reason: 'r', kind }) }) }).kind).toBe('manual');
+    }
+    expect(readSharedFreeze({ board: '/b', branch: BRANCH, run: reader({ text: JSON.stringify({ frozen: true, reason: 'r', kind: 'auto' }) }) }).kind).toBe('auto');
+  });
+
+  it('an AUTOMATIC shared freeze holds normal PRs but lets the current main-fix PR through (it is not a manual stop)', () => {
+    const auto = { ...MANUAL, kind: 'auto', reason: 'decide --apply' };
+    expect(row({ freeze: auto, runs: RED_RUNS, pr: FIX_PR })).toMatchObject({ status: 'pass' });
+    expect(row({ freeze: auto, runs: RED_RUNS })).toMatchObject({ status: 'hold' });
+    expect(row({ freeze: auto }).reason).toMatch(/automatic red-main freeze: decide --apply/);
+  });
+
+  it('the writer refuses to publish an automatic marker at all', () => {
+    expect(() => publishSharedFreeze({ marker: { reason: 'r', kind: 'auto' }, board: '/b', branch: BRANCH, run: () => '' })).toThrow(/automatic freeze/);
   });
 
   it('a MANUAL freeze holds even the main-fix PR', () => {

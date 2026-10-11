@@ -6,8 +6,10 @@
  *   now ALSO publishes the state to a shared `ops/*` git branch (same transport as `ops/review-requests`:
  *   `./git-transport-branch.mjs`), and CI reads that branch.
  *
- *   - WRITER: `red-main-remediation.mjs freeze|decide --apply` writes the local marker FIRST (the drain stops at once;
- *     no publish can delay it), THEN calls {@link publishFreezeFromCli} — even when the local write failed.
+ *   - WRITER: `red-main-remediation.mjs freeze` (the operator's MANUAL stop) writes the local marker FIRST (the drain
+ *     stops at once; no publish can delay it), THEN calls {@link publishFreezeFromCli} — even when the local write
+ *     failed. `decide --apply` (an AUTOMATIC freeze) writes the local marker only and publishes nothing: main's own CI
+ *     is the merge-gate's authority for a red main, and a published copy would hold even the main-fix PR.
  *     `unfreeze` clears locally, then publishes an EXPLICIT clear (`clear: true`). `publish` republishes the local
  *     freeze and REFUSES when there is none: "no marker" (a clone without the gitignored file, or a corrupt one) is
  *     never a clear, so only `unfreeze` can publish `frozen:false`. The local marker stays the drain's own source.
@@ -70,6 +72,7 @@ export function buildSharedFreezeDoc(marker, { now = () => new Date().toISOStrin
     at: frozen ? (marker.at ?? null) : null,
     redRef: frozen ? (marker.redRef ?? 'main') : null,
     mergeSha: frozen ? (marker.mergeSha ?? null) : null,
+    kind: frozen ? 'manual' : null, // the shared copy carries MANUAL freezes only (operator ruling 2026-10-11)
     publishedAt: now(),
     publishedBy: host,
   };
@@ -98,6 +101,8 @@ export function publishSharedFreeze({ marker, clear = false, lifted, board = REP
   // "No marker" is NOT "cleared": a clone without the gitignored local marker (or one holding a corrupt file) reads
   // `null`, and mirroring that would silently clear a standing freeze. Only an explicit clear may publish frozen:false.
   if (marker == null && clear !== true) throw refusal('red-main-freeze-shared: refusing to publish frozen:false without an explicit clear (no local freeze marker is not a clear)');
+  // An automatic freeze is never published: it would read as a manual stop and hold even the main-fix PR.
+  if (marker?.kind === 'auto') throw refusal('red-main-freeze-shared: refusing to publish an automatic freeze (the shared copy carries manual freezes only; main CI is the authority)');
   const doc = buildSharedFreezeDoc(marker, { ...(now ? { now } : {}), ...(host ? { host } : {}) });
   const text = `${JSON.stringify(doc, null, 2)}\n`;
   const content = clear === true && lifted != null
@@ -191,5 +196,6 @@ export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBran
   try { doc = JSON.parse(text); } catch { return { source, error: `${SHARED_FREEZE_FILE} is not JSON` }; }
   if (!doc || typeof doc.frozen !== 'boolean') return { source, error: `${SHARED_FREEZE_FILE} has no boolean "frozen"` };
   const clean = (v) => (v == null ? null : flatText(v)); // printed to the CI log and the hold reason: never raw
-  return { source, frozen: doc.frozen, reason: clean(doc.reason), at: clean(doc.at), publishedAt: clean(doc.publishedAt) };
+  // `kind`: only an explicit 'auto' is automatic; anything else (absent, an old doc, junk) counts as MANUAL (fail closed).
+  return { source, frozen: doc.frozen, kind: doc.kind === 'auto' ? 'auto' : 'manual', reason: clean(doc.reason), at: clean(doc.at), publishedAt: clean(doc.publishedAt) };
 }

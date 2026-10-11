@@ -369,7 +369,10 @@ export function combineRedMain(freeze, mainCi, pr = null) {
   if (freeze?.error) return { source, error: freeze.error };
   if (!mainCi) return { source, error: 'main CI status not read' };
   if (mainCi.error) return { source, error: mainCi.error };
-  if (freeze?.frozen) return { source, frozen: true, reason: `manual freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
+  // A MANUAL freeze holds every PR. An automatic one (never published by this writer, but an old or foreign doc may say
+  // so) counts as a red main: it holds every PR except the current main-fix PR, the same as main CI red below.
+  if (freeze?.frozen && freeze.kind !== 'auto') return { source, frozen: true, reason: `manual freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
+  if (freeze?.frozen && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `automatic red-main freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
   const sha = mainCi.firstRedSha ? ` since ${String(mainCi.firstRedSha).slice(0, 9)}` : '';
   if (mainCi.red && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt ?? null };
   return { source: mainCi.red ? `${source} (main CI red${sha}; main-fix PR exempt)` : source, frozen: false, reason: null, publishedAt: freeze?.publishedAt ?? null };

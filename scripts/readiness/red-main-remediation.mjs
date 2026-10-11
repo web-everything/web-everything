@@ -271,6 +271,9 @@ export function buildFreezeMarker(meta = {}) {
     redRef: meta.redRef || 'main',
     mergeSha: meta.mergeSha || null,
     revertAuthority: true,
+    // `auto`: raised by `decide --apply` on a red post-land result — main's own CI already says so to the merge-gate.
+    // `manual`: the operator's stop-the-line (`freeze`) — the only kind the shared copy carries (ruling 2026-10-11).
+    kind: meta.kind === 'auto' ? 'auto' : 'manual',
   };
 }
 
@@ -308,7 +311,8 @@ function parseFlags(argv) {
 async function runCli(argv) {
   const cmd = argv[0];
   const flags = parseFlags(argv.slice(1));
-  // xyd06qo: the shared ops/* copy CI's merge-gate reads. A RAISE writes the local marker FIRST (the drain stops at once,
+  // xyd06qo: the shared ops/* copy CI's merge-gate reads — MANUAL freezes only (`freeze`; `decide --apply` is automatic
+  // and stays local). A RAISE writes the local marker FIRST (the drain stops at once,
   // whatever the publish does), then publishes; a local write error never skips the publish. A failed publish exits 1
   // with the retry named. Only an explicit CLEAR (`unfreeze`) may publish frozen:false —
   // "no marker here" (a clone without the gitignored file, or a corrupt one) is never a clear.
@@ -349,11 +353,20 @@ async function runCli(argv) {
   } else if (cmd === 'decide') {
     const d = decidePostLand({ trigger: flags.trigger, ref: flags.ref, result: flags.result, mergeSha: flags['merge-sha'] });
     writeAllSync(1, JSON.stringify(d, null, 2) + '\n');
-    // A `proceed` decision raises nothing, so it publishes nothing either (it must not mirror an absent marker as a clear).
-    if (d.action === 'stop-the-line' && flags.apply) await raise({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'] });
+    // An AUTOMATIC freeze: the local marker stops the drain, but nothing is published — the shared copy carries manual
+    // freezes only, and main's own CI already tells the merge-gate that main is red (operator ruling 2026-10-11). A
+    // published copy would read as a manual stop and hold even the main-fix PR. A `proceed` decision raises nothing.
+    if (d.action === 'stop-the-line' && flags.apply) freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'], kind: 'auto' });
   } else if (cmd === 'publish') {
-    // Republish the current local FREEZE to the shared branch — the retry after a failed raise. No valid marker → refused.
-    await (await shared()).publishFreezeFromCli({ marker: readFreeze() });
+    // Republish the current local MANUAL freeze — the retry after a failed `freeze`. No valid marker → refused; an
+    // automatic one → refused too (it is never published: see `decide`).
+    const local = readFreeze();
+    if (local?.kind === 'auto') {
+      process.stderr.write('red-main freeze: ✗ the local freeze is AUTOMATIC (decide --apply) and is not published — main\'s own CI is the merge-gate\'s authority for a red main. To stop everything by hand, run: node scripts/readiness/red-main-remediation.mjs freeze --reason=<why>\n');
+      process.exitCode = 1;
+      return;
+    }
+    await (await shared()).publishFreezeFromCli({ marker: local });
   } else {
     process.stderr.write('usage: red-main-remediation.mjs <freeze|unfreeze|status|decide|publish> [--flags]\n');
     process.exit(2);
