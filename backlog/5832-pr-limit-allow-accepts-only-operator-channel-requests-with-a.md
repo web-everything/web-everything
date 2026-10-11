@@ -1,4 +1,5 @@
 ---
+bornAs: xfaz7ho
 kind: story
 size: 2
 status: active
@@ -16,7 +17,7 @@ Twice on 2026-10-10 a worker agent ran `node we:scripts/operations/pr-limit.mjs 
 
 ## Acceptance
 
-- [A1] **Executable** — `npm run test:unit` over we:scripts/lib/__tests__/pr-limit.test.mjs and we:scripts/__tests__/worker-brief.test.mjs: the `allow is operator-only (xfaz7ho)` block (worker refused, lane refused, own branch refused, missing quote refused, operator channel with quote accepted, legacy entries honoured) and the worker-brief rule test fail before this item and pass after.
+- [A1] **Executable** — `npm run test:unit` over we:scripts/lib/__tests__/pr-limit.test.mjs and we:scripts/__tests__/worker-brief.test.mjs: the `allow is operator-only (5832)` block (worker refused, lane refused, own branch refused, missing quote refused, operator channel with quote accepted, legacy entries honoured) and the worker-brief rule test fail before this item and pass after.
 - [A2] Live: `node we:scripts/operations/pr-limit.mjs allow` from a worker lane exits 3 with the reason written to the store's history as `allow-refused`; the same command from the primary checkout with `--operator-quote` exits 0 and records the quote and channel on the entry.
 
 ## Non-goals

@@ -1,4 +1,5 @@
 ---
+bornAs: xiu4726
 kind: story
 size: 2
 status: active
@@ -21,7 +22,7 @@ PR 4791 gated the `allow` and `off` verbs of `we:scripts/operations/pr-limit.mjs
 
 ## Non-goals
 
-- [N1] The land-time session check for allow-list grants — that is `x964z5g`.
+- [N1] The land-time session check for allow-list grants — that is `5831`.
 
 ## Edge cases this change must handle
 

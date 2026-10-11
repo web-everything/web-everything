@@ -1,4 +1,5 @@
 ---
+bornAs: x964z5g
 kind: story
 size: 3
 status: active
@@ -16,7 +17,7 @@ Self-review of PR 4791 found the own-branch refusal in authoriseAllow keys on th
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/pr-limit.test.mjs`: a new case where the allow-list entry for `lane/x` records `session: S` and the over-limit open check runs as session `S` stays refused; the same entry checked as a different session is honoured. Red before, green after.
-- [A2] An entry with no recorded `session` (written before xfaz7ho) is honoured as today.
+- [A2] An entry with no recorded `session` (written before 5832) is honoured as today.
 
 ## Non-goals
 
