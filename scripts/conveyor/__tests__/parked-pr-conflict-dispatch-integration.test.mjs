@@ -140,6 +140,7 @@ describe('#xu2krte end-to-end — a REAL merge conflict, dispatched through the 
     expect(planned).toEqual([{
       overlapScope: [], itemNum: '9099', pr: 8801, laneRef: 'lane/9099-conflict-fixture', scope: item.scope, scopeSource: 'item',
       isConflict: true, body: prBody, headRefOid: 'deadbeef'.repeat(5),
+      attempts: 0, cap: 3, // card xrbu1bp — the planner's spent-round count rides onto every planned fix.
     }]);
   });
 
