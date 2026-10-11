@@ -150,10 +150,16 @@ export function isScratchSessionDir(cwd, scratchRoot, realpath = (p) => p) {
 export function buildRoundResumePrompt({ pr, itemNum = null, round, cap = null, lane, headRefOid, history = '' }) {
   const item = itemNum ? `item #${itemNum}` : 'no backlog item';
   const sha = String(headRefOid ?? '').slice(0, 9);
-  const retake = lane?.held === 'own'
+  // Your own lease counts as holding the lane only while it is live: an expired one may be reclaimed by the pool at
+  // any moment, so it is re-taken like a released lane (a failed re-take falls back to a fresh acquire, below).
+  const ownLive = lane?.held === 'own' && lane?.leaseLive === true;
+  const ownExpired = lane?.held === 'own' && !ownLive;
+  const retake = ownLive
     ? `You still hold lane-${lane?.lane} (\`${lane?.path}\`), at the PR head \`${sha}\`. Work there: \`cd "${lane?.path}"\`.`
-    : lane?.held === 'free' && sameSha(lane?.head, headRefOid)
-      ? `Your lane was lane-${lane?.lane} (\`${lane?.path}\`); it was released when your last turn ended and nobody has taken it since. `
+    : (ownExpired || lane?.held === 'free') && sameSha(lane?.head, headRefOid)
+      ? `Your lane was lane-${lane?.lane} (\`${lane?.path}\`); ${ownExpired
+        ? 'your lease on it has expired, so the pool may reclaim it — you no longer hold it'
+        : 'it was released when your last turn ended and nobody has taken it since'}. `
         + `Re-take it first with the SAME \`lane-pool.mjs acquire\` command as step 1 of your brief, but with \`--lane=${lane?.lane} --no-reset\` `
         + 'in place of `--base=...` (the two cannot be combined), then `cd` into it.'
       : `Your old lane-${lane?.lane} was released when your last turn ended and has been reused since. The PR head is exactly `

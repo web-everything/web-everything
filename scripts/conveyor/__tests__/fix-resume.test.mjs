@@ -41,6 +41,9 @@ describe('fix settings cascade — card xrbu1bp keys', () => {
   it('settings file, then env, win in that order; a bad value falls through', () => {
     const read = () => JSON.stringify({ fix: { resumeAcrossRounds: 'off', strongerModelFromRound: 4 } });
     expect(resolveFixSettings({ env: {}, read })).toMatchObject({ resumeAcrossRounds: 'off', strongerModelFromRound: 4 });
+    // the file layer is its `fix` object: a flat (un-namespaced) key is not a setting
+    const flat = () => JSON.stringify({ resumeAcrossRounds: 'off', strongerModelFromRound: 4 });
+    expect(resolveFixSettings({ env: {}, read: flat })).toMatchObject({ resumeAcrossRounds: 'on', strongerModelFromRound: 3 });
     expect(resolveFixSettings({ env: { WE_FIX_RESUME_ACROSS_ROUNDS: 'on', WE_FIX_STRONGER_MODEL_FROM_ROUND: '2' }, read }))
       .toMatchObject({ resumeAcrossRounds: 'on', strongerModelFromRound: 2, sources: { resumeAcrossRounds: 'env', strongerModelFromRound: 'env' } });
     expect(resolveFixSettings({ env: { WE_FIX_STRONGER_MODEL_FROM_ROUND: 'soon' }, read }).strongerModelFromRound).toBe(4);
@@ -254,6 +257,23 @@ describe('the previous session and its lane', () => {
     const taken = buildRoundResumePrompt({ pr: 77, round: 2, lane: { ...freeLane, held: 'taken', head: OTHER }, headRefOid: HEAD });
     expect(taken).not.toContain('--no-reset');
     expect(taken).toContain('acquire a fresh lane exactly as step 1');
+  });
+  it('an expired own lease requires reacquisition before resume work (PR #4779 review round 5)', () => {
+    const files = { '/pool/we/lane-4/.git/.lane-lease': JSON.stringify({ session: 'fix-77', ownerSession: SID, acquiredAt: '2026-01-01T00:00:00Z', ttlMinutes: 1 }) };
+    const lane = findSessionLane({
+      slug: 'fix-77', sessionId: SID, poolRoot: '/pool', readJournal: () => [], headOf: () => HEAD,
+      list: (d) => ({ '/pool': ['we'], [join('/pool', 'we')]: ['lane-4'] })[d] ?? (() => { throw new Error('ENOENT'); })(),
+      read: (f) => { if (!(f in files)) throw new Error('ENOENT'); return files[f]; },
+    });
+    expect(lane).toMatchObject({ lane: 4, held: 'own', leaseLive: false });
+    const expired = buildRoundResumePrompt({ pr: 77, round: 2, lane, headRefOid: HEAD });
+    expect(expired).not.toContain('You still hold');
+    expect(expired).toContain('--lane=4 --no-reset');
+    expect(expired).toMatch(/lease on it has expired/);
+    // A lease that is still live keeps the lane in hand.
+    expect(buildRoundResumePrompt({ pr: 77, round: 2, lane: { ...lane, leaseLive: true }, headRefOid: HEAD })).toContain('You still hold lane-4');
+    // Expired and the lane head moved: a fresh acquire, never a re-take.
+    expect(buildRoundResumePrompt({ pr: 77, round: 2, lane: { ...lane, head: OTHER }, headRefOid: HEAD })).toContain('acquire a fresh lane exactly as step 1');
   });
 });
 
