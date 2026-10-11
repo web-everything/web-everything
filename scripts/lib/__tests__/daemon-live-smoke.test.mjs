@@ -121,7 +121,7 @@ describe('resource shadow observations', () => {
   // children (not CPU) and were killed, so main, every overlay and last-good all failed the smoke.
   it('keeps load scaling for the I/O-bound checks even when admitted (smokeIoBoundLoadScale, standard on)', () => {
     const b = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
-    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 720_000, ghApiMs: 30_000 });
+    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 1_200_000, ghApiMs: 30_000 });
     expect(resolveIoBoundLoadScale({})).toMatchObject({ enabled: true, source: 'standard' });
   });
   it('the I/O-bound rule never lowers a non-admit factor, and honours the env layer and absolute overrides', () => {
@@ -134,8 +134,8 @@ describe('resource shadow observations', () => {
   });
   it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict } };
-    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(720_000);
-    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(360_000);
+    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(1_200_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(600_000);
   });
   it('preserves disabled scaling and absolute per-check overrides under a hold', () => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } };
@@ -250,17 +250,17 @@ describe('load-aware smoke budgets', () => {
       lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
       laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
       ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 120_000,
-      dispatchDryRunMs: 180_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
+      dispatchDryRunMs: 300_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
     });
   });
 
   it('load 48 on 12 cores scales dispatch and reconcile by four', () => {
-    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 720_000, reconcileMs: 480_000 });
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 1_200_000, reconcileMs: 480_000 });
   });
 
   it('load 100 on 12 cores is capped at four times the defaults', () => {
     expect(resolveSmokeBudgets({}, host(100))).toEqual(resolveSmokeBudgets({}, host()));
-    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(1_200_000);
   });
 
   it('an explicit operator budget stays absolute under load', () => {
@@ -279,7 +279,7 @@ describe('load-aware smoke budgets', () => {
 
   it('WE_SMOKE_LOAD_SCALE_MAX=2 caps scaling at twice the defaults', () => {
     expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host())).toMatchObject({
-      dispatchDryRunMs: 360_000, reconcileMs: 240_000,
+      dispatchDryRunMs: 600_000, reconcileMs: 240_000,
     });
   });
 
@@ -288,7 +288,7 @@ describe('load-aware smoke budgets', () => {
   });
 
   it.each(['0', '-1', 'invalid', 'Infinity'])('invalid budget override %s still scales the default', (value) => {
-    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(1_200_000);
   });
 
   it('exports the knobs and a pure factor with a one-core floor', () => {
@@ -313,7 +313,7 @@ describe('load-aware smoke budgets', () => {
     const widened = widenSmokeBudgetsEnv({ ...env, WE_SMOKE_LOAD_SCALE: '0' });
     delete widened.WE_SMOKE_LOAD_SCALE;
     const retry = resolveSmokeBudgets(widened, host());
-    expect(retry.dispatchDryRunMs).toBe(1_800_000);
+    expect(retry.dispatchDryRunMs).toBe(3_000_000);
     expect(retry.reconcileMs).toBe(1_200_000);
   });
 });
