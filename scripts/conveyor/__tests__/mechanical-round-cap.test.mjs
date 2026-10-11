@@ -430,7 +430,8 @@ describe('only the reconcile-finding opening makes a bounce mechanical, never qu
   });
 });
 
-describe('readMechanicalRoundFacts (real git)', () => {
+// Each case builds a real repo and runs up to ~8 git calls: seconds under load, so an explicit budget over the 5s default.
+describe('readMechanicalRoundFacts (real git)', { timeout: 30_000 }, () => {
   function repo() {
     const dir = mkdtempSync(join(tmpdir(), 'mech-round-'));
     const g = (...args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -496,7 +497,7 @@ describe('readMechanicalRoundFacts (real git)', () => {
   });
 
   // Ref names reach git argv; one outside the safe pattern is refused before ANY git call runs.
-  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main x', 'main`id`', "ma'in", 'mäin'];
+  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main x', 'main`id`', "ma'in", 'mäin', 'main\rx', 'main​x', 'main﻿'];
   it.each(UNSAFE)('an unsafe base ref %j is refused with no git call', (bad) => {
     let calls = 0;
     const exec = () => { calls++; return ''; };
@@ -538,12 +539,31 @@ describe('readMechanicalRoundFacts (real git)', () => {
         .toMatchObject({ proven: false, reason: 'git-read-failed', error: `${cmd} died` });
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
-  it('a failed `git merge-base` read is refused, never proven', () => {
+  it('a failed `git merge-base --is-ancestor` read is refused as not-on-base, never proven', () => {
     const r = repo();
     try {
-      const exec = (c, args, opts) => { if (args[0] === 'merge-base') throw new Error('merge-base died'); return r.exec(c, args, opts); };
+      const exec = (c, args, opts) => { if (args[0] === 'merge-base' && args[1] === '--is-ancestor') throw new Error('merge-base died'); return r.exec(c, args, opts); };
       expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
-        .toMatchObject({ proven: false });
+        .toMatchObject({ proven: false, reason: 'merged-parent-not-on-base' });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('a failed plain `git merge-base` read (after the ancestry check passed) is git-read-failed, never proven', () => {
+    const r = repo();
+    try {
+      const exec = (c, args, opts) => { if (args[0] === 'merge-base' && args[1] !== '--is-ancestor') throw new Error('merge-base died'); return r.exec(c, args, opts); };
+      expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+        .toMatchObject({ proven: false, reason: 'git-read-failed', error: 'merge-base died' });
+    } finally { rmSync(r.dir, { recursive: true, force: true }); }
+  });
+  it('a git read that overruns its buffer or timeout (it throws) is git-read-failed, never proven', () => {
+    const r = repo();
+    try {
+      const exec = (c, args, opts) => {
+        if (args[0] === 'diff' && args.includes('--name-only')) throw Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+        return r.exec(c, args, opts);
+      };
+      expect(readMechanicalRoundFacts({ pr: { headRefOid: r.g('rev-parse', 'HEAD'), headRefName: 'lane/x', baseRefName: 'main' }, exec }))
+        .toMatchObject({ proven: false, reason: 'git-read-failed', error: 'spawnSync git ENOBUFS' });
     } finally { rmSync(r.dir, { recursive: true, force: true }); }
   });
   it('empty git output (a read that returned nothing) is not proven', () => {
