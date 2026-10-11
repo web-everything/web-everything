@@ -23,7 +23,9 @@ const history = [
   ['a99c637a41a14b9137da9c1d6856e4ec425d75b8', '1be5affcd252f21798e3242eeb64b1d7e02e7016', '10T12:39:12', 'conveyor fix: resume the previous round’s fixer session + stronger model from round 3'],
 ];
 const at = (s) => `2026-10-${s}Z`;
-const commits = history.map(([sha, parents, date, subject]) => ({ sha, parents: parents.split(' '), authoredAt: at(date), subject }));
+// Every #4757 merge pulled in upstream history (its base lane or main), never the PR's own work.
+const commits = history.map(([sha, parents, date, subject]) => ({ sha, parents: parents.split(' '), authoredAt: at(date), subject,
+  ...(parents.includes(' ') ? { mergesPrWork: false } : {}) }));
 const head = commits[0].sha;
 const comment = (date, body) => ({ createdAt: at(date), body, author: { login: 'web-everything' } });
 const begin = (date, who = 'fix-4757') => comment(date, `${FIX_BEGIN_MARKER}\n\n**Who:** \`${who}\``);
@@ -76,7 +78,7 @@ describe('mechanical re-arm rounds', () => {
       expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 6 }));
     });
     it('a round whose only commits are merges or drain rebases is still refunded', () => {
-      const merge = { ...commits[0], parents: [commits[1].sha, commits[2].sha], subject: 'Merge branch x', authoredAt: at('11T01:05:00') };
+      const merge = { ...commits[0], parents: [commits[1].sha, commits[2].sha], subject: 'Merge branch x', authoredAt: at('11T01:05:00'), mergesPrWork: false };
       expect(countRealFixRounds({ ...pr, comments: cycles.slice(0, 2), roundCommits: { head, commits: [merge] } })).toMatchObject({ ok: true, real: 0, total: 1 });
     });
   });
@@ -96,7 +98,7 @@ describe('mechanical re-arm rounds', () => {
     });
     it('a begin from before the previous re-arm does not reach back into the earlier round', () => {
       const earlier = comment('11T01:30:00', REARM_COMMENT_MARKER);
-      const merge = { ...commits[0], parents: [fixCommit.sha, commits[2].sha], subject: 'Merge branch x', authoredAt: at('11T03:30:00') };
+      const merge = { ...commits[0], parents: [fixCommit.sha, commits[2].sha], subject: 'Merge branch x', authoredAt: at('11T03:30:00'), mergesPrWork: false };
       const fix = { ...fixCommit, sha: commits[1].sha, parents: [commits[3].sha] };
       const result = countRealFixRounds({ ...pr, comments: [begin('11T01:00:00', 'fix-7'), earlier, begin('11T03:00:00', 'fix-8'), rearm],
         roundCommits: { head, commits: [{ ...merge, parents: [fix.sha, commits[2].sha] }, fix] } });
@@ -121,12 +123,60 @@ describe('mechanical re-arm rounds', () => {
       expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 6 }));
     });
   });
+  describe('real fixes merged from a repair branch (--no-ff)', () => {
+    // Six rounds: fix-begin, a fix commit on a repair branch off the PR head, a --no-ff merge of it back, re-arm.
+    const sha = (n) => n.toString(16).padStart(40, '0');
+    const baseTip = sha(0x1000);
+    const line = []; const fixes = []; const cycles = [];
+    let prev = baseTip;
+    for (let i = 1; i <= 6; i += 1) {
+      const fix = { sha: sha(0x2000 + i), parents: [prev], authoredAt: at(`11T0${i}:05:00`), subject: `PR #4914: fix — round ${i}` };
+      const merge = { sha: sha(0x3000 + i), parents: [prev, fix.sha], authoredAt: at(`11T0${i}:06:00`), subject: `Merge branch 'repair-${i}'` };
+      fixes.push(fix); line.unshift(merge); prev = merge.sha;
+      cycles.push(begin(`11T0${i}:00:00`, 'fix-7'), comment(`11T0${i}:10:00`, REARM_COMMENT_MARKER));
+    }
+    const repairPr = { ...pr, number: 4914, headRefOid: line[0].sha, headRefName: 'lane/repair', baseRefName: 'main', comments: cycles };
+    const log = (list) => list.map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n');
+    const exec = (_bin, args) => (args[0] === 'fetch' ? '' : log([...line, ...fixes]));
+    it('readRoundCommits marks a merge whose merged side is not upstream as bringing PR work', () => {
+      const facts = readRoundCommits({ pr: repairPr, exec });
+      expect(facts.commits.map((c) => c.sha)).toEqual(line.map((c) => c.sha));
+      expect(facts.commits.every((c) => c.mergesPrWork === true)).toBe(true);
+    });
+    it('countRealFixRounds counts all six repair-branch rounds as spent', () => {
+      expect(countRealFixRounds({ ...repairPr, roundCommits: readRoundCommits({ pr: repairPr, exec }) })).toMatchObject({ ok: true, real: 6, total: 6 });
+    });
+    it('the planner keeps the durable six attempts instead of refunding them', () => {
+      const result = planReconcile({ prs: [{ ...repairPr, roundCommits: readRoundCommits({ pr: repairPr, exec }) }], agents: [],
+        durableCounts: { 4914: 6 }, requiredChecks: ['test'], now: Date.parse(at('11T07:00:00')) });
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 6 }));
+    });
+    it('a stacked PR (base is another lane) still counts repair-branch merges as spent', () => {
+      const stacked = { ...repairPr, baseRefName: 'lane/parent' };
+      const facts = readRoundCommits({ pr: stacked, exec });
+      expect(countRealFixRounds({ ...stacked, roundCommits: facts })).toMatchObject({ ok: true, real: 6, total: 6 });
+    });
+    it('a merge of upstream main (merged side not in the PR range) is still refunded', () => {
+      const upstream = line.map((m, i) => ({ ...m, parents: [m.parents[0], sha(0x4000 + i)], subject: 'Merge origin/main' }));
+      const upstreamExec = (_bin, args) => (args[0] === 'fetch' ? '' : log(upstream));
+      const facts = readRoundCommits({ pr: { ...repairPr, headRefOid: upstream[0].sha }, exec: upstreamExec });
+      expect(facts.commits.every((c) => c.mergesPrWork === false)).toBe(true);
+      expect(countRealFixRounds({ ...repairPr, headRefOid: upstream[0].sha, roundCommits: facts })).toMatchObject({ ok: true, real: 0, total: 6 });
+    });
+    it('a merge commit without the merged-side evidence fails closed', () => {
+      const facts = readRoundCommits({ pr: repairPr, exec });
+      const stripped = { ...facts, commits: facts.commits.map(({ mergesPrWork, ...c }) => c) };
+      expect(countRealFixRounds({ ...repairPr, roundCommits: stripped })).toMatchObject({ ok: false });
+    });
+  });
   it('walks the drain merge last parent, skips base-side commits, and uses author dates', () => {
+    // The drain rebased this stacked PR onto main: main's tip is outside main..head but inside the stacked base range.
     const extra = { ...commits[0], sha: commits[7].parents[0], subject: 'base-only fix' };
     const exec = (_bin, args) => {
       if (args[0] === 'fetch') return '';
       expect(args).toContain('--format=%H%x00%P%x00%aI%x00%s');
-      return [...commits, extra].map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n');
+      const list = args.at(-1).startsWith('origin/main..') ? commits : [...commits, extra];
+      return list.map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n');
     };
     expect(readRoundCommits({ pr, exec })).toEqual(facts);
     expect(readRoundCommits({ pr, exec: () => { throw new Error('offline'); } })).toMatchObject({ head, ok: false });

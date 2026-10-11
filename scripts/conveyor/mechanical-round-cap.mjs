@@ -346,7 +346,9 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
 /**
  * IO: collect the PR's own line for review-round accounting. Author dates survive rebases.
  * A drain rebase merge puts main first and the branch LAST; ordinary merges keep the branch first.
- * Missing/malformed git data and a truncated walk fail closed, never returning a partial proof.
+ * Every merge on the line carries `mergesPrWork`: true when a merged-in parent is reachable from neither the base
+ * nor the default branch (a repair branch merged --no-ff), so its fix commits off the line are never read as a
+ * mechanical round. Missing/malformed git data and a truncated walk fail closed, never returning a partial proof.
  */
 export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin', exec = execFileSync } = {}) {
   const head = lc(pr?.headRefOid);
@@ -354,31 +356,44 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
   if (!SHA40.test(head)) return fail('no-head');
   const base = String(pr?.baseRefName || defaultBranch);
   const headRef = String(pr?.headRefName ?? '');
-  if ([base, remote, ...(headRef ? [headRef] : [])].some((ref) => !SAFE_REF.test(ref) || ref.startsWith('-'))) return fail('unsafe-ref');
+  if ([base, remote, defaultBranch, ...(headRef ? [headRef] : [])].some((ref) => !SAFE_REF.test(ref) || ref.startsWith('-'))) return fail('unsafe-ref');
   const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 256 * 1024 * 1024 }) ?? '');
-  try {
-    git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
-      ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
-    const text = git(['log', '--format=%H%x00%P%x00%aI%x00%s', '--end-of-options', `${remote}/${base}..${head}`]);
+  const readRange = (upstream) => {
+    const text = git(['log', '--format=%H%x00%P%x00%aI%x00%s', '--end-of-options', `${remote}/${upstream}..${head}`]);
     const map = new Map();
     for (const line of text.split('\n').filter(Boolean)) {
       const fields = line.split('\0');
-      if (fields.length !== 4) return fail('invalid-commit-data');
+      if (fields.length !== 4) return null;
       const [sha, parentText, authoredAt, subject] = fields;
       const parents = parentText ? parentText.split(' ') : [];
-      if (!SHA40.test(sha) || parents.some((p) => !SHA40.test(p)) || !Number.isFinite(Date.parse(authoredAt)) || map.has(sha)) return fail('invalid-commit-data');
+      if (!SHA40.test(sha) || parents.some((p) => !SHA40.test(p)) || !Number.isFinite(Date.parse(authoredAt)) || map.has(sha)) return null;
       map.set(sha, { sha, parents, authoredAt, subject });
     }
+    return map;
+  };
+  try {
+    git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
+      ...(defaultBranch !== base ? [`+${defaultBranch}:refs/remotes/${remote}/${defaultBranch}`] : []),
+      ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
+    const map = readRange(base);
+    if (!map) return fail('invalid-commit-data');
     if (!map.has(head)) return fail('missing-head');
+    // A merged-in parent is upstream when the base or the default branch reaches it (a sync, or a drain rebase of a
+    // stacked PR onto main). Anything else is the PR's own work brought in off the line.
+    const onDefault = defaultBranch === base ? map : readRange(defaultBranch);
+    if (!onDefault) return fail('invalid-commit-data');
     const commits = []; const seen = new Set();
     let sha = head;
     while (map.has(sha)) {
       if (commits.length >= 500 || seen.has(sha)) return fail('walk-limit');
       seen.add(sha);
       const commit = map.get(sha);
-      commits.push(commit);
-      sha = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
+      const lineParent = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
         ? commit.parents.at(-1) : commit.parents[0];
+      commits.push(commit.parents.length > 1
+        ? { ...commit, mergesPrWork: commit.parents.some((p) => p !== lineParent && map.has(p) && onDefault.has(p)) }
+        : commit);
+      sha = lineParent;
     }
     // The walk must leave the range through a real parent (a base-side commit). A parentless last commit is a
     // root or a shallow-clone boundary: the earlier fix rounds are missing, so it proves nothing.
