@@ -151,6 +151,35 @@ export function decideHumanClearanceCarry({ enabled = true, clearance = null, he
   return { carry: true, fromSha: clearance.sha.toLowerCase(), toSha: h, fingerprint: live, actor: clearance.actor };
 }
 
+/**
+ * IO (read-only): shared carry proof for the drain and CI. Check the pinned diff before touching git;
+ * unreadable evidence or history never grants a carry. No record is posted and nothing is logged.
+ * @returns {{carry:boolean, applicable:boolean, reason:string, fromSha?:string, toSha?:string,
+ *   fingerprint?:string, actor?:string, mechanicalReason?:string}}
+ */
+export function proveHumanClearanceCarry({ evidence, enabled = true, exec, cwd, mainRef = 'origin/main' } = {}) {
+  try {
+    const clearance = evidence?.humanClearance;
+    if (!clearance || !evidence?.headSha) return { carry: false, applicable: false, reason: 'no recorded human clearance or live head' };
+    if (String(evidence.headSha).toLowerCase() === String(clearance.sha).toLowerCase()) {
+      return { carry: false, applicable: false, reason: 'clearance already bound to the live head' };
+    }
+    if (String(evidence.headDiffSha || '').toLowerCase() !== String(evidence.headSha).toLowerCase()) {
+      return { carry: false, applicable: true,
+        reason: `the live net diff was read from ${evidence.headDiffSha ? String(evidence.headDiffSha).slice(0, 9) : 'an unresolved tip'}, not the live head` };
+    }
+    const inputs = { enabled, clearance, headSha: evidence.headSha, headDiff: evidence.headDiff };
+    const pre = decideHumanClearanceCarry({ ...inputs, mechanical: { ok: true, reason: '(not yet checked)' } });
+    if (!pre.carry) return { ...pre, applicable: true };
+    const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
+    const mechanical = proveMechanicalMove({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
+    const decision = decideHumanClearanceCarry({ ...inputs, mechanical });
+    return { ...decision, applicable: true, ...(decision.carry ? { mechanicalReason: mechanical.reason, reason: mechanical.reason } : {}) };
+  } catch (e) {
+    return { carry: false, applicable: true, reason: `carry proof failed: ${String(e?.message ?? e).split('\n')[0]}` };
+  }
+}
+
 /** PURE: the carry marker line. */
 export function buildCarryMarker({ fromSha, toSha, fingerprint }) {
   return `<!-- ${HUMAN_CLEARANCE_CARRIED_MARKER}: from=${fromSha} to=${toSha} diff=${fingerprint} -->`;
@@ -202,31 +231,12 @@ export function applyHumanClearanceCarry({
   evidence, pr, repo = null, cwd, exec, dryRun = false, mainRef = 'origin/main',
   setting = resolveHumanClearanceCarrySetting(), log = (s) => process.stderr.write(s),
 } = {}) {
-  const clearance = evidence?.humanClearance || null;
-  if (!clearance || !evidence?.headSha) return null;
-  if (String(evidence.headSha).toLowerCase() === clearance.sha) return null;
+  const d = proveHumanClearanceCarry({ evidence, enabled: setting.value, exec, cwd, mainRef });
+  if (!d.applicable) return null;
   logCarrySettingOnce(setting, log);
   const tag = `${repo ? `${repo}` : ''}#${pr}`;
-  // The record stamps `reviewed-sha` = headSha next to the diff's fingerprint, so the diff must be the one OF that sha: it
-  // is read from the branch tip a moment after `headRefOid`, and a push in between would pair a newer diff with an older head.
-  if (String(evidence.headDiffSha || '').toLowerCase() !== String(evidence.headSha).toLowerCase()) {
-    log(`  human-clearance-carry ${tag}: NOT carried ${clearance.sha.slice(0, 9)}→${String(evidence.headSha).slice(0, 9)} — `
-      + `the live net diff was read from ${evidence.headDiffSha ? String(evidence.headDiffSha).slice(0, 9) : 'an unresolved tip'}, not the live head\n`);
-    return null;
-  }
-  // Pure pre-checks first: no git call unless the content already matches.
-  const pre = decideHumanClearanceCarry({ enabled: setting.value, clearance, headSha: evidence.headSha,
-    headDiff: evidence.headDiff, mechanical: { ok: true, reason: '(not yet checked)' } });
-  if (!pre.carry) {
-    log(`  human-clearance-carry ${tag}: NOT carried ${clearance.sha.slice(0, 9)}→${String(evidence.headSha).slice(0, 9)} — ${pre.reason}\n`);
-    return null;
-  }
-  const gitExec = (cmd, args, opts) => exec(cmd, args, { cwd, ...opts });
-  const mechanical = proveMechanicalMove({ exec: gitExec, fromSha: clearance.sha, toSha: evidence.headSha, mainRef });
-  const d = decideHumanClearanceCarry({ enabled: setting.value, clearance, headSha: evidence.headSha,
-    headDiff: evidence.headDiff, mechanical });
   if (!d.carry) {
-    log(`  human-clearance-carry ${tag}: NOT carried ${clearance.sha.slice(0, 9)}→${String(evidence.headSha).slice(0, 9)} — ${d.reason}\n`);
+    log(`  human-clearance-carry ${tag}: NOT carried ${String(evidence?.humanClearance?.sha || '').slice(0, 9)}→${String(evidence?.headSha || '').slice(0, 9)} — ${d.reason}\n`);
     return null;
   }
   const carried = { fromSha: d.fromSha, toSha: d.toSha, fingerprint: d.fingerprint, actor: d.actor, recorded: false };
@@ -234,7 +244,7 @@ export function applyHumanClearanceCarry({
     log(`  human-clearance-carry ${tag}: WOULD carry ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} (diff ${d.fingerprint.slice(0, 12)}; dry run, no record)\n`);
     return { carried };
   }
-  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: mechanical.reason });
+  const body = buildCarryRecordBody({ ...d, headDiffText: evidence.headDiff, mechanicalReason: d.mechanicalReason });
   try {
     exec('gh', ['pr', 'comment', String(pr), ...(repo ? ['--repo', repo] : []), '--body', body],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -244,6 +254,6 @@ export function applyHumanClearanceCarry({
     return { action: 'defer', applyLabel: null,
       reason: `human clearance carry proven (${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)}) but its durable record could not be written — merge deferred this pass` };
   }
-  log(`  human-clearance-carry ${tag}: CARRIED ${d.actor}'s clearance ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} (diff ${d.fingerprint.slice(0, 12)}; ${mechanical.reason}) — record posted\n`);
+  log(`  human-clearance-carry ${tag}: CARRIED ${d.actor}'s clearance ${d.fromSha.slice(0, 9)}→${d.toSha.slice(0, 9)} (diff ${d.fingerprint.slice(0, 12)}; ${d.mechanicalReason}) — record posted\n`);
   return { carried: { ...carried, recorded: true } };
 }
