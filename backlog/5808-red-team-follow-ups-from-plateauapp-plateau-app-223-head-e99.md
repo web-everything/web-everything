@@ -1,21 +1,19 @@
 ---
-bornAs: xdlqu2e
-humanGate: { kind: setup, what: "operator creates and installs the reviewer GitHub App" }
+bornAs: xaevuyu
 kind: story
-size: 3
-status: resolved
-dateResolved: "2026-10-10"
-supersededBy: "5812"
-scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/review-set-label.mjs"]
+size: 2
+status: open
+scope: ["we:src/wip/shared-source.ts"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Reviewer GitHub App: reviews post as their own identity (native reviews, own API budget)
+# Red-team follow-ups from plateauapp/plateau-app#223 (head e992f92b3)
 
-Operator 2026-10-10: will create a separate GitHub App for reviews. The review daemon posts reviews/advisories and swaps review labels as that App, enabling native GitHub reviews (an approval from a non-author identity) and giving reviews their own API budget (shared core limit exhausted 2026-10-10 20:25Z, 15,000/h). Identity is a setting (review.identity) via the cascade with fallback to the shared App. HUMAN GATE (setup): operator creates and installs the App; agents wire the review daemon and token shim. Done when: a live review on a real PR is posted by the reviewer App, and the shared App's call count drops accordingly (coroner GitHub-calls section).
+Filed mechanically by the red-team gate: the post-accept red team on plateauapp/plateau-app#223 (reviewed head `e992f92b30475879c9b569de3af0c298981fdab2`) found these, Claude's re-check confirmed them, and the setting `redTeam.confirmedBreaks` files their class as a follow-up card instead of blocking the PR:
+1. `we:src/wip/shared-source.ts:167` — (failing-input, degraded) A session becoming blocked no longer wakes its feeds
 
-**Merged into 5812 (2026-10-10):** the operator moved to five per-role Apps (worker, reviewer, merger, ledger, observer); this card's App, its permissions, rulesets and cutover now live in that one migration card.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5783.
 
 ## Acceptance
 

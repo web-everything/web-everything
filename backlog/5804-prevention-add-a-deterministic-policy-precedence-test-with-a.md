@@ -1,21 +1,21 @@
 ---
-bornAs: xdlqu2e
-humanGate: { kind: setup, what: "operator creates and installs the reviewer GitHub App" }
+bornAs: xwwdesj
 kind: story
 size: 3
-status: resolved
-dateResolved: "2026-10-10"
-supersededBy: "5812"
-scope: ["we:scripts/operations/review-pr.mjs", "we:scripts/review-set-label.mjs"]
+parent: "4075"
+status: open
+scope: ["we:scripts/lib/__tests__/daemon-live-smoke.test.mjs"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Reviewer GitHub App: reviews post as their own identity (native reviews, own API budget)
+# Prevention — Add a deterministic policy-precedence test with a false platform setting and explicit env enable;… (from web-everything/web-everything#4841 review)
 
-Operator 2026-10-10: will create a separate GitHub App for reviews. The review daemon posts reviews/advisories and swaps review labels as that App, enabling native GitHub reviews (an approval from a non-author identity) and giving reviews their own API budget (shared core limit exhausted 2026-10-10 20:25Z, 15,000/h). Identity is a setting (review.identity) via the cascade with fallback to the shared App. HUMAN GATE (setup): operator creates and installs the App; agents wire the review daemon and token shim. Done when: a live review on a real PR is posted by the reviewer App, and the shared App's call count drops accordingly (coroner GitHub-calls section).
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-**Merged into 5812 (2026-10-10):** the operator moved to five per-role Apps (worker, reviewer, merger, ledger, observer); this card's App, its permissions, rulesets and cutover now live in that one migration card.
+1. `we:scripts/lib/__tests__/daemon-live-smoke.test.mjs:100` — Add a deterministic policy-precedence test with a false platform setting and explicit env enable; removing the '1' branch must make that named test fail.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4841@0ffea26aa94fd5e11de7c11c03b943262de0391b
 
 ## Acceptance
 
