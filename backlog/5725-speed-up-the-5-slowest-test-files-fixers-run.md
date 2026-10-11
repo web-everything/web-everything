@@ -4,7 +4,7 @@ kind: story
 size: 5
 priority: high
 status: open
-scope: ["we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs", "we:scripts/conveyor/__tests__/session-reaper-cli.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/conveyor/__tests__/pr-stack.test.mjs", "we:scripts/conveyor/session-reaper.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-constants.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-constants.test.mjs"]
+scope: ["we:scripts/conveyor/__tests__/health-watch-jobs.test.mjs", "we:scripts/conveyor/__tests__/session-reaper-cli.test.mjs", "we:scripts/operations/__tests__/review-loop-cli.test.mjs", "we:scripts/lib/__tests__/review-loop-policy.test.mjs", "we:scripts/conveyor/__tests__/pr-stack.test.mjs", "we:scripts/conveyor/session-reaper.mjs", "we:scripts/conveyor/__tests__/session-reaper.test.mjs", "we:scripts/lib/review-loop-policy.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/operations/review-pr-constants.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-constants.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-10"
 preparedAgainstSha: "c437fe56a396aa378b6b54b613b4bcf2fe660526"
