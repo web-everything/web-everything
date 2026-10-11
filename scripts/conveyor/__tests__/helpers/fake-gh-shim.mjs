@@ -563,8 +563,9 @@ function handleApi(store, rest) {
       }
     }
     // The same declared set as the BRANCH body's classic protection — `required-status-checks.mjs` reads the classic
-    // set here (App-token readable) and unions it with the ruleset set below.
-    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/branches\/([^/?]+)$/))) {
+    // set here (App-token readable) and unions it with the ruleset set below. Only that un-`--jq`'d read is served:
+    // `merge-queue-hook.mjs`'s `--jq '{sha: .commit.sha}'` tip read stays unsupported, exactly as before.
+    if (!jq && (m = path.match(/^repos\/([^/]+)\/([^/]+)\/branches\/([^/?]+)$/))) {
       const repoState = requireRepo(store, `${m[1]}/${m[2]}`);
       if (Array.isArray(repoState.requiredChecks)) {
         return jsonResult({ name: m[3], protected: true, protection: { enabled: true, required_status_checks: {

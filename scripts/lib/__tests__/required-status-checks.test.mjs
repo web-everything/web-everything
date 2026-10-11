@@ -318,6 +318,35 @@ describe('defaultReadRequiredStatusChecks', () => {
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['test', 'smoke']);
   });
 
+  // Live 2026-10-11 bodies: frontierui is ruleset-protected with no check rule; plateau-app is unprotected. Two
+  // successful reads that require nothing are an authoritative "nothing required" — the declared policy, cached
+  // as `declared` like a protection denial, never the untrusted `fallback` the review gate refuses.
+  it.each([
+    ['frontier-ui/frontierui', JSON.stringify([[{ type: 'deletion' }, { type: 'non_fast_forward' }]]),
+      JSON.stringify({ protected: true, protection: { enabled: false, required_status_checks: { checks: [], contexts: [], enforcement_level: 'off' } } }),
+      ['test']],
+    ['plateauapp/plateau-app', '[[]]',
+      JSON.stringify({ protected: false, protection: { enabled: false, required_status_checks: { checks: [], contexts: [], enforcement_level: 'off' } } }),
+      ['test', 'e2e']],
+  ])('%s: nothing required by either source selects the declared policy', (repo, rules, branchBody, declared) => {
+    const cachePath = join(dir, 'cache.json');
+    const gh = bothSources(rules, branchBody);
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
+    expect(() => readChecks({ repo })).toThrow(expect.objectContaining({ noRequiredChecks: true }));
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks })).toEqual({ checks: declared, source: 'declared' });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1001, readChecks })).toEqual({ checks: declared, source: 'declared' });
+  });
+
+  it('nothing required never clobbers a live cache entry (stale-cache, file untouched)', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'frontier-ui/frontierui';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test'] });
+    const gh = bothSources('[[]]', UNPROTECTED);
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    })).toMatchObject({ checks: ['test'], source: 'stale-cache' });
+  });
+
   it('drops blank or non-string classic contexts instead of turning them into check names', () => {
     const body = JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: {
       contexts: ['', null, 7, 'real'], checks: [{ context: '' }, null, {}] } } });

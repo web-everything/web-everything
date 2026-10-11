@@ -25,7 +25,8 @@
  * DEGRADATION, on the same "never lose the read" principle `we:scripts/progress-board.mjs` documents: a fresh
  * live fetch wins when available; a live fetch that fails falls back to the last cache written (even stale —
  * a branch-protection change is rare, so a day-old required set is still far more accurate than guessing);
- * a protection 403/404 (never a rate-limit 403 — that is transient) instead selects the repo's declared
+ * a protection 403/404 (never a rate-limit 403 — that is transient), or both sources read fine and requiring
+ * nothing, instead selects the repo's declared
  * policy, cached for the normal TTL as `declared`, unless a live entry already exists: that is returned as
  * `stale-cache` and left untouched on disk.
  * Other failures still retry and prefer the cache, with its original age exposed to admission gates.
@@ -174,7 +175,13 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     // A transient rules failure must not become a denial just because protection is inaccessible.
     throw rulesError && !protectionAccessDenied(rulesError) ? rulesError : error;
   }
-  if (!rulesError) return [...new Set([...rulesChecks, ...checks])];
+  if (!rulesError) {
+    const union = [...new Set([...rulesChecks, ...checks])];
+    // Both sources read fine and neither requires a check: an authoritative "nothing required", which selects the
+    // repo's declared policy exactly as a protection denial does — never the untrusted `fallback`.
+    if (!union.length) throw Object.assign(new Error('required-status-checks: no required checks in rules or branch protection'), { noRequiredChecks: true });
+    return union;
+  }
   // Rulesets can require checks classic protection lacks, so a partial classic set after a TRANSIENT rules
   // failure must not be returned as live: throw so the caller's stale-cache handling keeps the last real set.
   // Only a rules ACCESS denial lets a non-empty classic set stand (the rules API is simply unreadable here).
@@ -249,7 +256,7 @@ export function getRequiredStatusChecks({
       return save(checks, 'live');
     }
   } catch (error) {
-    if (protectionAccessDenied(error)) {
+    if (protectionAccessDenied(error) || error?.noRequiredChecks === true) {
       // An existing live entry (source `live`, or a legacy source-less one) is real branch-protection data: a
       // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
       // the file is untouched, so the next call re-reads live once more.
