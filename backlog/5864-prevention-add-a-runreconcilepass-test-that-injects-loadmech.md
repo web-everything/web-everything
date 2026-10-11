@@ -41,3 +41,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#4770 (finding 2: `we:scripts/conveyor/mechanical-round-cap.mjs:84` — Add a lint or standards rule that any predicate over comment bodies checks author trust before regex work. A cheap alternative is to replace the .* runs in MECHANICAL_ATTRIBUTION with split and indexOf checks. Add a bounded-time test with an adversarial 60KB line from an untrusted author.)

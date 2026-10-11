@@ -103,12 +103,12 @@
 import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
+import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
@@ -1564,9 +1564,9 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
   if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  // The PR list read stops at GH_LIST_COMMENT_CAP comments, so a thread of exactly that length may be cut before a
-  // later withdrawal or takeover marker. A full re-read runs longer than the cap; a cut list grants nothing.
-  if (comments.length === GH_LIST_COMMENT_CAP) return { ok: false, reason: 'thread-truncated' };
+  // A cut list (exactly the list cap) may hide a later withdrawal or takeover marker: it grants nothing. The same
+  // check guards every past-cap grant (`takeover-budget.mjs#threadMayBeTruncated`).
+  if (threadMayBeTruncated(comments)) return { ok: false, reason: 'thread-truncated' };
   const rulings = decidingOperatorBlocks(pr, head, blocked);
   if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
@@ -2058,7 +2058,8 @@ export function planReconcile({
             + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover budget — fix.takeoverBudget or env WE_FIX_TAKEOVER_BUDGET — is 0 or invalid)' : '')
             + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
             + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
-            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
+            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : '')
+            + (takeover?.reason === 'thread-truncated' ? ' (no automatic takeover: the PR comment list was read only up to its first 100 comments, so the takeover markers and reviews after them could not be counted)' : ''),
       });
     };
     const refuseCapExhausted = capExhaustedVia(refuse);
@@ -2444,7 +2445,7 @@ export function planReconcile({
     }
 
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       const healBudget = healBudgetFor(pr);
       const healAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
@@ -2580,7 +2581,7 @@ export function planReconcile({
       // tick plans a fresh heal with no human intervention required. Checked BEFORE the `ci-heal` cap below
       // (and skips it entirely) for the same reason `owed-ci-rerun` is: an escalation is a DIFFERENT, more
       // definitive stop than "one more round against the attempt cap".
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       if (escalation) {
         const isSystemFix = escalation.outcome === 'waiting-on-system-fix';
         // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything)
@@ -2613,12 +2614,17 @@ export function planReconcile({
           // Falls straight through to the ordinary ci-heal cap/dispatch path below, exactly as if this PR had
           // never been escalated at all — never a second, separate re-dispatch path to keep in sync with it.
         } else {
+          const isInherited = escalation.outcome === 'inherited-from-base';
           const kind = isSystemFix ? 'waiting-on-system-fix' : 'ci-heal-escalated';
           refuse(kind, {
             ...withPhase, headSha: escalation.headSha,
             ...(escalation.reason ? { escalationReason: escalation.reason } : {}),
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
-            why: isSystemFix
+            ...(escalation.basePr ? { basePr: escalation.basePr } : {}),
+            ...(escalation.baseHeadSha ? { baseHeadSha: escalation.baseHeadSha } : {}),
+            why: isInherited
+              ? `ci-heal found this exact head's red (\`${escalation.headSha}\`) inherited from base PR #${escalation.basePr} at base head \`${escalation.baseHeadSha}\` — owed to the base PR's fixer, not the operator; re-arms automatically when the base head moves or a new push changes this head`
+              : isSystemFix
               ? `ci-heal already escalated this exact head (\`${escalation.headSha}\`) as waiting on system fix #${escalation.systemFixRef} — the red is the tooling/gate's own fault, not this PR's; nothing further is owed until that fix lands or a new push changes this head`
               : isNotCiBreak
                 ? `ci-heal already confirmed this exact head (\`${escalation.headSha}\`) is NOT a CI break — the red is the review gate itself, held by the review label. No further heal is owed; review waits for complete successful required checks`
@@ -2631,7 +2637,7 @@ export function planReconcile({
           // per tick, until a new push or a person clears it. `not-a-ci-break` is deliberately NOT a dead end
           // (see above) — it still gets this same informational note (an operator reading the report should
           // see why no MORE ci-heal is coming), but cannot override the required-check prerequisite for review.
-          notes.push({
+          if (!isInherited) notes.push({
             kind: 'ci-heal-escalated', prNumber, headSha: escalation.headSha, outcome: escalation.outcome,
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
             text: isSystemFix

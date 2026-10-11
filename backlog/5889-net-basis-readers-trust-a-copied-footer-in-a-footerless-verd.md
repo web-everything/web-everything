@@ -1,4 +1,5 @@
 ---
+bornAs: xk599v0
 kind: story
 size: 3
 status: open

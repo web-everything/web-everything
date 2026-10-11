@@ -21,7 +21,7 @@
  * rebase or a fresh push moves the head, the old escalation comment stops matching, and the very next
  * reconcile tick plans a heal again — no human intervention required, no stale record to clean up.
  *
- * OUTCOME IS THREE-VALUED (we:backlog/heal-wait-for-rerun, Fork 2; `not-a-ci-break` added we:backlog/
+ * OUTCOME IS FOUR-VALUED (we:backlog/heal-wait-for-rerun, Fork 2; `not-a-ci-break` added we:backlog/
  * fix-review-ciheal-deadlock, LIVE DEADLOCK 2026-09-28/29, PR #2878 web-everything/web-everything):
  *   · `needs-human` — a genuine judgment call the agent could not safely make (the diff itself looks wrong, a
  *     real conflict, the lane ref is gone).
@@ -41,6 +41,8 @@
  *     left to heal — a deadlock neither side could see, because the reason lived only in unstructured prose
  *     neither side parsed. A `not-a-ci-break` escalation reads instead as "dispatch the review this PR was
  *     always owed, in parallel with refusing another heal" (see that function's own header for the exact fold).
+ *
+ *   · `inherited-from-base` — the base PR's fixer owns the red; re-arms when either head moves.
  *
  * NO PARALLEL STATE STORE (#2612 invariant, matching every sibling marker in this directory): the record lives
  * on the PR's own comment thread, read back by {@link latestCiHealEscalationForHead}, exactly as
@@ -71,17 +73,17 @@ export const MAIN_DEFECT_CAUSE = 'main-defect';
 /** xo7mr6l — prose shapes ci-heal wrote before `cause:` existed (live: PRs #4368/#4369, 2026-10-08). */
 const LEGACY_MAIN_DEFECT_REASON = /^(?:red is main's own defect\b|main-wide (?:health-gate )?red\b)/i;
 
-/** The three outcomes a ci-heal escalation can carry — see the file header for what distinguishes them. */
-export const CI_HEAL_ESCALATION_OUTCOMES = Object.freeze(['needs-human', 'waiting-on-system-fix', 'not-a-ci-break']);
+/** The four outcomes a ci-heal escalation can carry — see the file header for what distinguishes them. */
+export const CI_HEAL_ESCALATION_OUTCOMES = Object.freeze(['needs-human', 'waiting-on-system-fix', 'not-a-ci-break', 'inherited-from-base']);
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#buildCiHealEscalationComment — the durable comment body a
  * ci-heal escalation posts. Its FIRST line MUST be {@link CI_HEAL_ESCALATION_MARKER}; every field after it is a
  * `key: value` line so {@link parseCiHealEscalations} can read it back with no ambiguity. Pure.
- * @param {{headSha:string, outcome:'needs-human'|'waiting-on-system-fix'|'not-a-ci-break', reason?:string, systemFixRef?:(number|string|null), authDiagnosis?:object}} o
+ * @param {{headSha:string, outcome:'needs-human'|'waiting-on-system-fix'|'not-a-ci-break'|'inherited-from-base', reason?:string, systemFixRef?:(number|string|null), authDiagnosis?:object, basePr?:(number|string|null), baseHeadSha?:(string|null)}} o
  * @returns {string}
  */
-export function buildCiHealEscalationComment({ headSha, outcome, reason = '', systemFixRef = null, authDiagnosis = null, cause = null } = {}) {
+export function buildCiHealEscalationComment({ headSha, outcome, reason = '', systemFixRef = null, authDiagnosis = null, cause = null, basePr = null, baseHeadSha = null } = {}) {
   if (!headSha || typeof headSha !== 'string') throw new TypeError('ci-heal-escalation-mark: headSha is required');
   if (!CI_HEAL_ESCALATION_OUTCOMES.includes(outcome)) {
     throw new TypeError(`ci-heal-escalation-mark: outcome must be one of ${CI_HEAL_ESCALATION_OUTCOMES.join('|')}, got ${JSON.stringify(outcome)}`);
@@ -96,11 +98,20 @@ export function buildCiHealEscalationComment({ headSha, outcome, reason = '', sy
     if (!systemFixRef) throw new TypeError('ci-heal-escalation-mark: waiting-on-system-fix requires systemFixRef');
     lines.push(`system-fix: #${String(systemFixRef).replace(/^#/, '')}`);
   }
+  if (outcome === 'inherited-from-base') {
+    if (!basePr || !baseHeadSha) throw new TypeError('ci-heal-escalation-mark: inherited-from-base requires basePr and baseHeadSha');
+    lines.push(`base-pr: #${String(basePr).replace(/^#/, '')}`);
+  }
+  if (baseHeadSha) lines.push(`base-head: ${baseHeadSha.trim().toLowerCase()}`);
   if (cause === MAIN_DEFECT_CAUSE) lines.push(`cause: ${MAIN_DEFECT_CAUSE}`);
   if (reason) lines.push(`reason: ${reason}`);
   lines.push('');
   lines.push(
-    outcome === 'waiting-on-system-fix'
+    outcome === 'inherited-from-base'
+      ? `The red is inherited from base PR #${String(basePr).replace(/^#/, '')} at base head ${baseHeadSha.trim().toLowerCase().slice(0, 7)}; ` +
+        "the fix is owed to the base PR's fixer, not the operator; this PR's ci-heal re-arms automatically " +
+        "when the base head moves or this PR's head changes."
+      : outcome === 'waiting-on-system-fix'
       ? 'This required check is red because of the tooling/gate itself, not this PR\'s own code — a system-level ' +
         'fix is already open for it. Nothing further is owed here until that fix lands or this PR\'s own head ' +
         'changes; re-dispatching a heal against this exact head would only repeat the same finding.'
@@ -117,13 +128,13 @@ export function buildCiHealEscalationComment({ headSha, outcome, reason = '', sy
 
 /**
  * we:scripts/conveyor/ci-heal-escalation-mark.mjs#parseCiHealEscalations — every trusted escalation comment on
- * a PR, normalized to `{ headSha, outcome, reason, systemFixRef, createdAt }`, in the order `comments` was
+ * a PR, normalized to `{ headSha, outcome, reason, systemFixRef, basePr, baseHeadSha, createdAt }`, in the order `comments` was
  * given. Pure, and the ONE place the leading-line + field-parsing rule is written. A comment matches only when
  * the marker is its LEADING line (mirrors every sibling marker in this directory) AND {@link
  * isTrustedMarkerAuthor} — WE's PRs are public, so an untrusted login must never be able to forge "already
  * escalated" onto a PR and suppress its own real ci-heal.
  * @param {Array<{body?:string, createdAt?:string}|string>|null|undefined} comments
- * @returns {Array<{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), createdAt:(string|null)}>}
+ * @returns {Array<{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), basePr:(string|null), baseHeadSha:(string|null), createdAt:(string|null)}>}
  */
 export function parseCiHealEscalations(comments) {
   return parseEscalationsIndexed(comments).map(({ e }) => e);
@@ -140,11 +151,13 @@ function parseEscalationsIndexed(comments) {
     const outcome = (/^outcome:\s*(\S+)/m.exec(body) || [])[1] ?? null;
     const headSha = (/^head:\s*(\S+)/m.exec(body) || [])[1] ?? null;
     const systemFixRef = (/^system-fix:\s*#?(\d+)/m.exec(body) || [])[1] ?? null;
+    const baseHeadSha = (/^base-head:\s*(\S+)/m.exec(body) || [])[1]?.toLowerCase() ?? null;
+    const basePr = (/^base-pr:\s*#?(\d+)/m.exec(body) || [])[1] ?? null;
     const reason = (/^reason:\s*(.+)$/m.exec(body) || [])[1] ?? '';
     const cause = (/^cause:\s*(\S+)/m.exec(body) || [])[1] ?? null;
     if (!outcome || !headSha) continue; // malformed/foreign — never half-parse a marker into a false match
     out.push({ index, e: {
-      headSha: headSha.toLowerCase(), outcome, reason, systemFixRef, cause,
+      headSha: headSha.toLowerCase(), outcome, reason, systemFixRef, cause, baseHeadSha, basePr,
       createdAt: typeof c === 'object' && c ? (c.createdAt ?? null) : null,
     } });
   }
@@ -166,9 +179,9 @@ export function isUnverifiedLaneEscalation(e) {
  * word on this exact head.
  * @param {Array<object>|null|undefined} comments
  * @param {string|null|undefined} headSha
- * @returns {{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), createdAt:(string|null)}|null}
+ * @returns {{headSha:string, outcome:string, reason:string, systemFixRef:(string|null), basePr:(string|null), baseHeadSha:(string|null), createdAt:(string|null)}|null}
  */
-export function latestCiHealEscalationForHead(comments, headSha, { recheck } = {}) {
+export function latestCiHealEscalationForHead(comments, headSha, { recheck, baseHead = null } = {}) {
   const sha = typeof headSha === 'string' ? headSha.trim().toLowerCase() : '';
   if (!sha) return null;
   // card x9zznl9 — a `not-a-ci-break` verdict a LATER trusted void comment names (same head) is not the word on
@@ -178,7 +191,69 @@ export function latestCiHealEscalationForHead(comments, headSha, { recheck } = {
   const matches = parseEscalationsIndexed(comments)
     .filter(({ e }) => e.headSha === sha && !isUnverifiedLaneEscalation(e))
     .filter(({ e, index }) => !(e.outcome === 'not-a-ci-break' && voids.some((v) => v.index > index)));
-  return matches.length ? matches[matches.length - 1].e : null;
+  const latest = matches.length ? matches[matches.length - 1].e : null;
+  return escalationStaleAgainstBase(latest, baseHead) ? null : latest;
+}
+
+/** A moved base invalidates the verdict; legacy records use the base commit time. Pure. */
+export function escalationStaleAgainstBase(escalation, baseHead) {
+  if (!escalation || !baseHead) return false;
+  if (escalation.baseHeadSha && baseHead.sha) {
+    return escalation.baseHeadSha.toLowerCase() !== baseHead.sha.toLowerCase();
+  }
+  if (!escalation.baseHeadSha && baseHead.committedAt && escalation.createdAt) {
+    const committed = Date.parse(baseHead.committedAt);
+    const created = Date.parse(escalation.createdAt);
+    return Number.isFinite(committed) && Number.isFinite(created) && committed > created;
+  }
+  return false;
+}
+
+/** GitHub owns this fact: daemon clones do not fetch stacked base refs (#4792). */
+export function defaultReadBaseHead(baseRefName, { repo = null, exec = execFileSync } = {}) {
+  if (!repo) return null;
+  try {
+    const result = JSON.parse(exec('gh', ['api',
+      `repos/${repo}/branches/${encodeURIComponent(baseRefName)}`,
+      '--jq', '{sha: .commit.sha, committedAt: .commit.commit.committer.date}',
+    ], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] }));
+    if (typeof result?.sha !== 'string' || !result.sha) return null;
+    return { sha: result.sha, committedAt: typeof result.committedAt === 'string' ? result.committedAt : null };
+  } catch { return null; }
+}
+
+/** Read only bases with a current escalation, once per branch per pass. */
+export function enrichPrsWithEscalationBaseFacts(prs, {
+  repo = null, defaultBranch = 'main', readBaseHead = defaultReadBaseHead,
+} = {}) {
+  if (!Array.isArray(prs)) return [];
+  const cache = new Map();
+  return prs.map(pr => {
+    const ref = pr?.baseRefName;
+    if (!ref || ref === defaultBranch || !latestCiHealEscalationForHead(pr.comments, pr.headRefOid)) return pr;
+    if (!cache.has(ref)) {
+      try { cache.set(ref, readBaseHead(ref, { repo })); }
+      catch { cache.set(ref, null); }
+    }
+    const baseHead = cache.get(ref);
+    return baseHead ? { ...pr, escalationBaseHead: { sha: baseHead.sha, committedAt: baseHead.committedAt } } : pr;
+  });
+}
+
+export const CI_HEAL_INHERITED_BASE_NOTE_MARKER = '🚦 conveyor CI-heal — red inherited by a stacked PR';
+
+/** Route inherited red to the branch that owns the repair. Pure. */
+export function buildInheritedRedBaseNote({ stackedPr, stackedHead, baseHeadSha, reason = '' }) {
+  return [
+    CI_HEAL_INHERITED_BASE_NOTE_MARKER,
+    `stacked-pr: #${stackedPr}`,
+    `stacked-head: ${stackedHead}`,
+    `base-head: ${baseHeadSha}`,
+    ...(reason ? [`reason: ${reason}`] : []),
+    '',
+    `PR #${stackedPr} is stacked on this PR and its required CI is red because of code/tests on this branch at ${baseHeadSha}; ` +
+      `the fix is owed HERE, by this PR's fixer; PR #${stackedPr}'s ci-heal re-arms automatically once this branch's head moves.`,
+  ].join('\n');
 }
 
 /**
@@ -349,6 +424,7 @@ async function defaultReadRequiredChecks({ repo }) {
 export function composeCiHealEscalation(flags, { collect = collectCiAuthDiagnosis } = {}) {
   const original = { headSha: flags.head, outcome: flags.outcome,
     reason: typeof flags.reason === 'string' ? flags.reason : '', systemFixRef: flags['system-fix'] ?? null,
+    basePr: flags['base-pr'] ?? null, baseHeadSha: flags['base-head'] ?? null,
     cause: flags.cause === MAIN_DEFECT_CAUSE ? MAIN_DEFECT_CAUSE : null };
   const body = buildCiHealEscalationComment(original);
   if (flags.run === undefined && flags.attempt === undefined) return body;
@@ -384,17 +460,44 @@ async function main() {
   };
   const pr = Number(positionals[0]);
   if (!Number.isInteger(pr) || pr <= 0) {
-    fail('usage: ci-heal-escalation-mark.mjs <pr> --head=<sha> --outcome=needs-human|waiting-on-system-fix|not-a-ci-break '
-      + '[--reason="<text>"] [--system-fix=<n>] [--cause=main-defect] [--repo=<owner/name>] [--run=<id> --attempt=<n>]');
+    fail('usage: ci-heal-escalation-mark.mjs <pr> --head=<sha> --outcome=needs-human|waiting-on-system-fix|not-a-ci-break|inherited-from-base '
+      + '[--reason="<text>"] [--system-fix=<n>] [--base-pr=<n>] [--base-head=<sha>] [--cause=main-defect] [--repo=<owner/name>] [--run=<id> --attempt=<n>]');
   }
   if (typeof flags.head !== 'string' || !flags.head) fail('--head=<sha> is required');
+  const repo = typeof flags.repo === 'string' ? flags.repo : undefined;
+  const repoSlug = repo || resolveOwedRepo({ repoFlag: repo })?.slug;
+  const inherited = flags.outcome === 'inherited-from-base';
+  const repoArgs = repoSlug ? ['--repo', repoSlug] : [];
+  const ghRead = args => execFileSync('gh', args, {
+    encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+  // Best effort for ordinary escalations; inherited red must identify its owner and judged base.
+  if (!flags['base-head'] || (inherited && !flags['base-pr'])) {
+    let baseRefName;
+    try { baseRefName = JSON.parse(ghRead(['pr', 'view', String(pr), ...repoArgs, '--json', 'baseRefName,headRefOid'])).baseRefName; }
+    catch { /* GitHub may be unavailable; keep explicitly supplied facts. */ }
+    let defaultBranch = 'main';
+    try { defaultBranch = ghRead(['repo', 'view', ...(repoSlug ? [repoSlug] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name']) || 'main'; }
+    catch { /* Default to main when the repository metadata is unavailable. */ }
+    if (baseRefName && baseRefName !== defaultBranch) {
+      if (!flags['base-head']) flags['base-head'] = defaultReadBaseHead(baseRefName, { repo: repoSlug })?.sha;
+      if (inherited && !flags['base-pr']) {
+        try {
+          const number = ghRead(['pr', 'list', ...repoArgs, '--head', baseRefName, '--state', 'open', '--json', 'number', '--jq', '.[0].number']);
+          if (/^[1-9]\d*$/.test(number)) flags['base-pr'] = number;
+        } catch { /* The required-field check below explains what must be supplied. */ }
+      }
+    }
+  }
+  if (inherited && (!flags['base-pr'] || !flags['base-head'])) {
+    fail('inherited-from-base requires --base-pr=<n> and --base-head=<sha>; could not resolve the stacked base from GitHub');
+  }
   let body;
   try {
     body = composeCiHealEscalation(flags);
   } catch (e) {
     fail(String(e.message || e));
   }
-  const repo = typeof flags.repo === 'string' ? flags.repo : undefined;
   // card x9zznl9 — never record `not-a-ci-break` while a required check is still running, missing, or red (live
   // PR #4535: recorded 25 s before `test` completed FAILED, then pinned that head for hours).
   const recordable = await checkNotCiBreakRecordable({ pr, repo, headSha: flags.head, outcome: flags.outcome });
@@ -411,6 +514,17 @@ async function main() {
   }
   if (!posted.commented) {
     process.stderr.write(`⚠ CI-heal escalation on PR #${pr} refused by the GitHub budget — recorded owed (head ${flags.head}); the next ci-heal-pr-dispatch tick posts it\n`);
+  }
+  let baseNotePosted = false;
+  if (inherited && posted.commented) {
+    try {
+      postPrComment({ pr: flags['base-pr'], repo: repoSlug, body: buildInheritedRedBaseNote({
+        stackedPr: pr, stackedHead: flags.head, baseHeadSha: flags['base-head'], reason: flags.reason || '',
+      }) });
+      baseNotePosted = true;
+    } catch (e) {
+      process.stderr.write(`⚠ could not post inherited-red note on base PR #${flags['base-pr']}: ${String(e?.message || e).split('\n')[0]}\n`);
+    }
   }
   // Replace a stale `review-status:fixing`/`review-status:fix-stalled` label IMMEDIATELY — this session is about
   // to exit, and waiting for the next scheduled `review-status-tag.mjs` tick (still driven by a LIVE-agent read
@@ -432,7 +546,7 @@ async function main() {
     // a failed clear here is never worth failing the escalation itself over; the next scheduled tick still
     // self-corrects it once this process is gone.
   }
-  process.stdout.write(JSON.stringify({ ok: true, pr, escalated: true, ...(posted.owed ? { owed: true } : {}), outcome: flags.outcome }) + '\n');
+  process.stdout.write(JSON.stringify({ ok: true, pr, escalated: true, ...(posted.owed ? { owed: true } : {}), outcome: flags.outcome, ...(inherited ? { baseNotePosted } : {}) }) + '\n');
 }
 if (IS_CLI) {
   main().catch((e) => {
