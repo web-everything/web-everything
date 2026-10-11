@@ -505,6 +505,43 @@ describe('defaultReadRequiredStatusChecks', () => {
     expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({ ...expected, fetchedAtMs: 1000 });
   });
 
+  // The same break with the sources swapped: a readable ruleset behind a classic denial is a floor too.
+  it('a classic access denial behind a readable ruleset keeps every ruleset check on top of the declared policy', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    const gh = () => bothSources(JSON.stringify([[requiredRule('test', 'security-scan')]]),
+      new Error('HTTP 403: Resource not accessible by integration'));
+    expect(() => defaultReadRequiredStatusChecks({ gh: gh() }))
+      .toThrow(expect.objectContaining({ partialChecks: ['test', 'security-scan'] }));
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: gh() });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS, 'security-scan'], source: 'declared' });
+  });
+
+  it('a denial behind a live cache adds the readable source\'s checks to the stale-cache result, file untouched', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('test', 'new-classic')) });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000, readChecks }))
+      .toMatchObject({ checks: ['test', 'security-scan', 'new-classic'], source: 'stale-cache' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`].checks).toEqual(['test', 'security-scan']);
+  });
+
+  it('a transient rules failure with no cache keeps the readable classic set on top of the fallback', () => {
+    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce(classicBranch('classic-only'));
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
+    expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath: join(dir, 'cache.json'), readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS, 'classic-only'], source: 'fallback' });
+  });
+
+  it('a rules read that throws a falsy value is still a failed read, never a classic-only live set', () => {
+    const gh = vi.fn().mockImplementationOnce(() => { throw undefined; }).mockReturnValueOnce(classicBranch('classic'));
+    let threw = false;
+    try { defaultReadRequiredStatusChecks({ gh }); } catch { threw = true; }
+    expect(threw).toBe(true);
+  });
+
   it('a rules access denial on an undeclared repo with no cache is an untrusted fallback that keeps the classic set', () => {
     const cachePath = join(dir, 'cache.json');
     const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('classic')) });

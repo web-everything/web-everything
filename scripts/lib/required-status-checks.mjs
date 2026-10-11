@@ -155,6 +155,7 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
   const base = `repos/${repo || '{owner}/{repo}'}`;
   let rulesChecks = [];
   let rulesError;
+  let rulesFailed = false; // a flag, not `rulesError`'s truthiness: a `throw undefined` is still a failed read
   try {
     // The rules endpoint pages at 30: read every page (`--slurp` → one array of pages) so a required check on a
     // later page is never dropped. A blank body is a failed read, not "no rules" (JSON.parse('') throws).
@@ -162,6 +163,7 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     rulesChecks = requiredChecksFromRules(flattenRulePages(JSON.parse(out.trim())));
   } catch (error) {
     rulesError = error;
+    rulesFailed = true;
   }
 
   // GitHub enforces rulesets AND classic protection together, so classic protection is always read too and the
@@ -173,10 +175,12 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     const out = gh(['api', `${base}/branches/${branch}`]);
     checks = requiredChecksFromBranch(JSON.parse(out.trim())); // blank body = failed read, same as the rules read
   } catch (error) {
+    // The ruleset read fine: its set is partial, never live, but stays required on whatever the caller falls back to.
+    if (!rulesFailed) throw withPartialChecks(error, rulesChecks);
     // A transient rules failure must not become a denial just because protection is inaccessible.
-    throw rulesError && !protectionAccessDenied(rulesError) ? rulesError : error;
+    throw !protectionAccessDenied(rulesError) ? rulesError : error;
   }
-  if (!rulesError) {
+  if (!rulesFailed) {
     const union = [...new Set([...rulesChecks, ...checks])];
     // Both sources read fine and neither requires a check: an authoritative "nothing required", which selects the
     // repo's declared policy exactly as a protection denial does — never the untrusted `fallback`.
@@ -185,10 +189,21 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
   }
   // Rulesets can require checks classic protection lacks, and an unreadable ruleset does not mean its requirements
   // disappeared — so after ANY rules failure the classic set is partial and never returned as live: throw the rules
-  // error (its denial/transient classification intact) so the caller keeps a live cache or the declared policy. A
-  // denial carries the classic set as `partialChecks`, a floor the caller still requires (PR #4924 red team).
-  if (protectionAccessDenied(rulesError)) rulesError.partialChecks = checks;
-  throw rulesError;
+  // error (its denial/transient classification intact) so the caller keeps a live cache or the declared policy. It
+  // carries the classic set as `partialChecks`, a floor the caller still requires (PR #4924 red team).
+  throw withPartialChecks(rulesError, checks);
+}
+
+/**
+ * One source read fine while the other failed: attach the readable source's checks to the failure as
+ * `partialChecks` — never a live set, but a floor {@link getRequiredStatusChecks} adds to every degraded result.
+ * A non-object throw cannot carry it and passes through unchanged (its classification must not change either).
+ */
+function withPartialChecks(error, partialChecks) {
+  if (error && typeof error === 'object' && partialChecks.length) {
+    try { error.partialChecks = partialChecks; } catch { /* a frozen error degrades without the floor */ }
+  }
+  return error;
 }
 
 /**
@@ -252,28 +267,31 @@ export function getRequiredStatusChecks({
     return { checks, source };
   };
 
+  // Checks a source that DID read still requires (the other source failed): never live, but added to every degraded
+  // result below — the declared policy, the stale cache or the fallback — so a degraded read never drops them.
+  let partial = [];
+  const withPartial = checks => [...new Set([...checks, ...partial])];
   try {
     const checks = readChecks({ repo, branch });
     if (Array.isArray(checks) && checks.length) {
       return save(checks, 'live');
     }
   } catch (error) {
+    if (Array.isArray(error?.partialChecks)) partial = error.partialChecks;
     if (protectionAccessDenied(error) || error?.noRequiredChecks === true) {
       // An existing live entry (source `live`, or a legacy source-less one) is real branch-protection data: a
       // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
       // the file is untouched, so the next call re-reads live once more.
       const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
-      // Checks a readable source still requires (classic protection behind a rules denial) are never dropped.
-      const partial = Array.isArray(error.partialChecks) ? error.partialChecks : [];
       if (!hasLiveCache) {
-        if (declared) return save([...new Set([...declared, ...partial])], 'declared');
-        if (!cache) return { checks: [...partial], source: 'fallback' };
+        if (declared) return save(withPartial(declared), 'declared');
+        if (!cache) return { checks: withPartial([]), source: 'fallback' };
       }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */
   }
 
-  if (cache) return { checks: cache.checks, source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
+  if (cache) return { checks: withPartial(cache.checks), source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
     cacheAgeMs: now - cache.fetchedAtMs };
-  return declared ? { checks: [...declared], source: 'fallback' } : { checks: [], source: 'unavailable' };
+  return declared ? { checks: withPartial(declared), source: 'fallback' } : { checks: withPartial([]), source: 'unavailable' };
 }
