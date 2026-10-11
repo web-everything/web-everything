@@ -1387,6 +1387,27 @@ describe('judgeSpawn — an unparseable stdout is retried once with a fresh sess
     expect(calls).toHaveLength(1);
   });
 
+  it('rejects an invalid caller-supplied retry count BEFORE spawning — never resolves undefined', async () => {
+    const bad = [-1, Number.NaN, 0.5, 1.5, UNPARSEABLE_RETRY_SETTING.max + 1, Infinity, -Infinity, '1', null, true, {}, []];
+    for (const retries of bad) {
+      const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+      const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries, log: () => {}, spawnFn: fn })
+        .then((r) => ({ resolved: r }), (e) => e);
+      expect(err, `retries=${String(retries)}`).toBeInstanceOf(RangeError);
+      expect(err.message).toContain('retries');
+      expect(calls, `retries=${String(retries)}`).toHaveLength(0);
+    }
+  });
+
+  it('accepts every integer retry count in 0..max, and spawns 1 + retries times when all fail', async () => {
+    for (let retries = 0; retries <= UNPARSEABLE_RETRY_SETTING.max; retries += 1) {
+      const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }]);
+      await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries, log: () => {}, spawnFn: fn }))
+        .rejects.toBeInstanceOf(JudgeUnparseableError);
+      expect(calls).toHaveLength(1 + retries);
+    }
+  });
+
   it('does NOT retry a juror that answered with its own error text (a real failure, not a lost output)', async () => {
     const { fn, calls } = scriptedSpawn([{ stdout: JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), code: 1 }]);
     await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn }))

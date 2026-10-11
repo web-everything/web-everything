@@ -198,16 +198,21 @@ export const UNPARSEABLE_RETRY_SETTING = Object.freeze({
   key: 'judgeUnparseableRetries', env: 'WE_JUDGE_UNPARSEABLE_RETRIES', builtIn: 1, max: 3,
 });
 
+/** True for a bounded whole-number retry count (0..max) — the one definition settings and callers share. */
+function isValidRetryCount(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= UNPARSEABLE_RETRY_SETTING.max;
+}
+
 /** Resolve a valid retry count from environment, settings, then the built-in default. */
 export function resolveUnparseableRetries({
   env = process.env,
   file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json'),
   readFile = (p) => readFileSync(p, 'utf8'),
 } = {}) {
-  const { key, env: envKey, builtIn, max } = UNPARSEABLE_RETRY_SETTING;
+  const { key, env: envKey, builtIn } = UNPARSEABLE_RETRY_SETTING;
   const valid = (value) => {
     if (typeof value === 'string' && /^\d+$/.test(value)) value = Number(value);
-    return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= max ? value : null;
+    return isValidRetryCount(value) ? value : null;
   };
   const fromEnv = valid(env[envKey]);
   if (fromEnv !== null) return { value: fromEnv, source: 'env' };
@@ -881,6 +886,11 @@ export async function judgeSpawn({
   assertLaneCwd(cwd, allowedTools);
   // Only reached for a tool-free juror, which cannot write and for which the directory is immaterial.
   const spawnCwd = cwd ?? process.cwd();
+  // An explicit count gets the same bound the settings get. Unchecked, -1 / NaN skip the loop and 0.5 exits it
+  // early, so the call fell off the end and resolved `undefined` instead of a verdict or a thrown error.
+  if (retries !== undefined && !isValidRetryCount(retries)) {
+    throw new RangeError(`judge-spawn: \`retries\` must be an integer from 0 to ${UNPARSEABLE_RETRY_SETTING.max}, got ${typeof retries === 'number' ? retries : typeof retries}`);
+  }
   const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
   retries = setting.value;
   const total = 1 + retries;
