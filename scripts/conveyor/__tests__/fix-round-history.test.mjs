@@ -71,11 +71,29 @@ describe('fix round history (card xx0055i)', () => {
     const many = [];
     for (let i = 0; i < 12; i++) {
       const head = (i.toString(16)).repeat(40).slice(0, 40);
-      many.push(review(`2026-10-01T${String(i + 1).padStart(2, '0')}:00:00Z`, head, Array.from({ length: 8 }, (_, k) => [`src/f${k}.mjs`, k + 1, 'x'.repeat(200)])));
+      many.push(review(`2026-10-01T${String(i + 1).padStart(2, '0')}:00:00Z`, head, Array.from({ length: 8 }, (_, k) => [`src/f${k}.mjs`, k + 1, `RND_${i}_${k}_${'x'.repeat(200)}`])));
     }
     const text = renderRoundHistory(buildRoundHistory({ comments: many }), { maxChars: 3000 });
     expect(text.length).toBeLessThanOrEqual(3000);
     expect(text).toMatch(/earlier round\(s\) left out|cut at 3000/);
+    // The OLDEST rounds go first: the newest previous round's findings survive and every omitted round is older than every kept one.
+    expect(text).toContain('RND_10_');
+    expect(text).not.toContain('RND_0_');
+    const kept = [...text.matchAll(/RND_(\d+)_/g)].map((m) => Number(m[1]));
+    const dropped = [...Array(11).keys()].filter((i) => !kept.includes(i)); // the 12th (latest) round is the current one, never listed as previous
+    expect(dropped.length).toBeGreaterThan(0);
+    expect(Math.max(...dropped)).toBeLessThan(Math.min(...kept));
+  });
+
+  it('when ONE round alone is over the cap, the round text is cut and the current rulings survive', () => {
+    const huge = review('2026-10-01T01:00:00Z', SHA('a'), Array.from({ length: 30 }, (_, k) => [`src/f${k}.mjs`, k + 1, `BIG_${k}_${'y'.repeat(210)}`]));
+    const comments = [huge, rulings('2026-10-01T01:05:00Z', SHA('a'), [['src/f0.mjs', 1, 'the ruled claim', 'block']]),
+      review('2026-10-01T02:00:00Z', SHA('b'), [['src/z.mjs', 1, 'current round']])];
+    const text = renderRoundHistory(buildRoundHistory({ comments }), { maxChars: 1200 });
+    expect(text.length).toBeLessThanOrEqual(1200);
+    expect(text).toMatch(/cut at 1200/);
+    expect(text).toContain('## Current rulings');
+    expect(text).toContain('the ruled claim');
   });
 
   it('current rulings keep only the latest ruling per finding', () => {

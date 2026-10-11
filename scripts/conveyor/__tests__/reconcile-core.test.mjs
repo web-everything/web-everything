@@ -186,7 +186,7 @@ describe('case 1 — the dispatch, keyed by PR NUMBER (#3296)', () => {
   // pushes onto `refusals` must be registered. (Dynamic kinds — `refuse(live.kind, …)` — are covered by the plan tests.)
   it('every LITERAL refusal kind the source can emit is on the frozen REFUSAL_KINDS list (no unregistered refusal)', () => {
     const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'reconcile-core.mjs'), 'utf8');
-    const literal = new Set([...src.matchAll(/\brefuse\(\s*'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]));
+    const literal = new Set([...src.matchAll(/\brefuse\w*\(\s*'([a-z][a-z0-9-]*)'/g)].map((m) => m[1]));
     for (const m of src.matchAll(/refusals\.push\(\{\s*(?:\.\.\.[A-Za-z]+,\s*)?kind:\s*'([a-z][a-z0-9-]*)'/g)) literal.add(m[1]);
     expect(literal.size).toBeGreaterThan(15); // the scan really found the call sites
     // `timeout-retry-ineligible` is deliberately NOT a refusal kind: it is pushed alongside the `ci-heal` dispatch the

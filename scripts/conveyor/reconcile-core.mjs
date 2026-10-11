@@ -106,7 +106,8 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
-import { takeoverReviewCap } from './fix-takeover.mjs';
+import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
+import { parseOperatorRulingComment, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
@@ -319,6 +320,11 @@ export const REFUSAL_KINDS = Object.freeze([
   // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
   // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
   'scope-bloat', 'ruling-dispute',
+  // Same class again, from the cap step's `refuseFn(...)` calls (the scan only matched `refuse(`): a PR the takeover
+  // planner declines to take over gets one of these instead of the registered `cap-exhausted`. `gate-hold` — held by
+  // its own gate with no open defect; `takeover-awaiting-review` — the latest takeover's head is not judged yet;
+  // `mechanical-carry-forward` — a proven mechanical round carries its parent's verdict, no fix owed.
+  'gate-hold', 'takeover-awaiting-review', 'mechanical-carry-forward',
 ]);
 
 /**
@@ -1404,6 +1410,84 @@ function dispatchReviewRow({
   });
 }
 
+/** `fix.operatorRulingExtraRounds` — how many directed repair rounds one operator ruling grants past the round cap. */
+export const OPERATOR_RULING_EXTRA_ROUNDS_SETTING = 'operatorRulingExtraRounds';
+export const OPERATOR_RULING_EXTRA_ROUNDS_ENV = 'WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS';
+export const OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT = 1;
+/** A rounds value: an integer 0..99 (a number, or a digit string). `null` when invalid (`[2]`, `""`, `1.5`, `-1`, `off`). */
+const asRounds = (v) => {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 99 ? v : null;
+  return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : null;
+};
+
+/**
+ * PURE: the policy cascade for `fix.operatorRulingExtraRounds` — standard default → platform preference → tool override
+ * (`we:scripts/settings/fix.json`) → env. Both file layers are the parsed JSON documents, whose settings live under
+ * their `fix` key (like every other `fix.*` setting; see `takeover-budget.mjs#resolveTakeoverBudget`). It fails
+ * CLOSED, like that sibling: the highest layer that is PRESENT (a non-blank env var, or a key that is not null in a
+ * file's `fix` object) decides, and a present value that is not a valid count turns the grant off (value 0, source
+ * `<layer>-invalid`) instead of falling through to the standard 1, so a typo meant to stop it never starts a session.
+ * @returns {{value:number, source:'standard'|'platform'|'repo'|'env'|'platform-invalid'|'repo-invalid'|'env-invalid'}}
+ */
+export function resolveOperatorRulingExtraRounds({ env = {}, platform = null, repo = null } = {}) {
+  const present = (v) => v !== undefined && v !== null;
+  const envRaw = env?.[OPERATOR_RULING_EXTRA_ROUNDS_ENV];
+  const layers = [
+    ['env', typeof envRaw === 'string' && envRaw.trim() === '' ? undefined : envRaw],
+    ['repo', repo?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]],
+    ['platform', platform?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]],
+  ];
+  for (const [source, raw] of layers) {
+    if (!present(raw)) continue;
+    const v = asRounds(raw);
+    return v === null ? { value: 0, source: `${source}-invalid` } : { value: v, source };
+  }
+  return { value: OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT, source: 'standard' };
+}
+
+/**
+ * PURE: the directed repair round an operator ruling grants on the blocked-findings round cap (live: PR #4631
+ * @f0f4943fb, 2026-10-10 — the operator ruled every open finding `block` WITH A DIRECTION on the current head, and
+ * the cap still sent it back to "a person must take it over", so nothing could act on the direction).
+ *
+ * Granted only when EVERY block-ruled referral on this head is covered by a trusted operator `block` ruling recorded
+ * for this exact head (an `auto-policy` block is not the operator). The grant is bound to the ruling: takeover
+ * markers posted on this head after the latest covering ruling count against `allowance`, so the same ruling never
+ * grants a second round (a voided marker — the launch provably never started — does not count). A new head is not
+ * covered by a ruling on the old one, so a finding that comes back goes to the operator again.
+ * @returns {{ok:true, head:string, rulingAt:string, used:number, allowance:number, rulings:Array<object>}|{ok:false, reason:string}}
+ */
+export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT } = {}) {
+  const head = String(pr?.headRefOid ?? '');
+  const blocked = Array.isArray(pr?.blockRuledReferrals) ? pr.blockRuledReferrals : [];
+  if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
+  if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const covering = [];
+  for (const c of comments) {
+    const record = parseOperatorRulingComment(c)?.record;
+    if (!record || record.head !== head || String(record.actor).toLowerCase() === AUTO_POLICY_ACTOR) continue;
+    for (const x of record.rulings) {
+      if (x.result === 'block') covering.push({ key: x.key, actor: record.actor, channel: record.channel, reason: record.reason, at: record.at, createdAt: c.createdAt ?? null });
+    }
+  }
+  if (!blocked.every((b) => covering.some((r) => r.key === b.key))) return { ok: false, reason: 'not-covered' };
+  const rulings = covering.filter((r) => blocked.some((b) => b.key === r.key));
+  const stamp = (r) => Date.parse(r.createdAt ?? r.at);
+  const rulingAtMs = Math.max(...rulings.map(stamp).filter(Number.isFinite));
+  if (!Number.isFinite(rulingAtMs)) return { ok: false, reason: 'not-covered' };
+  const used = takeoverMarkers(comments).filter((m) => sameHeadSha(m.head, head) && Date.parse(m.at ?? '') > rulingAtMs).length;
+  if (used >= allowance) return { ok: false, reason: 'ruling-round-spent', used, allowance };
+  return { ok: true, head, rulingAt: new Date(rulingAtMs).toISOString(), used, allowance, rulings };
+}
+
+/** The operator's direction(s), verbatim, as the fix brief's operator-answer section reads them. */
+function operatorRulingAnswer(rulings) {
+  const reasons = [...new Set(rulings.map((r) => r.reason))];
+  const last = rulings.at(-1);
+  return { actor: last.actor, channel: last.channel, at: last.at, reason: reasons.join('\n\n') };
+}
+
 // A canonical operator verdict is itself the durable grant. Anchor the allowance to
 // the counters BEFORE that comment, never to the counters on the current tick.
 // GitHub author metadata is required: copied attribution in an agent comment grants nothing.
@@ -1585,6 +1669,9 @@ export function planReconcile({
   // default): a proven mechanical round's head carries its parent's verdict forward on an identical net diff, or earns
   // one review past the cap when only the conflict hunks changed. `true`: mechanical rounds count as rounds.
   mechanicalRoundsCountTowardCap = false,
+  // `fix.operatorRulingExtraRounds` ({value, source}; see {@link resolveOperatorRulingExtraRounds}). The IO shell passes
+  // the resolved cascade; the default is the standard layer alone.
+  operatorRulingExtraRounds = resolveOperatorRulingExtraRounds(),
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -2518,6 +2605,29 @@ export function planReconcile({
     // Unruled referrals never reach here (`blockRuledReferrals` is empty while any is pending).
     if (phase === 'needs-human' && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
       const attempts = roundAttempts();
+      // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
+      // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see
+      // {@link operatorRulingRound}.
+      // The directed takeover is still an automatic takeover: the takeover kill switches stop it too
+      // (`fix.roundCapAction=person`, `fix.takeoverBudget` 0 or invalid), so one off switch turns off every
+      // automatic takeover, not only the one `planTakeover` dispatches.
+      const takeoverOn = roundCapAction === 'takeover' && Number.isInteger(takeoverBudget) && takeoverBudget > 0;
+      const directed = attempts >= effectiveRoundCap && takeoverOn ? operatorRulingRound(pr, { allowance: operatorRulingExtraRounds.value }) : null;
+      if (directed?.ok) {
+        const setting = `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}=${operatorRulingExtraRounds.value} (source: ${operatorRulingExtraRounds.source})`;
+        const ladder = takeoverRung(fixerLadder);
+        dispatch.push({
+          ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: pr.blockRuledReferrals.length,
+          attempts, cap: effectiveRoundCap, blockRuledReferrals: pr.blockRuledReferrals,
+          operatorAnswer: operatorRulingAnswer(directed.rulings),
+          takeover: { attempts, cap: effectiveRoundCap, rung: ladder.rung, route: ladder.route, n: directed.used + 1, budget: directed.allowance },
+          operatorRulingRound: { head: directed.head, rulingAt: directed.rulingAt, used: directed.used, allowance: directed.allowance,
+            setting: `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}`, source: operatorRulingExtraRounds.source },
+          why: `fix rounds exhausted (${attempts}/${effectiveRoundCap}), but the operator ruled every blocked finding on this head with a direction`
+            + ` (${directed.rulingAt}) — directed takeover ${directed.used + 1} of ${directed.allowance} on the ${ladder.rung.id} route, ${setting}`,
+        });
+        continue;
+      }
       if (attempts >= effectiveRoundCap) {
         refuseCapExhausted({
           ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
