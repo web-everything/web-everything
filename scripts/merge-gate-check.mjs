@@ -387,7 +387,8 @@ export function combineRedMain(freeze, mainCi, pr = null) {
 export function applyFreezeRecheck(verdict, first, recheck, { mainCi = undefined, mainCiRecheck = undefined, exempt = false } = {}) {
   if (!verdict.ok) return verdict;
   let why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${recheck?.error || 'not read'}`
-    : recheck.frozen ? `main went RED during this run (freeze: ${recheck.reason || 'active'})`
+    // Same rule as combineRedMain: an automatic freeze spares a run made only of current main-fix PRs; a manual one never.
+    : recheck.frozen && (recheck.kind !== 'auto' || !exempt) ? `main went RED during this run (freeze: ${recheck.reason || 'active'})`
       : (first?.frozen !== recheck.frozen || (first?.publishedAt ?? null) !== (recheck.publishedAt ?? null)) ? 'red-main freeze changed during this run'
         : null;
   if (!why && mainCi !== undefined) {

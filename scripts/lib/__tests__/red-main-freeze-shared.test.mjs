@@ -432,6 +432,18 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     expect(gate(combineRedMain(freeze, red, { ...PR, headRefName: 'lane/x' }))).toMatchObject({ status: 'hold' });
   });
 
+  it('`decide --apply` never DOWNGRADES a standing manual freeze whose publish failed — `publish` still lands it as manual', () => {
+    fx.breakOrigin();
+    expect(fx.run(['freeze', '--reason=operator stop'], { WE_RED_MAIN_FREEZE_SHARED_DEADLINE_MS: '1' }).status).toBe(1);
+    fx.fixOrigin();
+    const d = fx.run(['decide', '--trigger=push', '--ref=main', '--result=red', '--merge-sha=abc', '--apply']);
+    expect(d.status).toBe(0);
+    expect(d.stderr).toMatch(/MANUAL freeze is already standing.*kept/);
+    expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ kind: 'manual', reason: 'operator stop' });
+    expect(fx.run(['publish']).status).toBe(0);
+    expect(fx.shared()).toMatchObject({ frozen: true, kind: 'manual', reason: 'operator stop' });
+  });
+
   it('`publish` refuses to republish an AUTOMATIC local freeze (it would become a manual stop that blocks the main-fix PR)', () => {
     fx.run(['decide', '--trigger=push', '--ref=main', '--result=red', '--apply']);
     const r = fx.run(['publish']);
@@ -591,6 +603,14 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
     });
     it('a run made only of main-fix PRs keeps its PASS while main is red', () => {
       expect(applyFreezeRecheck(PASS, CLEAR, CLEAR, { mainCi: { source: 'ci', red: true }, mainCiRecheck: { source: 'ci', red: true }, exempt: true })).toEqual(PASS);
+    });
+    it('the verdict-time re-read honours the same auto/manual rule: an AUTOMATIC freeze spares an all-main-fix run, a MANUAL one never', () => {
+      const red = { source: 'ci', red: true, redShas: ['b'.repeat(40)] };
+      const auto = { ...CLEAR, frozen: true, kind: 'auto', reason: 'decide --apply' };
+      const manual = { ...CLEAR, frozen: true, kind: 'manual', reason: 'operator stop' };
+      expect(applyFreezeRecheck(PASS, auto, auto, { mainCi: red, mainCiRecheck: red, exempt: true })).toEqual(PASS);
+      expect(applyFreezeRecheck(PASS, auto, auto, { mainCi: red, mainCiRecheck: red, exempt: false }).ok).toBe(false);
+      expect(applyFreezeRecheck(PASS, manual, manual, { mainCi: red, mainCiRecheck: red, exempt: true }).ok).toBe(false);
     });
     it('main still green → PASS stands', () => {
       expect(applyFreezeRecheck(PASS, CLEAR, CLEAR, { mainCi: green, mainCiRecheck: green })).toEqual(PASS);

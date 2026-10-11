@@ -356,7 +356,13 @@ async function runCli(argv) {
     // An AUTOMATIC freeze: the local marker stops the drain, but nothing is published — the shared copy carries manual
     // freezes only, and main's own CI already tells the merge-gate that main is red (operator ruling 2026-10-11). A
     // published copy would read as a manual stop and hold even the main-fix PR. A `proceed` decision raises nothing.
-    if (d.action === 'stop-the-line' && flags.apply) freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'], kind: 'auto' });
+    // A standing MANUAL marker is never downgraded: overwriting it with `auto` would make `publish` refuse it, and an
+    // operator's stop that has not yet reached CI would then never reach it.
+    if (d.action === 'stop-the-line' && flags.apply) {
+      const standing = readFreeze();
+      if (standing && standing.kind !== 'auto') process.stderr.write(`red-main freeze: a MANUAL freeze is already standing (${String(standing.reason ?? 'frozen').slice(0, 120)}); kept as is — the drain stays stopped.\n`);
+      else freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'], kind: 'auto' });
+    }
   } else if (cmd === 'publish') {
     // Republish the current local MANUAL freeze — the retry after a failed `freeze`. No valid marker → refused; an
     // automatic one → refused too (it is never published: see `decide`).
