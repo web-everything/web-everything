@@ -608,6 +608,53 @@ describe('held item 212 red team — shared prerequisites are not evidence of a 
     expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
   });
 
+  it('…nor when the prerequisite branch moved again after P was built on an older copy of it', async () => {
+    const f = fixture();
+    const h = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite' }) });
+    f.push('lane/c', h, { [TAKEOVER]: lines({ 2: 'c edit' }) });
+    const h1 = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite', 11: 'restacked' }) });
+    f.push('lane/p', h1, { [TAKEOVER]: lines({ 2: 'p edit' }) });
+    f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite', 12: 'restacked again' }) }); // H2: P's copy is no tip
+    f.fetch();
+    const plan = await siblingsPlan(f, { 9501: ['lane/h'], 9502: ['lane/p', 'lane/h'] });
+    expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+  });
+
+  it('…nor when both siblings cherry-picked the same registered hotfix', async () => {
+    const f = fixture();
+    const HOTFIX = 'scripts/ci-hotfix.mjs';
+    f.push('lane/x', f.init, { [HOTFIX]: 'fix\n' });
+    const px = f.push('lane/p', f.init, { [HOTFIX]: 'fix\n' }); // the same patch, under P's own subject
+    f.push('lane/p', px, { [TAKEOVER]: lines({ 2: 'p edit' }) });
+    const cx = f.push('lane/c', f.init, { [HOTFIX]: 'fix\n' });
+    f.push('lane/c', cx, { [TAKEOVER]: lines({ 2: 'c edit' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9502 ? ['lane/p'] : []),
+      overlays: [{ ref: 'lane/x', pr: 9500 }, { ref: 'lane/p', pr: 9501 }, { ref: 'lane/c', pr: 9502 }],
+    });
+    expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+  });
+
+  it('live shape with the intermediate chain refs pushed and registered: their content still counts as the base\'s work', async () => {
+    const f = fixture();
+    const mids = CHAINS[4792].slice(0, 3);
+    for (const m of mids) gitOk(f.author, ['push', '-q', '-f', 'origin', `${f.ladder}:refs/heads/${m}`]);
+    f.moveBase();
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+      overlays: [{ ref: BASE, pr: 4756 }, ...mids.map((ref, i) => ({ ref, pr: 9601 + i })), { ref: LAST, pr: 4792 }],
+    });
+    expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+    expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'apply' });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
+  });
+
   it('a real child of a rebased base that shares a prerequisite with it is still recognised (its own work matches)', async () => {
     const f = fixture();
     const h = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite' }) });

@@ -147,26 +147,57 @@ export async function planOverlayStacks({
     nodes.push({ raw, ref: raw.ref, pr, sha, chain: Array.isArray(chain) ? chain : [] });
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
-  // Git evidence that C was built on P, short of ancestry: C carries a commit patch-equivalent to one of P's (cherry-mark
-  // `=`; survives a reworded or re-dated rebase), or one with the same author and subject (survives a rebase that resolved
-  // conflicts, which changes the patch). Only commits ONE side lacks count (P...C, newest 400): a prerequisite both
-  // branch from is shared history, not P's work, so siblings on it are not a stack. Commits reachable from P's own PR
-  // bases are not P's work either (a sibling may carry an older copy of that prerequisite); that list is untrusted, but
-  // it can only remove evidence, never add it. Unsigned history can be imitated by whoever can push the branch, so this
-  // bounds accidents and retargeted PRs, not a deliberate insider — who can already push any code to their branch.
-  const sharesWork = (p, c) => {
-    const notP = p.chain.map((r) => verifyRev(git, `refs/remotes/origin/${r}^{commit}`)).filter(Boolean);
-    const log = git(['log', '--no-merges', '--left-right', '--cherry-mark', '-n', '400', '--format=%m%x09%ae%x09%s',
-      `${p.sha}...${c.sha}`, '--not', mainSha, ...notP]);
-    if (log.status !== 0) return false;
-    const pk = new Set();
-    const ck = new Set();
-    for (const l of String(log.stdout ?? '').split('\n')) {
-      if (l.startsWith('=')) return true;
-      if (l.startsWith('<')) pk.add(l.slice(2));
-      else if (l.startsWith('>')) ck.add(l.slice(2));
+  const outLines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter((l) => l.trim()) : []);
+  // "author<TAB>subject" of the commits `sha` adds on top of main, newest 400 (cached per sha).
+  const keysCache = new Map();
+  const keysOf = (sha) => {
+    if (!keysCache.has(sha)) {
+      keysCache.set(sha, new Set(outLines(git(['log', '--no-merges', '-n', '400', '--format=%ae%x09%s', sha, '--not', mainSha]))));
     }
-    return [...pk].some((k) => ck.has(k));
+    return keysCache.get(sha);
+  };
+  const chainOf = (n) => [...n.chain, ...(Array.isArray(n.raw.stackBases) ? n.raw.stackBases : [])];
+  // Content that is NOT P's work, so it never corroborates "C is stacked on P": P's own PR bases (the prerequisites P is
+  // built on), and every other registered overlay that is not part of this stack — not P or C, not named in C's chain (a
+  // ref between C and P carries P's old work), not claiming P or C, and not descending from either. A chain is untrusted,
+  // but here it can only remove evidence, never add it.
+  const foreignShas = (p, c) => {
+    const shas = p.chain.map((r) => verifyRev(git, `refs/remotes/origin/${r}^{commit}`));
+    for (const o of nodes) {
+      if (o === p || o === c || c.chain.includes(o.ref)) continue;
+      if (chainOf(o).some((r) => r === p.ref || r === c.ref) || anc(p.sha, o.sha) || anc(c.sha, o.sha)) continue;
+      shas.push(o.sha);
+    }
+    return [...new Set(shas.filter(Boolean))];
+  };
+  // Git evidence that C was built on P, short of ancestry: C's oldest commit that P lacks (newest 400, foreign content
+  // skipped) is patch-equivalent to one of P's (cherry-mark `=`; survives a reworded or re-dated rebase) or has the same
+  // author and subject as one of P's (survives a rebase that resolved conflicts, which changes the patch) — a child is
+  // built on P's work, so that work comes first. Only commits ONE side lacks count (P...C), so a prerequisite both branch
+  // from is not evidence; foreign content is dropped from the evidence by reachability, by author/subject and by patch,
+  // so a re-copied prerequisite or a hotfix cherry-picked into both siblings is not evidence either.
+  // Residue git cannot decide: an identical commit with no branch and no registration, first on both siblings, is the
+  // same history as "C was built on P when P held only that commit". Unsigned history can be imitated by whoever can
+  // push the branch, so this bounds accidents and retargeted PRs, not a deliberate insider — who can already push any
+  // code to their branch.
+  const sharesWork = (p, c) => {
+    const foreign = foreignShas(p, c);
+    const notFrom = ['--not', mainSha, ...foreign];
+    const pKeys = new Set(outLines(git(['log', '--no-merges', '-n', '400', '--format=%ae%x09%s', `${c.sha}..${p.sha}`, ...notFrom])));
+    const cLog = git(['log', '--no-merges', '--right-only', '--cherry-mark', '--reverse', '-n', '400',
+      '--format=%m%x09%H%x09%ae%x09%s', `${p.sha}...${c.sha}`, ...notFrom]);
+    if (cLog.status !== 0) return false;
+    const fKeys = new Set(foreign.flatMap((s) => [...keysOf(s)]));
+    // C's commits patch-equivalent to foreign content (cherry-mark against each foreign tip).
+    const fPatch = new Set(foreign.flatMap((s) => outLines(git(['log', '--no-merges', '--right-only', '--cherry-mark',
+      '--format=%m%x09%H', `${s}...${c.sha}`, '--not', mainSha])).filter((l) => l.startsWith('=')).map((l) => l.slice(2))));
+    for (const l of outLines(cLog)) {
+      const [mark, sha, ...rest] = l.split('\t');
+      const key = rest.join('\t');
+      if (fKeys.has(key) || fPatch.has(sha)) continue;
+      return mark === '=' || pKeys.has(key);
+    }
+    return false;
   };
   // A chain recorded on the entry by an earlier rebuild (persistStackBases writes only claims that passed this check) is
   // evidence that survives a rebase that left nothing else to compare.
