@@ -65,6 +65,7 @@ export const OBSERVATION_ONLY = Object.freeze({
   "review-label-missing": "A missing label is reported only; restoring review goes through the guarded re-arm command, never a responder label write.",
   "review-same-head-unposted": "Alert only; inspect failed posting effects and the review caps, never re-arm or post a review from the responder.",
   "review-seat-cap-near-limit":"Low severity; report only, no provider/cap changes and no operator ping.",
+  "review-seat-failure-rate": "Failing juror seats are fixed in the spawn path via normal delivery; the responder never re-runs a review, raises the retry count or edits the threshold.",
   "ruling-needed-waiting": "A ruling is the operator's judgment; never record, infer or auto-answer one.",
   "self-sync-conflict": "Never force or hand-merge a clone/overlay from the responder.",
   "session-stuck": "Silence or repetition is a warning, not proof of death; the session watchdog and reaper alone act on the worker.",

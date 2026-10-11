@@ -17,7 +17,7 @@ import {
   runMissingRunRecoveryAllRepos, formatMissingRunActionLine,
   runPromoteDraftDispatchAllRepos, formatPromoteActionLine,
   defaultTagDispatchStatus, withFixDispatchClaimRefresh,
-  buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits,
+  buildAwaitVerifyStep, buildFixThrottle, buildDaemonExits, fixQueueLengthOf,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 import { CONSTELLATION_REPOS } from '../../../scripts/lib/constellation-repos.mjs';
 import { assertMainNotStale } from '../../../scripts/lib/main-staleness.mjs';
@@ -1221,12 +1221,34 @@ describe('xn025gx glue — buildAwaitVerifyStep, buildFixThrottle, buildDaemonEx
     expect(legacyPass).toHaveBeenCalledWith({ allowResume: false });
   });
   it('buildFixThrottle counts the fix cap with the injected active-only claim list, not the raw one', () => {
+    vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); // the legacy cap + gate decide here; the cut-over is tested below
+    vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
     const fix = { meta: { kind: 'fix', repo: 'we', pr: 1 } };
     const base = { env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '1' }, sample: () => null, loadavg: () => 0, cpuCount: () => 8, alive: () => true };
     const full = buildFixThrottle({ ...base, slotClaims: () => [fix] }).tryAdmit('fix');
     expect(full).toMatchObject({ admit: false, kind: 'fix-cap' });
     const parkedGaveItBack = buildFixThrottle({ ...base, slotClaims: () => [] }).tryAdmit('fix');
     expect(parkedGaveItBack.admit).toBe(true);
+    vi.unstubAllEnvs();
+  });
+  it('x6nuodj: fixQueueLengthOf counts distinct PRs the pass held for the fixer cap or the host gate', () => {
+    expect(fixQueueLengthOf(
+      { refusals: [{ repo: 'we', pr: 1, kind: 'fix-cap' }, { repo: 'we', pr: 2, kind: 'host-load' }, { repo: 'we', pr: 3, kind: 'queue-cap' }] },
+      { refusals: [{ repo: 'we', prNumber: 1, kind: 'fix-cap' }, { repo: 'plateau-app', prNumber: 1, kind: 'fix-cap' }] },
+      undefined,
+    )).toBe(3);
+    expect(fixQueueLengthOf()).toBe(0);
+  });
+  it('x6nuodj: buildFixThrottle sizes the dynamic cap from the queue length it is given (raised above the floor)', () => {
+    const claims = Array.from({ length: 2 }, (_, i) => ({ meta: { kind: 'fix', repo: 'we', pr: i + 1 } }));
+    const fixCap = { floor: 2, ceiling: 4, ceilingAboveFloor: 2, raiseQueueOver: 5, raiseMinCpuIdlePct: 30, raiseStepPerPass: 2 };
+    const now = Date.parse('2026-10-10T15:00:00Z');
+    const readSnap = () => ({ sampledAt: new Date(now - 5000).toISOString(), freshUntil: new Date(now + 20000).toISOString(),
+      cpu: { idlePct: 45, loadAvg: [40] }, memory: { pressureLevel: 1 }, disk: { busyPct: 100 } });
+    const t = buildFixThrottle({ slotClaims: () => claims, alive: () => true, queueLength: () => 7, readSnap, nowMs: () => now,
+      settings: { cutover: 'enforce', fixCap }, gate: () => ({ admit: true }), log: () => {}, env: { WE_FIX_DISPATCH_MAX_CONCURRENT: '2' } });
+    expect(t.tryAdmit('fix')).toMatchObject({ admit: true, aboveStaticCap: true });
+    expect(t.capDecision()).toMatchObject({ cap: 4, raised: true });
   });
   it('buildDaemonExits: both exits stop the loop child BEFORE releasing the lease and exiting; a second signal is a no-op', () => {
     const calls = [];

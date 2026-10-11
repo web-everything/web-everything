@@ -39,7 +39,7 @@ import {
  *  `--limit` the whole union costs 1 point (measured with `rateLimit(dryRun:true)`, 2026-09-27). */
 export const SNAPSHOT_FIELDS = Object.freeze([
   'number', 'title', 'body', 'url', 'isDraft', 'createdAt', 'updatedAt',
-  'headRefName', 'headRefOid', 'baseRefName', 'mergeable', 'mergeStateStatus',
+  'headRefName', 'headRefOid', 'baseRefName', 'isCrossRepository', 'mergeable', 'mergeStateStatus',
   'labels', 'files', 'comments', 'statusCheckRollup',
 ]);
 

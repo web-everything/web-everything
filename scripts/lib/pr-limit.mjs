@@ -65,10 +65,27 @@ export function resolvePrLimit(repoKey, env = process.env) {
 
 /** Built-in default: a card-only PR (every changed file under `backlog/`) is NOT counted — it costs the review
  *  system almost nothing (CI light path, no code review), so letting it fill the cap blocks real work for no gain. */
-export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true });
+export const PR_LIMIT_SCOPE_DEFAULTS = Object.freeze({ excludeCardOnly: true, excludeStackedAwaitingBase: true });
 
 /** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeCardOnly. */
 export const PR_LIMIT_EXCLUDE_CARD_ONLY_ENV = 'WE_PR_LIMIT_EXCLUDE_CARD_ONLY';
+/** The env override for {@link PR_LIMIT_SCOPE_DEFAULTS}.excludeStackedAwaitingBase. */
+export const PR_LIMIT_EXCLUDE_STACKED_ENV = 'WE_PR_LIMIT_EXCLUDE_STACKED_AWAITING_BASE';
+/** The label the review-status tagger puts on a draft whose base is another open PR (we:scripts/conveyor/review-status-tag.mjs). */
+export const AWAITING_BASE_LABEL = 'review-status:awaiting-base';
+
+/** Operator ruling 2026-10-10 (option c): a stacked draft waiting for its base PR (base is not the default branch, it
+ *  carries {@link AWAITING_BASE_LABEL}, AND its base branch is the head of another OPEN PR) is NOT counted — it cannot
+ *  land before that base does, so it adds no review or merge load yet. All three signals are required (fail-closed: a
+ *  stacked PR without the label, or a labelled one aimed at a branch no open PR owns — the label is hand-appliable and
+ *  the tagger puts it on any non-default base — still counts). `openHeadRefs` is the Set of every open UPSTREAM
+ *  (`isCrossRepository === false`) PR's `headRefName` — a fork's same-named head is not this repo's branch; absent/not
+ *  a Set → nothing is stacked. PURE. */
+export function isStackedAwaitingBasePr(pr, openHeadRefs, defaultBranch = 'main') {
+  const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
+  if (!base || base === defaultBranch || !(openHeadRefs instanceof Set) || !openHeadRefs.has(base)) return false;
+  return hasLabel(pr, AWAITING_BASE_LABEL);
+}
 
 const parseBool = (v) => {
   if (typeof v === 'boolean') return v;
@@ -82,13 +99,18 @@ const parseBool = (v) => {
  *  layer (`scripts/settings/pr-limit.json` → `prLimit`) → env. A value that is not a boolean (or a boolean-ish env
  *  string) is ignored at its layer, never coerced. */
 export function resolvePrLimitScope({ platform = {}, tool = {}, env = {} } = {}) {
-  let excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly;
-  let source = 'default';
-  if (typeof platform?.excludeCardOnly === 'boolean') { excludeCardOnly = platform.excludeCardOnly; source = 'platform'; }
-  if (typeof tool?.excludeCardOnly === 'boolean') { excludeCardOnly = tool.excludeCardOnly; source = 'tool'; }
-  const fromEnv = parseBool(env?.[PR_LIMIT_EXCLUDE_CARD_ONLY_ENV]);
-  if (fromEnv !== null) { excludeCardOnly = fromEnv; source = 'env'; }
-  return { excludeCardOnly, source: { excludeCardOnly: source } };
+  const resolveKey = (key, envName) => {
+    let value = PR_LIMIT_SCOPE_DEFAULTS[key];
+    let source = 'default';
+    if (typeof platform?.[key] === 'boolean') { value = platform[key]; source = 'platform'; }
+    if (typeof tool?.[key] === 'boolean') { value = tool[key]; source = 'tool'; }
+    const fromEnv = parseBool(env?.[envName]);
+    if (fromEnv !== null) { value = fromEnv; source = 'env'; }
+    return [value, source];
+  };
+  const [excludeCardOnly, cardSource] = resolveKey('excludeCardOnly', PR_LIMIT_EXCLUDE_CARD_ONLY_ENV);
+  const [excludeStackedAwaitingBase, stackedSource] = resolveKey('excludeStackedAwaitingBase', PR_LIMIT_EXCLUDE_STACKED_ENV);
+  return { excludeCardOnly, excludeStackedAwaitingBase, source: { excludeCardOnly: cardSource, excludeStackedAwaitingBase: stackedSource } };
 }
 
 /** Read the live scope (the settings files + env). Never throws: unreadable settings fall back to the default. */
@@ -96,8 +118,10 @@ export function readPrLimitScope({ env = process.env, read = readSettings } = {}
   let tool = {};
   try { tool = read()?.prLimit ?? {}; } catch { tool = {}; }
   const scope = resolvePrLimitScope({ platform: platformPreference('prLimit', { env }), tool, env });
-  const layer = scope.source.excludeCardOnly;
-  logCascadeSources('prLimit', { value: scope, sources: { excludeCardOnly: layer === 'default' ? 'standard' : layer } }, { env });
+  const std = (layer) => (layer === 'default' ? 'standard' : layer);
+  logCascadeSources('prLimit', { value: scope, sources: {
+    excludeCardOnly: std(scope.source.excludeCardOnly), excludeStackedAwaitingBase: std(scope.source.excludeStackedAwaitingBase),
+  } }, { env });
   return scope;
 }
 
@@ -170,7 +194,12 @@ export function countBackpressurePrs(prs) {
   return list.filter((pr) => isAiGeneratedPr(pr) && !hasLabel(pr, REVIEW_LABELS.accepted));
 }
 
-/** Fetch a repo's open PRs (`number,labels,headRefName,headRefOid` — deliberately NOT `commits`, see {@link fetchPrCommits})
+/** The open-PR fields this limit reads. `isCrossRepository` tells an upstream head from a fork's same-named one (a
+ *  stacked PR's base is always an upstream branch); every field must also be in the shared snapshot's field list
+ *  (we:scripts/lib/pr-snapshot.mjs#SNAPSHOT_FIELDS), or the snapshot never serves this reader. */
+const OPEN_PR_FIELDS = 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files';
+
+/** Fetch a repo's open PRs ({@link OPEN_PR_FIELDS} — deliberately NOT `commits`, see {@link fetchPrCommits})
  *  through the shared throttle. Fail-SOFT: any gh/auth/network hiccup returns `null` (never throws), so a
  *  transient `gh` failure degrades to "unknown count", not "block everything".
  *  @param {string} repoSlug - the gh `owner/repo` slug
@@ -180,10 +209,10 @@ export function fetchOpenPrs(repoSlug, { exec = runGhSync, localOnly = false, re
   try {
     // #gh-graphql-budget — the host-shared open-PR snapshot first (null = not applicable → the direct read).
     // `readShared` is the test seam for that snapshot (a fake `exec` alone never reaches it).
-    if (readShared || exec === runGhSync) { const shared = (readShared ?? readSharedOpenPrs)({ repo: repoSlug, fields: 'number,labels,headRefName,headRefOid,baseRefName,files', cacheOnly: localOnly }); if (shared) return shared; }
+    if (readShared || exec === runGhSync) { const shared = (readShared ?? readSharedOpenPrs)({ repo: repoSlug, fields: OPEN_PR_FIELDS, cacheOnly: localOnly }); if (shared) return shared; }
     if (localOnly) return null;
     const out = exec(
-      ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--json', 'number,labels,headRefName,headRefOid,baseRefName,files', '--limit', '100'],
+      ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--json', OPEN_PR_FIELDS, '--limit', '100'],
       { throttle: { op: 'pr list (pr-limit)' }, encoding: 'utf8' },
     );
     const rows = JSON.parse(String(out ?? '[]'));
@@ -226,43 +255,76 @@ export function fetchPrCommits(repoSlug, number, { exec = runGhSync, headRefName
  *  PR whose commits lookup fails is DROPPED from the count (unknown authorship is never assumed AI). */
 export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTable = CONSTELLATION_REPOS, git, cwd, localOnly = false, readShared, authorshipCache = null, maxApiFetches = Infinity, now = Date.now(), scope } = {}) {
   const meta = reposTable[repoKey];
-  const { excludeCardOnly } = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
+  const liveScope = scope && typeof scope.excludeCardOnly === 'boolean' ? scope : readPrLimitScope({ env });
+  const { excludeCardOnly } = liveScope;
+  const excludeStacked = liveScope.excludeStackedAwaitingBase ?? PR_LIMIT_SCOPE_DEFAULTS.excludeStackedAwaitingBase;
   const limit = resolvePrLimit(repoKey, env);
   if (!meta) return { repoKey, slug: null, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
   const prs = fetchOpenPrs(meta.slug, { exec, localOnly, readShared });
-  if (prs === null) return { repoKey, slug: meta.slug, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0 };
+  if (prs === null) return { repoKey, slug: meta.slug, count: null, prNumbers: [], limit, unavailable: true, unresolved: 0, excludeCardOnly };
   // Excluded BEFORE any commits read: an accepted or card-only PR never costs an authorship lookup.
   const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
   const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
   const cardOnlySet = new Set(cardOnlyPrs);
+  // Only an UPSTREAM head can be a stacked PR's base (a base is always a branch of this repo), so a fork PR's
+  // same-named head never counts as one. `isCrossRepository` must be exactly false: a row that does not say is no base.
+  const upstreamPrs = prs.filter((pr) => pr?.isCrossRepository === false && typeof pr?.headRefName === 'string' && pr.headRefName);
+  const openHeadRefs = new Set(upstreamPrs.map((pr) => pr.headRefName));
   // GitHub-call budget for the per-PR commits reads (git is tried first and is not counted); an exhausted budget
   // leaves the PR UNRESOLVED rather than spending past it.
   let apiFetches = 0;
   const repoCwd = cwd ?? (meta.path ? meta.path.replace('$HOME', homedir()) : process.cwd());
   const liveKeys = new Set();
+  const verdictMemo = new Map();
+  /** The PR's authorship: true (agent) / false (human) / null (unresolved). Read at most once per PR per call. */
+  const verdictOf = (pr) => {
+    if (verdictMemo.has(pr)) return verdictMemo.get(pr);
+    const ai = readVerdict(pr);
+    verdictMemo.set(pr, ai);
+    return ai;
+  };
+  const readVerdict = (pr) => {
+    // A verdict is immutable for a given head oid, so it is cached by (repo, PR, oid) — a head that moved is a miss.
+    const key = pr.headRefOid ? `${meta.slug}#${pr.number}@${pr.headRefOid}` : null;
+    if (key) liveKeys.add(key);
+    const hit = key && authorshipCache ? authorshipCache.get(key) : undefined;
+    if (typeof hit === 'boolean') return hit;
+    const coolingDown = Number.isFinite(hit?.failedAt) && now - hit.failedAt < AUTHORSHIP_FAILURE_COOLDOWN_MS;
+    let spent = false;
+    const commits = fetchPrCommits(meta.slug, pr.number, {
+      exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
+      allowApi: !coolingDown && apiFetches < maxApiFetches, onApi: () => { apiFetches++; spent = true; },
+    });
+    if (!Array.isArray(commits)) {
+      // Only an attempted API read earns a cooldown; budget/local-only misses must stay eligible.
+      if (spent && key && authorshipCache) authorshipCache.set(key, { failedAt: now });
+      return null;
+    }
+    const ai = isAiGeneratedPr({ ...pr, commits });
+    if (key && authorshipCache) authorshipCache.set(key, ai);
+    return ai;
+  };
+  // A stacked PR is excluded only while its base chain ends at a root PR this limit COUNTS: an upstream, not accepted,
+  // not card-only, non-stacked PR whose authorship resolved to agent. A human-authored or unresolved root, an accepted
+  // or card-only base, or a cycle (the walk keeps a visited set) shields nobody — every PR on such a chain counts on
+  // its own verdict. Roots are read first (they are counted anyway); an excluded candidate never costs a lookup.
+  const byHead = new Map();
+  for (const pr of upstreamPrs) byHead.set(pr.headRefName, [...(byHead.get(pr.headRefName) ?? []), pr]);
+  const isAccepted = (pr) => hasLabel(pr, REVIEW_LABELS.accepted);
+  const isCandidate = (pr) => isStackedAwaitingBasePr(pr, openHeadRefs);
+  const chainEndsAtCounted = (pr, seen) => {
+    if (seen.has(pr)) return false;
+    seen.add(pr);
+    return (byHead.get(pr.baseRefName) ?? []).some((b) => b !== pr && !isAccepted(b) && !cardOnlySet.has(b)
+      && (isCandidate(b) ? chainEndsAtCounted(b, seen) : verdictOf(b) === true));
+  };
+  const stackedPrs = excludeStacked
+    ? prs.filter((pr) => !isAccepted(pr) && !cardOnlySet.has(pr) && isCandidate(pr) && chainEndsAtCounted(pr, new Set()))
+    : [];
+  for (const pr of stackedPrs) cardOnlySet.add(pr); // excluded from the authorship lookup and the count alike
   const verdicts = prs
     .filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr))
-    .map((pr) => {
-      // A verdict is immutable for a given head oid, so it is cached by (repo, PR, oid) — a head that moved is a miss.
-      const key = pr.headRefOid ? `${meta.slug}#${pr.number}@${pr.headRefOid}` : null;
-      if (key) liveKeys.add(key);
-      const hit = key && authorshipCache ? authorshipCache.get(key) : undefined;
-      if (typeof hit === 'boolean') return { pr, ai: hit };
-      const coolingDown = Number.isFinite(hit?.failedAt) && now - hit.failedAt < AUTHORSHIP_FAILURE_COOLDOWN_MS;
-      let spent = false;
-      const commits = fetchPrCommits(meta.slug, pr.number, {
-        exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
-        allowApi: !coolingDown && apiFetches < maxApiFetches, onApi: () => { apiFetches++; spent = true; },
-      });
-      if (!Array.isArray(commits)) {
-        // Only an attempted API read earns a cooldown; budget/local-only misses must stay eligible.
-        if (spent && key && authorshipCache) authorshipCache.set(key, { failedAt: now });
-        return { pr, ai: null };
-      }
-      const ai = isAiGeneratedPr({ ...pr, commits });
-      if (key && authorshipCache) authorshipCache.set(key, ai);
-      return { pr, ai };
-    });
+    .map((pr) => ({ pr, ai: verdictOf(pr) }));
   authorshipCache?.flush(liveKeys);
   // A PR whose commits could not be read (local-only mode with its head not fetched, or the budget spent) is unknown,
   // not absent: `unresolved` lets a caller tell an undercount from a true count instead of silently failing open.
@@ -270,7 +332,8 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const counted = verdicts.filter((v) => v.ai === true).map((v) => v.pr);
   return {
     repoKey, slug: meta.slug, count: counted.length, prNumbers: counted.map((p) => p.number), limit, unavailable: false, unresolved, apiFetches,
-    cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
+    excludeCardOnly, cardOnly: cardOnlyPrs.length, cardOnlyPrNumbers: cardOnlyPrs.map((p) => p.number),
+    stacked: stackedPrs.length, stackedPrNumbers: stackedPrs.map((p) => p.number), accepted: acceptedPrs.length, acceptedPrNumbers: acceptedPrs.map((p) => p.number),
   };
 }
 
@@ -353,12 +416,18 @@ export function countOpenPrsAllRepos(o = {}) {
  */
 export function decideOpenPr({
   repoKey, limit, openCount, changedFiles = [], branch = null, branchAllowed = false, globalOff = false, forceOpen = false, forceReason = null,
-  cardOnlyExcluded = null, acceptedExcluded = null,
+  cardOnlyExcluded = null, acceptedExcluded = null, stackedExcluded = null, excludeCardOnly = PR_LIMIT_SCOPE_DEFAULTS.excludeCardOnly,
 } = {}) {
-  const split = cardOnlyExcluded == null && acceptedExcluded == null ? ''
-    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
+  const split = cardOnlyExcluded == null && acceptedExcluded == null && stackedExcluded == null ? ''
+    : ` — ${openCount} counted (${cardOnlyExcluded ?? 0} card-only excluded, ${stackedExcluded ?? 0} stacked awaiting-base excluded, ${acceptedExcluded ?? 0} accepted excluded)`;
   if (isExemptChangeset(changedFiles)) {
     return { allowed: true, reason: 'exempt: conveyor/daemon infrastructure changeset (a fix to the review/land machinery itself always gets through)', exempt: true, overridden: false };
+  }
+  // A card-only PR is never COUNTED (#4713), so refusing to OPEN one guards a count it cannot raise (xbxahvf; live
+  // 2026-10-10 the first card-batch draft was refused at 17/15). `isCardOnlyDiff` is the one definition, fail-closed.
+  // Only while the count excludes them: with `excludeCardOnly` OFF a card-only PR IS counted, so it meets the cap too.
+  if (excludeCardOnly !== false && isCardOnlyDiff(changedFiles)) {
+    return { allowed: true, reason: 'exempt: card-only changeset (not counted toward the limit)', exempt: true, overridden: false };
   }
   if (globalOff) {
     return { allowed: true, reason: 'pr-limit is globally OFF (operator override)', exempt: false, overridden: true };

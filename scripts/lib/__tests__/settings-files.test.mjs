@@ -47,6 +47,16 @@ describe('mergeSettingsLayers — pure', () => {
     expect(settingsLeaves(data).sort()).toEqual(['constructor.prototype.polluted2', 'ok.v']);
   });
 
+  it('a top-level $comment owns no leaf, so two feature files may each carry one', () => {
+    const { duplicates, owners } = mergeSettingsLayers([
+      { source: 'settings/a.json', data: { $comment: 'about a', a: 1 } },
+      { source: 'settings/b.json', data: { $comment: 'about b', b: 2 } },
+    ]);
+    expect(duplicates).toEqual([]);
+    expect(Object.keys(owners).sort()).toEqual(['a', 'b']);
+    expect(settingsLeaves({ $comment: 'x', n: { $comment: 'nested' } })).toEqual(['n.$comment']);
+  });
+
   it('a leaf named like an Object.prototype member is not a false duplicate', () => {
     const { duplicates } = mergeSettingsLayers([
       { source: 'settings/a.json', data: { toString: 1 } },

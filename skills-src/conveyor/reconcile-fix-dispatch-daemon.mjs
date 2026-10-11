@@ -63,7 +63,7 @@ import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promo
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
-import { createDispatchThrottle } from '../../scripts/lib/dispatch-throttle.mjs'; // fix-cap + host-load
+import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createFixBorrowGate } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
 import { fixLauncherAvailable } from '../../scripts/operations/dispatch-providers/fix.mjs';
@@ -739,6 +739,7 @@ export async function runTickAllRepos({
     : runReconcileFixDispatchAllRepos({ repos, ...(fixTick ? { tick: fixTick } : { queueAdmission, dispatchThrottle, borrowGate }) })));
   const ciHeal = await timedAsync('ci-heal', async () => (authGate.paused ? pausedDispatchResult()
     : await runReconcileCiHealDispatchAllRepos({ repos, ...(ciHealTick ? { tick: ciHealTick } : { queueAdmission, dispatchThrottle }) })));
+  if (dispatchThrottle) lastFixQueueLength = fixQueueLengthOf(fix, ciHeal);
   const hungCi = timed('hung-ci', () => runHungCiRecoveryAllRepos({ repos, ...(hungCiTick ? { tick: hungCiTick } : {}) }));
   // x5uqim1 follow-up (#4075/#3383) — the FOURTH half this daemon now owns: see
   // {@link runMainRedRebaseAllRepos}'s own docblock for why this daemon, specifically, is where it lives (same
@@ -927,9 +928,21 @@ export function formatNoteCommentLine(c) {
 export function buildAwaitVerifyStep({ run = runTickAwaitVerify, legacyPass = runAwaitVerifyPassDefault } = {}) {
   return ({ allowResume }) => run({ allowResume, legacyPass });
 }
-/** The fix/ci-heal dispatch throttle, counting the cap with R2's active-only claim list. */
-export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, ...rest } = {}) {
-  return createDispatchThrottle({ ...rest, listClaims: () => slotClaims() });
+/** Card x6nuodj — how many PRs waited for a fixer slot in the previous pass (null before the first pass). */
+let lastFixQueueLength = null;
+/** PURE: the distinct PRs a pass refused for the fixer cap or the host gate — the fix queue the next pass sizes the
+ *  dynamic cap from. */
+export function fixQueueLengthOf(...results) {
+  const waiting = new Set();
+  for (const r of results) for (const x of (r?.refusals ?? [])) {
+    if (x?.kind === 'fix-cap' || x?.kind === 'host-load') waiting.add(`${x.repo ?? ''}#${x.pr ?? x.prNumber}`);
+  }
+  return waiting.size;
+}
+/** The fix/ci-heal dispatch throttle, counting the cap with R2's active-only claim list. x6nuodj: the cap is dynamic
+ *  (floor..ceiling, raised when the CPU is free and the queue is long) and the host gate decides through admit(). */
+export function buildFixThrottle({ slotClaims = defaultSlotCountedFixClaims, queueLength = () => lastFixQueueLength, ...rest } = {}) {
+  return createResourceFixThrottle({ ...rest, queueLength, listClaims: () => slotClaims() });
 }
 /**
  * main()'s three exits: SIGTERM/SIGINT (`shutdown`), restart-onto-new-code (`restartOntoNewCode`) and `runDaemonLoop`

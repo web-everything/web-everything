@@ -5,7 +5,7 @@ size: 8
 priority: high
 parent: "4376"
 status: open
-scope: ["we:skills-src/conveyor/build-dispatch-daemon.mjs", "we:scripts/conveyor/tick-core.mjs", "we:scripts/lib/delivery-platform-preferences.json"]
+
 dateOpened: "2026-10-10"
 tags: []
 ---
@@ -37,3 +37,12 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — groups are keyed by repo; a card's claim names the group lane so ownership checks still pass.
 6. **State over time** — a card that becomes blocked or resolved after grouping is dropped from the group before the lane starts.
 7. **Who wrote it** — only conveyor-dispatched cards are grouped; operator-initiated builds always build alone.
+
+## Findings (standalone worker, 2026-10-10)
+
+The build-dispatch daemon held #5732 with:
+
+> worker-declined: **could-not-prepare** — two policy values remain unspecified: whether 'builder.batchBuild' defaults on or off, and the maximum total points per batch. The card requires a size cap without defining it. Existing limits in 'we:scripts/conveyor/build-dispatch-policy.mjs:46–55' govern concurrent builds, open PRs, and open items; none establishes a batch point budget. Choosing these values would invent policy. The feature is not already delivered: 'we:scripts/operations/dispatch-lane.mjs:20–21' explicitly dispatches one item per call. No files changed or stamped. Working tree is clean; no tests run.
+
+`scope:` was cleared above so this card is picked up by the existing unshaped-item auto-prepare path;
+a prepare pass re-scopes it against the finding.

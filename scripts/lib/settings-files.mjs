@@ -70,6 +70,9 @@ const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArr
  *  would reach `Object.prototype`. It is skipped, not merged. (`constructor` / `prototype` are plain own keys here:
  *  `into.constructor` is a function, never a plain object, so a merge cannot walk through them.) */
 const UNSAFE_KEYS = new Set(['__proto__']);
+/** A top-level `$comment` is documentation, not a setting: every feature file may carry its own, so it owns no leaf
+ *  (two files each with a `$comment` are not a duplicate owner). */
+const DOC_KEY = '$comment';
 
 /** PURE: every leaf path (`a.b.c`) of a plain object. Arrays and scalars are leaves. */
 export function settingsLeaves(obj, prefix = '') {
@@ -77,6 +80,7 @@ export function settingsLeaves(obj, prefix = '') {
   const out = [];
   for (const [k, v] of Object.entries(obj)) {
     if (UNSAFE_KEYS.has(k)) continue;
+    if (k === DOC_KEY && !prefix) continue;
     const p = prefix ? `${prefix}.${k}` : k;
     if (isPlainObject(v)) out.push(...settingsLeaves(v, p));
     else out.push(p);

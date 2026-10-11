@@ -39,6 +39,7 @@ import { repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { execFileSync } from 'node:child_process';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { readBotLogins } from '../lib/github-app-identity.mjs';
 
 /**
  * we:scripts/conveyor/stand-down.mjs#STAND_DOWN_MARKER — the stable FIRST LINE of the durable stand-down comment.
@@ -468,10 +469,11 @@ const bodyOf = (c) => (typeof c === 'string' ? c : c?.body);
  * comment's real author and nothing a commenter writes in the BODY can forge it, the exact non-forgeability
  * property `viewerDidAuthor` was originally chosen for, just read off a different, READ-stable field.
  * Overridable via `WE_AUTOMATION_LOGINS` (comma-separated) for a differently-named install; the default is the
- * one login measured live across every marker this file's own history covers.
+ * `delivery.botLogins` setting (`we:scripts/lib/github-app-identity.mjs#readBotLogins`): the one login measured live
+ * across every marker this file's own history covers, plus every per-role App's bot login once configured.
  */
 export const AUTOMATION_LOGINS = Object.freeze(
-  (process.env.WE_AUTOMATION_LOGINS ? process.env.WE_AUTOMATION_LOGINS.split(',') : ['web-everything'])
+  (process.env.WE_AUTOMATION_LOGINS ? process.env.WE_AUTOMATION_LOGINS.split(',') : readBotLogins())
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean),
 );

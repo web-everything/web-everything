@@ -11,6 +11,10 @@
  * with no App config at all), `mint-failed`, `insufficient-access`, `shim-failed`, ... A `policy-personal` caller is
  * a deliberate choice and is never a breach.
  *
+ * PER-ROLE FALLBACK (we:scripts/lib/github-app-identity.mjs): once any per-role App is configured, a caller whose own
+ * role App was unconfigured or failed, and that fell back to the worker App or today's App, is ALSO a breach — even
+ * though it is still on an App (`fallback: true` in its caller file). A fallback is never silent.
+ *
  * Only evaluated when the App token cache exists on this host (`appToken.present`): a fixture tick stubs that probe
  * to `{present:false}`, so a test never reads the machine's real caller files through it.
  *
@@ -34,7 +38,10 @@ export default {
     return callers
       .filter((c) => c && typeof c.caller === 'string' && c.reason !== 'policy-personal')
       .map((c) => {
-        const breach = !c.applied;
+        const fellBack = !!c.applied && c.fallback === true;
+        const breach = !c.applied || fellBack;
+        const from = Array.isArray(c.fallbackFrom) ? c.fallbackFrom.map((f) => `${f.role}: ${f.reason}`).join(', ') : '';
+        const on = c.role === 'legacy' ? "today's App" : `the ${c.role} App`;
         const missing = [...(c.missing ?? []), ...(c.keyUnreadable ? ['a readable private key'] : [])];
         const why = c.reason === 'half-configured'
           ? `App auth is half-configured (missing ${missing.join(', ') || '?'})`
@@ -44,9 +51,13 @@ export default {
         return {
           subject: c.caller,
           breach,
-          measure: { applied: !!c.applied, reason: c.reason ?? null, missing, checkedAt: c.checkedAt ?? null },
-          summary: breach ? `${c.caller}: on the PERSONAL login — ${why}.` : `${c.caller}: on the App installation.`,
-          recommendation: breach
+          measure: { applied: !!c.applied, reason: c.reason ?? null, missing, checkedAt: c.checkedAt ?? null, ...(c.requestedRole ? { role: c.role ?? null, requestedRole: c.requestedRole, fallback: !!c.fallback } : {}) },
+          summary: fellBack
+            ? `${c.caller}: plays the ${c.requestedRole} role but FELL BACK to ${on} (${from || '?'}).`
+            : breach ? `${c.caller}: on the PERSONAL login — ${why}.` : `${c.caller}: on the App installation.`,
+          recommendation: fellBack
+            ? `Fill in or fix delivery.identity.${c.requestedRole} (scripts/settings/delivery-identity.json: appId, installations, key reference), then check \`node scripts/conveyor/github-app-status.mjs\`.`
+            : breach
             ? (c.reason === 'half-configured' || c.reason === 'not-configured'
               ? `Add the missing WE_GITHUB_APP_* value(s) to ${c.caller}'s launchd plist (values from another com.we.* plist), then reload it: launchctl bootout + launchctl bootstrap (kickstart does not reload env).`
               : `Run \`node scripts/conveyor/github-app-status.mjs\`; if only this caller fails, reload its daemon (it may be running stale in-memory code).`)

@@ -8,7 +8,7 @@
  *   (push-rejected, going nowhere) and starved #4235's for an hour.
  */
 import os from 'node:os';
-import { gateHost } from './dispatch-throttle.mjs';
+import { gateLaunch } from './resource-gate.mjs';
 
 export function resolveCiHealReserve({ env = process.env } = {}) {
   const e = env?.WE_CI_HEAL_RESERVE;
@@ -19,6 +19,8 @@ export function resolveCiHealReserve({ env = process.env } = {}) {
 /** ONE per pass. `tryAdmit()` -> `{admit:true, reserved:true}` | `{admit:false, kind, why}`. */
 export function createCiHealReserve({
   listClaims = () => [], env = process.env, loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, sample,
+  // x6nuodj: the host gate decides through admit({kind:'ci-heal'}) (legacy gateHost is the logged comparison).
+  gate = () => gateLaunch({ kind: 'ci-heal', gate: 'ci-heal-reserve', env, loadavg, cpuCount, ...(sample ? { sample } : {}) }),
 } = {}) {
   let liveHeal = null;
   let holders = [];
@@ -33,9 +35,9 @@ export function createCiHealReserve({
         const who = holders.length ? ` — held by ci-heal ${holders.join(', ')}; this PR is next in line` : '';
         return { admit: false, kind: 'fix-cap', why: `fixer cap full and the ${reserve} reserved ci-heal slot(s) (WE_CI_HEAL_RESERVE) are in use (${liveHeal} live ci-heal)${who}` };
       }
-      let gate = { admit: true };
-      try { gate = gateHost({ kind: 'ci-heal', env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { /* fail open */ }
-      if (!gate.admit) return gate;
+      let g = { admit: true };
+      try { g = gate(); } catch { /* fail open */ }
+      if (!g.admit) return g;
       liveHeal += 1;
       return { admit: true, reserved: true };
     },

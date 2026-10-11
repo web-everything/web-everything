@@ -31,8 +31,10 @@ import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
 
 // In-process fixtures use a no-op; subprocess fixtures inherit the explicit off switch.
-vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn() }));
-beforeEach(() => vi.stubEnv('WE_RESOURCE_SHADOW', 'off'));
+vi.mock('../../lib/resource-admission.mjs', () => ({ shadowAdmission: vi.fn(), admit: vi.fn(), decideAdmission: vi.fn(), readSnapshot: vi.fn() }));
+// x6nuodj — the legacy telemetry rule's tests run with the shared decision observing only (`shadow`); the cut-over
+// (admit() deciding) has its own describe below with an explicit `mode`.
+beforeEach(() => { vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); });
 afterEach(() => vi.unstubAllEnvs());
 
 describe('load admission shadow observation', () => {
@@ -74,6 +76,38 @@ describe('load admission shadow observation', () => {
     expect(observed.stderr).toContain(`resource-shadow gate=heavy-admission.load-status kind=${kind ?? 'build'}`);
     const rows = readFileSync(join(lockRoot, 'resource', 'shadow.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(rows.at(-1)).toMatchObject({ gate: 'heavy-admission.load-status', kind: kind ?? 'build', old: { verdict: 'admit' } });
+  });
+});
+
+describe('x6nuodj — load admission decided by admit() (enforce)', () => {
+  const at = new Date('2026-10-09T12:00:00Z');
+  const seed = (load1) => writeFileSync(join(lockRoot, `${utcDayKey(at)}.jsonl`),
+    metricLine('host.cpu.load1', load1, at.toISOString()) + metricLine('host.cpu.count', 12, at.toISOString()));
+  it('a high load average the legacy rule holds is admitted when admit() admits (CPU idle healthy)', () => {
+    seed(63);
+    const admitFn = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 40% ≥ 15%', snapshotAge: 4, unknown: false }));
+    const d = resolveLoadAdmission({ env: {}, root: lockRoot, now: at, shadow: () => undefined, admitFn, mode: 'enforce' });
+    expect(admitFn).toHaveBeenCalledWith(expect.objectContaining({ kind: 'build' }));
+    expect(d).toMatchObject({ held: false, load1: 63, resourceAdmission: { verdict: 'admit', decidedBy: 'admit', legacyHeld: true, snapshotAge: 4 } });
+    expect(d.reason).toBeUndefined();
+  });
+  it('a quiet legacy reading is held when admit() holds (stale snapshot = hold a heavy kind)', () => {
+    seed(3);
+    const admitFn = () => ({ verdict: 'hold', reason: 'snapshot-stale (age 300s)', snapshotAge: 300, unknown: true });
+    const d = resolveLoadAdmission({ env: {}, root: lockRoot, now: at, kind: 'review', shadow: () => undefined, admitFn, mode: 'enforce' });
+    expect(d).toMatchObject({ held: true, reason: 'resource-admission: hold — snapshot-stale (age 300s)', resourceAdmission: { unknown: true, legacyHeld: false } });
+  });
+  it('the shadow decision itself is used when the observer returns one (one admit() call per tick)', () => {
+    seed(63);
+    const admitFn = vi.fn();
+    const shadow = vi.fn(() => ({ verdict: 'wait', reason: 'cpu idle 9% < 15%', snapshotAge: 2, unknown: false }));
+    expect(resolveLoadAdmission({ env: {}, root: lockRoot, now: at, shadow, admitFn, mode: 'enforce' }).held).toBe(true);
+    expect(admitFn).not.toHaveBeenCalled();
+  });
+  it('the off / CI bypasses stay bypasses', () => {
+    const admitFn = vi.fn();
+    expect(resolveLoadAdmission({ env: { [LOAD_ADMISSION_SWITCH_ENV]: 'off' }, admitFn, mode: 'enforce' })).toMatchObject({ held: false, bypassed: 'off' });
+    expect(admitFn).not.toHaveBeenCalled();
   });
 });
 

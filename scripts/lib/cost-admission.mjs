@@ -148,7 +148,8 @@ export function tokenBudgetExhausted({ claudeUsdToday = null } = {}, settings) {
  *   kind: string,
  *   settings: object,                       // resolveCostAdmissionSettings()
  *   facts?: { cpuIdlePct?:number|null, memFreePct?:number|null, minMemFreePct?:number,
- *             lightInFlight?:number, claudeUsdToday?:number|null },
+ *             lightInFlight?:number, claudeUsdToday?:number|null,
+ *             resource?:{admit:boolean, decidedBy:'admit'|'legacy', why?:string, note?:string} },
  *   legacy?: { admit:boolean, why?:string } // today's decision for this launch; only read on the legacy path
  * }} o
  * @returns {{ admit:boolean, costClass:'heavy'|'light', rule:'legacy'|'light', reason:string, why?:string }}
@@ -168,6 +169,14 @@ export function admitLaunch({ kind, settings, facts = {}, legacy = { admit: true
   if (inFlight >= settings.lightMaxConcurrent) {
     return { ...base, admit: false, reason: 'light-cap',
       why: `${inFlight} light job(s) in flight >= light cap ${settings.lightMaxConcurrent} (WE_LIGHT_MAX_CONCURRENT); ${kind} deferred` };
+  }
+  // x6nuodj — a shared resource decision (`facts.resource`, from admit({kind:'light'})) replaces the legacy CPU floor
+  // and free-memory checks when it decided; the budget and the light cap above are not resource checks and stay.
+  const resource = facts.resource && typeof facts.resource === 'object' && facts.resource.decidedBy === 'admit' ? facts.resource : null;
+  if (resource) {
+    if (!resource.admit) return { ...base, admit: false, reason: 'resource-admission', why: `${resource.why ?? 'held by admit()'}; light ${kind} deferred` };
+    return { ...base, admit: true, reason: 'admitted',
+      why: `light ${kind} admitted: ${inFlight}/${settings.lightMaxConcurrent} in flight, ${resource.note ?? 'admit() admitted'}` };
   }
   if (Number.isFinite(facts.cpuIdlePct) && facts.cpuIdlePct < settings.lightCpuIdleMinPct) {
     return { ...base, admit: false, reason: 'light-cpu-floor',
