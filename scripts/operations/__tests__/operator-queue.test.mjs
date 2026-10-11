@@ -243,3 +243,35 @@ it('separates answered stand-downs while a newer unanswered question still needs
   expect(stdout()).toContain(`answered — waiting for the fixer to resume\no/n#1  PR 1  [answered ${answer.createdAt}]`);
   expect(stdout().split('STOOD DOWN')[1].split('answered —')[0]).not.toContain('o/n#1');
 });
+
+describe('staged copies missing an optional reader', () => {
+  const importWithout = async (missing) => {
+    vi.resetModules();
+    vi.doMock(missing, () => { throw new Error(`Cannot find module ${missing}`); });
+    try { return await import('../operator-queue.mjs'); }
+    finally { vi.doUnmock(missing); }
+  };
+
+  it('missing answer reader leaves a stand-down visible as unanswered', async () => {
+    const staged = await importWithout('../../conveyor/stand-down-answer-core.mjs');
+    execFileSync.mockReturnValue(JSON.stringify([pr(1, [standDown, answer])]));
+    await staged.main(['--repo=o/n', '--json'], { sleep, unsupportedPath: '/nonexistent-operator-queue-test/unsupported-repo.json' });
+    const report = JSON.parse(stdout());
+    expect(report.stoodDown).toEqual([expect.objectContaining({ number: 1 })]);
+    expect(report.standDownAnswered ?? []).toEqual([]);
+    expect(report.incomplete).not.toBe(true);
+  });
+
+  it('missing complete reader marks the split read incomplete, never an empty thread', async () => {
+    const staged = await importWithout('../../conveyor/pr-comments-complete.mjs');
+    execFileSync.mockImplementation((_cmd, args) => {
+      if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');
+      return JSON.stringify([pr(1)]);
+    });
+    await staged.main(['--repo=o/n', '--json'], { sleep, unsupportedPath: '/nonexistent-operator-queue-test/unsupported-repo.json' });
+    const report = JSON.parse(stdout());
+    expect(report).toMatchObject({ incomplete: true, errors: [expect.stringContaining('o/n#1:')] });
+    expect(report.stoodDown).toEqual([]);
+    expect(process.exitCode).toBe(1);
+  });
+});
