@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { countRealFixRounds, planReconcile } from '../reconcile-core.mjs';
+import { describe, it, expect, vi } from 'vitest';
+import { countRealFixRounds, planReconcile, resolveRoundCap } from '../reconcile-core.mjs';
 import { readRoundCommits, enrichPrsWithMechanicalRound, BOUNCE_PREFIX } from '../mechanical-round-cap.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { FIX_BEGIN_MARKER } from '../fix-procedure.mjs';
@@ -74,9 +74,31 @@ describe('mechanical re-arm rounds', () => {
     expect(readRoundCommits({ pr, exec: () => { throw new Error('offline'); } })).toMatchObject({ head, ok: false });
   });
   it('enriches trusted re-arms without requiring a conflict marker, and contains injected failures', () => {
-    expect(enrichPrsWithMechanicalRound([pr], { readRoundCommits: () => facts })[0].roundCommits).toEqual(facts);
-    expect(enrichPrsWithMechanicalRound([pr], { readRoundCommits: () => { throw new Error('offline'); } })[0].roundCommits).toMatchObject({ head, ok: false });
+    expect(enrichPrsWithMechanicalRound([pr], { roundCap: 6, readRoundCommits: () => facts })[0].roundCommits).toEqual(facts);
+    expect(enrichPrsWithMechanicalRound([pr], { roundCap: 6, readRoundCommits: () => { throw new Error('offline'); } })[0].roundCommits).toMatchObject({ head, ok: false });
     const foreign = { ...pr, comments: comments.map((c) => ({ ...c, author: { login: 'outsider' } })) };
-    expect(enrichPrsWithMechanicalRound([foreign], { readRoundCommits: () => { throw new Error('must not read'); } })[0]).toBe(foreign);
+    expect(enrichPrsWithMechanicalRound([foreign], { roundCap: 6, readRoundCommits: () => { throw new Error('must not read'); } })[0]).toBe(foreign);
+  });
+  it('leaves a PR with one trusted re-arm unchanged without reading commits', () => {
+    const belowCap = { ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)] };
+    const reader = vi.fn(() => { throw new Error('must not read'); });
+    expect(enrichPrsWithMechanicalRound([belowCap], { roundCap: 5, readRoundCommits: reader })[0]).toBe(belowCap);
+    expect(reader).not.toHaveBeenCalled();
+  });
+  it.each([undefined, '', ' 3 ', '06', '0', '-1', '1.5', '5oops', '9007199254740992'])('defaults to the reconcile round cap for env %j', (value) => {
+    vi.stubEnv('WE_REVIEW_ROUND_CAP', value);
+    try {
+      const cap = resolveRoundCap(process.env);
+      for (const count of [0, 1, 2, 3, 4, 5, 6, 7]) {
+        const candidate = { ...pr, comments: Array.from({ length: count }, () => comment('11T06:06:06', REARM_COMMENT_MARKER)) };
+        const reader = vi.fn(() => facts);
+        const enriched = enrichPrsWithMechanicalRound([candidate], { readRoundCommits: reader })[0];
+        expect(reader).toHaveBeenCalledTimes(count >= cap ? 1 : 0);
+        if (count < cap) expect(enriched).toBe(candidate);
+        else expect(enriched.roundCommits).toEqual(facts);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

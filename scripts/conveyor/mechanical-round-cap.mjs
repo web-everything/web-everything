@@ -280,16 +280,24 @@ export function hasPendingMechanicalRound(pr) {
   return Math.max(...markers) > (verdicts.length ? Math.max(...verdicts) : -Infinity);
 }
 
+// Keep in sync with reconcile-core.mjs#resolveRoundCap; importing it here would create a cycle.
+function resolveRoundCap(env = process.env) {
+  const value = env.WE_REVIEW_ROUND_CAP;
+  return typeof value === 'string' && /^\d+$/.test(value.trim())
+    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : 5;
+}
+
 /** IO: attach `mechanicalRound` facts to each PR whose latest round was mechanical. Never throws. */
 export function enrichPrsWithMechanicalRound(prs, {
   defaultBranch = 'main', readFacts = readMechanicalRoundFacts, readRoundCommits: readCommits = readRoundCommits,
+  roundCap = resolveRoundCap(),
 } = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
     let enriched = pr;
     if (hasPendingMechanicalRound(pr)) {
       try { enriched = { ...enriched, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { /* preserve existing behavior */ }
     }
-    if (Array.isArray(pr?.comments) && pr.comments.some(isRearmMarker)) {
+    if (Array.isArray(pr?.comments) && pr.comments.filter(isRearmMarker).length >= roundCap) {
       try { enriched = { ...enriched, roundCommits: readCommits({ pr, defaultBranch }) }; }
       catch { enriched = { ...enriched, roundCommits: { head: lc(pr?.headRefOid), ok: false, reason: 'git-read-failed' } }; }
     }
