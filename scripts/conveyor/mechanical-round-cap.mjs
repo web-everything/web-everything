@@ -106,7 +106,29 @@ export function verdictKind(c) {
   return 'accept';
 }
 
-const isMechanicalRoundMarker = (c) => bodyOf(c).trimStart().startsWith(CONFLICT_FIX_COMMENT_MARKER) && isTrustedMarkerAuthor(c);
+const REVIEWED_MARKER_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi');
+const NET_BASIS_RE = /Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`/gi;
+
+/**
+ * The commits a trusted verdict comment says it JUDGED: its structured `reviewed-sha` markers and its `Net basis:
+ * <base>..<head>` heads (7-40 hex, lower-cased). A sha merely mentioned in prose ("compared against <sha>") is NOT a
+ * reviewed commit and is never returned. Pure.
+ */
+export function reviewedHeadsOf(c) {
+  const body = bodyOf(c);
+  const out = [];
+  for (const re of [REVIEWED_MARKER_RE, NET_BASIS_RE]) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(body)) !== null) out.push(m[1].toLowerCase());
+  }
+  return out;
+}
+
+/** Did this verdict judge `sha` (a full 40-hex head)? Matches a full or abbreviated structured sha, never prose. */
+const verdictJudged = (c, sha) => SHA40.test(sha) && reviewedHeadsOf(c).some((h) => sha.startsWith(h));
+
+const isMechanicalRoundMarker =(c) => bodyOf(c).trimStart().startsWith(CONFLICT_FIX_COMMENT_MARKER) && isTrustedMarkerAuthor(c);
 
 /**
  * PURE: may the PR's CURRENT head, produced by a mechanical round, get past the review round cap?
@@ -133,7 +155,7 @@ export function mechanicalRoundGrant({ pr, countTowardCap = MECHANICAL_ROUNDS_ST
   if (verdicts.some((c) => lc(bodyOf(c)).includes(head))) return { ok: false, reason: 'head-already-reviewed' };
   // A review landing after the round already used this head's allowance (it named an older sha, e.g. a stale read).
   if (verdicts.some((c) => timeOf(c) > roundAt)) return { ok: false, reason: 'mechanical-review-spent' };
-  const onPrior = verdicts.filter((c) => SHA40.test(priorHead) && lc(bodyOf(c)).includes(priorHead));
+  const onPrior = verdicts.filter((c) => verdictJudged(c, priorHead));
   // The parent head was never judged: the mechanical round did not take anything from it. Its own standing (a
   // takeover allowance, or the cap) governs, not this exemption.
   if (!onPrior.length) return { ok: false, reason: 'prior-head-unreviewed', priorHead };

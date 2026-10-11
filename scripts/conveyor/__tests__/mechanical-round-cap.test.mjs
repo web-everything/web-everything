@@ -115,6 +115,29 @@ describe('mechanical round vs the review round cap', () => {
     capped(plan(pr([...spent, rearm(7), { ...mechMarker(8), author: { login: 'mallory' } }])));
     capped(plan(pr(comments, { mechanicalRound: facts({ head: 'e'.repeat(40) }) })));
   });
+  describe('the parent head counts as reviewed only by a structured sha, never by prose', () => {
+    const OTHER = 'd'.repeat(40);
+    const identical = facts({ netDiffIdentical: true });
+    const grant = (verdict) => mechanicalRoundGrant({ pr: pr([rearm(5), verdict, rearm(7), mechMarker(8)], { mechanicalRound: identical }) });
+    it('a verdict whose reviewed-sha marker names another commit but mentions the parent in prose is not a verdict on the parent', () => {
+      const v = { author: BOT, createdAt: at(6), body: `✅ review — accepted\n\nCompared against earlier commit ${PRIOR}.\n\n<!-- reviewed-sha: ${OTHER} -->` };
+      expect(grant(v)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+    });
+    it('a bounce whose Net basis head is another commit but mentions the parent in prose is not a verdict on the parent', () => {
+      const v = { author: BOT, createdAt: at(6),
+        body: `🔁 review — changes requested\n\nSee also ${PRIOR}.\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
+      expect(grant(v)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+    });
+    it('a bare sha in prose with no structured marker at all is not a verdict on the parent', () => {
+      const v = { author: BOT, createdAt: at(6), body: `🔁 review — changes requested\n\nrebased from ${PRIOR}` };
+      expect(grant(v)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+    });
+    it('a structured marker naming the parent (full or abbreviated, any case) still counts', () => {
+      expect(grant(acceptOn(PRIOR, 6))).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
+      expect(grant(acceptOn(PRIOR.slice(0, 12).toUpperCase(), 6))).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
+      expect(grant(bounceOn(PRIOR, 6))).toMatchObject({ ok: true, action: 'carry', verdict: 'changes' });
+    });
+  });
   it('red CI still refuses the mechanical review (the review gate is not weakened)', () => {
     const p0 = pr([...spent, rearm(7), mechMarker(8)]);
     const p = plan({ ...p0, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', headSha: HEAD }] });
