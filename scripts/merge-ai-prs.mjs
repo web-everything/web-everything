@@ -4804,10 +4804,10 @@ async function runCli() {
     const run = async (limit) => {
       // #4108 (converge round 2) — only widen to SWEEP_LIST_FIELDS when RECONCILE is actually on: that is the
       // ONLY case anything reuses this repo's rows for the context (see `liveListingsByRepo` below). RECONCILE
-      // off means this call is never reused, so the extra context fields (`files`, `isDraft`) would just be
-      // GraphQL cost with no offsetting call removed.
+      // off means this call is never reused, but the workflow-edit gate still needs `files` when enabled.
       const listArgs = ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(limit),
-        '--json', RECONCILE ? SWEEP_LIST_FIELDS : CANDIDATE_ONLY_FIELDS];
+        '--json', RECONCILE ? SWEEP_LIST_FIELDS
+          : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '')];
       const { stdout } = await execFileP('gh', listArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return JSON.parse(stdout.trim() || '[]');
     };
