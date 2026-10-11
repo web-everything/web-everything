@@ -1,15 +1,16 @@
 ---
+bornAs: xnlrx8s
 kind: story
-size: 3
+size: 2
 status: active
 scaffoldedBy: "fix-4784"
 dateScaffolded: "2026-10-10"
-scope: ["we:scripts/review-set-label.mjs"]
+scope: ["we:scripts/operations/review-pr-io.mjs"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# review-set-label stamps the human clearance from a head sha and a diff read in two non-atomic steps (pin the tip with computeNetDiffText pinRev)
+# review-pr-io reads the net diff, then paths, then rev-parses the tip afterwards so the reviewer basis can name a different commit than the text judged (use pinRev + revSha)
 
 TODO digest — one ≤100-word paragraph: what this item does and why (replace this line).
 
