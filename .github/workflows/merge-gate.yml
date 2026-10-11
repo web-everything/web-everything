@@ -1,0 +1,157 @@
+# The `merge-gate` required check: every gate the drain (scripts/merge-ai-prs.mjs) applies right before its merge
+# write, evaluated in CI so GitHub's native merge queue can do the merging (merge-delivery strategy
+# `github-merge-queue`, scripts/lib/merge-delivery-policy.mjs). Decision logic: scripts/lib/merge-gate-ci.mjs
+# (reuses the drain's own pure functions). Gate list + where each gate lives: scripts/lib/merge-gate-inventory.mjs
+# (a test fails when the drain gains a gate this check does not account for).
+#
+# Runs on `pull_request_target` (so a PR can be added to the queue) and on `merge_group` (each PR in the group is
+# re-evaluated against the group's commit right before GitHub merges it). `workflow_dispatch` is the dry run.
+#
+# SCRIPTS COME FROM MAIN, NEVER FROM THE PR (same rule and reasoning as review-gate.yml): a PR cannot neuter the
+# gate's SCRIPTS by editing them in its diff. The PR's body, labels, comments and diff are read as data, and every
+# git read is pinned to the PR's exact head SHA (the event's `pull_request.head.sha`, or for `merge_group` each PR's
+# sha inside the group commit) — never the branch name; an unfetchable sha or a head that moved fails closed.
+# No secret is exposed: the job has only the read-scoped GITHUB_TOKEN and never executes PR code.
+# WHY `pull_request_target`, NOT `pull_request` (PR #4708 round 6): for `pull_request` GitHub reads the workflow
+# file from the PR's merge ref, so a PR could edit THIS file to `exit 0` and turn its own required check green.
+# For `pull_request_target` GitHub reads the YAML from the base branch (main). Its usual danger — running PR code
+# with a write token — does not apply: the job checks out `ref: main`, never the PR ref, never runs PR code, and the
+# token is read-only (`permissions` below). A fork head is refused (pinnedHeadOf).
+# WHAT IS STILL NOT PINNED BY THIS FILE: for `merge_group`, GitHub reads this workflow YAML from the group commit,
+# which contains the PR's edits. Four layers, outermost first:
+#   (1) HUMAN-ONLY WORKFLOW EDITS IN THE PR RUN: the PR-leg run (main's YAML + main's scripts) holds, for a HUMAN,
+#       any PR whose change list at the pinned head (git, both sides of a rename) touches .github/workflows/** or
+#       .github/actions/**, unless a clear-human ceremony reviewed that exact sha (workflowEditFact in
+#       scripts/lib/merge-gate-ci.mjs). An AI-reviewable escalation cannot clear it. Since a PR must pass its
+#       required checks before GitHub lets it into the queue, a PR that edits a workflow never reaches a merge_group
+#       run without a human having looked at that exact commit.
+#   (2) SELF-CHECK (in this repo): the evaluator refuses to pass unless the RUNNING workflow file
+#       (GITHUB_WORKFLOW_REF @ GITHUB_WORKFLOW_SHA) is byte-identical to main's — fail closed
+#       (verifyRunningWorkflow in scripts/merge-gate-check.mjs). It cannot catch an edit that never reaches the
+#       evaluator (the job made `exit 0`, or a new workflow whose job is named `merge-gate`).
+#   (3) THE ENQUEUE REFUSAL, which no PR can edit because it does not run in a workflow: enqueuePr
+#       (scripts/lib/merge-queue-enqueue.mjs) runs from the daemon's own main checkout and refuses, for a HUMAN
+#       (humanOnly, not an escalation an AI reviewer can accept), any PR whose full change list AT THE ENQUEUED SHA
+#       (git, never the branch's current file list) touches .github/workflows/** or .github/actions/** (either
+#       spelling, any case, both sides of a rename); an unreadable list or a moved head fails closed but stays
+#       retryable, and the mutation carries expectedHeadOid. enqueuePr is the ONLY code that may send the enqueue
+#       mutation (a test fails if any other script does); the drain's wiring of it is card xtpxusq.
+#   (4) THE RULESET (required before `merge-gate` is made required): the ruleset's `workflows` rule pins every
+#       workflow that defines a required check to refs/heads/main (rulesetSuggestion.requiredWorkflows in
+#       scripts/lib/merge-queue-enqueue.mjs), so GitHub runs them from main rather than from the group commit, and
+#       the required status checks are restricted to the GitHub Actions integration id
+#       (requiredStatusCheckIntegrationId 15368) so no other app/token can post a green `merge-gate`. Print the
+#       exact ruleset with `node scripts/merge-gate-check.mjs --print-ruleset`. A test fails when a workflow
+#       defining a required check is not in that pin.
+# HONEST LIMITS: (a) the drain does not call enqueuePr yet, so today nothing enqueues and this check is not
+# required, so this YAML decides no merge; (b) an entry added by hand (the UI, `gh pr merge --auto`, a raw API call)
+# bypasses enqueuePr — layer (1) still holds a workflow edit in the PR run, but a NEW workflow that posts its own
+# green `merge-gate` on the PR is closed only by the ruleset pin (4), so do not make `merge-gate` required, or flip
+# the strategy, before the operator applies it. The review escalation of a workflow diff (blast radius, pinned by
+# merge-gate-ci.test.mjs) stays as a further layer; card xha9nns adds CODEOWNERS / trust-chain human approval.
+# BOOTSTRAP (true bootstrap only): until this lands, main has neither scripts/merge-gate-check.mjs nor this
+# workflow, so the check reports clear (the same bootstrap review-gate.yml documents); it is not required by the
+# ruleset until the operator adds it. The moment main has this workflow, a missing script FAILS CLOSED — a later
+# rename or removal of the script can never turn the required check green (pinned by merge-gate-ci.test.mjs).
+#
+# FAILS CLOSED: an input that is unreadable, or that has no shared source CI can reach yet, holds the PR.
+#
+# MODE (`mergeGate.mode`, shadow | enforce; scripts/lib/merge-gate-ci.mjs `loadMergeGateMode`): resolved standard
+# default (shadow) -> platform preference -> repo setting -> env (the MERGE_GATE_MODE repository variable), and the
+# winning source is logged. SHADOW evaluates and prints every rule exactly as enforce, adds "SHADOW: would HOLD on
+# <rules>" to the step summary, and exits 0; it changes only the exit code, never a verdict, and never masks a run
+# with no verdict. Shadow until the shared red-main freeze source lands (#4715 flips the repo setting to enforce).
+# The ruleset step (making `merge-gate` required) needs enforce.
+# TRIGGERS: head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge,
+# review:*). Any other label event is skipped under a DIFFERENT job name (a skipped job counts as passing for a
+# required check, so it must never post as `merge-gate`) and in its own concurrency group (it never cancels a real
+# run). Body edits do not re-run the PR leg; the merge_group run re-evaluates everything before GitHub merges.
+name: Merge gate
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: 'PR numbers to evaluate (comma-separated) — dry run'
+        required: false
+      merge_group_head_sha:
+        description: 'Dry-run a merge group: its head commit (with base sha)'
+        required: false
+      merge_group_base_sha:
+        description: 'Dry-run a merge group: its base commit'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  statuses: read
+
+concurrency:
+  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  merge-gate:
+    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
+    if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          # no `cache:` — a pull_request_target run must not write the base branch's cache scope
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Evaluate the drain's merge gates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha || inputs.merge_group_head_sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha || inputs.merge_group_base_sha }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          DISPATCH_PRS: ${{ inputs.prs }}
+          MERGE_GATE_MODE: ${{ vars.MERGE_GATE_MODE }}
+        run: |
+          if [ ! -f scripts/merge-gate-check.mjs ]; then
+            if [ -f .github/workflows/merge-gate.yml ]; then
+              echo "::error::scripts/merge-gate-check.mjs is missing from main although .github/workflows/merge-gate.yml is there (renamed or removed?) — failing closed." >&2
+              exit 1
+            fi
+            echo "::warning::neither scripts/merge-gate-check.mjs nor .github/workflows/merge-gate.yml is on main yet — merge gate not bootstrapped; reporting clear."
+            exit 0
+          fi
+          git config user.name merge-gate && git config user.email merge-gate@users.noreply.github.com
+          if [ -n "$MG_HEAD_SHA" ]; then
+            for sha in "$MG_HEAD_SHA" "$MG_BASE_SHA"; do
+              [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-gate: merge group sha is not a 40-hex commit id — failing closed." >&2; exit 1; }
+            done
+            git fetch origin -- "$MG_HEAD_SHA" "$MG_BASE_SHA"
+            GROUP_TREE="$RUNNER_TEMP/group-tree"
+            mkdir -p "$GROUP_TREE"
+            git archive "$MG_HEAD_SHA" backlog | tar -x -C "$GROUP_TREE"
+            node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs --repo="$REPO" --merge-group --head-sha="$MG_HEAD_SHA" --base-sha="$MG_BASE_SHA" --head-ref="$MG_HEAD_REF" --group-tree="$GROUP_TREE"
+          elif [ -n "$PR_NUMBER" ]; then
+            [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-gate: pull_request head sha is not a 40-hex commit id — failing closed." >&2; exit 1; }
+            node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs --repo="$REPO" --pr="$PR_NUMBER" --expect-head="$PR_HEAD_SHA"
+          elif [ -n "$DISPATCH_PRS" ]; then
+            node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs --repo="$REPO" --pr="$DISPATCH_PRS"
+          else
+            echo "::error::merge-gate: no PR or merge group to evaluate (event $EVENT) — failing closed." >&2
+            exit 1
+          fi

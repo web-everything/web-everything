@@ -1478,16 +1478,19 @@ export function runReviewLabelCli({
     // reviewer identity (plateau-reviewer[bot], the operator), stops the carry. The across-hold and derived carries
     // already read the formal reviews through `latestAcceptRecord`; `decideRestampHumanClearance` read none, so a plain
     // restamp re-dated the `cleared-human` record past a standing change request (and the carry rule then saw that
-    // review as "before the accept"). Same evidence read, same rule (`laterReviewHold`): unreadable = a retryable miss,
-    // a standing review = a decided refusal. Nothing is written either way: the accept stays on its old head, so the
-    // moved head needs a review. (A restamp of a plain agent accept still reads no review: card xqugnf2 (0a).)
-    if (humanClearance) {
+    // review as "before the accept"). A restamp of a plain agent accept is the same carry (it moves `review:accepted` and
+    // `reviewed-sha` onto a head nobody reviewed), so EVERY restamp asks, whatever the carry setting. Same evidence read,
+    // same rule (`laterReviewHold`): unreadable = a retryable miss, a standing review = a decided refusal. Nothing is
+    // written either way: the accept stays on its old head, and the drain's coverage read refuses to cover the moved head
+    // by diff identity while the review stands (`readDrainAcceptance`), so a review of the head is owed.
+    {
+      const carried = humanClearance ? 'the operator clearance' : 'the accept';
       const { comments: carryComments, reviews } = readCarryEvidence();
       const stands = Array.isArray(reviews) ? laterReviewHold(reviews, latestAcceptRecord(carryComments, reviews)?.at ?? null) : null;
       if (stands !== false) {
         const reason = stands === null
-          ? 'the PR\'s formal reviews could not be read; a standing changes-requested review is unproven absent, so the operator clearance is not carried'
-          : 'a formal GitHub changes-requested review stands on this PR; the operator clearance is not carried (a review of the head is owed)';
+          ? `the PR's formal reviews could not be read; a standing changes-requested review is unproven absent, so ${carried} is not carried`
+          : `a formal GitHub changes-requested review stands on this PR; ${carried} is not carried (a review of the head is owed)`;
         emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason, ...(stands === null ? { retryable: true } : {}) } }))}\n`);
         process.exit(1);
       }

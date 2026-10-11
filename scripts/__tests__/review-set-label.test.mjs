@@ -2073,6 +2073,8 @@ describe('the write arc and its #2964 ordering', () => {
       readLabels: () => { calls.push('readLabels'); return labels.map((name) => ({ name })); },
       setLabels: (_r, _p, spec) => { calls.push('setLabels'); calls.push(spec); },
       postComment: () => { calls.push('postComment'); },
+      // PR #4631 round 11: every restamp reads the PR's formal reviews before it carries (a real provider always has this).
+      readPrReviews: () => [],
       ...(readPrFiles ? { readPrFiles: (...args) => { calls.push('readPrFiles'); return readPrFiles(...args); } } : {}),
     };
   }
@@ -3750,14 +3752,14 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(result.added[0].body).not.toContain("drain's own");
     expect(result.ledger).toHaveLength(1);
     expect(result.ledger[0].coverage.headSha).toBe(healedHead);
-    // A carried operator clearance reads the formal reviews first (PR #4631 round 11); a plain accept never asks.
-    expect(result.calls.map(a => a[0] === 'api' ? 'reviews' : a[1])).toEqual(mode === 'human' ? ['view', 'reviews', 'view', 'comment', 'view'] : ['view', 'view', 'comment', 'view']);
+    // Every carry reads the formal reviews first (PR #4631 round 11), agent accept or operator clearance alike.
+    expect(result.calls.map(a => a[0] === 'api' ? 'reviews' : a[1])).toEqual(['view', 'reviews', 'view', 'comment', 'view']);
   });
 
-  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the CI-heal carry of an operator clearance is a carry too —
-  // a standing native CHANGES_REQUESTED review (the bot or the operator) refuses it, before any write.
-  it.each(['plateau-reviewer[bot]', 'chalbert'])('refuses to carry a human acceptance past a standing CHANGES_REQUESTED review by %s', login => {
-    refused(run({ mode: 'human', reviews: [{ state: 'CHANGES_REQUESTED', submitted_at: '2020-01-01T00:00:00Z', user: { login } }] }));
+  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the CI-heal carry is a carry too — a standing native
+  // CHANGES_REQUESTED review (the bot or the operator) refuses it, for an agent accept and an operator clearance alike.
+  it.each([['plain', 'plateau-reviewer[bot]'], ['plain', 'chalbert'], ['human', 'plateau-reviewer[bot]'], ['human', 'chalbert']])('refuses to carry a %s acceptance past a standing CHANGES_REQUESTED review by %s', (mode, login) => {
+    refused(run({ mode, reviews: [{ state: 'CHANGES_REQUESTED', submitted_at: '2020-01-01T00:00:00Z', user: { login } }] }));
   });
 
   it.each(['source.js', 'source.test.js', 'README.md', 'config.json', 'data.json'])('refuses an actual contribution change in %s', file => {

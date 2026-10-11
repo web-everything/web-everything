@@ -1,0 +1,75 @@
+{% raw %}
+<h2>The question</h2>
+
+<p>The operator asked, on 2026-10-10, for "a single event stream and state manager for all": every daemon, every
+operator page and every tool reading one picture of the world instead of each polling GitHub or re-scanning files on
+its own. This topic holds the inventory, the measured evidence, the prior art and the design. The decision is card
+xqux73p. The full working is in <a href="/reports/2026-10-10-event-stream-state-manager.md">the session report</a>.</p>
+
+<h2>Measured on 2026-10-10</h2>
+
+<ul>
+  <li><strong>Ledger shadow:</strong> 591 of 593 compares unreadable across 139 drain runs, every one a git
+    <code>ENOBUFS</code> on a whole-file read. This one has its own one-line fix and is evidence of the pattern, not a
+    reason to build.</li>
+  <li><strong>operator-queue:</strong> its own <code>gh pr list</code> with comments overflowed a 1 MB buffer and hid
+    all 25 open PRs.</li>
+  <li><strong>Fixer:</strong> passes of 1514, 1771 and 2322 seconds; each PR planned four times with no cache.</li>
+  <li><strong>Reviewer:</strong> 27 restarts since midnight, each followed by a 4–9 minute cold first tick.</li>
+  <li><strong>Drain:</strong> PR listing median 16 s, p90 41 s, every pass.</li>
+  <li><strong>WIP page:</strong> 1,479 full 24-hour session re-scans over about 3,958 transcripts.</li>
+  <li><strong>Shape of the code:</strong> 68 <code>gh pr list</code> call expressions in 56 files, three PR-state
+    caches, three host-load samplers, 20+ separate JSONL logs, and one cursor module that is not wired in.</li>
+</ul>
+
+<h2>What the world does</h2>
+
+<ul>
+  <li><strong>Kubernetes informers.</strong> List at a version, watch from it, relist on <code>410 Gone</code>, keep
+    one shared cache per process, enqueue only keys, reconcile against current state, resync slowly. One writer
+    (the apiserver) with optimistic concurrency. The daemons here are controllers, so this is the main model.</li>
+  <li><strong>Event sourcing and CQRS.</strong> The log is the truth for what we decided; projections are rebuilt
+    from it; old events are upcast on read, never edited. GitHub stays the truth for GitHub facts.</li>
+  <li><strong>SQLite WAL.</strong> Many readers, one writer, one host only. <code>node:sqlite</code> is a release
+    candidate only from Node 25.7; this repo runs Node 22.1. A good local cache, not a cross-host authority.</li>
+  <li><strong>NATS JetStream and Redis Streams.</strong> Durable consumers and watchable key-value stores built in,
+    but a new always-on service that VMs and CI must reach.</li>
+  <li><strong>Litestream and LiteFS.</strong> Asynchronous single-writer replication: backup, not shared
+    writes.</li>
+  <li><strong>Cloudflare Durable Objects.</strong> A single-threaded, strongly consistent object with SQLite
+    storage and WebSocket hibernation. The existing webhook object is already the sequencer role.</li>
+  <li><strong>Git as a database.</strong> Every write is a commit and a push; concurrent pushes collide.</li>
+  <li><strong>Nomad, Consul, Temporal, CI runners.</strong> Long-poll with an index and jitter; agents connect
+    outbound only; deterministic replay of a per-workflow history.</li>
+  <li><strong>GitHub webhooks.</strong> No automatic redelivery of failed deliveries; a 3-day window to redeliver;
+    a delivery id to deduplicate. A reconciling poll must stay.</li>
+</ul>
+
+<h2>What is already ruled here</h2>
+
+<p>One ordered PR event log in the Durable Object (#5452, E1–E7); one portable event-log schema, Durable Objects as
+the hosted authority and local SQLite never a second authority (#4601); judgments on the git ledger joined with
+GitHub facts at read time; one drain writing <code>main</code>; schedule-only ticks over one shared view (#5767);
+one resource sampler (#5712). Each covers one kind. Nothing joins them.</p>
+
+<h2>The design the card recommends</h2>
+
+<ol>
+  <li><strong>One sequenced stream per tenant</strong> for every shared kind, reachable from any host; the store is
+    picked by name and the default adapter is the existing Durable Object. Host-local kinds keep a per-host journal
+    in the same envelope.</li>
+  <li><strong>One informer library:</strong> list at <code>seq</code>, watch from it, relist on a gap, a durable
+    cursor per consumer, a warm per-host cache, one fold per kind.</li>
+  <li><strong>One versioned envelope,</strong> with the producer stamped from its credential.</li>
+  <li><strong>One authority per kind;</strong> an authority moves into the stream only after a tested restore.</li>
+  <li><strong>Leases stay conditional writes;</strong> the stream only observes them.</li>
+  <li><strong>Webhooks plus one budgeted reconciler</strong> and a redeliver sweep; live per-PR probes before a
+    write stay.</li>
+  <li><strong>Stale is visible, never silent;</strong> unreadable is never empty.</li>
+  <li><strong>No permanent dual read path:</strong> each consumer cuts over in shadow first.</li>
+</ol>
+
+<p>An independent Codex review reached the same defaults. A skeptic pass and a separate framing screen then
+reshaped the forks: the ENOBUFS claim was withdrawn, per-type append permission and live-read exemptions were
+added, and build order moved out of the forks into the slice plan.</p>
+{% endraw %}

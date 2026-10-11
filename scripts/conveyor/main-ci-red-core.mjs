@@ -20,6 +20,7 @@
  */
 
 import { isTrustedMarkerAuthor, AUTOMATION_LOGINS } from '../lib/marker-authorship.mjs';
+import { parsePushBeforeGate } from '../lib/fix-push-policy.mjs';
 
 /**
  * Is this PR's AUTHOR the conveyor or the operator? `gh pr list --json author` reports the conveyor's GitHub App as
@@ -77,14 +78,61 @@ export const MAIN_CI_RED_DEFAULTS = Object.freeze({
   mainCiRedPriorityTtlMs: 30 * MINUTE,
 });
 
-/** Merge the health config over the defaults, keeping only well-typed values. PURE. */
+/** Merge the health config over the defaults, keeping only well-typed values. PURE.
+ *  `mainCiRedPushBeforeGate` is NOT a default: it is one LAYER of the {@link resolveMainFixPushPolicy} cascade, so it is
+ *  carried through only when the health config sets it (a filled-in default would claim the `health` source falsely). */
 export function mainCiRedSettings(config = {}) {
   const out = {};
   for (const [k, d] of Object.entries(MAIN_CI_RED_DEFAULTS)) {
     const v = config?.[k];
     out[k] = v !== undefined && v !== null && typeof v === typeof d ? v : d;
   }
+  if (config?.mainCiRedPushBeforeGate !== undefined && config?.mainCiRedPushBeforeGate !== null) out.mainCiRedPushBeforeGate = config.mainCiRedPushBeforeGate;
   return out;
+}
+
+/** The operator's one-off override of `mainCiRed.pushBeforeGate` (the top layer of the cascade below). */
+export const MAIN_FIX_PUSH_BEFORE_GATE_ENV = 'WE_MAIN_FIX_PUSH_BEFORE_GATE';
+
+/**
+ * `mainCiRed.pushBeforeGate` — operator 2026-10-10 ~15:20 ET: "make sure the worker that fixes main pushes as soon as
+ * possible for the CI to start running". While main is red nothing lands, so a full local gate before the push only
+ * delays CI (live: main-fix-2cb94418d sat in the heavy queue before pushing).
+ *
+ *   on  (standard) — the owner opens its READY PR as soon as the failing tests pass, then runs the full verify and
+ *                    pushes follow-up commits (never forced). The required CI check still gates the merge.
+ *   off            — before this change exactly: full verify, then the PR.
+ *
+ * Same value semantics as the fixer's `fix.pushBeforeGate` (we:scripts/lib/fix-push-policy.mjs, `parsePushBeforeGate`).
+ * Cascade, lowest to highest — a layer answers only with a VALID value:
+ *   1. standard — `true`;
+ *   2. platform — `mainCiRed.pushBeforeGate` in `we:scripts/lib/delivery-platform-preferences.json`;
+ *   3. tool     — `mainCiRed.pushBeforeGate` in the declared settings files (`we:scripts/settings/*.json`);
+ *   4. health   — `mainCiRedPushBeforeGate` in the health watch's own config (where every other main-red setting lives);
+ *   5. env      — `WE_MAIN_FIX_PUSH_BEFORE_GATE`, an operator's one-off override.
+ * PURE: the caller passes the layers it read.
+ * @param {{platform?:object|null, tool?:object|null, health?:unknown, env?:object}} layers  `platform`/`tool` = the files' `mainCiRed` blocks
+ * @returns {{pushBeforeGate:boolean, source:'standard'|'platform'|'tool'|'health'|'env', invalid:string[]}}
+ */
+export function resolveMainFixPushPolicy({ platform = null, tool = null, health, env = {} } = {}) {
+  let pushBeforeGate = true;
+  let source = 'standard';
+  const invalid = [];
+  const layers = [['platform', platform?.pushBeforeGate], ['tool', tool?.pushBeforeGate], ['health', health], ['env', env?.[MAIN_FIX_PUSH_BEFORE_GATE_ENV]]];
+  for (const [name, raw] of layers) {
+    if (raw === undefined || raw === null || raw === '') continue;
+    const parsed = parsePushBeforeGate(raw);
+    if (parsed === null) { invalid.push(`${name}.pushBeforeGate=${JSON.stringify(raw)}`); continue; }
+    pushBeforeGate = parsed;
+    source = name;
+  }
+  return { pushBeforeGate, source, invalid };
+}
+
+/** One log line naming the effective value and the layer that set it. PURE. */
+export function formatMainFixPushPolicyLine(policy) {
+  const bad = policy?.invalid?.length ? `; ignored invalid ${policy.invalid.join(', ')}` : '';
+  return `main-fix-push-policy: mainCiRed.pushBeforeGate=${policy?.pushBeforeGate ? 'on' : 'off'} (${policy?.source ?? 'standard'})${bad}`;
 }
 
 const RED = new Set(['failure', 'timed_out', 'startup_failure']);
@@ -331,9 +379,13 @@ export function quoteData(text, max = 1500) {
 
 /**
  * The owner's brief. Failing-job names and test titles come from CI output, so they go in as fenced DATA. PURE.
- * @param {{state:object, failing?:{jobs?:string[], tests?:string[]}, weRoot:string, repoSlug:string, settings?:object}} o
+ * `pushPolicy` ({@link resolveMainFixPushPolicy}) orders the steps: ON = open the READY PR as soon as the failing tests
+ * pass, then the full verify; OFF = the full verify first. Omitted = resolved from `settings` (the health layer) alone.
+ * @param {{state:object, failing?:{jobs?:string[], tests?:string[]}, weRoot:string, repoSlug:string, settings?:object,
+ *   pushPolicy?:{pushBeforeGate:boolean, source:string, invalid?:string[]}}} o
  */
-export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, settings = MAIN_CI_RED_DEFAULTS }) {
+export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, settings = MAIN_CI_RED_DEFAULTS, pushPolicy = null }) {
+  const policy = pushPolicy ?? resolveMainFixPushPolicy({ health: settings?.mainCiRedPushBeforeGate });
   // Everything interpolated OUTSIDE the data fence is a validated token (a hex sha, a number) — never CI-supplied free
   // text (review round 1, F3: same class as the combine brief's branch name). The raw values go in the fenced data below.
   const rawSha = String(state.firstRed.sha ?? '');
@@ -365,9 +417,18 @@ export function buildOwnerBrief({ state, failing = {}, weRoot, repoSlug, setting
     `2. Find the cause in the merged range ${range} (\`git log --oneline ${lastGreenSha ? range : sha9}\`) and the failing job logs (\`gh run view ${Number.isInteger(runId) ? runId : 0} --log-failed\`).`,
     '3. Main can have SEVERAL red causes on one commit (2026-10-08: a soak scenario AND a ledger-id test). You own them all, in ONE PR: fix every failing job listed above. If an open PR already fixes one cause, build ON its branch (`git merge origin/<its branch>` into yours) so your PR carries every fix, and name it in your PR body. Two PRs that each fix one cause DEADLOCK: each one\'s CI fails on the other\'s cause.',
     '4. Write or keep a failing test, then fix the ROOT CAUSE. Never delete, skip or loosen a test or a merge-gate guard to get green.',
-    '5. Run the failing tests with `npm run test:unit -- <files>` and the gate with `node scripts/operations/run.mjs verify --checkout=<lane>`.',
-    `6. Commit with a tight pathspec, then open exactly one READY PR: \`node scripts/operations/run.mjs open-pr --ref=${ref} --title="fix red main @ ${sha9}: <what>" --bodyFile=<file> --json\`. The body must name the first red commit ${sha}. It opens READY (never a draft) and goes first in every queue while main is red.`,
-    '7. Release the lane. No --force, no --no-verify, no history rewrite, no pattern kills.',
+    ...(policy.pushBeforeGate ? [
+      '5. Run the failing tests with `npm run test:unit -- <files>` until they pass.',
+      `6. PUSH AT ONCE so CI starts: as soon as those tests pass, commit with a tight pathspec and open exactly one READY PR: \`WE_REQUIRE_VERIFIED=0 node scripts/operations/run.mjs open-pr --ref=${ref} --title="fix red main @ ${sha9}: <what>" --bodyFile=<file> --json\`. The body must name the first red commit ${sha}. It opens READY (never a draft) and goes first in every queue while main is red. \`WE_REQUIRE_VERIFIED=0\` is the sanctioned opt-out for a CI-gated open (no verify marker exists yet; the required CI check still gates the merge). Do not start the full verify before the PR is open: an unfinished verify for this commit makes open-pr refuse.`,
+      `7. Then run the full gate: \`node scripts/operations/run.mjs verify --checkout=<lane>\`. If it (or CI) finds more, fix it with a NEW commit on top and push it to the same branch: \`git push origin HEAD:refs/heads/${ref}\`. Never amend, rebase or force.`,
+      '8. Release the lane. No --force, no --no-verify, no history rewrite, no pattern kills.',
+    ] : [
+      '5. Run the failing tests with `npm run test:unit -- <files>` and the gate with `node scripts/operations/run.mjs verify --checkout=<lane>`.',
+      `6. Commit with a tight pathspec, then open exactly one READY PR: \`node scripts/operations/run.mjs open-pr --ref=${ref} --title="fix red main @ ${sha9}: <what>" --bodyFile=<file> --json\`. The body must name the first red commit ${sha}. It opens READY (never a draft) and goes first in every queue while main is red.`,
+      '7. Release the lane. No --force, no --no-verify, no history rewrite, no pattern kills.',
+    ]),
+    '',
+    `Policy: ${formatMainFixPushPolicyLine(policy).replace(/^main-fix-push-policy: /, '')}.`,
     '',
     `Report in at most 8 lines: the cause, the PR number, and the tests that now pass.`,
   ].join('\n');

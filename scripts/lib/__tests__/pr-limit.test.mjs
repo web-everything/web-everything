@@ -5,10 +5,12 @@
  *   global off allows, a per-branch allow-list entry allows, and under-limit allows — plus the smaller
  *   pure helpers (limit resolution, exemption matching, AI/label counting, override-state parse/expiry).
  */
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, afterAll } from 'vitest';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { isCardOnlyDiff } from '../../ci-card-only.mjs';
 import {
   PR_LIMIT_DEFAULTS, PR_LIMIT_ENV, resolvePrLimit,
   EXEMPT_PATH_PREFIXES, isExemptPath, isExemptChangeset,
@@ -18,8 +20,12 @@ import {
   isGlobalOffNow, isBranchAllowedNow,
   fetchOpenPrs, fetchPrCommits, countOpenPrsForRepo,
   createAuthorshipCache, countOpenPrsForDispatch, DISPATCH_PR_COUNT_API_CAP, AUTHORSHIP_FAILURE_COOLDOWN_MS,
-  PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope,
+  PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope, isStackedAwaitingBasePr,
+  authoriseAllow, runPrLimitCli, readLimitState,
+  authoriseOverride, OVERRIDE_VERBS, UNGATED_VERBS, OPERATOR_QUOTE_MAX, HISTORY_MAX, capHistory, appendHistory, isGlobalOffLive,
+  refusalReason, updateLimitState, writeLimitState,
 } from '../pr-limit.mjs';
+import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 
 describe('resolvePrLimit', () => {
   it('defaults to the operator-set per-repo caps', () => {
@@ -101,10 +107,39 @@ describe('decideOpenPr — the five required behaviours', () => {
     expect(d.reason).toMatch(/backpressure limit reached for plateau-app: 5\/5/);
   });
 
+  it('the refusal tells an agent to stop and report, and names every exception with its operator quote (xfaz7ho)', () => {
+    const { reason } = decideOpenPr({ ...base, openCount: 5 });
+    expect(reason).toMatch(/An agent stops and reports here/);
+    expect(reason).toMatch(/allow --branch=<b> --reason=… --operator-quote="<verbatim>"/);
+    expect(reason).toMatch(/off --operator-quote="<verbatim>"/);
+    expect(reason).not.toMatch(/`pr-limit\.mjs off`/); // never a bare, quote-less `off`
+  });
+
   it('an EXEMPT (infra-only) changeset is allowed even over the limit', () => {
     const d = decideOpenPr({ ...base, openCount: 9, changedFiles: ['scripts/conveyor/tick-core.mjs'] });
     expect(d.allowed).toBe(true);
     expect(d.exempt).toBe(true);
+  });
+
+  it('a CARD-ONLY changeset may OPEN even over the limit — it is not counted, so it cannot raise the count (xbxahvf)', () => {
+    const d = decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md', 'backlog/x9dscc7-b.md'] });
+    expect(d.allowed).toBe(true);
+    expect(d.exempt).toBe(true);
+    expect(d.reason).toMatch(/card-only/);
+  });
+
+  it('a card-only changeset still meets the limit when excludeCardOnly is OFF (the toggle gates the open exemption too)', () => {
+    const d = decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md'], excludeCardOnly: false });
+    expect(d.allowed).toBe(false);
+    expect(d.exempt).toBe(false);
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md'], excludeCardOnly: true }).allowed).toBe(true);
+    // omitted → the built-in default (exclude)
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md'] }).allowed).toBe(true);
+  });
+
+  it('a card plus any non-card file, or an unreadable (empty) changeset, still meets the limit', () => {
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: ['backlog/xfyhz2z-a.md', 'docs/x.md'] }).allowed).toBe(false);
+    expect(decideOpenPr({ ...base, openCount: 17, changedFiles: [] }).allowed).toBe(false);
   });
 
   it('GLOBAL OFF allows even over the limit', () => {
@@ -149,8 +184,8 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
   const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
   const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
 
-  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
-    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,files'])); expect(args).not.toContain('commits'); return '[]'; };
+  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
+    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files'])); expect(args).not.toContain('commits'); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
   });
 
@@ -182,7 +217,7 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
       throw new Error(`unexpected call: ${JSON.stringify(args)}`);
     };
     const result = countOpenPrsForRepo('we', { exec, env: {} });
-    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, cardOnly: 0, cardOnlyPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
+    expect(result).toEqual({ repoKey: 'we', slug: 'web-everything/web-everything', count: 1, prNumbers: [1], limit: 15, unavailable: false, unresolved: 0, apiFetches: 2, excludeCardOnly: true, cardOnly: 0, cardOnlyPrNumbers: [], stacked: 0, stackedPrNumbers: [], accepted: 1, acceptedPrNumbers: [2] });
     // Exactly one list call + one commits call per NOT-accepted PR (#2 is skipped — already accepted).
     expect(calls.filter((a) => a[1] === 'list')).toHaveLength(1);
     expect(calls.filter((a) => a[0] === 'api' && a[1] === 'graphql')).toHaveLength(2);
@@ -206,8 +241,8 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
 describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
   const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
-  const card = (n) => ({ number: n, labels: [], files: [{ path: `backlog/${n}-card.md` }] });
-  const code = (n) => ({ number: n, labels: [], files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
+  const card = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: `backlog/${n}-card.md` }] });
+  const code = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
   const execFor = (rows, calls = []) => (args) => {
     calls.push(args);
     if (args[1] === 'list') return JSON.stringify(rows);
@@ -216,7 +251,7 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   };
 
   it('defaults to excluding card-only PRs; the tool layer and env override it, in that order', () => {
-    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true });
+    expect(PR_LIMIT_SCOPE_DEFAULTS).toEqual({ excludeCardOnly: true, excludeStackedAwaitingBase: true });
     expect(resolvePrLimitScope({})).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'default' } });
     expect(resolvePrLimitScope({ tool: { excludeCardOnly: false } })).toMatchObject({ excludeCardOnly: false, source: { excludeCardOnly: 'tool' } });
     expect(resolvePrLimitScope({ tool: { excludeCardOnly: 'no' } }).excludeCardOnly).toBe(true);
@@ -225,6 +260,122 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
 
   it('the shipped settings file states the ruling (excludeCardOnly: true)', () => {
     expect(readPrLimitScope({ env: {} })).toMatchObject({ excludeCardOnly: true, source: { excludeCardOnly: 'tool' } });
+  });
+
+  it('excludeStackedAwaitingBase resolves through the same cascade, and the shipped file sets it (operator ruling option c)', () => {
+    expect(resolvePrLimitScope({ platform: { excludeStackedAwaitingBase: false } })).toMatchObject({
+      excludeStackedAwaitingBase: false, source: { excludeStackedAwaitingBase: 'platform' } });
+    expect(resolvePrLimitScope({ platform: { excludeStackedAwaitingBase: false }, env: { WE_PR_LIMIT_EXCLUDE_STACKED_AWAITING_BASE: '1' } }))
+      .toMatchObject({ excludeStackedAwaitingBase: true, source: { excludeStackedAwaitingBase: 'env' } });
+    expect(readPrLimitScope({ env: {} })).toMatchObject({ excludeStackedAwaitingBase: true, source: { excludeStackedAwaitingBase: 'tool' } });
+  });
+
+  it('a stacked draft awaiting its base PR is not counted; a stacked PR without the label, or on main, still is', () => {
+    const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
+    const baseRow = { ...code(9), headRefName: 'lane/settings-cascade-audit' };
+    const rows = [awaiting(6, 'lane/settings-cascade-audit'), { ...code(7), baseRefName: 'lane/x' }, awaiting(8, 'main'), code(3), baseRow];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
+    expect(r).toMatchObject({ count: 4, stacked: 1, stackedPrNumbers: [6] });
+    const off = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: false } });
+    expect(off).toMatchObject({ count: 5, stacked: 0 });
+  });
+
+  it('a labelled draft whose base is NOT the head of another open PR still counts (the label and a scratch base are not enough)', () => {
+    const awaiting = (n, base) => ({ ...code(n), baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
+    const rows = [awaiting(6, 'scratch/not-a-pr'), awaiting(7, 'lane/real-base'), { ...code(9), headRefName: 'lane/real-base' }];
+    const r = countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope: { excludeCardOnly: true, excludeStackedAwaitingBase: true } });
+    expect(r).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [7] });
+    expect(isStackedAwaitingBasePr(awaiting(6, 'scratch/not-a-pr'), new Set(['lane/real-base']))).toBe(false);
+    expect(isStackedAwaitingBasePr(awaiting(7, 'lane/real-base'), new Set(['lane/real-base']))).toBe(true);
+    // fail-closed: no open-heads set → not stacked
+    expect(isStackedAwaitingBasePr(awaiting(7, 'lane/real-base'))).toBe(false);
+  });
+
+  it('a labelled draft whose base PR is itself excluded (card-only / accepted) or part of a cycle still counts; a chain that ends at a counted PR does not', () => {
+    const awaiting = (n, base, head) => ({ ...code(n), headRefName: head ?? `lane/d${n}`, baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const count = (rows) => countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope });
+    const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', isCrossRepository: false, files: [{ path: 'backlog/x.md' }] };
+    // a card-only base shields nobody: both drafts hang off an uncounted PR and are counted
+    expect(count([cardBase, awaiting(6, 'lane/card-base'), awaiting(7, 'lane/card-base')])).toMatchObject({ count: 2, stacked: 0, cardOnly: 1 });
+    // an accepted base likewise
+    const acceptedBase = { ...code(51), headRefName: 'lane/acc-base', labels: [{ name: 'review:accepted' }] };
+    expect(count([acceptedBase, awaiting(6, 'lane/acc-base')])).toMatchObject({ count: 1, stacked: 0, accepted: 1 });
+    // a two-PR cycle (each the other's base) shields neither
+    expect(count([awaiting(6, 'lane/d7'), awaiting(7, 'lane/d6')])).toMatchObject({ count: 2, stacked: 0 });
+    // a chain d8 → d7 → real counted base: both drafts are excluded
+    const real = { ...code(9), headRefName: 'lane/real' };
+    expect(count([real, awaiting(7, 'lane/real'), awaiting(8, 'lane/d7')])).toMatchObject({ count: 1, stacked: 2, stackedPrNumbers: [7, 8] });
+    // the same chain over a card-only root counts both
+    expect(count([cardBase, awaiting(7, 'lane/card-base'), awaiting(8, 'lane/d7')])).toMatchObject({ count: 2, stacked: 0 });
+  });
+
+  // Red-team break 1 (PR #4785, head e0f5f964d): the chain's root must be COUNTED, which includes authorship.
+  it('a human-authored (uncounted) base shields nobody: its agent-authored awaiting-base child is counted', () => {
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const verdicts = { 'web-everything/web-everything#9@o9': false, 'web-everything/web-everything#6@o6': true };
+    const authorshipCache = { get: (k) => verdicts[k], set() {}, flush() {} };
+    const humanBase = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
+    const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
+    const calls = [];
+    const r = countOpenPrsForRepo('we', { exec: execFor([humanBase, child], calls), env: {}, scope, authorshipCache });
+    expect(r).toMatchObject({ count: 1, prNumbers: [6], stacked: 0, stackedPrNumbers: [], unresolved: 0 });
+    expect(calls.filter((a) => a[0] === 'api')).toHaveLength(0); // both verdicts came from the cache
+    // a chain d8 → d6 → human root: neither draft is shielded
+    const grandchild = { ...code(8), headRefName: 'lane/gc', headRefOid: 'o8', baseRefName: 'lane/child', labels: [{ name: 'review-status:awaiting-base' }] };
+    verdicts['web-everything/web-everything#8@o8'] = true;
+    expect(countOpenPrsForRepo('we', { exec: execFor([humanBase, child, grandchild]), env: {}, scope, authorshipCache })).toMatchObject({ count: 2, stacked: 0 });
+    // positive control: an agent-authored base still shields its child, and the child costs no lookup
+    verdicts['web-everything/web-everything#9@o9'] = true;
+    expect(countOpenPrsForRepo('we', { exec: execFor([humanBase, child]), env: {}, scope, authorshipCache })).toMatchObject({ count: 1, prNumbers: [9], stacked: 1, stackedPrNumbers: [6] });
+  });
+
+  it('a base whose authorship is unresolved (budget spent / read failed) shields nobody, and is looked up only once', () => {
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const base = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
+    const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
+    const calls = [];
+    const exec = (args) => {
+      calls.push(args);
+      if (args[1] === 'list') return JSON.stringify([base, child]);
+      if (args[0] === 'api' && args.includes('number=9')) throw new Error('gh: rate limited');
+      if (args[0] === 'api') return commitsPage([aiCommit]);
+      throw new Error(`unexpected call: ${JSON.stringify(args)}`);
+    };
+    // the base row names `main` + an oid, so the real git transport would run (and fetch, in a checkout whose origin is the repo)
+    const git = () => { throw new Error('git unavailable'); };
+    const r = countOpenPrsForRepo('we', { exec, env: {}, scope, git });
+    expect(r).toMatchObject({ count: 1, prNumbers: [6], stacked: 0, unresolved: 1, apiFetches: 2 });
+    expect(calls.filter((a) => a[0] === 'api' && a.includes('number=9'))).toHaveLength(1);
+  });
+
+  // Red-team break 2 (PR #4785, head e0f5f964d): a fork PR's head branch is not an upstream ref.
+  it('a fork PR whose head name matches a draft\'s base is not that draft\'s base: the draft still counts', () => {
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const fork = { ...code(9), headRefName: 'release', baseRefName: 'main', isCrossRepository: true };
+    const draft = { ...code(6), headRefName: 'lane/d6', baseRefName: 'release', labels: [{ name: 'review-status:awaiting-base' }] };
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    // fail-closed: a row that does not say where its head lives is never a base either
+    const { isCrossRepository: _omit, ...unknown } = fork;
+    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    // the same base name owned by an upstream PR does stack (a fork CHILD is fine — only the base must be upstream)
+    const upstream = { ...fork, number: 10, isCrossRepository: false };
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
+  });
+
+  it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
+    const r = countOpenPrsForRepo('we', { exec: () => { throw new Error('boom'); }, env: {}, scope: { excludeCardOnly: false, excludeStackedAwaitingBase: true } });
+    expect(r).toMatchObject({ unavailable: true, excludeCardOnly: false });
+  });
+
+  it('fetchOpenPrs requests baseRefName and isCrossRepository on both the direct and the shared-snapshot read (the stacked test needs them)', () => {
+    const exec = (args) => { expect(args[args.indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['baseRefName', 'isCrossRepository'])); return '[]'; };
+    expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
+    let fields = null;
+    fetchOpenPrs('o/n', { exec: () => '[]', readShared: (o) => { fields = o.fields; return []; } });
+    expect(fields.split(',')).toEqual(expect.arrayContaining(['baseRefName', 'isCrossRepository']));
+    // the shared snapshot must actually carry every field asked for, or it silently never serves this reader
+    expect(fields.split(',').every((f) => SNAPSHOT_FIELDS.includes(f))).toBe(true);
   });
 
   it('fetchOpenPrs asks for files (the card-only test needs them)', () => {
@@ -247,16 +398,18 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
 
   it('the setting OFF counts card-only PRs again', () => {
     const r = countOpenPrsForRepo('we', { exec: execFor([card(1), code(3)]), env: {}, scope: { excludeCardOnly: false } });
-    expect(r).toMatchObject({ count: 2, cardOnly: 0 });
+    expect(r).toMatchObject({ count: 2, cardOnly: 0, excludeCardOnly: false });
+    // wiring: pr-land feeds this resolved value into decideOpenPr, so the open exemption follows the same toggle
+    expect(decideOpenPr({ repoKey: 'we', limit: 2, openCount: r.count, excludeCardOnly: r.excludeCardOnly, changedFiles: ['backlog/x.md'] }).allowed).toBe(false);
   });
 
   it('the refusal reports "N counted (M card-only excluded, K accepted excluded)"', () => {
-    const d = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 15, cardOnlyExcluded: 6, acceptedExcluded: 2 });
+    const d = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 15, cardOnlyExcluded: 6, acceptedExcluded: 2, stackedExcluded: 3 });
     expect(d.allowed).toBe(false);
-    expect(d.reason).toContain('15 counted (6 card-only excluded, 2 accepted excluded)');
+    expect(d.reason).toContain('15 counted (6 card-only excluded, 3 stacked awaiting-base excluded, 2 accepted excluded)');
     const ok = decideOpenPr({ repoKey: 'we', limit: 15, openCount: 9, cardOnlyExcluded: 6, acceptedExcluded: 0 });
     expect(ok.allowed).toBe(true);
-    expect(ok.reason).toContain('9 counted (6 card-only excluded, 0 accepted excluded)');
+    expect(ok.reason).toContain('9 counted (6 card-only excluded, 0 stacked awaiting-base excluded, 0 accepted excluded)');
   });
 });
 
@@ -526,5 +679,425 @@ describe('bounded networked count (dispatch round) — the GitHub-call budget th
     const r = countOpenPrsForDispatch('we', { exec: h.exec, readShared: h.readShared, env: {}, authorshipCache: cache });
     expect(h.graphql()).toBe(0);
     expect(r).toMatchObject({ fallback: true, count: DISPATCH_PR_COUNT_API_CAP, unresolved: 0 });
+  });
+});
+
+// xfaz7ho — `allow` is the operator's exception to grant. Twice on 2026-10-10 a worker ran
+// `pr-limit.mjs allow --branch=<its own branch>` and opened its PR past the limit (#4786, #4779).
+describe('allow is operator-only (xfaz7ho)', () => {
+  const QUOTE = 'ok, let 4786 open past the limit';
+  const operatorEnv = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'main-session' };
+  const primary = '/Users/op/workspace/webeverything';
+  const lane = '/Users/op/workspace/.lanes/web-everything/lane-7';
+  const tmpState = () => join(mkdtempSync(join(tmpdir(), 'pr-limit-allow-')), 'pr-limit.json');
+  const silent = () => ({ write: () => true });
+
+  it('refuses a dispatched worker session (WE_CONVEYOR_WORKER=1), even with a quote', () => {
+    const d = authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwdReal: primary });
+    expect(d.ok).toBe(false);
+    expect(d.channel).toBe('worker');
+    expect(d.refusal).toMatch(/stop and report/);
+  });
+
+  it('refuses an unrecognised worker marker (fail closed)', () => {
+    const d = authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: { ...operatorEnv, WE_CONVEYOR_WORKER: 'true' }, cwdReal: primary });
+    expect(d.ok).toBe(false);
+    expect(d.channel).toBe('unknown');
+  });
+
+  it('refuses an agent working inside a lane clone, even with a quote', () => {
+    const d = authoriseAllow({ branch: 'lane/other', operatorQuote: QUOTE, env: operatorEnv, cwdReal: lane });
+    expect(d.ok).toBe(false);
+    expect(d.channel).toBe('lane');
+  });
+
+  it("refuses allow-listing the caller's OWN checked-out branch", () => {
+    const d = authoriseAllow({ branch: '4786-x', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: 'origin/lane/4786-x' });
+    expect(d.ok).toBe(false);
+    expect(d.refusal).toMatch(/own branch/);
+  });
+
+  it("refuses the own branch when ANY of the checkout's names matches (checked-out branch, upstream, push target)", () => {
+    for (const ownBranch of [['lane/child', 'lane/parent'], ['lane/parent', 'lane/child'], 'lane/child']) {
+      const d = authoriseAllow({ branch: 'lane/child', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch });
+      expect(d).toMatchObject({ ok: false, channel: 'own-branch' });
+    }
+    expect(authoriseAllow({ branch: 'lane/other', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: ['lane/child', 'lane/parent'] }).ok).toBe(true);
+  });
+
+  // Red-team break on #4791: the upstream was read FIRST and the checked-out branch never, and only an `origin/` prefix
+  // was stripped — so a branch tracking another branch, or tracking a remote not named origin, slipped through.
+  describe('CLI on a real checkout: the checked-out branch is refused whatever it tracks', () => {
+    const gitIn = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'init.defaultBranch=main', ...args], { cwd, stdio: 'pipe' });
+    const checkout = (remoteName, upstreamBranch, localBranch = 'lane/child', { fetch = true } = {}) => {
+      const root = mkdtempSync(join(tmpdir(), 'pr-limit-own-'));
+      const bare = join(root, 'remote.git');
+      const work = join(root, 'work');
+      mkdirSync(work);
+      gitIn(root, 'init', '--bare', '-q', bare);
+      gitIn(work, 'init', '-q');
+      gitIn(work, 'commit', '-q', '--allow-empty', '-m', 'base');
+      gitIn(work, 'remote', 'add', remoteName, bare);
+      gitIn(work, 'checkout', '-q', '-b', localBranch);
+      if (fetch) {
+        gitIn(work, 'push', '-q', remoteName, `HEAD:refs/heads/${upstreamBranch}`);
+        gitIn(work, 'fetch', '-q', remoteName);
+        gitIn(work, 'branch', '-q', `--set-upstream-to=${remoteName}/${upstreamBranch}`);
+      } else { // upstream configured, but its remote-tracking ref was never fetched — `@{u}` cannot resolve
+        gitIn(work, 'config', `branch.${localBranch}.remote`, remoteName);
+        gitIn(work, 'config', `branch.${localBranch}.merge`, `refs/heads/${upstreamBranch}`);
+      }
+      return work;
+    };
+    const allowFrom = (cwd) => {
+      const path = tmpState();
+      const code = runPrLimitCli(['allow', '--branch=lane/child', '--reason=r', `--operator-quote=${QUOTE}`],
+        { env: operatorEnv, cwd, path, stderr: silent(), stdout: silent() });
+      return { code, st: readLimitState(path) };
+    };
+
+    it('lane/child tracking origin/lane/parent is refused', () => {
+      const { code, st } = allowFrom(checkout('origin', 'lane/parent'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    it('lane/child tracking upstream/lane/child (a remote not named origin) is refused', () => {
+      const { code, st } = allowFrom(checkout('upstream', 'lane/child'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    it('a remote whose name contains a slash is stripped whole (fork/x tracking fork/x/lane/child is refused)', () => {
+      const { code, st } = allowFrom(checkout('fork/x', 'lane/child'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    // The UPSTREAM read on its own (the checked-out branch is named differently, so HEAD alone cannot refuse it):
+    // remote prefixes are stripped by the checkout's remote list, a slash-named remote whole.
+    for (const remote of ['origin', 'upstream', 'fork/x']) {
+      it(`a local branch named otherwise but tracking ${remote}/lane/child is refused lane/child`, () => {
+        const { code, st } = allowFrom(checkout(remote, 'lane/child', 'work'));
+        expect(code).not.toBe(0);
+        expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+      });
+    }
+
+    it('an upstream configured but never fetched (branch.<b>.merge only) is still refused', () => {
+      const { code, st } = allowFrom(checkout('upstream', 'lane/child', 'work', { fetch: false }));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    it('a different branch is still grantable from that checkout', () => {
+      const path = tmpState();
+      const code = runPrLimitCli(['allow', '--branch=lane/elsewhere', '--reason=r', `--operator-quote=${QUOTE}`],
+        { env: operatorEnv, cwd: checkout('upstream', 'lane/parent'), path, stderr: silent(), stdout: silent() });
+      expect(code).toBe(0);
+    });
+  });
+
+  it('refuses a missing or blank --operator-quote', () => {
+    for (const q of [undefined, '', '   ', true]) {
+      const d = authoriseAllow({ branch: 'lane/x', operatorQuote: q, env: operatorEnv, cwdReal: primary });
+      expect(d.ok).toBe(false);
+      expect(d.refusal).toMatch(/--operator-quote/);
+    }
+  });
+
+  it('accepts the operator channel with a quote (orchestrator session or a bare terminal)', () => {
+    expect(authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary })).toMatchObject({ ok: true, channel: 'operator-session' });
+    expect(authoriseAllow({ branch: 'lane/x', operatorQuote: QUOTE, env: {}, cwdReal: primary })).toMatchObject({ ok: true, channel: 'terminal' });
+  });
+
+  it('CLI: a worker session is refused with a non-zero exit, nothing allow-listed, and the refusal logged', () => {
+    const path = tmpState();
+    const code = runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=need it', `--operator-quote=${QUOTE}`],
+      { env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() });
+    expect(code).not.toBe(0);
+    const st = readLimitState(path);
+    expect(isBranchAllowedNow(st, 'lane/4786-x')).toBe(false);
+    expect(st.history.at(-1)).toMatchObject({ action: 'allow-refused', target: '4786-x' });
+  });
+
+  it('CLI: missing quote is refused; operator channel with a quote is accepted and records the quote verbatim', () => {
+    const path = tmpState();
+    const deps = { env: operatorEnv, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() };
+    expect(runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r'], deps)).not.toBe(0);
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/4786-x')).toBe(false);
+    expect(runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r', `--operator-quote=${QUOTE}`], deps)).toBe(0);
+    const st = readLimitState(path);
+    expect(isBranchAllowedNow(st, 'lane/4786-x')).toBe(true);
+    expect(st.branches['lane/4786-x']).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session' });
+  });
+
+  it('existing allow-list entries written before this rule (no quote, no channel) are still honoured', () => {
+    const legacy = parseLimitState(JSON.stringify({ branches: { '4779-y': { reason: 'old', by: 'nic', at: '2026-10-10T10:00:00.000Z', until: null } } }));
+    expect(isBranchAllowedNow(legacy, 'lane/4779-y')).toBe(true);
+  });
+
+  // ── #4791 round-4 review: guarantees the PR states but no test held ──
+
+  it('the operator quote is bounded at exactly OPERATOR_QUOTE_MAX characters (1000 ok, 1001 refused, no grant written)', () => {
+    expect(OPERATOR_QUOTE_MAX).toBe(1000);
+    expect(authoriseAllow({ branch: 'lane/x', operatorQuote: 'q'.repeat(1000), env: operatorEnv, cwdReal: primary }).ok).toBe(true);
+    const over = authoriseAllow({ branch: 'lane/x', operatorQuote: 'q'.repeat(1001), env: operatorEnv, cwdReal: primary });
+    expect(over).toMatchObject({ ok: false });
+    expect(over.refusal).toMatch(/over 1000 characters/);
+    const path = tmpState();
+    expect(runPrLimitCli(['allow', '--branch=lane/x', '--reason=r', `--operator-quote=${'q'.repeat(1001)}`],
+      { env: operatorEnv, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() })).toBe(3);
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/x')).toBe(false);
+  });
+
+  it('CLI: refused when run from inside a lane clone, even from an operator session with a quote', () => {
+    const path = tmpState();
+    const code = runPrLimitCli(['allow', '--branch=lane/other', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: operatorEnv, cwd: lane, path, ownBranch: '', stderr: silent(), stdout: silent() });
+    expect(code).toBe(3);
+    const st = readLimitState(path);
+    expect(isBranchAllowedNow(st, 'lane/other')).toBe(false);
+    expect(st.history.at(-1).reason).toMatch(/\[channel=lane session=main-session\]/);
+  });
+
+  it('CLI: a grant records the caller session, and the session/quote/channel survive a store round-trip', () => {
+    const path = tmpState();
+    expect(runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: operatorEnv, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() })).toBe(0);
+    const entry = readLimitState(path).branches['lane/4786-x'];
+    expect(entry).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session', session: 'main-session' });
+    const again = parseLimitState(serializeLimitState(parseLimitState(readFileSync(path, 'utf8'))));
+    expect(again.branches['lane/4786-x']).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session', session: 'main-session' });
+  });
+
+  it('CLI: a refusal is logged with its channel and the caller session', () => {
+    const path = tmpState();
+    runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() });
+    expect(readLimitState(path).history.at(-1)).toMatchObject({ action: 'allow-refused' });
+    expect(readLimitState(path).history.at(-1).reason).toMatch(/\[channel=worker session=main-session\]$/);
+  });
+
+  it('refuses a target that matches ONLY the checkout push destination (@{push} via a remote push refspec)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-limit-push-'));
+    const bare = join(root, 'remote.git');
+    const work = join(root, 'work');
+    mkdirSync(work);
+    const gitIn = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'init.defaultBranch=main', ...args], { cwd, stdio: 'pipe' });
+    gitIn(root, 'init', '--bare', '-q', bare);
+    gitIn(work, 'init', '-q');
+    gitIn(work, 'commit', '-q', '--allow-empty', '-m', 'base');
+    gitIn(work, 'remote', 'add', 'origin', bare);
+    gitIn(work, 'checkout', '-q', '-b', 'work');
+    gitIn(work, 'push', '-q', 'origin', 'HEAD:refs/heads/lane/parent', 'HEAD:refs/heads/lane/child');
+    gitIn(work, 'fetch', '-q', 'origin');
+    gitIn(work, 'branch', '-q', '--set-upstream-to=origin/lane/parent');
+    gitIn(work, 'config', 'remote.origin.push', 'refs/heads/work:refs/heads/lane/child');
+    const path = tmpState();
+    const code = runPrLimitCli(['allow', '--branch=lane/child', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: operatorEnv, cwd: work, path, stderr: silent(), stdout: silent() });
+    expect(code).toBe(3);
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/child')).toBe(false);
+  });
+});
+
+// #4791 round-4 review (block ruling): `off` lifted the limit for EVERY agent with no gate — the same self-grant
+// `allow` closed. Every limit-lifting verb now goes through one gate.
+describe('off is operator-only too (#4791)', () => {
+  const QUOTE = 'turn the limit off for the release';
+  const operatorEnv = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'main-session' };
+  const primary = '/Users/op/workspace/webeverything';
+  const lane = '/Users/op/workspace/.lanes/web-everything/lane-7';
+  const tmpState = () => join(mkdtempSync(join(tmpdir(), 'pr-limit-off-')), 'pr-limit.json');
+  const silent = () => ({ write: () => true });
+  const off = (env, cwd, extra = [`--operator-quote=${QUOTE}`]) => {
+    const path = tmpState();
+    const code = runPrLimitCli(['off', '--reason=r', '--for=2h', ...extra], { env, cwd, path, stderr: silent(), stdout: silent() });
+    return { code, st: readLimitState(path) };
+  };
+
+  it('a worker session cannot turn the limit off, even with a quote — refused, logged, limit still on', () => {
+    const { code, st } = off({ ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, primary);
+    expect(code).toBe(3);
+    expect(isGlobalOffNow(st)).toBe(false);
+    expect(st.history.at(-1)).toMatchObject({ action: 'off-refused' });
+    expect(st.history.at(-1).reason).toMatch(/\[channel=worker session=main-session\]$/);
+  });
+
+  it('an unknown role and a lane cwd are refused; a missing quote is refused', () => {
+    expect(off({ ...operatorEnv, WE_CONVEYOR_WORKER: 'yes' }, primary).code).toBe(3);
+    expect(off(operatorEnv, lane).code).toBe(3);
+    const noQuote = off(operatorEnv, primary, []);
+    expect(noQuote.code).toBe(3);
+    expect(isGlobalOffNow(noQuote.st)).toBe(false);
+  });
+
+  it('the operator channel with a quote turns it off and records quote, channel and session (surviving a round-trip)', () => {
+    const { code, st } = off(operatorEnv, primary);
+    expect(code).toBe(0);
+    expect(isGlobalOffNow(st)).toBe(true);
+    expect(st.global).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session', session: 'main-session' });
+  });
+
+  it('authoriseOverride: `off` has no own-branch rule; `allow` keeps it', () => {
+    expect(authoriseOverride({ verb: 'off', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: 'lane/x' }).ok).toBe(true);
+    expect(authoriseOverride({ verb: 'allow', branch: 'lane/x', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: 'lane/x' }).ok).toBe(false);
+  });
+
+  it('every CLI verb is declared gated or ungated, and every gated verb refuses a worker', () => {
+    const verbs = [...OVERRIDE_VERBS, ...UNGATED_VERBS];
+    expect(new Set(verbs).size).toBe(verbs.length);
+    expect(OVERRIDE_VERBS).toEqual(['allow', 'off']);
+    const src = readFileSync(resolve(process.cwd(), 'scripts/lib/pr-limit.mjs'), 'utf8'); // vitest runs from the repo root
+    const cliVerbs = [...src.matchAll(/\bcmd === '([a-z-]+)'/g)].map((m) => m[1]);
+    expect(new Set(cliVerbs)).toEqual(new Set(verbs));
+    for (const verb of OVERRIDE_VERBS) {
+      const path = tmpState();
+      const code = runPrLimitCli([verb, '--branch=lane/x', '--reason=r', `--operator-quote=${QUOTE}`],
+        { env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() });
+      expect(code).toBe(3);
+    }
+  });
+
+  it('`WE_PR_LIMIT_OFF=1` inherited by a worker is still honoured (the dispatcher and the worker must agree)', () => {
+    const path = tmpState();
+    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1' }, path })).toBe(true);
+    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1', WE_CONVEYOR_WORKER: '1' }, path })).toBe(true);
+  });
+});
+
+describe('override history keeps grants over refusals (#4791)', () => {
+  const rec = (action, i) => ({ at: `t${i}`, actor: null, reason: null, action, target: `b${i}` });
+  const made = [];
+  const tmpStore = (prefix) => { const d = mkdtempSync(join(tmpdir(), prefix)); made.push(d); return join(d, 'pr-limit.json'); };
+  afterAll(() => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
+
+  it('a looping refused caller never evicts a grant record — refusals are evicted first', () => {
+    let s = appendHistory(emptyLimitState(), { action: 'allow-branch', target: 'kept' });
+    for (let i = 0; i < HISTORY_MAX + 50; i++) s = appendHistory(s, { action: 'allow-refused', target: `r${i}` });
+    expect(s.history.length).toBe(HISTORY_MAX);
+    expect(s.history[0]).toMatchObject({ action: 'allow-branch', target: 'kept' });
+  });
+
+  it('the cap on READ is the same policy (an oversized store keeps its grants)', () => {
+    const history = [rec('off', 0), ...Array.from({ length: HISTORY_MAX + 10 }, (_, i) => rec('off-refused', i + 1))];
+    const st = parseLimitState(JSON.stringify({ history }));
+    expect(st.history.length).toBe(HISTORY_MAX);
+    expect(st.history[0]).toMatchObject({ action: 'off' });
+  });
+
+  it('a looping ungated `on` never evicts a grant record either — every non-grant entry goes first', () => {
+    let s = appendHistory(emptyLimitState(), { action: 'off', target: 'kept-off' });
+    s = appendHistory(s, { action: 'allow-branch', target: 'kept-allow' });
+    for (let i = 0; i < HISTORY_MAX + 50; i++) s = appendHistory(s, { action: 'on', target: null });
+    expect(s.history.length).toBe(HISTORY_MAX);
+    expect(s.history.slice(0, 2).map((r) => r.target)).toEqual(['kept-off', 'kept-allow']);
+  });
+
+  it('caller-supplied text is clipped: a refused call with a huge --by and --reason stores a bounded record', () => {
+    const path = tmpStore('pr-limit-clip-');
+    const big = 'x'.repeat(100_000);
+    runPrLimitCli(['off', `--by=${big}`, `--reason=${big}`], { env: { WE_CONVEYOR_WORKER: '1' }, cwd: '/x', path, stderr: { write: () => true }, stdout: { write: () => true } });
+    const rec = readLimitState(path).history.at(-1);
+    expect(rec.action).toBe('off-refused');
+    expect(rec.actor.length).toBeLessThan(300);
+    expect(rec.reason.length).toBeLessThan(2100);
+    const granted = allowBranch(emptyLimitState(), 'lane/x', { reason: big, by: big });
+    expect(granted.branches['lane/x'].reason.length).toBeLessThan(2100);
+    expect(granted.branches['lane/x'].by.length).toBeLessThan(300);
+    expect(setGlobalOff(emptyLimitState(), { reason: big, by: big }).global.reason.length).toBeLessThan(2100);
+  });
+
+  // #4791 self-review: the grant evidence lived only on the live record, which the ungated `on` resets and a re-grant
+  // overwrites — the history entry (the one capHistory protects) must carry it too.
+  it('CLI: an `off` grant and an `allow` grant keep quote/channel/session in history after `on` and a re-grant', () => {
+    const path = tmpStore('pr-limit-evidence-');
+    const env = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'op-session' };
+    const deps = { env, cwd: '/Users/op/workspace/webeverything', path, ownBranch: '', stderr: { write: () => true }, stdout: { write: () => true } };
+    expect(runPrLimitCli(['off', '--reason=r', '--operator-quote=first off'], deps)).toBe(0);
+    expect(runPrLimitCli(['on'], { ...deps, env: { WE_CONVEYOR_WORKER: '1' } })).toBe(0); // ungated, resets `global`
+    expect(runPrLimitCli(['allow', '--branch=lane/y', '--reason=r', '--operator-quote=first allow'], deps)).toBe(0);
+    expect(runPrLimitCli(['allow', '--branch=lane/y', '--reason=r', '--operator-quote=second allow'], deps)).toBe(0);
+    const st = readLimitState(path);
+    expect(st.global.operatorQuote).toBeUndefined();
+    const evidence = st.history.filter((r) => r.action === 'off' || r.action === 'allow-branch');
+    expect(evidence).toMatchObject([
+      { action: 'off', operatorQuote: 'first off', channel: 'operator-session', session: 'op-session' },
+      { action: 'allow-branch', operatorQuote: 'first allow', channel: 'operator-session', session: 'op-session' },
+      { action: 'allow-branch', operatorQuote: 'second allow', channel: 'operator-session', session: 'op-session' },
+    ]);
+  });
+
+  it('a refusal keeps its [channel=… session=…] tag even when the refusal text is clipped (a long lane cwd)', () => {
+    const path = tmpStore('pr-limit-tag-');
+    const cwd = `/Users/op/workspace/.lanes/${'d'.repeat(5000)}`;
+    runPrLimitCli(['off', '--reason=r', '--operator-quote=q'], { env: { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's1' }, cwd, path, stderr: { write: () => true }, stdout: { write: () => true } });
+    const rec = readLimitState(path).history.at(-1);
+    expect(rec.action).toBe('off-refused');
+    expect(rec.reason).toMatch(/\[channel=lane session=s1\]$/);
+    expect(rec.reason.length).toBeLessThanOrEqual(2000);
+    expect(refusalReason({ refusal: 'x'.repeat(10_000), channel: 'worker' }, 'y'.repeat(10_000))).toMatch(/\[channel=worker session=y+…\[clipped \d+\]\]$/);
+  });
+
+  // #4791 self-review: a refused call that read the store just before an operator grant wrote its stale copy back
+  // and erased the grant. Every CLI write is now a locked read-modify-write — a held lock blocks it, never bypassed.
+  it('every CLI write goes through the store lock: with the lock held, a refusal neither writes nor proceeds unlocked', () => {
+    const path = tmpStore('pr-limit-lock-');
+    writeLimitState(allowBranch(emptyLimitState(), 'lane/granted', { operatorQuote: 'q' }), path);
+    const before = readFileSync(path, 'utf8');
+    writeFileSync(`${path}.lock`, `${process.pid}\n`); // a live holder (this process) — never stolen
+    for (const argv of [['off', '--reason=r'], ['allow', '--branch=lane/x', '--reason=r'], ['on']]) {
+      expect(() => runPrLimitCli(argv, { env: { WE_CONVEYOR_WORKER: '1' }, cwd: '/x', path, ownBranch: '', lockOpts: { timeoutMs: 50, pollMs: 5 }, stderr: { write: () => true }, stdout: { write: () => true } }))
+        .toThrow(/timed out/);
+    }
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+
+  it('updateLimitState re-reads INSIDE the lock, so a write made after the caller started is kept', () => {
+    const path = tmpStore('pr-limit-reread-');
+    writeLimitState(emptyLimitState(), path);
+    const next = updateLimitState(path, (s) => {
+      expect(isBranchAllowedNow(s, 'lane/late')).toBe(false);
+      return appendHistory(s, { action: 'allow-refused', target: 'w' });
+    });
+    expect(next.history.at(-1).action).toBe('allow-refused');
+    writeLimitState(allowBranch(readLimitState(path), 'lane/late', { operatorQuote: 'q' }), path); // the operator's grant lands
+    updateLimitState(path, (s) => appendHistory(s, { action: 'off-refused', target: null })); // a later refusal
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/late')).toBe(true);
+  });
+
+  it('with no non-grant entries left to evict, the oldest grants go (still capped)', () => {
+    const h = Array.from({ length: HISTORY_MAX + 3 }, (_, i) => rec('allow-branch', i));
+    const capped = capHistory(h);
+    expect(capped.length).toBe(HISTORY_MAX);
+    expect(capped[0].target).toBe('b3');
+  });
+});
+
+// The card-only open exemption (xbxahvf) is only as honest as its changed-file list: `isCardOnlyDiff` documents that it
+// needs the `--no-renames` list (both sides of a rename), or a code file moved into backlog/ reads as card-only.
+describe('pr-land card-only open exemption — the changed-file list keeps both sides of a rename', () => {
+  it('git’s default rename detection hides a code file moved into backlog/; --no-renames does not', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-limit-rename-'));
+    const git = (...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
+    git('init', '-q', '-b', 'main');
+    mkdirSync(join(dir, 'scripts')); mkdirSync(join(dir, 'backlog'));
+    const body = Array.from({ length: 40 }, (_, i) => `export const v${i} = ${i};`).join('\n') + '\n';
+    writeFileSync(join(dir, 'scripts', 'foo.mjs'), body);
+    git('add', '-A'); git('commit', '-qm', 'base');
+    const base = git('rev-parse', 'HEAD').trim();
+    git('mv', 'scripts/foo.mjs', 'backlog/foo.md'); git('commit', '-qm', 'move');
+    const list = (...flags) => git('diff', '--name-only', ...flags, `${base}...HEAD`).split('\n').filter(Boolean);
+    expect(isCardOnlyDiff(list())).toBe(true); // the hole: the default list shows only backlog/foo.md
+    expect(list('--no-renames').sort()).toEqual(['backlog/foo.md', 'scripts/foo.mjs']);
+    expect(isCardOnlyDiff(list('--no-renames'))).toBe(false);
+  });
+
+  it('pr-land builds the open-limit changed-file list with --no-renames (source-level pin)', () => {
+    const src = readFileSync(resolve(process.cwd(), 'scripts/pr-land.mjs'), 'utf8');
+    const m = src.match(/changedFilesForLimit = gitC\((\[[^\]]*\])\)/);
+    expect(m, 'changedFilesForLimit git invocation not found').not.toBeNull();
+    expect(m[1]).toContain("'--no-renames'");
   });
 });

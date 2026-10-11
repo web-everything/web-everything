@@ -45,6 +45,11 @@ on:
     branches: [main]
   pull_request:
     branches: [main, 'lane/**']  # lane/**: a GitHub-stacked PR runs its own required checks while its base is open (stack.reviewWhileBaseOpen)
+  # GitHub merge queue (merge-delivery strategy `github-merge-queue`): the required checks `test`, `smoke` and
+  # `daemon-soak` re-run on each merge-group commit (main + the entries ahead + this PR). Check names unchanged so
+  # the ruleset requires the same names. A merge_group is never card-only-light (ci-card-only.mjs: not a
+  # pull_request) and always runs the full soak (daemon-soak-scope: not a pull_request ⇒ run=true).
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -183,7 +188,7 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit shard ${{ matrix.shard }}/4: ${#files[@]} files"
-          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
+          npm run test:coverage:shard -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 
       - name: Unit suite no-coverage group (scripts tests that cannot reach a covered file)
         if: ${{ matrix.shard == 5 }}
@@ -195,7 +200,7 @@ jobs:
           files=()
           while IFS= read -r f; do [ -z "$f" ] || files+=("$f"); done <<< "$list"
           echo "unit no-coverage group: ${#files[@]} files"
-          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}"
+          npm run test:unit -- --reporter=default --reporter=json --outputFile.json=coverage/timing-unit-${{ matrix.shard }}.json "${files[@]}" $(node scripts/ci/quarantine-skip.mjs) # red-main quarantine (xx7ckd6): skip args from ops/quarantine, empty unless redMainMode=quarantine
 
       # Upload this shard's partial coverage for the `test` job to merge. `if-no-files-found: error`
       # turns a missing report into a red shard (not a silent under-count) — the merge's --expect guard
@@ -443,7 +448,7 @@ jobs:
   #                 scope job itself failed (fail closed), otherwise red unless EVERY shard succeeded. Full coverage is preserved — sharding only changes WHERE
   #                 each scenario runs, never WHETHER it runs; every scenario still runs on every daemon PR.
   daemon-soak-scope:
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -504,7 +509,7 @@ jobs:
   # silently read as satisfied, same guard the `test` aggregator above uses for `test-shard`.
   daemon-soak:
     needs: [daemon-soak-scope, soak-shard]
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

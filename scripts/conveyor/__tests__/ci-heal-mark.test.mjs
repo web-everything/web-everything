@@ -274,8 +274,8 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       expect(calls.filter(c => c[1] === 'edit')).toHaveLength(rearmed ? 1 : 0);
       // The formal-reviews GET (a carried operator clearance, PR #4631 round 11) names the repo inside its endpoint path.
       expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything')
-        || (c[0] === 'api' && c.includes('repos/web-everything/web-everything/pulls/42/reviews')))).toBe(true);
-      expect(calls.filter(c => c[0] === 'api')).toHaveLength(scenario === 'human' ? 1 : 0);
+        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews')))).toBe(true);
+      if (carried) expect(calls.filter(c => c[0] === 'api').length).toBeGreaterThanOrEqual(1);
       if (scenario === 'unchanged') console.info('CI-heal proven replay', JSON.stringify(proof));
       if (scenario === 'soak') {
         let previousHead = healedHead;

@@ -5,9 +5,13 @@
  *   average, which read 49–82 while the CPU was 37–46% idle. The IO half (snapshot read, policy-cascade file read,
  *   shadow log) is we:scripts/lib/resource-admission.mjs.
  */
-// maxDiskBusyPct defaults to null (record, never gate): on this NVMe host the disk reads 100% busy (several I/Os
-// in flight) on an ordinary afternoon with the CPU 45% idle, so a disk threshold needs calibrating from the shadow
-// log first (slice 2) — a tool override or platform preference can set one now.
+// Calibrated (x9xkupj, slice 2) from 1261 sampler snapshots 2026-10-09 19:27–23:01 ET plus the shadow log:
+// - CPU idle p5/p25/p50/p95 = 11/19/24/49%; load average 11–109 (never ≤ 9, ≤ 15 only 3% of samples). Every shadow
+//   pair was old "hold" (load) vs new "admit" (CPU idle 14–49%). So rebuild-smoke keeps a 5% floor (admits 97%) and
+//   load-flake-rearm a 20% floor (admits 68%): its re-dispatched fixer re-runs timing-sensitive tests.
+// - maxDiskBusyPct stays null (record, never gate): disk read 100% busy in 100% of samples, CPU 45% idle included —
+//   on this NVMe host busy% means "I/Os in flight", not saturation. A tool override or platform preference can set one.
+// - Memory pressure read level 2 in every sample, so maxMemPressureLevel 2 admits it; only level 4 (critical) holds.
 const kindPolicy = (cpu, cost = 'heavy') => Object.freeze({ class: cost, minCpuIdlePct: cpu,
   maxMemPressureLevel: 2, maxDiskBusyPct: null, waitMinutes: 2 });
 // Fixes tolerate busier CPUs; timing-sensitive flake re-verification needs a quiet host.
