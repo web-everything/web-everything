@@ -707,6 +707,66 @@ describe('allow is operator-only (xfaz7ho)', () => {
     expect(d.refusal).toMatch(/own branch/);
   });
 
+  it("refuses the own branch when ANY of the checkout's names matches (checked-out branch, upstream, push target)", () => {
+    for (const ownBranch of [['lane/child', 'lane/parent'], ['lane/parent', 'lane/child'], 'lane/child']) {
+      const d = authoriseAllow({ branch: 'lane/child', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch });
+      expect(d).toMatchObject({ ok: false, channel: 'own-branch' });
+    }
+    expect(authoriseAllow({ branch: 'lane/other', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: ['lane/child', 'lane/parent'] }).ok).toBe(true);
+  });
+
+  // Red-team break on #4791: the upstream was read FIRST and the checked-out branch never, and only an `origin/` prefix
+  // was stripped — so a branch tracking another branch, or tracking a remote not named origin, slipped through.
+  describe('CLI on a real checkout: the checked-out branch is refused whatever it tracks', () => {
+    const gitIn = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'init.defaultBranch=main', ...args], { cwd, stdio: 'pipe' });
+    const checkout = (remoteName, upstreamBranch) => {
+      const root = mkdtempSync(join(tmpdir(), 'pr-limit-own-'));
+      const bare = join(root, 'remote.git');
+      const work = join(root, 'work');
+      mkdirSync(work);
+      gitIn(root, 'init', '--bare', '-q', bare);
+      gitIn(work, 'init', '-q');
+      gitIn(work, 'commit', '-q', '--allow-empty', '-m', 'base');
+      gitIn(work, 'remote', 'add', remoteName, bare);
+      gitIn(work, 'push', '-q', remoteName, `HEAD:refs/heads/${upstreamBranch}`);
+      gitIn(work, 'fetch', '-q', remoteName);
+      gitIn(work, 'checkout', '-q', '-b', 'lane/child');
+      gitIn(work, 'branch', '-q', `--set-upstream-to=${remoteName}/${upstreamBranch}`);
+      return work;
+    };
+    const allowFrom = (cwd) => {
+      const path = tmpState();
+      const code = runPrLimitCli(['allow', '--branch=lane/child', '--reason=r', `--operator-quote=${QUOTE}`],
+        { env: operatorEnv, cwd, path, stderr: silent(), stdout: silent() });
+      return { code, st: readLimitState(path) };
+    };
+
+    it('lane/child tracking origin/lane/parent is refused', () => {
+      const { code, st } = allowFrom(checkout('origin', 'lane/parent'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    it('lane/child tracking upstream/lane/child (a remote not named origin) is refused', () => {
+      const { code, st } = allowFrom(checkout('upstream', 'lane/child'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    it('a remote whose name contains a slash is stripped whole (fork/x tracking fork/x/lane/child is refused)', () => {
+      const { code, st } = allowFrom(checkout('fork/x', 'lane/child'));
+      expect(code).not.toBe(0);
+      expect(isBranchAllowedNow(st, 'lane/child')).toBe(false);
+    });
+
+    it('a different branch is still grantable from that checkout', () => {
+      const path = tmpState();
+      const code = runPrLimitCli(['allow', '--branch=lane/elsewhere', '--reason=r', `--operator-quote=${QUOTE}`],
+        { env: operatorEnv, cwd: checkout('upstream', 'lane/parent'), path, stderr: silent(), stdout: silent() });
+      expect(code).toBe(0);
+    });
+  });
+
   it('refuses a missing or blank --operator-quote', () => {
     for (const q of [undefined, '', '   ', true]) {
       const d = authoriseAllow({ branch: 'lane/x', operatorQuote: q, env: operatorEnv, cwdReal: primary });

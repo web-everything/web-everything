@@ -605,7 +605,7 @@ export const OPERATOR_QUOTE_MAX = 1000;
  *   • `worker`  — `WE_CONVEYOR_WORKER=1` (every dispatch spawn site sets it, we:scripts/operations/session-role.mjs) → refused;
  *   • `unknown` — an unrecognised marker value → refused (fail closed, same as pre-pr-review's bypass gate);
  *   • `lane`    — run from inside a lane clone (`/.lanes/`), where every worker works → refused;
- *   • own branch — the target is the branch the calling checkout itself tracks → refused;
+ *   • own branch — the target is ANY name the calling checkout goes by (checked-out branch, upstream, push target) → refused;
  *   • otherwise `operator-session` (a Claude session outside any lane) or `terminal` (no Claude env) — accepted
  *     only with a verbatim `--operator-quote`, recorded on the entry (the #2895 honesty tax).
  * Like review-independence (#2895), this is NOT unforgeable — an agent with a shell can `cd` out and unset vars.
@@ -619,8 +619,12 @@ export function authoriseAllow({ branch, operatorQuote, env = {}, cwdReal = '', 
   if (role !== 'orchestrator') return { ok: false, channel: 'unknown', refusal: `pr-limit allow refused: the session role is unknown (${reason}), so the grant fails closed. ${STOP}` };
   if (String(cwdReal || '').includes('/.lanes/')) return { ok: false, channel: 'lane', refusal: `pr-limit allow refused: run from inside a lane clone (${cwdReal}) — that is where workers run; the operator grants from the primary checkout or a terminal. ${STOP}` };
   const target = normalizeBranchName(branch);
-  const own = normalizeBranchName(String(ownBranch || '').replace(/^(refs\/remotes\/)?origin\//, ''));
-  if (own && own === target) return { ok: false, channel: 'own-branch', refusal: `pr-limit allow refused: ${target} is this checkout's own branch — a session never allow-lists its own branch. ${STOP}` };
+  // EVERY name the checkout goes by — its checked-out branch, its upstream, its push target — is "own"; a branch
+  // tracking another branch (or a remote not named origin) must not hide the one it actually is (#4791 red team).
+  const owns = (Array.isArray(ownBranch) ? ownBranch : [ownBranch])
+    .map((b) => normalizeBranchName(String(b || '').replace(/^refs\/heads\//, '').replace(/^(refs\/remotes\/)?origin\//, '')))
+    .filter(Boolean);
+  if (target && owns.includes(target)) return { ok: false, channel: 'own-branch', refusal: `pr-limit allow refused: ${target} is this checkout's own branch — a session never allow-lists its own branch. ${STOP}` };
   const channel = env && env.CLAUDECODE ? 'operator-session' : 'terminal';
   const quote = typeof operatorQuote === 'string' ? operatorQuote.trim() : '';
   if (!quote) return { ok: false, channel, refusal: `pr-limit allow refused: --operator-quote="<the operator's instruction, verbatim>" is required — exceptions are the operator's to grant, and the grant records their words. ${STOP}` };
@@ -628,14 +632,32 @@ export function authoriseAllow({ branch, operatorQuote, env = {}, cwdReal = '', 
   return { ok: true, channel, refusal: '' };
 }
 
-/** The branch the checkout at `cwd` tracks (its upstream, else its current branch), or '' — fails soft. */
-export function readOwnBranch(cwd) {
-  for (const args of [['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], ['rev-parse', '--abbrev-ref', 'HEAD']]) {
-    const r = gitRun('git', args, { cwd });
-    const out = r.status === 0 ? String(r.stdout).trim() : ''; // not a git checkout, or no upstream — try the next read
-    if (out && out !== 'HEAD' && out !== 'main' && out !== 'origin/main') return out;
+/**
+ * EVERY branch name the checkout at `cwd` goes by, remote prefixes stripped: the checked-out branch, its upstream
+ * (`@{u}`, plus `branch.<b>.merge` for an upstream with no fetched remote-tracking ref) and its push target
+ * (`@{push}`). Each read is independent — a missing upstream never hides the checked-out branch (#4791 red team:
+ * the old upstream-first read returned `origin/lane/parent` for `lane/child` and never looked at HEAD). A remote
+ * prefix is stripped by the checkout's own remote list, longest first, so `upstream/…` and a remote whose name
+ * contains `/` strip whole. Fails soft to the names it could read ([] outside a git checkout).
+ * @returns {string[]}
+ */
+export function readOwnBranches(cwd, { run = gitRun } = {}) {
+  const git = (...args) => { const r = run('git', args, { cwd }); return r && r.status === 0 ? String(r.stdout).trim() : ''; };
+  const remotes = git('remote').split('\n').map((s) => s.trim()).filter(Boolean).sort((a, b) => b.length - a.length);
+  const shortRef = (full) => {
+    if (full.startsWith('refs/heads/')) return full.slice('refs/heads/'.length);
+    if (!full.startsWith('refs/remotes/')) return '';
+    const rest = full.slice('refs/remotes/'.length);
+    const remote = remotes.find((r) => rest.startsWith(`${r}/`));
+    return remote ? rest.slice(remote.length + 1) : rest.replace(/^[^/]+\//, '');
+  };
+  const head = git('symbolic-ref', '--quiet', '--short', 'HEAD'); // '' when detached
+  const names = [head];
+  if (head) {
+    for (const spec of ['@{upstream}', '@{push}']) names.push(shortRef(git('rev-parse', '--symbolic-full-name', spec)));
+    names.push(shortRef(git('config', '--get', `branch.${head}.merge`)));
   }
-  return '';
+  return [...new Set(names.filter(Boolean))];
 }
 
 function realpathSafe(p) { try { return realpathSync(p); } catch { return resolve(String(p || '.')); } }
@@ -705,7 +727,7 @@ export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), pa
   if (cmd === 'allow') {
     if (!flags.branch || flags.branch === true) { stderr.write('usage: pr-limit.mjs allow --branch=<b> --reason=<why> --operator-quote="<operator instruction, verbatim>" [--for=<duration>] [--by=<actor>]\n'); return 2; }
     const session = currentActorId(env) || null;
-    const decision = authoriseAllow({ branch: flags.branch, operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd), ownBranch: ownBranch ?? readOwnBranch(cwd) });
+    const decision = authoriseAllow({ branch: flags.branch, operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd), ownBranch: ownBranch ?? readOwnBranches(cwd) });
     if (!decision.ok) {
       // LOGGED: the refusal lands in the same override history every grant does, naming channel + session.
       writeLimitState(appendHistory(readLimitState(path), { actor: by, reason: `${decision.refusal} [channel=${decision.channel}${session ? ` session=${session}` : ''}]`, action: 'allow-refused', target: normalizeBranchName(flags.branch) }), path);
