@@ -32,3 +32,9 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — Per repo and PR.
 6. **State over time** — Old labels are removed once, idempotently.
 7. **Who wrote it** — Only the conveyor's writer touches stage labels.
+
+## Progress
+
+2026-10-11: Implemented `needs-you` using the operator queue's NEEDS YOU / RULING NEEDED predicates, required-check `ci-red` with automatic readiness restoration, and reason states for escalations, stand-downs, answered stand-downs, review/red-team send-backs and waiting on a base. Legacy `review-status:*` retirement is gated by `legacyReviewStatus`; the default remains on, and the durable draft-withdrawn marker is preserved.
+
+Remaining: migrate the `review-status:*` readers, then flip the default. The operator confirmed the regression tests red before implementation; the queued suite awaits an operator rerun after this fix.

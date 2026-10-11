@@ -22,6 +22,9 @@
  * bug), so this reads `claude agents --json` fresh and matches by session NAME only (`review-<pr>` /
  * `fix-<pr>`, the same slugs `we:scripts/operations/review-dispatch.mjs#reviewSessionSlug` and
  * `we:scripts/operations/dispatch-lane.mjs`'s own `fix-${id}` mint), rather than sharing that binding.
+ *
+ * 5748 (2026-10-11): legacy `review-status:*` writes stay on (LEGACY_REVIEW_STATUS_DEFAULT) until their readers
+ * migrate; `legacyReviewStatus:false` removes them except the durable `review-status:draft-withdrawn` hold.
  */
 import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
 import { mintSessionSlug } from './session-slug.mjs';
@@ -35,6 +38,9 @@ import { createGhProvider } from '../lib/review-label-provider.mjs';
 import { writeAllSync, writeLineSync } from '../lib/write-all-sync.mjs';
 // The ONE `status:*` label (what the PR waits on) — written here, by the same owner, never a second writer (D5).
 import { derivePrStatusLabel, planPrStatusLabel, PR_STATUS_DESCRIPTIONS } from './pr-status-label.mjs';
+
+/** Compatibility default while dispatch and hold readers still use review-status labels. */
+export const LEGACY_REVIEW_STATUS_DEFAULT = true;
 
 /** Matches this module's own label shape, and only this shape.
  *
@@ -216,7 +222,7 @@ export function describeReviewState({ labels = [], status = null } = {}) {
  * (`we:skills-src/conveyor/review-daemon.mjs#runReviewTick`, wired to reuse it) passes it straight through.
  * Omitting either (the default, and every pre-existing caller/test) reads fresh, byte-identical to before
  * these options existed.
- * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, readFixClaim?:Function}} o
+ * @param {{pr:number|string, repo:string, listAgents?:Function, provider?:object, agents?:Array<object>, currentLabels?:Array<{name?:string}|string>, isDraft?:boolean, baseRefName?:string, defaultBranch?:string, mergeConflicted?:boolean, readFixClaim?:Function, legacyReviewStatus?:boolean}} o
  * @returns {{changed:boolean, label:string|null, removed:string[], reviewState:{code:string, text:string}|null}}
  */
 // x26lw6u — the default listing includes live review JOBS (`we:scripts/operations/review-job.mjs`): a review no
@@ -235,6 +241,7 @@ export function tagReviewStatus({
   // This tick's planner rows for the PR (dispatch rows, refusals, notes) — what the `status:*` label renders.
   // `null` (a standalone CLI call) leaves any `status:*` label untouched: without the plan it cannot be derived.
   planRows = null,
+  legacyReviewStatus = LEGACY_REVIEW_STATUS_DEFAULT,
 } = {}) {
   const repoKey = repo === undefined ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`review-status-tag: --repo ${repo} is not a constellation repo`);
@@ -248,7 +255,11 @@ export function tagReviewStatus({
   const status = deriveReviewStatus({ pr, agents, repo: repoKey, isDraft: isDraft ?? subject?.isDraft ?? false,
     baseRefName: baseRefName ?? subject?.baseRefName, defaultBranch, mergeConflicted, fixClaim, escalation });
   const currentLabels = suppliedLabels ?? provider.readLabels(repo, pr);
-  const plan = planStatusLabelChange({ status, currentLabels });
+  const plan = legacyReviewStatus ? planStatusLabelChange({ status, currentLabels }) : {
+    add: null,
+    remove: currentLabels.map((l) => typeof l === 'string' ? l : l?.name)
+      .filter((name) => name?.startsWith('review-status:') && name !== 'review-status:draft-withdrawn'),
+  };
   // #4967 — the single plain state, returned for a viewer to show instead of the raw, possibly contradictory
   // labels. The labels themselves are untouched; rendering it is Plateau's follow-up.
   const reviewState = describeReviewState({ labels: currentLabels, status });
@@ -268,7 +279,7 @@ export function tagReviewStatus({
   if (!plan.add && plan.remove.length === 0) {
     applyPrStatus();
     return withStatus({ changed: false, label: currentLabels.some(l => (typeof l === 'string' ? l : l?.name) === 'review-status:draft-withdrawn')
-      ? 'review-status:draft-withdrawn' : status ? `review-status:${status.state}` : null, removed: [], reviewState });
+      ? 'review-status:draft-withdrawn' : legacyReviewStatus && status ? `review-status:${status.state}` : null, removed: [], reviewState });
   }
   // `review-status:*` is a small fixed enum, but a repo that has never carried one yet still needs it created
   // before `gh pr edit --add-label` will accept it — same reasoning as `review-round-tag.mjs`'s own ensure.
