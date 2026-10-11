@@ -52,14 +52,16 @@
  *     agent, not a fixer's remaining rounds or a permanent stand-down.
  *   Flagged in this item's PR body as a follow-up candidate rather than folded in silently.
  *
- * PURE. No fs, no clock, no network. Reads `process.env` once per call (env overrides), same discipline
- * `we:scripts/conveyor/stand-down.mjs#AUTOMATION_LOGINS` already uses.
+ * No clock, no network. The automation logins are read ONCE at import: the `delivery.botLogins` setting
+ * (`we:scripts/lib/github-app-identity.mjs#readBotLogins` — today's bot plus every per-role App's bot, e.g.
+ * `plateau-reviewer[bot]`), with `WE_AUTOMATION_LOGINS` still winning when set.
  */
+import { readBotLogins } from './github-app-identity.mjs';
 
 /**
  * we:scripts/lib/marker-authorship.mjs#AUTOMATION_LOGINS — the GitHub login(s) this repo's own conveyor
  * automation posts comments under. Overridable via `WE_AUTOMATION_LOGINS` (comma-separated) for a
- * differently-named install; the default covers both shapes actually observed live in this repo — the plain
+ * differently-named install; the default is the `delivery.botLogins` setting, which covers both shapes actually observed live in this repo — the plain
  * GraphQL-backed `gh pr list/view --json comments` shape (`web-everything`, confirmed on
  * `web-everything/web-everything#2578`/`#2602`/`#2607`) and the REST App-bot shape some `gh` paths/installs surface
  * (`web-everything[bot]`) — so a caller reading either shape resolves the same way. Compared case-insensitively.
@@ -72,7 +74,7 @@ function readLoginList(envVar, fallback) {
 }
 
 export const AUTOMATION_LOGINS = Object.freeze(
-  readLoginList('WE_AUTOMATION_LOGINS', ['web-everything', 'web-everything[bot]']),
+  readLoginList('WE_AUTOMATION_LOGINS', readBotLogins()),
 );
 
 /**

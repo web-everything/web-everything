@@ -23,6 +23,7 @@ import {
   PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope, isStackedAwaitingBasePr,
   authoriseAllow, runPrLimitCli, readLimitState,
 } from '../pr-limit.mjs';
+import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 
 describe('resolvePrLimit', () => {
   it('defaults to the operator-set per-repo caps', () => {
@@ -173,8 +174,8 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
   const humanCommit = { authors: [{ name: 'A Human', email: 'human@example.com' }], messageBody: '' };
   const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
 
-  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
-    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,files'])); expect(args).not.toContain('commits'); return '[]'; };
+  it('fetchOpenPrs asks for number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files — deliberately NOT commits (the GraphQL node-limit footgun)', () => {
+    const exec = (args) => { expect(args).toEqual(expect.arrayContaining(['--json', 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files'])); expect(args).not.toContain('commits'); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
   });
 
@@ -230,8 +231,8 @@ describe('fetchOpenPrs / fetchPrCommits / countOpenPrsForRepo — the IO shell',
 describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
   const aiCommit = { authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }], messageBody: '' };
   const commitsPage = (c) => JSON.stringify([{ data: { repository: { pullRequest: { commits: { nodes: c.map((commit) => ({ commit: { ...commit, authors: { nodes: commit.authors } } })) } } } } }]);
-  const card = (n) => ({ number: n, labels: [], files: [{ path: `backlog/${n}-card.md` }] });
-  const code = (n) => ({ number: n, labels: [], files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
+  const card = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: `backlog/${n}-card.md` }] });
+  const code = (n) => ({ number: n, labels: [], isCrossRepository: false, files: [{ path: 'scripts/x.mjs' }, { path: 'backlog/x.md' }] });
   const execFor = (rows, calls = []) => (args) => {
     calls.push(args);
     if (args[1] === 'list') return JSON.stringify(rows);
@@ -284,7 +285,7 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     const awaiting = (n, base, head) => ({ ...code(n), headRefName: head ?? `lane/d${n}`, baseRefName: base, labels: [{ name: 'review-status:awaiting-base' }] });
     const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
     const count = (rows) => countOpenPrsForRepo('we', { exec: execFor(rows), env: {}, scope });
-    const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', files: [{ path: 'backlog/x.md' }] };
+    const cardBase = { number: 50, labels: [], headRefName: 'lane/card-base', headRefOid: 'o50', baseRefName: 'main', isCrossRepository: false, files: [{ path: 'backlog/x.md' }] };
     // a card-only base shields nobody: both drafts hang off an uncounted PR and are counted
     expect(count([cardBase, awaiting(6, 'lane/card-base'), awaiting(7, 'lane/card-base')])).toMatchObject({ count: 2, stacked: 0, cardOnly: 1 });
     // an accepted base likewise
@@ -299,17 +300,72 @@ describe('card-only exclusion (operator ruling 2026-10-09 ~17:05 ET)', () => {
     expect(count([cardBase, awaiting(7, 'lane/card-base'), awaiting(8, 'lane/d7')])).toMatchObject({ count: 2, stacked: 0 });
   });
 
+  // Red-team break 1 (PR #4785, head e0f5f964d): the chain's root must be COUNTED, which includes authorship.
+  it('a human-authored (uncounted) base shields nobody: its agent-authored awaiting-base child is counted', () => {
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const verdicts = { 'web-everything/web-everything#9@o9': false, 'web-everything/web-everything#6@o6': true };
+    const authorshipCache = { get: (k) => verdicts[k], set() {}, flush() {} };
+    const humanBase = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
+    const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
+    const calls = [];
+    const r = countOpenPrsForRepo('we', { exec: execFor([humanBase, child], calls), env: {}, scope, authorshipCache });
+    expect(r).toMatchObject({ count: 1, prNumbers: [6], stacked: 0, stackedPrNumbers: [], unresolved: 0 });
+    expect(calls.filter((a) => a[0] === 'api')).toHaveLength(0); // both verdicts came from the cache
+    // a chain d8 → d6 → human root: neither draft is shielded
+    const grandchild = { ...code(8), headRefName: 'lane/gc', headRefOid: 'o8', baseRefName: 'lane/child', labels: [{ name: 'review-status:awaiting-base' }] };
+    verdicts['web-everything/web-everything#8@o8'] = true;
+    expect(countOpenPrsForRepo('we', { exec: execFor([humanBase, child, grandchild]), env: {}, scope, authorshipCache })).toMatchObject({ count: 2, stacked: 0 });
+    // positive control: an agent-authored base still shields its child, and the child costs no lookup
+    verdicts['web-everything/web-everything#9@o9'] = true;
+    expect(countOpenPrsForRepo('we', { exec: execFor([humanBase, child]), env: {}, scope, authorshipCache })).toMatchObject({ count: 1, prNumbers: [9], stacked: 1, stackedPrNumbers: [6] });
+  });
+
+  it('a base whose authorship is unresolved (budget spent / read failed) shields nobody, and is looked up only once', () => {
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const base = { ...code(9), headRefName: 'lane/base', headRefOid: 'o9', baseRefName: 'main' };
+    const child = { ...code(6), headRefName: 'lane/child', headRefOid: 'o6', baseRefName: 'lane/base', labels: [{ name: 'review-status:awaiting-base' }] };
+    const calls = [];
+    const exec = (args) => {
+      calls.push(args);
+      if (args[1] === 'list') return JSON.stringify([base, child]);
+      if (args[0] === 'api' && args.includes('number=9')) throw new Error('gh: rate limited');
+      if (args[0] === 'api') return commitsPage([aiCommit]);
+      throw new Error(`unexpected call: ${JSON.stringify(args)}`);
+    };
+    // the base row names `main` + an oid, so the real git transport would run (and fetch, in a checkout whose origin is the repo)
+    const git = () => { throw new Error('git unavailable'); };
+    const r = countOpenPrsForRepo('we', { exec, env: {}, scope, git });
+    expect(r).toMatchObject({ count: 1, prNumbers: [6], stacked: 0, unresolved: 1, apiFetches: 2 });
+    expect(calls.filter((a) => a[0] === 'api' && a.includes('number=9'))).toHaveLength(1);
+  });
+
+  // Red-team break 2 (PR #4785, head e0f5f964d): a fork PR's head branch is not an upstream ref.
+  it('a fork PR whose head name matches a draft\'s base is not that draft\'s base: the draft still counts', () => {
+    const scope = { excludeCardOnly: true, excludeStackedAwaitingBase: true };
+    const fork = { ...code(9), headRefName: 'release', baseRefName: 'main', isCrossRepository: true };
+    const draft = { ...code(6), headRefName: 'lane/d6', baseRefName: 'release', labels: [{ name: 'review-status:awaiting-base' }] };
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    // fail-closed: a row that does not say where its head lives is never a base either
+    const { isCrossRepository: _omit, ...unknown } = fork;
+    expect(countOpenPrsForRepo('we', { exec: execFor([unknown, draft]), env: {}, scope })).toMatchObject({ count: 2, stacked: 0 });
+    // the same base name owned by an upstream PR does stack (a fork CHILD is fine — only the base must be upstream)
+    const upstream = { ...fork, number: 10, isCrossRepository: false };
+    expect(countOpenPrsForRepo('we', { exec: execFor([fork, upstream, { ...draft, isCrossRepository: true }]), env: {}, scope })).toMatchObject({ count: 2, stacked: 1, stackedPrNumbers: [6] });
+  });
+
   it('an unavailable count still reports the resolved excludeCardOnly (so pr-land does not fall back to the default)', () => {
     const r = countOpenPrsForRepo('we', { exec: () => { throw new Error('boom'); }, env: {}, scope: { excludeCardOnly: false, excludeStackedAwaitingBase: true } });
     expect(r).toMatchObject({ unavailable: true, excludeCardOnly: false });
   });
 
-  it('fetchOpenPrs requests baseRefName on both the direct and the shared-snapshot read (the stacked test needs it)', () => {
-    const exec = (args) => { expect(args[args.indexOf('--json') + 1].split(',')).toContain('baseRefName'); return '[]'; };
+  it('fetchOpenPrs requests baseRefName and isCrossRepository on both the direct and the shared-snapshot read (the stacked test needs them)', () => {
+    const exec = (args) => { expect(args[args.indexOf('--json') + 1].split(',')).toEqual(expect.arrayContaining(['baseRefName', 'isCrossRepository'])); return '[]'; };
     expect(fetchOpenPrs('o/n', { exec })).toEqual([]);
     let fields = null;
     fetchOpenPrs('o/n', { exec: () => '[]', readShared: (o) => { fields = o.fields; return []; } });
-    expect(fields.split(',')).toContain('baseRefName');
+    expect(fields.split(',')).toEqual(expect.arrayContaining(['baseRefName', 'isCrossRepository']));
+    // the shared snapshot must actually carry every field asked for, or it silently never serves this reader
+    expect(fields.split(',').every((f) => SNAPSHOT_FIELDS.includes(f))).toBe(true);
   });
 
   it('fetchOpenPrs asks for files (the card-only test needs them)', () => {

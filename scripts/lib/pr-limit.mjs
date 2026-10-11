@@ -81,8 +81,9 @@ export const AWAITING_BASE_LABEL = 'review-status:awaiting-base';
  *  carries {@link AWAITING_BASE_LABEL}, AND its base branch is the head of another OPEN PR) is NOT counted — it cannot
  *  land before that base does, so it adds no review or merge load yet. All three signals are required (fail-closed: a
  *  stacked PR without the label, or a labelled one aimed at a branch no open PR owns — the label is hand-appliable and
- *  the tagger puts it on any non-default base — still counts). `openHeadRefs` is the Set of every open PR's
- *  `headRefName`; absent/not a Set → nothing is stacked. PURE. */
+ *  the tagger puts it on any non-default base — still counts). `openHeadRefs` is the Set of every open UPSTREAM
+ *  (`isCrossRepository === false`) PR's `headRefName` — a fork's same-named head is not this repo's branch; absent/not
+ *  a Set → nothing is stacked. PURE. */
 export function isStackedAwaitingBasePr(pr, openHeadRefs, defaultBranch = 'main') {
   const base = typeof pr?.baseRefName === 'string' ? pr.baseRefName : '';
   if (!base || base === defaultBranch || !(openHeadRefs instanceof Set) || !openHeadRefs.has(base)) return false;
@@ -196,7 +197,12 @@ export function countBackpressurePrs(prs) {
   return list.filter((pr) => isAiGeneratedPr(pr) && !hasLabel(pr, REVIEW_LABELS.accepted));
 }
 
-/** Fetch a repo's open PRs (`number,labels,headRefName,headRefOid` — deliberately NOT `commits`, see {@link fetchPrCommits})
+/** The open-PR fields this limit reads. `isCrossRepository` tells an upstream head from a fork's same-named one (a
+ *  stacked PR's base is always an upstream branch); every field must also be in the shared snapshot's field list
+ *  (we:scripts/lib/pr-snapshot.mjs#SNAPSHOT_FIELDS), or the snapshot never serves this reader. */
+const OPEN_PR_FIELDS = 'number,labels,headRefName,headRefOid,baseRefName,isCrossRepository,files';
+
+/** Fetch a repo's open PRs ({@link OPEN_PR_FIELDS} — deliberately NOT `commits`, see {@link fetchPrCommits})
  *  through the shared throttle. Fail-SOFT: any gh/auth/network hiccup returns `null` (never throws), so a
  *  transient `gh` failure degrades to "unknown count", not "block everything".
  *  @param {string} repoSlug - the gh `owner/repo` slug
@@ -206,10 +212,10 @@ export function fetchOpenPrs(repoSlug, { exec = runGhSync, localOnly = false, re
   try {
     // #gh-graphql-budget — the host-shared open-PR snapshot first (null = not applicable → the direct read).
     // `readShared` is the test seam for that snapshot (a fake `exec` alone never reaches it).
-    if (readShared || exec === runGhSync) { const shared = (readShared ?? readSharedOpenPrs)({ repo: repoSlug, fields: 'number,labels,headRefName,headRefOid,baseRefName,files', cacheOnly: localOnly }); if (shared) return shared; }
+    if (readShared || exec === runGhSync) { const shared = (readShared ?? readSharedOpenPrs)({ repo: repoSlug, fields: OPEN_PR_FIELDS, cacheOnly: localOnly }); if (shared) return shared; }
     if (localOnly) return null;
     const out = exec(
-      ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--json', 'number,labels,headRefName,headRefOid,baseRefName,files', '--limit', '100'],
+      ['pr', 'list', '--repo', repoSlug, '--state', 'open', '--json', OPEN_PR_FIELDS, '--limit', '100'],
       { throttle: { op: 'pr list (pr-limit)' }, encoding: 'utf8' },
     );
     const rows = JSON.parse(String(out ?? '[]'));
@@ -263,51 +269,65 @@ export function countOpenPrsForRepo(repoKey, { exec, env = process.env, reposTab
   const acceptedPrs = prs.filter((pr) => hasLabel(pr, REVIEW_LABELS.accepted));
   const cardOnlyPrs = excludeCardOnly ? prs.filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && isCardOnlyPr(pr)) : [];
   const cardOnlySet = new Set(cardOnlyPrs);
-  const openHeadRefs = new Set(prs.map((pr) => pr?.headRefName).filter((h) => typeof h === 'string' && h));
-  // A stacked PR is excluded only while its base chain ends at a PR that still carries load: a base that is itself
-  // accepted or card-only (excluded) would shield any number of labelled drafts, and two PRs each the other's base
-  // (a cycle) would shield each other. The walk keeps a visited set; reaching nothing countable → the PR counts.
-  const byHead = new Map();
-  for (const pr of prs) if (typeof pr?.headRefName === 'string' && pr.headRefName) byHead.set(pr.headRefName, [...(byHead.get(pr.headRefName) ?? []), pr]);
-  const isAccepted = (pr) => hasLabel(pr, REVIEW_LABELS.accepted);
-  const isCandidate = (pr) => isStackedAwaitingBasePr(pr, openHeadRefs);
-  const chainEndsAtCounted = (pr, seen) => {
-    if (seen.has(pr)) return false;
-    seen.add(pr);
-    return (byHead.get(pr.baseRefName) ?? []).some((b) => b !== pr && !isAccepted(b) && !cardOnlySet.has(b) && (!isCandidate(b) || chainEndsAtCounted(b, seen)));
-  };
-  const stackedPrs = excludeStacked
-    ? prs.filter((pr) => !isAccepted(pr) && !cardOnlySet.has(pr) && isCandidate(pr) && chainEndsAtCounted(pr, new Set()))
-    : [];
-  for (const pr of stackedPrs) cardOnlySet.add(pr); // excluded from the authorship lookup and the count alike
+  // Only an UPSTREAM head can be a stacked PR's base (a base is always a branch of this repo), so a fork PR's
+  // same-named head never counts as one. `isCrossRepository` must be exactly false: a row that does not say is no base.
+  const upstreamPrs = prs.filter((pr) => pr?.isCrossRepository === false && typeof pr?.headRefName === 'string' && pr.headRefName);
+  const openHeadRefs = new Set(upstreamPrs.map((pr) => pr.headRefName));
   // GitHub-call budget for the per-PR commits reads (git is tried first and is not counted); an exhausted budget
   // leaves the PR UNRESOLVED rather than spending past it.
   let apiFetches = 0;
   const repoCwd = cwd ?? (meta.path ? meta.path.replace('$HOME', homedir()) : process.cwd());
   const liveKeys = new Set();
+  const verdictMemo = new Map();
+  /** The PR's authorship: true (agent) / false (human) / null (unresolved). Read at most once per PR per call. */
+  const verdictOf = (pr) => {
+    if (verdictMemo.has(pr)) return verdictMemo.get(pr);
+    const ai = readVerdict(pr);
+    verdictMemo.set(pr, ai);
+    return ai;
+  };
+  const readVerdict = (pr) => {
+    // A verdict is immutable for a given head oid, so it is cached by (repo, PR, oid) — a head that moved is a miss.
+    const key = pr.headRefOid ? `${meta.slug}#${pr.number}@${pr.headRefOid}` : null;
+    if (key) liveKeys.add(key);
+    const hit = key && authorshipCache ? authorshipCache.get(key) : undefined;
+    if (typeof hit === 'boolean') return hit;
+    const coolingDown = Number.isFinite(hit?.failedAt) && now - hit.failedAt < AUTHORSHIP_FAILURE_COOLDOWN_MS;
+    let spent = false;
+    const commits = fetchPrCommits(meta.slug, pr.number, {
+      exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
+      allowApi: !coolingDown && apiFetches < maxApiFetches, onApi: () => { apiFetches++; spent = true; },
+    });
+    if (!Array.isArray(commits)) {
+      // Only an attempted API read earns a cooldown; budget/local-only misses must stay eligible.
+      if (spent && key && authorshipCache) authorshipCache.set(key, { failedAt: now });
+      return null;
+    }
+    const ai = isAiGeneratedPr({ ...pr, commits });
+    if (key && authorshipCache) authorshipCache.set(key, ai);
+    return ai;
+  };
+  // A stacked PR is excluded only while its base chain ends at a root PR this limit COUNTS: an upstream, not accepted,
+  // not card-only, non-stacked PR whose authorship resolved to agent. A human-authored or unresolved root, an accepted
+  // or card-only base, or a cycle (the walk keeps a visited set) shields nobody — every PR on such a chain counts on
+  // its own verdict. Roots are read first (they are counted anyway); an excluded candidate never costs a lookup.
+  const byHead = new Map();
+  for (const pr of upstreamPrs) byHead.set(pr.headRefName, [...(byHead.get(pr.headRefName) ?? []), pr]);
+  const isAccepted = (pr) => hasLabel(pr, REVIEW_LABELS.accepted);
+  const isCandidate = (pr) => isStackedAwaitingBasePr(pr, openHeadRefs);
+  const chainEndsAtCounted = (pr, seen) => {
+    if (seen.has(pr)) return false;
+    seen.add(pr);
+    return (byHead.get(pr.baseRefName) ?? []).some((b) => b !== pr && !isAccepted(b) && !cardOnlySet.has(b)
+      && (isCandidate(b) ? chainEndsAtCounted(b, seen) : verdictOf(b) === true));
+  };
+  const stackedPrs = excludeStacked
+    ? prs.filter((pr) => !isAccepted(pr) && !cardOnlySet.has(pr) && isCandidate(pr) && chainEndsAtCounted(pr, new Set()))
+    : [];
+  for (const pr of stackedPrs) cardOnlySet.add(pr); // excluded from the authorship lookup and the count alike
   const verdicts = prs
     .filter((pr) => !hasLabel(pr, REVIEW_LABELS.accepted) && !cardOnlySet.has(pr))
-    .map((pr) => {
-      // A verdict is immutable for a given head oid, so it is cached by (repo, PR, oid) — a head that moved is a miss.
-      const key = pr.headRefOid ? `${meta.slug}#${pr.number}@${pr.headRefOid}` : null;
-      if (key) liveKeys.add(key);
-      const hit = key && authorshipCache ? authorshipCache.get(key) : undefined;
-      if (typeof hit === 'boolean') return { pr, ai: hit };
-      const coolingDown = Number.isFinite(hit?.failedAt) && now - hit.failedAt < AUTHORSHIP_FAILURE_COOLDOWN_MS;
-      let spent = false;
-      const commits = fetchPrCommits(meta.slug, pr.number, {
-        exec, headRefName: pr.headRefName, headRefOid: pr.headRefOid, baseRefName: pr.baseRefName, git, localOnly, cwd: repoCwd,
-        allowApi: !coolingDown && apiFetches < maxApiFetches, onApi: () => { apiFetches++; spent = true; },
-      });
-      if (!Array.isArray(commits)) {
-        // Only an attempted API read earns a cooldown; budget/local-only misses must stay eligible.
-        if (spent && key && authorshipCache) authorshipCache.set(key, { failedAt: now });
-        return { pr, ai: null };
-      }
-      const ai = isAiGeneratedPr({ ...pr, commits });
-      if (key && authorshipCache) authorshipCache.set(key, ai);
-      return { pr, ai };
-    });
+    .map((pr) => ({ pr, ai: verdictOf(pr) }));
   authorshipCache?.flush(liveKeys);
   // A PR whose commits could not be read (local-only mode with its head not fetched, or the budget spent) is unknown,
   // not absent: `unresolved` lets a caller tell an undercount from a true count instead of silently failing open.

@@ -1,0 +1,5 @@
+{
+  "$comment": "Platform preference for the review operation's seats (see scripts/lib/review-seat-settings.mjs). parallelSeats on|off: every juror seat of a review-pr run starts at once instead of one after another (tool override env WE_REVIEW_PARALLEL_SEATS). seatsByTouchSet on|off: the review daemon picks the seat list from the PR's touch-set before the run starts, so an all-prose PR (e.g. backlog cards only) does not seat the security juror; code PRs keep both mandatory seats (tool override env WE_REVIEW_SEATS_BY_TOUCH_SET).",
+  "parallelSeats": "on",
+  "seatsByTouchSet": "on"
+}

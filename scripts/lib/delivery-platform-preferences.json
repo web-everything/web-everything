@@ -1,0 +1,8 @@
+{
+  "mergeDelivery": {
+    "strategy": "drain-direct",
+    "batchSize": 3,
+    "maxGroupWaitMinutes": 5,
+    "mergeMethod": "merge"
+  }
+}
