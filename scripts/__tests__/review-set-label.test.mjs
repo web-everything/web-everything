@@ -3696,6 +3696,8 @@ if (a[0] === 'pr' && a[1] === 'view') {
  if (s.reads === 2 && s.race === 'human') s.labels.push({name:'review:human'});
  if (s.reads === 2 && s.race === 'acceptance') s.comments.push({...s.comments[0], id:'replacement'});
  console.log(JSON.stringify(s));
+} else if (a[0] === 'api' && a.includes('GET') && a.some(x => /\\/pulls\\/\\d+\\/reviews$/.test(x))) {
+ for (const r of (s.reviews || [])) console.log(JSON.stringify(r));
 } else if (a[0] === 'pr' && a[1] === 'comment') {
  s.comments.push({author:{login:'web-everything'}, body: fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8')});
 } else { console.error('unexpected forge mutation', a); process.exit(1); }
@@ -3705,7 +3707,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  function run({ mode = 'plain', expected = healedHead, labels = ['review:accepted'], race, state = 'OPEN', extra = [] } = {}) {
+  function run({ mode = 'plain', expected = healedHead, labels = ['review:accepted'], race, state = 'OPEN', extra = [], reviews = [] } = {}) {
     let comment = { author: { login: 'web-everything' }, body: buildVerdictComment({
       to: mode === 'human' ? 'clear-human' : 'accepted', actor: 'original reviewer', headSha: reviewedHead, reviewedDiff,
     }) };
@@ -3713,7 +3715,7 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     if (mode === 'no-digests') comment.body = buildReviewedShaMarker(reviewedHead);
     let comments = mode === 'missing' ? [] : [comment];
     if (mode === 'older-digest') comments.push({ author: comment.author, body: buildReviewedShaMarker(reviewedHead) });
-    const original = { state, headRefOid: healedHead, headRefName: 'lane', labels: labels.map(name => ({ name })), comments, race };
+    const original = { state, headRefOid: healedHead, headRefName: 'lane', labels: labels.map(name => ({ name })), comments, race, reviews };
     writeFileSync(join(dir, 'state.json'), JSON.stringify(original));
     const r = spawnSync(process.execPath, [script, '42', '--repo=web-everything/web-everything', '--to=restamp', '--actor=CI healer', '--channel=ci-heal',
       ...(expected === null ? [] : [`--expect-head=${expected}`]), ...extra], {
@@ -3730,7 +3732,8 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(result.r.status, result.r.stdout + result.r.stderr).not.toBe(0);
     expect(result.added).toEqual([]);
     expect(result.ledger).toEqual([]);
-    expect(result.calls.every(a => a[1] === 'view')).toBe(true);
+    // Reads only: PR views, and (a carried operator clearance, PR #4631 round 11) the formal-reviews GET.
+    expect(result.calls.every(a => a[1] === 'view' || (a[0] === 'api' && a.includes('GET')))).toBe(true);
   }
 
   it.each(['plain', 'human'])('carries %s acceptance through base movement with exact proven-head markers', mode => {
@@ -3747,7 +3750,14 @@ fs.writeFileSync('state.json', JSON.stringify(s));
     expect(result.added[0].body).not.toContain("drain's own");
     expect(result.ledger).toHaveLength(1);
     expect(result.ledger[0].coverage.headSha).toBe(healedHead);
-    expect(result.calls.map(a => a[1])).toEqual(['view', 'view', 'comment', 'view']);
+    // A carried operator clearance reads the formal reviews first (PR #4631 round 11); a plain accept never asks.
+    expect(result.calls.map(a => a[0] === 'api' ? 'reviews' : a[1])).toEqual(mode === 'human' ? ['view', 'reviews', 'view', 'comment', 'view'] : ['view', 'view', 'comment', 'view']);
+  });
+
+  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the CI-heal carry of an operator clearance is a carry too —
+  // a standing native CHANGES_REQUESTED review (the bot or the operator) refuses it, before any write.
+  it.each(['plateau-reviewer[bot]', 'chalbert'])('refuses to carry a human acceptance past a standing CHANGES_REQUESTED review by %s', login => {
+    refused(run({ mode: 'human', reviews: [{ state: 'CHANGES_REQUESTED', submitted_at: '2020-01-01T00:00:00Z', user: { login } }] }));
   });
 
   it.each(['source.js', 'source.test.js', 'README.md', 'config.json', 'data.json'])('refuses an actual contribution change in %s', file => {
