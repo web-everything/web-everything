@@ -6,8 +6,8 @@
  *   now ALSO publishes the state to a shared `ops/*` git branch (same transport as `ops/review-requests`:
  *   `./git-transport-branch.mjs`), and CI reads that branch.
  *
- *   - WRITER: `red-main-remediation.mjs freeze|decide --apply` calls {@link publishFreezeFromCli} FIRST (so a failure
- *     between the two writes can only leave the shared copy frozen, never clear), THEN writes the local marker.
+ *   - WRITER: `red-main-remediation.mjs freeze|decide --apply` writes the local marker FIRST (the drain stops at once;
+ *     no publish can delay it), THEN calls {@link publishFreezeFromCli} — even when the local write failed.
  *     `unfreeze` clears locally, then publishes an EXPLICIT clear (`clear: true`). `publish` republishes the local
  *     freeze and REFUSES when there is none: "no marker" (a clone without the gitignored file, or a corrupt one) is
  *     never a clear, so only `unfreeze` can publish `frozen:false`. The local marker stays the drain's own source.
@@ -19,7 +19,8 @@
  *
  *   A REJECTED push (a raced writer, a refusing hook, a transient blip) is retried, re-fetching the tip each time
  *   ({@link PUBLISH_ATTEMPTS}, within a total deadline), so a transient rejection no longer leaves CI reading a stale
- *   clear; the local marker is written after the FIRST failed attempt, so retrying never delays the drain's stop. A
+ *   clear. Every git call carries a timeout ({@link GIT_TIMEOUT_MS}), so a hung push or fetch fails instead of
+ *   blocking; the reader turns a timeout into `{error}` (fail closed). A
  *   clear is computed against the fresh tip and refuses to wipe a DIFFERENT freeze (another writer's, pushed meanwhile). The
  *   residual is EVERY attempt failing, for any reason (origin unreachable, a push policy that refuses each time): the
  *   local marker stays (the drain still stops) and the CLI exits non-zero with a loud line naming the retry
@@ -27,6 +28,7 @@
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
+import { execFileSync } from 'node:child_process';
 import { hostname } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +39,13 @@ import { readSettings } from './settings-files.mjs';
 export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
 /** How many times the CLI hook tries to land one publish before it reports failure. */
 export const PUBLISH_ATTEMPTS = 4;
+/** Per-git-call ceiling: a hung fetch/push FAILS (writer: reported + exit 1; reader: `{error}`, fail closed). */
+export const GIT_TIMEOUT_MS = 20_000;
+
+/** The transport's git runner, with a hard timeout (the transport's own default has none). */
+export function timedGit(timeoutMs = GIT_TIMEOUT_MS) {
+  return (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL', ...opts });
+}
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** The policy-cascade branch name (standard → platform → tool). Never throws. */
@@ -71,7 +80,7 @@ const refusal = (message) => Object.assign(new Error(message), { refusal: true }
  * overwrite would wipe while that writer's local marker stays frozen. `lifted` absent ⇒ an operator clear from a clone
  * with no marker: nothing to compare, so it clears (it is explicit).
  */
-export function publishSharedFreeze({ marker, clear = false, lifted, board = REPO_ROOT, branch = resolveFreezeBranch(), run, now, host, transport = {} } = {}) {
+export function publishSharedFreeze({ marker, clear = false, lifted, board = REPO_ROOT, branch = resolveFreezeBranch(), gitTimeoutMs = GIT_TIMEOUT_MS, run = timedGit(gitTimeoutMs), now, host, transport = {} } = {}) {
   if (!/^ops\/[a-z0-9][a-z0-9-]{0,63}$/.test(String(branch))) throw refusal(`red-main-freeze-shared: refusing to publish to "${branch}" — only an ops/<slug> branch`);
   // "No marker" is NOT "cleared": a clone without the gitignored local marker (or one holding a corrupt file) reads
   // `null`, and mirroring that would silently clear a standing freeze. Only an explicit clear may publish frozen:false.
@@ -123,13 +132,16 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
   // deadline (git here has no timeout of its own). A deterministic refusal is never retried. A CLEAR is tried once: a
   // rejected clear leaves CI frozen (fail closed), and a clear never overwrites a different freeze (see `lifted`).
   const tries = clear === true ? 1 : Math.max(1, attempts);
+  const envMs = (name) => { const n = Number(env[name]); return Number.isInteger(n) && n > 0 ? n : null; };
+  const gitTimeoutMs = envMs('WE_RED_MAIN_FREEZE_SHARED_GIT_TIMEOUT_MS') ?? GIT_TIMEOUT_MS;
+  deadlineMs = envMs('WE_RED_MAIN_FREEZE_SHARED_DEADLINE_MS') ?? deadlineMs;
   const started = nowMs();
   let error;
   let attempt = 0;
   while (attempt < tries) {
     attempt += 1;
     try {
-      const r = publish({ marker, ...(clear === true ? { clear: true, ...(lifted != null ? { lifted } : {}) } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
+      const r = publish({ marker, gitTimeoutMs, ...(clear === true ? { clear: true, ...(lifted != null ? { lifted } : {}) } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
       stderr(`red-main freeze: shared copy ${r.pushed ? 'published' : 'already current'} on ${r.branch} (frozen=${r.doc.frozen})${attempt > 1 ? ` after ${attempt} attempts` : ''}\n`);
       return { ok: true, branch: r.branch, pushed: r.pushed, attempts: attempt };
     } catch (e) {
@@ -156,10 +168,10 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
  * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, error?:string}}
  */
-export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run } = {}) {
+export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = timedGit() } = {}) {
   const source = `${branch}:${SHARED_FREEZE_FILE}`;
   let text;
-  try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], ...(run ? { run } : {}) })[SHARED_FREEZE_FILE]; }
+  try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
   catch (e) { return { source, error: `branch unreadable: ${String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 200)}` }; }
   if (text == null) return { source, error: `${SHARED_FREEZE_FILE} not on ${branch}` };
   let doc;

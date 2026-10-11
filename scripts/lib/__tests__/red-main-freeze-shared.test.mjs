@@ -269,7 +269,15 @@ function cliFixture() {
     chmodSync(hook, 0o755);
     return () => Number(readFileSync(left, 'utf8'));
   };
-  return { root, board, marker, shared, run, breakOrigin, fixOrigin, rejectNextPushes, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  /** A pre-receive hook that records, at each push, whether the local marker file already exists (then accepts). */
+  const recordMarkerAtPush = () => {
+    const log = join(root, 'marker-at-push');
+    const hook = join(remote, 'hooks', 'pre-receive');
+    writeFileSync(hook, `#!/bin/sh\nif [ -f '${marker}' ]; then echo present >> '${log}'; else echo missing >> '${log}'; fi\nexit 0\n`);
+    chmodSync(hook, 0o755);
+    return () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n') : []);
+  };
+  return { root, board, marker, shared, run, breakOrigin, fixOrigin, rejectNextPushes, recordMarkerAtPush, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)', { timeout: 60_000 }, () => {
@@ -381,7 +389,26 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     } finally { chmodSync(dir, 0o755); }
   });
 
-  it('`freeze` publishes BEFORE it writes the local marker (a local write failure cannot leave the shared copy clear)', () => {
+  it('`freeze` writes the LOCAL marker before the first push even starts (a hung publish can never delay the drain stop)', () => {
+    const atPush = fx.recordMarkerAtPush();
+    expect(fx.run(['freeze', '--reason=red']).status).toBe(0);
+    expect(atPush()).toEqual(['present']);
+    expect(fx.shared()).toMatchObject({ frozen: true, reason: 'red' });
+  });
+
+  it('a hung git call is cut off by the publish timeout: the CLI exits 1 with the local marker already written', () => {
+    const hook = join(fx.root, 'remote.git', 'hooks', 'pre-receive');
+    writeFileSync(hook, '#!/bin/sh\nsleep 30\nexit 0\n');
+    chmodSync(hook, 0o755);
+    const t0 = Date.now();
+    const r = fx.run(['freeze', '--reason=red'], { WE_RED_MAIN_FREEZE_SHARED_GIT_TIMEOUT_MS: '1500', WE_RED_MAIN_FREEZE_SHARED_DEADLINE_MS: '2000' });
+    expect(Date.now() - t0).toBeLessThan(20_000);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/NOT published/);
+    expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ frozen: true, reason: 'red' });
+  });
+
+  it('a local write failure still publishes the shared freeze (it can never leave the shared copy clear)', () => {
     const blocker = join(fx.root, 'blocker');
     writeFileSync(blocker, 'a file where a directory is needed');
     const r = fx.run(['freeze', '--reason=red'], { WE_RED_MAIN_FREEZE: join(blocker, 'sub', 'marker.json') });

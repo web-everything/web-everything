@@ -262,7 +262,7 @@ export function freezeDispatch(meta = {}, path = FREEZE_MARKER_PATH) {
   return writeFreezeMarker(buildFreezeMarker(meta), path);
 }
 
-/** The marker a freeze would write (pure) — the CLI builds it first so it can publish the shared copy BEFORE the local write. */
+/** The marker a freeze would write (pure) — the CLI builds it once so the local write and the shared publish carry the same marker. */
 export function buildFreezeMarker(meta = {}) {
   return {
     frozen: true,
@@ -308,24 +308,22 @@ function parseFlags(argv) {
 async function runCli(argv) {
   const cmd = argv[0];
   const flags = parseFlags(argv.slice(1));
-  // xyd06qo: the shared ops/* copy CI's merge-gate reads. A RAISE publishes it FIRST, then writes the local marker, so a
-  // failure between the two can only leave the shared copy frozen (CI holds), never clear. A failed publish still writes
-  // the local marker (the drain stops) and exits 1. Only an explicit CLEAR (`unfreeze`) may publish frozen:false —
+  // xyd06qo: the shared ops/* copy CI's merge-gate reads. A RAISE writes the local marker FIRST (the drain stops at once,
+  // whatever the publish does), then publishes; a local write error never skips the publish. A failed publish exits 1
+  // with the retry named. Only an explicit CLEAR (`unfreeze`) may publish frozen:false —
   // "no marker here" (a clone without the gitignored file, or a corrupt one) is never a clear.
   const shared = () => import('../lib/red-main-freeze-shared.mjs');
   const raise = async (meta) => {
     const marker = buildFreezeMarker(meta);
-    // Once one publish attempt has failed, "shared first" is already lost: write the local marker at once, so the
-    // hook's retries never keep the drain unfrozen while main is red. A local write error there is kept for the end.
+    // LOCAL FIRST: the drain stops on this file, so no publish (slow, hung, retried) may ever delay it. A local write
+    // error is held, never allowed to skip the publish: the shared copy still goes frozen, then the error surfaces.
     let written = null;
     let writeError = null;
-    const writeLocal = () => { if (written) return; try { written = freezeDispatch(marker); writeError = null; } catch (e) { writeError = e; } };
-    // Whatever goes wrong publishing (even loading the module), the local marker MUST still be written: the drain stops on it.
-    try { await (await shared()).publishFreezeFromCli({ marker, onFailedAttempt: writeLocal }); }
-    catch (e) { process.stderr.write(`red-main freeze: ✗ the SHARED copy was NOT published (${String(e?.message || e).split('\n')[0].slice(0, 300)}); writing the local marker anyway. Retry: node scripts/readiness/red-main-remediation.mjs publish\n`); process.exitCode = 1; }
-    if (written) return written;
+    try { written = freezeDispatch(marker); } catch (e) { writeError = e; }
+    try { await (await shared()).publishFreezeFromCli({ marker }); }
+    catch (e) { process.stderr.write(`red-main freeze: ✗ the SHARED copy was NOT published (${String(e?.message || e).split('\n')[0].slice(0, 300)}); the local marker is ${written ? 'written' : 'NOT written'}. Retry: node scripts/readiness/red-main-remediation.mjs publish\n`); process.exitCode = 1; }
     if (writeError) throw writeError;
-    return freezeDispatch(marker);
+    return written;
   };
   if (cmd === 'freeze') {
     const m = await raise({ reason: flags.reason, redRef: flags['red-ref'], mergeSha: flags['merge-sha'] });
