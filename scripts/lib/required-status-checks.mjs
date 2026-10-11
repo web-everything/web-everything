@@ -91,6 +91,25 @@ export function requiredChecksFromRules(rulesJson) {
 }
 
 /**
+ * Pure projection of a `GET repos/{repo}/branches/{branch}` body into its classic-protection required contexts
+ * (`contexts` ∪ `checks[].context`). An unprotected branch, or protection that requires no status checks, is [];
+ * a protected branch whose protection the token cannot see is an unexpected shape, never "no checks".
+ */
+export function requiredChecksFromBranch(branchJson) {
+  const shapeError = () => new Error('required-status-checks: unexpected shape from branch');
+  if (!branchJson || typeof branchJson !== 'object' || Array.isArray(branchJson)) throw shapeError();
+  if (branchJson.protected === false) return [];
+  if (branchJson.protected !== true || !branchJson.protection || typeof branchJson.protection !== 'object') throw shapeError();
+  if (branchJson.protection.enabled === false) return []; // protected by a ruleset only — no classic protection
+  const status = branchJson.protection.required_status_checks;
+  if (status == null) return [];
+  if (typeof status !== 'object') throw shapeError();
+  const contexts = Array.isArray(status.contexts) ? status.contexts : [];
+  const checks = Array.isArray(status.checks) ? status.checks.map(check => check?.context) : [];
+  return [...new Set([...contexts, ...checks].filter(context => typeof context === 'string' && context.length > 0))];
+}
+
+/**
  * `gh api --paginate --slurp` prints an array of PAGES; flatten it to the rule list. A bare rule list (no page
  * wrapper) passes through; a mix of pages and bare rules is an unexpected shape, never a partial read.
  */
@@ -145,17 +164,13 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
 
   // GitHub enforces rulesets AND classic protection together, so classic protection is always read too and the
   // required set is their UNION — a check only classic protection requires must never be dropped (PR #4924).
+  // Read it off the BRANCH (`protection.required_status_checks`), not `…/protection`: an App token gets a 403 on
+  // the latter (live 2026-10-11) but can read the former. Any classic failure throws — never a ruleset-only set.
   let checks;
   try {
-    const out = gh(['api', `${base}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts']);
-    const parsed = JSON.parse(out.trim()); // blank body = failed read, same as the rules read above
-    if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
-    checks = parsed.map(String);
+    const out = gh(['api', `${base}/branches/${branch}`]);
+    checks = requiredChecksFromBranch(JSON.parse(out.trim())); // blank body = failed read, same as the rules read
   } catch (error) {
-    // Rules read fine: a protection DENIAL (no classic protection on the branch — 404 — or a token that cannot
-    // read it — 403) leaves the ruleset set as the whole answer. Any other protection failure throws, so a
-    // ruleset-only partial set is never reported live; the caller's stale-cache handling keeps the last real set.
-    if (!rulesError && rulesChecks.length && protectionAccessDenied(error)) return rulesChecks;
     // A transient rules failure must not become a denial just because protection is inaccessible.
     throw rulesError && !protectionAccessDenied(rulesError) ? rulesError : error;
   }

@@ -562,6 +562,16 @@ function handleApi(store, rest) {
         return jsonResult({ required_status_checks: { contexts: repoState.requiredChecks } }, jq);
       }
     }
+    // The same declared set as the BRANCH body's classic protection — `required-status-checks.mjs` reads the classic
+    // set here (App-token readable) and unions it with the ruleset set below.
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/branches\/([^/?]+)$/))) {
+      const repoState = requireRepo(store, `${m[1]}/${m[2]}`);
+      if (Array.isArray(repoState.requiredChecks)) {
+        return jsonResult({ name: m[3], protected: true, protection: { enabled: true, required_status_checks: {
+          enforcement_level: 'non_admins', contexts: repoState.requiredChecks,
+          checks: repoState.requiredChecks.map((context) => ({ context, app_id: null })) } } }, jq);
+      }
+    }
     // The same declared set, served as a branch RULESET: `required-status-checks.mjs` reads rules first and
     // throws on any non-denial rules failure, so an unsupported rules path would degrade every `setRequiredChecks`
     // scenario to the untrusted fallback set instead of a live read.

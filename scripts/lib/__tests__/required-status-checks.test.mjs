@@ -249,6 +249,10 @@ describe('getRequiredStatusChecks', () => {
 const requiredRule = (...contexts) => ({ type: 'required_status_checks', parameters: {
   required_status_checks: contexts.map(context => ({ context, integration_id: 15368 })),
 } });
+/** A `GET repos/{repo}/branches/{branch}` body whose classic protection requires `contexts`. */
+const classicBranch = (...contexts) => JSON.stringify({ name: 'main', protected: true, protection: {
+  enabled: true, required_status_checks: { enforcement_level: 'non_admins', contexts, checks: [] },
+} });
 
 describe('requiredChecksFromRules', () => {
   it('unions required rules, deduplicating contexts and ignoring other rule types', () => {
@@ -281,31 +285,55 @@ describe('defaultReadRequiredStatusChecks', () => {
     if (reply instanceof Error) throw reply;
     return reply;
   });
-  const NOT_PROTECTED = new Error('gh: Branch not protected (HTTP 404)');
+  const UNPROTECTED = JSON.stringify({ name: 'main', protected: false });
 
   it('unions ruleset and classic-protection checks: a classic-only check is never dropped', () => {
-    const gh = bothSources(JSON.stringify([[requiredRule('smoke', 'test')]]), '["test","classic-only"]');
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke', 'test')]]), classicBranch('test', 'classic-only'));
     expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', branch: 'release', gh })).toEqual(['smoke', 'test', 'classic-only']);
     expect(gh.mock.calls).toEqual([
       [['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/release?per_page=100']],
-      [['api', 'repos/owner/repo/branches/release/protection', '--jq', '.required_status_checks.contexts']],
+      [['api', 'repos/owner/repo/branches/release']],
     ]);
   });
 
+  // Live 2026-10-11: the App token gets `Resource not accessible by integration (HTTP 403)` on `…/protection`, but
+  // `GET …/branches/main` returns this shape — so the classic set is read from the branch, never skipped on a 403.
+  it('reads classic checks off the branch body (contexts ∪ checks[].context) — the App-token-readable endpoint', () => {
+    const live = JSON.stringify({ name: 'main', protected: true, protection: { enabled: true, required_status_checks: {
+      enforcement_level: 'non_admins', contexts: ['test', 'smoke'],
+      checks: [{ app_id: 15368, context: 'test' }, { app_id: 15368, context: 'checks-only' }],
+    } } });
+    const gh = bothSources(JSON.stringify([[requiredRule('test', 'soak-replay-gate')]]), live);
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['test', 'soak-replay-gate', 'smoke', 'checks-only']);
+  });
+
   it.each([
-    ['no classic protection on the branch', NOT_PROTECTED],
-    ['classic protection unreadable by this token', new Error('HTTP 403: Resource not accessible by integration')],
-  ])('keeps the ruleset set alone when %s', (_label, protectionError) => {
-    const gh = bothSources(JSON.stringify([[requiredRule('test', 'smoke', 'test')]]), protectionError);
+    ['an unprotected branch', UNPROTECTED],
+    ['ruleset-only protection (classic disabled)', JSON.stringify({ protected: true, protection: { enabled: false,
+      required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } })],
+    ['classic protection that requires no status checks', JSON.stringify({ protected: true, protection: { enabled: true } })],
+    ['null contexts', JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: { contexts: null } } })],
+  ])('keeps the ruleset set alone for %s', (_label, branchBody) => {
+    const gh = bothSources(JSON.stringify([[requiredRule('test', 'smoke', 'test')]]), branchBody);
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['test', 'smoke']);
+  });
+
+  it('drops blank or non-string classic contexts instead of turning them into check names', () => {
+    const body = JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: {
+      contexts: ['', null, 7, 'real'], checks: [{ context: '' }, null, {}] } } });
+    expect(defaultReadRequiredStatusChecks({ gh: bothSources('[[]]', body) })).toEqual(['real']);
   });
 
   it.each([
     ['a transient failure', new Error('HTTP 502')],
     ['a rate-limit 403', new Error('HTTP 403: API rate limit exceeded')],
+    ['an access 403', new Error('HTTP 403: Resource not accessible by integration')],
+    ['a 404', new Error('gh: Not Found (HTTP 404)')],
     ['a blank body', ''],
-    ['a non-array body', '{"message":"x"}'],
-  ])('a nonempty ruleset never stands alone as live when classic protection hits %s', (_label, protection) => {
+    ['an array body', '["classic"]'],
+    ['a protected branch whose protection is hidden', JSON.stringify({ protected: true })],
+    ['a non-object required_status_checks', JSON.stringify({ protected: true, protection: { required_status_checks: 'x' } })],
+  ])('a nonempty ruleset never stands alone as live when the classic read hits %s', (_label, protection) => {
     const gh = bothSources(JSON.stringify([[requiredRule('smoke')]]), protection);
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
   });
@@ -324,13 +352,13 @@ describe('defaultReadRequiredStatusChecks', () => {
     const page1 = [requiredRule('test'), ...Array.from({ length: 29 }, () => ({ type: 'deletion' }))];
     const page2 = [requiredRule('security-scan')];
     // `gh api --paginate --slurp` prints one array of pages
-    const gh = bothSources(JSON.stringify([page1, page2]), NOT_PROTECTED);
+    const gh = bothSources(JSON.stringify([page1, page2]), UNPROTECTED);
     expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', gh })).toEqual(['test', 'security-scan']);
     expect(gh.mock.calls[0]).toEqual([['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/main?per_page=100']]);
   });
 
   it('treats a blank rules response as a failed read, never as "no rules"', () => {
-    const gh = vi.fn().mockReturnValueOnce('').mockReturnValueOnce('["classic"]');
+    const gh = vi.fn().mockReturnValueOnce('').mockReturnValueOnce(classicBranch('classic'));
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
   });
 
@@ -340,26 +368,26 @@ describe('defaultReadRequiredStatusChecks', () => {
   });
 
   it('falls through to classic protection when the single rules page is empty', () => {
-    const gh = vi.fn().mockReturnValueOnce('[[]]').mockReturnValueOnce('["classic"]');
+    const gh = vi.fn().mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('classic'));
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
   });
 
   it('rejects a non-array rules body', () => {
-    const gh = vi.fn().mockReturnValueOnce('{"message":"x"}').mockReturnValueOnce('["classic"]');
+    const gh = vi.fn().mockReturnValueOnce('{"message":"x"}').mockReturnValueOnce(classicBranch('classic'));
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
   });
 
   it('rejects a rules response that mixes pages and bare rules', () => {
-    const gh = vi.fn().mockReturnValueOnce(JSON.stringify([[requiredRule('test')], requiredRule('x')])).mockReturnValueOnce('["classic"]');
+    const gh = vi.fn().mockReturnValueOnce(JSON.stringify([[requiredRule('test')], requiredRule('x')])).mockReturnValueOnce(classicBranch('classic'));
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
   });
 
   it('falls back to classic protection when rules are empty', () => {
-    const gh = vi.fn().mockReturnValueOnce('[]').mockReturnValueOnce('["classic"]');
+    const gh = vi.fn().mockReturnValueOnce('[]').mockReturnValueOnce(classicBranch('classic'));
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
     expect(gh.mock.calls).toEqual([
       [['api', '--paginate', '--slurp', 'repos/{owner}/{repo}/rules/branches/main?per_page=100']],
-      [['api', 'repos/{owner}/{repo}/branches/main/protection', '--jq', '.required_status_checks.contexts']],
+      [['api', 'repos/{owner}/{repo}/branches/main']],
     ]);
   });
 
@@ -381,7 +409,7 @@ describe('defaultReadRequiredStatusChecks', () => {
 
   it.each(['HTTP 403: Resource not accessible by integration', 'HTTP 502'])('preserves rules failure when protection is empty: %s', message => {
     const error = new Error(message);
-    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce('[]');
+    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce(UNPROTECTED);
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
   });
 
@@ -389,7 +417,7 @@ describe('defaultReadRequiredStatusChecks', () => {
     const cachePath = join(dir, 'cache.json');
     const repo = 'web-everything/web-everything';
     getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['old-check'] });
-    const gh = bothSources(JSON.stringify([[requiredRule(...FALLBACK_REQUIRED_STATUS_CHECKS)]]), NOT_PROTECTED);
+    const gh = bothSources(JSON.stringify([[requiredRule(...FALLBACK_REQUIRED_STATUS_CHECKS)]]), UNPROTECTED);
     expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
       readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
     })).toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live' });
@@ -401,14 +429,14 @@ describe('defaultReadRequiredStatusChecks', () => {
 
   it('propagates a transient rules failure even when classic protection succeeds', () => {
     const error = new Error('HTTP 502');
-    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce('["classic"]');
+    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce(classicBranch('classic'));
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
   });
 
   it('uses successful protection when the rules API is merely inaccessible', () => {
     const gh = vi.fn()
       .mockImplementationOnce(() => { throw new Error('HTTP 403: Resource not accessible by integration'); })
-      .mockReturnValueOnce('["classic"]');
+      .mockReturnValueOnce(classicBranch('classic'));
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
   });
 
@@ -416,7 +444,7 @@ describe('defaultReadRequiredStatusChecks', () => {
     const cachePath = join(dir, 'cache.json');
     const repo = 'web-everything/web-everything';
     getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'soak-replay-gate'] });
-    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce('["test"]');
+    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce(classicBranch('test'));
     const result = getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
       readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
     });
@@ -434,14 +462,14 @@ describe('defaultReadRequiredStatusChecks', () => {
     const routed = (_bin, args, opts) => {
       expect(opts.env.GH_TOKEN === 'ghp_test_fixture').toBe(true);
       expect(opts.timeout).toBe(15_000);
-      const body = args.some(a => a.includes('/rules/')) ? [[requiredRule('personal-check')]] : ['classic-check'];
-      return { status: 0, stdout: Buffer.from(JSON.stringify(body)), stderr: Buffer.alloc(0) };
+      const body = args.some(a => a.includes('/rules/')) ? JSON.stringify([[requiredRule('personal-check')]]) : classicBranch('classic-check');
+      return { status: 0, stdout: Buffer.from(body), stderr: Buffer.alloc(0) };
     };
     spawnSync.mockImplementationOnce(routed).mockImplementationOnce(routed);
     expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check', 'classic-check']);
     expect(execFileSync).toHaveBeenCalledWith('gh', ['auth', 'token'], expect.any(Object));
     expect(spawnSync.mock.calls[0][1]).toEqual(['api', '--paginate', '--slurp', 'repos/web-everything/web-everything/rules/branches/main?per_page=100']);
-    expect(spawnSync.mock.calls[1][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts']);
+    expect(spawnSync.mock.calls[1][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main']);
     expect(process.env.GH_TOKEN === 'ghs_test_fixture').toBe(true);
   });
 
@@ -453,12 +481,13 @@ describe('defaultReadRequiredStatusChecks', () => {
       .toEqual({ source: 'declared', checks: ['test', 'e2e'] });
   });
 
-  it('shells `gh api repos/<repo>/branches/<branch>/protection --jq .required_status_checks.contexts`', () => {
+  it('shells `gh api repos/<repo>/branches/<branch>` for the classic set', () => {
+    execFileSync.mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('test', 'smoke', 'daemon-soak'));
     const result = defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything', branch: 'main' });
     expect(result).toEqual(['test', 'smoke', 'daemon-soak']);
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'],
+      ['api', 'repos/web-everything/web-everything/branches/main'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });
@@ -468,10 +497,11 @@ describe('defaultReadRequiredStatusChecks', () => {
   // rather than this reader failing a caller (e.g. a local CLI run with no `--repo` flag) that never had a
   // slug to pass.
   it('falls back to gh\'s own {owner}/{repo} template placeholders when no repo slug is given', () => {
+    execFileSync.mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('test'));
     defaultReadRequiredStatusChecks({});
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/{owner}/{repo}/branches/main/protection', '--jq', '.required_status_checks.contexts'],
+      ['api', 'repos/{owner}/{repo}/branches/main'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });
