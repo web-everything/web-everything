@@ -47,6 +47,19 @@ export default {
     refresh: (ref, o) => refreshOntoMain(ref, { ...o, rebase: (r) => { rebased.push(r.laneRef); return { action: 'rebased', newCommit: 'x' }; } }) });
     if (!red.dispatch.length) violations.push('main-red fixture did not dispatch (scenario is vacuous)');
     if (rebased.length) violations.push(`main-red path rebased/pushed a fork PR's head ref: ${rebased.join(', ')}`);
+    // 4. PR #4825 red team: a fork PR #30 sharing the parent's head name, listed first, must not block same-repo #10 → #20.
+    const twinRefreshed = [];
+    const twinPosted = [];
+    const green = [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+    sweepMissingRunRecovery({ ...common, apply: true, readComments: () => [], trigger: () => ({ ok: false }), clearLabel: () => false,
+      readOpenPrs: () => [{ number: 30, headRefName: 'lane/parent', baseRefName: 'main', statusCheckRollup: green },
+        { number: 10, headRefName: 'lane/parent', baseRefName: 'main', statusCheckRollup: green },
+        { number: 20, headRefName: 'lane/child', baseRefName: 'lane/parent', headRefOid: SHA, statusCheckRollup: [] }],
+      postComment: (n, o) => twinPosted.push([n, o]),
+      restack: (d, o) => restackStackedPr(d, { ...o, checkClaim: () => null, readIsCrossRepository: (n) => n === 30,
+        fetchRef: () => ({ ok: true }), refresh: (ref) => { twinRefreshed.push(ref); return { ok: true, action: 'rebased', newCommit: 'x' }; } }) });
+    if (twinRefreshed.join(',') !== 'lane/parent,lane/child') violations.push(`fork twin of the parent blocked the same-repo stack (refreshed: ${twinRefreshed.join(', ') || 'nothing'})`);
+    if (twinPosted.some(([, o]) => o.ok === false)) violations.push('fork twin of the parent burned a counted missing-run attempt on #20');
     return { violations };
   },
   judge(report) { return report.violations; },

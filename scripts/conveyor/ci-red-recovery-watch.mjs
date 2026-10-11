@@ -905,6 +905,16 @@ export function restackStackedPr(d, {
   fetchRef = defaultFetchStackRef, checkClaim = pushRefusal, readIsCrossRepository = defaultReadIsCrossRepository,
 } = {}) {
   const action = 'stack-restack';
+  const open = Array.isArray(prs) ? prs : [];
+  // Every link is verified same-repo before any claim check, fetch or push (a fork PR, or one whose head name
+  // merely shadows a same-repo lane in the chain, must never reach refreshOntoMain). One read per PR.
+  const verdicts = new Map();
+  const verify = (pr) => {
+    const n = pr.prNumber ?? pr.number;
+    if (!verdicts.has(n)) verdicts.set(n, sameRepoRefusal(n, { repo, readIsCrossRepository, action }));
+    return verdicts.get(n);
+  };
+  const refusal = pr => ({ ...verify(pr), error: `stack link ${pr.headRefName}: ${verify(pr).error}` });
   const chain = [];
   const seen = new Set();
   let link = d;
@@ -916,19 +926,26 @@ export function restackStackedPr(d, {
     seen.add(link.headRefName);
     chain.push(link);
     if (ref === defaultBranch) break;
-    link = (Array.isArray(prs) ? prs : []).find(pr => pr.headRefName === ref);
-    if (!link) return { ok: false, action, error: `stack base ${ref} is not an open PR head; cannot restack` };
+    const named = open.filter(pr => pr.headRefName === ref);
+    if (!named.length) return { ok: false, action, error: `stack base ${ref} is not an open PR head; cannot restack` };
+    if (verify(link)) return refusal(link);
+    // A fork can open a PR from a branch with the same name as a same-repo lane, so the parent is the same-repo
+    // PR among every name match, never the first match by listing order (PR #4825 round 5).
+    const parents = named.filter(pr => !verify(pr));
+    if (new Set(parents.map(pr => pr.baseRefName)).size > 1) {
+      return { ok: false, action, error: `stack base ${ref} heads several same-repo PRs with different bases; ambiguous stack, cannot restack` };
+    }
+    // No same-repo match: an unverifiable one defers (it may be the parent); only forks is a counted refusal.
+    if (!parents.length) return refusal(named.find(pr => verify(pr).deferred) ?? named[0]);
+    link = parents[0];
   }
   // A failure is a deferral only if the claim store holds a live claim on a chain link now (the push race) — never
   // because the failure text quotes the claim phrase (PR #4825 round 4).
   const failed = error => ({ ok: false, action, error,
     ...(chain.some(pr => checkClaim({ repo, branch: pr.headRefName })) ? { deferred: true } : {}),
   });
-  // Every link is verified same-repo before any claim check, fetch or push (a fork PR, or one whose head name
-  // merely shadows a same-repo lane in the chain, must never reach refreshOntoMain).
   for (const pr of chain) {
-    const refused = sameRepoRefusal(pr.prNumber ?? pr.number, { repo, readIsCrossRepository, action });
-    if (refused) return { ...refused, error: `stack link ${pr.headRefName}: ${refused.error}` };
+    if (verify(pr)) return refusal(pr);
   }
   for (const pr of chain) {
     const held = checkClaim({ repo, branch: pr.headRefName });

@@ -1565,6 +1565,51 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
       expect(watch.restackStackedPr({ ...stack[1], prNumber: 4759 }, { prs: stack, repo, checkClaim: () => null, readIsCrossRepository: read, refresh, fetchRef: () => ({ ok: true }) }).ok).toBe(true);
       expect(read.mock.calls.map(c => c[0])).toEqual([4759, 4756]);
     });
+    // PR #4825 red team: a fork PR sharing the parent's head name, listed first, must not block the same-repo parent.
+    describe('parent resolution skips a fork PR that shadows the parent head name', () => {
+      const parent = { number: 10, headRefName: 'lane/parent', baseRefName: 'main' };
+      const forkTwin = { number: 30, headRefName: 'lane/parent', baseRefName: 'main' };
+      const child = { number: 20, headRefName: 'lane/child', baseRefName: 'lane/parent', headRefOid: sha, statusCheckRollup: [] };
+      it.each([
+        ['fork listed before the same-repo parent', [forkTwin, parent, child]],
+        ['fork listed after the same-repo parent', [parent, forkTwin, child]],
+      ])('%s', (_name, prs) => {
+        const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'new' }));
+        const result = watch.restackStackedPr({ ...child, prNumber: 20 }, { prs, repo, checkClaim: () => null,
+          readIsCrossRepository: (n) => n === 30, refresh, fetchRef: () => ({ ok: true }) });
+        expect(result).toMatchObject({ ok: true, action: 'stack-restack' });
+        expect(refresh.mock.calls.map(c => [c[0], c[1].base])).toEqual([['lane/parent', 'origin/main'], ['lane/child', 'origin/lane/parent']]);
+      });
+      it('a fork-only parent name is still a counted refusal; an unverifiable twin defers', () => {
+        const refresh = vi.fn();
+        const opts = { repo, checkClaim: () => null, refresh, fetchRef: () => ({ ok: true }) };
+        const forkOnly = watch.restackStackedPr({ ...child, prNumber: 20 }, { ...opts, prs: [forkTwin, child], readIsCrossRepository: (n) => n === 30 });
+        expect(forkOnly).toMatchObject({ ok: false, error: expect.stringMatching(/fork/) });
+        expect(forkOnly.deferred).toBeUndefined();
+        const unknown = watch.restackStackedPr({ ...child, prNumber: 20 }, { ...opts, prs: [forkTwin, { ...parent, number: 11 }, child],
+          readIsCrossRepository: (n) => (n === 30 ? true : n === 11 ? null : false) });
+        expect(unknown).toMatchObject({ ok: false, deferred: true });
+        expect(refresh).not.toHaveBeenCalled();
+      });
+      it('two same-repo PRs from the parent head with different bases are an ambiguous stack, never a guess', () => {
+        const refresh = vi.fn();
+        const result = watch.restackStackedPr({ ...child, prNumber: 20 }, { prs: [parent, { number: 12, headRefName: 'lane/parent', baseRefName: 'lane/other' }, child],
+          repo, checkClaim: () => null, readIsCrossRepository: () => false, refresh, fetchRef: () => ({ ok: true }) });
+        expect(result).toMatchObject({ ok: false, error: expect.stringMatching(/ambiguous/) });
+        expect(refresh).not.toHaveBeenCalled();
+      });
+      it('sweep: the shadowing fork posts no marker and the stack refreshes', () => {
+        const refresh = vi.fn(() => ({ ok: true, action: 'rebased', newCommit: 'new' }));
+        const postComment = vi.fn();
+        sweepMissingRunRecovery({ apply: true, repo, readOpenPrs: () => [{ ...forkTwin, statusCheckRollup: [greenCheck] }, { ...parent, statusCheckRollup: [greenCheck] }, child],
+          mainRuns: runs, readRequiredContexts: () => ['test'], readHeadCommittedAt: () => '2026-10-10T12:00:00Z', readComments: () => [],
+          now: Date.parse('2026-10-10T21:00:00Z'),
+          restack: (d, o) => watch.restackStackedPr(d, { ...o, checkClaim: () => null, readIsCrossRepository: (n) => n === 30, refresh, fetchRef: () => ({ ok: true }) }),
+          trigger: vi.fn(), postComment, clearLabel: () => false });
+        expect(refresh).toHaveBeenCalledTimes(2);
+        expect(postComment).toHaveBeenCalledWith(20, expect.objectContaining({ ok: true, action: 'stack-restack' }));
+      });
+    });
     it('sweep: a stacked fork candidate reaches no refresh and posts a counted failure marker', () => {
       const refresh = vi.fn();
       const postComment = vi.fn();
