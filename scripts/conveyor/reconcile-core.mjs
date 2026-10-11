@@ -324,6 +324,10 @@ export const REFUSAL_KINDS = Object.freeze([
   // no review is dispatched and no "a person must take it over" note replaces it. Emitted through `capExhaustedVia`'s
   // injected `refuseFn`, which the source scan in `reconcile-core.test.mjs` now reads too.
   'mechanical-carry-forward',
+  // `gate-hold` (the PR's own gate holds it and no defect is open — no takeover) and `takeover-awaiting-review` (the
+  // latest takeover pushed a head no review has judged yet) — both emitted through the cap-site `refuseFn`, which the
+  // source scan in `reconcile-core.test.mjs` reads since PR #4770.
+  'gate-hold', 'takeover-awaiting-review',
 ]);
 
 /**

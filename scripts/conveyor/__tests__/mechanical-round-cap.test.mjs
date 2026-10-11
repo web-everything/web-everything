@@ -502,7 +502,7 @@ describe('readMechanicalRoundFacts (real git)', { timeout: 30_000 }, () => {
   });
 
   // Ref names reach git argv; one outside the safe pattern is refused before ANY git call runs.
-  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main x', 'main`id`', "ma'in", 'mäin', 'main\rx', 'main​x', 'main﻿'];
+  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main x', 'main`id`', "ma'in", 'mäin', 'main\rx', 'main\u200bx', 'main\ufeff'];
   it.each(UNSAFE)('an unsafe base ref %j is refused with no git call', (bad) => {
     let calls = 0;
     const exec = () => { calls++; return ''; };
