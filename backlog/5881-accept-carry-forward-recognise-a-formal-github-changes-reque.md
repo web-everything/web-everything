@@ -1,4 +1,5 @@
 ---
+bornAs: xqugnf2
 kind: story
 size: 3
 status: open
