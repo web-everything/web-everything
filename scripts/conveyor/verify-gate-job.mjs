@@ -888,7 +888,7 @@ function releaseLaneMain(argv) {
   if (!dir) { process.stderr.write('usage: verify-gate-job.mjs release-lane --dir=<lane dir> [--jobs-dir=<dir>]\n'); process.exit(64); }
   const out = releaseLaneByOperator({ jobsDir: arg('jobs-dir') || verifyJobsDir(), dir, who: `operator (pid ${process.pid})` });
   process.stdout.write(`${JSON.stringify({ dir, ...out })}\n`);
-  if (out.refused) process.exit(1);
+  if (out.refused) { process.exitCode = 1; return; }
   if (out.claim == null && !out.setAside.length) process.stderr.write(`release-lane: nothing held on ${JSON.stringify(dir)} (no unreleased claim, no unknown gate record)\n`);
 }
 
