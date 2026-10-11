@@ -23,7 +23,7 @@
  */
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { ADVISORY_LABELS, latestAdvisory, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
-import { takeoverEpisodes, isConcludedVerdict } from './takeover-budget.mjs';
+import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
 
 export const PR_STATUS_PREFIX = 'status:';
 export const PR_STATUS_STATES = Object.freeze([
@@ -44,7 +44,6 @@ export const PR_STATUS_DESCRIPTIONS = Object.freeze({
 /** Takeover reasons that hand the PR to a person (the note says "a person must decide/take it over"). */
 const ESCALATED = new Set(['takeover-budget-spent', 'takeover-not-converging', 'takeover-spent', 'takeover-void-limit', 'ruling-dispute', 'setting-person', 'setting-disabled']);
 const names = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
-const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? c?.created_at ?? ''); return Number.isFinite(t) ? t : NaN; };
 
 /** PURE: the operator queue's NEEDS YOU label gate (`we:scripts/operations/operator-queue.mjs#evaluatePr`, labels +
  *  advisory on this head; CI and mergeability are the queue's own late checks and do not change whose turn it is). */
@@ -56,11 +55,12 @@ export function operatorQueueNeedsYou(pr) {
   return Boolean(adv) && advisoryCoversHead(adv, String(pr?.headRefOid ?? '').toLowerCase()) && adv.outcome === ADVISORY_OUTCOMES.ACCEPT;
 }
 
-/** PURE: the latest takeover has not been judged yet (no concluded review verdict after it; a paused one is none). */
+/** PURE: the latest takeover has not been judged yet — no review of its own work landed (a delayed review of the old
+ *  head does not count; the same rule as the takeover budget's progress guard). */
 export function takeoverUnjudged(comments) {
   const latest = takeoverEpisodes(comments).at(-1);
   if (!latest) return false;
-  return !(Array.isArray(comments) ? comments : []).some((c) => isConcludedVerdict(c) && timeOf(c) > latest.end);
+  return !takeoverProgress(comments, latest).judged;
 }
 
 /**

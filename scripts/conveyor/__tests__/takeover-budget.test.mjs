@@ -7,7 +7,8 @@ import {
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
 import { takeoverReviewGrant } from '../takeover-review.mjs';
-import { planReconcile } from '../reconcile-core.mjs';
+import { planReconcile, ADVISORY_FIX_ROUND_CAP } from '../reconcile-core.mjs';
+import { buildAdvisoryFixComment } from '../advisory-fix-mark.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
 import { briefWithRoundContext } from '../reconcile-fix-dispatch.mjs';
@@ -257,6 +258,69 @@ describe('takeover 2+ brief', () => {
     const remaining = Array.from({ length: 10 }, (_, i) => ({ file: `f${i}.mjs`, line: i, claim: 'x' }));
     const text = notConvergingText(7, { n: 1, budget: 2, progress: { before: { count: 5, weight: 10 }, after: { count: 10, weight: 20 }, remaining } });
     expect(text).toMatch(/… and 4 more/);
+  });
+});
+
+describe('only a verdict on the takeover\'s own head judges it (PR #4779 review round 5)', () => {
+  const ep = (comments) => takeoverEpisodes(comments).at(-1);
+  const plain = (head, comments) => planTakeover({ pr: pr(head, comments), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER });
+  it('a delayed old-head verdict cannot authorize another takeover', () => {
+    // The review of R5 (the head the takeover started from) lands after the marker, with fewer findings.
+    const late = [...rounds5, marker(R5, 7), review(R5, 8, FOUR)];
+    expect(takeoverProgress(late, ep(late))).toMatchObject({ judged: false });
+    // Still on the start head: the takeover never pushed — the one-per-head bound holds.
+    expect(plain(R5, late)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+    // It pushed T1: its own review is still owed — no second takeover on an old-head verdict.
+    expect(plain(T1, [...late, rearm(9)])).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+    expect(plan(pr(T1, [...late, rearm(9)])).dispatch.filter((x) => x.prNumber === 7 && x.mode === 'takeover')).toEqual([]);
+    // The old-head review landing AFTER the takeover's push still judges nothing: it names the head reviewed before.
+    expect(plain(T1, [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+    // The takeover head's own verdict then judges it as usual.
+    expect(plain(T1, [...late, rearm(9), review(T1, 10, FOUR.slice(1))])).toMatchObject({ ok: true, n: 2 });
+  });
+  it('a judged takeover whose PR head is still the start head reads as never pushed', () => {
+    // A verdict naming another head, but the PR never moved off the head the takeover started from.
+    expect(plain(R5, [...rounds5, marker(R5, 7), review(T1, 9, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('an operator-only takeover that pushed and is unjudged awaits its review (not "spent")', () => {
+    const op = [...rounds5, operatorTakeover(7)];
+    expect(plain(T1, [...op, rearm(8)])).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+    // Never pushed: still on the reviewed head before it.
+    expect(plain(R5, op)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('A3: a judged takeover with no measurable before-round is never progress', () => {
+    const noBefore = [rearm(1), marker(R5, 7), review(T1, 9, [])];
+    expect(takeoverProgress(noBefore, ep(noBefore))).toMatchObject({ judged: true, progress: false, before: { count: 0 } });
+    // An unreadable thread (no parseable review round at all) judges nothing.
+    const unreadable = [rearm(1), marker(R5, 7), { author: BOT, createdAt: at(9), body: 'not a review' }];
+    expect(takeoverProgress(unreadable, ep(unreadable))).toMatchObject({ judged: false });
+  });
+  it('untrusted takeover signals and verdicts count for nothing', () => {
+    const forgedMarker = { ...marker(R5, 7), author: { login: 'mallory' } };
+    expect(takeoverEpisodes([...rounds5, forgedMarker, { ...operatorTakeover(8), author: { login: 'mallory' } }])).toEqual([]);
+    const forgedVerdict = { ...review(T1, 9, []), author: { login: 'mallory' } };
+    const thread = [...rounds5, marker(R5, 7), rearm(8), forgedVerdict];
+    expect(takeoverProgress(thread, ep(thread))).toMatchObject({ judged: false });
+  });
+});
+
+describe('every round cap kind leads to a takeover (A5)', () => {
+  it.each(['fix', 'review', 'advisory-fix'])('planTakeover owes a takeover at the %s cap with open defects', (capKind) => {
+    const judged = [...rounds5, rearm(7), review(T1, 8, FOUR)];
+    expect(planTakeover({ pr: pr(T1, judged), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind }))
+      .toMatchObject({ ok: true, n: 1 });
+  });
+  it('a review:human PR at the advisory-fix cap with open defects gets a takeover dispatch, not "a person must take it over"', () => {
+    const comments = [];
+    for (let i = 0; i < ADVISORY_FIX_ROUND_CAP; i += 1) {
+      comments.push(review(R5, 2 * i + 1, FIVE));
+      comments.push({ author: BOT, createdAt: at(2 * i + 2), body: buildAdvisoryFixComment({}) });
+    }
+    comments.push(review(R5, 9, FOUR)); // the note the last advisory fix did not clear, on the current head
+    const p = pr(R5, comments, { labels: [{ name: 'review:human' }, { name: 'advisory:changes' }] });
+    expect(plan(p).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', capKind: 'advisory-fix', takeover: { n: 1 } });
+    // With the person setting, the same PR is a plain advisory-fix cap refusal.
+    expect(plan(p, { roundCapAction: 'person' }).refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', capKind: 'advisory-fix' });
   });
 });
 
