@@ -115,8 +115,9 @@ function changedFiles(git, mainSha, sha) {
  * Overlays whose PR is MERGED/CLOSED or whose ref is gone take no part (the main loop removes them).
  * A PR base chain comes from the GitHub API, which any PR author can edit, so a chain claim ("C is stacked on P") makes C
  * a child of P only when git corroborates it: P's tip is an ancestor of C's tip, or C carries a commit patch-equivalent
- * to one of P's (`git cherry`), or one with the same author and subject (a rebase keeps both, so a rebased base is still
- * recognised through its old head), or the entry already records the claim (written by an earlier rebuild after it
+ * to one of P's (cherry-mark), or one with the same author and subject (a rebase keeps both, so a rebased base is still
+ * recognised through its old head) — counting only commits the other side lacks, so a shared prerequisite (or an older
+ * copy of one of P's own PR bases) never corroborates siblings — or the entry already records the claim (written by an earlier rebuild after it
  * passed this check). An uncorroborated claim is ignored and reported in `unconfirmed`. A base that moved is set aside only when git shows
  * a top really clashes with it; if every top merges cleanly with it, both apply independently.
  * `keepIndependent` names refs that must never be set aside (a base whose fallback could not be merged — see the 7b
@@ -146,26 +147,26 @@ export async function planOverlayStacks({
     nodes.push({ raw, ref: raw.ref, pr, sha, chain: Array.isArray(chain) ? chain : [] });
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
-  // "author<TAB>subject" of the commits an overlay adds on top of main (its own work), newest 200. A rebase keeps both.
-  const ownKeys = (n) => {
-    if (!n.keys) {
-      n.keys = new Set();
-      const mb = git(['merge-base', mainSha, n.sha]);
-      const base = mb.status === 0 ? String(mb.stdout ?? '').trim() : '';
-      const log = base ? git(['log', '--no-merges', '-n', '200', '--format=%ae%x09%s', `${base}..${n.sha}`]) : null;
-      if (log?.status === 0) for (const l of String(log.stdout ?? '').split('\n')) if (l.trim()) n.keys.add(l);
-    }
-    return n.keys;
-  };
-  // Git evidence that C was built on P, short of ancestry: C carries a commit patch-equivalent to one of P's (`git cherry`
-  // marks it `-`; survives a reworded or re-dated rebase), or the same author and subject (survives a rebase that
-  // resolved conflicts, which changes the patch). Unsigned history can be imitated by whoever can push the branch, so
-  // this bounds accidents and retargeted PRs, not a deliberate insider — who can already push any code to their branch.
+  // Git evidence that C was built on P, short of ancestry: C carries a commit patch-equivalent to one of P's (cherry-mark
+  // `=`; survives a reworded or re-dated rebase), or one with the same author and subject (survives a rebase that resolved
+  // conflicts, which changes the patch). Only commits ONE side lacks count (P...C, newest 400): a prerequisite both
+  // branch from is shared history, not P's work, so siblings on it are not a stack. Commits reachable from P's own PR
+  // bases are not P's work either (a sibling may carry an older copy of that prerequisite); that list is untrusted, but
+  // it can only remove evidence, never add it. Unsigned history can be imitated by whoever can push the branch, so this
+  // bounds accidents and retargeted PRs, not a deliberate insider — who can already push any code to their branch.
   const sharesWork = (p, c) => {
-    const ch = git(['cherry', p.sha, c.sha]);
-    if (ch.status === 0 && String(ch.stdout ?? '').split('\n').some((l) => l.startsWith('-'))) return true;
-    const pk = ownKeys(p);
-    return pk.size > 0 && [...pk].some((k) => ownKeys(c).has(k));
+    const notP = p.chain.map((r) => verifyRev(git, `refs/remotes/origin/${r}^{commit}`)).filter(Boolean);
+    const log = git(['log', '--no-merges', '--left-right', '--cherry-mark', '-n', '400', '--format=%m%x09%ae%x09%s',
+      `${p.sha}...${c.sha}`, '--not', mainSha, ...notP]);
+    if (log.status !== 0) return false;
+    const pk = new Set();
+    const ck = new Set();
+    for (const l of String(log.stdout ?? '').split('\n')) {
+      if (l.startsWith('=')) return true;
+      if (l.startsWith('<')) pk.add(l.slice(2));
+      else if (l.startsWith('>')) ck.add(l.slice(2));
+    }
+    return [...pk].some((k) => ck.has(k));
   };
   // A chain recorded on the entry by an earlier rebuild (persistStackBases writes only claims that passed this check) is
   // evidence that survives a rebase that left nothing else to compare.

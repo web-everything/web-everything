@@ -576,3 +576,48 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
     }, 30_000);
   });
 });
+
+describe('held item 212 red team — shared prerequisites are not evidence of a stack', () => {
+  const siblingsPlan = (f, chains) => planRebuild({
+    git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => chains[pr] ?? [],
+    overlays: [{ ref: 'lane/p', pr: 9501 }, { ref: 'lane/c', pr: 9502 }],
+  });
+
+  it('siblings on one unmerged prerequisite: a retargeted claim does not evict the live sibling (the claimer is parked)', async () => {
+    const f = fixture();
+    const h = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite' }) });
+    f.push('lane/p', h, { [TAKEOVER]: lines({ 2: 'p edit' }) });
+    f.push('lane/c', h, { [TAKEOVER]: lines({ 2: 'c edit' }) });
+    f.fetch();
+    const plan = await siblingsPlan(f, { 9502: ['lane/p'] });
+    expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+  });
+
+  it('…nor when each sibling carries its own copy of the prerequisite and P names its branch as its PR base', async () => {
+    const f = fixture();
+    const h = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite' }) });
+    f.push('lane/c', h, { [TAKEOVER]: lines({ 2: 'c edit' }) });
+    const h2 = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite', 11: 'restacked' }) }); // same subject, new patch
+    f.push('lane/p', h2, { [TAKEOVER]: lines({ 2: 'p edit' }) });
+    f.fetch();
+    const plan = await siblingsPlan(f, { 9501: ['lane/h'], 9502: ['lane/p', 'lane/h'] });
+    expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+  });
+
+  it('a real child of a rebased base that shares a prerequisite with it is still recognised (its own work matches)', async () => {
+    const f = fixture();
+    const h = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite' }) });
+    const pOld = f.push('lane/p', h, { [TAKEOVER]: lines({ 2: 'p v1' }) });
+    f.push('lane/c', pOld, { [TAKEOVER]: lines({ 2: 'p v1', 9: 'c edit' }) });
+    f.push('lane/p', h, { [TAKEOVER]: lines({ 2: 'p v2' }) }); // P rebased in place: same subject, clashing line
+    f.fetch();
+    const plan = await siblingsPlan(f, { 9502: ['lane/p'] });
+    expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'apply' });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
+  });
+});
