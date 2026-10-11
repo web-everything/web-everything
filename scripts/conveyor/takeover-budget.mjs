@@ -165,9 +165,9 @@ function mergeFinding(into, f) {
  * (`not-real`, `card`, …) are left out.
  *
  * Inside one segment, each head has ONE round: a review naming a head the segment already has rejoins that round,
- * and a review naming a new head opens its own. A comment naming no head joins the segment's newest head. A round
- * whose head was first seen before a newer head is `stale: true` (a late review of older code: it never stands for
- * the current head), and `repeat: true` marks any round whose head an earlier round already reviewed.
+ * and a review naming a new head opens its own. A comment naming no head joins the segment's newest-code round.
+ * `repeat: true` marks a round whose head an earlier segment already reviewed; it is also `stale: true` (a late review
+ * of older code) when its segment reviews a head no earlier segment had — the new code the segment's push brought.
  */
 export function reviewRounds(comments) {
   const list = Array.isArray(comments) ? comments : [];
@@ -185,35 +185,34 @@ export function reviewRounds(comments) {
   for (const t of boundaries) items.push({ t, boundary: true });
   items.sort((a, b) => a.t - b.t || (a.boundary ? -1 : 1));
   const rounds = [];
-  const seen = []; // heads in the order they were first reviewed (whole thread)
-  let open = null; // the segment's round for its newest head (a headless comment joins it)
+  const seen = new Set(); // heads an earlier segment already reviewed (whole thread)
+  let segment = []; // this segment's rounds
+  let open = null; // the round a headless comment joins: the segment's newest-code round, else its latest
   let byHead = new Map(); // this segment's round per head
-  const note = (h) => {
-    const repeat = seen.includes(h);
-    const stale = repeat && seen.at(-1) !== h;
-    if (!repeat) seen.push(h);
-    return { repeat, stale };
+  // A segment that reviews a head no earlier segment reviewed is reviewing NEW code (what the push at its start
+  // brought); every other head reviewed in it is a late review of older code: stale. A segment that reviews only
+  // heads already seen (a re-review with no new push, a reset to an older sha) marks nothing stale.
+  const close = () => {
+    if (segment.some((r) => r.head && !r.repeat)) for (const r of segment) if (r.head && r.repeat) r.stale = true;
+    for (const r of segment) if (r.head) seen.add(r.head);
+    segment = []; open = null; byHead = new Map();
   };
   for (const it of items) {
-    if (it.boundary) { open = null; byHead = new Map(); continue; }
+    if (it.boundary) { close(); continue; }
     const h = it.ev.head ? String(it.ev.head).slice(0, 9).toLowerCase() : null;
     let r = h ? byHead.get(h) : open;
-    if (!r && h && open && !open.head) {
-      // The segment's headless round learns its head (unless that head is older code: then it is its own round).
-      const flags = note(h);
-      if (!flags.stale) { r = Object.assign(open, { head: h }, flags); byHead.set(h, r); }
-      else { r = { at: it.t, end: it.t, head: h, findings: [], ...flags }; rounds.push(r); byHead.set(h, r); }
-    }
+    // The segment's headless round learns the first NEW head named in it (a repeat head may be older code).
+    if (!r && h && open && !open.head && !seen.has(h)) { r = Object.assign(open, { head: h, repeat: false }); byHead.set(h, r); }
     if (!r) {
-      const flags = h ? note(h) : { repeat: false, stale: false };
-      r = { at: it.t, end: it.t, head: h, findings: [], ...flags };
-      rounds.push(r);
+      r = { at: it.t, end: it.t, head: h, findings: [], repeat: Boolean(h && seen.has(h)), stale: false };
+      rounds.push(r); segment.push(r);
       if (h) byHead.set(h, r);
-      if (!flags.stale) open = r;
+      if (!open || !(open.head && !open.repeat)) open = r;
     }
     r.end = it.t;
     for (const f of it.ev.findings ?? []) mergeFinding(r.findings, f);
   }
+  close();
   for (const r of rounds) r.findings = r.findings.filter(isOpen);
   return rounds;
 }
@@ -296,7 +295,7 @@ export function takeoverProgress(comments, episode) {
   const markerStart = markerStartHead(episode);
   const rule = dispatchJudgeRule(comments, { start: episode.start, end: episode.end, startHead: markerStart });
   const heads = { oldHeads: rule.oldHeads, markerStart };
-  const after = rounds.filter((r) => !r.stale && rule.judges(r.at, [r.head])).at(-1) ?? null;
+  const after = rounds.filter((r) => rule.judges(r.at, [r.head])).at(-1) ?? null;
   if (!after) return { judged: false, ...heads };
   const b = tally(before?.findings ?? []);
   const a = tally(after.findings);
@@ -338,11 +337,12 @@ export function gateHoldReason(pr, { defaultBranch = 'main' } = {}) {
  * was never reviewed, so there is no current round (null) — never an older head's round.
  */
 export function currentRound(comments, head = null, { strict = false } = {}) {
-  const rounds = reviewRounds(comments).filter((r) => !r.stale);
+  const all = reviewRounds(comments);
   const h = String(head ?? '').toLowerCase();
-  const onHead = h ? rounds.filter((r) => !r.head || sameHeadSha(r.head, h)).at(-1) : null;
+  // A round naming the PR head always stands for it, stale or not; only the fallbacks skip older code.
+  const onHead = h ? all.filter((r) => (r.head ? sameHeadSha(r.head, h) : !r.stale)).at(-1) : null;
   if (strict && /^[0-9a-f]{40}$/.test(h)) return onHead ?? null;
-  return onHead ?? rounds.at(-1) ?? null;
+  return onHead ?? all.filter((r) => !r.stale).at(-1) ?? all.at(-1) ?? null;
 }
 
 /** The open DEFECT findings of the PR's current review round (null when the thread has none). */

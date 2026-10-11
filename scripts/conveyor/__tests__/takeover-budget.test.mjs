@@ -324,6 +324,17 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
       { ...review(T1, 9, [['src/d.mjs', 7, 'cosmetic']]), createdAt: at(9, 40) }];
     expect(plain(T1, thread)).toMatchObject({ ok: true, previous: { after: { count: 4 } } });
   });
+  it('out-of-order reviews and a reset to an older head never wedge the current head\'s round', () => {
+    const R6 = H('7');
+    // R6 reviewed, then R5's first-ever review lands late; a rearm; R6 re-reviewed with one finding.
+    const late = [rearm(1), review(R6, 2, FOUR), review(R5, 3, FIVE), rearm(4), review(R6, 5, [['src/d.mjs', 7, 'cosmetic']])];
+    expect(openDefects(late, R6)).toMatchObject({ count: 1 });
+    expect(planTakeover({ pr: pr(R6, late), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' })).toMatchObject({ ok: true });
+    // R5, then R6, then the head reset back to R5 and re-reviewed: R5's latest round is current.
+    const reset = [rearm(1), review(R5, 2, FIVE), rearm(3), review(R6, 4, FOUR), rearm(5), review(R5, 6, [['src/d.mjs', 7, 'cosmetic']])];
+    expect(openDefects(reset, R5)).toMatchObject({ count: 1 });
+    expect(planTakeover({ pr: pr(R5, reset), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' })).toMatchObject({ ok: true });
+  });
   it('a late old-head review before a manual takeover does not hide the push that made its start head unreviewed', () => {
     const R6 = H('7');
     const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, { ...review(R5, 6, FIVE), createdAt: at(6, 45) },
