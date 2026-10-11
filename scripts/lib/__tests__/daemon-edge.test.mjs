@@ -115,7 +115,7 @@ describe('flag', () => {
     pushBranch('lane/fix-a', { 'a.txt': 'a\n' });
     const clone = join(mktemp('daemon-edge-slice1-clone-'), 'w');
     gitOk(tmpdir(), ['clone', '-q', origin, clone]);
-    const offEnv = { ...env, WE_DAEMON_EDGE: '', WE_DAEMON_OVERLAY_DIR: join(dirname(clone), 'ov') };
+    const offEnv = { ...env, WE_DAEMON_EDGE: '', WE_DAEMON_OVERLAY_DIR: join(dirname(clone), 'ov'), WE_DAEMON_OVERLAY_STACK_BASES: '{}' };
     const r = spawnSync(process.execPath, [join(REPO, 'scripts/daemon-overlay.mjs'), 'add', `--clone=${clone}`, '--ref=lane/fix-a', '--pr=7', '--json'], {
       encoding: 'utf8', env: offEnv, timeout: 20_000,
     });

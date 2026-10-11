@@ -14,7 +14,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { GH_ARGV, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
+import { GH_ARGV, PR_COMMENTS_PAGE_SIZE, PR_STATE_FIELDS, createGhProvider, writeOrder, clampLabelDescription, GITHUB_LABEL_DESCRIPTION_MAX } from '../review-label-provider.mjs';
 
 describe('clampLabelDescription', () => {
   it('exports the GitHub limit and preserves strings up to that limit', () => {
@@ -162,6 +162,35 @@ describe('the gh adapter', () => {
   it('readPrFiles returns an empty array, never throws, on blank output', () => {
     const p = createGhProvider({ exec: () => '' });
     expect(p.readPrFiles('o/n', 2223)).toEqual([]);
+  });
+
+  // PR #4631 (operator ruling a): no label-timeline reader exists — a hold's origin is its LABEL, never its history.
+  it('there is no label-timeline reader (the carry never infers a hold\'s origin from events)', () => {
+    expect(GH_ARGV.readHoldLabelEvents).toBeUndefined();
+    expect(createGhProvider({ exec: () => '' }).readHoldLabelEvents).toBeUndefined();
+  });
+
+  it('readPrReviews pages the dedicated reviews endpoint with --method GET and parses one JSON review per line (PR #4631 round 3)', () => {
+    const argv = GH_ARGV.readPrReviews('o/n', 9);
+    expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/pulls/9/reviews']);
+    const line = '{"state":"CHANGES_REQUESTED","submitted_at":"2026-10-09T16:00:00Z","user":{"login":"x"}}';
+    expect(createGhProvider({ exec: () => `${line}\n${line}\n` }).readPrReviews('o/n', 9)).toHaveLength(2);
+    expect(createGhProvider({ exec: () => '' }).readPrReviews('o/n', 9)).toEqual([]);
+  });
+
+  it('readComments pages the issue-comments endpoint and returns the gh-view shape (author.login / body / createdAt)', () => {
+    const argv = GH_ARGV.readComments('o/n', 9);
+    expect(argv.slice(0, 7)).toEqual(['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', 'repos/o/n/issues/9/comments']);
+    expect(argv.join(' ')).toContain('createdAt: .created_at');
+    const line = '{"author":{"login":"x"},"body":"b","createdAt":"2026-10-09T16:00:00Z"}';
+    expect(createGhProvider({ exec: () => `${line}\n${line}\n${line}\n` }).readComments('o/n', 9)).toHaveLength(3);
+    expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readComments('o/n', 9)).toThrow(/gh failed/);
+    expect(PR_COMMENTS_PAGE_SIZE).toBe(100);
+  });
+
+  it('readPrReviews throws on a malformed line or a gh failure (never "no reviews")', () => {
+    expect(() => createGhProvider({ exec: () => 'not json\n' }).readPrReviews('o/n', 9)).toThrow();
+    expect(() => createGhProvider({ exec: () => { throw new Error('gh failed'); } }).readPrReviews('o/n', 9)).toThrow(/gh failed/);
   });
 });
 

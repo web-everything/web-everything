@@ -61,11 +61,12 @@ try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rul
 // The effective ladder says where a twice-ignored finding becomes the operator's; absent, the platform default stands.
 let rulingHumanAt;
 try { rulingHumanAt = (await import('../conveyor/fixer-ladder.mjs')).loadFixerLadder().humanAt; } catch { /* default */ }
-// Staged CLI copies may omit the complete reader. Only the split fallback needs it;
+// Staged CLI copies may omit the complete reader. Capped listings and the split fallback need it;
 // an unavailable reader must fail that read, never substitute an empty comment thread.
 let readCompletePrComments;
+let LIST_COMMENTS_PAGE_SIZE = 100;
 let completeCommentsImportError;
-try { ({ readCompletePrComments } = await import('../conveyor/pr-comments-complete.mjs')); }
+try { ({ readCompletePrComments, LIST_COMMENTS_PAGE_SIZE = 100 } = await import('../conveyor/pr-comments-complete.mjs')); }
 catch (error) { completeCommentsImportError = error; }
 const hasLabel = (pr, name) => (pr.labels ?? []).some((label) => label.name === name);
 
@@ -442,28 +443,30 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     try {
       const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup';
       const listing = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json'];
+      const completePr = (pr) => {
+        try {
+          const comments = retryPrRead(() => {
+            if (!readCompletePrComments) throw completeCommentsImportError;
+            return readCompletePrComments(pr.number, { repo, exec: execFileSync });
+          }, { attempts: readAttempts.value, sleep });
+          return [{ ...pr, comments }];
+        } catch (error) {
+          failedRead(`${repo}#${pr.number}`, error);
+          // Never classify a PR using a missing or partial thread.
+          return [];
+        }
+      };
       let prs;
-      // Keep the one-call success path: existing consumers/mock queues expect comments in the listing.
+      // Short threads keep the one-call success path; capped threads need a complete read.
       // Only after its final failed attempt fall back to a small listing plus separate comment reads.
       try {
         prs = read([...listing, `${fields},comments`], Array.isArray);
+        prs = prs.flatMap((pr) => Array.isArray(pr.comments) && pr.comments.length >= LIST_COMMENTS_PAGE_SIZE
+          ? completePr(pr) : [pr]);
       } catch (error) {
         if (permanentPrReadFailure(error)) throw error;
         prs = read([...listing, fields], Array.isArray);
-        const complete = [];
-        for (const pr of prs) {
-          try {
-            const comments = retryPrRead(() => {
-              if (!readCompletePrComments) throw completeCommentsImportError;
-              return readCompletePrComments(pr.number, { repo, exec: execFileSync });
-            }, { attempts: readAttempts.value, sleep });
-            complete.push({ ...pr, comments });
-          } catch (error) {
-            failedRead(`${repo}#${pr.number}`, error);
-          }
-        }
-        // Never classify a PR with missing comments as if it had an empty thread.
-        prs = complete;
+        prs = prs.flatMap(completePr);
       }
       const readyNumbersThisRepo = new Set();
       const redTeamSetting = readConfirmedBreaks().value;
