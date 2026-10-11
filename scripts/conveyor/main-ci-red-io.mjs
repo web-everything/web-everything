@@ -19,6 +19,7 @@ import { readFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 import { execFileSyncThrottled } from '../lib/gh-throttle.mjs';
+import { getRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { isGhDeferred } from '../lib/gh-deferred.mjs';
 import { writeJsonAtomic, withFileLock } from '../lib/atomic-json-file.mjs';
 import { resolveChildTimeoutMs } from '../lib/bounded-child.mjs';
@@ -70,12 +71,37 @@ export function readFailingTests(jobId, { exec = execFileSyncThrottled, repoSlug
     .map((a) => String(a.title || a.path).slice(0, 300));
 }
 
+/** Read the current main commit and its checks best-effort; any unreadable fact leaves the runs-only rule in charge. */
+export function readMainTip({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings(), runs = [], requiredChecks,
+  readRequired = getRequiredStatusChecks } = {}) {
+  try {
+    // --jq .sha emits plain text, so quote that result for the guarded JSON reader.
+    const sha = ghJson((bin, argv, opts) => {
+      const out = exec(bin, argv, opts);
+      return isGhDeferred(out) ? out : JSON.stringify(String(out).trim());
+    }, ['api', `repos/${repoSlug}/commits/${settings.mainCiRedBranch}`, '--jq', '.sha']);
+    if (!/^[0-9a-f]{7,64}$/i.test(sha)) return null;
+    const checksOf = (commit) => {
+      const page = ghJson(exec, ['api', `repos/${repoSlug}/commits/${commit}/check-runs?per_page=100`]);
+      if (!Array.isArray(page?.check_runs)) throw new Error('main check-runs read returned no list');
+      return page.check_runs.map(({ id, name, status, conclusion }) => ({ id, name, status, conclusion }));
+    };
+    const checks = requiredChecks ?? readRequired({ repo: repoSlug }).checks;
+    if (!Array.isArray(checks) || !checks.length) return null;
+    const newest = [...runs].filter((r) => r.headSha === sha).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    const tip = { sha, runStatus: newest?.status ?? null, checkRuns: checksOf(sha), requiredChecks: checks };
+    const state = mainRedState(runs);
+    if (state.status === 'red' && state.latestRed.sha !== sha) tip.redCheckRuns = checksOf(state.latestRed.sha);
+    return tip;
+  } catch { return null; }
+}
+
 /**
  * Main's CI workflow runs (by WORKFLOW, never across all workflows — card xfrjlsi), with recent failures checked for
  * "only cancelled / no runner" (`infraOnly`, not a code failure), plus the failing jobs and tests of the latest real
  * red run. Throws on an unreadable runs read (= unknown).
  */
-export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings() } = {}) {
+export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAULT_REPO_SLUG, settings = mainCiRedSettings(), readRequired = getRequiredStatusChecks } = {}) {
   const list = (limit) => ghJson(exec, ['run', 'list', '--repo', repoSlug, '--workflow', settings.mainCiRedWorkflow, '--branch', settings.mainCiRedBranch,
     '--limit', String(limit), '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,workflowName']);
   let runs = list(settings.mainCiRedRunLimit);
@@ -128,7 +154,8 @@ export function probeMainCiRuns({ exec = execFileSyncThrottled, repoSlug = DEFAU
     if (!candidate || jobsRead.has(candidate.databaseId)) break; // already inspected: genuine, or unreadable
     if (!markInfraOnly(candidate, jobsOf(candidate))) break;
   }
-  return { runs: sorted, failing };
+  const tip = readMainTip({ exec, repoSlug, settings, runs: sorted, readRequired });
+  return { runs: sorted, failing, ...(tip ? { tip } : {}) };
 }
 
 /**
@@ -214,9 +241,13 @@ export async function probeAndOwnMainCi({
 } = {}) {
   const settings = mainCiRedSettings(config);
   const probe = readRuns({ repoSlug, settings });
-  const state = mainRedState(probe.runs);
+  const state = mainRedState(probe.runs, { tip: probe.tip });
   const base = { ...probe, owner: null, decision: null, dispatched: null, priority: null };
   // Main green: clear the owner-PR priority. Unknown: leave it to expire on its own TTL (never act on a blind read).
+  if (state.status === 'pending') {
+    if (!dryRun) { publishPriority(null); publishState(null); }
+    return { ...base, decision: { owed: false, reason: 'main-tip-red-causes-passed' } };
+  }
   if (state.status !== 'red') {
     if (state.status === 'green' && !dryRun) {
       publishPriority(null);
