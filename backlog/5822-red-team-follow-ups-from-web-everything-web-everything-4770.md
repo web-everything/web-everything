@@ -1,4 +1,5 @@
 ---
+bornAs: xx9fszb
 kind: story
 size: 2
 status: open
