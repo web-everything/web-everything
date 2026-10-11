@@ -355,8 +355,14 @@ describe('tool-layer settings read (hermetic in a test run)', () => {
       writeFileSync(file, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
       expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file })).toEqual({ mergeDelivery: { strategy: 'github-merge-queue' } });
       expect(readMergeDeliveryToolSettings({ VITEST: 'true', [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file }).mergeDelivery.strategy).toBe('github-merge-queue');
-      expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: join(dir, 'missing.json') })).toEqual({});
+      const warned = [];
+      expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: join(dir, 'missing.json') }, (m) => warned.push(m))).toEqual({});
+      expect(warned).toHaveLength(1);
+      expect(warned[0]).toMatch(/unreadable/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('outside a test run with no override, the declared settings files are read (the live path stays wired)', () => {
+    expect(readMergeDeliveryToolSettings({})).toHaveProperty('mergeQueue');
   });
   it('feeds resolveDrainMergePolicy: the default load honours the override file', () => {
     const dir = mkdtempSync(join(tmpdir(), 'mdts-'));

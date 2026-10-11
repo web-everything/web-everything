@@ -56,10 +56,11 @@ export function queueStatePath(env = process.env) { return join(resolveCoordinat
  * real strategy never changes what a test that spawns the real drain CLI sees. `WE_MERGE_DELIVERY_SETTINGS_FILE` replaces
  * the declared files (and works outside a test run too). An unreadable override reads as "layer not set".
  */
-export function readMergeDeliveryToolSettings(env = process.env) {
+export function readMergeDeliveryToolSettings(env = process.env, warn = (m) => process.stderr.write(`${m}\n`)) {
   const override = String(env?.[MERGE_DELIVERY_SETTINGS_FILE_ENV] ?? '').trim();
   if (override) {
-    try { return JSON.parse(readFileSync(override, 'utf8')); } catch { return {}; }
+    try { return JSON.parse(readFileSync(override, 'utf8')); }
+    catch (e) { warn(`  ⚠ ${MERGE_DELIVERY_SETTINGS_FILE_ENV}=${override} unreadable (${String(e?.message ?? e).split('\n')[0]}) — merge-delivery tool layer treated as not set`); return {}; }
   }
   if (env?.VITEST || env?.WE_UNDER_TEST) return {};
   return readSettings();
