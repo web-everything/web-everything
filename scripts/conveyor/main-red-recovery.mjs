@@ -818,21 +818,26 @@ function markerHeader(body) {
 }
 
 // 2026-10-10 live: #4784 claim-held refusals burned the cap.
-// A red-era attempt is refunded only when the caller does not know main to be red RIGHT NOW. While main stays red the
-// rebase sweep still dispatches (a red-main fix PR, a check green on main again — PR #4825 round 4), so those markers
-// are real attempts and must burn the cap. Once main is green on a new sha, the green-sha reset below refunds them.
-// `refundRed` is false for the missing-run counter, which does not depend on main's state (PR #4825 round 3).
+// A red-era attempt is refunded only once main is KNOWN not to be red right now. While main stays red the rebase sweep
+// still dispatches (a red-main fix PR, a check green on main again — PR #4825 round 4), so those markers are real
+// attempts and must burn the cap. "Red now" is red by EITHER reading (the planner's open window, or the latest decisive
+// run), and a caller that passes neither (reconcile-core's cap check) counts them too: refunding there while the
+// sweep counts would leave each side waiting on the other until main recovers. Once main is green on a new sha, the
+// green-sha reset below refunds them. `refundRed` is false for the missing-run counter (PR #4825 round 3).
 function recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen, { refundRed = true } = {}) {
   // Legacy claim refusals only (the sweeps now defer instead): the exact `pushRefusal` message, at a line start or
   // right after the builder's own `FAILED: ` — free text is one line with `FAILED:` defanged, so it cannot forge one.
   if (LEGACY_CLAIM_REFUSAL.test(body)) return true;
   const header = markerHeader(body);
   const state = header.match(/^main-state: (.*)$/m);
-  const refundRedNow = refundRed && mainGreen?.red !== true;
+  const windows = Array.isArray(mainRedWindows) ? mainRedWindows : [];
+  const known = mainGreen != null || windows.length > 0;
+  const redNow = mainGreen?.red === true || isMainCurrentlyRed(windows);
+  const refundRedNow = refundRed && known && !redNow;
   if (refundRedNow && state?.[1] === 'red') return true;
   const at = Date.parse(c?.createdAt);
-  if (refundRedNow && !state && isWithinRedWindow(at, mainRedWindows)) return true;
-  if (mainGreen && !mainGreen.red && mainGreen.sha) {
+  if (refundRedNow && !state && isWithinRedWindow(at, windows)) return true;
+  if (!redNow && mainGreen?.sha) {
     const sha = header.match(/^main-green-sha: (.*)$/m);
     if (sha && sha[1] !== mainGreen.sha) return true;
     if (!sha && Number.isFinite(at) && at < Date.parse(mainGreen.at)) return true;

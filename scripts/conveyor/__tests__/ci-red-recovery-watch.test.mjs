@@ -1263,7 +1263,9 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     const count = (comments, opts) => core.countRebaseOntoMainComments(comments, sha, opts);
     expect(count([marker('', '2026-10-10T19:16:56Z')], { mainRedWindows: windows })).toBe(0);
     expect(count([marker('', '2026-10-10T20:14:54Z')], { mainRedWindows: windows })).toBe(1);
-    expect(count([marker('main-state: red')])).toBe(0);
+    // PR #4825 round 4: with no main state (reconcile-core's cap check) a red-era attempt counts, as it does in the sweep.
+    expect(count([marker('main-state: red')])).toBe(1);
+    expect(count([marker('main-state: red')], { mainRedWindows: windows })).toBe(0);
     const comments = [marker(`main-state: green\nmain-green-sha: ${green.sha}\npush failed`), marker(`main-green-sha: ${green.sha}\npush failed`)];
     expect(count(comments, { mainGreen: green })).toBe(2);
     expect(count(comments, { mainGreen: { ...green, sha: 'new-green' } })).toBe(0);
@@ -1393,7 +1395,19 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     const rebase = marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z');
     expect(core.countRebaseOntoMainComments([rebase], sha, { mainRedWindows: openWindow, mainGreen: redNow })).toBe(1);
     expect(core.countRebaseOntoMainComments([marker('', '2026-10-10T19:30:00Z')], sha, { mainRedWindows: openWindow, mainGreen: redNow })).toBe(1);
-    expect(core.countRebaseOntoMainComments([rebase], sha, { mainRedWindows: openWindow, mainGreen: green })).toBe(0);
+    // Red by either reading is red now: an open window outweighs a green latest run (and vice versa).
+    expect(core.countRebaseOntoMainComments([rebase], sha, { mainRedWindows: openWindow, mainGreen: green })).toBe(1);
+    expect(core.countRebaseOntoMainComments([rebase], sha, { mainRedWindows: windows, mainGreen: green })).toBe(0);
+    expect(core.countRebaseOntoMainComments([marker('', '2026-10-10T19:30:00Z')], sha, { mainRedWindows: windows, mainGreen: redNow })).toBe(1);
+  });
+  // PR #4825 round 4 self-review: the sweep and reconcile-core's no-options cap check must agree while main is red, or
+  // the sweep refuses `rebase-cap-exhausted` (owed a ci-heal) while reconcile still reads `owed-ci-rerun` — a stall.
+  it('the no-options cap read agrees with the sweep on red-era attempts while main stays red', () => {
+    const redRuns = [{ status: 'completed', conclusion: 'failure', updatedAt: '2026-10-10T18:44:00Z' }];
+    const markers = [1, 2].map(() => marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z'));
+    const sweepCount = core.countRebaseOntoMainComments(markers, sha, { mainRedWindows: core.computeMainRedWindows(redRuns), mainGreen: core.currentMainGreen(redRuns) });
+    expect(core.countRebaseOntoMainComments(markers, sha)).toBe(sweepCount);
+    expect(sweepCount).toBe(2);
   });
   it('bounds a permanently failing missing-run restack across many ticks while main stays red', () => {
     const comments = [];
