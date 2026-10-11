@@ -11,28 +11,26 @@ tags: []
 
 # pr-land --force-open lifts the PR limit with no operator gate
 
-PR 4791 gated pr-limit allow and off behind authoriseOverride (worker/unknown/lane refused, verbatim operator quote required). pr-land --force-open still lifts the limit for one PR with only a free-text reason, so a worker refused by the limit can open its PR anyway. Route --force-open through the same gate. The open-prs-over-limit health smell still tells the operator to run off without --operator-quote; update the hint.
+PR 4791 gated the `allow` and `off` verbs of `we:scripts/operations/pr-limit.mjs` behind `authoriseOverride` in `we:scripts/lib/pr-limit.mjs`: a worker, unknown-role or lane session is refused, and a verbatim `--operator-quote` is required. `pr-land --force-open` still lifts the limit for one PR with only a free-text reason, so a worker refused by the limit can open its PR anyway. Route `--force-open` through the same gate. The `open-prs-over-limit` health smell still tells the operator to run `off` without `--operator-quote`; update the hint.
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `npm run test:unit -- we:scripts/lib/__tests__/pr-limit.test.mjs`: `decideOpenPr` (or the `pr-land` caller) with `forceOpen` from a worker env (`WE_CONVEYOR_WORKER=1`) stays refused over the limit; from the operator channel with a quote it is allowed. Red before, green after.
+- [A2] `OVERRIDE_VERBS` (or a sibling list) names `--force-open`, so the enumeration test covers every limit-lifting entry point.
+- [A3] The health-smell hint names `--operator-quote`.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] The land-time session check for allow-list grants — that is `x964z5g`.
 
 ## Edge cases this change must handle
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the quote is bounded by `OPERATOR_QUOTE_MAX` and stored verbatim, as for `allow`/`off`.
+2. **Truncated reads** — n/a: no new reads.
+3. **Shared state files** — n/a: `--force-open` writes no store entry; the refusal is logged through the existing history writer.
+4. **Fail closed** — an unknown session role refuses `--force-open`.
+5. **Identity scoping** — the role is read from the `pr-land` process env, the same marker every dispatch spawn site sets.
+6. **State over time** — n/a: a one-shot flag.
+7. **Who wrote it** — the operator channel and quote are recorded in the PR-limit history.
