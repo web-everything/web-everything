@@ -6,6 +6,10 @@
  *     Every `ensureFreshGithubAppEnv` call refreshes the token `REFRESH_BUFFER_MS` (10 min) before it expires, so
  *     an expired cache means refresh is failing or nothing is calling it, and the next gh call that trusts the
  *     cached token gets a 401.
+ *   Configured roles use `app-token:<role>` and their own expiry/per-caller refresh time. The legacy
+ *   subject remains only with no configured roles or a caller still using legacy auth. Missing role caches
+ *   breach; legacy fixture probes retain their original no-cache behavior.
+ *
  *   - `rest-core`: the REST `core` bucket has less than `minRemainingFraction` (10%) left.
  *
  * Neighbours, so this never double-alerts: an App token that is refused outright (`status.applied === false`:
@@ -35,8 +39,12 @@ export default {
   recommendationHint: 'The GitHub App token is not being refreshed, or the REST rate limit is nearly spent.',
   evaluate({ appToken, restBudget, appStatus }, { now }) {
     const out = [];
-    // No cache file = App auth not configured on this host (gh runs on the operator's own login) — no subject.
-    if (appToken && appToken.present) {
+    const roles = appStatus?.roleCaches ?? [];
+    const subjects = roles.map((cache) => ({ subject: `app-token:${cache.role}`, token: cache, status: cache }));
+    if ((!roles.length || appStatus?.legacyInUse) && appToken?.present) {
+      subjects.push({ subject: 'app-token', token: appToken, status: appStatus });
+    }
+    for (const { subject, token: appToken, status: appStatus } of subjects) {
       const exp = Date.parse(appToken.expiresAt ?? '');
       const checked = Date.parse(appStatus?.checkedAt ?? '');
       const expired = !Number.isFinite(exp) || exp <= now;
@@ -46,7 +54,7 @@ export default {
         ...(refreshStale ? [`last refresh attempt ${fmtAge(now - checked)} ago`] : []),
       ];
       out.push({
-        subject: 'app-token',
+        subject,
         breach: expired || refreshStale,
         measure: {
           expiresAt: appToken.expiresAt ?? null, expiresInMs: Number.isFinite(exp) ? exp - now : null,
