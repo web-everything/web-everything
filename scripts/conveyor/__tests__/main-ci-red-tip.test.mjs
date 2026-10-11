@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { latestCheckVerdicts, tipRequiredVerdict, mainRedState, runsAsOf } from '../main-ci-red-core.mjs';
 import { readMainTip, probeMainCiRuns, probeAndOwnMainCi, ledgerPathIn } from '../main-ci-red-io.mjs';
+import smell from '../health-smells/main-ci-red.mjs';
+import { runSafetyNet, resolveQuarantineSettings } from '../../lib/red-main-quarantine-io.mjs';
 
 const RED_SHA = 'c12db238f029cfe03b3dd79f03f2286b78c4120a';
 const TIP_SHA = 'b5e21364240ec2b10a3987115a9f2fa893e8e974';
@@ -46,6 +48,18 @@ describe('main CI truth follows the tip (2026-10-11 incident)', () => {
     const { runs, tip } = replay();
     tip.checkRuns.push(check('test-shard (3)', 'failure', 100));
     expect(mainRedState(runs, { tip }).status).toBe('red');
+  });
+  it('keeps red when an unrelated, non-required check has already failed on the tip', () => {
+    const { runs, tip } = replay();
+    expect(tipRequiredVerdict(tip)).toBe('pending');
+    tip.checkRuns = tip.checkRuns.map((c) => (c.name === 'test-shard (2)' ? check('test-shard (2)', 'failure', 200) : c));
+    expect(tip.checkRuns.find((c) => c.name === 'test-shard (2)').conclusion).toBe('failure');
+    expect(tipRequiredVerdict(tip)).toBe('pending'); // the summary job is still running, so the tip is not required-red
+    expect(mainRedState(runs, { tip })).toEqual(mainRedState(runs));
+    expect(mainRedState(runs, { tip }).status).toBe('red');
+    // A later passing rerun of that same shard lifts the hold again.
+    tip.checkRuns.push(check('test-shard (2)', 'success', 300));
+    expect(mainRedState(runs, { tip }).status).toBe('pending');
   });
   it('clears after completion despite the absent PR-only required check', () => {
     const { runs, tip } = replay('19:27:10');
@@ -141,5 +155,35 @@ describe('best-effort tip IO', () => {
     const probe = probeMainCiRuns({ exec: (bin, argv) => argv[0] === 'run' ? JSON.stringify(snapshot) : fail(), readRequired: fail });
     expect(probe.runs).toEqual([...snapshot].reverse());
     expect(probe).not.toHaveProperty('tip');
+  });
+});
+
+describe('tip facts reach the smell and the quarantine safety net', () => {
+  const failing = { jobs: ['test-shard (3)', 'test'], tests: [], runId: 38166405992 };
+  const evaluate = (mainCiRuns) => smell.evaluate({ mainCiRuns }, { now: at('19:24:34'), config: {}, quarantineSafetyNet: () => null });
+  it('the smell reports the red without tip facts and stays quiet once the causes passed on the tip', () => {
+    const { runs, tip } = replay();
+    expect(evaluate({ runs, failing })).toHaveLength(1);
+    expect(evaluate({ runs, failing, tip })).toEqual([]);
+  });
+  it('the safety net plans a quarantine without tip facts and does nothing once the causes passed on the tip', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'main-ci-red-tip-net-'));
+    try {
+      const { runs, tip } = replay();
+      const net = (mainCiRuns, sub) => {
+        const calls = { jobs: 0, logs: 0, writes: 0 };
+        const r = runSafetyNet({ dir: join(dir, sub), settings: resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: null }),
+          mode: { value: 'stop', source: 'settings' }, live: false, now: at('19:24:34'), mainCiRuns,
+          readJobs: () => { calls.jobs += 1; return { failed: [] }; }, readLog: () => { calls.logs += 1; return { complete: false }; },
+          readList: () => ({ ok: true, list: { version: 1, entries: [] } }), write: () => { calls.writes += 1; return { events: [] }; }, log: () => {} });
+        return { r, calls };
+      };
+      const without = net({ runs, failing }, 'a');
+      expect(without.calls.jobs).toBe(1); // a red window reads the failing job's log
+      const withTip = net({ runs, failing, tip }, 'b');
+      expect(withTip.calls).toEqual({ jobs: 0, logs: 0, writes: 0 });
+      expect(withTip.r.plan?.action ?? 'none').toBe('none');
+      expect(withTip.r.plan?.firstRedSha ?? null).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

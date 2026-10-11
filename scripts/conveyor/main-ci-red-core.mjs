@@ -196,7 +196,10 @@ export function mainRedState(runs, { tip } = {}) {
     const nonSummary = redNames.filter((name) => !MAIN_CI_RED_DEFAULTS.mainCiRedSummaryJobs.includes(name));
     const causes = nonSummary.length ? nonSummary : redNames;
     const tipVerdicts = latestCheckVerdicts(tip.checkRuns);
-    if (causes.length && causes.every((name) => tipVerdicts.get(name) === 'green')) return {
+    // A check that is not in the required set can already be red on the tip (a different shard failing): the old
+    // causes passing proves nothing about it, so any red check on the tip keeps the hold.
+    const tipHasRed = [...tipVerdicts.values()].includes('red');
+    if (!tipHasRed && causes.length && causes.every((name) => tipVerdicts.get(name) === 'green')) return {
       status: 'pending', reason: 'red-causes-passed-on-tip', tipSha: tip.sha, clearedRedSha: s.latestRed.sha, causes,
     };
   }
