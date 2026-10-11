@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { isReviewVerdictComment } from './mechanical-round-cap.mjs';
-import { takeoverMarkers, takeoverVoidCount, takeoverRung, sameHeadSha, TAKEOVER_MAX_VOIDS } from './fix-takeover.mjs';
+import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 
 export const TAKEOVER_BUDGET_SETTING = 'takeoverBudget';
 export const TAKEOVER_BUDGET_ENV = 'WE_FIX_TAKEOVER_BUDGET';
@@ -113,7 +113,8 @@ export function takeoverEpisodes(comments) {
     const judgedBetween = last && verdictTimes.some((t) => t > last.end && t < s.at);
     if (last && !judgedBetween) {
       last.end = s.at;
-      last.head = last.head ?? s.head;
+      // The head the LATEST launch named: a retry on a new head after a voided launch is where the takeover now stands.
+      last.head = s.head ?? last.head;
       if (!last.kinds.includes(s.kind)) last.kinds.push(s.kind);
       continue;
     }
@@ -289,7 +290,7 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
       // the old one-per-head bound. Otherwise its head is waiting for its review (`takeover-review.mjs` grants it).
       const neverPushed = !latest.head || sameHeadSha(latest.head, head);
       if (neverPushed) {
-        const voidLimit = takeoverVoidCount(comments) >= TAKEOVER_MAX_VOIDS;
+        const voidLimit = takeoverVoidRefused(comments);
         return { ok: false, reason: voidLimit ? 'takeover-void-limit' : 'takeover-spent', heads: markerHeads, n: episodes.length, budget };
       }
       return { ok: false, reason: 'takeover-awaiting-review', heads: markerHeads, n: episodes.length, budget };
