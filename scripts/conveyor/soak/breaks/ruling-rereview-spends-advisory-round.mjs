@@ -24,11 +24,12 @@ export async function replay(root = REPO_ROOT) {
   const { ADVISORY_NOTE_MARKER, countAdvisoryComments } = await load(ADVISORY);
   const { OPERATOR_LOGINS } = await load('scripts/lib/marker-authorship.mjs');
   const { buildOperatorRulingComment } = await load('scripts/lib/jury-core.mjs');
+  const { CONSTELLATION_REPOS } = await load('scripts/lib/constellation-repos.mjs');
   const operator = { login: OPERATOR_LOGINS[0] };
   const note = `${ADVISORY_NOTE_MARKER}\n\nAdvisory review of head A.\n\n---\n\n`
     + `Net basis: \`${BASE}..${HEAD_A}\` (rev \`origin/lane/x\` at review time) — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
   const ruling = buildOperatorRulingComment({
-    version: 1, repo: 'web-everything/web-everything', pr: 4715, head: HEAD_A,
+    version: 1, repo: CONSTELLATION_REPOS.we.slug, pr: 4715, head: HEAD_A,
     actor: operator.login, channel: 'console', reason: 'Re-review this head after ruling on the referral.',
     at: '2026-10-11T08:00:00Z', clearerId: '',
     rulings: [{ runId: 'soak-ruling-rereview', key: 'finding-a', result: 'not-real' }],
