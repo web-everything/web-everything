@@ -22,6 +22,7 @@
  * cannot be read as a record contributes nothing here (the hold itself already fails closed on malformed ones).
  */
 import { readReferralRecords, referralRecordState, mandatoryReferralState,parseOperatorRulingComment, readOperatorRulings, carriedBackingHolds, sameFindingForClearing, operatorRulingId, AUTO_POLICY_ACTOR } from './jury-core.mjs';
+import { isRestackOf } from './restack-equivalence.mjs';
 import { isOperatorAuthored, isTrustedMarkerAuthor } from './marker-authorship.mjs';
 import { DEFAULT_FIXER_ESCALATION, TEST_FIRST_INSTRUCTION, humanAtMisses } from './fixer-escalation-policy.mjs';
 
@@ -175,7 +176,9 @@ const isFindingBlock = (b) => b.source === 'record' || b.source === 'structured'
  * A ruling the operator wrote AFTER this head's record is a fresh ruling on it, not an ignored one.
  * @returns {null|{head:string, misses:number, escalate:boolean, sentBack:boolean, sentBackAt:?number, matches:Array<object>}}
  */
-export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStalls = false } = {}) {
+export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStalls = false,
+  restackOf = (from, to) => isRestackOf({ fromHead: from, toHead: to }),
+} = {}) {
   const head = String(pr?.headRefOid ?? '').toLowerCase();
   if (!SHA.test(head)) return null;
   const snaps = recordSnapshots(pr?.comments, head);
@@ -272,6 +275,7 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
   };
 
   const matches = [];
+  const restacks = new Map();
   let worst = 0;
   for (const { record } of cur) {
     // A `block` already recorded on THIS head is the normal bounce, not an ignored ruling. Another ruling recorded
@@ -305,6 +309,15 @@ export function ignoredRulings(pr, { humanAt = DEFAULT_HUMAN_AT, countInfraStall
         if (!b || c.index > b.index) b = c;
       }
       if (!b) continue;
+      // #4770: a base-only restack of the LATEST standing block is the same ruled code, not a fix turn that ignored it.
+      if (SHA.test(b.priorHead) && b.priorHead !== head) {
+        if (!restacks.has(b.priorHead)) {
+          let equivalent = false;
+          try { equivalent = restackOf(b.priorHead, head, pr) === true; } catch { /* fail closed */ }
+          restacks.set(b.priorHead, equivalent);
+        }
+        if (restacks.get(b.priorHead)) continue;
+      }
       // The operator re-ruled on this very head after seeing it: handled, not ignored.
       if (operator.some((o) => o.index > firstIndex && hintMatchesFile(o.hints, g.file) && claimSimilarity(g.summary, o.text) >= SIMILARITY_FLOOR)) continue;
       const heads = new Set([head]);
