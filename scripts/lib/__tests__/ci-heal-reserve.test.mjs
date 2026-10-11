@@ -1,10 +1,16 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCiHealReserve, resolveCiHealReserve } from '../ci-heal-reserve.mjs';
 import { createDispatchThrottle } from '../dispatch-throttle.mjs';
 import { runReconcileCiHealDispatch } from '../../operations/ci-heal-pr-dispatch.mjs';
+
+// x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
+// cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
+beforeEach(() => { vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow'); vi.stubEnv('WE_RESOURCE_SHADOW', 'off'); });
+afterEach(() => vi.unstubAllEnvs());
+
 
 const claim = (kind, pr) => ({ meta: { kind, pr, repo: 'we' } });
 const idle = { sample: () => ({ ok: false }), loadavg: () => 1, cpuCount: () => 12 };

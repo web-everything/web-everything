@@ -48,7 +48,7 @@ import { advance, runStatus } from './engine.mjs';
 import { applyPendingEffects } from './effect-executor.mjs';
 import { createRegistry } from './registry.mjs';
 import {
-  reviewPrOperation, REVIEW_EFFECTS, confirmAnswerFor, codexAdvisoryFromRun, correctnessAdvisoryFromEnv,
+  reviewPrOperation, REVIEW_EFFECTS, confirmAnswerFor, codexAdvisoryFromRun, securitySeatFromRun, correctnessAdvisoryFromEnv,
   antigravityReviewFromEnv, seatSettingsForRun,
 } from './review-pr.mjs';
 import { loadReviewSeatSettings } from '../lib/review-seat-provider.mjs';
@@ -292,6 +292,8 @@ export async function advanceReviewPrToWriteUp(record, { to, store, sinks = crea
     antigravityReview: antigravityReviewFromEnv(),
     // Card 84 — the advisory agy seat's presence is read off the saved run, like seat 3.
     seatSettings: seatSettingsForRun(record, loadReviewSeatSettings()),
+    // `review.seatsByTouchSet` — whether the security juror was seated is read off the saved run, like seat 3.
+    securitySeat: securitySeatFromRun(record),
   }));
   if (runStatus(record, { registry }) !== 'awaiting-confirm') return record;
 

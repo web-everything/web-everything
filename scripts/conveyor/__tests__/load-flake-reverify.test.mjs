@@ -1,11 +1,17 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import os from 'node:os';
+import { admit, shadowAdmission } from '../../lib/resource-admission.mjs';
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, chmodSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { runBounded } from '../../lib/bounded-child.mjs';
 import { RUNNER_LOCK_ROOT } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { runLoadFlakeReverify, planLoadFlakeReverify, defaultReverifyIo, reverifyConfig, VERIFY_ENV_ALLOWLIST } from '../load-flake-reverify.mjs';
 import { buildLoadFlakeHoldComment, buildLoadFlakeResolvedComment } from '../stand-down.mjs';
+// Pass-through spies: the suite never observes or writes the host's resource state unless a test stubs a decision.
+vi.mock('../../lib/resource-admission.mjs', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, admit: vi.fn(actual.admit), shadowAdmission: vi.fn(actual.shadowAdmission) };
+});
 const now = Date.parse('2026-10-04T22:00:00Z');
 const comment = (body, createdAt = '2026-10-04T18:51:50Z') => ({ body, createdAt, author: { login: 'web-everything' } });
 const hold = comment(buildLoadFlakeHoldComment({ head: 'aaa1111', alt: 'lane/fix-alt', altSha: 'bbb2222' }));
@@ -426,5 +432,109 @@ describe('a pushed fix owes its re-arm (#4361)', () => {
       listPrs: vi.fn(async () => [structuredClone(pr)]), readPr: vi.fn(async () => (pushedYet ? after : pr)) };
     expect(await runLoadFlakeReverify({}, fake)).toMatchObject({ result: 'pushed', rearm: 'rearmed' });
     expect(fake.rearm).toHaveBeenCalledWith('web-everything/web-everything', 3881);
+  });
+});
+
+
+describe('resource-admission cut-over (x9xkupj)', () => {
+  const decision = (verdict, reason, snapshotAge = 3, unknown = false) =>
+    ({ kind: 'load-flake-reverify', verdict, reason, snapshotAge, unknown });
+  it('redispatches live #220 despite high load when resource admission admits', async () => {
+    const { buildLoadFlakeRedispatchComment } = await import('../stand-down.mjs');
+    const { io, pr } = fixture(); pr.number = 220;
+    pr.comments = [comment(buildLoadFlakeRedispatchComment({ head: pr.headRefOid, detail: 'timing' }))];
+    io.loadavg = () => [22.94, 22.38];
+    io.admission = vi.fn(() => decision('admit', 'cpu idle 42.6% ≥ 20%'));
+    const config = reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'ci', WE_LOAD_FLAKE_REVERIFY_MAX_LOAD_PER_CORE: '1.25' });
+    const out = await runLoadFlakeReverify({ config }, io);
+    expect(io.admission).toHaveBeenCalledTimes(1);
+    expect(io.admission).toHaveBeenCalledWith({ load: [22.94, 22.38], cores: 12, config: expect.anything() });
+    expect(out.redispatched).toEqual([{ pr: 220, result: 'redispatched' }]);
+    expect(io.comment.mock.calls[0][2]).toContain('resource admission admit (cpu idle 42.6% ≥ 20%)');
+  });
+  it.each([
+    ['wait', 'cpu idle 9% < 20%', 2, false],
+    ['hold', 'snapshot-missing', null, true],
+  ])('defers quiet load on admission %s without writes', async (verdict, reason, snapshotAge, unknown) => {
+    const { io } = fixture(); io.loadavg = () => [1, 1];
+    io.admission = vi.fn(() => decision(verdict, reason, snapshotAge, unknown));
+    const config = reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'local' });
+    expect(await runLoadFlakeReverify({ config }, io)).toMatchObject({
+      deferred: 'host-load', admission: { verdict, reason, snapshotAge },
+      load: [1, 1], cores: 12, maxLoadPerCore: config.maxLoadPerCore,
+    });
+    expect(io.acquire).not.toHaveBeenCalled(); expect(io.comment).not.toHaveBeenCalled(); expect(io.push).not.toHaveBeenCalled();
+  });
+  it.each([
+    [[50, 50], 'admit', 'cpu idle 42.6% ≥ 20%'],
+    [[1, 1], 'wait', 'cpu idle 9% < 20%'],
+  ])('plans from admission at load %j (%s)', (load, verdict, reason) => {
+    const { pr } = fixture();
+    const plan = planLoadFlakeReverify({ prs: [pr], load, cores: 12, now, admission: decision(verdict, reason) });
+    if (verdict === 'admit') expect(plan.candidate?.pr).toEqual(pr);
+    else expect(plan).toMatchObject({ deferred: 'host-load' });
+  });
+  it('exports the inclusive legacy load-per-core rule', async () => {
+    const { legacyLoadQuiet } = await import('../load-flake-reverify.mjs');
+    expect(typeof legacyLoadQuiet).toBe('function');
+    expect(legacyLoadQuiet([9, 9], 12, { maxLoadPerCore: 0.75 })).toBe(true);
+    expect(legacyLoadQuiet([9.1, 1], 12, { maxLoadPerCore: 0.75 })).toBe(false);
+  });
+  it('wires admission into the default IO', () => {
+    expect(typeof defaultReverifyIo().admission).toBe('function');
+  });
+  // WE_RESOURCE_CUTOVER=shadow is the rollback switch: the shared decision is logged only, the legacy load rule decides.
+  it.each([
+    ['shadow', [50, 50], undefined],
+    ['enforce', [50, 50], 'admit'],
+  ])('default IO admission under WE_RESOURCE_CUTOVER=%s at load %j', (mode, load, expected) => {
+    const shadow = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 50%' }));
+    const admitFn = vi.fn(() => ({ verdict: 'admit' }));
+    const io = defaultReverifyIo({ shadow, admitFn, env: { WE_RESOURCE_CUTOVER: mode } });
+    const out = io.admission({ load, cores: 12, config: reverifyConfig({}) });
+    expect(out?.verdict).toBe(expected);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    if (mode === 'shadow') expect(admitFn).not.toHaveBeenCalled();
+  });
+  // The pass must outlive a broken admission probe: throw / nothing / a malformed answer all leave the legacy load rule,
+  // and the result carries no `admission` summary (there was no decision to summarise).
+  it.each([
+    ['throws', () => { throw new Error('probe exploded'); }],
+    ['answers undefined', () => undefined],
+    ['answers null', () => null],
+    ['answers a verdict-less object', () => ({ reason: 'no verdict' })],
+    ['answers a non-string verdict', () => ({ verdict: true })],
+  ])('falls back to the legacy load rule when the admission probe %s', async (_name, probe) => {
+    const config = reverifyConfig({ WE_LOAD_FLAKE_REVERIFY_MODE: 'local' });
+    const noisy = fixture(); noisy.io.loadavg = () => [20, 20]; noisy.io.admission = vi.fn(probe);
+    const deferred = await runLoadFlakeReverify({ config }, noisy.io);
+    expect(deferred).toMatchObject({ deferred: 'host-load', load: [20, 20] });
+    expect(deferred).not.toHaveProperty('admission');
+    expect(noisy.io.admission).toHaveBeenCalledTimes(1);
+    expect(noisy.io.acquire).not.toHaveBeenCalled();
+    const quiet = fixture(); quiet.io.loadavg = () => [1, 1]; quiet.io.admission = vi.fn(probe);
+    expect(await runLoadFlakeReverify({ config }, quiet.io)).toMatchObject({ result: 'pushed' });
+  });
+});
+
+// defaultReverifyIo().admission: the shadow call's own decision when shadowing is on; a direct admit() when it is off.
+describe('defaultReverifyIo admission decision source (x9xkupj)', () => {
+  const decision = (verdict) => ({ kind: 'load-flake-rearm', verdict, reason: 'stub', snapshotAge: 1, unknown: false });
+  const args = () => ({ load: [50, 50], cores: 12, config: reverifyConfig({}) });
+  afterEach(() => { vi.unstubAllEnvs(); vi.mocked(admit).mockReset(); vi.mocked(shadowAdmission).mockReset(); });
+  it('WE_RESOURCE_SHADOW=off: shadowAdmission answers nothing, so the decision comes from admit()', () => {
+    vi.stubEnv('WE_RESOURCE_SHADOW', 'off');
+    vi.mocked(shadowAdmission).mockReturnValue(undefined);
+    vi.mocked(admit).mockReturnValue(decision('admit'));
+    expect(defaultReverifyIo().admission(args())).toEqual(decision('admit'));
+    expect(admit).toHaveBeenCalledTimes(1);
+    expect(admit).toHaveBeenCalledWith({ kind: 'load-flake-rearm' });
+  });
+  it('shadowing on: the shadow decision is used and admit() is not called again', () => {
+    vi.mocked(shadowAdmission).mockReturnValue(decision('wait'));
+    expect(defaultReverifyIo().admission(args())).toEqual(decision('wait'));
+    expect(admit).not.toHaveBeenCalled();
+    expect(shadowAdmission).toHaveBeenCalledWith(expect.objectContaining({
+      gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: 'hold' }));
   });
 });
