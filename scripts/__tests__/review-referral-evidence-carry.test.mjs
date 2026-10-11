@@ -108,6 +108,36 @@ describe('referral evidence carry across an identical-diff head move (#4708)', (
       .toThrow(/no-current-head-review-evidence/);
   });
 
+  // PR #4857 round 3: the case above makes the current-head run the NEWEST and parked, so without the
+  // `mine.some(r => r.head === head)` guard it still passed — the newest-run sort picked that parked run and the
+  // `prior.parked` check refused instead. Here the current-head run is OLDER than the earlier head's clean run
+  // (a head that went A parked → B clean → back to A), so the guard is the only thing that refuses.
+  describe('an existing current-head run prevents carry even when another head has a newer clean run', () => {
+    const olderHere = flags => [...RUNS(), { ...run(HEAD, { at: -5000 }), ...flags }];
+    const carryOf = runs => referralEvidenceCarry({ runs, repo, pr, head: HEAD, readNetDiff: IDENTICAL });
+
+    it('control: without the current-head run the same fixture carries', () => {
+      expect(carryOf(RUNS())?.fromHead).toBe(PRIOR);
+    });
+
+    for (const [name, flags] of [
+      ['clean', {}],
+      ['parked', { parked: true }],
+      ['pending referrals', { pending: ['["judgeSecurity","x",1,"open"]'] }],
+      ['persistence failed', { persistenceFailed: true }],
+    ]) {
+      it(`${name} current-head run older than the clean run: no carry`, () => {
+        expect(carryOf(olderHere(flags))).toBeNull();
+      });
+    }
+
+    it('the gate refuses: an older parked current-head run stands over a newer clean run on another head', () => {
+      const parkedHere = () => olderHere({ parked: true, pending: ['["judgeSecurity","x",1,"open"]'] });
+      expect(() => assertMandatoryReferralsCleared(stateFor(), { repo, pr, readRuns: parkedHere, readNetDiff: IDENTICAL }))
+        .toThrow(/no-current-head-review-evidence/);
+    });
+  });
+
   it('carries the earlier head\'s live verdict, not a pass: a standing hold on that head still refuses', () => {
     const held = comment(referral(PRIOR, 'An unruled referral on the approved head'));
     expect(() => assertMandatoryReferralsCleared(stateFor(HEAD, [held]), { repo, pr, readRuns: RUNS, readNetDiff: IDENTICAL }))
