@@ -91,41 +91,61 @@ export function isMechanicalBounce(c) {
 // #buildReviewedShaMarker, the review-pr `Net basis:` line): a marker mid-line, indented or after `>` is a quote.
 const REVIEWED_MARKER_LINE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->\\s*$`, 'i');
 // A `Net basis` line counts only in a producer's exact shape, tail included (we:scripts/operations/review-pr.mjs
-// #renderVerdictWriteUp / #renderAdvisoryNote, we:scripts/lib/review-escalation.mjs's converted advisory note). A
-// verdict with no footer of its own (a `review-set-label` bounce) carries only free text, so a bare
-// `Net basis: \`a..b\`` written there at column 0 never names the head it judged.
+// #renderVerdictWriteUp / #renderAdvisoryNote, we:scripts/lib/review-escalation.mjs's converted advisory note), and
+// only in the comment's LAST `---` section: every producer writes `---` after the reviewer's text and its basis line
+// after that. A verdict with no footer of its own (a `review-set-label` bounce, a degraded write-up) carries the
+// juror's free text only, which may copy the whole line, so a basis line there never names the head it judged.
 const NET_BASIS_LINES = [
   /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`(?: \(rev `[^`]*` at review time\))? — \d+ net changed file\(s\) vs current main\b/i,
   /^Net basis: `([0-9a-f]{7,40})\.\.\1` \(this head; no fresh diff computed\b/i,
 ];
+const SECTION_RULE = /^---[ \t]*$/;
 // A Markdown fence: at most 3 spaces of indent; a backtick fence's info string holds no backtick (```a``` is inline code).
 const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 // Any spelling of the marker, quoted or not: only the loose "is this verdict-shaped" check reads it (fail closed).
 const ANY_REVIEWED_MARKER = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:`, 'i');
 
+const fenceOf = (line) => {
+  const f = FENCE_LINE.exec(line);
+  return f && !(f[1][0] === '`' && f[2].includes('`')) ? { ch: f[1][0], len: f[1].length, closer: !f[2].trim() } : null;
+};
+
 /**
- * The structured marker lines of a comment, in order, that are NOT quoted: fenced code (an unclosed fence runs to the
- * end), a blockquote, an indented or mid-line marker, or a line joined by U+2028 (only `\n` ends a line) never count.
+ * The structured marker lines of a comment, in order, that are NOT quoted: a closed fenced code block, a blockquote,
+ * an indented or mid-line marker, or a line joined by U+2028 (only `\n` ends a line) never count. A fence that never
+ * closes hides nothing: reviewer text opening one must not swallow the producer's footer appended after it. Linear:
+ * whether an opener closes is read from a suffix table, never by rescanning.
  * @returns {{kind:'reviewed-sha'|'net-basis', sha:string}[]}
  */
 function structuredMarkerLines(body) {
+  const lines = body.split('\n').map((raw) => (raw.endsWith('\r') ? raw.slice(0, -1) : raw));
+  const fences = lines.map(fenceOf);
+  // longestCloser[ch][i]: the longest closing fence of `ch` at or after line i.
+  const longestCloser = { '`': new Array(lines.length + 1).fill(0), '~': new Array(lines.length + 1).fill(0) };
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    for (const ch of ['`', '~']) longestCloser[ch][i] = longestCloser[ch][i + 1];
+    const f = fences[i];
+    if (f?.closer) longestCloser[f.ch][i] = Math.max(longestCloser[f.ch][i], f.len);
+  }
   const out = [];
-  let fence = null;
-  for (const raw of body.split('\n')) {
-    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
-    const f = FENCE_LINE.exec(line);
-    const isFence = f && !(f[1][0] === '`' && f[2].includes('`'));
-    if (fence) {
-      if (isFence && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
+  let lastRule = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const f = fences[i];
+    if (f) {
+      if (longestCloser[f.ch][i + 1] >= f.len) {
+        i += 1;
+        while (!(fences[i]?.closer && fences[i].ch === f.ch && fences[i].len >= f.len)) i += 1;
+      }
       continue;
     }
-    if (isFence) { fence = f[1]; continue; }
+    const line = lines[i];
+    if (SECTION_RULE.test(line)) { lastRule = i; continue; }
     const s = REVIEWED_MARKER_LINE.exec(line);
     const n = s ? null : NET_BASIS_LINES.map((re) => re.exec(line)).find(Boolean);
-    if (s) out.push({ kind: 'reviewed-sha', sha: s[1].toLowerCase() });
-    else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase() });
+    if (s) out.push({ kind: 'reviewed-sha', sha: s[1].toLowerCase(), at: i });
+    else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase(), at: i });
   }
-  return out;
+  return out.filter((m) => m.kind === 'reviewed-sha' || (lastRule >= 0 && m.at > lastRule)).map(({ kind, sha }) => ({ kind, sha }));
 }
 
 /**
@@ -157,8 +177,8 @@ export function verdictKind(c) {
 
 /**
  * The commit a trusted verdict comment says it JUDGED: the head of its LAST unquoted structured marker line, of either
- * format (`<!-- reviewed-sha: <sha> -->` or a producer-shaped `Net basis: <base>..<head> — …` line, 7-40 hex,
- * lower-cased). It relies on every
+ * format (`<!-- reviewed-sha: <sha> -->`, or a producer-shaped `Net basis: <base>..<head> — …` line in the last `---`
+ * section; 7-40 hex, lower-cased). It relies on every
  * producer appending that footer LAST, after any quoted text, so a quoted earlier one never wins. One head, never one
  * per format: a quoted `Net basis` naming the parent must not ride along with a real `reviewed-sha` footer for another
  * commit. A sha merely mentioned in prose is never returned. Pure.
