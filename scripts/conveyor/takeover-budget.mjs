@@ -163,6 +163,11 @@ function mergeFinding(into, f) {
  * between two boundaries — a fixer turn (re-arm, advisory fix) or a takeover signal. Grouping by those boundaries,
  * not by head sha, keeps a round whole when some of its comments name no head. Findings closed by a ruling
  * (`not-real`, `card`, …) are left out.
+ *
+ * Inside one segment, each head has ONE round: a review naming a head the segment already has rejoins that round,
+ * and a review naming a new head opens its own. A comment naming no head joins the segment's newest head. A round
+ * whose head was first seen before a newer head is `stale: true` (a late review of older code: it never stands for
+ * the current head), and `repeat: true` marks any round whose head an earlier round already reviewed.
  */
 export function reviewRounds(comments) {
   const list = Array.isArray(comments) ? comments : [];
@@ -180,16 +185,34 @@ export function reviewRounds(comments) {
   for (const t of boundaries) items.push({ t, boundary: true });
   items.sort((a, b) => a.t - b.t || (a.boundary ? -1 : 1));
   const rounds = [];
-  let open = null;
+  const seen = []; // heads in the order they were first reviewed (whole thread)
+  let open = null; // the segment's round for its newest head (a headless comment joins it)
+  let byHead = new Map(); // this segment's round per head
+  const note = (h) => {
+    const repeat = seen.includes(h);
+    const stale = repeat && seen.at(-1) !== h;
+    if (!repeat) seen.push(h);
+    return { repeat, stale };
+  };
   for (const it of items) {
-    if (it.boundary) { open = null; continue; }
-    // A review naming a DIFFERENT head than the open round's starts its own round: a late review of an older head
-    // must never merge into (and rename) the round of the head after it.
-    if (open && open.head && it.ev.head && !sameHeadSha(open.head, String(it.ev.head).slice(0, 9))) open = null;
-    if (!open) { open = { at: it.t, end: it.t, head: null, findings: [] }; rounds.push(open); }
-    open.end = it.t;
-    if (it.ev.head) open.head = String(it.ev.head).slice(0, 9);
-    for (const f of it.ev.findings ?? []) mergeFinding(open.findings, f);
+    if (it.boundary) { open = null; byHead = new Map(); continue; }
+    const h = it.ev.head ? String(it.ev.head).slice(0, 9).toLowerCase() : null;
+    let r = h ? byHead.get(h) : open;
+    if (!r && h && open && !open.head) {
+      // The segment's headless round learns its head (unless that head is older code: then it is its own round).
+      const flags = note(h);
+      if (!flags.stale) { r = Object.assign(open, { head: h }, flags); byHead.set(h, r); }
+      else { r = { at: it.t, end: it.t, head: h, findings: [], ...flags }; rounds.push(r); byHead.set(h, r); }
+    }
+    if (!r) {
+      const flags = h ? note(h) : { repeat: false, stale: false };
+      r = { at: it.t, end: it.t, head: h, findings: [], ...flags };
+      rounds.push(r);
+      if (h) byHead.set(h, r);
+      if (!flags.stale) open = r;
+    }
+    r.end = it.t;
+    for (const f of it.ev.findings ?? []) mergeFinding(r.findings, f);
   }
   for (const r of rounds) r.findings = r.findings.filter(isOpen);
   return rounds;
@@ -244,9 +267,14 @@ export function dispatchJudgeRule(comments, { start, end, startHead = null }) {
   return { anchor, pushed, oldHeads, judges };
 }
 
-/** PURE: did a trusted fixer push land after the last review round that ended before `at` (or with no such round)? */
+/**
+ * PURE: did a trusted fixer turn land after the last FIRST review of a head that ended before `at` (or with no such
+ * round)? A re-review of a head already reviewed (`repeat`, e.g. a late review of older code) does not count as that
+ * last review. Any fixer turn counts as a possible push, even one that pushed nothing: the thread cannot tell, so this
+ * fails closed (the caller then keeps a manual takeover's marker head in its one-per-head bound).
+ */
 function pushedSinceLastReview(comments, at) {
-  const before = reviewRounds(comments).filter((r) => r.end < at).at(-1) ?? null;
+  const before = reviewRounds(comments).filter((r) => r.end < at && !r.repeat).at(-1) ?? null;
   const since = before ? before.end : -Infinity;
   return (Array.isArray(comments) ? comments : []).some((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)
     && timeOf(c) > since && timeOf(c) < at);
@@ -264,11 +292,11 @@ const markerStartHead = (episode) => (episode?.kinds?.length === 1 && episode.ki
  */
 export function takeoverProgress(comments, episode) {
   const rounds = reviewRounds(comments);
-  const before = rounds.filter((r) => r.end < episode.start).at(-1) ?? null;
+  const before = rounds.filter((r) => r.end < episode.start && !r.stale).at(-1) ?? null;
   const markerStart = markerStartHead(episode);
   const rule = dispatchJudgeRule(comments, { start: episode.start, end: episode.end, startHead: markerStart });
   const heads = { oldHeads: rule.oldHeads, markerStart };
-  const after = rounds.filter((r) => rule.judges(r.at, [r.head])).at(-1) ?? null;
+  const after = rounds.filter((r) => !r.stale && rule.judges(r.at, [r.head])).at(-1) ?? null;
   if (!after) return { judged: false, ...heads };
   const b = tally(before?.findings ?? []);
   const a = tally(after.findings);
@@ -305,13 +333,15 @@ export function gateHoldReason(pr, { defaultBranch = 'main' } = {}) {
 
 /**
  * PURE: the PR's CURRENT review round: the latest round that names the PR head (or names no head), else the latest
- * round. A late review of an older head is its own round ({@link reviewRounds}) and never stands in for the review of
- * the head the PR is on now.
+ * round that is not a late review of older code. A late review of an older head (`stale`, {@link reviewRounds}) never
+ * stands in for the review of the head the PR is on now. `strict` (the review-cap check): a PR head no round names
+ * was never reviewed, so there is no current round (null) — never an older head's round.
  */
-export function currentRound(comments, head = null) {
-  const rounds = reviewRounds(comments);
+export function currentRound(comments, head = null, { strict = false } = {}) {
+  const rounds = reviewRounds(comments).filter((r) => !r.stale);
   const h = String(head ?? '').toLowerCase();
   const onHead = h ? rounds.filter((r) => !r.head || sameHeadSha(r.head, h)).at(-1) : null;
+  if (strict && /^[0-9a-f]{40}$/.test(h)) return onHead ?? null;
   return onHead ?? rounds.at(-1) ?? null;
 }
 
@@ -344,7 +374,7 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
   // the latest review round came after the latest fixer push and left open defects. An unjudged head is owed a
   // review, not a takeover on top of code nobody has looked at.
   if (capKind === 'review') {
-    const latest = currentRound(comments, pr?.headRefOid ?? null);
+    const latest = currentRound(comments, pr?.headRefOid ?? null, { strict: true });
     const lastPush = (Array.isArray(comments) ? comments : [])
       .filter((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)).map(timeOf).filter(Number.isFinite);
     const pushedAt = lastPush.length ? Math.max(...lastPush) : -Infinity;
