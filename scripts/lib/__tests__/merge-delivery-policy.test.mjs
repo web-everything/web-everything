@@ -10,8 +10,17 @@ describe('merge delivery policy cascade', () => {
     const policy = resolveMergeDeliveryPolicy();
     expect(policy).toMatchObject(STANDARD_MERGE_DELIVERY);
     expect(policy.strategy).toBe('drain-direct');
-    expect(policy.sources).toEqual({ strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard' });
+    expect(policy.sources).toEqual({ strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard' });
     expect(policy.invalid).toEqual([]);
+  });
+
+  it('resolves the shared red-main freeze branch through the cascade and refuses a non-ops branch (xyd06qo)', () => {
+    expect(resolveMergeDeliveryPolicy().redMainFreezeBranch).toBe('ops/red-main-freeze');
+    expect(resolveMergeDeliveryPolicy({ platform: { redMainFreezeBranch: 'ops/freeze-a' }, tool: { redMainFreezeBranch: 'ops/freeze-b' } }))
+      .toMatchObject({ redMainFreezeBranch: 'ops/freeze-b', sources: { redMainFreezeBranch: 'tool' } });
+    const bad = resolveMergeDeliveryPolicy({ platform: { redMainFreezeBranch: 'ops/freeze-a' }, tool: { redMainFreezeBranch: 'main' } });
+    expect(bad).toMatchObject({ redMainFreezeBranch: 'ops/freeze-a', sources: { redMainFreezeBranch: 'platform' } });
+    expect(bad.invalid).toEqual(['tool.redMainFreezeBranch="main"']);
   });
 
   it('resolves each key independently, with tool overriding platform', () => {
