@@ -152,13 +152,59 @@ export function classifyRun(run) {
 const ts = (s) => { const t = Date.parse(s ?? ''); return Number.isFinite(t) ? t : null; };
 const pick = (r) => (r ? { sha: String(r.headSha ?? ''), runId: r.databaseId ?? null, createdAt: r.createdAt ?? null, updatedAt: r.updatedAt ?? null } : null);
 
+/** The newest attempt of each named check wins; skipped and cancelled checks prove neither success nor failure. PURE.
+ * @returns {Map<string, 'green'|'red'|'pending'|'other'>}
+ */
+export function latestCheckVerdicts(checkRuns) {
+  const latest = new Map();
+  for (const check of checkRuns || []) {
+    if (!check?.name) continue;
+    if (!latest.has(check.name) || check.id > latest.get(check.name).id) latest.set(check.name, check);
+  }
+  return new Map([...latest].map(([name, check]) => [name, check.status !== 'completed' ? 'pending'
+    : check.conclusion === 'success' ? 'green' : RED.has(check.conclusion) ? 'red' : 'other']));
+}
+
+/** Required checks on the tip: a finished run may omit checks that only run on PRs. PURE.
+ * @returns {'green'|'red'|'pending'|'unknown'}
+ */
+export function tipRequiredVerdict(tip) {
+  if (!tip?.sha || !Array.isArray(tip.checkRuns) || !Array.isArray(tip.requiredChecks) || !tip.requiredChecks.length) return 'unknown';
+  const verdicts = latestCheckVerdicts(tip.checkRuns);
+  const present = tip.requiredChecks.filter((name) => verdicts.has(name));
+  if (present.some((name) => verdicts.get(name) === 'red')) return 'red';
+  if (present.length && present.every((name) => verdicts.get(name) === 'green')
+    && (tip.runStatus === 'completed' || present.length === tip.requiredChecks.length)) return 'green';
+  return 'pending';
+}
+
 /**
  * Is main red? PURE.
  * @param {Array<object>|null|undefined} runs  main's CI workflow runs (`gh run list` rows, any order)
- * @returns {{status:'green'|'red'|'unknown', reason?:string, firstRed?:object, lastGreen?:object|null,
+ * @param {{tip?:object|null}} options  optional facts about the current main commit
+ * @returns {{status:'green'|'red'|'pending'|'unknown', reason?:string, firstRed?:object, lastGreen?:object|null,
  *   latestRed?:object, redSinceMs?:number, windowTruncated?:boolean, latestGreen?:object}}
  */
-export function mainRedState(runs) {
+export function mainRedState(runs, { tip } = {}) {
+  const s = completedMainRedState(runs);
+  const verdict = tipRequiredVerdict(tip);
+  if (verdict === 'green') return {
+    status: 'green', latestGreen: { sha: tip.sha, runId: null, createdAt: null, updatedAt: null }, via: 'tip-required-checks',
+  };
+  if (verdict === 'pending' && s.status === 'red' && s.latestRed.sha !== tip.sha && Array.isArray(tip.redCheckRuns)) {
+    const redNames = [...latestCheckVerdicts(tip.redCheckRuns)].filter(([, v]) => v === 'red').map(([name]) => name);
+    const nonSummary = redNames.filter((name) => !MAIN_CI_RED_DEFAULTS.mainCiRedSummaryJobs.includes(name));
+    const causes = nonSummary.length ? nonSummary : redNames;
+    const tipVerdicts = latestCheckVerdicts(tip.checkRuns);
+    if (causes.length && causes.every((name) => tipVerdicts.get(name) === 'green')) return {
+      status: 'pending', reason: 'red-causes-passed-on-tip', tipSha: tip.sha, clearedRedSha: s.latestRed.sha, causes,
+    };
+  }
+  return s;
+}
+
+/** The completed workflow runs' state, preserved when tip facts cannot clear it. PURE. */
+function completedMainRedState(runs) {
   if (!Array.isArray(runs)) return { status: 'unknown', reason: 'runs-unreadable' };
   const considered = runs
     .filter((r) => r && ts(r.createdAt) !== null && classifyRun(r) !== 'ignore')
