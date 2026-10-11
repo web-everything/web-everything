@@ -123,8 +123,8 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
   const recA = record({ head: H4, runId: 'run-4', file: 'scripts/review-set-label.mjs', summary: 'An identical diff can erase a deliberately re-added human hold because carry-forward never proves that the hold was mechanical' });
   const recB = record({ head: H4, runId: 'run-4:referral-chunk:2', file: 'scripts/lib/accept-carry-forward.mjs', summary: 'Timing and event counts can misidentify an operator deliberate hold as the drain mechanical park' });
   const blocked = [recA, recB].map((r) => ({ key: r.referrals[0].key, findingId: null, finding: { file: r.referrals[0].original.file, line: 12, summary: r.referrals[0].original.summary } }));
-  const rulingOn = (rec, { min = 80, head = H4, login = 'chalbert', actor = 'chalbert', reason = DIRECTION } = {}) => {
-    const r = { version: 1, repo, pr: 3794, head, rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'block' }], actor, channel: 'claude-code-chat', reason, at: iso(min), clearerId: 'sess' };
+  const rulingOn = (rec, { min = 80, head = H4, login = 'chalbert', actor = 'chalbert', reason = DIRECTION, result = 'block' } = {}) => {
+    const r = { version: 1, repo, pr: 3794, head, rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result }], actor, channel: 'claude-code-chat', reason, at: iso(min), clearerId: 'sess' };
     return { body: buildOperatorRulingComment(r), createdAt: iso(min), author: { login } };
   };
   const marker = (min, head = H4) => trusted(takeoverMarkerBody({ pr: 3794, head, attempts: 6, cap: 5, rung: { id: 'stronger-model' }, n: 1, budget: 1 }), min);
@@ -160,6 +160,69 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
   it('only when EVERY blocked finding is covered by an operator ruling on this head', () => {
     expect(planAt([...base, rulingOn(recA)]).refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
     expect(planAt([...base, rulingOn(recA, { head: H3 }), rulingOn(recB, { head: H3 })]).refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+  });
+
+  // Red-team break on head 26eff6d2a: a withdrawn operator block on run-4 covered run-5's reviewer block of the same
+  // finding, and the planner dispatched a directed takeover carrying the withdrawn direction. The blocked list here is
+  // the production one (`blockRuledReferralsFor`), not a hand-built fixture.
+  describe('the covering ruling is the one that DECIDES each blocked finding, per review run', async () => {
+    const { blockRuledReferralsFor } = await import('../review-referral-hold.mjs');
+    const { BLOCK } = await import('./ruling-fixtures.mjs');
+    const K = { file: 'scripts/review-set-label.mjs', summary: 'An identical diff can erase a deliberately re-added human hold because carry-forward never proves that the hold was mechanical' };
+    const run4 = record({ head: H4, runId: 'run-4', ...K });
+    const run5 = record({ head: H4, runId: 'run-5', ...K });
+    const run5Blocked = record({ head: H4, runId: 'run-5', ...K, rulings: [BLOCK] });
+    const planLive = (comments) => {
+      // The PR body's author stamp makes the run-5 reviewer an independent clearer, so its block counts.
+      const pr = { ...basePr(H4, comments), body: '<!-- authored-by-actor: author -->', createdAt: iso(0) };
+      const live = blockRuledReferralsFor(pr, { repo });
+      expect(live.map((b) => b.key)).toEqual([run4.referrals[0].key]); // production reports the current block
+      return planOn(comments, {}, { blockRuledReferrals: live });
+    };
+    const reviewerBlocksRun5 = [recordComment(run5, 86), recordComment(run5Blocked, 87)];
+
+    it('a withdrawn operator block (later operator not-real) does not cover a later run\'s reviewer block', () => {
+      const p = planLive([recordComment(run4, 60), marker(70), rulingOn(run4, { min: 80 }),
+        rulingOn(run4, { min: 85, result: 'not-real', reason: 'withdrawn: not a real defect' }), ...reviewerBlocksRun5]);
+      expect(p.dispatch).toEqual([]);
+      expect(p.refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+    });
+
+    it('a live operator block on run-4 does not cover run-5, whose block only the reviewer ruled (fails closed)', () => {
+      const p = planLive([recordComment(run4, 60), marker(70), rulingOn(run4, { min: 80 }), ...reviewerBlocksRun5]);
+      expect(p.dispatch).toEqual([]);
+      expect(p.refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+    });
+
+    it('control: the operator ruling block on every run of the finding grants the directed takeover', () => {
+      const p = planLive([recordComment(run4, 60), rulingOn(run4, { min: 80 }), ...reviewerBlocksRun5, rulingOn(run5, { min: 88 })]);
+      expect(p.dispatch.map((d) => [d.mode, d.operatorRulingRound?.used])).toEqual([['takeover', 0]]);
+    });
+
+    // Self-review variant (truncated read): the PR list read returns at most 100 comments, so a withdrawal (or a spent
+    // takeover marker) past comment 100 is invisible. A list cut at exactly the cap grants nothing; a full re-read is
+    // longer than the cap and is trusted.
+    it('a thread cut at the list cap grants nothing: the withdrawal past comment 100 may be missing', async () => {
+      const { GH_LIST_COMMENT_CAP } = await import('../review-referral-hold.mjs');
+      const head = [recordComment(run4, 1), rulingOn(run4, { min: 2 })];
+      const filler = (n) => Array.from({ length: n }, (_, i) => trusted(`note ${i}`, 3));
+      const full = [...head, ...filler(GH_LIST_COMMENT_CAP - head.length), rulingOn(run4, { min: 85, result: 'not-real', reason: 'withdrawn' })];
+      const cut = full.slice(0, GH_LIST_COMMENT_CAP);
+      const directed = (comments) => planOn(comments, {}, { blockRuledReferrals: [{ key: run4.referrals[0].key, findingId: null, finding: {} }] })
+        .dispatch.filter((d) => d.operatorRulingRound).length;
+      expect(directed(cut)).toBe(0);
+      // control: the same live ruling on a full (longer than the cap) thread still grants its round
+      expect(directed([...head, ...filler(GH_LIST_COMMENT_CAP)])).toBe(1);
+    });
+
+    it('a block re-issued after the withdrawal covers again (the latest operator ruling decides)', () => {
+      const p = planLive([recordComment(run4, 60), rulingOn(run4, { min: 80, reason: 'old direction' }),
+        rulingOn(run4, { min: 85, result: 'not-real', reason: 'withdrawn' }), rulingOn(run4, { min: 89 })]);
+      expect(p.dispatch.map((d) => d.mode)).toEqual(['takeover']);
+      const brief = withPlannedContext('BRIEF', p.dispatch[0]);
+      expect(brief).toContain(DIRECTION);
+      expect(brief).not.toContain('old direction');
+    });
   });
 
   it('a forged ruling (not the operator\'s login) or an auto-policy block grants nothing', () => {

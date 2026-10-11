@@ -103,11 +103,11 @@
 import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { REFERRAL_HOLD_MARKER, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
-import { parseOperatorRulingComment, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
+import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged } from './mechanical-round-cap.mjs';
@@ -321,11 +321,15 @@ export const REFUSAL_KINDS = Object.freeze([
   // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
   // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
   'scope-bloat', 'ruling-dispute',
-  // Same class again, from the cap step's `refuseFn(...)` calls (the scan only matched `refuse(`): a PR the takeover
-  // planner declines to take over gets one of these instead of the registered `cap-exhausted`. `gate-hold` — held by
-  // its own gate with no open defect; `takeover-awaiting-review` — the latest takeover's head is not judged yet;
-  // `mechanical-carry-forward` — a proven mechanical round carries its parent's verdict, no fix owed.
-  'gate-hold', 'takeover-awaiting-review', 'mechanical-carry-forward',
+  // xs9re3k — a past-cap mechanical round (a conflict-resolution merge, no other edits) whose net diff is identical
+  // to the head the prior verdict judged: that verdict is carried forward (`mechanical-round-cap.mjs#mechanicalRoundGrant`),
+  // no review is dispatched and no "a person must take it over" note replaces it. Emitted through `capExhaustedVia`'s
+  // injected `refuseFn`, which the source scan in `reconcile-core.test.mjs` now reads too.
+  'mechanical-carry-forward',
+  // `gate-hold` (the PR's own gate holds it and no defect is open — no takeover) and `takeover-awaiting-review` (the
+  // latest takeover pushed a head no review has judged yet) — both emitted through the cap-site `refuseFn`, which the
+  // source scan in `reconcile-core.test.mjs` reads since PR #4770.
+  'gate-hold', 'takeover-awaiting-review',
 ]);
 
 /**
@@ -1560,22 +1564,54 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
   if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const covering = [];
-  for (const c of comments) {
-    const record = parseOperatorRulingComment(c)?.record;
-    if (!record || record.head !== head || String(record.actor).toLowerCase() === AUTO_POLICY_ACTOR) continue;
-    for (const x of record.rulings) {
-      if (x.result === 'block') covering.push({ key: x.key, actor: record.actor, channel: record.channel, reason: record.reason, at: record.at, createdAt: c.createdAt ?? null });
-    }
-  }
-  if (!blocked.every((b) => covering.some((r) => r.key === b.key))) return { ok: false, reason: 'not-covered' };
-  const rulings = covering.filter((r) => blocked.some((b) => b.key === r.key));
+  // The PR list read stops at GH_LIST_COMMENT_CAP comments, so a thread of exactly that length may be cut before a
+  // later withdrawal or takeover marker. A full re-read runs longer than the cap; a cut list grants nothing.
+  if (comments.length === GH_LIST_COMMENT_CAP) return { ok: false, reason: 'thread-truncated' };
+  const rulings = decidingOperatorBlocks(pr, head, blocked);
+  if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
   const rulingAtMs = Math.max(...rulings.map(stamp).filter(Number.isFinite));
   if (!Number.isFinite(rulingAtMs)) return { ok: false, reason: 'not-covered' };
   const used = takeoverMarkers(comments).filter((m) => sameHeadSha(m.head, head) && Date.parse(m.at ?? '') > rulingAtMs).length;
   if (used >= allowance) return { ok: false, reason: 'ruling-round-spent', used, allowance };
   return { ok: true, head, rulingAt: new Date(rulingAtMs).toISOString(), used, allowance, rulings };
+}
+
+/**
+ * PURE: the operator `block` ruling that DECIDES each blocked finding on `head`, in every review run that holds it, or
+ * null when any is not decided that way. Read with the same per-record state the acceptance gate uses
+ * ({@link referralRecordState}), so an operator ruling counts only while it is the latest operator word on that exact
+ * (head, run, finding): a later operator `not-real` withdraws it, and a block on run-4 never covers run-5's block of
+ * the same finding, which only the reviewer ruled (red-team break on head 26eff6d2a). A run that still holds the
+ * finding pending also answers null (fail closed). An `auto-policy` block is not the operator.
+ */
+function decidingOperatorBlocks(pr, head, blocked) {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const operatorRulings = [];
+  for (const c of comments) {
+    for (const r of readOperatorRulings([c], { head }).rulings) operatorRulings.push({ ...r, createdAt: c.createdAt ?? null });
+  }
+  const records = readReferralRecords(comments, { head }).records.filter((r) => r.head === head);
+  const context = { head, body: typeof pr?.body === 'string' ? pr.body : '', createdAt: pr?.createdAt, operatorRulings, records };
+  const states = new Map(records.map((r) => [r, referralRecordState(r, context)]));
+  const deciding = [];
+  for (const b of blocked) {
+    const runs = records.filter((r) => activeReferrals(r).some((f) => f.key === b.key));
+    let held = false;
+    for (const r of runs) {
+      const state = states.get(r);
+      if (state.pending.includes(b.key)) return null;
+      if (!state.blocked.includes(b.key)) continue;
+      const decided = state.rulings.filter((x) => x.key === b.key);
+      const op = decided.length === 1 ? decided[0] : null;
+      if (!op?.operator || op.result !== 'block' || op.head !== head || op.runId !== r.runId
+        || String(op.actor).toLowerCase() === AUTO_POLICY_ACTOR) return null;
+      deciding.push(op);
+      held = true;
+    }
+    if (!held) return null;
+  }
+  return deciding;
 }
 
 /** The operator's direction(s), verbatim, as the fix brief's operator-answer section reads them. */
@@ -1908,58 +1944,69 @@ export function planReconcile({
     // pushes its own `ci-heal-exhausted` note) also pushes a `round-cap-exhausted` note, mirroring that note's
     // own "refuse AND surface" treatment. `capKind` names the population; see {@link roundCapExhaustedNoteText}
     // for why the text carries no clock-derived number.
+    // The grants that may replace a FIX/REVIEW cap row, read only by {@link capExhaustedVia} and only at a site that
+    // allows them. `{ action: 'review', row, why }` (one review past the cap), `{ action: 'carry', mech, why }` (a
+    // carried accept), `{ action: 'annotate', mech }` (a carried bounce: the cap row stays) or `null`.
+    const pastCapGrant = (extra) => {
+      const head = String(pr?.headRefOid ?? '').slice(0, 9);
+      // A takeover's own head is judged once even though the cap is spent (live: #4708, takeover head 7e29b95c4
+      // refused 5/5 every tick, so the takeover could never be reviewed). Only a head pushed after a trusted takeover
+      // signal or the system's own escalation rung that no verdict names yet, and only `takeoverReviewAttempts` reviews.
+      const takeover = takeoverReviewGrant({ pr, takeoverReviewAttempts });
+      if (takeover.ok) {
+        return { action: 'review', row: { takeoverReview: takeover },
+          why: `${takeover.via === 'escalation-rung' ? 'escalation-rung' : 'takeover'} head \`${head}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
+            + ` but a head pushed by the system's own escalation (${takeover.via ?? 'takeover'}) earns ${takeover.allowance} review(s) beyond the cap`
+            + ` (review.takeoverReviewAttempts); ${takeover.used} used` };
+      }
+      // The mechanical-round grants below never apply to an advisory-fix head (a review:human PR's advisory repair).
+      if (extra.capKind === 'advisory-fix') return null;
+      // A head made by a PROVEN mechanical round (conflict-resolution merge, no other edits) does not spend a round
+      // (live: #4631 f0f4943fb). Identical net diff → the parent head's verdict is carried; only the conflict hunks
+      // changed → one review past the cap. The merge gate is untouched.
+      const mech = mechanicalRoundGrant({ pr, countTowardCap: mechanicalRoundsCountTowardCap });
+      if (!mech.ok) return null;
+      if (mech.action === 'review') {
+        return { action: 'review', row: { mechanicalRound: mech },
+          why: `mechanical head \`${head}\` — a conflict-resolution round on`
+            + ` \`${mech.priorHead.slice(0, 9)}\` changed only conflict hunks (${mech.changedFiles.join(', ') || 'none listed'});`
+            + ` it spends no round (${extra.attempts}/${extra.cap}), so this head earns one review`
+            + ' (review.mechanicalRoundsCountTowardCap=false)' };
+      }
+      if (mech.action === 'carry' && mech.verdict === 'accept') {
+        // TODO(#4631): the accept itself is re-stamped by the accept carry-forward sweep
+        // (we:scripts/lib/accept-carry-forward.mjs#decideAcceptCarryForward), which owns the head-bound proofs.
+        // Here the planner only stops asking a person to take over a PR whose reviewed diff did not change.
+        return { action: 'carry', mech,
+          why: `PR #${prNumber}: mechanical round on \`${mech.priorHead.slice(0, 9)}\` left the net diff byte-identical;`
+            + ' its accept is carried forward (no new review, no round spent)' };
+      }
+      return mech.action === 'carry' ? { action: 'annotate', mech } : null;
+    };
     // Built over an injected `refuseFn` so the ci-red-parallel review (below) can fold its `cap-exhausted` into
     // the PR's one `owed-ci-rerun` row while still surfacing the SAME note.
     const capExhaustedVia = (refuseFn) => (extra, { allowTakeover = true, allowTakeoverReview = allowTakeover } = {}) => {
-      // A takeover's own head is judged once even though the cap is spent (live: #4708, takeover head 7e29b95c4
-      // refused 5/5 every tick, so the takeover could never be reviewed). Only the FIX/REVIEW round caps, only a head
-      // pushed after a trusted takeover signal that no verdict names yet, and only `takeoverReviewAttempts` reviews.
-      // The review still needs green CI and no referral hold; review:human still needs the operator. A call site that
-      // passes `allowTakeover: false` (the operator send-back, whose must-fix body a person reads) is never replaced
-      // by a review dispatch either.
-      if (allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix')) {
-        const grant = takeoverReviewGrant({ pr, takeoverReviewAttempts });
-        if (grant.ok) {
-          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
-          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
-          dispatch.push({
-            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), takeoverReview: grant,
-            why: `${grant.via === 'escalation-rung' ? 'escalation-rung' : 'takeover'} head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
-              + ` but a head pushed by the system's own escalation (${grant.via ?? 'takeover'}) earns ${grant.allowance} review(s) beyond the cap`
-              + ` (review.takeoverReviewAttempts); ${grant.used} used`,
-          });
-          return;
-        }
+      // Only the FIX/REVIEW round caps take a past-cap grant. Its review still needs green CI and no referral hold;
+      // review:human still needs the operator. A call site that passes `allowTakeover: false` (the operator send-back,
+      // whose must-fix body a person reads) is never replaced by a review dispatch either (the default below).
+      // `allowTakeoverReview: false` opts the site out of EVERY past-cap grant (the takeover review and the mechanical
+      // round's review or carried verdict): its head is owed a fix, or a person reads the row. The grants are read in
+      // ONE place, {@link pastCapGrant}, which only runs when the site allows them, and every review a grant sends
+      // passes the same referral-hold and CI gates below. A new grant joins pastCapGrant; it never gets its own
+      // dispatch path (review on 3bef179e4: the mechanical grant was first added as a second, unguarded copy).
+      const grant = allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') ? pastCapGrant(extra) : null;
+      if (grant?.action === 'review') {
+        if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
+        if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
+        dispatch.push({ ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), ...grant.row, why: grant.why });
+        return;
       }
-      // A head made by a PROVEN mechanical round (conflict-resolution merge, no other edits) does not spend a round
-      // (live: #4631 f0f4943fb). Identical net diff → the parent head's verdict is carried; only the conflict hunks
-      // changed → one review past the cap. Same review gates as above; the merge gate is untouched.
-      if (extra.capKind === 'fix' || extra.capKind === 'review') {
-        const mech = mechanicalRoundGrant({ pr, countTowardCap: mechanicalRoundsCountTowardCap });
-        if (mech.ok && mech.action === 'review') {
-          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
-          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
-          dispatch.push({
-            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), mechanicalRound: mech,
-            why: `mechanical head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — a conflict-resolution round on`
-              + ` \`${mech.priorHead.slice(0, 9)}\` changed only conflict hunks (${mech.changedFiles.join(', ') || 'none listed'});`
-              + ` it spends no round (${extra.attempts}/${extra.cap}), so this head earns one review`
-              + ' (review.mechanicalRoundsCountTowardCap=false)',
-          });
-          return;
-        }
-        if (mech.ok && mech.action === 'carry' && mech.verdict === 'accept') {
-          // TODO(#4631): the accept itself is re-stamped by the accept carry-forward sweep
-          // (we:scripts/lib/accept-carry-forward.mjs#decideAcceptCarryForward), which owns the head-bound proofs.
-          // Here the planner only stops asking a person to take over a PR whose reviewed diff did not change.
-          const text = `PR #${prNumber}: mechanical round on \`${mech.priorHead.slice(0, 9)}\` left the net diff byte-identical;`
-            + ' its accept is carried forward (no new review, no round spent)';
-          refuseFn('mechanical-carry-forward', { ...extra, mechanicalRound: mech, why: text });
-          notes.push({ kind: 'mechanical-carry-forward', prNumber, verdict: mech.verdict, priorHead: mech.priorHead, text });
-          return;
-        }
-        if (mech.ok && mech.action === 'carry') extra = { ...extra, mechanicalRound: mech };
+      if (grant?.action === 'carry') {
+        refuseFn('mechanical-carry-forward', { ...extra, mechanicalRound: grant.mech, why: grant.why });
+        notes.push({ kind: 'mechanical-carry-forward', prNumber, verdict: grant.mech.verdict, priorHead: grant.mech.priorHead, text: grant.why });
+        return;
       }
+      if (grant?.action === 'annotate') extra = { ...extra, mechanicalRound: grant.mech };
       // Card xx0055i + takeover budget — at the FIX round cap, `fix.roundCapAction: takeover` dispatches a takeover fix
       // (full round history, top claude rung of the fixer ladder) instead of the "a person must take it over" note,
       // up to `fix.takeoverBudget` per PR, a further one only when the previous one REDUCED the open findings
