@@ -1,0 +1,519 @@
+// @vitest-environment node
+/**
+ * Card xx7ckd6 N1 — the red-main QUARANTINE safety net's auto add/prune (we:scripts/lib/red-main-quarantine-io.mjs
+ * `runSafetyNet`, hooked on the `main-ci-red` health smell). Replays today's red main: last green c3c3ba71d, first
+ * red 2cb94418d (run 38077022020, 2026-10-10 18:44Z), failing job `test-shard (3)` + its aggregator `test`, one failing
+ * test `scripts/operations/__tests__/record-referral-ruling.test.mjs > #4979 the sanctioned writer > …`.
+ * With `redMainMode: stop` (the shipped setting) it only logs what it WOULD do.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import * as quarantine from '../../lib/red-main-quarantine.mjs';
+const { parseVitestFailures, planSafetyNet, addEntries, pruneOnGreen, setMode, validateQuarantineList } = quarantine;
+import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, skipForList, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER, STAMP_RECHECK_MS } from '../../lib/red-main-quarantine-io.mjs';
+import smell, { defaultQuarantineSafetyNet } from '../health-smells/main-ci-red.mjs';
+import { healthDir } from '../health-watch-section.mjs';
+
+const TEST_FILE = 'scripts/operations/__tests__/record-referral-ruling.test.mjs';
+const TEST_NAME = '#4979 the sanctioned writer > the reader hands the ruled PR and its head to the card resolver';
+const FIRST_RED = '2cb94418d3d95e9d64ca59ce6de789a319a6718c';
+const T = (iso) => Date.parse(iso);
+const MIN = 60_000;
+
+// Main's CI runs around the break (real, from `gh run list --workflow ci.yml --branch main`).
+const GREEN = { databaseId: 38076234498, status: 'completed', conclusion: 'success', headSha: 'c3c3ba71d389e04b3c883ddf584243c37a9c3e73', createdAt: '2026-10-10T18:33:07Z', updatedAt: '2026-10-10T18:44:56Z', event: 'push' };
+const CANCELLED = { databaseId: 38076915712, status: 'completed', conclusion: 'cancelled', headSha: 'a4d09c6916ff259b15b744bf603499264cfd7685', createdAt: '2026-10-10T18:43:16Z', updatedAt: '2026-10-10T18:44:53Z', event: 'push' };
+const RED = { databaseId: 38077022020, status: 'completed', conclusion: 'failure', headSha: FIRST_RED, createdAt: '2026-10-10T18:44:51Z', updatedAt: '2026-10-10T18:54:42Z', event: 'push' };
+const LATER_GREEN = { databaseId: 99, status: 'completed', conclusion: 'success', headSha: 'd'.repeat(40), createdAt: '2026-10-10T20:00:00Z', updatedAt: '2026-10-10T20:12:00Z', event: 'push' };
+const RED_RUNS = [RED, CANCELLED, GREEN];
+const FAILING = { jobs: ['test-shard (3)', 'test'], tests: [], runId: 38077022020 };
+const JOBS = { failed: [{ id: 114286123395, name: 'test-shard (3)' }, { id: 114287958124, name: 'test' }] };
+
+// The real log lines of job 114286123395 (ANSI colour + GitHub timestamps kept).
+const E = '\x1b';
+const LOG = [
+  `2026-10-10T18:51:42.2758298Z  ${E}[32m✓${E}[39m scripts/conveyor/__tests__/review-side-import-cycle.test.mjs ${E}[2m (${E}[22m${E}[2m7 tests${E}[22m${E}[2m)${E}[22m`,
+  `2026-10-10T18:51:42.3015305Z ${E}[31m⎯⎯⎯⎯⎯⎯⎯${E}[1m${E}[7m Failed Tests 1 ${E}[27m${E}[22m⎯⎯⎯⎯⎯⎯⎯${E}[39m`,
+  `2026-10-10T18:51:42.3059106Z ${E}[31m${E}[1m${E}[7m FAIL ${E}[27m${E}[22m${E}[39m ${TEST_FILE}${E}[2m > ${E}[22m#4979 the sanctioned writer${E}[2m > ${E}[22mthe reader hands the ruled PR and its head to the card resolver`,
+  `2026-10-10T18:51:42.3088534Z ${E}[31m${E}[1mAssertionError${E}[22m: expected [] to deeply equal [ { repo: 'o/r', pr: 7, …(1) } ]${E}[39m`,
+  `2026-10-10T18:51:42.3315589Z ${E}[2m Test Files ${E}[22m ${E}[1m${E}[31m1 failed${E}[39m${E}[22m${E}[2m | ${E}[22m${E}[1m${E}[32m242 passed${E}[39m${E}[22m${E}[90m (243)${E}[39m`,
+  `2026-10-10T18:51:42.3345065Z ${E}[2m      Tests ${E}[22m ${E}[1m${E}[31m1 failed${E}[39m${E}[22m${E}[2m | ${E}[22m${E}[1m${E}[32m8244 passed${E}[39m`,
+].join('\n');
+
+const STOP = { value: 'stop', source: 'settings' };
+const QUARANTINE = { value: 'quarantine', source: 'env' };
+const SETTINGS = resolveQuarantineSettings({ env: {}, file: '/nonexistent', platform: null });
+
+let dir;
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'rmq-auto-')); });
+afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+
+function net(o) {
+  const calls = { jobs: 0, logs: 0, writes: [], reads: 0, logLines: [] };
+  const r = runSafetyNet({
+    dir, settings: SETTINGS, mode: STOP, live: true,
+    readJobs: () => { calls.jobs += 1; return JOBS; },
+    readLog: () => { calls.logs += 1; return parseVitestFailures(LOG); },
+    readList: () => { calls.reads += 1; return { ok: true, list: o.list ?? { version: 1, entries: [] } }; },
+    write: (w) => { calls.writes.push(w); return { events: [] }; },
+    log: (l) => calls.logLines.push(l),
+    ...o,
+  });
+  return { r, calls };
+}
+const shadowLines = () => (existsSync(join(dir, SAFETY_NET_SHADOW_LOG)) ? readFileSync(join(dir, SAFETY_NET_SHADOW_LOG), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+
+describe('parseVitestFailures — a CI job log', () => {
+  it('names the failing file and test from the real 2026-10-10 log, complete against the summary', () => {
+    const f = parseVitestFailures(LOG);
+    expect(f.files).toEqual([TEST_FILE]);
+    expect(f.tests).toEqual([{ file: TEST_FILE, name: TEST_NAME }]);
+    expect(f.complete).toBe(true);
+  });
+  it('a log with no summary line (crash, cut-off) is not complete', () => {
+    expect(parseVitestFailures(LOG.split('\n').slice(0, 3).join('\n')).complete).toBe(false);
+  });
+  it('a summary naming more failed files than were parsed is not complete', () => {
+    expect(parseVitestFailures(LOG.replace('1 failed', '2 failed')).complete).toBe(false);
+  });
+  it('a suite that failed to load (`FAIL file [ file ]`) is still a failing file', () => {
+    const f = parseVitestFailures(` FAIL  a/__tests__/x.test.mjs [ a/__tests__/x.test.mjs ]\n Test Files  1 failed | 3 passed (4)`);
+    expect(f.files).toEqual(['a/__tests__/x.test.mjs']);
+    expect(f.complete).toBe(true);
+  });
+  it('an unsafe path is never a test id', () => {
+    expect(parseVitestFailures(' FAIL ../etc/x.test.mjs\n FAIL a/$(rm).test.mjs\n Test Files  2 failed').files).toEqual([]);
+  });
+});
+
+describe('planSafetyNet — pure rules', () => {
+  const jf = { 'test-shard (3)': parseVitestFailures(LOG) };
+  const now = T('2026-10-10T19:00:00Z');
+  it('main red on a known failing test ⇒ add exactly that file', () => {
+    const p = planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: jf, list: { version: 1, entries: [] }, fixPrs: null, now });
+    expect(p).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    expect(p.names).toEqual([`${TEST_FILE} > ${TEST_NAME}`]);
+  });
+  it('a failed job outside the unit suite ⇒ none (quarantine cannot skip it; STOP holds)', () => {
+    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: [...FAILING.jobs, 'smoke'], jobFailures: jf, list: { version: 1, entries: [] }, now }).action).toBe('none');
+  });
+  it('a unit job whose failing tests are unknown ⇒ none', () => {
+    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: { 'test-shard (3)': null }, list: { version: 1, entries: [] }, now }).action).toBe('none');
+  });
+  it('more failing files than maxTests ⇒ none', () => {
+    const many = { files: ['a/1.test.mjs', 'a/2.test.mjs'], tests: [], complete: true };
+    expect(planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: ['test-shard (1)'], jobFailures: { 'test-shard (1)': many }, list: { version: 1, entries: [] }, now, settings: { maxTests: 1 } }).action).toBe('none');
+  });
+  it('main green with entries ⇒ prune (main-green)', () => {
+    const list = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now }).list;
+    expect(planSafetyNet({ status: 'green', list, now })).toMatchObject({ action: 'prune', mainGreen: true });
+  });
+  it('an entry for this red that already expired is never re-added (stale-entry guard)', () => {
+    const p = planSafetyNet({ status: 'red', firstRedSha: FIRST_RED, failedJobs: FAILING.jobs, jobFailures: jf, list: { version: 1, entries: [] }, addedForRed: [TEST_FILE], now });
+    expect(p.action).toBe('none');
+    expect(p.why).toMatch(/expired — STOP/);
+  });
+  it('unknown main state ⇒ none', () => {
+    expect(planSafetyNet({ status: 'unknown', now }).action).toBe('none');
+  });
+});
+
+describe('runSafetyNet — replay of 2026-10-10 (first red 2cb94418d)', () => {
+  const at = T('2026-10-10T18:56:00Z');
+  it('SHADOW (redMainMode stop): logs that it WOULD add exactly record-referral-ruling.test.mjs; writes nothing', () => {
+    const { r, calls } = net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at });
+    expect(r).toMatchObject({ mode: 'stop', shadow: true, applied: false });
+    expect(r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    expect(calls.writes).toEqual([]);
+    // Shadow plans on its simulated list. The live list is read once, only to learn whether a stamp is live (a fresh
+    // ledger cannot know); once that is recorded, later shadow ticks never read it.
+    expect(calls.reads).toBe(1);
+    expect(net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at + MIN }).calls.reads).toBe(0);
+    const lines = shadowLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ wouldDo: 'add', tests: [TEST_FILE], firstRedSha: FIRST_RED, mode: 'stop', modeSource: 'settings' });
+    expect(lines[0].names).toEqual([`${TEST_FILE} > ${TEST_NAME}`]);
+    expect(lines[0].settingsSources).toMatchObject({ ttlMin: 'standard', maxTests: 'standard' });
+    expect(calls.logLines.join('\n')).toMatch(/WOULD add scripts\/operations\/__tests__\/record-referral-ruling\.test\.mjs/);
+  });
+  it('reads the job logs once per red window and adds once; later ticks are quiet', () => {
+    const first = net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at });
+    const second = net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at + MIN });
+    expect(first.calls.logs).toBe(1);
+    expect(second.calls.logs).toBe(0);
+    expect(second.r.plan.action).toBe('none');
+    expect(shadowLines()).toHaveLength(1);
+  });
+  it('the fix PR set rides on the list once one is published', () => {
+    net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at });
+    const r = net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: { pr: 4980, prs: [4980] } }, now: at + MIN }).r;
+    expect(r.plan.fixPrs).toEqual([4980]);
+    expect(shadowLines()[1]).toMatchObject({ wouldDo: 'none', fixPrs: [4980] });
+    expect(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).shadowList.fixPrs).toEqual([4980]);
+  });
+  it('PRUNE on green: the shadow list empties and the log says it would prune', () => {
+    net({ mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: null }, now: at });
+    const g = net({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] }, priority: null }, now: T('2026-10-10T20:13:00Z') });
+    expect(g.r.plan).toMatchObject({ action: 'prune', mainGreen: true });
+    expect(shadowLines().at(-1)).toMatchObject({ wouldDo: 'prune' });
+    expect(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).shadowList.entries).toEqual([]);
+    // green again next tick: nothing more to do
+    expect(net({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, now: T('2026-10-10T20:14:00Z') }).r.plan.action).toBe('none');
+  });
+  it('LIVE (redMainMode quarantine): writes the add as red-main-safety-net with the file entry', () => {
+    const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: { runs: RED_RUNS, failing: FAILING, priority: { pr: 4980, prs: [4980] } }, now: at });
+    expect(r).toMatchObject({ shadow: false, applied: true });
+    expect(calls.writes).toHaveLength(1);
+    expect(calls.writes[0].actor).toBe('red-main-safety-net');
+    const res = calls.writes[0].change({ version: 1, entries: [] });
+    expect(res.ok).toBe(true);
+    expect(res.list.entries.map((e) => [e.test, e.brokenSha, e.owner])).toEqual([[TEST_FILE, FIRST_RED, 'red-main-safety-net']]);
+    expect(res.list.entries[0].expiresAt - res.list.entries[0].addedAt).toBe(360 * MIN);
+    expect(res.list.fixPrs).toEqual([4980]);
+    expect(shadowLines()).toEqual([]);
+  });
+  it('LIVE but a replay/dry-run tick (`live:false`) stays shadow', () => {
+    const { r, calls } = net({ mode: QUARANTINE, live: false, mainCiRuns: { runs: RED_RUNS, failing: FAILING }, now: at });
+    expect(r.shadow).toBe(true);
+    expect(calls.writes).toEqual([]);
+  });
+  it('LIVE with an unreadable list does nothing (fail closed)', () => {
+    const { r, calls } = net({ mode: QUARANTINE, readList: () => ({ ok: false, error: 'fetch failed' }), mainCiRuns: { runs: RED_RUNS, failing: FAILING }, now: at });
+    expect(r.plan.action).toBe('none');
+    expect(calls.writes).toEqual([]);
+  });
+  it('no dir ⇒ does nothing', () => {
+    expect(runSafetyNet({ mainCiRuns: { runs: RED_RUNS, failing: FAILING } })).toBeNull();
+  });
+});
+
+describe('runSafetyNet — review round 1 (PR #4816)', () => {
+  const at = T('2026-10-10T18:56:00Z');
+  const RUNS = { runs: RED_RUNS, failing: FAILING, priority: null };
+  const flaky = (n) => { let left = n; return () => { if (left-- > 0) throw new Error('rate limited'); return parseVitestFailures(LOG); }; };
+
+  it('a failed log read is retried on a later tick (after its backoff), not cached for the red window', () => {
+    const first = net({ mainCiRuns: RUNS, now: at, readLog: flaky(1) });
+    expect(first.r.plan.action).toBe('none');
+    expect(first.r.plan.why).toMatch(/unknown/);
+    const early = net({ mainCiRuns: RUNS, now: at + 10_000 });
+    expect(early.calls.logs).toBe(0); // inside the backoff: no hammering of a rate-limited API
+    expect(early.r.plan.action).toBe('none');
+    const later = net({ mainCiRuns: RUNS, now: at + 2 * MIN });
+    expect(later.calls.logs).toBe(1);
+    expect(later.r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    // now it IS cached: a further tick reads nothing
+    expect(net({ mainCiRuns: RUNS, now: at + 3 * MIN }).calls.logs).toBe(0);
+  });
+  it('a failed jobs-list read is retried too', () => {
+    let throws = 1;
+    const readJobs = () => { if (throws-- > 0) throw new Error('timeout'); return JOBS; };
+    expect(net({ mainCiRuns: RUNS, now: at, readJobs }).r.plan.action).toBe('none');
+    expect(net({ mainCiRuns: RUNS, now: at + 2 * MIN, readJobs }).r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+  });
+  it('the retry backoff grows while reads keep failing', () => {
+    const bad = () => { throw new Error('rate limited'); };
+    net({ mainCiRuns: RUNS, now: at, readLog: bad });
+    net({ mainCiRuns: RUNS, now: at + 2 * MIN, readLog: bad });
+    expect(net({ mainCiRuns: RUNS, now: at + 3 * MIN }).calls.logs).toBe(0); // 2nd failure ⇒ 2 min backoff
+    expect(net({ mainCiRuns: RUNS, now: at + 5 * MIN }).calls.logs).toBe(1);
+  });
+
+  it('an incomplete parse (cut-off / still-uploading log) is retried, not cached as the answer', () => {
+    const partial = parseVitestFailures(LOG.split('\n').slice(0, 3).join('\n'));
+    expect(partial.complete).toBe(false);
+    expect(net({ mainCiRuns: RUNS, now: at, readLog: () => partial }).r.plan.action).toBe('none');
+    expect(net({ mainCiRuns: RUNS, now: at + 2 * MIN }).r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+  });
+  it('a re-run of the same run id (new updatedAt) is read again', () => {
+    expect(net({ mainCiRuns: RUNS, now: at }).calls.logs).toBe(1);
+    const rerun = { ...RUNS, runs: RED_RUNS.map((r) => (r === RED ? { ...RED, updatedAt: '2026-10-10T19:30:00Z' } : r)) };
+    expect(net({ mainCiRuns: rerun, now: at + MIN }).calls.logs).toBe(1);
+    expect(net({ mainCiRuns: rerun, now: at + 2 * MIN }).calls.logs).toBe(0);
+  });
+  it('a live push that throws after landing is still withdrawable on a flip back to stop', () => {
+    const boom = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('push timed out'); } });
+    expect(boom.r.error).toMatch(/push timed out/);
+    const stamped = { version: 1, entries: [], mode: 'quarantine' };
+    const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + MIN });
+    expect(stopped.calls.writes).toHaveLength(1);
+    expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+  });
+  it('a prune-only live write does not mark the mode as published', () => {
+    const list = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list; // unstamped
+    const g = net({ mode: QUARANTINE, mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, list, now: at + MIN });
+    expect(g.r.plan.action).toBe('prune');
+    expect(net({ mode: STOP, mainCiRuns: RUNS, list: { version: 1, entries: [], mode: 'quarantine' }, now: at + 2 * MIN }).calls.reads).toBe(0);
+  });
+
+  it('a shadow add does not stop the first LIVE add of the same red window (stop → quarantine)', () => {
+    const shadow = net({ mainCiRuns: RUNS, now: at });
+    expect(shadow.r.plan.action).toBe('add');
+    const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
+    expect(live.r.plan).toMatchObject({ action: 'add', tests: [TEST_FILE] });
+    expect(live.calls.writes).toHaveLength(1);
+  });
+
+  it('an active red stays non-renewable beyond the ledger retention (no re-add of an expired entry)', () => {
+    const t0 = at;
+    const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: t0 });
+    const entry = first.calls.writes[0].change({ version: 1, entries: [] }).list;
+    const afterTtl = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: t0 + 7 * 60 * MIN });
+    expect(afterTtl.r.plan.why).toMatch(/expired — STOP/);
+    net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: t0 + 49 * 60 * MIN }); // the tick that used to evict the live window's record
+    const wayLater = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: t0 + 50 * 60 * MIN });
+    expect(wayLater.r.plan.why).toMatch(/expired — STOP/);
+    expect(wayLater.calls.writes.every((w) => w.change(entry).events?.every((e) => e.type !== 'quarantine-added'))).toBe(true);
+    expect(wayLater.calls.logs).toBe(0); // the record (and its log cache) survived
+  });
+  it('a truncated read whose first red slides to a newer commit keeps the window record (no re-add under the new sha)', () => {
+    const red = (n, sha, created) => ({ ...RED, databaseId: n, headSha: sha, createdAt: created, updatedAt: created });
+    const A = red(1, 'a'.repeat(40), '2026-10-10T18:44:51Z');
+    const B = red(2, 'b'.repeat(40), '2026-10-10T19:44:51Z');
+    const C = red(3, 'c'.repeat(40), '2026-10-10T20:44:51Z');
+    const win1 = { ...RUNS, runs: [A, B] }; // no green in the window: windowTruncated, first red = A
+    const win2 = { ...RUNS, runs: [B, C] }; // the window slid past A: first red = B
+    const t0 = at;
+    const first = net({ mode: QUARANTINE, mainCiRuns: win1, now: t0 });
+    const entry = first.calls.writes[0].change({ version: 1, entries: [] }).list;
+    expect(entry.entries).toHaveLength(1);
+    const slid = net({ mode: QUARANTINE, mainCiRuns: win2, list: entry, now: t0 + 7 * 60 * MIN }); // the entry has expired
+    expect(slid.r.plan.why).toMatch(/expired — STOP/);
+    expect(slid.calls.writes.every((w) => w.change(entry).events?.every((e) => e.type !== 'quarantine-added'))).toBe(true);
+    const reds = Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds);
+    expect(reds).toEqual(['a'.repeat(40)]); // still ONE window record; the slid sha did not fork a fresh one
+    // …and the record is exempt from eviction while ANY of the window's red commits is still in view.
+    net({ mode: QUARANTINE, mainCiRuns: win2, list: entry, now: t0 + 60 * 60 * MIN * 50 });
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds)).toEqual(['a'.repeat(40)]);
+  });
+  describe('a push that lands but throws (PR #4816 review round 2)', () => {
+    const ledger = () => JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8'));
+    const addedEvents = (calls, list) => calls.writes.flatMap((w) => w.change(list).events ?? []).filter((e) => e.type === 'quarantine-added');
+    // A writer that persists the composed list and then throws (the push landed, the ack was lost).
+    const landThenThrow = () => { const box = { list: { version: 1, entries: [] } }; return { box, write: (w) => { box.list = w.change(box.list).list; throw new Error('push: connection reset after the ref moved'); }, readList: () => ({ ok: true, list: box.list }) }; };
+
+    it('never renews the expired entry', () => {
+      const t0 = at;
+      const lost = landThenThrow();
+      const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: t0, write: lost.write, readList: lost.readList });
+      expect(first.r.error).toMatch(/connection reset/);
+      expect(lost.box.list.entries).toHaveLength(1); // it did land
+      const later = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: t0 + 7 * 60 * MIN }); // expired, then pruned
+      expect(later.r.plan.why).toMatch(/expired — STOP/);
+      expect(addedEvents(later.calls, { version: 1, entries: [] })).toEqual([]);
+    });
+    it('the intent is on disk BEFORE the push, so a crash between the push and the ledger write still cannot renew it', () => {
+      let onDisk = null;
+      const crash = { write: () => { onDisk = ledger(); throw new Error('killed'); } };
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, ...crash });
+      expect(Object.values(onDisk.reds)[0].added).toEqual([TEST_FILE]);
+    });
+    it('an unreadable list after the throw keeps the intent (fail closed: STOP holds, nothing is renewed)', () => {
+      let reads = 0; // readable for the tick's own read, unreadable for the check after the throw
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('boom'); }, readList: () => (reads++ === 0 ? { ok: true, list: { version: 1, entries: [] } } : { ok: false, error: 'x' }) });
+      expect(Object.values(ledger().reds)[0].added).toEqual([TEST_FILE]);
+    });
+    it('no push is made when the intent cannot be made durable (a failed ledger write blocks the add)', () => {
+      mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // a directory where the ledger file must go: the atomic write fails
+      const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+      expect(calls.writes).toEqual([]);
+      expect(r.applied).toBe(false);
+      expect(r.error).toMatch(/ledger/);
+    });
+    it('a push that never landed is retried on the next tick', () => {
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at, write: () => { throw new Error('rejected'); } });
+      expect(Object.values(ledger().reds)[0].added).toEqual([]);
+      const retry = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
+      expect(retry.r.plan.action).toBe('add');
+    });
+    it('a live entry for this red that the ledger does not know is adopted, so it is not renewed after it is pruned', () => {
+      const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+      const entry = first.calls.writes[0].change({ version: 1, entries: [] }).list;
+      rmSync(join(dir, SAFETY_NET_LEDGER)); // the ledger was lost (crash, reset)
+      net({ mode: QUARANTINE, mainCiRuns: RUNS, list: entry, now: at + MIN });
+      const later = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: at + 7 * 60 * MIN });
+      expect(later.r.plan.why).toMatch(/expired — STOP/);
+    });
+  });
+  it('the `skip` CLI path honours the published mode like CI does: stop, no stamp or an unreadable list skip nothing', () => {
+    const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at }).calls.writes[0].change({ version: 1, entries: [] }).list;
+    const skip = (r) => skipForList(r, { now: at + MIN, prNumber: 4990, fixPrs: [], onMain: false });
+    expect(skip({ ok: true, list: live })).toEqual([TEST_FILE]);
+    expect(skip({ ok: true, list: setMode(live, { mode: 'stop', actor: 'red-main-safety-net', now: at }).list })).toEqual([]);
+    const { mode: _drop, ...unstamped } = live;
+    expect(skip({ ok: true, list: unstamped })).toEqual([]);
+    expect(skip({ ok: false, error: 'x' })).toEqual([]);
+  });
+  it('a red window that has not been seen for 48h is forgotten', () => {
+    net({ mainCiRuns: RUNS, now: at });
+    net({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: { jobs: [], tests: [] } }, now: at + 49 * 60 * MIN });
+    expect(Object.keys(JSON.parse(readFileSync(join(dir, SAFETY_NET_LEDGER), 'utf8')).reds)).toEqual([]);
+  });
+
+  it('LIVE publishes the effective mode on the list, so CI reads the same switch as the daemon', () => {
+    const { calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+    expect(calls.writes[0].change({ version: 1, entries: [] }).list.mode).toBe('quarantine');
+  });
+  it('LIVE re-stamps the mode when live entries exist but the stamp is missing (stop → quarantine flip)', () => {
+    const first = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+    const unstamped = { ...first.calls.writes[0].change({ version: 1, entries: [] }).list };
+    delete unstamped.mode;
+    const { calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: unstamped, now: at + MIN });
+    expect(calls.writes).toHaveLength(1);
+    expect(calls.writes[0].change(unstamped).list.mode).toBe('quarantine');
+  });
+  it('flipping back to stop withdraws a stamp the daemon published; a daemon that never published writes nothing', () => {
+    const never = net({ mode: STOP, mainCiRuns: RUNS, now: at });
+    expect(never.calls.writes).toEqual([]);
+    expect(never.calls.reads).toBe(1); // a fresh ledger reads once to learn the list is unstamped …
+    expect(net({ mode: STOP, mainCiRuns: RUNS, now: at + MIN / 2 }).calls.reads).toBe(0); // … then knows
+    const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at + MIN });
+    const stamped = live.calls.writes[0].change({ version: 1, entries: [] }).list;
+    const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
+    expect(stopped.calls.writes).toHaveLength(1);
+    expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+    expect(net({ mode: STOP, mainCiRuns: RUNS, list: { ...stamped, mode: 'stop' }, now: at + 3 * MIN }).calls.writes).toEqual([]);
+  });
+  describe('the stamp is withdrawn even when the ledger was lost (PR #4816 review round 3)', () => {
+    const publishThenLose = () => {
+      const live = net({ mode: QUARANTINE, mainCiRuns: RUNS, now: at });
+      const stamped = live.calls.writes[0].change({ version: 1, entries: [] }).list;
+      rmSync(join(dir, SAFETY_NET_LEDGER)); // the ledger was lost (crash, reset)
+      return stamped;
+    };
+    it('a recovered ledger learns the stamp from a quiet quarantine tick, so a flip to stop still withdraws it', () => {
+      const stamped = publishThenLose();
+      const quiet = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: stamped, now: at + MIN });
+      expect(quiet.calls.writes).toEqual([]); // nothing to change on the list: the tick returns early
+      const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
+      expect(stopped.calls.writes).toHaveLength(1);
+      expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+    });
+    it('a lost ledger followed straight by a flip to stop still withdraws the stamp, then reads no more', () => {
+      const stamped = publishThenLose();
+      const stopped = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + MIN });
+      expect(stopped.calls.writes).toHaveLength(1);
+      expect(stopped.calls.writes[0].change(stamped).list.mode).toBe('stop');
+      const next = net({ mode: STOP, mainCiRuns: RUNS, list: { ...stamped, mode: 'stop' }, now: at + 2 * MIN });
+      expect(next.calls.reads).toBe(0);
+      expect(next.calls.writes).toEqual([]);
+    });
+    it('a withdraw that fails is retried on the next stop tick', () => {
+      const stamped = publishThenLose();
+      const fail = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + MIN, write: () => { throw new Error('push rejected'); } });
+      expect(fail.r.demoteError).toMatch(/push rejected/);
+      const retry = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + 2 * MIN });
+      expect(retry.calls.writes).toHaveLength(1);
+    });
+    it('an unreadable list leaves the stamp unknown, so the next stop tick reads it again', () => {
+      publishThenLose();
+      const blind = net({ mode: STOP, mainCiRuns: RUNS, now: at + MIN, readList: () => ({ ok: false, error: 'fetch failed' }) });
+      expect(blind.calls.writes).toEqual([]);
+      expect(net({ mode: STOP, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: at + 2 * MIN }).calls.reads).toBe(1);
+    });
+    it('an "unstamped" record goes stale: a stamp that appears later (old ledger restored, another writer) is still withdrawn', () => {
+      net({ mode: STOP, mainCiRuns: RUNS, now: at }); // records "unstamped"
+      const stamped = { version: 1, entries: [], mode: 'quarantine' };
+      expect(net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + STAMP_RECHECK_MS - 1 }).calls.reads).toBe(0);
+      const later = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + STAMP_RECHECK_MS });
+      expect(later.calls.reads).toBe(1);
+      expect(later.calls.writes).toHaveLength(1);
+      expect(later.calls.writes[0].change(stamped).list.mode).toBe('stop');
+    });
+    it('an "unstamped" record dated in the future (clock stepped back) is not trusted', () => {
+      net({ mode: STOP, mainCiRuns: RUNS, now: at + 60 * MIN }); // recorded by a clock running an hour ahead
+      const stamped = { version: 1, entries: [], mode: 'quarantine' };
+      const back = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at });
+      expect(back.calls.reads).toBe(1);
+      expect(back.calls.writes).toHaveLength(1);
+    });
+    it('a stamp-only push is refused when the ledger cannot record it (else a stale "unstamped" record would hide it)', () => {
+      const unstamped = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list;
+      mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // the ledger write fails (the tick's own read records "unstamped")
+      const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: unstamped, now: at + MIN });
+      expect(calls.writes).toEqual([]);
+      expect(r.applied).toBe(false);
+      expect(r.error).toMatch(/ledger/);
+    });
+    it('a replay tick (`live:false`) never reads or writes the live list, even with no ledger', () => {
+      const { calls } = net({ mode: STOP, live: false, mainCiRuns: RUNS, list: { version: 1, entries: [], mode: 'quarantine' }, now: at });
+      expect(calls.reads).toBe(0);
+      expect(calls.writes).toEqual([]);
+    });
+  });
+  it('an operator add or a prune keeps the published mode; a bad mode makes the list unreadable', () => {
+    const stamped = { ...addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list, mode: 'quarantine' };
+    expect(addEntries(stamped, { tests: ['a/b.test.mjs'], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'operator', now: at }).list.mode).toBe('quarantine');
+    expect(pruneOnGreen(stamped, { mainGreen: null, now: at }).list.mode).toBe('quarantine');
+    expect(setMode(stamped, { mode: 'stop', actor: 'red-main-safety-net', now: at }).list.mode).toBe('stop');
+    expect(setMode(stamped, { mode: 'stop', actor: 'someone', now: at }).ok).toBe(false);
+    expect(validateQuarantineList({ ...stamped, mode: 'yolo' }).ok).toBe(false);
+  });
+});
+
+describe('readListOrAbsent — the first add must be possible', () => {
+  const fail = (status) => (args) => { if (args[0] === 'ls-remote') { const e = new Error('ls-remote'); e.status = status; throw e; } throw new Error('fetch failed'); };
+  it('a branch that provably does not exist yet (ls-remote exit 2) is an empty list', () => {
+    expect(readListOrAbsent({ board: '/x', run: fail(2) })).toMatchObject({ ok: true, absent: true, list: { version: 1, entries: [] } });
+  });
+  it('any other failure stays unreadable', () => {
+    expect(readListOrAbsent({ board: '/x', run: fail(128) }).ok).toBe(false);
+  });
+});
+
+describe('settings cascade — standard → platform → tool → env, with sources', () => {
+  it('standard defaults', () => {
+    expect(SETTINGS.value).toMatchObject({ ttlMin: 360, maxTests: 5, derivedJobs: ['test'] });
+    expect(SETTINGS.sources.ttlMin).toBe('standard');
+  });
+  it('platform, then env override; an invalid env value never wins', () => {
+    const s = resolveQuarantineSettings({ env: { WE_RED_MAIN_QUARANTINE_TTL_MIN: '90', WE_RED_MAIN_QUARANTINE_MAX_TESTS: 'lots' }, file: '/nonexistent', platform: { maxTests: 3 } });
+    expect(s.value).toMatchObject({ ttlMin: 90, maxTests: 3 });
+    expect(s.sources).toMatchObject({ ttlMin: 'env', maxTests: 'platform' });
+    expect(s.invalid.join(' ')).toMatch(/maxTests/);
+  });
+});
+
+describe('main-ci-red smell hook', () => {
+  it('runs the safety net every tick and reports its plan in the measure, red or green', () => {
+    const seen = [];
+    const ctx = { now: T('2026-10-10T19:20:00Z'), config: {}, quarantineSafetyNet: (m) => { seen.push(m); return { mode: 'stop', shadow: true, plan: { action: 'add', tests: [TEST_FILE], why: 'w' } }; } };
+    const res = smell.evaluate({ mainCiRuns: { runs: RED_RUNS, failing: FAILING } }, ctx);
+    expect(res[0].measure.quarantine).toEqual({ mode: 'stop', shadow: true, action: 'add', tests: [TEST_FILE], why: 'w' });
+    expect(smell.evaluate({ mainCiRuns: { runs: [LATER_GREEN, ...RED_RUNS], failing: {} } }, ctx)).toEqual([]);
+    expect(seen).toHaveLength(2); // green ticks still reach the net (that is where prune happens)
+  });
+  it('a throwing safety net never breaks the smell', () => {
+    const res = smell.evaluate({ mainCiRuns: { runs: RED_RUNS, failing: FAILING } }, { now: T('2026-10-10T19:20:00Z'), config: {}, quarantineSafetyNet: () => { throw new Error('boom'); } });
+    expect(res[0].measure.quarantine).toBeNull();
+  });
+  it('the default net never runs under test (no live IO from a smell test)', () => {
+    expect(defaultQuarantineSafetyNet({ runs: RED_RUNS, failing: FAILING }, { now: Date.now() })).toBeNull();
+  });
+  describe('defaultQuarantineSafetyNet — replay flags (PR #4816 review round 2)', () => {
+    const REAL = healthDir();
+    const probe = (argv) => { const seen = []; defaultQuarantineSafetyNet({ runs: RED_RUNS, failing: FAILING }, { now: 1, argv, underTest: false, run: (o) => { seen.push(o); return null; } }); return seen[0]; };
+    it('a normal tick is live and writes under the daemon health dir', () => {
+      const o = probe(['node', 'health-watch.mjs', 'tick']);
+      expect(o.live).toBe(true);
+      expect(o.dir).toBe(REAL);
+    });
+    it('--state-root=DIR keeps the ledger and shadow log under that root, and is shadow', () => {
+      const o = probe(['node', 'health-watch.mjs', 'tick', '--state-root=/fixture/root']);
+      expect(o.live).toBe(false);
+      expect(o.dir).toBe(healthDir('/fixture/root'));
+    });
+    it('--state-root DIR (two words) is read too', () => {
+      expect(probe(['node', 'h.mjs', 'tick', '--state-root', '/fixture/root']).dir).toBe(healthDir('/fixture/root'));
+    });
+    it.each(['--main-ci-runs-fixture=/f.json', '--dry-run', '--lock-root=/l'])('%s without a state root never touches the real health dir', (flag) => {
+      const o = probe(['node', 'h.mjs', 'tick', flag]);
+      expect(o.live).toBe(false);
+      expect(o.dir).not.toBe(REAL);
+      expect(o.dir.startsWith(tmpdir())).toBe(true);
+    });
+  });
+});
