@@ -44,22 +44,32 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   `mergeGate.mode: "enforce"` in a repo settings file or the `MERGE_GATE_MODE` repository variable
   (`we:scripts/lib/merge-gate-ci.mjs`, `loadMergeGateMode`). Confirm the merge-gate log shows `mode=enforce`.
 - [ ] Merge-gate shadow audit clean: no shadow "would HOLD" on a PR the drain then landed.
-- [ ] You can run `gh` with your own admin login (the ruleset keeps the admin bypass), and you can merge this
-  PR by hand: the freeze below stops the drain from merging it.
+- [ ] Main's CI is green and the safety net has published no red: neither `main-ci-red-state.json` nor
+  `main-red-priority.json` exists (`we:scripts/lib/red-main-hold.mjs`). A published main-fix PR is exempt from
+  the freeze's hold, so the drain would still `gh pr merge` it.
+- [ ] You can run `gh` with your own admin login and merge this PR by hand: the freeze below stops the drain
+  from merging it.
 
 ## Why the drain must be frozen during the switch
 
-While the ruleset is on and the drain is still `drain-direct`, the drain's non-admin `gh pr merge --merge` is
-turned into an enqueue by gh. The drain still reports `merged:true`, adds the PR to `merged` / `landedThisPass`,
-posts its landed trace and starts post-land work. The PR may then fail merge-group CI and never land. This is
-true in both directions (apply and rollback), and a short window does not prevent it: any pass that starts inside
-it can do this. So no drain pass may merge anything between the ruleset change and the settings change.
+The drain and the ruleset must change together, and they cannot. While the ruleset is on and the drain is still
+`drain-direct`, the drain's non-admin `gh pr merge --merge` is turned into an enqueue by gh. The drain still
+reports `merged:true`, adds the PR to `merged` / `landedThisPass`, posts its landed trace and starts post-land
+work. The PR may then fail merge-group CI and never land. This is true in both directions (apply and rollback),
+and a short window does not prevent it: any pass that starts inside it can do this. So no drain pass may merge
+anything while the two disagree.
 
 Use the existing manual red-main freeze for that. With `redMainHold: on` (the default, `we:scripts/settings/red-main-hold.json`)
-the drain keeps running, but it skips every PR as `red-main-hold` and runs no `gh pr merge`. A manual freeze
-has no published main-fix PR, so nothing is exempt. With `redMainHold: off` the drain stops with exit 5
-(`stopped: red-main-freeze`). Both are safe. The freeze marker lives in the host's coordination root, so it
-covers every drain clone. Run these on the drain host.
+the drain keeps running, but it skips every PR as `red-main-hold` and runs no `gh pr merge`; with `off` it stops
+with exit 5 (`stopped: red-main-freeze`). It does not stop a pass already in flight (the freeze is read once, at
+plan time), and `--no-red-main-freeze` / `WE_MERGE_BREAK_GLASS=1` skip it entirely: do not use either during the
+switch. The marker lives in the host's coordination root, so it covers every drain clone, provided the freeze
+command runs with the same `WE_COORDINATION_ROOT` / `WE_RED_MAIN_FREEZE` as the daemon: compare the `path`
+printed by `status` with the path the drain uses. Run these on the drain host.
+
+The drain reads `mergeDelivery` from its own clone's `scripts/settings/*.json`, and a clone only pulls main when
+the drain lands something or its per-pass refresh succeeds (a failed refresh is non-fatal). So unfreeze only
+after every drain clone has the settings commit (the clone check below).
 
 ## Apply order
 
@@ -73,7 +83,16 @@ covers every drain clone. Run these on the drain host.
 
    Do not go on until a pass that began after the freeze has finished. A pass already past its freeze check can
    still merge.
-2. Apply the ruleset with the operator's personal gh, not the App token:
+2. Merge this settings PR yourself, **before** the ruleset exists, so the merge needs no queue bypass. The
+   frozen drain will not merge it. Do not go on until GitHub says it merged:
+
+   ```bash
+   env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh pr merge 4950 --merge
+   gh pr view 4950 --json state,mergeCommit --jq '.state, .mergeCommit.oid'   # MERGED, <sha>
+   ```
+
+   Until step 3, the drain is `github-merge-queue` against an unqueued main, but it is frozen, so nothing runs.
+3. Apply the ruleset with the operator's personal gh, not the App token:
 
    ```bash
    env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh api -X PUT repos/web-everything/web-everything/rulesets/24883772 --input scripts/rulesets/main-required-checks.merge-queue.json
@@ -81,27 +100,28 @@ covers every drain clone. Run these on the drain host.
    ```
 
    The readback must show `required_status_checks` and `merge_queue`.
-3. Merge this settings PR yourself, as the admin (bypass `always` merges directly, it is not enqueued). The
-   frozen drain will not merge it:
+4. Check every drain clone has the settings commit from step 2 (still frozen; a frozen pass still refreshes, so
+   wait one pass if a clone is behind). Clones are listed by `daemonCloneRoots` in
+   `we:scripts/lib/daemon-clone-registry.mjs`; for each:
 
    ```bash
-   env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh pr merge 4950 --admin --merge
+   git -C <drain clone> merge-base --is-ancestor <merge commit sha> HEAD && echo ok
    ```
 
-4. Unfreeze, so the next pass reads the new setting and starts enqueueing:
+5. Unfreeze, so the next pass reads the new setting and starts enqueueing:
 
    ```bash
    node scripts/readiness/red-main-remediation.mjs unfreeze
    ```
 
-5. Confirm the next drain pass logs:
+6. Confirm the next drain pass logs:
 
    ```text
    merge-delivery policy: strategy=github-merge-queue (tool), batchSize=5 (tool), maxGroupWaitMinutes=5 (tool), mergeMethod=merge (tool)
    ```
 
-   If step 2 fails or the readback is wrong, nothing has changed on the drain side: unfreeze and stop.
-   If step 3 fails after step 2 succeeded, stay frozen and either retry the merge or run the rollback below.
+   If step 2 fails, nothing has changed: unfreeze and stop. If step 3 fails after step 2 succeeded, stay frozen
+   and retry it, or run the rollback below.
 
 ## First-batch proof to collect
 
@@ -124,18 +144,22 @@ Freeze the drain for the whole rollback, for the same reason as above: between t
 ruleset restore, one side is always wrong (a `github-merge-queue` drain on an unqueued branch, or a
 `drain-direct` drain on a queued one).
 
+The order is the reverse of apply: ruleset first, then the settings revert, so the revert needs no queue bypass.
+The same precondition applies (no published red).
+
 1. Freeze and wait for a post-freeze pass with no `gh pr merge`, as in apply step 1
    (`--reason="merge-queue switch: rollback"`).
-2. Put the drain back: revert this PR (remove the `mergeDelivery` block, or set its `strategy` to
-   `drain-direct`) and merge the revert yourself with `gh pr merge <revert PR> --admin --merge` (the frozen
-   drain will not).
-3. Restore the ruleset from the saved body, stripping read-only fields:
+2. Restore the ruleset from the saved body, stripping read-only fields:
 
    ```bash
    jq '{name,target,enforcement,conditions,rules,bypass_actors}' scripts/rulesets/main-required-checks.rollback.json | env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh api -X PUT repos/web-everything/web-everything/rulesets/24883772 --input -
    ```
 
-4. Read it back: `.rules[].type` is only `required_status_checks`, and `merge-gate` is absent from the required
+3. Read it back: `.rules[].type` is only `required_status_checks`, and `merge-gate` is absent from the required
    list. Dequeue entries still in GitHub's queue in the GitHub UI; the drain picks them up again as ready PRs.
-5. Unfreeze (`node scripts/readiness/red-main-remediation.mjs unfreeze`) and confirm the next pass logs
+4. Put the drain back: revert this PR (remove the `mergeDelivery` block, or set its `strategy` to
+   `drain-direct`) and merge the revert yourself with `gh pr merge <revert PR> --merge` (the frozen drain will
+   not). Confirm `gh pr view <revert PR> --json state,mergeCommit` shows `MERGED`.
+5. Check every drain clone has the revert commit (apply step 4), then unfreeze
+   (`node scripts/readiness/red-main-remediation.mjs unfreeze`) and confirm the next pass logs
    `strategy=drain-direct`.
