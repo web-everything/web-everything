@@ -47,7 +47,7 @@ describe('fast lane — the fast slot is ADDED ON TOP of the heavy cap (operator
   it('cap 2: TWO full suites run at once while a short job uses the fast slot', async () => {
     const lockRoot = tempRoot();
     const clock = fakeTime();
-    const opts = { lockRoot, cap: 2, env: {}, ceilingMs: 10_000, log: () => {}, ...clock };
+    const opts = { lockRoot, cap: 2, env: {}, canDefer: true, ceilingMs: 10_000, log: () => {}, ...clock };
     const a = await acquireSlotBlocking({ ...opts, owner: 'lane-full-a', kind: 'FULL' });
     const b = await acquireSlotBlocking({ ...opts, owner: 'lane-full-b', kind: 'FULL' });
     const c = await acquireSlotBlocking({ ...opts, owner: 'lane-fixer-check', kind: 'selected' });
@@ -61,7 +61,7 @@ describe('fast lane — the fast slot is ADDED ON TOP of the heavy cap (operator
     const lockRoot = tempRoot();
     holdSlot(lockRoot, 2, 'lane-full-a', 'FULL', 0);
     holdSlot(lockRoot, 2, 'lane-full-b', 'FULL', 1);
-    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-full-c', kind: 'FULL', env: {}, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-full-c', kind: 'FULL', env: {}, canDefer: true, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
     expect(r).toMatchObject({ ok: false, ceilingHit: true });
   });
 
@@ -70,14 +70,14 @@ describe('fast lane — the fast slot is ADDED ON TOP of the heavy cap (operator
     holdSlot(lockRoot, 2, 'lane-full-a', 'FULL', 0);
     holdSlot(lockRoot, 2, 'lane-full-b', 'FULL', 1);
     markWaiting({ lockRoot, owner: 'lane-full-waiting', lane: '5', pid: process.pid, kind: 'FULL', nowIso: iso(T0 - 60_000) });
-    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-fixer-check', kind: 'standards', env: {}, ceilingMs: 60_000, log: () => {}, ...fakeTime() });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-fixer-check', kind: 'standards', env: {}, canDefer: true, ceilingMs: 60_000, log: () => {}, ...fakeTime() });
     expect(r).toMatchObject({ ok: true, slot: 2, waitedMs: 0 });
   });
 
   it('when the fast slot is busy, a short job may take a free heavy slot', async () => {
     const lockRoot = tempRoot();
     holdSlot(lockRoot, 2, 'lane-short-busy', 'selected', 2);
-    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-fixer-check', kind: 'files', env: {}, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-fixer-check', kind: 'files', env: {}, canDefer: true, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
     expect(r).toMatchObject({ ok: true, slot: 0 });
   });
 
@@ -87,7 +87,7 @@ describe('fast lane — the fast slot is ADDED ON TOP of the heavy cap (operator
     markWaiting({ lockRoot, owner: 'lane-full-waiting', lane: '5', pid: process.pid, kind: 'FULL', nowIso: iso(T0 - 60_000) });
     const clock = fakeTime({ onSleep: (n) => { if (n === 1) releaseOwnedSlot({ lockRoot, cap: 1, owner: 'lane-full-running' }); } });
     const r = await acquireSlotBlocking({
-      lockRoot, cap: 1, owner: 'lane-fixer-check', kind: 'standards', env: { WE_HEAVY_ADMISSION_FAST_SLOTS: '0' }, ceilingMs: 60_000, log: () => {}, ...clock,
+      lockRoot, cap: 1, owner: 'lane-fixer-check', kind: 'standards', env: { WE_HEAVY_ADMISSION_FAST_SLOTS: '0', LANE_POOL_ROOT: '/private-test-pool' }, canDefer: true, ceilingMs: 60_000, log: () => {}, ...clock,
     });
     expect(r).toMatchObject({ ok: true, slot: 0 });
     expect(clock.polls()).toBe(1);
@@ -96,14 +96,14 @@ describe('fast lane — the fast slot is ADDED ON TOP of the heavy cap (operator
   it('first-come-first-served still holds INSIDE the fast lane: an older short waiter goes first', async () => {
     const lockRoot = tempRoot();
     markWaiting({ lockRoot, owner: 'lane-older-short', lane: '7', pid: process.pid, kind: 'selected', nowIso: iso(T0 - 60_000) });
-    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'lane-newer-short', kind: 'files', env: {}, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 1, owner: 'lane-newer-short', kind: 'files', env: {}, canDefer: true, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
     expect(r).toMatchObject({ ok: false, ceilingHit: true });
   });
 
   it('a full-suite waiter still ranks first-come-first-served among full suites', async () => {
     const lockRoot = tempRoot();
     markWaiting({ lockRoot, owner: 'lane-older-full', lane: '7', pid: process.pid, kind: 'FULL', nowIso: iso(T0 - 60_000) });
-    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-newer-full', kind: 'FULL', env: {}, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
+    const r = await acquireSlotBlocking({ lockRoot, cap: 2, owner: 'lane-newer-full', kind: 'FULL', env: {}, canDefer: true, ceilingMs: 10_000, log: () => {}, ...fakeTime() });
     expect(r).toMatchObject({ ok: false, ceilingHit: true });
   });
 });
