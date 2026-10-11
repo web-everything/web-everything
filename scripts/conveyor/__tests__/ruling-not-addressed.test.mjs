@@ -104,3 +104,126 @@ describe('ruling not addressed — what the fixer receives', () => {
     expect(exec).toHaveBeenCalledTimes(2);
   });
 });
+
+// ── An operator ruling WITH A DIRECTION on the blocked-findings round cap (live: PR #4631 @f0f4943fb, 2026-10-10). Every
+// open finding on the head was ruled `block` by the operator with one direction ("only the drain's own machine park
+// marker counts; no inference from timing or events"), but the head had spent its rounds (6/5): the cap answered
+// "a person must take it over" and nothing could act on the direction. The ruling now buys ONE directed takeover.
+describe('operator ruling with a direction on the blocked-findings round cap (#4631 shape)', async () => {
+  const { buildOperatorRulingComment } = await import('../../lib/jury-core.mjs');
+  const { takeoverMarkerBody, takeoverVoidMarkerBody } = await import('../fix-takeover.mjs');
+  const { withPlannedContext } = await import('../reconcile-fix-dispatch.mjs');
+  const { loadFixerLadder } = await import('../fixer-ladder.mjs');
+  const { resolveOperatorRulingExtraRounds } = await import('../reconcile-core.mjs');
+  const { loadOperatorRulingExtraRounds } = await import('../reconcile-pass.mjs');
+  const DIRECTION = 'operator 2026-10-10 ~11:55 ET: Ok — keep block WITH DIRECTION: carry-forward may lift a review:human hold ONLY when that hold carries the drain\'s own machine park marker (positive proof it was mechanical); any hold without that marker (incl. an operator\'s deliberate re-hold) is never removed. No inference from timing or event counts.';
+  const ladder = loadFixerLadder({ override: null });
+  const recA = record({ head: H4, runId: 'run-4', file: 'scripts/review-set-label.mjs', summary: 'An identical diff can erase a deliberately re-added human hold because carry-forward never proves that the hold was mechanical' });
+  const recB = record({ head: H4, runId: 'run-4:referral-chunk:2', file: 'scripts/lib/accept-carry-forward.mjs', summary: 'Timing and event counts can misidentify an operator deliberate hold as the drain mechanical park' });
+  const blocked = [recA, recB].map((r) => ({ key: r.referrals[0].key, findingId: null, finding: { file: r.referrals[0].original.file, line: 12, summary: r.referrals[0].original.summary } }));
+  const rulingOn = (rec, { min = 80, head = H4, login = 'chalbert', actor = 'chalbert', reason = DIRECTION } = {}) => {
+    const r = { version: 1, repo, pr: 3794, head, rulings: [{ runId: rec.runId, key: rec.referrals[0].key, result: 'block' }], actor, channel: 'claude-code-chat', reason, at: iso(min), clearerId: 'sess' };
+    return { body: buildOperatorRulingComment(r), createdAt: iso(min), author: { login } };
+  };
+  const marker = (min, head = H4) => trusted(takeoverMarkerBody({ pr: 3794, head, attempts: 6, cap: 5, rung: { id: 'stronger-model' }, n: 1, budget: 1 }), min);
+  const base = [recordComment(recA, 60), recordComment(recB, 61)];
+  const planAt = (comments, extra = {}, prExtra = {}) => planReconcile({ repo: 'we', agents: [], now: Date.parse('2026-10-04T12:00:00Z'), requiredChecks: ['test'],
+    fixerLadder: ladder, durableCounts: { 3794: 6 }, prs: [{ ...basePr(H4, comments), blockRuledReferrals: blocked, ...prExtra }], ...extra });
+
+  it('before: with no operator ruling, the blocked-findings cap asks a person (cap-exhausted)', () => {
+    const p = planAt(base);
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+  });
+
+  it('after: the operator ruling grants ONE directed takeover on the stronger rung, its brief carrying the ruling verbatim', () => {
+    const p = planAt([...base, rulingOn(recA, { min: 80 }), rulingOn(recB, { min: 81 })]);
+    expect(p.refusals.map((r) => r.kind)).not.toContain('cap-exhausted');
+    expect(p.dispatch.map((d) => [d.kind, d.mode])).toEqual([['fix', 'takeover']]);
+    const d = p.dispatch[0];
+    expect(d.takeover).toMatchObject({ attempts: 6, cap: 5, n: 1, budget: 1, rung: { id: 'stronger-model' }, route: { provider: 'claude' } });
+    expect(d.operatorRulingRound).toMatchObject({ head: H4, used: 0, allowance: 1, setting: 'fix.operatorRulingExtraRounds', source: 'standard' });
+    expect(d.why).toMatch(/fix\.operatorRulingExtraRounds=1 \(source: standard\)/);
+    const brief = withPlannedContext('BRIEF', d);
+    expect(brief).toContain(DIRECTION); // verbatim, once (the same direction on both rulings)
+    expect(brief.split(DIRECTION).length).toBe(2);
+    expect(brief).toContain('scripts/review-set-label.mjs');
+    expect(brief).toContain('scripts/lib/accept-carry-forward.mjs');
+    expect(brief.endsWith('BRIEF')).toBe(true);
+  });
+
+  it('only when EVERY blocked finding is covered by an operator ruling on this head', () => {
+    expect(planAt([...base, rulingOn(recA)]).refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+    expect(planAt([...base, rulingOn(recA, { head: H3 }), rulingOn(recB, { head: H3 })]).refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+  });
+
+  it('a forged ruling (not the operator\'s login) or an auto-policy block grants nothing', () => {
+    expect(planAt([...base, rulingOn(recA, { login: 'stranger' }), rulingOn(recB, { login: 'stranger' })]).dispatch).toEqual([]);
+    const auto = [rulingOn(recA, { actor: 'auto-policy', login: 'web-everything' }), rulingOn(recB, { actor: 'auto-policy', login: 'web-everything' })];
+    expect(planAt([...base, ...auto]).dispatch).toEqual([]);
+  });
+
+  it('no loop: once the directed takeover started on this head, the same ruling grants nothing more', () => {
+    const ruled = [...base, rulingOn(recA, { min: 80 }), rulingOn(recB, { min: 81 })];
+    const p = planAt([...ruled, marker(90)]);
+    expect(p.dispatch.some((d) => d.operatorRulingRound)).toBe(false);
+    expect(p.refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+    // A takeover whose launch provably never started (void marker) did not spend the round.
+    expect(planAt([...ruled, marker(90), trusted(takeoverVoidMarkerBody({ pr: 3794, head: H4 }), 95)]).dispatch.map((d) => d.mode)).toEqual(['takeover']);
+    // A NEW ruling after the spent round is a new ruling: it grants its own round.
+    expect(planAt([...ruled, marker(90), rulingOn(recA, { min: 100 }), rulingOn(recB, { min: 101 })]).dispatch.map((d) => d.mode)).toEqual(['takeover']);
+  });
+
+  it('a new head with the findings still blocked goes back to the operator (the ruling bound the old head)', () => {
+    const p = planReconcile({ repo: 'we', agents: [], now: Date.parse('2026-10-04T12:00:00Z'), requiredChecks: ['test'], fixerLadder: ladder, durableCounts: { 3794: 7 },
+      prs: [{ ...basePr('e'.repeat(40), [...base, rulingOn(recA), rulingOn(recB), marker(90)]), blockRuledReferrals: blocked }] });
+    expect(p.dispatch).toEqual([]);
+    expect(p.refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+  });
+
+  it('below the cap the ordinary block-ruled fix runs (the grant is only past the cap)', () => {
+    const p = planAt([...base, rulingOn(recA), rulingOn(recB)], {}, {});
+    const under = planReconcile({ repo: 'we', agents: [], now: Date.parse('2026-10-04T12:00:00Z'), requiredChecks: ['test'], fixerLadder: ladder, durableCounts: { 3794: 2 },
+      prs: [{ ...basePr(H4, [...base, rulingOn(recA), rulingOn(recB)]), blockRuledReferrals: blocked }] });
+    expect(p.dispatch[0].mode).toBe('takeover');
+    expect(under.dispatch.map((d) => d.mode)).toEqual(['block-ruled-referral']);
+  });
+
+  it('the allowance is a setting: 0 grants nothing; 2 grants a second round on the same ruling', () => {
+    const ruled = [...base, rulingOn(recA), rulingOn(recB)];
+    expect(planAt(ruled, { operatorRulingExtraRounds: { value: 0, source: 'env' } }).refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+    const two = planAt([...ruled, marker(90)], { operatorRulingExtraRounds: { value: 2, source: 'platform' } });
+    expect(two.dispatch.map((d) => d.mode)).toEqual(['takeover']);
+    expect(two.dispatch[0].operatorRulingRound).toMatchObject({ used: 1, allowance: 2, source: 'platform' });
+    expect(two.dispatch[0].takeover).toMatchObject({ n: 2, budget: 2 });
+  });
+
+  it('fix.operatorRulingExtraRounds resolves standard → platform → tool (fix.json) → env', () => {
+    expect(resolveOperatorRulingExtraRounds({})).toEqual({ value: 1, source: 'standard' });
+    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { operatorRulingExtraRounds: 0 } } })).toEqual({ value: 0, source: 'platform' });
+    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { operatorRulingExtraRounds: 0 } }, repo: { operatorRulingExtraRounds: 3 } })).toEqual({ value: 3, source: 'repo' });
+    expect(resolveOperatorRulingExtraRounds({ repo: { operatorRulingExtraRounds: 3 }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: '2' } })).toEqual({ value: 2, source: 'env' });
+    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { operatorRulingExtraRounds: -1 } }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: 'x' } })).toEqual({ value: 1, source: 'standard' });
+    // The IO shell reads the platform preference and the tool override files.
+    const files = { platform: { fix: { operatorRulingExtraRounds: 2 } } };
+    const read = (f) => JSON.stringify(/delivery-platform-preferences/.test(f) ? files.platform : {});
+    expect(loadOperatorRulingExtraRounds({ env: {}, read })).toEqual({ value: 2, source: 'platform' });
+  });
+
+  it('is wired through the real reconcile pass, which logs the setting\'s layer', () => {
+    // One trusted re-arm = one spent round; WE_REVIEW_ROUND_CAP=1 puts the head at the cap (1/1).
+    const pr = { ...basePr(H4, [trusted('🔧 conveyor fix — re-armed for re-review', 50), ...base, rulingOn(recA), rulingOn(recB)]) };
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const out = runReconcilePass({ repo, now: Date.parse('2026-10-04T12:00:00Z'), readPrs: () => [pr], readAgents: () => [], enrich: (x) => x,
+        enrichMainRed: (prs) => ({ prs }), enrichAlreadyLanded: (x) => x, enrichBaseRef: (x) => x, enrichSystemFix: (x) => x,
+        enrichFixClaims: (x) => x, enrichTimeouts: (x) => x, enrichReferralHolds: (prs) => prs.map((p) => ({ ...p, blockRuledReferrals: blocked, referralHold: null })),
+        enrichMechanicalRound: (x) => x, loadOperatorRulingRounds: () => ({ value: 1, source: 'env' }),
+        resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), env: { WE_REVIEW_ROUND_CAP: '1' } });
+      const d = out.dispatch.find((x) => x.operatorRulingRound);
+      expect(d).toBeTruthy();
+      expect(d.operatorRulingRound.source).toBe('env');
+      expect(log.mock.calls.flat().join('\n')).toMatch(/operator-ruling-round: fix\.operatorRulingExtraRounds=1 \(source: env\)/);
+    } finally { log.mockRestore(); }
+  });
+});
