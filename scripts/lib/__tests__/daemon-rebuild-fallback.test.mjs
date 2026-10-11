@@ -22,7 +22,7 @@ import {
   rebuildClone, readRebuildState, candidateSmokeEnv, rebuildStatePath,
   candidateWorktreePath, failsSameChecks, DISPATCH_CWD_ROOT_ENV,
 } from '../daemon-rebuild.mjs';
-import { budgetedRunChild } from '../daemon-rebuild/smoke.mjs';
+import { budgetedRunChild, smokeFailureFiles, attributeSmokeFailure } from '../daemon-rebuild/smoke.mjs';
 import { addOverlay, readOverlays, removeOverlay } from '../daemon-overlays.mjs';
 import { defaultPoolRoot } from '../lane-pool-paths.mjs';
 import { DISPATCH_CWD_ENV } from '../../operations/dispatch-lane-io.mjs';
@@ -214,7 +214,76 @@ describe('rebuildClone passes candidateSmokeEnv to runSmoke', () => {
 
 // ── c. plain-main fallback (a bad NON-pinned overlay) ───────────────────────────────────────────────────────
 
+describe('smokeFailureFiles', () => {
+  it('strips the candidate prefix and sorts unique URL and bare paths', () => {
+    expect(smokeFailureFiles([
+      { detail: 'exited 1: file:///tmp/work/scripts/z.mjs:20:3 /tmp/work/a.ts:4' },
+      { detail: '/tmp/work/scripts/z.mjs:20 /elsewhere/no.js:1 file:///tmp/work/bin/check:8' },
+    ], { candidatePath: '/tmp/work' })).toEqual(['a.ts', 'bin/check', 'scripts/z.mjs']);
+  });
+
+  it('recognizes a generic candidate directory', () => {
+    expect(smokeFailureFiles([{ detail: 'file:///Users/x/state/hash.candidate-20492-abc/scripts/a.cjs:20' }],
+      { candidatePath: '/different' })).toEqual(['scripts/a.cjs']);
+  });
+
+  it('resolves requested relative modules beside the importer', () => {
+    expect(smokeFailureFiles([{ detail: "file:///tmp/work/scripts/conveyor/review.mjs:20 The requested module '../takeover-budget.mjs' does not provide an export" }],
+      { candidatePath: '/tmp/work' })).toEqual(['scripts/conveyor/review.mjs', 'scripts/takeover-budget.mjs']);
+  });
+
+  it('ignores truncated paths and modules without an importer', () => {
+    expect(smokeFailureFiles([{ detail: "file:///tmp/work/scripts/a.mjs: /tmp/work/b.json The requested module './c.js'" }],
+      { candidatePath: '/tmp/work' })).toEqual([]);
+  });
+});
+
+describe('attributeSmokeFailure', () => {
+  it('matches changed files and reports unreadable diffs', () => {
+    const git = vi.fn((args) => {
+      if (args[0] === 'merge-base') return { status: 0, stdout: 'base\n' };
+      if (args.at(-1) === 'unknown') return { status: 1 };
+      return { status: 0, stdout: 'scripts/bad.mjs\ngood.txt\n' };
+    });
+    expect(attributeSmokeFailure({ git, files: ['scripts/bad.mjs'], overlays: [
+      { ref: 'lane/bad', pr: 1, sha: 'bad' }, { ref: 'lane/unknown', pr: 2, sha: 'unknown' },
+    ] })).toEqual({
+      culprits: [{ ref: 'lane/bad', pr: 1, sha: 'bad', matched: ['scripts/bad.mjs'] }],
+      unknown: ['lane/unknown'],
+    });
+    expect(git).toHaveBeenCalledWith(['diff', '--name-only', 'base', 'bad']);
+  });
+});
+
 describe('smokeAndAdopt fallback-plain-main (x5wbsbc)', () => {
+  it.each([true, false])('two overlays: attributable=%s preserves only proven-good overlays', async (attributable) => {
+    const { originDir, cloneDir, env } = makeFixture();
+    const mainSha = advanceMain(originDir, (dir) => writeFile(dir, 'main-moved.txt', 'main'));
+    const good = pushBranch(originDir, 'lane/good', (dir) => writeFile(dir, 'good.txt', 'good'));
+    const bad = pushBranch(originDir, 'lane/bad', (dir) => writeFile(dir, 'scripts/conveyor/bad.mjs', 'bad'));
+    addOverlay(cloneDir, { ref: 'lane/good' }, { env });
+    addOverlay(cloneDir, { ref: 'lane/bad' }, { env });
+    const runSmoke = vi.fn(async ({ root }) => failsWhenFile('scripts/conveyor/bad.mjs', {
+      verdict: 'code', attempts: 1, smoke: { results: [{
+        ok: false, name: 'x', mayBeTransient: false,
+        detail: attributable ? `exited 1: file://${root}/scripts/conveyor/bad.mjs:20` : 'boom',
+      }] },
+    })({ root }));
+    const result = await rebuildClone({
+      root: cloneDir, env, runSmoke, prState: async () => null, lockOpts: LOCK_OPTS,
+    });
+    expect(result.reason).toBe(attributable ? 'overlay-set-aside' : 'fallback-plain-main');
+    expect(result.adopted).toBe(true);
+    expect(git(cloneDir, ['merge-base', '--is-ancestor', good, 'HEAD']).status).toBe(attributable ? 0 : 1);
+    expect(git(cloneDir, ['merge-base', '--is-ancestor', bad, 'HEAD']).status).toBe(1);
+    expect(readOverlays(cloneDir, { env }).map((o) => o.ref)).toEqual(attributable ? ['lane/good'] : []);
+    expect(result.alerts.filter((a) => a.kind === 'overlay-dropped-smoke-failed').map((a) => a.detail.ref).sort())
+      .toEqual(attributable ? ['lane/bad'] : ['lane/bad', 'lane/good']);
+    expect(result.alerts.some((a) => a.kind === 'overlay-set-aside-attributed')).toBe(attributable);
+    if (!attributable) expect(gitOk(cloneDir, ['rev-parse', 'HEAD']).trim()).toBe(mainSha);
+    expect(runSmoke).toHaveBeenCalledTimes(2);
+  });
+
   it('a bad NON-pinned overlay: falls back to plain main, adopts it, drops the overlay, alerts both kinds', async () => {
     const { originDir, cloneDir, env } = makeFixture();
     const prevHead = gitOk(cloneDir, ['rev-parse', 'HEAD']).trim();
