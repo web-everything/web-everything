@@ -6,9 +6,14 @@
  *
  * THE RULE (pure, {@link planWrongBranchHeal}): heal ONLY when the clone sits on a branch named in the
  * `wrongBranchHeal.branches` setting AND every tracked change is under a `wrongBranchHeal.pathPrefixes` prefix
- * (store files). Anything else — an unknown branch, a detached HEAD, a change outside the store paths, no local
+ * (store files). Anything else — an unknown branch, a change outside the store paths, no local
  * `main` — still refuses, exactly as before. Untracked files are never touched (a checkout that would overwrite
  * one fails, and the heal refuses).
+ *
+ * DETACHED CASE (live 2026-10-11 ~17:50 ET): the drain daemon was detached at local main's exact commit,
+ * blocking rebuilds and overlay loads. Reattach only when verified HEAD equals verified local main and
+ * readable status shows zero tracked changes. This changes no files and needs no saved ref; unreadable
+ * HEAD, a different commit, or any tracked change still refuses.
  *
  * THE HEAL ({@link healWrongBranch}): save the tracked changes as a commit under a named ref
  * (`refs/we/wrong-branch-heal/<ts>`, via `stash create`, so nothing is lost), drop them from the tree, and switch
@@ -39,11 +44,18 @@ export function resolveWrongBranchHealSettings({ path = daemonRebuildSettingsPat
 
 /**
  * Pure: may this clone state be healed back to main?
- * @param {{branch: string|null, changedPaths: string[]|null, hasMain: boolean, settings: {branches: string[], pathPrefixes: string[]}}} o
+ * @param {{branch: string|null, headSha?: string|null, mainSha?: string|null, changedPaths: string[]|null, hasMain: boolean, settings: {branches: string[], pathPrefixes: string[]}}} o
  * @returns {{heal: true} | {heal: false, reason: string, detail?: object}}
  */
-export function planWrongBranchHeal({ branch, changedPaths, hasMain, settings }) {
-  if (!branch) return { heal: false, reason: 'detached-or-unreadable-head' };
+export function planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings }) {
+  if (!branch) {
+    if (!headSha) return { heal: false, reason: 'detached-or-unreadable-head' };
+    if (!hasMain || !mainSha) return { heal: false, reason: 'no-local-main' };
+    if (headSha !== mainSha) return { heal: false, reason: 'detached-off-main' };
+    if (changedPaths === null) return { heal: false, reason: 'status-unreadable' };
+    if (changedPaths.length) return { heal: false, reason: 'detached-with-changes' };
+    return { heal: true };
+  }
   if (branch === 'main') return { heal: false, reason: 'already-on-main' };
   if (!settings.branches.includes(branch)) return { heal: false, reason: 'branch-not-allowlisted', detail: { branch } };
   if (!hasMain) return { heal: false, reason: 'no-local-main' };
@@ -75,10 +87,14 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
   const out = (r) => String(r?.stdout ?? '').trim();
   const head = git(['symbolic-ref', '--short', 'HEAD']);
   const branch = head.status === 0 ? out(head) : null;
-  const hasMain = git(['rev-parse', '--verify', '--quiet', 'refs/heads/main']).status === 0;
+  const main = git(['rev-parse', '--verify', '--quiet', 'refs/heads/main']);
+  const hasMain = main.status === 0;
+  const mainSha = hasMain ? out(main) : null;
+  const detachedHead = !branch ? git(['rev-parse', '--verify', '--quiet', 'HEAD']) : null;
+  const headSha = detachedHead?.status === 0 ? out(detachedHead) : null;
   const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   const changedPaths = st.status === 0 ? parseTrackedChanges(st.stdout) : null;
-  const plan = planWrongBranchHeal({ branch, changedPaths, hasMain, settings });
+  const plan = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings });
   if (!plan.heal) return { healed: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) };
 
   let savedRef = null;
@@ -96,5 +112,5 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
   // NOT forced: an untracked file the switch would overwrite makes it fail, and we refuse instead of clobbering.
   const sw = git(['checkout', '--quiet', 'main']);
   if (sw.status !== 0) return { healed: false, reason: 'switch-failed', detail: { savedRef, stderr: String(sw.stderr ?? '').slice(0, 300) } };
-  return { healed: true, from: branch, savedRef };
+  return { healed: true, from: branch || `(detached at ${headSha.slice(0, 9)})`, savedRef };
 }
