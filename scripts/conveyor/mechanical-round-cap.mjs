@@ -106,26 +106,35 @@ export function verdictKind(c) {
   return 'accept';
 }
 
-const REVIEWED_MARKER_RE = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->`, 'gi');
-// Line-anchored like we:scripts/lib/advisory-labels.mjs: a finding that QUOTES a `Net basis:` line mid-line is prose.
-const NET_BASIS_RE = /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`/gim;
+// Both formats must fill a whole line at column 0, as the producers write them (we:scripts/lib/review-escalation.mjs
+// #buildReviewedShaMarker, the review-pr `Net basis:` line): a marker mid-line, indented or after `>` is a quote.
+const REVIEWED_MARKER_LINE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->\\s*$`, 'i');
+const NET_BASIS_LINE = /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`/i;
+const FENCE_LINE = /^\s*(`{3,}|~{3,})(.*)$/;
 
 /**
- * The commits a trusted verdict comment says it JUDGED: its LAST structured `reviewed-sha` marker and its LAST
- * line-anchored `Net basis: <base>..<head>` head (7-40 hex, lower-cased) — the producers append both as the footer, so
- * a quoted earlier one (findings quote PR-author text) never wins. A sha merely mentioned in prose ("compared against
- * <sha>") is NOT a reviewed commit and is never returned. Pure.
+ * The commit a trusted verdict comment says it JUDGED: the head of its LAST structured footer line, of either format
+ * (`<!-- reviewed-sha: <sha> -->` or `Net basis: <base>..<head>`, 7-40 hex, lower-cased) — the producers append it as
+ * the footer, so a quoted earlier one never wins. One head, never one per format: a quoted `Net basis` naming the
+ * parent must not ride along with a real `reviewed-sha` footer for another commit. Quoted text never counts — fenced
+ * code (an unclosed fence runs to the end, so it fails closed), a blockquote, an indented or mid-line marker, or a
+ * line joined by U+2028 (only `\n` ends a line). A sha merely mentioned in prose is never returned. Pure.
+ * @returns {string[]} zero or one head
  */
 export function reviewedHeadsOf(c) {
-  const body = bodyOf(c);
-  const out = [];
-  for (const re of [REVIEWED_MARKER_RE, NET_BASIS_RE]) {
-    re.lastIndex = 0;
-    let m; let last = null;
-    while ((m = re.exec(body)) !== null) last = m[1].toLowerCase();
-    if (last) out.push(last);
+  let fence = null; let last = null;
+  for (const raw of bodyOf(c).split('\n')) {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    const f = FENCE_LINE.exec(line);
+    if (fence) {
+      if (f && f[1][0] === fence[0] && f[1].length >= fence.length && !f[2].trim()) fence = null;
+      continue;
+    }
+    if (f) { fence = f[1]; continue; }
+    const m = REVIEWED_MARKER_LINE.exec(line) ?? NET_BASIS_LINE.exec(line);
+    if (m) last = m[1].toLowerCase();
   }
-  return out;
+  return last ? [last] : [];
 }
 
 /** Did this verdict judge `sha` (a full 40-hex head)? Matches a full or abbreviated structured sha, never prose. */

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   mechanicalRoundGrant, resolveMechanicalRoundsSetting, isReviewVerdictComment, isMechanicalBounce,
-  MECHANICAL_BOUNCE_PHRASE, readMechanicalRoundFacts, hasPendingMechanicalRound,
+  MECHANICAL_BOUNCE_PHRASE, readMechanicalRoundFacts, hasPendingMechanicalRound, reviewedHeadsOf,
 } from '../mechanical-round-cap.mjs';
 import { RECONCILE_FINDING_BANNER } from '../reconcile-finding.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
@@ -140,6 +140,32 @@ describe('mechanical round vs the review round cap', () => {
       const lineStart = { author: BOT, createdAt: at(6),
         body: `🔁 review — changes requested\n\nNet basis: \`${'0'.repeat(40)}..${PRIOR}\`\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
       expect(grant(lineStart)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+    });
+    // Red team on 471b1003b: each format's last match counted on its own, so a quoted `Net basis` naming the parent
+    // beat an accept whose real footer was a `reviewed-sha` for another commit. One footer per verdict, quotes never count.
+    it('a quoted marker in either format never makes the parent reviewed, whatever the real footer format', () => {
+      const z = '0'.repeat(40);
+      const bodies = [
+        `✅ review — accepted\n\nHistorical example:\n\`\`\`\nNet basis: \`${z}..${PRIOR}\`\n\`\`\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `✅ review — accepted\n\n~~~~text\n<!-- reviewed-sha: ${PRIOR} -->\n~~~~\n\nNet basis: \`${z}..${OTHER}\``,
+        `✅ review — accepted\n\nNet basis: \`${z}..${PRIOR}\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `🔁 review — changes requested\n\n<!-- reviewed-sha: ${PRIOR} -->\n\nNet basis: \`${z}..${OTHER}\``,
+        `✅ review — accepted\n\n> <!-- reviewed-sha: ${PRIOR} -->\n> Net basis: \`${z}..${PRIOR}\``,
+        `✅ review — accepted\n\nthe footer \`<!-- reviewed-sha: ${PRIOR} -->\` was stale`,
+        `✅ review — accepted\n\n    <!-- reviewed-sha: ${PRIOR} -->`,
+        `✅ review — accepted\n\nquoted Net basis: \`${z}..${PRIOR}\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `✅ review — accepted\n\n\`\`\`\nunclosed fence\n<!-- reviewed-sha: ${PRIOR} -->`,
+      ];
+      for (const body of bodies) {
+        expect(reviewedHeadsOf(body).includes(PRIOR), body).toBe(false);
+        expect(grant({ author: BOT, createdAt: at(6), body }), body).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+      }
+    });
+    it('a verdict whose real footer names the parent still counts when a quoted marker names another commit', () => {
+      const z = '0'.repeat(40);
+      const body = `✅ review — accepted\n\n\`\`\`\nNet basis: \`${z}..${OTHER}\`\n\`\`\`\n\nNet basis: \`${z}..${PRIOR}\`\n<!-- reviewed-sha: ${PRIOR} -->`;
+      expect(reviewedHeadsOf(body)).toEqual([PRIOR]);
+      expect(grant({ author: BOT, createdAt: at(6), body })).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
     });
     it('a verdict naming the CURRENT head by an abbreviated structured sha (before the round marker) is head-already-reviewed', () => {
       const v = { author: BOT, createdAt: at(6), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${HEAD.slice(0, 12)} -->` };
