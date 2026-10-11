@@ -791,15 +791,35 @@ function bodyHasExactLine(body, line) {
   return body.split('\n').some((l) => l === line);
 }
 
+/** Free text (git/rebase stderr, a refresh error) embedded in a marker body: collapsed to ONE line so it can never
+ *  start a `main-state:` / `main-green-sha:` line of its own, and the claim-refusal phrase is defanged so a failure
+ *  that merely quotes it cannot read as a (free) claim-held marker. The sweeps never post a claim-held marker
+ *  (they defer instead), so no new marker legitimately carries the phrase. */
+function markerFreeText(text) {
+  return String(text).replace(/\s+/g, ' ').replace(/holds the fix claim/gi, 'holds the fix-claim').trim();
+}
+
+/** The structured part of a marker: every line before the outcome line (`conveyor …`), which is where the
+ *  free text lives. A trailer-shaped line anywhere after it is never read. */
+function markerHeader(body) {
+  const lines = body.split('\n');
+  const end = lines.findIndex((l) => l.startsWith('conveyor '));
+  return (end < 0 ? lines : lines.slice(0, end)).join('\n');
+}
+
 // 2026-10-10 live: #4784 claim-held refusals burned the cap.
-function recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen) {
+// `refundRed` is true only for the rebase counter: a rebase onto main waits for main to go green, so an attempt made
+// while main was red is not an attempt. Missing-run recovery does not depend on main's state (PR #4825 round 3), so
+// its counter never refunds on red — only once main has since moved to a NEW green sha (a bounded fresh budget).
+function recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen, { refundRed = true } = {}) {
   if (body.includes('holds the fix claim')) return true;
-  const state = body.match(/^main-state: (.*)$/m);
-  if (state?.[1] === 'red') return true;
+  const header = markerHeader(body);
+  const state = header.match(/^main-state: (.*)$/m);
+  if (refundRed && state?.[1] === 'red') return true;
   const at = Date.parse(c?.createdAt);
-  if (!state && isWithinRedWindow(at, mainRedWindows)) return true;
+  if (refundRed && !state && isWithinRedWindow(at, mainRedWindows)) return true;
   if (mainGreen && !mainGreen.red && mainGreen.sha) {
-    const sha = body.match(/^main-green-sha: (.*)$/m);
+    const sha = header.match(/^main-green-sha: (.*)$/m);
     if (sha && sha[1] !== mainGreen.sha) return true;
     if (!sha && Number.isFinite(at) && at < Date.parse(mainGreen.at)) return true;
   }
@@ -847,7 +867,7 @@ export function buildRebaseOntoMainComment({
     ? (action === 'current'
       ? "found this branch's head already current with main's tip — nothing to do."
       : "refreshed this branch onto main's current tip.")
-    : `attempted to refresh this branch onto main and it FAILED: ${error ?? '(no error text captured)'} — this attempt still counts toward the retry cap so a persistently-failing refresh cannot retry forever; once capped, this is left for a ci-heal agent to investigate instead.`;
+    : `attempted to refresh this branch onto main and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a persistently-failing refresh cannot retry forever; once capped, this is left for a ci-heal agent to investigate instead.`;
   return [
     REBASE_ONTO_MAIN_COMMENT_MARKER,
     '',
@@ -1375,7 +1395,7 @@ export function countMissingRunComments(comments, headSha = null, { baseRefName 
       && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}?, head repo `)
       && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${baseRefName}, head repo `)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
-    if (recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen)) continue;
+    if (recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen, { refundRed: false })) continue;
     n += 1;
   }
   return n;
@@ -1394,11 +1414,11 @@ export function buildMissingRunComment({
 } = {}) {
   // Preserve refresh details when rendering historical attempts.
   const refreshNote = refresh
-    ? ` (refresh onto main first: ${refresh}${refreshError ? ` — ${refreshError}` : ''})`
+    ? ` (refresh onto main first: ${markerFreeText(refresh)}${refreshError ? ` — ${markerFreeText(refreshError)}` : ''})`
     : '';
   const outcome = ok
     ? `this head had no required-check run at all — requested CI via ${action}; PR checks must still be observed${refreshNote}.`
-    : `attempted to trigger CI (${action}${refreshNote}) and it FAILED: ${error ?? '(no error text captured)'} — this attempt still counts toward the retry cap so a persistently-failing trigger cannot retry forever; once capped, this is left for a human/ci-heal look instead.`;
+    : `attempted to trigger CI (${action}${refreshNote}) and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a persistently-failing trigger cannot retry forever; once capped, this is left for a human/ci-heal look instead.`;
   return [
     MISSING_RUN_COMMENT_MARKER,
     '',

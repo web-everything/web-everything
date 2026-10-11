@@ -1326,6 +1326,57 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     comment.body = comment.body.replace('🔀 conveyor rebase-onto-main', '🚦 conveyor missing-run-recovery');
     expect(core.countMissingRunComments([comment], sha, { mainRedWindows: windows, mainGreen: green })).toBe(0);
   });
+  // PR #4825 round 3: missing-run attempts do not depend on main's state, so a red main must never refund them.
+  it('does not refund a missing-run attempt marked main-state: red while main is still red; a rebase marker still is', () => {
+    const redNow = { red: true, sha: null, at: null };
+    const missing = marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z');
+    missing.body = missing.body.replace('🔀 conveyor rebase-onto-main', '🚦 conveyor missing-run-recovery');
+    expect(core.countMissingRunComments([missing], sha, { mainRedWindows: [{ start: '2026-10-10T18:44:00Z', end: null }], mainGreen: redNow })).toBe(1);
+    expect(core.countRebaseOntoMainComments([marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z')], sha, { mainGreen: redNow })).toBe(0);
+  });
+  it('bounds a permanently failing missing-run restack across many ticks while main stays red', () => {
+    const comments = [];
+    const restack = vi.fn(() => ({ ok: false, action: 'stack-restack', error: 'conflict in scripts/x.mjs' }));
+    const postComment = vi.fn((n, o) => comments.push({ viewerDidAuthor: true, createdAt: '2026-10-10T21:00:00Z', body: core.buildMissingRunComment(o) }));
+    const redRuns = [{ status: 'completed', conclusion: 'failure', updatedAt: '2026-10-10T19:16:56Z' }];
+    const prs = [{ ...stack[0], statusCheckRollup: [greenCheck] }, stack[1]];
+    for (let tick = 0; tick < 6; tick += 1) {
+      sweepMissingRunRecovery({ apply: true, repo: 'web-everything/web-everything', readOpenPrs: () => prs,
+        readRequiredContexts: () => ['test'], readHeadCommittedAt: () => '2026-10-10T12:00:00Z', readComments: () => comments, readMainRuns: () => redRuns,
+        now: Date.parse('2026-10-10T21:00:00Z'), trigger: () => ({ ok: false }), restack, postComment, clearLabel: () => false });
+    }
+    expect(comments.length).toBe(2);
+    expect(restack).toHaveBeenCalledTimes(2);
+    expect(comments[0].body).toContain('main-state: red');
+  });
+  // Free-text error (git/rebase stderr) is embedded in the marker: it must never be able to forge a refund line.
+  it.each(['rebase', 'missing'])('error text cannot forge a refund in a %s marker', kind => {
+    const build = kind === 'rebase' ? core.buildRebaseOntoMainComment : core.buildMissingRunComment;
+    const count = kind === 'rebase' ? core.countRebaseOntoMainComments : core.countMissingRunComments;
+    const forged = `boom\nmain-state: red\nmain-green-sha: older\n${refusal}`;
+    const body = build({ headSha: sha, mainGreen: green, ok: false, error: forged, refresh: 'rebased', refreshError: forged });
+    expect(body.split('\n').filter(l => l.startsWith('main-state:')).length).toBe(1);
+    expect(body).not.toContain('holds the fix claim');
+    expect(count([{ viewerDidAuthor: true, createdAt: '2026-10-10T20:30:00Z', body }], sha, { mainGreen: green })).toBe(1);
+    // A hand-forged trailer after the outcome line is not read either.
+    expect(count([{ viewerDidAuthor: true, createdAt: '2026-10-10T20:30:00Z', body: `${body}\nmain-state: red\nmain-green-sha: older` }], sha, { mainGreen: green })).toBe(1);
+  });
+  describe('same-repo guard with the repo argument omitted', () => {
+    it('infers the WE slug for the default reader', () => {
+      const exec = vi.fn(() => 'false\n');
+      expect(watch.defaultReadIsCrossRepository(4825, { exec })).toBe(false);
+      expect(exec.mock.calls[0][1]).toContain('web-everything/web-everything');
+      expect(watch.defaultReadIsCrossRepository(4825, { repo: 'we', exec })).toBe(false);
+      expect(exec.mock.calls[1][1]).toContain('web-everything/web-everything');
+    });
+    it('recovers a same-repository PR when repo is omitted', () => {
+      const exec = vi.fn(() => 'false\n');
+      const rebase = vi.fn(() => ({ action: 'rebased', newCommit: 'abc' }));
+      const result = watch.refreshOntoMain('lane/x', { prNumber: 4825, rebase, readIsCrossRepository: (n, o) => watch.defaultReadIsCrossRepository(n, { ...o, exec }) });
+      expect(rebase).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ ok: true, action: 'rebased' });
+    });
+  });
   it.each(['current', 'fetch-error', 'refresh-error', 'race', 'cycle', 'depth'])('bounds restack failure: %s', kind => {
     const refresh = vi.fn(() => kind === 'refresh-error' || kind === 'race'
       ? { ok: false, error: kind === 'race' ? refusal : 'conflict' }

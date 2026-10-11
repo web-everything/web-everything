@@ -861,9 +861,11 @@ function defaultFetchStackRef(ref, { root, run = gitRun }) {
  * @returns {boolean|null}
  */
 export function defaultReadIsCrossRepository(prNumber, { repo = null, exec = execFileSyncThrottled } = {}) {
-  if (!repo || !Number.isSafeInteger(prNumber)) return null;
+  if (!Number.isSafeInteger(prNumber)) return null;
+  // An omitted repo means WE itself (the same reading `sweepCiRedRecovery`'s `isWe` uses), never "cannot verify".
+  const slug = !repo ? CONSTELLATION_REPOS.we.slug : (CONSTELLATION_REPOS[repo]?.slug ?? repo);
   try {
-    const out = exec('gh', ['pr', 'view', String(prNumber), '--repo', repo, '--json', 'isCrossRepository', '--jq', '.isCrossRepository'], {
+    const out = exec('gh', ['pr', 'view', String(prNumber), '--repo', slug,'--json', 'isCrossRepository', '--jq', '.isCrossRepository'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
     });
     const v = String(out || '').trim();
