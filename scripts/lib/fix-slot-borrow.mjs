@@ -28,7 +28,8 @@ import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './di
 
 import { readSettings } from './settings-files.mjs';
 import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
-import { fixDispatchClaimRoot, fixDispatchResource } from '../conveyor/fix-dispatch-claim.mjs';
+// Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
+import { fixDispatchClaimRoot, fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
 
 const platformPreferences = () => {
   try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
