@@ -107,7 +107,7 @@ import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
-import { parseOperatorRulingComment, AUTO_POLICY_ACTOR } from '../lib/jury-core.mjs';
+import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
@@ -1560,22 +1560,51 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
   if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  const covering = [];
-  for (const c of comments) {
-    const record = parseOperatorRulingComment(c)?.record;
-    if (!record || record.head !== head || String(record.actor).toLowerCase() === AUTO_POLICY_ACTOR) continue;
-    for (const x of record.rulings) {
-      if (x.result === 'block') covering.push({ key: x.key, actor: record.actor, channel: record.channel, reason: record.reason, at: record.at, createdAt: c.createdAt ?? null });
-    }
-  }
-  if (!blocked.every((b) => covering.some((r) => r.key === b.key))) return { ok: false, reason: 'not-covered' };
-  const rulings = covering.filter((r) => blocked.some((b) => b.key === r.key));
+  const rulings = decidingOperatorBlocks(pr, head, blocked);
+  if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
   const rulingAtMs = Math.max(...rulings.map(stamp).filter(Number.isFinite));
   if (!Number.isFinite(rulingAtMs)) return { ok: false, reason: 'not-covered' };
   const used = takeoverMarkers(comments).filter((m) => sameHeadSha(m.head, head) && Date.parse(m.at ?? '') > rulingAtMs).length;
   if (used >= allowance) return { ok: false, reason: 'ruling-round-spent', used, allowance };
   return { ok: true, head, rulingAt: new Date(rulingAtMs).toISOString(), used, allowance, rulings };
+}
+
+/**
+ * PURE: the operator `block` ruling that DECIDES each blocked finding on `head`, in every review run that holds it, or
+ * null when any is not decided that way. Read with the same per-record state the acceptance gate uses
+ * ({@link referralRecordState}), so an operator ruling counts only while it is the latest operator word on that exact
+ * (head, run, finding): a later operator `not-real` withdraws it, and a block on run-4 never covers run-5's block of
+ * the same finding, which only the reviewer ruled (red-team break on head 26eff6d2a). A run that still holds the
+ * finding pending also answers null (fail closed). An `auto-policy` block is not the operator.
+ */
+function decidingOperatorBlocks(pr, head, blocked) {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const operatorRulings = [];
+  for (const c of comments) {
+    for (const r of readOperatorRulings([c], { head }).rulings) operatorRulings.push({ ...r, createdAt: c.createdAt ?? null });
+  }
+  const records = readReferralRecords(comments, { head }).records.filter((r) => r.head === head);
+  const context = { head, body: typeof pr?.body === 'string' ? pr.body : '', createdAt: pr?.createdAt, operatorRulings, records };
+  const states = new Map(records.map((r) => [r, referralRecordState(r, context)]));
+  const deciding = [];
+  for (const b of blocked) {
+    const runs = records.filter((r) => activeReferrals(r).some((f) => f.key === b.key));
+    let held = false;
+    for (const r of runs) {
+      const state = states.get(r);
+      if (state.pending.includes(b.key)) return null;
+      if (!state.blocked.includes(b.key)) continue;
+      const decided = state.rulings.filter((x) => x.key === b.key);
+      const op = decided.length === 1 ? decided[0] : null;
+      if (!op?.operator || op.result !== 'block' || op.head !== head || op.runId !== r.runId
+        || String(op.actor).toLowerCase() === AUTO_POLICY_ACTOR) return null;
+      deciding.push(op);
+      held = true;
+    }
+    if (!held) return null;
+  }
+  return deciding;
 }
 
 /** The operator's direction(s), verbatim, as the fix brief's operator-answer section reads them. */
