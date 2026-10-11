@@ -389,9 +389,10 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
       const [tree, ...conflicted] = out.split('\0');
       if (!SHA40.test(tree) || conflicted.some(Boolean)) return false;
       if (tree === commit.tree) return true;
-      const changed = git(['diff', '--no-ext-diff', '--name-only', '--no-renames', '-z', '--end-of-options', tree, commit.tree])
+      // Only the manifest's DELETION is the drain's: an added or edited manifest is content no parent brought.
+      const changed = git(['diff', '--no-ext-diff', '--name-status', '--no-renames', '-z', '--end-of-options', tree, commit.tree])
         .split('\0').filter(Boolean);
-      return changed.length > 0 && changed.every((path) => path === LANE_MANIFEST);
+      return changed.length === 2 && changed[0] === 'D' && changed[1] === LANE_MANIFEST;
     } catch { return false; } // merge-tree exits 1 on a conflict: not a clean merge
   };
   try {

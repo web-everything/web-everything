@@ -214,6 +214,8 @@ describe('mechanical re-arm rounds', () => {
         } else {
           if (variant === 'repair') merged[`scripts/fix-${i}.mjs`] = `export const fix = ${i};\n`;
           if (variant === 'revert-upstream') delete merged[`u${i}.txt`];
+          // Only the manifest's deletion is excused: content smuggled into it is still the PR's own.
+          if (variant === 'manifest-edit') merged[LANE_MANIFEST] = `{"fix":${i}}\n`;
           prev = commit(merged, [prev, upstream], 'Merge origin/main', date);
         }
         prFiles = merged;
@@ -224,7 +226,7 @@ describe('mechanical re-arm rounds', () => {
       const mergePr = { ...pr, number: 4914, headRefOid: prev, headRefName: 'lane/x', baseRefName: 'main', comments: cycles };
       return { mergePr, roundCommits: readRoundCommits({ pr: mergePr, exec }) };
     };
-    it.each([['repair', 6], ['revert-upstream', 6], ['clean', 0], ['drain', 0]])('a %s merge of origin/main counts %i spent rounds', (variant, real) => {
+    it.each([['repair', 6], ['revert-upstream', 6], ['manifest-edit', 6], ['clean', 0], ['drain', 0]])('a %s merge of origin/main counts %i spent rounds', (variant, real) => {
       const { mergePr, roundCommits } = build(variant);
       expect(roundCommits.commits.filter((c) => c.parents.length > 1).every((c) => c.mergesPrWork === (real > 0))).toBe(true);
       expect(countRealFixRounds({ ...mergePr, roundCommits })).toMatchObject({ ok: true, real, total: 6 });
