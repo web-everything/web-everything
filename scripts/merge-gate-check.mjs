@@ -46,6 +46,7 @@ import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
 import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
 import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
@@ -153,7 +154,7 @@ export function readLedgerConfig(read = readDeclaredSettings) {
 }
 
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
   const facts = { repo, num };
   // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
   // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. The ledger evidence
@@ -232,8 +233,9 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   else if (groupDuplicateIds && !Array.isArray(groupDuplicateIds)) facts.duplicateIds = { error: `group tree scan: ${groupDuplicateIds.error || 'unreadable'}` };
   else facts.duplicateIds = { main: mainDup, ...(groupDuplicateIds ? { group: groupDuplicateIds } : {}) };
 
-  // Red-main freeze: no shared source exists yet (the marker is local to the drain host) → evaluator fails closed.
-  facts.redMain = { source: null };
+  // Red-main freeze: the SHARED copy on the ops branch (xyd06qo), read once per run by the caller. Not passed, or
+  // unreadable → `{source:null}` / `{error}` → the evaluator fails closed.
+  facts.redMain = redMain ?? { source: null };
   // Enqueue clearance (drain-stamped) is not wired yet → manifest couples/blockedBy fail closed in the evaluator.
   facts.enqueueClearance = null;
   return facts;
@@ -303,6 +305,29 @@ export function groupHeadsOf(commits = []) {
 }
 
 /**
+ * The shared red-main freeze for this run (xyd06qo): read ONCE, from the run's checkout, off the branch the policy
+ * cascade names — the same knob the writer (`red-main-remediation.mjs`) publishes to. Never throws (unreadable is
+ * `{source, error}`, which the evaluator fails closed on).
+ */
+export function readRedMainFact({ cwd, policy, read = readSharedFreeze }) {
+  return read({ board: cwd, branch: policy.redMainFreezeBranch });
+}
+
+/**
+ * The freeze RE-READ right before the verdict (PR 4715 review): fact-gathering between the first read and the verdict
+ * is slow and untimed, so a freeze published meanwhile must still hold this run. A PASS survives only when the second
+ * read is readable, not frozen, and the same document as the first; anything else holds (fail closed). Pure.
+ */
+export function applyFreezeRecheck(verdict, first, recheck) {
+  if (!verdict.ok) return verdict;
+  const why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${recheck?.error || 'not read'}`
+    : recheck.frozen ? `main went RED during this run (freeze: ${recheck.reason || 'active'})`
+      : (first?.frozen !== recheck.frozen || (first?.publishedAt ?? null) !== (recheck.publishedAt ?? null)) ? 'red-main freeze changed during this run'
+        : null;
+  return why ? { ...verdict, ok: false, reason: `${why} — fail closed; ${verdict.reason}` } : verdict;
+}
+
+/**
  * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
  * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
  * queue merge. `'pull_request'` needs POSITIVE proof — the runner reporting exactly `pull_request` — because it is
@@ -352,15 +377,20 @@ async function main() {
   }
 
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
+  // One read of the shared red-main freeze for the whole run (xyd06qo); branch name from the same policy cascade.
+  const redMain = readRedMainFact({ cwd, policy });
+  process.stderr.write(`red-main freeze (${redMain.source}): ${redMain.error ? `UNREADABLE — ${redMain.error}` : redMain.frozen ? `FROZEN — ${redMain.reason}` : 'clear'}\n`);
   const ledgerConfig = readLedgerConfig();
   const expectHead = typeof f['expect-head'] === 'string' && f['expect-head'] ? f['expect-head'] : null;
   if (expectHead && nums.length !== 1) { process.stderr.write('merge-gate-check: --expect-head pins exactly one --pr\n'); process.exit(3); }
   const pinOf = (num) => (f['merge-group'] ? { expectedHeadSha: membership?.heads?.[num] ?? null, requireExpectedHead: true } : { expectedHeadSha: expectHead });
-  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, ...pinOf(num) }), { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
+  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, redMain, ...pinOf(num) }), { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`merge-gate: workflow self-check — ${wfCheck.ok ? 'ok' : 'FAIL'}: ${wfCheck.reason}\n`);
   const base = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
-  const verdict = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
+  const preRecheck = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
+  // Re-read the freeze last: the facts above can take minutes, and a freeze published meanwhile must still hold.
+  const verdict = preRecheck.ok ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy })) : preRecheck;
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, workflowCheck: wfCheck, policy, prs }, null, 2)}\n`);
   else {
     for (const p of prs) writeAllSync(1, `${formatPrResult(p)}\n`);

@@ -2,9 +2,11 @@
 bornAs: xyd06qo
 kind: story
 size: 3
-status: open
-scope: ["we:scripts/readiness/red-main-remediation.mjs", "we:scripts/merge-gate-check.mjs"]
+status: resolved
+scope: ["we:scripts/readiness/red-main-remediation.mjs", "we:scripts/merge-gate-check.mjs", "we:scripts/lib/red-main-freeze-shared.mjs", "we:scripts/lib/merge-delivery-policy.mjs"]
 dateOpened: "2026-10-09"
+dateStarted: "2026-10-09"
+dateResolved: "2026-10-09"
 tags: []
 ---
 
@@ -14,24 +16,21 @@ The required merge-gate CI check (we:scripts/merge-gate-check.mjs, strategy gith
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
-
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
-
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+- [A1] **Executable** — `npm run test:unit` on we:scripts/lib/__tests__/red-main-freeze-shared.test.mjs (the module does not exist before this item): a clear shared copy passes the merge-gate `red-main-freeze` gate, a simulated freeze holds it, and a missing branch / missing file / bad JSON / non-boolean `frozen` fails it closed.
+- [A2] `we:scripts/readiness/red-main-remediation.mjs` `freeze`, `unfreeze`, `decide --apply` and the new `publish` write the local marker exactly as before, then publish its state to the shared branch (`we:scripts/lib/red-main-freeze-shared.mjs`, through `we:scripts/lib/git-transport-branch.mjs`). A failed publish keeps the local marker, prints the retry command and exits 1.
+- [A3] The branch is the policy-cascade knob `mergeDelivery.redMainFreezeBranch` (`we:scripts/lib/merge-delivery-policy.mjs`, default `ops/red-main-freeze`, only `ops/<slug>` accepted); writer and reader resolve it the same way.
+- [A4] `we:scripts/merge-gate-check.mjs` reads the shared copy once per run into `facts.redMain`; live proof: #4643 goes from `fail-closed red-main-freeze` to `pass` after the live publish.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] The drain's own reader in `we:scripts/merge-ai-prs.mjs` keeps reading the local marker (held by #4624/#4631) — follow-up card x09e2bn, blocked on xx7ckd6.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
-
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the shared doc is parsed as data; only a boolean `frozen` is trusted, anything else fails closed.
+2. **Truncated reads** — a fetch failure or absent file is an error (fail closed), never "not frozen".
+3. **Shared state files** — the branch is written only through the worktree transport (no branch switch, push pinned to exactly `refs/heads/<branch>`, no force).
+4. **Fail closed** — unreadable shared copy → merge-gate `fail-closed`; failed publish → CLI exit 1 with retry hint, local marker intact.
+5. **Identity scoping** — one branch per repo, named by policy; the writer refuses any non-`ops/` ref.
+6. **State over time** — every publish mirrors the CURRENT local marker (not a delta), so `publish` is an idempotent repair after any missed write.
+7. **Who wrote it** — the doc records `publishedAt` and `publishedBy` (host); pushes need repo write access, same trust as the other ops branches.
