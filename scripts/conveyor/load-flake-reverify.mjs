@@ -16,6 +16,7 @@ import { enrichPrsWithCompleteComments } from './pr-comments-complete.mjs';
 import { redactSecrets } from './ci-heal-mark.mjs';
 import { RUNNER_LOCK_ROOT } from '../../skills-src/conveyor/runner-lock.mjs';
 import { admit, shadowAdmission } from '../lib/resource-admission.mjs';
+import { resolveCutoverMode } from '../lib/resource-gate.mjs';
 
 export const VERIFY_ENV_ALLOWLIST = Object.freeze([
   'PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TERM', 'CI', 'NODE_ENV', 'NODE_OPTIONS', 'FORCE_COLOR', 'NO_COLOR',
@@ -292,7 +293,8 @@ export function scrubVerifyEnv(env = process.env, { allow = [], scratchDir, home
   return clean;
 }
 
-export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..') } = {}) {
+export function defaultReverifyIo({ run = execFileSync, runVerification = runBounded, verifyEnvAllow = [], readComments, root = resolve(dirname(fileURLToPath(import.meta.url)), '../..'),
+  shadow = shadowAdmission, admitFn = admit, env = process.env } = {}) {
   const command = (bin, args, opts = {}) => run(bin, args, { cwd: root, encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024, ...opts });
   const gh = (args) => JSON.parse(command('gh', args));
   const lanePool = (...args) => command(process.execPath, [resolve(root, 'scripts/lane-pool.mjs'), ...args]);
@@ -300,12 +302,14 @@ export function defaultReverifyIo({ run = execFileSync, runVerification = runBou
     now: Date.now, loadavg: os.loadavg, cpuCount: () => os.cpus().length,
     // x9xkupj: the shared resource service decides kind `load-flake-rearm` (stale/missing snapshot = hold). The old
     // load rule rides along as the logged comparison (shadow.jsonl + a stderr line in the pass log). With
-    // WE_RESOURCE_SHADOW=off the comparison is skipped but the decision still comes from admit().
+    // WE_RESOURCE_SHADOW=off the comparison is skipped but the decision still comes from admit(). Under the rollback
+    // switch WE_RESOURCE_CUTOVER=shadow the pair is only logged and no decision is returned (the legacy rule decides).
     admission: ({ load, cores, config }) => {
       const quiet = legacyLoadQuiet(load, cores, config);
-      return shadowAdmission({ gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: quiet ? 'admit' : 'hold',
-        oldReason: `load ${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores vs ${config.maxLoadPerCore}/core` })
-        ?? admit({ kind: 'load-flake-rearm' });
+      const observed = shadow({ gate: 'load-flake-reverify', kind: 'load-flake-rearm', oldVerdict: quiet ? 'admit' : 'hold',
+        oldReason: `load ${load.slice(0, 2).map((n) => Math.round(n * 100) / 100).join('/')} on ${cores} cores vs ${config.maxLoadPerCore}/core` });
+      if (resolveCutoverMode(env) !== 'enforce') return undefined;
+      return observed ?? admitFn({ kind: 'load-flake-rearm' });
     },
     // `gh pr list --json comments` stops at 100: a hold past that was invisible here while fix-dispatch (which reads the
     // complete thread) kept refusing the PR as `load-flake-hold` (live #4017, 286 comments). Same complete reader as fix-dispatch.
