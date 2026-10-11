@@ -90,6 +90,18 @@ export function requiredChecksFromRules(rulesJson) {
     .filter(context => typeof context === 'string' && context.length > 0))];
 }
 
+/**
+ * `gh api --paginate --slurp` prints an array of PAGES; flatten it to the rule list. A bare rule list (no page
+ * wrapper) passes through; a mix of pages and bare rules is an unexpected shape, never a partial read.
+ */
+function flattenRulePages(parsed) {
+  if (!Array.isArray(parsed)) return parsed; // requiredChecksFromRules rejects the shape
+  const pages = parsed.filter(Array.isArray).length;
+  if (pages === 0) return parsed;
+  if (pages !== parsed.length) throw new Error('required-status-checks: unexpected mix of pages and rules from branch rules');
+  return parsed.flat();
+}
+
 /** Shared routing, timeout and piped IO for both GitHub sources. */
 function readRequiredChecksGh(args) {
   const opts = { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] };
@@ -122,8 +134,10 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
   const base = `repos/${repo || '{owner}/{repo}'}`;
   let rulesError;
   try {
-    const out = gh(['api', `${base}/rules/branches/${branch}`]);
-    const checks = requiredChecksFromRules(JSON.parse(out.trim() || '[]'));
+    // The rules endpoint pages at 30: read every page (`--slurp` → one array of pages) so a required check on a
+    // later page is never dropped. A blank body is a failed read, not "no rules" (JSON.parse('') throws).
+    const out = gh(['api', '--paginate', '--slurp', `${base}/rules/branches/${branch}?per_page=100`]);
+    const checks = requiredChecksFromRules(flattenRulePages(JSON.parse(out.trim())));
     if (checks.length) return checks;
   } catch (error) {
     rulesError = error;

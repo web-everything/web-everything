@@ -278,14 +278,32 @@ describe('defaultReadRequiredStatusChecks', () => {
   it('reads rules first and never reads protection after a nonempty result', () => {
     const gh = vi.fn(() => JSON.stringify([requiredRule('test', 'smoke', 'test')]));
     expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', branch: 'release', gh })).toEqual(['test', 'smoke']);
-    expect(gh.mock.calls).toEqual([[['api', 'repos/owner/repo/rules/branches/release']]]);
+    expect(gh.mock.calls).toEqual([[['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/release?per_page=100']]]);
+  });
+
+  it('reads EVERY rules page: a required check on page two is not dropped', () => {
+    const page1 = [requiredRule('test'), ...Array.from({ length: 29 }, () => ({ type: 'deletion' }))];
+    const page2 = [requiredRule('security-scan')];
+    const gh = vi.fn(() => JSON.stringify([page1, page2])); // `gh api --paginate --slurp` prints one array of pages
+    expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', gh })).toEqual(['test', 'security-scan']);
+    expect(gh.mock.calls).toEqual([[['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/main?per_page=100']]]);
+  });
+
+  it('treats a blank rules response as a failed read, never as "no rules"', () => {
+    const gh = vi.fn().mockReturnValueOnce('').mockReturnValueOnce('["classic"]');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('rejects a rules response that mixes pages and bare rules', () => {
+    const gh = vi.fn().mockReturnValueOnce(JSON.stringify([[requiredRule('test')], requiredRule('x')])).mockReturnValueOnce('["classic"]');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
   });
 
   it('falls back to classic protection when rules are empty', () => {
     const gh = vi.fn().mockReturnValueOnce('[]').mockReturnValueOnce('["classic"]');
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
     expect(gh.mock.calls).toEqual([
-      [['api', 'repos/{owner}/{repo}/rules/branches/main']],
+      [['api', '--paginate', '--slurp', 'repos/{owner}/{repo}/rules/branches/main?per_page=100']],
       [['api', 'repos/{owner}/{repo}/branches/main/protection', '--jq', '.required_status_checks.contexts']],
     ]);
   });
@@ -298,7 +316,7 @@ describe('defaultReadRequiredStatusChecks', () => {
   ])('preserves error classification: rules %s, protection %s', (rulesMessage, protectionMessage, source) => {
     const rulesError = new Error(rulesMessage);
     const protectionError = new Error(protectionMessage);
-    const gh = vi.fn(args => { throw args[1].includes('/rules/') ? rulesError : protectionError; });
+    const gh = vi.fn(args => { throw args.some(a => a.includes('/rules/')) ? rulesError : protectionError; });
     const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
     expect(() => readChecks({})).toThrow(source === 'fallback' && !rulesMessage.includes('Resource not accessible') ? rulesError : protectionError);
     expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath: join(dir, 'cache.json'), readChecks }))
@@ -365,7 +383,7 @@ describe('defaultReadRequiredStatusChecks', () => {
     });
     expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check']);
     expect(execFileSync).toHaveBeenCalledWith('gh', ['auth', 'token'], expect.any(Object));
-    expect(spawnSync.mock.calls[0][1]).toEqual(['api', 'repos/web-everything/web-everything/rules/branches/main']);
+    expect(spawnSync.mock.calls[0][1]).toEqual(['api', '--paginate', '--slurp', 'repos/web-everything/web-everything/rules/branches/main?per_page=100']);
     expect(process.env.GH_TOKEN === 'ghs_test_fixture').toBe(true);
   });
 
