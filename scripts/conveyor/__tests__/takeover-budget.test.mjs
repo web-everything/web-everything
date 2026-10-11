@@ -278,6 +278,28 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
     // The takeover head's own verdict then judges it as usual.
     expect(plain(T1, [...late, rearm(9), review(T1, 10, FOUR.slice(1))])).toMatchObject({ ok: true, n: 2 });
   });
+  it('the review grant and the progress guard agree: a delayed old-head review after the push spends no grant (no stall)', () => {
+    const thread = [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FOUR)];
+    expect(takeoverReviewGrant({ pr: pr(T1, thread), takeoverReviewAttempts: 1 })).toMatchObject({ ok: true, used: 0 });
+    // The takeover head T1 is owed its review, dispatched now — not a silent `takeover-awaiting-review` forever.
+    expect(plan(pr(T1, thread, { labels: [{ name: 'review:changes' }] })).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'review' });
+  });
+  it('a manual takeover whose marker names the head it pushed (#4708) still earns a second takeover once judged', () => {
+    const thread = [...rounds5, operatorTakeover(7), marker(T1, 8), review(T1, 9, FOUR)];
+    expect(plain(T1, thread)).toMatchObject({ ok: true, n: 2 });
+  });
+  it('no parseable head before the takeover: the automatic marker\'s start head still marks a delayed review as old', () => {
+    const headless = [rearm(1), rearm(2), rearm(3), rearm(4), rearm(5), { ...review(R5, 6, FIVE), body: review(R5, 6, FIVE).body.replace(/Net basis:[^\n]*/, '') }];
+    // After the push, a delayed review of R5 judges nothing.
+    expect(plain(T1, [...headless, marker(R5, 7), rearm(8), review(R5, 9, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+    // No push yet and the PR still on R5: the one-per-head bound holds even though a verdict landed.
+    expect(plain(R5, [...headless, marker(R5, 7), review(R5, 8, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
+  it('a delayed review of an even older head (reviewed before the takeover) judges nothing either', () => {
+    const R4 = H('4');
+    const thread = [rearm(1), rearm(2), rearm(3), review(R4, 4, SIX), rearm(5), review(R5, 6, FIVE), marker(R5, 7), rearm(8), review(R4, 9, FOUR)];
+    expect(plain(T1, thread)).toMatchObject({ ok: false, reason: 'takeover-awaiting-review' });
+  });
   it('a judged takeover whose PR head is still the start head reads as never pushed', () => {
     // A verdict naming another head, but the PR never moved off the head the takeover started from.
     expect(plain(R5, [...rounds5, marker(R5, 7), review(T1, 9, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-spent' });
