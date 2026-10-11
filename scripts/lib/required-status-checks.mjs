@@ -146,7 +146,7 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
   let checks;
   try {
     const out = gh(['api', `${base}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts']);
-    const parsed = JSON.parse(out.trim() || '[]');
+    const parsed = JSON.parse(out.trim()); // blank body = failed read, same as the rules read above
     if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
     checks = parsed.map(String);
   } catch (error) {

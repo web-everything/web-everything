@@ -294,6 +294,21 @@ describe('defaultReadRequiredStatusChecks', () => {
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
   });
 
+  it('treats a blank classic-protection body as a failed read, never as "no checks"', () => {
+    const gh = vi.fn().mockReturnValueOnce('[[]]').mockReturnValueOnce('');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('falls through to classic protection when the single rules page is empty', () => {
+    const gh = vi.fn().mockReturnValueOnce('[[]]').mockReturnValueOnce('["classic"]');
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+  });
+
+  it('rejects a non-array rules body', () => {
+    const gh = vi.fn().mockReturnValueOnce('{"message":"x"}').mockReturnValueOnce('["classic"]');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
   it('rejects a rules response that mixes pages and bare rules', () => {
     const gh = vi.fn().mockReturnValueOnce(JSON.stringify([[requiredRule('test')], requiredRule('x')])).mockReturnValueOnce('["classic"]');
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
