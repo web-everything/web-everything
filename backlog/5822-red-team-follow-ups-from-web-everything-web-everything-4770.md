@@ -39,3 +39,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by web-everything/web-everything#4770 (finding 1: `we:scripts/conveyor/mechanical-round-cap.mjs:219` — failing-input, degraded Unrelated edits within a base-changed file are incorrectly proven mechanical.)

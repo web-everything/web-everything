@@ -55,12 +55,23 @@
 # rename or removal of the script can never turn the required check green (pinned by merge-gate-ci.test.mjs).
 #
 # FAILS CLOSED: an input that is unreadable, or that has no shared source CI can reach yet, holds the PR.
+#
+# MODE (`mergeGate.mode`, shadow | enforce; scripts/lib/merge-gate-ci.mjs `loadMergeGateMode`): resolved standard
+# default (shadow) -> platform preference -> repo setting -> env (the MERGE_GATE_MODE repository variable), and the
+# winning source is logged. SHADOW evaluates and prints every rule exactly as enforce, adds "SHADOW: would HOLD on
+# <rules>" to the step summary, and exits 0; it changes only the exit code, never a verdict, and never masks a run
+# with no verdict. Shadow until the shared red-main freeze source lands (#4715 flips the repo setting to enforce).
+# The ruleset step (making `merge-gate` required) needs enforce.
+# TRIGGERS: head changes (opened/synchronize/reopened, merge_group) plus the labels the gates read (ready-to-merge,
+# review:*). Any other label event is skipped under a DIFFERENT job name (a skipped job counts as passing for a
+# required check, so it must never post as `merge-gate`) and in its own concurrency group (it never cancels a real
+# run). Body edits do not re-run the PR leg; the merge_group run re-evaluates everything before GitHub merges.
 name: Merge gate
 
 on:
   pull_request_target:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled, edited, ready_for_review]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
   merge_group:
   workflow_dispatch:
     inputs:
@@ -81,11 +92,13 @@ permissions:
   statuses: read
 
 concurrency:
-  group: merge-gate-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
+  group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}
   cancel-in-progress: true
 
 jobs:
   merge-gate:
+    name: ${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && 'merge-gate (unwatched label, skipped)' || 'merge-gate' }}
+    if: ${{ !((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -113,6 +126,7 @@ jobs:
           MG_BASE_SHA: ${{ github.event.merge_group.base_sha || inputs.merge_group_base_sha }}
           MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
           DISPATCH_PRS: ${{ inputs.prs }}
+          MERGE_GATE_MODE: ${{ vars.MERGE_GATE_MODE }}
         run: |
           if [ ! -f scripts/merge-gate-check.mjs ]; then
             if [ -f .github/workflows/merge-gate.yml ]; then
@@ -131,12 +145,12 @@ jobs:
             GROUP_TREE="$RUNNER_TEMP/group-tree"
             mkdir -p "$GROUP_TREE"
             git archive "$MG_HEAD_SHA" backlog | tar -x -C "$GROUP_TREE"
-            node scripts/merge-gate-check.mjs --repo="$REPO" --merge-group --head-sha="$MG_HEAD_SHA" --base-sha="$MG_BASE_SHA" --head-ref="$MG_HEAD_REF" --group-tree="$GROUP_TREE"
+            node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs --repo="$REPO" --merge-group --head-sha="$MG_HEAD_SHA" --base-sha="$MG_BASE_SHA" --head-ref="$MG_HEAD_REF" --group-tree="$GROUP_TREE"
           elif [ -n "$PR_NUMBER" ]; then
             [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::merge-gate: pull_request head sha is not a 40-hex commit id — failing closed." >&2; exit 1; }
-            node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$PR_NUMBER" --expect-head="$PR_HEAD_SHA"
+            node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs --repo="$REPO" --pr="$PR_NUMBER" --expect-head="$PR_HEAD_SHA"
           elif [ -n "$DISPATCH_PRS" ]; then
-            node scripts/merge-gate-check.mjs --repo="$REPO" --pr="$DISPATCH_PRS"
+            node scripts/lib/merge-gate-ci.mjs --run-gate -- scripts/merge-gate-check.mjs --repo="$REPO" --pr="$DISPATCH_PRS"
           else
             echo "::error::merge-gate: no PR or merge group to evaluate (event $EVENT) — failing closed." >&2
             exit 1
