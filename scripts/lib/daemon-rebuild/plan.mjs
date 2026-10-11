@@ -55,6 +55,9 @@ export function pinnedStatus(git, raw, mainSha, ovSha) {
  *  (re-read the overlay list, re-apply the overlay once rebased). */
 const MECHANISM_CORE_PATHS = Object.freeze(['scripts/lib/daemon-rebuild.mjs', 'scripts/lib/daemon-overlays.mjs']);
 
+/** A full commit id — the only shape a sha read from git output or the GitHub API may take before it reaches a git argv. */
+const OID = /^[0-9a-f]{40}$/;
+
 /**
  * xpinskip (live 2026-09-26 23:39 ET) — may a CONFLICTING pinned overlay be skipped for this build instead of
  * refusing the whole rebuild? The pin exists so a build never lands on a tree that cannot rebuild itself (the
@@ -104,30 +107,38 @@ function changedFiles(git, mainSha, sha) {
  * and carries #4757. #4756 was rebased; its children still carry its OLD head. Applied as independent overlays,
  * the children conflicted with the live #4756 every rebuild and were parked, so none of the stack's fixes went live.
  *
- * An overlay C is a CHILD of a registered overlay P when C's PR base chain names P's branch, or P's tip is an
- * ancestor of C's tip (the fallback when gh cannot answer). A TOP has no registered child. Every non-top base P:
+ * Operator ruling (2026-10-11, PR #4815): only HARD evidence decides; look-alike commits (author/subject, patch-id) never do.
+ * MEMBERSHIP: an overlay C is a CHILD of a registered overlay P when P's tip is an ancestor of C's tip, or C's PR base
+ * chain (gh baseRefName, nearest first; else the entry's recorded `stackBases`) names P's branch. A TOP has no registered
+ * child. Every non-top base P:
  *   - is `stack-contained` when one of its tops contains P's current tip: it is live through that top;
- *   - is `stack-base-moved` when none does (P was rebased; its children still carry the old head): set aside, the
- *     children's tops kept until they are restacked. This deliberately overrides "live overlays win" for P.
+ *   - is `stack-base-moved` only when a top that really clashes with it (merge-tree status 1) contains a head P has
+ *     since moved away from — proven by (a) a head of P an earlier daemon build merged (`daemon-rebuild: merge overlay
+ *     <P>` on the first-parent line of HEAD or a HEAD reflog entry), or (b) the `before` commit of a GitHub
+ *     head_ref_force_pushed event on P's PR. Set aside, the children's tops kept until they are restacked. This
+ *     deliberately overrides "live overlays win" for P. A sibling retargeted onto P never contains a head of P, so it
+ *     never evicts P (it is reported in `unconfirmed` and parked by the plain conflict rule).
+ *   - when the force-push read is UNKNOWN (gh unreachable) and (a) found nothing, the last adopted build decides: P keeps
+ *     what it had there — live if HEAD merged P, set aside if HEAD merged its clashing tops but not P, else live
+ *     (no eviction). Reported in `unknown`.
  * A PINNED base (flag or mechanism), contained or moved, is never set aside — it stays an independent overlay, so
  * its pin refuses a conflicting build rather than the build silently going without it. A registered overlay whose
  * tip is already an ancestor of main takes no part either (the main loop removes it as `in-main`).
  * Overlays whose PR is MERGED/CLOSED or whose ref is gone take no part (the main loop removes them).
- * A PR base chain comes from the GitHub API, which any PR author can edit, so a chain claim ("C is stacked on P") makes C
- * a child of P only when git corroborates it: P's tip is an ancestor of C's tip, or C carries a commit patch-equivalent
- * to one of P's (cherry-mark), or one with the same author and subject (a rebase keeps both, so a rebased base is still
- * recognised through its old head) — counting only commits the other side lacks, so a shared prerequisite (or an older
- * copy of one of P's own PR bases) never corroborates siblings — or the entry already records the claim (written by an earlier rebuild after it
- * passed this check). An uncorroborated claim is ignored and reported in `unconfirmed`. A base that moved is set aside only when git shows
- * a top really clashes with it; if every top merges cleanly with it, both apply independently.
+ * If every top merges cleanly with a non-contained base, both apply independently.
+ * Residue: P registered while its tip was a bare shared prerequisite H, then extended — a sibling built on H carries an
+ * adopted head of P. A child built on a head of P the daemon never merged and GitHub never force-pushed away is not
+ * recognised (a safe miss: nothing is evicted).
  * `keepIndependent` names refs that must never be set aside (a base whose fallback could not be merged — see the 7b
  * pass of {@link planRebuild}).
- * @returns {Promise<{setAside:Map<string,{ref:string,pr:number|null,sha:string,reason:string,tops:Array<object>}>,
- *   tops:Array<{ref:string,pr:number|null,sha:string}>, unconfirmed:Array<{ref:string,base:string}>}>}
+ * @returns {Promise<{setAside:Map<string,{ref:string,pr:number|null,sha:string,reason:string,evidence?:string,tops:Array<object>}>,
+ *   tops:Array<{ref:string,pr:number|null,sha:string}>, unconfirmed:Array<{ref:string,base:string}>,
+ *   unknown:Array<{ref:string,pr:number|null,kept:'live'|'set-aside',tops:string[]}>}>}
  *   `tops` = the tops of stacks only, in list order.
  */
 export async function planOverlayStacks({
   git, mainSha, overlays, stateOf = async () => null, prBaseChain = null, isPinned = () => false, keepIndependent = new Set(),
+  headSha = null, prForcePushes = null,
 }) {
   const nodes = [];
   for (const raw of overlays) {
@@ -144,77 +155,72 @@ export async function planOverlayStacks({
     if (pr != null && typeof prBaseChain === 'function') {
       try { chain = await prBaseChain(pr); } catch { chain = null; }
     }
-    nodes.push({ raw, ref: raw.ref, pr, sha, chain: Array.isArray(chain) ? chain : [] });
+    if (!Array.isArray(chain)) chain = Array.isArray(raw.stackBases) ? raw.stackBases : [];
+    nodes.push({ raw, ref: raw.ref, pr, sha, chain });
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
   const outLines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter((l) => l.trim()) : []);
-  // "author<TAB>subject" of the commits `sha` adds on top of main, newest 400 (cached per sha).
-  const keysCache = new Map();
-  const keysOf = (sha) => {
-    if (!keysCache.has(sha)) {
-      keysCache.set(sha, new Set(outLines(git(['log', '--no-merges', '-n', '400', '--format=%ae%x09%s', sha, '--not', mainSha]))));
+  // ref → Set of the overlay heads one daemon build merged: the second parent of each `daemon-rebuild: merge overlay <ref>`
+  // two-parent commit on the build's first-parent line above main (newest 200). Daemon-authored, local: an overlay's own
+  // commits sit on second-parent lines, so they never count. Cached per build.
+  const buildCache = new Map();
+  const mergedBy = (build) => {
+    if (!build || !OID.test(build)) return new Map();
+    if (!buildCache.has(build)) {
+      const m = new Map();
+      for (const l of outLines(git(['log', '--first-parent', '-n', '200', '--format=%P%x09%s', build, '--not', mainSha]))) {
+        const [parents, subject = ''] = l.split('\t');
+        const ps = parents.split(' ');
+        const hit = subject.match(/^daemon-rebuild: merge overlay (\S+) /);
+        if (!hit || ps.length !== 2 || !OID.test(ps[1])) continue;
+        if (!m.has(hit[1])) m.set(hit[1], new Set());
+        m.get(hit[1]).add(ps[1]);
+      }
+      buildCache.set(build, m);
     }
-    return keysCache.get(sha);
+    return buildCache.get(build);
   };
-  const chainOf = (n) => [...n.chain, ...(Array.isArray(n.raw.stackBases) ? n.raw.stackBases : [])];
-  // Content that is NOT P's work, so it never corroborates "C is stacked on P": P's own PR bases (the prerequisites P is
-  // built on), and every other registered overlay that is not part of this stack — not P or C, not named in C's chain (a
-  // ref between C and P carries P's old work), not claiming P or C, and not descending from either. A chain is untrusted,
-  // but here it can only remove evidence, never add it.
-  const foreignShas = (p, c) => {
-    const shas = p.chain.map((r) => verifyRev(git, `refs/remotes/origin/${r}^{commit}`));
-    for (const o of nodes) {
-      if (o === p || o === c || c.chain.includes(o.ref)) continue;
-      if (chainOf(o).some((r) => r === p.ref || r === c.ref) || anc(p.sha, o.sha) || anc(c.sha, o.sha)) continue;
-      shas.push(o.sha);
+  // Every adopted build this clone still remembers: the running HEAD, then the HEAD reflog (newest 50) — each rebuild
+  // moves HEAD onto the build it adopted, so the reflog keeps the heads of P that earlier builds merged.
+  let builds = null;
+  const adoptedHeads = (ref) => {
+    if (!builds) {
+      builds = [...new Set([headSha, ...outLines(git(['reflog', '-n', '50', '--format=%H', 'HEAD']))].filter((s) => s && OID.test(s)))];
     }
-    return [...new Set(shas.filter(Boolean))];
+    const out = new Set();
+    for (const b of builds) for (const s of mergedBy(b).get(ref) ?? []) out.add(s);
+    return out;
   };
-  // Git evidence that C was built on P, short of ancestry: C's oldest commit that P lacks (newest 400, foreign content
-  // skipped) is patch-equivalent to one of P's (cherry-mark `=`; survives a reworded or re-dated rebase) or has the same
-  // author and subject as one of P's (survives a rebase that resolved conflicts, which changes the patch) — a child is
-  // built on P's work, so that work comes first. Only commits ONE side lacks count (P...C), so a prerequisite both branch
-  // from is not evidence; foreign content is dropped from the evidence by reachability, by author/subject and by patch,
-  // so a re-copied prerequisite or a hotfix cherry-picked into both siblings is not evidence either.
-  // Residue git cannot decide: an identical commit with no branch and no registration, first on both siblings, is the
-  // same history as "C was built on P when P held only that commit". Unsigned history can be imitated by whoever can
-  // push the branch, so this bounds accidents and retargeted PRs, not a deliberate insider — who can already push any
-  // code to their branch.
-  const sharesWork = (p, c) => {
-    const foreign = foreignShas(p, c);
-    const notFrom = ['--not', mainSha, ...foreign];
-    const pKeys = new Set(outLines(git(['log', '--no-merges', '-n', '400', '--format=%ae%x09%s', `${c.sha}..${p.sha}`, ...notFrom])));
-    const cLog = git(['log', '--no-merges', '--right-only', '--cherry-mark', '--reverse', '-n', '400',
-      '--format=%m%x09%H%x09%ae%x09%s', `${p.sha}...${c.sha}`, ...notFrom]);
-    if (cLog.status !== 0) return false;
-    const fKeys = new Set(foreign.flatMap((s) => [...keysOf(s)]));
-    // C's commits patch-equivalent to foreign content (cherry-mark against each foreign tip).
-    const fPatch = new Set(foreign.flatMap((s) => outLines(git(['log', '--no-merges', '--right-only', '--cherry-mark',
-      '--format=%m%x09%H', `${s}...${c.sha}`, '--not', mainSha])).filter((l) => l.startsWith('=')).map((l) => l.slice(2))));
-    for (const l of outLines(cLog)) {
-      const [mark, sha, ...rest] = l.split('\t');
-      const key = rest.join('\t');
-      if (fKeys.has(key) || fPatch.has(sha)) continue;
-      return mark === '=' || pKeys.has(key);
+  const fpCache = new Map();
+  const forcePushedHeads = async (pr) => {
+    if (pr == null || typeof prForcePushes !== 'function') return null;
+    if (!fpCache.has(pr)) {
+      let events = null;
+      try { events = await prForcePushes(pr); } catch { events = null; }
+      fpCache.set(pr, Array.isArray(events) && events.every((e) => typeof e?.before === 'string' && OID.test(e.before))
+        ? events.map((e) => e.before) : null);
     }
-    return false;
+    return fpCache.get(pr);
   };
-  // A chain recorded on the entry by an earlier rebuild (persistStackBases writes only claims that passed this check) is
-  // evidence that survives a rebase that left nothing else to compare.
-  const recordedClaim = (c, p) => Array.isArray(c.raw.stackBases) && c.raw.stackBases.includes(p.ref);
+  // Hard evidence that P moved away from a head one of `clashing` was built on, or null when it cannot be known.
+  const movedEvidence = async (p, clashing) => {
+    // A head already in main is everyone's history, not P's: never evidence.
+    const carried = (s) => s !== p.sha && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0
+      && clashing.some((t) => anc(s, t.sha));
+    if ([...adoptedHeads(p.ref)].some(carried)) return 'adopted-head';
+    const before = await forcePushedHeads(p.pr);
+    if (before == null) return null;
+    return before.some(carried) ? 'force-pushed' : 'none';
+  };
   const unconfirmed = [];
+  const unknown = [];
   const children = new Map(nodes.map((n) => [n.ref, new Set()]));
   for (const c of nodes) {
     for (const p of nodes) {
       if (p === c || p.sha === c.sha) continue;
-      if (anc(p.sha, c.sha)) children.get(p.ref).add(c.ref);
-      else if (c.chain.includes(p.ref)) {
-        if (recordedClaim(c, p) || sharesWork(p, c)) children.get(p.ref).add(c.ref);
-        else unconfirmed.push({ ref: c.ref, base: p.ref });
-      }
+      if (anc(p.sha, c.sha) || c.chain.includes(p.ref)) children.get(p.ref).add(c.ref);
     }
   }
-  const byRef = new Map(nodes.map((n) => [n.ref, n]));
   const descendants = (ref) => {
     const seen = new Set();
     const walk = (r) => { for (const k of children.get(r) ?? []) if (!seen.has(k) && k !== ref) { seen.add(k); walk(k); } };
@@ -237,8 +243,23 @@ export async function planOverlayStacks({
     } else {
       // A moved base is only worth setting aside when a top really clashes with it (merge-tree status 1). Clean merge or a
       // git error: both apply on their own, as before stacks existed.
-      if (!tops.some((t) => git(['merge-tree', '--write-tree', '--no-messages', p.sha, t.sha]).status === 1)) continue;
-      setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
+      const clashing = tops.filter((t) => git(['merge-tree', '--write-tree', '--no-messages', p.sha, t.sha]).status === 1);
+      if (clashing.length === 0) continue;
+      let evidence = await movedEvidence(p, clashing);
+      if (evidence == null) {
+        // Unknown: keep what the last adopted build did with P (never a fresh eviction).
+        const last = mergedBy(headSha);
+        const keptAside = !last.has(p.ref) && clashing.some((t) => last.has(t.ref));
+        unknown.push({ ref: p.ref, pr: p.pr, kept: keptAside ? 'set-aside' : 'live', tops: clashing.map((t) => t.ref) });
+        if (!keptAside) continue;
+        evidence = 'last-adopted';
+      } else if (evidence === 'none') {
+        for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
+        continue;
+      }
+      setAside.set(p.ref, {
+        ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', evidence, tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })),
+      });
     }
     for (const t of tops) stackTops.add(t.ref);
   }
@@ -246,6 +267,7 @@ export async function planOverlayStacks({
     setAside,
     tops: nodes.filter((n) => stackTops.has(n.ref)).map(({ ref, pr, sha }) => ({ ref, pr, sha })),
     unconfirmed,
+    unknown,
   };
 }
 
@@ -265,7 +287,8 @@ export async function planOverlayStacks({
  * @param {{git:(args:string[], opts?:{env?:object})=>{status:number,stdout:string,stderr:string},
  *   headSha:string, mainRef:string, overlays?:Array<{ref:string, pr?:number|null}>,
  *   prState?:(pr:number)=>(Promise<string|null>|string|null), mainOnly?:boolean, edgeResolve?:boolean,
- *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null, stackMode?:'tops'|'independent',
+ *   prBaseChain?:((pr:number)=>(Promise<string[]|null>|string[]|null))|null,
+ *   prForcePushes?:((pr:number)=>(Promise<Array<{before:string,after?:string|null}>|null>))|null, stackMode?:'tops'|'independent',
  *   stackModeSource?:string}} o
  * @returns {Promise<{ok:false, reason:'main-unresolved'}|{ok:true, mainSha:string, finalSha:string,
  *   applied:Array<{ref:string,pr:number|null,sha:string}>,
@@ -274,7 +297,7 @@ export async function planOverlayStacks({
  */
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
-  prBaseChain = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
+  prBaseChain = null, prForcePushes = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -332,10 +355,10 @@ export async function planRebuild({
   // Held item 212 (live 2026-10-10) — stacked overlay PRs are one stack: apply only its tops. See planOverlayStacks.
   const stacks = stackMode === 'tops' && listed.length > 1
     ? await planOverlayStacks({
-      git, mainSha, overlays: listed, stateOf, prBaseChain, keepIndependent,
+      git, mainSha, overlays: listed, stateOf, prBaseChain, keepIndependent, headSha, prForcePushes,
       isPinned: (raw, sha) => pinnedStatus(git, raw, mainSha, sha).pinned,
     })
-    : { setAside: new Map(), tops: [], unconfirmed: [] };
+    : { setAside: new Map(), tops: [], unconfirmed: [], unknown: [] };
   if (keepIndependent.size > 0) {
     alerts.push({
       kind: 'overlay-stack-base-restored',
@@ -350,7 +373,16 @@ export async function planRebuild({
       kind: 'overlay-stack-claim-unconfirmed',
       detail: {
         claims: stacks.unconfirmed,
-        message: `PR base chain names overlay(s) git does not link to the claimer (${stacks.unconfirmed.map((u) => `${u.ref} on ${u.base}`).join('; ')}) — treated as independent overlays`,
+        message: `stacked on a base with no hard evidence it moved (${stacks.unconfirmed.map((u) => `${u.ref} on ${u.base}`).join('; ')}) — the base stays live, the clashing child is planned as an independent overlay`,
+      },
+    });
+  }
+  if (stacks.unknown.length > 0) {
+    alerts.push({
+      kind: 'overlay-stack-evidence-unknown',
+      detail: {
+        bases: stacks.unknown,
+        message: `could not read whether stack base(s) moved (${stacks.unknown.map((u) => `${u.ref}: kept ${u.kept}`).join('; ')}) — kept as the last adopted build had them`,
       },
     });
   }
@@ -361,8 +393,8 @@ export async function planRebuild({
       alerts.push({
         kind: 'overlay-stack-base-moved',
         detail: {
-          ref: a.ref, pr: a.pr, sha: a.sha, tops: a.tops.map((t) => t.ref),
-          message: `stack base moved: ${label(a)} set aside, tops ${a.tops.map(label).join(' ')} kept until restacked`,
+          ref: a.ref, pr: a.pr, sha: a.sha, tops: a.tops.map((t) => t.ref), evidence: a.evidence,
+          message: `stack base moved (${a.evidence}): ${label(a)} set aside, tops ${a.tops.map(label).join(' ')} kept until restacked`,
         },
       });
     }
@@ -563,7 +595,7 @@ export async function planRebuild({
   }
   if (lostBases.length > 0) {
     return planRebuild({
-      git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, stackMode, stackModeSource,
+      git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, prForcePushes, stackMode, stackModeSource,
       keepIndependent: new Set([...keepIndependent, ...lostBases]),
     });
   }

@@ -378,10 +378,12 @@ function ghJson(args, { env, timeoutMs = GH_CALL_TIMEOUT_MS } = {}) {
  * its recorded `stackBases` (never from a half-walked chain after a trip). A lookup that fails without a timeout in the
  * middle of a walk also answers from the recorded chain when there is one.
  * `fresh` (a property of the returned function) holds `pr → chain` for the chains gh answered completely, for
- * {@link persistStackBases}.
+ * {@link persistStackBases}. `forcePushes(pr)` (also a property) reads the PR's force-push events for the rebuild's
+ * "base moved" evidence, under the same budget.
  * @param {{root:string, overlays?:Array<object>, gh?:(args:string[], o?:{env?:object,timeoutMs?:number})=>unknown,
  *   maxDepth?:number, budgetMs?:number, now?:()=>number, slug?:string|null, env?:NodeJS.ProcessEnv}} o
- * @returns {((pr:number)=>Promise<string[]|null>) & {fresh:Map<number,string[]>}}
+ * @returns {((pr:number)=>Promise<string[]|null>) & {fresh:Map<number,string[]>,
+ *   forcePushes:(pr:number)=>Promise<Array<{before:string,after:string|null}>|null>}}
  */
 export function makePrBaseChain({
   root, overlays = [], gh = ghJson, maxDepth = 8, budgetMs = GH_CHAIN_BUDGET_MS, now = Date.now, slug: slugOverride, env,
@@ -449,15 +451,46 @@ export function makePrBaseChain({
     return memo.get(pr);
   };
   chainOf.fresh = fresh;
+  // The PR's head_ref_force_pushed events (newest 50) as `{before, after}`, under the same budget and breaker; `null`
+  // (unknown) when gh cannot answer, answers in an unexpected shape, or names a commit it no longer has.
+  const pushesMemo = new Map();
+  chainOf.forcePushes = async (pr) => {
+    const n = Number(pr);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    if (!pushesMemo.has(n)) {
+      const s = slugOf();
+      const [owner, name] = s ? s.split('/') : [];
+      const out = owner && name
+        ? call(['api', 'graphql', '-f', `query=${FORCE_PUSHES_QUERY}`, '-f', `o=${owner}`, '-f', `r=${name}`, '-F', `n=${n}`])
+        : undefined;
+      const nodes = out && typeof out === 'object' && !out.errors ? out.data?.repository?.pullRequest?.timelineItems?.nodes : undefined;
+      let events = null;
+      if (Array.isArray(nodes)) {
+        events = [];
+        for (const e of nodes) {
+          const before = e?.beforeCommit?.oid;
+          const after = e?.afterCommit?.oid;
+          if (typeof before !== 'string' || !OID.test(before)) { events = null; break; }
+          events.push({ before, after: typeof after === 'string' && OID.test(after) ? after : null });
+        }
+      }
+      pushesMemo.set(n, events);
+    }
+    return pushesMemo.get(n);
+  };
   return chainOf;
 }
+
+const OID = /^[0-9a-f]{40}$/;
+const FORCE_PUSHES_QUERY = 'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){'
+  + 'timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],last:50){nodes{... on HeadRefForcePushedEvent{beforeCommit{oid} afterCommit{oid}}}}}}}';
 
 /**
  * Record the base chains gh answered completely (`fresh`: `pr → chain`, from {@link makePrBaseChain}) on the registered
  * entries, so a later rebuild that cannot reach gh still sees the stack. Writes only entries whose chain changed (an empty
  * chain clears the field), under the list lock and from a fresh read, so a concurrent add/remove is never overwritten and
- * an entry that vanished is skipped. Only `stackBases` is touched — `pr`, `reason` and the rest stay as they are. The
- * rebuild still checks every recorded claim against git ancestry/history, so a recorded chain never decides alone.
+ * an entry that vanished is skipped. Only `stackBases` is touched — `pr`, `reason` and the rest stay as they are. A
+ * recorded chain only says which stack an overlay belongs to; setting a base aside still needs hard evidence it moved.
  * @param {string} root
  * @param {Map<number,string[]>} fresh
  * @param {{env?:NodeJS.ProcessEnv}} [o]

@@ -98,7 +98,15 @@ function fixture({ githubLike = false } = {}) {
   };
   const runGit = (args, opts = {}) => gitRun(args, { cwd: clone, env: { ...env, ...opts.env } });
   const fetch = () => gitOk(clone, ['fetch', '-q', '-f', 'origin', '+refs/heads/*:refs/remotes/origin/*']);
-  return { clone, author, env, init, bOld, ladder, last, ruling, moveBase, runGit, fetch, push };
+  /** The daemon adopts a build: HEAD moves onto it (and its reflog keeps the builds before it). */
+  const adopt = (sha) => gitOk(clone, ['update-ref', '-m', 'rebuild: adopt', 'HEAD', sha]);
+  /** One adopted build of `overlays` on top of main, as the daemon makes it; returns the build sha. */
+  const build = async (overlays, headSha = null) => {
+    const p = await planRebuild({ git: runGit, headSha, mainRef: 'origin/main', overlays, stackMode: 'independent' });
+    adopt(p.finalSha);
+    return p.finalSha;
+  };
+  return { clone, author, env, init, bOld, ladder, last, ruling, moveBase, runGit, fetch, push, adopt, build };
 }
 
 const passSmoke = () => vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke: { results: [] } }));
@@ -106,11 +114,15 @@ const passSmoke = () => vi.fn(async () => ({ verdict: 'pass', attempts: 1, smoke
 describe('held item 212 — stacked overlays apply as stack tops', () => {
   it('live 2026-10-10: #4756 moved and is live; #4792/#4797/#4757 go live as tops, #4756 is set aside and logged', async () => {
     const f = fixture();
+    f.fetch();
+    // An earlier build adopted #4756's OLD head (the one its children carry) — the hard evidence it later moved.
+    const old = await f.build([{ ref: BASE, pr: 4756 }], f.init);
     const bNew = f.moveBase();
     f.fetch();
     // The running build carries #4756's NEW head only (as on wev-fix-daemon before the fix).
-    const live = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: BASE, pr: 4756 }] });
+    const live = await planRebuild({ git: f.runGit, headSha: old, mainRef: 'origin/main', overlays: [{ ref: BASE, pr: 4756 }] });
     expect(live.applied.map((a) => a.ref)).toEqual([BASE]);
+    f.adopt(live.finalSha);
 
     const plan = await planRebuild({
       git: f.runGit, headSha: live.finalSha, mainRef: 'origin/main', overlays: OVERLAYS, prBaseChain, stackMode: 'tops',
@@ -125,7 +137,7 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
     for (const k of ['overlay-newcomer-parked', 'established-overlay-dropped', 'overlay-conflict-unresolved']) expect(kinds).not.toContain(k);
     expect(plan.decisions.some((d) => d.action === 'drop' || d.action === 'remove')).toBe(false);
     const moved = plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved');
-    expect(moved?.detail.message).toBe('stack base moved: #4756 set aside, tops #4792 #4797 kept until restacked');
+    expect(moved?.detail.message).toBe('stack base moved (adopted-head): #4756 set aside, tops #4792 #4797 kept until restacked');
     const tops = plan.alerts.filter((a) => a.kind === 'overlay-stack-tops');
     expect(tops).toHaveLength(1);
     expect(tops[0].detail).toMatchObject({ mode: 'tops', tops: ['#4792', '#4797'] });
@@ -170,6 +182,7 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
     f.fetch();
     const plan = await planRebuild({
       git: f.runGit, headSha: null, mainRef: 'origin/main', overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }], prBaseChain,
+      prForcePushes: async (pr) => (pr === 4756 ? [{ before: f.bOld, after: bNew }] : []),
     });
     expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'drop', reason: 'conflict' });
     expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply', reason: 'applied-stack-fallback' });
@@ -178,8 +191,12 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
 
   it('rebuildClone adopts the stack tops end to end (base chains recorded on the entries, no gh) and logs the one stack line', async () => {
     const f = fixture();
-    f.moveBase();
     f.fetch();
+    // First the daemon runs #4756's old head alone; that adopted build is what proves the base moved later.
+    addOverlay(f.clone, { ref: BASE, pr: 4756 }, { env: f.env });
+    const first = await rebuildClone({ root: f.clone, env: f.env, runSmoke: passSmoke(), prState: async () => 'OPEN', log: { error: () => {} } });
+    expect(first, JSON.stringify(first.alerts)).toMatchObject({ adopted: true });
+    f.moveBase();
     for (const o of OVERLAYS) addOverlay(f.clone, { ...o, stackBases: CHAINS[o.pr] }, { env: f.env });
     const logs = [];
     const r = await rebuildClone({
@@ -189,8 +206,8 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
     const head = gitOk(f.clone, ['rev-parse', 'HEAD']).trim();
     for (const sha of [f.last, f.ruling, f.ladder]) expect(isAncestor(f.clone, sha, head)).toBe(true);
     expect(logs.filter((m) => m.includes('overlay-stack-tops'))).toHaveLength(1);
-    expect(logs.some((m) => m.includes('stack base moved: #4756 set aside, tops #4792 #4797 kept until restacked'))).toBe(true);
-  });
+    expect(logs.some((m) => m.includes('stack base moved (adopted-head): #4756 set aside, tops #4792 #4797 kept until restacked'))).toBe(true);
+  }, 30_000);
 });
 
 describe('overlay.stackMode cascade', () => {
@@ -380,7 +397,8 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
     expect(plan.ok).toBe(true);
     expect(plan.decisions.map((d) => [d.ref, d.action])).toEqual([['lane/unrelated', 'apply'], ['lane/claimer', 'apply']]);
     expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-tops');
-    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+    // Operator ruling 2026-10-11: the chain alone makes membership; with nothing clashing there is nothing to decide or log.
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
   });
 
   it('an unconfirmed chain claim that also clashes with the named overlay still leaves that overlay live (the claimer is parked)', async () => {
@@ -425,40 +443,138 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       return f;
     };
 
-    it('a reworded, conflict-resolved rebase leaves a bare chain claim unconfirmed (the top stays parked, loudly)', async () => {
+    const NO_PUSHES = async () => [];
+
+    it('with no hard evidence the base moved, a chain claim leaves the base live (the top stays parked, loudly)', async () => {
       const f = rewordedBase();
       const plan = await planRebuild({
-        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain, prForcePushes: NO_PUSHES,
         overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }],
       });
       expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'drop', reason: 'conflict' });
       expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
     });
 
-    it('…but a chain recorded on the entry by an earlier rebuild still identifies the stack after that rebase', async () => {
+    it('…but a force-push of the base whose before-head the top carries sets the base aside', async () => {
       const f = rewordedBase();
       const plan = await planRebuild({
         git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        prForcePushes: async (pr) => (pr === 4756 ? [{ before: f.bOld, after: null }] : []),
         overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792, stackBases: CHAINS[4792] }],
       });
       expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
       expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'apply' });
-      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved')?.detail.evidence).toBe('force-pushed');
     });
 
-    it('a patch-equivalent commit confirms the claim even when the subject was reworded', async () => {
+    it('look-alike commits are not evidence: a same-subject rebase of the base (no adopted head, no force-push) leaves it live', async () => {
       const f = fixture();
-      gitOk(f.author, ['fetch', '-q', 'origin']);
-      gitOk(f.author, ['checkout', '-q', '-B', BASE, f.init]);
-      write(f.author, TAKEOVER, lines({ 2: 'history takeover v1' })); // the very change the children carry
-      gitOk(f.author, ['commit', '-q', '-am', 'same change, other words']);
-      gitOk(f.author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${BASE}`]);
+      f.moveBase(); // same author and subject as the head the children carry, clashing line
       f.fetch();
       const plan = await planRebuild({
-        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain, prForcePushes: NO_PUSHES,
         overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }],
       });
-      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+    });
+
+    it('a force-push whose before-head no top carries is not evidence', async () => {
+      const f = rewordedBase();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        prForcePushes: async () => [{ before: f.init, after: null }, { before: 'f'.repeat(40), after: null }],
+        overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }],
+      });
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+    });
+
+    it('a malformed force-push answer is unknown, never "no pushes" (and never an eviction)', async () => {
+      const f = rewordedBase();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        prForcePushes: async () => [{ before: '--upload-pack=x' }],
+        overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }],
+      });
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases).toEqual([
+        { ref: BASE, pr: 4756, kept: 'live', tops: [LAST] },
+      ]);
+    });
+  });
+
+  describe('adopted-head evidence and the unknown rule', () => {
+    /** P → its old head was adopted; C was built on that head; P then advanced by a fast-forward that clashes with C. */
+    const ffMove = async ({ adoptOld = true } = {}) => {
+      const f = fixture();
+      const pOld = f.push('lane/ff-p', f.init, { [LADDER]: lines({ 4: 'p v1' }) });
+      f.fetch();
+      if (adoptOld) await f.build([{ ref: 'lane/ff-p', pr: 9701 }], f.init);
+      f.push('lane/ff-c', pOld, { [TAKEOVER]: lines({ 5: 'c edit' }), [LADDER]: lines({ 4: 'p v1', 8: 'c keeps p v1 here' }) });
+      const pNew = f.push('lane/ff-p', pOld, { [LADDER]: lines({ 4: 'p v1', 8: 'p v2 here' }) }); // a fast-forward
+      f.fetch();
+      return { f, pOld, pNew };
+    };
+    const ffPlan = (f, extra = {}) => planRebuild({
+      git: f.runGit, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9702 ? ['lane/ff-p'] : []), prForcePushes: async () => [],
+      overlays: [{ ref: 'lane/ff-p', pr: 9701 }, { ref: 'lane/ff-c', pr: 9702 }], headSha: null, ...extra,
+    });
+
+    it('a fast-forward move is proven by a head an earlier build adopted that the child carries', async () => {
+      const { f } = await ffMove();
+      const plan = await ffPlan(f);
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved')?.detail.evidence).toBe('adopted-head');
+    });
+
+    it('…and from two builds back (the reflog keeps every adopted build)', async () => {
+      const f = fixture();
+      const pOld = f.push('lane/ff-p', f.init, { [LADDER]: lines({ 4: 'p v1' }) });
+      f.fetch();
+      const b1 = await f.build([{ ref: 'lane/ff-p', pr: 9701 }], f.init);
+      f.push('lane/ff-c', pOld, { [TAKEOVER]: lines({ 5: 'c edit' }), [LADDER]: lines({ 4: 'p v1', 8: 'c keeps p v1 here' }) });
+      const pMid = f.push('lane/ff-p', pOld, { [TAKEOVER]: lines({ 11: 'p mid' }) });
+      f.fetch();
+      const b2 = await f.build([{ ref: 'lane/ff-p', pr: 9701 }], b1);
+      f.push('lane/ff-p', pMid, { [LADDER]: lines({ 4: 'p v1', 8: 'p v2 here' }), [TAKEOVER]: lines({ 11: 'p mid' }) });
+      f.fetch();
+      const plan = await ffPlan(f, { headSha: b2 });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply' });
+    });
+
+    it('a retargeted sibling that carries no adopted head never evicts the base, even after it fast-forwarded', async () => {
+      const f = fixture();
+      const pOld = f.push('lane/ff-p', f.init, { [LADDER]: lines({ 4: 'p v1' }) });
+      f.fetch();
+      await f.build([{ ref: 'lane/ff-p', pr: 9701 }], f.init);
+      f.push('lane/ff-p', pOld, { [LADDER]: lines({ 4: 'p v1', 8: 'p v2 here' }) });
+      f.push('lane/ff-c', f.init, { [LADDER]: lines({ 8: 'sibling edit' }) }); // never built on P
+      f.fetch();
+      const plan = await ffPlan(f);
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+    });
+
+    it('unknown evidence, base live in the last build: it stays live (no eviction), logged', async () => {
+      const { f } = await ffMove({ adoptOld: false });
+      const live = await f.build([{ ref: 'lane/ff-p', pr: 9701 }], f.init); // the last build ran P's NEW head
+      const plan = await ffPlan(f, { headSha: live, prForcePushes: async () => null });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases[0]).toMatchObject({ kept: 'live' });
+    });
+
+    it('unknown evidence, base set aside in the last build: it stays set aside', async () => {
+      const { f } = await ffMove({ adoptOld: false });
+      const last = await f.build([{ ref: 'lane/ff-c', pr: 9702 }], f.init); // the last build ran the top, not P
+      const plan = await ffPlan(f, { headSha: last, prForcePushes: async () => null });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases[0]).toMatchObject({ kept: 'set-aside' });
     });
   });
 
@@ -505,6 +621,36 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       const chain = makePrBaseChain({ root: '/nonexistent', overlays: [{ ref: 'lane/c', pr: 1, stackBases: ['lane/b', 'lane/a'] }], gh, slug: SLUG });
       expect(await chain(1)).toEqual(['lane/b', 'lane/a']);
       expect(chain.fresh.size).toBe(0);
+    });
+
+    it('forcePushes reads the PR timeline (validated oids), treats any odd answer as unknown, and shares the gh breaker', async () => {
+      const A = 'a'.repeat(40);
+      const B = 'b'.repeat(40);
+      const answers = {
+        1: { data: { repository: { pullRequest: { timelineItems: { nodes: [{ beforeCommit: { oid: A }, afterCommit: { oid: B } }] } } } } },
+        2: { data: { repository: { pullRequest: { timelineItems: { nodes: [] } } } } },
+        3: [], // not the GraphQL shape (e.g. a stub answering another command)
+        4: { data: { repository: { pullRequest: { timelineItems: { nodes: [{ beforeCommit: null }] } } } } },
+        5: { data: { repository: { pullRequest: { timelineItems: { nodes: [{ beforeCommit: { oid: '--output=x' } }] } } } } },
+        6: { errors: [{ message: 'x' }], data: { repository: { pullRequest: { timelineItems: { nodes: [] } } } } },
+      };
+      const seen = [];
+      const gh = (args) => {
+        seen.push(args);
+        const n = Number(args.find((a) => a.startsWith('n=')).slice(2));
+        return n === 7 ? GH_TIMED_OUT : answers[n];
+      };
+      const chain = makePrBaseChain({ root: '/nonexistent', overlays: [], gh, slug: SLUG });
+      expect(await chain.forcePushes(1)).toEqual([{ before: A, after: B }]);
+      expect(await chain.forcePushes(2)).toEqual([]);
+      for (const pr of [3, 4, 5, 6]) expect(await chain.forcePushes(pr)).toBeNull();
+      expect(await chain.forcePushes(1)).toEqual([{ before: A, after: B }]); // memoised
+      expect(seen.filter((a) => a.includes('n=1'))).toHaveLength(1);
+      expect(seen[0].slice(0, 2)).toEqual(['api', 'graphql']);
+      expect(seen[0]).toEqual(expect.arrayContaining(['-f', 'o=o', '-f', 'r=r', '-F', 'n=1']));
+      expect(await chain.forcePushes(7)).toBeNull(); // a timeout trips the breaker…
+      expect(await chain(8)).toBeNull(); // …for the base-chain reads too
+      expect(await chain.forcePushes('1; rm -rf /')).toBeNull();
     });
 
     it('a total time budget stops further gh calls', async () => {
@@ -578,8 +724,10 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
 });
 
 describe('held item 212 red team — shared prerequisites are not evidence of a stack', () => {
-  const siblingsPlan = (f, chains) => planRebuild({
+  // gh answers: no force-push on any PR unless a test says otherwise.
+  const siblingsPlan = (f, chains, pushes = {}) => planRebuild({
     git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => chains[pr] ?? [],
+    prForcePushes: async (pr) => pushes[pr] ?? [],
     overlays: [{ ref: 'lane/p', pr: 9501 }, { ref: 'lane/c', pr: 9502 }],
   });
 
@@ -633,6 +781,7 @@ describe('held item 212 red team — shared prerequisites are not evidence of a 
     f.fetch();
     const plan = await planRebuild({
       git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9502 ? ['lane/p'] : []),
+      prForcePushes: async () => [],
       overlays: [{ ref: 'lane/x', pr: 9500 }, { ref: 'lane/p', pr: 9501 }, { ref: 'lane/c', pr: 9502 }],
     });
     expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'apply' });
@@ -640,7 +789,7 @@ describe('held item 212 red team — shared prerequisites are not evidence of a 
     expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
   });
 
-  it('live shape with the intermediate chain refs pushed and registered: their content still counts as the base\'s work', async () => {
+  it('live shape with the intermediate chain refs pushed and registered: the moved base is still set aside', async () => {
     const f = fixture();
     const mids = CHAINS[4792].slice(0, 3);
     for (const m of mids) gitOk(f.author, ['push', '-q', '-f', 'origin', `${f.ladder}:refs/heads/${m}`]);
@@ -648,6 +797,7 @@ describe('held item 212 red team — shared prerequisites are not evidence of a 
     f.fetch();
     const plan = await planRebuild({
       git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+      prForcePushes: async (pr) => (pr === 4756 ? [{ before: f.bOld, after: null }] : []),
       overlays: [{ ref: BASE, pr: 4756 }, ...mids.map((ref, i) => ({ ref, pr: 9601 + i })), { ref: LAST, pr: 4792 }],
     });
     expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
@@ -655,14 +805,14 @@ describe('held item 212 red team — shared prerequisites are not evidence of a 
     expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
   });
 
-  it('a real child of a rebased base that shares a prerequisite with it is still recognised (its own work matches)', async () => {
+  it('a real child of a force-pushed base that shares a prerequisite with it is still recognised (it carries the before-head)', async () => {
     const f = fixture();
     const h = f.push('lane/h', f.init, { [LADDER]: lines({ 5: 'prerequisite' }) });
     const pOld = f.push('lane/p', h, { [TAKEOVER]: lines({ 2: 'p v1' }) });
     f.push('lane/c', pOld, { [TAKEOVER]: lines({ 2: 'p v1', 9: 'c edit' }) });
-    f.push('lane/p', h, { [TAKEOVER]: lines({ 2: 'p v2' }) }); // P rebased in place: same subject, clashing line
+    f.push('lane/p', h, { [TAKEOVER]: lines({ 2: 'p v2' }) }); // P force-pushed in place: clashing line
     f.fetch();
-    const plan = await siblingsPlan(f, { 9502: ['lane/p'] });
+    const plan = await siblingsPlan(f, { 9502: ['lane/p'] }, { 9501: [{ before: pOld, after: null }] });
     expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
     expect(plan.decisions.find((d) => d.ref === 'lane/c')).toMatchObject({ action: 'apply' });
     expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');

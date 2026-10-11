@@ -38,7 +38,7 @@ import {
  * smoke a candidate — see {@link rebuildClone}).
  */
 export async function prepareRebuild({
-  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain,
+  root, env, log, run, prState, stateOpts, mainOnly, now, skipCheck, prBaseChain, prForcePushes,
 }) {
   const stEnv = { ...env, ...(stateOpts?.env || {}) };
   const git = makeGit({ run, cwd: root, env });
@@ -260,18 +260,13 @@ export async function prepareRebuild({
   const plan = await planRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
     stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
+    prForcePushes: prForcePushes ?? chainOf.forcePushes ?? null,
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
-  // Only claims git corroborated are recorded: a retargeted PR's unconfirmed claim must not become "recorded" evidence.
+  // A chain only names a stack's members; setting a base aside still needs hard evidence it moved (planOverlayStacks).
   if (chainOf.fresh?.size > 0) {
-    const claims = (plan.alerts || []).find((a) => a.kind === 'overlay-stack-claim-unconfirmed')?.detail.claims ?? [];
-    const confirmed = new Map();
-    for (const [pr, chain] of chainOf.fresh) {
-      const ref = overlaysBefore.find((o) => o && o.pr === pr)?.ref;
-      confirmed.set(pr, chain.filter((b) => !claims.some((c) => c.ref === ref && c.base === b)));
-    }
-    try { persistStackBases(root, confirmed, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
+    try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
   for (const event of plan.alerts || []) {
     alert(event.kind, event.detail);
