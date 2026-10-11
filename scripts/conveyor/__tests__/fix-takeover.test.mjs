@@ -2,7 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   resolveFixSettings, planTakeover, takeoverRung, takeoverMarkers, takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover,
-  launchProvedNotStarted,
+  launchProvedNotStarted, takeoverReviewCap,
   FIX_SETTINGS_FILE,
 } from '../fix-takeover.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -37,8 +37,14 @@ function cappedPr(extraComments = []) {
 
 describe('fix settings cascade (card xx0055i)', () => {
   it('built-in default is takeover + history on + one takeover per PR', () => {
-    const s = resolveFixSettings({ env: {}, read: () => { throw new Error('no file'); } });
+    const s = resolveFixSettings({ env: {}, read: () => { throw Object.assign(new Error('no file'), { code: 'ENOENT' }); } });
     expect(s).toMatchObject({ roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 });
+  });
+  it('a settings file that is there but unreadable (not a missing file) fails closed to person / 0 (self-review, round 6)', () => {
+    for (const code of ['EACCES', 'EISDIR', 'EIO', undefined]) {
+      const s = resolveFixSettings({ env: {}, read: () => { throw Object.assign(new Error('read failed'), { code }); } });
+      expect(s).toMatchObject({ roundCapAction: 'person', takeoverMaxPerPr: 0, sources: { roundCapAction: 'settings-invalid', takeoverMaxPerPr: 'settings-invalid' } });
+    }
   });
   it('the shipped platform preference is takeover + on, under the `fix` namespace', () => {
     expect(JSON.parse(readFileSync(FIX_SETTINGS_FILE, 'utf8'))).toMatchObject({ fix: { roundCapAction: 'takeover', roundHistory: 'on', takeoverMaxPerPr: 1 } });
@@ -122,6 +128,23 @@ describe('planTakeover (card xx0055i)', () => {
     // and the resolved 0 reaches the planner as `setting-disabled`
     const s = resolveFixSettings({ env: { WE_FIX_TAKEOVER_MAX_PER_PR: 'off' }, read: () => '{}' });
     expect(planTakeover({ pr: cappedPr(), roundCapAction: 'takeover', takeoverMaxPerPr: s.takeoverMaxPerPr, fixerLadder: LADDER })).toMatchObject({ reason: 'setting-disabled' });
+  });
+  it('a present but malformed `fix` container (or file) fails closed to person / 0, never the built-in takeover / 1 (review round 6)', () => {
+    const closed = { roundCapAction: 'person', takeoverMaxPerPr: 0, sources: { roundCapAction: 'settings-invalid', takeoverMaxPerPr: 'settings-invalid' } };
+    for (const bad of [false, true, 'off', '', 0, 3, [], [{ roundCapAction: 'takeover' }]]) {
+      expect(resolveFixSettings({ env: {}, read: () => JSON.stringify({ fix: bad }) })).toMatchObject(closed);
+    }
+    // the file itself: not an object at the top, or not JSON at all
+    for (const raw of ['[]', '"fix"', '42', 'true', '{ "fix": { "roundCapAction": "takeover", }', '']) {
+      expect(resolveFixSettings({ env: {}, read: () => raw })).toMatchObject(closed);
+    }
+    // a valid env layer still decides over a malformed file
+    expect(resolveFixSettings({ env: { WE_FIX_ROUND_CAP_ACTION: 'takeover', WE_FIX_TAKEOVER_MAX_PER_PR: '1' }, read: () => JSON.stringify({ fix: false }) }))
+      .toMatchObject({ roundCapAction: 'takeover', takeoverMaxPerPr: 1, sources: { roundCapAction: 'env', takeoverMaxPerPr: 'env' } });
+    // absent stays absent: no `fix` key, `fix: null`, top-level null, or no file at all keep the built-in defaults
+    for (const raw of ['{}', '{"fix":null}', 'null', '{"other":1}']) {
+      expect(resolveFixSettings({ env: {}, read: () => raw })).toMatchObject({ roundCapAction: 'takeover', takeoverMaxPerPr: 1, sources: { roundCapAction: 'built-in', takeoverMaxPerPr: 'built-in' } });
+    }
   });
   it('the operator note for a disabled takeover says it is turned off, not that it already ran', () => {
     const NOW = Date.parse('2026-10-10T00:00:00Z');
@@ -262,6 +285,54 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
     expect(takeoverMarkers([marker(HEAD), marker(other), voided(HEAD)]).map((m) => m.head)).toEqual([other]);
     // a void on its own is not a start marker
     expect(takeoverMarkers([voided(HEAD)])).toEqual([]);
+  });
+
+  describe('voids are read in thread order (review round 6)', () => {
+    const at = (c, t) => ({ ...c, createdAt: `2026-10-10T${t}:00Z` });
+    const startAt = (attempts, t) => at({ author: BOT, body: takeoverMarkerBody({ pr: 7, head: HEAD, attempts, cap: 5, rung: { id: 'stronger-model' } }) }, t);
+
+    it('a void cancels only a preceding start and preserves the retry launch count', () => {
+      const thread = [startAt(5, '01:00'), at(voided(HEAD), '01:01'), startAt(6, '02:00')];
+      expect(takeoverMarkers(thread)).toMatchObject([{ head: HEAD, attempts: 6 }]);
+      expect(takeoverReviewCap(thread, 5)).toBe(7);
+      // the same thread handed over out of order is read by time, not by array position
+      expect(takeoverMarkers([thread[2], thread[0], thread[1]])).toMatchObject([{ attempts: 6 }]);
+    });
+
+    it('the retry launched at 6 gets its review at 7 (wiring through planReconcile)', () => {
+      const NOW = Date.parse('2026-10-10T03:00:00Z');
+      const green = [{ name: 'gate', status: 'COMPLETED', conclusion: 'SUCCESS' }];
+      const thread = [...Array.from({ length: 7 }, (_, i) => rearm(i + 1)), startAt(5, '01:00'), at(voided(HEAD), '01:01'), startAt(6, '02:00')];
+      const p = planReconcile({ prs: [{ ...cappedPr(thread), labels: [{ name: 'review:pending' }], statusCheckRollup: green }], agents: [], durableCounts: {}, now: NOW, fixerLadder: LADDER, roundCapAction: 'takeover', requiredChecks: ['gate'] });
+      expect(p.dispatch.find((d) => d.prNumber === 7)).toMatchObject({ kind: 'review', attempts: 7 });
+      expect(p.refusals.find((r) => r.prNumber === 7)).toBeUndefined();
+    });
+
+    it('a void posted BEFORE a start cancels nothing (it voids no launch that came later)', () => {
+      expect(takeoverMarkers([at(voided(HEAD), '00:30'), startAt(5, '01:00')])).toHaveLength(1);
+    });
+
+    it('a takeover that RAN after two voided launches is spent, not a void-limit (the note says it already ran)', () => {
+      const thread = [startAt(5, '01:00'), at(voided(HEAD), '01:01'), startAt(5, '02:00'), at(voided(HEAD), '02:01'), startAt(5, '03:00')];
+      expect(planTakeover({ pr: cappedPr(thread), roundCapAction: 'takeover', fixerLadder: LADDER })).toMatchObject({ ok: false, reason: 'takeover-spent' });
+      const NOW = Date.parse('2026-10-10T04:00:00Z');
+      const p = planReconcile({ prs: [cappedPr([...Array.from({ length: 6 }, (_, i) => rearm(i + 1)), ...thread])], agents: [], durableCounts: { 7: 6 }, now: NOW, fixerLadder: LADDER, roundCapAction: 'takeover' });
+      const text = p.notes.find((n) => n.kind === 'round-cap-exhausted')?.text ?? '';
+      expect(text).toMatch(/already ran/);
+      expect(text).not.toMatch(/launch faults/);
+    });
+
+    it('a refused void on an OLDER head does not mislabel a later clean takeover on a new head (self-review, round 6)', () => {
+      const h1 = 'c'.repeat(40);
+      const startOn = (head, t) => at({ author: BOT, body: takeoverMarkerBody({ pr: 7, head, attempts: 5, cap: 5, rung: { id: 'stronger-model' } }) }, t);
+      const faulted = [startOn(h1, '01:00'), at(voided(h1), '01:01'), startOn(h1, '02:00'), at(voided(h1), '02:01'), startOn(h1, '03:00'), at(voided(h1), '03:01')];
+      // on h1 alone the last fault was refused: void-limit
+      expect(planTakeover({ pr: { ...cappedPr(faulted), headRefOid: h1 }, roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER }))
+        .toMatchObject({ ok: false, reason: 'takeover-void-limit' });
+      // then a clean takeover on HEAD (no void of its own): that one ran, so the PR is spent, not void-limited
+      expect(planTakeover({ pr: cappedPr([...faulted, startOn(HEAD, '04:00')]), roundCapAction: 'takeover', takeoverMaxPerPr: 2, fixerLadder: LADDER }))
+        .toMatchObject({ ok: false, reason: 'takeover-spent' });
+    });
   });
 });
 
