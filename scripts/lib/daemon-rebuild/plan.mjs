@@ -185,7 +185,8 @@ export async function planOverlayStacks({
     return buildCache.get(build);
   };
   // The same overlay: same branch AND same PR (a branch name reused by another PR is a different overlay).
-  const sameOverlay = (m, n) => m.ref === n.ref && (m.pr ?? null) === (n.pr ?? null);
+  const prKey = (pr) => (pr == null || pr === '' ? null : Number(pr));
+  const sameOverlay = (m, n) => m.ref === n.ref && prKey(m.pr) === prKey(n.pr);
   // Every adopted build this clone still remembers: the running HEAD, then the HEAD reflog (newest 50) — each rebuild
   // moves HEAD onto the build it adopted, so the reflog keeps the heads of P that earlier builds merged.
   let builds = null;
@@ -253,8 +254,10 @@ export async function planOverlayStacks({
       if (evidence == null || evidence === 'none') {
         // No fresh proof (unknown, or the proof aged out of the reflog): keep what the last adopted build did with P —
         // set aside if it merged a clashing top but not P, else live. Never a fresh eviction.
+        // P's tip already in HEAD (merged directly, or through a top that contained it) means P is live: never set aside.
         const last = mergedBy(headSha);
-        const keptAside = !last.some((m) => sameOverlay(m, p)) && clashing.some((t) => last.some((m) => sameOverlay(m, t)));
+        const pLive = !!headSha && git(['merge-base', '--is-ancestor', p.sha, headSha]).status === 0;
+        const keptAside = !pLive && !last.some((m) => sameOverlay(m, p)) && clashing.some((t) => last.some((m) => sameOverlay(m, t)));
         if (evidence == null) unknown.push({ ref: p.ref, pr: p.pr, kept: keptAside ? 'set-aside' : 'live', tops: clashing.map((t) => t.ref) });
         else if (!keptAside) for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
         if (!keptAside) continue;

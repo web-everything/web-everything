@@ -582,6 +582,24 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       expect(plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved')?.detail.evidence).toBe('last-adopted');
     });
 
+    it('a base live in HEAD only through its top\'s OLD head is never set aside when that top is rewritten to clash', async () => {
+      const f = fixture();
+      const p = f.push('lane/ff-p', f.init, { [LADDER]: lines({ 4: 'p v1' }) });
+      f.push('lane/ff-c', p, { [TAKEOVER]: lines({ 5: 'c edit' }) }); // contains P: the build merges C only
+      f.fetch();
+      const b1 = (await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9702 ? ['lane/ff-p'] : []),
+        overlays: [{ ref: 'lane/ff-p', pr: 9701 }, { ref: 'lane/ff-c', pr: 9702 }],
+      })).finalSha;
+      f.adopt(b1);
+      f.push('lane/ff-c', f.init, { [LADDER]: lines({ 4: 'c rewrote it' }) }); // C dropped P and now clashes with it
+      f.fetch();
+      const plan = await ffPlan(f, { headSha: b1 });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+    });
+
     it('unknown evidence, base live in the last build: it stays live (no eviction), logged', async () => {
       const { f } = await ffMove({ adoptOld: false });
       const live = await f.build([{ ref: 'lane/ff-p', pr: 9701 }], f.init); // the last build ran P's NEW head
