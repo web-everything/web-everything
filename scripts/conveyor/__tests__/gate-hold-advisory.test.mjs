@@ -75,6 +75,13 @@ describe('gate-held advisory at the repair cap', () => {
     expectNote(p, 'review-human-hold');
     expect(noteFor(p).text).toMatch(/already reviewed/);
   });
+  it('treats a trusted changes verdict whose net basis names the live head as already reviewed', () => {
+    const verdict = { author: BOT, createdAt: at(10),
+      body: `${ADVISORY_NOTE_MARKER} Changes: 0 finding(s)\n\n**Advisory outcome:** \`changes\`\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`\n\n### Findings\n\n` };
+    const p = plan(pr([verdict]));
+    expectNote(p, 'review-human-hold');
+    expect(noteFor(p).text).toMatch(/already reviewed/);
+  });
   it('does not let an untrusted reviewed-sha marker suppress the owed advisory', () => {
     expectReview(plan(pr([{ author: { login: 'mallory' }, createdAt: at(10), body: `<!-- reviewed-sha: ${HEAD} -->` }])));
   });

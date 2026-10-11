@@ -64,7 +64,7 @@ import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admissio
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
 import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
-import { createDispatchSinks, defaultClaudeProvider } from '../../scripts/operations/dispatch-lane-io.mjs';
+import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync } from 'node:fs';
@@ -757,7 +757,7 @@ export async function runTickAllRepos({
       },
       dispatch: createRoutedCiHealDispatch({ dispatch: dispatchCiHeal,
         route: (planned) => fixExecutorRoute({ ...entries.find((e) => e.kind === 'ci-heal' && e.prNumber === planned.pr), ...planned }),
-        createSinks: createDispatchSinks, launchCodex: fixDetachedProvider, launchClaude: defaultClaudeProvider,
+        createSinks: createDispatchSinks, launchCodex: fixDetachedProvider,
         writePrompt: writePrivateBorrowedPrompt, removePrompt: (file) => { try { unlinkSync(file); } catch {} },
         profileFor: repoProfile,
       }),

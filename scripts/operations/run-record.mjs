@@ -120,8 +120,16 @@ export function newJobRunRecord({ id, kind, input = {}, codeMode, maxAttempts, c
  * THE METERED FIELDS of one juror spawn, and NOTHING ELSE. See {@link normalizeJudgeTelemetry}.
  * `usage` is handled separately (it is an object of counters, not a scalar).
  */
-const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens']);
-const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision']);
+const TELEMETRY_NUMBERS = Object.freeze(['costUsd', 'durationMs', 'wallMs', 'numTurns', 'loadedContextTokens', 'exitCode', 'attempts']);
+const TELEMETRY_STRINGS = Object.freeze(['sessionId', 'stopReason', 'lens', 'model', 'effort', 'transcriptFile', 'requestedModel', 'servedModel', 'servedBackend', 'modelEvidence', 'quotaState', 'quotaResetsAt', 'fallbackDecision', 'signal', 'stderrTail', 'failure']);
+/**
+ * Held item 223 — WHY A SEAT FAILED, not only what it cost. `exitCode`, `signal`, `attempts`, `failure` and a
+ * `stderrTail` come from `we:scripts/lib/judge-spawn.mjs#JudgeUnparseableError`'s telemetry. Before they were on this
+ * list, 15 of 119 review runs on 2026-10-10 died on "the juror did not emit parseable JSON on stdout" and no record
+ * could say whether the juror was killed, crashed or printed nothing. `stderrTail` is bounded here as well as at the
+ * source, because this row is written on every `advance`.
+ */
+const TELEMETRY_STRING_MAX = Object.freeze({ stderrTail: 1000 });
 /**
  * THE FLAGS, recorded only when TRUE. A `timedOut: false` on every row is noise; the fact being recorded is
  * the exception, and its absence is the ordinary case (#3203). Without it a juror that hit the wall and a
@@ -136,8 +144,8 @@ const TELEMETRY_FLAGS = Object.freeze(['timedOut']);
  * never makes it — see {@link ./engine.mjs}), so its contents come from outside the pure core, and the record
  * is JSON-serialized to disk AND printed verbatim by `--json`. A spread would let a caller put the juror's
  * whole argv (which carries the mandate) or an unbounded transcript into a record that is written on every
- * `advance`. This takes the five numbers, the five names and the counter block that answer "what did that
- * juror cost", and drops everything else silently — a caller adding a field gets no error and no leak.
+ * `advance`. This takes the listed numbers and names (what the juror cost, and why a failed one failed) and the
+ * counter block, and drops everything else silently — a caller adding a field gets no error and no leak.
  *
  * `usage` is copied ONE level deep and only its numeric entries, for the same reason. A flag is copied only
  * when true — see {@link TELEMETRY_FLAGS}.
@@ -152,7 +160,7 @@ export function normalizeJudgeTelemetry({ step = '', stepIndex = null, telemetry
     if (typeof src[k] === 'number' && Number.isFinite(src[k])) row[k] = src[k];
   }
   for (const k of TELEMETRY_STRINGS) {
-    if (typeof src[k] === 'string' && src[k]) row[k] = src[k];
+    if (typeof src[k] === 'string' && src[k]) row[k] = TELEMETRY_STRING_MAX[k] ? src[k].slice(-TELEMETRY_STRING_MAX[k]) : src[k];
   }
   for (const k of TELEMETRY_FLAGS) {
     if (src[k] === true) row[k] = true;
@@ -513,6 +521,20 @@ export function validateRunRecord(record) {
             errors.push(`stepTimings[${i}] has an invalid durationMs ${JSON.stringify(t.durationMs)}`);
           }
         }
+      });
+    }
+  }
+  // SAVED SEAT ANSWERS (held item 223) — the answers of juror seats that ran beside a seat that failed, kept so a
+  // resume commits them instead of paying for them again (`we:scripts/operations/cli-adapter.mjs#driveRun`).
+  // Tolerated when absent; each entry must name its step, since that is what a resume matches it by.
+  if (record.prefilledSeats !== undefined) {
+    if (!Array.isArray(record.prefilledSeats)) {
+      errors.push('`prefilledSeats` must be an array when present');
+    } else {
+      record.prefilledSeats.forEach((p, i) => {
+        if (!isPlainObject(p)) { errors.push(`prefilledSeats[${i}] must be an object`); return; }
+        if (typeof p.step !== 'string' || !p.step) errors.push(`prefilledSeats[${i}] has no step name`);
+        if (!Number.isInteger(p.stepIndex) || p.stepIndex < 0) errors.push(`prefilledSeats[${i}] has an invalid stepIndex`);
       });
     }
   }

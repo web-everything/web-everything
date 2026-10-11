@@ -203,32 +203,44 @@ describe('main', () => {
 
   it('filters out PRs without review:human and continues after a repo error', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    execFileSync.mockReset()
-      .mockImplementationOnce(() => { throw new Error('unavailable'); })
-      .mockReturnValueOnce(JSON.stringify([
+    const previousExitCode = process.exitCode;
+    const sleep = vi.fn();
+    execFileSync.mockReset().mockImplementation((_command, args) => {
+      if (args[args.indexOf('--repo') + 1] === 'owner/broken') throw new Error('unavailable');
+      return JSON.stringify([
         fixture({ number: 1, labels: [] }), fixture(), fixture({ number: 43, labels: [HUMAN] }),
-      ]));
-    main(['--repo=owner/broken', '--repo=owner/good', '--json'], { unsupportedPath: NO_UNSUPPORTED });
-    expect(JSON.parse(log.mock.calls[0][0])).toEqual({
-      ready: [{ repo: 'owner/good', number: 42, title: 'Ready for review' }],
-      rulingNeeded: [],
-      pending: [],
-      notReady: [{
-        repo: 'owner/good', number: 43, title: 'Ready for review',
-        reasons: ['label/comment disagreement: advisory comment says accept on this head but advisory:accepted is absent'],
-      }],
-      stoodDown: [],
-      stuck: [],
-      errors: ['owner/broken: unavailable'],
-      unsupported: [],
-      laneDecisions: [],
-      backpressure: [],
-      reconcileNotes: [],
+      ]);
     });
-    expect(execFileSync).toHaveBeenLastCalledWith('gh', [
-      'pr', 'list', '--repo', 'owner/good', '--state', 'open', '--limit', '200', '--json',
-      'number,title,labels,headRefOid,mergeable,statusCheckRollup,comments',
-    ], expect.objectContaining({ encoding: 'utf8' }));
+    try {
+      main(['--repo=owner/broken', '--repo=owner/good', '--json'], { sleep, unsupportedPath: NO_UNSUPPORTED });
+      expect(JSON.parse(log.mock.calls[0][0])).toEqual({
+        ready: [{ repo: 'owner/good', number: 42, title: 'Ready for review' }],
+        rulingNeeded: [],
+        pending: [],
+        notReady: [{
+          repo: 'owner/good', number: 43, title: 'Ready for review',
+          reasons: ['label/comment disagreement: advisory comment says accept on this head but advisory:accepted is absent'],
+        }],
+        stoodDown: [],
+        stuck: [],
+        errors: ['owner/broken: unavailable'],
+        incomplete: true,
+        unsupported: [],
+        laneDecisions: [],
+        backpressure: [],
+        reconcileNotes: [],
+      });
+      expect(execFileSync).toHaveBeenLastCalledWith('gh', [
+        'pr', 'list', '--repo', 'owner/good', '--state', 'open', '--limit', '200', '--json',
+        'number,title,labels,headRefOid,mergeable,statusCheckRollup,comments',
+      ], expect.objectContaining({ encoding: 'utf8' }));
+      expect(execFileSync.mock.calls.filter(([, args]) =>
+        args[args.indexOf('--repo') + 1] === 'owner/broken').length).toBeGreaterThan(1);
+      expect(sleep).toHaveBeenCalled();
+      expect(process.exitCode).toBe(1);
+    } finally {
+      process.exitCode = previousExitCode;
+    }
   });
 
   it('UNKNOWN then MERGEABLE on re-poll → NEEDS YOU (the flapping gate settles)', () => {

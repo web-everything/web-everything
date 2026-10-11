@@ -42,7 +42,9 @@ describe('resolveMaxTestWorkers — one configurable vitest worker ceiling', () 
 
   it('parses the cap exactly like heavy-admission.mjs#resolveCap (no drift)', () => {
     for (const v of [undefined, '', '0', '1', '2', '3', '5', '8', '2.7', 'x', '-1']) {
-      const env = v === undefined ? {} : { WE_HEAVY_ADMISSION_CAP: v };
+      // A private pool (LANE_POOL_ROOT) is where resolveCap still reads this env; on the shared host pool the cap
+      // comes from the host-wide heavyAdmission policy instead (admission-no-fail-open).
+      const env = v === undefined ? { LANE_POOL_ROOT: '/private-test-pool' } : { LANE_POOL_ROOT: '/private-test-pool', WE_HEAVY_ADMISSION_CAP: v };
       expect(resolveMaxTestWorkers(env, 24)).toBe(Math.max(1, Math.min(4, Math.floor(24 / resolveCap(env)))));
     }
   });

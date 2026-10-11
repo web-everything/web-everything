@@ -1832,6 +1832,12 @@ export function runReconcileFixDispatch({
     if (!t.admit) {
       const b = t.kind === 'fix-cap' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
       if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
+      // A borrowed non-Claude launch never applies the ladder table (`launchTableFor`), so an entry that carries one
+      // (ruling send-back, takeover, round escalation) keeps waiting for the fixer cap instead.
+      if (b.executor !== 'claude' && (entry.takeover || entry.rulingNotAddressed || roundEscalationFor(entry, { fixSettings: resolveFixSettings() }))) {
+        refusals.push({ pr: entry.pr, kind: t.kind, why: `${t.why}; not borrowing a ${b.executor} builder slot: this repair runs on a stronger Claude model rung` });
+        continue;
+      }
       borrowed = { executor: b.executor, reason: b.reason ?? BORROW_REASON };
       console.error(`reconcile-fix-dispatch: PR #${entry.pr} ${BORROW_REASON} (executor ${b.executor}, waited ${b.waitedMinutes} min on the fixer cap)`);
     } else if (borrowGate) borrowGate.clear({ repo: repoKey, pr: entry.pr });
