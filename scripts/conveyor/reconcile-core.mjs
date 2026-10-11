@@ -321,6 +321,11 @@ export const REFUSAL_KINDS = Object.freeze([
   // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
   // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
   'scope-bloat', 'ruling-dispute',
+  // Same class again, from the cap step's `refuseFn(...)` calls (the scan only matched `refuse(`): a PR the takeover
+  // planner declines to take over gets one of these instead of the registered `cap-exhausted`. `gate-hold` — held by
+  // its own gate with no open defect; `takeover-awaiting-review` — the latest takeover's head is not judged yet;
+  // `mechanical-carry-forward` — a proven mechanical round carries its parent's verdict, no fix owed.
+  'gate-hold', 'takeover-awaiting-review', 'mechanical-carry-forward',
 ]);
 
 /**
@@ -1506,23 +1511,35 @@ function dispatchReviewRow({
 export const OPERATOR_RULING_EXTRA_ROUNDS_SETTING = 'operatorRulingExtraRounds';
 export const OPERATOR_RULING_EXTRA_ROUNDS_ENV = 'WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS';
 export const OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT = 1;
-const asRounds = (v) => { const s = String(v ?? '').trim(); return /^\d{1,2}$/.test(s) ? Number(s) : null; };
+/** A rounds value: an integer 0..99 (a number, or a digit string). `null` when invalid (`[2]`, `""`, `1.5`, `-1`, `off`). */
+const asRounds = (v) => {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 99 ? v : null;
+  return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : null;
+};
 
 /**
- * PURE: the policy cascade for `fix.operatorRulingExtraRounds` — standard default → platform preference
- * (`platform.fix`) → tool override (`we:scripts/settings/fix.json`, `repo`) → env. The IO shell reads the layers;
- * an invalid layer is skipped, never trusted.
- * @returns {{value:number, source:'standard'|'platform'|'repo'|'env'}}
+ * PURE: the policy cascade for `fix.operatorRulingExtraRounds` — standard default → platform preference → tool override
+ * (`we:scripts/settings/fix.json`) → env. Both file layers are the parsed JSON documents, whose settings live under
+ * their `fix` key (like every other `fix.*` setting; see `takeover-budget.mjs#resolveTakeoverBudget`). It fails
+ * CLOSED, like that sibling: the highest layer that is PRESENT (a non-blank env var, or a key that is not null in a
+ * file's `fix` object) decides, and a present value that is not a valid count turns the grant off (value 0, source
+ * `<layer>-invalid`) instead of falling through to the standard 1, so a typo meant to stop it never starts a session.
+ * @returns {{value:number, source:'standard'|'platform'|'repo'|'env'|'platform-invalid'|'repo-invalid'|'env-invalid'}}
  */
 export function resolveOperatorRulingExtraRounds({ env = {}, platform = null, repo = null } = {}) {
-  let out = { value: OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT, source: 'standard' };
-  const p = asRounds(platform?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]);
-  if (p !== null) out = { value: p, source: 'platform' };
-  const r = asRounds(repo?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]);
-  if (r !== null) out = { value: r, source: 'repo' };
-  const e = asRounds(env?.[OPERATOR_RULING_EXTRA_ROUNDS_ENV]);
-  if (e !== null) out = { value: e, source: 'env' };
-  return out;
+  const present = (v) => v !== undefined && v !== null;
+  const envRaw = env?.[OPERATOR_RULING_EXTRA_ROUNDS_ENV];
+  const layers = [
+    ['env', typeof envRaw === 'string' && envRaw.trim() === '' ? undefined : envRaw],
+    ['repo', repo?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]],
+    ['platform', platform?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]],
+  ];
+  for (const [source, raw] of layers) {
+    if (!present(raw)) continue;
+    const v = asRounds(raw);
+    return v === null ? { value: 0, source: `${source}-invalid` } : { value: v, source };
+  }
+  return { value: OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT, source: 'standard' };
 }
 
 /**
@@ -2715,7 +2732,11 @@ export function planReconcile({
       // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
       // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see
       // {@link operatorRulingRound}.
-      const directed = attempts >= effectiveRoundCap ? operatorRulingRound(pr, { allowance: operatorRulingExtraRounds.value }) : null;
+      // The directed takeover is still an automatic takeover: the takeover kill switches stop it too
+      // (`fix.roundCapAction=person`, `fix.takeoverBudget` 0 or invalid), so one off switch turns off every
+      // automatic takeover, not only the one `planTakeover` dispatches.
+      const takeoverOn = roundCapAction === 'takeover' && Number.isInteger(takeoverBudget) && takeoverBudget > 0;
+      const directed = attempts >= effectiveRoundCap && takeoverOn ? operatorRulingRound(pr, { allowance: operatorRulingExtraRounds.value }) : null;
       if (directed?.ok) {
         const setting = `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}=${operatorRulingExtraRounds.value} (source: ${operatorRulingExtraRounds.source})`;
         const ladder = takeoverRung(fixerLadder);

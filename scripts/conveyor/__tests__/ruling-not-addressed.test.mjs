@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { REPO_FIX_SETTINGS_PATH } from '../takeover-budget.mjs';
 import { describe, expect, it, vi } from 'vitest';
 import { runReconcilePass, enrichPrsWithIgnoredRulings } from '../reconcile-pass.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
@@ -127,8 +129,11 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
   };
   const marker = (min, head = H4) => trusted(takeoverMarkerBody({ pr: 3794, head, attempts: 6, cap: 5, rung: { id: 'stronger-model' }, n: 1, budget: 1 }), min);
   const base = [recordComment(recA, 60), recordComment(recB, 61)];
+  // The shipped `fix` settings turn the automatic takeover on (`roundCapAction: takeover`, a budget above 0); the pure core's own defaults are off.
+  const TAKEOVER_ON = { roundCapAction: 'takeover', takeoverBudget: 2 };
   const planAt = (comments, extra = {}, prExtra = {}) => planReconcile({ repo: 'we', agents: [], now: Date.parse('2026-10-04T12:00:00Z'), requiredChecks: ['test'],
     fixerLadder: ladder, durableCounts: { 3794: 6 }, prs: [{ ...basePr(H4, comments), blockRuledReferrals: blocked, ...prExtra }], ...extra });
+  const planOn = (comments, extra = {}, prExtra = {}) => planAt(comments, { ...TAKEOVER_ON, ...extra }, prExtra);
 
   it('before: with no operator ruling, the blocked-findings cap asks a person (cap-exhausted)', () => {
     const p = planAt(base);
@@ -137,7 +142,7 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
   });
 
   it('after: the operator ruling grants ONE directed takeover on the stronger rung, its brief carrying the ruling verbatim', () => {
-    const p = planAt([...base, rulingOn(recA, { min: 80 }), rulingOn(recB, { min: 81 })]);
+    const p = planOn([...base, rulingOn(recA, { min: 80 }), rulingOn(recB, { min: 81 })]);
     expect(p.refusals.map((r) => r.kind)).not.toContain('cap-exhausted');
     expect(p.dispatch.map((d) => [d.kind, d.mode])).toEqual([['fix', 'takeover']]);
     const d = p.dispatch[0];
@@ -165,13 +170,13 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
 
   it('no loop: once the directed takeover started on this head, the same ruling grants nothing more', () => {
     const ruled = [...base, rulingOn(recA, { min: 80 }), rulingOn(recB, { min: 81 })];
-    const p = planAt([...ruled, marker(90)]);
+    const p = planOn([...ruled, marker(90)]);
     expect(p.dispatch.some((d) => d.operatorRulingRound)).toBe(false);
-    expect(p.refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
+    expect(p.dispatch).toEqual([]);
     // A takeover whose launch provably never started (void marker) did not spend the round.
-    expect(planAt([...ruled, marker(90), trusted(takeoverVoidMarkerBody({ pr: 3794, head: H4 }), 95)]).dispatch.map((d) => d.mode)).toEqual(['takeover']);
+    expect(planOn([...ruled, marker(90), trusted(takeoverVoidMarkerBody({ pr: 3794, head: H4 }), 95)]).dispatch.map((d) => d.operatorRulingRound?.used)).toEqual([0]);
     // A NEW ruling after the spent round is a new ruling: it grants its own round.
-    expect(planAt([...ruled, marker(90), rulingOn(recA, { min: 100 }), rulingOn(recB, { min: 101 })]).dispatch.map((d) => d.mode)).toEqual(['takeover']);
+    expect(planOn([...ruled, marker(90), rulingOn(recA, { min: 100 }), rulingOn(recB, { min: 101 })]).dispatch.map((d) => d.operatorRulingRound?.used)).toEqual([0]);
   });
 
   it('a new head with the findings still blocked goes back to the operator (the ruling bound the old head)', () => {
@@ -182,7 +187,7 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
   });
 
   it('below the cap the ordinary block-ruled fix runs (the grant is only past the cap)', () => {
-    const p = planAt([...base, rulingOn(recA), rulingOn(recB)], {}, {});
+    const p = planOn([...base, rulingOn(recA), rulingOn(recB)], {}, {});
     const under = planReconcile({ repo: 'we', agents: [], now: Date.parse('2026-10-04T12:00:00Z'), requiredChecks: ['test'], fixerLadder: ladder, durableCounts: { 3794: 2 },
       prs: [{ ...basePr(H4, [...base, rulingOn(recA), rulingOn(recB)]), blockRuledReferrals: blocked }] });
     expect(p.dispatch[0].mode).toBe('takeover');
@@ -191,35 +196,83 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
 
   it('the allowance is a setting: 0 grants nothing; 2 grants a second round on the same ruling', () => {
     const ruled = [...base, rulingOn(recA), rulingOn(recB)];
-    expect(planAt(ruled, { operatorRulingExtraRounds: { value: 0, source: 'env' } }).refusals.map((r) => r.kind)).toEqual(['cap-exhausted']);
-    const two = planAt([...ruled, marker(90)], { operatorRulingExtraRounds: { value: 2, source: 'platform' } });
+    expect(planOn(ruled, { operatorRulingExtraRounds: { value: 0, source: 'env' } }).dispatch.some((d) => d.operatorRulingRound)).toBe(false);
+    const two = planOn([...ruled, marker(90)], { operatorRulingExtraRounds: { value: 2, source: 'platform' } });
     expect(two.dispatch.map((d) => d.mode)).toEqual(['takeover']);
     expect(two.dispatch[0].operatorRulingRound).toMatchObject({ used: 1, allowance: 2, source: 'platform' });
     expect(two.dispatch[0].takeover).toMatchObject({ n: 2, budget: 2 });
   });
 
-  it('fix.operatorRulingExtraRounds resolves standard → platform → tool (fix.json) → env', () => {
+  it('fix.operatorRulingExtraRounds resolves standard → platform → tool (fix.json) → env, each file layer under its `fix` key', () => {
+    const R = 'operatorRulingExtraRounds';
     expect(resolveOperatorRulingExtraRounds({})).toEqual({ value: 1, source: 'standard' });
-    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { operatorRulingExtraRounds: 0 } } })).toEqual({ value: 0, source: 'platform' });
-    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { operatorRulingExtraRounds: 0 } }, repo: { operatorRulingExtraRounds: 3 } })).toEqual({ value: 3, source: 'repo' });
-    expect(resolveOperatorRulingExtraRounds({ repo: { operatorRulingExtraRounds: 3 }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: '2' } })).toEqual({ value: 2, source: 'env' });
-    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { operatorRulingExtraRounds: -1 } }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: 'x' } })).toEqual({ value: 1, source: 'standard' });
-    // The IO shell reads the platform preference and the tool override files.
-    const files = { platform: { fix: { operatorRulingExtraRounds: 2 } } };
-    const read = (f) => JSON.stringify(/delivery-platform-preferences/.test(f) ? files.platform : {});
-    expect(loadOperatorRulingExtraRounds({ env: {}, read })).toEqual({ value: 2, source: 'platform' });
+    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { [R]: 0 } } })).toEqual({ value: 0, source: 'platform' });
+    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { [R]: 0 } }, repo: { fix: { [R]: 3 } } })).toEqual({ value: 3, source: 'repo' });
+    expect(resolveOperatorRulingExtraRounds({ repo: { fix: { [R]: 3 } }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: '2' } })).toEqual({ value: 2, source: 'env' });
+    // The repo file namespaces its settings under `fix`; a flat top-level key is not the documented shape and is not read.
+    expect(resolveOperatorRulingExtraRounds({ repo: { [R]: 3 } })).toEqual({ value: 1, source: 'standard' });
+    // A blank env var, a null key, an absent key and a different `fix` setting are "not present": they fall through.
+    expect(resolveOperatorRulingExtraRounds({ platform: { fix: { [R]: 2 } }, repo: { fix: { [R]: null, takeoverBudget: 0 } }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: '  ' } })).toEqual({ value: 2, source: 'platform' });
+  });
+
+  it('fails CLOSED: a present but invalid value turns the grant off instead of falling through to the standard', () => {
+    const R = 'operatorRulingExtraRounds';
+    for (const bad of ['off', 'none', '-1', '1.5', 'x', '100', false, [2], {}, -1, 1.5, true]) {
+      expect(resolveOperatorRulingExtraRounds({ repo: { fix: { [R]: bad } } }), `repo ${JSON.stringify(bad)}`).toEqual({ value: 0, source: 'repo-invalid' });
+      expect(resolveOperatorRulingExtraRounds({ platform: { fix: { [R]: bad } } }), `platform ${JSON.stringify(bad)}`).toEqual({ value: 0, source: 'platform-invalid' });
+    }
+    for (const bad of ['off', 'none', '-1', '1.5', '100', 'x']) {
+      expect(resolveOperatorRulingExtraRounds({ env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: bad } }), `env ${bad}`).toEqual({ value: 0, source: 'env-invalid' });
+    }
+    expect(resolveOperatorRulingExtraRounds({ env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: '0' } })).toEqual({ value: 0, source: 'env' });
+    // the highest PRESENT layer decides: an invalid env beats a valid repo value
+    expect(resolveOperatorRulingExtraRounds({ repo: { fix: { [R]: 3 } }, env: { WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS: 'x' } })).toEqual({ value: 0, source: 'env-invalid' });
+  });
+
+  it('the IO shell reads both files in their real `fix`-namespaced shape (the shipped scripts/settings/fix.json included)', () => {
+    const R = 'operatorRulingExtraRounds';
+    const files = (platform, repoFile) => (f) => JSON.stringify(/delivery-platform-preferences/.test(f) ? platform : repoFile);
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: files({ fix: { [R]: 2 } }, {}) })).toEqual({ value: 2, source: 'platform' });
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: files({ fix: { [R]: 2 } }, { $comment: 'c', fix: { roundCapAction: 'takeover', [R]: 0 } }) })).toEqual({ value: 0, source: 'repo' });
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: files({}, { fix: { [R]: 2 } }) })).toEqual({ value: 2, source: 'repo' });
+    // an unreadable file is skipped (the standard), not a throw
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: () => { throw new Error('ENOENT'); } })).toEqual({ value: 1, source: 'standard' });
+    // the real shipped fix.json goes through the same loader: it carries no such key, so the standard stands
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: (f) => (/delivery-platform-preferences/.test(f) ? '{}' : readFileSync(f, 'utf8')) })).toEqual({ value: 1, source: 'standard' });
+    // and the same file with the key set (the shape the card documents) is honoured
+    const shipped = JSON.parse(readFileSync(REPO_FIX_SETTINGS_PATH, 'utf8'));
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: files({}, { ...shipped, fix: { ...shipped.fix, [R]: 0 } }) })).toEqual({ value: 0, source: 'repo' });
+  });
+
+  it('the takeover kill switches stop the directed takeover too (roundCapAction=person, budget 0 or invalid)', () => {
+    const ruled = [...base, rulingOn(recA), rulingOn(recB)];
+    expect(planOn(ruled).dispatch.map((d) => d.operatorRulingRound?.used)).toEqual([0]);
+    for (const off of [{ roundCapAction: 'person' }, { takeoverBudget: 0 }, { takeoverBudget: Number.NaN }]) {
+      const p = planOn(ruled, off);
+      expect(p.dispatch, JSON.stringify(off)).toEqual([]);
+      expect(p.refusals.map((r) => r.kind), JSON.stringify(off)).toEqual(['cap-exhausted']);
+    }
   });
 
   it('is wired through the real reconcile pass, which logs the setting\'s layer', () => {
     // One trusted re-arm = one spent round; WE_REVIEW_ROUND_CAP=1 puts the head at the cap (1/1).
     const pr = { ...basePr(H4, [trusted('🔧 conveyor fix — re-armed for re-review', 50), ...base, rulingOn(recA), rulingOn(recB)]) };
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pass = (loaders = {}) => runReconcilePass({ repo, now: Date.parse('2026-10-04T12:00:00Z'), readPrs: () => [pr], readAgents: () => [], enrich: (x) => x,
+      enrichMainRed: (prs) => ({ prs }), enrichAlreadyLanded: (x) => x, enrichBaseRef: (x) => x, enrichSystemFix: (x) => x,
+      enrichFixClaims: (x) => x, enrichTimeouts: (x) => x, enrichReferralHolds: (prs) => prs.map((p) => ({ ...p, blockRuledReferrals: blocked, referralHold: null })),
+      enrichMechanicalRound: (x) => x, loadOperatorRulingRounds: () => ({ value: 1, source: 'env' }),
+      loadFixSettings: () => ({ roundCapAction: 'takeover' }), loadTakeoverBudget: () => ({ value: 2, source: 'env' }), ...loaders,
+      resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), env: { WE_REVIEW_ROUND_CAP: '1' } });
     try {
-      const out = runReconcilePass({ repo, now: Date.parse('2026-10-04T12:00:00Z'), readPrs: () => [pr], readAgents: () => [], enrich: (x) => x,
-        enrichMainRed: (prs) => ({ prs }), enrichAlreadyLanded: (x) => x, enrichBaseRef: (x) => x, enrichSystemFix: (x) => x,
-        enrichFixClaims: (x) => x, enrichTimeouts: (x) => x, enrichReferralHolds: (prs) => prs.map((p) => ({ ...p, blockRuledReferrals: blocked, referralHold: null })),
-        enrichMechanicalRound: (x) => x, loadOperatorRulingRounds: () => ({ value: 1, source: 'env' }),
-        resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), env: { WE_REVIEW_ROUND_CAP: '1' } });
+      // The takeover off switches, read by the pass's own loaders, stop the directed grant (the wiring, not just the planner).
+      for (const [name, loaders] of [['roundCapAction=person', { loadFixSettings: () => ({ roundCapAction: 'person' }) }],
+        ['budget 0', { loadTakeoverBudget: () => ({ value: 0, source: 'env' }) }],
+        ['budget invalid', { loadTakeoverBudget: () => ({ value: 0, source: 'env-invalid' }) }],
+        ['unreadable fix settings', { loadFixSettings: () => { throw new Error('unreadable'); } }]]) {
+        expect(pass(loaders).dispatch.some((x) => x.operatorRulingRound), name).toBe(false);
+      }
+      const out = pass();
       const d = out.dispatch.find((x) => x.operatorRulingRound);
       expect(d).toBeTruthy();
       expect(d.operatorRulingRound.source).toBe('env');
