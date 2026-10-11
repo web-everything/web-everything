@@ -422,8 +422,9 @@ describe('only the reconcile-finding opening makes a bounce mechanical, never qu
         expect(isMechanicalBounce(body), body).toBe(false);
         expect(isReviewVerdictComment({ author: BOT, createdAt: at(9), body }), body).toBe(true);
       }
-      // it counts against the takeover allowance and the mechanical head's one review
-      const v = { author: BOT, createdAt: at(9), body: openings[0](q) };
+      // it counts against the takeover allowance and the mechanical head's one review. It names a head the dispatch
+      // produced (not PRIOR: a late verdict on the already-reviewed old head judges nothing the takeover did).
+      const v = { author: BOT, createdAt: at(9), body: openings[0](q).replaceAll(PRIOR, 'd'.repeat(40)) };
       expect(takeoverReviewGrant({ pr: pr([...spent, takeoverOp(7), v]), takeoverReviewAttempts: 1 }).ok, q).toBe(false);
       expect(mechanicalRoundGrant({ pr: pr([...spent, mechMarker(8), v]) }), q).toMatchObject({ ok: false, reason: 'mechanical-review-spent' });
     }
