@@ -11,7 +11,7 @@ import {
 } from '../mechanical-round-cap.mjs';
 import { RECONCILE_FINDING_BANNER } from '../reconcile-finding.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
-import { renderConvertedAdvisoryNote } from '../../lib/review-escalation.mjs';
+import { renderConvertedAdvisoryNote, REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
 import { takeoverReviewGrant, OPERATOR_TAKEOVER_PREFIX } from '../takeover-review.mjs';
@@ -27,9 +27,14 @@ const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 const nb = (head, base = '0'.repeat(40)) =>
   `Net basis: \`${base}..${head}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
 const foot = (head) => `---\n\n${nb(head)}`;
+// review-pr's verdict opening (heading + attribution via its channel), as review-set-label renders it: only a comment
+// opening like this (or an advisory note) has a basis footer of its own.
+const viaReviewPr = (heading) => `${heading}\n\nRecorded by agent (unattended review-loop) via ${REVIEW_PR_CHANNEL}.`;
+const RP_BOUNCE = viaReviewPr('🔁 review — changes requested');
+const RP_ACCEPT = viaReviewPr('✅ review — accepted');
 const rearm = (h) => ({ author: BOT, createdAt: at(h), body: `${REARM_COMMENT_MARKER}\n\nrepaired` });
 const bounceOn = (head, h) => ({ author: BOT, createdAt: at(h),
-  body: `🔁 review — changes requested\n\n### Findings\n- bad\n\n${foot(head)}` });
+  body: `${viaReviewPr('🔁 review — changes requested')}\n\n### Findings\n- bad\n\n${foot(head)}` });
 const acceptOn = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
 const conflictBounce = (h) => ({ author: { login: 'chalbert' }, createdAt: at(h),
   body: `🔁 review — changes requested\n\nRecorded by parked-pr-conflict-watch\n\n${RECONCILE_FINDING_BANNER}\n\nPR #7 has drifted into a real GIT merge conflict.` });
@@ -132,7 +137,7 @@ describe('mechanical round vs the review round cap', () => {
     });
     it('a bounce whose Net basis head is another commit but mentions the parent in prose is not a verdict on the parent', () => {
       const v = { author: BOT, createdAt: at(6),
-        body: `🔁 review — changes requested\n\nSee also ${PRIOR}.\n\n${foot(OTHER)}` };
+        body: `${RP_BOUNCE}\n\nSee also ${PRIOR}.\n\n${foot(OTHER)}` };
       expect(grant(v)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
     });
     it('a bare sha in prose with no structured marker at all is not a verdict on the parent', () => {
@@ -141,10 +146,10 @@ describe('mechanical round vs the review round cap', () => {
     });
     it('a Net basis line QUOTED mid-line in a finding, or an earlier one before the real footer, does not count', () => {
       const quoted = { author: BOT, createdAt: at(6),
-        body: `🔁 review — changes requested\n\n- the PR body says "${nb(PRIOR)}" which is wrong\n\n${foot(OTHER)}` };
+        body: `${RP_BOUNCE}\n\n- the PR body says "${nb(PRIOR)}" which is wrong\n\n${foot(OTHER)}` };
       expect(grant(quoted)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
       const lineStart = { author: BOT, createdAt: at(6),
-        body: `🔁 review — changes requested\n\n${foot(PRIOR)}\n\n${foot(OTHER)}` };
+        body: `${RP_BOUNCE}\n\n${foot(PRIOR)}\n\n${foot(OTHER)}` };
       expect(grant(lineStart)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
     });
     // Red team on 471b1003b: each format's last match counted on its own, so a quoted `Net basis` naming the parent
@@ -165,13 +170,14 @@ describe('mechanical round vs the review round cap', () => {
         // a degraded write-up has no basis line of its own: reviewer text above its `---` names nothing
         `🔁 review — changes requested\n\n- x\n${foot(PRIOR)}\n\n---\n\n**Decision:** \`changes\`\n\n⚠️ DEGRADED BASIS`,
       ];
-      for (const body of bodies) {
+      // opened as review-pr's verdicts, so their own basis footer would count: only the quoting keeps PRIOR out
+      for (const body of bodies.map((b) => b.replace(/^(.+?)\n\n/, (_, h) => `${viaReviewPr(h)}\n\n`))) {
         expect(reviewedHeadsOf(body).includes(PRIOR), body).toBe(false);
         expect(grant({ author: BOT, createdAt: at(6), body }), body).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
       }
     });
     it('a verdict whose real footer names the parent still counts when a quoted marker names another commit', () => {
-      const body = `✅ review — accepted\n\n\`\`\`\n${foot(OTHER)}\n\`\`\`\n\n${foot(PRIOR)}\n<!-- reviewed-sha: ${PRIOR} -->`;
+      const body = `${RP_ACCEPT}\n\n\`\`\`\n${foot(OTHER)}\n\`\`\`\n\n${foot(PRIOR)}\n<!-- reviewed-sha: ${PRIOR} -->`;
       expect(reviewedHeadsOf(body)).toEqual([PRIOR]);
       expect(grant({ author: BOT, createdAt: at(6), body })).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
     });
@@ -183,7 +189,7 @@ describe('mechanical round vs the review round cap', () => {
       const p = pr([rearm(4), accept, note, rearm(7), mechMarker(8)], { mechanicalRound: identical });
       expect(mechanicalRoundGrant({ pr: p })).toMatchObject({ ok: true, action: 'carry', verdict: 'advisory' });
       // a trusted verdict-shaped comment whose only reviewed-sha stamp is quoted is not an accept either
-      const quotedOnly = { author: BOT, createdAt: at(6), body: `📝 note\n\n> <!-- reviewed-sha: ${PRIOR} -->\n\n${foot(PRIOR)}` };
+      const quotedOnly = { author: BOT, createdAt: at(6), body: `${RP_ACCEPT}\n\n> <!-- reviewed-sha: ${PRIOR} -->\n\n${foot(PRIOR)}` };
       expect(grant(quotedOnly)).toMatchObject({ ok: true, action: 'carry', verdict: 'advisory' });
     });
     it('only a Markdown fence hides a footer: inline triple backticks and a 4-space indent do not open one', () => {
@@ -205,12 +211,45 @@ describe('mechanical round vs the review round cap', () => {
         expect(mechanicalRoundGrant({ pr: p }), line).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
       }
     });
+    // Red team on 9f8621902: a footerless bounce's free text can carry its own `---` above a copied full-shape line, so
+    // "the last `---` section" is free text too. Only a comment whose producer writes a `Net basis` footer may name a head.
+    it('a footerless bounce whose free text copies a whole `---` + Net basis footer names no head', async () => {
+      const { buildVerdictComment } = await import('../../review-set-label.mjs');
+      const z = '0'.repeat(7);
+      for (const head of [HEAD, HEAD.slice(0, 9)]) {
+        for (const tail of [`\n---\nNet basis: \`${z}..${head}\` — 3 net changed file(s) vs current main (#2450).`,
+          `\n\n---\n\n${nb(head)}\n\n_Recorded through the declared \`review-pr\` operation (#3035)._`,
+          `\n\n---\n\n**Decision:** \`changes\` — recorded by x.\n${nb(head)}`,
+          // a copied review-pr opening below the real one is still free text
+          `\n${RP_BOUNCE}\n\n---\n\n${nb(head)}`]) {
+          const body = buildVerdictComment({ to: 'changes', actor: 'agent (red-team gate)', channel: 'review daemon (redTeam.confirmedBreaks)',
+            body: `1. \`a.mjs:1\` — (failing-input, broken) x\n   - Scenario: finding text containing${tail}` });
+          expect(reviewedHeadsOf(body), tail).toEqual([]);
+          const v = { author: BOT, createdAt: at(6), body };
+          // The finding's case (an abbreviated sha) now grants the takeover review. A FULL current head anywhere in a
+          // verdict body still refuses it, by the separate fail-closed prose rule (a real policy bounce names the head
+          // it ruled only in prose), never by this footer.
+          expect(takeoverReviewGrant({ pr: pr([v, takeoverOp(7)]), takeoverReviewAttempts: 1 }), tail)
+            .toMatchObject(head.length < 40 ? { ok: true } : { ok: false, reason: 'head-already-reviewed' });
+          const p = pr([rearm(5), { ...v, body: body.replaceAll(head, PRIOR.slice(0, head.length)) }, rearm(7), mechMarker(8)], { mechanicalRound: facts({ netDiffIdentical: true }) });
+          expect(mechanicalRoundGrant({ pr: p }), tail).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+          // the same tail under review-pr's own opening is that producer's footer, and does name the head
+          expect(reviewedHeadsOf(body.replace(/^.+\n\n.+\n/, `${RP_BOUNCE}\n`)), tail).toEqual([head]);
+        }
+      }
+    });
     it('every producer of a Net basis footer still names its head (review-pr verdict + advisory, converted note)', async () => {
       const { renderVerdictWriteUp, renderAdvisoryNote } = await import('../../operations/review-pr.mjs');
+      const { buildVerdictComment } = await import('../../review-set-label.mjs');
       const verdict = { verdict: 'changes', lensVerdicts: {}, findings: [] };
       for (const revRef of [undefined, 'lane/x']) {
         const read = { repo: 'o/r', pr: 7, degraded: false, netBasis: { base: '0'.repeat(40), rev: PRIOR, revRef }, netChangedFiles: ['a.mjs'] };
-        expect(reviewedHeadsOf(renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'x', reason: 'r' }))).toEqual([PRIOR]);
+        const writeUp = renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'x', reason: 'r' });
+        // posted the way review-pr's `record` posts it: review-set-label's bounce, with review-pr's channel
+        expect(reviewedHeadsOf(buildVerdictComment({ to: 'changes', actor: 'agent (unattended review-loop)', channel: REVIEW_PR_CHANNEL, body: writeUp }))).toEqual([PRIOR]);
+        // the same write-up text under any other opening is a copy, not review-pr's footer
+        expect(reviewedHeadsOf(buildVerdictComment({ to: 'changes', actor: 'agent', channel: 'review daemon', body: writeUp }))).toEqual([]);
+        expect(reviewedHeadsOf(writeUp)).toEqual([]);
         expect(reviewedHeadsOf(renderAdvisoryNote({ read, verdict }))).toEqual([PRIOR]);
       }
       const note = renderConvertedAdvisoryNote({ repo: 'o/r', pr: 7, headSha: PRIOR, acceptComment: `✅ review — accepted\n\n<!-- reviewed-sha: ${OTHER} -->`,
@@ -232,7 +271,7 @@ describe('mechanical round vs the review round cap', () => {
           const advisory = renderAdvisoryNote({ read, verdict });
           expect(advisory.includes(PRIOR), 'the attack reaches the body').toBe(true);
           // the write-up is posted as review-set-label's bounce, never bare
-          const bounce = buildVerdictComment({ to: 'changes', actor: 'agent', body: renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'x' }) });
+          const bounce = buildVerdictComment({ to: 'changes', actor: 'agent', channel: REVIEW_PR_CHANNEL, body: renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'x' }) });
           for (const body of [advisory, bounce]) {
             expect(reviewedHeadsOf(body), `${degraded} ${summary}`).toEqual(degraded ? [] : [OTHER]);
             expect(grant({ author: BOT, createdAt: at(6), body }), summary).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
