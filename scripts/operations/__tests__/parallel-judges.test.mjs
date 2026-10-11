@@ -25,7 +25,7 @@ import { compute, judge as judgeStep } from '../step-kinds.mjs';
 import { createMemoryRunStore } from '../run-store.mjs';
 import { startRun, advance, rewindRunToStep } from '../engine.mjs';
 import { driveRun, judgeOutcome, restampStepStart } from '../cli-adapter.mjs';
-import { planJudgeBatch, readsAnyStep, runJudgeBatch } from '../parallel-judges.mjs';
+import { planJudgeBatch, readsAnyStep, runJudgeBatch, seatFailureEvidence } from '../parallel-judges.mjs';
 import {
   REVIEW_EFFECTS, reviewPrOperation, renameSourcePaths, seatSecurityForTouchSet, securitySeatFromRun, SECURITY_SEAT_STEP,
 } from '../review-pr.mjs';
@@ -238,6 +238,37 @@ describe('planJudgeBatch — only independent judge steps are batched', () => {
       judge: async (r) => { if (r.lens === 'b') throw new Error('no'); return 1; },
     });
     expect(results.map((r) => r.ok)).toEqual([true, false]);
+  });
+
+  // Held item 223: a failed seat says WHY — exit code, signal, attempts and a stderr tail — on the seat result and in
+  // the log line, instead of a bare "failed after N ms" that left the cause unrecoverable.
+  it('a failed seat carries its spawn evidence on the result and in the log line', async () => {
+    const lines = [];
+    const spawnErr = Object.assign(new Error('judge-spawn: the juror did not emit parseable JSON on stdout (attempt 2/2, exit 1, signal none, stdout 0 bytes).'), {
+      exitCode: 1, signal: null, attempts: 2, stderrTail: 'boom: socket hang up',
+    });
+    const results = await runJudgeBatch({
+      batch: [{ step: 'a', stepIndex: 1, request: { lens: 'a' } }, { step: 'judgeSecurity', stepIndex: 2, request: { lens: 'security' } }],
+      judge: async (r) => { if (r.lens === 'security') throw spawnErr; return 1; },
+      log: (l) => lines.push(l),
+    });
+    expect(results[1].ok).toBe(false);
+    expect(results[1].failure).toEqual({ exitCode: 1, signal: null, attempts: 2, stderrTail: 'boom: socket hang up' });
+    expect(results[0].failure).toBeUndefined();
+    const line = lines.find((l) => l.includes('judgeSecurity failed'));
+    expect(line).toMatch(/exit 1/);
+    expect(line).toMatch(/signal none/);
+    expect(line).toMatch(/2 attempts/);
+    expect(line).toMatch(/socket hang up/);
+  });
+
+  it('seatFailureEvidence is null for an error with no spawn evidence, and bounds the stderr tail', () => {
+    expect(seatFailureEvidence(new Error('plain'))).toBe(null);
+    expect(seatFailureEvidence(null)).toBe(null);
+    const ev = seatFailureEvidence(Object.assign(new Error('x'), { exitCode: 2, stderrTail: 'y'.repeat(5000) }));
+    expect(ev.exitCode).toBe(2);
+    expect(ev.signal).toBe(null);
+    expect(ev.stderrTail.length).toBeLessThanOrEqual(1000);
   });
 });
 

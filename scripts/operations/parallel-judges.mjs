@@ -86,6 +86,18 @@ export function sameJudgeRequest(a, b) {
   try { return JSON.stringify(a) === JSON.stringify(b); } catch { return false; }
 }
 
+/** Extract bounded spawn failure evidence without changing the error. PURE. */
+export function seatFailureEvidence(error) {
+  if (!error || typeof error !== 'object'
+    || !['exitCode', 'signal', 'attempts', 'stderrTail'].some((key) => error[key] !== undefined)) return null;
+  return {
+    exitCode: error.exitCode ?? null,
+    signal: error.signal ?? null,
+    attempts: error.attempts ?? null,
+    stderrTail: String(error.stderrTail ?? '').slice(-1000),
+  };
+}
+
 /**
  * SPAWN A BATCH CONCURRENTLY. Never throws: every seat settles to `{ok, value|error, startedAt, finishedAt, cwd}`.
  *
@@ -110,9 +122,20 @@ export async function runJudgeBatch({ batch, judge, clock = () => Date.now(), se
       .then(() => (cwd ? judge(seat.request, { cwd }) : judge(seat.request)))
       .then(
         (value) => { results[k] = { ...seat, ok: true, value, startedAt, finishedAt: clock(), cwd: cwd ?? null }; },
-        (error) => { results[k] = { ...seat, ok: false, error, startedAt, finishedAt: clock(), cwd: cwd ?? null }; },
+        (error) => {
+          const failure = seatFailureEvidence(error);
+          results[k] = { ...seat, ok: false, error, ...(failure ? { failure } : {}), startedAt, finishedAt: clock(), cwd: cwd ?? null };
+        },
       )
-      .then(() => log(`parallel seats: ${seat.step} ${results[k].ok ? 'returned' : 'failed'} after ${results[k].finishedAt - startedAt} ms`));
+      .then(() => {
+        const result = results[k];
+        const failure = result.failure;
+        const tail = failure?.stderrTail.trim().replace(/\s+/g, ' ').slice(-200);
+        const evidence = failure
+          ? ` — exit ${failure.exitCode ?? 'none'}, signal ${failure.signal ?? 'none'}, ${failure.attempts ?? 'none'} attempts${tail ? `, stderr: ${tail}` : ''}`
+          : '';
+        log(`parallel seats: ${seat.step} ${result.ok ? 'returned' : 'failed'} after ${result.finishedAt - startedAt} ms${evidence}`);
+      });
   };
 
   const running = [];
