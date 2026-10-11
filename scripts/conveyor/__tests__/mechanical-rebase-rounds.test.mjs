@@ -63,6 +63,42 @@ describe('mechanical re-arm rounds', () => {
   it('excludes the ci-heal commit before the next review fix-begin', () => {
     expect(countRealFixRounds({ ...pr, comments: [begin('11T00:44:34', 'ci-heal-4757'), begin('11T01:30:50'), comment('11T01:33:11', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [{ ...commits[8], sha: head }] } })).toMatchObject({ ok: true, real: 0 });
   });
+  describe('crash-and-replace fixer claims', () => {
+    const fixCommit = { ...commits[0], subject: 'real fix', authoredAt: at('11T02:00:00') };
+    const rearm = comment('11T04:00:00', REARM_COMMENT_MARKER);
+    const end = (date, who = 'fix-7') => comment(date, `🔓 conveyor fix-end — fix claim released\n\n\`${who}\` released the fix claim at \`abcdef123\`.`);
+    const count = (extra) => countRealFixRounds({ ...pr, comments: [...extra, rearm], roundCommits: { head, commits: [fixCommit] } });
+    it('keeps the round start at the first begin when a replacement claim never saw a release', () => {
+      expect(count([begin('11T01:00:00', 'fix-7'), begin('11T03:00:00', 'fix-7')])).toMatchObject({ ok: true, real: 1 });
+    });
+    it('keeps the first begin through several unreleased replacements', () => {
+      expect(count([begin('11T01:00:00', 'fix-7'), begin('11T01:30:00', 'fix-8'), begin('11T03:00:00', 'fix-9')])).toMatchObject({ ok: true, real: 1 });
+    });
+    it('starts a new window after a clean release, so the earlier claim does not own the later round', () => {
+      expect(count([begin('11T01:00:00', 'fix-7'), end('11T02:30:00'), begin('11T03:00:00', 'fix-8')])).toMatchObject({ ok: true, real: 0 });
+    });
+    it('does not let an untrusted release comment split the window', () => {
+      const forged = { ...end('11T02:30:00'), author: { login: 'outsider' } };
+      expect(count([begin('11T01:00:00', 'fix-7'), forged, begin('11T03:00:00', 'fix-7')])).toMatchObject({ ok: true, real: 1 });
+    });
+  });
+  describe('truncated (shallow) history', () => {
+    const shallow = commits.map((c, i) => (i === commits.length - 1 ? { ...c, parents: [] } : c));
+    it('countRealFixRounds refuses a walk whose last commit has no parent', () => {
+      expect(countRealFixRounds({ ...pr, roundCommits: { head, commits: shallow } })).toMatchObject({ ok: false });
+    });
+    it('countRealFixRounds refuses a single commit with no parent', () => {
+      expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [{ ...commits[0], parents: [] }] } })).toMatchObject({ ok: false });
+    });
+    it('readRoundCommits fails closed when the walk ends on a parentless boundary commit', () => {
+      const exec = (_bin, args) => (args[0] === 'fetch' ? '' : shallow.map((c) => [c.sha, c.parents.join(' '), c.authoredAt, c.subject].join('\0')).join('\n'));
+      expect(readRoundCommits({ pr, exec })).toMatchObject({ head, ok: false, reason: 'truncated-history' });
+    });
+    it('a shallow boundary stops the planner replacing the durable count with zero', () => {
+      const result = plan({ ...pr, roundCommits: { head, commits: shallow } });
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 6 }));
+    });
+  });
   it('walks the drain merge last parent, skips base-side commits, and uses author dates', () => {
     const extra = { ...commits[0], sha: commits[7].parents[0], subject: 'base-only fix' };
     const exec = (_bin, args) => {

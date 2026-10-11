@@ -475,6 +475,8 @@ export function countRealFixRounds(pr) {
     const c = facts.commits[i];
     const next = c.parents.length > 1 && c.subject.startsWith('drain: rebase') ? c.parents.at(-1) : c.parents[0];
     if (i + 1 < facts.commits.length ? next !== facts.commits[i + 1].sha : seen.has(next)) return fail('invalid-walk');
+    // The last commit must lead out of the range; a parentless one is a root or shallow boundary (missing rounds).
+    if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
   }
   const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
   const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
@@ -483,10 +485,24 @@ export function countRealFixRounds(pr) {
   const time = (c) => Date.parse(c.createdAt);
   if ([...rearms, ...begins].some((c) => !Number.isFinite(time(c)))) return fail('invalid-comment-time');
   rearms.sort((a, b) => time(a) - time(b));
+  begins.sort((a, b) => time(a) - time(b));
+  // Only a clean release (fix-end by a review fixer) closes a claim; a crashed fixer leaves none.
+  const releases = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_END_MARKER)
+    && /^fix-\d+$/.test(FIX_END_WHO_RE.exec(c.body.trimStart())?.[1] ?? '') && Number.isFinite(time(c))).map(time);
   let previous = -Infinity;
   const rounds = rearms.map((c) => {
     const end = time(c);
-    const start = begins.reduce((latest, begin) => time(begin) <= end ? Math.max(latest, time(begin)) : latest, previous);
+    // A replacement claim taken after a crash (no release in between) continues the same round: its start is
+    // the earliest begin of the unbroken chain ending at the latest begin, never the replacement's own begin.
+    let start = previous;
+    let chainEnd = null;
+    for (let i = begins.length - 1; i >= 0; i -= 1) {
+      const t = time(begins[i]);
+      if (t > end || t <= previous) continue;
+      if (chainEnd !== null && releases.some((r) => r > t && r <= chainEnd)) break;
+      start = Math.max(previous, t);
+      chainEnd = t;
+    }
     const shas = facts.commits.filter((commit) => commit.parents.length === 1 && !commit.subject.startsWith('drain: rebase')
       && Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end).map((commit) => commit.sha);
     previous = end;

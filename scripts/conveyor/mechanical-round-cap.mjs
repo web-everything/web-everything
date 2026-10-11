@@ -380,6 +380,9 @@ export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin'
       sha = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
         ? commit.parents.at(-1) : commit.parents[0];
     }
+    // The walk must leave the range through a real parent (a base-side commit). A parentless last commit is a
+    // root or a shallow-clone boundary: the earlier fix rounds are missing, so it proves nothing.
+    if (!SHA40.test(sha ?? '')) return fail('truncated-history');
     return { head, commits };
   } catch { return fail('git-read-failed'); }
 }
