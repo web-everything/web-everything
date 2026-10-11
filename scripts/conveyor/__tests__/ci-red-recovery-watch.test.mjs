@@ -1589,6 +1589,10 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
         const unknown = watch.restackStackedPr({ ...child, prNumber: 20 }, { ...opts, prs: [forkTwin, { ...parent, number: 11 }, child],
           readIsCrossRepository: (n) => (n === 30 ? true : n === 11 ? null : false) });
         expect(unknown).toMatchObject({ ok: false, deferred: true });
+        // A verified same-repo parent beside an unverifiable twin is no license to guess: the twin may be a second parent.
+        const mixed = watch.restackStackedPr({ ...child, prNumber: 20 }, { ...opts, prs: [parent, { ...parent, number: 11, baseRefName: 'lane/other' }, child],
+          readIsCrossRepository: (n) => (n === 11 ? null : false) });
+        expect(mixed).toMatchObject({ ok: false, deferred: true });
         expect(refresh).not.toHaveBeenCalled();
       });
       it('two same-repo PRs from the parent head with different bases are an ambiguous stack, never a guess', () => {

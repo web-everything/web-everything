@@ -932,11 +932,15 @@ export function restackStackedPr(d, {
     // A fork can open a PR from a branch with the same name as a same-repo lane, so the parent is the same-repo
     // PR among every name match, never the first match by listing order (PR #4825 round 5).
     const parents = named.filter(pr => !verify(pr));
-    if (new Set(parents.map(pr => pr.baseRefName)).size > 1) {
+    // An unverifiable match defers (it may be the parent, or a second same-repo parent making the stack ambiguous).
+    const unverified = named.find(pr => verify(pr)?.deferred);
+    if (unverified) return refusal(unverified);
+    // GitHub allows one open PR per head/base pair, so two same-repo matches always differ in base.
+    if (parents.length > 1) {
       return { ok: false, action, error: `stack base ${ref} heads several same-repo PRs with different bases; ambiguous stack, cannot restack` };
     }
-    // No same-repo match: an unverifiable one defers (it may be the parent); only forks is a counted refusal.
-    if (!parents.length) return refusal(named.find(pr => verify(pr).deferred) ?? named[0]);
+    // Only forks match: a fork's branch can never be the base-repo branch this PR targets — a counted refusal.
+    if (!parents.length) return refusal(named[0]);
     link = parents[0];
   }
   // A failure is a deferral only if the claim store holds a live claim on a chain link now (the push race) — never
