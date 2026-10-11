@@ -1,5 +1,6 @@
 {
   "referralDefault": "auto-block",
   "scopedRereview": "shadow",
-  "roundBudget": 3
+  "roundBudget": 3,
+  "takeoverReviewAttempts": 1
 }
