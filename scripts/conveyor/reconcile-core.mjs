@@ -2042,7 +2042,8 @@ export function planReconcile({
         const latest = headSha ? latestAdvisory(trustedComments) : undefined;
         const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
         const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
-          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+          || trustedComments.some(c => isReviewVerdictComment(c)
+            && (String(c?.body ?? '').toLowerCase().includes(headSha) || verdictJudged(c, headSha))));
         if (takeover.hold === 'review-human-hold' && headSha && !advisoryIsCurrent && !alreadyReviewed) {
           if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
           if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
