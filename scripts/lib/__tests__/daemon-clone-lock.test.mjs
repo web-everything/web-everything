@@ -20,8 +20,12 @@ import {
   withWriteLock,
   inspectCloneLock,
   cloneLockKey,
+  cloneLockDirs,
+  HEARTBEAT_INTERVAL_MS,
   defaultProbePidLiveness,
 } from '../daemon-clone-lock.mjs';
+
+import { heartbeat } from '../../readiness/file-locks.mjs';
 
 const MODULE_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'daemon-clone-lock.mjs');
 
@@ -113,6 +117,37 @@ describe('Dekker ordering between acquireRead and acquireWrite', () => {
 });
 
 describe('acquireWrite waiting on readers', () => {
+  // live 2026-10-11 rebuild-job livelock: the reservation must outlive its initial lease.
+  it('heartbeats the writer while a live reader drains for over twelve minutes', async () => {
+    const lockRoot = mkTmp('dcl-lockroot-');
+    const clone = mkTmp('dcl-clone-');
+    const { readersRoot } = cloneLockDirs(clone, lockRoot);
+    let clock = 0;
+    expect(acquireRead(clone, {
+      owner: 'reader-a', lockRoot, nowMs: clock, pid: 333, probe: alwaysAlive,
+    }).ok).toBe(true);
+    let checked = false;
+    const result = await acquireWrite(clone, {
+      owner: 'writer-a', lockRoot, waitMs: 15 * 60_000, pollMs: 1000,
+      now: () => clock, pid: 111, probe: alwaysAlive,
+      sleep: async (ms) => {
+        clock += ms;
+        heartbeat(readersRoot, 'reader-a', 'reader-a', new Date(clock).toISOString(), 333);
+        if (clock === 12 * 60_000) {
+          const snapshot = inspectCloneLock(clone, { lockRoot, nowMs: clock, probe: alwaysAlive });
+          expect(snapshot.writerLive).toBe(true);
+          expect(clock - Date.parse(snapshot.writer.heartbeatAt)).toBeLessThanOrEqual(HEARTBEAT_INTERVAL_MS);
+          expect(snapshot.readers.some((r) => r.owner === 'reader-a' && r.live)).toBe(true);
+          checked = true;
+        }
+        if (clock === 13 * 60_000) releaseRead(clone, { owner: 'reader-a', lockRoot });
+      },
+    });
+    expect(checked).toBe(true);
+    expect(clock).toBe(13 * 60_000);
+    expect(result).toEqual({ ok: true });
+  });
+
   it('waits for a live reader, then succeeds once the reader releases (fake sleep releases it)', async () => {
     const lockRoot = mkTmp('dcl-lockroot-');
     const clone = mkTmp('dcl-clone-');
