@@ -38,6 +38,7 @@
  *      the delivery-priority scale (`we:scripts/lib/delivery-priority.mjs`) and takes the next free slot, heavy or
  *      fast, ahead of every other waiter. FCFS still holds within a class; a running holder is never preempted.
  */
+import vm from 'node:vm';
 import { deliveryPriority, PRIORITY_CLASSES } from '../lib/delivery-priority.mjs';
 
 /** Every heavy-command kind the queue distinguishes. Same vocabulary `we:scripts/operations/heavy-queue.mjs`
@@ -496,14 +497,85 @@ export const DEFAULT_REPAIR_PATTERNS = Object.freeze([
 export const ADMISSION_PRIORITY_MODES = Object.freeze(['enforce', 'off']);
 const IDENTITY_FIELDS = ['purpose', 'session', 'holder', 'envSession'];
 
-/** True when every entry is a non-empty string that compiles as a RegExp. Pure. */
+/** Resource bounds on operator-set repair patterns. They run on the admission path BEFORE the queue and ceiling checks,
+ *  so one catastrophic pattern would stall the caller for good (a synchronous RegExp cannot be interrupted from JS):
+ *  a pattern is length-capped and must not nest a repeat inside a repeat, an identity value longer than a slug is
+ *  never matched, and every match runs under a hard wall-clock bound ({@link repairPatternMatches}). */
+export const MAX_REPAIR_PATTERN_LENGTH = 200;
+export const MAX_REPAIR_MATCH_VALUE_LENGTH = 256;
+export const REPAIR_MATCH_TIMEOUT_MS = 50;
+
+/** True when `src` repeats a group that already contains a repeat (`(a+)+`, `([a-z]+)*`, `(?:a{1,5}){2,}`) — the
+ *  exponential-backtracking shape — or uses a backreference. A conservative scan, not a regex parser; the hard time
+ *  bound in {@link repairPatternMatches} covers what it cannot see (overlapping alternation such as `(a|aa)+`). Pure. */
+function hasUnsafeRepeat(src) {
+  const n = src.length;
+  const groups = [false]; // per open group: does it contain a repeat?
+  let prevGroupRepeats = false; // the atom just closed is a group that contains a repeat
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    let repeat = false;
+    let step = 1;
+    let closedRepeats = false;
+    if (c === '\\') {
+      if (/[1-9k]/.test(src[i + 1] ?? '')) return true; // backreference
+      step = 2;
+    } else if (c === '[') {
+      let j = i + 1;
+      while (j < n && src[j] !== ']') j += src[j] === '\\' ? 2 : 1;
+      step = j + 1 - i;
+    } else if (c === '(') groups.push(false);
+    else if (c === ')') { if (groups.length > 1) closedRepeats = groups.pop(); if (closedRepeats) groups[groups.length - 1] = true; }
+    else if (c === '*' || c === '+') repeat = true;
+    else if (c === '{') {
+      const m = /^\{(\d+)(?:(,)(\d*))?\}/.exec(src.slice(i, i + 24));
+      if (m) { step = m[0].length; repeat = m[2] ? (m[3] === '' || Number(m[3]) > 1) : Number(m[1]) > 1; }
+    }
+    if (repeat) {
+      if (prevGroupRepeats) return true;
+      groups[groups.length - 1] = true;
+    }
+    prevGroupRepeats = c === ')' && closedRepeats;
+    i += step;
+  }
+  return false;
+}
+
+/** True when every entry is a non-empty, length-capped string that compiles as a RegExp and nests no repeat. Pure. */
 export function validRepairPatterns(v) {
   if (!Array.isArray(v)) return false;
   for (const p of v) {
-    if (typeof p !== 'string' || p === '') return false;
+    if (typeof p !== 'string' || p === '' || p.length > MAX_REPAIR_PATTERN_LENGTH) return false;
     try { new RegExp(p); } catch { return false; }
+    if (hasUnsafeRepeat(p)) return false;
   }
   return true;
+}
+
+let repairMatchSandbox = null;
+/** Patterns that have blown the time bound in this process; they are skipped from then on (a poisoned pattern is
+ *  treated as not matching, which is the safe direction: the waiter stays normal class P3). */
+const timedOutRepairPatterns = new Set();
+
+/**
+ * Does `pattern` match `value`? Bounded: the test runs in a `node:vm` script with a wall-clock `timeout`, which V8
+ * enforces inside regexp backtracking, so a pattern that gets past {@link validRepairPatterns} still cannot stall the
+ * caller. A timeout, an invalid pattern or an over-long value is "no match". Pure apart from the poisoned-pattern memo.
+ */
+export function repairPatternMatches(pattern, value) {
+  if (typeof pattern !== 'string' || typeof value !== 'string' || value.length > MAX_REPAIR_MATCH_VALUE_LENGTH) return false;
+  if (timedOutRepairPatterns.has(pattern)) return false;
+  repairMatchSandbox ??= { context: vm.createContext(Object.create(null)), script: new vm.Script('new RegExp(__pattern).test(__value)') };
+  const { context, script } = repairMatchSandbox;
+  context.__pattern = pattern;
+  context.__value = value;
+  try {
+    return script.runInContext(context, { timeout: REPAIR_MATCH_TIMEOUT_MS }) === true;
+  } catch (err) {
+    if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') timedOutRepairPatterns.add(pattern);
+    return false;
+  }
 }
 
 /**
@@ -521,7 +593,7 @@ export function classifyWaiterPriority(identity, priority) {
   for (const field of IDENTITY_FIELDS) {
     const value = identity?.[field];
     if (typeof value !== 'string' || value === '') continue;
-    const pattern = patterns.find((p) => new RegExp(p).test(value));
+    const pattern = patterns.find((p) => repairPatternMatches(p, value));
     if (pattern === undefined) continue;
     const d = deliveryPriority({ incident: { open: true, owner: true } }, { mode: 'enforce' }, 0);
     return { class: d.class, reason: `red-main repair: ${d.reasons.join('; ')}`, matched: { field, value, pattern } };

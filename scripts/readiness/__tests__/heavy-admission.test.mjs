@@ -10,6 +10,7 @@ import { mkdtempSync, rmSync, mkdirSync, realpathSync, symlinkSync, writeFileSyn
 import { execFileSync, execSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir, userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   DEFAULT_ADMISSION_CAP, DEFAULT_TIMEOUT_MS, DEFAULT_ADMISSION_CEILING_MS, ADMISSION_SWITCH_ENV,
   ADMISSION_LEASE_MINUTES, resolveCap, resolveTimeoutMs, resolveCeilingMs, isAdmissionOff, slotPath,
@@ -30,7 +31,7 @@ import {
 import {
   ADMISSION_DEFERRED_EXIT, ADMISSION_POLICY_STANDARD, resolveAdmissionPolicy, formatAdmissionPolicy,
   resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy, privateAdmissionPool,
-  classifyWaiterPriority, slotOrderFor, recordHoldDuration, readHoldDurations,
+  classifyWaiterPriority, slotOrderFor, recordHoldDuration, readHoldDurations, validRepairPatterns, DEFAULT_REPAIR_PATTERNS,
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
@@ -1763,6 +1764,63 @@ describe('main-fix queue priority — red-main repair waiters are class P0 (deli
     expect(r).toMatchObject({ class: 'P0', matched: { field: 'purpose', value: 'main-fix-2cb94418d' } });
     expect(r.reason).toMatch(/main-red/);
     expect(classifyWaiterPriority({ purpose: 'main-fix-2cb94418d' }, { ...ADMISSION_POLICY_STANDARD.priority, mode: 'off' }).class).toBe('P3');
+  });
+
+  // Resource bounds: an operator-set repair pattern is matched on the admission path BEFORE the queue / ceiling checks,
+  // so one catastrophic pattern must never be able to stall a caller (reproduced: ^(main-fix-)?([a-z]+)+$ on 60 a's).
+  const probe = (patterns, value) => {
+    const script = `
+      import { acquireSlotBlocking, ADMISSION_POLICY_STANDARD, classifyWaiterPriority } from ${JSON.stringify(pathToFileURL(CLI).href)};
+      const priority = { mode: 'enforce', repairPatterns: ${JSON.stringify(patterns)} };
+      const t0 = Date.now();
+      const cls = classifyWaiterPriority({ purpose: ${JSON.stringify(value)} }, priority);
+      const r = await acquireSlotBlocking({ lockRoot: ${JSON.stringify(lockRoot)}, cap: 1, owner: 'MF', kind: 'files', pollMs: 10, ceilingMs: 1000, canDefer: true,
+        policy: { settings: { ...ADMISSION_POLICY_STANDARD, priority }, sources: {}, invalid: [], ignored: [] },
+        readLease: () => ({ purpose: ${JSON.stringify(value)}, holder: null, session: null }), log: () => {}, env: {} });
+      console.log(JSON.stringify({ cls: cls.class, ok: r.ok, ms: Date.now() - t0 }));`;
+    const res = spawnSync(process.execPath, ['--input-type=module', '-e', script],
+      { encoding: 'utf8', timeout: 8000, env: { ...process.env, WE_RESOURCE_SHADOW: 'off', WE_RESOURCE_CUTOVER: 'shadow' } });
+    return { timedOut: res.error?.code === 'ETIMEDOUT', out: res.stdout.trim() ? JSON.parse(res.stdout.trim().split('\n').pop()) : null, stderr: res.stderr };
+  };
+
+  it('validRepairPatterns rejects a nested quantifier, a backreference, and an over-long pattern; accepts the standard patterns', () => {
+    for (const bad of ['^(main-fix-)?([a-z]+)+$', '^(a+)+$', '^(a*)*$', '^((ab)+)+x$', '^(a|b+)+$', '^(?:a{1,5}){2,}$', '^(a+){2}$', '^([a-z]+)\\1$', '^(?<n>a)\\k<n>$', `^${'a'.repeat(300)}$`]) {
+      expect(validRepairPatterns([bad]), bad).toBe(false);
+    }
+    for (const ok of [...DEFAULT_REPAIR_PATTERNS, '^hotfix-', '^b-{2,3}', '^(?:a|b)+$', '^(abc)+$', '^[a-z]+-\\d+$', '^x(?=y)', '^((ab)+)?x+$', '^\\(a+\\)+$']) {
+      expect(validRepairPatterns([ok]), ok).toBe(true);
+    }
+  });
+
+  it('a catastrophic pattern in the policy is reported invalid and the standard patterns still decide', () => {
+    const p = resolveAdmissionPolicy({ platform: { priority: { repairPatterns: ['^(main-fix-)?([a-z]+)+$'] } } });
+    expect(p.invalid.join('\n')).toMatch(/platform\.priority\.repairPatterns/);
+    expect(p.settings.priority.repairPatterns).toEqual([...DEFAULT_REPAIR_PATTERNS]);
+  });
+
+  it('classifyWaiterPriority never stalls: an unsafe pattern handed straight to it is bounded and falls to P3', () => {
+    const r = probe(['^(main-fix-)?([a-z]+)+$'], 'a'.repeat(60) + '-1');
+    expect(r.timedOut, r.stderr).toBe(false);
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out.ms).toBeLessThan(4000);
+  });
+
+  it('the matcher has a hard time bound: overlapping alternation (not caught by validation) is cut off, other patterns still match', () => {
+    expect(validRepairPatterns(['^(a|aa)+$'])).toBe(true); // star-height 1: only the time bound can stop it
+    const r = probe(['^(a|aa)+$', '^a+-1$'], 'a'.repeat(70) + 'b');
+    expect(r.timedOut, r.stderr).toBe(false);
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out.ms).toBeLessThan(4000);
+    const hit = probe(['^(a|aa)+$', '^a+b$'], 'a'.repeat(70) + 'b'); // the second pattern is still honoured after the first is cut off
+    expect(hit.timedOut, hit.stderr).toBe(false);
+    expect(hit.out.cls).toBe('P0');
+  });
+
+  it('an over-long identity value is not matched at all (it is no repair slug)', () => {
+    const custom = { mode: 'enforce', repairPatterns: ['^hotfix-'] };
+    expect(classifyWaiterPriority({ purpose: 'hotfix-1' }, custom).class).toBe('P0');
+    expect(classifyWaiterPriority({ purpose: 'hotfix-'.padEnd(400, 'x') }, custom).class).toBe('P3');
+    expect(classifyWaiterPriority({ purpose: 'main-fix-2cb94418d' }, ADMISSION_POLICY_STANDARD.priority).class).toBe('P0');
   });
 
   it('cascade: standard → platform → tool → env, each leaf named with its source; invalid values never override', () => {

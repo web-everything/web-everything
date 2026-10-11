@@ -124,7 +124,9 @@
  *     rank FCFS among themselves in one queue across both lanes and may take any free slot, heavy or fast. A
  *     running holder is never preempted. `heavyAdmission.priority.mode` (enforce|off) and the patterns resolve
  *     standard → platform → tool → env (WE_HEAVY_ADMISSION_PRIORITY / WE_HEAVY_ADMISSION_REPAIR_PATTERNS, a JSON
- *     array), and the P0 / yield log lines name the mode's source;
+ *     array), and the P0 / yield log lines name the mode's source. Patterns are bounded (≤200 chars, no repeat nested
+ *     in a repeat, no backreference — else the whole list is invalid and the standard patterns apply), and every match
+ *     runs under a 50 ms vm timeout, so an operator pattern can never stall admission;
  *   • THE FAST LANE: short kinds (selected / files / standards) rank first-come-first-served among themselves.
  *     The fastSlots setting adds capacity above cap (default 2 heavy + 1 fast); short jobs can also take heavy
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
