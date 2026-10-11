@@ -23,7 +23,8 @@ import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 import { BUILD_DISPATCH_POLICY } from '../conveyor/build-dispatch-policy.mjs';
-import { gateHost, isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
+import { gateLaunch } from './resource-gate.mjs';
+import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
 
 export const BORROW_REASON = 'borrowed-build-slot';
 /** A PR not deferred on the cap for this long starts its wait over. */
@@ -89,6 +90,7 @@ export function createFixBorrowGate({
   ledger = fileLedger(defaultBorrowLedgerPath()),
   listBuildClaims = () => [], listFixClaims = () => [], caps = resolveBuilderCaps(env),
   loadavg = () => os.loadavg()[0], cpuCount = () => os.cpus().length, alive = isPidAlive, sample,
+  hostGate, // x6nuodj: null → gateLaunch (admit({kind:'fix'}) decides; legacy gateHost is the logged comparison)
   outcomes = fileOutcomeStore(),
   launcherAvailable = (executor) => executor === 'claude',
 } = {}) {
@@ -120,7 +122,7 @@ export function createFixBorrowGate({
       const { executor } = settings;
       if (!launcherAvailable(executor)) return { borrow: false, why: `no ${executor} fix launcher in this checkout` };
       let gate = { admit: true };
-      try { gate = gateHost({ kind: 'fix', env, loadavg, cpuCount, ...(sample ? { sample } : {}) }); } catch { /* fail open, like every load read */ }
+      try { gate = (hostGate ?? (() => gateLaunch({ kind: 'fix', gate: 'fix-slot-borrow', env, loadavg, cpuCount, ...(sample ? { sample } : {}) })))(); } catch { /* fail open, like every load read */ }
       if (!gate.admit) return { borrow: false, why: gate.why };
       const klass = borrowClass(executor);
       let builds = 0; let borrowedLive = 0;
