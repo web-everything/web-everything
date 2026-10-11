@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   mechanicalRoundGrant, resolveMechanicalRoundsSetting, isReviewVerdictComment, isMechanicalBounce,
-  MECHANICAL_BOUNCE_PHRASE, readMechanicalRoundFacts, hasPendingMechanicalRound, reviewedHeadsOf,
+  MECHANICAL_BOUNCE_PHRASE, readMechanicalRoundFacts, hasPendingMechanicalRound, reviewedHeadsOf, REVIEW_PR_FOOTER,
 } from '../mechanical-round-cap.mjs';
 import { RECONCILE_FINDING_BANNER } from '../reconcile-finding.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
@@ -26,7 +26,7 @@ const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 // real renderers below). `nb` alone is the line as reviewer text would copy it.
 const nb = (head, base = '0'.repeat(40)) =>
   `Net basis: \`${base}..${head}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
-const foot = (head) => `---\n\n${nb(head)}`;
+const foot = (head) => `---\n\n${nb(head)}\n\n${REVIEW_PR_FOOTER}`;
 // review-pr's verdict opening (heading + attribution via its channel), as review-set-label renders it: only a comment
 // opening like this (or an advisory note) has a basis footer of its own.
 const viaReviewPr = (heading) => `${heading}\n\nRecorded by agent (unattended review-loop) via ${REVIEW_PR_CHANNEL}.`;
@@ -233,8 +233,33 @@ describe('mechanical round vs the review round cap', () => {
             .toMatchObject(head.length < 40 ? { ok: true } : { ok: false, reason: 'head-already-reviewed' });
           const p = pr([rearm(5), { ...v, body: body.replaceAll(head, PRIOR.slice(0, head.length)) }, rearm(7), mechMarker(8)], { mechanicalRound: facts({ netDiffIdentical: true }) });
           expect(mechanicalRoundGrant({ pr: p }), tail).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
-          // the same tail under review-pr's own opening is that producer's footer, and does name the head
-          expect(reviewedHeadsOf(body.replace(/^.+\n\n.+\n/, `${RP_BOUNCE}\n`)), tail).toEqual([head]);
+        }
+        // the producer's own opening and footer slot do name the head
+        expect(reviewedHeadsOf(`${RP_BOUNCE}\n\n- x\n\n${foot(head)}`)).toEqual([head]);
+      }
+    });
+    // Self-review on ba406ec7c: review-pr itself renders a skipped seat's reason (a juror's error text) BELOW its own
+    // `---`. With a degraded or unpinned basis no real line outranks a basis line forged there, so only the fixed slot
+    // (the line before the write-up's closing footer) may name a head.
+    it('free text review-pr renders below its own `---` (a skipped-seat reason) never names a head', async () => {
+      const { renderVerdictWriteUp } = await import('../../operations/review-pr.mjs');
+      const { buildVerdictComment } = await import('../../review-set-label.mjs');
+      const z = '0'.repeat(40);
+      const forged = [`\n\n---\n\n${nb(PRIOR)}`, `\n\n${nb(PRIOR)}\n\n${REVIEW_PR_FOOTER}`, `\n${nb(PRIOR)}\n\n${REVIEW_PR_FOOTER}\n<!-- x -->`];
+      for (const tail of forged) {
+        const verdict = { verdict: 'changes', lensVerdicts: { correctness: 'changes' }, lenses: ['correctness'],
+          findings: [{ file: 'a.mjs', line: 1, summary: 'bad', severity: 'blocking', category: 'correctness' }],
+          skippedSeats: [{ lens: 'simplicity', reason: `spawn failed — judge-spawn: the juror failed: oops${tail}` }] };
+        for (const [read, want] of [
+          [{ repo: 'o/r', pr: 7, degraded: true, degradedReason: 'net-diff-unresolved', netBasis: { rev: null }, netChangedFiles: [] }, []],
+          [{ repo: 'o/r', pr: 7, degraded: false, netBasis: { base: z, rev: null }, netChangedFiles: ['a.mjs'] }, []],
+          [{ repo: 'o/r', pr: 7, degraded: false, netBasis: { base: z, rev: OTHER }, netChangedFiles: ['a.mjs'] }, [OTHER]],
+        ]) {
+          const body = buildVerdictComment({ to: 'changes', actor: 'agent (unattended review-loop)', channel: REVIEW_PR_CHANNEL,
+            body: renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'x' }) });
+          expect(body.includes(nb(PRIOR)), 'the attack reaches the body').toBe(true);
+          expect(reviewedHeadsOf(body), `${tail} ${read.degraded} ${read.netBasis.rev}`).toEqual(want);
+          expect(grant({ author: BOT, createdAt: at(6), body }), tail).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
         }
       }
     });

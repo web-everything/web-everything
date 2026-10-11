@@ -92,10 +92,11 @@ export function isMechanicalBounce(c) {
 const REVIEWED_MARKER_LINE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->\\s*$`, 'i');
 // A `Net basis` line counts only in a producer's exact shape, tail included (we:scripts/operations/review-pr.mjs
 // #renderVerdictWriteUp / #renderAdvisoryNote, we:scripts/lib/review-escalation.mjs's converted advisory note), only
-// in the comment's LAST `---` section (every producer writes `---` after the reviewer's text and its basis line after
-// that), and only in a comment whose OPENING lines name one of those producers ({@link writesNetBasis}). The opening
-// is the one part free text never reaches: a verdict with no footer of its own (a red-team or policy bounce, any
-// other `review-set-label` caller) ends in juror free text, which may copy a whole `---` + basis footer.
+// in a comment whose OPENING lines name one of those producers, and only at that producer's fixed footer slot
+// ({@link basisSlot}). The opening is the one part free text never reaches: a verdict with no footer of its own (a
+// red-team or policy bounce, any other `review-set-label` caller) ends in juror free text, which may copy a whole
+// `---` + basis footer. The fixed slot keeps out free text a producer itself renders below its own `---` (review-pr's
+// skipped-seat reasons carry a juror's error text, and a degraded or unpinned basis leaves no real line to outrank it).
 const NET_BASIS_LINES = [
   /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`(?: \(rev `[^`]*` at review time\))? — \d+ net changed file\(s\) vs current main\b/i,
   /^Net basis: `([0-9a-f]{7,40})\.\.\1` \(this head; no fresh diff computed\b/i,
@@ -111,16 +112,28 @@ const ANY_REVIEWED_MARKER = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:`, 'i');
 const REVIEW_PR_HEADINGS = [BOUNCE_PREFIX, '✅ review — accepted'];
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const REVIEW_PR_ATTRIBUTION = new RegExp(`^Recorded by \\S.* via ${escapeRe(REVIEW_PR_CHANNEL)}\\.$`);
+// The write-up's own last line, then (an accept only) buildVerdictComment's `<!-- … -->` marker block.
+export const REVIEW_PR_FOOTER = `_Recorded through ${REVIEW_PR_CHANNEL}._`;
+const MARKER_COMMENT_LINE = /^<!--.*-->$/;
 
 /**
- * Does this comment's producer write a `Net basis` footer? Read from the opening lines only: an advisory or converted
- * advisory note's lead marker, or a review-pr verdict's heading plus its attribution line naming the review-pr channel.
+ * The one line index where this comment's producer writes its `Net basis` line, or -1. The producer is read from the
+ * opening lines only; the slot is fixed by that producer's own layout:
+ *   - an advisory / converted advisory note (lead marker): `---`, a blank line, then the basis line;
+ *   - a review-pr verdict (heading, blank, `Recorded by … via <review-pr channel>.`): the basis line, a blank line, then
+ *     {@link REVIEW_PR_FOOTER} as the write-up's last line (only marker lines may follow it).
+ * No other line of the comment names a head, whatever it looks like.
  */
-function writesNetBasis(lines) {
+function basisSlot(lines, lastRule) {
   const at = lines.findIndex((l) => l.trim() !== '');
   const lead = at < 0 ? '' : lines[at].trimStart();
-  if (lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(CONVERTED_ADVISORY_NOTE_MARKER)) return true;
-  return REVIEW_PR_HEADINGS.includes(lead.trimEnd()) && lines[at + 1] === '' && REVIEW_PR_ATTRIBUTION.test(lines[at + 2] ?? '');
+  if (lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(CONVERTED_ADVISORY_NOTE_MARKER)) {
+    return lastRule >= 0 && lines[lastRule + 1] === '' ? lastRule + 2 : -1;
+  }
+  if (!(REVIEW_PR_HEADINGS.includes(lead.trimEnd()) && lines[at + 1] === '' && REVIEW_PR_ATTRIBUTION.test(lines[at + 2] ?? ''))) return -1;
+  let end = lines.length - 1;
+  while (end > at && (lines[end].trim() === '' || MARKER_COMMENT_LINE.test(lines[end]))) end -= 1;
+  return lines[end] === REVIEW_PR_FOOTER && lines[end - 1] === '' && end - 2 > lastRule && lastRule > at ? end - 2 : -1;
 }
 
 const fenceOf = (line) => {
@@ -163,8 +176,8 @@ function structuredMarkerLines(body) {
     if (s) out.push({ kind: 'reviewed-sha', sha: s[1].toLowerCase(), at: i });
     else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase(), at: i });
   }
-  const basisFooter = lastRule >= 0 && writesNetBasis(lines);
-  return out.filter((m) => m.kind === 'reviewed-sha' || (basisFooter && m.at > lastRule)).map(({ kind, sha }) => ({ kind, sha }));
+  const slot = basisSlot(lines, lastRule);
+  return out.filter((m) => m.kind === 'reviewed-sha' || m.at === slot).map(({ kind, sha }) => ({ kind, sha }));
 }
 
 /**
@@ -196,9 +209,9 @@ export function verdictKind(c) {
 
 /**
  * The commit a trusted verdict comment says it JUDGED: the head of its LAST unquoted structured marker line, of either
- * format (`<!-- reviewed-sha: <sha> -->`, or a producer-shaped `Net basis: <base>..<head> — …` line in the last `---`
- * section of a comment whose opening lines name a basis producer — review-pr's verdict or an advisory note; 7-40 hex,
- * lower-cased). It relies on every
+ * format (`<!-- reviewed-sha: <sha> -->`, or a producer-shaped `Net basis: <base>..<head> — …` line at the fixed
+ * footer slot of a comment whose opening lines name a basis producer — review-pr's verdict or an advisory note; 7-40
+ * hex, lower-cased). It relies on every
  * producer appending that footer LAST, after any quoted text, so a quoted earlier one never wins. One head, never one
  * per format: a quoted `Net basis` naming the parent must not ride along with a real `reviewed-sha` footer for another
  * commit. A sha merely mentioned in prose is never returned. An advisory or converted advisory note never stamps a
