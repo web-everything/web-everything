@@ -67,6 +67,13 @@ export const REVIEW_LABELS = {
   // card x5f2daz — a PREPARE PR (card-only) got the light single-reviewer pass (`we:scripts/conveyor/prep-review.mjs`).
   // It is a RECORD that a review looked, not a verdict: it never blocks, never unblocks, and is never applied to a code PR.
   prep: 'review:prep',
+  // card xu7kxtt (PR #4631, operator ruling 2026-10-10 ~14:20 ET, option a) — the drain's MECHANICAL park: its
+  // anti-test-gaming re-park of a PR the operator already cleared on an older head (the merge queue / a rebase moved
+  // the SHA). ONLY the drain writes it, so its presence is the positive proof the hold is mechanical, and it is the
+  // ONLY hold accept carry-forward may lift (`review-set-label.mjs --to=restamp`, on a byte-identical net diff).
+  // `review:human` always means a person set the hold and is never removed automatically. A hold like any other
+  // (`REVIEW_HOLD_LABELS`): the PR may not merge while it stands.
+  heldMechanical: 'review:held-mechanical',
 };
 
 /**
@@ -86,6 +93,7 @@ export const REVIEW_LABEL_META = {
   // backfill) — unlike the pre-existing labels above, this one is minted fresh through that same validated path.
   [REVIEW_LABELS.awaitingAdvisory]: { color: 'FEF2C0', description: 'review:human PR awaiting its advisory panel; cleared once it posts (mechanical-dispatcher)' },
   [REVIEW_LABELS.prep]: { color: 'C5DEF5', description: 'Prepare PR given the light single-reviewer pass (advice only; never a code-PR verdict)' },
+  [REVIEW_LABELS.heldMechanical]: { color: 'D4C5F9', description: 'Drain re-parked an operator-cleared PR after its head moved; lifted only on an identical diff' },
 };
 
 /** Default rubric thresholds (tuning knobs — loose to start). The VALUES live in the machine-diffable contract
@@ -2019,6 +2027,28 @@ export function decideParkToHuman({ currentLabels = [], keepHumanClearance = fal
 }
 
 /**
+ * card xu7kxtt (PR #4631, operator ruling 2026-10-10 ~14:20 ET, option a) — the drain's MECHANICAL park: the
+ * anti-test-gaming gate re-parking a PR whose operator clearance names an OLDER head (a successful read showed it;
+ * a fetch miss never reaches this). It holds with the drain's own `review:held-mechanical`, NEVER `review:human`, so
+ * the one hold accept carry-forward may lift is one only the drain writes; a person's `review:human` (placed before,
+ * during or after this park) is a different label and is never touched. The stale `review:accepted` goes (the
+ * clearance is proven not to name this head; `--to=restamp` re-adds it on a carry). Pure; always allowed.
+ * @returns {{allowed: true, addLabel: string, removeLabels: string[], keepsHuman: false, reason: string}}
+ */
+export function decideMechanicalPark({ currentLabels = [] } = {}) {
+  return {
+    allowed: true,
+    addLabel: REVIEW_LABELS.heldMechanical,
+    removeLabels: [REVIEW_LABELS.pending, REVIEW_LABELS.redteamAccepted, REVIEW_LABELS.accepted],
+    keepsHuman: false,
+    reason: 'parked to review:held-mechanical — the operator clearance names an older head; the carry-forward sweep '
+      + 'lifts this drain-only hold on a byte-identical net diff, or hands it to the operator'
+      + (hasReviewLabel(currentLabels, REVIEW_LABELS.changes)
+        ? '; review:changes preserved — explicit send-back still requires a fix' : ''),
+  };
+}
+
+/**
  * we:scripts/lib/review-escalation.mjs#findContradictoryReviewVerdicts — THE CHECK: does this PR carry more
  * than one of the four review:* VERDICT/HOLD labels at once (`pending`, `accepted`, `changes`, `human`)? A
  * send-back may deliberately coexist with a human hold; this detector reports co-presence, not whether
@@ -2335,6 +2365,9 @@ export function hasUnclearedReviewLabel(labels, { allowPending = false } = {}) {
   //     made `--to=accepted` strip `changes` for exactly that reason. Refusing it here would reverse a ratified
   //     reading and strand any PR still carrying the pre-#2974 pair, so it is left exactly as it was.
   if (hasReviewLabel(labels, REVIEW_LABELS.human)) return true;
+  // PR #4631 (ruling a): the drain's mechanical park holds like `review:human` — never waived, never cleared by a
+  // co-present accept (the sanctioned carry REMOVES it as it adds `review:accepted`, so the pair is never sanctioned).
+  if (hasReviewLabel(labels, REVIEW_LABELS.heldMechanical)) return true;
   if (!allowPending && hasReviewLabel(labels, REVIEW_LABELS.pending)) return true;
   if (hasReviewLabel(labels, REVIEW_LABELS.accepted)) return false;
   return hasReviewLabel(labels, REVIEW_LABELS.changes);
@@ -2348,12 +2381,14 @@ export function hasUnclearedReviewLabel(labels, { allowPending = false } = {}) {
 export const READY_TO_MERGE_LABEL = 'ready-to-merge';
 
 /**
- * #2832 — the three REVIEW-HOLD labels: applying ANY of them means "this PR is held, it may NOT merge". A held
+ * #2832 — the REVIEW-HOLD labels: applying ANY of them means "this PR is held, it may NOT merge". A held
  * PR and `ready-to-merge` are contradictory (a hold AND a go-ahead at once), so wherever a hold label is
  * written or observed, `ready-to-merge` must be refused/stripped. Frozen — the canonical hold set.
  * (`review:accepted` is NOT a hold — it CLEARS one; `redteam:accepted` is an orthogonal sign-off, not a hold.)
+ * PR #4631 (ruling a) added the drain's mechanical park, `review:held-mechanical`, last (its readers that pick
+ * the first hold present still name a person's hold first).
  */
-export const REVIEW_HOLD_LABELS = Object.freeze([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human]);
+export const REVIEW_HOLD_LABELS = Object.freeze([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]);
 
 /** #2832 — is `label` one of the three review-hold labels? Pure. Used by the write sites that must strip
  *  `ready-to-merge` in the same operation they apply a hold. */

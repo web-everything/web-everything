@@ -81,6 +81,11 @@
  * main is set aside and named in a warning, so it never blocks an unrelated add. A real `add` runs the check and
  * the registration under a per-clone add-guard lock, so two concurrent adds cannot both pass against a list that
  * holds neither (PR #2827 review).
+ * Stack-aware rule: #4914/#4915 were refused on 2026-10-11 by their own moved bases.
+ * Discover registered bases from the PR base chain and read-only tip ancestry. On conflict, preview again
+ * with those bases set aside: the candidate carries their work, as the stack-tops rebuild applies it.
+ * Accept only if that preview is clean; conflicts with main or other overlays still refuse, and a failed
+ * second preview preserves the original refusal.
  */
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -95,6 +100,102 @@ import { overlaySafetySettings } from './lib/daemon-load-overlay.mjs';
 import { pruneStaleOverlayRecords } from './lib/daemon-clone-registry.mjs';
 import { workspaceFor } from './lib/lane-pool-paths.mjs';
 import { edgeEnabled, registerPr } from './lib/daemon-edge.mjs';
+
+/**
+ * Best-effort, read-only stack evidence. Remote tips are checked only against objects already in root;
+ * absent objects contribute no ancestry evidence. The explicit chain map suppresses all gh calls.
+ */
+export function findStackBases({
+  root, ref, pr = null, existingOverlays, env = process.env, originUrl, run = spawnSync,
+}) {
+  const refs = [...new Set(existingOverlays.map(o => o.ref).filter(r => r !== ref))];
+  const via = { chain: [], ancestry: [] };
+  const invoke = (cmd, args) => {
+    try {
+      return run(cmd, args, {
+        cwd: root, encoding: 'utf8', timeout: 15_000,
+        env: { ...env, GIT_OPTIONAL_LOCKS: '0' },
+      }) ?? { status: null };
+    } catch {
+      return { status: null };
+    }
+  };
+  const mapped = env.WE_DAEMON_OVERLAY_STACK_BASES !== undefined;
+  let chainMap = {};
+  if (mapped) {
+    try {
+      const parsed = JSON.parse(env.WE_DAEMON_OVERLAY_STACK_BASES);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) chainMap = parsed;
+    } catch { /* An invalid test map is empty, never a reason to call gh. */ }
+  }
+  let head = ref;
+  const seen = new Set([ref]);
+  for (let hop = 0; hop < 12; hop++) {
+    let base;
+    if (mapped) {
+      base = Object.hasOwn(chainMap, head) ? chainMap[head] : null;
+    } else {
+      const args = hop === 0 && pr != null
+        ? ['pr', 'view', String(pr), '--json', 'baseRefName', '--jq', '.baseRefName']
+        : ['pr', 'list', '--head', head, '--state', 'open', '--json', 'baseRefName', '--jq', '.[0].baseRefName'];
+      const result = invoke('gh', args);
+      base = result.status === 0 ? result.stdout : null;
+    }
+    base = typeof base === 'string' ? base.trim() : '';
+    if (!base || base === 'null' || seen.has(base)) break;
+    via.chain.push(base);
+    if (base === 'main' || base === 'master') break;
+    seen.add(base);
+    head = base;
+  }
+
+  if (refs.length) {
+    let url = originUrl;
+    if (!url) {
+      const result = invoke('git', ['-C', root, 'remote', 'get-url', 'origin']);
+      url = result.status === 0 ? String(result.stdout ?? '').trim() : null;
+    }
+    if (url) {
+      const result = invoke('git', ['ls-remote', url, ...[ref, ...refs].map(r => `refs/heads/${r}`)]);
+      if (result.status === 0) {
+        const tips = new Map();
+        for (const line of String(result.stdout ?? '').split('\n')) {
+          const match = /^([0-9a-f]{40,64})\s+refs\/heads\/(.+)$/.exec(line);
+          if (match) tips.set(match[2], match[1]);
+        }
+        const candidate = tips.get(ref);
+        if (candidate) {
+          for (const base of refs) {
+            const tip = tips.get(base);
+            if (tip && invoke('git', ['merge-base', '--is-ancestor', tip, candidate]).status === 0) {
+              via.ancestry.push(base);
+            }
+          }
+        }
+      }
+    }
+  }
+  const found = new Set([...via.chain, ...via.ancestry]);
+  return { bases: refs.filter(r => found.has(r)), via };
+}
+
+/** Retry a conflicting preview with the candidate's registered bases set aside, like stack-tops rebuild. */
+export async function stackAwareOverlayCheck({
+  root, ref, pr = null, existingOverlays, env = process.env, originUrl,
+  preview = previewOverlayConflict, stackBases = findStackBases,
+}) {
+  const options = { root, ref, pr, existingOverlays, env, originUrl };
+  const { bases, via } = await stackBases(options);
+  const full = await preview(options);
+  const evidence = { stackBases: bases, stackVia: via };
+  if (!full.ok || full.clean || bases.length === 0) return { ...full, ...evidence };
+  const sa = await preview({ ...options, existingOverlays: existingOverlays.filter(o => !bases.includes(o.ref)) });
+  if (!sa.ok) return { ...full, ...evidence };
+  return {
+    ...sa, ...evidence,
+    ...(sa.clean ? { stackConflictIgnored: { files: full.files, conflicting: full.conflicting } } : {}),
+  };
+}
 
 function parseFlags(argv) {
   const flags = {};
@@ -337,7 +438,13 @@ async function main() {
     const runGuard = async () => {
       const overlayState = readOverlayState(root, { env });
       if (overlayState.corrupt) return { ok: false, reason: 'overlay-store-corrupt', corruptStore: true };
-      return previewOverlayConflict({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+      return stackAwareOverlayCheck({ root, ref: flags.ref, pr, existingOverlays: overlayState.overlays, env });
+    };
+
+    const reportStackConflict = (check) => {
+      if (!asJson && check.stackConflictIgnored) {
+        process.stderr.write(`daemon-overlay: stack-aware — ${flags.ref} conflicts only with its own stack base(s) ${check.stackBases.join(', ')} (files: ${check.stackConflictIgnored.files.join(', ')}); checked against main + the other overlays instead, as the stack-tops rebuild applies it.\n`);
+      }
     };
 
     // `--check`: report the SAME guard result and stop — never calls `addOverlay`/`appendOverlayEvent`, so a
@@ -346,6 +453,7 @@ async function main() {
     if (flags.check) {
       const check = await runGuard();
       warnSetAside(check);
+      reportStackConflict(check);
       if (asJson) {
         process.stdout.write(`${JSON.stringify({ check, wouldRegister: check.ok && (check.clean || allowConflict) })}\n`);
       } else if (!check.ok) {
@@ -373,6 +481,7 @@ async function main() {
         throw new Error(`overlay state file ${overlayFilePath(root, env)} is corrupt — refusing to overwrite it; fix or remove it by hand`);
       }
       warnSetAside(check);
+      reportStackConflict(check);
       if (!check.ok) {
         // The guard itself could not determine safety (no network, unresolved ref, a merge-tree error, …) — fail
         // CLOSED: refuse rather than register on an unproven merge. `--allow-conflict` names a KNOWN conflict it
@@ -407,6 +516,8 @@ async function main() {
       appendOverlayEvent(root, {
         kind: 'added', ref: flags.ref, pr, by, reason, ...(pinned !== undefined ? { pinned } : {}),
         ...(pr == null ? { noPr: true } : {}),
+        ...(check.stackBases?.length ? { stackBases: check.stackBases } : {}),
+        ...(check.stackConflictIgnored ? { stackConflictIgnored: check.stackConflictIgnored } : {}),
         ...(!check.clean ? { conflictOverride: { files: check.files, conflicting: check.conflicting } } : {}),
       }, { env });
       return { list, check };

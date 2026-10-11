@@ -13,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/merge-ai-prs.mjs:5784` — Extract the fact derivation into an exported function that takes the PR listing and verdicts, and add a replay test over a stacked-PR listing. Backlog card xmp483n and the x7kz8uv standards check already point at the same inline-logic-in-`runCli` class.
+1. `we:scripts/merge-ai-prs.mjs:5784` — Extract the fact derivation into an exported function that takes the PR listing and verdicts, and add a replay test over a stacked-PR listing. Backlog card 5880 and the 5877 standards check already point at the same inline-logic-in-`runCli` class.
 2. `we:scripts/lib/accept-carry-forward.mjs:160` — Add a replay case for a post-accept CHANGES_REQUESTED followed by an APPROVED from the same reviewer, and compute the time-based objections only over reviews not superseded by that reviewer's later decisive state.
 3. `we:scripts/lib/accept-carry-forward.mjs:119` — Match `**Advisory outcome:**` as an allowlist, so only `accept` is machine chatter and every other outcome blocks. Add a replay test that iterates the writer's outcome set (ADVISORY_OUTCOMES plus the pending-referral constant) and asserts which ones block.
 4. `we:scripts/lib/accept-carry-forward.mjs` — Add a deterministic regression test matrix covering changes-requested followed by approval both before and after acceptance, and require it in the existing test gate.

@@ -1885,7 +1885,7 @@ describe('hasReviewLabel + REVIEW_LABELS', () => {
     expect(hasReviewLabel([], REVIEW_LABELS.accepted)).toBe(false);
   });
   it('exposes the ratified verdict labels (+ the #2285 human gate, #2439 validator, mechanical-dispatcher\'s awaiting-advisory) + tuning knobs', () => {
-    expect(REVIEW_LABELS).toEqual({ pending: 'review:pending', accepted: 'review:accepted', changes: 'review:changes', human: 'review:human', redteamAccepted: 'redteam:accepted', awaitingAdvisory: 'review:awaiting-advisory', prep: 'review:prep' });
+    expect(REVIEW_LABELS).toEqual({ pending: 'review:pending', accepted: 'review:accepted', changes: 'review:changes', human: 'review:human', redteamAccepted: 'redteam:accepted', awaitingAdvisory: 'review:awaiting-advisory', prep: 'review:prep', heldMechanical: 'review:held-mechanical' });
     expect(DEFAULT_THRESHOLDS.diffLines).toBeGreaterThan(0);
   });
 });
