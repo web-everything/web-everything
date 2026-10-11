@@ -11,7 +11,7 @@
  *   advancing (at least every 2 minutes) throughout, rather than lapsing mid-gate.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -19,7 +19,7 @@ import {
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
   reconcileInFlight, pidAlive, processGroupAlive, killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
-  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun,
+  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun, wireGateJobs,
 } from '../verify-daemon.mjs';
 import { laneNeedsVerifyDispatch } from '../../../scripts/conveyor/verify-dispatch.mjs';
 import { VERIFY_FILENAME, verifyStartBody } from '../../../scripts/lib/lane-verify.mjs';
@@ -560,12 +560,55 @@ describe('in-flight PID reconciliation', () => {
   it('drops a dead PID, kills its surviving group, and logs the orphan', () => {
     const run = entry();
     const inFlight = new Map([['lane', run]]);
-    const killGroup = vi.fn(); const log = vi.fn();
-    const result = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => true, killGroup, log });
+    const killed = new Set();
+    const killGroup = vi.fn((g) => killed.add(-g)); const log = vi.fn();
+    const result = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: (p) => !killed.has(p), killGroup, log });
     expect(inFlight.size).toBe(0);
     expect(killGroup).toHaveBeenCalledWith(-777);
     expect(log).toHaveBeenCalledWith('verify-daemon: we/lane-9 in-flight run 12345678 orphaned (pid 777 gone) — dropped and re-queued');
     expect(result).toEqual({ orphaned: [{ pool: 'we', lane: 9, runId: run.runId, pid: 777, reason: 'pid-gone' }] });
+  });
+
+  it('PR 4764 round 7: a group that survives the kill (or cannot be checked) keeps the lane held; dropped only once confirmed gone', () => {
+    const run = entry();
+    const inFlight = new Map([['lane', run]]);
+    let survives = true;
+    const killGroup = vi.fn(); const log = vi.fn();
+    const opts = { isAlive: () => false, groupAlive: () => survives, killGroup, log };
+    expect(reconcileInFlight(inFlight, opts).orphaned).toEqual([]);
+    expect(reconcileInFlight(inFlight, { ...opts, groupAlive: () => { throw new Error('EPERM?'); } }).orphaned).toEqual([]);
+    expect(inFlight.get('lane')).toBe(run); // never a lane free beside surviving test runners
+    expect(killGroup).toHaveBeenCalledTimes(1); // the check that threw neither killed nor released
+    survives = false;
+    expect(reconcileInFlight(inFlight, opts).orphaned).toEqual([expect.objectContaining({ reason: 'pid-gone' })]);
+    expect(inFlight.size).toBe(0);
+    expect(log.mock.calls.flat().filter((l) => /not confirmed gone/.test(l))).toHaveLength(1);
+  });
+
+  it('PR 4764 round 8: a settled leader whose pid exists again was reused — its group is gone: released, never killed', () => {
+    const inFlight = new Map([['lane', entry({ leaderSettled: true })]]);
+    const killGroup = vi.fn(); const log = vi.fn();
+    // The reused pid is now some other process that leads its own group: neither may be signalled.
+    const result = reconcileInFlight(inFlight, { isAlive: () => true, groupAlive: () => true, killGroup, log });
+    expect(killGroup).not.toHaveBeenCalled();
+    expect(inFlight.size).toBe(0);
+    expect(result.orphaned).toEqual([]);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/settled leader's process group is gone \(pid 777 since reused\) — released/);
+  });
+
+  it('PR 4764 round 8: a settled leader\'s leftover group is killed each tick and released once gone — not logged as a re-queued orphan', () => {
+    const inFlight = new Map([['lane', entry({ leaderSettled: true })]]);
+    let group = true;
+    const killGroup = vi.fn(); const log = vi.fn();
+    const opts = { isAlive: () => false, groupAlive: () => group, killGroup, log };
+    reconcileInFlight(inFlight, opts);
+    expect(inFlight.has('lane')).toBe(true);
+    expect(killGroup).toHaveBeenCalledWith(-777);
+    group = false;
+    expect(reconcileInFlight(inFlight, opts).orphaned).toEqual([]);
+    expect(inFlight.size).toBe(0);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/leftover process group of pid 777 gone — released/);
+    expect(log.mock.calls.flat().join('\n')).not.toMatch(/re-queued/);
   });
 
   // A pid whose process and group are both gone may already belong to an unrelated process that became its own
@@ -649,8 +692,9 @@ describe('in-flight PID reconciliation', () => {
       expect(inFlight.size).toBe(0);
       return { dispatched: [], deferred: [], failures: [] };
     });
+    let checks = 0; // the group is there for the kill (which throws), and gone by the re-check after it
     const effects = buildCliDaemonEffects({ log, runVerify, isDraining: () => draining,
-      processIsAlive: () => false, groupAlive: () => true, killGroup: () => { throw new Error('kill denied'); } });
+      processIsAlive: () => false, groupAlive: () => (checks++ === 0), killGroup: () => { throw new Error('kill denied'); } });
     effects.inFlight.set('lane', entry());
     effects.onTick(await effects.tickOnce());
     expect(effects.inFlight.size).toBe(0);
@@ -749,21 +793,174 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     }
   }, 10000);
 
+  it('PR 4764 round 8: a hand-off carries a leader-settled run; the successor adopts its leftover group (leader gone, group alive) and skips a reused pid', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-adopt-group-'));
+    try {
+      const path = join(root, 'inflight.json');
+      writeInFlightHandoff(new Map([
+        ['/lanes/a', { pool: 'p', lane: 1, dir: '/lanes/a', runId: 'run-a', pid: 501, sha: 'aaa', startedMs: 1, leaderSettled: true }],
+        ['/lanes/b', { pool: 'p', lane: 2, dir: '/lanes/b', runId: 'run-b', pid: 502, sha: 'bbb', startedMs: 1, leaderSettled: true }],
+        ['/lanes/c', { pool: 'p', lane: 3, dir: '/lanes/c', runId: 'run-c', pid: 503, sha: 'ccc', startedMs: 1 }],
+      ]), path);
+      expect(JSON.parse(readFileSync(path, 'utf8')).records[0]).toMatchObject({ leaderSettled: true });
+      const inFlight = new Map();
+      const adopted = adoptInFlight(inFlight, { path, log: () => {}, isOurs: () => false,
+        pidExists: (pid) => pid === 502, groupAlive: (pid) => pid !== 503 });
+      expect(adopted.map((r) => r.runId)).toEqual(['run-a']); // b: pid reused; c: leader and group both gone
+      expect(inFlight.get('/lanes/a')).toMatchObject({ adopted: true, leaderSettled: true, pid: 501 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('PR 4764 round 8: an unreadable hand-off is kept and raised as a HEALTH alert, never read as "nothing left running"', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-adopt-torn-'));
+    try {
+      const path = join(root, 'inflight.json');
+      writeFileSync(path, '{"records": [{"pid": 5');
+      const log = vi.fn();
+      expect(adoptInFlight(new Map(), { path, log })).toEqual([]);
+      expect(log.mock.calls.flat().join('\n')).toMatch(/⚠ HEALTH the in-flight hand-off .* cannot be read/);
+      expect(existsSync(path)).toBe(false);
+      expect(readdirSync(root).some((n) => n.startsWith('inflight.json.unreadable-'))).toBe(true);
+      expect(adoptInFlight(new Map(), { path: join(root, 'absent.json'), log })).toEqual([]); // no file: nothing handed off, no alert
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('an adopted run that exits is released (its child wrote the marker); one past the ceiling is killed and settled', () => {
     const log = vi.fn();
-    const killGroup = vi.fn();
+    const killed = new Set();
+    const killGroup = vi.fn((g) => killed.add(-g));
     const settleKilled = vi.fn();
     const inFlight = new Map([
       ['done', { pool: 'p', lane: 1, runId: 'r1', pid: 11, startedMs: 0, adopted: true }],
       ['hung', { pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true }],
       ['fresh', { pool: 'p', lane: 3, runId: 'r3', pid: 33, startedMs: 9_000, adopted: true }],
     ]);
-    const { orphaned } = reconcileInFlight(inFlight, { isAlive: (pid) => pid !== 11, groupAlive: () => true, killGroup,
+    const { orphaned } = reconcileInFlight(inFlight, { isAlive: (pid) => pid !== 11, groupAlive: (p) => !killed.has(p), killGroup,
       nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log });
     expect(orphaned.map(o => o.reason)).toEqual(['pid-gone', 'adopted-ceiling']);
     expect(settleKilled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'r2' }), 5_000);
     expect(killGroup).toHaveBeenCalledWith(-22);
     expect([...inFlight.keys()]).toEqual(['fresh']);
     expect(log.mock.calls.flat().join('\n')).toMatch(/adopted run r1.*finished/);
+  });
+
+  it('PR 4764 round 7: an adopted run past its ceiling whose group survives the kill keeps its lane, is settled once, and is killed again each tick', () => {
+    const settleKilled = vi.fn();
+    const killGroup = vi.fn();
+    let alive = true;
+    const inFlight = new Map([['hung', { pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true }]]);
+    const opts = { isAlive: () => alive, groupAlive: () => true, killGroup, nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log: () => {} };
+    reconcileInFlight(inFlight, opts);
+    reconcileInFlight(inFlight, opts);
+    expect(inFlight.has('hung')).toBe(true);
+    expect(settleKilled).toHaveBeenCalledTimes(1);
+    expect(killGroup).toHaveBeenCalledTimes(2);
+    alive = false;
+    const { orphaned } = reconcileInFlight(inFlight, { ...opts, groupAlive: () => false });
+    expect(inFlight.size).toBe(0);
+    expect(orphaned).toEqual([]); // already reported when the ceiling killed it
+  });
+});
+
+describe('#4135 — gate jobs: a restart never waits on, kills, or re-dispatches a running gate', () => {
+  it('a code-change restart no longer waits for gate JOBS (they outlive the process); in-process runs still defer it', () => {
+    const inFlight = new Map([['/l1', { jobId: 'j1', pid: 9 }]]);
+    const guard = makeCodeChangedGuard({ inFlight, bootHead: 'a', readHead: () => 'b' });
+    expect(guard()).toBe(true);
+    inFlight.set('/l2', { runId: 'legacy', pid: 10 });
+    expect(guard()).toBe(false);
+  });
+
+  it('every exit leaves gate jobs running (the successor re-attaches); only restartInFlight: kill stops them', async () => {
+    const mk = (restartInFlight, stopJobs = vi.fn(async () => {})) => {
+      const kill = vi.fn();
+      const exit = vi.fn();
+      const inFlight = new Map([['/l1', { jobId: 'j1', pid: 9 }], ['/l2', { runId: 'r', pid: 10 }]]);
+      const cleanup = createCleanup({ inFlight, kill, exit, stopHeartbeat: () => {}, release: () => {}, log: { error: () => {} },
+        restartInFlight, handoff: (m) => [...m.values()], stopJobs });
+      return { cleanup, kill, exit, stopJobs };
+    };
+    const a = mk('adopt');
+    a.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    expect(a.kill).not.toHaveBeenCalled(); // job left, legacy handed off
+    expect(a.stopJobs).not.toHaveBeenCalled();
+    expect(a.exit).toHaveBeenCalledWith(0);
+
+    const b = mk('adopt');
+    b.cleanup.stopAndExit('loop stopped (lease-lost)');
+    expect(b.kill).toHaveBeenCalledWith(-10, 'SIGKILL'); // the in-process run is still killed, as before
+    expect(b.kill).not.toHaveBeenCalledWith(-9, 'SIGKILL'); // the job is not
+    expect(b.stopJobs).not.toHaveBeenCalled();
+
+    const c = mk('kill');
+    c.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    await new Promise((r) => setImmediate(r));
+    expect(c.stopJobs).toHaveBeenCalledTimes(1);
+    expect(c.kill).toHaveBeenCalledWith(-10, 'SIGKILL');
+    expect(c.exit).toHaveBeenCalledWith(0);
+  });
+
+  it('with gateJobs, the tick syncs the store BEFORE dispatch, passes launchGate, and launches in the same tick', async () => {
+    const order = [];
+    const gateJobs = {
+      sync: vi.fn(async () => { order.push('sync'); }),
+      launch: vi.fn(() => ({ id: 'j' })),
+    };
+    const runVerify = vi.fn(async (o) => { order.push('dispatch'); o.launchGate({ lane: 1 }); return { dispatched: [{ lane: 1 }], deferred: [], failures: [] }; });
+    const effects = buildCliDaemonEffects({ runVerify, gateJobs, isDraining: () => false, log: { error: () => {} } });
+    await effects.tickOnce();
+    expect(order).toEqual(['sync', 'dispatch', 'sync']);
+    expect(gateJobs.launch).toHaveBeenCalledWith({ lane: 1 });
+  });
+
+  it('reconcileInFlight never touches a job entry (the job store owns it)', () => {
+    const inFlight = new Map([['/l1', { jobId: 'j1', pid: 123, startedMs: 0 }]]);
+    const { orphaned } = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => true, killGroup: () => { throw new Error('no'); }, nowMs: 1e12, log: () => {} });
+    expect(orphaned).toEqual([]);
+    expect(inFlight.size).toBe(1);
+  });
+});
+
+describe('#4135 — rollback (WE_VERIFY_GATE_AS_JOB=0) still sees running gate jobs', () => {
+  it('syncs the job store every tick (so a live job holds its lane) but launches no new job', async () => {
+    const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn() };
+    const runVerify = vi.fn(async () => ({ dispatched: [], deferred: [], failures: [] }));
+    const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob: false, isDraining: () => false, log: { error: () => {} } });
+    await effects.tickOnce();
+    expect(gateJobs.sync).toHaveBeenCalledTimes(1);
+    expect(runVerify.mock.calls[0][0].launchGate).toBeUndefined();
+  });
+
+  it('main()\'s wiring: WE_VERIFY_GATE_AS_JOB=0 still builds the job store (live jobs hold lanes) and only stops new launches', () => {
+    const create = vi.fn(() => ({ id: 'store' }));
+    expect(wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: false });
+    expect(wireGateJobs({}, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: true });
+  });
+
+  it('rollback builds the store with launchJobs off; every tick hands the dispatch the store\'s laneHeld check (PR 4764 round 7)', async () => {
+    const create = vi.fn(() => ({ id: 'store' }));
+    wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, create);
+    expect(create).toHaveBeenLastCalledWith({ launchJobs: false });
+    wireGateJobs({}, create);
+    expect(create).toHaveBeenLastCalledWith({ launchJobs: true });
+    for (const gateAsJob of [true, false]) {
+      const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(), laneHeld: vi.fn(() => 'held') };
+      const runVerify = vi.fn(async (o) => ({ held: o.laneHeld?.('/lane'), dispatched: [], deferred: [], failures: [] }));
+      const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} } });
+      expect((await effects.tickOnce()).held).toBe('held');
+      // rollback also scans the lane's processes (no job child does it there); job mode leaves that to the job.
+      expect(gateJobs.laneHeld).toHaveBeenCalledWith('/lane', { scanProcs: !gateAsJob });
+    }
+  });
+
+  it('every tick hands the dispatch the store\'s re-probing killJobGate, in job mode and in rollback', async () => {
+    for (const gateAsJob of [true, false]) {
+      const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(() => false) };
+      const runVerify = vi.fn(async (o) => { o.killJobGate({ jobId: 'j' }); return { dispatched: [], deferred: [], failures: [] }; });
+      const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} } });
+      await effects.tickOnce();
+      expect(gateJobs.killJobGate).toHaveBeenCalledWith({ jobId: 'j' });
+    }
   });
 });

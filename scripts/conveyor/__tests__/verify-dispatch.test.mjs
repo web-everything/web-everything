@@ -13,10 +13,13 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
-import { VERIFY_DAEMON_LEASE_KEY } from '../../../skills-src/conveyor/verify-daemon.mjs';
+import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
+import { createVerifyGateJobs, VERIFY_GATE_JOB_KIND, gatePath } from '../verify-gate-job.mjs';
+import { createJobStore, enqueueJob } from '../../lib/daemon-jobs-runtime.mjs';
+import { markClaimed, markFailed, markLaunching } from '../../lib/daemon-jobs.mjs';
 
 describe('laneNeedsVerifyDispatch — the pure dispatch decision', () => {
   it('dispatches a running marker for the lane\'s own current HEAD', () => {
@@ -950,7 +953,13 @@ it('settles a superseded run in the background without overwriting the newer req
   const path = join(laneDir, '.git', '.lane-verify');
   const newer = { ...JSON.parse(readFileSync(path, 'utf8')), runId: 'new-request', startedAt: '2099-01-01T00:00:00.000Z' };
   writeFileSync(path, JSON.stringify(newer));
-  const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  // The SIGKILL takes the gate's group down: once signalled, an existence probe (signal 0) finds no such group.
+  let groupKilled = false;
+  const kill = vi.spyOn(process, 'kill').mockImplementation((_pid, sig) => {
+    if (sig === 0 && groupKilled) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    if (sig === 'SIGKILL') groupKilled = true;
+    return true;
+  });
   try {
     vi.stubEnv('VERIFY_DISPATCH_KILL_SUPERSEDED', '0');
     expect((await runVerifyDispatch(opts)).superseded).toEqual([]);
@@ -1119,4 +1128,183 @@ spawnGateBounded([${JSON.stringify(gate)}], { queueCeilingMs: 60000, gateCeiling
     for (let i = 0; i < 100 && !existsSync(done); i += 1) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(done)).toBe(true);
   }, 15000);
+});
+
+describe('#4135 — job mode: a pending lane is handed to launchGate, never spawned in this process', () => {
+  it('calls launchGate (not spawnGate) once per pending lane, records the jobId on the registry entry, and returns at once', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const spawnGate = vi.fn();
+    const launches = [];
+    const inFlight = new Map();
+    const result = await runVerifyDispatch({ poolRoot, spawnGate, inFlight, awaitSettle: false,
+      launchGate: (o) => { launches.push(o); return { id: 'job-verify-gate-1' }; } });
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(launches).toHaveLength(1);
+    expect(launches[0]).toMatchObject({ pool: 'flagtest', lane: 1, dir: laneDir });
+    expect(launches[0].runId).toMatch(/[0-9a-f-]{36}/);
+    expect(launches[0].marker.status).toBe('running');
+    expect(inFlight.get(laneDir)).toMatchObject({ jobId: 'job-verify-gate-1', runId: launches[0].runId });
+    expect(result.dispatched).toEqual([expect.objectContaining({ lane: 1, launched: true, jobId: 'job-verify-gate-1' })]);
+
+    // The next sweep sees the lane in flight and neither queues nor spawns it again.
+    const again = await runVerifyDispatch({ poolRoot, spawnGate, inFlight, awaitSettle: false,
+      launchGate: () => { throw new Error('must not relaunch'); } });
+    expect(again.dispatched).toEqual([]);
+  });
+
+  it('a launchGate that throws is a non-fatal dispatch failure and frees the lane for the next sweep', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const inFlight = new Map();
+    const failures = [];
+    const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, onSettled: (f) => failures.push(f),
+      launchGate: () => { throw new Error('store unwritable'); } });
+    expect(result.dispatched).toEqual([]);
+    expect(failures).toEqual([expect.objectContaining({ lane: 1 })]);
+    expect(inFlight.size).toBe(0);
+  });
+
+  it('a superseded gate JOB is killed only through killJobGate (a fresh probe), never by its registry pid alone', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const stale = { pool: 'flagtest', lane: 1, dir: laneDir, runId: 'old-run', requestStartedAt: 'old', sha: '0000000',
+      suites: 'other', treeHash: null, jobId: 'job-old', pid: 4242424 };
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const killJobGate = vi.fn(() => false); // the fresh probe finds the gate gone (its pid may be reused)
+      const inFlight = new Map([[laneDir, { ...stale }]]);
+      const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, launchGate: () => ({ id: 'x' }), killJobGate });
+      expect(killJobGate).toHaveBeenCalledWith(expect.objectContaining({ jobId: 'job-old' }));
+      expect(result.superseded).toEqual([{ pool: 'flagtest', lane: 1, runId: 'old-run' }]);
+      // With no hook at all, a job entry is still never signalled by its bare pid.
+      await runVerifyDispatch({ poolRoot, inFlight: new Map([[laneDir, { ...stale }]]), awaitSettle: false, launchGate: () => ({ id: 'x' }) });
+      expect(kill).not.toHaveBeenCalledWith(-4242424, 'SIGKILL');
+    } finally { kill.mockRestore(); }
+  });
+
+  it('rollback (WE_VERIFY_GATE_AS_JOB=0) end to end: a live gate job holds its lane, so no in-process gate starts beside it', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    mkdirSync(join(base, 'jobs'), { recursive: true });
+    const store = createJobStore(join(base, 'jobs'));
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de',
+      input: { pool: 'flagtest', lane: 1, dir: laneDir, headSha, runId: 'job-run', suites: 'true', treeHash: null, requestStartedAt: null } });
+    const at = new Date().toISOString();
+    store.update(q.id, (r) => markClaimed(markLaunching(r, { at }), { at, handle: 'h:1:s', host: 'h', pid: 1, procStart: 's' })); // its supervisor runs
+    const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, (o) => createVerifyGateJobs({ store, ...o,
+      reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, probe: () => 'dead', evict: () => {}, snapshot: {} }));
+    const spawnGate = vi.fn(() => new Promise(() => {}));
+    const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
+      runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate }) });
+    const result = await effects.tickOnce();
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(effects.inFlight.get(laneDir)).toMatchObject({ runId: 'job-run' });
+  });
+
+  it('rollback end to end (PR 4764 round 7): a detached job whose gate sidecar cannot be read still holds its lane — no in-process gate beside it', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    mkdirSync(join(base, 'jobs'), { recursive: true });
+    const store = createJobStore(join(base, 'jobs'));
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const a = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de',
+      input: { pool: 'flagtest', lane: 1, dir: laneDir, headSha, runId: 'run-a', suites: 'true', treeHash: null, requestStartedAt: null } });
+    store.update(a.id, (r) => markFailed(r, { at: new Date().toISOString(), reason: 'handle dead; 2/2 attempts used' }));
+    writeFileSync(gatePath(store.dir, a.id), '{"pid":91'); // torn: its gate may still run
+    const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, (o) => createVerifyGateJobs({ store, ...o,
+      reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, evict: () => {}, snapshot: {},
+      probe: () => 'dead', pidExists: () => false, groupExists: () => false, kill: () => {} }));
+    const spawnGate = vi.fn(() => new Promise(() => {}));
+    const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
+      runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate }) });
+    const result = await effects.tickOnce();
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+  });
+
+  it('in-process (rollback) gate: when its leader settles while its process group lives on, the lane stays in flight (PR 4764 round 7)', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    // A real process group standing in for test runners that outlive their verify-lane leader.
+    const runners = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { detached: true, stdio: 'ignore' });
+    try {
+      const inFlight = new Map();
+      await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: true,
+        spawnGate: (args, o) => { o.onSpawn(runners.pid); return Promise.resolve({ pid: runners.pid }); } });
+      expect(inFlight.get(laneDir)).toMatchObject({ pid: runners.pid, leaderSettled: true });
+      process.kill(-runners.pid, 'SIGKILL');
+      for (let i = 0; i < 100 && processGroupMayExist(runners.pid); i += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(processGroupMayExist(runners.pid)).toBe(false); // the daemon's reconcile drops the entry from here
+    } finally { try { process.kill(-runners.pid, 'SIGKILL'); } catch {} }
+  });
+
+  it('PR 4764 round 8: killOrphanGroup signals a settled leader\'s group only while its pid exists nowhere and the group has members', () => {
+    const esrch = () => { throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' }); };
+    const calls = [];
+    const fake = (table) => (pid, sig) => { calls.push([pid, sig]); const r = table(pid, sig); if (r === 'esrch') esrch(); return true; };
+    // Leader gone, group alive: killed.
+    expect(killOrphanGroup(700, { kill: fake((pid, sig) => (pid === 700 && sig === 0 ? 'esrch' : 'ok')) })).toBe(true);
+    expect(calls).toContainEqual([-700, 'SIGKILL']);
+    calls.length = 0;
+    // The pid exists again (reused): never signalled, whatever group it leads now.
+    expect(killOrphanGroup(701, { kill: fake(() => 'ok') })).toBe(false);
+    expect(calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    // Leader and group both gone: nothing to kill.
+    expect(killOrphanGroup(702, { kill: fake(() => 'esrch') })).toBe(false);
+    // A probe that cannot answer (EPERM): fail closed, no kill.
+    expect(killOrphanGroup(703, { kill: (pid, sig) => { if (sig === 0 && pid > 0) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); return true; } })).toBe(false);
+    expect(killOrphanGroup(1)).toBe(false);
+  });
+
+  it('PR 4764 round 8: a superseded in-process entry whose leader settled is killed only as an orphan group, never by a reused pid', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    // An older run for this lane whose leader settled; its pid now belongs to an unrelated live process (every probe
+    // answers "exists"). The kill is fully mocked: no real signal is ever sent, with or without the fix.
+    const inFlight = new Map([[laneDir, { pool: 'flagtest', lane: 1, dir: laneDir, runId: 'old-run', pid: 424242, sha: headSha,
+      suites: 'other-gate', requestStartedAt: '2000-01-01T00:00:00.000Z', startedMs: 1, leaderSettled: true }]]);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, spawnGate: () => new Promise(() => {}) });
+      expect(result.superseded).toEqual([expect.objectContaining({ runId: 'old-run' })]);
+      expect(kill.mock.calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    } finally { kill.mockRestore(); }
+  });
+
+  it('a lane the job store says is held (laneHeld) is deferred at spawn time, in both modes — never spawned or queued', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const spawnGate = vi.fn(() => new Promise(() => {}));
+    const launchGate = vi.fn(() => ({ id: 'j' }));
+    for (const mode of [{}, { launchGate }]) {
+      const result = await runVerifyDispatch({ poolRoot, spawnGate, inFlight: new Map(), awaitSettle: false, ...mode,
+        laneHeld: (d) => (d === laneDir ? 'job j1 holds the lane' : null) });
+      expect(result.dispatched).toEqual([]);
+      expect(result.deferred).toEqual([expect.objectContaining({ lane: 1, reason: 'lane-held' })]);
+    }
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(launchGate).not.toHaveBeenCalled();
+  });
+
+  it('rollback end to end: when the job holding the lane ends, another job\'s surviving gate keeps it held — no in-process gate beside it', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    mkdirSync(join(base, 'jobs'), { recursive: true });
+    const store = createJobStore(join(base, 'jobs'));
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const input = { pool: 'flagtest', lane: 1, dir: laneDir, headSha, suites: 'true', treeHash: null, requestStartedAt: null };
+    const at = new Date().toISOString();
+    const a = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de', input: { ...input, runId: 'run-a' } });
+    store.update(a.id, (r) => markFailed(r, { at, reason: 'handle dead; 2/2 attempts used' }));
+    writeFileSync(gatePath(store.dir, a.id), JSON.stringify({ pid: 910, handle: 'h:910:x', runId: 'run-a' })); // A's gate survives
+    const b = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, codeSha: 'c0de', input: { ...input, runId: 'run-b' } });
+    store.update(b.id, (r) => markFailed(r, { at, reason: 'refused beside a survivor' }));
+    const { gateJobs, gateAsJob } = wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, () => createVerifyGateJobs({ store,
+      reattach: async () => ({ actions: [] }), readHead: () => 'c0de', log: () => {}, evict: () => {}, snapshot: {},
+      probe: (h) => (h === 'h:910:x' ? 'alive' : 'dead'), pidExists: () => false, groupExists: () => false, kill: () => {} }));
+    const spawnGate = vi.fn(() => new Promise(() => {}));
+    const effects = buildCliDaemonEffects({ gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} },
+      runVerify: (o) => runVerifyDispatch({ ...o, poolRoot, spawnGate }) });
+    // B held the lane last tick (it was live then); this tick B is finished and A's gate still runs.
+    effects.inFlight.set(laneDir, { pool: 'flagtest', lane: 1, dir: laneDir, runId: 'run-b', jobId: b.id, pid: null, startedMs: Date.now() });
+    const result = await effects.tickOnce();
+    expect(spawnGate).not.toHaveBeenCalled();
+    expect(result.dispatched).toEqual([]);
+    expect(effects.inFlight.get(laneDir)).toMatchObject({ jobId: a.id });
+  });
 });
