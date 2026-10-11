@@ -53,6 +53,19 @@ export function starvationLockWaitMs(baseWaitMs, starvedCount, env = process.env
 export const REBUILD_LOCK_WAIT_ENV = 'WE_DAEMON_REBUILD_LOCK_WAIT_MS';
 export const DEFAULT_REBUILD_LOCK_WAIT_MS = 60_000;
 
+// live 2026-10-11 rebuild-job livelock: detached waits never delay the daemon's tick.
+export const REBUILD_JOB_LOCK_WAIT_ENV = 'WE_DAEMON_REBUILD_JOB_LOCK_WAIT_MS';
+export const DEFAULT_REBUILD_JOB_LOCK_WAIT_MS = 15 * 60_000;
+
+/** Detached jobs outwait in-flight ticks; foreground callers keep their normal starvation policy. */
+export function rebuildLockWaitMs({ env = process.env, starvedCount = 0, readyOnly = false } = {}) {
+  const base = Number(env?.[REBUILD_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_LOCK_WAIT_MS;
+  const normal = starvationLockWaitMs(base, starvedCount, env);
+  if (!readyOnly) return normal;
+  const job = Number(env?.[REBUILD_JOB_LOCK_WAIT_ENV]) > 0 ? Number(env[REBUILD_JOB_LOCK_WAIT_ENV]) : DEFAULT_REBUILD_JOB_LOCK_WAIT_MS;
+  return Math.max(normal, job);
+}
+
 /** How long the write-lock wait is once a candidate has PASSED its smoke (or a passed candidate is waiting to be
  *  adopted) — longer than {@link DEFAULT_REBUILD_LOCK_WAIT_MS}: a passing smoke is expensive to redo, and while
  *  this process waits, the writer reservation already refuses every NEW read slot, so the wait is bounded by the
