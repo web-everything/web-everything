@@ -1209,6 +1209,22 @@ describe('ci-red-recovery-watch — check-scoped recovery (xd3dkzx live replay)'
     expect(refresh).not.toHaveBeenCalled();
     expect(result.refusals.map((r) => r.kind)).toEqual(['rebase-cap-exhausted', 'rebase-cap-exhausted', 'rebase-cap-exhausted']);
   });
+  // PR #4825 round 4: a refresh dispatched while main is still red (here `test` is green on main again) is a real
+  // attempt — its marker says `main-state: red`, and it must still burn the per-sha cap.
+  it('bounds a permanently failing check-scoped refresh across many ticks while main stays red on another check', async () => {
+    const { buildRebaseOntoMainComment } = await import('../main-red-recovery.mjs');
+    const comments = new Map();
+    const refresh = vi.fn(() => ({ ok: false, action: 'error', error: 'push to lane/x failed (remote rejected)' }));
+    const postComment = vi.fn((n, o) => comments.set(n, [...(comments.get(n) ?? []),
+      { viewerDidAuthor: true, createdAt: '2026-10-08T22:10:00Z', body: buildRebaseOntoMainComment(o) }]));
+    for (let tick = 0; tick < 6; tick += 1) {
+      sweepCiRedRecovery({ ...commonReaders, apply: true, readComments: (n) => comments.get(n) ?? [], readPriority: () => null,
+        checkClaim: () => null, refresh, postComment });
+    }
+    expect(refresh).toHaveBeenCalledTimes(2 * fixture.candidates.length);
+    expect([...comments.values()].map((c) => c.length)).toEqual(fixture.candidates.map(() => 2));
+    expect(comments.get(fixture.candidates[0].prNumber)[0].body).toContain('main-state: red');
+  });
 });
 
 // 2026-10-10 live: #4784 claim-held refusals burned the cap.
@@ -1234,6 +1250,14 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
   it('refunds both exact claim refusals even with no options', () => {
     const comments = ['2026-10-10T20:14:54Z', '2026-10-10T20:16:29Z'].map(at => marker(refusal, at));
     expect(core.countRebaseOntoMainComments(comments, sha)).toBe(0);
+    const legacy = marker(`conveyor rebase-onto-main attempted to refresh this branch onto main and it FAILED: ${refusal}`);
+    expect(core.countRebaseOntoMainComments([legacy], sha)).toBe(0);
+  });
+  // PR #4825 round 4: a legacy failure that merely QUOTES the phrase (not the refusal's own shape) is still counted.
+  it('counts a legacy marker whose failure text only quotes the claim phrase', () => {
+    const quoted = marker(`conveyor rebase-onto-main attempted to refresh this branch onto main and it FAILED: push to lane/x failed (remote: ${refusal})`);
+    expect(core.countRebaseOntoMainComments([quoted], sha)).toBe(1);
+    expect(core.countRebaseOntoMainComments([marker('hook said: fix-1 holds the fix claim on PR #1')], sha)).toBe(1);
   });
   it('refunds legacy red-window attempts, explicit red state, and stale green attempts', () => {
     const count = (comments, opts) => core.countRebaseOntoMainComments(comments, sha, opts);
@@ -1273,17 +1297,48 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     expect(build({ headSha: sha, mainGreen: { red: true, sha: null } })).toContain('main-state: red\nmain-green-sha: none');
   });
   it.each([false, true])('defers claim holds before refresh or at the push race (%s)', race => {
-    const refresh = vi.fn(() => ({ ok: false, error: refusal }));
+    // The race: the claim is taken after the pre-check, so the push is refused and the claim store now holds it.
+    let claimed = !race;
+    const refresh = vi.fn(() => { claimed = true; return { ok: false, error: refusal }; });
     const postComment = vi.fn();
     const result = sweepCiRedRecovery({ apply: true, repo: 'web-everything/web-everything', requiredCheck: 'test',
       readOpenPrs: () => [{ number: 4784, headRefName: 'lane/human-clearance-carry', headRefOid: sha, statusCheckRollup: [failingCheck('2026-10-10T19:30:00Z')] }],
       readMainRuns: () => runs, readMainLatestCheckRuns: () => [], readAheadBy: () => 3, readComments: () => [],
-      checkClaim: () => race ? null : { message: refusal }, refresh, postComment });
+      checkClaim: () => claimed ? { message: refusal } : null, refresh, postComment });
     expect(refresh).toHaveBeenCalledTimes(race ? 1 : 0);
     expect(postComment).not.toHaveBeenCalled();
     expect(result.applied[0]).toMatchObject({ prNumber: 4784, action: 'deferred', deferred: true, error: refusal });
     expect(result.mainRuns).toEqual(runs);
     expect(formatReport(result)).toContain('  … deferred PR #4784 lane/human-clearance-carry');
+  });
+  // PR #4825 round 4: the deferral is decided by the claim store, never by the failure text.
+  it('a refresh failure that merely quotes the claim phrase is still counted when no claim is live', () => {
+    const refresh = vi.fn(() => ({ ok: false, action: 'error', error: `push to lane/human-clearance-carry failed (remote: ${refusal})` }));
+    const postComment = vi.fn();
+    const result = sweepCiRedRecovery({ apply: true, repo: 'web-everything/web-everything', requiredCheck: 'test',
+      readOpenPrs: () => [{ number: 4784, headRefName: 'lane/human-clearance-carry', headRefOid: sha, statusCheckRollup: [failingCheck('2026-10-10T19:30:00Z')] }],
+      readMainRuns: () => runs, readMainLatestCheckRuns: () => [], readAheadBy: () => 3, readComments: () => [],
+      checkClaim: () => null, refresh, postComment });
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(result.applied[0].deferred).toBeUndefined();
+  });
+  it('bounds a permanently failing red-main fix PR refresh across many ticks while main stays red', () => {
+    const comments = [];
+    const redRuns = [
+      { status: 'completed', conclusion: 'success', updatedAt: '2026-10-10T18:00:00Z', headSha: 'g0' },
+      { status: 'completed', conclusion: 'failure', updatedAt: '2026-10-10T18:44:00Z' },
+    ];
+    const refresh = vi.fn(() => ({ ok: false, action: 'error', error: 'push to lane/red-main-fix failed (remote rejected)' }));
+    const postComment = vi.fn((n, o) => comments.push({ viewerDidAuthor: true, createdAt: '2026-10-10T21:00:00Z', body: core.buildRebaseOntoMainComment(o) }));
+    for (let tick = 0; tick < 6; tick += 1) {
+      sweepCiRedRecovery({ apply: true, repo: 'web-everything/web-everything', requiredCheck: 'test',
+        readOpenPrs: () => [{ number: 4522, headRefName: 'lane/red-main-fix', headRefOid: sha, statusCheckRollup: [failingCheck('2026-10-10T19:30:00Z')] }],
+        readMainRuns: () => redRuns, readMainLatestCheckRuns: () => [], readAheadBy: () => 3, readComments: () => comments,
+        readPriority: () => ({ repo: 'we', prs: [4522] }), checkClaim: () => null, refresh, postComment });
+    }
+    expect(refresh).toHaveBeenCalledTimes(2);
+    expect(comments.length).toBe(2);
+    expect(comments[0].body).toContain('main-state: red');
   });
   it('refunds #4759 stacked refusal markers on the same base', () => {
     const comments = ['13:12:00', '18:43:00'].map(t => ({ viewerDidAuthor: true, createdAt: `2026-10-10T${t}Z`,
@@ -1327,12 +1382,18 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     expect(core.countMissingRunComments([comment], sha, { mainRedWindows: windows, mainGreen: green })).toBe(0);
   });
   // PR #4825 round 3: missing-run attempts do not depend on main's state, so a red main must never refund them.
-  it('does not refund a missing-run attempt marked main-state: red while main is still red; a rebase marker still is', () => {
+  // PR #4825 round 4: rebases are dispatched while main is red too (a red-main fix PR, a check green on main again), so a
+  // red-era rebase marker counts while main is STILL red; it is refunded only once main goes green on a new sha.
+  it('does not refund a missing-run or rebase attempt marked main-state: red while main is still red', () => {
     const redNow = { red: true, sha: null, at: null };
+    const openWindow = [{ start: '2026-10-10T18:44:00Z', end: null }];
     const missing = marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z');
     missing.body = missing.body.replace('🔀 conveyor rebase-onto-main', '🚦 conveyor missing-run-recovery');
-    expect(core.countMissingRunComments([missing], sha, { mainRedWindows: [{ start: '2026-10-10T18:44:00Z', end: null }], mainGreen: redNow })).toBe(1);
-    expect(core.countRebaseOntoMainComments([marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z')], sha, { mainGreen: redNow })).toBe(0);
+    expect(core.countMissingRunComments([missing], sha, { mainRedWindows: openWindow, mainGreen: redNow })).toBe(1);
+    const rebase = marker('main-state: red\nmain-green-sha: none', '2026-10-10T19:30:00Z');
+    expect(core.countRebaseOntoMainComments([rebase], sha, { mainRedWindows: openWindow, mainGreen: redNow })).toBe(1);
+    expect(core.countRebaseOntoMainComments([marker('', '2026-10-10T19:30:00Z')], sha, { mainRedWindows: openWindow, mainGreen: redNow })).toBe(1);
+    expect(core.countRebaseOntoMainComments([rebase], sha, { mainRedWindows: openWindow, mainGreen: green })).toBe(0);
   });
   it('bounds a permanently failing missing-run restack across many ticks while main stays red', () => {
     const comments = [];
@@ -1394,10 +1455,15 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
       expect(result).toMatchObject({ ok: true, action: 'rebased' });
     });
   });
-  it.each(['current', 'fetch-error', 'refresh-error', 'race', 'cycle', 'depth'])('bounds restack failure: %s', kind => {
-    const refresh = vi.fn(() => kind === 'refresh-error' || kind === 'race'
-      ? { ok: false, error: kind === 'race' ? refusal : 'conflict' }
-      : { ok: true, action: kind === 'current' ? 'current' : 'rebased', newCommit: 'new' });
+  it.each(['current', 'fetch-error', 'refresh-error', 'race', 'quoted', 'cycle', 'depth'])('bounds restack failure: %s', kind => {
+    // 'race': the claim is taken during the push. 'quoted': the failure text quotes the claim phrase, but no claim is live.
+    let claimed = false;
+    const refresh = vi.fn(() => {
+      if (kind === 'race') claimed = true;
+      return kind === 'refresh-error' || kind === 'race' || kind === 'quoted'
+        ? { ok: false, error: kind === 'refresh-error' ? 'conflict' : refusal }
+        : { ok: true, action: kind === 'current' ? 'current' : 'rebased', newCommit: 'new' };
+    });
     const fetchRef = vi.fn(() => ({ ok: false, error: 'fetch failed' }));
     let prs = stack;
     let d = stack[1];
@@ -1406,10 +1472,11 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
       prs = Array.from({ length: 11 }, (_, i) => ({ number: i, headRefName: `lane/depth-${i}`, baseRefName: i === 10 ? 'main' : `lane/depth-${i + 1}` }));
       d = prs[0];
     }
-    const result = watch.restackStackedPr(d, { prs, checkClaim: () => null, readIsCrossRepository: () => false, refresh,
+    const result = watch.restackStackedPr(d, { prs, checkClaim: () => claimed ? { message: refusal } : null, readIsCrossRepository: () => false, refresh,
       fetchRef: kind === 'fetch-error' ? fetchRef : () => ({ ok: true }) });
     expect(result.ok).toBe(false);
     expect(result.deferred === true).toBe(kind === 'race');
+    if (kind === 'quoted') expect(refresh).toHaveBeenCalledTimes(1);
     if (kind === 'current') expect(result.error).toBe('stack already current with main; CI still absent — needs a human look');
     if (kind === 'fetch-error') { expect(result.error).toBe('fetch failed'); expect(refresh).toHaveBeenCalledTimes(1); }
     if (kind === 'refresh-error') { expect(result.error).toBe('conflict'); expect(refresh).toHaveBeenCalledTimes(1); }

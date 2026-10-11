@@ -806,6 +806,8 @@ export function markerFreeText(text) {
 }
 /** A comment over GitHub's 65,536-character limit makes `gh pr comment` throw, leaving the attempt uncounted. */
 const MARKER_FREE_TEXT_MAX = 500;
+/** `fix-procedure.mjs#pushRefusal`'s message as an old marker embedded it. */
+const LEGACY_CLAIM_REFUSAL = /(?:^|FAILED: )push to \S+ refused: [^\n]* holds the fix claim on PR #\d+/m;
 
 /** The structured part of a marker: every line before the outcome line (`conveyor …`), which is where the
  *  free text lives. A trailer-shaped line anywhere after it is never read. */
@@ -816,16 +818,20 @@ function markerHeader(body) {
 }
 
 // 2026-10-10 live: #4784 claim-held refusals burned the cap.
-// `refundRed` is true only for the rebase counter: a rebase onto main waits for main to go green, so an attempt made
-// while main was red is not an attempt. Missing-run recovery does not depend on main's state (PR #4825 round 3), so
-// its counter never refunds on red — only once main has since moved to a NEW green sha (a bounded fresh budget).
+// A red-era attempt is refunded only when the caller does not know main to be red RIGHT NOW. While main stays red the
+// rebase sweep still dispatches (a red-main fix PR, a check green on main again — PR #4825 round 4), so those markers
+// are real attempts and must burn the cap. Once main is green on a new sha, the green-sha reset below refunds them.
+// `refundRed` is false for the missing-run counter, which does not depend on main's state (PR #4825 round 3).
 function recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen, { refundRed = true } = {}) {
-  if (body.includes('holds the fix claim')) return true;
+  // Legacy claim refusals only (the sweeps now defer instead): the exact `pushRefusal` message, at a line start or
+  // right after the builder's own `FAILED: ` — free text is one line with `FAILED:` defanged, so it cannot forge one.
+  if (LEGACY_CLAIM_REFUSAL.test(body)) return true;
   const header = markerHeader(body);
   const state = header.match(/^main-state: (.*)$/m);
-  if (refundRed && state?.[1] === 'red') return true;
+  const refundRedNow = refundRed && mainGreen?.red !== true;
+  if (refundRedNow && state?.[1] === 'red') return true;
   const at = Date.parse(c?.createdAt);
-  if (refundRed && !state && isWithinRedWindow(at, mainRedWindows)) return true;
+  if (refundRedNow && !state && isWithinRedWindow(at, mainRedWindows)) return true;
   if (mainGreen && !mainGreen.red && mainGreen.sha) {
     const sha = header.match(/^main-green-sha: (.*)$/m);
     if (sha && sha[1] !== mainGreen.sha) return true;

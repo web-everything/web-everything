@@ -314,8 +314,9 @@ export function sweepCiRedRecovery({
       // Passing prNumber makes refreshOntoMain verify the PR is same-repo before it rebases and force-pushes.
       const result = held ? { ok: false, error: held.message }
         : refresh(d.headRefName, { base: `origin/${defaultBranch}`, root: repoRoot, prNumber: d.prNumber, repo, readIsCrossRepository });
-      // 2026-10-10 live: #4784 claim-held refusals burned the cap.
-      if (held || result.deferred || String(result.error ?? '').includes('holds the fix claim')) {
+      // 2026-10-10 live: #4784 claim-held refusals burned the cap. A failed push re-reads the claim store (the push
+      // race); the failure text is never trusted to say a claim is held (PR #4825 round 4).
+      if (held || result.deferred || (!result.ok && checkClaim({ repo, branch: d.headRefName }))) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, ok: false, action: 'deferred', deferred: true, error: result.error });
         continue;
       }
@@ -918,8 +919,10 @@ export function restackStackedPr(d, {
     link = (Array.isArray(prs) ? prs : []).find(pr => pr.headRefName === ref);
     if (!link) return { ok: false, action, error: `stack base ${ref} is not an open PR head; cannot restack` };
   }
+  // A failure is a deferral only if the claim store holds a live claim on a chain link now (the push race) — never
+  // because the failure text quotes the claim phrase (PR #4825 round 4).
   const failed = error => ({ ok: false, action, error,
-    ...(String(error).includes('holds the fix claim') ? { deferred: true } : {}),
+    ...(chain.some(pr => checkClaim({ repo, branch: pr.headRefName })) ? { deferred: true } : {}),
   });
   // Every link is verified same-repo before any claim check, fetch or push (a fork PR, or one whose head name
   // merely shadows a same-repo lane in the chain, must never reach refreshOntoMain).
