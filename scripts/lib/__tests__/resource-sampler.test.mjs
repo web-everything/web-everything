@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { cpuIdlePctFromTimes, parseIoregDiskStats, diskFromDeltas, parsePsCpu, fseventsCpuPct, countAgentSessions, memoryPressureLevel, buildSnapshot, createSampler, resourcePaths, writeSnapshot, readSnapshot, appendResourceLog } from '../resource-sampler.mjs';
+import { cpuIdlePctFromTimes, parseIoregDiskStats, diskFromDeltas, parsePsCpu, fseventsCpuPct, countAgentSessions, memoryPressureLevel, swapUsedPct, buildSnapshot, createSampler, resourcePaths, writeSnapshot, readSnapshot, appendResourceLog } from '../resource-sampler.mjs';
 const roots = [];
 const temp = () => { const root = mkdtempSync(join(tmpdir(), 'resource-')); roots.push(root); return root; };
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
@@ -43,6 +43,13 @@ describe('resource sampler', () => {
     expect(memoryPressureLevel('3')).toBeNull();
     expect(memoryPressureLevel('1junk')).toBeNull();
   });
+  it('fix-cap signals: parses swap use from `sysctl vm.swapusage` (live 2026-10-10: 26.5 of 27.6 GB)', () => {
+    expect(swapUsedPct('total = 27648.00M  used = 26500.00M  free = 1148.00M  (encrypted)')).toBeCloseTo(95.8, 1);
+    expect(swapUsedPct('total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)')).toBe(0);
+    expect(swapUsedPct('nonsense')).toBeNull();
+    const snapshot = buildSnapshot({ sampledAtMs: 0, intervalMs: 10000, memFreePct: 12, memPressureLevel: 2, swapUsedPct: 95.8 });
+    expect(snapshot.memory).toEqual({ pressureLevel: 2, freePct: 12, swapUsedPct: 95.8 });
+  });
   it('builds freshness and preserves unavailable counters', () => {
     const snapshot = buildSnapshot({ sampledAtMs: 0, intervalMs: 10000 });
     expect(snapshot.freshUntil).toBe('1970-01-01T00:00:30.000Z');
@@ -59,7 +66,7 @@ describe('resource sampler', () => {
     const s = sampler.sample();
     expect(s.cpu.idlePct).toBe(75);
     expect(s.disk.busyPct).toBe(1);
-    expect(s.memory).toEqual({ pressureLevel: null, freePct: 25 });
+    expect(s.memory).toEqual({ pressureLevel: null, freePct: 25, swapUsedPct: null });
     expect(s.errors).toContainEqual({ probe: 'memPressureLevel', error: 'denied' });
     expect(s.agentSessions.total).toBe(1);
     for (const [, , options] of exec.mock.calls) expect(options).toMatchObject({ timeout: 5000, env: { LC_ALL: 'C' } });
