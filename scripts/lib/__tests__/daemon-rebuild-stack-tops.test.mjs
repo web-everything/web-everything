@@ -243,7 +243,10 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
       expect(isAncestor(f.clone, p2, plan.finalSha)).toBe(true);
     });
 
-    it('mixed evidence: a top carrying an adopted head and one carrying a force-pushed head both replace the base', async () => {
+    it.each([
+      ['a top carrying an adopted head and one carrying a force-pushed head both replace the base', 'read'],
+      ['an unknown force-push read keeps every clashing top a carrier (never narrowed to the adopted proof)', 'unknown'],
+    ])('mixed evidence: %s', async (_name, pushes) => {
       const f = fixture();
       const p0 = f.push('lane/p', f.init, { [TAKEOVER]: lines({ 2: 'p0' }) });
       f.fetch();
@@ -261,7 +264,7 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
         git: f.runGit, headSha: old, mainRef: 'origin/main',
         overlays: [{ ref: 'lane/p', pr: 9901 }, { ref: 'lane/t1', pr: 9902 }, { ref: 'lane/t2', pr: 9903 }],
         prBaseChain: async (pr) => (pr === 9901 ? [] : ['lane/p']),
-        prForcePushes: async (pr) => (pr === 9901 ? [{ before: p1, after: p2 }] : []),
+        prForcePushes: async (pr) => (pushes === 'unknown' ? null : pr === 9901 ? [{ before: p1, after: p2 }] : []),
       });
       expect(plan.decisions.find((d) => d.ref === 'lane/t1')).toMatchObject({ action: 'drop', reason: 'conflict' });
       expect(plan.decisions.find((d) => d.ref === 'lane/t2')).toMatchObject({ action: 'apply' });

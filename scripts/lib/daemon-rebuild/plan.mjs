@@ -218,7 +218,9 @@ export async function planOverlayStacks({
     const adopted = carriersOf(ownHeads([...adoptedHeads(p)]));
     if (adopted.length === clashing.length) return { evidence: 'adopted-head', carriers: adopted };
     const before = await forcePushedHeads(p.pr);
-    if (before == null) return adopted.length > 0 ? { evidence: 'adopted-head', carriers: adopted } : { evidence: null, carriers: [] };
+    // An unknown force-push read never narrows the carriers: a clashing top no adopted head proves may still carry a
+    // force-pushed head, so with an adopted proof every clashing top stays a carrier.
+    if (before == null) return adopted.length > 0 ? { evidence: 'adopted-head', carriers: clashing } : { evidence: null, carriers: [] };
     const pushed = carriersOf(ownHeads(before));
     const carriers = clashing.filter((t) => adopted.includes(t) || pushed.includes(t));
     if (carriers.length === 0) return { evidence: 'none', carriers };
