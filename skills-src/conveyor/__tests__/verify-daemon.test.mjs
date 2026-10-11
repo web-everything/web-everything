@@ -843,6 +843,22 @@ describe('#4135 — rollback (WE_VERIFY_GATE_AS_JOB=0) still sees running gate j
     expect(wireGateJobs({}, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: true });
   });
 
+  it('rollback builds the store with launchJobs off; every tick hands the dispatch the store\'s laneHeld check (PR 4764 round 7)', async () => {
+    const create = vi.fn(() => ({ id: 'store' }));
+    wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, create);
+    expect(create).toHaveBeenLastCalledWith({ launchJobs: false });
+    wireGateJobs({}, create);
+    expect(create).toHaveBeenLastCalledWith({ launchJobs: true });
+    for (const gateAsJob of [true, false]) {
+      const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(), laneHeld: vi.fn(() => 'held') };
+      const runVerify = vi.fn(async (o) => ({ held: o.laneHeld?.('/lane'), dispatched: [], deferred: [], failures: [] }));
+      const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} } });
+      expect((await effects.tickOnce()).held).toBe('held');
+      // rollback also scans the lane's processes (no job child does it there); job mode leaves that to the job.
+      expect(gateJobs.laneHeld).toHaveBeenCalledWith('/lane', { scanProcs: !gateAsJob });
+    }
+  });
+
   it('every tick hands the dispatch the store\'s re-probing killJobGate, in job mode and in rollback', async () => {
     for (const gateAsJob of [true, false]) {
       const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(() => false) };

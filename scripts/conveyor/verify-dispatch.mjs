@@ -623,6 +623,8 @@ export function readLaneState(dir) {
  * entry carries the `jobId`, and settlement is the job's, not this sweep's. A superseded JOB entry is killed only
  * through `killJobGate(entry)`, which re-probes the job's gate handle first — never by the registry `pid` alone
  * (proven at the last sync, possibly exited and reused since); with no `killJobGate` a job entry is not signalled.
+ * `laneHeld(dir) → string|null` (the job store's lane claims) is asked right before each start, in both modes: a held
+ * lane is deferred (`reason: 'lane-held'`), never spawned or queued.
  * @param {{dryRun?:boolean, spawnGate?:typeof spawnGateBounded, poolRoot?:string,
  *   inFlight?:Map<string, object>|null, awaitSettle?:boolean, maxInFlight?:number,
  *   onSettled?:((failure:object) => void)|null}} [o] `spawnGate` and
@@ -633,7 +635,7 @@ export function readLaneState(dir) {
  */
 export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateBounded, poolRoot = POOL_ROOT,
   inFlight = null, awaitSettle = true, maxInFlight = resolveMaxInFlight(process.env), onSettled = null,
-  launchGate = null, killJobGate = null,
+  launchGate = null, killJobGate = null, laneHeld = null,
 } = {}) {
   const deferred = [];
   const superseded = [];
@@ -715,6 +717,16 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
   const settlements = pending.map(({ pool, lane, dir, headSha, suites, marker }) => {
     // `runId` rides into the marker via the child's own start stamp (`--run-id`), so a queue-phase kill — before
     // `onGateStarted` could capture a `startedAt` — can still tell this run's marker from a newer request's.
+    // #4135 (PR 4764 round 7) — the job store's lane claims have the last word, read right before the start: a lane
+    // whose previous gate is not CONFIRMED gone gets no new gate, in-process or job (a check that fails is a hold too).
+    if (laneHeld) {
+      let held;
+      try { held = laneHeld(dir); } catch (error) { held = `its hold check failed (${String(error?.message || error).split('\n')[0]})`; }
+      if (held) {
+        deferred.push({ pool, lane, sha: headSha, reason: 'lane-held', why: held });
+        return Promise.resolve();
+      }
+    }
     const runId = randomUUID();
     const entry = { pool, lane, dir, runId, pid: null, sha: headSha, suites: marker.suites, treeHash: marker.treeHash ?? null,
       requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath: null };

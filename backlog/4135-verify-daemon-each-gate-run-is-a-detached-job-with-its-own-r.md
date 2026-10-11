@@ -46,7 +46,19 @@ Slice of decision 4120 (daemon job model); audit we:reports/2026-09-24-daemon-bl
   BEFORE dispatch, queues through `runVerifyDispatch`'s new `launchGate`, launches in the same tick, and consumes each
   finished job once (`gate job … settled: green — marker green @ <sha>`). A code-change restart no longer waits for
   jobs; no exit kills a job except `restartInFlight: kill`. Rollback: `WE_VERIFY_GATE_AS_JOB=0` runs NEW gates
-  in-process, but the daemon still syncs the job store each tick, so a job-supervised gate still running holds its lane.
+  in-process and starts no gate supervisor (queued or relaunched), but the daemon still reads the job store and its
+  lane claims each tick, so a detached gate still running — or not provably gone — holds its lane. Reverting the code
+  itself is safe only once no lane claim is held: run with `WE_VERIFY_GATE_AS_JOB=0` until the daemon log shows no
+  `⚠ HEALTH lane … is held` and no job entry, then revert.
+- **One gate per lane (operator ruling 2026-10-10 on PR 4764, = daemon design O15).** A new gate starts on a lane only
+  once the previous one is CONFIRMED gone: its handle probes dead by pid + start time and its process group is gone.
+  An unreadable or foreign handle or record, a pid with no start time, a gate recorded only as pending: each means
+  "possibly running" — the lane is held with a `⚠ HEALTH` log line, never treated as free, and an operator who has
+  checked the gate is gone releases it with `node we:scripts/conveyor/verify-gate-job.mjs release-lane --dir=<lane>`.
+  Between jobs this is the LANE CLAIM, taken before anything is recorded or spawned: the lane's next numbered claim
+  file is created exclusively (`link`), so of two jobs racing for a lane exactly one wins whatever their clocks say;
+  it passes on only once the holder's supervisor (its handle is in the claim) and its gate are proven gone. The
+  dispatch sweep asks the same claims right before every start, in both modes.
 - **Unchanged.** Marker keyed to exact HEAD, heavy admission (verify-lane's own slot), since-last-green selection
   (#4732, inside verify-lane), supersede rules (the daemon kills the job's gate group from its recorded handle), the
   max-in-flight cap, the drain file.
