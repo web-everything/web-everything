@@ -63,17 +63,23 @@
  * after `--tools ""` would be swallowed as a tool name. `buildJudgeArgv` therefore always follows
  * `--tools ""` with an option token, and a unit test pins that.
  *
+ * WHY RETRY LOST OUTPUT (held item 223). On 2026-10-10, 15/119 review runs lost their final
+ * output even though OTEL showed the juror's API calls completed. Replaying the same requests later
+ * succeeded 3/3: a transient loss of final output. Each retry uses a distinct derived session id to
+ * preserve reviewer independence, and retains the failed attempt's evidence.
+ *
  * NOT IN SCOPE: the hosted-tier backend. This is tier one only; the tier-two substitution sits behind this
  * same signature and is not built here (#3028 "Not in scope").
  *
- * PURE except `judgeSpawn`, which spawns a subprocess and takes an injectable `spawnFn` so callers and
- * tests can substitute one. A LEAF module: it imports nothing from the review/jury seams.
+ * `judgeSpawn` takes an injectable `spawnFn`, and retry settings take an injectable file reader.
+ * Argv construction and outcome parsing are pure. A LEAF module: it imports nothing from the review/jury seams.
  */
 
 import { spawn as nodeSpawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { resolve as resolvePath, dirname, join } from 'node:path';
-import { realpathSync, statSync, existsSync } from 'node:fs';
+import { realpathSync, statSync, existsSync, readFileSync } from 'node:fs';
 import { markWorkerEnv } from '../operations/session-role.mjs';
 // #landing-freeze-2779 — a juror's spawn (below) built its env straight off the caller's `env` (default
 // `process.env`) with no sanitize step, the same gap named in full in
@@ -186,6 +192,68 @@ export const JUDGE_TIMEOUT_MS = 20 * 60 * 1000;
  * uncatchable, so `close` normally fires within milliseconds; this is the belt, not the braces.
  */
 export const JUDGE_TIMEOUT_GRACE_MS = 2000;
+
+/** Bounded retry policy for transient loss of the juror's final stdout. */
+export const UNPARSEABLE_RETRY_SETTING = Object.freeze({
+  key: 'judgeUnparseableRetries', env: 'WE_JUDGE_UNPARSEABLE_RETRIES', builtIn: 1, max: 3,
+});
+
+/** True for a bounded whole-number retry count (0..max) — the one definition settings and callers share. */
+function isValidRetryCount(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= UNPARSEABLE_RETRY_SETTING.max;
+}
+
+/** Resolve a valid retry count from environment, settings, then the built-in default. */
+export function resolveUnparseableRetries({
+  env = process.env,
+  file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'review.json'),
+  readFile = (p) => readFileSync(p, 'utf8'),
+} = {}) {
+  const { key, env: envKey, builtIn } = UNPARSEABLE_RETRY_SETTING;
+  const valid = (value) => {
+    if (typeof value === 'string' && /^\d+$/.test(value)) value = Number(value);
+    return isValidRetryCount(value) ? value : null;
+  };
+  const fromEnv = valid(env[envKey]);
+  if (fromEnv !== null) return { value: fromEnv, source: 'env' };
+  try {
+    const fromFile = valid(JSON.parse(readFile(file))[key]);
+    if (fromFile !== null) return { value: fromFile, source: 'settings' };
+  } catch { /* unreadable or invalid settings fall through */ }
+  return { value: builtIn, source: 'default' };
+}
+
+/** A bounded single-line stderr excerpt for failure and retry summaries. */
+function stderrSnippet(stderr) {
+  return String(stderr).trim().replace(/\s+/g, ' ').slice(-160);
+}
+
+/** Final unparseable output, with evidence from every failed attempt. */
+export class JudgeUnparseableError extends Error {
+  constructor({ attempt, attempts, exitCode, signal, stdout, stderr, wallMs, sessionId, failedAttempts }) {
+    const bytes = stdout.length;
+    const snippet = stderrSnippet(stderr);
+    const tail = String(stderr).trim().slice(-600);
+    exitCode = exitCode ?? null;
+    signal = signal ?? null;
+    super(
+      `judge-spawn: the juror did not emit parseable JSON on stdout (attempt ${attempt}/${attempts}, exit ${exitCode ?? 'none'}, signal ${signal ?? 'none'}, stdout ${bytes} bytes${snippet ? `, stderr: ${snippet}` : ''}).\n`
+      + `stdout[0..600]: ${String(stdout).slice(0, 600)}\n`
+      + (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
+    );
+    this.name = 'JudgeUnparseableError';
+    this.unparseable = true;
+    this.exitCode = exitCode;
+    this.signal = signal;
+    this.attempts = attempts;
+    this.stderrTail = String(stderr).trim().slice(-1000);
+    this.stdoutBytes = bytes;
+    this.wallMs = wallMs;
+    this.sessionId = sessionId;
+    this.failedAttempts = failedAttempts;
+    this.telemetry = { sessionId, wallMs, exitCode, signal, stderrTail: this.stderrTail, attempts, failure: 'unparseable-stdout' };
+  }
+}
 
 /**
  * A juror that hit the wall AND left nothing parseable behind.
@@ -513,6 +581,11 @@ export function deriveSessionId(seed) {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
 
+/** A fresh deterministic actor identity for each retry. */
+export function retrySessionId(sessionId, attempt) {
+  return deriveSessionId(sessionSeed([sessionId, `retry-${attempt}`]));
+}
+
 /**
  * THE PURE HALF: the juror's argv. Spawns nothing, reads no environment, touches no disk.
  *
@@ -638,12 +711,27 @@ export function parseJudgeOutcome(stdout, stderr = '', budget = null) {
   try {
     parsed = JSON.parse(String(stdout));
   } catch {
-    const tail = String(stderr).trim().slice(-600);
-    throw new Error(
-      `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
-      `stdout[0..600]: ${String(stdout).slice(0, 600)}\n` +
-      (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
-    );
+    for (const line of String(stdout).split(/\r?\n/).reverse()) {
+      if (!line.trim()) continue;
+      try {
+        const candidate = JSON.parse(line);
+        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+          && ('session_id' in candidate || 'structured_output' in candidate || 'is_error' in candidate || candidate.type === 'result')) {
+          parsed = candidate;
+          break;
+        }
+      } catch { /* stray stdout lines are not result objects */ }
+    }
+    if (parsed === undefined) {
+      const tail = String(stderr).trim().slice(-600);
+      const err = new Error(
+        `judge-spawn: the juror did not emit parseable JSON on stdout.\n` +
+        `stdout[0..600]: ${String(stdout).slice(0, 600)}\n` +
+        (tail ? `stderr[-600..]: ${tail}` : 'stderr: <empty>'),
+      );
+      err.unparseableStdout = true;
+      throw err;
+    }
   }
 
   if (parsed?.is_error) {
@@ -749,10 +837,12 @@ export function loadedContextTokens(usage = {}) {
  * @param {object} [opts.env] - environment for the spawn; defaults to the caller's.
  * @param {string} [opts.cli] - the binary to run.
  * @param {number} [opts.timeoutMs] - kill the juror after this long.
+ * @param {number} [opts.retries] - retries for unparseable stdout; otherwise resolved from settings.
+ * @param {(line: string) => void} [opts.log] - retry diagnostics.
  * @param {Function} [opts.spawnFn] - injectable `child_process.spawn`, for tests.
  * @returns {Promise<{value: object, sessionId: string, costUsd: number, durationMs: number,
  *                    wallMs: number, numTurns: number, stopReason: string, usage: object,
- *                    loadedContextTokens: number, argv: string[]}>}
+ *                    loadedContextTokens: number, argv: string[], attempts: number, failedAttempts: object[]}>}
  */
 export async function judgeSpawn({
   mandate,
@@ -773,6 +863,8 @@ export async function judgeSpawn({
   timeoutMs = JUDGE_TIMEOUT_MS,
   allowedTools = null,
   spawnFn = nodeSpawn,
+  retries,
+  log = (line) => { try { process.stderr.write(line + '\n'); } catch { /* best effort */ } },
 } = {}) {
   if (typeof input !== 'string' || !input.trim()) {
     throw new TypeError('judge-spawn: `input` must be a non-empty string — there is nothing to judge');
@@ -794,74 +886,106 @@ export async function judgeSpawn({
   assertLaneCwd(cwd, allowedTools);
   // Only reached for a tool-free juror, which cannot write and for which the directory is immaterial.
   const spawnCwd = cwd ?? process.cwd();
-  const argv = buildJudgeArgv({ mandate, shape, model, effort, budget, sessionId: sid, allowedTools });
-
-  // Belt-and-braces: the trap can never reach a real process, even if `buildJudgeArgv` is later edited.
-  assertNoForbiddenArgv(argv);
-
-  const startedAt = Date.now();
-  // THE KILL RESOLVES, IT DOES NOT REJECT (#3203). It used to reject, which threw away every byte the juror had
-  // already written — and a tool-bearing juror at the wall has usually done most of the review. Killing and
-  // then settling with the accumulated streams turns total loss into a parse attempt: often the answer IS
-  // there and only the process failed to exit.
-  const { stdout, stderr, code, timedOut } = await new Promise((resolve, reject) => {
-    let child;
-    try {
-      child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] });
-    } catch (e) {
-      reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
-      return;
-    }
-    let out = '';
-    let err = '';
-    let timer = null;
-    let grace = null;
-    let killed = false;
-    let settled = false;
-    // `close` and the grace timer can both fire; whichever is first wins and the other is inert.
-    const settle = (r) => {
-      if (settled) return;
-      settled = true;
-      if (timer) clearTimeout(timer);
-      if (grace) clearTimeout(grace);
-      resolve(r);
-    };
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        killed = true;
-        try { child.kill('SIGKILL'); } catch { /* already gone */ }
-        // Settling on `close` rather than here is what preserves the partial output: Node delivers the
-        // buffered `data` events first. The grace timer only covers a `close` that never arrives.
-        grace = setTimeout(() => settle({ stdout: out, stderr: err, code: null, timedOut: true }), JUDGE_TIMEOUT_GRACE_MS);
-        if (typeof grace.unref === 'function') grace.unref();
-      }, timeoutMs);
-      if (typeof timer.unref === 'function') timer.unref();
-    }
-    child.stdout?.on('data', (d) => { out += d; });
-    child.stderr?.on('data', (d) => { err += d; });
-    child.on('error', (e) => {
-      if (timer) clearTimeout(timer);
-      if (grace) clearTimeout(grace);
-      reject(new Error(`judge-spawn: \`${cli}\` failed to run: ${e.message}`));
-    });
-    child.on('close', (c) => settle({ stdout: out, stderr: err, code: c, timedOut: killed }));
-    // The judged material rides stdin — see the header on ARG_MAX and the variadic `--tools`.
-    child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
-    child.stdin?.end(input);
-  });
-
-  const wallMs = Date.now() - startedAt;
-  // A KILLED JUROR IS TRIED, NOT DISCARDED. The wall is a bound on runaway, and a juror that emitted its
-  // answer and then failed to exit has produced a perfectly good review — the old code threw it away along
-  // with the ones that really had nothing. `timedOut` rides out on the result so the run record can say which
-  // happened, because "hit the bound" and "crashed" are different facts about a review.
-  if (timedOut) {
-    let outcome = null;
-    try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
-    if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
-    return { ...outcome, wallMs, timedOut: true, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
+  // An explicit count gets the same bound the settings get. Unchecked, -1 / NaN skip the loop and 0.5 exits it
+  // early, so the call fell off the end and resolved `undefined` instead of a verdict or a thrown error.
+  if (retries !== undefined && !isValidRetryCount(retries)) {
+    throw new RangeError(`judge-spawn: \`retries\` must be an integer from 0 to ${UNPARSEABLE_RETRY_SETTING.max}, got ${typeof retries === 'number' ? retries : typeof retries}`);
   }
-  // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.
-  const outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
-  return { ...outcome, wallMs, timedOut: false, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
+  const setting = retries === undefined ? resolveUnparseableRetries({ env }) : { value: retries, source: 'caller' };
+  retries = setting.value;
+  const total = 1 + retries;
+  const failedAttempts = [];
+  let wallMs = 0;
+  for (let attempt = 1; attempt <= total; attempt += 1) {
+    const thisSid = attempt === 1 ? sid : retrySessionId(sid, attempt);
+    const argv = buildJudgeArgv({ mandate, shape, model, effort, budget, sessionId: thisSid, allowedTools });
+
+    // Belt-and-braces: the trap can never reach a real process, even if `buildJudgeArgv` is later edited.
+    assertNoForbiddenArgv(argv);
+
+    const startedAt = Date.now();
+    // THE KILL RESOLVES, IT DOES NOT REJECT (#3203). It used to reject, which threw away every byte the juror had
+    // already written — and a tool-bearing juror at the wall has usually done most of the review. Killing and
+    // then settling with the accumulated streams turns total loss into a parse attempt: often the answer IS
+    // there and only the process failed to exit.
+    const { stdout, stderr, code, signal, timedOut } = await new Promise((resolve, reject) => {
+      let child;
+      try {
+        child = spawnFn(cli, argv, { cwd: spawnCwd, env: markWorkerEnv(sanitizeSpawnEnv(env)), stdio: ['pipe', 'pipe', 'pipe'] });
+      } catch (e) {
+        reject(new Error(`judge-spawn: could not start \`${cli}\`: ${e.message}`));
+        return;
+      }
+      let out = '';
+      let err = '';
+      let timer = null;
+      let grace = null;
+      let killed = false;
+      let settled = false;
+      // `close` and the grace timer can both fire; whichever is first wins and the other is inert.
+      const settle = (r) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        if (grace) clearTimeout(grace);
+        resolve(r);
+      };
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          killed = true;
+          try { child.kill('SIGKILL'); } catch { /* already gone */ }
+          // Settling on `close` rather than here is what preserves the partial output: Node delivers the
+          // buffered `data` events first. The grace timer only covers a `close` that never arrives.
+          grace = setTimeout(() => settle({ stdout: out, stderr: err, code: null, signal: null, timedOut: true }), JUDGE_TIMEOUT_GRACE_MS);
+          if (typeof grace.unref === 'function') grace.unref();
+        }, timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+      }
+      child.stdout?.on('data', (d) => { out += d; });
+      child.stderr?.on('data', (d) => { err += d; });
+      child.on('error', (e) => {
+        if (timer) clearTimeout(timer);
+        if (grace) clearTimeout(grace);
+        reject(new Error(`judge-spawn: \`${cli}\` failed to run: ${e.message}`));
+      });
+      child.on('close', (c, signal) => settle({ stdout: out, stderr: err, code: c, signal, timedOut: killed }));
+      // The judged material rides stdin — see the header on ARG_MAX and the variadic `--tools`.
+      child.stdin?.on('error', () => { /* the child may exit before we finish writing; `close` reports it */ });
+      child.stdin?.end(input);
+    });
+
+    const thisAttemptMs = Date.now() - startedAt;
+    wallMs += thisAttemptMs;
+    // A KILLED JUROR IS TRIED, NOT DISCARDED. The wall is a bound on runaway, and a juror that emitted its
+    // answer and then failed to exit has produced a perfectly good review — the old code threw it away along
+    // with the ones that really had nothing. `timedOut` rides out on the result so the run record can say which
+    // happened, because "hit the bound" and "crashed" are different facts about a review.
+    if (timedOut) {
+      let outcome = null;
+      try { outcome = parseJudgeOutcome(stdout, stderr, budget); } catch { outcome = null; }
+      if (!outcome) throw new JudgeTimeoutError({ timeoutMs, wallMs, stdout, stderr });
+      return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: true, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
+    }
+    // `parseJudgeOutcome` throws with the CLI's own words; a non-zero exit with unparseable stdout lands there too.
+    let outcome;
+    try {
+      outcome = parseJudgeOutcome(stdout, stderr || (code === 0 ? '' : `exit code ${code}`), budget);
+    } catch (error) {
+      if (error.unparseableStdout !== true) throw error;
+      failedAttempts.push({
+        attempt, sessionId: thisSid, exitCode: code ?? null, signal: signal ?? null,
+        stdoutBytes: stdout.length, stderrTail: stderr.trim().slice(-1000), wallMs: thisAttemptMs,
+      });
+      if (attempt < total) {
+        const snippet = stderrSnippet(stderr);
+        const nextSid = retrySessionId(sid, attempt + 1);
+        log(`judge-spawn: juror ${lens || '-'} attempt ${attempt}/${total} emitted no parseable JSON (exit ${code ?? 'none'}, signal ${signal ?? 'none'}, stdout ${stdout.length} bytes${snippet ? `, stderr: ${snippet}` : ''}); retrying with a fresh session id ${nextSid} — ${UNPARSEABLE_RETRY_SETTING.key}=${retries} (source: ${setting.source})`);
+        continue;
+      }
+      throw new JudgeUnparseableError({
+        attempt, attempts: total, exitCode: code, signal, stdout, stderr, wallMs, sessionId: thisSid, failedAttempts,
+      });
+    }
+    return { ...outcome, wallMs, attempts: attempt, failedAttempts, timedOut: false, loadedContextTokens: loadedContextTokens(outcome.usage), argv };
+  }
 }
