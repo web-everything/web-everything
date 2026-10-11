@@ -319,6 +319,11 @@ export const REFUSAL_KINDS = Object.freeze([
   // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
   // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
   'scope-bloat', 'ruling-dispute',
+  // xs9re3k — a past-cap mechanical round (a conflict-resolution merge, no other edits) whose net diff is identical
+  // to the head the prior verdict judged: that verdict is carried forward (`mechanical-round-cap.mjs#mechanicalRoundGrant`),
+  // no review is dispatched and no "a person must take it over" note replaces it. Emitted through `capExhaustedVia`'s
+  // injected `refuseFn`, which the source scan in `reconcile-core.test.mjs` now reads too.
+  'mechanical-carry-forward',
 ]);
 
 /**
