@@ -200,7 +200,7 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
  * A non-object throw cannot carry it and passes through unchanged (its classification must not change either).
  */
 function withPartialChecks(error, partialChecks) {
-  if (error && typeof error === 'object' && partialChecks.length) {
+  if (error && typeof error === 'object') { // always set: a reused error never keeps an earlier call's floor
     try { error.partialChecks = partialChecks; } catch { /* a frozen error degrades without the floor */ }
   }
   return error;
@@ -268,9 +268,10 @@ export function getRequiredStatusChecks({
   };
 
   // Checks a source that DID read still requires (the other source failed): never live, but added to every degraded
-  // result below — the declared policy, the stale cache or the fallback — so a degraded read never drops them.
+  // result below — the declared policy, the stale cache or the fallback — so a degraded read never drops them. Only
+  // on top of a non-empty base: an empty set means "count every observed check", and a partial set would narrow it.
   let partial = [];
-  const withPartial = checks => [...new Set([...checks, ...partial])];
+  const withPartial = checks => (checks.length ? [...new Set([...checks, ...partial])] : checks);
   try {
     const checks = readChecks({ repo, branch });
     if (Array.isArray(checks) && checks.length) {
@@ -285,7 +286,7 @@ export function getRequiredStatusChecks({
       const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
       if (!hasLiveCache) {
         if (declared) return save(withPartial(declared), 'declared');
-        if (!cache) return { checks: withPartial([]), source: 'fallback' };
+        if (!cache) return { checks: [], source: 'fallback' };
       }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */
@@ -293,5 +294,5 @@ export function getRequiredStatusChecks({
 
   if (cache) return { checks: withPartial(cache.checks), source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
     cacheAgeMs: now - cache.fetchedAtMs };
-  return declared ? { checks: withPartial(declared), source: 'fallback' } : { checks: withPartial([]), source: 'unavailable' };
+  return declared ? { checks: withPartial(declared), source: 'fallback' } : { checks: [], source: 'unavailable' };
 }

@@ -542,11 +542,17 @@ describe('defaultReadRequiredStatusChecks', () => {
     expect(threw).toBe(true);
   });
 
-  it('a rules access denial on an undeclared repo with no cache is an untrusted fallback that keeps the classic set', () => {
+  // With no base set, an empty set means "count every observed check": a partial set would narrow that and drop a
+  // ruleset-only red for source-blind readers (`reduceCheckState`, `ciFailed`), so it is never returned alone.
+  it.each([
+    ['a rules access denial', () => rulesDenied(classicBranch('classic')), 'fallback'],
+    ['a transient rules failure', () => vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); })
+      .mockReturnValueOnce(classicBranch('classic')), 'unavailable'],
+  ])('%s on an undeclared repo with no cache returns the empty "count everything" set, never the partial one', (_label, gh, source) => {
     const cachePath = join(dir, 'cache.json');
-    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('classic')) });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: gh() });
     expect(getRequiredStatusChecks({ repo: 'owner/undeclared', cachePath, now: 1000, readChecks }))
-      .toEqual({ checks: ['classic'], source: 'fallback' });
+      .toEqual({ checks: [], source });
     expect(existsSync(cachePath)).toBe(false);
   });
 
