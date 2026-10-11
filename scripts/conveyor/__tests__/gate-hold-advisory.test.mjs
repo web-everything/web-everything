@@ -3,6 +3,7 @@ import { describe, it, expect } from 'vitest';
 import { planReconcile } from '../reconcile-core.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { ADVISORY_NOTE_MARKER } from '../advisory-round-count.mjs';
+import { isStatusOnlyNote } from '../../lib/pr-comment-policy.mjs';
 
 const BOT = { login: 'web-everything' };
 const OLD = 'a'.repeat(40);
@@ -30,7 +31,7 @@ function pr(comments = [advisory(OLD)], overrides = {}) {
 const plan = (p) => planReconcile({ prs: [p], agents: [], durableCounts: { 4764: 7 },
   now: Date.parse(at(12)), requiredChecks: ['test'], roundCapAction: 'takeover', takeoverBudget: 2,
 });
-const noteFor = p => p.notes.find(n => n.kind === 'gate-hold-needs-operator' && n.prNumber === 4764);
+const noteFor = p => p.notes.find(n => ['gate-hold-needs-operator', 'stacked-awaiting-base'].includes(n.kind) && n.prNumber === 4764);
 function expectReview(p) {
   expect(p.dispatch).toHaveLength(1);
   expect(p.dispatch[0]).toMatchObject({ prNumber: 4764, kind: 'review', phase: 'bounced', attempts: 7, cap: 6,
@@ -77,12 +78,53 @@ describe('gate-held advisory at the repair cap', () => {
   });
   it('treats a trusted changes verdict whose net basis names the live head as already reviewed', () => {
     const verdict = { author: BOT, createdAt: at(10),
-      body: `${ADVISORY_NOTE_MARKER} Changes: 0 finding(s)\n\n**Advisory outcome:** \`changes\`\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\`\n\n### Findings\n\n` };
+      body: `${ADVISORY_NOTE_MARKER} Changes: 0 finding(s)\n\n**Advisory outcome:** \`changes\`\n\n### Findings\n\n---\n\nNet basis: \`${'0'.repeat(40)}..${HEAD}\` — 2 net changed file(s) vs current main` };
     const p = plan(pr([verdict]));
     expectNote(p, 'review-human-hold');
     expect(noteFor(p).text).toMatch(/already reviewed/);
   });
   it('does not let an untrusted reviewed-sha marker suppress the owed advisory', () => {
     expectReview(plan(pr([{ author: { login: 'mallory' }, createdAt: at(10), body: `<!-- reviewed-sha: ${HEAD} -->` }])));
+  });
+  it('does not treat an incidental live-head reference as a reviewed verdict', () => {
+    const old = advisory(OLD);
+    old.body += `\n\nA later push (${HEAD}) is not covered by this review.`;
+    expectReview(plan(pr([old])));
+  });
+});
+
+describe('gate-held advisory shares the review pre-gates and never goes silent', () => {
+  const noReview = p => expect(p.dispatch.filter(d => d.kind === 'review')).toEqual([]);
+  it('refuses the owed advisory with review-referrals-pending when pr.referralHold is set, and tells the operator', () => {
+    const p = plan(pr(undefined, { referralHold: { why: 'a referral awaits its answer' } }));
+    noReview(p);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ prNumber: 4764, kind: 'review-referrals-pending' }));
+    expect(noteFor(p).text).toContain('review-referrals-pending');
+  });
+  it('tells the operator when red CI refuses the owed advisory', () => {
+    const p = plan(pr(undefined, { statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'FAILURE', headSha: HEAD }] }));
+    expect(noteFor(p).text).toContain('review-ci');
+  });
+  it('never reviews a draft PR', () => {
+    const p = plan(pr(undefined, { isDraft: true }));
+    noReview(p);
+    expect(p.dispatch.filter(d => d.prNumber === 4764 && d.advisoryReview)).toEqual([]);
+  });
+  it('never reviews a scope-bloated diff', () => {
+    const p = plan(pr(undefined, { scopeBloat: { why: 'diff mostly not this PR', stale: false } }));
+    noReview(p);
+    expect(p.refusals).toContainEqual(expect.objectContaining({ prNumber: 4764, kind: 'scope-bloat' }));
+  });
+  it('keeps a self-clearing base hold status-only and a person-owned hold escalated', () => {
+    const cases = [
+      [pr(undefined, { labels: ['review:changes', 'review-status:awaiting-base'].map(name => ({ name })) }), 'awaiting-base', true],
+      [pr(undefined, { baseRefName: 'lane/base', labels: [{ name: 'review:changes' }] }), 'stacked-base-unmerged', true],
+      [pr([advisory(HEAD)]), 'review-human-hold', false],
+    ];
+    for (const [p, hold, statusOnly] of cases) {
+      const note = noteFor(plan(p));
+      expect(note).toMatchObject({ hold });
+      expect(isStatusOnlyNote(note)).toBe(statusOnly);
+    }
   });
 });

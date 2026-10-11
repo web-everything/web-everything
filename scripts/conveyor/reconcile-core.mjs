@@ -1359,6 +1359,7 @@ export function resolveRoundCap(env = {}) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
+  advisoryReview = null,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1460,6 +1461,17 @@ function dispatchReviewRow({
       why: `this exact head (\`${headSha}\`) already carries a \`reviewed-sha\` accept marker from a prior` +
         ' review — dispatching another review for a commit nobody has touched since risks a second,' +
         ' contradicting verdict landing on it (#2588)',
+    });
+    return;
+  }
+  // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
+  // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
+  // the CI gate: it is this function's review, never a second hand-rolled copy of it.
+  if (advisoryReview) {
+    if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+    dispatch.push({
+      ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
+      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason }, why: advisoryReview.why,
     });
     return;
   }
@@ -2041,32 +2053,47 @@ export function planReconcile({
         const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
         const latest = headSha ? latestAdvisory(trustedComments) : undefined;
         const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
+        // Structured evidence only: a verdict counts when its own footer names the live head. A sha merely mentioned
+        // in a verdict's prose (an older review quoting the new head) never marks that head reviewed.
         const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
-          || trustedComments.some(c => isReviewVerdictComment(c)
-            && (String(c?.body ?? '').toLowerCase().includes(headSha) || verdictJudged(c, headSha))));
+          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+        // The owed advisory goes through dispatchReviewRow, the ONE review decision (referral hold, scope-bloat, draft,
+        // already-reviewed-head, CI). If it refuses, the refusal is named in the operator note below, never swallowed.
+        let reviewRefusal = null;
         if (takeover.hold === 'review-human-hold' && headSha && !advisoryIsCurrent && !alreadyReviewed) {
-          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
-          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
-          dispatch.push({
-            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments),
-            advisoryReview: { head: headSha, reason: 'gate-hold-advisory' },
-            why: `the repair rounds are spent (${extra.attempts}/${extra.cap}), but an advisory review is not a repair round;`
-              + ` the newest advisory is on \`${latest?.head ?? 'none'}\`, not the live head \`${headSha}\`,`
-              + ' so one advisory review runs on the live head so the operator has a current advisory',
+          const rowsBefore = dispatch.length;
+          dispatchReviewRow({
+            pr, requiredChecks, withPhase: extra, base, attempts: extra.attempts, roundCap: extra.cap, now, dispatch,
+            refuse: (kind, x) => { reviewRefusal = { kind, why: x?.why }; refuseFn(kind, x); },
+            refuseCapExhausted: () => {},
+            advisoryReview: {
+              head: headSha, reason: 'gate-hold-advisory',
+              why: `the repair rounds are spent (${extra.attempts}/${extra.cap}), but an advisory review is not a repair round;`
+                + ` the newest advisory is on \`${latest?.head ?? 'none'}\`, not the live head \`${headSha}\`,`
+                + ' so one advisory review runs on the live head so the operator has a current advisory',
+            },
           });
-          return;
+          if (dispatch.length > rowsBefore) return;
         }
         refuseFn('gate-hold', { ...extra, takeover: 'gate-hold', hold: takeover.hold,
           why: `held by its own gate (${takeover.hold}) with no open defect finding — the gate is doing its job; no takeover` });
-        const reason = takeover.hold !== 'review-human-hold'
+        const selfClearing = takeover.hold === 'awaiting-base' || takeover.hold === 'stacked-base-unmerged';
+        const reason = selfClearing
+          ? `waiting on its base branch (${takeover.hold}); the hold clears itself when the base PR lands, nobody needs to act`
+          : takeover.hold !== 'review-human-hold'
           ? `a person must resolve the gate dependency (${takeover.hold}) before this PR can advance`
+          : reviewRefusal
+            ? `the advisory review owed on the live head \`${headSha.slice(0, 9)}\` was refused (${reviewRefusal.kind}: ${reviewRefusal.why ?? 'no reason given'})`
+              + ' — clear that, or a person must review the PR and supply a ruling'
           : advisoryIsCurrent
             ? `the advisory on the live head \`${headSha.slice(0, 9)}\` is in — a person must rule (review it, or send it back with a ruling)`
             : alreadyReviewed
               ? `the live head \`${headSha.slice(0, 9)}\` was already reviewed but has no current trusted advisory — a person must check the review and supply a ruling`
               : 'the live head is unavailable — a person must check the PR before an advisory can run';
         notes.push({
-          kind: 'gate-hold-needs-operator', prNumber, hold: takeover.hold,
+          // A base hold clears itself: it reuses the status-only `stacked-awaiting-base` kind (no PR comment, no escalation).
+          kind: selfClearing ? 'stacked-awaiting-base' : 'gate-hold-needs-operator', prNumber, hold: takeover.hold,
+          ...(selfClearing ? { baseRefName: pr?.baseRefName } : {}),
           attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind, head: headSha,
           text: `PR #${prNumber}: held by its own gate (${takeover.hold}) at the repair cap (${extra.attempts}/${extra.cap}, ${extra.capKind}); ${reason}`,
         });
