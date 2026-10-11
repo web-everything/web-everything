@@ -68,7 +68,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runVerifyDispatch, recordKilledVerification } from '../../scripts/conveyor/verify-dispatch.mjs';
+import { runVerifyDispatch, recordKilledVerification, killOrphanGroup } from '../../scripts/conveyor/verify-dispatch.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
@@ -489,7 +489,10 @@ export function adoptInFlight(inFlight, { path = VERIFY_DAEMON_INFLIGHT_FILE, is
  *  (a successor would then double-dispatch the same lane). An entry without a pid has not spawned yet; a pid
  *  that already exited throws and is skipped. `kill` is injectable for tests. */
 export function killInFlight(inFlight, kill = process.kill.bind(process)) {
-  for (const { pid } of inFlight.values()) {
+  for (const { pid, leaderSettled } of inFlight.values()) {
+    // PR 4764 — a settled leader's pid may already belong to an unrelated process: its group is killed only while that
+    // pid exists nowhere and the group still has members (the same rule as reconcile and the supersede path).
+    if (leaderSettled) { killOrphanGroup(pid, { kill }); continue; }
     try { if (pid > 0) kill(-pid, 'SIGKILL'); } catch {}
   }
 }

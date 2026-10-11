@@ -813,7 +813,7 @@ describe('round 7 self-review: proof kept, rollback orphans stopped, release gua
     const inFlight = new Map();
     await jobs.sync(inFlight);
     expect(inFlight.has(INPUT.dir)).toBe(false);
-    expect(JSON.parse(readFileSync(gatePath(dir, q.id), 'utf8'))).toMatchObject({ pid: 4321, gone: true });
+    expect(gateJob.readGate(dir, q.id)).toMatchObject({ pid: 4321, gone: true });
     reused = true; // pid 4321 now belongs to an unrelated process
     await mk({ pidExists: () => reused, now: soon }).sync(inFlight);
     expect(inFlight.has(INPUT.dir)).toBe(false);
@@ -979,10 +979,98 @@ describe('round 8 self-review: a leftover process group is the gate\'s, and no d
     const old = { pid: 996, handle: 'h:996:s', runId: 'run-1', attempt: 1 };
     writeFileSync(gatePath(dir, 'mg'), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-1', attempt: 2 }));
     gateJob.markGone(dir, 'mg', old);
-    expect(JSON.parse(readFileSync(gatePath(dir, 'mg'), 'utf8'))).toMatchObject({ pending: true, attempt: 2 });
+    expect(gateJob.readGate(dir, 'mg')).toMatchObject({ pending: true, attempt: 2 });
+    expect(gateJob.readGate(dir, 'mg').gone).toBeUndefined();
     writeFileSync(gatePath(dir, 'mg'), JSON.stringify(old));
     gateJob.markGone(dir, 'mg', old);
-    expect(JSON.parse(readFileSync(gatePath(dir, 'mg'), 'utf8'))).toMatchObject({ pid: 996, gone: true });
+    expect(gateJob.readGate(dir, 'mg')).toMatchObject({ pid: 996, gone: true });
+    expect(gateState(gateJob.readGate(dir, 'mg'), { probe: () => 'alive' })).toBe('dead'); // the proof outlives a reused pid
+  });
+
+  it('PR 4764 round 9 — a newer attempt that records its gate INSIDE markGone (after any check, before any write) stays discoverable', () => {
+    const old = { pid: 997, handle: 'h:997:s', runId: 'run-1', attempt: 1, spawnedAt: 'a1' };
+    const newer = { pid: 998, handle: 'h:998:s', runId: 'run-1', attempt: 2, spawnedAt: 'a2' };
+    writeFileSync(gatePath(dir, 'mi'), JSON.stringify(old));
+    // Deterministic interleaving: the relaunched supervisor writes its record the first time markGone serialises the old
+    // record — after any read or comparison it made, before any write (a check-then-rewrite loses here).
+    const stringify = JSON.stringify;
+    const given = JSON.parse(stringify(old));
+    let injected = false;
+    const spy = vi.spyOn(JSON, 'stringify').mockImplementation((v, ...r) => {
+      const s = stringify(v, ...r);
+      if (!injected && v?.pid === 997) { injected = true; writeFileSync(gatePath(dir, 'mi'), stringify(newer)); }
+      return s;
+    });
+    try { gateJob.markGone(dir, 'mi', given); } finally { spy.mockRestore(); }
+    expect(injected).toBe(true);
+    expect(JSON.parse(readFileSync(gatePath(dir, 'mi'), 'utf8'))).toEqual(newer); // the live record was never replaced
+    const now = gateJob.readGate(dir, 'mi');
+    expect(now.gone).toBeUndefined(); // the old gate's proof never applies to the new one
+    expect(gateState(now, { probe: (h) => (h === 'h:998:s' ? 'alive' : 'dead') })).toBe('alive');
+    // ...and markGone after the new record is down never touches it either.
+    gateJob.markGone(dir, 'mi', old);
+    expect(JSON.parse(readFileSync(gatePath(dir, 'mi'), 'utf8'))).toEqual(newer);
+    expect(gateJob.readGate(dir, 'mi').gone).toBeUndefined();
+  });
+
+  it('PR 4764 round 9 — release-lane releases only the exact record it judged: a gate recorded since is never released; the sidecar is never rewritten', () => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markFailed(r, { at: AT, reason: 'x' }));
+    const pending = { pid: null, handle: null, pending: true, runId: 'run-1', dir: INPUT.dir, at: 'p1', attempt: 1 };
+    writeFileSync(gatePath(dir, q.id), JSON.stringify(pending));
+    const deps = { probe: () => 'dead', pidExists: () => true, groupExists: () => false };
+    // A relaunched supervisor records its live gate the moment the operator has judged the old record.
+    const stringify = JSON.stringify;
+    const live = { pid: 5100, handle: 'h:5100:s', runId: 'run-1', dir: INPUT.dir, spawnedAt: 's2', attempt: 2 };
+    let injected = false;
+    const spy = vi.spyOn(JSON, 'stringify').mockImplementation((v, ...r) => {
+      const s = stringify(v, ...r);
+      if (!injected && v?.pending === true && v?.at === 'p1') { injected = true; writeFileSync(gatePath(dir, q.id), stringify(live)); }
+      return s;
+    });
+    let out;
+    try { out = gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps }); } finally { spy.mockRestore(); }
+    expect(injected).toBe(true);
+    expect(out.setAside).toEqual([q.id]); // the PENDING record was released...
+    expect(JSON.parse(readFileSync(gatePath(dir, q.id), 'utf8'))).toEqual(live); // ...the live one is untouched
+    expect(gateState(gateJob.readGate(dir, q.id), { probe: () => 'alive' })).toBe('alive');
+    // An unreadable record is released by its exact bytes; different bytes later are not.
+    writeFileSync(gatePath(dir, q.id), '{"pid": 52');
+    expect(gateState(gateJob.readGate(dir, q.id))).toBe('unknown');
+    expect(gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps }).setAside).toEqual([q.id]);
+    expect(gateState(gateJob.readGate(dir, q.id))).toBe('dead');
+    writeFileSync(gatePath(dir, q.id), '{"pid": 53');
+    expect(gateState(gateJob.readGate(dir, q.id))).toBe('unknown');
+  });
+
+  it('PR 4764 round 9 — a supervisor stopped after its gate leader exited kills only a leftover group, never a reused pid', () => {
+    const exit = vi.fn();
+    const calls = [];
+    // The reused pid exists (every probe answers): no kill once the leader has settled.
+    gateStopHandler({ getPid: () => 4300, getSettled: () => true, kill: (p, s) => { calls.push([p, s]); return true; }, exit })();
+    expect(calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    // The leader is gone, its group lives on: the group is killed.
+    const calls2 = [];
+    const esrch = () => { throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' }); };
+    gateStopHandler({ getPid: () => 4301, getSettled: () => true, kill: (p, s) => { calls2.push([p, s]); if (p === 4301 && s === 0) esrch(); return true; }, exit })();
+    expect(calls2).toContainEqual([-4301, 'SIGKILL']);
+    // Before the leader settles it is our unreaped child: killed as before.
+    const calls3 = [];
+    gateStopHandler({ getPid: () => 4302, kill: (p, s) => { calls3.push([p, s]); return true; }, exit })();
+    expect(calls3).toEqual([[-4302, 'SIGKILL']]);
+    expect(exit).toHaveBeenCalledTimes(3);
+  });
+
+  it('PR 4764 round 9 — runGateStep reports the gate settled (only once a gate was spawned)', async () => {
+    const settled = vi.fn();
+    await runGateStep({ jobId: 'st', input: INPUT, jobsDir: dir, log: () => {}, laneState, scanLane: () => [], supervisorHandle: () => 'h:77:s',
+      probe: () => 'dead', groupExists: () => false, pidExists: () => false, readStart: () => null, onGateSettled: settled,
+      runGate: vi.fn(async (o) => { o.onSpawn(4400); expect(settled).not.toHaveBeenCalled(); }) });
+    expect(settled).toHaveBeenCalledTimes(1);
+    const none = vi.fn();
+    await runGateStep({ jobId: 'st2', input: { ...INPUT, dir: '/lanes/we/lane-8' }, jobsDir: dir, log: () => {}, laneState, scanLane: () => [],
+      supervisorHandle: () => 'h:77:s', probe: () => 'dead', onGateSettled: none, runGate: vi.fn(async () => {}) });
+    expect(none).not.toHaveBeenCalled();
   });
 
   it('S5 — a lane whose identity cannot be read (not "missing") is held, never keyed by another spelling', async () => {

@@ -54,7 +54,7 @@ import { evictSnapshots } from '../lib/daemon-job-snapshots.mjs';
 import { TERMINAL_JOB_STATUSES, formatJobHandle, parseJobHandle } from '../operations/job-record.mjs';
 import { daemonJobsDir, deleteRun } from '../operations/run-store.mjs';
 import { cloneNodeModulesInstaller } from '../lib/daemon-rebuild/rebuild-job.mjs';
-import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, gateCeilings } from './verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, runLaneGate, readLaneState, gateCeilings, killOrphanGroup } from './verify-dispatch.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const CLONE_ROOT = resolve(dirname(SELF), '..', '..');
@@ -63,6 +63,7 @@ const CLONE_ROOT = resolve(dirname(SELF), '..', '..');
 export const VERIFY_GATE_AS_JOB_ENV = 'WE_VERIFY_GATE_AS_JOB';
 export const GATE_SUFFIX = '.gate';
 export const RESULT_SUFFIX = '.result';
+export const GONE_SUFFIX = '.gate-gone-';
 // Not `.json`: the run store lists every `*.json` in the jobs dir as a job record (and calls this one corrupt).
 const CONSUMED_FILE = 'consumed.ids';
 /** A consumed job's files are kept this long for diagnosis, then removed. */
@@ -110,11 +111,28 @@ export function readGate(dir, id) {
   try { text = readFileSync(gatePath(dir, id), 'utf8'); } catch (e) {
     return e?.code === 'ENOENT' ? null : { unreadable: e?.code || errLine(e) };
   }
-  try {
-    const v = JSON.parse(text);
-    return v && typeof v === 'object' && !Array.isArray(v) ? v : { unreadable: 'not a record' };
-  } catch { return { unreadable: 'not JSON' }; }
+  let v;
+  try { v = JSON.parse(text); } catch { v = undefined; }
+  if (!v || typeof v !== 'object' || Array.isArray(v)) {
+    // An operator released exactly these bytes ({@link releaseLaneByOperator}): read as a record that names no gate.
+    if (existsSync(rawProofPath(dir, id, text))) return { pid: null, handle: null, none: true, why: 'released unreadable record' };
+    return { unreadable: v === undefined ? 'not JSON' : 'not a record', textHash: rawHash(text) };
+  }
+  // A gone-proof ({@link markGone}) is keyed by this exact record's content: it applies to this record and no other.
+  if (v.gone !== true) {
+    try {
+      const proof = JSON.parse(readFileSync(goneProofPath(dir, id, v), 'utf8'));
+      if (typeof proof?.goneAt === 'string') return { ...v, gone: true, goneAt: proof.goneAt };
+    } catch {} // no proof (or an unreadable one): the record stands as written — never "gone" by accident
+  }
+  return v;
 }
+
+/** Where the gone-proof for gate record `gate` of job `id` lives: next to the sidecar, named by the record's hash. */
+export const goneProofPath = (dir, id, gate) => join(dir, `${id}${GONE_SUFFIX}${rawHash(JSON.stringify(gate))}`);
+const rawHash = (text) => createHash('sha256').update(String(text)).digest('hex').slice(0, 24);
+/** The release proof for an unreadable record: keyed by its exact bytes, so a record rewritten since never matches it. */
+const rawProofPath = (dir, id, text) => join(dir, `${id}${GONE_SUFFIX}raw-${rawHash(text)}`);
 
 /**
  * PURE: classify a settled gate the way the in-process sweep's `settle` does — exit 0 green, exit 2 red (a normal
@@ -231,13 +249,15 @@ export function gateState(gate, { probe = probeHandle, pidExists = pidExistsDefa
  * Write down that a recorded gate was proven gone ({@link gateState} `dead`), so the proof outlives its pid: a
  * handle-less record would otherwise read "possibly running" again the day that pid is handed to another process.
  * Only for a record that names a gate and is not already marked; a failed write just leaves the proof to be redone.
+ *
+ * The proof is its OWN file, named by the hash of the exact record it proves ({@link goneProofPath}) — never a rewrite
+ * of the sidecar. A reader is not the sidecar's writer: between any read and any write, a relaunched supervisor may
+ * record its new gate there, and a rewrite would replace that live record with the old one's death. A proof file
+ * cannot: the new record hashes differently, so the proof never applies to it.
  */
 export function markGone(dir, id, gate) {
   if (!gate || gate.unreadable || gate.none || gate.gone || (gate.pid == null && !gate.handle)) return;
-  // Re-read right before the write: a newer attempt may have recorded its own gate since `gate` was read, and the
-  // proof about the old one must never overwrite it.
-  if (JSON.stringify(readGate(dir, id)) !== JSON.stringify(gate)) return;
-  try { writeJson(gatePath(dir, id), { ...gate, gone: true, goneAt: new Date().toISOString() }); } catch {}
+  try { createExclusive(goneProofPath(dir, id, gate), { goneAt: new Date().toISOString(), pid: gate.pid ?? null }); } catch {}
 }
 
 /**
@@ -611,6 +631,7 @@ export function createVerifyGateJobs({
         if (holdsClaim(r)) continue; // its sidecar is what proves the claim's gate gone: never delete it first
         try { deleteRun(r.id, store.dir); } catch {}
         for (const ext of ['.log', GATE_SUFFIX, RESULT_SUFFIX, '.json.lock']) rmSync(join(store.dir, `${r.id}${ext}`), { force: true });
+        try { for (const n of readdirSync(store.dir)) if (n.startsWith(`${r.id}${GONE_SUFFIX}`)) rmSync(join(store.dir, n), { force: true }); } catch {}
         consumed.delete(r.id);
         survivorLogged.delete(r.id);
         startLogged.delete(r.id);
@@ -667,7 +688,7 @@ export async function runGateStep({
   laneState = readLaneState, probe = probeHandle, readStart = readProcStart, kill = process.kill.bind(process),
   onGate = () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pidExists = pidExistsDefault,
   groupExists = groupExistsDefault, listJobs = () => createJobStore(jobsDir).list(), scanLane = findLaneGatePidsDefault,
-  supervisorHandle = selfHandleOrNull,
+  supervisorHandle = selfHandleOrNull, onGateSettled = () => {},
 }) {
   const deps = { probe, pidExists, groupExists };
   const where = `${input.pool}/lane-${input.lane} @ ${String(input.headSha).slice(0, 8)}`;
@@ -803,6 +824,8 @@ export async function runGateStep({
     ok = false;
     error = e;
   }
+  // The leader has exited and been reaped: from here a stop handler treats its pid as possibly reused.
+  if (spawnedPid != null) { try { onGateSettled(); } catch {} }
   const after = laneState(input.dir).marker;
   const markerOut = after ? { status: after.status, sha: after.sha ?? null, runId: after.runId ?? null } : null;
   if (spawnedPid == null) noGate('not spawned');
@@ -886,11 +909,17 @@ export function releaseLaneByOperator({ jobsDir, dir, who = 'operator', deps = {
   }
   const claim = cur.seq > 0 && !cur.released && releaseLaneClaim(jobsDir, cur, { by: who, why: 'release-lane' }) ? cur.seq : null;
   const setAside = [];
-  for (const { id, state } of states) {
+  for (const { id, gate, state } of states) {
     if (state !== 'unknown') continue;
-    const path = gatePath(jobsDir, id);
-    renameSync(path, `${path}.released-${Date.now()}`);
-    writeJson(path, { pid: null, handle: null, none: true, why: `released by ${who}`, dir, at: new Date().toISOString() });
+    // Released by proof file, keyed by the exact record the operator judged ({@link goneProofPath}) — the sidecar is
+    // never rewritten: a supervisor relaunched since this read records a new gate there, which this release never touches.
+    if (gate?.unreadable) {
+      // Keyed by the exact bytes judged unreadable; a file that could not be read at all has none, so it stays held.
+      if (!gate.textHash) continue;
+      try { createExclusive(join(jobsDir, `${id}${GONE_SUFFIX}raw-${gate.textHash}`), { goneAt: new Date().toISOString(), releasedBy: who }); } catch { continue; }
+    } else {
+      try { createExclusive(goneProofPath(jobsDir, id, gate), { goneAt: new Date().toISOString(), releasedBy: who }); } catch { continue; }
+    }
     setAside.push(id);
   }
   return { claim, setAside };
@@ -899,18 +928,22 @@ export function releaseLaneByOperator({ jobsDir, dir, who = 'operator', deps = {
 /**
  * The supervisor's SIGTERM/SIGINT handler: a stopped supervisor (stalled, or `restartInFlight: kill`) takes its gate
  * group down with it — never an orphan. `getPid` reads the pid `onGate` captured at spawn (before the sidecar write).
+ * Once the leader has exited (`getSettled`), it is reaped and its pid may be handed to an unrelated process: only a
+ * leftover group is then killed, while that pid exists nowhere ({@link killOrphanGroup}).
  */
-export function gateStopHandler({ getPid, kill = process.kill.bind(process), exit = (code) => process.exit(code) }) {
+export function gateStopHandler({ getPid, getSettled = () => false, kill = process.kill.bind(process), exit = (code) => process.exit(code) }) {
   return () => {
     const pid = getPid();
-    try { if (Number.isInteger(pid) && pid > 1) kill(-pid, 'SIGKILL'); } catch {}
+    if (getSettled()) killOrphanGroup(pid, { kill });
+    else { try { if (Number.isInteger(pid) && pid > 1) kill(-pid, 'SIGKILL'); } catch {} }
     exit(143);
   };
 }
 
 async function jobMain() {
   let gatePid = null;
-  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, gateStopHandler({ getPid: () => gatePid }));
+  let gateSettled = false;
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, gateStopHandler({ getPid: () => gatePid, getSettled: () => gateSettled }));
   const jobsDir = process.env.OPERATION_RUNS_DIR;
   const attempt = Number(process.env[JOB_ATTEMPT_ENV]) || 1;
   const out = await runJob({
@@ -919,7 +952,7 @@ async function jobMain() {
       run: async ({ jobId, input }) => {
         // runJob has read these; the gate's own children (verify-lane, the test runner) must not inherit them.
         for (const k of [JOB_ID_ENV, JOB_ATTEMPT_ENV, JOB_HEARTBEAT_MS_ENV, 'OPERATION_RUNS_DIR']) delete process.env[k];
-        return runGateStep({ jobId, input, jobsDir, attempt, onGate: (pid) => { gatePid = pid; } });
+        return runGateStep({ jobId, input, jobsDir, attempt, onGate: (pid) => { gatePid = pid; }, onGateSettled: () => { gateSettled = true; } });
       },
     }],
   });

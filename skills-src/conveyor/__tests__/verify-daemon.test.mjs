@@ -596,6 +596,38 @@ describe('in-flight PID reconciliation', () => {
     expect(log.mock.calls.flat().join('\n')).toMatch(/settled leader's process group is gone \(pid 777 since reused\) — released/);
   });
 
+  it('PR 4764 round 9 (prevention): EVERY consumer of the in-flight registry never signals a leader-settled entry whose pid was reused', async () => {
+    // One entry whose leader settled; its pid now belongs to an unrelated live process that leads its own group, so every
+    // probe answers "exists". The kill is fully mocked — no real signal is sent, with or without the fix.
+    const settledEntry = () => ({ pool: 'p', lane: 1, dir: '/lanes/a', runId: 'run-a', pid: 424242, sha: 'aaa', startedMs: 1, leaderSettled: true });
+    const sigkills = (calls) => calls.filter(([, s]) => s === 'SIGKILL' || s === undefined);
+    // 1. killInFlight — every non-handoff exit path (lease lost, restartInFlight: kill, a failed hand-off).
+    const k1 = [];
+    killInFlight(new Map([['/lanes/a', settledEntry()]]), (p, s) => { k1.push([p, s]); return true; });
+    expect(sigkills(k1)).toEqual([]);
+    // 2. createCleanup — kill mode and adopt mode with a failing hand-off both end in killInFlight.
+    for (const restartInFlight of ['kill', 'adopt']) {
+      const k2 = [];
+      const c = createCleanup({ inFlight: new Map([['/lanes/a', settledEntry()]]), stopHeartbeat: () => {}, release: () => {},
+        kill: (p, s) => { k2.push([p, s]); return true; }, exit: () => {}, log: { error: () => {} }, restartInFlight,
+        handoff: () => { throw new Error('disk full'); } });
+      c.stopAndExit('test', { adoptable: true });
+      expect(sigkills(k2)).toEqual([]);
+    }
+    // 3. reconcile — released without a kill.
+    const k3 = vi.fn();
+    const inFlight = new Map([['/lanes/a', settledEntry()]]);
+    reconcileInFlight(inFlight, { isAlive: () => true, groupAlive: () => true, killGroup: k3, log: () => {} });
+    expect(k3).not.toHaveBeenCalled();
+    // 4. hand-off — the flag survives, so the successor applies the same rule.
+    const root = mkdtempSync(join(tmpdir(), 'verify-settled-sweep-'));
+    try {
+      writeInFlightHandoff(new Map([['/lanes/a', settledEntry()]]), join(root, 'h.json'));
+      expect(JSON.parse(readFileSync(join(root, 'h.json'), 'utf8')).records[0].leaderSettled).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+    // 5. supersede — covered in verify-dispatch.test.mjs ("a superseded in-process entry whose leader settled ...").
+  });
+
   it('PR 4764 round 8: a settled leader\'s leftover group is killed each tick and released once gone — not logged as a re-queued orphan', () => {
     const inFlight = new Map([['lane', entry({ leaderSettled: true })]]);
     let group = true;
