@@ -234,7 +234,22 @@ export function gateState(gate, { probe = probeHandle, pidExists = pidExistsDefa
  */
 export function markGone(dir, id, gate) {
   if (!gate || gate.unreadable || gate.none || gate.gone || (gate.pid == null && !gate.handle)) return;
+  // Re-read right before the write: a newer attempt may have recorded its own gate since `gate` was read, and the
+  // proof about the old one must never overwrite it.
+  if (JSON.stringify(readGate(dir, id)) !== JSON.stringify(gate)) return;
   try { writeJson(gatePath(dir, id), { ...gate, gone: true, goneAt: new Date().toISOString() }); } catch {}
+}
+
+/**
+ * The leader pid of a recorded gate whose leader is PROVEN gone (its handle probes dead and that pid exists nowhere)
+ * while its process GROUP still has members — test runners that outlived it. Those members are this gate's: a pid is
+ * never handed out while a live group carries it, so the group the leader made is still the only one with that id.
+ * Null in every other case, and whenever a check cannot answer.
+ */
+export function orphanGroupPid(gate, { probe = probeHandle, pidExists = pidExistsDefault, groupExists = groupExistsDefault } = {}) {
+  const pid = gatePid(gate);
+  if (!pid || gate.gone) return null;
+  try { return probe(gate.handle) === 'dead' && !pidExists(pid) && groupExists(pid) ? pid : null; } catch { return null; }
 }
 
 /** The gate process recorded by a job's supervisor: `{gate, state, alive}` ({@link gateState}; `alive` = proven alive). */
@@ -252,7 +267,9 @@ const CLAIM_KEEP = 8;
 const claimDirOf = (jobsDir) => join(jobsDir, LANE_CLAIM_DIR);
 /** A lane dir as ONE spelling: its real path (symlinks, `..`, a trailing slash all collapse), else its resolved form. */
 export function laneRealDir(dir) {
-  try { return realpathSync(String(dir)); } catch { return resolve(String(dir)); }
+  // Only a lane that does not exist falls back to its resolved spelling; any other error throws (a different key would
+  // read another lane's claims — "never claimed"), and every caller treats a throw as "held".
+  try { return realpathSync(String(dir)); } catch (e) { if (e?.code === 'ENOENT') return resolve(String(dir)); throw e; }
 }
 /** One lane's key: the hash of its real dir — every comparison of two lane dirs goes through this. */
 export const laneKey = (dir) => createHash('sha1').update(laneRealDir(dir)).digest('hex').slice(0, 16);
@@ -503,10 +520,15 @@ export function createVerifyGateJobs({
         // re-probing, so an `unknown` survivor holds the lane with no pid (no proof the handle is still this gate,
         // a kill could hit a reused pid).
         const pid = survivor.state === 'alive' ? gatePid(survivor.gate) : null;
-        const killed = survivor.state === 'alive' && killGateGroup(survivor.gate, kill);
+        // A leader proven gone whose group lives on: the group is the gate's ({@link orphanGroupPid}), killed each tick.
+        const orphan = survivor.state === 'alive' ? null : orphanGroupPid(survivor.gate, deps);
+        let killed = survivor.state === 'alive' && killGateGroup(survivor.gate, kill);
+        if (orphan) { try { kill(-orphan, 'SIGKILL'); } catch {} killed = true; }
         if (!survivorLogged.has(r.id)) {
           survivorLogged.add(r.id);
-          log(`verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} ${how} but its gate pid ${survivor.gate.pid ?? '?'} may still be alive (${survivor.state}) — lane held${killed ? ', killing it each tick' : ', NOT killed (no trustworthy pid / unprobeable)'}`);
+          log(killed
+            ? `verify-daemon: gate job ${r.id} for ${input.pool}/lane-${input.lane} ${how} but its gate ${orphan ? `(leader pid ${orphan} gone) still has a live process group` : `pid ${survivor.gate.pid ?? '?'} is still alive`} — lane held, killing it each tick`
+            : `verify-daemon: ⚠ HEALTH gate job ${r.id} for ${input.pool}/lane-${input.lane} ${how} but its gate pid ${survivor.gate.pid ?? '?'} cannot be proven gone (${survivor.state}${survivor.gate.unreadable ? `, record unreadable: ${survivor.gate.unreadable}` : ''}) — lane held, NOT killed (no proof the pid is still that gate). If it is gone and cannot be proven, release it: node scripts/conveyor/verify-gate-job.mjs release-lane --dir=${JSON.stringify(String(input.dir))}`);
         }
         const prev = inFlight.get(input.dir);
         holdLane(input.dir, r, pid, prev);
@@ -568,7 +590,7 @@ export function createVerifyGateJobs({
         const held = laneHold(dir);
         if (!held) continue;
         const prev = inFlight.get(dir);
-        const jobId = held.claim?.jobId ?? `lane-claim:${laneKey(dir)}`;
+        const jobId = held.claim?.jobId ?? `lane-claim:${(() => { try { return laneKey(dir); } catch { return String(dir); } })()}`;
         live.add(jobId);
         holders.set(dir, { pool: where.pool, lane: where.lane, dir, runId: held.claim?.runId ?? null, sha: where.headSha ?? where.sha ?? null,
           suites: null, treeHash: null, requestStartedAt: null, jobId, pid: null,
@@ -590,6 +612,8 @@ export function createVerifyGateJobs({
         try { deleteRun(r.id, store.dir); } catch {}
         for (const ext of ['.log', GATE_SUFFIX, RESULT_SUFFIX, '.json.lock']) rmSync(join(store.dir, `${r.id}${ext}`), { force: true });
         consumed.delete(r.id);
+        survivorLogged.delete(r.id);
+        startLogged.delete(r.id);
       }
       try { writeJson(consumedPath, [...consumed]); } catch {}
       const referenced = records.filter((r) => !TERMINAL_JOB_STATUSES.includes(r.job.status)).flatMap((r) => r.job.snapshotKeys || []);
@@ -675,6 +699,18 @@ export async function runGateStep({
     }
     // A bounded kill attempt is not proof of death: never start a second gate beside one that still owns the marker.
     if (state === 'alive') state = gateState(prior.gate, deps);
+  }
+  // Its leader is proven gone but its process group lives on ({@link orphanGroupPid}): that group is the gate's — kill
+  // it, and go on only once the group is proven gone too.
+  const orphan = state === 'unknown' ? orphanGroupPid(prior.gate, deps) : null;
+  if (orphan) {
+    log(`[verify-gate-job ${jobId}] attempt ${attempt}: previous gate's leader pid ${orphan} is gone but its process group lives on — killing the group`);
+    try { kill(-orphan, 'SIGKILL'); } catch {}
+    for (let i = 0; i < 50; i += 1) {
+      state = gateState(prior.gate, deps);
+      if (state !== 'unknown') break;
+      await sleep(100);
+    }
   }
   if (state !== 'dead') {
     const g = prior.gate;
@@ -794,8 +830,10 @@ function otherLaneGate({ jobId, input, jobsDir, listJobs, scanLane, deps }) {
   const kind = VERIFY_GATE_JOB_KIND.kind;
   let listing;
   try { listing = listJobs(); } catch (e) { return `the gate jobs could not be listed (${errLine(e)})`; }
-  const key = laneKey(input.dir);
-  const sameLane = (d) => typeof d === 'string' && laneKey(d) === key; // two spellings of one lane are one lane
+  let key;
+  try { key = laneKey(input.dir); } catch (e) { return `this lane's identity cannot be read (${errLine(e)})`; }
+  // Two spellings of one lane are one lane; a dir whose identity cannot be read may be this lane.
+  const sameLane = (d) => { if (typeof d !== 'string') return false; try { return laneKey(d) === key; } catch { return true; } };
   const peers = [
     ...(listing?.records || []).filter((r) => r.id !== jobId && r.job?.kind === kind && sameLane(r.input?.dir))
       .map((r) => ({ id: r.id, gate: readGate(jobsDir, r.id) })),
@@ -833,10 +871,18 @@ export function releaseLaneByOperator({ jobsDir, dir, who = 'operator', deps = {
   let sup = null;
   if (cur.seq > 0 && !cur.released && cur.claim) { try { sup = parseJobHandle(cur.claim.supervisor) ? (deps.probe ?? probeHandle)(cur.claim.supervisor) : null; } catch { sup = null; } }
   const alive = states.filter((s) => s.state === 'alive').map((s) => s.id);
-  if (sup === 'alive' || alive.length) {
+  // A recorded leader that exists nowhere while its process group still has members: that group is running (it is
+  // positive evidence, not doubt), so the operator kills it before releasing — never released beside it.
+  const orphans = states.filter((s) => s.state === 'unknown').map((s) => {
+    const pid = Number(s.gate?.pid);
+    if (!Number.isInteger(pid) || pid <= 1) return null;
+    try { return !(deps.pidExists ?? pidExistsDefault)(pid) && (deps.groupExists ?? groupExistsDefault)(pid) ? pid : null; } catch { return null; }
+  }).filter(Boolean);
+  if (sup === 'alive' || alive.length || orphans.length) {
     return { claim: null, setAside: [], refused: sup === 'alive'
       ? `job ${cur.claim.jobId}'s supervisor is running (it may be about to spawn its gate) — stop it first`
-      : `the gate of job ${alive.join(', ')} is proven alive — kill it first` };
+      : alive.length ? `the gate of job ${alive.join(', ')} is proven alive — kill it first`
+        : `the process group of gate pid ${orphans.join(', ')} still has members — kill it first (kill -9 -<pid>)` };
   }
   const claim = cur.seq > 0 && !cur.released && releaseLaneClaim(jobsDir, cur, { by: who, why: 'release-lane' }) ? cur.seq : null;
   const setAside = [];

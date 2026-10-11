@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist, killOrphanGroup } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -1233,6 +1233,39 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
       for (let i = 0; i < 100 && processGroupMayExist(runners.pid); i += 1) await new Promise((r) => setTimeout(r, 50));
       expect(processGroupMayExist(runners.pid)).toBe(false); // the daemon's reconcile drops the entry from here
     } finally { try { process.kill(-runners.pid, 'SIGKILL'); } catch {} }
+  });
+
+  it('PR 4764 round 8: killOrphanGroup signals a settled leader\'s group only while its pid exists nowhere and the group has members', () => {
+    const esrch = () => { throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' }); };
+    const calls = [];
+    const fake = (table) => (pid, sig) => { calls.push([pid, sig]); const r = table(pid, sig); if (r === 'esrch') esrch(); return true; };
+    // Leader gone, group alive: killed.
+    expect(killOrphanGroup(700, { kill: fake((pid, sig) => (pid === 700 && sig === 0 ? 'esrch' : 'ok')) })).toBe(true);
+    expect(calls).toContainEqual([-700, 'SIGKILL']);
+    calls.length = 0;
+    // The pid exists again (reused): never signalled, whatever group it leads now.
+    expect(killOrphanGroup(701, { kill: fake(() => 'ok') })).toBe(false);
+    expect(calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    // Leader and group both gone: nothing to kill.
+    expect(killOrphanGroup(702, { kill: fake(() => 'esrch') })).toBe(false);
+    // A probe that cannot answer (EPERM): fail closed, no kill.
+    expect(killOrphanGroup(703, { kill: (pid, sig) => { if (sig === 0 && pid > 0) throw Object.assign(new Error('EPERM'), { code: 'EPERM' }); return true; } })).toBe(false);
+    expect(killOrphanGroup(1)).toBe(false);
+  });
+
+  it('PR 4764 round 8: a superseded in-process entry whose leader settled is killed only as an orphan group, never by a reused pid', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    const headSha = execFileSync('git', ['-C', laneDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    // An older run for this lane whose leader settled; its pid now belongs to an unrelated live process (every probe
+    // answers "exists"). The kill is fully mocked: no real signal is ever sent, with or without the fix.
+    const inFlight = new Map([[laneDir, { pool: 'flagtest', lane: 1, dir: laneDir, runId: 'old-run', pid: 424242, sha: headSha,
+      suites: 'other-gate', requestStartedAt: '2000-01-01T00:00:00.000Z', startedMs: 1, leaderSettled: true }]]);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const result = await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: false, spawnGate: () => new Promise(() => {}) });
+      expect(result.superseded).toEqual([expect.objectContaining({ runId: 'old-run' })]);
+      expect(kill.mock.calls.filter(([, s]) => s === 'SIGKILL')).toEqual([]);
+    } finally { kill.mockRestore(); }
   });
 
   it('a lane the job store says is held (laneHeld) is deferred at spawn time, in both modes — never spawned or queued', async () => {

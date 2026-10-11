@@ -11,7 +11,7 @@
  *   advancing (at least every 2 minutes) throughout, rather than lapsing mid-gate.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -585,6 +585,32 @@ describe('in-flight PID reconciliation', () => {
     expect(log.mock.calls.flat().filter((l) => /not confirmed gone/.test(l))).toHaveLength(1);
   });
 
+  it('PR 4764 round 8: a settled leader whose pid exists again was reused — its group is gone: released, never killed', () => {
+    const inFlight = new Map([['lane', entry({ leaderSettled: true })]]);
+    const killGroup = vi.fn(); const log = vi.fn();
+    // The reused pid is now some other process that leads its own group: neither may be signalled.
+    const result = reconcileInFlight(inFlight, { isAlive: () => true, groupAlive: () => true, killGroup, log });
+    expect(killGroup).not.toHaveBeenCalled();
+    expect(inFlight.size).toBe(0);
+    expect(result.orphaned).toEqual([]);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/settled leader's process group is gone \(pid 777 since reused\) — released/);
+  });
+
+  it('PR 4764 round 8: a settled leader\'s leftover group is killed each tick and released once gone — not logged as a re-queued orphan', () => {
+    const inFlight = new Map([['lane', entry({ leaderSettled: true })]]);
+    let group = true;
+    const killGroup = vi.fn(); const log = vi.fn();
+    const opts = { isAlive: () => false, groupAlive: () => group, killGroup, log };
+    reconcileInFlight(inFlight, opts);
+    expect(inFlight.has('lane')).toBe(true);
+    expect(killGroup).toHaveBeenCalledWith(-777);
+    group = false;
+    expect(reconcileInFlight(inFlight, opts).orphaned).toEqual([]);
+    expect(inFlight.size).toBe(0);
+    expect(log.mock.calls.flat().join('\n')).toMatch(/leftover process group of pid 777 gone — released/);
+    expect(log.mock.calls.flat().join('\n')).not.toMatch(/re-queued/);
+  });
+
   // A pid whose process and group are both gone may already belong to an unrelated process that became its own
   // group leader; signalling -pid would kill that stranger.
   it('never signals the group of a dead PID when no member of the group remains', () => {
@@ -766,6 +792,39 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
       rmSync(root, { recursive: true, force: true });
     }
   }, 10000);
+
+  it('PR 4764 round 8: a hand-off carries a leader-settled run; the successor adopts its leftover group (leader gone, group alive) and skips a reused pid', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-adopt-group-'));
+    try {
+      const path = join(root, 'inflight.json');
+      writeInFlightHandoff(new Map([
+        ['/lanes/a', { pool: 'p', lane: 1, dir: '/lanes/a', runId: 'run-a', pid: 501, sha: 'aaa', startedMs: 1, leaderSettled: true }],
+        ['/lanes/b', { pool: 'p', lane: 2, dir: '/lanes/b', runId: 'run-b', pid: 502, sha: 'bbb', startedMs: 1, leaderSettled: true }],
+        ['/lanes/c', { pool: 'p', lane: 3, dir: '/lanes/c', runId: 'run-c', pid: 503, sha: 'ccc', startedMs: 1 }],
+      ]), path);
+      expect(JSON.parse(readFileSync(path, 'utf8')).records[0]).toMatchObject({ leaderSettled: true });
+      const inFlight = new Map();
+      const adopted = adoptInFlight(inFlight, { path, log: () => {}, isOurs: () => false,
+        pidExists: (pid) => pid === 502, groupAlive: (pid) => pid !== 503 });
+      expect(adopted.map((r) => r.runId)).toEqual(['run-a']); // b: pid reused; c: leader and group both gone
+      expect(inFlight.get('/lanes/a')).toMatchObject({ adopted: true, leaderSettled: true, pid: 501 });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('PR 4764 round 8: an unreadable hand-off is kept and raised as a HEALTH alert, never read as "nothing left running"', () => {
+    const root = mkdtempSync(join(tmpdir(), 'verify-adopt-torn-'));
+    try {
+      const path = join(root, 'inflight.json');
+      writeFileSync(path, '{"records": [{"pid": 5');
+      const log = vi.fn();
+      expect(adoptInFlight(new Map(), { path, log })).toEqual([]);
+      expect(log.mock.calls.flat().join('\n')).toMatch(/⚠ HEALTH the in-flight hand-off .* cannot be read/);
+      expect(existsSync(path)).toBe(false);
+      expect(readdirSync(root).some((n) => n.startsWith('inflight.json.unreadable-'))).toBe(true);
+      expect(adoptInFlight(new Map(), { path: join(root, 'absent.json'), log })).toEqual([]); // no file: nothing handed off, no alert
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 
   it('an adopted run that exits is released (its child wrote the marker); one past the ceiling is killed and settled', () => {
     const log = vi.fn();

@@ -280,6 +280,17 @@ export function reconcileInFlight(inFlight, {
     // PR 4764 round 7 — a lane passes on only once its gate's process GROUP is confirmed gone: re-checked after the
     // kill, and a group still there (or a check that fails) keeps the entry for the next tick to retry.
     const groupGone = () => { try { return !groupAlive(pid); } catch { return false; } };
+    // A run whose leader already settled (its group outlived it): if that pid exists again it was reused, which a pid
+    // never is while a live group carries it, so our group is gone. Released — never killed (the pid is not ours).
+    if (entry.leaderSettled && pid > 0) {
+      let reused = false;
+      try { reused = isAlive(pid); } catch {}
+      if (reused) {
+        inFlight.delete(dir);
+        log(`verify-daemon: ${pool}/lane-${lane} run ${String(runId).slice(0, 8)}: its settled leader's process group is gone (pid ${pid} since reused) — released`);
+        continue;
+      }
+    }
     if (entry.adopted && pid > 0 && !entry.ceilingKilled && isAlive(pid) && nowMs - startedMs > adoptedCeilingMs) {
       try { if (groupAlive(pid)) killGroup(-pid); } catch {}
       entry.ceilingKilled = true;
@@ -310,6 +321,10 @@ export function reconcileInFlight(inFlight, {
     }
     inFlight.delete(dir);
     if (entry.ceilingKilled) continue; // already settled and reported when the ceiling killed it
+    if (entry.leaderSettled) { // its leader settled the marker; only the leftover group was being waited out
+      log(`verify-daemon: ${pool}/lane-${lane} run ${String(runId).slice(0, 8)}: leftover process group of pid ${pid} gone — released`);
+      continue;
+    }
     // An adopted run that exited wrote its own terminal marker; only a run that died unsettled is re-queued.
     log(entry.adopted
       ? `verify-daemon: ${pool}/lane-${lane} adopted run ${String(runId).slice(0, 8)} finished (pid ${pid} gone) — released`
@@ -406,8 +421,9 @@ export function resolveRestartInFlight(env = process.env, fileConfig = loadVerif
 export function inFlightHandoff(inFlight) {
   return [...inFlight.values()]
     .filter((e) => e.pid > 0 && e.dir && e.runId)
-    .map(({ pool, lane, dir, runId, pid, sha, suites, treeHash, requestStartedAt, startedMs, logPath }) =>
-      ({ pool, lane, dir, runId, pid, sha, suites, treeHash: treeHash ?? null, requestStartedAt: requestStartedAt ?? null, startedMs, logPath: logPath ?? null }));
+    .map(({ pool, lane, dir, runId, pid, sha, suites, treeHash, requestStartedAt, startedMs, logPath, leaderSettled }) =>
+      ({ pool, lane, dir, runId, pid, sha, suites, treeHash: treeHash ?? null, requestStartedAt: requestStartedAt ?? null, startedMs, logPath: logPath ?? null,
+        ...(leaderSettled ? { leaderSettled: true } : {}) }));
 }
 
 export function writeInFlightHandoff(inFlight, path = VERIFY_DAEMON_INFLIGHT_FILE) {
@@ -433,14 +449,34 @@ export function isDispatchedRun(pid, runId, readCommand = (p) => execFileSync('p
  * consumed (removed) whatever it held; a record whose pid is gone or is no longer our child is skipped — its
  * marker either already settled or stays `running` and is re-dispatched as before.
  */
-export function adoptInFlight(inFlight, { path = VERIFY_DAEMON_INFLIGHT_FILE, isOurs = isDispatchedRun, log = console.error } = {}) {
+export function adoptInFlight(inFlight, { path = VERIFY_DAEMON_INFLIGHT_FILE, isOurs = isDispatchedRun, log = console.error,
+  pidExists = pidAlive, groupAlive = processGroupAlive } = {}) {
   let parsed;
-  try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch { return []; }
+  try { parsed = JSON.parse(readFileSync(path, 'utf8')); } catch (error) {
+    if (error?.code === 'ENOENT') return [];
+    // PR 4764 — an unreadable hand-off is not "no gates left running": keep it for diagnosis and say so loudly. The
+    // lanes it named are still guarded by the store's claims and the rollback process scan.
+    const kept = `${path}.unreadable-${Date.now()}`;
+    try { renameSync(path, kept); } catch {}
+    log(`verify-daemon: ⚠ HEALTH the in-flight hand-off ${path} cannot be read (${String(error?.message || error).split('\n')[0]}) — its gates may still run; kept as ${kept}. Check for verify gates left running before clearing it.`);
+    return [];
+  }
   try { rmSync(path, { force: true }); } catch {}
   const adopted = [];
   for (const record of Array.isArray(parsed?.records) ? parsed.records : []) {
     if (!(record?.pid > 0) || !record.dir || !record.runId || inFlight.has(record.dir)) continue;
-    if (!isOurs(record.pid, record.runId)) continue;
+    if (!isOurs(record.pid, record.runId)) {
+      // PR 4764 — the leader is gone, but its process group may live on (test runners that outlived it). While that
+      // pid exists nowhere and the group has members, the group is this gate's: hold the lane until it is gone (the
+      // reconcile kills it). A pid that exists again was reused, so the group is gone.
+      let orphan = false;
+      try { orphan = !pidExists(record.pid) && groupAlive(record.pid); } catch { orphan = false; }
+      if (!orphan) continue;
+      inFlight.set(record.dir, { ...record, adopted: true, leaderSettled: true });
+      adopted.push(record);
+      log(`verify-daemon: adopted the leftover process group of run ${String(record.runId).slice(0, 8)} for ${record.pool}/lane-${record.lane} (leader pid ${record.pid} gone) — lane held until it is gone`);
+      continue;
+    }
     inFlight.set(record.dir, { ...record, adopted: true });
     adopted.push(record);
     log(`verify-daemon: adopted in-flight run ${String(record.runId).slice(0, 8)} for ${record.pool}/lane-${record.lane} @ ${String(record.sha).slice(0, 8)} (pid ${record.pid})`);

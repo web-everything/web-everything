@@ -559,6 +559,19 @@ export function processGroupMayExist(pgid) {
 }
 
 /**
+ * SIGKILL the surviving group of a gate whose leader already exited — only while the leader's pid exists nowhere and
+ * the group still has members (then the group is the gate's: a pid is not reused while a group carries it). A pid that
+ * exists again was reused, so its group is not ours. Fails closed: a check that cannot answer kills nothing.
+ * @returns {boolean} whether a kill was sent
+ */
+export function killOrphanGroup(pid, { kill = process.kill.bind(process) } = {}) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try { kill(pid, 0); return false; } catch (e) { if (e?.code !== 'ESRCH') return false; }
+  try { kill(-pid, 0); } catch (e) { if (e?.code === 'ESRCH') return false; }
+  try { kill(-pid, 'SIGKILL'); return true; } catch { return false; }
+}
+
+/**
  * Run ONE lane's gate to settlement: spawn `verify-lane.mjs` under both ceilings ({@link spawnGateBounded}) and,
  * when the run was killed (a ceiling, a signal), stamp the infrastructure failure on the still-owned marker
  * ({@link recordKilledVerification}). Resolves on a clean exit; rejects with the spawn error otherwise (exit 2 =
@@ -690,6 +703,9 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
           let killed = !entry.jobId;
           try {
             if (entry.jobId) killed = killJobGate?.(entry) === true;
+            // A settled leader's pid may already belong to another process: its group is ours only while that pid
+            // exists nowhere (a pid is never handed out while a live group carries it).
+            else if (entry.leaderSettled) killed = killOrphanGroup(entry.pid);
             else if (entry.pid > 1) process.kill(-entry.pid, 'SIGKILL');
           } catch {}
           log(`  ✂ ${pool}/lane-${lane}: in-flight run ${String(entry.runId).slice(0, 8)} superseded by a newer request — ${killed

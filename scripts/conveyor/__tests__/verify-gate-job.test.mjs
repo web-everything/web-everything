@@ -901,6 +901,104 @@ describe('round 7 self-review: proof kept, rollback orphans stopped, release gua
   });
 });
 
+describe('round 8 self-review: a leftover process group is the gate\'s, and no doubt reads as "gone" (PR 4764)', () => {
+  const running = { status: 'running', sha: 'abc12345', startedAt: INPUT.requestStartedAt, suites: 'true' };
+  const laneState = () => ({ marker: running, headSha: 'abc12345' });
+  const noReattach = async () => ({ actions: [] });
+  const soon = () => Date.parse(AT) + 60_000;
+  const mk = (extra = {}) => createVerifyGateJobs({ store, reattach: noReattach, readHead: () => 'c0de', log: () => {},
+    probe: () => 'dead', evict: () => {}, snapshot: {}, pidExists: () => false, groupExists: () => false, kill: vi.fn(), now: soon, ...extra });
+  const finishedWith = (sidecar) => {
+    const q = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: INPUT, codeSha: 'c0de' });
+    store.update(q.id, (r) => markFailed(r, { at: AT, reason: 'x' }));
+    writeFileSync(gatePath(dir, q.id), JSON.stringify(sidecar));
+    return q;
+  };
+
+  it('S1 — a finished job whose gate leader is proven gone while its group lives on: the group is killed each tick, the lane held until it is gone', async () => {
+    const q = finishedWith({ pid: 990, handle: 'h:990:s', runId: 'run-1', dir: INPUT.dir });
+    let group = true;
+    const kill = vi.fn((pid, sig) => { if (sig === 'SIGKILL' && pid === -990) group = false; });
+    const log = vi.fn();
+    const jobs = mk({ kill, log, groupExists: () => group });
+    const inFlight = new Map();
+    await jobs.sync(inFlight);
+    expect(kill).toHaveBeenCalledWith(-990, 'SIGKILL');
+    expect(inFlight.get(INPUT.dir)).toMatchObject({ jobId: q.id, pid: null });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/leader pid 990 gone\) still has a live process group — lane held, killing it each tick/);
+    await jobs.sync(inFlight);
+    expect(inFlight.has(INPUT.dir)).toBe(false); // the group is gone now: proven, released
+  });
+
+  it('S1 — a pid that exists again (reused) is never killed as a leftover group, and a held-not-killed lane raises a HEALTH alert', async () => {
+    finishedWith({ pid: 991, handle: 'h:991:s', runId: 'run-1', dir: INPUT.dir });
+    const kill = vi.fn();
+    const log = vi.fn();
+    // probe dead + pid exists → the leader was reused: dead (as before). A pid-only record whose pid exists: unknown, held.
+    const q2 = enqueueJob({ store, kindDef: VERIFY_GATE_JOB_KIND, input: { ...INPUT, dir: '/lanes/we/lane-4', runId: 'run-2' }, codeSha: 'c0de' });
+    store.update(q2.id, (r) => markFailed(r, { at: AT, reason: 'x' }));
+    writeFileSync(gatePath(dir, q2.id), JSON.stringify({ pid: 992, handle: null, runId: 'run-2' }));
+    const inFlight = new Map();
+    await mk({ kill, log, pidExists: () => true, groupExists: () => true }).sync(inFlight);
+    expect(kill).not.toHaveBeenCalled();
+    expect(inFlight.has(INPUT.dir)).toBe(false);
+    expect(inFlight.get('/lanes/we/lane-4')).toMatchObject({ jobId: q2.id, pid: null });
+    expect(log.mock.calls.flat().join('\n')).toMatch(/⚠ HEALTH gate job .* cannot be proven gone \(unknown\) — lane held, NOT killed.*release-lane --dir="\/lanes\/we\/lane-4"/);
+  });
+
+  it('S1 — a retry over a leftover group kills it and starts only once the group is proven gone; a group that survives refuses the run', async () => {
+    writeFileSync(gatePath(dir, 'rt'), JSON.stringify({ pid: 993, handle: 'h:993:s', runId: 'run-1', dir: INPUT.dir }));
+    let group = true;
+    const kill = vi.fn((pid, sig) => { if (sig === 'SIGKILL' && pid === -993) group = false; });
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'rt', input: INPUT, jobsDir: dir, attempt: 2, runGate, log: () => {}, laneState, kill,
+      probe: () => 'dead', pidExists: () => false, groupExists: () => group, scanLane: () => [], supervisorHandle: () => 'h:77:s', sleep: async () => {} });
+    expect(kill).toHaveBeenCalledWith(-993, 'SIGKILL');
+    expect(out.outcome).toBe('green');
+    expect(runGate).toHaveBeenCalledTimes(1);
+
+    writeFileSync(gatePath(dir, 'rs'), JSON.stringify({ pid: 994, handle: 'h:994:s', runId: 'run-1', dir: '/lanes/we/lane-9' }));
+    const runGate2 = vi.fn(async () => {});
+    const out2 = await runGateStep({ jobId: 'rs', input: { ...INPUT, dir: '/lanes/we/lane-9' }, jobsDir: dir, attempt: 2, runGate: runGate2, log: () => {},
+      laneState, kill: vi.fn(), probe: () => 'dead', pidExists: () => false, groupExists: () => true, scanLane: () => [], supervisorHandle: () => 'h:77:s', sleep: async () => {} });
+    expect(out2.outcome).toBe('failed');
+    expect(runGate2).not.toHaveBeenCalled();
+  });
+
+  it('S1 — release-lane refuses while a recorded gate\'s leader exists nowhere but its group still has members', () => {
+    const q = finishedWith({ pid: 995, handle: null, runId: 'run-1', dir: INPUT.dir });
+    const refused = gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps: { probe: () => 'dead', pidExists: () => false, groupExists: () => true } });
+    expect(refused.refused).toMatch(/process group of gate pid 995 still has members/);
+    expect(JSON.parse(readFileSync(gatePath(dir, q.id), 'utf8'))).toMatchObject({ pid: 995 }); // untouched
+    // A pid that exists with no start time is the doubt release-lane is for: released.
+    expect(gateJob.releaseLaneByOperator({ jobsDir: dir, dir: INPUT.dir, deps: { probe: () => 'dead', pidExists: () => true, groupExists: () => true } }))
+      .toMatchObject({ setAside: [q.id] });
+  });
+
+  it('S6 — markGone never overwrites a record a newer attempt wrote since the proof was read', () => {
+    const old = { pid: 996, handle: 'h:996:s', runId: 'run-1', attempt: 1 };
+    writeFileSync(gatePath(dir, 'mg'), JSON.stringify({ pid: null, handle: null, pending: true, runId: 'run-1', attempt: 2 }));
+    gateJob.markGone(dir, 'mg', old);
+    expect(JSON.parse(readFileSync(gatePath(dir, 'mg'), 'utf8'))).toMatchObject({ pending: true, attempt: 2 });
+    writeFileSync(gatePath(dir, 'mg'), JSON.stringify(old));
+    gateJob.markGone(dir, 'mg', old);
+    expect(JSON.parse(readFileSync(gatePath(dir, 'mg'), 'utf8'))).toMatchObject({ pid: 996, gone: true });
+  });
+
+  it('S5 — a lane whose identity cannot be read (not "missing") is held, never keyed by another spelling', async () => {
+    const loop = join(dir, 'loop');
+    symlinkSync(loop, loop); // realpath: ELOOP
+    expect(() => gateJob.laneRealDir(loop)).toThrow();
+    expect(gateJob.laneRealDir(join(dir, 'gone', 'lane-1'))).toBe(join(dir, 'gone', 'lane-1')); // a missing lane: its resolved spelling
+    expect(mk().laneHeld(loop)).toMatch(/cannot be listed/);
+    const runGate = vi.fn(async () => {});
+    const out = await runGateStep({ jobId: 'lp', input: { ...INPUT, dir: loop }, jobsDir: dir, runGate, log: () => {}, laneState,
+      scanLane: () => [], supervisorHandle: () => 'h:77:s', probe: () => 'dead' });
+    expect(out.outcome).toBe('failed');
+    expect(runGate).not.toHaveBeenCalled();
+  });
+});
+
 describe('findLaneGatePidsDefault (real processes)', () => {
   it('findLaneGatePidsDefault finds a real gate by its exact --repo token (with a --run-id), and nothing else', async () => {
     const lane = join(dir, 'lane 7'); // a space in the path must still match exactly
