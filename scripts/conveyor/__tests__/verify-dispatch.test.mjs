@@ -953,7 +953,13 @@ it('settles a superseded run in the background without overwriting the newer req
   const path = join(laneDir, '.git', '.lane-verify');
   const newer = { ...JSON.parse(readFileSync(path, 'utf8')), runId: 'new-request', startedAt: '2099-01-01T00:00:00.000Z' };
   writeFileSync(path, JSON.stringify(newer));
-  const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  // The SIGKILL takes the gate's group down: once signalled, an existence probe (signal 0) finds no such group.
+  let groupKilled = false;
+  const kill = vi.spyOn(process, 'kill').mockImplementation((_pid, sig) => {
+    if (sig === 0 && groupKilled) throw Object.assign(new Error('ESRCH'), { code: 'ESRCH' });
+    if (sig === 'SIGKILL') groupKilled = true;
+    return true;
+  });
   try {
     vi.stubEnv('VERIFY_DISPATCH_KILL_SUPERSEDED', '0');
     expect((await runVerifyDispatch(opts)).superseded).toEqual([]);
