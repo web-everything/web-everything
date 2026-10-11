@@ -120,14 +120,15 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
-import { reduceCheckState } from '../operations/pr-status.mjs';
+import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
+import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER } from './ci-heal-mark.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -404,6 +405,102 @@ const OWED_ELSEWHERE = Object.freeze({
  * own copy's value so a drift between them fails loud in CI rather than silently diverging.
  */
 export const CI_HEAL_ROUND_CAP = 3;
+
+/** `ciHeal.attemptCap` / `ciHeal.resetOnFixHead` — the ci-heal budget settings (live PR #4631, 2026-10-10). */
+export const CI_HEAL_ATTEMPT_CAP_ENV = 'WE_CI_HEAL_ATTEMPT_CAP';
+export const CI_HEAL_RESET_ON_FIX_HEAD_ENV = 'WE_CI_HEAL_RESET_ON_FIX_HEAD';
+const asHealCap = (v) => { const s = String(v ?? '').trim(); return /^\d{1,2}$/.test(s) ? Number(s) : null; };
+const asFlag = (v) => {
+  if (typeof v === 'boolean') return v;
+  const s = String(v ?? '').trim().toLowerCase();
+  return ['1', 'true', 'on'].includes(s) ? true : ['0', 'false', 'off'].includes(s) ? false : null;
+};
+
+/**
+ * PURE: the ci-heal budget cascade — standard default → platform preference (`platform.ciHeal`) → tool override
+ * (`repo`, the `ciHeal` settings block) → env. An invalid layer is skipped, never trusted. Each value carries the
+ * layer that set it, and that source rides on every ci-heal row and note, so the log names where the budget came from.
+ * `resetOnFixHead` (standard `true`): a fixer's push (a new non-mechanical head) starts a new heal budget — LIVE PR
+ * #4631 2026-10-10 22:11 ET was refused "exhausted (3/3)" five minutes after the fixer pushed a real fix, on heals
+ * spent against older heads. Still bounded: fix rounds have their own cap, so heal↔fix cannot alternate forever.
+ * @returns {{cap:number, capSource:string, resetOnFixHead:boolean, resetSource:string}}
+ */
+export function resolveCiHealBudget({ env = {}, platform = null, repo = null } = {}) {
+  const out = { cap: CI_HEAL_ROUND_CAP, capSource: 'standard', resetOnFixHead: true, resetSource: 'standard' };
+  for (const [source, layer, capRaw, resetRaw] of [
+    ['platform', platform?.ciHeal, platform?.ciHeal?.attemptCap, platform?.ciHeal?.resetOnFixHead],
+    ['repo', repo, repo?.attemptCap, repo?.resetOnFixHead],
+    ['env', env, env?.[CI_HEAL_ATTEMPT_CAP_ENV], env?.[CI_HEAL_RESET_ON_FIX_HEAD_ENV]],
+  ]) {
+    if (!layer || typeof layer !== 'object') continue;
+    const cap = asHealCap(capRaw);
+    if (cap !== null && cap > 0) Object.assign(out, { cap, capSource: source });
+    const reset = asFlag(resetRaw);
+    if (reset !== null) Object.assign(out, { resetOnFixHead: reset, resetSource: source });
+  }
+  return out;
+}
+
+const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
+const FIX_MARKER_WHO_RE = /^\*\*Who:\*\* `([^`]+)`/m;
+const FIX_END_WHO_RE = /^`([^`]+)` released the fix claim/m;
+
+/**
+ * PURE: when this PR last got a new NON-MECHANICAL head — the latest trusted `fix-end` from a fixer (any session
+ * that is not a ci-heal) whose released sha differs from the sha its own `fix-begin` claimed at, i.e. the fixer
+ * pushed. A ci-heal's own push, a fix turn that pushed nothing, a marker with no sha and an untrusted author never
+ * count. Reads only the PR's own comments (no commit list is fetched for a review-labelled PR).
+ * @returns {{at:string, by:string, sha:string}|null}
+ */
+export function ciHealBudgetResetAt(comments) {
+  const trusted = (Array.isArray(comments) ? comments : [])
+    .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c) && Number.isFinite(Date.parse(c?.createdAt)));
+  const beginSha = new Map();
+  let latest = null;
+  for (const c of trusted) {
+    const body = c.body.trimStart();
+    if (body.startsWith(FIX_BEGIN_MARKER)) {
+      const who = FIX_MARKER_WHO_RE.exec(body)?.[1];
+      if (who) beginSha.set(who, FIX_MARKER_SHA_RE.exec(body.split('\n').find((l) => l.startsWith('**Branch:**')) ?? '')?.[1] ?? null);
+      continue;
+    }
+    if (!body.startsWith(FIX_END_MARKER)) continue;
+    const who = FIX_END_WHO_RE.exec(body)?.[1];
+    const sha = FIX_MARKER_SHA_RE.exec(body)?.[1];
+    if (!who || !sha || /ci-heal/.test(who)) continue;
+    const from = beginSha.get(who);
+    if (!from || from.slice(0, 7) === sha.slice(0, 7)) continue;
+    if (!latest || Date.parse(c.createdAt) > Date.parse(latest.at)) latest = { at: c.createdAt, by: who, sha };
+  }
+  return latest;
+}
+
+/** PURE: drop ci-heal marker comments posted at/before `resetAt`; every other comment (refund windows too) stays. */
+function healCommentsSince(comments, resetAt) {
+  if (!resetAt) return comments;
+  const cut = Date.parse(resetAt);
+  return (Array.isArray(comments) ? comments : []).filter((c) => {
+    const first = (typeof c === 'string' ? c : c?.body ?? '').trimStart().split('\n')[0];
+    const isHeal = first.startsWith(CI_HEAL_COMMENT_MARKER) || first === CI_HEAL_FAILURE_MARKER;
+    return !isHeal || Date.parse(c?.createdAt) > cut;
+  });
+}
+
+/**
+ * PURE: split the head's failing checks (latest run per name) into the REQUIRED ones a ci-heal repairs and the
+ * non-required ones it only reports. Live PR #4631: `merge-gate` (not required, red by design until #4715) was
+ * named four times as a failure to heal. Without a required set, the `reduceCheckState` exclusion list applies.
+ * @returns {{required:string[], nonRequired:string[]}}
+ */
+export function splitFailingChecks(rollup, requiredChecks) {
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
+  const out = { required: [], nonRequired: [] };
+  for (const name of failingCheckNames(collapseRollupToLatestPerName(rollup))) {
+    const isRequired = required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);
+    out[isRequired ? 'required' : 'nonRequired'].push(name);
+  }
+  return out;
+}
 
 /** How long a requested-but-unobserved CI re-run may be held quietly before it becomes an operator escalation. */
 export const TIMEOUT_RETRY_PENDING_ESCALATE_MS = 30 * 60 * 1000;
@@ -1634,7 +1731,10 @@ export function missingReviewLabel(pr) {
 }
 
 export function planReconcile({
-  repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
+  repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
+  // `ciHeal.*` budget cascade ({@link resolveCiHealBudget}); the IO shell may pass the resolved layers. An explicit
+  // `ciHealCap` still wins (source `caller`).
+  ciHealBudget = resolveCiHealBudget({ env: globalThis.process?.env ?? {} }),
   ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
   codeqlOwnBudget = resolveCodeqlOwnBudget(process.env), // #4453 — a CodeQL hold is charged only CodeQL heals
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
@@ -1688,6 +1788,20 @@ export function planReconcile({
   const refusals = [];
   const notes = [];
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
+  const ciHealCap = Number.isInteger(ciHealCapArg) && ciHealCapArg >= 0 ? ciHealCapArg : ciHealBudget.cap;
+  const ciHealCapSource = ciHealCap === ciHealCapArg ? 'caller' : ciHealBudget.capSource;
+  // The heal budget a PR is charged against right now: heals since its last non-mechanical head (when the setting is
+  // on), with the sources named so the log says where the cap and the reset rule came from.
+  const healBudgetFor = (pr) => {
+    const reset = ciHealBudget.resetOnFixHead ? ciHealBudgetResetAt(pr?.comments) : null;
+    const comments = healCommentsSince(pr?.comments, reset?.at);
+    const spentBeforeReset = reset ? countCiHealComments(pr?.comments) - countCiHealComments(comments) : 0;
+    return {
+      comments,
+      log: { cap: ciHealCap, capSource: ciHealCapSource, resetOnFixHead: ciHealBudget.resetOnFixHead,
+        resetSource: ciHealBudget.resetSource, resetAt: reset?.at ?? null, resetBy: reset?.by ?? null, spentBeforeReset },
+    };
+  };
 
   // Stable: only the red-main fix PR moves to the front; every other PR keeps its order.
   const orderedPrs = (Array.isArray(prs) ? [...prs] : []).sort((a, b) => (isMainFixPriority(a?.number) ? 0 : 1) - (isMainFixPriority(b?.number) ? 0 : 1));
@@ -2267,7 +2381,8 @@ export function planReconcile({
 
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
       const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
-      const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
+      const healBudget = healBudgetFor(pr);
+      const healAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
         refuse('ci-heal-escalated', {
           ...withPhase, headSha: escalation.headSha,
@@ -2275,16 +2390,16 @@ export function planReconcile({
         });
       } else if (healAttempts >= ciHealCap) {
         refuse('cap-exhausted', {
-          ...withPhase, attempts: healAttempts, cap: ciHealCap,
+          ...withPhase, attempts: healAttempts, cap: ciHealCap, ciHealBudget: healBudget.log,
           why: `the drain holds this PR for a failed CodeQL check, and its durable CI-heal count is ${healAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
         });
         notes.push({
-          kind: 'ci-heal-exhausted', prNumber, attempts: healAttempts, cap: ciHealCap, lastFailureReason: 'CodeQL (drain gate)',
+          kind: 'ci-heal-exhausted', prNumber, attempts: healAttempts, cap: ciHealCap, lastFailureReason: 'CodeQL (drain gate)', ciHealBudget: healBudget.log,
           text: `PR #${prNumber}: ci-heal attempts exhausted (${healAttempts}/${ciHealCap}) — auto-heal cannot clear the CodeQL alert the drain is holding this PR for; a person must take it over. Last failure: CodeQL (drain gate)`,
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure,
+          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
           why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`,
         });
       }
@@ -2508,12 +2623,18 @@ export function planReconcile({
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
-      const ciHealAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
-      const refunded = countCiHealComments(pr?.comments) - ciHealAttempts;
+      // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
+      // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
+      // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
+      const failing = splitFailingChecks(pr?.statusCheckRollup, requiredChecks);
+      const healBudget = healBudgetFor(pr);
+      const ciHealAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore });
+      const refunded = countCiHealComments(healBudget.comments) - ciHealAttempts;
+      const healFacts = { failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log };
       const refund = refunded > 0 ? { refunded } : {};
       if (ciHealAttempts >= ciHealCap) {
         refuse('cap-exhausted', {
-          ...withPhase, ...refund, attempts: ciHealAttempts, cap: ciHealCap,
+          ...withPhase, ...refund, ...healFacts, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
         });
         // #xznd5za (epic #3383/#4075) — a capped `ci-red` PR must never be MERELY refused. `cap-exhausted` was
@@ -2530,16 +2651,19 @@ export function planReconcile({
         // makes the operator re-open the PR just to find out what is actually still red. `failingCheckNames`
         // reads the SAME `pr.statusCheckRollup` `withPhase`/`check` above already derived `check.state` from;
         // never re-fetched, never re-derived beyond naming the rows a `red` state already counted.
-        const lastFailureReason = failingCheckNames(pr?.statusCheckRollup).join(', ') || 'required check failing (no readable check name)';
+        const lastFailureReason = failing.required.join(', ') || 'required check failing (no readable check name)';
+        const reported = failing.nonRequired.length ? ` (not required, reported only: ${failing.nonRequired.join(', ')})` : '';
         notes.push({
-          kind: 'ci-heal-exhausted', prNumber, attempts: ciHealAttempts, cap: ciHealCap, lastFailureReason,
+          kind: 'ci-heal-exhausted', prNumber, attempts: ciHealAttempts, cap: ciHealCap, lastFailureReason, ...healFacts,
           text: `PR #${prNumber}: ci-heal attempts exhausted (${ciHealAttempts}/${ciHealCap}) — auto-heal cannot`
-            + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}`,
+            + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}${reported}`,
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, ...refund, kind: 'ci-heal', attempts: ciHealAttempts,
-          why: `a required check is failing, nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`,
+          ...base, ...withPhase, ...refund, ...healFacts, kind: 'ci-heal', attempts: ciHealAttempts,
+          why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
+            + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
+            + ` (cap from ${ciHealCapSource})`,
         });
       }
       continue;
