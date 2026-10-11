@@ -413,9 +413,14 @@ describe('only the reconcile-finding opening makes a bounce mechanical, never qu
         expect(isMechanicalBounce(body), body).toBe(false);
         expect(isReviewVerdictComment({ author: BOT, createdAt: at(9), body }), body).toBe(true);
       }
-      // it counts against the takeover allowance and the mechanical head's one review
+      // it counts against the takeover allowance (a review of the takeover's own work, not of PRIOR) and the mechanical
+      // head's one review
       const v = { author: BOT, createdAt: at(9), body: openings[0](q) };
-      expect(takeoverReviewGrant({ pr: pr([...spent, takeoverOp(7), v]), takeoverReviewAttempts: 1 }).ok, q).toBe(false);
+      const TAKEN = 'd'.repeat(40);
+      const onTakeover = { ...v, body: v.body.replace(nb(PRIOR), nb(TAKEN)) };
+      expect(takeoverReviewGrant({ pr: pr([...spent, takeoverOp(7), onTakeover]), takeoverReviewAttempts: 1 }).ok, q).toBe(false);
+      // PR #4779 (block ruling): a late review of PRIOR, the head reviewed before the takeover, judged none of its work
+      expect(takeoverReviewGrant({ pr: pr([...spent, takeoverOp(7), v]), takeoverReviewAttempts: 1 }), q).toMatchObject({ ok: true, used: 0 });
       expect(mechanicalRoundGrant({ pr: pr([...spent, mechMarker(8), v]) }), q).toMatchObject({ ok: false, reason: 'mechanical-review-spent' });
     }
   });
