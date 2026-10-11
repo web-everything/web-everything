@@ -29,7 +29,7 @@ import {
 } from '../heavy-admission.mjs';
 import {
   ADMISSION_DEFERRED_EXIT, ADMISSION_POLICY_STANDARD, resolveAdmissionPolicy, formatAdmissionPolicy,
-  resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan,
+  resolveEffectiveFastSlots, resolveFastSlots, resolveSlotSpan, loadAdmissionPolicy,
 } from '../heavy-admission.mjs';
 import { utcDayKey } from '../../operations/telemetry-summary-io.mjs';
 import { readLockEntry } from '../file-locks.mjs';
@@ -1431,8 +1431,8 @@ describe('resolveAdmissionPolicy — the one cascade every process reads (standa
     expect(p.sources).toMatchObject({ cap: 'standard', fastSlots: 'standard', onTimeout: 'standard' });
   });
 
-  it('layers platform under tool, and names each leaf\'s source', () => {
-    const p = resolveAdmissionPolicy({ platform: { cap: 3, onTimeout: 'run' }, tool: { cap: 4, fastScale: { maxSlots: 3 } } });
+  it('layers platform under tool (private pool), and names each leaf\'s source', () => {
+    const p = resolveAdmissionPolicy({ platform: { cap: 3, onTimeout: 'run' }, tool: { cap: 4, fastScale: { maxSlots: 3 } }, env: { LANE_POOL_ROOT: '/tmp/private-pool' } });
     expect(p.settings).toMatchObject({ cap: 4, fastSlots: 1, onTimeout: 'run', fastScale: { maxSlots: 3 } });
     expect(p.sources).toMatchObject({ cap: 'tool', onTimeout: 'platform', 'fastScale.maxSlots': 'tool', fastSlots: 'standard' });
   });
@@ -1487,6 +1487,64 @@ describe('resolveCap / resolveFastSlots — every process on the host pool agree
 
   it('a private pool keeps its own env cap (tests and soak sandboxes)', () => {
     expect(resolveCap({ WE_PLATFORM_PREFERENCES: prefs, LANE_POOL_ROOT: lockRoot, WE_HEAVY_ADMISSION_CAP: '5' })).toBe(5);
+  });
+});
+
+describe('shared-pool capacity — naming the host pool explicitly, or a checkout-local settings file, never makes a caller private', () => {
+  const CAPS = { WE_HEAVY_ADMISSION_CAP: '4', WE_HEAVY_ADMISSION_FAST_SLOTS: '2' };
+  const caps = (p) => [p.settings.cap, p.settings.fastSlots];
+
+  it.each([
+    ['the exact host pool path', '/workspace/.lanes'],
+    ['a trailing slash', '/workspace/.lanes/'],
+    ['a dot segment', '/workspace/./.lanes'],
+    ['a .. segment', '/workspace/other/../.lanes'],
+  ])('LANE_POOL_ROOT naming the host pool (%s) resolves the same cap / fast slots as no override', (_why, pool) => {
+    const checkoutRoot = '/workspace/web-everything';
+    const plain = resolveAdmissionPolicy({ env: {}, checkoutRoot });
+    const named = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: pool, ...CAPS }, checkoutRoot });
+    expect(caps(named)).toEqual(caps(plain));
+    expect(caps(named)).toEqual([2, 1]);
+    expect(named.ignored.join('\n')).toMatch(/WE_HEAVY_ADMISSION_CAP=4/);
+  });
+
+  it('a lane clone of the same workspace sees the same host pool', () => {
+    const p = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: '/workspace/.lanes', ...CAPS }, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
+    expect(caps(p)).toEqual([2, 1]);
+  });
+
+  it('a pool that is genuinely elsewhere stays private and honours the env', () => {
+    const p = resolveAdmissionPolicy({ env: { LANE_POOL_ROOT: '/tmp/sandbox-pool', ...CAPS }, checkoutRoot: '/workspace/web-everything' });
+    expect(caps(p)).toEqual([4, 2]);
+  });
+
+  it('the tool layer (checkout-local settings) is ignored for shared capacity but still applies on a private pool', () => {
+    const tool = { cap: 4, fastSlots: 2, fastScale: { maxSlots: 5 }, onTimeout: 'run' };
+    const shared = resolveAdmissionPolicy({ platform: { cap: 2, fastSlots: 1 }, tool, env: {}, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
+    expect(caps(shared)).toEqual([2, 1]);
+    expect(shared.settings.fastScale.maxSlots).toBeNull();
+    expect(shared.settings.onTimeout).toBe('run');
+    expect(shared.ignored.join('\n')).toMatch(/tool\.cap=4/);
+    const priv = resolveAdmissionPolicy({ platform: { cap: 2, fastSlots: 1 }, tool, env: { LANE_POOL_ROOT: '/tmp/sandbox-pool' }, checkoutRoot: '/workspace/.lanes/web-everything/lane-2' });
+    expect(caps(priv)).toEqual([4, 2]);
+    expect(priv.settings.fastScale.maxSlots).toBe(5);
+  });
+
+  it('two checkouts sharing one pool, only one carrying a heavy-admission settings file, resolve identical capacity', () => {
+    const home = join(lockRoot, 'home');
+    const prefs = join(lockRoot, 'prefs.json');
+    writeFileSync(prefs, JSON.stringify({ heavyAdmission: { cap: 2, fastSlots: 1 } }));
+    const mk = (n, heavyAdmission) => {
+      const root = join(lockRoot, 'workspace', '.lanes', 'web-everything', `lane-${n}`);
+      mkdirSync(join(root, 'scripts', 'settings'), { recursive: true });
+      if (heavyAdmission) writeFileSync(join(root, 'scripts', 'settings', 'heavy-admission.json'), JSON.stringify({ heavyAdmission }));
+      return root;
+    };
+    const env = { WE_PLATFORM_PREFERENCES: prefs };
+    const one = loadAdmissionPolicy({ env, repoRoot: mk(1), home });
+    const two = loadAdmissionPolicy({ env, repoRoot: mk(2, { cap: 4, fastSlots: 2 }), home });
+    expect(caps(two)).toEqual(caps(one));
+    expect(caps(two)).toEqual([2, 1]);
   });
 });
 

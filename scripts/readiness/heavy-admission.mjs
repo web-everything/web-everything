@@ -97,8 +97,8 @@
  * (exit 75); a caller that cannot defer keeps waiting. `admission.onTimeout` (defer|run) is resolved through
  * heavyAdmission: standard → platform preferences → tool settings → env WE_HEAVY_ADMISSION_ON_TIMEOUT.
  * Explicit `run` retains the loud unslotted escape. Dead / lease-expired holders are still reclaimed first.
- * Cap and fastSlots use one host-wide resolver; their env overrides apply only to a private LANE_POOL_ROOT
- * pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
+ * Cap, fastSlots and fastScale use one host-wide resolver (standard → platform preferences); their env and
+ * checkout-local tool-settings overrides apply only to a PRIVATE pool — a LANE_POOL_ROOT that is not the host pool. DEFAULT_TIMEOUT_MS remains a legacy CLI fallback; WE_HEAVY_ADMISSION=off bypasses admission.
  *
  * THE LOAD-ADMISSION GATE (#4076, revised #4343) — a SECOND, DIFFERENT admission axis this module now also
  * hosts, gating NEW DISPATCHED SESSIONS (not heavy commands) by the host's ACTUAL capacity — CPU idle% and
@@ -123,7 +123,7 @@
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
  *     fresh resource snapshot permits it. Status and release scan every slot that scaling may hand out.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync, appendFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { hostname, homedir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -134,7 +134,7 @@ import { LEGACY_SETTINGS_PATH, readDeclaredSettings } from '../lib/settings-file
 import { cutoverDecision, loadResourceGateSettings } from '../lib/resource-gate.mjs';
 import { LEASE_FILENAME, isLeaseStale } from '../lib/lane-lease.mjs';
 import { reserve, releaseLockDir, readLockEntry } from './file-locks.mjs';
-import { defaultPoolRoot, guardedPoolRoot } from '../lib/lane-pool-paths.mjs';
+import { defaultPoolRoot, guardedPoolRoot, workspaceFor } from '../lib/lane-pool-paths.mjs';
 import { writeAllSync } from '../lib/write-all-sync.mjs';
 import { execContainerized, containerCliAvailable, containerImageAvailable, resolveContainerImage, resolveNodeModulesVolume, nodeModulesVolumeAvailable } from '../lib/container-exec.mjs'; // #3621 sequencing note (tracked on #3383) — the heavy-command-pool container POC; see that module's own header for proven scope (check:standards + test:unit)
 import { resolveHostRoot, readHostToday, extractSamplesByName, utcDayKey } from '../operations/telemetry-summary-io.mjs'; // #4076 — REUSE the host-sampler's own root-resolution + tail-read + metric-extraction primitives (never reimplemented — see loadAdmissionDecision's section header below)
@@ -217,10 +217,29 @@ const ADMISSION_VALID = {
 const ADMISSION_ENV = { cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT' };
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const admissionLeaf = (block, path) => path.split('.').reduce((v, key) => admissionObject(v) && Object.hasOwn(v, key) ? v[key] : undefined, block);
-const privateAdmissionPool = (env) => typeof env.LANE_POOL_ROOT === 'string' && env.LANE_POOL_ROOT.trim() !== '';
+const ADMISSION_MODULE_ROOT = (() => { try { return fileURLToPath(new URL('../../', import.meta.url)); } catch { return process.cwd(); } })();
+const canonicalPath = (p) => { const abs = resolve(p); try { return realpathSync(abs); } catch { return abs; } };
 
-/** PURE: valid leaves override standard → platform → tool → env; shared capacity ignores process env. */
-export function resolveAdmissionPolicy({ platform, tool, env = {} } = {}) {
+/**
+ * A pool is PRIVATE only when `LANE_POOL_ROOT` points somewhere other than the host-shared pool the checkout
+ * would use with no override (`<workspace>/.lanes`). Setting the variable to the host pool's own path (any
+ * spelling: trailing slash, `.`/`..`, symlink) names the SHARED pool, so it earns no per-process capacity.
+ */
+export function privateAdmissionPool(env, checkoutRoot = ADMISSION_MODULE_ROOT) {
+  const raw = env?.LANE_POOL_ROOT;
+  if (typeof raw !== 'string' || raw.trim() === '') return false;
+  const named = canonicalPath(defaultPoolRoot(checkoutRoot, env));
+  const hostPool = canonicalPath(join(workspaceFor(checkoutRoot), '.lanes'));
+  return named !== hostPool;
+}
+
+/**
+ * PURE: valid leaves override standard → platform → tool → env. Capacity leaves (everything but onTimeout) of
+ * the shared host pool come from standard → platform only: process env and checkout-local tool settings would
+ * give two callers of one pool different caps. A private pool (see {@link privateAdmissionPool}) keeps both.
+ */
+export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
+  const isPrivate = privateAdmissionPool(env, checkoutRoot);
   const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
@@ -229,13 +248,17 @@ export function resolveAdmissionPolicy({ platform, tool, env = {} } = {}) {
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
       const v = admissionLeaf(block, leaf);
       if (v === undefined) continue;
+      if (layer === 'tool' && leaf !== 'onTimeout' && !isPrivate) {
+        ignored.push(`tool.${leaf}=${JSON.stringify(v)} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
+        continue;
+      }
       if (valid(v)) { value = v; sources[leaf] = layer; }
       else invalid.push(`${layer}.${leaf}=${JSON.stringify(v)}`);
     }
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
     if (raw !== undefined) {
-      if (leaf !== 'onTimeout' && !privateAdmissionPool(env)) {
+      if (leaf !== 'onTimeout' && !isPrivate) {
         ignored.push(`env ${name}=${raw} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
       } else {
         const s = String(raw).trim();
@@ -252,13 +275,14 @@ export function resolveAdmissionPolicy({ platform, tool, env = {} } = {}) {
 
 const admissionPolicyCache = new Map();
 /** IO: the shared platform/tool settings, cached for ten seconds per path and environment. Never throws. */
-export function loadAdmissionPolicy({ env = process.env, repoRoot, home = homedir() } = {}) {
+export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot, home = homedir() } = {}) {
   let platform; let tool; let path; const errors = [];
   try { repoRoot ??= fileURLToPath(new URL('../../', import.meta.url)); }
   catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
+  checkoutRoot ??= repoRoot;
   try { path = env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'); }
   catch (e) { errors.push(`platform: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const key = JSON.stringify([path, repoRoot, env.LANE_POOL_ROOT, ...Object.values(ADMISSION_ENV).map((name) => env[name])]);
+  const key = JSON.stringify([path, repoRoot, checkoutRoot, env.LANE_POOL_ROOT,...Object.values(ADMISSION_ENV).map((name) => env[name])]);
   const nowMs = Date.now();
   const cached = admissionPolicyCache.get(key);
   if (cached && nowMs < cached.expiresAt) return cached.policy;
@@ -271,7 +295,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, home = homedi
     const declared = readDeclaredSettings({ dir: settingsDir, legacyPath: join(dirname(settingsDir), basename(LEGACY_SETTINGS_PATH)) });
     if (Object.hasOwn(declared.settings, 'heavyAdmission')) tool = declared.settings.heavyAdmission;
   } catch (e) { errors.push(`tool: ${String(e?.message ?? e).split('\n')[0]}`); }
-  const policy = resolveAdmissionPolicy({ platform, tool, env });
+  const policy = resolveAdmissionPolicy({ platform, tool, env, checkoutRoot });
   policy.invalid.push(...errors);
   for (const [k, entry] of admissionPolicyCache) if (nowMs >= entry.expiresAt) admissionPolicyCache.delete(k);
   admissionPolicyCache.set(key, { policy, expiresAt: nowMs + 10_000 });
@@ -1493,9 +1517,10 @@ async function main(argv) {
   const { flags, positionals } = parseFlags(preArgv);
   // Resolve before lock-root derivation so relative --repo uses the same shared pool and execution cwd.
   const repo = resolve(typeof flags.repo === 'string' ? flags.repo : process.cwd());
-  const policy = loadAdmissionPolicy({ env: process.env });
-  const cap = flags.cap != null && privateAdmissionPool(process.env) ? Number(flags.cap) : policy.settings.cap;
-  if (flags.cap != null && !privateAdmissionPool(process.env)) {
+  const policy = loadAdmissionPolicy({ env: process.env, checkoutRoot: repo });
+  const privatePool = privateAdmissionPool(process.env, repo);
+  const cap = flags.cap != null && privatePool ? Number(flags.cap) : policy.settings.cap;
+  if (flags.cap != null && !privatePool) {
     process.stderr.write(`heavy-admission: --cap=${flags.cap} ignored on the shared host pool (cap=${cap} from ${policy.sources.cap})\n`);
   }
   const lockRoot = admissionLockRoot(repo, process.env);
