@@ -32,6 +32,13 @@ import { writeAllSync } from '../lib/write-all-sync.mjs';
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
 
+/**
+ * The first value that is set and not blank (trimmed), or `null`. GitHub Actions sets `GITHUB_BASE_REF` (and
+ * `GITHUB_HEAD_REF`) to '' on every non-pull_request event, merge_group included: `??` would keep that '' and never
+ * reach the event payload's value.
+ */
+export const firstSet = (...vs) => { for (const v of vs) if (v != null && String(v).trim() !== '') return String(v).trim(); return null; };
+
 /** The files this PR changes against its base (`origin/<base>...HEAD`), or `null` when not provable. */
 export function changedFilesOf({ board, base, run = git }) {
   if (!base) return null;
@@ -47,6 +54,7 @@ export function changedFilesOf({ board, base, run = git }) {
 export function quarantineSkip({
   env = process.env, board = process.cwd(), now = Date.now(), flags = {},
   mode = undefined, read = null, readList = (b) => readQuarantine({ board: b }), changed = undefined, readEvent = (p) => JSON.parse(readFileSync(p, 'utf8')),
+  changedOf = changedFilesOf,
 }) {
   // The mode is the one the safety net PUBLISHED on the list (it resolves it through env / preference / settings, which
   // a CI job cannot see). No stamp ⇒ stop: this job's tree and env are PR-controlled, never a source for the mode.
@@ -56,13 +64,13 @@ export function quarantineSkip({
   mode = mode ?? published ?? { value: 'stop', source: r.ok ? 'no stamp on ops/quarantine' : 'ops/quarantine unreadable' };
   if (mode.value !== 'quarantine') return { line: '', why: `redMainMode is ${mode.value} (${mode.source}) — running everything` };
   let event = null;
-  const eventPath = flags['event-path'] ?? env.GITHUB_EVENT_PATH;
+  const eventPath = firstSet(flags['event-path'], env.GITHUB_EVENT_PATH);
   try { event = eventPath ? readEvent(eventPath) : null; } catch { event = null; }
-  const ctx = ciJobContext({ eventName: flags.event ?? env.GITHUB_EVENT_NAME, ref: flags.ref ?? env.GITHUB_REF, event });
-  const base = flags.base ?? env.GITHUB_BASE_REF ?? event?.pull_request?.base?.ref ?? event?.merge_group?.base_ref?.replace(/^refs\/heads\//, '') ?? null;
+  const ctx = ciJobContext({ eventName: firstSet(flags.event, env.GITHUB_EVENT_NAME), ref: firstSet(flags.ref, env.GITHUB_REF), event });
+  const base = firstSet(flags.base, env.GITHUB_BASE_REF, event?.pull_request?.base?.ref, event?.merge_group?.base_ref?.replace(/^refs\/heads\//, ''));
   const changedFiles = changed !== undefined ? changed
     : flags.changed !== undefined ? String(flags.changed).split(',').filter(Boolean)
-      : (ctx.known && !ctx.onMain ? changedFilesOf({ board, base }) : null);
+      : (ctx.known && !ctx.onMain ? changedOf({ board, base }) : null);
   const d = decideCiSkip({ mode: mode.value, read: r, ctx, changedFiles, now });
   const why = `${d.why}${d.unsupported?.length ? `; ${d.unsupported.length} name-qualified entr${d.unsupported.length === 1 ? 'y' : 'ies'} not skipped (vitest --exclude is per file)` : ''}`;
   return { line: d.skip.map((f) => `--exclude=${f}`).join(' '), why, skip: d.skip };

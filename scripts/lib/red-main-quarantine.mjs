@@ -242,7 +242,7 @@ export function ciJobContext({ eventName, ref, event = null }) {
     return Number.isInteger(n) && n > 0 ? { onMain: false, prNumber: n, known: true } : { onMain: false, prNumber: null, known: false };
   }
   if (eventName === 'merge_group') {
-    const n = Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(String(event?.merge_group?.head_ref ?? ref ?? ''))?.[1]);
+    const n = Number(/\/pr-(\d+)-[0-9a-f]+$/.exec(String(event?.merge_group?.head_ref || ref || ''))?.[1]);
     return Number.isInteger(n) && n > 0 ? { onMain: false, prNumber: n, known: true } : { onMain: false, prNumber: null, known: false };
   }
   return { onMain: false, prNumber: null, known: false };
@@ -277,7 +277,10 @@ export function decideCiSkip({ mode, read, ctx, changedFiles = null, now }) {
  */
 export function testsToSkip({ list, now, prNumber = null, fixPrs = [], onMain = false }) {
   if (onMain) return [];
-  if (prNumber != null && fixPrs.map(Number).includes(Number(prNumber))) return [];
+  // The main-fix PR set published on the list always counts: a caller's `fixPrs` only adds to it, so no reader (CI's
+  // step, the `skip` CLI) can make the fix PR skip the test it must prove passes by forgetting to pass them.
+  const fix = [...(fixPrs ?? []), ...(Array.isArray(list?.fixPrs) ? list.fixPrs : [])].map(Number);
+  if (prNumber != null && String(prNumber).trim() !== '' && fix.includes(Number(prNumber))) return [];
   return [...new Set(activeEntries(list, { now }).map((e) => e.test))];
 }
 

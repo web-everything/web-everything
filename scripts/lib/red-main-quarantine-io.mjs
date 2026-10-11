@@ -11,7 +11,8 @@
  *   node scripts/lib/red-main-quarantine-io.mjs skip [--pr=<n>] [--fix-prs=<n,..>] [--on-main] [--format=json|vitest]
  *       Fetch the CURRENT list and print the tests to skip. Mode-gated like CI's step (scripts/ci/quarantine-skip.mjs):
  *       only a list stamped `mode: quarantine` skips anything. Unreadable list / `stop` / no stamp ⇒ prints nothing to
- *       skip (CI runs everything — the safe direction). The main-fix PR / main always skip nothing.
+ *       skip (CI runs everything — the safe direction). The main-fix PR / main always skip nothing: the fix PRs the
+ *       list publishes always count, `--fix-prs` only adds to them.
  *   node scripts/lib/red-main-quarantine-io.mjs add --actor=<red-main-safety-net|operator> --broken-sha=<sha>
  *       --owner=<who> --reason=<why> --tests=<id,id> [--area=<dir/>] [--ttl-min=<n>]
  *   node scripts/lib/red-main-quarantine-io.mjs prune --actor=<..> --main-green=<true|false|unknown>

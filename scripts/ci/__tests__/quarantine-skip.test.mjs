@@ -9,7 +9,8 @@ import { readFileSync } from 'node:fs';
 import yaml from 'js-yaml';
 
 import { quarantineSkip } from '../quarantine-skip.mjs';
-import { decideCiSkip, ciJobContext, addEntries, setFixPrs, pruneOnGreen, validateQuarantineList } from '../../lib/red-main-quarantine.mjs';
+import { decideCiSkip, ciJobContext, addEntries, setFixPrs, pruneOnGreen, validateQuarantineList, testsToSkip } from '../../lib/red-main-quarantine.mjs';
+import { skipForList } from '../../lib/red-main-quarantine-io.mjs';
 
 const TEST_FILE = 'scripts/operations/__tests__/record-referral-ruling.test.mjs';
 const FIRST_RED = '2cb94418d3d95e9d64ca59ce6de789a319a6718c';
@@ -59,6 +60,46 @@ describe('quarantine-skip — 2026-10-10 replay', () => {
     const pruned = pruneOnGreen(LIST, { mainGreen: true, now: NOW });
     expect(pruned.list).toEqual({ version: 1, entries: [] });
     expect(run({ pr: 4990, event: prEvent(4990), read: { ok: true, list: pruned.list } }).line).toBe('');
+  });
+});
+
+describe('empty Actions env values fall through to the event (PR #4816 review round 4)', () => {
+  // GitHub Actions sets GITHUB_BASE_REF / GITHUB_HEAD_REF to '' on every non-pull_request event (merge_group included).
+  const mg = { merge_group: { head_ref: 'refs/heads/gh-readonly-queue/main/pr-4990-abc123', base_ref: 'refs/heads/main' } };
+  const probe = (env, event = mg) => {
+    const bases = [];
+    const r = quarantineSkip({ env, now: NOW, mode: Q, read: READ, readEvent: () => event, changedOf: ({ base }) => { bases.push(base); return base ? [] : null; } });
+    return { r, bases };
+  };
+  it('merge_group with GITHUB_BASE_REF="" still finds the base from the event, so the quarantined file is skipped', () => {
+    const { r, bases } = probe({ GITHUB_EVENT_NAME: 'merge_group', GITHUB_REF: 'refs/heads/gh-readonly-queue/main/pr-4990-abc123', GITHUB_BASE_REF: '', GITHUB_EVENT_PATH: '/e.json' });
+    expect(bases).toEqual(['main']);
+    expect(r.line).toBe(`--exclude=${TEST_FILE}`);
+  });
+  it('a whitespace-only base env value falls through too', () => {
+    expect(probe({ GITHUB_EVENT_NAME: 'merge_group', GITHUB_REF: 'refs/heads/gh-readonly-queue/main/pr-4990-abc123', GITHUB_BASE_REF: '  ', GITHUB_EVENT_PATH: '/e.json' }).bases).toEqual(['main']);
+  });
+  it('an empty --base= flag falls through to the env', () => {
+    const bases = [];
+    quarantineSkip({ env: { GITHUB_BASE_REF: 'main' }, now: NOW, mode: Q, read: READ, readEvent: () => prEvent(4990), flags: { base: '', event: 'pull_request', ref: 'refs/pull/4990/merge', 'event-path': '/e.json' }, changedOf: ({ base }) => { bases.push(base); return []; } });
+    expect(bases).toEqual(['main']);
+  });
+  it('an empty GITHUB_REF / merge_group head_ref still yields the PR from the other one', () => {
+    expect(ciJobContext({ eventName: 'merge_group', ref: 'refs/heads/gh-readonly-queue/main/pr-4990-abc123', event: { merge_group: { head_ref: '' } } }).prNumber).toBe(4990);
+    expect(probe({ GITHUB_EVENT_NAME: 'merge_group', GITHUB_REF: '', GITHUB_BASE_REF: '', GITHUB_EVENT_PATH: '/e.json' }).r.line).toBe(`--exclude=${TEST_FILE}`);
+  });
+});
+
+describe('the main-fix PR set on the list is honoured by every reader (PR #4816 review round 4)', () => {
+  const stampedList = { ...LIST, mode: 'quarantine' };
+  it('testsToSkip reads the list\'s fixPrs itself — no caller has to pass them', () => {
+    expect(testsToSkip({ list: stampedList, now: NOW, prNumber: FIX_PR })).toEqual([]);
+    expect(testsToSkip({ list: stampedList, now: NOW, prNumber: String(FIX_PR) })).toEqual([]); // a CLI flag is a string
+    expect(testsToSkip({ list: stampedList, now: NOW, prNumber: 4990 })).toEqual([TEST_FILE]);
+  });
+  it('the `skip` CLI path (skipForList) runs the quarantined test for the main-fix PR without --fix-prs', () => {
+    expect(skipForList({ ok: true, list: stampedList }, { now: NOW, prNumber: String(FIX_PR) })).toEqual([]);
+    expect(skipForList({ ok: true, list: stampedList }, { now: NOW, prNumber: '4990' })).toEqual([TEST_FILE]);
   });
 });
 
