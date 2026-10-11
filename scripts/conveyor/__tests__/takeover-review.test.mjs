@@ -14,7 +14,7 @@ const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 const bounce = (head, h) => ({ author: BOT, createdAt: at(h),
   body: `🔁 review — changes requested\n\nRecorded by auto-policy\n\nruled \`block\` on head \`${head}\`.\n\n### Findings\n\n**correctness/logic** (1)\n- \`src/a.mjs:1\` — bad` });
 const advisory = (head, h) => ({ author: BOT, createdAt: at(h),
-  body: `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** Changes: 1 finding\n\nNet basis: \`${'0'.repeat(40)}..${head}\`` });
+  body: `**⚠️ THIS IS AN ADVISORY REVIEW, NOT A RECORDED VERDICT.** Changes: 1 finding\n\nNet basis: \`${'0'.repeat(40)}..${head}\` — 1 net changed file(s) vs current main (#2450).` });
 const marker = (head, h, author = BOT) => ({ author, createdAt: at(h),
   body: takeoverMarkerBody({ pr: 7, head, attempts: 5, cap: 5, rung: { id: 'stronger-model' } }) });
 const operatorTakeover = (h) => ({ author: BOT, createdAt: at(h), body: `${OPERATOR_TAKEOVER_PREFIX} — all open findings fixed**` });

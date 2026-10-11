@@ -90,7 +90,14 @@ export function isMechanicalBounce(c) {
 // Both formats must fill a whole line at column 0, as the producers write them (we:scripts/lib/review-escalation.mjs
 // #buildReviewedShaMarker, the review-pr `Net basis:` line): a marker mid-line, indented or after `>` is a quote.
 const REVIEWED_MARKER_LINE = new RegExp(`^<!--\\s*${REVIEWED_SHA_MARKER}:\\s*([0-9a-f]{7,40})\\s*-->\\s*$`, 'i');
-const NET_BASIS_LINE = /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`/i;
+// A `Net basis` line counts only in a producer's exact shape, tail included (we:scripts/operations/review-pr.mjs
+// #renderVerdictWriteUp / #renderAdvisoryNote, we:scripts/lib/review-escalation.mjs's converted advisory note). A
+// verdict with no footer of its own (a `review-set-label` bounce) carries only free text, so a bare
+// `Net basis: \`a..b\`` written there at column 0 never names the head it judged.
+const NET_BASIS_LINES = [
+  /^Net basis: `[0-9a-f]+\.\.([0-9a-f]{7,40})`(?: \(rev `[^`]*` at review time\))? — \d+ net changed file\(s\) vs current main\b/i,
+  /^Net basis: `([0-9a-f]{7,40})\.\.\1` \(this head; no fresh diff computed\b/i,
+];
 // A Markdown fence: at most 3 spaces of indent; a backtick fence's info string holds no backtick (```a``` is inline code).
 const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 // Any spelling of the marker, quoted or not: only the loose "is this verdict-shaped" check reads it (fail closed).
@@ -114,7 +121,7 @@ function structuredMarkerLines(body) {
     }
     if (isFence) { fence = f[1]; continue; }
     const s = REVIEWED_MARKER_LINE.exec(line);
-    const n = s ? null : NET_BASIS_LINE.exec(line);
+    const n = s ? null : NET_BASIS_LINES.map((re) => re.exec(line)).find(Boolean);
     if (s) out.push({ kind: 'reviewed-sha', sha: s[1].toLowerCase() });
     else if (n) out.push({ kind: 'net-basis', sha: n[1].toLowerCase() });
   }
@@ -150,7 +157,8 @@ export function verdictKind(c) {
 
 /**
  * The commit a trusted verdict comment says it JUDGED: the head of its LAST unquoted structured marker line, of either
- * format (`<!-- reviewed-sha: <sha> -->` or `Net basis: <base>..<head>`, 7-40 hex, lower-cased). It relies on every
+ * format (`<!-- reviewed-sha: <sha> -->` or a producer-shaped `Net basis: <base>..<head> — …` line, 7-40 hex,
+ * lower-cased). It relies on every
  * producer appending that footer LAST, after any quoted text, so a quoted earlier one never wins. One head, never one
  * per format: a quoted `Net basis` naming the parent must not ride along with a real `reviewed-sha` footer for another
  * commit. A sha merely mentioned in prose is never returned. Pure.

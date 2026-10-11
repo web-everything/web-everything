@@ -22,9 +22,12 @@ const PRIOR = 'a'.repeat(40);  // the head the mechanical round merged main into
 const HEAD = 'b'.repeat(40);   // the mechanical round's merge commit
 const at = (h) => `2026-10-10T${String(h).padStart(2, '0')}:00:00Z`;
 
+// review-pr's footer line, tail included (only that shape names a head; pinned to the renderers below).
+const nb = (head, base = '0'.repeat(40)) =>
+  `Net basis: \`${base}..${head}\` — 3 net changed file(s) vs current main (#2450), not \`gh pr diff\`'s three-dot list.`;
 const rearm = (h) => ({ author: BOT, createdAt: at(h), body: `${REARM_COMMENT_MARKER}\n\nrepaired` });
 const bounceOn = (head, h) => ({ author: BOT, createdAt: at(h),
-  body: `🔁 review — changes requested\n\n### Findings\n- bad\n\nNet basis: \`${'0'.repeat(40)}..${head}\`` });
+  body: `🔁 review — changes requested\n\n### Findings\n- bad\n\n${nb(head)}` });
 const acceptOn = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
 const conflictBounce = (h) => ({ author: { login: 'chalbert' }, createdAt: at(h),
   body: `🔁 review — changes requested\n\nRecorded by parked-pr-conflict-watch\n\n${RECONCILE_FINDING_BANNER}\n\nPR #7 has drifted into a real GIT merge conflict.` });
@@ -127,7 +130,7 @@ describe('mechanical round vs the review round cap', () => {
     });
     it('a bounce whose Net basis head is another commit but mentions the parent in prose is not a verdict on the parent', () => {
       const v = { author: BOT, createdAt: at(6),
-        body: `🔁 review — changes requested\n\nSee also ${PRIOR}.\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
+        body: `🔁 review — changes requested\n\nSee also ${PRIOR}.\n\n${nb(OTHER)}` };
       expect(grant(v)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
     });
     it('a bare sha in prose with no structured marker at all is not a verdict on the parent', () => {
@@ -136,25 +139,24 @@ describe('mechanical round vs the review round cap', () => {
     });
     it('a Net basis line QUOTED mid-line in a finding, or an earlier one before the real footer, does not count', () => {
       const quoted = { author: BOT, createdAt: at(6),
-        body: `🔁 review — changes requested\n\n- the PR body says "Net basis: \`${'0'.repeat(40)}..${PRIOR}\`" which is wrong\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
+        body: `🔁 review — changes requested\n\n- the PR body says "${nb(PRIOR)}" which is wrong\n\n${nb(OTHER)}` };
       expect(grant(quoted)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
       const lineStart = { author: BOT, createdAt: at(6),
-        body: `🔁 review — changes requested\n\nNet basis: \`${'0'.repeat(40)}..${PRIOR}\`\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
+        body: `🔁 review — changes requested\n\n${nb(PRIOR)}\n\n${nb(OTHER)}` };
       expect(grant(lineStart)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
     });
     // Red team on 471b1003b: each format's last match counted on its own, so a quoted `Net basis` naming the parent
     // beat an accept whose real footer was a `reviewed-sha` for another commit. One footer per verdict, quotes never count.
     it('a quoted marker in either format never makes the parent reviewed, whatever the real footer format', () => {
-      const z = '0'.repeat(40);
       const bodies = [
-        `✅ review — accepted\n\nHistorical example:\n\`\`\`\nNet basis: \`${z}..${PRIOR}\`\n\`\`\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
-        `✅ review — accepted\n\n~~~~text\n<!-- reviewed-sha: ${PRIOR} -->\n~~~~\n\nNet basis: \`${z}..${OTHER}\``,
-        `✅ review — accepted\n\nNet basis: \`${z}..${PRIOR}\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
-        `🔁 review — changes requested\n\n<!-- reviewed-sha: ${PRIOR} -->\n\nNet basis: \`${z}..${OTHER}\``,
-        `✅ review — accepted\n\n> <!-- reviewed-sha: ${PRIOR} -->\n> Net basis: \`${z}..${PRIOR}\``,
+        `✅ review — accepted\n\nHistorical example:\n\`\`\`\n${nb(PRIOR)}\n\`\`\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `✅ review — accepted\n\n~~~~text\n<!-- reviewed-sha: ${PRIOR} -->\n~~~~\n\n${nb(OTHER)}`,
+        `✅ review — accepted\n\n${nb(PRIOR)}\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `🔁 review — changes requested\n\n<!-- reviewed-sha: ${PRIOR} -->\n\n${nb(OTHER)}`,
+        `✅ review — accepted\n\n> <!-- reviewed-sha: ${PRIOR} -->\n> ${nb(PRIOR)}`,
         `✅ review — accepted\n\nthe footer \`<!-- reviewed-sha: ${PRIOR} -->\` was stale`,
         `✅ review — accepted\n\n    <!-- reviewed-sha: ${PRIOR} -->`,
-        `✅ review — accepted\n\nquoted Net basis: \`${z}..${PRIOR}\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `✅ review — accepted\n\nquoted ${nb(PRIOR)}\n\n<!-- reviewed-sha: ${OTHER} -->`,
         `✅ review — accepted\n\n\`\`\`\nunclosed fence\n<!-- reviewed-sha: ${PRIOR} -->`,
       ];
       for (const body of bodies) {
@@ -163,8 +165,7 @@ describe('mechanical round vs the review round cap', () => {
       }
     });
     it('a verdict whose real footer names the parent still counts when a quoted marker names another commit', () => {
-      const z = '0'.repeat(40);
-      const body = `✅ review — accepted\n\n\`\`\`\nNet basis: \`${z}..${OTHER}\`\n\`\`\`\n\nNet basis: \`${z}..${PRIOR}\`\n<!-- reviewed-sha: ${PRIOR} -->`;
+      const body = `✅ review — accepted\n\n\`\`\`\n${nb(OTHER)}\n\`\`\`\n\n${nb(PRIOR)}\n<!-- reviewed-sha: ${PRIOR} -->`;
       expect(reviewedHeadsOf(body)).toEqual([PRIOR]);
       expect(grant({ author: BOT, createdAt: at(6), body })).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
     });
@@ -176,13 +177,38 @@ describe('mechanical round vs the review round cap', () => {
       const p = pr([rearm(4), accept, note, rearm(7), mechMarker(8)], { mechanicalRound: identical });
       expect(mechanicalRoundGrant({ pr: p })).toMatchObject({ ok: true, action: 'carry', verdict: 'advisory' });
       // a trusted verdict-shaped comment whose only reviewed-sha stamp is quoted is not an accept either
-      const quotedOnly = { author: BOT, createdAt: at(6), body: `📝 note\n\n> <!-- reviewed-sha: ${PRIOR} -->\n\nNet basis: \`${'0'.repeat(40)}..${PRIOR}\`` };
+      const quotedOnly = { author: BOT, createdAt: at(6), body: `📝 note\n\n> <!-- reviewed-sha: ${PRIOR} -->\n\n${nb(PRIOR)}` };
       expect(grant(quotedOnly)).toMatchObject({ ok: true, action: 'carry', verdict: 'advisory' });
     });
     it('only a Markdown fence hides a footer: inline triple backticks and a 4-space indent do not open one', () => {
       expect(reviewedHeadsOf(`✅ review — accepted\n\n\`\`\`a\`\`\` is inline\n\n<!-- reviewed-sha: ${PRIOR} -->`)).toEqual([PRIOR]);
       expect(reviewedHeadsOf(`✅ review — accepted\n\n    \`\`\`\n\n<!-- reviewed-sha: ${PRIOR} -->`)).toEqual([PRIOR]);
       expect(reviewedHeadsOf(`✅ review — accepted\n\n   \`\`\`\n<!-- reviewed-sha: ${OTHER} -->\n   \`\`\`\n<!-- reviewed-sha: ${PRIOR} -->`)).toEqual([PRIOR]);
+    });
+    // Red team follow-up: a verdict with no footer of its own (a review-set-label bounce) is free text end to end, so
+    // "last unquoted line wins" cannot tell its quote from a footer. Only a producer's full line shape names a head.
+    it('a footerless bounce whose free text has a bare column-0 Net basis line is not a verdict on the parent', () => {
+      const z = '0'.repeat(40);
+      const changed = facts({ netDiffIdentical: false });
+      for (const line of [`Net basis: \`${z}..${PRIOR}\``, `Net basis: \`${z}..${PRIOR}\` (as quoted from round 1)`,
+        `Net basis: \`${z}..${PRIOR}\` — see round 1`, `Net basis: \`${PRIOR}..${PRIOR}\``]) {
+        const body = `🔁 review — changes requested\n\nRecorded by agent (red-team gate) via review daemon.\n\nScenario:\n${line}\nthen push B.`;
+        expect(reviewedHeadsOf(body), line).toEqual([]);
+        const p = pr([rearm(5), { author: BOT, createdAt: at(6), body }, rearm(7), mechMarker(8)], { mechanicalRound: changed });
+        expect(mechanicalRoundGrant({ pr: p }), line).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+      }
+    });
+    it('every producer of a Net basis footer still names its head (review-pr verdict + advisory, converted note)', async () => {
+      const { renderVerdictWriteUp, renderAdvisoryNote } = await import('../../operations/review-pr.mjs');
+      const verdict = { verdict: 'changes', lensVerdicts: {}, findings: [] };
+      for (const revRef of [undefined, 'lane/x']) {
+        const read = { repo: 'o/r', pr: 7, degraded: false, netBasis: { base: '0'.repeat(40), rev: PRIOR, revRef }, netChangedFiles: ['a.mjs'] };
+        expect(reviewedHeadsOf(renderVerdictWriteUp({ read, verdict, answer: 'changes', actor: 'x', reason: 'r' }))).toEqual([PRIOR]);
+        expect(reviewedHeadsOf(renderAdvisoryNote({ read, verdict }))).toEqual([PRIOR]);
+      }
+      const note = renderConvertedAdvisoryNote({ repo: 'o/r', pr: 7, headSha: PRIOR, acceptComment: `✅ review — accepted\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        escalation: { kind: 'size', reasonText: 'big' }, targetedCheckAnswer: { verdict: 'changes', note: 'bad' } });
+      expect(reviewedHeadsOf(note)).toEqual([PRIOR]);
     });
     it('a verdict naming the CURRENT head by an abbreviated structured sha (before the round marker) is head-already-reviewed', () => {
       const v = { author: BOT, createdAt: at(6), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${HEAD.slice(0, 12)} -->` };
