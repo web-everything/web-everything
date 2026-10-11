@@ -63,8 +63,10 @@ import {
   REVIEW_SEAT_DISPATCH_KIND, REVIEW_SEAT_PROVIDERS, reviewSeatTaskType, selectReviewSeatProvider,
 } from '../lib/provider-routing.mjs';
 import {
-  findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding, redTeamRequired,
+  findingCorroboratedBy, foldRedTeamVerdict, IMPACT_LEVELS, normalizeFinding, redTeamRequired, VERDICTS,
 } from '../lib/jury-core.mjs';
+import { ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
+import { advisoryLabelOutcome } from './review-pr.mjs';
 import { expectationForLens, huntBriefForLens } from '../lib/review-core.mjs';
 import { appendScorecard, readStore, resolveScorecardStorePath } from '../conveyor/run-scorecard-store.mjs';
 import { scrubPublish } from '../lib/secret-scrub.mjs';
@@ -904,6 +906,34 @@ export function redTeamEnabled(env = process.env) {
   return extraSeatsEnabled(env) && !['0', 'off', 'false', 'no'].includes(raw);
 }
 
+/**
+ * Card xyyuvyz — IS THE RED TEAM OWED FOR THIS FINISHED REVIEW? PURE. The one gate the job, the sequential pass and
+ * the speculative finish all read, so they can never disagree. Owed on EVERY head the panel accepts:
+ *   - a recorded accept ({@link redTeamRequired}); or
+ *   - a `review:human` ADVISORY accept: the run reduced to `needs-human` only because the human gate applies
+ *     (`verdict.humanRequired`), and the panel itself reduces to accept — the SAME `advisoryLabelOutcome` the advisory
+ *     note states and the `advisory:accepted` label applies (a pinned, non-degraded read; no blocked or pending
+ *     referral). Live gap #4722: the red team broke head ea117e881, the fix landed as e125ac999, the panel accepted
+ *     it under `review:human`, and no red team ran on the fixed head.
+ * Once per head is not decided here: the pass keys its row and comment by `(pr, netBasis.rev)` and resumes, never
+ * re-runs, a head that already has a clean row.
+ * @param {object|null} loopPayload - `review-loop-cli.mjs --json`'s payload.
+ * @returns {boolean}
+ */
+export function redTeamOwedFor(loopPayload) {
+  const verdict = loopPayload?.verdict;
+  if (!verdict || typeof verdict !== 'object') return false;
+  if (redTeamRequired(verdict.verdict ?? null)) return true;
+  if (verdict.verdict !== VERDICTS.NEEDS_HUMAN || verdict.humanRequired !== true) return false;
+  return advisoryLabelOutcome({ read: loopPayload?.findings?.read, verdict }) === ADVISORY_OUTCOMES.ACCEPT;
+}
+
+/** The `not-owed` reason both passes report, naming the advisory case so a skip is never read as "no accept". PURE. */
+function notOwedReason(loopPayload) {
+  const v = loopPayload?.verdict ?? {};
+  return `review verdict is ${v.verdict ?? 'missing'}${v.humanRequired === true ? ' (human gate; the panel did not reduce to accept)' : ''}, not accept`;
+}
+
 /** Did a TRUSTED principal already post this head's red-team comment? A marker from any other login never counts. PURE. */
 export function redTeamCommentPosted(comments, pr, rev) {
   const marker = redTeamMarker(pr, rev);
@@ -1231,8 +1261,7 @@ async function resumeRedTeam({ pr, repo, rev, title, prior, records, post, recor
 export async function runRedTeam({ pr, repo, lanePath, loopPayload, env = process.env, post = true, record = true } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    const verdict = loopPayload?.verdict?.verdict ?? null;
-    if (!redTeamRequired(verdict)) return { status: 'not-owed', reason: `review verdict is ${verdict ?? 'missing'}, not accept` };
+    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     const read = loopPayload?.findings?.read;
     const recording = record !== false && loopPayload?.replay !== true;
     const pass = await speculateRedTeam({ pr, repo, lanePath, read, claudeFindings: claudeFindingsFromLoop(loopPayload), env, post, record: recording }, io);
@@ -1445,8 +1474,7 @@ export async function completeRedTeam({ pr, repo, loopPayload, pass, post = true
 export async function finishSpeculativeRedTeam({ pr, repo, loopPayload, pass, env = process.env, post = true } = {}, io = createRedTeamIo({ env })) {
   try {
     if (!redTeamEnabled(env)) return { status: 'disabled', reason: `${RED_TEAM_ENV}=${env?.[RED_TEAM_ENV] ?? ''} ${EXTRA_SEATS_ENV}=${env?.[EXTRA_SEATS_ENV] ?? ''}`.trim() };
-    const verdict = loopPayload?.verdict?.verdict ?? null;
-    if (!redTeamRequired(verdict)) return { status: 'not-owed', reason: `review verdict is ${verdict ?? 'missing'}, not accept` };
+    if (!redTeamOwedFor(loopPayload)) return { status: 'not-owed', reason: notOwedReason(loopPayload) };
     if (pass?.status !== 'speculated') return { status: 'stale', reason: `the speculative pass is ${pass?.status ?? 'missing'}, not speculated` };
     const read = loopPayload?.findings?.read;
     const fp = redTeamReadFingerprint(read);
