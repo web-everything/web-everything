@@ -199,7 +199,9 @@ export function resolveSmokeBudgets(env = process.env, { load = () => loadavg()[
     // waiting on gh/git children — the cost grows with the open-PR count, not with load. 45s/60s held every
     // daemon clone off main (`smoke-env-timeout`). Generous defaults, still load-scaled below.
     reconcileMs: envMs(env, SMOKE_BUDGET_ENV.reconcileMs, 120_000),
-    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 180_000),
+    // Live 2026-10-11 on plain main, quiet host: three passes took 168s (fix 61s, ci-heal 92s,
+    // review 11s), leaving little margin under 180s. Allow 300s before the load scaling below.
+    dispatchDryRunMs: envMs(env, SMOKE_BUDGET_ENV.dispatchDryRunMs, 300_000),
     treeStaysCleanMs: envMs(env, SMOKE_BUDGET_ENV.treeStaysCleanMs, 10_000),
     daemonBootMs: envMs(env, SMOKE_BUDGET_ENV.daemonBootMs, DEFAULT_DAEMON_BOOT_MS),
   };
