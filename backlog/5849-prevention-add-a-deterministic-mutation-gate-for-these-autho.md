@@ -1,21 +1,21 @@
 ---
+bornAs: xonce6d
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/review-stack-base.mjs", "we:scripts/conveyor/__tests__/review-stack-base.test.mjs"]
+scope: ["we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs"]
 dateOpened: "2026-10-11"
 tags: []
 ---
 
-# Prevention — Mutation-test every new guard clause in the conveyor stack-policy modules. A pre-merge check coul… (from web-everything/web-everything#4899 review)
+# Prevention — Add a deterministic mutation gate for these authorization guards, requiring the named negative te… (from web-everything/web-everything#4797 review)
 
-Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this PR's latest advisory review named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/conveyor/review-stack-base.mjs:131` — Mutation-test every new guard clause in the conveyor stack-policy modules. A pre-merge check could fail when a deleted conjunct leaves the suite green, in place of relying on reviewers to notice an undefended `||`.
-2. `we:scripts/conveyor/review-stack-base.mjs:122` — When changing a policy's source of truth, review for and remove superseded resolution paths; preserve the declared-base and ambiguous-ancestry tests while consolidating this into one resolver.
+1. `we:scripts/conveyor/__tests__/ruling-not-addressed.test.mjs` — Add a deterministic mutation gate for these authorization guards, requiring the named negative tests to fail when their guard is bypassed; configure each fixture with takeovers enabled and a matching authorized positive control.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4899@f972144073b25385fc473fb3acda064946db5d3d
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4797@c1330f26b1114a75e88370f52f2eb9adadf91d0d
 
 ## Acceptance
 
