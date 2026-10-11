@@ -39,6 +39,7 @@ import { readFileSync, appendFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { writeAllSync } from './write-all-sync.mjs';
 
 export const TRUST_LABEL = 'ready-to-merge';
 export const REQUIRED_CHECK = 'test';
@@ -431,7 +432,7 @@ const GATE_SCRIPT = fileURLToPath(new URL('../merge-gate-check.mjs', import.meta
  * Runs exactly merge-gate-check.mjs (anything else is a usage error, exit 3) with `--json` appended, then applies
  * the resolved mode. Returns the exit code; IO is injected.
  */
-export function runGate({ argv = [], modeInfo, spawn = spawnSync, write = (s) => process.stdout.write(s), warn = (s) => process.stderr.write(s), appendSummary = null, cwd = process.cwd() } = {}) {
+export function runGate({ argv = [], modeInfo, spawn = spawnSync, write = (s) => writeAllSync(1, s), warn = (s) => writeAllSync(2, s), appendSummary = null, cwd = process.cwd() } = {}) {
   const i = argv.indexOf('--');
   const [target, ...args] = i === -1 ? [] : argv.slice(i + 1);
   if (!target || (resolve(cwd, target) !== GATE_SCRIPT && resolve(target) !== GATE_SCRIPT)) {
@@ -451,8 +452,8 @@ export function runGate({ argv = [], modeInfo, spawn = spawnSync, write = (s) =>
 const IS_CLI = process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url));
 if (IS_CLI && process.argv.includes('--run-gate')) {
   const summaryPath = process.env.GITHUB_STEP_SUMMARY;
-  process.exit(runGate({
+  process.exitCode = runGate({
     argv: process.argv.slice(2), modeInfo: loadMergeGateMode(),
     appendSummary: summaryPath ? (s) => appendFileSync(summaryPath, s) : null,
-  }));
+  });
 }
