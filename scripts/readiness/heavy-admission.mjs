@@ -118,6 +118,13 @@
  *     the standard time of every live waiter, and the expected demand of sessions dispatched in the last few
  *     minutes that have not reached the slots yet (read from their lane leases) — which `tick-core.mjs#planTick`
  *     and the fix / ci-heal daemons feed to `createQueueBudget` to admit or hold (`queue-cap`) new dispatches;
+ *   • RED-MAIN REPAIR CLASS (main-fix-queue-priority, live 2026-10-10 19:08Z): a waiter whose lane purpose /
+ *     session / holder (or WE_HEAVY_SESSION) matches `heavyAdmission.priority.repairPatterns` is class P0 on the
+ *     delivery-priority scale. Its marker records the class; every waiter yields to a live P0 marker; P0 waiters
+ *     rank FCFS among themselves in one queue across both lanes and may take any free slot, heavy or fast. A
+ *     running holder is never preempted. `heavyAdmission.priority.mode` (enforce|off) and the patterns resolve
+ *     standard → platform → tool → env (WE_HEAVY_ADMISSION_PRIORITY / WE_HEAVY_ADMISSION_REPAIR_PATTERNS, a JSON
+ *     array), and the P0 / yield log lines name the mode's source;
  *   • THE FAST LANE: short kinds (selected / files / standards) rank first-come-first-served among themselves.
  *     The fastSlots setting adds capacity above cap (default 2 heavy + 1 fast); short jobs can also take heavy
  *     slots, but full suites cannot take fast slots. Fast capacity can scale with short-kind demand when a
@@ -144,6 +151,7 @@ import {
   classifyCommandKind, refineKind, holderLabel, holdBreakdown, resolveFastRunTimeoutMs, normalizeKind, queueLaneOf, typicalMinutes, typicalDispatchMinutes, resolvePrepareAdmission, classifyDispatchKind, dispatchDemandMinutes,
   queueBacklog, laneProjection, slotOrderFor, DEFAULT_QUEUE_MAX_WAIT_MINUTES, QUEUE_MAX_WAIT_ENV,
   QUEUE_ADMISSION_SWITCH_ENV, DEFAULT_ARRIVAL_WINDOW_MINUTES,
+  classifyWaiterPriority, waiterPriorityClass, validRepairPatterns, DEFAULT_REPAIR_PATTERNS, ADMISSION_PRIORITY_MODES,
 } from './heavy-queue-projection.mjs'; // card xkyw1x4 — the pure projection + fast-lane rules
 export * from './heavy-queue-projection.mjs';
 
@@ -204,6 +212,8 @@ export const ADMISSION_DEFERRED_EXIT = 75; // EX_TEMPFAIL: re-queue; the command
 export const ADMISSION_POLICY_STANDARD = Object.freeze({
   cap: DEFAULT_ADMISSION_CAP, fastSlots: 1, onTimeout: 'defer',
   fastScale: Object.freeze({ maxSlots: null, minShortWaiters: 3, minShortShare: 0.6, minCpuIdlePct: 30, maxMemPressureLevel: 1 }),
+  // main-fix-queue-priority — a red-main repair waiter (P0) is admitted to the next free slot ahead of all others.
+  priority: Object.freeze({ mode: 'enforce', repairPatterns: DEFAULT_REPAIR_PATTERNS }),
 });
 
 /** Upper bound on any slot count: a typo like `cap: 1e9` would otherwise make every scan walk a billion lock entries. */
@@ -216,8 +226,22 @@ const ADMISSION_VALID = {
   'fastScale.minShortShare': (v) => Number.isFinite(v) && v >= 0 && v <= 1,
   'fastScale.minCpuIdlePct': (v) => Number.isFinite(v) && v >= 0 && v <= 100,
   'fastScale.maxMemPressureLevel': (v) => admissionInt(1)(v) && v <= 4,
+  'priority.mode': (v) => ADMISSION_PRIORITY_MODES.includes(v),
+  'priority.repairPatterns': validRepairPatterns,
 };
-const ADMISSION_ENV = { cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT' };
+const ADMISSION_ENV = {
+  cap: 'WE_HEAVY_ADMISSION_CAP', fastSlots: 'WE_HEAVY_ADMISSION_FAST_SLOTS', onTimeout: 'WE_HEAVY_ADMISSION_ON_TIMEOUT',
+  'priority.mode': 'WE_HEAVY_ADMISSION_PRIORITY', 'priority.repairPatterns': 'WE_HEAVY_ADMISSION_REPAIR_PATTERNS',
+};
+/** Leaves that only shape what THIS caller does (never the shared slot range), so their env applies anywhere. */
+const PER_CALLER_LEAVES = new Set(['onTimeout', 'priority.mode', 'priority.repairPatterns']);
+/** Env text → a leaf value: a JSON array (or one bare pattern) for the repair patterns, lower-case for words. */
+function parseAdmissionEnv(leaf, raw) {
+  const s = String(raw).trim();
+  if (leaf === 'priority.repairPatterns') { if (!s.startsWith('[')) return s ? [s] : NaN; try { return JSON.parse(s); } catch { return NaN; } }
+  if (leaf === 'onTimeout' || leaf === 'priority.mode') return s.toLowerCase();
+  return s === '' ? NaN : Number(s);
+}
 const admissionObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const admissionLeaf = (block, path) => path.split('.').reduce((v, key) => admissionObject(v) && Object.hasOwn(v, key) ? v[key] : undefined, block);
 const ADMISSION_MODULE_ROOT = (() => { try { return fileURLToPath(new URL('../../', import.meta.url)); } catch { return process.cwd(); } })();
@@ -263,7 +287,8 @@ export function privateAdmissionPool(env, checkoutRoot) {
  */
 export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot } = {}) {
   const isPrivate = privateAdmissionPool(env, checkoutRoot);
-  const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale } };
+  const settings = { ...ADMISSION_POLICY_STANDARD, fastScale: { ...ADMISSION_POLICY_STANDARD.fastScale },
+    priority: { ...ADMISSION_POLICY_STANDARD.priority, repairPatterns: [...ADMISSION_POLICY_STANDARD.priority.repairPatterns] } };
   const sources = {}; const invalid = []; const ignored = [];
   for (const [leaf, valid] of Object.entries(ADMISSION_VALID)) {
     let value = admissionLeaf(settings, leaf);
@@ -271,7 +296,7 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     for (const [layer, block] of [['platform', platform], ['tool', tool]]) {
       const v = admissionLeaf(block, leaf);
       if (v === undefined) continue;
-      if (layer === 'tool' && leaf !== 'onTimeout' && !isPrivate) {
+      if (layer === 'tool' && !PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`tool.${leaf}=${oneLine(JSON.stringify(v))} (checkout-local settings would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
         continue;
       }
@@ -281,16 +306,16 @@ export function resolveAdmissionPolicy({ platform, tool, env = {}, checkoutRoot 
     const name = ADMISSION_ENV[leaf];
     const raw = name ? env[name] : undefined;
     if (raw !== undefined) {
-      if (leaf !== 'onTimeout' && !isPrivate) {
+      if (!PER_CALLER_LEAVES.has(leaf) && !isPrivate) {
         ignored.push(`env ${name}=${oneLine(raw)} (a per-process value would diverge from the shared host pool; set heavyAdmission.${leaf} in platform-preferences)`);
       } else {
-        const s = String(raw).trim();
-        const v = leaf === 'onTimeout' ? s.toLowerCase() : (s === '' ? NaN : Number(s));
+        const v = parseAdmissionEnv(leaf, raw);
         if (valid(v)) { value = v; sources[leaf] = `env ${name}`; }
         else invalid.push(`env ${name}=${JSON.stringify(raw)}`);
       }
     }
-    if (leaf.startsWith('fastScale.')) settings.fastScale[leaf.slice('fastScale.'.length)] = value;
+    const dot = leaf.indexOf('.');
+    if (dot > 0) settings[leaf.slice(0, dot)][leaf.slice(dot + 1)] = value;
     else settings[leaf] = value;
   }
   return { settings, sources, invalid, ignored };
@@ -343,7 +368,7 @@ export function loadAdmissionPolicy({ env = process.env, repoRoot, checkoutRoot,
 }
 
 export function formatAdmissionPolicy({ settings, sources, ignored = [], invalid = [] }) {
-  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots']
+  const values = ['cap', 'fastSlots', 'onTimeout', 'fastScale.maxSlots', 'priority.mode']
     .map((leaf) => `${leaf}=${admissionLeaf(settings, leaf)} (${sources[leaf] ?? 'standard'})`);
   return `heavy-admission policy · ${values.join(', ')}${ignored.length ? ` · ignored: ${ignored.join('; ')}` : ''}${invalid.length ? ` · invalid: ${invalid.join('; ')}` : ''}`;
 }
@@ -838,13 +863,15 @@ function lockIdSafe(owner) {
 }
 
 /** Mark `owner` as waiting for a slot. Best-effort — a write failure never blocks the caller's retry loop. */
-export function markWaiting({ lockRoot, owner, lane = null, num = null, nowIso, pid = null, repo = null, kind = null }) {
+export function markWaiting({ lockRoot, owner, lane = null, num = null, nowIso, pid = null, repo = null, kind = null, priority = null, priorityReason = null }) {
   try {
     mkdirSync(waitingDir(lockRoot), { recursive: true });
     // `pid` + `host` + `repo` (xaipsbs) are what the stale-waiter reap reads to prove the owner is gone.
     // Markers written before they existed carry none of them; the reap falls back to the lane lease for those.
     // `kind` (card xkyw1x4) — which queue lane this waiter ranks in, and what `queue-status` costs it at.
-    const body = { owner: String(owner), lane, num, requestedAt: nowIso, pid: Number.isInteger(pid) ? pid : null, host: hostname(), repo, ...(kind ? { kind } : {}) };
+    // `priority` (main-fix-queue-priority) — only a non-normal class is written; a marker without one ranks as P3.
+    const cls = priority && priority !== 'P3' ? { priority, ...(priorityReason ? { priorityReason } : {}) } : {};
+    const body = { owner: String(owner), lane, num, requestedAt: nowIso, pid: Number.isInteger(pid) ? pid : null, host: hostname(), repo, ...(kind ? { kind } : {}), ...cls };
     writeFileSync(waitingFile(lockRoot, owner), JSON.stringify(body, null, 2) + '\n', 'utf8');
   } catch { /* best-effort — the wait itself must never fail on a marker write */ }
 }
@@ -1027,21 +1054,34 @@ export function isDeadOwnerWaiter(marker, {
  * @param {{lockRoot:string, owner:string, nowMs:number, ttlMs?:number, pidLiveness?:(pid:number)=>('dead'|'alive'|'unknown'), host?:string}} o
  * @returns {boolean}
  */
-export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL_MINUTES * 60_000, kind = undefined, ...seams }) {
+export function isOldestLiveWaiter({ lockRoot, owner, nowMs, ttlMs = WAITING_TTL_MINUTES * 60_000, kind = undefined, priorityMode = 'enforce', ...seams }) {
   // Card xkyw1x4 — THE FAST LANE. With a `kind`, rank only against waiters in the SAME queue lane: a short job is
   // never behind a full-suite waiter, and first-come-first-served (#2692) still holds inside each lane. A marker
   // with no `kind` (written by older code) ranks in the slow lane. Without a `kind`: one global queue, as before.
   const lane = kind === undefined ? null : queueLaneOf(normalizeKind(kind));
-  const live = listWaiting(lockRoot)
-    .filter((m) => isRankableWaiter(m, { nowMs, ttlMs, ...seams }))
-    .filter((m) => lane === null || queueLaneOf(normalizeKind(m.kind)) === lane);
+  const rankable = listWaiting(lockRoot).filter((m) => isRankableWaiter(m, { nowMs, ttlMs, ...seams }));
+  // main-fix-queue-priority — a red-main repair (P0) may take any slot, so it ranks in ONE queue across both lanes,
+  // ahead of every other waiter; FCFS still orders the P0 waiters among themselves. While a live P0 waits, nobody
+  // else attempts. `priorityMode: 'off'` ignores the markers' class (today's FCFS).
+  if (priorityMode === 'enforce') {
+    const p0 = rankable.filter((m) => waiterPriorityClass(m) === 'P0');
+    const self = rankable.find((m) => m.owner === owner);
+    if (self && waiterPriorityClass(self) === 'P0') return oldestOwner(p0) === owner;
+    if (p0.some((m) => m.owner !== owner)) return false;
+  }
+  const live = rankable.filter((m) => lane === null || queueLaneOf(normalizeKind(m.kind)) === lane);
   if (live.length === 0) return true;
-  const oldest = [...live].sort((a, b) => {
+  return oldestOwner(live) === owner;
+}
+
+/** The owner of the earliest `requestedAt` marker (ties on owner name), or null for none. */
+function oldestOwner(markers) {
+  if (markers.length === 0) return null;
+  return [...markers].sort((a, b) => {
     const at = Date.parse(a.requestedAt), bt = Date.parse(b.requestedAt);
     const an = Number.isNaN(at) ? Infinity : at, bn = Number.isNaN(bt) ? Infinity : bt;
     return an !== bn ? an - bn : String(a.owner).localeCompare(String(b.owner));
-  })[0];
-  return oldest.owner === owner;
+  })[0].owner;
 }
 
 // ── the blocking wait primitive a heavy-command call site uses ─────────────────────────────────────────
@@ -1094,6 +1134,19 @@ export async function acquireSlotBlocking({
   // Item 100 — a missing / `other` kind is re-derived from the command or the acquiring script; `other` that
   // survives is a truly unknown command, and the command / holder are recorded with the hold.
   const jobKind = refineKind(kind, { command, holder, env });
+  // main-fix-queue-priority — the admission class, from the dispatcher's session env and the lane lease as it is
+  // NOW. A red-main repair is P0 on the delivery-priority scale: next free slot, heavy or fast, ahead of all others.
+  const priority = policy.settings.priority ?? ADMISSION_POLICY_STANDARD.priority;
+  const prioritySrc = `priority.mode=${priority.mode} (${policy.sources?.['priority.mode'] ?? 'standard'})`;
+  let waiterLease = null;
+  try { const leaseRepo = repo ?? repoOfOwner(owner); if (leaseRepo) waiterLease = (seams.readLease || readLaneLease)(leaseRepo); } catch { /* best-effort */ }
+  const cls = classifyWaiterPriority({
+    purpose: waiterLease?.purpose ?? null, session: waiterLease?.session ?? null, holder: waiterLease?.holder ?? null,
+    envSession: clipIdentity(env?.[HOLD_SESSION_ENV]),
+  }, priority);
+  if (cls.class === 'P0') {
+    log(`heavy-command admission: red-main repair — class P0 (${cls.reason}; matched ${cls.matched.field}=${cls.matched.value} by /${cls.matched.pattern}/) ranks ahead of every other waiter and may take any free slot, heavy or fast [${prioritySrc}]\n`);
+  }
   // xaipsbs — every admission attempt first clears stale waiters, so debris never outlives the next caller.
   reapStaleWaiters({ lockRoot, nowMs: startedAt, apply: true, ...seams });
   // MECHANICAL FAIRNESS (#3383 card xb0iuxq) — mark BEFORE the first attempt, not only after it fails, so
@@ -1102,9 +1155,11 @@ export async function acquireSlotBlocking({
   // `tryAcquireSlot` itself would have won a slot for it. A caller with no contention (the common case) still
   // succeeds with zero wait below — `isOldestLiveWaiter` reports it "oldest" (nothing else live to rank
   // against) on its very first check.
-  markWaiting({ lockRoot, owner, lane, num, pid, repo, kind: jobKind, nowIso: new Date(startedAt).toISOString() });
+  markWaiting({ lockRoot, owner, lane, num, pid, repo, kind: jobKind, nowIso: new Date(startedAt).toISOString(),
+    priority: cls.class, priorityReason: cls.class === 'P0' ? cls.reason : null });
   let lastLoggedAt = startedAt;
   let ceilingChecked = false;
+  let yieldLogged = false;
   try {
     for (;;) {
       const attempt = now();
@@ -1114,19 +1169,28 @@ export async function acquireSlotBlocking({
         try { snapshot = readResourceSnapshot(); } catch { snapshot = null; }
       }
       const fastSlots = resolveEffectiveFastSlots({ policy: policy.settings, waiting: listWaiting(lockRoot), snapshot, nowMs: attempt });
-      const slotOrder = slotOrderFor(jobKind, cap, fastSlots);
+      const slotOrder = slotOrderFor(jobKind, cap, fastSlots, cls.class);
       const atCeiling = !ceilingChecked && attempt - startedAt >= ceilingMs;
       // Fairness holds at the ceiling too: only the oldest live waiter of its lane tries (a dead or lease-expired
       // holder is reclaimed by that attempt, so the ceiling never needs an unranked grab that cuts the queue).
-      if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, ...seams })) {
+      if (isOldestLiveWaiter({ lockRoot, owner, nowMs: attempt, kind: jobKind, priorityMode: priority.mode, ...seams })) {
         const nowIso = new Date(attempt).toISOString();
         // `meta` carries the kind + acquire time so the release can record the hold duration by kind.
         // Card xmh9mtr — WHO holds it is fixed here, at acquire (env first, then the lane lease as it is NOW);
         // reading it at release mis-attributes a lane whose lease was reaped or re-leased meanwhile.
         const identity = resolveHoldIdentity({ env, repo: repo ?? repoOfOwner(owner), readLease: seams.readLease });
-        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...identity };
+        const meta = { kind: jobKind, acquiredAt: nowIso, lane: lane ?? null, ...(command ? { command: String(command).slice(0, 200) } : {}), ...(holder ? { holder } : {}), ...identity, ...(cls.class !== 'P3' ? { priority: cls.class } : {}) };
         const r = tryAcquireSlot({ lockRoot, cap, owner, nowMs: attempt, nowIso, pid, leaseMinutes, meta, slots: slotOrder });
-        if (r.ok) return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
+        if (r.ok) {
+          if (cls.class === 'P0') log(`heavy-command admission: red-main repair admitted — class P0, slot ${r.slot}, after ${Math.round((attempt - startedAt) / 1000)}s [${prioritySrc}]\n`);
+          return { ok: true, slot: r.slot, timedOut: false, waitedMs: attempt - startedAt };
+        }
+      } else if (!yieldLogged && cls.class !== 'P0' && priority.mode === 'enforce') {
+        const repair = listWaiting(lockRoot).find((m) => waiterPriorityClass(m) === 'P0' && m.owner !== owner);
+        if (repair) {
+          yieldLogged = true;
+          log(`heavy-command admission: yielding to red-main repair waiter ${repair.lane ? `lane ${repair.lane}` : repair.owner} (class P0) [${prioritySrc}]\n`);
+        }
       }
       if (atCeiling) {
         ceilingChecked = true;
@@ -1164,7 +1228,7 @@ const DURATIONS_LOG = 'durations.jsonl';
 export const DURATIONS_LOG_MAX_LINES = 2000;
 
 /** Append one hold-duration record. Never throws. */
-export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null, runId = null }) {
+export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = null, at = new Date().toISOString(), dispatchKind = null, session = null, leaseAcquiredAt = null, command = null, holder = null, runId = null, priority = null }) {
   if (!Number.isFinite(ms) || ms < 0) return false;
   const file = join(lockRoot, DURATIONS_LOG);
   try {
@@ -1177,6 +1241,7 @@ export function recordHoldDuration({ lockRoot, kind, ms, lane = null, repo = nul
       ...(runId != null ? { runId } : {}),
       ...(command ? { command } : {}),
       ...(holder ? { holder } : {}),
+      ...(priority ? { priority } : {}),
     }) + '\n', 'utf8');
     const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
     if (lines.length > DURATIONS_LOG_MAX_LINES) writeFileSync(file, lines.slice(-Math.floor(DURATIONS_LOG_MAX_LINES / 2)).join('\n') + '\n', 'utf8');
@@ -1204,7 +1269,7 @@ function recordReleasedHold(lockRoot, entry, nowMs = Date.now()) {
     session: m.session ?? fromLease.session ?? null,
     leaseAcquiredAt: m.leaseAcquiredAt ?? (m.session ? null : fromLease.leaseAcquiredAt ?? null),
     runId: m.runId ?? null,
-    command: m.command ?? null, holder: m.holder ?? null,
+    command: m.command ?? null, holder: m.holder ?? null, priority: m.priority ?? null,
   });
 }
 

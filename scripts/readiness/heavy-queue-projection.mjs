@@ -33,7 +33,12 @@
  *      fast slot first and may also take any free heavy slot; a full suite never takes a fast slot. Short jobs
  *      rank first-come-first-served among themselves, never behind a full-suite waiter
  *      ({@link resolveFastSlots}, {@link slotOrderFor}).
+ *   5. RED-MAIN REPAIR CLASS (main-fix-queue-priority, 2026-10-10): while main is red nothing lands, so a waiter whose
+ *      lane purpose / session / holder marks it as a red-main repair ({@link classifyWaiterPriority}) is class P0 on
+ *      the delivery-priority scale (`we:scripts/lib/delivery-priority.mjs`) and takes the next free slot, heavy or
+ *      fast, ahead of every other waiter. FCFS still holds within a class; a running holder is never preempted.
  */
+import { deliveryPriority, PRIORITY_CLASSES } from '../lib/delivery-priority.mjs';
 
 /** Every heavy-command kind the queue distinguishes. Same vocabulary `we:scripts/operations/heavy-queue.mjs`
  *  already reported (`FULL` is the whole unit suite; `selected` a verify-lane diff-driven run; `files` a bare
@@ -467,10 +472,64 @@ export function resolveFastSlots(env = {}) {
  * heavy job) tries only the heavy slots.
  * @returns {number[]}
  */
-export function slotOrderFor(kind, cap, fastSlots) {
+export function slotOrderFor(kind, cap, fastSlots, priorityClass = null) {
   const c = Number.isFinite(cap) && cap >= 1 ? Math.floor(cap) : 1;
   const f = Number.isFinite(fastSlots) && fastSlots > 0 ? Math.floor(fastSlots) : 0;
   const heavy = Array.from({ length: c }, (_, i) => i);
   const fast = Array.from({ length: f }, (_, i) => c + i);
-  return queueLaneOf(normalizeKind(kind)) === 'fast' ? [...fast, ...heavy] : heavy;
+  if (queueLaneOf(normalizeKind(kind)) === 'fast') return [...fast, ...heavy];
+  // A red-main repair (P0) takes the next free slot, heavy or fast — its own lane's slots first.
+  return priorityClass === 'P0' ? [...heavy, ...fast] : heavy;
+}
+
+// ── red-main repair class (main-fix-queue-priority) ───────────────────────────────────────────────────────
+
+/** The standard repair patterns, matched against a waiter's lane purpose, session and holder slug:
+ *  `main-fix-<sha>` (`main-ci-red-core.mjs#ownerSessionSlug`, and its `-lane-N-<id>` holder slug),
+ *  `main-fix-combine-<pr>`, and `revert-red-<sha|pr>`. Anchored on a sha / PR number so an ordinary lane that merely
+ *  starts with `main-fix-` or `revert-red-` (e.g. `main-fix-queue-priority`, `revert-red-check`) stays normal. */
+export const DEFAULT_REPAIR_PATTERNS = Object.freeze([
+  '^main-fix-[0-9a-f]{7,40}(?:-lane-\\d+-[0-9a-f]+)?$',
+  '^main-fix-combine-\\d+(?:-lane-\\d+-[0-9a-f]+)?$',
+  '^revert-red-(?:[0-9a-f]{7,40}|\\d+)(?:-lane-\\d+-[0-9a-f]+)?$',
+]);
+export const ADMISSION_PRIORITY_MODES = Object.freeze(['enforce', 'off']);
+const IDENTITY_FIELDS = ['purpose', 'session', 'holder', 'envSession'];
+
+/** True when every entry is a non-empty string that compiles as a RegExp. Pure. */
+export function validRepairPatterns(v) {
+  if (!Array.isArray(v)) return false;
+  for (const p of v) {
+    if (typeof p !== 'string' || p === '') return false;
+    try { new RegExp(p); } catch { return false; }
+  }
+  return true;
+}
+
+/**
+ * The admission class of one waiter. PURE. A red-main repair — any identity field matching a repair pattern — is
+ * classed by the delivery-priority rule as the owner of the open main-red episode's fix (P0); everything else is
+ * P3 (normal). Mode `off` makes every waiter P3 (today's FCFS).
+ * @param {{purpose?:string|null, session?:string|null, holder?:string|null, envSession?:string|null}} identity
+ * @param {{mode:'enforce'|'off', repairPatterns:string[]}} priority
+ * @returns {{class:string, reason:string, matched:{field:string, value:string, pattern:string}|null}}
+ */
+export function classifyWaiterPriority(identity, priority) {
+  const normal = (reason) => ({ class: 'P3', reason, matched: null });
+  if (priority?.mode !== 'enforce') return normal('priority off');
+  const patterns = validRepairPatterns(priority.repairPatterns) ? priority.repairPatterns : DEFAULT_REPAIR_PATTERNS;
+  for (const field of IDENTITY_FIELDS) {
+    const value = identity?.[field];
+    if (typeof value !== 'string' || value === '') continue;
+    const pattern = patterns.find((p) => new RegExp(p).test(value));
+    if (pattern === undefined) continue;
+    const d = deliveryPriority({ incident: { open: true, owner: true } }, { mode: 'enforce' }, 0);
+    return { class: d.class, reason: `red-main repair: ${d.reasons.join('; ')}`, matched: { field, value, pattern } };
+  }
+  return normal('normal');
+}
+
+/** A waiting marker's class: its recorded `priority` when it is a known class, else P3. Pure. */
+export function waiterPriorityClass(marker) {
+  return PRIORITY_CLASSES.includes(marker?.priority) ? marker.priority : 'P3';
 }
