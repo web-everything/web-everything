@@ -7,7 +7,8 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { decideAffected as decideAffectedRule, readAffectedFacts, isGateFile, DEFAULT_RETEST_MODE, MAX_GRAPH_FILES, MAX_CLOSURE_FILES } from '../merge-queue-affected.mjs';
+import { decideAffected as decideAffectedRule, readAffectedFacts, isGateFile, DEFAULT_RETEST_MODE, MAX_GRAPH_FILES, MAX_CLOSURE_FILES,
+  resolveSettingsPolicy, readSettingsReaders, logPolicyOnce, MAX_SETTINGS_KEYS, MAX_SETTINGS_READERS, MAX_SETTINGS_FILES, SETTINGS_DIRECTORY_CONSUMERS, SETTINGS_READER_MODE_ENV, SETTINGS_GATE_FILES_ENV, DEFAULT_SETTINGS_GATE_FILES } from '../merge-queue-affected.mjs';
 import { relativeSpecifierBases, resolvedImportsOf, specifierBasesResolvingTo } from '../related-test-selection.mjs';
 
 /** The rule with no unchanged importers anywhere (the forward-walk cases below); a case that needs some passes `importersOf`. */
@@ -70,7 +71,7 @@ describe('decideAffected (pure)', () => {
   });
   it.each([
     'scripts/merge-ai-prs.mjs', 'scripts/lib/merge-queue-hook.mjs', 'scripts/lib/merge-freshness.mjs', '.github/workflows/ci.yml',
-    'scripts/settings/merge-queue.json', 'scripts/settings/anything-else.json',
+    'scripts/settings/merge-queue.json', 'scripts/settings/red-main-hold.json', 'scripts/settings/README',
     'package.json', 'package-lock.json', 'vitest.config.ts', 'tsconfig.json', 'scripts/__tests__/fixtures/shared-git-fixture.mjs', 'scripts/ci/shard-assign.mjs',
   ])('the gate itself (%s) on EITHER side always re-tests', (gate) => {
     expect(isGateFile(gate)).toBe(true);
@@ -176,6 +177,15 @@ function fakeGit(trees, { fetchable = true, batchFails = false } = {}) {
     }
     if (cmd === 'fetch') { if (fetchable) for (const s of Object.keys(trees)) present.add(s); return ''; }
     if (cmd === 'ls-tree') { if (!args.includes('-z')) throw new Error('ls-tree must be -z (quoted non-ASCII paths)'); return Object.keys(trees[args.at(-1)]).join('\0'); }
+    if (cmd === 'grep') { // `grep -l -z -I -E -e <p>… <sha> -- <dir>…` → `<sha>:<path>\0`…; no match = exit 1, no stderr
+      const sep = args.indexOf('--');
+      const sha = args[sep - 1];
+      const res = args.flatMap((a, i) => (args[i - 1] === '-e' ? [new RegExp(a, 'm')] : []));
+      const dirs = args.slice(sep + 1);
+      const hits = Object.entries(trees[sha] ?? {}).filter(([f, body]) => dirs.some((d) => f.startsWith(`${d}/`)) && res.some((re) => re.test(body))).map(([f]) => `${sha}:${f}\0`);
+      if (!hits.length) throw Object.assign(new Error('exit 1'), { status: 1, stderr: '' });
+      return hits.join('');
+    }
     if (cmd === 'show') { const [sha, path] = args[1].split(/:(.*)/s); if (!(path in (trees[sha] ?? {}))) throw new Error(`fatal: path '${path}' does not exist in '${sha}'`); return trees[sha][path]; }
     throw new Error(`unexpected git ${args.join(' ')}`);
   };
@@ -713,4 +723,258 @@ describe('classifyMergeQueueSkip — real 2026-10-09 drain reasons, previously `
     ['merge-queue: refuse (required-check-failed)', 'merge-queue-refuse'],
   ])('%s → %s', (reason, kind) => { expect(classifyMergeQueueSkip(reason)).toBe(kind); });
   it('a non-merge-queue reason is not claimed', () => { expect(classifyMergeQueueSkip('required check "test" is not green')).toBeNull(); });
+});
+
+// Live 2026-10-10 18:23 ET: the drain merged #4763 (it added scripts/settings/review.json) and every other ready PR
+// (#4805, #4811, #4813, #4821, #4822, #4827, #4828, #4829) got `refresh (… affected:gate-touched:scripts/settings/review.json)`:
+// the whole settings folder was the gate. Only the settings the gate reads stay the gate; any other settings file is
+// replaced by its readers in the import-graph rules, and an unresolvable one still re-tests.
+describe('declared settings: only the gate\'s own settings are the gate; the rest resolve to their readers', () => {
+  const REVIEW = 'scripts/settings/review.json';
+  const READER = 'scripts/lib/review-seat-settings.mjs';
+  it('a non-gate settings file is not the gate; the gate\'s own settings are; `gate-all` restores the old rule', () => {
+    expect(isGateFile(REVIEW)).toBe(false);
+    expect(isGateFile('scripts/settings/merge-queue.json')).toBe(true);
+    expect(isGateFile('scripts/settings/red-main-hold.json')).toBe(true);
+    expect(isGateFile(REVIEW, { mode: 'gate-all', gateFiles: DEFAULT_SETTINGS_GATE_FILES })).toBe(true);
+    expect(isGateFile(REVIEW, { mode: 'resolve', gateFiles: ['review.json'] })).toBe(true);
+  });
+  const readers = (map) => (_side, f) => map[f] ?? null;
+  it('main changed a settings file whose readers the PR never reaches → not affected', () => {
+    const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: [REVIEW], importsOf: none, settingsReadersOf: readers({ [REVIEW]: { readers: [READER], keys: ['parallelSeats'] } }) });
+    expect(r).toMatchObject({ affected: false, reasons: ['main-delta-unaffected', `settings-readers:main:${REVIEW}=1`] });
+  });
+  it('the PR changed a reader of the settings file main changed → affected (same file)', () => {
+    const r = decideAffected({ prFiles: [READER], mainFiles: [REVIEW], importsOf: none, settingsReadersOf: readers({ [REVIEW]: { readers: [READER], keys: ['parallelSeats'] } }) });
+    expect(r.reasons[0]).toBe(`same-file:${READER}`);
+  });
+  it('a PR file that imports a reader → affected (the reader stands in for the settings file)', () => {
+    const importsOf = (side, f) => (side === 'pr' && f === 'scripts/a.mjs' ? [READER] : []);
+    const r = decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: [REVIEW], importsOf, settingsReadersOf: readers({ [REVIEW]: { readers: [READER], keys: ['parallelSeats'] } }) });
+    expect(r.reasons[0]).toBe(`pr-file-imports-main-file:scripts/a.mjs->${READER}`);
+  });
+  it('unresolvable readers (no resolver, or `null`) fail closed; a reader that is the gate re-tests', () => {
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: [REVIEW], importsOf: none }).reasons[0]).toBe(`settings-readers-unresolved:${REVIEW}`);
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: [REVIEW], importsOf: none, settingsReadersOf: () => ({ why: 'no reader of x' }) }).reasons[0])
+      .toBe(`settings-readers-unresolved:${REVIEW} (no reader of x)`);
+    expect(decideAffected({ prFiles: ['scripts/a.mjs'], mainFiles: [REVIEW], importsOf: none, settingsReadersOf: () => ({ readers: [], keys: ['k'], gateReader: 'scripts/merge-ai-prs.mjs' }) }).reasons[0])
+      .toBe(`gate-touched:${REVIEW} (read by scripts/merge-ai-prs.mjs)`);
+  });
+  it('both sides changing the same top-level settings key → affected', () => {
+    const r = decideAffected({ prFiles: ['scripts/settings/other.json'], mainFiles: [REVIEW], importsOf: none,
+      settingsReadersOf: readers({ [REVIEW]: { readers: [READER], keys: ['parallelSeats'] }, 'scripts/settings/other.json': { readers: ['scripts/o.mjs'], keys: ['parallelSeats'] } }) });
+    expect(r.reasons[0]).toBe('settings-key-both-sides:parallelSeats');
+  });
+
+  describe('through git: replay of the 2026-10-10 18:23 ET pass (#4763 added the review settings file)', () => {
+    const HEAD = 'h'.repeat(40);
+    const TIP = 't'.repeat(40);
+    const SEATS = JSON.stringify({ $comment: 'doc', parallelSeats: 'on', seatsByTouchSet: 'on' });
+    const base = {
+      [READER]: "import { readSettings } from './settings-files.mjs';\nexport const v = (s) => s.parallelSeats ?? s.seatsByTouchSet;",
+      'scripts/lib/settings-files.mjs': '',
+      'scripts/operations/review-pr.mjs': "import { v } from '../lib/review-seat-settings.mjs';",
+      'scripts/other/a.mjs': '',
+      'scripts/other/a.test.mjs': "import './a.mjs';",
+      'scripts/settings/merge-queue.json': '{"mergeQueue":{}}',
+    };
+    const trees = (extraHead = {}, extraTip = {}) => ({ [HEAD]: { ...base, ...extraHead }, [TIP]: { ...base, [REVIEW]: SEATS, ...extraTip } });
+    const POLICY = { mode: 'resolve', gateFiles: DEFAULT_SETTINGS_GATE_FILES };
+    it('BEFORE (gate-all = the old rule): every ready PR re-tests on gate-touched', () => {
+      const { git } = fakeGit(trees());
+      expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [REVIEW], git, settingsPolicy: { ...POLICY, mode: 'gate-all' } }).reasons)
+        .toEqual([`gate-touched:${REVIEW}`]);
+    });
+    it('AFTER: a PR whose closure reaches no reader of the review settings is NOT re-tested', () => {
+      const { git } = fakeGit(trees());
+      const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [REVIEW], git, settingsPolicy: POLICY });
+      expect(r).toMatchObject({ affected: false, reasons: ['main-delta-unaffected', `settings-readers:main:${REVIEW}=1`] });
+    });
+    it('AFTER: a PR that imports a reader IS re-tested', () => {
+      const { git } = fakeGit(trees({ 'scripts/other/a.mjs': "import '../lib/review-seat-settings.mjs';" }));
+      const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [REVIEW], git, settingsPolicy: POLICY });
+      expect(r).toMatchObject({ affected: true, reasons: [`pr-file-imports-main-file:scripts/other/a.mjs->${READER}`, `settings-readers:main:${REVIEW}=1`] });
+    });
+    it('an answer the no-IO pre-check gives carries no reader count (it never resolved the readers)', () => {
+      const { git } = fakeGit(trees());
+      expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [REVIEW, 'scripts/other/a.mjs'], git, settingsPolicy: POLICY }).reasons)
+        .toEqual(['same-file:scripts/other/a.mjs']);
+    });
+    it('a merge-queue settings change still re-tests every PR', () => {
+      const { git } = fakeGit(trees({}, { 'scripts/settings/merge-queue.json': '{"mergeQueue":{"enabled":true}}' }));
+      expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: ['scripts/settings/merge-queue.json'], git, settingsPolicy: POLICY }).reasons)
+        .toEqual(['gate-touched:scripts/settings/merge-queue.json']);
+    });
+    it('an unresolvable settings file re-tests: a changed key nothing reads, or a file that is not JSON', () => {
+      const orphan = 'scripts/settings/orphan.json';
+      const { git } = fakeGit(trees({}, { [orphan]: '{"nobodyReadsThis":1}' }));
+      expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [orphan], git, settingsPolicy: POLICY }).reasons[0])
+        .toBe(`settings-readers-unresolved:${orphan} (no reader of nobodyReadsThis)`);
+      const { git: g2 } = fakeGit(trees({}, { [orphan]: '{ not json' }));
+      expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [orphan], git: g2, settingsPolicy: POLICY }).reasons[0])
+        .toMatch(new RegExp(`^settings-readers-unresolved:${orphan} \\(not JSON`));
+    });
+    it('a reader that is the gate itself re-tests; data files that mention a key are not readers', () => {
+      const { git } = fakeGit(trees({}, { 'scripts/merge-ai-prs.mjs': 'const x = s.parallelSeats;', 'scripts/ci/timings.json': '{"parallelSeats":1}' }));
+      const r = readSettingsReaders({ git, file: REVIEW, shas: [TIP, HEAD] });
+      expect(r).toMatchObject({ gateReader: 'scripts/merge-ai-prs.mjs', keys: ['parallelSeats', 'seatsByTouchSet'] });
+      const { git: g2 } = fakeGit(trees({}, { 'scripts/ci/timings.json': '{"parallelSeats":1}', 'docs-in-scripts.md': '' }));
+      expect(readSettingsReaders({ git: g2, file: REVIEW, shas: [TIP, HEAD] })).toEqual({ readers: [READER], keys: ['parallelSeats', 'seatsByTouchSet'], gateReader: null });
+    });
+    it('a $comment-only change has no changed key: only files naming the settings file read it', () => {
+      const { git } = fakeGit(trees({ [REVIEW]: SEATS.replace('doc', 'old doc') }));
+      expect(readSettingsReaders({ git, file: REVIEW, shas: [TIP, HEAD] })).toEqual({ readers: [], keys: [], gateReader: null });
+    });
+
+    describe('fail-closed settings paths (review of #4843)', () => {
+      const MIXED = 'scripts/settings/mixed.json';
+      const treesFor = (head, tip) => ({ [HEAD]: { ...base, ...head }, [TIP]: { ...base, ...tip } });
+      const resolve = (git, extra = {}) => readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: [MIXED], git, settingsPolicy: POLICY, ...extra });
+      const failing = (git, cmd, err) => (args, o) => { if (args[0] === cmd) throw err(args); return git(args, o); };
+
+      it('one resolved key cannot mask an unresolved changed key (mixed read / unread)', () => {
+        const { git } = fakeGit(treesFor({}, { [MIXED]: '{"readKey":1,"orphanKey":2}', 'scripts/lib/x.mjs': 'export const v = (s) => s.readKey;' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: 'no reader of orphanKey' });
+        expect(resolve(git).reasons[0]).toBe(`settings-readers-unresolved:${MIXED} (no reader of orphanKey)`);
+      });
+      it('a source file that merely names the settings file does not stand in for an orphaned key', () => {
+        const { git } = fakeGit(treesFor({}, { [MIXED]: '{"orphanKey":2}', 'scripts/lib/x.mjs': "readFileSync('scripts/settings/mixed.json')" }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: 'no reader of orphanKey' });
+      });
+      it('every changed key read → resolved; a key read only by the gate is read too', () => {
+        const { git } = fakeGit(treesFor({}, { [MIXED]: '{"alphaKey":1,"betaKey":2}', 'scripts/lib/x.mjs': 's.alphaKey', 'scripts/lib/y.mjs': 's.betaKey' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ readers: ['scripts/lib/x.mjs', 'scripts/lib/y.mjs'], keys: ['alphaKey', 'betaKey'], gateReader: null });
+        const { git: g2 } = fakeGit(treesFor({}, { [MIXED]: '{"alphaKey":1,"betaKey":2}', 'scripts/lib/x.mjs': 's.alphaKey', 'scripts/merge-ai-prs.mjs': 's.betaKey' }));
+        expect(readSettingsReaders({ git: g2, file: MIXED, shas: [TIP, HEAD] })).toMatchObject({ gateReader: 'scripts/merge-ai-prs.mjs' });
+      });
+      it('more changed keys than MAX_SETTINGS_KEYS re-tests', () => {
+        const wide = JSON.stringify(Object.fromEntries(Array.from({ length: MAX_SETTINGS_KEYS + 1 }, (_, i) => [`k${i}`, i])));
+        const { git } = fakeGit(treesFor({}, { [MIXED]: wide }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: `too many changed keys (${MAX_SETTINGS_KEYS + 1})` });
+      });
+      it('a key that is not a plain identifier is never spliced into a search: a newline cannot add a second alternate that resolves an orphan', () => {
+        const sneaky = 'orphanKey\nbystander';
+        const { git, calls } = fakeGit(treesFor({}, { [MIXED]: JSON.stringify({ [sneaky]: 1 }), 'scripts/lib/harmless.mjs': 'const bystander = 1;' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] }).why).toMatch(/^unsafe name /);
+        expect(calls.filter((c) => c.startsWith('grep'))).toEqual([]); // nothing was searched
+        expect(resolve(git).affected).toBe(true);
+        for (const bad of ['a b', 'a|b', '-x', '', 'a\rb', 'é']) {
+          const { git: g } = fakeGit(treesFor({}, { [MIXED]: JSON.stringify({ [bad]: 1 }), 'scripts/lib/harmless.mjs': 's.x' }));
+          expect(readSettingsReaders({ git: g, file: MIXED, shas: [TIP, HEAD] }).why, JSON.stringify(bad)).toMatch(/^unsafe name /);
+        }
+        const { git: g2 } = fakeGit(treesFor({}, { 'scripts/settings/we ird.json': '{"k":1}' }));
+        expect(readSettingsReaders({ git: g2, file: 'scripts/settings/we ird.json', shas: [TIP, HEAD] }).why).toMatch(/^unsafe name /);
+      });
+      it('the search is bounded: past the graph deadline it is unresolved, and a pile of settings files is not resolved one by one', () => {
+        const { git, calls } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD], deadline: Date.now() - 1 })).toEqual({ why: 'graph-budget-exceeded' });
+        expect(calls.filter((c) => c.startsWith('grep'))).toEqual([]);
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD], deadline: Date.now() + 60_000 }).readers).toEqual(['scripts/lib/x.mjs']);
+        const files = Array.from({ length: MAX_SETTINGS_FILES + 1 }, (_, i) => `scripts/settings/f${i}.json`);
+        const boom = () => { throw new Error('no resolution expected'); };
+        expect(decideAffected({ prFiles: ['scripts/other/a.mjs'], mainFiles: files, importsOf: none, settingsReadersOf: boom }).reasons[0]).toBe(`too-many-settings-files:${MAX_SETTINGS_FILES + 1}`);
+        expect(decideAffected({ prFiles: files.slice(0, MAX_SETTINGS_FILES), mainFiles: ['scripts/other/a.mjs'], importsOf: none, settingsReadersOf: () => ({ readers: [], keys: [] }) }).reasons[0]).not.toMatch(/^too-many-settings-files/);
+      });
+      it('the loader consumer list names real files, the first being where the whole-folder loader lives', () => {
+        for (const f of SETTINGS_DIRECTORY_CONSUMERS) expect(() => readFileSync(join(SETTINGS_DIR, '..', '..', f), 'utf8'), f).not.toThrow();
+        expect(readFileSync(join(SETTINGS_DIR, '..', '..', SETTINGS_DIRECTORY_CONSUMERS[0]), 'utf8')).toMatch(/export function readDeclaredSettings/);
+      });
+      it('a shell script reading the setting re-tests (non-source reader)', () => {
+        const { git } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', 'scripts/run.sh': 'jq .k scripts/settings/mixed.json' }));
+        expect(readSettingsReaders({ git, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: 'non-source reader scripts/run.sh' });
+        expect(resolve(git)).toMatchObject({ affected: true, reasons: [`settings-readers-unresolved:${MIXED} (non-source reader scripts/run.sh)`] });
+      });
+      it('more than MAX_SETTINGS_READERS source readers re-tests; exactly the maximum does not', () => {
+        const readersN = (n) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`scripts/lib/r${i}.mjs`, 's.k']));
+        const { git: over } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', ...readersN(MAX_SETTINGS_READERS + 1) }));
+        expect(readSettingsReaders({ git: over, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: `too many readers (${MAX_SETTINGS_READERS + 1})` });
+        expect(resolve(over)).toMatchObject({ affected: true, reasons: [`settings-readers-unresolved:${MIXED} (too many readers (${MAX_SETTINGS_READERS + 1}))`] });
+        const { git: exact } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', ...readersN(MAX_SETTINGS_READERS) }));
+        expect(readSettingsReaders({ git: exact, file: MIXED, shas: [TIP, HEAD] }).readers).toHaveLength(MAX_SETTINGS_READERS);
+      });
+      it('a failed git grep re-tests (exit 1 with stderr, or any other failure — not "no match")', () => {
+        const { git } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }));
+        const boom = failing(git, 'grep', () => Object.assign(new Error('grep died'), { status: 2, stderr: 'fatal: bad' }));
+        expect(readSettingsReaders({ git: boom, file: MIXED, shas: [TIP, HEAD] }).why).toBe(`grep failed at ${TIP.slice(0, 9)}`);
+        const stderr1 = failing(git, 'grep', () => Object.assign(new Error('exit 1'), { status: 1, stderr: 'warning: something' }));
+        expect(readSettingsReaders({ git: stderr1, file: MIXED, shas: [TIP, HEAD] }).why).toMatch(/^grep failed at /);
+        expect(resolve(boom)).toMatchObject({ affected: true, reasons: [expect.stringContaining('(grep failed at')] });
+      });
+      it('a settings file unreadable at a sha re-tests (a timeout is not "absent")', () => {
+        const { git } = fakeGit(treesFor({}, { [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }));
+        const boom = failing(git, 'show', () => Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' }));
+        expect(readSettingsReaders({ git: boom, file: MIXED, shas: [TIP, HEAD] })).toEqual({ why: `unreadable at ${TIP.slice(0, 9)}` });
+        expect(resolve(boom).affected).toBe(true);
+      });
+      it('a docs-only main move does not excuse a PR whose settings change is read by the gate', () => {
+        const { git } = fakeGit(treesFor({ [MIXED]: '{"gatedKey":1}', 'scripts/merge-ai-prs.mjs': 'const v = s.gatedKey;' }, {}));
+        const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: [MIXED], mainFiles: ['docs/b.md'], git, settingsPolicy: POLICY });
+        expect(r).toMatchObject({ affected: true, reasons: [`gate-touched:${MIXED} (read by scripts/merge-ai-prs.mjs)`] });
+        const pure = decideAffected({ prFiles: [MIXED], mainFiles: ['docs/b.md'], importsOf: none, settingsReadersOf: () => ({ readers: [], keys: ['gatedKey'], gateReader: 'scripts/merge-ai-prs.mjs' }) });
+        expect(pure.reasons[0]).toBe(`gate-touched:${MIXED} (read by scripts/merge-ai-prs.mjs)`);
+      });
+      it('a docs-only main move with a PR settings change no gate reads stays unaffected, and a PR with no settings reads no graph', () => {
+        const { git } = fakeGit(treesFor({ [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }, {}));
+        const r = readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: [MIXED], mainFiles: ['docs/b.md'], git, settingsPolicy: POLICY });
+        expect(r).toMatchObject({ affected: false });
+        expect(r.reasons[0]).toBe('main-gained-no-code'); // still never excuses the pass's age
+        const { git: g2, calls } = fakeGit(treesFor({}, {}));
+        expect(readAffectedFacts({ headSha: HEAD, tipSha: TIP, prFiles: ['scripts/other/a.mjs'], mainFiles: ['docs/b.md'], git: g2, settingsPolicy: POLICY }).reasons).toEqual(['main-gained-no-code']);
+        expect(calls).toEqual([]);
+      });
+      it.each(SETTINGS_DIRECTORY_CONSUMERS)('changing the settings loader/layout test (%s) re-tests against ANY settings change on the other side', (consumer) => {
+        const reads = { [MIXED]: { readers: ['scripts/lib/x.mjs'], keys: ['k'] } };
+        const settingsReadersOf = (_s, f) => reads[f] ?? null;
+        const pr = decideAffected({ prFiles: [consumer], mainFiles: [MIXED], importsOf: none, settingsReadersOf });
+        expect(pr.reasons[0]).toBe(`settings-loader-vs-settings:${consumer} (pr) vs ${MIXED} (main)`);
+        const main = decideAffected({ prFiles: [MIXED], mainFiles: [consumer], importsOf: none, settingsReadersOf });
+        expect(main.reasons[0]).toBe(`settings-loader-vs-settings:${consumer} (main) vs ${MIXED} (pr)`);
+        // …and only against a settings change: the loader alone, or a settings change alone, is judged by the graph as before.
+        expect(decideAffected({ prFiles: [consumer], mainFiles: ['scripts/other/a.mjs'], importsOf: none, settingsReadersOf }).reasons[0]).not.toMatch(/^settings-loader-vs-settings/);
+        expect(decideAffected({ prFiles: ['scripts/other/a.mjs'], mainFiles: [MIXED], importsOf: none, settingsReadersOf }).reasons[0]).toBe('main-delta-unaffected');
+      });
+      it('through git: a PR that tightens the loader re-tests when main adds a non-gate settings file', () => {
+        const { git } = fakeGit(treesFor({ 'scripts/lib/settings-files.mjs': 'export const x = 1;' }, { [MIXED]: '{"k":1}', 'scripts/lib/x.mjs': 's.k' }));
+        expect(resolve(git, { prFiles: ['scripts/lib/settings-files.mjs'] }).reasons[0]).toMatch(/^settings-loader-vs-settings:scripts\/lib\/settings-files\.mjs \(pr\) vs scripts\/settings\/mixed\.json/);
+      });
+    });
+  });
+
+  describe('the policy is a setting: built-in → declared settings → env, each with its source', () => {
+    it('built-in: resolve, the gate\'s own settings files', () => {
+      expect(resolveSettingsPolicy({ env: {}, declared: { settings: {}, owners: {} } }))
+        .toEqual({ mode: 'resolve', modeSource: 'built-in', gateFiles: [...DEFAULT_SETTINGS_GATE_FILES], gateFilesSource: 'built-in', errors: [] });
+    });
+    it('the declared settings override, naming the file that set them; env overrides both', () => {
+      const declared = { settings: { mergeFreshness: { settingsReaderMode: 'gate-all', settingsGateFiles: ['merge-queue*.json'] } },
+        owners: { 'mergeFreshness.settingsReaderMode': 'settings/merge-queue.json', 'mergeFreshness.settingsGateFiles': 'settings/merge-queue.json' } };
+      expect(resolveSettingsPolicy({ env: {}, declared })).toMatchObject({ mode: 'gate-all', modeSource: 'settings/merge-queue.json', gateFiles: ['merge-queue*.json'], gateFilesSource: 'settings/merge-queue.json' });
+      expect(resolveSettingsPolicy({ env: { [SETTINGS_READER_MODE_ENV]: 'resolve', [SETTINGS_GATE_FILES_ENV]: 'a.json, b*.json' }, declared }))
+        .toMatchObject({ mode: 'resolve', modeSource: `env ${SETTINGS_READER_MODE_ENV}`, gateFiles: ['a.json', 'b*.json'], gateFilesSource: `env ${SETTINGS_GATE_FILES_ENV}` });
+    });
+    it('an invalid value keeps the layer below and is named', () => {
+      const r = resolveSettingsPolicy({ env: { [SETTINGS_READER_MODE_ENV]: 'yolo' }, declared: { settings: { mergeFreshness: { settingsGateFiles: 'x' } }, owners: {} } });
+      expect(r).toMatchObject({ mode: 'resolve', modeSource: 'built-in', gateFilesSource: 'built-in' });
+      expect(r.errors.join('\n')).toMatch(/settingsGateFiles[\s\S]*yolo/);
+    });
+    it('logPolicyOnce logs a policy exactly once per dedupe set, with each field\'s source, and again for a different policy', () => {
+      const seen = new Set();
+      const lines = [];
+      const policy = resolveSettingsPolicy({ env: {}, declared: { settings: { mergeFreshness: { settingsReaderMode: 'gate-all' } }, owners: { 'mergeFreshness.settingsReaderMode': 'settings/merge-queue.json' } } });
+      logPolicyOnce(policy, (l) => lines.push(l), seen);
+      logPolicyOnce(policy, (l) => lines.push(l), seen);
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0].replace(/^merge-queue · affected-settings: /, ''))).toMatchObject({ mode: 'gate-all', modeSource: 'settings/merge-queue.json', gateFilesSource: 'built-in' });
+      logPolicyOnce({ ...policy, mode: 'resolve' }, (l) => lines.push(l), seen);
+      expect(lines).toHaveLength(2);
+    });
+    it('readAffectedFacts logs the resolved policy once per process (its own dedupe set), with its sources', () => {
+      const lines = [];
+      const loggedPolicies = new Set();
+      const { git } = fakeGit({ ['h'.repeat(40)]: {}, ['t'.repeat(40)]: {} });
+      for (let i = 0; i < 2; i++) readAffectedFacts({ headSha: 'h'.repeat(40), tipSha: 't'.repeat(40), prFiles: ['docs/a.md'], mainFiles: ['docs/b.md'], git, log: (l) => lines.push(l), loggedPolicies });
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0].replace(/^merge-queue · affected-settings: /, ''))).toMatchObject({ mode: 'resolve', modeSource: 'built-in', gateFilesSource: 'built-in' });
+    });
+  });
 });
