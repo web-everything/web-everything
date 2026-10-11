@@ -1,10 +1,10 @@
 /**
  * @file scripts/lib/merge-gate-ci.mjs
- * @description PURE evaluator behind the required `merge-gate` CI check (`we:scripts/merge-gate-check.mjs`,
+ * @description Evaluator behind the required `merge-gate` CI check (`we:scripts/merge-gate-check.mjs`,
  *   `.github/workflows/merge-gate.yml`). Facts in, per-gate verdicts out. It REUSES the drain's own decision
  *   functions (classifyPr, buildDrainVerdicts, drainGateInputs, decideReviewGate, scoreEscalation, diffBaseline,
  *   scanTestTampering, shouldReparkForTestTampering, decideLedgerGate) — it never re-implements a rule. The IO
- *   side (the CLI) only gathers facts.
+ *   side (the CLI) gathers facts; the one evaluator IO exception is the injectable carry proof below.
  *
  *   One result per inventory gate (`./merge-gate-inventory.mjs`):
  *     pass | hold (the drain would not merge) | fail-closed (an input is unreadable or has no shared source yet)
@@ -17,8 +17,10 @@
  *   unreadable input is a fail-closed, never a pass; the ledger mode is the drain's own default.
  *
  *   MODE (`mergeGate.mode`, shadow | enforce — bottom of this file): shadow reports every verdict exactly as
- *   enforce but exits 0 on a HOLD. The only IO in this file is `loadMergeGateMode` and the `--run-gate` CLI the
- *   workflow calls around merge-gate-check.mjs; everything else stays pure.
+ *   enforce but exits 0 on a HOLD. `mergeGate.carryApproval` (on | off, default on) uses the same cascade:
+ *   standard → platform → declared repo settings → MERGE_GATE_CARRY_APPROVAL. Invalid/unreadable → off.
+ *   In addition to setting loaders and the --run-gate CLI, evaluatePrGates may read git through the shared
+ *   drain carry proof when no carry fact is supplied. Inject carrySetting, proveCarry and write for pure tests.
  */
 import { hasLabel, isAiGeneratedPr } from './ai-pr-authorship.mjs';
 import {
@@ -34,9 +36,10 @@ import { classifyPr, buildDrainVerdicts, drainGateInputs, isCodeQLFailed } from 
 import { DRAIN_GATES } from './merge-gate-inventory.mjs';
 import { placementOf, PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { workflowEditHold } from './merge-queue-enqueue.mjs';
+import { proveHumanClearanceCarry } from './human-clearance-carry.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
 import { readFileSync, appendFileSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { writeAllSync } from './write-all-sync.mjs';
@@ -91,16 +94,22 @@ export function duplicateIdText(d) {
 
 const r = (id, status, reason) => ({ id, status, reason });
 
+let loggedCarryApproval = false;
+const defaultProveCarry = ({ evidence }) => proveHumanClearanceCarry({
+  evidence, enabled: true, exec: execFileSync, cwd: process.cwd(), mainRef: 'origin/main',
+});
+
 /**
- * Evaluate every inventory gate for one PR. Pure.
+ * Evaluate every inventory gate for one PR. Carry IO is injectable (or supplied as facts.clearanceCarry).
  * @param {object} facts  gathered by the CLI — see merge-gate-check.mjs `gatherPrFacts` for the shape.
  * `mergeEvent` is the event this run is actually evaluating for: `'pull_request'` or `'merge_group'`. Only
  * `'pull_request'` may hand a gate to the drain (`skipped-by-policy`); the queue merges on `'merge_group'`, so
  * nothing is skipped there, and an omitted / unrecognised value evaluates every gate (fail closed).
- * @param {{policy?:object, requiredCheck?:string, trustLabel?:string, blockOnCodeQL?:boolean, mergeEvent?:string}} [o]
- * @returns {{num:number, ok:boolean, results:Array<{id,status,reason}>, blocking:Array}}
+ * @param {{policy?:object, requiredCheck?:string, trustLabel?:string, blockOnCodeQL?:boolean, mergeEvent?:string,
+ *   carrySetting?:{value:string,source:string}, proveCarry?:Function, write?:Function}} [o]
+ * @returns {{num:number, ok:boolean, results:Array<{id,status,reason}>, blocking:Array, clearanceCarry?:object}}
  */
-export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED_CHECK, trustLabel = TRUST_LABEL, blockOnCodeQL = true, mergeEvent = null } = {}) {
+export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED_CHECK, trustLabel = TRUST_LABEL, blockOnCodeQL = true, mergeEvent = null, carrySetting = undefined, proveCarry = undefined, write = (s) => process.stderr.write(s) } = {}) {
   const num = Number(facts?.pr?.number ?? facts?.num);
   const out = new Map();
   const set = (id, status, reason) => out.set(id, r(id, status, reason));
@@ -111,6 +120,31 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     for (const id of mergeGateIds) set(id, 'fail-closed', `PR read failed: ${facts?.prReadError || 'no PR facts'}`);
     return finish(num, out, policy, mergeEvent);
   }
+  const pinnedSha = facts.pinnedHead?.sha;
+  let clearanceCarry = facts.clearanceCarry;
+  let setting;
+  const eligible = facts.acceptance && !facts.acceptance.error && facts.acceptance.humanClearance && pinnedSha
+    && String(pinnedSha).toLowerCase() !== String(facts.acceptance.humanClearance.sha).toLowerCase();
+  if (clearanceCarry !== undefined || eligible) {
+    setting = carrySetting ?? loadCarryApproval();
+    if (!loggedCarryApproval) {
+      loggedCarryApproval = true;
+      write(`merge-gate · mergeGate.carryApproval=${setting.value} (source: ${setting.source})\n`);
+    }
+    if (clearanceCarry === undefined) {
+      try {
+        clearanceCarry = setting.value === 'on'
+          ? (proveCarry ?? defaultProveCarry)({ evidence: facts.acceptance, pinnedSha })
+          : { carry: false, applicable: true, reason: `mergeGate.carryApproval=${setting.value} (source: ${setting.source})` };
+      } catch (e) {
+        clearanceCarry = { carry: false, applicable: true, reason: `carry proof failed: ${String(e?.message ?? e).split('\n')[0]}` };
+      }
+    }
+  }
+  const carried = setting?.value === 'on' && clearanceCarry?.carry === true && !!pinnedSha && !facts.acceptance?.error
+    && String(clearanceCarry.toSha || '').toLowerCase() === String(pinnedSha).toLowerCase()
+    && String(clearanceCarry.toSha || '').toLowerCase() === String(facts.acceptance?.headSha || '').toLowerCase();
+  const acceptance = carried ? { ...facts.acceptance, humanClearedSha: pinnedSha } : facts.acceptance;
   const pr = facts.pr;
   const labels = pr.labels || [];
   const queued = asQueuedPr(pr, requiredCheck);
@@ -147,7 +181,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   // the checks that judge it. An AI-reviewable escalation cannot clear that; only a `clear-human` ceremony whose
   // reviewed sha IS the pinned head can. An unread or missing change list fails closed.
   const sig = facts.netSignals;
-  const wf = workflowEditFact(facts);
+  const wf = workflowEditFact({ ...facts, acceptance });
   if (wf) set('review-acceptance', wf.status, wf.reason);
   else if (facts.manifest?.error) set('review-acceptance', 'fail-closed', `manifest read failed: ${facts.manifest.error}`);
   else if (!sig || (!sig.scored && !sig.fallbackFiles)) set('review-acceptance', 'fail-closed', `net diff unreadable: ${sig?.error || 'not computed'}`);
@@ -158,12 +192,20 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
       diffHunks: sig.diffHunks ?? null, basisNarrowed: sig.basisNarrowed, deviation: v.deviation,
     });
     const inputs = drainGateInputs({ score, labels, deviation: v.deviation });
-    if (hasReviewLabel(labels, REVIEW_LABELS.accepted) && facts.acceptance?.error) {
-      set('review-acceptance', 'fail-closed', `review acceptance verification unreadable: ${facts.acceptance.error}`);
+    if (hasReviewLabel(labels, REVIEW_LABELS.accepted) && acceptance?.error) {
+      set('review-acceptance', 'fail-closed', `review acceptance verification unreadable: ${acceptance.error}`);
     } else {
-      const gate = decideReviewGate({ ...inputs, labels, ...(facts.acceptance && !facts.acceptance.error ? facts.acceptance : {}) });
+      const gate = decideReviewGate({ ...inputs, labels, ...(acceptance && !acceptance.error ? acceptance : {}) });
       set('review-acceptance', gate.action === 'merge' ? 'pass' : 'hold', `${gate.action}: ${gate.reason || ''}${score.reasons?.length ? ` [${score.reasons.join('; ')}]` : ''}`);
     }
+  }
+
+  if (carried || clearanceCarry?.applicable || clearanceCarry?.carry === true || eligible) {
+    const review = out.get('review-acceptance');
+    const detail = carried
+      ? `human clearance carried ${String(clearanceCarry.fromSha).slice(0, 9)}→${String(clearanceCarry.toSha).slice(0, 9)}`
+      : `clearance not carried: ${setting?.value !== 'on' ? 'carry approval disabled' : clearanceCarry?.carry === true ? 'carry head does not match pinned and acceptance heads' : clearanceCarry?.reason || 'carry unproven'}`;
+    set('review-acceptance', review.status, `${review.reason} · ${detail} (mergeGate.carryApproval=${setting.value}, source: ${setting.source})`);
   }
 
   // manifest-baseline — every historical body is a candidate baseline (≥ the drain's first sighting).
@@ -180,11 +222,11 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
   if (!sig?.scored || typeof sig.netDiffText?.text !== 'string') set('test-gaming', 'fail-closed', 'net diff text not computed');
   else {
     const gaming = scanTestTampering({ diffText: sig.netDiffText.text });
-    const accepted = hasReviewLabel(labels, REVIEW_LABELS.accepted) && facts.acceptance && !facts.acceptance.error;
+    const accepted = hasReviewLabel(labels, REVIEW_LABELS.accepted) && acceptance && !acceptance.error;
     const repark = shouldReparkForTestTampering({
       tampered: gaming.tampered, netDiffScored: true,
-      humanClearedSha: accepted && gaming.tampered ? facts.acceptance.humanClearedSha ?? null : null,
-      headSha: accepted && gaming.tampered ? facts.acceptance.headSha ?? null : null,
+      humanClearedSha: accepted && gaming.tampered ? acceptance.humanClearedSha ?? null : null,
+      headSha: accepted && gaming.tampered ? acceptance.headSha ?? null : null,
     });
     set('test-gaming', repark ? 'hold' : 'pass', repark ? `test-gaming suspected: ${gaming.reasons.join('; ')}` : (gaming.tampered ? 'tampering human-cleared at this head' : 'no test tampering'));
   }
@@ -225,7 +267,7 @@ export function evaluatePrGates(facts, { policy = null, requiredCheck = REQUIRED
     set('ledger', ledger.clear ? 'pass' : ledger.defer ? 'fail-closed' : 'hold', `${ledger.authority}: ${ledger.reason}`);
   }
 
-  return finish(num, out, policy, mergeEvent);
+  return { ...finish(num, out, policy, mergeEvent), clearanceCarry };
 }
 
 /**
@@ -365,30 +407,53 @@ export const MERGE_GATE_MODE_ENV = 'MERGE_GATE_MODE';
  * Resolve the mode from raw layer values. `undefined`, `null` and `''` mean "layer not set". Pure.
  * @returns {{mode:'shadow'|'enforce', source:string, invalid:string[]}}
  */
-export function resolveMergeGateMode({ platform, repo, env, readErrors = [] } = {}) {
-  let mode = STANDARD_MERGE_GATE_MODE;
+export function resolveMergeGateMode(layers = {}) {
+  const { value, ...rest } = resolveGateSetting({ ...layers, allowed: MERGE_GATE_MODES, standard: STANDARD_MERGE_GATE_MODE, failClosedValue: 'enforce' });
+  return { mode: value, ...rest };
+}
+
+export const STANDARD_CARRY_APPROVAL = 'on';
+export const CARRY_APPROVAL_ENV = 'MERGE_GATE_CARRY_APPROVAL';
+
+/** PURE: the carry relaxation defaults on, but any invalid or unreadable layer disables it. */
+export function resolveCarryApproval(layers = {}) {
+  return resolveGateSetting({ ...layers, allowed: ['on', 'off'], standard: STANDARD_CARRY_APPROVAL, failClosedValue: 'off' });
+}
+
+/** PURE: common cascade; absent values do not override, errors at ANY layer fail closed. */
+function resolveGateSetting({ allowed, standard, failClosedValue, platform, repo, env, readErrors = [] }) {
+  let value = standard;
   let source = 'standard';
   const invalid = [...readErrors];
   for (const [name, v] of [['platform', platform], ['repo', repo], ['env', env]]) {
     if (v === undefined || v === null || v === '') continue;
-    if (!MERGE_GATE_MODES.includes(v)) { invalid.push(`${name}=${JSON.stringify(v)}`); continue; }
-    mode = v;
+    if (!allowed.includes(v)) { invalid.push(`${name}=${JSON.stringify(v)}`); continue; }
+    value = v;
     source = name;
   }
-  if (invalid.length) return { mode: 'enforce', source: `fail-closed (${invalid.join('; ')})`, invalid };
-  return { mode, source, invalid };
+  if (invalid.length) return { value: failClosedValue, source: `fail-closed (${invalid.join('; ')})`, invalid };
+  return { value, source, invalid };
 }
 
 /** IO: read the three configurable layers and resolve. Never throws. */
-export function loadMergeGateMode({ env = process.env, platformPath = PLATFORM_PREFERENCES_PATH, readFile = readFileSync, readDeclared = readDeclaredSettings } = {}) {
+export function loadMergeGateMode(options = {}) {
+  return resolveMergeGateMode(loadGateSetting('mode', MERGE_GATE_MODE_ENV, options));
+}
+
+/** IO: read the carry layers; a missing platform file leaves that layer unset. Never throws. */
+export function loadCarryApproval(options = {}) {
+  return resolveCarryApproval(loadGateSetting('carryApproval', CARRY_APPROVAL_ENV, options));
+}
+
+function loadGateSetting(key, envName, { env = process.env, platformPath = PLATFORM_PREFERENCES_PATH, readFile = readFileSync, readDeclared = readDeclaredSettings } = {}) {
   const readErrors = [];
-  const modeOf = (block, name) => {
+  const valueOf = (block, name) => {
     if (block === undefined) return undefined;
     if (block === null || typeof block !== 'object' || Array.isArray(block)) { readErrors.push(`${name} mergeGate block is not an object`); return undefined; }
-    return block.mode;
+    return block[key];
   };
   let platform;
-  try { platform = modeOf(JSON.parse(readFile(platformPath, 'utf8'))?.mergeGate, 'platform'); }
+  try { platform = valueOf(JSON.parse(readFile(platformPath, 'utf8'))?.mergeGate, 'platform'); }
   catch (e) { if (e?.code !== 'ENOENT') readErrors.push(`platform file unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
   let repo;
   try {
@@ -396,9 +461,12 @@ export function loadMergeGateMode({ env = process.env, platformPath = PLATFORM_P
     if (errors?.length) readErrors.push(`repo settings unreadable: ${errors.map((x) => `${x.source}: ${x.error}`).join('; ')}`);
     const dup = (duplicates || []).find((d) => /^mergeGate(\.|$)/.test(String(d?.path)));
     if (dup) readErrors.push(`mergeGate set by more than one settings file (${(dup.sources || []).join(', ')})`);
-    repo = modeOf(settings?.mergeGate, 'repo');
+    repo = valueOf(settings?.mergeGate, 'repo');
   } catch (e) { readErrors.push(`repo settings unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
-  return resolveMergeGateMode({ platform, repo, env: env?.[MERGE_GATE_MODE_ENV], readErrors });
+  let envValue;
+  try { envValue = env?.[envName]; }
+  catch (e) { readErrors.push(`env unreadable: ${String(e?.message ?? e).split('\n')[0]}`); }
+  return { platform, repo, env: envValue, readErrors };
 }
 
 /**
