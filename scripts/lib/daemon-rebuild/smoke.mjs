@@ -14,7 +14,7 @@ import { removeOverlay, appendOverlayEvent } from '../daemon-overlays.mjs';
 import { mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 import { makeGit, verifyRev, OVERLAY_EDGE_RESOLVE_ENV } from './shared.mjs';
 import { candidateSmokeEnv, materializeCandidate, removeCandidate } from './candidate.mjs';
 import { hostname } from 'node:os';
@@ -55,6 +55,63 @@ export function smokePassIdentity(git, sha) {
 }
 
 // ── smoke-rejection helpers ────────────────────────────────────────────────────────────────────────────────
+
+/** PURE: repository files named by complete source locations in raw smoke failure details. */
+export function smokeFailureFiles(failedRows, { candidatePath }) {
+  const files = new Set();
+  const prefix = candidatePath ? candidatePath.replace(/\/$/, '') + '/' : null;
+  const add = (path) => {
+    const normalized = posix.normalize(path);
+    if (normalized !== '.' && normalized !== '..' && !normalized.startsWith('../') && !posix.isAbsolute(normalized)) {
+      files.add(normalized);
+      return normalized;
+    }
+    return null;
+  };
+  for (const row of failedRows || []) {
+    const detail = String(row?.detail ?? '');
+    const importers = [];
+    for (const match of detail.matchAll(/(?:file:\/\/(\/[^\s"'<>():]+)|(\/[^\s"'<>():]+\.(?:mjs|js|cjs|json|ts))):\d+/g)) {
+      const absolute = match[1] ?? match[2];
+      const relative = prefix && absolute.startsWith(prefix)
+        ? absolute.slice(prefix.length)
+        : absolute.match(/\/[^/]+\.candidate-[^/]+\/(.+)$/)?.[1];
+      if (relative) {
+        const importer = add(relative);
+        if (importer) importers.push(importer);
+      }
+    }
+    for (const match of detail.matchAll(/The requested module '([^']+)'/g)) {
+      if (!match[1].startsWith('./') && !match[1].startsWith('../')) continue;
+      for (const importer of importers) add(posix.join(posix.dirname(importer), match[1]));
+    }
+  }
+  return [...files].sort();
+}
+
+/** Attribute named files to overlay diffs; unreadable diffs prevent a selective set-aside. */
+export function attributeSmokeFailure({ git, files, overlays }) {
+  const culprits = [];
+  const unknown = [];
+  const wanted = new Set(files);
+  for (const ap of overlays || []) {
+    try {
+      const baseRes = ap.sha ? git(['merge-base', 'origin/main', ap.sha]) : { status: 1 };
+      const base = baseRes.status === 0 ? String(baseRes.stdout ?? '').trim() : '';
+      const diff = base ? git(['diff', '--name-only', base, ap.sha]) : null;
+      if (!diff || diff.status !== 0) {
+        unknown.push(ap.ref);
+        continue;
+      }
+      const changed = String(diff.stdout ?? '').split('\n').map((file) => file.trim());
+      const matched = [...new Set(changed.filter((file) => wanted.has(file)))].sort();
+      if (matched.length) culprits.push({ ref: ap.ref, pr: ap.pr ?? null, sha: ap.sha, matched });
+    } catch {
+      unknown.push(ap.ref);
+    }
+  }
+  return { culprits, unknown };
+}
 
 /** Did only EXTERNAL checks fail? Every failed row is one `daemon-live-smoke.mjs#SMOKE_CHECKS` marks
  *  `mayBeTransient` (it runs `gh`, not code from the tree under test). An empty list is not external-only. */
@@ -220,6 +277,9 @@ async function resolveDispatchSmoke(opt, env) {
  * Phase 2 body (x5wbsbc — the operator's fallback ruling, 2026-09-26: "fallback on last working version rather
  * than block delivery"). Smokes candidate A = `plan` (main + overlays). On a pass: adopt (phase 3), as before.
  * On a `'code'` failure, in order:
+ *   (a0) ATTRIBUTED SET-ASIDE: when failure files implicate only some non-pinned overlays and every diff
+ *       is readable, smoke main + the remaining overlays first. A pass adopts that build and drops only
+ *       the implicated overlays; unavailable attribution or a failed attempt continues to (a).
  *   (a) PLAIN MAIN: when A carries any NON-pinned overlay, build B = main + pinned overlays only and smoke it. B
  *       passes ⇒ adopt B and DROP A's non-pinned overlays from the list (they are what broke it — every one is
  *       reported, `overlay-dropped-smoke-failed`; with several, all are dropped as suspects, never bisected).
@@ -623,6 +683,52 @@ export async function smokeAndAdopt({
     ...extra,
     message: 'every failed check is load-shaped (timeout / lock contention) and no same-run differential pinned it on an overlay — environment, not the candidate; overlays kept, retrying with backoff',
   });
+  // ── (a0) set aside only the overlays that changed files named by A's failures ─────────────────────────
+  if (!mainOnly && !loadOnly && suspects.length > 1) {
+    const files = smokeFailureFiles(failedA, { candidatePath: lease.path });
+    const { culprits, unknown } = files.length
+      ? attributeSmokeFailure({ git, files, overlays: suspects })
+      : { culprits: [], unknown: [] };
+    if (culprits.length > 0 && unknown.length === 0 && culprits.length < suspects.length) {
+      const culpritRefs = new Set(culprits.map((ap) => ap.ref));
+      const kept = plan.applied.filter((ap) => !culpritRefs.has(ap.ref));
+      const planA2 = await planRebuild({
+        git, headSha: prevHead, mainRef: 'origin/main',
+        overlays: kept.map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr })),
+        edgeResolve: env[OVERLAY_EDGE_RESOLVE_ENV] !== '0',
+      });
+      const failedNames = failedA.map((r) => r.name).join(',');
+      let failed = planA2.reason ?? 'not planned';
+      if (planA2.ok) {
+        alert('overlay-set-aside-attributed', {
+          culprits: culprits.map(({ ref, pr, matched }) => ({ ref, pr, matched })),
+          files, kept: kept.map((ap) => ap.ref), target: planA2.finalSha,
+          message: 'main + overlays failed the live smoke on files only these overlays change — smoking main + the other overlays without them before falling back to plain main',
+        });
+        const a2 = budgetAllows('set-aside')
+          ? await smokeSha(planA2.finalSha, changedSince(planA2.finalSha), 'set-aside', suspectsFor(planA2.applied), { failFast: failedA.map((r) => r.name) })
+          : { budgetSkipped: true };
+        if (a2.dispatch && !a2.dispatch.result.ok) {
+          alert('overlay-set-aside-dispatch-smoke-failed', { reason: a2.dispatch.result.reason, suspects: a2.dispatch.suspects.map((s) => s.ref) });
+        }
+        if (!a2.worktreeFailed && !a2.threw && a2.smokeResult?.verdict === 'pass' && (!a2.dispatch || a2.dispatch.result.ok)) {
+          if (a2.dispatch) dispatchPassedAlert(a2.dispatch);
+          const dropCulprits = ({ alert: finAlert }) => dropSuspectOverlays({
+            root, env, suspects: culprits, failed: failedNames, alert: finAlert,
+          });
+          const fin = await finalize(planA2, dropCulprits, {
+            kind: 'fallback', forInputsKey: plan.inputsKey,
+            dropRefs: culprits.map(({ ref, pr, sha }) => ({ ref, pr, sha })), failed: failedNames,
+          }, a2.smokeResult);
+          return { ...fin, reason: 'overlay-set-aside', setAside: { from: plan.finalSha, to: planA2.finalSha, dropped: culprits } };
+        }
+        failed = failedRows(a2.smokeResult).map((r) => r.name).join(',')
+          || (a2.budgetSkipped ? 'skipped: budget' : a2.worktreeFailed ? `worktree: ${a2.worktreeFailed}` : a2.dispatch ? `dispatch: ${a2.dispatch.result.reason}` : 'threw');
+      }
+      alert('overlay-set-aside-failed', { failed, culprits });
+    }
+  }
+
   if (!mainOnly && suspects.length > 0) {
     const pinnedOverlays = withPin.filter((ap) => ap.pinned).map((ap) => ({ ...(rawByRef.get(ap.ref) ?? {}), ref: ap.ref, pr: ap.pr }));
     const planB = await planRebuild({
