@@ -110,6 +110,45 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
+import { resolveFixSettings } from './fix-takeover.mjs';
+import { resolveTakeoverBudget } from './takeover-budget.mjs';
+import { resolveReviewSettings } from '../lib/review-settings.mjs';
+import { enrichPrsWithMechanicalRound, resolveMechanicalRoundsSetting } from './mechanical-round-cap.mjs';
+
+/** The last logged `review.mechanicalRoundsCountTowardCap` resolution, so a daemon logs the layer once per change. */
+let loggedMechanicalSetting = '';
+/** `review.mechanicalRoundsCountTowardCap` for `planReconcile`, logging the cascade layer it came from. */
+function mechanicalRoundsSetting(resolveSetting, env, log = (line) => console.error(line)) {
+  let r;
+  try { r = resolveSetting({ env }); } catch { return {}; }
+  if (typeof r?.value !== 'boolean') return {};
+  const line = `mechanical-round-cap: review.mechanicalRoundsCountTowardCap=${r.value} (source: ${r.source})`;
+  if (line !== loggedMechanicalSetting) { loggedMechanicalSetting = line; log(line); }
+  return { mechanicalRoundsCountTowardCap: r.value };
+}
+
+/** `review.takeoverReviewAttempts` for `planReconcile`; an unreadable setting keeps the pure core's 0. */
+function takeoverReviewSetting(load, env) {
+  try { const n = load({ env }).takeoverReviewAttempts; return Number.isInteger(n) ? { takeoverReviewAttempts: n } : {}; } catch { return {}; }
+}
+
+/** The last logged `fix.takeoverBudget` resolution, so a daemon logs the layer once per change. */
+let loggedTakeoverBudget = '';
+/** Card xx0055i + takeover budget — the round-cap action and `fix.takeoverBudget` (logged with its cascade layer) for
+ *  `planReconcile`; an unreadable setting keeps the pure core's defaults (`person`, budget 1). */
+function fixCapSettings(load, env, resolveBudget = resolveTakeoverBudget, log = (line) => console.error(line)) {
+  const out = {};
+  try { out.roundCapAction = load({ env }).roundCapAction; } catch { /* keep the pure default */ }
+  try {
+    const b = resolveBudget({ env });
+    if (Number.isInteger(b?.value)) {
+      out.takeoverBudget = b.value;
+      const line = `fix-takeover: fix.takeoverBudget=${b.value} (source: ${b.source})`;
+      if (line !== loggedTakeoverBudget) { loggedTakeoverBudget = line; log(line); }
+    }
+  } catch { /* keep the pure default */ }
+  return out;
+}
 
 /** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
  *  the PR thread alone, so a daemon restart loses nothing). Never throws: an unreadable thread means no claim. */
@@ -1287,6 +1326,16 @@ export function runReconcilePass({
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
+  // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
+  loadFixSettings = resolveFixSettings,
+  // Takeover budget — `fix.takeoverBudget` (standard 2 → platform preference → we:scripts/settings/fix.json → env).
+  loadTakeoverBudget = resolveTakeoverBudget,
+  // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
+  loadReviewSettings = resolveReviewSettings,
+  // `review.mechanicalRoundsCountTowardCap` (policy cascade, logged with its source layer) and the git evidence a
+  // mechanical round's head needs (we:scripts/conveyor/mechanical-round-cap.mjs). Injectable.
+  loadMechanicalRoundsSetting = resolveMechanicalRoundsSetting,
+  enrichMechanicalRound = enrichPrsWithMechanicalRound,
   now = Date.now(), repo = null, defaultBranch = 'main', env = process.env,
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
@@ -1336,15 +1385,23 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+  const prsBeforeMechanical = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
     { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
+  const mechanicalSetting = mechanicalRoundsSetting(loadMechanicalRoundsSetting, env);
+  // The git evidence is read in THIS checkout, so only for the repo it is a clone of (WE); elsewhere no PR carries
+  // facts and the normal cap applies. Skipped entirely when mechanical rounds count toward the cap.
+  const prs = repoKey === 'we' && mechanicalSetting.mechanicalRoundsCountTowardCap === false
+    ? enrichMechanicalRound(prsBeforeMechanical, { defaultBranch }) : prsBeforeMechanical;
   const agents = enrich(readAgents({}));
   const mainSha = resolveMainSha(defaultBranch);
   const plan = planReconcile({
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
+    ...fixCapSettings(loadFixSettings, env, loadTakeoverBudget),
+    ...takeoverReviewSetting(loadReviewSettings, env),
+    ...mechanicalSetting,
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
   });
