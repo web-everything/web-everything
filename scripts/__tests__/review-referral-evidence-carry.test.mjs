@@ -62,6 +62,21 @@ describe('referral evidence carry across an identical-diff head move (#4708)', (
     }
   });
 
+  // PR #4857 round 3 self-review: in the case above the only unscored read also had empty text, so the `scored` check
+  // and the `!fingerprint` check each hid the other — deleting either one left the suite green. One guard per case.
+  describe('each diff-read guard refuses the carry on its own', () => {
+    const carryOf = readNetDiff => referralEvidenceCarry({ runs: RUNS(), repo, pr, head: HEAD, readNetDiff });
+    const read = (scored, text) => () => ({ scored, text });
+
+    it('unscored reads with identical non-empty text: no carry', () => {
+      expect(carryOf(read(false, DIFF))).toBeNull();
+    });
+    it('scored reads with identical empty or whitespace text (no fingerprint): no carry', () => {
+      expect(carryOf(read(true, ''))).toBeNull();
+      expect(carryOf(read(true, ' \n'))).toBeNull();
+    });
+  });
+
   it('refuses when the latest earlier run was not clean (parked, pending or persistence-failed)', () => {
     const dirty = () => [run(PRIOR, { at: 10000 }), run(OLD, { at: 20000, clean: false })];
     expect(() => assertMandatoryReferralsCleared(stateFor(), { repo, pr, readRuns: dirty, readNetDiff: IDENTICAL }))
