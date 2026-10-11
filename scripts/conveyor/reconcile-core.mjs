@@ -454,7 +454,9 @@ const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
 /**
  * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
  * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
- * Invalid evidence leaves the historical cap accounting untouched.
+ * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
+ * every round except one proven mechanical (its window holds only merge / drain-rebase commits). A round with no
+ * commit at all is spent, never refunded.
  */
 export function countRealFixRounds(pr) {
   const facts = pr?.roundCommits;
@@ -495,12 +497,14 @@ export function countRealFixRounds(pr) {
     // errs toward keeping the attempt spent.
     const first = begins.find((b) => time(b) > previous && time(b) <= end);
     const start = first ? time(first) : previous;
-    const shas = facts.commits.filter((commit) => commit.parents.length === 1 && !commit.subject.startsWith('drain: rebase')
-      && Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end).map((commit) => commit.sha);
+    const inWindow = facts.commits.filter((commit) => Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end);
+    const shas = inWindow.filter((commit) => commit.parents.length === 1 && !commit.subject.startsWith('drain: rebase')).map((commit) => commit.sha);
     previous = end;
-    return { at: c.createdAt, real: shas.length > 0, shas };
+    // Refund only on positive evidence: the window holds commits and every one is a merge or drain rebase. A window
+    // with NO commit proves nothing (an unchanged head re-armed again, a rewritten branch), so it stays spent.
+    return { at: c.createdAt, real: shas.length > 0, mechanical: shas.length === 0 && inWindow.length > 0, shas };
   });
-  return { ok: true, real: rounds.filter((r) => r.real).length, total: rounds.length, rounds };
+  return { ok: true, real: rounds.filter((r) => !r.mechanical).length, total: rounds.length, rounds };
 }
 
 const FIX_MARKER_WHO_RE = /^\*\*Who:\*\* `([^`]+)`/m;

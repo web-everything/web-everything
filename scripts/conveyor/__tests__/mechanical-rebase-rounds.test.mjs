@@ -61,7 +61,24 @@ describe('mechanical re-arm rounds', () => {
     expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [{ ...commits[0], subject }] } })).toMatchObject({ ok: true, real });
   });
   it('excludes the ci-heal commit before the next review fix-begin', () => {
-    expect(countRealFixRounds({ ...pr, comments: [begin('11T00:44:34', 'ci-heal-4757'), begin('11T01:30:50'), comment('11T01:33:11', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [{ ...commits[8], sha: head }] } })).toMatchObject({ ok: true, real: 0 });
+    const drain = { ...commits[0], parents: [commits[8].sha], subject: 'drain: rebase x onto main', authoredAt: at('11T01:32:00') };
+    expect(countRealFixRounds({ ...pr, comments: [begin('11T00:44:34', 'ci-heal-4757'), begin('11T01:30:50'), comment('11T01:33:11', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [drain, commits[8]] } })).toMatchObject({ ok: true, real: 0 });
+  });
+  describe('a re-arm with no commit is never refunded', () => {
+    const cycles = ['01', '02', '03', '04', '05', '06'].flatMap((h) => [begin(`11T${h}:00:00`, 'fix-7'), comment(`11T${h}:10:00`, REARM_COMMENT_MARKER)]);
+    const oldHead = { ...commits[0], authoredAt: at('10T00:00:00') };
+    it('counts six fix-begin → re-arm cycles on an unchanged head as six spent attempts', () => {
+      expect(countRealFixRounds({ ...pr, comments: cycles, roundCommits: { head, commits: [oldHead] } })).toMatchObject({ ok: true, real: 6, total: 6 });
+    });
+    it('keeps the planner at the cap instead of replacing the durable count with zero', () => {
+      const others = comments.filter((c) => !c.body.startsWith(REARM_COMMENT_MARKER) && !c.body.startsWith(FIX_BEGIN_MARKER));
+      const result = plan({ ...pr, comments: [...others, ...cycles], roundCommits: { head, commits: [oldHead] } });
+      expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted', attempts: 6 }));
+    });
+    it('a round whose only commits are merges or drain rebases is still refunded', () => {
+      const merge = { ...commits[0], parents: [commits[1].sha, commits[2].sha], subject: 'Merge branch x', authoredAt: at('11T01:05:00') };
+      expect(countRealFixRounds({ ...pr, comments: cycles.slice(0, 2), roundCommits: { head, commits: [merge] } })).toMatchObject({ ok: true, real: 0, total: 1 });
+    });
   });
   describe('crash-and-replace fixer claims', () => {
     const fixCommit = { ...commits[0], subject: 'real fix', authoredAt: at('11T02:00:00') };
@@ -79,9 +96,12 @@ describe('mechanical re-arm rounds', () => {
     });
     it('a begin from before the previous re-arm does not reach back into the earlier round', () => {
       const earlier = comment('11T01:30:00', REARM_COMMENT_MARKER);
+      const merge = { ...commits[0], parents: [fixCommit.sha, commits[2].sha], subject: 'Merge branch x', authoredAt: at('11T03:30:00') };
+      const fix = { ...fixCommit, sha: commits[1].sha, parents: [commits[3].sha] };
       const result = countRealFixRounds({ ...pr, comments: [begin('11T01:00:00', 'fix-7'), earlier, begin('11T03:00:00', 'fix-8'), rearm],
-        roundCommits: { head, commits: [fixCommit] } });
-      expect(result).toMatchObject({ ok: true, total: 2, real: 0 });
+        roundCommits: { head, commits: [{ ...merge, parents: [fix.sha, commits[2].sha] }, fix] } });
+      expect(result.rounds[1]).toMatchObject({ real: false });
+      expect(result).toMatchObject({ ok: true, total: 2, real: 1 });
     });
   });
   describe('truncated (shallow) history', () => {
