@@ -209,7 +209,7 @@ describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
       const posted = [];
       const view = { headRefOid: PR4722.head, headRefName: 'lane/resource-usage-service', comments };
       const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
-      const opts = { pr: 4722, repo: 'web-everything/web-everything', local: true, exec,
+      const opts = { files: ['scripts/resource-usage-service.mjs'], pr: 4722, repo: 'web-everything/web-everything', local: true, exec,
         netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } };
       const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true }, opts);
       expect(gate.action).toBe('merge');
@@ -221,11 +221,25 @@ describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
     });
   }
 
+  it('workflow edits cannot carry an older human clearance even across an identical diff', () => {
+    const posted = [];
+    const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp)] };
+    const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
+    const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, {
+      pr: 4722, local: true, files: ['.github/workflows/merge-gate.yml'], exec,
+      netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }),
+      carry: { setting: ON, log: quiet },
+    });
+    expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human, reason: expect.stringContaining('human-only:') });
+    expect(posted).toHaveLength(0);
+    expect(gate.carriedClearance).toBeUndefined();
+  });
+
   it('without the carry (setting off) the same state re-parks review:human — the bug', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), restampComment] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: { value: false, source: 'env' }, log: quiet } });
+      { files: ['scripts/resource-usage-service.mjs'], pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: { value: false, source: 'env' }, log: quiet } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
     expect(gate.reason).toContain('permission-change');
   });
@@ -237,7 +251,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp)] };
     const exec = graphExec({ parents: over.parents || pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: over.diff || PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
+      { files: ['scripts/resource-usage-service.mjs'], pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: over.diff || PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     return { gate, posted };
   };
   it('a changed net diff re-parks review:human, no record', () => {
@@ -262,7 +276,7 @@ describe('drain gate: what does NOT carry', () => {
     // PR #4631 round 7: such a diff is not the live head's own, so it is a read miss — the pass parks without re-labelling
     // (UNVERIFIED, `applyLabel: null`), exactly as for any other diff that was not read at the head.
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: tip || 'origin/lane/x', revSha: tip || undefined }), carry: { setting: ON, log: quiet } });
+      { files: ['scripts/resource-usage-service.mjs'], pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: tip || 'origin/lane/x', revSha: tip || undefined }), carry: { setting: ON, log: quiet } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: null });
     expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
@@ -277,7 +291,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [plainAccept(PR4722.r1, PR4722.fp), clearHumanComment(PR4722.e125, null)] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
+      { files: ['scripts/resource-usage-service.mjs'], pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
     expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
@@ -288,7 +302,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), forged] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
+      { files: ['scripts/resource-usage-service.mjs'], pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     expect(gate.action).toBe('merge');
     expect(gate.carriedClearance.actor).toBe('chalbert');
     expect(posted[0]).toContain('<!-- cleared-human: chalbert -->');
@@ -300,7 +314,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), forged] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: DIFF, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
+      { files: ['scripts/resource-usage-service.mjs'], pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: DIFF, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     expect(gate.action).toBe('park');
     const text = JSON.stringify([gate.reason, gate.clearance]);
     expect(text).not.toMatch(/@org|https?:\/\/|\[click\]|\]\(|\\n/);
