@@ -103,6 +103,12 @@ export const SETTINGS_READER_MODES = Object.freeze(['resolve', 'gate-all']);
 export const DEFAULT_SETTINGS_READER_MODE = 'resolve';
 export const SETTINGS_GATE_FILES_ENV = 'WE_MERGE_QUEUE_SETTINGS_GATE_FILES';
 export const SETTINGS_READER_MODE_ENV = 'WE_MERGE_QUEUE_SETTINGS_READER_MODE';
+/**
+ * Code that loads or validates the WHOLE settings folder (the loader, its layout test). It names no settings file and
+ * no key, so the reader search never finds it, yet a change to it is judged against EVERY settings file. When one side
+ * changes it and the other side changes any settings file, the PR re-tests (`settings-loader-vs-settings`).
+ */
+export const SETTINGS_DIRECTORY_CONSUMERS = Object.freeze(['scripts/lib/settings-files.mjs', 'scripts/lib/__tests__/settings-files.test.mjs']);
 /** Where a reader of a settings file can live (searched at both the PR head and the main tip). */
 export const SETTINGS_READER_DIRS = Object.freeze(['scripts', 'skills-src', '.github', '.githooks']);
 /** The built-in policy: what a pure caller and a test run get unless they pass one. */
@@ -159,11 +165,11 @@ export function resolveSettingsPolicy({ env = process.env, declared } = {}) {
 }
 
 const LOGGED_POLICIES = new Set();
-/** Log the policy once per process per distinct value (stderr, so it reaches the daemon log under --json). */
-function logPolicyOnce(policy, log = (line) => process.stderr.write(`${line}\n`)) {
+/** Log the policy once per process per distinct value (stderr, so it reaches the daemon log under --json). `seen` is the dedupe set: a test passes its own. */
+export function logPolicyOnce(policy, log = (line) => process.stderr.write(`${line}\n`), seen = LOGGED_POLICIES) {
   const line = `merge-queue · affected-settings: ${JSON.stringify(policy)}`;
-  if (LOGGED_POLICIES.has(line)) return;
-  LOGGED_POLICIES.add(line);
+  if (seen.has(line)) return;
+  seen.add(line);
   try { log(line); } catch { /* logging is best-effort */ }
 }
 
@@ -225,9 +231,17 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
   // then may "main gained nothing that can matter" end the question — and only prose counts as nothing (isNonCodeFile).
   const gate = [...mainAll0, ...prRaw].find((f) => isGateFile(f, settingsPolicy));
   if (gate) return done(true, [`gate-touched:${gate}`]);
-  if (!mainCode0.length) return done(false, [NO_CODE_REASON]); // read nothing: never excuses age (excusesPassAge)
+  // The settings loader / layout test is judged against every settings file, and no reader search names it.
+  const anySettings = (files) => files.find((f) => SETTINGS_FILE_RE.test(f));
+  const consumer = (files) => files.find((f) => SETTINGS_DIRECTORY_CONSUMERS.includes(f));
+  const loaderPr = consumer(prRaw);
+  const loaderMain = consumer(mainAll0);
+  if (loaderPr && anySettings(mainAll0)) return done(true, [`settings-loader-vs-settings:${loaderPr} (pr) vs ${anySettings(mainAll0)} (main)`]);
+  if (loaderMain && anySettings(prRaw)) return done(true, [`settings-loader-vs-settings:${loaderMain} (main) vs ${anySettings(prRaw)} (pr)`]);
   // A changed non-gate settings file is replaced by its readers (see SETTINGS_FILE_RE): from here on, those readers
-  // are the changed files on that side. Unresolvable → re-test; a reader that is the gate → re-test.
+  // are the changed files on that side. Unresolvable → re-test; a reader that is the gate → re-test. The PR's settings
+  // are resolved BEFORE "main gained no code" may answer: a docs-only main move must not excuse a PR whose settings
+  // change is read by the gate.
   const isSettings = (f) => isResolvableSettingsFile(f, settingsPolicy);
   const keysBySide = { pr: new Set(), main: new Set() };
   const readersBySide = { pr: [], main: [] };
@@ -241,6 +255,7 @@ export function decideAffected({ prFiles = [], mainFiles = [], nonCodePaths = ['
       notes.push(`settings-readers:${side}:${f}=${r.readers.length}`);
     }
   }
+  if (!mainCode0.length) return done(false, [NO_CODE_REASON]); // read nothing: never excuses age (excusesPassAge)
   // Two sides that each change the same top-level settings key (in any settings files) collide in the merged settings
   // object (a duplicate owner fails the settings layout test): re-test.
   const sharedKey = [...keysBySide.main].find((k) => keysBySide.pr.has(k));
@@ -413,6 +428,8 @@ function readTipGraph({ git, tipSha, maxFiles, tipFiles }) {
 
 /** More readers than this for one settings file ⇒ do not walk them; re-test (bounded IO, fail closed). */
 export const MAX_SETTINGS_READERS = 200;
+/** More changed top-level keys than this in one settings file ⇒ not attributed one by one (one search each); re-test (bounded IO, fail closed). */
+export const MAX_SETTINGS_KEYS = 40;
 const DATA_HIT_RE = /\.(?:json|jsonl|snap|md|markdown|txt|csv|svg|html?|css|lock)$/i; // cannot read a setting: text or data
 const YAML_RE = /\.ya?ml$/i;
 const escapeEre = (s) => String(s).replace(/[.+?^${}()|[\]\\*]/g, '\\$&');
@@ -442,31 +459,46 @@ export function readSettingsReaders({ git, file, shas, policy = DEFAULT_SETTINGS
   const all = [...new Set(versions.flatMap((v) => Object.keys(v)))].filter((k) => !k.startsWith('$comment'));
   const keys = all.filter((k) => new Set(versions.map((v) => JSON.stringify(v[k]))).size > 1);
   const name = file.slice(file.lastIndexOf('/') + 1);
-  const patterns = [`(^|[^A-Za-z0-9_.-])${escapeEre(name)}`, ...keys.map((k) => `(^|[^A-Za-z0-9_$])${escapeEre(k)}([^A-Za-z0-9_$]|$)`)];
-  const hits = new Set();
-  for (const sha of [...new Set(shas)]) {
-    let outText;
-    try {
-      outText = String(git(['grep', '-l', '-z', '-I', '-E', ...patterns.flatMap((p) => ['-e', p]), sha, '--', ...SETTINGS_READER_DIRS]));
-    } catch (e) {
-      if (e?.status === 1 && !String(e?.stderr ?? '').trim()) continue; // git grep: exit 1 + no stderr = no match
-      return { why: `grep failed at ${String(sha).slice(0, 9)}` };
+  if (keys.length > MAX_SETTINGS_KEYS) return { why: `too many changed keys (${keys.length})` };
+  // One search per pattern, so a hit is attributed to the key it names: a key with no reader of its own cannot hide
+  // behind another key's reader, or behind a file that merely names the settings file.
+  const namePattern = `(^|[^A-Za-z0-9_.-])${escapeEre(name)}`;
+  const keyPattern = (k) => `(^|[^A-Za-z0-9_$])${escapeEre(k)}([^A-Za-z0-9_$]|$)`;
+  const grepHits = (pattern) => {
+    const hits = new Set();
+    for (const sha of [...new Set(shas)]) {
+      let outText;
+      try {
+        outText = String(git(['grep', '-l', '-z', '-I', '-E', '-e', pattern, sha, '--', ...SETTINGS_READER_DIRS]));
+      } catch (e) {
+        if (e?.status === 1 && !String(e?.stderr ?? '').trim()) continue; // git grep: exit 1 + no stderr = no match
+        return { why: `grep failed at ${String(sha).slice(0, 9)}` };
+      }
+      for (const entry of outText.split('\0').filter(Boolean)) hits.add(entry.startsWith(`${sha}:`) ? entry.slice(sha.length + 1) : entry);
     }
-    for (const entry of outText.split('\0').filter(Boolean)) hits.add(entry.startsWith(`${sha}:`) ? entry.slice(sha.length + 1) : entry);
-  }
-  const readers = [];
+    return { hits };
+  };
+  const readers = new Set();
   let gateReader = null;
-  for (const h of [...hits].sort()) {
-    if (SETTINGS_FILE_RE.test(h)) continue; // another settings file holding the same key: the both-sides key rule covers it
-    if (isGateFile(h, policy) && (isGraphSourceFile(h) || YAML_RE.test(h) || !DATA_HIT_RE.test(h))) { gateReader ??= h; continue; }
-    if (DATA_HIT_RE.test(h) || YAML_RE.test(h)) continue;
-    if (!isGraphSourceFile(h)) return { why: `non-source reader ${h}` };
-    readers.push(h);
+  const resolvedKeys = new Set();
+  for (const { key, pattern } of [{ key: null, pattern: namePattern }, ...keys.map((k) => ({ key: k, pattern: keyPattern(k) }))]) {
+    const g = grepHits(pattern);
+    if (g.why) return g;
+    for (const h of [...g.hits].sort()) {
+      if (SETTINGS_FILE_RE.test(h)) continue; // another settings file holding the same key: the both-sides key rule covers it
+      if (isGateFile(h, policy) && (isGraphSourceFile(h) || YAML_RE.test(h) || !DATA_HIT_RE.test(h))) { gateReader ??= h; if (key !== null) resolvedKeys.add(key); continue; }
+      if (DATA_HIT_RE.test(h) || YAML_RE.test(h)) continue;
+      if (!isGraphSourceFile(h)) return { why: `non-source reader ${h}` };
+      readers.add(h);
+      if (key !== null) resolvedKeys.add(key);
+    }
   }
-  if (gateReader) return { readers, keys, gateReader };
-  if (keys.length && !readers.length) return { why: `no reader of ${keys.join(',')}` };
-  if (readers.length > MAX_SETTINGS_READERS) return { why: `too many readers (${readers.length})` };
-  return { readers, keys, gateReader: null };
+  const sorted = [...readers].sort();
+  if (gateReader) return { readers: sorted, keys, gateReader };
+  const orphans = keys.filter((k) => !resolvedKeys.has(k));
+  if (orphans.length) return { why: `no reader of ${orphans.join(',')}` };
+  if (sorted.length > MAX_SETTINGS_READERS) return { why: `too many readers (${sorted.length})` };
+  return { readers: sorted, keys, gateReader: null };
 }
 
 /** Tip graphs shared by the PRs of one drain pass, keyed by `<checkout>\0<tip sha>`: a sha names one immutable tree, so an entry can never go stale. */
@@ -484,7 +516,7 @@ const hasCommit = (git, sha) => { try { git(['cat-file', '-e', `${sha}^{commit}`
  *   nonCodePaths?: string[], git?: Function, budgetMs?: number}} a
  * @returns {{affected: boolean, reasons: string[], mainCodeFiles: number, ms: number}}
  */
-export function readAffectedFacts({ root = process.cwd(), num = null, headSha, tipSha, prFiles, mainFiles, nonCodePaths, git: injectedGit, budgetMs = MAX_GRAPH_MS, maxReverseFiles = MAX_REVERSE_FILES, tipGraphCache, settingsPolicy, log }) {
+export function readAffectedFacts({ root = process.cwd(), num = null, headSha, tipSha, prFiles, mainFiles, nonCodePaths, git: injectedGit, budgetMs = MAX_GRAPH_MS, maxReverseFiles = MAX_REVERSE_FILES, tipGraphCache, settingsPolicy, log, loggedPolicies }) {
   const git = injectedGit ?? gitRunner(root);
   // The real runner shares tip graphs across PRs of one drain pass; an injected git (a test's fake tree) never does.
   const cache = tipGraphCache ?? (injectedGit ? new Map() : SHARED_TIP_GRAPHS);
@@ -493,14 +525,17 @@ export function readAffectedFacts({ root = process.cwd(), num = null, headSha, t
   let policy = settingsPolicy;
   if (!policy) {
     const p = resolveSettingsPolicy();
-    logPolicyOnce(p, log);
+    logPolicyOnce(p, log, loggedPolicies);
     policy = p;
   }
   // Cheap first: no IO when the pure rule already answers without the graph. Settings readers are not read yet: an
   // empty answer can only make the pre-check LESS affected, and its unaffected answer is discarded below.
   const pre0 = decideAffected({ prFiles, mainFiles, nonCodePaths, importsOf: () => [], importersOf: () => [], settingsReadersOf: () => ({ readers: [], keys: [] }), settingsPolicy: policy });
   const pre = { ...pre0, reasons: pre0.reasons.filter((r) => !r.startsWith('settings-readers:')) }; // the stub's reader counts are not facts
-  if (pre.affected || pre.reasons[0] === NO_CODE_REASON) return out(pre);
+  // A prose-only main move answers without IO, unless the PR changes a settings file: only its readers (read below)
+  // can say whether the gate reads it, and a docs-only main must not excuse that.
+  const prSettings = (prFiles ?? []).some((f) => isResolvableSettingsFile(f, policy));
+  if (pre.affected || (pre.reasons[0] === NO_CODE_REASON && !prSettings)) return out(pre);
   if (!headSha || !tipSha) return out({ ...pre, affected: true, reasons: ['shas-unknown'] });
   try {
     const missing = [headSha, tipSha].filter((s) => !hasCommit(git, s));
