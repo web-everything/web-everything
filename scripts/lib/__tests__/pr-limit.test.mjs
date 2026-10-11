@@ -959,11 +959,10 @@ describe('off is operator-only too (#4791)', () => {
     }
   });
 
-  it('`WE_PR_LIMIT_OFF=1` lifts the limit only outside a worker session', () => {
+  it('`WE_PR_LIMIT_OFF=1` inherited by a worker is still honoured (the dispatcher and the worker must agree)', () => {
     const path = tmpState();
     expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1' }, path })).toBe(true);
-    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1', WE_CONVEYOR_WORKER: '1' }, path })).toBe(false);
-    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1', WE_CONVEYOR_WORKER: 'x' }, path })).toBe(false);
+    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1', WE_CONVEYOR_WORKER: '1' }, path })).toBe(true);
   });
 });
 
@@ -984,7 +983,29 @@ describe('override history keeps grants over refusals (#4791)', () => {
     expect(st.history[0]).toMatchObject({ action: 'off' });
   });
 
-  it('with no refusals left to evict, the oldest entries go (still capped)', () => {
+  it('a looping ungated `on` never evicts a grant record either — every non-grant entry goes first', () => {
+    let s = appendHistory(emptyLimitState(), { action: 'off', target: 'kept-off' });
+    s = appendHistory(s, { action: 'allow-branch', target: 'kept-allow' });
+    for (let i = 0; i < HISTORY_MAX + 50; i++) s = appendHistory(s, { action: 'on', target: null });
+    expect(s.history.length).toBe(HISTORY_MAX);
+    expect(s.history.slice(0, 2).map((r) => r.target)).toEqual(['kept-off', 'kept-allow']);
+  });
+
+  it('caller-supplied text is clipped: a refused call with a huge --by and --reason stores a bounded record', () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'pr-limit-clip-')), 'pr-limit.json');
+    const big = 'x'.repeat(100_000);
+    runPrLimitCli(['off', `--by=${big}`, `--reason=${big}`], { env: { WE_CONVEYOR_WORKER: '1' }, cwd: '/x', path, stderr: { write: () => true }, stdout: { write: () => true } });
+    const rec = readLimitState(path).history.at(-1);
+    expect(rec.action).toBe('off-refused');
+    expect(rec.actor.length).toBeLessThan(300);
+    expect(rec.reason.length).toBeLessThan(2100);
+    const granted = allowBranch(emptyLimitState(), 'lane/x', { reason: big, by: big });
+    expect(granted.branches['lane/x'].reason.length).toBeLessThan(2100);
+    expect(granted.branches['lane/x'].by.length).toBeLessThan(300);
+    expect(setGlobalOff(emptyLimitState(), { reason: big, by: big }).global.reason.length).toBeLessThan(2100);
+  });
+
+  it('with no non-grant entries left to evict, the oldest grants go (still capped)', () => {
     const h = Array.from({ length: HISTORY_MAX + 3 }, (_, i) => rec('allow-branch', i));
     const capped = capHistory(h);
     expect(capped.length).toBe(HISTORY_MAX);

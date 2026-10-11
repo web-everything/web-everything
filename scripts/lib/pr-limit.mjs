@@ -506,19 +506,33 @@ export function parseLimitState(text) {
 /** Max override-history entries kept. */
 export const HISTORY_MAX = 500;
 
-/** Cap the history at {@link HISTORY_MAX}, evicting REFUSALS (`*-refused`) before anything else — a caller looping
- *  on a refused `allow`/`off` must never push the grant records the audit trail exists to keep out of the store
- *  (#4791 review). The one cap, used on read and on append. PURE. */
+/** The history actions that record an operator GRANT — the records the audit trail exists to keep. */
+export const GRANT_ACTIONS = Object.freeze(['allow-branch', 'off']);
+
+/** Cap the history at {@link HISTORY_MAX}, evicting every NON-grant entry (refusals, `on`, anything else) oldest
+ *  first before any {@link GRANT_ACTIONS} record — a caller looping on a refused `allow`/`off`, or on the ungated
+ *  `on`, must never push the grant records out of the store (#4791 review). Only when nothing else is left do the
+ *  oldest grants go. The one cap, used on read and on append. PURE. */
 export function capHistory(history) {
   const h = Array.isArray(history) ? history : [];
   let excess = h.length - HISTORY_MAX;
   if (excess <= 0) return h;
   const kept = [];
   for (const rec of h) {
-    if (excess > 0 && /-refused$/.test(String(rec?.action || ''))) { excess -= 1; continue; }
+    if (excess > 0 && !GRANT_ACTIONS.includes(String(rec?.action || ''))) { excess -= 1; continue; }
     kept.push(rec);
   }
   return excess > 0 ? kept.slice(excess) : kept;
+}
+
+/** Bounds on the free text a history or grant record stores — every one is caller-supplied (`--by`, `--reason`,
+ *  the cwd inside a refusal) and a refused call can now write it, so it is clipped, never stored unbounded. */
+export const HISTORY_TEXT_MAX = Object.freeze({ actor: 200, reason: 2000, target: 300 });
+
+function clipText(v, max) {
+  if (v == null) return null;
+  const s = String(v);
+  return s.length > max ? `${s.slice(0, max)}…[clipped ${s.length - max}]` : s;
 }
 
 /** Serialize a state object back to the store's JSON text (newline-terminated). PURE. */
@@ -544,7 +558,7 @@ export function parseDurationMs(text) {
  *  requirement. PURE (the timestamp is injected, so this stays directly unit-testable). */
 export function appendHistory(state, entry, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
-  const rec = { at: new Date(now).toISOString(), actor: entry?.actor ?? null, reason: entry?.reason ?? null, action: entry?.action ?? 'unknown', target: entry?.target ?? null };
+  const rec = { at: new Date(now).toISOString(), actor: clipText(entry?.actor ?? null, HISTORY_TEXT_MAX.actor), reason: clipText(entry?.reason ?? null, HISTORY_TEXT_MAX.reason), action: entry?.action ?? 'unknown', target: clipText(entry?.target ?? null, HISTORY_TEXT_MAX.target) };
   return { ...s, history: capHistory([...(Array.isArray(s.history) ? s.history : []), rec]) };
 }
 
@@ -554,8 +568,8 @@ export function setGlobalOff(state, { reason = null, by = null, untilMs = null, 
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const global = {
     off: true,
-    reason: reason != null && String(reason).trim() ? String(reason).trim() : 'operator override',
-    by: by != null && String(by).trim() ? String(by).trim() : null,
+    reason: reason != null && String(reason).trim() ? clipText(String(reason).trim(), HISTORY_TEXT_MAX.reason) : 'operator override',
+    by: by != null && String(by).trim() ? clipText(String(by).trim(), HISTORY_TEXT_MAX.actor) : null,
     at: new Date(now).toISOString(),
     until: untilMs != null ? new Date(now + untilMs).toISOString() : null,
   };
@@ -580,7 +594,7 @@ export function allowBranch(state, branch, { reason = null, by = null, untilMs =
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const name = String(branch || '').trim();
   if (!name) return s;
-  const entry = { reason: reason != null && String(reason).trim() ? String(reason).trim() : 'operator override', by: by || null, at: new Date(now).toISOString(), until: untilMs != null ? new Date(now + untilMs).toISOString() : null };
+  const entry = { reason: reason != null && String(reason).trim() ? clipText(String(reason).trim(), HISTORY_TEXT_MAX.reason) : 'operator override', by: by ? clipText(by, HISTORY_TEXT_MAX.actor) : null, at: new Date(now).toISOString(), until: untilMs != null ? new Date(now + untilMs).toISOString() : null };
   if (operatorQuote) entry.operatorQuote = String(operatorQuote);
   if (channel) entry.channel = String(channel);
   if (session) entry.session = String(session);
@@ -736,12 +750,14 @@ export function writeLimitState(state, path = resolveLimitStatePath()) {
 }
 
 /** Is the global off-switch in effect RIGHT NOW, reading the live store — the one predicate `pr-land.mjs`
- *  and the dispatcher's intake hold consult. A bare `WE_PR_LIMIT_OFF=1` env var is a belt-and-braces global
- *  off too (no state-file write needed, e.g. for a CI run) — checked FIRST since it needs no fs read at all —
- *  but ONLY outside a worker session: a worker prefixing its own `pr-land` with it would lift the limit with no
- *  gate at all (#4791 review, the same class as an ungated `off`). A worker or unknown-role env ignores it. */
+ *  and the dispatcher's intake hold consult. A bare `WE_PR_LIMIT_OFF=1` env var is an unconditional
+ *  belt-and-braces global off too (no state-file write needed, e.g. for a CI run) — checked FIRST since it
+ *  needs no fs read at all. It is honoured in a worker session too, on purpose: worker spawns inherit the
+ *  operator's env (`markWorkerEnv` copies it), so ignoring it there would let the dispatcher dispatch over the
+ *  limit and then refuse every worker at open. Telling an inherited value from one a worker set itself needs the
+ *  spawn site to strip it — filed as xpuaafy, with the other `WE_PR_LIMIT_*` env overrides. */
 export function isGlobalOffLive({ env = process.env, path = resolveLimitStatePath(env) } = {}) {
-  if (String(env?.WE_PR_LIMIT_OFF || '') === '1' && classifySession(env).role === 'orchestrator') return true;
+  if (String(env?.WE_PR_LIMIT_OFF || '') === '1') return true;
   return isGlobalOffNow(readLimitState(path));
 }
 
