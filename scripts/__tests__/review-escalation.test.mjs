@@ -644,8 +644,9 @@ describe('review-escalation — #2366 hasUnclearedReviewLabel (the concurrent-la
 });
 
 describe('review-escalation — #2832 label/hold self-consistency primitives', () => {
-  it('REVIEW_HOLD_LABELS is exactly the three hold labels (accepted/redteam are NOT holds)', () => {
-    expect(REVIEW_HOLD_LABELS).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human]);
+  it('REVIEW_HOLD_LABELS is exactly the four hold labels (accepted/redteam are NOT holds)', () => {
+    // PR #4631 (operator ruling a): the drain's own mechanical park, `review:held-mechanical`, is a hold too.
+    expect(REVIEW_HOLD_LABELS).toEqual([REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical]);
     expect(REVIEW_HOLD_LABELS).not.toContain(REVIEW_LABELS.accepted);
   });
   it('isReviewHoldLabel is true for each hold label, false for accepted/ready/anything else', () => {

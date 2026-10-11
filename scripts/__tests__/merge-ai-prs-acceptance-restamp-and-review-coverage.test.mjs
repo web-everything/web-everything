@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { readDrainAcceptance, decideDrainReviewGate, reconcileDrainReviewPending, classifyPr, needsAcceptanceRestamp, restampAcceptance, computeNetDiffSignals, drainReasonMarker, buildDrainReasonComment, hasDrainReasonComment, LAND_REASON, applyEscalationRelief, REVIEW_COVERAGE_KIND, REVIEW_COVERAGE_GAP_META, reviewRecordKind, recordedReviewRecords, readReviewRecord, reviewCoverageGaps, buildReviewCoverageReason } from '../merge-ai-prs.mjs';
 import { drainGateInputs, permissionChangeForCandidate } from '../merge-ai-prs.mjs';
-import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, scoreEscalation, REVIEW_LABELS } from '../lib/review-escalation.mjs';
+import { normalizeDiffFingerprint, normalizeContributionFingerprint, decideReviewGate, scoreEscalation, REVIEW_LABELS, acceptanceCoversHead } from '../lib/review-escalation.mjs';
 
 
 /**
@@ -388,21 +388,37 @@ describe('#3184 — the drain records a fingerprint READ MISS instead of collaps
     const view = acceptanceView();
     view.comments = [{ viewerDidAuthor: true, body: `<!-- reviewed-sha: ${REVIEWED} -->` }];
     const netDiff = vi.fn();
-    expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff }).headReadFailed).toBe(false);
+    expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff, carrySetting: 'off' }).headReadFailed).toBe(false);
     expect(netDiff).not.toHaveBeenCalled();
+    // card xu7kxtt — with carry-forward on, the accepted commit's own net diff is derived first; an unreadable
+    // derivation still owes no live read and reports no read miss (SHA identity, as before).
+    const derive = vi.fn(() => ({ scored: false }));
+    expect(readDrainAcceptance({ ...acceptanceOptions(view), netDiff: derive, carrySetting: 'on', readReviews: () => [] }).headReadFailed).toBe(false);
+    expect(derive).toHaveBeenCalledTimes(1);
+    expect(derive.mock.calls[0][0].rev).toBe(REVIEWED);
   });
 
   it('pins diff reads to the sibling clone', () => {
     const exec = vi.fn((cmd) => cmd === 'gh' ? JSON.stringify(acceptanceView()) : 'git result');
-    readDrainAcceptance({ pr: 3432, repo: 'frontier-ui/frontierui', cwd: '/ws/frontierui', exec,
+    readDrainAcceptance({ pr: 3432, repo: 'frontier-ui/frontierui', cwd: '/ws/frontierui', exec, readReviews: () => [],
       netDiff: ({ exec: git, rev, fetchExtraRefs }) => {
-        expect(rev).toBe('lane/3432');
+        // PR #4631 round 7: the live read is AT the head SHA; the branch is only fetched for its objects.
+        expect(rev).toBe(REBASED);
         expect(fetchExtraRefs).toEqual(['lane/3432']);
         git('git', ['diff'], { encoding: 'utf8' });
-        return { scored: true, text: REVIEWED_DIFF };
+        return { scored: true, text: REVIEWED_DIFF, rev };
       },
     });
     expect(exec.mock.calls[1][2].cwd).toBe('/ws/frontierui');
+  });
+
+  it('PR #4631 round 7: a diff that was not read at the head SHA is a read miss, never coverage', () => {
+    const view = acceptanceView();
+    const netDiff = () => ({ scored: true, text: REVIEWED_DIFF, rev: 'origin/lane/3432' });
+    const evidence = readDrainAcceptance({ ...acceptanceOptions(view), netDiff });
+    expect(evidence.headDiff).toBe(null);
+    expect(evidence.headReadFailed).toBe(true);
+    expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, { ...acceptanceOptions(view), netDiff }).action).toBe('park');
   });
 
   it('a suppressed re-park is STILL not waivable by the relief valve — staleAcceptance carries it', () => {
@@ -528,8 +544,55 @@ function acceptanceView() {
 }
 function acceptanceOptions(view = acceptanceView()) {
   return { pr: 3432, repo: 'web-everything/web-everything', local: true,
-    exec: () => JSON.stringify(view), netDiff: () => ({ scored: true, text: REVIEWED_DIFF }) };
+    // `rev` echoes the commit asked for, as `computeNetDiffText` does: the read is bound to that SHA.
+    exec: () => JSON.stringify(view), netDiff: ({ rev }) => ({ scored: true, text: REVIEWED_DIFF, rev }),
+    // PR #4631 round 11: a moved head covered by diff identity reads the PR's formal reviews (none here).
+    readReviews: () => [] };
 }
+
+// PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): a native GitHub CHANGES_REQUESTED review stops accept
+// carry-forward. Covering a MOVED head by an identical net diff is a carry, so the drain's coverage read checks the latest
+// formal review state first — for the merge gate and for the pending → accepted re-accept alike.
+describe('PR #4631 round 11 — the drain never covers a moved head past a standing CHANGES_REQUESTED review', () => {
+  const labels = [REVIEW_LABELS.accepted, REVIEW_LABELS.pending];
+  const standing = (login = 'plateau-reviewer[bot]') => () => [{ state: 'CHANGES_REQUESTED', submitted_at: '2020-01-01T00:00:00Z', user: { login } }];
+  it.each(['plateau-reviewer[bot]', 'chalbert'])('a standing review by %s drops the diff coverage: no merge, no re-accept', (login) => {
+    const options = { ...acceptanceOptions(), readReviews: standing(login) };
+    const evidence = readDrainAcceptance(options);
+    expect(evidence.standingChangesRequested).toBe(true);
+    expect(acceptanceCoversHead(evidence).covers).toBe(false);
+    expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, options).action).not.toBe('merge');
+    const spawn = vi.fn(() => ({ ok: true }));
+    expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(false);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+  it('the same accept with that reviewer\'s later APPROVED (or no review) still covers the moved head', () => {
+    // The accept is timed (an untimed accept counts every non-approving review as later: fail closed).
+    const view = acceptanceView();
+    view.comments[0].createdAt = '2020-01-03T00:00:00Z';
+    for (const readReviews of [() => [], () => [...standing()(), { state: 'APPROVED', submitted_at: '2020-01-02T00:00:00Z', user: { login: 'plateau-reviewer[bot]' } }]]) {
+      const options = { ...acceptanceOptions(view), readReviews };
+      expect(acceptanceCoversHead(readDrainAcceptance(options)).covers).toBe(true);
+      expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, options).action).toBe('merge');
+    }
+  });
+  it('unreadable reviews DEFER the pass (no label write) and skip the re-accept, never "no review stands"', () => {
+    for (const readReviews of [() => { throw new Error('gh api failed'); }, () => null]) {
+      const options = { ...acceptanceOptions(), readReviews };
+      expect(decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true }, options)).toMatchObject({ action: 'defer', applyLabel: null });
+      const spawn = vi.fn(() => ({ ok: true }));
+      expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(false);
+      expect(spawn).not.toHaveBeenCalled();
+    }
+  });
+  it('a same-head accept reads no review (nothing is carried)', () => {
+    const view = acceptanceView();
+    view.headRefOid = REVIEWED;
+    const readReviews = vi.fn(() => []);
+    readDrainAcceptance({ ...acceptanceOptions(view), readReviews });
+    expect(readReviews).not.toHaveBeenCalled();
+  });
+});
 
 describe('PR #3432 — drain acceptance verification and pending reconciliation', () => {
   const labels = [REVIEW_LABELS.accepted, REVIEW_LABELS.pending];
@@ -593,8 +656,8 @@ describe('PR #3432 — drain acceptance verification and pending reconciliation'
   it.each(['no markers', 'changed content', 'unreadable diff'])('does not clear pending without coverage: %s', (failure) => {
     const view = acceptanceView();
     if (failure === 'no markers') view.comments = [];
-    const options = { ...acceptanceOptions(view), netDiff: () => failure === 'unreadable diff'
-      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed') } };
+    const options = { ...acceptanceOptions(view), netDiff: ({ rev }) => failure === 'unreadable diff'
+      ? { scored: false } : { scored: true, text: REVIEWED_DIFF.replace('+new', '+unreviewed'), rev } };
     const spawn = vi.fn();
     expect(reconcileDrainReviewPending({ currentLabels: labels, ...options }, { spawn }).ok).toBe(false);
     expect(spawn).not.toHaveBeenCalled();

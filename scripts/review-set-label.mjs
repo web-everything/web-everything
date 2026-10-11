@@ -82,7 +82,7 @@ import {
   // re-exported below for the same reason `REASONLESS_BOUNCE_REFUSAL` is: this file is the SINGLE label home
   // (#2644), so a reader looks HERE for what governs a label swap even though the pure decision itself lives
   // in the leaf module merge-ai-prs.mjs's own gh-free imports resolve against (avoiding the circular import
-  // that keeping it here would force — `review-set-label.mjs` already imports `computeNetDiffText` FROM
+  // that keeping it here would force — `review-set-label.mjs` already imports `readNetDiffAtHead` FROM
   // `merge-ai-prs.mjs`, so `merge-ai-prs.mjs` cannot import back from here).
   decideParkToHuman, findContradictoryReviewVerdicts,
   // #2766/#2767 follow-up — HEALING an existing contradictory pair (not just preventing a new one). Same
@@ -92,6 +92,7 @@ import {
 // #4140 — `decideRestampHumanClearance` names the carried clearance's actor from TRUSTED comments only, so a later
 // untrusted `cleared-human` marker cannot rename it (the other three parsers it reaches gate themselves).
 import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt
 import { referralCardReadable } from './lib/referral-card-readable.mjs';
 import { assertOperatorCliFresh } from './lib/main-staleness.mjs';
 import { referralLiveContext } from './lib/referral-live-context.mjs';
@@ -110,7 +111,7 @@ import { buildVerdictRecord, appendVerdict, verdictForLabelTarget, verdictClears
 // #2979 — the NET diff vs current main, NOT `gh pr diff`'s three-dot output (see the fingerprint block in
 // `runReviewLabelCli` for why that distinction is the whole point). Imported from the CLI that owns it, the same
 // way `we:scripts/fetch-parked.mjs` already does — it is the single home of the #2450 net-diff basis.
-import { computeNetDiffText } from './merge-ai-prs.mjs';
+import { readNetDiffAtHead } from './merge-ai-prs.mjs';
 import { parseDelegationMarker } from './lib/delegation-marker.mjs';
 import { readStore } from './conveyor/run-scorecard-store.mjs';
 import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
@@ -120,7 +121,7 @@ import { logDelegationTrial } from './conveyor/log-delegation-trial.mjs';
 // its declared file scope), so the automatic session-delegation trial write below REFUSES to log one rather
 // than silently producing the row Fork 2 forbids.
 const FORBIDDEN_DELEGATION_TASK_TYPES = Object.freeze(['self-fix', 'other']);
-import { createGhProvider, writeOrder } from './lib/review-label-provider.mjs';
+import { createGhProvider, writeOrder, PR_COMMENTS_PAGE_SIZE } from './lib/review-label-provider.mjs';
 // #x01u7az — the advisory:* label pair `clear-human` must strip: an advisory only means something on a
 // `review:human` PR (its own header), so a gate-self clearance that drops `review:human` must drop whichever
 // advisory label is still riding along, or the label reads as if an independent advisory endorsed a head
@@ -254,7 +255,7 @@ export { decideParkToHuman, findContradictoryReviewVerdicts, decideContradictory
  *   its CLI also binds OPEN state and the pushed head before writing and verifies the result afterward.
  * @returns {{allowed:boolean, addLabel:string, removeLabels:string[], keepsHuman:boolean, reason:string}}
  */
-export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null } = {}) {
+export function decideSetLabel({ to, currentLabels, findingCount = null, reason = '', requireLive = null, humanCarry = null } = {}) {
   // we:scripts/review-set-label.mjs#decideSetLabel — only the targets in the closed set are valid.
   if (!REVIEW_LABEL_TARGETS.includes(to)) {
     throw new Error(
@@ -263,6 +264,9 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   }
 
   const isHuman = hasReviewLabel(currentLabels, REVIEW_LABELS.human);
+  // PR #4631 (operator ruling 2026-10-10 ~14:20 ET, option a): the drain's own mechanical park. It needs a human or a
+  // proven carry exactly like `review:human`, but it is the ONE hold `restamp` may lift (see that branch).
+  const isHeldMechanical = hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical);
 
   // we:scripts/review-set-label.mjs#decideSetLabel — clear-human (#2895): the ONE target that removes
   // `review:human`, and the only sanctioned way to clear a gate-self PR. It exists because #2882 closed the raw
@@ -285,7 +289,8 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // it binds importers only, and today it binds none (see its doc on `runReviewLabelCli`). None of the three is
   // a barrier.
   if (to === 'clear-human') {
-    if (!isHuman) {
+    // The operator may also clear the drain's mechanical park by hand (it is a hold a human resolves when no carry can).
+    if (!isHuman && !isHeldMechanical) {
       return {
         allowed: false,
         addLabel: '',
@@ -316,7 +321,7 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       // `clear-human` at 13:38:11Z left `advisory:accepted` (stamped 13:29:54Z, while still `review:human`) sitting
       // on the PR through three more review rounds with no `review:human` left to explain it.
       removeLabels: [
-        REVIEW_LABELS.human, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
+        REVIEW_LABELS.human, REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.changes, REVIEW_LABELS.redteamAccepted,
         ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
       ],
       keepsHuman: false,
@@ -424,10 +429,37 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
   // THE REFUSALS ARE THE WHOLE GUARD. A `restamp` that could CREATE an acceptance would be a strictly worse
   // `accepted`: one that skips INVARIANT 2, skips #2844's independence check, and claims a review nobody ran.
   if (to === 'restamp') {
-    if (isHuman) {
+    // card xu7kxtt (#5472, ruling P4; PR #4631 operator ruling 2026-10-10 ~14:20 ET, option a) — the ONE way a
+    // re-stamp crosses a hold: the hold is the drain's OWN mechanical park (`review:held-mechanical`, a label only the
+    // drain writes, so its presence is the proof the hold is mechanical), and the operator already cleared this exact
+    // net diff (`humanCarry`, the caller's proof from `decideAcceptCarryForward`: a trusted `clear-human` record whose
+    // strict reviewed-diff equals the live head's, nothing after it standing against it). Live #4535: merge-queue
+    // refresh fcc29ce1 → 143107a87, re-parked 14:36Z. It completes nothing new: the verdict it carries was given for
+    // these exact bytes. `review:human` is NEVER crossed — it always means a person set the hold, whatever evidence
+    // sits beside it — so a PR carrying both (an operator held it before, during or after the drain's park) stays held.
+    if (isHeldMechanical && !isHuman && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes)
+      && humanCarry && humanCarry.action === 'carry' && humanCarry.human === true) {
       return {
-        allowed: false, addLabel: '', removeLabels: [], keepsHuman: true,
-        reason: 'gate-self: review:human is uncleared — a re-stamp carries an acceptance, it cannot complete one',
+        allowed: true,
+        addLabel: REVIEW_LABELS.accepted,
+        // The mechanical hold and any parked/advisory state riding on it (the superset `clear-human` drops, minus
+        // `review:human`, which is not present here and is never this target's to remove).
+        removeLabels: [
+          REVIEW_LABELS.heldMechanical, REVIEW_LABELS.pending, REVIEW_LABELS.redteamAccepted, REVIEW_LABELS.awaitingAdvisory,
+          ADVISORY_LABELS.ACCEPTED, ADVISORY_LABELS.CHANGES, RULING_NEEDED_LABEL,
+        ],
+        keepsHuman: false,
+        humanCarried: true,
+        reason: `re-stamped — the operator's clearance carried across the drain's mechanical park (${humanCarry.reason}); no review was re-run`,
+      };
+    }
+    if (isHuman || isHeldMechanical) {
+      return {
+        allowed: false, addLabel: '', removeLabels: [], keepsHuman: isHuman,
+        reason: (isHuman
+          ? 'gate-self: review:human is uncleared — a person set it, and a re-stamp never removes it'
+          : 'review:held-mechanical is uncleared — a re-stamp lifts it only on a proven carry of the operator clearance')
+          + (humanCarry?.reason ? ` (carry-forward: ${humanCarry.action} — ${humanCarry.reason})` : ''),
       };
     }
     if (!hasReviewLabel(currentLabels, REVIEW_LABELS.accepted)) {
@@ -464,6 +496,14 @@ export function decideSetLabel({ to, currentLabels, findingCount = null, reason 
       removeLabels: [],
       keepsHuman: isHuman,
       reason: 'gate-self: review:human is human-ceremony-only — clear via /review in a session',
+    };
+  }
+  // PR #4631 (ruling a): the drain's mechanical park is the anti-test-gaming hold on an operator-cleared PR; an agent
+  // accept never clears it (only a proven carry, `restamp`, or the operator's `clear-human`).
+  if (to === 'accepted' && isHeldMechanical) {
+    return {
+      allowed: false, addLabel: '', removeLabels: [], keepsHuman: false,
+      reason: 'review:held-mechanical is the drain\'s test-gaming park of an operator-cleared PR — it is lifted only by a proven carry (--to=restamp) or the operator (--to=clear-human)',
     };
   }
 
@@ -1181,14 +1221,22 @@ export function runReviewLabelCli({
   // reason (`we:scripts/operations/review-pr-io.mjs`'s label sink) renders it into the body and passes no
   // `--reason` flag at all — see `bounceEvidenceFromWriteUp`.
   const bounceEvidence = bounceEvidenceFromWriteUp(verdictBody);
-  const decision = decideSetLabel({
+  // card xu7kxtt — a re-stamp across the drain's MECHANICAL park is decided AFTER the net diff is read (below): its only
+  // allowed shape needs the live fingerprint as proof. Every other refusal still exits here, before any read. PR #4631
+  // (operator ruling 2026-10-10 ~14:20 ET, option a): only `review:held-mechanical` — the label only the drain writes —
+  // is ever crossed; a PR that also carries `review:human` (a person's hold, whenever it was set) or a live
+  // `review:changes` send-back is refused right here, with no write.
+  const restampAcrossHold = to === 'restamp' && !guardedRestamp
+    && hasReviewLabel(currentLabels, REVIEW_LABELS.heldMechanical) && !hasReviewLabel(currentLabels, REVIEW_LABELS.human)
+    && !hasReviewLabel(currentLabels, REVIEW_LABELS.changes);
+  let decision = decideSetLabel({
     to,
     currentLabels,
     findingCount: bounceEvidence.findingCount,
     reason: clearReason || bounceEvidence.reason,
     requireLive: onlyIf,
   });
-  if (!decision.allowed) {
+  if (!decision.allowed && !restampAcrossHold) {
     emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
     process.exit(1);
   }
@@ -1235,12 +1283,16 @@ export function runReviewLabelCli({
       // For the NEXT caller: run this CLI from the named repo's checkout, or pin the child process to it. A
       // `cwd` on this one call would not be enough — the `--body-file` allowlist is rooted at `process.cwd()`
       // too, so the process's location is the contract, not any single read's.
-      const net = computeNetDiffText({
-        exec: execFileSyncThrottled,
-        rev: guardedRestamp || pinnedAccept ? expectedHead : headRefName,
-        fetchExtraRefs: guardedRestamp || pinnedAccept ? [] : headRefName ? [headRefName] : [],
-      });
-      diffScored = !!net?.scored && (!(guardedRestamp || pinnedAccept) || net.rev === expectedHead);
+      // PR #4631 round 7 (toctou-head-binding): the diff is read AT `headSha` — the commit this verdict stamps (for a
+      // guarded restamp or a pinned accept `headSha === expectedHead`, checked above) — never at the branch name, which
+      // can point at another commit by the time it is fetched (a force-push between the PR read and this fetch would
+      // fingerprint one commit's diff onto another's `reviewed-sha`). See `readNetDiffAtHead`. A pinned read fetches
+      // no branch (the pin already names the commit). No branch name on an unguarded read (the hermetic fake-gh
+      // suites) → no read at all, as before.
+      const net = guardedRestamp || pinnedAccept || headRefName
+        ? readNetDiffAtHead({ exec: execFileSyncThrottled, headSha, headRef: guardedRestamp || pinnedAccept ? null : headRefName })
+        : null;
+      diffScored = !!net?.scored;
       reviewedDiff = diffScored ? net.text : '';
     } catch { reviewedDiff = ''; /* miss → no marker → SHA-identity fallback (the stricter path) */ }
   }
@@ -1249,6 +1301,126 @@ export function runReviewLabelCli({
   if (pinnedAccept) {
     if (!diffScored) fail('pinned accept unproven: the net diff of --expect-head is unscored', 1);
     if (normalizeDiffFingerprint(reviewedDiff) !== expectedFingerprint) fail('net diff of --expect-head differs from --expect-fingerprint', 1);
+  }
+
+  // card xu7kxtt (#5472) — the proof a re-stamp needs to cross a `review:human` re-hold: the latest trusted accept is
+  // the operator's `clear-human`, and its strict reviewed-diff equals THIS head's net diff. Unscored diff → no proof
+  // → refused (fail closed). The comment records both SHAs (the reason names the cleared one; the marker the new one).
+  // PR #4631 review round 1 (F1): the clearance this re-stamp carries is DERIVED FROM THE SAME carry verdict that let it
+  // cross the hold (`decideAcceptCarryForward`), never re-derived by a second function. `decideRestampHumanClearance`
+  // reads the diff marker off the clearing comment, which is empty exactly when the carry proof was re-derived from
+  // git (plateau-app #217): it returned null, the re-stamp minted no `cleared-human` marker, and the next hold check
+  // saw a plain accept that no longer covered the head.
+  let carriedHumanClearance = null;
+  // The ONE derivation of the carry verdict, shared by the across-hold path below and the plain (no hold) restamp's
+  // fallback further down, so the two can never disagree on what a clearance covers.
+  // The PR's formal reviews, read once and only for a carry (a plain accept never asks): `null` = unreadable, which the
+  // rule turns into a retryable refusal rather than "no review stands against it" (PR #4631 round 3).
+  // The carry's evidence beyond the one page `gh pr view --json comments` returns: the COMPLETE thread when that page is full
+  // (a hold or the clear-human past comment 100 would be invisible) and the formal reviews. Either read missing makes
+  // `reviews` null, which the rule refuses as a retryable miss. Read once, and only for a human-cleared record with the
+  // setting on, so a plain accept (or the setting off) pays no extra `gh` call.
+  let evidenceRead;
+  const readCarryEvidence = () => {
+    if (evidenceRead) return evidenceRead;
+    let comments = prComments;
+    let reviews = null;
+    try {
+      if (prComments.length >= PR_COMMENTS_PAGE_SIZE) {
+        comments = provider.readComments(repo, pr);
+        if (!Array.isArray(comments)) throw new Error('comments read returned no array');
+      }
+      reviews = provider.readPrReviews(repo, pr);
+      if (!Array.isArray(reviews)) reviews = null;
+    } catch { reviews = null; }
+    evidenceRead = { comments, reviews };
+    return evidenceRead;
+  };
+  // Across the drain's mechanical park the full evidence is ALWAYS read (setting on): a clear-human past comment 100 must
+  // not read as "no clearance", which would hand the hold to the operator instead of lifting it.
+  const carryThread = () => (resolveAcceptCarryForward().value === 'on' && (restampAcrossHold || latestAcceptRecord(prComments)?.humanCleared)
+    ? readCarryEvidence() : { comments: prComments, reviews: undefined });
+  const deriveHumanCarry = () => {
+    const thread = carryThread();
+    let record = latestAcceptRecord(thread.comments, thread.reviews);
+    // A clearance stamped without a diff fingerprint (cross-repo checkout, live plateau-app #217): re-derive the
+    // cleared commit's own net diff from git. Unreadable → no proof → refused (and `retryable`: a git read miss is
+    // not a verdict, so the sweep must not remember it as one).
+    let proofReadMissed = false;
+    if (record && !record.diff && diffScored) {
+      try {
+        const old = readNetDiffAtHead({ exec: execFileSyncThrottled, headSha: record.sha, headRef: record.sha });
+        if (old.scored) record = { ...record, diff: normalizeDiffFingerprint(old.text) }; else proofReadMissed = true;
+      } catch { proofReadMissed = true; }
+    }
+    let humanCarry = decideAcceptCarryForward({
+      setting: resolveAcceptCarryForward().value,
+      record,
+      headSha,
+      headDiff: diffScored ? normalizeDiffFingerprint(reviewedDiff) : null,
+    });
+    if (proofReadMissed && humanCarry.action === 'review-owed') humanCarry.retryable = true;
+    // PR #4631 round 10 (self-review, crash between writes): a lift posts its record (a `cleared-human` comment naming the
+    // LIVE head) before its label swap; a swap that then fails leaves the drain label under a clearance that already names
+    // this exact head. That is not a refusal — the operator's verdict covers these bytes — so it lifts, provided nothing
+    // since stands against it (`same-head` is decided before the later-hold checks, so they are re-applied here).
+    if (restampAcrossHold && humanCarry.action === 'same-head' && humanCarry.human === true) {
+      if (record.reviewsUnreadable) {
+        humanCarry = { ...humanCarry, action: 'review-owed', retryable: true, reason: 'the PR\'s formal reviews could not be read; a standing changes-requested review is unproven absent' };
+      } else if (!record.laterVerdict && !record.laterBodyDerivedHold) {
+        humanCarry = { ...humanCarry, action: 'carry', reason: `the operator clearance already names the live head ${String(headSha).slice(0, 9)} (an earlier lift recorded it but did not swap the label)` };
+      } else {
+        humanCarry = { ...humanCarry, action: 'none', reason: 'a later verdict or deliberate hold supersedes the clearance on the live head' };
+      }
+    }
+    const clearer = parseOperatorClearance((Array.isArray(thread.comments) ? thread.comments : []).filter(isTrustedMarkerAuthor));
+    const clearance = humanCarry.action === 'carry' && humanCarry.human === true
+      ? { actor: clearer?.actor || record?.actor || 'the operator', sha: humanCarry.from } : null;
+    return { humanCarry, clearance, reviewsUnreadable: !!record?.reviewsUnreadable };
+  };
+  // PR #4631 (ruling a): a DECIDED refusal to carry across the drain's mechanical park (the diff changed, a later
+  // verdict or objection stands, the clearance has no fingerprint) means a review of the change is owed — exactly what
+  // the drain's park would have said had its own carry read succeeded (`decideTestGamingPark` parks `review:human` on a
+  // decided refusal). So the hold is handed to the operator: `review:held-mechanical` → `review:human` (plus
+  // `review:awaiting-advisory`, which every `review:human` site carries), with a comment naming why. It ADDS the human
+  // hold and removes only the drain's own label; it never removes `review:human`. Re-read live first: a PR whose labels
+  // moved since this run read them is left alone. Any write miss marks the refusal retryable, so the sweep comes back.
+  let handOffRetryable = false;
+  const handMechanicalHoldToOperator = (why) => {
+    try {
+      const live = provider.readLabels(repo, pr);
+      if (!hasReviewLabel(live, REVIEW_LABELS.heldMechanical) || hasReviewLabel(live, REVIEW_LABELS.human)) return;
+      // The explanation FIRST: once the label swap lands the sweep stops planning this PR (`review:human` stands), so a
+      // comment posted after it would be lost on a failure. A comment with no swap behind it is retried (and repeated).
+      provider.postComment(repo, pr, [
+        '🧑‍⚖️ review — mechanical hold handed to the operator',
+        '',
+        `The drain's \`${REVIEW_LABELS.heldMechanical}\` park could not be lifted by carrying the operator's clearance: ${String(why || 'the carry was refused')}.`,
+        `A review of this head is owed, so the hold is now \`${REVIEW_LABELS.human}\` (card xu7kxtt, PR #4631 ruling a).`,
+      ].join('\n'));
+      if (!hasReviewLabel(live, REVIEW_LABELS.awaitingAdvisory)) provider.setLabels(repo, pr, { add: REVIEW_LABELS.awaitingAdvisory, remove: [] });
+      provider.setLabels(repo, pr, { add: REVIEW_LABELS.human, remove: [REVIEW_LABELS.heldMechanical] });
+    } catch (e) {
+      handOffRetryable = true;
+      process.stderr.write(`review-set-label: mechanical-hold hand-off failed (retryable) — ${String((e && e.message) || e).split('\n')[0]}\n`);
+    }
+  };
+  if (restampAcrossHold) {
+    const derived = deriveHumanCarry();
+    const { clearance, humanCarry } = derived;
+    // PR #4631 (ruling a): the hold's ORIGIN needs no inference — `review:held-mechanical` is written only by the drain's
+    // test-gaming park (`decideTestGamingPark`, merge-ai-prs.mjs), so its presence is the proof. What is left to prove
+    // is the CONTENT: the operator cleared exactly these bytes and nothing since stands against it (`humanCarry`).
+    decision = decideSetLabel({ to, currentLabels, findingCount: bounceEvidence.findingCount, reason: clearReason, requireLive: onlyIf, humanCarry });
+    if (!decision.allowed) {
+      // `retryable`: the refusal is a read miss (unreadable diff / reviews / thread), not a decision about the PR.
+      if (!humanCarry.retryable) handMechanicalHoldToOperator(humanCarry.reason);
+      if (humanCarry.retryable || handOffRetryable) decision = { ...decision, retryable: true };
+      emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision }))}\n`);
+      process.exit(1);
+    }
+    carriedHumanClearance = clearance;
+    clearReason = `carried from ${humanCarry.from} to ${humanCarry.to}: ${humanCarry.reason}. ${clearReason}`.trim();
   }
 
   const carryEvidence = (comments) => {
@@ -1277,9 +1449,45 @@ export function runReviewLabelCli({
   // #x9krtkb (bug 1) — DOES THIS RESTAMP OWE A CARRIED HUMAN CLEARANCE? See `decideRestampHumanClearance`'s own
   // docstring for the full decision; only `to==='restamp'` ever asks (a plain accept/changes/clear-human has no
   // rebase to carry anything across).
-  const humanClearance = to === 'restamp'
-    ? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff })
-    : null;
+  // A plain (no live hold) restamp of a clearance whose clearing comment has no diff marker (plateau-app #217) is the
+  // same F1 shape: `decideRestampHumanClearance` cannot prove coverage from the comment alone, so it falls back to the
+  // shared carry derivation (git-re-derived fingerprint, setting on, no later verdict). Never for a CI-heal restamp,
+  // which has its own coverage proof above.
+  let humanClearance = null;
+  if (to === 'restamp') {
+    humanClearance = carriedHumanClearance ?? decideRestampHumanClearance({ comments: prComments, headSha, headDiff: reviewedDiff });
+    if (!humanClearance && !guardedRestamp && !restampAcrossHold) {
+      const derived = deriveHumanCarry();
+      // An unreadable review / full-thread read must not mint this accept WITHOUT its `cleared-human` marker: that would drop
+      // the operator's clearance for good (the #4535 symptom) on what is only a read miss. Refuse, retryable, nothing written.
+      if (derived.reviewsUnreadable) {
+        emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason: derived.humanCarry.reason, retryable: true } }))}\n`);
+        process.exit(1);
+      }
+      humanClearance = derived.clearance;
+    }
+    // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): a native GitHub CHANGES_REQUESTED review, from any
+    // reviewer identity (plateau-reviewer[bot], the operator), stops the carry. The across-hold and derived carries
+    // already read the formal reviews through `latestAcceptRecord`; `decideRestampHumanClearance` read none, so a plain
+    // restamp re-dated the `cleared-human` record past a standing change request (and the carry rule then saw that
+    // review as "before the accept"). A restamp of a plain agent accept is the same carry (it moves `review:accepted` and
+    // `reviewed-sha` onto a head nobody reviewed), so EVERY restamp asks, whatever the carry setting. Same evidence read,
+    // same rule (`laterReviewHold`): unreadable = a retryable miss, a standing review = a decided refusal. Nothing is
+    // written either way: the accept stays on its old head, and the drain's coverage read refuses to cover the moved head
+    // by diff identity while the review stands (`readDrainAcceptance`), so a review of the head is owed.
+    {
+      const carried = humanClearance ? 'the operator clearance' : 'the accept';
+      const { comments: carryComments, reviews } = readCarryEvidence();
+      const stands = Array.isArray(reviews) ? laterReviewHold(reviews, latestAcceptRecord(carryComments, reviews)?.at ?? null) : null;
+      if (stands !== false) {
+        const reason = stands === null
+          ? `the PR's formal reviews could not be read; a standing changes-requested review is unproven absent, so ${carried} is not carried`
+          : `a formal GitHub changes-requested review stands on this PR; ${carried} is not carried (a review of the head is owed)`;
+        emit(`${JSON.stringify(refusalResult({ pr: Number(pr), decision: { allowed: false, reason, ...(stands === null ? { retryable: true } : {}) } }))}\n`);
+        process.exit(1);
+      }
+    }
+  }
 
   // we:scripts/review-set-label.mjs#runReviewLabelCli — render the durable comment ONCE, here, so the bytes
   // that are size-checked, written and posted are the same bytes.
@@ -2006,7 +2214,9 @@ if (IS_CLI) {
       humanClearance,
     }),
     successResult: ({ pr, to, labels }) => ({ ok: true, pr, to, labels }),
-    refusalResult: ({ decision }) => ({ error: decision.reason }),
+    // `refused` marks a DECISION (as opposed to a crash / gh failure, which prints `{error}` too); `retryable` marks a
+    // refusal that was only a read miss. The accept-carry sweep memoizes the first, never the second (PR #4631 F2).
+    refusalResult: ({ decision }) => ({ error: decision.reason, refused: true, ...(decision.retryable ? { retryable: true } : {}) }),
     // #2895 — UNCONDITIONAL, so every shell invocation of this CLI is opted in, including one run for
     // `--to=accepted`. The opt-in therefore constrains nothing here; it exists so an IMPORTER of
     // `runReviewLabelCli` has to name the capability in its own source. See `allowClearHuman` on that function

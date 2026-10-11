@@ -234,6 +234,9 @@ if (a[0] === 'pr' && a[1] === 'view') {
  if (s.reads === 3 && ${JSON.stringify(scenario)} === 'verdict-race') s.labels = [{name:'review:changes'}];
  console.log(JSON.stringify(s));
 }
+else if (a[0] === 'api' && a.includes('GET') && a.some(x => /\\/pulls\\/\\d+\\/reviews$/.test(x))) {
+ for (const r of (s.reviews || [])) console.log(JSON.stringify(r)); // PR #4631 round 11: a clearance carry reads the formal reviews
+}
 else if (a[0] === 'pr' && a[1] === 'comment') {
  const body = a.includes('--body-file') ? fs.readFileSync(a[a.indexOf('--body-file') + 1], 'utf8') : a[a.indexOf('--body') + 1];
  s.comments.push({author:{login:'web-everything'}, body});
@@ -269,7 +272,10 @@ fs.writeFileSync('state.json', JSON.stringify(s));
       const calls = proof.calls.trim().split('\n').map(JSON.parse);
       expect(calls[0].slice(0, 2)).toEqual(['pr', 'comment']);
       expect(calls.filter(c => c[1] === 'edit')).toHaveLength(rearmed ? 1 : 0);
-      expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything'))).toBe(true);
+      // The formal-reviews GET (a carried operator clearance, PR #4631 round 11) names the repo inside its endpoint path.
+      expect(calls.every(c => c.includes('web-everything/web-everything') || c.includes('--repo=web-everything/web-everything')
+        || (c[0] === 'api' && c.includes('GET') && c.includes('repos/web-everything/web-everything/pulls/42/reviews')))).toBe(true);
+      if (carried) expect(calls.filter(c => c[0] === 'api').length).toBeGreaterThanOrEqual(1);
       if (scenario === 'unchanged') console.info('CI-heal proven replay', JSON.stringify(proof));
       if (scenario === 'soak') {
         let previousHead = healedHead;

@@ -76,7 +76,7 @@ jobs:
         env:
           LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
         run: |
-          HOLD_LABELS_LIST='review:pending,review:changes,review:human'
+          HOLD_LABELS_LIST='review:pending,review:changes,review:human,review:held-mechanical'
           echo "done=true" >> "$GITHUB_OUTPUT"
           held="$(printf '%s' "$LABELS_JSON" | jq -r --arg l "$HOLD_LABELS_LIST" '[.[].name] | map(select(. as $n | ($l | split(",")) | index($n))) | join(", ")')"
           if [ -n "$held" ]; then
