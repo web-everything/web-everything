@@ -33,8 +33,38 @@
 
 import { readFileSync } from 'node:fs';
 import { createSign } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+/**
+ * Read an App's PEM private key from a REFERENCE (`we:scripts/lib/github-app-identity.mjs` — settings only ever hold
+ * a reference): `{file}` (or a bare path) reads the file; `{keychain: {service, account?}}` reads the macOS keychain
+ * with the absolute `/usr/bin/security` (never a PATH lookup). `security -w` prints a secret containing newlines (a
+ * PEM) as hex, so a hex answer that decodes to a PEM is decoded. Throws on failure — the caller treats it like an
+ * unreadable key and never echoes the value.
+ * @param {string|{file?:string, keychain?:{service:string, account?:string}}} keyRef
+ * @param {{readFile?:Function, exec?:Function}} [o]
+ * @returns {string}
+ */
+export function readPrivateKeyRef(keyRef, { readFile = (p) => readFileSync(p, 'utf8'), exec = (cmd, args) => execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 }) } = {}) {
+  const ref = typeof keyRef === 'string' ? { file: keyRef } : keyRef;
+  if (ref?.file) return String(readFile(ref.file));
+  const kc = ref?.keychain;
+  if (!kc?.service) throw new TypeError('github-app-token: key reference needs {file} or {keychain:{service}}');
+  const args = ['find-generic-password', '-s', kc.service, ...(kc.account ? ['-a', kc.account] : []), '-w'];
+  const out = String(exec('/usr/bin/security', args) ?? '').trim();
+  if (/^[0-9a-f]+$/i.test(out) && out.length % 2 === 0) {
+    const decoded = Buffer.from(out, 'hex').toString('utf8');
+    if (decoded.includes('PRIVATE KEY')) return decoded;
+  }
+  return out.replace(/\\n/g, '\n');
+}
+
+/** Can the key reference be read? Never throws, never returns the key. */
+export function canReadPrivateKeyRef(keyRef, o) {
+  try { return readPrivateKeyRef(keyRef, o).length > 0; } catch { return false; }
+}
 
 /** GitHub's own documented maximum JWT lifetime — a longer `exp` is rejected outright by their API. */
 export const MAX_JWT_LIFETIME_SECONDS = 600;

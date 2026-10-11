@@ -1,5 +1,6 @@
 {
   "prLimit": {
-    "excludeCardOnly": true
+    "excludeCardOnly": true,
+    "excludeStackedAwaitingBase": true
   }
 }

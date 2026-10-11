@@ -48,6 +48,9 @@ export function worktreeGitEnv(wt, base = process.env) {
   const env = { ...base };
   for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY']) delete env[k];
   env.GIT_CEILING_DIRECTORIES = dirname(wt);
+  // Every ops/** write goes through this worktree, so it plays the LEDGER role (we:scripts/lib/github-app-identity.mjs):
+  // any gh / credential-helper call made for it picks the Ledger App once that role is configured.
+  env.WE_GITHUB_APP_ROLE = 'ledger';
   return env;
 }
 
