@@ -13,7 +13,7 @@ import { join } from 'node:path';
 
 import * as quarantine from '../../lib/red-main-quarantine.mjs';
 const { parseVitestFailures, planSafetyNet, addEntries, pruneOnGreen, setMode, validateQuarantineList } = quarantine;
-import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, skipForList, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER } from '../../lib/red-main-quarantine-io.mjs';
+import { runSafetyNet, resolveQuarantineSettings, readListOrAbsent, skipForList, SAFETY_NET_SHADOW_LOG, SAFETY_NET_LEDGER, STAMP_RECHECK_MS } from '../../lib/red-main-quarantine-io.mjs';
 import smell, { defaultQuarantineSafetyNet } from '../health-smells/main-ci-red.mjs';
 import { healthDir } from '../health-watch-section.mjs';
 
@@ -413,6 +413,25 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
       const blind = net({ mode: STOP, mainCiRuns: RUNS, now: at + MIN, readList: () => ({ ok: false, error: 'fetch failed' }) });
       expect(blind.calls.writes).toEqual([]);
       expect(net({ mode: STOP, mainCiRuns: RUNS, list: { version: 1, entries: [] }, now: at + 2 * MIN }).calls.reads).toBe(1);
+    });
+    it('an "unstamped" record goes stale: a stamp that appears later (old ledger restored, another writer) is still withdrawn', () => {
+      net({ mode: STOP, mainCiRuns: RUNS, now: at }); // records "unstamped"
+      const stamped = { version: 1, entries: [], mode: 'quarantine' };
+      expect(net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + STAMP_RECHECK_MS - 1 }).calls.reads).toBe(0);
+      const later = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at + STAMP_RECHECK_MS });
+      expect(later.calls.reads).toBe(1);
+      expect(later.calls.writes).toHaveLength(1);
+      expect(later.calls.writes[0].change(stamped).list.mode).toBe('stop');
+    });
+    it('a stamp-only push is refused when the ledger cannot record it (else a stale "unstamped" record would hide it)', () => {
+      const unstamped = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list;
+      net({ mode: STOP, mainCiRuns: RUNS, now: at }); // the ledger says "unstamped"
+      rmSync(join(dir, SAFETY_NET_LEDGER));
+      mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // from now on the ledger write fails
+      const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: unstamped, now: at + MIN });
+      expect(calls.writes).toEqual([]);
+      expect(r.applied).toBe(false);
+      expect(r.error).toMatch(/ledger/);
     });
     it('a replay tick (`live:false`) never reads or writes the live list, even with no ledger', () => {
       const { calls } = net({ mode: STOP, live: false, mainCiRuns: RUNS, list: { version: 1, entries: [], mode: 'quarantine' }, now: at });

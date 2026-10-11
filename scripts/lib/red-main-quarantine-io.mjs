@@ -126,6 +126,8 @@ const JOB_READ_RETRY_MAX_MS = 15 * 60_000;
 const LEDGER_RETENTION_MS = 48 * 60 * 60 * 1000;
 /** Red commits a window record remembers (newest kept), so the ledger stays bounded on a long red. */
 const RED_SHAS_KEPT = 200;
+/** How long a stop tick trusts the ledger's "the list is unstamped" record before reading the list again. */
+export const STAMP_RECHECK_MS = 15 * 60_000;
 
 const readJson = (path) => { try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return null; } };
 
@@ -203,16 +205,17 @@ export function runSafetyNet({
   let sha = null;
   let activeKey = null;
   try {
-    // In `stop`, unless the ledger KNOWS the list carries no `quarantine` stamp: read the list and withdraw a live
-    // stamp, so CI (which reads the mode from the list) stops skipping at once, not at entry expiry. That covers a
-    // flip back to `stop` after this daemon published, and a fresh, lost or reset ledger (the stamp is then unknown,
-    // so it is read once, then recorded). A failed read or withdraw leaves it unknown: retried next tick. Nothing is
-    // written when the list is unstamped, and a replay tick never reads or writes.
-    if (!isLive && live === true && ledger.publishedMode !== 'stop') {
+    // In `stop`, unless the ledger KNOWS (from a recent read) the list carries no `quarantine` stamp: read the list and
+    // withdraw a live stamp, so CI (which reads the mode from the list) stops skipping at once, not at entry expiry.
+    // That covers a flip back to `stop` after this daemon published, and a fresh, lost, reset or stale ledger: an
+    // "unstamped" record is trusted only for STAMP_RECHECK_MS, then read again. A failed read or withdraw leaves it
+    // unknown: retried next tick. Nothing is written when the list is unstamped, and a replay tick never reads or writes.
+    const knownUnstamped = ledger.publishedMode === 'stop' && now - (Number(ledger.publishedModeAt) || 0) < STAMP_RECHECK_MS;
+    if (!isLive && live === true && !knownUnstamped) {
       try {
         const cur = readList();
         if (cur.ok && cur.list?.mode === 'quarantine') write({ actor: SAFETY_NET_ACTOR, message: `quarantine: mode → ${mode.value} (${mode.source})`, change: (list) => setMode(list, { mode: 'stop', actor: SAFETY_NET_ACTOR, now }) });
-        if (cur.ok) ledger.publishedMode = 'stop';
+        if (cur.ok) { ledger.publishedMode = 'stop'; ledger.publishedModeAt = now; }
       } catch (e) { out.demoteError = String(e?.message || e).split('\n')[0]; }
     }
     sha = state.status === 'red' ? String(state.firstRed?.sha ?? '') : null;
@@ -261,8 +264,12 @@ export function runSafetyNet({
     // ledger recorded it (a push that landed but threw, a lost ledger): it must not be re-added once it expires.
     if (isLive && rec) for (const e of read.list?.entries ?? []) if (rec.shas?.includes(e.brokenSha) && e.test) rec.added = [...new Set([...(rec.added ?? []), e.test])];
     // Likewise the stamp: a live stamp is recorded whatever this tick then does (even nothing), so a recovered ledger
-    // still withdraws it on a flip to stop. An unstamped list is recorded only when the ledger knew nothing yet.
-    if (isLive) { if (read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine'; else ledger.publishedMode ??= 'stop'; }
+    // still withdraws it on a flip to stop. An unstamped list never overwrites a recorded `quarantine` (the stop tick
+    // re-reads and decides).
+    if (isLive) {
+      if (read.list?.mode === 'quarantine') ledger.publishedMode = 'quarantine';
+      else if (ledger.publishedMode !== 'quarantine') { ledger.publishedMode = 'stop'; ledger.publishedModeAt = now; }
+    }
     const pri = mainCiRuns?.priority;
     const fixPrs = pri ? (Array.isArray(pri.prs) ? pri.prs : [pri.pr]) : null;
     const plan = planSafetyNet({
@@ -294,10 +301,11 @@ export function runSafetyNet({
       // between the push and the ledger write must never let the entry be added again once it expires.
       const intended = plan.action === 'add' && rec ? plan.tests.filter((t) => !(rec.added ?? []).includes(t)) : [];
       if (intended.length) { rec.added = [...(rec.added ?? []), ...intended]; }
-      // No durable intent, no push: a push that lands with nothing on disk could be added again after it expires.
-      if (!persist() && intended.length) {
-        rec.added = rec.added.filter((t) => !intended.includes(t));
-        out.error = 'quarantine: ledger write failed — not adding (the "added for this red" record cannot be made durable)';
+      // No durable intent, no push: a push that lands with nothing on disk could be added again after it expires, or
+      // (a stamp) be hidden behind an "unstamped" record, so a flip to stop would not withdraw it.
+      if (!persist() && (intended.length || stamping)) {
+        if (intended.length) rec.added = rec.added.filter((t) => !intended.includes(t));
+        out.error = 'quarantine: ledger write failed — not writing the list (the "added for this red" / published-mode record cannot be made durable)';
         return out;
       }
       let r;
