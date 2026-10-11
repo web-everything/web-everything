@@ -111,6 +111,12 @@ import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
 import { resolveFixSettings } from './fix-takeover.mjs';
+import { resolveReviewSettings } from '../lib/review-settings.mjs';
+
+/** `review.takeoverReviewAttempts` for `planReconcile`; an unreadable setting keeps the pure core's 0. */
+function takeoverReviewSetting(load, env) {
+  try { const n = load({ env }).takeoverReviewAttempts; return Number.isInteger(n) ? { takeoverReviewAttempts: n } : {}; } catch { return {}; }
+}
 
 /** Card xx0055i — the round-cap action + takeover bound for `planReconcile`; an unreadable setting keeps `person`. */
 function fixCapSettings(load, env) {
@@ -1295,6 +1301,8 @@ export function runReconcilePass({
   loadLadder = loadFixerLadder,
   // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
   loadFixSettings = resolveFixSettings,
+  // `review.*` settings (env > we:scripts/review-settings.json > built-in) — read for takeoverReviewAttempts. Injectable.
+  loadReviewSettings = resolveReviewSettings,
   now = Date.now(), repo = null, defaultBranch = 'main', env = process.env,
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
@@ -1354,6 +1362,7 @@ export function runReconcilePass({
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
     ...fixCapSettings(loadFixSettings, env),
+    ...takeoverReviewSetting(loadReviewSettings, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
   });
