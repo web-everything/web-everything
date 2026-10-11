@@ -3,7 +3,7 @@ kind: story
 size: 5
 priority: high
 status: resolved
-blockedBy: ["xe2s04u", "5726"]
+blockedBy: ["5778", "5726"]
 scope: ["we:scripts/operations/review-job.mjs", "we:scripts/operations/review-extra-seats.mjs", "we:scripts/operations/review-loop-cli.mjs", "we:scripts/lib/review-speculative-red-team.mjs", "we:scripts/settings/review.json"]
 dateOpened: "2026-10-10"
 dateResolved: "2026-10-10"
