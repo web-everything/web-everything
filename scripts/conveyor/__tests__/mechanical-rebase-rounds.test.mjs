@@ -68,18 +68,20 @@ describe('mechanical re-arm rounds', () => {
     const rearm = comment('11T04:00:00', REARM_COMMENT_MARKER);
     const end = (date, who = 'fix-7') => comment(date, `🔓 conveyor fix-end — fix claim released\n\n\`${who}\` released the fix claim at \`abcdef123\`.`);
     const count = (extra) => countRealFixRounds({ ...pr, comments: [...extra, rearm], roundCommits: { head, commits: [fixCommit] } });
-    it('keeps the round start at the first begin when a replacement claim never saw a release', () => {
+    it('keeps the round start at the first begin when a replacement claim follows a crash', () => {
       expect(count([begin('11T01:00:00', 'fix-7'), begin('11T03:00:00', 'fix-7')])).toMatchObject({ ok: true, real: 1 });
     });
-    it('keeps the first begin through several unreleased replacements', () => {
+    it('keeps the first begin through several replacements', () => {
       expect(count([begin('11T01:00:00', 'fix-7'), begin('11T01:30:00', 'fix-8'), begin('11T03:00:00', 'fix-9')])).toMatchObject({ ok: true, real: 1 });
     });
-    it('starts a new window after a clean release, so the earlier claim does not own the later round', () => {
-      expect(count([begin('11T01:00:00', 'fix-7'), end('11T02:30:00'), begin('11T03:00:00', 'fix-8')])).toMatchObject({ ok: true, real: 0 });
+    it.each([['harness reclaim', 'fix-7'], ['own release', 'fix-8']])('a fix-end (%s) between claims does not split the round', (_name, who) => {
+      expect(count([begin('11T01:00:00', 'fix-7'), end('11T02:30:00', who), begin('11T03:00:00', 'fix-8')])).toMatchObject({ ok: true, real: 1 });
     });
-    it('does not let an untrusted release comment split the window', () => {
-      const forged = { ...end('11T02:30:00'), author: { login: 'outsider' } };
-      expect(count([begin('11T01:00:00', 'fix-7'), forged, begin('11T03:00:00', 'fix-7')])).toMatchObject({ ok: true, real: 1 });
+    it('a begin from before the previous re-arm does not reach back into the earlier round', () => {
+      const earlier = comment('11T01:30:00', REARM_COMMENT_MARKER);
+      const result = countRealFixRounds({ ...pr, comments: [begin('11T01:00:00', 'fix-7'), earlier, begin('11T03:00:00', 'fix-8'), rearm],
+        roundCommits: { head, commits: [fixCommit] } });
+      expect(result).toMatchObject({ ok: true, total: 2, real: 0 });
     });
   });
   describe('truncated (shallow) history', () => {

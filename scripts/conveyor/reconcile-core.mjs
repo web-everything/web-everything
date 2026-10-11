@@ -453,7 +453,7 @@ export function resolveCiHealBudget({ env = {}, platform = null, repo = null } =
 const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
 /**
  * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
- * start is the later of the previous re-arm and latest review fix-begin (never ci-heal).
+ * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
  * Invalid evidence leaves the historical cap accounting untouched.
  */
 export function countRealFixRounds(pr) {
@@ -486,23 +486,15 @@ export function countRealFixRounds(pr) {
   if ([...rearms, ...begins].some((c) => !Number.isFinite(time(c)))) return fail('invalid-comment-time');
   rearms.sort((a, b) => time(a) - time(b));
   begins.sort((a, b) => time(a) - time(b));
-  // Only a clean release (fix-end by a review fixer) closes a claim; a crashed fixer leaves none.
-  const releases = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_END_MARKER)
-    && /^fix-\d+$/.test(FIX_END_WHO_RE.exec(c.body.trimStart())?.[1] ?? '') && Number.isFinite(time(c))).map(time);
   let previous = -Infinity;
   const rounds = rearms.map((c) => {
     const end = time(c);
-    // A replacement claim taken after a crash (no release in between) continues the same round: its start is
-    // the earliest begin of the unbroken chain ending at the latest begin, never the replacement's own begin.
-    let start = previous;
-    let chainEnd = null;
-    for (let i = begins.length - 1; i >= 0; i -= 1) {
-      const t = time(begins[i]);
-      if (t > end || t <= previous) continue;
-      if (chainEnd !== null && releases.some((r) => r > t && r <= chainEnd)) break;
-      start = Math.max(previous, t);
-      chainEnd = t;
-    }
+    // Only a re-arm closes a round, so a replacement claim (after a crash, a reclaim's fix-end, or a stand-down)
+    // never moves the start past work an earlier claim in the same round already did: the start is the EARLIEST
+    // review fix-begin after the previous re-arm. A ci-heal commit inside such a window reads as real, which only
+    // errs toward keeping the attempt spent.
+    const first = begins.find((b) => time(b) > previous && time(b) <= end);
+    const start = first ? time(first) : previous;
     const shas = facts.commits.filter((commit) => commit.parents.length === 1 && !commit.subject.startsWith('drain: rebase')
       && Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end).map((commit) => commit.sha);
     previous = end;
