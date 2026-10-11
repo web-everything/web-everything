@@ -1655,7 +1655,7 @@ async function main(argv) {
     // A fresh CLI invocation is, by definition, a different real process than whichever one is stuck holding
     // the slot — pid: null opts into the loose owner-only match (#3383's deliberate manual/operator escape
     // hatch; see releaseOwnedSlot's own docstring).
-    const r = releaseOwnedSlot({ lockRoot, cap, owner, pid: null });
+    const r = releaseOwnedSlot({ lockRoot, cap, owner, pid: null, fastSlots: resolveSlotSpan({ ...policy.settings, cap }) - cap });
     if (asJson) emit(r); else process.stderr.write(r.released ? `released slot-${r.slot} for ${owner}\n` : `${owner} held no slot\n`);
     return;
   }
