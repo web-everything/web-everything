@@ -150,6 +150,11 @@ gh pr view {{PR_NUM}} --json title,body,comments --repo {{REPO}}
 
 Take the **latest** changes-requested comment as the authoritative ask.
 
+**If this prompt opens with a `Previous rounds` (or `Takeover`) section, read it first** (card xx0055i). It lists
+each earlier round's findings, what the previous fixer changed, which findings were raised again, and the current
+rulings. A finding marked "raised again" means the last fix did not hold: fix the whole defect class, not the
+same line again. Never re-argue a `not-real` ruling, and never work around a `block` ruling.
+
 **Reproduce it before you touch any code.** Run or write a test that FAILS for the exact reason the reviewer
 named, and show it red. Where the finding is observable on a real surface — a CLI dry-run, a read-only query, a
 page render — probe that surface too and show the SAME failure there, not only in the test. Trim both outputs;

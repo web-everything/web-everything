@@ -17,7 +17,7 @@
  * now" — so the override that lifts it must be visible to every lane/session on this machine at once, the
  * same reason `~/.claude/github-app-token` and other machine-wide operator state live under `~/.claude`.
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -32,6 +32,10 @@ import { writeAllSync } from './write-all-sync.mjs';
 import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of card-only (backlog/ only, fail-closed) — never re-derived here
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
+import { gitRun } from './git-run.mjs';
+import { withFileLock } from './atomic-json-file.mjs';
+import { classifySession } from '../operations/session-role.mjs'; // THE worker/orchestrator marker — the same one pre-pr-review's bypass gate reads
+import { currentActorId } from './review-independence.mjs'; // the harness session id, recorded on every grant/refusal
 
 // ── LIMITS (defaults + per-repo env override) ───────────────────────────────────────────────────────────
 
@@ -448,7 +452,7 @@ export function decideOpenPr({
       allowed: false,
       exempt: false,
       overridden: false,
-      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first, or override (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=…\` / \`node scripts/operations/pr-limit.mjs off --reason=… [--for=2h]\` / \`pr-land --force-open --reason=…\`)`,
+      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first. An agent stops and reports here — exceptions are the operator's to grant (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=… --operator-quote="<verbatim>"\` or \`pr-limit.mjs off --operator-quote="<verbatim>"\`, both from the operator's channel, never a worker or lane session)`,
     };
   }
   return { allowed: true, reason: `under limit (${openCount}/${limit})${split}`, exempt: false, overridden: false };
@@ -478,6 +482,10 @@ export function parseLimitState(text) {
       by: v.by != null ? String(v.by) : null,
       at: v.at != null ? String(v.at) : null,
       until: v.until != null ? String(v.until) : null,
+      // xfaz7ho's grant record — kept when present so a later write never strips an earlier grant's quote.
+      ...(v.operatorQuote != null ? { operatorQuote: String(v.operatorQuote) } : {}),
+      ...(v.channel != null ? { channel: String(v.channel) } : {}),
+      ...(v.session != null ? { session: String(v.session) } : {}),
     };
   }
   return {
@@ -487,10 +495,45 @@ export function parseLimitState(text) {
       by: g.by != null ? String(g.by) : null,
       at: g.at != null ? String(g.at) : null,
       until: g.until != null ? String(g.until) : null,
+      ...(g.operatorQuote != null ? { operatorQuote: String(g.operatorQuote) } : {}),
+      ...(g.channel != null ? { channel: String(g.channel) } : {}),
+      ...(g.session != null ? { session: String(g.session) } : {}),
     },
     branches,
-    history: Array.isArray(raw.history) ? raw.history.slice(-500) : [],
+    history: capHistory(Array.isArray(raw.history) ? raw.history : []),
   };
+}
+
+/** Max override-history entries kept. */
+export const HISTORY_MAX = 500;
+
+/** The history actions that record an operator GRANT — the records the audit trail exists to keep. */
+export const GRANT_ACTIONS = Object.freeze(['allow-branch', 'off']);
+
+/** Cap the history at {@link HISTORY_MAX}, evicting every NON-grant entry (refusals, `on`, anything else) oldest
+ *  first before any {@link GRANT_ACTIONS} record — a caller looping on a refused `allow`/`off`, or on the ungated
+ *  `on`, must never push the grant records out of the store (#4791 review). Only when nothing else is left do the
+ *  oldest grants go. The one cap, used on read and on append. PURE. */
+export function capHistory(history) {
+  const h = Array.isArray(history) ? history : [];
+  let excess = h.length - HISTORY_MAX;
+  if (excess <= 0) return h;
+  const kept = [];
+  for (const rec of h) {
+    if (excess > 0 && !GRANT_ACTIONS.includes(String(rec?.action || ''))) { excess -= 1; continue; }
+    kept.push(rec);
+  }
+  return excess > 0 ? kept.slice(excess) : kept;
+}
+
+/** Bounds on the free text a history or grant record stores — every one is caller-supplied (`--by`, `--reason`,
+ *  the cwd inside a refusal) and a refused call can now write it, so it is clipped, never stored unbounded. */
+export const HISTORY_TEXT_MAX = Object.freeze({ actor: 200, reason: 2000, target: 300 });
+
+function clipText(v, max) {
+  if (v == null) return null;
+  const s = String(v);
+  return s.length > max ? `${s.slice(0, max)}…[clipped ${s.length - max}]` : s;
 }
 
 /** Serialize a state object back to the store's JSON text (newline-terminated). PURE. */
@@ -511,27 +554,44 @@ export function parseDurationMs(text) {
   return Math.round(n * perUnit[unit]);
 }
 
-/** Append one entry to the state's override history (capped at 500 — an advisory audit trail, not a
+/** Append one entry to the state's override history (capped by {@link capHistory} — an advisory audit trail, not a
  *  ledger of record). Every override this module writes is logged with actor + reason, per #4075's
  *  requirement. PURE (the timestamp is injected, so this stays directly unit-testable). */
 export function appendHistory(state, entry, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
-  const rec = { at: new Date(now).toISOString(), actor: entry?.actor ?? null, reason: entry?.reason ?? null, action: entry?.action ?? 'unknown', target: entry?.target ?? null };
-  return { ...s, history: [...(Array.isArray(s.history) ? s.history : []), rec].slice(-500) };
+  const rec = { at: new Date(now).toISOString(), actor: clipText(entry?.actor ?? null, HISTORY_TEXT_MAX.actor), reason: clipText(entry?.reason ?? null, HISTORY_TEXT_MAX.reason), action: entry?.action ?? 'unknown', target: clipText(entry?.target ?? null, HISTORY_TEXT_MAX.target) };
+  // A grant's evidence (xfaz7ho) lives on its HISTORY entry too, not only on the live `global`/`branches` record —
+  // the ungated `on` resets `global` and a re-grant overwrites a branch entry, so the live record alone would lose
+  // the operator's words (#4791 self-review). History keeps grants over every other entry ({@link capHistory}).
+  if (entry?.operatorQuote) rec.operatorQuote = clipText(entry.operatorQuote, OPERATOR_QUOTE_MAX);
+  if (entry?.channel) rec.channel = clipText(entry.channel, HISTORY_TEXT_MAX.actor);
+  if (entry?.session) rec.session = clipText(entry.session, HISTORY_TEXT_MAX.actor);
+  return { ...s, history: capHistory([...(Array.isArray(s.history) ? s.history : []), rec]) };
+}
+
+/** The history `reason` of a refused `allow`/`off`: the refusal, then `[channel=… session=…]`. The refusal is
+ *  clipped FIRST so the tag always survives — `clipText` keeps the head, and the refusal can carry a long cwd. PURE. */
+export function refusalReason(decision, session) {
+  const tag = ` [channel=${decision?.channel}${session ? ` session=${clipText(session, HISTORY_TEXT_MAX.actor)}` : ''}]`;
+  return `${clipText(decision?.refusal ?? '', HISTORY_TEXT_MAX.reason - tag.length - 40)}${tag}`;
 }
 
 /** Set (or re-set) the global off-switch. `untilMs` (from {@link parseDurationMs}) becomes an absolute
  *  `until` timestamp; omitted/`null` means "off until explicitly cleared". PURE. */
-export function setGlobalOff(state, { reason = null, by = null, untilMs = null } = {}, now = Date.now()) {
+export function setGlobalOff(state, { reason = null, by = null, untilMs = null, operatorQuote = null, channel = null, session = null } = {}, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const global = {
     off: true,
-    reason: reason != null && String(reason).trim() ? String(reason).trim() : 'operator override',
-    by: by != null && String(by).trim() ? String(by).trim() : null,
+    reason: reason != null && String(reason).trim() ? clipText(String(reason).trim(), HISTORY_TEXT_MAX.reason) : 'operator override',
+    by: by != null && String(by).trim() ? clipText(String(by).trim(), HISTORY_TEXT_MAX.actor) : null,
     at: new Date(now).toISOString(),
     until: untilMs != null ? new Date(now + untilMs).toISOString() : null,
   };
-  return appendHistory({ ...s, global }, { actor: global.by, reason: global.reason, action: 'off', target: global.until ? `until ${global.until}` : 'indefinite' }, now);
+  // The same grant record `allowBranch` keeps (xfaz7ho) — the off-switch is an operator exception too.
+  if (operatorQuote) global.operatorQuote = String(operatorQuote);
+  if (channel) global.channel = String(channel);
+  if (session) global.session = String(session);
+  return appendHistory({ ...s, global }, { actor: global.by, reason: global.reason, action: 'off', target: global.until ? `until ${global.until}` : 'indefinite', operatorQuote: global.operatorQuote, channel: global.channel, session: global.session }, now);
 }
 
 /** Clear the global off-switch — back to enforced. PURE. */
@@ -541,14 +601,19 @@ export function clearGlobalOff(state, { by = null, reason = null } = {}, now = D
   return appendHistory(next, { actor: by, reason: reason || 'operator re-armed the limit', action: 'on', target: null }, now);
 }
 
-/** Allow-list one branch (indefinitely, or until `untilMs` from now). PURE. */
-export function allowBranch(state, branch, { reason = null, by = null, untilMs = null } = {}, now = Date.now()) {
+/** Allow-list one branch (indefinitely, or until `untilMs` from now). PURE. `operatorQuote`/`channel`/`session`
+ *  (xfaz7ho) are recorded on the entry when given; entries written without them (before xfaz7ho) stay valid —
+ *  {@link isBranchAllowedNow} never reads them, the gate is at WRITE time ({@link authoriseAllow}). */
+export function allowBranch(state, branch, { reason = null, by = null, untilMs = null, operatorQuote = null, channel = null, session = null } = {}, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const name = String(branch || '').trim();
   if (!name) return s;
-  const entry = { reason: reason != null && String(reason).trim() ? String(reason).trim() : 'operator override', by: by || null, at: new Date(now).toISOString(), until: untilMs != null ? new Date(now + untilMs).toISOString() : null };
+  const entry = { reason: reason != null && String(reason).trim() ? clipText(String(reason).trim(), HISTORY_TEXT_MAX.reason) : 'operator override', by: by ? clipText(by, HISTORY_TEXT_MAX.actor) : null, at: new Date(now).toISOString(), until: untilMs != null ? new Date(now + untilMs).toISOString() : null };
+  if (operatorQuote) entry.operatorQuote = String(operatorQuote);
+  if (channel) entry.channel = String(channel);
+  if (session) entry.session = String(session);
   const next = { ...s, branches: { ...s.branches, [name]: entry } };
-  return appendHistory(next, { actor: entry.by, reason: entry.reason, action: 'allow-branch', target: name }, now);
+  return appendHistory(next, { actor: entry.by, reason: entry.reason, action: 'allow-branch', target: name, operatorQuote: entry.operatorQuote, channel: entry.channel, session: entry.session }, now);
 }
 
 /** Normalize a branch/ref for allow-list comparison — a stored `--branch=4080-foo` matches a lane ref
@@ -580,6 +645,97 @@ export function isBranchAllowedNow(state, branch, nowMs = Date.now()) {
   return !Number.isFinite(untilMs) || nowMs < untilMs;
 }
 
+// ── WHO MAY GRANT AN EXCEPTION (xfaz7ho) ──────────────────────────────────────────────────────────────────
+
+/** Max length of a recorded operator quote — it is stored verbatim, so it is bounded, not truncated silently. */
+export const OPERATOR_QUOTE_MAX = 1000;
+
+/**
+ * May THIS caller allow-list `branch`? PURE given its inputs. Exceptions are the operator's to grant: twice on
+ * 2026-10-10 a worker ran `pr-limit.mjs allow --branch=<its own branch>` and opened its PR past the limit
+ * (#4786, #4779 — both ratified after the fact). The channel is DERIVED from what the harness and our own spawn
+ * sites put in the environment and from where the command runs — never from an argv flag the caller sets:
+ *   • `worker`  — `WE_CONVEYOR_WORKER=1` (every dispatch spawn site sets it, we:scripts/operations/session-role.mjs) → refused;
+ *   • `unknown` — an unrecognised marker value → refused (fail closed, same as pre-pr-review's bypass gate);
+ *   • `lane`    — run from inside a lane clone (`/.lanes/`), where every worker works → refused;
+ *   • own branch — the target is ANY name the calling checkout goes by (checked-out branch, upstream, push target) → refused;
+ *   • otherwise `operator-session` (a Claude session outside any lane) or `terminal` (no Claude env) — accepted
+ *     only with a verbatim `--operator-quote`, recorded on the entry (the #2895 honesty tax).
+ * Like review-independence (#2895), this is NOT unforgeable — an agent with a shell can `cd` out and unset vars.
+ * What it buys: a self-grant now takes a deliberate evasion, and every grant and refusal is logged with its channel.
+ * @returns {{ok:boolean, channel:string, refusal:string}}
+ */
+export function authoriseAllow(args = {}) {
+  return authoriseOverride({ ...args, verb: 'allow' });
+}
+
+/**
+ * The CLI verbs that LIFT the limit, every one gated by {@link authoriseOverride} — and the ones that do not lift
+ * it (`on` only re-arms enforcement, `status` only reads). A new verb must be added to one list or the other; the
+ * test enumerates both against the CLI (#4791 review: `off` lifted the limit for everyone with no gate at all).
+ */
+export const OVERRIDE_VERBS = Object.freeze(['allow', 'off']);
+export const UNGATED_VERBS = Object.freeze(['on', 'status']);
+
+/**
+ * May THIS caller use a limit-lifting verb (`allow` or `off`)? PURE given its inputs. The same channel rules as
+ * {@link authoriseAllow} (worker / unknown / lane → refused; operator channel → only with a verbatim quote); the
+ * own-branch rule applies to `allow` only, since `off` names no branch.
+ * @returns {{ok:boolean, channel:string, refusal:string}}
+ */
+export function authoriseOverride({ verb = 'allow', branch, operatorQuote, env = {}, cwdReal = '', ownBranch = '' } = {}) {
+  const STOP = 'An agent refused by the limit must stop and report; the operator grants exceptions.';
+  const what = `pr-limit ${verb} refused`;
+  const { role, reason } = classifySession(env);
+  if (role === 'worker') return { ok: false, channel: 'worker', refusal: `${what}: this is a dispatched worker session (${reason}). ${STOP}` };
+  if (role !== 'orchestrator') return { ok: false, channel: 'unknown', refusal: `${what}: the session role is unknown (${reason}), so the grant fails closed. ${STOP}` };
+  if (String(cwdReal || '').includes('/.lanes/')) return { ok: false, channel: 'lane', refusal: `${what}: run from inside a lane clone (${cwdReal}) — that is where workers run; the operator grants from the primary checkout or a terminal. ${STOP}` };
+  if (verb === 'allow') {
+    const target = normalizeBranchName(branch);
+    // EVERY name the checkout goes by — its checked-out branch, its upstream, its push target — is "own"; a branch
+    // tracking another branch (or a remote not named origin) must not hide the one it actually is (#4791 red team).
+    const owns = (Array.isArray(ownBranch) ? ownBranch : [ownBranch])
+      .map((b) => normalizeBranchName(String(b || '').replace(/^refs\/heads\//, '').replace(/^(refs\/remotes\/)?origin\//, '')))
+      .filter(Boolean);
+    if (target && owns.includes(target)) return { ok: false, channel: 'own-branch', refusal: `${what}: ${target} is this checkout's own branch — a session never allow-lists its own branch. ${STOP}` };
+  }
+  const channel = env && env.CLAUDECODE ? 'operator-session' : 'terminal';
+  const quote = typeof operatorQuote === 'string' ? operatorQuote.trim() : '';
+  if (!quote) return { ok: false, channel, refusal: `${what}: --operator-quote="<the operator's instruction, verbatim>" is required — exceptions are the operator's to grant, and the grant records their words. ${STOP}` };
+  if (quote.length > OPERATOR_QUOTE_MAX) return { ok: false, channel, refusal: `${what}: --operator-quote is over ${OPERATOR_QUOTE_MAX} characters — quote the instruction itself.` };
+  return { ok: true, channel, refusal: '' };
+}
+
+/**
+ * EVERY branch name the checkout at `cwd` goes by, remote prefixes stripped: the checked-out branch, its upstream
+ * (`@{u}`, plus `branch.<b>.merge` for an upstream with no fetched remote-tracking ref) and its push target
+ * (`@{push}`). Each read is independent — a missing upstream never hides the checked-out branch (#4791 red team:
+ * the old upstream-first read returned `origin/lane/parent` for `lane/child` and never looked at HEAD). A remote
+ * prefix is stripped by the checkout's own remote list, longest first, so `upstream/…` and a remote whose name
+ * contains `/` strip whole. Fails soft to the names it could read ([] outside a git checkout).
+ * @returns {string[]}
+ */
+export function readOwnBranches(cwd, { run = gitRun } = {}) {
+  const git = (...args) => { const r = run('git', args, { cwd }); return r && r.status === 0 ? String(r.stdout).trim() : ''; };
+  const remotes = git('remote').split('\n').map((s) => s.trim()).filter(Boolean).sort((a, b) => b.length - a.length);
+  const shortRef = (full) => {
+    if (full.startsWith('refs/heads/')) return full.slice('refs/heads/'.length);
+    if (!full.startsWith('refs/remotes/')) return '';
+    const rest = full.slice('refs/remotes/'.length);
+    const remote = remotes.find((r) => rest.startsWith(`${r}/`));
+    return remote ? rest.slice(remote.length + 1) : rest.replace(/^[^/]+\//, '');
+  };
+  const head = git('symbolic-ref', '--quiet', '--short', 'HEAD'); // '' when detached
+  const names = [head];
+  if (head) {
+    for (const spec of ['@{upstream}', '@{push}']) names.push(shortRef(git('rev-parse', '--symbolic-full-name', spec)));
+    names.push(shortRef(git('config', '--get', `branch.${head}.merge`)));
+  }
+  return [...new Set(names.filter(Boolean))];
+}
+
+function realpathSafe(p) { try { return realpathSync(p); } catch { return resolve(String(p || '.')); } }
+
 // ── THIN FS SHELL (the boundary) ────────────────────────────────────────────────────────────────────────
 
 /** The canonical store path: `WE_PR_LIMIT_STATE_FILE` override wins, else `~/.claude/conveyor/pr-limit.json`. */
@@ -607,10 +763,27 @@ export function writeLimitState(state, path = resolveLimitStatePath()) {
   renameSync(tmp, path);
 }
 
+/** Read-modify-write the store UNDER A LOCK (`<path>.lock`), re-reading inside it: `fn(state) → next`. The atomic
+ *  rename alone stops a torn read, not a LOST UPDATE — a refused call that read the store just before the operator's
+ *  `allow`/`off` wrote would write its stale copy back and erase the grant (#4791 self-review). Every CLI write goes
+ *  through here. Throws if the lock stays contended (fail loud — never write unlocked). `lockOpts` go to
+ *  {@link withFileLock} (tests shorten its timeout). @returns the written state */
+export function updateLimitState(path, fn, lockOpts = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${path}.lock`, () => {
+    const next = fn(readLimitState(path));
+    writeLimitState(next, path);
+    return next;
+  }, lockOpts);
+}
+
 /** Is the global off-switch in effect RIGHT NOW, reading the live store — the one predicate `pr-land.mjs`
  *  and the dispatcher's intake hold consult. A bare `WE_PR_LIMIT_OFF=1` env var is an unconditional
  *  belt-and-braces global off too (no state-file write needed, e.g. for a CI run) — checked FIRST since it
- *  needs no fs read at all. */
+ *  needs no fs read at all. It is honoured in a worker session too, on purpose: worker spawns inherit the
+ *  operator's env (`markWorkerEnv` copies it), so ignoring it there would let the dispatcher dispatch over the
+ *  limit and then refuse every worker at open. Telling an inherited value from one a worker set itself needs the
+ *  spawn site to strip it — filed as xpuaafy, with the other `WE_PR_LIMIT_*` env overrides. */
 export function isGlobalOffLive({ env = process.env, path = resolveLimitStatePath(env) } = {}) {
   if (String(env?.WE_PR_LIMIT_OFF || '') === '1') return true;
   return isGlobalOffNow(readLimitState(path));
@@ -637,34 +810,49 @@ function parseFlags(argv) {
 /** The CLI body, exported so `scripts/operations/pr-limit.mjs` can be a thin re-export (mirrors
  *  `dispatch-pause.mjs`'s own inline CLI, kept here since this module already owns every piece of state
  *  the CLI touches). */
-export function runPrLimitCli(argv) {
+export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), path = resolveLimitStatePath(env), ownBranch, stderr = process.stderr, stdout = null, lockOpts = {} } = {}) {
   const cmd = argv[0];
+  const update = (fn) => updateLimitState(path, fn, lockOpts); // every write: locked read-modify-write
   const flags = parseFlags(argv.slice(1));
-  const path = resolveLimitStatePath();
-  const by = flags.by || process.env.USER || null;
+  const by = flags.by || env.USER || null;
+  const out = (text) => (stdout ? stdout.write(text) : writeAllSync(1, text));
+  if (cmd === 'allow') {
+    if (!flags.branch || flags.branch === true) { stderr.write('usage: pr-limit.mjs allow --branch=<b> --reason=<why> --operator-quote="<operator instruction, verbatim>" [--for=<duration>] [--by=<actor>]\n'); return 2; }
+    const session = currentActorId(env) || null;
+    const decision = authoriseAllow({ branch: flags.branch, operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd), ownBranch: ownBranch ?? readOwnBranches(cwd) });
+    if (!decision.ok) {
+      // LOGGED: the refusal lands in the same override history every grant does, naming channel + session.
+      update((s) => appendHistory(s, { actor: by, reason: refusalReason(decision, session), action: 'allow-refused', target: normalizeBranchName(flags.branch) }));
+      stderr.write(`✗ ${decision.refusal}\n`);
+      return 3;
+    }
+    const untilMs = parseDurationMs(flags.for);
+    const state = update((s) => allowBranch(s, flags.branch, { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session }));
+    stderr.write(`✓ branch ${normalizeBranchName(flags.branch)} allow-listed — ${state.branches[String(flags.branch).trim()]?.reason}${by ? ` (by ${by})` : ''} via ${decision.channel}; operator quote recorded\n`);
+    out(JSON.stringify(state, null, 2) + '\n');
+    return 0;
+  }
 
   if (cmd === 'off') {
+    // GATED like `allow` (#4791 review): `off` lifts the limit for EVERY agent, so a worker refused by the limit
+    // must not be able to run it either.
+    const session = currentActorId(env) || null;
+    const decision = authoriseOverride({ verb: 'off', operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd) });
+    if (!decision.ok) {
+      update((s) => appendHistory(s, { actor: by, reason: refusalReason(decision, session), action: 'off-refused', target: null }));
+      stderr.write(`✗ ${decision.refusal}\n`);
+      return 3;
+    }
     const untilMs = parseDurationMs(flags.for);
-    const state = setGlobalOff(readLimitState(path), { reason: flags.reason, by, untilMs });
-    writeLimitState(state, path);
-    process.stderr.write(`⏸ pr-limit OFF — ${state.global.reason}${state.global.until ? ` (until ${state.global.until})` : ''}${by ? ` (by ${by})` : ''}\n`);
-    writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
+    const state = update((s) => setGlobalOff(s, { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session }));
+    stderr.write(`⏸ pr-limit OFF — ${state.global.reason}${state.global.until ? ` (until ${state.global.until})` : ''}${by ? ` (by ${by})` : ''} via ${decision.channel}; operator quote recorded\n`);
+    out(JSON.stringify(state, null, 2) + '\n');
     return 0;
   }
   if (cmd === 'on') {
-    const state = clearGlobalOff(readLimitState(path), { by, reason: flags.reason });
-    writeLimitState(state, path);
-    process.stderr.write(`▶ pr-limit ON — enforcement re-armed${by ? ` (by ${by})` : ''}\n`);
-    writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
-    return 0;
-  }
-  if (cmd === 'allow') {
-    if (!flags.branch) { process.stderr.write('usage: pr-limit.mjs allow --branch=<b> --reason=<why> [--for=<duration>] [--by=<actor>]\n'); return 2; }
-    const untilMs = parseDurationMs(flags.for);
-    const state = allowBranch(readLimitState(path), flags.branch, { reason: flags.reason, by, untilMs });
-    writeLimitState(state, path);
-    process.stderr.write(`✓ branch ${normalizeBranchName(flags.branch)} allow-listed — ${state.branches[String(flags.branch).trim()]?.reason}${by ? ` (by ${by})` : ''}\n`);
-    writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
+    const state = update((s) => clearGlobalOff(s, { by, reason: flags.reason }));
+    stderr.write(`▶ pr-limit ON — enforcement re-armed${by ? ` (by ${by})` : ''}\n`);
+    out(JSON.stringify(state, null, 2) + '\n');
     return 0;
   }
   if (cmd === 'status') {
@@ -681,7 +869,7 @@ export function runPrLimitCli(argv) {
     writeAllSync(1, JSON.stringify(out, null, 2) + '\n');
     return 0;
   }
-  process.stderr.write('usage: pr-limit.mjs <off|on|status|allow> [--reason=<text>] [--for=<duration>] [--branch=<b>] [--by=<who>]\n');
+  stderr.write('usage: pr-limit.mjs <off|on|status|allow> [--reason=<text>] [--for=<duration>] [--branch=<b>] [--operator-quote=<verbatim>] [--by=<who>]\n');
   return 2;
 }
 

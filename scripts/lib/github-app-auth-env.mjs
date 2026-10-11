@@ -35,7 +35,7 @@ import { createHash } from 'node:crypto';
 import { dirname, basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { mintInstallationToken, getInstallationInfo, readPrivateKeyRef, canReadPrivateKeyRef } from './github-app-token.mjs';
-import { readDeliveryIdentity, resolveRequestedRole, buildIdentityChain, ROLE_ENV, LEGACY_ROLE } from './github-app-identity.mjs';
+import { readDeliveryIdentity, resolveRequestedRole, buildIdentityChain, ROLE_ENV, LEGACY_ROLE, shimRoleTable } from './github-app-identity.mjs';
 import { readGithubAuthPolicy } from './github-auth-policy.mjs';
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 import { installationMap, ownerOfSlug, remapLegacyInstallationId, installationCachePath } from './github-app-installations.mjs';
@@ -296,14 +296,29 @@ function writeStatusFile(path, status) {
  * @param {string} [path]
  * @returns {{applied:boolean, reason:string, missingPermissions?:string[], missingRepos?:string[], checkedAt:string}|null}
  */
-export function readGithubAppStatus(path = defaultStatusPath(), { callerDir = join(dirname(path), 'callers'), now = Date.now() } = {}) {
-  let status = null;
-  try { status = JSON.parse(readFileSync(path, 'utf8')); } catch { status = null; }
-  // Per-caller outcomes (half-configured daemons, a daemon stuck on mint-failed): the shared file above is
-  // last-writer-wins, so one healthy daemon's `ok` would hide another's fallback. Attached only when present.
-  const callers = readGithubAppCallerStatuses({ dir: callerDir, now });
-  if (!callers.length) return status;
-  return { ...(status ?? {}), callers };
+export function readGithubAppStatus(path = defaultStatusPath(), {
+  callerDir = join(dirname(path), 'callers'), now = Date.now(),
+  cachePath = join(dirname(path), 'web-everything.json'),
+  identity, readIdentity = readDeliveryIdentity, readCache = readCacheFile,
+  readCallers = readGithubAppCallerStatuses,
+} = {}) {
+  const status = readCache(path);
+  // Per-caller outcomes are last-writer-per-caller, unlike the legacy shared status.
+  const callers = readCallers({ dir: callerDir, now });
+  const id = identity ?? readIdentity();
+  const table = shimRoleTable({ identity: id, cachePath });
+  if (!Object.keys(table).length) return callers.length ? { ...(status ?? {}), callers } : status;
+  const roleCaches = Object.entries(table).map(([role, entry]) => {
+    const cache = readCache(entry.cachePath);
+    // Select by the credential actually applied, never requestedRole (which may have fallen back).
+    const latest = callers.filter((c) => c.role === role && Number.isFinite(Date.parse(c.checkedAt)))
+      .sort((a, b) => Date.parse(b.checkedAt) - Date.parse(a.checkedAt))[0];
+    // Only expiry is projected from the cache; credentials never enter the health probe.
+    return { role, path: entry.cachePath, present: !!cache, expiresAt: cache?.expiresAt ?? null,
+      checkedAt: latest?.checkedAt ?? null, reason: latest?.reason ?? null };
+  });
+  const legacyInUse = callers.some((c) => c.reason !== 'policy-personal' && (!c.role || c.role === LEGACY_ROLE));
+  return { ...(status ?? {}), callers, roleCaches, legacyInUse };
 }
 
 /**
