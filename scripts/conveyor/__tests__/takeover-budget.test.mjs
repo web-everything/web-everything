@@ -324,6 +324,19 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
       { ...review(T1, 9, [['src/d.mjs', 7, 'cosmetic']]), createdAt: at(9, 40) }];
     expect(plain(T1, thread)).toMatchObject({ ok: true, previous: { after: { count: 4 } } });
   });
+  it('a late re-review of older post-takeover code never outranks the fresh round that judges the takeover', () => {
+    const T3 = H('9');
+    const TWO = FOUR.slice(2);
+    const thread = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR), rearm(10), review(T3, 11, TWO), { ...review(T1, 11, SIX), createdAt: at(11, 30) }];
+    expect(plain(T3, thread)).toMatchObject({ ok: true, n: 2, previous: { reviewedHead: T3.slice(0, 9), after: { count: 2 } } });
+  });
+  it('a headless review never counts as the first review a manual takeover\'s push check compares against', () => {
+    const R6 = H('7');
+    const headless = { author: BOT, createdAt: at(6, 40), body: '🔁 review — changes requested\n\nRecorded by auto-policy\n\n### Findings\n\n**correctness/logic** (1)\n- `src/q.mjs:1` — bad' };
+    const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, headless, { ...review(R5, 6, FIVE), createdAt: at(6, 45) },
+      operatorTakeover(7), marker(R6, 8), review(R6, 9, FOUR)];
+    expect(plain(R6, thread)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
   it('out-of-order reviews and a reset to an older head never wedge the current head\'s round', () => {
     const R6 = H('7');
     // R6 reviewed, then R5's first-ever review lands late; a rearm; R6 re-reviewed with one finding.

@@ -165,7 +165,8 @@ function mergeFinding(into, f) {
  * (`not-real`, `card`, …) are left out.
  *
  * Inside one segment, each head has ONE round: a review naming a head the segment already has rejoins that round,
- * and a review naming a new head opens its own. A comment naming no head joins the segment's newest-code round.
+ * and a review naming a new head opens its own. A comment naming no head joins the segment's first new-code round,
+ * else its latest round.
  * `repeat: true` marks a round whose head an earlier segment already reviewed; it is also `stale: true` (a late review
  * of older code) when its segment reviews a head no earlier segment had — the new code the segment's push brought.
  */
@@ -273,7 +274,8 @@ export function dispatchJudgeRule(comments, { start, end, startHead = null }) {
  * fails closed (the caller then keeps a manual takeover's marker head in its one-per-head bound).
  */
 function pushedSinceLastReview(comments, at) {
-  const before = reviewRounds(comments).filter((r) => r.end < at && !r.repeat).at(-1) ?? null;
+  // A round naming no head cannot prove which head it reviewed, so it is never that last first review.
+  const before = reviewRounds(comments).filter((r) => r.end < at && r.head && !r.repeat).at(-1) ?? null;
   const since = before ? before.end : -Infinity;
   return (Array.isArray(comments) ? comments : []).some((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)
     && timeOf(c) > since && timeOf(c) < at);
@@ -295,7 +297,9 @@ export function takeoverProgress(comments, episode) {
   const markerStart = markerStartHead(episode);
   const rule = dispatchJudgeRule(comments, { start: episode.start, end: episode.end, startHead: markerStart });
   const heads = { oldHeads: rule.oldHeads, markerStart };
-  const after = rounds.filter((r) => rule.judges(r.at, [r.head])).at(-1) ?? null;
+  // A late re-review of older code (stale) judges only when no fresh round does.
+  const judging = rounds.filter((r) => rule.judges(r.at, [r.head]));
+  const after = judging.filter((r) => !r.stale).at(-1) ?? judging.at(-1) ?? null;
   if (!after) return { judged: false, ...heads };
   const b = tally(before?.findings ?? []);
   const a = tally(after.findings);
