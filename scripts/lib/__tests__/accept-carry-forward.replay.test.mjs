@@ -445,6 +445,43 @@ describe('review-set-label --to=restamp across a review:human re-hold (CLI, real
     expect(parseLatestHumanClearedSha([clearComment(), { author: BOT, body }])).toBe(heads.head);
   });
 
+  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the PLAIN restamp's own clearance carry
+  // (`decideRestampHumanClearance`, a clearance whose markers already cover the head) read no formal review at all, so it
+  // re-dated the `cleared-human` record past a standing CHANGES_REQUESTED review — after which the carry rule saw that
+  // review as "before the accept". Every carry of a clearance now checks the latest formal review state first.
+  const coveringClear = () => ({ author: BOT, createdAt: '2026-10-09T12:00:00Z',
+    body: `✅ review — cleared\n<!-- reviewed-sha: ${heads.head} -->\n<!-- reviewed-diff: ${'d'.repeat(64)} -->\n<!-- cleared-human: chalbert -->` });
+  const botChanges = (submitted_at = '2026-10-09T13:00:00Z') => ({ state: 'CHANGES_REQUESTED', submitted_at, user: { login: 'plateau-reviewer[bot]' } });
+  it('ROUND 11: a plain restamp refuses to carry a clearance past a standing CHANGES_REQUESTED review (bot or operator): NO write', () => {
+    for (const login of ['plateau-reviewer[bot]', 'chalbert']) {
+      const r = restamp({ comments: [coveringClear()], labels: ['review:accepted'], reviews: [{ ...botChanges(), user: { login } }] });
+      expect(r.exitCode).not.toBe(0);
+      expect(r.writes).toEqual(NO_WRITES);
+      expect(printedOf(r)).toMatchObject({ refused: true });
+      expect(printedOf(r).retryable).toBeUndefined();
+      expect(printedOf(r).error).toMatch(/formal GitHub changes-requested review stands/i);
+    }
+  });
+  it('ROUND 11: the review submitted BEFORE the clearance still refuses while it is that reviewer\'s latest decisive state', () => {
+    const r = restamp({ comments: [coveringClear()], labels: ['review:accepted'], reviews: [botChanges('2026-10-09T11:00:00Z')] });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+  });
+  it('ROUND 11: unreadable reviews refuse the plain clearance carry as a retryable miss (nothing written)', () => {
+    const r = restamp({ comments: [coveringClear()], labels: ['review:accepted'], reviews: null });
+    expect(r.exitCode).not.toBe(0);
+    expect(r.writes).toEqual(NO_WRITES);
+    expect(printedOf(r)).toMatchObject({ refused: true, retryable: true });
+  });
+  it('ROUND 11: with no standing review (or one the reviewer later approved) the plain restamp still carries cleared-human', () => {
+    for (const reviews of [[], [botChanges('2026-10-09T11:00:00Z'), { state: 'APPROVED', submitted_at: '2026-10-09T11:30:00Z', user: { login: 'plateau-reviewer[bot]' } }]]) {
+      const r = restamp({ comments: [coveringClear()], labels: ['review:accepted'], reviews });
+      expect(r.exitCode).toBe(0);
+      expect(r.reads.reviews).toBe(1);
+      expect(r.writes.postComment[0]).toContain('cleared-human: chalbert');
+    }
+  });
+
   it('F2-F4: a later escalation-policy drain park refuses the carry and hands the hold to the operator (no accept)', () => {
     const later = { author: BOT, body: parkBody('review escalation: blast-radius over threshold') };
     expectHandedOff(restamp({ comments: [clearComment(), later] }));
@@ -716,11 +753,48 @@ describe('later hold channels — free text and formal reviews (pure)', () => {
     // PENDING is an unsubmitted draft (visible only to its author): nobody has objected yet.
     for (const state of ['APPROVED', 'DISMISSED', 'PENDING']) expect(laterReviewHold([rv(state, '2026-10-09T15:00:00Z')], at)).toBe(false);
   });
-  it('a review submitted BEFORE the accept is superseded by it; a missing / unparseable time or accept time fails closed', () => {
-    expect(laterReviewHold([rv('CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], at)).toBe(false);
+  it('a missing / unparseable time or accept time fails closed', () => {
     expect(laterReviewHold([rv('CHANGES_REQUESTED', undefined)], at)).toBe(true);
     expect(laterReviewHold([rv('CHANGES_REQUESTED', 'nope')], at)).toBe(true);
     expect(laterReviewHold([rv('CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], null)).toBe(true);
+  });
+  // PR #4631 round 11 (operator ruling 2026-10-10 ~19:25 ET): the LATEST formal review state decides, not only reviews
+  // timed after the accept. A restamp re-dates the accept record without being a review, so a CHANGES_REQUESTED review
+  // that lands between the clearance and a restamp would otherwise read as "before the accept" and be laundered.
+  const rvBy = (login, state, submitted_at) => ({ state, submitted_at, user: { login } });
+  it('a reviewer\'s CHANGES_REQUESTED submitted BEFORE the accept still stands while it is that reviewer\'s latest decisive state', () => {
+    expect(laterReviewHold([rvBy('plateau-reviewer[bot]', 'CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], at)).toBe(true);
+    expect(laterReviewHold([rvBy('chalbert', 'CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], at)).toBe(true);
+    // A login-less review is its own reviewer: nothing can supersede it.
+    expect(laterReviewHold([rv('CHANGES_REQUESTED', '2026-10-09T09:00:00Z')], at)).toBe(true);
+    // A COMMENTED review is not decisive: it never supersedes a standing CHANGES_REQUESTED.
+    expect(laterReviewHold([
+      rvBy('plateau-reviewer[bot]', 'CHANGES_REQUESTED', '2026-10-09T08:00:00Z'), rvBy('plateau-reviewer[bot]', 'COMMENTED', '2026-10-09T09:00:00Z'),
+    ], at)).toBe(true);
+  });
+  it('an earlier CHANGES_REQUESTED the same reviewer later APPROVED, or that was DISMISSED, no longer stands', () => {
+    expect(laterReviewHold([
+      rvBy('plateau-reviewer[bot]', 'CHANGES_REQUESTED', '2026-10-09T08:00:00Z'), rvBy('plateau-reviewer[bot]', 'APPROVED', '2026-10-09T09:00:00Z'),
+    ], at)).toBe(false);
+    expect(laterReviewHold([rvBy('plateau-reviewer[bot]', 'DISMISSED', '2026-10-09T09:00:00Z')], at)).toBe(false);
+    // Another reviewer's approval does not lift it.
+    expect(laterReviewHold([
+      rvBy('plateau-reviewer[bot]', 'CHANGES_REQUESTED', '2026-10-09T08:00:00Z'), rvBy('chalbert', 'APPROVED', '2026-10-09T09:00:00Z'),
+    ], at)).toBe(true);
+    // A COMMENTED review before the accept is superseded by it (it decides nothing).
+    expect(laterReviewHold([rvBy('plateau-reviewer[bot]', 'COMMENTED', '2026-10-09T09:00:00Z')], at)).toBe(false);
+  });
+  it('a review in the SAME second as the accept counts (GitHub times are whole seconds)', () => {
+    expect(laterReviewHold([rvBy('x', 'COMMENTED', at)], at)).toBe(true);
+  });
+  it('a restamp between the CHANGES_REQUESTED and the carry does not launder it', () => {
+    const restampComment = { author: { login: 'chalbert' }, createdAt: '2026-10-09T16:00:00Z',
+      body: ['📌 review — acceptance re-stamped after a rebase (no new review)', `<!-- reviewed-sha: ${NEW} -->`,
+        `<!-- reviewed-diff: ${fx.netDiff[NEW]} -->`, '<!-- cleared-human: chalbert -->'].join('\n') };
+    const record = latestAcceptRecord([...fx.comments, restampComment], [rvBy('plateau-reviewer[bot]', 'CHANGES_REQUESTED', '2026-10-09T15:00:00Z')]);
+    expect(record.at).toBe('2026-10-09T16:00:00Z');
+    expect(record.laterVerdict).toBe(true);
+    expect(decideAcceptCarryForward({ setting: 'on', record, headSha: 'f'.repeat(40), headDiff: fx.netDiff[NEW] }).action).toBe('none');
   });
   it('the camelCase `submittedAt` shape (gh pr view --json reviews) is read too', () => {
     expect(laterReviewHold([{ state: 'CHANGES_REQUESTED', submittedAt: '2026-10-09T15:00:00Z' }], at)).toBe(true);

@@ -134,20 +134,44 @@ export function isKnownMachineBody(body) {
 /**
  * Pure: did a formal GitHub review land after the accept that stands against it? `gh pr view --json comments` never
  * returns reviews, so a "Request changes" review (or a review that only comments) was invisible to the thread reader
- * (PR #4631 review round 3). Any review whose state is not APPROVED / DISMISSED / PENDING, submitted after the accept, counts; a
- * review with a missing or unparseable `submitted_at` counts too (fail closed). `acceptAt` null = unknown → every
- * such review counts.
- * @param {Array<{state?:string, submitted_at?:string, submittedAt?:string}>} reviews
+ * (PR #4631 review round 3). Any review whose state is not APPROVED / DISMISSED / PENDING, submitted after the accept
+ * (or in the same second: GitHub times are whole seconds), counts; a review with a missing or unparseable
+ * `submitted_at` counts too (fail closed). `acceptAt` null = unknown → every such review counts.
+ *
+ * THE LATEST FORMAL REVIEW STATE (PR #4631 round 11, operator ruling 2026-10-10 ~19:25 ET: a later native GitHub
+ * "changes requested" review, from any trusted reviewer identity including plateau-reviewer[bot] and the operator, must
+ * stop accept carry-forward; "check the latest formal review state on the live head before carrying"). Timing alone
+ * cannot decide it: a restamp re-dates the accept record without being a review, so a CHANGES_REQUESTED that landed
+ * between the clearance and a restamp would read as "before the accept" and be laundered. So, whatever the timing, a
+ * reviewer whose LATEST decisive review (APPROVED / CHANGES_REQUESTED / DISMISSED; a COMMENTED or PENDING review decides
+ * nothing) is CHANGES_REQUESTED holds: GitHub's own rule for a standing change request, which only that reviewer's
+ * approval or a dismissal lifts. A review with no login is its own reviewer (nothing can supersede it).
+ * @param {Array<{state?:string, submitted_at?:string, submittedAt?:string, user?:{login?:string}, author?:{login?:string}}>} reviews
  */
 export function laterReviewHold(reviews, acceptAt = null) {
   const at = Date.parse(String(acceptAt ?? ''));
-  return (Array.isArray(reviews) ? reviews : []).some((r) => {
+  const list = Array.isArray(reviews) ? reviews : [];
+  const timeOf = (r) => Date.parse(String(r?.submitted_at ?? r?.submittedAt ?? ''));
+  const laterObjection = list.some((r) => {
     const state = String(r?.state ?? '').toUpperCase();
     // PENDING = an unsubmitted draft (visible only to its author): not an objection anyone has made yet.
     if (state === 'APPROVED' || state === 'DISMISSED' || state === 'PENDING') return false;
-    const t = Date.parse(String(r?.submitted_at ?? r?.submittedAt ?? ''));
-    return !Number.isFinite(at) || !Number.isFinite(t) || t > at;
+    const t = timeOf(r);
+    return !Number.isFinite(at) || !Number.isFinite(t) || t >= at;
   });
+  if (laterObjection) return true;
+  // Each reviewer's latest decisive review, in submission order. An unparseable time sorts last, so its
+  // CHANGES_REQUESTED stands (fail closed); the stable sort keeps the REST list's own order on ties.
+  const latest = new Map();
+  list.map((r, i) => ({ r, i, t: timeOf(r) }))
+    .sort((a, b) => (Number.isFinite(a.t) ? a.t : Infinity) - (Number.isFinite(b.t) ? b.t : Infinity) || a.i - b.i)
+    .forEach(({ r, i }) => {
+      const state = String(r?.state ?? '').toUpperCase();
+      if (state !== 'APPROVED' && state !== 'CHANGES_REQUESTED' && state !== 'DISMISSED') return;
+      const login = String(r?.user?.login ?? r?.author?.login ?? '').trim().toLowerCase();
+      latest.set(login || `#${i}`, state);
+    });
+  return [...latest.values()].includes('CHANGES_REQUESTED');
 }
 
 const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while ((m = re.exec(body)) !== null) out = m[1].toLowerCase(); return out; };
