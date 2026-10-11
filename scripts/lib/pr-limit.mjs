@@ -451,7 +451,7 @@ export function decideOpenPr({
       allowed: false,
       exempt: false,
       overridden: false,
-      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first. An agent stops and reports here — exceptions are the operator's to grant (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=… --operator-quote="<verbatim>"\` from the operator's channel, never a worker or lane session; or \`pr-limit.mjs off\`)`,
+      reason: `open-PR backpressure limit reached for ${repoKey}: ${openCount}/${limit} open agent-authored PRs not yet review:accepted${split} — land or review the existing ones first. An agent stops and reports here — exceptions are the operator's to grant (\`node scripts/operations/pr-limit.mjs allow --branch=<b> --reason=… --operator-quote="<verbatim>"\` or \`pr-limit.mjs off --operator-quote="<verbatim>"\`, both from the operator's channel, never a worker or lane session)`,
     };
   }
   return { allowed: true, reason: `under limit (${openCount}/${limit})${split}`, exempt: false, overridden: false };
@@ -494,10 +494,31 @@ export function parseLimitState(text) {
       by: g.by != null ? String(g.by) : null,
       at: g.at != null ? String(g.at) : null,
       until: g.until != null ? String(g.until) : null,
+      ...(g.operatorQuote != null ? { operatorQuote: String(g.operatorQuote) } : {}),
+      ...(g.channel != null ? { channel: String(g.channel) } : {}),
+      ...(g.session != null ? { session: String(g.session) } : {}),
     },
     branches,
-    history: Array.isArray(raw.history) ? raw.history.slice(-500) : [],
+    history: capHistory(Array.isArray(raw.history) ? raw.history : []),
   };
+}
+
+/** Max override-history entries kept. */
+export const HISTORY_MAX = 500;
+
+/** Cap the history at {@link HISTORY_MAX}, evicting REFUSALS (`*-refused`) before anything else — a caller looping
+ *  on a refused `allow`/`off` must never push the grant records the audit trail exists to keep out of the store
+ *  (#4791 review). The one cap, used on read and on append. PURE. */
+export function capHistory(history) {
+  const h = Array.isArray(history) ? history : [];
+  let excess = h.length - HISTORY_MAX;
+  if (excess <= 0) return h;
+  const kept = [];
+  for (const rec of h) {
+    if (excess > 0 && /-refused$/.test(String(rec?.action || ''))) { excess -= 1; continue; }
+    kept.push(rec);
+  }
+  return excess > 0 ? kept.slice(excess) : kept;
 }
 
 /** Serialize a state object back to the store's JSON text (newline-terminated). PURE. */
@@ -518,18 +539,18 @@ export function parseDurationMs(text) {
   return Math.round(n * perUnit[unit]);
 }
 
-/** Append one entry to the state's override history (capped at 500 — an advisory audit trail, not a
+/** Append one entry to the state's override history (capped by {@link capHistory} — an advisory audit trail, not a
  *  ledger of record). Every override this module writes is logged with actor + reason, per #4075's
  *  requirement. PURE (the timestamp is injected, so this stays directly unit-testable). */
 export function appendHistory(state, entry, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const rec = { at: new Date(now).toISOString(), actor: entry?.actor ?? null, reason: entry?.reason ?? null, action: entry?.action ?? 'unknown', target: entry?.target ?? null };
-  return { ...s, history: [...(Array.isArray(s.history) ? s.history : []), rec].slice(-500) };
+  return { ...s, history: capHistory([...(Array.isArray(s.history) ? s.history : []), rec]) };
 }
 
 /** Set (or re-set) the global off-switch. `untilMs` (from {@link parseDurationMs}) becomes an absolute
  *  `until` timestamp; omitted/`null` means "off until explicitly cleared". PURE. */
-export function setGlobalOff(state, { reason = null, by = null, untilMs = null } = {}, now = Date.now()) {
+export function setGlobalOff(state, { reason = null, by = null, untilMs = null, operatorQuote = null, channel = null, session = null } = {}, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const global = {
     off: true,
@@ -538,6 +559,10 @@ export function setGlobalOff(state, { reason = null, by = null, untilMs = null }
     at: new Date(now).toISOString(),
     until: untilMs != null ? new Date(now + untilMs).toISOString() : null,
   };
+  // The same grant record `allowBranch` keeps (xfaz7ho) — the off-switch is an operator exception too.
+  if (operatorQuote) global.operatorQuote = String(operatorQuote);
+  if (channel) global.channel = String(channel);
+  if (session) global.session = String(session);
   return appendHistory({ ...s, global }, { actor: global.by, reason: global.reason, action: 'off', target: global.until ? `until ${global.until}` : 'indefinite' }, now);
 }
 
@@ -612,23 +637,44 @@ export const OPERATOR_QUOTE_MAX = 1000;
  * What it buys: a self-grant now takes a deliberate evasion, and every grant and refusal is logged with its channel.
  * @returns {{ok:boolean, channel:string, refusal:string}}
  */
-export function authoriseAllow({ branch, operatorQuote, env = {}, cwdReal = '', ownBranch = '' } = {}) {
+export function authoriseAllow(args = {}) {
+  return authoriseOverride({ ...args, verb: 'allow' });
+}
+
+/**
+ * The CLI verbs that LIFT the limit, every one gated by {@link authoriseOverride} — and the ones that do not lift
+ * it (`on` only re-arms enforcement, `status` only reads). A new verb must be added to one list or the other; the
+ * test enumerates both against the CLI (#4791 review: `off` lifted the limit for everyone with no gate at all).
+ */
+export const OVERRIDE_VERBS = Object.freeze(['allow', 'off']);
+export const UNGATED_VERBS = Object.freeze(['on', 'status']);
+
+/**
+ * May THIS caller use a limit-lifting verb (`allow` or `off`)? PURE given its inputs. The same channel rules as
+ * {@link authoriseAllow} (worker / unknown / lane → refused; operator channel → only with a verbatim quote); the
+ * own-branch rule applies to `allow` only, since `off` names no branch.
+ * @returns {{ok:boolean, channel:string, refusal:string}}
+ */
+export function authoriseOverride({ verb = 'allow', branch, operatorQuote, env = {}, cwdReal = '', ownBranch = '' } = {}) {
   const STOP = 'An agent refused by the limit must stop and report; the operator grants exceptions.';
+  const what = `pr-limit ${verb} refused`;
   const { role, reason } = classifySession(env);
-  if (role === 'worker') return { ok: false, channel: 'worker', refusal: `pr-limit allow refused: this is a dispatched worker session (${reason}). ${STOP}` };
-  if (role !== 'orchestrator') return { ok: false, channel: 'unknown', refusal: `pr-limit allow refused: the session role is unknown (${reason}), so the grant fails closed. ${STOP}` };
-  if (String(cwdReal || '').includes('/.lanes/')) return { ok: false, channel: 'lane', refusal: `pr-limit allow refused: run from inside a lane clone (${cwdReal}) — that is where workers run; the operator grants from the primary checkout or a terminal. ${STOP}` };
-  const target = normalizeBranchName(branch);
-  // EVERY name the checkout goes by — its checked-out branch, its upstream, its push target — is "own"; a branch
-  // tracking another branch (or a remote not named origin) must not hide the one it actually is (#4791 red team).
-  const owns = (Array.isArray(ownBranch) ? ownBranch : [ownBranch])
-    .map((b) => normalizeBranchName(String(b || '').replace(/^refs\/heads\//, '').replace(/^(refs\/remotes\/)?origin\//, '')))
-    .filter(Boolean);
-  if (target && owns.includes(target)) return { ok: false, channel: 'own-branch', refusal: `pr-limit allow refused: ${target} is this checkout's own branch — a session never allow-lists its own branch. ${STOP}` };
+  if (role === 'worker') return { ok: false, channel: 'worker', refusal: `${what}: this is a dispatched worker session (${reason}). ${STOP}` };
+  if (role !== 'orchestrator') return { ok: false, channel: 'unknown', refusal: `${what}: the session role is unknown (${reason}), so the grant fails closed. ${STOP}` };
+  if (String(cwdReal || '').includes('/.lanes/')) return { ok: false, channel: 'lane', refusal: `${what}: run from inside a lane clone (${cwdReal}) — that is where workers run; the operator grants from the primary checkout or a terminal. ${STOP}` };
+  if (verb === 'allow') {
+    const target = normalizeBranchName(branch);
+    // EVERY name the checkout goes by — its checked-out branch, its upstream, its push target — is "own"; a branch
+    // tracking another branch (or a remote not named origin) must not hide the one it actually is (#4791 red team).
+    const owns = (Array.isArray(ownBranch) ? ownBranch : [ownBranch])
+      .map((b) => normalizeBranchName(String(b || '').replace(/^refs\/heads\//, '').replace(/^(refs\/remotes\/)?origin\//, '')))
+      .filter(Boolean);
+    if (target && owns.includes(target)) return { ok: false, channel: 'own-branch', refusal: `${what}: ${target} is this checkout's own branch — a session never allow-lists its own branch. ${STOP}` };
+  }
   const channel = env && env.CLAUDECODE ? 'operator-session' : 'terminal';
   const quote = typeof operatorQuote === 'string' ? operatorQuote.trim() : '';
-  if (!quote) return { ok: false, channel, refusal: `pr-limit allow refused: --operator-quote="<the operator's instruction, verbatim>" is required — exceptions are the operator's to grant, and the grant records their words. ${STOP}` };
-  if (quote.length > OPERATOR_QUOTE_MAX) return { ok: false, channel, refusal: `pr-limit allow refused: --operator-quote is over ${OPERATOR_QUOTE_MAX} characters — quote the instruction itself.` };
+  if (!quote) return { ok: false, channel, refusal: `${what}: --operator-quote="<the operator's instruction, verbatim>" is required — exceptions are the operator's to grant, and the grant records their words. ${STOP}` };
+  if (quote.length > OPERATOR_QUOTE_MAX) return { ok: false, channel, refusal: `${what}: --operator-quote is over ${OPERATOR_QUOTE_MAX} characters — quote the instruction itself.` };
   return { ok: true, channel, refusal: '' };
 }
 
@@ -690,11 +736,12 @@ export function writeLimitState(state, path = resolveLimitStatePath()) {
 }
 
 /** Is the global off-switch in effect RIGHT NOW, reading the live store — the one predicate `pr-land.mjs`
- *  and the dispatcher's intake hold consult. A bare `WE_PR_LIMIT_OFF=1` env var is an unconditional
- *  belt-and-braces global off too (no state-file write needed, e.g. for a CI run) — checked FIRST since it
- *  needs no fs read at all. */
+ *  and the dispatcher's intake hold consult. A bare `WE_PR_LIMIT_OFF=1` env var is a belt-and-braces global
+ *  off too (no state-file write needed, e.g. for a CI run) — checked FIRST since it needs no fs read at all —
+ *  but ONLY outside a worker session: a worker prefixing its own `pr-land` with it would lift the limit with no
+ *  gate at all (#4791 review, the same class as an ungated `off`). A worker or unknown-role env ignores it. */
 export function isGlobalOffLive({ env = process.env, path = resolveLimitStatePath(env) } = {}) {
-  if (String(env?.WE_PR_LIMIT_OFF || '') === '1') return true;
+  if (String(env?.WE_PR_LIMIT_OFF || '') === '1' && classifySession(env).role === 'orchestrator') return true;
   return isGlobalOffNow(readLimitState(path));
 }
 
@@ -743,18 +790,27 @@ export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), pa
   }
 
   if (cmd === 'off') {
+    // GATED like `allow` (#4791 review): `off` lifts the limit for EVERY agent, so a worker refused by the limit
+    // must not be able to run it either.
+    const session = currentActorId(env) || null;
+    const decision = authoriseOverride({ verb: 'off', operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd) });
+    if (!decision.ok) {
+      writeLimitState(appendHistory(readLimitState(path), { actor: by, reason: `${decision.refusal} [channel=${decision.channel}${session ? ` session=${session}` : ''}]`, action: 'off-refused', target: null }), path);
+      stderr.write(`✗ ${decision.refusal}\n`);
+      return 3;
+    }
     const untilMs = parseDurationMs(flags.for);
-    const state = setGlobalOff(readLimitState(path), { reason: flags.reason, by, untilMs });
+    const state = setGlobalOff(readLimitState(path), { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session });
     writeLimitState(state, path);
-    process.stderr.write(`⏸ pr-limit OFF — ${state.global.reason}${state.global.until ? ` (until ${state.global.until})` : ''}${by ? ` (by ${by})` : ''}\n`);
-    writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
+    stderr.write(`⏸ pr-limit OFF — ${state.global.reason}${state.global.until ? ` (until ${state.global.until})` : ''}${by ? ` (by ${by})` : ''} via ${decision.channel}; operator quote recorded\n`);
+    out(JSON.stringify(state, null, 2) + '\n');
     return 0;
   }
   if (cmd === 'on') {
     const state = clearGlobalOff(readLimitState(path), { by, reason: flags.reason });
     writeLimitState(state, path);
-    process.stderr.write(`▶ pr-limit ON — enforcement re-armed${by ? ` (by ${by})` : ''}\n`);
-    writeAllSync(1, JSON.stringify(state, null, 2) + '\n');
+    stderr.write(`▶ pr-limit ON — enforcement re-armed${by ? ` (by ${by})` : ''}\n`);
+    out(JSON.stringify(state, null, 2) + '\n');
     return 0;
   }
   if (cmd === 'status') {

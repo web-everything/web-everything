@@ -22,6 +22,7 @@ import {
   createAuthorshipCache, countOpenPrsForDispatch, DISPATCH_PR_COUNT_API_CAP, AUTHORSHIP_FAILURE_COOLDOWN_MS,
   PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope, isStackedAwaitingBasePr,
   authoriseAllow, runPrLimitCli, readLimitState,
+  authoriseOverride, OVERRIDE_VERBS, UNGATED_VERBS, OPERATOR_QUOTE_MAX, HISTORY_MAX, capHistory, appendHistory, isGlobalOffLive,
 } from '../pr-limit.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 
@@ -103,6 +104,14 @@ describe('decideOpenPr — the five required behaviours', () => {
     const d = decideOpenPr({ ...base, openCount: 5 });
     expect(d.allowed).toBe(false);
     expect(d.reason).toMatch(/backpressure limit reached for plateau-app: 5\/5/);
+  });
+
+  it('the refusal tells an agent to stop and report, and names every exception with its operator quote (xfaz7ho)', () => {
+    const { reason } = decideOpenPr({ ...base, openCount: 5 });
+    expect(reason).toMatch(/An agent stops and reports here/);
+    expect(reason).toMatch(/allow --branch=<b> --reason=… --operator-quote="<verbatim>"/);
+    expect(reason).toMatch(/off --operator-quote="<verbatim>"/);
+    expect(reason).not.toMatch(/`pr-limit\.mjs off`/); // never a bare, quote-less `off`
   });
 
   it('an EXEMPT (infra-only) changeset is allowed even over the limit', () => {
@@ -825,6 +834,161 @@ describe('allow is operator-only (xfaz7ho)', () => {
   it('existing allow-list entries written before this rule (no quote, no channel) are still honoured', () => {
     const legacy = parseLimitState(JSON.stringify({ branches: { '4779-y': { reason: 'old', by: 'nic', at: '2026-10-10T10:00:00.000Z', until: null } } }));
     expect(isBranchAllowedNow(legacy, 'lane/4779-y')).toBe(true);
+  });
+
+  // ── #4791 round-4 review: guarantees the PR states but no test held ──
+
+  it('the operator quote is bounded at exactly OPERATOR_QUOTE_MAX characters (1000 ok, 1001 refused, no grant written)', () => {
+    expect(OPERATOR_QUOTE_MAX).toBe(1000);
+    expect(authoriseAllow({ branch: 'lane/x', operatorQuote: 'q'.repeat(1000), env: operatorEnv, cwdReal: primary }).ok).toBe(true);
+    const over = authoriseAllow({ branch: 'lane/x', operatorQuote: 'q'.repeat(1001), env: operatorEnv, cwdReal: primary });
+    expect(over).toMatchObject({ ok: false });
+    expect(over.refusal).toMatch(/over 1000 characters/);
+    const path = tmpState();
+    expect(runPrLimitCli(['allow', '--branch=lane/x', '--reason=r', `--operator-quote=${'q'.repeat(1001)}`],
+      { env: operatorEnv, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() })).toBe(3);
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/x')).toBe(false);
+  });
+
+  it('CLI: refused when run from inside a lane clone, even from an operator session with a quote', () => {
+    const path = tmpState();
+    const code = runPrLimitCli(['allow', '--branch=lane/other', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: operatorEnv, cwd: lane, path, ownBranch: '', stderr: silent(), stdout: silent() });
+    expect(code).toBe(3);
+    const st = readLimitState(path);
+    expect(isBranchAllowedNow(st, 'lane/other')).toBe(false);
+    expect(st.history.at(-1).reason).toMatch(/\[channel=lane session=main-session\]/);
+  });
+
+  it('CLI: a grant records the caller session, and the session/quote/channel survive a store round-trip', () => {
+    const path = tmpState();
+    expect(runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: operatorEnv, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() })).toBe(0);
+    const entry = readLimitState(path).branches['lane/4786-x'];
+    expect(entry).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session', session: 'main-session' });
+    const again = parseLimitState(serializeLimitState(parseLimitState(readFileSync(path, 'utf8'))));
+    expect(again.branches['lane/4786-x']).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session', session: 'main-session' });
+  });
+
+  it('CLI: a refusal is logged with its channel and the caller session', () => {
+    const path = tmpState();
+    runPrLimitCli(['allow', '--branch=lane/4786-x', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() });
+    expect(readLimitState(path).history.at(-1)).toMatchObject({ action: 'allow-refused' });
+    expect(readLimitState(path).history.at(-1).reason).toMatch(/\[channel=worker session=main-session\]$/);
+  });
+
+  it('refuses a target that matches ONLY the checkout push destination (@{push} via a remote push refspec)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pr-limit-push-'));
+    const bare = join(root, 'remote.git');
+    const work = join(root, 'work');
+    mkdirSync(work);
+    const gitIn = (cwd, ...args) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'init.defaultBranch=main', ...args], { cwd, stdio: 'pipe' });
+    gitIn(root, 'init', '--bare', '-q', bare);
+    gitIn(work, 'init', '-q');
+    gitIn(work, 'commit', '-q', '--allow-empty', '-m', 'base');
+    gitIn(work, 'remote', 'add', 'origin', bare);
+    gitIn(work, 'checkout', '-q', '-b', 'work');
+    gitIn(work, 'push', '-q', 'origin', 'HEAD:refs/heads/lane/parent', 'HEAD:refs/heads/lane/child');
+    gitIn(work, 'fetch', '-q', 'origin');
+    gitIn(work, 'branch', '-q', '--set-upstream-to=origin/lane/parent');
+    gitIn(work, 'config', 'remote.origin.push', 'refs/heads/work:refs/heads/lane/child');
+    const path = tmpState();
+    const code = runPrLimitCli(['allow', '--branch=lane/child', '--reason=r', `--operator-quote=${QUOTE}`],
+      { env: operatorEnv, cwd: work, path, stderr: silent(), stdout: silent() });
+    expect(code).toBe(3);
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/child')).toBe(false);
+  });
+});
+
+// #4791 round-4 review (block ruling): `off` lifted the limit for EVERY agent with no gate — the same self-grant
+// `allow` closed. Every limit-lifting verb now goes through one gate.
+describe('off is operator-only too (#4791)', () => {
+  const QUOTE = 'turn the limit off for the release';
+  const operatorEnv = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'main-session' };
+  const primary = '/Users/op/workspace/webeverything';
+  const lane = '/Users/op/workspace/.lanes/web-everything/lane-7';
+  const tmpState = () => join(mkdtempSync(join(tmpdir(), 'pr-limit-off-')), 'pr-limit.json');
+  const silent = () => ({ write: () => true });
+  const off = (env, cwd, extra = [`--operator-quote=${QUOTE}`]) => {
+    const path = tmpState();
+    const code = runPrLimitCli(['off', '--reason=r', '--for=2h', ...extra], { env, cwd, path, stderr: silent(), stdout: silent() });
+    return { code, st: readLimitState(path) };
+  };
+
+  it('a worker session cannot turn the limit off, even with a quote — refused, logged, limit still on', () => {
+    const { code, st } = off({ ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, primary);
+    expect(code).toBe(3);
+    expect(isGlobalOffNow(st)).toBe(false);
+    expect(st.history.at(-1)).toMatchObject({ action: 'off-refused' });
+    expect(st.history.at(-1).reason).toMatch(/\[channel=worker session=main-session\]$/);
+  });
+
+  it('an unknown role and a lane cwd are refused; a missing quote is refused', () => {
+    expect(off({ ...operatorEnv, WE_CONVEYOR_WORKER: 'yes' }, primary).code).toBe(3);
+    expect(off(operatorEnv, lane).code).toBe(3);
+    const noQuote = off(operatorEnv, primary, []);
+    expect(noQuote.code).toBe(3);
+    expect(isGlobalOffNow(noQuote.st)).toBe(false);
+  });
+
+  it('the operator channel with a quote turns it off and records quote, channel and session (surviving a round-trip)', () => {
+    const { code, st } = off(operatorEnv, primary);
+    expect(code).toBe(0);
+    expect(isGlobalOffNow(st)).toBe(true);
+    expect(st.global).toMatchObject({ operatorQuote: QUOTE, channel: 'operator-session', session: 'main-session' });
+  });
+
+  it('authoriseOverride: `off` has no own-branch rule; `allow` keeps it', () => {
+    expect(authoriseOverride({ verb: 'off', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: 'lane/x' }).ok).toBe(true);
+    expect(authoriseOverride({ verb: 'allow', branch: 'lane/x', operatorQuote: QUOTE, env: operatorEnv, cwdReal: primary, ownBranch: 'lane/x' }).ok).toBe(false);
+  });
+
+  it('every CLI verb is declared gated or ungated, and every gated verb refuses a worker', () => {
+    const verbs = [...OVERRIDE_VERBS, ...UNGATED_VERBS];
+    expect(new Set(verbs).size).toBe(verbs.length);
+    expect(OVERRIDE_VERBS).toEqual(['allow', 'off']);
+    const src = readFileSync(resolve(process.cwd(), 'scripts/lib/pr-limit.mjs'), 'utf8'); // vitest runs from the repo root
+    const cliVerbs = [...src.matchAll(/\bcmd === '([a-z-]+)'/g)].map((m) => m[1]);
+    expect(new Set(cliVerbs)).toEqual(new Set(verbs));
+    for (const verb of OVERRIDE_VERBS) {
+      const path = tmpState();
+      const code = runPrLimitCli([verb, '--branch=lane/x', '--reason=r', `--operator-quote=${QUOTE}`],
+        { env: { ...operatorEnv, WE_CONVEYOR_WORKER: '1' }, cwd: primary, path, ownBranch: '', stderr: silent(), stdout: silent() });
+      expect(code).toBe(3);
+    }
+  });
+
+  it('`WE_PR_LIMIT_OFF=1` lifts the limit only outside a worker session', () => {
+    const path = tmpState();
+    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1' }, path })).toBe(true);
+    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1', WE_CONVEYOR_WORKER: '1' }, path })).toBe(false);
+    expect(isGlobalOffLive({ env: { WE_PR_LIMIT_OFF: '1', WE_CONVEYOR_WORKER: 'x' }, path })).toBe(false);
+  });
+});
+
+describe('override history keeps grants over refusals (#4791)', () => {
+  const rec = (action, i) => ({ at: `t${i}`, actor: null, reason: null, action, target: `b${i}` });
+
+  it('a looping refused caller never evicts a grant record — refusals are evicted first', () => {
+    let s = appendHistory(emptyLimitState(), { action: 'allow-branch', target: 'kept' });
+    for (let i = 0; i < HISTORY_MAX + 50; i++) s = appendHistory(s, { action: 'allow-refused', target: `r${i}` });
+    expect(s.history.length).toBe(HISTORY_MAX);
+    expect(s.history[0]).toMatchObject({ action: 'allow-branch', target: 'kept' });
+  });
+
+  it('the cap on READ is the same policy (an oversized store keeps its grants)', () => {
+    const history = [rec('off', 0), ...Array.from({ length: HISTORY_MAX + 10 }, (_, i) => rec('off-refused', i + 1))];
+    const st = parseLimitState(JSON.stringify({ history }));
+    expect(st.history.length).toBe(HISTORY_MAX);
+    expect(st.history[0]).toMatchObject({ action: 'off' });
+  });
+
+  it('with no refusals left to evict, the oldest entries go (still capped)', () => {
+    const h = Array.from({ length: HISTORY_MAX + 3 }, (_, i) => rec('allow-branch', i));
+    const capped = capHistory(h);
+    expect(capped.length).toBe(HISTORY_MAX);
+    expect(capped[0].target).toBe('b3');
   });
 });
 
