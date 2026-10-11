@@ -2,7 +2,7 @@
  * Split out of daemon-rebuild.mjs (move-only).
  */
 
-import { verifyRev, rebuildCommitEnv } from './shared.mjs';
+import { verifyRev, rebuildCommitEnv, FULL_SHA_RE, REBUILD_IDENTITY_ENV } from './shared.mjs';
 import { resolveOverlayConflict } from './overlay-strategies.mjs';
 import { recordedEdgeSha } from './edge-fetch.mjs';
 import { createHash } from 'node:crypto';
@@ -56,7 +56,9 @@ export function pinnedStatus(git, raw, mainSha, ovSha) {
 const MECHANISM_CORE_PATHS = Object.freeze(['scripts/lib/daemon-rebuild.mjs', 'scripts/lib/daemon-overlays.mjs']);
 
 /** A full commit id — the only shape a sha read from git output or the GitHub API may take before it reaches a git argv. */
-const OID = /^[0-9a-f]{40}$/;
+const OID = FULL_SHA_RE;
+/** Who commits a daemon build's overlay merges (REBUILD_IDENTITY_ENV) — only those merges count as adopted heads. */
+const REBUILD_COMMITTER = REBUILD_IDENTITY_ENV.GIT_COMMITTER_EMAIL;
 
 /**
  * xpinskip (live 2026-09-26 23:39 ET) — may a CONFLICTING pinned overlay be skipped for this build instead of
@@ -113,14 +115,15 @@ function changedFiles(git, mainSha, sha) {
  * child. Every non-top base P:
  *   - is `stack-contained` when one of its tops contains P's current tip: it is live through that top;
  *   - is `stack-base-moved` only when a top that really clashes with it (merge-tree status 1) contains a head P has
- *     since moved away from — proven by (a) a head of P an earlier daemon build merged (`daemon-rebuild: merge overlay
- *     <P>` on the first-parent line of HEAD or a HEAD reflog entry), or (b) the `before` commit of a GitHub
- *     head_ref_force_pushed event on P's PR. Set aside, the children's tops kept until they are restacked. This
- *     deliberately overrides "live overlays win" for P. A sibling retargeted onto P never contains a head of P, so it
- *     never evicts P (it is reported in `unconfirmed` and parked by the plain conflict rule).
- *   - when the force-push read is UNKNOWN (gh unreachable) and (a) found nothing, the last adopted build decides: P keeps
- *     what it had there — live if HEAD merged P, set aside if HEAD merged its clashing tops but not P, else live
- *     (no eviction). Reported in `unknown`.
+ *     since moved away from (not in main) — proven by (a) a head of P (same branch AND PR) an earlier daemon build
+ *     merged (a rebuild-committed `daemon-rebuild: merge overlay <P> (PR #n)` on the first-parent line of HEAD or a
+ *     HEAD reflog entry — "the recorded adopted head sha changing", fast-forwards included), or (b) the `before`
+ *     commit of a GitHub head_ref_force_pushed event on P's PR. Set aside, the children's tops kept until they are
+ *     restacked. This deliberately overrides "live overlays win" for P. A sibling retargeted onto P never contains a
+ *     head of P, so it never evicts P (it is reported in `unconfirmed` and parked by the plain conflict rule).
+ *   - with no fresh proof — the force-push read is UNKNOWN (gh unreachable; reported in `unknown`), or the proof aged
+ *     out of the reflog — the last adopted build decides: P keeps what it had there — set aside if HEAD merged a
+ *     clashing top but not P, else live. Never a fresh eviction.
  * A PINNED base (flag or mechanism), contained or moved, is never set aside — it stays an independent overlay, so
  * its pin refuses a conflicting build rather than the build silently going without it. A registered overlay whose
  * tip is already an ancestor of main takes no part either (the main loop removes it as `in-main`).
@@ -160,36 +163,37 @@ export async function planOverlayStacks({
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
   const outLines = (r) => (r.status === 0 ? String(r.stdout ?? '').split('\n').filter((l) => l.trim()) : []);
-  // ref → Set of the overlay heads one daemon build merged: the second parent of each `daemon-rebuild: merge overlay <ref>`
-  // two-parent commit on the build's first-parent line above main (newest 200). Daemon-authored, local: an overlay's own
-  // commits sit on second-parent lines, so they never count. Cached per build.
+  // The overlay heads one daemon build merged, as `{ref, pr, sha}`: the second parent of each two-parent
+  // `daemon-rebuild: merge overlay <ref> [(PR #n)] onto …` commit the rebuild identity committed on the build's
+  // first-parent line above main (newest 200). Local and daemon-made: an overlay's own commits sit on second-parent
+  // lines and carry their author's committer, so they never count. Cached per build.
   const buildCache = new Map();
   const mergedBy = (build) => {
-    if (!build || !OID.test(build)) return new Map();
+    if (!build || !OID.test(build)) return [];
     if (!buildCache.has(build)) {
-      const m = new Map();
-      for (const l of outLines(git(['log', '--first-parent', '-n', '200', '--format=%P%x09%s', build, '--not', mainSha]))) {
-        const [parents, subject = ''] = l.split('\t');
+      const merged = [];
+      const log = git(['log', '--first-parent', '-n', '200', '--format=%P%x09%ce%x09%s', build, '--not', mainSha]);
+      for (const l of outLines(log)) {
+        const [parents, committer, ...rest] = l.split('\t');
         const ps = parents.split(' ');
-        const hit = subject.match(/^daemon-rebuild: merge overlay (\S+) /);
-        if (!hit || ps.length !== 2 || !OID.test(ps[1])) continue;
-        if (!m.has(hit[1])) m.set(hit[1], new Set());
-        m.get(hit[1]).add(ps[1]);
+        const hit = rest.join('\t').match(/^daemon-rebuild: merge overlay (\S+) (?:\(PR #(\d+)\) )?onto /);
+        if (!hit || committer !== REBUILD_COMMITTER || ps.length !== 2 || !OID.test(ps[1])) continue;
+        merged.push({ ref: hit[1], pr: hit[2] != null ? Number(hit[2]) : null, sha: ps[1] });
       }
-      buildCache.set(build, m);
+      buildCache.set(build, merged);
     }
     return buildCache.get(build);
   };
+  // The same overlay: same branch AND same PR (a branch name reused by another PR is a different overlay).
+  const sameOverlay = (m, n) => m.ref === n.ref && (m.pr ?? null) === (n.pr ?? null);
   // Every adopted build this clone still remembers: the running HEAD, then the HEAD reflog (newest 50) — each rebuild
   // moves HEAD onto the build it adopted, so the reflog keeps the heads of P that earlier builds merged.
   let builds = null;
-  const adoptedHeads = (ref) => {
+  const adoptedHeads = (n) => {
     if (!builds) {
       builds = [...new Set([headSha, ...outLines(git(['reflog', '-n', '50', '--format=%H', 'HEAD']))].filter((s) => s && OID.test(s)))];
     }
-    const out = new Set();
-    for (const b of builds) for (const s of mergedBy(b).get(ref) ?? []) out.add(s);
-    return out;
+    return new Set(builds.flatMap((b) => mergedBy(b).filter((m) => sameOverlay(m, n)).map((m) => m.sha)));
   };
   const fpCache = new Map();
   const forcePushedHeads = async (pr) => {
@@ -207,7 +211,7 @@ export async function planOverlayStacks({
     // A head already in main is everyone's history, not P's: never evidence.
     const carried = (s) => s !== p.sha && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0
       && clashing.some((t) => anc(s, t.sha));
-    if ([...adoptedHeads(p.ref)].some(carried)) return 'adopted-head';
+    if ([...adoptedHeads(p)].some(carried)) return 'adopted-head';
     const before = await forcePushedHeads(p.pr);
     if (before == null) return null;
     return before.some(carried) ? 'force-pushed' : 'none';
@@ -246,16 +250,15 @@ export async function planOverlayStacks({
       const clashing = tops.filter((t) => git(['merge-tree', '--write-tree', '--no-messages', p.sha, t.sha]).status === 1);
       if (clashing.length === 0) continue;
       let evidence = await movedEvidence(p, clashing);
-      if (evidence == null) {
-        // Unknown: keep what the last adopted build did with P (never a fresh eviction).
+      if (evidence == null || evidence === 'none') {
+        // No fresh proof (unknown, or the proof aged out of the reflog): keep what the last adopted build did with P —
+        // set aside if it merged a clashing top but not P, else live. Never a fresh eviction.
         const last = mergedBy(headSha);
-        const keptAside = !last.has(p.ref) && clashing.some((t) => last.has(t.ref));
-        unknown.push({ ref: p.ref, pr: p.pr, kept: keptAside ? 'set-aside' : 'live', tops: clashing.map((t) => t.ref) });
+        const keptAside = !last.some((m) => sameOverlay(m, p)) && clashing.some((t) => last.some((m) => sameOverlay(m, t)));
+        if (evidence == null) unknown.push({ ref: p.ref, pr: p.pr, kept: keptAside ? 'set-aside' : 'live', tops: clashing.map((t) => t.ref) });
+        else if (!keptAside) for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
         if (!keptAside) continue;
         evidence = 'last-adopted';
-      } else if (evidence === 'none') {
-        for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
-        continue;
       }
       setAside.set(p.ref, {
         ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', evidence, tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })),

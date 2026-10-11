@@ -398,7 +398,9 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
     expect(plan.decisions.map((d) => [d.ref, d.action])).toEqual([['lane/unrelated', 'apply'], ['lane/claimer', 'apply']]);
     expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-tops');
     // Operator ruling 2026-10-11: the chain alone makes membership; with nothing clashing there is nothing to decide or log.
-    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+    for (const k of ['overlay-stack-base-moved', 'overlay-stack-claim-unconfirmed', 'overlay-stack-evidence-unknown']) {
+      expect(plan.alerts.map((a) => a.kind)).not.toContain(k);
+    }
   });
 
   it('an unconfirmed chain claim that also clashes with the named overlay still leaves that overlay live (the claimer is parked)', async () => {
@@ -558,6 +560,26 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
       expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
       expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+    });
+
+    it('a head adopted under the same branch name for ANOTHER PR is not evidence', async () => {
+      const { f, pOld } = await ffMove({ adoptOld: false });
+      gitOk(f.clone, ['update-ref', 'refs/remotes/origin/lane/ff-p', pOld]); // the old head, built as PR #9999's overlay
+      await f.build([{ ref: 'lane/ff-p', pr: 9999 }], f.init);
+      f.fetch();
+      const plan = await ffPlan(f);
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    });
+
+    it('proof that aged out of the reflog keeps the last adopted build: a base it set aside stays set aside', async () => {
+      const { f } = await ffMove(); // P's old head adopted, then a build with the top only (P set aside)
+      const last = await f.build([{ ref: 'lane/ff-c', pr: 9702 }], f.init);
+      gitOk(f.clone, ['reflog', 'expire', '--expire=now', '--all']);
+      const plan = await ffPlan(f, { headSha: last });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved')?.detail.evidence).toBe('last-adopted');
     });
 
     it('unknown evidence, base live in the last build: it stays live (no eviction), logged', async () => {
