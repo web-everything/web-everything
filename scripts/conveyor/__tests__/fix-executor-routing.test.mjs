@@ -264,3 +264,43 @@ it('routes an admitted second round to Codex before attempting a Claude resume',
     expect(launch).toHaveBeenCalledWith(expect.objectContaining({ policyRoute: { provider: 'codex' } }));
   } finally { log.mockRestore(); }
 });
+
+// Review self-check (PR #4897 round 2): the borrow gate is a SECOND executor chooser. A table-bearing entry (ruling
+// send-back, takeover, round escalation) must never borrow a non-Claude slot, because that launcher ignores the table.
+describe('borrowing a builder slot keeps table-bearing entries on Claude', () => {
+  const rung = { id: 'opus-high', at: 1 };
+  const claudeRoute = { provider: 'claude', model: 'opus', effort: 'high' };
+  const run = async (extra, executor) => {
+    const { runReconcileFixDispatch } = await import('../reconcile-fix-dispatch.mjs');
+    const dispatch = vi.fn(() => ({ pr: 42 }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const result = runReconcileFixDispatch({
+        root: '/repo', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }),
+        reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefName: 'lane/42-x', attempts: 1, files: ['scripts/x.mjs'], ...extra }],
+          refusals: [], notes: [] }),
+        findItemFn: () => ({ num: '42', scope: ['we:scripts/x.mjs'], specPath: 'backlog/42-x.md' }),
+        loadItems: () => [], pickFreeLanes: () => [2], listBuildClaims: () => [], listFixClaims: () => [],
+        dispatchThrottle: { tryAdmit: () => ({ admit: false, kind: 'fix-cap', why: 'fixer cap full' }) },
+        borrowGate: { consider: () => ({ borrow: true, executor, waitedMinutes: 30 }), clear: vi.fn() },
+        tryResume: () => ({ resumed: false }), tryResumeRound: () => ({ resumed: false }), dispatch,
+      });
+      return { result, dispatch };
+    } finally { log.mockRestore(); }
+  };
+  it.each([
+    ['ruling-not-addressed send-back', { rulingNotAddressed: { rung, route: claudeRoute, matches: [] } }],
+    ['takeover', { takeover: { rung, route: claudeRoute, attempts: 5, cap: 5 } }],
+  ])('refuses a codex borrow for a %s and keeps waiting', async (_name, extra) => {
+    const { result, dispatch } = await run(extra, 'codex');
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.dispatched).toHaveLength(0);
+    expect(result.refusals).toEqual([expect.objectContaining({ pr: 42, kind: 'fix-cap', why: expect.stringContaining("Claude") })]);
+  });
+  it('still lets a table-bearing entry borrow a Claude-class slot, and an ordinary one borrow codex', async () => {
+    const claude = await run({ rulingNotAddressed: { rung, route: claudeRoute, matches: [] } }, 'claude');
+    expect(claude.dispatch).toHaveBeenCalledTimes(1);
+    const ordinary = await run({}, 'codex');
+    expect(ordinary.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
