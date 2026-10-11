@@ -1029,6 +1029,7 @@ export function tryResumeRoundFix(planned, {
   resumeOptions = {},
   scratchRoot = dispatchScratchRoot({ root }),
   realpath = realpathSync,
+  isolateSession = isolateDispatchSession,
   dryRun = false,
 } = {}) {
   if (!dryRun) assertNotALaneCheckout(root);
@@ -1045,6 +1046,16 @@ export function tryResumeRoundFix(planned, {
   const decision = planRoundResume({ planned, settings: fixSettings, desiredModel, scratchRoot, realpath, ...inputs });
   if (!decision.resume) return declined(decision);
   if (dryRun) return { resumed: false, decision, dryRun: true, roundEscalation };
+  // The resumed session reloads `<cwd>/.claude/settings.local.json`, whose guard hooks were written at its first
+  // launch with absolute paths into the dispatcher's checkout of that time (a self-sync candidate dir may be gone
+  // since: a missing hook script is a non-blocking error, so the guards would silently not run). Re-write them for
+  // THIS dispatcher before resuming, exactly as a fresh dispatch does; if that write fails, cold-start instead.
+  let isolation = null;
+  try { isolation = isolateSession(inputs.prior.cwd); } catch (e) { isolation = { hooks: { ok: false, reason: describeDispatchFailure(e) } }; }
+  if (isolation?.hooks?.ok !== true || isolation?.write?.ok === false) {
+    const why = isolation?.hooks?.reason ?? isolation?.write?.reason ?? 'no result';
+    return declined({ resume: false, reason: 'guard-hooks-unwritten', why: `could not re-write the guard hooks in the earlier session's cwd (${why})` });
+  }
   let historyInputs = null;
   try { historyInputs = readHistoryInputs({ repo, pr: planned.pr }); } catch { historyInputs = null; }
   const history = historyInputs ? renderRoundHistory(buildRoundHistory(historyInputs), { previousOnly: false, title: 'All rounds so far' }) : '';

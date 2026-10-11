@@ -285,7 +285,33 @@ describe('tryResumeRoundFix', () => {
   const base = {
     root: '/repo', fixSettings: SETTINGS, wrapFix: false, loadLadder: () => LADDER, listAgentsAll: () => [],
     postNotice: () => false, readHistoryInputs: () => null, scratchRoot: '/scratch', realpath: (p) => p,
+    isolateSession: () => ({ write: { ok: true }, hooks: { ok: true, count: 8 } }),
   };
+  const inputsOk = () => ({ prior, job, transcript: true, lane: freeLane, base: { rebased: false } });
+  it('the guard hooks are re-written in the earlier session\'s cwd BEFORE the resume trigger spawns', () => {
+    const order = [];
+    const isolateSession = vi.fn((cwd) => { order.push(`isolate ${cwd}`); return { write: { ok: true }, hooks: { ok: true, count: 8 } }; });
+    const resume = vi.fn(() => { order.push('resume'); return { resumed: true, result: { sessionId: SID } }; });
+    tryResumeRoundFix(planned(), { ...base, readInputs: inputsOk, isolateSession, resume });
+    expect(order).toEqual(['isolate /scratch/x', 'resume']);
+  });
+  it.each([
+    ['the hooks write failed', () => ({ write: { ok: true }, hooks: { ok: false, reason: 'write-failed' } })],
+    ['the worktree write failed', () => ({ write: { ok: false, reason: 'write-failed' }, hooks: { ok: true } })],
+    ['the isolation threw', () => { throw new Error('EACCES'); }],
+    ['no result', () => undefined],
+  ])('%s: no resume (cold start writes fresh hooks), nothing posted', (_, isolateSession) => {
+    const resume = vi.fn(); const postNotice = vi.fn();
+    const r = tryResumeRoundFix(planned(), { ...base, readInputs: inputsOk, isolateSession, resume, postNotice });
+    expect(r.resumeAttempt).toMatchObject({ attempted: false, refused: 'guard-hooks-unwritten' });
+    expect(resume).not.toHaveBeenCalled();
+    expect(postNotice).not.toHaveBeenCalled();
+  });
+  it('a dry run never writes the hooks', () => {
+    const isolateSession = vi.fn();
+    tryResumeRoundFix(planned(), { ...base, dryRun: true, readInputs: inputsOk, isolateSession, resume: vi.fn() });
+    expect(isolateSession).not.toHaveBeenCalled();
+  });
   it('a prior session whose listing cwd is a lane checkout is never resumed there (cold start, no trigger spawned)', () => {
     const resume = vi.fn();
     const inLane = { ...prior, cwd: '/lanes/we/lane-4' };
