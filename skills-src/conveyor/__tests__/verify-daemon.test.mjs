@@ -19,7 +19,7 @@ import {
   startIndependentHeartbeat, DEFAULT_HEARTBEAT_INTERVAL_MS,
   reconcileInFlight, pidAlive, processGroupAlive, killInFlight, makeCodeChangedGuard, createCleanup, runDaemon,
   VERIFY_DAEMON_LEASE_KEY, DEFAULT_INTERVAL_MS,
-  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun,
+  resolveRestartInFlight, writeInFlightHandoff, adoptInFlight, isDispatchedRun, wireGateJobs,
 } from '../verify-daemon.mjs';
 import { laneNeedsVerifyDispatch } from '../../../scripts/conveyor/verify-dispatch.mjs';
 import { VERIFY_FILENAME, verifyStartBody } from '../../../scripts/lib/lane-verify.mjs';
@@ -765,5 +765,107 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
     expect(killGroup).toHaveBeenCalledWith(-22);
     expect([...inFlight.keys()]).toEqual(['fresh']);
     expect(log.mock.calls.flat().join('\n')).toMatch(/adopted run r1.*finished/);
+  });
+});
+
+describe('#4135 — gate jobs: a restart never waits on, kills, or re-dispatches a running gate', () => {
+  it('a code-change restart no longer waits for gate JOBS (they outlive the process); in-process runs still defer it', () => {
+    const inFlight = new Map([['/l1', { jobId: 'j1', pid: 9 }]]);
+    const guard = makeCodeChangedGuard({ inFlight, bootHead: 'a', readHead: () => 'b' });
+    expect(guard()).toBe(true);
+    inFlight.set('/l2', { runId: 'legacy', pid: 10 });
+    expect(guard()).toBe(false);
+  });
+
+  it('every exit leaves gate jobs running (the successor re-attaches); only restartInFlight: kill stops them', async () => {
+    const mk = (restartInFlight, stopJobs = vi.fn(async () => {})) => {
+      const kill = vi.fn();
+      const exit = vi.fn();
+      const inFlight = new Map([['/l1', { jobId: 'j1', pid: 9 }], ['/l2', { runId: 'r', pid: 10 }]]);
+      const cleanup = createCleanup({ inFlight, kill, exit, stopHeartbeat: () => {}, release: () => {}, log: { error: () => {} },
+        restartInFlight, handoff: (m) => [...m.values()], stopJobs });
+      return { cleanup, kill, exit, stopJobs };
+    };
+    const a = mk('adopt');
+    a.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    expect(a.kill).not.toHaveBeenCalled(); // job left, legacy handed off
+    expect(a.stopJobs).not.toHaveBeenCalled();
+    expect(a.exit).toHaveBeenCalledWith(0);
+
+    const b = mk('adopt');
+    b.cleanup.stopAndExit('loop stopped (lease-lost)');
+    expect(b.kill).toHaveBeenCalledWith(-10, 'SIGKILL'); // the in-process run is still killed, as before
+    expect(b.kill).not.toHaveBeenCalledWith(-9, 'SIGKILL'); // the job is not
+    expect(b.stopJobs).not.toHaveBeenCalled();
+
+    const c = mk('kill');
+    c.cleanup.stopAndExit('SIGTERM', { adoptable: true });
+    await new Promise((r) => setImmediate(r));
+    expect(c.stopJobs).toHaveBeenCalledTimes(1);
+    expect(c.kill).toHaveBeenCalledWith(-10, 'SIGKILL');
+    expect(c.exit).toHaveBeenCalledWith(0);
+  });
+
+  it('with gateJobs, the tick syncs the store BEFORE dispatch, passes launchGate, and launches in the same tick', async () => {
+    const order = [];
+    const gateJobs = {
+      sync: vi.fn(async () => { order.push('sync'); }),
+      launch: vi.fn(() => ({ id: 'j' })),
+    };
+    const runVerify = vi.fn(async (o) => { order.push('dispatch'); o.launchGate({ lane: 1 }); return { dispatched: [{ lane: 1 }], deferred: [], failures: [] }; });
+    const effects = buildCliDaemonEffects({ runVerify, gateJobs, isDraining: () => false, log: { error: () => {} } });
+    await effects.tickOnce();
+    expect(order).toEqual(['sync', 'dispatch', 'sync']);
+    expect(gateJobs.launch).toHaveBeenCalledWith({ lane: 1 });
+  });
+
+  it('reconcileInFlight never touches a job entry (the job store owns it)', () => {
+    const inFlight = new Map([['/l1', { jobId: 'j1', pid: 123, startedMs: 0 }]]);
+    const { orphaned } = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => true, killGroup: () => { throw new Error('no'); }, nowMs: 1e12, log: () => {} });
+    expect(orphaned).toEqual([]);
+    expect(inFlight.size).toBe(1);
+  });
+});
+
+describe('#4135 — rollback (WE_VERIFY_GATE_AS_JOB=0) still sees running gate jobs', () => {
+  it('syncs the job store every tick (so a live job holds its lane) but launches no new job', async () => {
+    const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn() };
+    const runVerify = vi.fn(async () => ({ dispatched: [], deferred: [], failures: [] }));
+    const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob: false, isDraining: () => false, log: { error: () => {} } });
+    await effects.tickOnce();
+    expect(gateJobs.sync).toHaveBeenCalledTimes(1);
+    expect(runVerify.mock.calls[0][0].launchGate).toBeUndefined();
+  });
+
+  it('main()\'s wiring: WE_VERIFY_GATE_AS_JOB=0 still builds the job store (live jobs hold lanes) and only stops new launches', () => {
+    const create = vi.fn(() => ({ id: 'store' }));
+    expect(wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: false });
+    expect(wireGateJobs({}, create)).toEqual({ gateJobs: { id: 'store' }, gateAsJob: true });
+  });
+
+  it('rollback builds the store with launchJobs off; every tick hands the dispatch the store\'s laneHeld check (PR 4764 round 7)', async () => {
+    const create = vi.fn(() => ({ id: 'store' }));
+    wireGateJobs({ WE_VERIFY_GATE_AS_JOB: '0' }, create);
+    expect(create).toHaveBeenLastCalledWith({ launchJobs: false });
+    wireGateJobs({}, create);
+    expect(create).toHaveBeenLastCalledWith({ launchJobs: true });
+    for (const gateAsJob of [true, false]) {
+      const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(), laneHeld: vi.fn(() => 'held') };
+      const runVerify = vi.fn(async (o) => ({ held: o.laneHeld?.('/lane'), dispatched: [], deferred: [], failures: [] }));
+      const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} } });
+      expect((await effects.tickOnce()).held).toBe('held');
+      // rollback also scans the lane's processes (no job child does it there); job mode leaves that to the job.
+      expect(gateJobs.laneHeld).toHaveBeenCalledWith('/lane', { scanProcs: !gateAsJob });
+    }
+  });
+
+  it('every tick hands the dispatch the store\'s re-probing killJobGate, in job mode and in rollback', async () => {
+    for (const gateAsJob of [true, false]) {
+      const gateJobs = { sync: vi.fn(async () => {}), launch: vi.fn(), killJobGate: vi.fn(() => false) };
+      const runVerify = vi.fn(async (o) => { o.killJobGate({ jobId: 'j' }); return { dispatched: [], deferred: [], failures: [] }; });
+      const effects = buildCliDaemonEffects({ runVerify, gateJobs, gateAsJob, isDraining: () => false, log: { error: () => {} } });
+      await effects.tickOnce();
+      expect(gateJobs.killJobGate).toHaveBeenCalledWith({ jobId: 'j' });
+    }
   });
 });
