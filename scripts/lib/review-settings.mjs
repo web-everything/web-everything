@@ -29,9 +29,16 @@ export const ROUND_BUDGET_OFF = 'off';
 export const ROUND_BUDGET_MAX = 50;
 /** THE ONE PREDICATE for a usable K, shared by the file, the env and every consumer of the resolved value. */
 export const isValidRoundBudget = (v) => Number.isInteger(v) && v >= 1 && v <= ROUND_BUDGET_MAX;
-export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF });
+/**
+ * `review.takeoverReviewAttempts` — how many reviews a head pushed by a takeover earns beyond the round cap
+ * (we:scripts/conveyor/takeover-review.mjs). Built-in 1: without it a takeover's work is never judged. 0 turns it off.
+ * An integer 0..{@link TAKEOVER_REVIEW_ATTEMPTS_MAX} from the file, or its decimal string from the env.
+ */
+export const TAKEOVER_REVIEW_ATTEMPTS_MAX = 5;
+export const BUILT_IN_REVIEW_SETTINGS = Object.freeze({ referralDefault: 'operator', scopedRereview: 'off', roundBudget: ROUND_BUDGET_OFF,
+  takeoverReviewAttempts: 1 });
 export const REVIEW_SETTINGS_ENV = Object.freeze({ referralDefault: 'WE_REVIEW_REFERRAL_DEFAULT', scopedRereview: 'WE_REVIEW_SCOPED_REREVIEW',
-  roundBudget: 'WE_REVIEW_ROUND_BUDGET' });
+  roundBudget: 'WE_REVIEW_ROUND_BUDGET', takeoverReviewAttempts: 'WE_REVIEW_TAKEOVER_REVIEW_ATTEMPTS' });
 const ALLOWED = Object.freeze({ referralDefault: REFERRAL_DEFAULTS, scopedRereview: SCOPED_REREVIEW_MODES });
 /** Each key's parser: the valid value, or `undefined` to keep the lower layer. `fromEnv` reads a string. */
 const PARSERS = Object.freeze({
@@ -40,6 +47,10 @@ const PARSERS = Object.freeze({
     if (v === ROUND_BUDGET_OFF) return v;
     const k = fromEnv ? (typeof v === 'string' && /^[1-9]\d*$/.test(v) ? Number(v) : undefined) : v;
     return isValidRoundBudget(k) ? k : undefined;
+  },
+  takeoverReviewAttempts: (v, { fromEnv = false } = {}) => {
+    const k = fromEnv ? (typeof v === 'string' && /^\d+$/.test(v) ? Number(v) : undefined) : v;
+    return Number.isInteger(k) && k >= 0 && k <= TAKEOVER_REVIEW_ATTEMPTS_MAX ? k : undefined;
   },
 });
 /** The WE root RUNNING the daemon owns this file; a PR under review cannot weaken it. */
