@@ -483,6 +483,19 @@ describe('resource-admission cut-over (x9xkupj)', () => {
   it('wires admission into the default IO', () => {
     expect(typeof defaultReverifyIo().admission).toBe('function');
   });
+  // WE_RESOURCE_CUTOVER=shadow is the rollback switch: the shared decision is logged only, the legacy load rule decides.
+  it.each([
+    ['shadow', [50, 50], undefined],
+    ['enforce', [50, 50], 'admit'],
+  ])('default IO admission under WE_RESOURCE_CUTOVER=%s at load %j', (mode, load, expected) => {
+    const shadow = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 50%' }));
+    const admitFn = vi.fn(() => ({ verdict: 'admit' }));
+    const io = defaultReverifyIo({ shadow, admitFn, env: { WE_RESOURCE_CUTOVER: mode } });
+    const out = io.admission({ load, cores: 12, config: reverifyConfig({}) });
+    expect(out?.verdict).toBe(expected);
+    expect(shadow).toHaveBeenCalledTimes(1);
+    if (mode === 'shadow') expect(admitFn).not.toHaveBeenCalled();
+  });
   // The pass must outlive a broken admission probe: throw / nothing / a malformed answer all leave the legacy load rule,
   // and the result carries no `admission` summary (there was no decision to summarise).
   it.each([

@@ -193,6 +193,7 @@ import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/con
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
+import { applyHumanClearanceCarry, latestHumanClearance, sanitizeActor } from './lib/human-clearance-carry.mjs'; // #xnqxtdy
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
 import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
@@ -647,9 +648,13 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     acceptedSha: parseReviewedSha(d.comments),
     acceptedDiff: parseReviewedDiff(d.comments),
     acceptedContribution: parseReviewedContribution(d.comments),
-    operatorClearance: parseOperatorClearance(d.comments),
+    // Read over ALL comments (a forgeable actor), and `decideReviewGate` prints `.actor` into the drain's own park reason and
+    // revocation comment — so the name is made safe here, once, for every renderer (#xnqxtdy review: same class as the carry record).
+    operatorClearance: ((c) => (c ? { ...c, actor: sanitizeActor(c.actor) } : c))(parseOperatorClearance(d.comments)),
     humanClearedSha: parseLatestHumanClearedSha(d.comments),
-    headDiff: null, headContribution: null, headReadFailed: false,
+    // #xnqxtdy — sha, diff and actor all from the ONE trusted clearance comment (never the latest marker of any comment).
+    humanClearance: latestHumanClearance(d.comments),
+    headDiff: null, headDiffSha: null, headContribution: null, headReadFailed: false,
   };
   const { acceptedSha, headSha, acceptedDiff, acceptedContribution } = evidence;
   const liveDiffReadOwed = !!((acceptedDiff || acceptedContribution) && acceptedSha
@@ -658,10 +663,15 @@ export function readDrainAcceptance({ pr, repo, cwd, local = false, exec = execF
     try {
       const net = netDiff({
         exec: (cmd, args, opts) => exec(cmd, args, { cwd, ...opts }),
-        rev: d.headRefName, fetchExtraRefs: [d.headRefName],
+        rev: d.headRefName, fetchExtraRefs: [d.headRefName], pinRev: true,
       });
+      // #xnqxtdy — `headRefOid` and the branch tip the diff was read from are two non-atomic reads. The tip the diff is FOR
+      // is resolved to one sha BEFORE the diff and the diff is taken from that sha (`pinRev`), so the carry can refuse a
+      // diff that belongs to a different push than the head it would stamp. A scored read that names no sha leaves
+      // `headDiffSha` null (the carry refuses it) — it is never labelled by a second, later lookup of a ref that can move.
       evidence.headDiff = net?.scored ? net.text : null;
       evidence.headContribution = evidence.headDiff;
+      evidence.headDiffSha = net?.scored && typeof net.revSha === 'string' && net.revSha ? net.revSha : null;
     } catch { /* An owed but unreadable diff is not proof of staleness (#3184). */ }
   }
   evidence.headReadFailed = liveDiffReadOwed && !evidence.headDiff;
@@ -687,7 +697,14 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
         reason: `review acceptance verification unreadable — merge deferred this pass: ${error.message || error}` };
     }
   }
-  return decideReviewGate({ ...gateInputs, labels, ...evidence });
+  // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
+  // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
+  const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
+    cwd: readOptions?.cwd, exec: readOptions?.exec ?? execFileSync, dryRun: !!readOptions?.dryRun, ...readOptions?.carry });
+  if (carry?.action === 'defer') return carry;
+  if (carry?.carried) evidence = { ...evidence, humanClearedSha: evidence.headSha };
+  const gate = decideReviewGate({ ...gateInputs, labels, ...evidence });
+  return carry?.carried ? { ...gate, carriedClearance: carry.carried } : gate;
 }
 
 /** Label coexistence alone cannot clear pending: require the merge gate's coverage proof first. */
@@ -3484,7 +3501,7 @@ export function computeNetDiffChangedFiles({ exec, remote = 'origin', base = 'ma
  *   pass it to share ONE fetch + candidate probe with `computeNetDiffChangedFiles` instead of resolving twice.
  * @returns {{text:string, base:string|null, rev:string|null, scored:boolean, reason?:'exec-contract'|'ref-unresolved'|'diff-failed'|'basis-mismatch'}}
  */
-export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null } = {}) {
+export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev, fetchExtraRefs = [], basis: sharedBasis = null, pinRev = false } = {}) {
   const unscored = { text: '', base: null, rev: null, scored: false };
   if (typeof exec !== 'function' || !rev) return unscored;
   // #2890-review-r2 finding 1 — refuse a basis resolved for a DIFFERENT request rather than answering about the
@@ -3495,7 +3512,28 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
   // candidate probe, shared with `computeNetDiffChangedFiles`); otherwise resolve our own exactly as before.
   const basis = sharedBasis || resolveNetDiffBasis({ exec, remote, base, rev, fetchExtraRefs });
   if (!basis.ok) return { ...unscored, reason: basis.reason }; // caller falls back to `gh pr diff`
-  const { diffBase, candidate } = basis;
+  let { diffBase, candidate } = basis;
+  // #xnqxtdy — `pinRev`: a caller that STAMPS the tip next to this text (the human-clearance carry) cannot read the
+  // tip in a second step: a concurrent fetch can move the tracking ref between the two reads and label an old diff with
+  // a newer sha. Resolve the tip to ONE commit sha first, then take the fork point AND the text from that sha only, and
+  // hand the sha back as `revSha` — the diff and its label can no longer disagree. Any failure is unscored (fail closed).
+  let revSha;
+  if (pinRev) {
+    try {
+      revSha = String(exec('git', ['rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '').trim().toLowerCase();
+      if (!/^[0-9a-f]{40,64}$/.test(revSha)) return { ...unscored, reason: 'diff-failed' };
+      // Only the fork-point basis can be pinned on BOTH sides: a `base-tip` / `ancestry` basis diffs against the moving
+      // `<remote>/<base>` NAME, which is an unpinned ref read next to the stamp — it is unscored here (fail closed).
+      if (basis.basisKind !== 'merge-base') return { ...unscored, reason: 'diff-failed' };
+      diffBase = String(exec('git', ['merge-base', '--end-of-options', basis.baseRef, revSha],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }) || '').split('\n')[0].trim();
+      if (!/^[0-9a-f]{40,64}$/i.test(diffBase)) return { ...unscored, reason: 'diff-failed' };
+      candidate = revSha;
+    } catch (err) {
+      return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
+    }
+  }
   try {
     // Same guard, same reason — this is the reviewer-facing diff TEXT, off the same caller-supplied candidate.
     // #2890-review-r2 finding 2b — `--no-ext-diff`. A `diff.external` in the caller's git config, or a
@@ -3507,7 +3545,7 @@ export function computeNetDiffText({ exec, remote = 'origin', base = 'main', rev
     // binary blobs into it would splat megabytes of asset bytes into the reviewer-facing text (see
     // `diff-hunks.mjs`, where `--text` is right precisely because the payload is one bounded file).
     const text = String(exec('git', ['diff', '--no-ext-diff', '--end-of-options', diffBase, candidate], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }) || '');
-    return { text, base: diffBase, rev: candidate, scored: true };
+    return { text, base: diffBase, rev: candidate, scored: true, ...(revSha ? { revSha } : {}) };
   } catch (err) {
     // the text diff failed even though the basis resolved → caller falls back to `gh pr diff`
     return { ...unscored, reason: isExecContractError(err) ? 'exec-contract' : 'diff-failed' };
@@ -5219,7 +5257,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo) });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
