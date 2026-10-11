@@ -9,6 +9,8 @@
  *   accepted one (`normalizeDiffFingerprint`: only text-section `index` lines and the root lane manifest are left
  *   out). That is what a pure merge/rebase of main produces. Anything else (a conflict resolution, a new commit,
  *   a fingerprint that cannot be read) is NOT carried: a review of the change is owed, as today.
+ *   The contribution tier extends this rule only when the caller supplies `headContribution`, under
+ *   `review.carryEquivalence`, using the shared helper `scripts/lib/carry-equivalence.mjs`.
  *
  *   WHY THIS EXISTS (live, #4535, 2026-10-09). The operator cleared #4535 at head fcc29ce1. The merge queue (#4619)
  *   refreshed it onto main at 14:25Z (new head 143107a87, a merge commit). The net diff stayed byte-identical
@@ -18,6 +20,8 @@
  *   WHAT IT NEVER DOES. It never widens to the contribution digest (context-insensitive): a carry needs the STRICT
  *   fingerprint. It never carries past a later verdict or a body-derived hold (manifest tamper): those are not
  *   content of the diff, so an identical diff proves nothing about them.
+ *   The contribution-tier exception requires caller-supplied `headContribution`, under
+ *   `review.carryEquivalence`, using the shared helper `scripts/lib/carry-equivalence.mjs`.
  *
  *   SETTING `acceptCarryForward` (`on` | `off`), policy cascade (card x5wnfcg): standard default (built-in `off` =
  *   today: a moved head loses a SHA-bound accept) → platform preference (`we:scripts/settings/accept-carry-forward.json`)
@@ -29,6 +33,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { compareCarryFingerprints, resolveCarryEquivalenceSetting } from './carry-equivalence.mjs';
 import { isTrustedMarkerAuthor } from './marker-authorship.mjs';
 
 export const ACCEPT_CARRY_FORWARD_SETTINGS_FILE = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'accept-carry-forward.json');
@@ -50,6 +55,7 @@ const SHA_RE = /^[0-9a-f]{40}$/;
 const FP_RE = /^[0-9a-f]{64}$/;
 const REVIEWED_SHA_RE = /<!--\s*reviewed-sha:\s*([0-9a-f]{40})\s*-->/gi;
 const REVIEWED_DIFF_RE = /<!--\s*reviewed-diff:\s*([0-9a-f]{64})\s*-->/gi;
+const REVIEWED_CONTRIBUTION_RE = /<!--\s*reviewed-contribution:\s*([0-9a-f]{64})\s*-->/gi;
 const CLEARED_HUMAN_RE = /<!--\s*cleared-human:\s*([^>]*?)\s*-->/i;
 /** A drain park whose reason is NOT a function of the diff: an identical diff proves nothing about it. */
 const BODY_DERIVED_HOLD_RE = /manifest baseline mismatch/i;
@@ -182,7 +188,7 @@ const lastMatch = (re, body) => { re.lastIndex = 0; let m; let out = null; while
  * @param {Array|null|undefined} reviews — the PR's formal reviews (`pulls/{n}/reviews`): an array = read; `null` =
  *   UNREADABLE (the record is marked `reviewsUnreadable`, which {@link decideAcceptCarryForward} refuses as a retryable
  *   read miss); `undefined` = the caller has no review channel (pure thread analysis, e.g. the sweep's planning pass).
- * @returns {{sha:string, diff:string|null, humanCleared:boolean, actor:string|null, index:number, at:string|null,
+ * @returns {{sha:string, diff:string|null, contribution:string|null, humanCleared:boolean, actor:string|null, index:number, at:string|null,
  *   laterBodyDerivedHold:boolean, laterVerdict:boolean, reviewsUnreadable:boolean}|null}
  */
 export function latestAcceptRecord(comments, reviews = undefined) {
@@ -194,7 +200,7 @@ export function latestAcceptRecord(comments, reviews = undefined) {
     const sha = body ? lastMatch(REVIEWED_SHA_RE, body) : null;
     if (!sha) return;
     const human = CLEARED_HUMAN_RE.exec(body);
-    rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index,
+    rec = { sha, diff: lastMatch(REVIEWED_DIFF_RE, body), contribution: lastMatch(REVIEWED_CONTRIBUTION_RE, body), humanCleared: !!human, actor: human ? human[1] || null : null, index,
       at: typeof c?.createdAt === 'string' ? c.createdAt : (typeof c?.created_at === 'string' ? c.created_at : null) };
   });
   if (!rec) return null;
@@ -210,14 +216,14 @@ export function latestAcceptRecord(comments, reviews = undefined) {
 /**
  * THE RULE. Facts in, verdict out. Pure.
  * @param {{setting?:'on'|'off', record?:ReturnType<typeof latestAcceptRecord>, headSha?:string|null,
- *   headDiff?:string|null, laterVerdict?:boolean}} facts — `headDiff` is the strict `normalizeDiffFingerprint` of the
+ *   headDiff?:string|null, headContribution?:string|null, equivalence?:'contribution'|'strict', laterVerdict?:boolean}} facts — `headDiff` is the strict `normalizeDiffFingerprint` of the
  *   live head's net diff (null when it could not be read).
  * @returns {{action:'off'|'none'|'same-head'|'carry'|'review-owed', from?:string, to?:string, human?:boolean,
  *   reason:string, retryable?:boolean}} — `retryable`: the refusal is a read miss, not a decision; try again later.
  *   `carry` = the accept holds on the new head (record both SHAs). `review-owed` = the net diff changed or could not
  *   be proven identical: today's path (a review of the change; a `review:human` PR goes back to the operator).
  */
-export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAULT, record = null, headSha = null, headDiff = null, laterVerdict = false } = {}) {
+export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAULT, record = null, headSha = null, headDiff = null, headContribution = null, equivalence = resolveCarryEquivalenceSetting().value, laterVerdict = false } = {}) {
   if (setting !== 'on') return { action: 'off', reason: 'acceptCarryForward is off (today: a moved head loses a SHA-bound accept)' };
   const head = typeof headSha === 'string' ? headSha.toLowerCase() : '';
   if (!record || !SHA_RE.test(record.sha ?? '')) return { action: 'none', reason: 'no trusted accept record on the PR' };
@@ -237,9 +243,13 @@ export function decideAcceptCarryForward({ setting = ACCEPT_CARRY_FORWARD_DEFAUL
   // re-derived either, so "no fingerprint" would otherwise mask the miss as a settled refusal.
   if (!FP_RE.test(live)) return { ...base, action: 'review-owed', reason: 'the live net diff could not be read; identity unproven', retryable: true };
   if (!FP_RE.test(accepted)) return { ...base, action: 'review-owed', reason: 'the accept carries no reviewed-diff fingerprint; identity unproven' };
-  if (accepted !== live) {
+  const match = compareCarryFingerprints({ mode: equivalence,
+    cleared: { diff: record.diff, contribution: record.contribution }, live: { diff: headDiff, contribution: headContribution } });
+  if (!match.same) {
     return { ...base, action: 'review-owed', reason: `net diff changed since the accept at ${record.sha.slice(0, 9)} — a review of the change is owed${record.humanCleared ? '; it goes back to the operator' : ''}` };
   }
+  if (match.tier === 'contribution') return { ...base, action: 'carry',
+    reason: `contribution tier: ${match.reason}; accept at ${record.sha.slice(0, 9)} carried to ${head.slice(0, 9)}` };
   return { ...base, action: 'carry', reason: `net diff byte-identical to the accept at ${record.sha.slice(0, 9)} (reviewed-diff ${accepted.slice(0, 12)}); accept carried to ${head.slice(0, 9)}` };
 }
 

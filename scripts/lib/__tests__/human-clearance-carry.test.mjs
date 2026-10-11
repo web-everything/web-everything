@@ -12,7 +12,7 @@ import {
   decideHumanClearanceCarry, latestHumanClearance, proveMechanicalMove, applyHumanClearanceCarry,
   resolveHumanClearanceCarrySetting, buildCarryRecordBody, HUMAN_CLEARANCE_CARRIED_MARKER, MAX_MECHANICAL_COMMITS, sanitizeActor,
 } from '../human-clearance-carry.mjs';
-import { normalizeDiffFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
+import { normalizeDiffFingerprint, normalizeContributionFingerprint, parseLatestHumanClearedSha, REVIEW_LABELS } from '../review-escalation.mjs';
 import { decideDrainReviewGate, readDrainAcceptance } from '../../merge-ai-prs.mjs';
 
 const DIFF = 'diff --git a/x.mjs b/x.mjs\n--- a/x.mjs\n+++ b/x.mjs\n@@ -1 +1 @@\n-old\n+new\n';
@@ -33,7 +33,14 @@ describe('decideHumanClearanceCarry (pure)', () => {
   const mech = { ok: true, reason: '1 merge(s) of origin/main' };
   it('carries an identical net diff across a mechanical move', () => {
     expect(decideHumanClearanceCarry({ clearance, headSha: HEAD, headDiff: DIFF, mechanical: mech }))
-      .toEqual({ carry: true, fromSha: CLEARED, toSha: HEAD, fingerprint: FP, actor: 'chalbert' });
+      .toEqual({ carry: true, fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'chalbert' });
+  });
+  it('a contribution match requires a replay proof, not just a merge proof', () => {
+    const moved = DIFF.replace('@@ -1 +1 @@', '@@ -4 +4 @@');
+    const facts = { clearance: { ...clearance, contribution: normalizeContributionFingerprint(DIFF) }, headSha: HEAD, headDiff: moved };
+    expect(decideHumanClearanceCarry({ ...facts, mechanical: { ok: true, kind: 'merge', reason: 'merge' } }))
+      .toEqual({ carry: false, reason: 'not a mechanical move: a context-only match needs the replay proof (merge)' });
+    expect(decideHumanClearanceCarry({ ...facts, mechanical: { ok: true, kind: 'replay', reason: 'replay' } })).toMatchObject({ carry: true, tier: 'contribution' });
   });
   it.each([
     ['setting off', { enabled: false }, 'off'],
@@ -53,7 +60,7 @@ describe('decideHumanClearanceCarry (pure)', () => {
 
 describe('latestHumanClearance', () => {
   it('reads the sha and diff from the SAME latest human comment', () => {
-    expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, actor: 'chalbert' });
+    expect(latestHumanClearance([clearHumanComment(CLEARED)])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert' });
   });
   it('a later plain accept means no clearance to carry', () => {
     expect(latestHumanClearance([clearHumanComment(CLEARED), plainAccept(HEAD)])).toBe(null);
@@ -62,7 +69,7 @@ describe('latestHumanClearance', () => {
     expect(latestHumanClearance([{ author: { login: 'mallory' }, body: clearHumanComment(CLEARED).body }])).toBe(null);
   });
   it('a diff-less clearance does NOT inherit an older accept\'s reviewed-diff', () => {
-    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, actor: 'chalbert' });
+    expect(latestHumanClearance([plainAccept(PR4722.r1), clearHumanComment(CLEARED, null)])).toEqual({ sha: CLEARED, diff: null, contribution: null, actor: 'chalbert' });
   });
   it('a clearance with an empty actor is not an attributed clearance', () => {
     const c = { author: { login: 'chalbert' }, body: `<!-- reviewed-sha: ${CLEARED} -->\n<!-- reviewed-diff: ${FP} -->\n<!-- cleared-human: -->` };
@@ -71,7 +78,7 @@ describe('latestHumanClearance', () => {
   it('a short or mixed-case sha is not compared or fed to git', () => {
     const short = clearHumanComment(CLEARED.slice(0, 12));
     expect(latestHumanClearance([short])).toBe(null);
-    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, actor: 'chalbert' });
+    expect(latestHumanClearance([clearHumanComment(CLEARED.toUpperCase())])).toEqual({ sha: CLEARED, diff: FP, contribution: null, actor: 'chalbert' });
   });
   it('the actor comes from the clearance comment, never from an untrusted later forgery', () => {
     const forged = { author: { login: 'mallory' }, body: '<!-- cleared-human: evil -->' };
@@ -124,14 +131,98 @@ describe('proveMechanicalMove (real git)', () => {
       expect(r.reason).toContain('not a merge');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  it('a history rewrite (rebase) is not', () => {
+  it.each([false, true])('author commits reverting to identical content are not mechanical (requireReplay=%s)', (requireReplay) => {
+    const { dir, g, cleared } = setup();
+    try {
+      g('merge', '-q', '--no-edit', 'main');
+      const mergedTree = g('rev-parse', 'HEAD^{tree}');
+      writeFileSync(join(dir, 'x.txt'), 'unreviewed\n'); g('add', '.'); g('commit', '-qm', 'author push');
+      g('revert', '--no-edit', 'HEAD');
+      expect(g('rev-parse', 'HEAD^{tree}')).toBe(mergedTree);
+      const r = proveMechanicalMove({ exec: exec(dir), fromSha: cleared, toSha: g('rev-parse', 'HEAD'), mainRef: 'main', requireReplay });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain('not a merge');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('a content-preserving rebase is mechanical (requireReplay=%s)', (requireReplay) => {
     const { dir, g, cleared } = setup();
     try {
       g('rebase', '-q', 'main');
-      const r = proveMechanicalMove({ exec: exec(dir), fromSha: cleared, toSha: g('rev-parse', 'HEAD'), mainRef: 'main' });
-      expect(r.ok).toBe(false);
-      expect(r.reason).toContain('not an ancestor');
+      const r = proveMechanicalMove({ exec: exec(dir), fromSha: cleared, toSha: g('rev-parse', 'HEAD'), mainRef: 'main', requireReplay });
+      expect(r).toMatchObject({ ok: true, kind: 'replay' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('fetches a cleared head absent from a real clone before checking ancestry', () => {
+    const { dir, g, cleared } = setup();
+    const clone = mkdtempSync(join(tmpdir(), 'we-hcc-clone-'));
+    try {
+      g('branch', 'cleared', cleared);
+      g('rebase', '-q', 'main');
+      const head = g('rev-parse', 'HEAD');
+      // Transport cloning only lane excludes the old head retained by origin's cleared ref.
+      g('clone', '--no-local', '--single-branch', '--branch', 'lane', dir, clone);
+      const run = exec(clone);
+      expect(() => run('git', ['cat-file', '-e', `${cleared}^{commit}`], { stdio: 'pipe' })).toThrow();
+      run('git', ['fetch', '--no-tags', '-q', 'origin', 'main:refs/remotes/origin/main']);
+      const tracked = vi.fn(run);
+      expect(proveMechanicalMove({ exec: tracked, fromSha: cleared, toSha: head })).toMatchObject({ ok: true, kind: 'replay' });
+      const calls = tracked.mock.calls.map(([, args]) => args);
+      expect(calls.filter((args) => args[0] === 'fetch')).toEqual([['fetch', '--no-tags', '-q', 'origin', cleared]]);
+      expect(calls.slice(0, 5)).toEqual([
+        ['cat-file', '-e', `${cleared}^{commit}`],
+        ['fetch', '--no-tags', '-q', 'origin', cleared],
+        ['cat-file', '-e', `${cleared}^{commit}`],
+        ['cat-file', '-e', `${head}^{commit}`],
+        ['merge-base', '--is-ancestor', cleared, head],
+      ]);
+    } finally {
+      rmSync(clone, { recursive: true, force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it.each([CLEARED, HEAD])('refuses unreadable commit %s before ancestry', (missing) => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'fetch' || (args[0] === 'cat-file' && args[2] === `${missing}^{commit}`)) throw new Error('missing');
+      return '';
+    });
+    expect(proveMechanicalMove({ exec, fromSha: CLEARED, toSha: HEAD })).toMatchObject({ ok: false, reason: expect.stringContaining('not readable locally') });
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'merge-base')).toBe(false);
+    expect(exec.mock.calls.filter(([, args]) => args[0] === 'fetch').map(([, args]) => args)).toEqual([['fetch', '--no-tags', '-q', 'origin', missing]]);
+  });
+  it('a rebase that changes one added line is not mechanical', () => {
+    const { dir, g, cleared } = setup();
+    try {
+      g('rebase', '-q', 'main');
+      writeFileSync(join(dir, 'x.txt'), 'changed\n'); g('add', '.'); g('commit', '--amend', '--no-edit');
+      const head = g('rev-parse', 'HEAD');
+      const r = proveMechanicalMove({ exec: exec(dir), fromSha: cleared, toSha: head, mainRef: 'main' });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain(`cleared head ${cleared.slice(0, 9)} is not an ancestor of ${head.slice(0, 9)} — `);
+      expect(r.reason).toContain('differs from the cleared change replayed onto main');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a merge of main requiring replay also proves its tree', () => {
+    const { dir, g, cleared } = setup();
+    try {
+      g('merge', '-q', '--no-edit', 'main');
+      const facts = { exec: exec(dir), fromSha: cleared, mainRef: 'main', requireReplay: true };
+      expect(proveMechanicalMove({ ...facts, toSha: g('rev-parse', 'HEAD') })).toMatchObject({ ok: true, kind: 'replay' });
+      writeFileSync(join(dir, 'x.txt'), 'unreviewed resolution\n'); g('add', '.'); g('commit', '--amend', '--no-edit');
+      const r = proveMechanicalMove({ ...facts, toSha: g('rev-parse', 'HEAD') });
+      expect(r.ok).toBe(false);
+      expect(r.reason).toContain('differs from the cleared change replayed onto main');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it.each(['head', 'parent'])('ancestry git errors refuse without replay (%s check)', (check) => {
+    const exec = vi.fn((_cmd, args) => {
+      if (args[0] === 'rev-list') return `${HEAD} parent1 parent2`;
+      if (args[0] === 'merge-base' && (check === 'head' || args[2] === 'parent1')) {
+        throw Object.assign(new Error('git read failed'), { status: 128 });
+      }
+      return '';
+    });
+    expect(proveMechanicalMove({ exec, fromSha: CLEARED, toSha: HEAD })).toMatchObject({ ok: false, reason: expect.stringContaining('git read failed') });
+    expect(exec.mock.calls.some(([, args]) => args[0] === 'merge-tree')).toBe(false);
   });
   it('fails closed when git throws', () => {
     const exec = () => { throw new Error('git exploded'); };
@@ -173,10 +264,15 @@ const graphExec = ({ parents, main, onComment = () => {}, view = null, tip = vie
   if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
   const ancestors = (sha) => { const seen = new Set(); const st = [sha]; while (st.length) { const s = st.pop(); if (seen.has(s)) continue; seen.add(s); st.push(...(parents[s] || [])); } return seen; };
   const mainSet = new Set([...main].flatMap((m) => [...ancestors(m)]));
+  if (args[0] === 'cat-file' && args[1] === '-e') {
+    const sha = args[2].replace(/\^\{commit\}$/, '');
+    if (!Object.hasOwn(parents, sha) && !Object.values(parents).some((ps) => ps.includes(sha))) throw new Error('missing commit');
+    return '';
+  }
   if (args[0] === 'merge-base' && args[1] === '--is-ancestor') {
     const [a, b] = args.slice(2);
     const ok = b === 'origin/main' ? mainSet.has(a) : ancestors(b).has(a);
-    if (!ok) throw new Error('not ancestor');
+    if (!ok) throw Object.assign(new Error('not ancestor'), { status: 1 });
     return '';
   }
   if (args[0] === 'rev-list') {
@@ -342,13 +438,13 @@ describe('sanitizeActor', () => {
 
 describe('buildCarryRecordBody', () => {
   it('binds reviewed-sha and cleared-human to the new head in one comment', () => {
-    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, actor: 'chalbert', headDiffText: DIFF });
+    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'chalbert', headDiffText: DIFF });
     expect(body).toContain(`<!-- reviewed-sha: ${HEAD} -->`);
     expect(body).toContain(`<!-- reviewed-diff: ${FP} -->`);
     expect(body).toContain('<!-- cleared-human: chalbert -->');
   });
   it('neutralises newlines, markup, mentions and links in the actor wherever it is rendered', () => {
-    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF });
+    const body = buildCarryRecordBody({ fromSha: CLEARED, toSha: HEAD, fingerprint: FP, tier: 'strict', actor: 'ev\nil <b>@victim</b> [x](http://e) `c`', headDiffText: DIFF });
     const prose = body.split('\n').find((l) => l.startsWith('Recorded by drain'));
     expect(prose).toContain('ev il');
     expect(prose).not.toMatch(/@|<|>|\]\(|`c`/);
@@ -441,5 +537,48 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     const { exec, calls } = movingTipExec();
     read(exec);
     expect(calls.filter((c) => c.startsWith('git merge-base')).at(-1)).toContain(NEW_TIP);
+  });
+});
+
+describe('PR #4715 context movement and manifest-drop replay', () => {
+  it.each(['strict', 'contribution', 'default', 'changed'])('%s policy through the durable carry', (mode) => {
+    const dir = mkdtempSync(join(tmpdir(), 'we-4715-'));
+    const g = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    const content = 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n';
+    const commit = (text) => { writeFileSync(join(dir, 'f.txt'), text); g('add', '.'); g('commit', '-qm', 'change'); };
+    try {
+      g('init', '-q', '-b', 'main'); commit(content);
+      const oldBase = g('rev-parse', 'HEAD');
+      g('checkout', '-qb', 'lane'); writeFileSync(join(dir, '.lane-manifest.json'), '{}'); commit(content.replace('five', 'lane'));
+      const cleared = g('rev-parse', 'HEAD');
+      const oldDiff = g('diff', oldBase, cleared);
+      g('checkout', '-q', 'main'); commit(content.replace('three', 'main'));
+      const newBase = g('rev-parse', 'HEAD');
+      g('checkout', '-qb', 'replayed'); commit(content.replace('three', 'main').replace('five', mode === 'changed' ? 'different' : 'lane'));
+      const headSha = g('rev-parse', 'HEAD');
+      const headDiff = g('diff', newBase, headSha);
+      const comment = clearHumanComment(cleared, normalizeDiffFingerprint(oldDiff));
+      comment.body += `\n<!-- reviewed-contribution: ${normalizeContributionFingerprint(oldDiff)} -->`;
+      const humanClearance = latestHumanClearance([comment]);
+      expect(normalizeDiffFingerprint(headDiff)).not.toBe(humanClearance.diff);
+      const posted = []; const logs = [];
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'git') return execFileSync(cmd, args, { ...opts, cwd: dir });
+        expect([cmd, ...args.slice(0, 2)]).toEqual(['gh', 'pr', 'comment']);
+        posted.push(args[args.indexOf('--body') + 1]); return '';
+      };
+      const result = applyHumanClearanceCarry({ evidence: { humanClearance, headSha, headDiff, headDiffSha: headSha }, pr: 4715, cwd: dir, exec, dryRun: false, mainRef: 'main', setting: ON, log: (s) => logs.push(s), ...(mode === 'default' ? {} : { equivalence: mode === 'changed' ? 'contribution' : mode }) });
+      if (mode === 'strict' || mode === 'changed') {
+        expect(result).toBe(null); expect(posted).toHaveLength(0);
+        expect(logs.join('')).toContain('net diff changed');
+      } else {
+        expect(result.carried).toMatchObject({ recorded: true, tier: 'contribution', mechanicalReason: expect.stringContaining('replay') });
+        expect(posted).toHaveLength(1);
+        expect(posted[0]).toContain(`human-clearance-carried: from=${cleared} to=${headSha}`);
+        expect(posted[0]).toContain("added/removed lines are identical");
+        expect(posted[0]).not.toContain('byte-identical');
+        expect(logs.join('')).toContain('tier contribution');
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
