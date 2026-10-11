@@ -11,9 +11,12 @@
  *     `unfreeze` clears locally, then publishes an EXPLICIT clear (`clear: true`). `publish` republishes the local
  *     freeze and REFUSES when there is none: "no marker" (a clone without the gitignored file, or a corrupt one) is
  *     never a clear, so only `unfreeze` can publish `frozen:false`. The local marker stays the drain's own source.
- *   - READER: {@link readSharedFreeze} → `facts.redMain = {source, frozen, reason}` for the merge-gate evaluator.
- *     Anything it cannot read or trust (no branch, no file, bad JSON, no boolean `frozen`) is `{source, error}`,
- *     which the evaluator turns into FAIL CLOSED — never into "not frozen".
+ *   - READER: {@link readSharedFreeze} → the merge-gate's MANUAL-freeze input. Since the operator ruling of 2026-10-11
+ *     the gate's authority for "is main red" is main's OWN CI status, read from GitHub (`merge-gate-check.mjs`
+ *     `readMainCiFact`), so a publisher that keeps failing can never hide a red main; this copy only adds manual
+ *     freezes. Anything it cannot read or trust (no branch, no file, bad JSON, no boolean `frozen`) is
+ *     `{source, error}`, which the evaluator turns into FAIL CLOSED — never into "not frozen". Its text fields are
+ *     flattened ({@link flatText}) before they reach a log.
  *   - The branch name is a policy-cascade knob: `mergeDelivery.redMainFreezeBranch` (default `ops/red-main-freeze`),
  *     validated to `ops/<slug>` so the writer can never push to main or a lane.
  *
@@ -76,6 +79,14 @@ export function buildSharedFreezeDoc(marker, { now = () => new Date().toISOStrin
 const refusal = (message) => Object.assign(new Error(message), { refusal: true });
 
 /**
+ * Branch text is untrusted (anyone who can push the ops branch): control characters, CR/LF and U+2028/2029 become
+ * spaces (no `::workflow-command::` line can start inside a log line) and the length is capped. Pure.
+ */
+export function flatText(v, max = 200) {
+  return [...String(v)].map((c) => { const n = c.charCodeAt(0); return n < 32 || n === 127 || n === 0x2028 || n === 0x2029 ? ' ' : c; }).join('').slice(0, max);
+}
+
+/**
  * Push the state to the shared branch. Throws on any git failure (the caller decides what that means).
  * `lifted` (a clear only): the local marker the clear lifts. The clear is computed against the FRESH tip and refused
  * when the tip carries a different freeze — one another writer pushed after this clear's local check, which a plain
@@ -94,7 +105,7 @@ export function publishSharedFreeze({ marker, clear = false, lifted, board = REP
       let tip = null;
       try { tip = existing == null ? null : JSON.parse(existing); } catch { tip = null; } // a corrupt copy is not a freeze to protect
       if (tip?.frozen === true && (tip.at ?? null) !== (lifted.at ?? null)) {
-        const flat = (v) => [...String(v ?? '?')].map((c) => { const n = c.charCodeAt(0); return n < 32 || n === 127 || n === 0x2028 || n === 0x2029 ? ' ' : c; }).join('').slice(0, 120); // branch text is untrusted (newlines, CR, line separators)
+        const flat = (v) => flatText(v ?? '?', 120);
         throw refusal(`red-main-freeze-shared: refusing to clear — the shared copy carries a DIFFERENT freeze (at ${flat(tip.at)}: ${flat(tip.reason)}) than the one lifted here (at ${flat(lifted.at)}); if that one should be lifted too, re-run unfreeze (no local marker remains, so it clears)`);
       }
       return text;
@@ -179,5 +190,6 @@ export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBran
   let doc;
   try { doc = JSON.parse(text); } catch { return { source, error: `${SHARED_FREEZE_FILE} is not JSON` }; }
   if (!doc || typeof doc.frozen !== 'boolean') return { source, error: `${SHARED_FREEZE_FILE} has no boolean "frozen"` };
-  return { source, frozen: doc.frozen, reason: doc.reason ?? null, at: doc.at ?? null, publishedAt: doc.publishedAt ?? null };
+  const clean = (v) => (v == null ? null : flatText(v)); // printed to the CI log and the hold reason: never raw
+  return { source, frozen: doc.frozen, reason: clean(doc.reason), at: clean(doc.at), publishedAt: clean(doc.publishedAt) };
 }

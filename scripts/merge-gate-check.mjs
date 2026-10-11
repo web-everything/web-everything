@@ -47,11 +47,12 @@ import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
 import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
 import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
+import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
 
-const PR_FIELDS = 'number,title,body,labels,commits,headRefName,headRefOid,baseRefName,statusCheckRollup,isCrossRepository';
+const PR_FIELDS = 'number,title,body,labels,commits,headRefName,headRefOid,baseRefName,statusCheckRollup,isCrossRepository,author';
 const BODY_HISTORY_QUERY = 'query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}';
 const SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -154,7 +155,7 @@ export function readLedgerConfig(read = readDeclaredSettings) {
 }
 
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
   const facts = { repo, num };
   // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
   // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. The ledger evidence
@@ -233,9 +234,9 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   else if (groupDuplicateIds && !Array.isArray(groupDuplicateIds)) facts.duplicateIds = { error: `group tree scan: ${groupDuplicateIds.error || 'unreadable'}` };
   else facts.duplicateIds = { main: mainDup, ...(groupDuplicateIds ? { group: groupDuplicateIds } : {}) };
 
-  // Red-main freeze: the SHARED copy on the ops branch (xyd06qo), read once per run by the caller. Not passed, or
-  // unreadable → `{source:null}` / `{error}` → the evaluator fails closed.
-  facts.redMain = redMain ?? { source: null };
+  // Red-main: main's OWN CI status (the source of truth) combined with the shared MANUAL freeze (xyd06qo), both read
+  // once per run by the caller. Either missing or unreadable → `{source:null}` / `{error}` → the evaluator fails closed.
+  facts.redMain = redMain ? combineRedMain(redMain, mainCi, pr) : { source: null };
   // Enqueue clearance (drain-stamped) is not wired yet → manifest couples/blockedBy fail closed in the evaluator.
   facts.enqueueClearance = null;
   return facts;
@@ -313,17 +314,68 @@ export function readRedMainFact({ cwd, policy, read = readSharedFreeze }) {
   return read({ board: cwd, branch: policy.redMainFreezeBranch });
 }
 
+/** How many of main's CI runs to read: enough to find the last green one behind a short red streak. */
+const MAIN_CI_RUNS = 30;
+
 /**
- * The freeze RE-READ right before the verdict (PR 4715 review): fact-gathering between the first read and the verdict
- * is slow and untimed, so a freeze published meanwhile must still hold this run. A PASS survives only when the second
- * read is readable, not frozen, and the same document as the first; anything else holds (fail closed). Pure.
+ * MAIN'S OWN CI STATUS, read straight from GitHub (operator ruling 2026-10-11, PR 4715): main's CI workflow runs on
+ * the default branch, judged by the same pure rule the red-main owner uses (`mainRedState`). A freeze publisher that
+ * keeps failing can then never hide a red main. Unreadable, or no finished run to judge, is `{source, error}`
+ * (fail closed). Bounded (timeout + maxBuffer). Never throws.
+ * @returns {{source:string, red?:boolean, firstRedSha?:string|null, error?:string}}
  */
-export function applyFreezeRecheck(verdict, first, recheck) {
+export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSync, workflow = MAIN_CI_RED_DEFAULTS.mainCiRedWorkflow }) {
+  const source = `${workflow}@${defaultBranch}`;
+  let runs;
+  try {
+    runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--limit', String(MAIN_CI_RUNS),
+      '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
+  } catch (e) { return { source, error: `main CI unreadable: ${firstLine(e)}` }; }
+  const st = mainRedState(runs);
+  if (st.status === 'unknown') return { source, error: `main CI status unknown (${st.reason})` };
+  return { source, red: st.status === 'red', firstRedSha: st.firstRed?.sha || null };
+}
+
+/**
+ * The drain's "only the main-fix PR lands" while main is red (`decideRedMainHold`, the `main-fix` queue class): the
+ * red-main owner's branch (`mainCiRedOwnerBranchPrefix`), from this repo, opened by the conveyor. Pure.
+ */
+export function isMainFixPr(pr) {
+  return !!pr && pr.isCrossRepository === false && String(pr.headRefName ?? '').startsWith(MAIN_CI_RED_DEFAULTS.mainCiRedOwnerBranchPrefix) && isTrustedPrAuthor(pr);
+}
+
+/**
+ * The red-main fact the evaluator judges: main's CI status is the authority; the shared freeze carries only MANUAL
+ * freezes, which hold every PR. Anything unreadable is `{error}` (fail closed). Pure.
+ */
+export function combineRedMain(freeze, mainCi, pr = null) {
+  const source = [freeze?.source, mainCi?.source].filter(Boolean).join(' + ');
+  if (freeze?.error) return { source, error: freeze.error };
+  if (!mainCi) return { source, error: 'main CI status not read' };
+  if (mainCi.error) return { source, error: mainCi.error };
+  if (freeze?.frozen) return { source, frozen: true, reason: `manual freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
+  const sha = mainCi.firstRedSha ? ` since ${String(mainCi.firstRedSha).slice(0, 9)}` : '';
+  if (mainCi.red && !isMainFixPr(pr)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt ?? null };
+  return { source: mainCi.red ? `${source} (main CI red${sha}; main-fix PR exempt)` : source, frozen: false, reason: null, publishedAt: freeze?.publishedAt ?? null };
+}
+
+/**
+ * The red-main sources RE-READ right before the verdict (PR 4715 review): fact-gathering between the first reads and
+ * the verdict is slow, so a freeze published, or main turning red, meanwhile must still hold this run. A PASS survives
+ * only when the second freeze read is readable, not frozen and the same document as the first, and main's CI is
+ * readable and not red (unless every PR judged is the main-fix PR: `exempt`). Anything else holds (fail closed). Pure.
+ */
+export function applyFreezeRecheck(verdict, first, recheck, { mainCi = undefined, mainCiRecheck = undefined, exempt = false } = {}) {
   if (!verdict.ok) return verdict;
-  const why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${recheck?.error || 'not read'}`
+  let why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${recheck?.error || 'not read'}`
     : recheck.frozen ? `main went RED during this run (freeze: ${recheck.reason || 'active'})`
       : (first?.frozen !== recheck.frozen || (first?.publishedAt ?? null) !== (recheck.publishedAt ?? null)) ? 'red-main freeze changed during this run'
         : null;
+  if (!why && mainCi !== undefined) {
+    why = !mainCiRecheck || mainCiRecheck.error ? `main CI unreadable at verdict time: ${mainCiRecheck?.error || 'not read'}`
+      : mainCiRecheck.red && !exempt ? `main CI went RED during this run${mainCiRecheck.firstRedSha ? ` (since ${String(mainCiRecheck.firstRedSha).slice(0, 9)})` : ''}`
+        : null;
+  }
   return why ? { ...verdict, ok: false, reason: `${why} — fail closed; ${verdict.reason}` } : verdict;
 }
 
@@ -380,17 +432,25 @@ async function main() {
   // One read of the shared red-main freeze for the whole run (xyd06qo); branch name from the same policy cascade.
   const redMain = readRedMainFact({ cwd, policy });
   process.stderr.write(`red-main freeze (${redMain.source}): ${redMain.error ? `UNREADABLE — ${redMain.error}` : redMain.frozen ? `FROZEN — ${redMain.reason}` : 'clear'}\n`);
+  // Main's OWN CI status — the authority for "is main red" (operator ruling 2026-10-11); the freeze above is manual only.
+  const mainCi = readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' });
+  process.stderr.write(`main CI (${mainCi.source}): ${mainCi.error ? `UNREADABLE — ${mainCi.error}` : mainCi.red ? `RED since ${String(mainCi.firstRedSha || '?').slice(0, 9)}` : 'green'}\n`);
   const ledgerConfig = readLedgerConfig();
   const expectHead = typeof f['expect-head'] === 'string' && f['expect-head'] ? f['expect-head'] : null;
   if (expectHead && nums.length !== 1) { process.stderr.write('merge-gate-check: --expect-head pins exactly one --pr\n'); process.exit(3); }
   const pinOf = (num) => (f['merge-group'] ? { expectedHeadSha: membership?.heads?.[num] ?? null, requireExpectedHead: true } : { expectedHeadSha: expectHead });
-  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, redMain, ...pinOf(num) }), { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
+  const factsOf = nums.map((num) => gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, redMain, mainCi, ...pinOf(num) }));
+  const prs = factsOf.map((facts) => evaluatePrGates(facts, { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`merge-gate: workflow self-check — ${wfCheck.ok ? 'ok' : 'FAIL'}: ${wfCheck.reason}\n`);
   const base = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
   const preRecheck = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
-  // Re-read the freeze last: the facts above can take minutes, and a freeze published meanwhile must still hold.
-  const verdict = preRecheck.ok ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy })) : preRecheck;
+  // Re-read both red-main sources last: the facts above can take minutes, and a freeze published (or main turning
+  // red) meanwhile must still hold. Only a run made entirely of main-fix PRs may pass a red main.
+  const verdict = preRecheck.ok
+    ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy }), {
+      mainCi, mainCiRecheck: readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' }), exempt: factsOf.length > 0 && factsOf.every((x) => isMainFixPr(x.pr)) })
+    : preRecheck;
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, workflowCheck: wfCheck, policy, prs }, null, 2)}\n`);
   else {
     for (const p of prs) writeAllSync(1, `${formatPrResult(p)}\n`);

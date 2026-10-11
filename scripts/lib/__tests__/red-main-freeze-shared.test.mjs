@@ -15,7 +15,8 @@ import {
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
-import { applyFreezeRecheck, gatherPrFacts, readRedMainFact } from '../../merge-gate-check.mjs';
+import { applyFreezeRecheck, gatherPrFacts, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
+import { isTrustedPrAuthor } from '../../conveyor/main-ci-red-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = resolve(HERE, '..', '..', 'readiness', 'red-main-remediation.mjs');
@@ -432,6 +433,112 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
   });
 });
 
+describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 2026-10-11, PR 4715)', () => {
+  const RED_SHA = 'b'.repeat(40);
+  const run = (conclusion, createdAt, headSha = RED_SHA, status = 'completed') => ({ databaseId: Date.parse(createdAt), status, conclusion, createdAt, updatedAt: createdAt, headSha });
+  const RED_RUNS = [run('success', '2026-10-11T00:00:00Z', 'a'.repeat(40)), run('failure', '2026-10-11T01:00:00Z')];
+  const GREEN_RUNS = [run('failure', '2026-10-11T00:00:00Z'), run('success', '2026-10-11T01:00:00Z', 'c'.repeat(40))];
+  const CLEAR = { source: `${BRANCH}:${SHARED_FREEZE_FILE}`, frozen: false, reason: null, publishedAt: 't0' };
+  const MANUAL = { source: `${BRANCH}:${SHARED_FREEZE_FILE}`, frozen: true, reason: 'operator stop', publishedAt: 't1' };
+  const ghRuns = (runs) => (cmd, args) => {
+    if (cmd === 'gh' && args[0] === 'run' && args[1] === 'list') { if (runs instanceof Error) throw runs; return JSON.stringify(runs); }
+    throw new Error(`stub: ${cmd} ${args.join(' ')}`);
+  };
+  const prExec = (pr) => (cmd, args) => {
+    if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view') return JSON.stringify(pr);
+    throw new Error(`stub: ${cmd} ${args.join(' ')}`);
+  };
+  const row = ({ freeze = CLEAR, runs = GREEN_RUNS, pr = { ...PR, headRefName: 'lane/x' } } = {}) => {
+    const mainCi = readMainCiFact({ repo: 'o/r', defaultBranch: 'main', exec: ghRuns(runs) });
+    const f = gatherPrFacts({ repo: 'o/r', num: 1, cwd: '/nowhere', defaultBranch: 'main', ledgerConfig: { authority: 'labels' }, exec: prExec(pr), redMain: freeze, mainCi });
+    return evaluatePrGates(f).results.find((r) => r.id === 'red-main-freeze');
+  };
+  const TRUSTED = { login: 'app/web-everything' };
+  const FIX_PR = { ...PR, headRefName: 'lane/main-fix-bbbbbbbbb', isCrossRepository: false, author: TRUSTED };
+
+  it('shared copy CLEAR but main\'s own CI is RED → HOLD (a failing freeze publisher can never hide a red main)', () => {
+    expect(row({ runs: RED_RUNS })).toMatchObject({ status: 'hold' });
+    expect(row({ runs: RED_RUNS }).reason).toMatch(/main CI red since bbbbbbbbb/);
+  });
+
+  it('shared clear and main CI green → pass', () => {
+    expect(row()).toMatchObject({ status: 'pass' });
+  });
+
+  it.each([
+    ['the runs read fails', Object.assign(new Error('HTTP 403'), { stderr: 'HTTP 403: Resource not accessible by integration' }), /main CI unreadable.*403/],
+    ['no finished run in the window', [run('', '2026-10-11T01:00:00Z', RED_SHA, 'in_progress')], /main CI status unknown \(no-finished-run\)/],
+    ['the reply is not a list', { nope: true }, /main CI status unknown \(runs-unreadable\)/],
+  ])('main CI status unreadable (%s) → FAIL CLOSED', (_n, runs, msg) => {
+    const r = row({ runs });
+    expect(r).toMatchObject({ status: 'fail-closed' });
+    expect(r.reason).toMatch(msg);
+  });
+
+  it('a hostile freeze reason (newline + workflow command, huge) is flattened and capped before it reaches the log', () => {
+    const LS = String.fromCharCode(0x2028);
+    const redMain = readSharedFreeze({ board: '/b', branch: BRANCH, run: reader({ text: JSON.stringify({ frozen: true, reason: `x\n::add-mask::secret\r${LS}::error::y${'z'.repeat(5000)}` }) }) });
+    expect(/[\n\r]/.test(redMain.reason) || redMain.reason.includes(LS)).toBe(false);
+    expect(redMain.reason.length).toBeLessThanOrEqual(200);
+    expect(row({ freeze: redMain }).reason).not.toMatch(/\n::/);
+  });
+
+  it('main CI not read at all → FAIL CLOSED (never treated as green)', () => {
+    const f = gatherPrFacts({ repo: 'o/r', num: 1, cwd: '/nowhere', defaultBranch: 'main', ledgerConfig: { authority: 'labels' }, exec: prExec(PR), redMain: CLEAR });
+    expect(evaluatePrGates(f).results.find((r) => r.id === 'red-main-freeze')).toMatchObject({ status: 'fail-closed' });
+  });
+
+  it('a MANUAL freeze on the shared copy still holds while main CI is green', () => {
+    expect(row({ freeze: MANUAL })).toMatchObject({ status: 'hold' });
+    expect(row({ freeze: MANUAL }).reason).toMatch(/manual freeze: operator stop/);
+  });
+
+  it('the trusted main-fix PR (lane/main-fix-*, same repo) passes while main CI is red — the drain\'s "only the main-fix PR lands"', () => {
+    expect(isTrustedPrAuthor({ author: TRUSTED })).toBe(true);
+    expect(row({ runs: RED_RUNS, pr: FIX_PR })).toMatchObject({ status: 'pass' });
+  });
+
+  it.each([
+    ['an untrusted author', { ...FIX_PR, author: { login: 'someone-else' } }],
+    ['no author', { ...FIX_PR, author: undefined }],
+    ['a fork (cross-repository)', { ...FIX_PR, isCrossRepository: true }],
+    ['another branch prefix', { ...FIX_PR, headRefName: 'lane/x-main-fix-b' }],
+  ])('the main-fix exemption is refused for %s → HOLD', (_n, pr) => {
+    expect(row({ runs: RED_RUNS, pr })).toMatchObject({ status: 'hold' });
+  });
+
+  it('a MANUAL freeze holds even the main-fix PR', () => {
+    expect(row({ freeze: MANUAL, runs: RED_RUNS, pr: FIX_PR })).toMatchObject({ status: 'hold' });
+  });
+
+  it('readMainCiFact reads main\'s CI WORKFLOW by name, bounded (timeout + maxBuffer)', () => {
+    let seen;
+    readMainCiFact({ repo: 'o/r', defaultBranch: 'trunk', exec: (cmd, args, opts) => { seen = { cmd, args, opts }; return '[]'; } });
+    expect(seen.cmd).toBe('gh');
+    expect(seen.args).toEqual(expect.arrayContaining(['run', 'list', '--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'trunk']));
+    expect(seen.opts).toMatchObject({ timeout: expect.any(Number), maxBuffer: expect.any(Number) });
+  });
+
+  describe('main CI is RE-READ right before the verdict too', () => {
+    const PASS = { ok: true, reason: 'all pass' };
+    const green = { source: 'ci', red: false };
+    it('main went red during the run → HOLD', () => {
+      const v = applyFreezeRecheck(PASS, CLEAR, CLEAR, { mainCi: green, mainCiRecheck: { source: 'ci', red: true, firstRedSha: RED_SHA } });
+      expect(v.ok).toBe(false);
+      expect(v.reason).toMatch(/main CI went RED during this run/);
+    });
+    it('main CI unreadable at verdict time → HOLD', () => {
+      expect(applyFreezeRecheck(PASS, CLEAR, CLEAR, { mainCi: green, mainCiRecheck: { source: 'ci', error: 'HTTP 502' } }).reason).toMatch(/main CI unreadable at verdict time: HTTP 502/);
+    });
+    it('a run made only of main-fix PRs keeps its PASS while main is red', () => {
+      expect(applyFreezeRecheck(PASS, CLEAR, CLEAR, { mainCi: { source: 'ci', red: true }, mainCiRecheck: { source: 'ci', red: true }, exempt: true })).toEqual(PASS);
+    });
+    it('main still green → PASS stands', () => {
+      expect(applyFreezeRecheck(PASS, CLEAR, CLEAR, { mainCi: green, mainCiRecheck: green })).toEqual(PASS);
+    });
+  });
+});
+
 describe('merge-gate-check threads the shared freeze into the gate facts (PR 4715 review)', () => {
   const stubExec = (prJson) => (cmd, args) => {
     if (cmd === 'gh' && args[0] === 'pr' && args[1] === 'view' && /^number,title/.test(args[args.indexOf('--json') + 1] || '')) return JSON.stringify(prJson);
@@ -439,9 +546,11 @@ describe('merge-gate-check threads the shared freeze into the gate facts (PR 471
   };
   const facts = (redMain) => gatherPrFacts({ repo: 'o/r', num: 1, cwd: '/nowhere', defaultBranch: 'main', ledgerConfig: { authority: 'labels' }, exec: stubExec({ ...PR, headRefName: 'lane/x' }), ...(redMain === undefined ? {} : { redMain }) });
 
-  it('a supplied redMain lands in facts.redMain unchanged', () => {
+  it('a supplied shared freeze lands in facts.redMain combined with main CI (a frozen copy holds as a MANUAL freeze)', () => {
     const redMain = { source: `${BRANCH}:${SHARED_FREEZE_FILE}`, frozen: true, reason: 'post-land red' };
-    expect(facts(redMain).redMain).toBe(redMain);
+    const f = gatherPrFacts({ repo: 'o/r', num: 1, cwd: '/nowhere', defaultBranch: 'main', ledgerConfig: { authority: 'labels' }, exec: stubExec({ ...PR, headRefName: 'lane/x' }), redMain, mainCi: { source: 'ci.yml@main', red: false } });
+    expect(f.redMain).toMatchObject({ frozen: true, reason: 'manual freeze: post-land red' });
+    expect(f.redMain.source).toContain(`${BRANCH}:${SHARED_FREEZE_FILE}`);
   });
 
   it('no redMain supplied → {source:null}, which the gate fails closed on', () => {
@@ -486,7 +595,17 @@ describe('merge-gate-check threads the shared freeze into the gate facts (PR 471
       const src = readFileSync(resolve(HERE, '..', '..', 'merge-gate-check.mjs'), 'utf8');
       const main = src.slice(src.indexOf('async function main()'));
       expect(main.indexOf('applyFreezeRecheck(preRecheck, redMain, readRedMainFact(')).toBeGreaterThan(main.indexOf('gatherPrFacts('));
-      expect(main).toMatch(/const verdict = preRecheck\.ok \? applyFreezeRecheck\(/);
+      expect(main).toMatch(/const verdict = preRecheck\.ok\s*\?\s*applyFreezeRecheck\(/);
+    });
+    it('main() reads main CI once before the facts, passes it to every gatherPrFacts, and re-reads it for the verdict', () => {
+      const src = readFileSync(resolve(HERE, '..', '..', 'merge-gate-check.mjs'), 'utf8');
+      const main = src.slice(src.indexOf('async function main()'));
+      const firstRead = main.indexOf('const mainCi = readMainCiFact(');
+      expect(firstRead).toBeGreaterThan(-1);
+      expect(firstRead).toBeLessThan(main.indexOf('gatherPrFacts('));
+      expect(main).toMatch(/gatherPrFacts\(\{[^}]*\bredMain, mainCi\b/);
+      expect(main).toMatch(/mainCi, mainCiRecheck: readMainCiFact\(/);
+      expect(main).toMatch(/exempt: factsOf\.length > 0 && factsOf\.every\(\(x\) => isMainFixPr\(x\.pr\)\)/);
     });
   });
 });
