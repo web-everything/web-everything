@@ -181,11 +181,17 @@ export function verdictKind(c) {
  * section; 7-40 hex, lower-cased). It relies on every
  * producer appending that footer LAST, after any quoted text, so a quoted earlier one never wins. One head, never one
  * per format: a quoted `Net basis` naming the parent must not ride along with a real `reviewed-sha` footer for another
- * commit. A sha merely mentioned in prose is never returned. Pure.
+ * commit. A sha merely mentioned in prose is never returned. An advisory or converted advisory note never stamps a
+ * `reviewed-sha` line (the converted note only `>`-quotes the prior accept) and is posted without
+ * we:scripts/review-set-label.mjs#buildVerdictComment's `<!--` escaping, so on one only its `Net basis` names a head:
+ * juror text there could otherwise forge an unquoted stamp. Pure.
  * @returns {string[]} zero or one head
  */
 export function reviewedHeadsOf(c) {
-  const last = structuredMarkerLines(bodyOf(c)).at(-1);
+  const body = bodyOf(c);
+  const lead = body.trimStart();
+  const advisory = lead.startsWith(ADVISORY_NOTE_MARKER) || lead.startsWith(CONVERTED_ADVISORY_NOTE_MARKER);
+  const last = structuredMarkerLines(body).filter((m) => !(advisory && m.kind === 'reviewed-sha')).at(-1);
   return last ? [last.sha] : [];
 }
 
