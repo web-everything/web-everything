@@ -2,7 +2,7 @@
 kind: story
 size: 5
 priority: high
-parent: "xx0055i"
+parent: "5851"
 status: resolved
 scope: ["we:scripts/settings/fix.json", "we:scripts/conveyor/fix-takeover.mjs", "we:scripts/conveyor/reconcile-fix-dispatch.mjs", "we:scripts/conveyor/fix-resume.mjs", "we:scripts/conveyor/__tests__/fix-resume.test.mjs"]
 dateOpened: "2026-10-10"

@@ -496,8 +496,12 @@ export function runReviewTick({
   // live" and strip its `review-status:reviewing` until the next tick. Those PRs read fresh (`undefined`).
   const dispatchedThisTick = new Set(dispatched.map((d) => Number(d.prNumber)));
   // Waiting stacks can have only a surfaced note; they still need their draft status label.
+  // Every PR of this tick's shared listing is tagged too: the `status:*` label is ONE per open PR, so a PR the plan
+  // gave no row this tick (accepted, parked with a person) still gets its label set and any stale one removed. The
+  // writer is idempotent and reads the shared snapshot, so a PR with nothing to change costs no `gh` call.
   const candidates = [...statusCandidates(reviews, plan.refusals ?? [], fixes, ciHeals),
-    ...(plan.notes ?? []).filter(n => ['stacked-awaiting-base', 'stacked-base-orphaned'].includes(n.kind))];
+    ...(plan.notes ?? []).filter(n => ['stacked-awaiting-base', 'stacked-base-orphaned'].includes(n.kind)),
+    ...(Array.isArray(rawPrs) ? rawPrs : []).filter(p => Number.isInteger(Number(p?.number)) && Number(p.number) > 0).map(p => ({ prNumber: Number(p.number) }))];
   // Every planner row per PR (dispatch rows, refusals, notes): the `status:*` label renders all of them, not just the
   // last one the de-duplication below keeps.
   const rowsByPr = new Map();

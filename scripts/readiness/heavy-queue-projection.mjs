@@ -33,6 +33,10 @@
  *      fast slot first and may also take any free heavy slot; a full suite never takes a fast slot. Short jobs
  *      rank first-come-first-served among themselves, never behind a full-suite waiter
  *      ({@link resolveFastSlots}, {@link slotOrderFor}).
+ *   5. RED-MAIN REPAIR CLASS (main-fix-queue-priority, 2026-10-10): while main is red nothing lands, so a waiter whose
+ *      lane purpose / session / holder marks it as a red-main repair (`classifyWaiterPriority`, in `./heavy-repair-priority.mjs`) is class P0 on
+ *      the delivery-priority scale (`we:scripts/lib/delivery-priority.mjs`) and takes the next free slot, heavy or
+ *      fast, ahead of every other waiter. FCFS still holds within a class; a running holder is never preempted.
  */
 
 /** Every heavy-command kind the queue distinguishes. Same vocabulary `we:scripts/operations/heavy-queue.mjs`
@@ -467,10 +471,12 @@ export function resolveFastSlots(env = {}) {
  * heavy job) tries only the heavy slots.
  * @returns {number[]}
  */
-export function slotOrderFor(kind, cap, fastSlots) {
+export function slotOrderFor(kind, cap, fastSlots, priorityClass = null) {
   const c = Number.isFinite(cap) && cap >= 1 ? Math.floor(cap) : 1;
   const f = Number.isFinite(fastSlots) && fastSlots > 0 ? Math.floor(fastSlots) : 0;
   const heavy = Array.from({ length: c }, (_, i) => i);
   const fast = Array.from({ length: f }, (_, i) => c + i);
-  return queueLaneOf(normalizeKind(kind)) === 'fast' ? [...fast, ...heavy] : heavy;
+  if (queueLaneOf(normalizeKind(kind)) === 'fast') return [...fast, ...heavy];
+  // A red-main repair (P0) takes the next free slot, heavy or fast — its own lane's slots first.
+  return priorityClass === 'P0' ? [...heavy, ...fast] : heavy;
 }
