@@ -24,9 +24,9 @@
 export const DRAIN_GATE_CALL_RE = /\b(decide[A-Z]\w*|scan[A-Z]\w*|should[A-Z]\w*|is[A-Z]\w*(?:Frozen|Failed|Green|Merged|Pending)|diffBaseline|carrierPreflight|planCoupleCascadeStep|findDuplicateIds|revalidate\w*|classifyPr|hasNonEmptyBody|hasUnclearedReviewLabel|couplePinExcuses|planLabelDrain|computeOverlapContext|coupleImplOpen|applyEscalationRelief|acceptanceCoversHead)\s*\(/g;
 
 /** Card that publishes the red-main freeze marker to a shared source (filed with this change). */
-export const RED_MAIN_SHARED_SOURCE_CARD = 'xyd06qo';
+export const RED_MAIN_SHARED_SOURCE_CARD = '5805';
 /** Card that wires strategy github-merge-queue into the drain + its enqueue-clearance marker. */
-export const DRAIN_ENQUEUE_WIRING_CARD = 'xtpxusq';
+export const DRAIN_ENQUEUE_WIRING_CARD = '5803';
 
 export const DRAIN_GATES = Object.freeze([
   { id: 'required-check-read', where: 'queue', input: 'github', signals: [], skipKinds: [],
