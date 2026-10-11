@@ -352,10 +352,8 @@ const GH_CALL_TIMEOUT_MS = 20_000;
 /** …and all gh calls of one rebuild's base-chain reads together may wait this long (rebuild lock is held meanwhile). */
 export const GH_CHAIN_BUDGET_MS = 60_000;
 
-function ghSlug(root, env) {
-  const fromEnv = env?.GH_REPO; // gh's own convention for "which repo"
-  if (typeof fromEnv === 'string' && /^[\w.-]+\/[\w.-]+$/.test(fromEnv)) return fromEnv;
-  const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
+function ghSlug(root, timeoutMs = GH_CALL_TIMEOUT_MS) {
+  const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
   const m = r.status === 0 ? String(r.stdout || '').trim().match(/github\.com[:/]+([^/]+)\/([^/.]+?)(?:\.git)?\/?$/) : null;
   return m ? `${m[1]}/${m[2]}` : null;
 }
@@ -388,10 +386,18 @@ function ghJson(args, { env, timeoutMs = GH_CALL_TIMEOUT_MS } = {}) {
 export function makePrBaseChain({
   root, overlays = [], gh = ghJson, maxDepth = 8, budgetMs = GH_CHAIN_BUDGET_MS, now = Date.now, slug: slugOverride, env,
 } = {}) {
-  let slug = slugOverride;
-  const slugOf = () => { if (slug === undefined) { try { slug = ghSlug(root, env); } catch { slug = null; } } return slug; };
   const startedAt = now();
   let tripped = false;
+  let slug = slugOverride;
+  // The slug read is a local `git` call, but it waits under the same budget as the gh calls (and never longer than 5s).
+  const slugOf = () => {
+    if (slug === undefined) {
+      const left = budgetMs - (now() - startedAt);
+      if (left <= 0) { tripped = true; return null; }
+      try { slug = ghSlug(root, Math.min(5_000, left)); } catch { slug = null; }
+    }
+    return slug;
+  };
   /** One gh call under the shared budget; `undefined` once tripped, out of budget, or when gh could not answer. */
   const call = (args) => {
     if (tripped) return undefined;
@@ -419,14 +425,19 @@ export function makePrBaseChain({
     let complete = true;
     let ref = base;
     while (ref && ref !== 'main' && chain.length < maxDepth && !chain.includes(ref)) {
+      // A base name gh hands back is data from the PR author: it must be a safe branch name before it is used again.
+      if (!isSafeBranchName(ref)) { complete = false; break; }
       chain.push(ref);
       if (!baseOfRef.has(ref)) {
-        const rows = failedRefs.has(ref) ? undefined : call(['pr', 'list', '--repo', s, '--head', ref, '--state', 'open', '--json', 'baseRefName', '--limit', '1']);
+        // `--head` matches the branch NAME in any fork, so ask for a few and take the first same-repository PR only.
+        const rows = failedRefs.has(ref) ? undefined : call(['pr', 'list', '--repo', s, '--head', ref, '--state', 'open', '--json', 'baseRefName,isCrossRepository', '--limit', '10']);
         if (!Array.isArray(rows)) { failedRefs.add(ref); complete = false; break; }
-        baseOfRef.set(ref, typeof rows[0]?.baseRefName === 'string' ? rows[0].baseRefName : null);
+        const own = rows.find((r) => r && r.isCrossRepository !== true);
+        baseOfRef.set(ref, typeof own?.baseRefName === 'string' ? own.baseRefName : null);
       }
       ref = baseOfRef.get(ref);
     }
+    if (ref && ref !== 'main') complete = false; // cut by maxDepth, a cycle, or an unsafe name: a prefix, not the whole chain
     if (tripped) return recorded(pr);
     if (!complete) return recorded(pr) ?? chain;
     fresh.set(pr, chain);

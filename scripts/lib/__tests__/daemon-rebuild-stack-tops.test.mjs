@@ -55,10 +55,12 @@ const OVERLAYS = [
   { ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }, { ref: RULING, pr: 4797 }, { ref: LADDER_REF, pr: 4757 },
 ];
 
-function fixture() {
+/** `githubLike`: the origin path ends in github.com/o/r.git, so the real slug reader resolves `o/r` (no network involved). */
+function fixture({ githubLike = false } = {}) {
   const base = mktemp('we-stack-tops-');
-  const origin = join(base, 'origin.git');
+  const origin = githubLike ? join(base, 'github.com', 'o', 'r.git') : join(base, 'origin.git');
   const clone = join(base, 'clone');
+  mkdirSync(dirname(origin), { recursive: true });
   gitOk(base, ['init', '--bare', '-q', origin]);
   mkdirSync(clone);
   gitOk(clone, ['init', '-q', '-b', 'main']);
@@ -410,8 +412,81 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
     expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
   });
 
+  describe('chain claim evidence', () => {
+    /** The base is rebased with a REWORDED subject and a clashing line: author+subject and patch evidence are both gone. */
+    const rewordedBase = () => {
+      const f = fixture();
+      gitOk(f.author, ['fetch', '-q', 'origin']);
+      gitOk(f.author, ['checkout', '-q', '-B', BASE, f.init]);
+      write(f.author, TAKEOVER, lines({ 2: 'history takeover v2 (restacked)' }));
+      gitOk(f.author, ['commit', '-q', '-am', 'a completely different subject']);
+      gitOk(f.author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${BASE}`]);
+      f.fetch();
+      return f;
+    };
+
+    it('a reworded, conflict-resolved rebase leaves a bare chain claim unconfirmed (the top stays parked, loudly)', async () => {
+      const f = rewordedBase();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }],
+      });
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+    });
+
+    it('…but a chain recorded on the entry by an earlier rebuild still identifies the stack after that rebase', async () => {
+      const f = rewordedBase();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792, stackBases: CHAINS[4792] }],
+      });
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'skip', reason: 'stack-base-moved' });
+      expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
+    });
+
+    it('a patch-equivalent commit confirms the claim even when the subject was reworded', async () => {
+      const f = fixture();
+      gitOk(f.author, ['fetch', '-q', 'origin']);
+      gitOk(f.author, ['checkout', '-q', '-B', BASE, f.init]);
+      write(f.author, TAKEOVER, lines({ 2: 'history takeover v1' })); // the very change the children carry
+      gitOk(f.author, ['commit', '-q', '-am', 'same change, other words']);
+      gitOk(f.author, ['push', '-q', '-f', 'origin', `HEAD:refs/heads/${BASE}`]);
+      f.fetch();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain,
+        overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }],
+      });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-claim-unconfirmed');
+    });
+  });
+
   describe('makePrBaseChain gh budget', () => {
     const SLUG = 'o/r';
+
+    it('ignores cross-repository (fork) PRs that merely share the head branch name', async () => {
+      const gh = (args) => {
+        if (args[1] === 'view') return { baseRefName: 'lane/b' };
+        expect(args).toContain('baseRefName,isCrossRepository');
+        return [{ baseRefName: 'lane/forged', isCrossRepository: true }, { baseRefName: 'main', isCrossRepository: false }];
+      };
+      const chain = makePrBaseChain({ root: '/nonexistent', overlays: [], gh, slug: SLUG });
+      expect(await chain(1)).toEqual(['lane/b']);
+      const onlyFork = makePrBaseChain({ root: '/nonexistent', overlays: [], slug: SLUG, gh: (args) => (args[1] === 'view' ? { baseRefName: 'lane/b' } : [{ baseRefName: 'lane/forged', isCrossRepository: true }]) });
+      expect(await onlyFork(1)).toEqual(['lane/b']);
+    });
+
+    it('a walk cut short (depth limit, cycle, unsafe name) is returned but never recorded as complete', async () => {
+      const cyc = (args) => (args[1] === 'view' ? { baseRefName: 'lane/a' } : [{ baseRefName: args.includes('lane/a') ? 'lane/b' : 'lane/a' }]);
+      const loop = makePrBaseChain({ root: '/nonexistent', overlays: [], gh: cyc, slug: SLUG });
+      expect(await loop(1)).toEqual(['lane/a', 'lane/b']);
+      const shallow = makePrBaseChain({ root: '/nonexistent', overlays: [], gh: cyc, slug: SLUG, maxDepth: 1 });
+      expect(await shallow(1)).toEqual(['lane/a']);
+      const evil = makePrBaseChain({ root: '/nonexistent', overlays: [], slug: SLUG, gh: () => ({ baseRefName: '--upload-pack=x' }) });
+      expect(await evil(1)).toEqual([]);
+      for (const c of [loop, shallow, evil]) expect(c.fresh.size).toBe(0);
+    });
     it('a gh that always times out costs one call in total, then every PR falls back to its recorded chain', async () => {
       const calls = [];
       const gh = (args) => { calls.push(args); return GH_TIMED_OUT; };
@@ -470,7 +545,7 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
     });
 
     it('a real rebuild records the chains gh answered; a later gh-less pass still sees the stack through them', async () => {
-      const f = fixture();
+      const f = fixture({ githubLike: true });
       f.moveBase();
       f.fetch();
       for (const o of OVERLAYS) addOverlay(f.clone, { ...o, reason: 'stack' }, { env: f.env });
@@ -488,7 +563,7 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
         "else { const b = m.headBase[a[a.indexOf('--head') + 1]]; console.log(JSON.stringify(b ? [{ baseRefName: b }] : [])); }", '',
       ].join('\n'));
       chmodSync(join(bin, 'gh'), 0o755);
-      const env = { ...f.env, PATH: `${bin}:${process.env.PATH}`, GH_REPO: 'o/r', FAKE_GH_JSON: map };
+      const env = { ...f.env, PATH: `${bin}:${process.env.PATH}`, FAKE_GH_JSON: map };
       const r = await rebuildClone({ root: f.clone, env, runSmoke: passSmoke(), prState: async () => 'OPEN', log: { error: () => {} } });
       expect(r, JSON.stringify(r.alerts)).toMatchObject({ adopted: true });
       const stored = readOverlays(f.clone, { env: f.env });

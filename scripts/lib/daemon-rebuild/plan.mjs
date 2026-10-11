@@ -114,9 +114,10 @@ function changedFiles(git, mainSha, sha) {
  * tip is already an ancestor of main takes no part either (the main loop removes it as `in-main`).
  * Overlays whose PR is MERGED/CLOSED or whose ref is gone take no part (the main loop removes them).
  * A PR base chain comes from the GitHub API, which any PR author can edit, so a chain claim ("C is stacked on P") makes C
- * a child of P only when git corroborates it: P's tip is an ancestor of C's tip, or C carries a commit with the same
- * author and subject as one of P's own (a rebase keeps both, so a rebased base is still recognised through its old head).
- * An uncorroborated claim is ignored and reported in `unconfirmed`. A base that moved is set aside only when git shows
+ * a child of P only when git corroborates it: P's tip is an ancestor of C's tip, or C carries a commit patch-equivalent
+ * to one of P's (`git cherry`), or one with the same author and subject (a rebase keeps both, so a rebased base is still
+ * recognised through its old head), or the entry already records the claim (written by an earlier rebuild after it
+ * passed this check). An uncorroborated claim is ignored and reported in `unconfirmed`. A base that moved is set aside only when git shows
  * a top really clashes with it; if every top merges cleanly with it, both apply independently.
  * `keepIndependent` names refs that must never be set aside (a base whose fallback could not be merged — see the 7b
  * pass of {@link planRebuild}).
@@ -156,7 +157,19 @@ export async function planOverlayStacks({
     }
     return n.keys;
   };
-  const sharesWork = (p, c) => { const pk = ownKeys(p); return pk.size > 0 && [...pk].some((k) => ownKeys(c).has(k)); };
+  // Git evidence that C was built on P, short of ancestry: C carries a commit patch-equivalent to one of P's (`git cherry`
+  // marks it `-`; survives a reworded or re-dated rebase), or the same author and subject (survives a rebase that
+  // resolved conflicts, which changes the patch). Unsigned history can be imitated by whoever can push the branch, so
+  // this bounds accidents and retargeted PRs, not a deliberate insider — who can already push any code to their branch.
+  const sharesWork = (p, c) => {
+    const ch = git(['cherry', p.sha, c.sha]);
+    if (ch.status === 0 && String(ch.stdout ?? '').split('\n').some((l) => l.startsWith('-'))) return true;
+    const pk = ownKeys(p);
+    return pk.size > 0 && [...pk].some((k) => ownKeys(c).has(k));
+  };
+  // A chain recorded on the entry by an earlier rebuild (persistStackBases writes only claims that passed this check) is
+  // evidence that survives a rebase that left nothing else to compare.
+  const recordedClaim = (c, p) => Array.isArray(c.raw.stackBases) && c.raw.stackBases.includes(p.ref);
   const unconfirmed = [];
   const children = new Map(nodes.map((n) => [n.ref, new Set()]));
   for (const c of nodes) {
@@ -164,7 +177,7 @@ export async function planOverlayStacks({
       if (p === c || p.sha === c.sha) continue;
       if (anc(p.sha, c.sha)) children.get(p.ref).add(c.ref);
       else if (c.chain.includes(p.ref)) {
-        if (sharesWork(p, c)) children.get(p.ref).add(c.ref);
+        if (recordedClaim(c, p) || sharesWork(p, c)) children.get(p.ref).add(c.ref);
         else unconfirmed.push({ ref: c.ref, base: p.ref });
       }
     }

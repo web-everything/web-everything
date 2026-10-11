@@ -263,8 +263,15 @@ export async function prepareRebuild({
   });
   // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
   // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
+  // Only claims git corroborated are recorded: a retargeted PR's unconfirmed claim must not become "recorded" evidence.
   if (chainOf.fresh?.size > 0) {
-    try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
+    const claims = (plan.alerts || []).find((a) => a.kind === 'overlay-stack-claim-unconfirmed')?.detail.claims ?? [];
+    const confirmed = new Map();
+    for (const [pr, chain] of chainOf.fresh) {
+      const ref = overlaysBefore.find((o) => o && o.pr === pr)?.ref;
+      confirmed.set(pr, chain.filter((b) => !claims.some((c) => c.ref === ref && c.base === b)));
+    }
+    try { persistStackBases(root, confirmed, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
   }
   for (const event of plan.alerts || []) {
     alert(event.kind, event.detail);
