@@ -17,7 +17,7 @@ The required merge-gate CI check (we:scripts/merge-gate-check.mjs, strategy gith
 ## Acceptance
 
 - [A1] **Executable** — `npm run test:unit` on we:scripts/lib/__tests__/red-main-freeze-shared.test.mjs (the module does not exist before this item): a clear shared copy passes the merge-gate `red-main-freeze` gate, a simulated freeze holds it, and a missing branch / missing file / bad JSON / non-boolean `frozen` fails it closed.
-- [A2] `we:scripts/readiness/red-main-remediation.mjs` `freeze`, `unfreeze`, `decide --apply` and the new `publish` write the local marker exactly as before, then publish its state to the shared branch (`we:scripts/lib/red-main-freeze-shared.mjs`, through `we:scripts/lib/git-transport-branch.mjs`). A failed publish keeps the local marker, prints the retry command and exits 1.
+- [A2] `we:scripts/readiness/red-main-remediation.mjs` `freeze`, `unfreeze` and the new `publish` write the local marker exactly as before, then publish its state to the shared branch (`we:scripts/lib/red-main-freeze-shared.mjs`, through `we:scripts/lib/git-transport-branch.mjs`). A failed publish keeps the local marker, prints the retry command and exits 1. `decide --apply` (an automatic freeze) writes the local marker only and publishes nothing: main's own CI is the merge-gate's authority for a red main (operator ruling 2026-10-11). A kind-less marker left by the old `decide --apply` counts as automatic; any other kind-less marker stays manual.
 - [A3] The branch is the policy-cascade knob `mergeDelivery.redMainFreezeBranch` (`we:scripts/lib/merge-delivery-policy.mjs`, default `ops/red-main-freeze`, only `ops/<slug>` accepted); writer and reader resolve it the same way.
 - [A4] `we:scripts/merge-gate-check.mjs` reads the shared copy once per run into `facts.redMain`; live proof: #4643 goes from `fail-closed red-main-freeze` to `pass` after the live publish.
 
@@ -33,4 +33,4 @@ The required merge-gate CI check (we:scripts/merge-gate-check.mjs, strategy gith
 4. **Fail closed** — unreadable shared copy → merge-gate `fail-closed`; failed publish → CLI exit 1 with retry hint, local marker intact.
 5. **Identity scoping** — one branch per repo, named by policy; the writer refuses any non-`ops/` ref.
 6. **State over time** — every publish mirrors the CURRENT local marker (not a delta), so `publish` is an idempotent repair after any missed write.
-7. **Who wrote it** — the doc records `publishedAt` and `publishedBy` (host); pushes need repo write access, same trust as the other ops branches.
+7. **Who wrote it** — the doc records `publishedAt` and `publishedBy` (a fixed actor label, `red-main-remediation` — never the host name, since the branch is readable by anyone who can read the repo); pushes need repo write access, same trust as the other ops branches.

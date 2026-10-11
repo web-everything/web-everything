@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -188,6 +188,22 @@ describe('shared red-main freeze (xyd06qo)', () => {
     const r = await publishFreezeFromCli({ marker: null, clear: true, env: { WE_RED_MAIN_FREEZE_SHARED: 'off' }, publish: () => { called = true; } });
     expect(r).toEqual({ ok: true, skipped: 'disabled' });
     expect(called).toBe(false);
+  });
+
+  it('CLI hook: every SKIP says so on stderr — a real `freeze` run with VITEST/WE_UNDER_TEST or the off switch exported never passes silently (shared:128)', async () => {
+    for (const [env, why] of [[{ VITEST: 'true' }, /test run/], [{ WE_UNDER_TEST: '1' }, /test run/], [{ WE_RED_MAIN_FREEZE_SHARED: 'off' }, /WE_RED_MAIN_FREEZE_SHARED=off/]]) {
+      const lines = [];
+      const r = await publishFreezeFromCli({ marker: { reason: 'operator stop' }, env, stderr: (s) => lines.push(s), publish: () => { throw new Error('must not publish'); } });
+      expect(r.ok).toBe(true);
+      expect(lines.join('')).toMatch(/shared copy was NOT published/);
+      expect(lines.join('')).toMatch(why);
+    }
+  });
+
+  it('the shared doc never carries the drain host\'s hostname — `publishedBy` is a coarse actor label (shared:62)', () => {
+    const doc = buildSharedFreezeDoc({ reason: 'r' }, { now: () => 't' });
+    expect(doc.publishedBy).toBe('red-main-remediation');
+    expect(JSON.stringify(doc)).not.toContain(hostname());
   });
 
   it('CLI: `publish` is a known command (republish the local state), skipped under test', () => {
@@ -517,6 +533,32 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     expect(r.status).not.toBe(0);
     expect(r.stderr).toMatch(/automatic.*not published/i);
     expect(fx.shared()).toBeNull();
+  });
+
+  describe('a LEGACY kind-less local marker (written before `kind` existed) — remediation:372', () => {
+    const legacy = (reason) => writeFileSync(fx.marker, `${JSON.stringify({ frozen: true, at: '2026-10-01T00:00:00Z', reason, redRef: 'main', mergeSha: 'abc', revertAuthority: true })}\n`);
+
+    it('the old `decide --apply` marker (reason "decide --apply") counts as AUTOMATIC: `publish` refuses it, nothing is published', () => {
+      legacy('decide --apply');
+      const r = fx.run(['publish']);
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toMatch(/automatic.*not published/i);
+      expect(fx.shared()).toBeNull();
+    });
+
+    it('the old `decide --apply` marker is not mistaken for a standing MANUAL freeze: `decide --apply` re-stamps it as auto', () => {
+      legacy('decide --apply');
+      const d = fx.run(['decide', '--trigger=push', '--ref=main', '--result=red', '--merge-sha=def', '--apply']);
+      expect(d.status).toBe(0);
+      expect(d.stderr).not.toMatch(/MANUAL freeze is already standing/);
+      expect(JSON.parse(readFileSync(fx.marker, 'utf8'))).toMatchObject({ frozen: true, kind: 'auto', mergeSha: 'def' });
+    });
+
+    it('any OTHER kind-less marker (the old operator `freeze`) stays MANUAL — fail closed: `publish` lands it as a manual stop', () => {
+      legacy('operator stop');
+      expect(fx.run(['publish']).status).toBe(0);
+      expect(fx.shared()).toMatchObject({ frozen: true, kind: 'manual', reason: 'operator stop' });
+    });
   });
 
   it('`freeze` (the operator\'s stop-the-line) publishes a MANUAL freeze', () => {

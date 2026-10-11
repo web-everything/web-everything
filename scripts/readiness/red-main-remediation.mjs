@@ -359,15 +359,17 @@ async function runCli(argv) {
     // A standing MANUAL marker is never downgraded: overwriting it with `auto` would make `publish` refuse it, and an
     // operator's stop that has not yet reached CI would then never reach it.
     if (d.action === 'stop-the-line' && flags.apply) {
+      // Same kind rule as `publish` and the writer (`freezeKindOf`): a kind-less marker left by the old `decide --apply`
+      // is automatic and gets re-stamped; any other kind-less marker is an operator stop and is kept.
       const standing = readFreeze();
-      if (standing && standing.kind !== 'auto') process.stderr.write(`red-main freeze: a MANUAL freeze is already standing (${String(standing.reason ?? 'frozen').slice(0, 120)}); kept as is — the drain stays stopped.\n`);
+      if (standing && (await shared()).freezeKindOf(standing) !== 'auto') process.stderr.write(`red-main freeze: a MANUAL freeze is already standing (${String(standing.reason ?? 'frozen').slice(0, 120)}); kept as is — the drain stays stopped.\n`);
       else freezeDispatch({ reason: 'decide --apply', redRef: flags.ref, mergeSha: flags['merge-sha'], kind: 'auto' });
     }
   } else if (cmd === 'publish') {
     // Republish the current local MANUAL freeze — the retry after a failed `freeze`. No valid marker → refused; an
     // automatic one → refused too (it is never published: see `decide`).
     const local = readFreeze();
-    if (local?.kind === 'auto') {
+    if (local && (await shared()).freezeKindOf(local) === 'auto') {
       process.stderr.write('red-main freeze: ✗ the local freeze is AUTOMATIC (decide --apply) and is not published — main\'s own CI is the merge-gate\'s authority for a red main. To stop everything by hand, run: node scripts/readiness/red-main-remediation.mjs freeze --reason=<why>\n');
       process.exitCode = 1;
       return;

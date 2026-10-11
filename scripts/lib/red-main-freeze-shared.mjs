@@ -35,7 +35,6 @@
  *   IMPURE (git, fs) — every side effect is injectable.
  */
 import { execFileSync } from 'node:child_process';
-import { hostname } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stageOnTransportBranch, readFromTransportBranch } from './git-transport-branch.mjs';
@@ -73,8 +72,26 @@ export function resolveFreezeBranch({ toolSettings } = {}) {
   return loadMergeDeliveryPolicy({ toolSettings: settings }).redMainFreezeBranch;
 }
 
+/** Who the shared doc says published it: a coarse actor label, never the drain host's name (the branch is repo-readable). */
+export const SHARED_FREEZE_ACTOR = 'red-main-remediation';
+
+/** The `reason` the pre-`kind` `decide --apply` stamped on its (automatic) marker. */
+const LEGACY_AUTO_REASON = 'decide --apply';
+
+/**
+ * A LOCAL marker's kind, the one rule every reader uses. An explicit `kind` wins. A marker written before `kind` existed
+ * is automatic only when it is the old `decide --apply` marker (that exact reason); any other kind-less marker is an
+ * operator `freeze` and stays MANUAL (fail closed). Pure.
+ * @returns {'auto'|'manual'}
+ */
+export function freezeKindOf(marker) {
+  if (marker?.kind === 'auto') return 'auto';
+  if (marker?.kind == null && marker?.reason === LEGACY_AUTO_REASON) return 'auto';
+  return 'manual';
+}
+
 /** The shared document for a local marker (`null` ⇒ not frozen). Pure. */
-export function buildSharedFreezeDoc(marker, { now = () => new Date().toISOString(), host = hostname() } = {}) {
+export function buildSharedFreezeDoc(marker, { now = () => new Date().toISOString(), host = SHARED_FREEZE_ACTOR } = {}) {
   const frozen = marker != null;
   return {
     schema: 1,
@@ -113,7 +130,7 @@ export function publishSharedFreeze({ marker, clear = false, lifted, board = REP
   // `null`, and mirroring that would silently clear a standing freeze. Only an explicit clear may publish frozen:false.
   if (marker == null && clear !== true) throw refusal('red-main-freeze-shared: refusing to publish frozen:false without an explicit clear (no local freeze marker is not a clear)');
   // An automatic freeze is never published: it would read as a manual stop and hold even the main-fix PR.
-  if (marker?.kind === 'auto') throw refusal('red-main-freeze-shared: refusing to publish an automatic freeze (the shared copy carries manual freezes only; main CI is the authority)');
+  if (marker != null && freezeKindOf(marker) === 'auto') throw refusal('red-main-freeze-shared: refusing to publish an automatic freeze (the shared copy carries manual freezes only; main CI is the authority)');
   const doc = buildSharedFreezeDoc(marker, { ...(now ? { now } : {}), ...(host ? { host } : {}) });
   const text = `${JSON.stringify(doc, null, 2)}\n`;
   const content = clear === true && lifted != null
@@ -148,9 +165,12 @@ export function publishSharedFreeze({ marker, clear = false, lifted, board = REP
  * @returns {Promise<{ok:boolean, skipped?:string, refused?:string, branch?:string, pushed?:boolean, error?:string, attempts?:number}>}
  */
 export async function publishFreezeFromCli({ marker, clear = false, lifted, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; }, attempts = PUBLISH_ATTEMPTS, backoffMs = 250, deadlineMs = 60_000, nowMs = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onFailedAttempt = null } = {}) {
-  if ((env.VITEST || env.WE_UNDER_TEST) && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'test-run' };
+  // A skip is never silent: a real `freeze` run from a shell that happens to export one of these must say the shared
+  // copy (which CI reads) was not touched.
+  const skip = (skipped, why) => { stderr(`red-main freeze: ⚠ the shared copy was NOT published — ${why}. CI's merge-gate does not see this ${clear === true ? 'clear' : 'freeze'}; unset it and re-run ${clear === true ? 'unfreeze' : 'publish'} if that was not intended.\n`); return { ok: true, skipped }; };
+  if ((env.VITEST || env.WE_UNDER_TEST) && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return skip('test-run', 'inside a test run (VITEST / WE_UNDER_TEST is set)');
   // Explicit off switch for a child CLI that must clear VITEST/WE_UNDER_TEST (they also pick the freeze-marker path) yet must never push the live ops branch.
-  if (env.WE_RED_MAIN_FREEZE_SHARED === 'off' && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'disabled' };
+  if (env.WE_RED_MAIN_FREEZE_SHARED === 'off' && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return skip('disabled', 'WE_RED_MAIN_FREEZE_SHARED=off');
   if (marker == null && clear !== true) {
     stderr('red-main freeze: ✗ refusing to publish — no valid local freeze marker here (missing or corrupt), and "no marker" is not a clear. The shared copy is unchanged. To clear it run: node scripts/readiness/red-main-remediation.mjs unfreeze\n');
     setExitCode(1);
