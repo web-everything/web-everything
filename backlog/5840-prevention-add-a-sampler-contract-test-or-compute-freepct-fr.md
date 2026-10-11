@@ -1,20 +1,23 @@
 ---
+bornAs: xi9sda9
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/lib/judge-spawn.mjs", "we:scripts/lib/__tests__/judge-spawn.test.mjs"]
-dateOpened: "2026-10-10"
+scope: ["we:scripts/lib/resource-gate.mjs", "we:scripts/readiness/heavy-admission.mjs", "we:scripts/lib/__tests__/resource-gate.test.mjs", "we:scripts/readiness/__tests__/heavy-admission.test.mjs"]
+dateOpened: "2026-10-11"
 tags: []
 ---
 
-# Prevention — Run one shared redactSecrets over any free-text stderr or stdout excerpt before it goes into an e… (from web-everything/web-everything#4865 review)
+# Prevention — Add a sampler contract test, or compute freePct from vm_stat (free + inactive + speculative) or f… (from web-everything/web-everything#4799 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/lib/judge-spawn.mjs:253` — Run one shared `redactSecrets` over any free-text stderr or stdout excerpt before it goes into an error message, telemetry row or log line. Add a `check:standards` rule or run-record test that fails when a free-text TELEMETRY_STRINGS field is written without that sanitizer.
+1. `we:scripts/lib/resource-gate.mjs:232` — Add a sampler contract test, or compute `freePct` from `vm_stat` (free + inactive + speculative) or from `memory_pressure`. Add a lint-style check that any new gate threshold input names its measurement source.
+2. `we:scripts/lib/resource-gate.mjs:232` — Add a table-driven decideFixCap test that nulls every signal one at a time and all at once, and require at least one known signal before any raise. Filing it as a backlog item for a unit-test rule is enough.
+3. `we:scripts/readiness/heavy-admission.mjs` — Add a deterministic test in we:scripts/readiness/__tests__/heavy-admission.test.mjs that disables both isUnderTest checks, supplies conflicting default and override preference files, and asserts that shared-pool capacity comes from the default file while a private pool honors the override.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4865@6cf5a69d9d35af3717fa0c5e422786178199920e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4799@c0cdc7f6cdcb366efdd73c2a391b02e6847235f8
 
 ## Acceptance
 
