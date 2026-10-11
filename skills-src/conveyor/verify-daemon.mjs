@@ -68,7 +68,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runVerifyDispatch, recordKilledVerification, killOrphanGroup, killAdoptedGroup, dispatchedRunState } from '../../scripts/conveyor/verify-dispatch.mjs';
+import { runVerifyDispatch, recordKilledVerification, killOrphanGroup, killAdoptedGroup, dispatchedRunState, countDispatchesInFlight } from '../../scripts/conveyor/verify-dispatch.mjs';
 import { loadVerifySettingsFile, resolveVerifySettings } from '../../scripts/lib/verify-settings.mjs';
 import { installDaemonLog } from './daemon-log.mjs';
 import { createVerifyGateJobs, resolveGateAsJob } from '../../scripts/conveyor/verify-gate-job.mjs';
@@ -328,6 +328,8 @@ export function reconcileInFlight(inFlight, {
     // pid recycled between two ticks is not detectable here.)
     try { if (pid > 0 && groupAlive(pid)) killGroup(-pid); } catch {}
     if (pid > 0 && !groupGone()) {
+      // Only its leftover group holds the lane now: no dispatch, so it stops spending the in-flight cap (round 10).
+      entry.heldBy = `leader pid ${pid} gone, its process group is not confirmed gone`;
       if (!entry.groupHeldLogged) {
         entry.groupHeldLogged = true;
         log(`verify-daemon: ${pool}/lane-${lane} run ${String(runId).slice(0, 8)}: leader pid ${pid} gone but its process group is not confirmed gone — lane held, killing it each tick`);
@@ -394,7 +396,10 @@ export function buildCliDaemonEffects({ intervalMs = DEFAULT_INTERVAL_MS, isAliv
     isAlive,
     onTick: (result) => {
       const { dispatched = [], deferred = [], draining = false, orphaned = [] } = result || {};
-      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${inFlight.size}${draining ? ' (draining)' : ''}, deferred ${deferred.length}, failed ${settledFailures}${orphaned.length ? `, orphaned ${orphaned.length}` : ''}`);
+      // A lane that only holds its slot is shown apart: it is no dispatch and never spends the in-flight cap.
+      const running = countDispatchesInFlight(inFlight);
+      const held = inFlight.size - running;
+      log.error(`verify-daemon: tick — dispatched ${dispatched.length}, in flight ${running}${held ? `, lanes held ${held}` : ''}${draining ? ' (draining)' : ''}, deferred ${deferred.length}, failed ${settledFailures}${orphaned.length ? `, orphaned ${orphaned.length}` : ''}`);
       settledFailures = 0;
     },
     onTickError: (error) => {

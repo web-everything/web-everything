@@ -486,13 +486,18 @@ export function createVerifyGateJobs({
     } catch { return true; }
   };
   const mine = () => store.list().records.filter((r) => r.job.kind === kind);
-  /** The registry entry for a job's lane — one shape for live jobs and held survivors. `pid` only when proven alive. */
-  const entryFor = (r, pid, prev) => {
+  /**
+   * The registry entry for a job's lane — one shape for live jobs and held survivors. `pid` only when proven alive.
+   * `heldBy` marks a survivor no running supervisor owns: it holds the lane but is no outstanding dispatch, so it never
+   * spends the dispatch sweep's in-flight budget (PR 4764 round 10). Always built fresh, so it never leaks to a live job.
+   */
+  const entryFor = (r, pid, prev, heldBy = null) => {
     const input = r.input;
     return {
       pool: input.pool, lane: input.lane, dir: input.dir, runId: input.runId, sha: input.headSha,
       suites: input.suites ?? null, treeHash: input.treeHash ?? null, requestStartedAt: input.requestStartedAt ?? null,
       jobId: r.id, pid, startedMs: prev?.startedMs ?? queuedMs(r, now), keptFor: prev?.keptFor,
+      ...(heldBy ? { heldBy } : {}),
     };
   };
   const consumedPath = join(store.dir, CONSUMED_FILE);
@@ -528,8 +533,8 @@ export function createVerifyGateJobs({
       // entry ends, another holder takes the lane over in this same sync, never one tick later (a dispatch in between,
       // e.g. a rollback's in-process gate, would start beside it).
       const holders = new Map();
-      const holdLane = (dir, r, pid, prev) => {
-        if (!holders.has(dir)) holders.set(dir, entryFor(r, pid, prev?.jobId === r.id ? prev : undefined));
+      const holdLane = (dir, r, pid, prev, heldBy = null) => {
+        if (!holders.has(dir)) holders.set(dir, entryFor(r, pid, prev?.jobId === r.id ? prev : undefined, heldBy));
       };
       /** A gate no running supervisor owns (its job finished, or never relaunches): hold its lane until it is proven gone. */
       const holdSurvivor = (r, input, how) => {
@@ -551,8 +556,9 @@ export function createVerifyGateJobs({
             : `verify-daemon: ⚠ HEALTH gate job ${r.id} for ${input.pool}/lane-${input.lane} ${how} but its gate pid ${survivor.gate.pid ?? '?'} cannot be proven gone (${survivor.state}${survivor.gate.unreadable ? `, record unreadable: ${survivor.gate.unreadable}` : ''}) — lane held, NOT killed (no proof the pid is still that gate). If it is gone and cannot be proven, release it: node scripts/conveyor/verify-gate-job.mjs release-lane --dir=${JSON.stringify(String(input.dir))}`);
         }
         const prev = inFlight.get(input.dir);
-        holdLane(input.dir, r, pid, prev);
-        if (!prev || prev.jobId === r.id) inFlight.set(input.dir, entryFor(r, pid, prev));
+        const heldBy = `gate job ${r.id} ${how} but its gate is not proven gone (${survivor.state})`;
+        holdLane(input.dir, r, pid, prev, heldBy);
+        if (!prev || prev.jobId === r.id) inFlight.set(input.dir, entryFor(r, pid, prev, heldBy));
       };
       const consumed = readConsumed();
       const settled = [];

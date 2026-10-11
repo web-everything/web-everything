@@ -235,6 +235,28 @@ export function resolveMaxInFlight(env) {
   return Number.isInteger(value) && value > 0 ? value : 8;
 }
 
+/** PR 4764 round 10 — does this registry entry only HOLD its lane (no dispatch of ours runs there)? `heldBy` (a lane
+ *  claim no live job carries, a finished job's surviving gate, a dead leader's leftover process group), a settled
+ *  leader's leftover group (`leaderSettled`) and a run already killed at its ceiling (`ceilingKilled`) each keep the
+ *  lane from a new gate, but none is an outstanding dispatch: it never spends the in-flight budget, or a few stuck
+ *  lanes would starve every healthy one. Execution capacity stays heavy-admission's.
+ * @param {object} entry
+ * @returns {boolean}
+ */
+export function entryHoldsLaneOnly(entry) {
+  return !!(entry?.heldBy || entry?.leaderSettled || entry?.ceilingKilled);
+}
+
+/** The in-flight entries that spend the budget: every one but the hold-only ({@link entryHoldsLaneOnly}).
+ * @param {Map<string, object>|null} inFlight
+ * @returns {number}
+ */
+export function countDispatchesInFlight(inFlight) {
+  let n = 0;
+  for (const entry of inFlight?.values() ?? []) if (!entryHoldsLaneOnly(entry)) n += 1;
+  return n;
+}
+
 /** #65 — is a re-stamped marker the SAME request this in-flight run already serves: same sha, same gate command,
  *  and the same (known) working-tree hash? An agent that re-runs `verify-lane request` after a wait timeout does
  *  exactly this; the running gate already answers it, so killing it only throws away minutes of gate work.
@@ -669,7 +691,8 @@ export function readLaneState(dir) {
  * through `killJobGate(entry)`, which re-probes the job's gate handle first — never by the registry `pid` alone
  * (proven at the last sync, possibly exited and reused since); with no `killJobGate` a job entry is not signalled.
  * `laneHeld(dir) → string|null` (the job store's lane claims) is asked right before each start, in both modes: a held
- * lane is deferred (`reason: 'lane-held'`), never spawned or queued.
+ * lane is deferred (`reason: 'lane-held'`), never spawned or queued. The `maxInFlight` cap counts only outstanding
+ * dispatches: a hold-only entry ({@link entryHoldsLaneOnly}) and a lane deferred as held never spend it.
  * @param {{dryRun?:boolean, spawnGate?:typeof spawnGateBounded, poolRoot?:string,
  *   inFlight?:Map<string, object>|null, awaitSettle?:boolean, maxInFlight?:number,
  *   onSettled?:((failure:object) => void)|null}} [o] `spawnGate` and
@@ -699,6 +722,8 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
   // 1. The synchronous scan — decide WHICH lanes need a gate this sweep. Nothing here spawns anything, so this
   //    walk is exactly as serial as it always was; only the dispatch step below (2) goes concurrent.
   const pending = [];
+  // Read before any start of this sweep adds an entry. A lane that only holds its slot is no outstanding dispatch.
+  const budget = inFlight ? maxInFlight - countDispatchesInFlight(inFlight) : Infinity;
   for (const pool of poolsToScan(poolRoot)) {
     const poolDir = join(poolRoot, pool);
     for (const lane of laneIndicesIn(poolDir)) {
@@ -744,11 +769,11 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
         }
         continue;
       }
-      if (inFlight && pending.length >= maxInFlight - inFlight.size) {
-        deferred.push({ pool, lane, sha: headSha, reason: 'max-in-flight' });
-        continue;
-      }
       if (dryRun) {
+        if (dispatched.length >= budget) {
+          deferred.push({ pool, lane, sha: headSha, reason: 'max-in-flight' });
+          continue;
+        }
         log(`  would dispatch verify for ${pool}/lane-${lane} @ ${String(headSha).slice(0, 8)} (suites: ${marker.suites || 'default'})`);
         dispatched.push({ pool, lane, sha: headSha });
         continue;
@@ -765,7 +790,14 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
   //    capacity semaphore via its own `acquireSlotBlocking` call (the sole chokepoint — see the comment at that
   //    call site), so offering several candidates at once here is sufficient to bound real concurrent gate
   //    execution at the cap.
+  // PR 4764 round 10 — the budget is spent only by gates actually started this sweep: a lane deferred as held below
+  // takes no slot from the healthy lane after it. Once the budget is full the rest wait for a later tick unchecked.
+  let started = 0;
   const settlements = pending.map(({ pool, lane, dir, headSha, suites, marker }) => {
+    if (started >= budget) {
+      deferred.push({ pool, lane, sha: headSha, reason: 'max-in-flight' });
+      return Promise.resolve();
+    }
     // `runId` rides into the marker via the child's own start stamp (`--run-id`), so a queue-phase kill — before
     // `onGateStarted` could capture a `startedAt` — can still tell this run's marker from a newer request's.
     // #4135 (PR 4764 round 7) — the job store's lane claims have the last word, read right before the start: a lane
@@ -778,6 +810,7 @@ export async function runVerifyDispatch({ dryRun = false, spawnGate = spawnGateB
         return Promise.resolve();
       }
     }
+    started += 1;
     const runId = randomUUID();
     const entry = { pool, lane, dir, runId, pid: null, sha: headSha, suites: marker.suites, treeHash: marker.treeHash ?? null,
       requestStartedAt: marker.startedAt ?? null, startedMs: Date.now(), logPath: null };
