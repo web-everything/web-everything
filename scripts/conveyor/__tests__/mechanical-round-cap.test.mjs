@@ -184,6 +184,13 @@ describe('mechanical round vs the review round cap', () => {
       expect(reviewedHeadsOf(body)).toEqual([PRIOR]);
       expect(grant({ author: BOT, createdAt: at(6), body })).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
     });
+    it('only a whole-line `<!-- … -->` marker may trail the footer; one joined by a line terminator may not', () => {
+      expect(reviewedHeadsOf(`${RP_ACCEPT}\n\n${foot(PRIOR)}\n<!-- note -->`)).toEqual([PRIOR]);
+      for (const sep of ['\u2028', '\u2029', '\r\u2028']) {
+        expect(reviewedHeadsOf(`${RP_ACCEPT}\n\n${foot(PRIOR)}\n<!-- a${sep}b -->`), JSON.stringify(sep)).toEqual([]);
+      }
+      expect(reviewedHeadsOf(`${RP_ACCEPT}\n\n${foot(PRIOR)}\n<!-->`)).toEqual([]);
+    });
     it('a converted advisory note quoting the prior accept is advisory, never a carried accept', () => {
       const accept = acceptOn(PRIOR, 5);
       const note = { author: BOT, createdAt: at(6), body: renderConvertedAdvisoryNote({ repo: 'o/r', pr: 7, headSha: PRIOR,
