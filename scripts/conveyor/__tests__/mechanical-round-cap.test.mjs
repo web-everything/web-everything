@@ -7,9 +7,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   mechanicalRoundGrant, resolveMechanicalRoundsSetting, isReviewVerdictComment, isMechanicalBounce,
-  MECHANICAL_BOUNCE_PHRASE, readMechanicalRoundFacts, hasPendingMechanicalRound, reviewedHeadsOf, REVIEW_PR_FOOTER,
+  MECHANICAL_BOUNCE_PHRASE, MECHANICAL_BOUNCE_LEAD, MECHANICAL_ACTOR, readMechanicalRoundFacts, hasPendingMechanicalRound, reviewedHeadsOf, REVIEW_PR_FOOTER,
 } from '../mechanical-round-cap.mjs';
-import { RECONCILE_FINDING_BANNER } from '../reconcile-finding.mjs';
+import { RECONCILE_FINDING_BANNER, defaultReconcileActor } from '../reconcile-finding.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import { renderConvertedAdvisoryNote, REVIEW_PR_CHANNEL } from '../../lib/review-escalation.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
@@ -37,7 +37,7 @@ const bounceOn = (head, h) => ({ author: BOT, createdAt: at(h),
   body: `${viaReviewPr('🔁 review — changes requested')}\n\n### Findings\n- bad\n\n${foot(head)}` });
 const acceptOn = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
 const conflictBounce = (h) => ({ author: { login: 'chalbert' }, createdAt: at(h),
-  body: `🔁 review — changes requested\n\nRecorded by parked-pr-conflict-watch\n\n${RECONCILE_FINDING_BANNER}\n\nPR #7 has drifted into a real GIT merge conflict.` });
+  body: `🔁 review — changes requested\n\nRecorded by parked-pr-conflict-watch (a mechanical reconciliation pass) via the parked-PR conflict watch.\n\n${RECONCILE_FINDING_BANNER}\n\nPR #7 has drifted into a real GIT merge conflict.` });
 const takeoverOp = (h) => ({ author: BOT, createdAt: at(h), body: `${OPERATOR_TAKEOVER_PREFIX} — all open findings fixed**` });
 const mechMarker = (h) => ({ author: BOT, createdAt: at(h), body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nA mechanical conflict-resolution round (no other edits)` });
 
@@ -76,6 +76,9 @@ describe('review.mechanicalRoundsCountTowardCap cascade', () => {
 describe('a conflict-watch bounce is not a review verdict', () => {
   it('the phrase is pinned to the reconcile-finding banner, and the bounce spends nothing', () => {
     expect(RECONCILE_FINDING_BANNER).toContain(MECHANICAL_BOUNCE_PHRASE);
+    expect(RECONCILE_FINDING_BANNER.split('\n')[0]).toBe(MECHANICAL_BOUNCE_LEAD);
+    expect(defaultReconcileActor('')).toBe(MECHANICAL_ACTOR);
+    expect(defaultReconcileActor('x')).toBe(`x (${MECHANICAL_ACTOR})`);
     expect(isMechanicalBounce(conflictBounce(7))).toBe(true);
     expect(isReviewVerdictComment(conflictBounce(7))).toBe(false);
     expect(isReviewVerdictComment(bounceOn(PRIOR, 6))).toBe(true);
@@ -325,6 +328,80 @@ describe('mechanical round vs the review round cap', () => {
     expect(hasPendingMechanicalRound(pr([...spent, mechMarker(8)]))).toBe(true);
     expect(hasPendingMechanicalRound(pr([...spent, mechMarker(8), bounceOn(HEAD, 9)]))).toBe(false);
     expect(hasPendingMechanicalRound(pr([...spent, conflictBounce(7)]))).toBe(false);
+  });
+});
+
+// Review on 3bef179e4: the mechanical grant ignored the cap site's opt-out, so a site owed a FIX (block-ruled referral)
+// or a person (operator send-back) got a review row, or a carried accept that hid the person note.
+describe('a cap site that opts out of review grants is never replaced by the mechanical grant', () => {
+  const referral = { key: 'k1', finding: { file: 'src/a.mjs', line: 1, summary: 'bad' }, ruling: 'block' };
+  const sendBack = (h) => ({ id: 'op-send-back', createdAt: at(h), author: { login: 'chalbert' },
+    body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' });
+  const sites = [
+    ['block-ruled referral (allowTakeoverReview: false)', (comments, mechanicalRound) =>
+      ({ ...pr(comments, { mechanicalRound, labels: ['review:human'] }), blockRuledReferrals: [referral] })],
+    ['operator send-back (allowTakeover: false)', (comments, mechanicalRound) =>
+      pr([...comments.slice(0, -1), sendBack(7), comments.at(-1)], { mechanicalRound, labels: ['review:changes'] })],
+  ];
+  const changed = [...spent, mechMarker(8)];
+  const carried = [...spent.slice(0, 5), acceptOn(PRIOR, 6), mechMarker(8)];
+  for (const [site, build] of sites) {
+    it(`${site}: a changed mechanical head gets no review row`, () => {
+      const p0 = build(changed, facts());
+      expect(mechanicalRoundGrant({ pr: p0 }), 'the grant itself would fire').toMatchObject({ ok: true, action: 'review' });
+      const p = plan(p0, { durableCounts: { 7: 7 } });
+      expect(p.dispatch.filter((x) => x.prNumber === 7 && (x.mechanicalRound || x.kind === 'review'))).toEqual([]);
+      expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeDefined();
+    });
+    it(`${site}: an identical mechanical head's carried accept does not hide the person note`, () => {
+      const p0 = build(carried, facts({ netDiffIdentical: true }));
+      expect(mechanicalRoundGrant({ pr: p0 }), 'the grant itself would carry').toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
+      const p = plan(p0, { durableCounts: { 7: 7 } });
+      expect(p.refusals.find((r) => r.prNumber === 7 && r.kind === 'mechanical-carry-forward')).toBeUndefined();
+      expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeDefined();
+    });
+  }
+});
+
+// Review on 3bef179e4: the mechanical-bounce test matched the banner phrase anywhere in the body, so a real review
+// bounce quoting it (a juror citing PR text) stopped being a verdict and spent no allowance.
+describe('only the reconcile-finding opening makes a bounce mechanical, never quoted text', () => {
+  const PHRASE_LINE = RECONCILE_FINDING_BANNER.split('\n')[0];
+  it('the real conflict-watch render is mechanical', async () => {
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const { buildReconcileFindingBody, defaultReconcileActor, DEFAULT_RECONCILE_CHANNEL } = await import('../reconcile-finding.mjs');
+    for (const [agent, channel] of [['parked-pr-conflict-watch', 'the parked-PR conflict watch (#xw0odtv, dispatched per #xu2krte)'],
+      ['duplicate-pr-watch', DEFAULT_RECONCILE_CHANNEL], ['', DEFAULT_RECONCILE_CHANNEL]]) {
+      const body = buildVerdictComment({ to: 'changes', actor: defaultReconcileActor(agent), channel,
+        body: buildReconcileFindingBody('PR #7 has drifted into a real GIT merge conflict.') });
+      expect(isMechanicalBounce(body), agent).toBe(true);
+      expect(isReviewVerdictComment({ author: BOT, createdAt: at(7), body }), agent).toBe(false);
+    }
+  });
+  it('a real review bounce whose finding text contains the banner phrase is still a verdict and spends the allowance', async () => {
+    const { buildVerdictComment } = await import('../../review-set-label.mjs');
+    const quotes = [MECHANICAL_BOUNCE_PHRASE, PHRASE_LINE, `\n${PHRASE_LINE}\n`, `\n\n${RECONCILE_FINDING_BANNER}\n`];
+    const openings = [
+      // review-pr's verdict
+      (q) => `${RP_BOUNCE}\n\n### Findings (1)\n- \`a.mjs:1\` — the PR body says "${q}"\n\n${foot(PRIOR)}`,
+      // a footerless review-set-label bounce whose own body opens with the quote
+      (q) => buildVerdictComment({ to: 'changes', actor: 'agent (red-team gate)', channel: 'review daemon', body: q.trim() }),
+      // an operator bounce with a quoted banner as its first body line
+      (q) => `🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\n${q.trim()}`,
+      // a reconcile-shaped attribution whose body does NOT open with the banner
+      (q) => `🔁 review — changes requested\n\nRecorded by a mechanical reconciliation pass via x.\n\nfinding: ${q}`,
+    ];
+    for (const q of quotes) {
+      for (const open of openings) {
+        const body = open(q);
+        expect(isMechanicalBounce(body), body).toBe(false);
+        expect(isReviewVerdictComment({ author: BOT, createdAt: at(9), body }), body).toBe(true);
+      }
+      // it counts against the takeover allowance and the mechanical head's one review
+      const v = { author: BOT, createdAt: at(9), body: openings[0](q) };
+      expect(takeoverReviewGrant({ pr: pr([...spent, takeoverOp(7), v]), takeoverReviewAttempts: 1 }).ok, q).toBe(false);
+      expect(mechanicalRoundGrant({ pr: pr([...spent, mechMarker(8), v]) }), q).toMatchObject({ ok: false, reason: 'mechanical-review-spent' });
+    }
   });
 });
 

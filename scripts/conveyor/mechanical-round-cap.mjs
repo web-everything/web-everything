@@ -71,6 +71,7 @@ const bodyOf = (c) => (typeof c === 'string' ? c : typeof c?.body === 'string' ?
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
 const SHA40 = /^[0-9a-f]{40}$/;
 const lc = (s) => String(s ?? '').trim().toLowerCase();
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** The bounce prefix every `review:changes` verdict comment leads with (a review, or a conflict-watch bounce). */
 export const BOUNCE_PREFIX = '🔁 review — changes requested';
@@ -80,11 +81,24 @@ export const BOUNCE_PREFIX = '🔁 review — changes requested';
  * module pulls in the whole review-set-label CLI.
  */
 export const MECHANICAL_BOUNCE_PHRASE = 'not a correctness/security review verdict';
+// The banner's first line, exactly, and the actor suffix `reconcile-finding.mjs#defaultReconcileActor` always writes.
+// Both pinned to the producer by a test.
+export const MECHANICAL_BOUNCE_LEAD = `**⚠️ Sequencing / cross-cutting-concern finding — ${MECHANICAL_BOUNCE_PHRASE}.**`;
+export const MECHANICAL_ACTOR = 'a mechanical reconciliation pass';
+const MECHANICAL_ATTRIBUTION = new RegExp(`^Recorded by (?:\\S.* \\(${escapeRe(MECHANICAL_ACTOR)}\\)|${escapeRe(MECHANICAL_ACTOR)}) via \\S.*\\.$`);
 
-/** A sequencing/merge-conflict bounce raised by a mechanical pass: it asks for a rebase, it judges nothing. */
+/**
+ * A sequencing/merge-conflict bounce raised by a mechanical pass: it asks for a rebase, it judges nothing. Read from
+ * the opening lines only, in reconcile-finding's exact layout (we:scripts/review-set-label.mjs#buildVerdictComment):
+ * the bounce heading, a blank line, `Recorded by <agent> (a mechanical reconciliation pass) via <channel>.`, a blank
+ * line, then the banner's first line. The phrase anywhere else (a juror quoting PR text in a real bounce) is free text
+ * and never turns a verdict into a non-verdict.
+ */
 export function isMechanicalBounce(c) {
-  const body = bodyOf(c);
-  return body.trimStart().startsWith(BOUNCE_PREFIX) && body.includes(MECHANICAL_BOUNCE_PHRASE);
+  const lines = bodyOf(c).split('\n').map((raw) => (raw.endsWith('\r') ? raw.slice(0, -1) : raw));
+  const at = lines.findIndex((l) => l.trim() !== '');
+  return at >= 0 && lines[at].trim() === BOUNCE_PREFIX && lines[at + 1] === ''
+    && MECHANICAL_ATTRIBUTION.test(lines[at + 2] ?? '') && lines[at + 3] === '' && lines[at + 4] === MECHANICAL_BOUNCE_LEAD;
 }
 
 // Both formats must fill a whole line at column 0, as the producers write them (we:scripts/lib/review-escalation.mjs
@@ -110,7 +124,6 @@ const ANY_REVIEWED_MARKER = new RegExp(`<!--\\s*${REVIEWED_SHA_MARKER}:`, 'i');
 // review-pr's `record` posts through we:scripts/review-set-label.mjs#buildVerdictComment: its heading, a blank line,
 // then `Recorded by <actor> via <channel>.`, all written before any caller body.
 const REVIEW_PR_HEADINGS = [BOUNCE_PREFIX, '✅ review — accepted'];
-const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const REVIEW_PR_ATTRIBUTION = new RegExp(`^Recorded by \\S.* via ${escapeRe(REVIEW_PR_CHANNEL)}\\.$`);
 // The write-up's own last line, then (an accept only) buildVerdictComment's `<!-- … -->` marker block.
 export const REVIEW_PR_FOOTER = `_Recorded through ${REVIEW_PR_CHANNEL}._`;

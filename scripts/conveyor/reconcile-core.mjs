@@ -1714,7 +1714,10 @@ export function planReconcile({
       // The review still needs green CI and no referral hold; review:human still needs the operator. A call site that
       // passes `allowTakeover: false` (the operator send-back, whose must-fix body a person reads) is never replaced
       // by a review dispatch either.
-      if (allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review')) {
+      // `allowTakeoverReview: false` opts the site out of EVERY grant below that replaces its row (the takeover review
+      // and the mechanical round's review or carried verdict): its head is owed a fix, or a person reads the row.
+      const reviewGrantsAllowed = allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review');
+      if (reviewGrantsAllowed) {
         const grant = takeoverReviewGrant({ pr, takeoverReviewAttempts });
         if (grant.ok) {
           if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
@@ -1730,8 +1733,8 @@ export function planReconcile({
       }
       // A head made by a PROVEN mechanical round (conflict-resolution merge, no other edits) does not spend a round
       // (live: #4631 f0f4943fb). Identical net diff → the parent head's verdict is carried; only the conflict hunks
-      // changed → one review past the cap. Same review gates as above; the merge gate is untouched.
-      if (extra.capKind === 'fix' || extra.capKind === 'review') {
+      // changed → one review past the cap. Same review gates and the same site opt-out as above; the merge gate is untouched.
+      if (reviewGrantsAllowed) {
         const mech = mechanicalRoundGrant({ pr, countTowardCap: mechanicalRoundsCountTowardCap });
         if (mech.ok && mech.action === 'review') {
           if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
