@@ -5,8 +5,8 @@
  *   global off allows, a per-branch allow-list entry allows, and under-limit allows — plus the smaller
  *   pure helpers (limit resolution, exemption matching, AI/label counting, override-state parse/expiry).
  */
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from 'node:fs';
+import { describe, it, expect, afterAll } from 'vitest';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -23,6 +23,7 @@ import {
   PR_LIMIT_SCOPE_DEFAULTS, resolvePrLimitScope, readPrLimitScope, isStackedAwaitingBasePr,
   authoriseAllow, runPrLimitCli, readLimitState,
   authoriseOverride, OVERRIDE_VERBS, UNGATED_VERBS, OPERATOR_QUOTE_MAX, HISTORY_MAX, capHistory, appendHistory, isGlobalOffLive,
+  refusalReason, updateLimitState, writeLimitState,
 } from '../pr-limit.mjs';
 import { SNAPSHOT_FIELDS } from '../pr-snapshot.mjs';
 
@@ -968,6 +969,9 @@ describe('off is operator-only too (#4791)', () => {
 
 describe('override history keeps grants over refusals (#4791)', () => {
   const rec = (action, i) => ({ at: `t${i}`, actor: null, reason: null, action, target: `b${i}` });
+  const made = [];
+  const tmpStore = (prefix) => { const d = mkdtempSync(join(tmpdir(), prefix)); made.push(d); return join(d, 'pr-limit.json'); };
+  afterAll(() => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
 
   it('a looping refused caller never evicts a grant record — refusals are evicted first', () => {
     let s = appendHistory(emptyLimitState(), { action: 'allow-branch', target: 'kept' });
@@ -992,7 +996,7 @@ describe('override history keeps grants over refusals (#4791)', () => {
   });
 
   it('caller-supplied text is clipped: a refused call with a huge --by and --reason stores a bounded record', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'pr-limit-clip-')), 'pr-limit.json');
+    const path = tmpStore('pr-limit-clip-');
     const big = 'x'.repeat(100_000);
     runPrLimitCli(['off', `--by=${big}`, `--reason=${big}`], { env: { WE_CONVEYOR_WORKER: '1' }, cwd: '/x', path, stderr: { write: () => true }, stdout: { write: () => true } });
     const rec = readLimitState(path).history.at(-1);
@@ -1003,6 +1007,64 @@ describe('override history keeps grants over refusals (#4791)', () => {
     expect(granted.branches['lane/x'].reason.length).toBeLessThan(2100);
     expect(granted.branches['lane/x'].by.length).toBeLessThan(300);
     expect(setGlobalOff(emptyLimitState(), { reason: big, by: big }).global.reason.length).toBeLessThan(2100);
+  });
+
+  // #4791 self-review: the grant evidence lived only on the live record, which the ungated `on` resets and a re-grant
+  // overwrites — the history entry (the one capHistory protects) must carry it too.
+  it('CLI: an `off` grant and an `allow` grant keep quote/channel/session in history after `on` and a re-grant', () => {
+    const path = tmpStore('pr-limit-evidence-');
+    const env = { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 'op-session' };
+    const deps = { env, cwd: '/Users/op/workspace/webeverything', path, ownBranch: '', stderr: { write: () => true }, stdout: { write: () => true } };
+    expect(runPrLimitCli(['off', '--reason=r', '--operator-quote=first off'], deps)).toBe(0);
+    expect(runPrLimitCli(['on'], { ...deps, env: { WE_CONVEYOR_WORKER: '1' } })).toBe(0); // ungated, resets `global`
+    expect(runPrLimitCli(['allow', '--branch=lane/y', '--reason=r', '--operator-quote=first allow'], deps)).toBe(0);
+    expect(runPrLimitCli(['allow', '--branch=lane/y', '--reason=r', '--operator-quote=second allow'], deps)).toBe(0);
+    const st = readLimitState(path);
+    expect(st.global.operatorQuote).toBeUndefined();
+    const evidence = st.history.filter((r) => r.action === 'off' || r.action === 'allow-branch');
+    expect(evidence).toMatchObject([
+      { action: 'off', operatorQuote: 'first off', channel: 'operator-session', session: 'op-session' },
+      { action: 'allow-branch', operatorQuote: 'first allow', channel: 'operator-session', session: 'op-session' },
+      { action: 'allow-branch', operatorQuote: 'second allow', channel: 'operator-session', session: 'op-session' },
+    ]);
+  });
+
+  it('a refusal keeps its [channel=… session=…] tag even when the refusal text is clipped (a long lane cwd)', () => {
+    const path = tmpStore('pr-limit-tag-');
+    const cwd = `/Users/op/workspace/.lanes/${'d'.repeat(5000)}`;
+    runPrLimitCli(['off', '--reason=r', '--operator-quote=q'], { env: { CLAUDECODE: '1', CLAUDE_CODE_SESSION_ID: 's1' }, cwd, path, stderr: { write: () => true }, stdout: { write: () => true } });
+    const rec = readLimitState(path).history.at(-1);
+    expect(rec.action).toBe('off-refused');
+    expect(rec.reason).toMatch(/\[channel=lane session=s1\]$/);
+    expect(rec.reason.length).toBeLessThanOrEqual(2000);
+    expect(refusalReason({ refusal: 'x'.repeat(10_000), channel: 'worker' }, 'y'.repeat(10_000))).toMatch(/\[channel=worker session=y+…\[clipped \d+\]\]$/);
+  });
+
+  // #4791 self-review: a refused call that read the store just before an operator grant wrote its stale copy back
+  // and erased the grant. Every CLI write is now a locked read-modify-write — a held lock blocks it, never bypassed.
+  it('every CLI write goes through the store lock: with the lock held, a refusal neither writes nor proceeds unlocked', () => {
+    const path = tmpStore('pr-limit-lock-');
+    writeLimitState(allowBranch(emptyLimitState(), 'lane/granted', { operatorQuote: 'q' }), path);
+    const before = readFileSync(path, 'utf8');
+    writeFileSync(`${path}.lock`, `${process.pid}\n`); // a live holder (this process) — never stolen
+    for (const argv of [['off', '--reason=r'], ['allow', '--branch=lane/x', '--reason=r'], ['on']]) {
+      expect(() => runPrLimitCli(argv, { env: { WE_CONVEYOR_WORKER: '1' }, cwd: '/x', path, ownBranch: '', lockOpts: { timeoutMs: 50, pollMs: 5 }, stderr: { write: () => true }, stdout: { write: () => true } }))
+        .toThrow(/timed out/);
+    }
+    expect(readFileSync(path, 'utf8')).toBe(before);
+  });
+
+  it('updateLimitState re-reads INSIDE the lock, so a write made after the caller started is kept', () => {
+    const path = tmpStore('pr-limit-reread-');
+    writeLimitState(emptyLimitState(), path);
+    const next = updateLimitState(path, (s) => {
+      expect(isBranchAllowedNow(s, 'lane/late')).toBe(false);
+      return appendHistory(s, { action: 'allow-refused', target: 'w' });
+    });
+    expect(next.history.at(-1).action).toBe('allow-refused');
+    writeLimitState(allowBranch(readLimitState(path), 'lane/late', { operatorQuote: 'q' }), path); // the operator's grant lands
+    updateLimitState(path, (s) => appendHistory(s, { action: 'off-refused', target: null })); // a later refusal
+    expect(isBranchAllowedNow(readLimitState(path), 'lane/late')).toBe(true);
   });
 
   it('with no non-grant entries left to evict, the oldest grants go (still capped)', () => {

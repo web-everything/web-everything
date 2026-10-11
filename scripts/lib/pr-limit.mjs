@@ -33,6 +33,7 @@ import { isCardOnlyDiff } from '../ci-card-only.mjs'; // THE one definition of c
 import { readSettings } from './settings-files.mjs';
 import { platformPreference, logCascadeSources } from './policy-cascade.mjs';
 import { gitRun } from './git-run.mjs';
+import { withFileLock } from './atomic-json-file.mjs';
 import { classifySession } from '../operations/session-role.mjs'; // THE worker/orchestrator marker — the same one pre-pr-review's bypass gate reads
 import { currentActorId } from './review-independence.mjs'; // the harness session id, recorded on every grant/refusal
 
@@ -559,7 +560,20 @@ export function parseDurationMs(text) {
 export function appendHistory(state, entry, now = Date.now()) {
   const s = state && typeof state === 'object' ? state : emptyLimitState();
   const rec = { at: new Date(now).toISOString(), actor: clipText(entry?.actor ?? null, HISTORY_TEXT_MAX.actor), reason: clipText(entry?.reason ?? null, HISTORY_TEXT_MAX.reason), action: entry?.action ?? 'unknown', target: clipText(entry?.target ?? null, HISTORY_TEXT_MAX.target) };
+  // A grant's evidence (xfaz7ho) lives on its HISTORY entry too, not only on the live `global`/`branches` record —
+  // the ungated `on` resets `global` and a re-grant overwrites a branch entry, so the live record alone would lose
+  // the operator's words (#4791 self-review). History keeps grants over every other entry ({@link capHistory}).
+  if (entry?.operatorQuote) rec.operatorQuote = clipText(entry.operatorQuote, OPERATOR_QUOTE_MAX);
+  if (entry?.channel) rec.channel = clipText(entry.channel, HISTORY_TEXT_MAX.actor);
+  if (entry?.session) rec.session = clipText(entry.session, HISTORY_TEXT_MAX.actor);
   return { ...s, history: capHistory([...(Array.isArray(s.history) ? s.history : []), rec]) };
+}
+
+/** The history `reason` of a refused `allow`/`off`: the refusal, then `[channel=… session=…]`. The refusal is
+ *  clipped FIRST so the tag always survives — `clipText` keeps the head, and the refusal can carry a long cwd. PURE. */
+export function refusalReason(decision, session) {
+  const tag = ` [channel=${decision?.channel}${session ? ` session=${clipText(session, HISTORY_TEXT_MAX.actor)}` : ''}]`;
+  return `${clipText(decision?.refusal ?? '', HISTORY_TEXT_MAX.reason - tag.length - 40)}${tag}`;
 }
 
 /** Set (or re-set) the global off-switch. `untilMs` (from {@link parseDurationMs}) becomes an absolute
@@ -577,7 +591,7 @@ export function setGlobalOff(state, { reason = null, by = null, untilMs = null, 
   if (operatorQuote) global.operatorQuote = String(operatorQuote);
   if (channel) global.channel = String(channel);
   if (session) global.session = String(session);
-  return appendHistory({ ...s, global }, { actor: global.by, reason: global.reason, action: 'off', target: global.until ? `until ${global.until}` : 'indefinite' }, now);
+  return appendHistory({ ...s, global }, { actor: global.by, reason: global.reason, action: 'off', target: global.until ? `until ${global.until}` : 'indefinite', operatorQuote: global.operatorQuote, channel: global.channel, session: global.session }, now);
 }
 
 /** Clear the global off-switch — back to enforced. PURE. */
@@ -599,7 +613,7 @@ export function allowBranch(state, branch, { reason = null, by = null, untilMs =
   if (channel) entry.channel = String(channel);
   if (session) entry.session = String(session);
   const next = { ...s, branches: { ...s.branches, [name]: entry } };
-  return appendHistory(next, { actor: entry.by, reason: entry.reason, action: 'allow-branch', target: name }, now);
+  return appendHistory(next, { actor: entry.by, reason: entry.reason, action: 'allow-branch', target: name, operatorQuote: entry.operatorQuote, channel: entry.channel, session: entry.session }, now);
 }
 
 /** Normalize a branch/ref for allow-list comparison — a stored `--branch=4080-foo` matches a lane ref
@@ -749,6 +763,20 @@ export function writeLimitState(state, path = resolveLimitStatePath()) {
   renameSync(tmp, path);
 }
 
+/** Read-modify-write the store UNDER A LOCK (`<path>.lock`), re-reading inside it: `fn(state) → next`. The atomic
+ *  rename alone stops a torn read, not a LOST UPDATE — a refused call that read the store just before the operator's
+ *  `allow`/`off` wrote would write its stale copy back and erase the grant (#4791 self-review). Every CLI write goes
+ *  through here. Throws if the lock stays contended (fail loud — never write unlocked). `lockOpts` go to
+ *  {@link withFileLock} (tests shorten its timeout). @returns the written state */
+export function updateLimitState(path, fn, lockOpts = {}) {
+  mkdirSync(dirname(path), { recursive: true });
+  return withFileLock(`${path}.lock`, () => {
+    const next = fn(readLimitState(path));
+    writeLimitState(next, path);
+    return next;
+  }, lockOpts);
+}
+
 /** Is the global off-switch in effect RIGHT NOW, reading the live store — the one predicate `pr-land.mjs`
  *  and the dispatcher's intake hold consult. A bare `WE_PR_LIMIT_OFF=1` env var is an unconditional
  *  belt-and-braces global off too (no state-file write needed, e.g. for a CI run) — checked FIRST since it
@@ -782,8 +810,9 @@ function parseFlags(argv) {
 /** The CLI body, exported so `scripts/operations/pr-limit.mjs` can be a thin re-export (mirrors
  *  `dispatch-pause.mjs`'s own inline CLI, kept here since this module already owns every piece of state
  *  the CLI touches). */
-export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), path = resolveLimitStatePath(env), ownBranch, stderr = process.stderr, stdout = null } = {}) {
+export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), path = resolveLimitStatePath(env), ownBranch, stderr = process.stderr, stdout = null, lockOpts = {} } = {}) {
   const cmd = argv[0];
+  const update = (fn) => updateLimitState(path, fn, lockOpts); // every write: locked read-modify-write
   const flags = parseFlags(argv.slice(1));
   const by = flags.by || env.USER || null;
   const out = (text) => (stdout ? stdout.write(text) : writeAllSync(1, text));
@@ -793,13 +822,12 @@ export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), pa
     const decision = authoriseAllow({ branch: flags.branch, operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd), ownBranch: ownBranch ?? readOwnBranches(cwd) });
     if (!decision.ok) {
       // LOGGED: the refusal lands in the same override history every grant does, naming channel + session.
-      writeLimitState(appendHistory(readLimitState(path), { actor: by, reason: `${decision.refusal} [channel=${decision.channel}${session ? ` session=${session}` : ''}]`, action: 'allow-refused', target: normalizeBranchName(flags.branch) }), path);
+      update((s) => appendHistory(s, { actor: by, reason: refusalReason(decision, session), action: 'allow-refused', target: normalizeBranchName(flags.branch) }));
       stderr.write(`✗ ${decision.refusal}\n`);
       return 3;
     }
     const untilMs = parseDurationMs(flags.for);
-    const state = allowBranch(readLimitState(path), flags.branch, { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session });
-    writeLimitState(state, path);
+    const state = update((s) => allowBranch(s, flags.branch, { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session }));
     stderr.write(`✓ branch ${normalizeBranchName(flags.branch)} allow-listed — ${state.branches[String(flags.branch).trim()]?.reason}${by ? ` (by ${by})` : ''} via ${decision.channel}; operator quote recorded\n`);
     out(JSON.stringify(state, null, 2) + '\n');
     return 0;
@@ -811,20 +839,18 @@ export function runPrLimitCli(argv, { env = process.env, cwd = process.cwd(), pa
     const session = currentActorId(env) || null;
     const decision = authoriseOverride({ verb: 'off', operatorQuote: flags['operator-quote'], env, cwdReal: realpathSafe(cwd) });
     if (!decision.ok) {
-      writeLimitState(appendHistory(readLimitState(path), { actor: by, reason: `${decision.refusal} [channel=${decision.channel}${session ? ` session=${session}` : ''}]`, action: 'off-refused', target: null }), path);
+      update((s) => appendHistory(s, { actor: by, reason: refusalReason(decision, session), action: 'off-refused', target: null }));
       stderr.write(`✗ ${decision.refusal}\n`);
       return 3;
     }
     const untilMs = parseDurationMs(flags.for);
-    const state = setGlobalOff(readLimitState(path), { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session });
-    writeLimitState(state, path);
+    const state = update((s) => setGlobalOff(s, { reason: flags.reason, by, untilMs, operatorQuote: String(flags['operator-quote']).trim(), channel: decision.channel, session }));
     stderr.write(`⏸ pr-limit OFF — ${state.global.reason}${state.global.until ? ` (until ${state.global.until})` : ''}${by ? ` (by ${by})` : ''} via ${decision.channel}; operator quote recorded\n`);
     out(JSON.stringify(state, null, 2) + '\n');
     return 0;
   }
   if (cmd === 'on') {
-    const state = clearGlobalOff(readLimitState(path), { by, reason: flags.reason });
-    writeLimitState(state, path);
+    const state = update((s) => clearGlobalOff(s, { by, reason: flags.reason }));
     stderr.write(`▶ pr-limit ON — enforcement re-armed${by ? ` (by ${by})` : ''}\n`);
     out(JSON.stringify(state, null, 2) + '\n');
     return 0;
