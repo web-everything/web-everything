@@ -71,6 +71,37 @@ describe('referral evidence carry across an identical-diff head move (#4708)', (
       .toThrow(/no-current-head-review-evidence/);
   });
 
+  // PR #4857 round 2: the case above sets `parked` and `pending` together (`run(..., { clean: false })`), so deleting
+  // either `prior.parked` or `(prior.pending ?? []).length` from referralEvidenceCarry left it green. One flag per run,
+  // so each guard is the ONLY thing that refuses — and a clean run proves the same fixture does carry.
+  describe('each not-clean flag on the latest earlier run refuses the carry on its own', () => {
+    const only = flags => [{ ...run(PRIOR, { at: 10000 }), ...flags }];
+    const carryOf = runs => referralEvidenceCarry({ runs, repo, pr, head: HEAD, readNetDiff: IDENTICAL });
+
+    it('control: the same fixture with no flag set carries', () => {
+      expect(carryOf(only({}))?.fromHead).toBe(PRIOR);
+    });
+
+    for (const [name, flags] of [
+      ['parked', { parked: true }],
+      ['pending referrals', { pending: ['["judgeSecurity","x",1,"open"]'] }],
+      ['persistence failed', { persistenceFailed: true }],
+    ]) {
+      it(`${name} alone: no carry`, () => {
+        expect(carryOf(only(flags))).toBeNull();
+      });
+      it(`${name} alone: the gate refuses with no-current-head-review-evidence`, () => {
+        expect(() => assertMandatoryReferralsCleared(stateFor(), { repo, pr, readRuns: () => only(flags), readNetDiff: IDENTICAL }))
+          .toThrow(/no-current-head-review-evidence/);
+      });
+    }
+
+    it('the newest earlier run decides: an older clean run does not stand in for a newer parked one', () => {
+      const runs = [{ ...run(OLD, { at: 0 }) }, { ...run(PRIOR, { at: 10000 }), parked: true }];
+      expect(carryOf(runs)).toBeNull();
+    });
+  });
+
   it('never carries over a review of the current head itself (a parked current-head run stands)', () => {
     const parkedHere = () => [...RUNS(), run(HEAD, { at: 20000, clean: false })];
     expect(() => assertMandatoryReferralsCleared(stateFor(), { repo, pr, readRuns: parkedHere, readNetDiff: IDENTICAL }))
