@@ -56,7 +56,7 @@ describe('routed CI-heal and claim accounting', () => {
     const { dispatchCiHeal } = await import('../../operations/ci-heal-pr-dispatch.mjs');
     const { DISPATCH_EFFECT } = await import('../../operations/dispatch-lane.mjs');
     const launchCodex = vi.fn(() => 'pid:123');
-    const launchClaude = vi.fn(() => 'claude-session');
+    const defaultProvider = vi.fn(() => 'claude-session'); // the sink's own provider; a Claude outcome must not replace it
     const stampExecutor = vi.fn();
     const stampRunner = vi.fn();
     const writePrompt = vi.fn(() => '/tmp/ci-heal.md');
@@ -64,12 +64,12 @@ describe('routed CI-heal and claim accounting', () => {
     const run = createRoutedCiHealDispatch({
       dispatch: dispatchCiHeal,
       route: () => chooseFixExecutor({ setting: { value, source: 'env' }, launcherAvailable: true }),
-      createSinks: ({ provider }) => ({ [DISPATCH_EFFECT]: async (payload) => {
+      createSinks: ({ provider = defaultProvider }) => ({ [DISPATCH_EFFECT]: async (payload) => {
         let runnerPid;
         const handle = await provider({ ...payload, reportWrapped: (pid) => { runnerPid = pid; } });
         return { handle, dispatch: { wrapped: !!runnerPid, runnerPid } };
       } }),
-      launchCodex, launchClaude, writePrompt, removePrompt: vi.fn(), stampExecutor,
+      launchCodex, writePrompt, removePrompt: vi.fn(), stampExecutor,
       profileFor: () => ({ slug: 'web-everything/web-everything', lanePoolRepo: '/repo' }),
     });
     try {
@@ -80,7 +80,7 @@ describe('routed CI-heal and claim accounting', () => {
       });
       expect(result.pr).toBe(42);
       if (value === 'codex-first') {
-        expect(launchClaude).not.toHaveBeenCalled();
+        expect(defaultProvider).not.toHaveBeenCalled();
         expect(launchCodex).toHaveBeenCalledWith(expect.objectContaining({
           policyRoute: { provider: 'codex' }, ref: 'lane/42-x', claimRepo: 'we', promptFile: '/tmp/ci-heal.md',
         }));
@@ -89,10 +89,68 @@ describe('routed CI-heal and claim accounting', () => {
         expect(stampRunner).toHaveBeenCalledWith(expect.objectContaining({ kind: 'ci-heal', pid: 123 }));
       } else {
         expect(launchCodex).not.toHaveBeenCalled();
-        expect(launchClaude).toHaveBeenCalledTimes(1);
+        expect(defaultProvider).toHaveBeenCalledTimes(1);
       }
       expect(log.mock.calls.filter(([line]) => line.includes('fix executor:'))).toHaveLength(1);
     } finally { log.mockRestore(); }
+  });
+
+  // Review finding (PR #4897, fix-slot-borrow.mjs:96): a Claude decision must keep the sink's default provider
+  // (`routeDispatchProvider` → injected `spawnAgent`) AND the heal router (`routeAvailableCiHeal`), exactly like the
+  // pre-change path. Real `createDispatchSinks` and real `routeAvailableCiHeal`; only fs/process seams are stubbed.
+  describe.each([
+    ['fix.executor=claude', { value: 'claude', source: 'env' }, {}],
+    ['provider-routing', { value: 'provider-routing', source: 'env' }, {}],
+    ['codex launcher unavailable', { value: 'codex-first', source: 'env' }, { launcherAvailable: false }],
+    ['takeover round', { value: 'codex-first', source: 'env' }, { takeover: true }],
+    ['stronger-model round', { value: 'codex-first', source: 'env' }, { strongerModel: true }],
+  ])('a Claude CI-heal decision (%s) keeps default provider and heal routing', (_name, setting, extra) => {
+    const NOW = Date.parse('2026-10-11T12:00:00Z');
+    const held = (provider) => ({ provider, status: 'quota-exhausted', scoredAt: new Date(NOW - 60_000).toISOString(),
+      quotaResetsAt: new Date(NOW + 3_600_000).toISOString() });
+    // Codex and the Antigravity seats are held too, so the router has no probation worker to fall back on and the
+    // native Claude hold refuses.
+    const claudeHold = [held('claude'), held('codex')];
+    const agyHold = { quotaResetsAt: new Date(NOW + 3_600_000).toISOString(), fallbackDecision: 'skip-quota-hold' };
+    const harness = async ({ scores, agy = null }) => {
+      const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+      const { dispatchCiHeal, routeAvailableCiHeal } = await import('../../operations/ci-heal-pr-dispatch.mjs');
+      const { createDispatchSinks } = await import('../../operations/dispatch-lane-io.mjs');
+      const spawnAgent = vi.fn(() => 'backgrounded · 2be0905c · ci-heal-42\n');
+      const launchCodex = vi.fn(() => 'pid:1');
+      const routeHeal = vi.fn((p) => routeAvailableCiHeal(p, { readHolds: () => agy, readScores: () => scores, now: NOW }));
+      const run = createRoutedCiHealDispatch({
+        dispatch: dispatchCiHeal,
+        route: () => chooseFixExecutor({ setting, launcherAvailable: true, ...extra }),
+        createSinks: (o) => createDispatchSinks({ ...o, modes: {}, mintSessionId: () => 'sid', sessionCwdFor: () => '/scratch',
+          ensureSessionCwd: (d) => d, grantLanePermission: () => {}, resolveSettingsEnv: () => null,
+          ensureWorktreeIsolation: () => {}, reserveLane: () => ({ reserved: false }), spawnAgent }),
+        launchCodex, writePrompt: vi.fn(), removePrompt: vi.fn(), stampExecutor: vi.fn(),
+        profileFor: () => ({ slug: 'web-everything/web-everything', lanePoolRepo: '/repo' }),
+      });
+      const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const result = await run({ pr: 42, itemNum: '42', lane: 2, laneRef: 'lane/42-x', scope: ['we:scripts/x.mjs'] }, {
+        root: '/repo', repo: 'we', readBrief: () => 'CI-heal {{PR_NUM}}', pollAttempts: () => [], readFixClaim: () => null,
+        acquireClaim: () => ({ ok: true }), releaseClaim: () => {}, claimOwner: 'test-owner', stampRunner: vi.fn(), routeHeal,
+      }).finally(() => log.mockRestore());
+      return { result, spawnAgent, launchCodex, routeHeal, log };
+    };
+
+    it('still returns the quota-held refusal and spawns nothing', async () => {
+      const { result, spawnAgent, launchCodex, routeHeal } = await harness({ scores: claudeHold, agy: agyHold });
+      expect(routeHeal).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ held: true, reason: 'native Claude quota held; no eligible CI-heal route' });
+      expect(spawnAgent).not.toHaveBeenCalled();
+      expect(launchCodex).not.toHaveBeenCalled();
+    });
+
+    it('launches through the sink default provider (injected spawnAgent) after consulting the heal router', async () => {
+      const { result, spawnAgent, launchCodex, routeHeal } = await harness({ scores: [] });
+      expect(routeHeal).toHaveBeenCalledTimes(1);
+      expect(spawnAgent).toHaveBeenCalledTimes(1);
+      expect(launchCodex).not.toHaveBeenCalled();
+      expect(result.pr).toBe(42);
+    });
   });
 
   it('records executor metadata without borrowing or writing borrow outcomes', async () => {

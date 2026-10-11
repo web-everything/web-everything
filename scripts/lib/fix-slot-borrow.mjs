@@ -70,15 +70,20 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
     { ...claim.meta, fixExecutor: { executor: decision.executor, reason: decision.reason } });
 }
 
-/** Adapt the CI-heal dispatch seam, retaining its claim, filled brief and dispatch sink bookkeeping. */
-export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launchCodex, launchClaude, writePrompt, removePrompt,
+/**
+ * Adapt the CI-heal dispatch seam, retaining its claim, filled brief and dispatch sink bookkeeping.
+ * ONLY a Codex decision replaces the sink's provider and heal router. EVERY Claude outcome (fix.executor=claude,
+ * provider-routing, takeover, main-fix, stronger-model, launcher unavailable) leaves both in place, so it launches
+ * exactly as before this routing existed: `routeDispatchProvider` (model/effort table, registry providers, probation
+ * worker, injected `spawnAgent`) and `routeAvailableCiHeal` (including the native-Claude quota-hold refusal).
+ */
+export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launchCodex, writePrompt, removePrompt,
   profileFor, stampExecutor = stampFixExecutor }) {
   return async (planned, options = {}) => {
     const decision = route({ ...planned, kind: 'ci-heal' });
-    const providerRouting = decision.reason === 'existing provider routing';
-    const sinks = createSinks({ ...options, ...(!providerRouting ? { provider: (request) => {
+    const codex = decision.executor === 'codex';
+    const sinks = createSinks({ ...options, ...(codex ? { provider: (request) => {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
-      if (decision.executor === 'claude') return launchClaude(request);
       const profile = profileFor(options.repo ?? planned.repo ?? 'we');
       stampExecutor({ repo: options.repo ?? planned.repo ?? 'we', pr: planned.pr, kind: 'ci-heal',
         owner: request.claimOwner, lockRoot: request.claimRoot, decision });
@@ -91,7 +96,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
         return handle;
       } catch (error) { removePrompt(promptFile); throw error; }
     } } : {}) });
-    if (providerRouting) {
+    if (!codex) {
       // Observe the existing provider's actual choice without changing that choice.
       const entries = Object.entries(sinks);
       for (const [key, sink] of entries) sinks[key] = async (...args) => {
@@ -100,7 +105,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
         return out;
       };
     }
-    return dispatch(planned, { ...options, sinks, ...(!providerRouting ? { routeHeal: () => null } : {}) });
+    return dispatch(planned, { ...options, sinks, ...(codex ? { routeHeal: () => null } : {}) });
   };
 }
 
