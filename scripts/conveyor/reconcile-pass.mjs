@@ -110,6 +110,12 @@ import { isUnderTest } from '../lib/under-test.mjs';
 import { enrichPrsWithScopeBloat } from './scope-bloat.mjs';
 import { ignoredRulings, resolveCountInfraStalls } from '../lib/ruling-ledger.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
+import { resolveFixSettings } from './fix-takeover.mjs';
+
+/** Card xx0055i — the round-cap action + takeover bound for `planReconcile`; an unreadable setting keeps `person`. */
+function fixCapSettings(load, env) {
+  try { const s = load({ env }); return { roundCapAction: s.roundCapAction, takeoverMaxPerPr: s.takeoverMaxPerPr }; } catch { return {}; }
+}
 
 /** A confirmed finding the operator already ruled `block` on an earlier head that came back on this one (read off
  *  the PR thread alone, so a daemon restart loses nothing). Never throws: an unreadable thread means no claim. */
@@ -1287,6 +1293,8 @@ export function runReconcilePass({
   enrichCodeQL = enrichPrsWithCodeQL, // card x8cnbii — the drain's CodeQL hold is owed a ci-heal
   // The fixer-escalation ladder (default + local override, models from the routing policy). Injectable for tests.
   loadLadder = loadFixerLadder,
+  // Card xx0055i — the `fix.*` settings (policy cascade: env > we:scripts/settings/fix.json > built-in). Injectable.
+  loadFixSettings = resolveFixSettings,
   now = Date.now(), repo = null, defaultBranch = 'main', env = process.env,
   // #2748 false-red follow-up — injectable so a test can supply a fixture with no network, matching every
   // other reader in this file. Defaults to the live, cached branch-protection read.
@@ -1345,6 +1353,7 @@ export function runReconcilePass({
     roundCap: resolveRoundCap(env),
     repo: repoKey, prs, agents, durableCounts: durableCountsFrom(prs), now, defaultBranch, mainRedWindows,
     mainLatestCheckRuns, requiredChecks, mainSha, fixerLadder,
+    ...fixCapSettings(loadFixSettings, env),
     // Card xu1nixv — the red-main fix PR's fast lane (published by the health watch; absent/expired = null).
     mainRedPriority: readPriority(),
   });
