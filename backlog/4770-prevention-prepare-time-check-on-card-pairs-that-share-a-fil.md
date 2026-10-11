@@ -3,9 +3,10 @@ bornAs: xawtq3o
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:backlog/4162-verify-lane-check-calls-a-never-started-request-an-abandoned.md", "we:backlog/4656-ci-heal-must-not-delete-the-pr-s-own-intended-change-to-turn.md", "we:backlog/4968-check-backlog-item-tests-write-their-fixture-card-into-a-tem.md"]
 dateOpened: "2026-10-03"
+dateResolved: "2026-10-11"
 tags: []
 ---
 

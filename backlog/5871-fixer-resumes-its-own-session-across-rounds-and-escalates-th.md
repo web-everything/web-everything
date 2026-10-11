@@ -1,4 +1,5 @@
 ---
+bornAs: xrbu1bp
 kind: story
 size: 5
 priority: high
@@ -12,7 +13,7 @@ tags: []
 
 # Fixer resumes its own session across rounds and escalates the model from round 3
 
-Items 2 and 3 of making the fixer as good as a focused worker (after #4756 / card xx0055i). (2) When round N>1 of a fix is dispatched and the previous round's fixer session (claude agents row named fix-<pr>, its job record in ~/.claude/jobs) is still resumable, resume it with the new round's findings + history instead of a cold start; bound: only when the session's own lane (lease ownerSession = that session) is still at the PR head and the base was not rebased under it, else cold start with the history brief. Setting fix.resumeAcrossRounds on|off (default on). (3) The fixer ladder's stronger-model rung starts at round 3 (fix.strongerModelFromRound, default 3) for ordinary fix rounds, not only after ruling misses. Both are settings under the policy cascade in we:scripts/settings/fix.json (env > settings > built-in). The dry-run (we:scripts/conveyor/reconcile-fix-dispatch.mjs --dry-run --replay-pr=N) shows the round, model route and resume decision for a live PR with no side effects.
+Items 2 and 3 of making the fixer as good as a focused worker (after #4756 / card 5851). (2) When round N>1 of a fix is dispatched and the previous round's fixer session (claude agents row named fix-<pr>, its job record in ~/.claude/jobs) is still resumable, resume it with the new round's findings + history instead of a cold start; bound: only when the session's own lane (lease ownerSession = that session) is still at the PR head and the base was not rebased under it, else cold start with the history brief. Setting fix.resumeAcrossRounds on|off (default on). (3) The fixer ladder's stronger-model rung starts at round 3 (fix.strongerModelFromRound, default 3) for ordinary fix rounds, not only after ruling misses. Both are settings under the policy cascade in we:scripts/settings/fix.json (env > settings > built-in). The dry-run (we:scripts/conveyor/reconcile-fix-dispatch.mjs --dry-run --replay-pr=N) shows the round, model route and resume decision for a live PR with no side effects.
 
 ## Acceptance
 
@@ -36,7 +37,7 @@ Items 2 and 3 of making the fixer as good as a focused worker (after #4756 / car
 
 One line per class: either the handling, or `n/a: <why>`.
 
-1. **Untrusted text** — the round history in the resume prompt is the xx0055i section (trusted comments only, scrubbed, capped, marked as DATA); journal/lease/job JSON is parsed defensively and a bad line is skipped.
+1. **Untrusted text** — the round history in the resume prompt is the 5851 section (trusted comments only, scrubbed, capped, marked as DATA); journal/lease/job JSON is parsed defensively and a bad line is skipped.
 2. **Truncated reads** — the pool journal is read as a 4 MB tail with the torn first line dropped; any unreadable input (listing, job record, lease, gh compare) is null, which declines the resume.
 3. **Shared state files** — leases, journal and job records are only read; the resume takes the existing fix-dispatch claim before `--resume` (no double resume) and releases it in every outcome.
 4. **Fail closed** — every unknown (base not provable, head unknown, lane not found) is a cold start with the history brief, never a resume; a fork from `--resume` is stopped.
