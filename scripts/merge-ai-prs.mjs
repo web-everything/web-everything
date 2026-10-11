@@ -168,7 +168,7 @@ import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, next
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
-import { isDispatchFrozen, readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
+import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
 // #2399 — the ONE remote-manifest `gh api` argv, shared with `/finish` (lane-resume) so the two readers never
 // drift. Re-exported to keep this file's public surface (and its tests' import site) stable.
 import { remoteManifestApiArgs } from './lib/remote-manifest.mjs';
@@ -195,7 +195,8 @@ import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review
 import { prepareItemFromRef } from './operations/prepare-pr.mjs';
 import { loadMergeQueueSettings, hookEnabled as mergeQueueHookEnabled, prioritizeMainFix, readMergeFreshnessFacts, decideMergeQueueAction, refreshedStatePath, readRefreshed, recordRefreshed, refreshStalePr, couplePinExcuses, readMainFixPriority } from './lib/merge-queue-hook.mjs'; // card xs1hdl7 — the merge-queue freshness hook (see the merge site)
 import { readMainRedPriority, readMainRedState } from './lib/main-red-priority.mjs';
-import { resolveRedMainHoldSetting, resolveRedMainMode, redMainSignal, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
+import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-freeze-shared.mjs';
+import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
@@ -5426,11 +5427,9 @@ async function runCli() {
   {
     const holdSetting = resolveRedMainHoldSetting();
     const holdOn = holdSetting.value === 'on';
-    const manualFreeze = redMainBypass ? null : readFreeze();
-    if (!redMainBypass && (holdOn || manualFreeze)) {
-      const sig = holdOn
-        ? redMainSignal({ mainRedState: readMainRedState(), priority: readMainRedPriority(), manualFreeze, now: Date.now() })
-        : redMainSignal({ manualFreeze, now: Date.now() }); // OFF: no fix-PR exemption, nothing lands
+    const freeze = redMainBypass ? null : await readDrainFreezePass();
+    if (!redMainBypass && (holdOn || freeze.frozen)) {
+      const sig = drainFreezeSignal({ state: freeze, mainRedState: readMainRedState(), priority: readMainRedPriority(), now: Date.now(), holdOn });
       if (sig.red) {
         redMainHeld = true;
         let held = 0;
@@ -5454,7 +5453,7 @@ async function runCli() {
           const d = quarantine && isLocalRepo(v.repo)
             ? decideQuarantineHold({ num: v.num, files: filesOf(v.num), signal: sig, list: qList, fixFiles, now: Date.now() })
             : decideRedMainHold({ num: v.num, isLocal: isLocalRepo(v.repo), signal: sig, setting: 'on' });
-          if (d.hold) { v.decision = 'skip'; v.reason = d.reason; v.redMainHold = true; held++; }
+          if (d.hold) { v.decision = 'skip'; v.reason = freeze.frozen ? `${RED_MAIN_HOLD_REASON}: ${freeze.reason}; ${d.reason}` : d.reason; v.redMainHold = true; held++; }
         }
         if (!AS_JSON) process.stderr.write(`  🛑 ${RED_MAIN_HOLD_REASON}: main red [${sig.sources.join('+')}] mode ${mode.value} — fix PR(s) ${sig.fixPrs.map((n) => `#${n}`).join(', ') || '(none published)'} allowed, ${held} other PR(s) held (setting ${holdSetting.value} via ${holdSetting.source})\n`);
       }
@@ -6388,7 +6387,15 @@ async function runCli() {
   //     merge-ai-prs-red-main-hold-wiring.test.mjs, which runs WITHOUT the bypass and asserts both the
   //     `gh pr merge` calls and every `git push` to main.
   const redMainBypass = !!flags['no-red-main-freeze'] || process.env.WE_MERGE_BREAK_GLASS === '1';
-  const redMainFreezeStop = () => {
+  let freezeBeforePass = null;
+  const readDrainFreezePass = async () => {
+    const cached = freezeBeforePass;
+    freezeBeforePass = null;
+    const strategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: true, isLocalRepo, localSlug });
+    return prepareDrainFreeze({ local: readFreeze(), ...(cached ? { shared: cached.shared, settings: cached.settings, logSettings: false } : {}),
+      repo: localSlug, branch: defaultBranchOf(null), enqueues: strategy.enqueues(null), dryRun: DRY_RUN });
+  };
+  const redMainFreezeStop = async () => {
     if (redMainBypass) return null;
     // A freeze raised before the marker moved to the coordination root is carried across once, so rollout never drops it.
     // (skipped on --dry-run: a read-only pass must not move files.) Any non-benign outcome is logged, never silent.
@@ -6403,12 +6410,15 @@ async function runCli() {
         process.stderr.write(`merge-ai-prs · WARNING: a legacy red-main freeze marker was NOT migrated (${mig.reason}) — it is being ignored; check ${pendingLegacyFreezeMarkers().join(', ') || resolveLegacyFreezeMarkerPath()}\n`);
       }
     }
-    if (!isDispatchFrozen()) return null;
     if (resolveRedMainHoldSetting().value === 'on') return null;
-    const fr = readFreeze();
+    if (freezeBeforePass) return null;
+    const fr = await readDrainFreezePass();
+    freezeBeforePass = fr;
+    if (!fr.frozen) return null;
+    const mergeSha = fr.local?.mergeSha || fr.shared?.mergeSha;
     return {
-      marker: fr,
-      detail: `main is RED (red-main dispatch-freeze active${fr?.reason ? `: ${fr.reason}` : ''}) — the drain lands NOTHING until main is green again. Revert-to-green${fr?.mergeSha ? ` (revert ${fr.mergeSha})` : ''}, then \`node scripts/readiness/red-main-remediation.mjs unfreeze\` (#2681).`,
+      marker: fr.local ?? fr.shared,
+      detail: `main is RED (red-main dispatch-freeze active: ${fr.reason}) — the drain lands NOTHING until main is green again. Revert-to-green${mergeSha ? ` (revert ${flatText(mergeSha)})` : ''}, then \`node scripts/readiness/red-main-remediation.mjs unfreeze\` (#2681).${fr.error ? ` Check the configured ops freeze branch (${flatText(fr.shared?.source ?? 'mergeDelivery.redMainFreezeBranch')}), origin connectivity/read access, and red-main-freeze.json for valid JSON with a boolean frozen field.` : ''}`,
     };
   };
   const emitRedMainStop = (stop) => {
@@ -6416,7 +6426,7 @@ async function runCli() {
     else process.stderr.write(`merge-ai-prs · STOP-THE-LINE — ${stop.detail}\n`);
   };
   {
-    const stop = redMainFreezeStop();
+    const stop = await redMainFreezeStop();
     if (stop) { emitRedMainStop(stop); process.exit(5); } // distinct from empty (0), merge-fail (2), dup-id (3): a red-main stop-the-line
   }
 
@@ -6462,7 +6472,7 @@ async function runCli() {
     // watch (the resident drain daemon is a long-lived `--watch`), and stop-the-line must catch it, not just a
     // freeze that predated process start. Symmetric to the dup-id stop below — break and surface with exit 5.
     {
-      const stop = redMainFreezeStop();
+      const stop = await redMainFreezeStop();
       if (stop) { emitRedMainStop(stop); redMainStopped = true; break; }
     }
     // #2395 — wall-clock lifetime cap: hard-stop a `--max-runtime-min` watch so an inert `--until-batches-idle`

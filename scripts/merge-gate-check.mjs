@@ -46,7 +46,7 @@ import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
 import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
 import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
-import { readSharedFreeze } from './lib/red-main-freeze-shared.mjs';
+import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
 import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
@@ -314,6 +314,11 @@ export function readRedMainFact({ cwd, policy, read = readSharedFreeze }) {
   return read({ board: cwd, branch: policy.redMainFreezeBranch });
 }
 
+/** Single log line even for injected/untrusted source, reason or read errors. */
+export function formatRedMainFreeze(redMain) {
+  return `red-main freeze (${flatText(redMain.source)}): ${redMain.error ? `UNREADABLE — ${flatText(redMain.error)}` : redMain.frozen ? `FROZEN — ${flatText(redMain.reason)}` : 'clear'}\n`;
+}
+
 /** How many of main's CI runs to read: enough to find the last green one behind a short red streak. */
 const MAIN_CI_RUNS = 30;
 
@@ -365,17 +370,17 @@ export function isMainFixPr(pr, redShas = []) {
  * freezes, which hold every PR. Anything unreadable is `{error}` (fail closed). Pure.
  */
 export function combineRedMain(freeze, mainCi, pr = null) {
-  const source = [freeze?.source, mainCi?.source].filter(Boolean).join(' + ');
-  if (freeze?.error) return { source, error: freeze.error };
+  const source = [freeze?.source, mainCi?.source].filter(Boolean).map(v => flatText(v)).join(' + ');
+  if (freeze?.error) return { source, error: flatText(freeze.error) };
   if (!mainCi) return { source, error: 'main CI status not read' };
-  if (mainCi.error) return { source, error: mainCi.error };
+  if (mainCi.error) return { source, error: flatText(mainCi.error) };
   // A MANUAL freeze holds every PR. An automatic one (never published by this writer, but an old or foreign doc may say
   // so) counts as a red main: it holds every PR except the current main-fix PR, the same as main CI red below.
-  if (freeze?.frozen && freeze.kind !== 'auto') return { source, frozen: true, reason: `manual freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
-  if (freeze?.frozen && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `automatic red-main freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
+  if (freeze?.frozen && freeze.kind !== 'auto') return { source, frozen: true, reason: `manual freeze: ${flatText(freeze.reason || 'active')}`, publishedAt: freeze.publishedAt == null ? null : flatText(freeze.publishedAt) };
+  if (freeze?.frozen && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `automatic red-main freeze: ${flatText(freeze.reason || 'active')}`, publishedAt: freeze.publishedAt == null ? null : flatText(freeze.publishedAt) };
   const sha = mainCi.firstRedSha ? ` since ${String(mainCi.firstRedSha).slice(0, 9)}` : '';
-  if (mainCi.red && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt ?? null };
-  return { source: mainCi.red ? `${source} (main CI red${sha}; main-fix PR exempt)` : source, frozen: false, reason: null, publishedAt: freeze?.publishedAt ?? null };
+  if (mainCi.red && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt == null ? null : flatText(freeze.publishedAt) };
+  return { source: mainCi.red ? `${source} (main CI red${sha}; main-fix PR exempt)` : source, frozen: false, reason: null, publishedAt: freeze?.publishedAt == null ? null : flatText(freeze.publishedAt) };
 }
 
 /**
@@ -386,9 +391,9 @@ export function combineRedMain(freeze, mainCi, pr = null) {
  */
 export function applyFreezeRecheck(verdict, first, recheck, { mainCi = undefined, mainCiRecheck = undefined, exempt = false } = {}) {
   if (!verdict.ok) return verdict;
-  let why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${recheck?.error || 'not read'}`
+  let why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${flatText(recheck?.error || 'not read')}`
     // Same rule as combineRedMain: an automatic freeze spares a run made only of current main-fix PRs; a manual one never.
-    : recheck.frozen && (recheck.kind !== 'auto' || !exempt) ? `main went RED during this run (freeze: ${recheck.reason || 'active'})`
+    : recheck.frozen && (recheck.kind !== 'auto' || !exempt) ? `main went RED during this run (freeze: ${flatText(recheck.reason || 'active')})`
       : (first?.frozen !== recheck.frozen || (first?.publishedAt ?? null) !== (recheck.publishedAt ?? null)) ? 'red-main freeze changed during this run'
         : null;
   if (!why && mainCi !== undefined) {
@@ -451,7 +456,7 @@ async function main() {
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
   // One read of the shared red-main freeze for the whole run (xyd06qo); branch name from the same policy cascade.
   const redMain = readRedMainFact({ cwd, policy });
-  process.stderr.write(`red-main freeze (${redMain.source}): ${redMain.error ? `UNREADABLE — ${redMain.error}` : redMain.frozen ? `FROZEN — ${redMain.reason}` : 'clear'}\n`);
+  process.stderr.write(formatRedMainFreeze(redMain));
   // Main's OWN CI status — the authority for "is main red" (operator ruling 2026-10-11); the freeze above is manual only.
   const mainCi = readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`main CI (${mainCi.source}): ${mainCi.error ? `UNREADABLE — ${mainCi.error}` : mainCi.red ? `RED since ${String(mainCi.firstRedSha || '?').slice(0, 9)}` : 'green'}\n`);
