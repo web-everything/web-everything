@@ -49,8 +49,13 @@ export function readSnapshot({ root } = {}) {
 
 // Resolved lazily: some test harnesses load modules from a non-file URL, where a top-level fileURLToPath throws.
 const repoRootOf = () => fileURLToPath(new URL('../../', import.meta.url));
-export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(), home = homedir() } = {}) {
+export function loadResourcePolicy({ env = process.env, repoRoot, home = homedir() } = {}) {
   const sources = { platform: null, tool: null };
+  // x6nuodj: a default param here threw under a non-file module URL and admit() then decided on NO snapshot (hold
+  // every heavy kind). Resolve it in the body: an unresolvable repo root only drops the tool layer, named in errors.
+  if (repoRoot === undefined) {
+    try { repoRoot = repoRootOf(); } catch (error) { (sources.errors ??= []).push({ source: 'tool', path: null, error: String(error?.message ?? error) }); }
+  }
   const readLayer = (source, path) => {
     try {
       const file = JSON.parse(readFileSync(path, 'utf8'));
@@ -65,6 +70,7 @@ export function loadResourcePolicy({ env = process.env, repoRoot = repoRootOf(),
     }
   };
   const platform = readLayer('platform', env.WE_PLATFORM_PREFERENCES || join(home, '.claude', 'platform-preferences.json'));
+  if (repoRoot === undefined) return { policy: resolveResourcePolicy({ platform }), sources };
   // The tool layer is the merged scripts/ settings (legacy shared file + scripts/settings/*.json), so a feature file can
   // carry `resourceAdmission` too. The legacy file sits beside the settings dir, so it is derived from it, not named here.
   const settingsDir = join(repoRoot, 'scripts', 'settings');

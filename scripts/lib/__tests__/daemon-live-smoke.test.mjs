@@ -56,6 +56,35 @@ describe('resource shadow observations', () => {
     });
     expect(admit).not.toHaveBeenCalled();
   });
+  it('busyPoolSkip stands (null) when the only busy signal is an unknown hold on a quiet host', () => {
+    const unknown = { verdict: 'hold', unknown: true };
+    const detail = 'lane-pool list failed: timed out after 60000ms (process group killed)';
+    const hostBusy = () => hostLooksBusy({}, { load: () => 1, cores: () => 12, shadow: () => unknown, admit: () => unknown });
+    expect(busyPoolSkip({ what: 'lane-pool list', detail, elapsedMs: 60_000, capMs: 60_000, ctx: { env: {}, hostBusy } })).toBeNull();
+  });
+  // WE_RESOURCE_CUTOVER=shadow is the rollback switch: the shared decision is only logged, the legacy load rule decides.
+  it.each([[60, true], [3, false]])('keeps the legacy load rule at load %s under WE_RESOURCE_CUTOVER=shadow', (load1, busy) => {
+    const env = { WE_RESOURCE_CUTOVER: 'shadow' };
+    const shadow = vi.fn(() => ({ verdict: 'admit', reason: 'cpu idle 50%' })); const admit = vi.fn(() => ({ verdict: 'admit' }));
+    expect(hostLooksBusy(env, { load: () => load1, cores: () => 12, shadow, admit })).toBe(busy);
+    expect(shadow).toHaveBeenCalledTimes(1); expect(admit).not.toHaveBeenCalled();
+  });
+  it('keeps legacy load-scaled budgets and reports no admission under WE_RESOURCE_CUTOVER=shadow', async () => {
+    const run = async (env) => {
+      const runChild = vi.fn(async () => '');
+      const out = await runLiveSmoke({ root: '/x', env, load: () => 63, cores: () => 12, clock: () => 0, changedFiles: [], closureOf: () => [],
+        runChild, shadow: () => ({ verdict: 'admit', reason: 'cpu idle 50%' }), admit: () => ({ verdict: 'admit' }) });
+      return { out, timeouts: runChild.mock.calls.map(([, , opts]) => opts.timeoutMs) };
+    };
+    const enforced = await run({ WE_RESOURCE_CUTOVER: 'enforce' });
+    const shadowed = await run({ WE_RESOURCE_CUTOVER: 'shadow' });
+    const legacy = await run({ WE_RESOURCE_CUTOVER: 'shadow', WE_SMOKE_LOAD_SCALE: undefined });
+    expect(shadowed.out.admission).toBeUndefined();
+    expect(shadowed.timeouts.length).toBeGreaterThan(0);
+    // load 63 on 12 cores: the legacy rule scales every budget up, the enforced admit decision does not.
+    expect(shadowed.timeouts.some((ms, i) => ms > enforced.timeouts[i])).toBe(true);
+    expect(legacy.timeouts).toEqual(shadowed.timeouts);
+  });
   // Every decision shape: busy ⇔ a KNOWN non-admit. An unknown hold (sampler down: snapshot-missing/stale) is no
   // evidence about the host, so the legacy load rule decides — never "busy" (that would launder a hung probe into a skip).
   it.each([
