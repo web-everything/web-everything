@@ -29,7 +29,7 @@ Must: on any error reading the snapshot the shared rule refuses heavy work (hold
 
 ## Non-goals
 
-- [N1] Deleting the old checks (`gateHost`, `WE_MIN_CPU_IDLE_PCT_*`, the light floor) — slice 4 (xmd6ngm).
+- [N1] Deleting the old checks (`gateHost`, `WE_MIN_CPU_IDLE_PCT_*`, the light floor) — slice 4 (5716).
 - [N2] The heavy SLOT count (`WE_HEAVY_ADMISSION_CAP` 4 + 2 fast) stays a semaphore; only the heavy LOAD admission (`load-status`, read by tick-core for the builder) moved onto `admit()`.
 - [N3] The builder's per-launch host gate (`cliHostLoadGate` in we:skills-src/conveyor/build-dispatch-daemon.mjs) was held by another agent's scope; it keeps the legacy `gateHost` until slice 4 swaps it for `gateLaunch` (one line). The builder's tick-core load gate and its light gate do decide through `admit()` here.
 

@@ -49,7 +49,7 @@ export default {
     let last;
     for (let tick = 0; tick < TICKS; tick++) {
       last = sweepMissingRunRecovery({
-        apply: true, repo: REPO, readOpenPrs: () => cases.map((c) => c.pr), readRequiredContexts: () => ['test'],
+        apply: true, repo: REPO, readOpenPrs: () => cases.map((c) => c.pr), readRequiredContexts: () => ['test'], readMainRuns: () => [],
         readHeadCommittedAt: () => '2026-09-26T14:20:26Z', readComments: (n) => comments.get(n), now,
         trigger: (d, o) => pushMissingRunCommit(d, { ...o, exec, env: cases.find((c) => c.pr.number === d.prNumber).env ?? { GH_TOKEN: 'ghp_x' }, checkClaim: () => null }),
         postComment: (n, o) => comments.get(n).push({ body: `🚦 conveyor missing-run-recovery\n\nsha: ${o.headSha}\n${o.error}`, author: { login: 'web-everything' } }),

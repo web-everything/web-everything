@@ -25,6 +25,12 @@ describe('derivePrStatusLabel', () => {
     expect(derive({ pr: pr(['review:changes'], [marker(7)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('takeover-running');
     expect(derive({ pr: pr(['review:changes'], [marker(7), advisory(8)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('fixing');
   });
+  it('a delayed review of the head before the takeover does not judge it: still takeover-running', () => {
+    const OLD = 'b'.repeat(40);
+    const oldReview = (h) => ({ ...advisory(h), body: advisory(h).body.replace(HEAD, OLD) });
+    const oldMarker = { ...marker(7), body: takeoverMarkerBody({ pr: 7, head: OLD, attempts: 5, cap: 5, rung: { id: 'x' } }) };
+    expect(derive({ pr: pr(['review:changes'], [oldReview(6), oldMarker, oldReview(8)]), reviewStatus: { role: 'fix', state: 'fixing' } })).toBe('takeover-running');
+  });
   it('a spent budget, a non-converging takeover or a ruling dispute is the operator\'s: escalated', () => {
     expect(derive({ pr: pr(['review:changes']), rows: [{ kind: 'cap-exhausted', takeover: 'takeover-budget-spent' }] })).toBe('escalated');
     // a takeover switched off (budget 0 or invalid) asks the operator too: it is not "a takeover is planned"

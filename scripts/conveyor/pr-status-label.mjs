@@ -5,8 +5,7 @@
  */
 import { rulingNeeded } from '../lib/ruling-ledger.mjs';
 import { latestAdvisory, advisoryCoversHead, ADVISORY_OUTCOMES } from '../lib/advisory-labels.mjs';
-import { takeoverEpisodes } from './takeover-budget.mjs';
-import { isReviewVerdictComment } from './mechanical-round-cap.mjs';
+import { takeoverEpisodes, takeoverProgress } from './takeover-budget.mjs';
 // The queue's stand-down CLI lazily reaches the tagger; load the queue dynamically too.
 // Its import-time dependencies have no path back here (including its ruling-ledger load).
 const { evaluatePr, rulingNeededRow } = await import('../operations/operator-queue.mjs');
@@ -41,7 +40,6 @@ export const PR_STATUS_DESCRIPTIONS = Object.freeze({
 /** Takeover reasons that hand the PR to a person (the note says "a person must decide/take it over"). */
 const ESCALATED = new Set(['takeover-budget-spent', 'takeover-not-converging', 'takeover-spent', 'takeover-void-limit', 'ruling-dispute', 'setting-person', 'setting-disabled']);
 const names = (labels) => (Array.isArray(labels) ? labels : []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
-const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? c?.created_at ?? ''); return Number.isFinite(t) ? t : NaN; };
 
 /** PURE: exactly the operator queue's NEEDS YOU or RULING NEEDED gate. */
 export function operatorQueueNeedsYou(pr, { humanAt } = {}) {
@@ -53,6 +51,8 @@ export function operatorQueueNeedsYou(pr, { humanAt } = {}) {
   return evaluatePr(subject).ready || Boolean(humanAt === undefined
     ? rulingNeededRow('', subject) : rulingNeeded(subject, { humanAt }));
 }
+
+const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? c?.created_at ?? ''); return Number.isFinite(t) ? t : NaN; };
 
 /** PURE: only required checks (or the CI failure label) can make the stage red. */
 function requiredCiRed(pr, labels, requiredChecks) {
@@ -71,11 +71,12 @@ const isHumanComment = (c) => {
     && !/^(web-everything|github-actions)$/i.test(login) && !/\[bot\]$/i.test(login);
 };
 
-/** PURE: the latest takeover has not been judged yet (no review verdict after it). */
+/** PURE: the latest takeover has not been judged yet — no review of its own work landed (a delayed review of the old
+ *  head does not count; the same rule as the takeover budget's progress guard). */
 export function takeoverUnjudged(comments) {
   const latest = takeoverEpisodes(comments).at(-1);
   if (!latest) return false;
-  return !(Array.isArray(comments) ? comments : []).some((c) => isReviewVerdictComment(c) && timeOf(c) > latest.end);
+  return !takeoverProgress(comments, latest).judged;
 }
 
 /**
