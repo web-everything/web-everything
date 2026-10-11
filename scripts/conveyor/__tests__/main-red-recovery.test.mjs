@@ -852,8 +852,8 @@ describe('failingRequiredCheckForAttribution — every required check, not test 
   const row = (name, conclusion, completedAt) => ({ __typename: 'CheckRun', name, status: 'COMPLETED', conclusion, completedAt });
   const pr = (...rows) => ({ number: 2783, statusCheckRollup: rows });
 
-  it('defaults to the required contexts test / smoke / daemon-soak / integration', () => {
-    expect(DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS).toEqual(['test', 'smoke', 'daemon-soak', 'integration']);
+  it('defaults to the required contexts test / smoke / daemon-soak / soak-replay-gate', () => {
+    expect(DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS).toEqual(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
   });
 
   it('DEFAULT_MAIN_RED_ATTRIBUTED_CHECKS is the SAME binding as required-status-checks.mjs\'s FALLBACK (#4501 — never a second hardcoded copy)', async () => {
@@ -936,6 +936,9 @@ describe('PR-scoped required checks are never main-attributable (configurable)',
   it('a failing PR-scoped check wins the attribution pick even inside a main-red window', () => {
     const pr = { statusCheckRollup: [row('daemon-soak', 'FAILURE', '2026-10-04T16:30:00Z'), row('soak-replay-gate', 'FAILURE', '2026-10-04T16:24:27Z')] };
     expect(failingRequiredCheckForAttribution(pr, { requiredChecks: REQ, mainRedWindows: WINDOWS })).toEqual({ name: 'soak-replay-gate', completedAt: '2026-10-04T16:24:27Z' });
+    const picked = failingRequiredCheckForAttribution(pr, { mainRedWindows: WINDOWS });
+    expect(picked).toEqual({ name: 'soak-replay-gate', completedAt: '2026-10-04T16:24:27Z' });
+    expect(isPrCiFailureOwedRerun({ requiredCheckCompletedAt: picked.completedAt, failingCheckName: picked.name, aheadBy: 12, mainRedWindows: WINDOWS })).toBe(false);
     expect(failingRequiredCheckForAttribution(pr, { requiredChecks: REQ, mainRedWindows: WINDOWS, prScopedChecks: [] }).name).toBe('daemon-soak');
   });
 

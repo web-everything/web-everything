@@ -13,8 +13,8 @@ beforeAll(() => { scratch = mkdtempSync(join(tmpdir(), 'pr-state-io-')); });
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 const green = name => ({ name, status: 'COMPLETED', conclusion: 'SUCCESS', completedAt: HEAD_AT });
-// The declared fallback required set is test/smoke/daemon-soak, so a green rollup must carry all three.
-const graphql = (comments = [], { nodes = ['test', 'smoke', 'daemon-soak', 'integration'].map(green), hasNextPage = false } = {}) => JSON.stringify({ data: { repository: { pullRequest: {
+// The declared fallback required set is test/smoke/daemon-soak/soak-replay-gate, so a green rollup must carry all four.
+const graphql = (comments = [], { nodes = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(green), hasNextPage = false } = {}) => JSON.stringify({ data: { repository: { pullRequest: {
   comments: { pageInfo: { hasPreviousPage: false }, nodes: comments },
   timelineItems: { nodes: [] },
   commits: { nodes: [{ commit: { oid: SHA, committedDate: HEAD_AT, statusCheckRollup: { contexts: { pageInfo: { hasNextPage }, nodes } } } }] } } } } });

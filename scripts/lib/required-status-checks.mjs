@@ -11,12 +11,9 @@
  * list — an advisory workflow's mere EXISTENCE was enough to cause a false red, and the same will be true of
  * the NEXT one someone adds, forever, unless something closes the gap structurally.
  *
- * THE FIX: invert the question. Branch protection (`gh api repos/<repo>/branches/<branch>/protection --jq
- * .required_status_checks.contexts`) already states which checks are ACTUALLY required to merge — the one
- * ground truth that does not need updating by hand every time a new advisory workflow is added. A reader that
- * asks "did a REQUIRED check fail" instead of "did any check outside a hand-maintained exclusion list fail"
- * cannot be fooled by a new advisory check, because the new check simply is not in the required set until
- * someone deliberately adds it to branch protection.
+ * THE FIX: invert the question. Read branch rulesets first (App-token readable), then classic branch
+ * protection, to learn which checks are ACTUALLY required to merge. Asking "did a REQUIRED check fail"
+ * cannot be fooled by a new advisory check: it only counts once explicitly required by repository policy.
  *
  * THIS FILE OWNS THE IO (`gh api …`, cached to a sidecar file — same convention as `we:scripts/progress-
  * board.mjs`'s own `reports/.progress-board-cache.json`) so every PURE reducer that wants the required set
@@ -46,12 +43,12 @@ import { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks } from './requi
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 /**
- * The required set as confirmed live on 2026-09-26 (`gh api repos/web-everything/web-everything/branches/main/
- * protection --jq .required_status_checks.contexts`). Used as WE's declared policy on protection 403/404,
- * or as an untrusted fallback for other failures when no cache exists. A successful live fetch always wins,
- * so a real branch-protection change is picked up on the next successful read regardless of this constant.
+ * The required set as confirmed live on 2026-10-11 via the rules API
+ * (`repos/web-everything/web-everything/rules/branches/main`, ruleset 24883772).
+ * Used as WE's declared policy on access denial, or as an untrusted fallback for other failures when no
+ * cache exists. A successful live fetch always wins, picking up changes on the next successful read.
  */
-export const FALLBACK_REQUIRED_STATUS_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'integration']);
+export const FALLBACK_REQUIRED_STATUS_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
 
 export { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks };
 
@@ -83,6 +80,32 @@ export function defaultCachePath() {
   return join(process.cwd(), 'reports', '.required-status-checks-cache.json');
 }
 
+/** Pure projection of branch rules into the union of required status-check contexts. */
+export function requiredChecksFromRules(rulesJson) {
+  if (!Array.isArray(rulesJson)) throw new Error('required-status-checks: unexpected shape from branch rules');
+  return [...new Set(rulesJson
+    .filter(rule => rule?.type === 'required_status_checks')
+    .flatMap(rule => rule.parameters?.required_status_checks ?? [])
+    .map(check => check?.context)
+    .filter(context => typeof context === 'string' && context.length > 0))];
+}
+
+/** Shared routing, timeout and piped IO for both GitHub sources. */
+function readRequiredChecksGh(args) {
+  const opts = { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] };
+  if (resolvePersonalRouteEnabled()) {
+    // Personal routing lives in the CLI read path, not runGhSync.
+    const result = runGhCliPassthrough(args, {
+      spawn: (bin, argv, spawnOpts) => spawnSync(bin, argv, { ...spawnOpts, ...opts }),
+    });
+    if (result.status !== 0 || result.deferred) {
+      throw Object.assign(new Error('required-status-checks: read failed'), { stderr: result.stderr });
+    }
+    return String(result.stdout ?? '');
+  }
+  return readGh(args, opts); // #74d: failure/oversize throws; never parsed as empty
+}
+
 /**
  * The injected `gh` reader. Returns the repo's required status-check context names, or throws — never
  * swallows an error itself, so {@link getRequiredStatusChecks} is the one place that decides what a failure
@@ -92,28 +115,32 @@ export function defaultCachePath() {
  * the CURRENT directory's git remote — the same "let gh infer it" convention this repo's other readers use
  * (e.g. `we:scripts/conveyor/reconcile-pass.mjs#defaultReadAheadBy`) — rather than failing a caller that never
  * had a repo slug to pass.
- * @param {{repo?: string, branch?: string}} o
+ * @param {{repo?: string, branch?: string, gh?: Function}} o
  * @returns {string[]}
  */
-export function defaultReadRequiredStatusChecks({ repo, branch = 'main' } = {}) {
-  const args = ['api', `repos/${repo || '{owner}/{repo}'}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts'];
-  const opts = { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] };
-  let out;
-  if (resolvePersonalRouteEnabled()) {
-    // Personal routing lives in the CLI read path, not runGhSync. Keep the reader's timeout and piped IO.
-    const result = runGhCliPassthrough(args, {
-      spawn: (bin, argv, spawnOpts) => spawnSync(bin, argv, { ...spawnOpts, ...opts }),
-    });
-    if (result.status !== 0 || result.deferred) {
-      throw Object.assign(new Error('required-status-checks: protection read failed'), { stderr: result.stderr });
-    }
-    out = String(result.stdout ?? '');
-  } else {
-    out = readGh(args, opts); // #74d: failure/oversize throws; never parsed as empty
+export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = readRequiredChecksGh } = {}) {
+  const base = `repos/${repo || '{owner}/{repo}'}`;
+  let rulesError;
+  try {
+    const out = gh(['api', `${base}/rules/branches/${branch}`]);
+    const checks = requiredChecksFromRules(JSON.parse(out.trim() || '[]'));
+    if (checks.length) return checks;
+  } catch (error) {
+    rulesError = error;
   }
-  const parsed = JSON.parse(out.trim() || '[]');
-  if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
-  return parsed.map(String);
+
+  let checks;
+  try {
+    const out = gh(['api', `${base}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts']);
+    const parsed = JSON.parse(out.trim() || '[]');
+    if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
+    checks = parsed.map(String);
+  } catch (error) {
+    // A transient rules failure must not become a denial just because protection is inaccessible.
+    throw rulesError && !protectionAccessDenied(rulesError) ? rulesError : error;
+  }
+  if (!checks.length && rulesError) throw rulesError;
+  return checks;
 }
 
 /**

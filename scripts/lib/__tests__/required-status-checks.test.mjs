@@ -16,7 +16,7 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...actual, spawnSync, execFileSync, default: { ...actual.default, spawnSync, execFileSync } };
 });
 import { execFileSync, spawnSync } from 'node:child_process';
-import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
+import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, requiredChecksFromRules, FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
 
 describe('getRequiredStatusChecks', () => {
   let dir;
@@ -101,7 +101,7 @@ describe('getRequiredStatusChecks', () => {
   it.each([
     ['plateauapp/plateau-app', ['test', 'e2e']],
     ['frontier-ui/frontierui', ['test']],
-    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak', 'integration']],
+    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak', 'soak-replay-gate']],
   ])('caches the declared set for %s on a plan-feature 403, then retries after TTL', (repo, checks) => {
     const readChecks = vi.fn(plan403);
     expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, ttlMs: 1000, readChecks }))
@@ -246,6 +246,25 @@ describe('getRequiredStatusChecks', () => {
   });
 });
 
+const requiredRule = (...contexts) => ({ type: 'required_status_checks', parameters: {
+  required_status_checks: contexts.map(context => ({ context, integration_id: 15368 })),
+} });
+
+describe('requiredChecksFromRules', () => {
+  it('unions required rules, deduplicating contexts and ignoring other rule types', () => {
+    expect(requiredChecksFromRules([
+      requiredRule('test', 'smoke', 'test'),
+      { ...requiredRule('ignored'), type: 'pull_request' },
+      requiredRule('smoke', 'daemon-soak'),
+      { type: 'deletion' },
+    ])).toEqual(['test', 'smoke', 'daemon-soak']);
+  });
+  it('returns no contexts when there are no required checks', () => {
+    expect(requiredChecksFromRules([])).toEqual([]);
+    expect(requiredChecksFromRules([{ type: 'deletion' }, requiredRule()])).toEqual([]);
+  });
+});
+
 describe('defaultReadRequiredStatusChecks', () => {
   let dir;
   beforeEach(() => {
@@ -256,7 +275,63 @@ describe('defaultReadRequiredStatusChecks', () => {
   });
   afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it('routes the protection read through the real throttle personal read path when enabled', () => {
+  it('reads rules first and never reads protection after a nonempty result', () => {
+    const gh = vi.fn(() => JSON.stringify([requiredRule('test', 'smoke', 'test')]));
+    expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', branch: 'release', gh })).toEqual(['test', 'smoke']);
+    expect(gh.mock.calls).toEqual([[['api', 'repos/owner/repo/rules/branches/release']]]);
+  });
+
+  it('falls back to classic protection when rules are empty', () => {
+    const gh = vi.fn().mockReturnValueOnce('[]').mockReturnValueOnce('["classic"]');
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+    expect(gh.mock.calls).toEqual([
+      [['api', 'repos/{owner}/{repo}/rules/branches/main']],
+      [['api', 'repos/{owner}/{repo}/branches/main/protection', '--jq', '.required_status_checks.contexts']],
+    ]);
+  });
+
+  it.each([
+    ['HTTP 403: Resource not accessible by integration', 'HTTP 403: Resource not accessible by integration', 'declared'],
+    ['HTTP 502', 'HTTP 403: Resource not accessible by integration', 'fallback'],
+    ['HTTP 403: API rate limit exceeded', 'HTTP 403: Resource not accessible by integration', 'fallback'],
+    ['HTTP 403: Resource not accessible by integration', 'HTTP 502', 'fallback'],
+  ])('preserves error classification: rules %s, protection %s', (rulesMessage, protectionMessage, source) => {
+    const rulesError = new Error(rulesMessage);
+    const protectionError = new Error(protectionMessage);
+    const gh = vi.fn(args => { throw args[1].includes('/rules/') ? rulesError : protectionError; });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
+    expect(() => readChecks({})).toThrow(source === 'fallback' && !rulesMessage.includes('Resource not accessible') ? rulesError : protectionError);
+    expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath: join(dir, 'cache.json'), readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source });
+    if (source === 'fallback') expect(existsSync(join(dir, 'cache.json'))).toBe(false);
+  });
+
+  it.each(['HTTP 403: Resource not accessible by integration', 'HTTP 502'])('preserves rules failure when protection is empty: %s', message => {
+    const error = new Error(message);
+    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce('[]');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
+  });
+
+  it('replaces an expired live cache with a successful rules read', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['old-check'] });
+    const gh = vi.fn(() => JSON.stringify([requiredRule(...FALLBACK_REQUIRED_STATUS_CHECKS)]));
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    })).toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
+      checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live', fetchedAtMs: 90_000_000,
+    });
+    expect(gh).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses successful protection after a transient rules failure', () => {
+    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce('["classic"]');
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+  });
+
+  it('routes the rules read through the real throttle personal read path when enabled', () => {
     vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
     vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads'); // github.auth=app keeps the route off unless 'reads' is listed
     vi.stubEnv('GH_TOKEN', 'ghs_test_fixture');
@@ -264,11 +339,11 @@ describe('defaultReadRequiredStatusChecks', () => {
     spawnSync.mockImplementationOnce((_bin, _args, opts) => {
       expect(opts.env.GH_TOKEN === 'ghp_test_fixture').toBe(true);
       expect(opts.timeout).toBe(15_000);
-      return { status: 0, stdout: Buffer.from('["personal-check"]'), stderr: Buffer.alloc(0) };
+      return { status: 0, stdout: Buffer.from(JSON.stringify([requiredRule('personal-check')])), stderr: Buffer.alloc(0) };
     });
     expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check']);
     expect(execFileSync).toHaveBeenCalledWith('gh', ['auth', 'token'], expect.any(Object));
-    expect(spawnSync.mock.calls[0][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts']);
+    expect(spawnSync.mock.calls[0][1]).toEqual(['api', 'repos/web-everything/web-everything/rules/branches/main']);
     expect(process.env.GH_TOKEN === 'ghs_test_fixture').toBe(true);
   });
 
@@ -306,9 +381,9 @@ describe('defaultReadRequiredStatusChecks', () => {
 
 describe('adding a required check never stalls reviews (live 2026-10-07, `integration`, #4261)', () => {
   const ok = (name) => ({ name, status: 'completed', conclusion: 'success' });
-  it('the declared fallback names `integration`', async () => {
+  it('the declared fallback matches ruleset 24883772', async () => {
     const m = await import('../required-status-checks.mjs');
-    expect(m.FALLBACK_REQUIRED_STATUS_CHECKS).toContain('integration');
+    expect(m.FALLBACK_REQUIRED_STATUS_CHECKS).toEqual(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
   });
   it('integration is implied by a green `test`, only when it has no row of its own', async () => {
     const { withoutImpliedRequiredChecks: w } = await import('../required-status-checks.mjs');
