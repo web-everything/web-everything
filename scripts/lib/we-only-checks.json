@@ -22,9 +22,5 @@
   {
     "file": "scripts/operations/land-advance-io.mjs",
     "reason": "The three flagged `gh`/reconcile-pass reads (a fix plan's PR-diff fallback scope, its itemless-PR diff-path resolution, and the cached reconcile-pass read) are all reached only for a `we` PR: `planFixesFromReconcile` is called only after `p.repo !== 'we'` is refused upstream as `unsupported-repo`, and `readReconcile`'s own docblock (`reconcile-pass owns what a PR is owed`) already states it is read once for `we`, the only repo it plans today."
-  },
-  {
-    "file": "scripts/lib/required-status-checks.mjs",
-    "reason": "The branch-protection reader uses the caller's `repo` slug when given; only when a caller has no slug to pass does it fall back to gh's `{owner}/{repo}` placeholder, resolved from the current checkout's git remote (the same convention `reconcile-pass.mjs#defaultReadAheadBy` uses), so it never hard-codes or silently assumes a repo."
   }
 ]
