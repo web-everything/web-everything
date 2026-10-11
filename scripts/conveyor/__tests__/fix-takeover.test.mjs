@@ -211,6 +211,21 @@ describe('takeover marker bound (card xx0055i review round 1)', () => {
       .toMatchObject({ ok: false, reason: 'takeover-void-limit' });
   });
 
+  it('a void cancels only a start that PRECEDES it: a later retry for the same head keeps its own marker', () => {
+    const at = (c, t) => ({ ...c, createdAt: `2026-10-10T${t}:00Z` });
+    // start(07) → void(08) → retry start(10): the void belongs to the 07 start; the 10:00 retry stands
+    const thread = [at(marker(HEAD), '07:00'), at(voided(HEAD), '08:00'), at(marker(HEAD), '10:00')];
+    expect(takeoverMarkers(thread).map((m) => m.at)).toEqual(['2026-10-10T10:00:00Z']);
+    // the pairing follows `createdAt`, not the order the caller handed the array in
+    expect(takeoverMarkers([thread[2], thread[1], thread[0]]).map((m) => m.at)).toEqual(['2026-10-10T10:00:00Z']);
+    // a void with no earlier start cancels nothing (it must not eat a later start)
+    expect(takeoverMarkers([at(voided(HEAD), '08:00'), at(marker(HEAD), '10:00')])).toHaveLength(1);
+    // an `unknown`-head void likewise only reaches an earlier `unknown` start
+    const unknownMarker = at({ ...marker(HEAD), body: takeoverMarkerBody({ pr: 7, head: null, attempts: 5, cap: 5 }) }, '10:00');
+    const unknownVoid = at({ ...voided(HEAD), body: takeoverVoidMarkerBody({ pr: 7, head: null }) }, '08:00');
+    expect(takeoverMarkers([unknownVoid, unknownMarker])).toHaveLength(1);
+  });
+
   it('a trusted comment that merely QUOTES a marker is not one (the match is anchored at the start of the body)', () => {
     const quoted = { author: BOT, createdAt: '2026-10-10T00:00:00Z', body: `summary of the takeover:\n${takeoverMarkerBody({ pr: 7, head: HEAD, attempts: 5, cap: 5 })}` };
     const quotedVoid = { author: BOT, createdAt: '2026-10-10T00:00:00Z', body: `quoting: ${takeoverVoidMarkerBody({ pr: 7, head: HEAD })}` };
