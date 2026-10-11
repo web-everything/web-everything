@@ -168,6 +168,8 @@ const graphExec = ({ parents, main, onComment = () => {}, view = null, tip = vie
   if (cmd === 'gh' && args[1] === 'view') return JSON.stringify(view);
   if (cmd === 'git' && args[0] === 'rev-parse') return `${tip}\n`; // the sha the branch tip (the net diff's rev) resolves to
   if (cmd === 'gh' && args[1] === 'comment') { onComment(args[args.indexOf('--body') + 1]); return ''; }
+  // PR #4631 round 11: a moved head's coverage reads the PR's formal reviews (`gh api …/reviews`); none stand here.
+  if (cmd === 'gh' && args[0] === 'api') return '';
   if (cmd !== 'git') throw new Error(`unexpected ${cmd}`);
   const ancestors = (sha) => { const seen = new Set(); const st = [sha]; while (st.length) { const s = st.pop(); if (seen.has(s)) continue; seen.add(s); st.push(...(parents[s] || [])); } return seen; };
   const mainSet = new Set([...main].flatMap((m) => [...ancestors(m)]));
@@ -223,7 +225,7 @@ describe('replay WE PR #4722 (e125ac999 → de961efb5)', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), restampComment] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: 'origin/lane/x' }), carry: { setting: { value: false, source: 'env' }, log: quiet } });
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: { value: false, source: 'env' }, log: quiet } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
     expect(gate.reason).toContain('permission-change');
   });
@@ -256,10 +258,12 @@ describe('drain gate: what does NOT carry', () => {
     const posted = [];
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp)] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
-    // the net diff names the sha it was pinned to (`revSha`); a different tip, or none, must not bind to the stamped head
+    // the net diff names the sha it was pinned to (`revSha`); a different tip, or none, must not bind to the stamped head.
+    // PR #4631 round 7: such a diff is not the live head's own, so it is a read miss — the pass parks without re-labelling
+    // (UNVERIFIED, `applyLabel: null`), exactly as for any other diff that was not read at the head.
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
       { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: tip || 'origin/lane/x', revSha: tip || undefined }), carry: { setting: ON, log: quiet } });
-    expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
+    expect(gate).toMatchObject({ action: 'park', applyLabel: null });
     expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
   });
@@ -273,7 +277,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [plainAccept(PR4722.r1, PR4722.fp), clearHumanComment(PR4722.e125, null)] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], onComment: (b) => posted.push(b), view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } });
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: PR4722.fp, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     expect(gate).toMatchObject({ action: 'park', applyLabel: REVIEW_LABELS.human });
     expect(gate.carriedClearance).toBeUndefined();
     expect(posted).toHaveLength(0);
@@ -296,7 +300,7 @@ describe('drain gate: what does NOT carry', () => {
     const view = { headRefOid: PR4722.head, headRefName: 'lane/x', comments: [clearHumanComment(PR4722.e125, PR4722.fp), forged] };
     const exec = graphExec({ parents: pr4722Graph, main: [PR4722.main2], view });
     const gate = decideDrainReviewGate({ labels: [REVIEW_LABELS.accepted], escalate: true, humanRequired: true, permissionChange: true },
-      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: DIFF, rev: 'origin/lane/x' }), carry: { setting: ON, log: quiet } });
+      { pr: 4722, local: true, exec, netDiff: () => ({ scored: true, text: DIFF, rev: PR4722.head, revSha: PR4722.head }), carry: { setting: ON, log: quiet } });
     expect(gate.action).toBe('park');
     const text = JSON.stringify([gate.reason, gate.clearance]);
     expect(text).not.toMatch(/@org|https?:\/\/|\[click\]|\]\(|\\n/);
@@ -367,8 +371,10 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     const calls = [];
     const exec = (cmd, args) => {
       calls.push([cmd, ...args].join(' '));
-      if (cmd === 'gh') return JSON.stringify(view());
+      if (cmd === 'gh') return args[0] === 'api' ? '' : JSON.stringify(view()); // no formal review stands (round 11)
       if (args[0] === 'fetch') throw new Error('offline'); // the fetch fails: the cached tracking ref is used
+      // a remote-tracking ref named by a sha does not exist (git: unknown revision) — the bare sha is the candidate
+      if (args.some((a) => /^origin\/[0-9a-f]{40}/.test(a))) throw new Error('unknown revision');
       if (args[0] === 'merge-base') return `${FORK}\n`;
       if (args[0] === 'rev-parse') return `${args.at(-1).startsWith('origin/lane/3432') ? ref : args.at(-1).replace(/\^\{commit\}$/, '')}\n`;
       if (args[0] === 'diff' && args.includes('--numstat')) return '1\t1\tx.mjs\n';
@@ -378,21 +384,22 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     return { exec, calls };
   }
 
-  it('never labels the cleared (old-tip) diff with a newer tip the ref moved to after the read', () => {
+  it('reads the diff AT the head sha (PR #4631 round 7), so a branch tip that moves mid-read cannot supply it', () => {
     const { exec, calls } = movingTipExec();
     const evidence = read(exec);
     expect(evidence.headDiff).toBe(DIFF);
-    expect(evidence.headDiffSha).toBe(OLD_TIP);
-    expect(evidence.headDiffSha).not.toBe(evidence.headSha);
-    // the text diff names the resolved sha, never the moving ref name
+    expect(evidence.headDiffSha).toBe(NEW_TIP);
+    expect(evidence.headDiffSha).toBe(evidence.headSha);
+    // the text diff names the resolved head sha, never the moving ref name
     const textDiff = calls.find((c) => c.startsWith('git diff --no-ext-diff'));
-    expect(textDiff).toContain(OLD_TIP);
+    expect(textDiff).toContain(NEW_TIP);
     expect(textDiff).not.toContain('origin/lane/3432');
   });
 
   it('end to end: the moved-tip diff is refused by the carry (no record is written, nothing is carried)', () => {
     const { exec } = movingTipExec();
-    const evidence = { ...read(exec), humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' } };
+    // the read itself is head-bound now (round 7); the carry's own check still refuses evidence naming another tip
+    const evidence = { ...read(exec), headDiffSha: OLD_TIP, humanClearance: { sha: CLEARED, diff: FP, actor: 'chalbert' } };
     const onComment = vi.fn();
     const r = applyHumanClearanceCarry({ evidence, pr: 3432, cwd: '/ws', exec: onComment, setting: ON, log: quiet });
     expect(r).toBe(null);
@@ -410,10 +417,10 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     expect(evidence.headDiff).toBe(null);
   });
 
-  it('a scored read that names no pinned sha leaves headDiffSha null — no second lookup labels it', () => {
-    const exec = vi.fn(() => JSON.stringify(view()));
+  it('a scored read that names no pinned sha is a read miss (round 7) — no second lookup labels it', () => {
+    const exec = vi.fn((cmd, args) => (args[0] === 'api' ? '' : JSON.stringify(view())));
     const evidence = read(exec, { netDiff: () => ({ scored: true, text: DIFF, rev: 'origin/lane/3432' }) });
-    expect(evidence.headDiff).toBe(DIFF);
+    expect(evidence.headDiff).toBe(null);
     expect(evidence.headDiffSha).toBe(null);
     expect(exec.mock.calls.filter(([cmd]) => cmd === 'git')).toEqual([]); // no post-diff rev-parse
   });
@@ -430,9 +437,9 @@ describe('the diff the carry reads is pinned to ONE resolved tip sha (a branch t
     expect(evidence.headReadFailed).toBe(true);
   });
 
-  it('the fork point is taken from the pinned sha, not the moving ref name', () => {
+  it('the fork point is taken from the pinned head sha, not the moving ref name', () => {
     const { exec, calls } = movingTipExec();
     read(exec);
-    expect(calls.filter((c) => c.startsWith('git merge-base')).at(-1)).toContain(OLD_TIP);
+    expect(calls.filter((c) => c.startsWith('git merge-base')).at(-1)).toContain(NEW_TIP);
   });
 });
