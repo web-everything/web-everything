@@ -83,7 +83,7 @@ const refusal = (message) => Object.assign(new Error(message), { refusal: true }
  * spaces (no `::workflow-command::` line can start inside a log line) and the length is capped. Pure.
  */
 export function flatText(v, max = 200) {
-  return [...String(v)].map((c) => { const n = c.charCodeAt(0); return n < 32 || n === 127 || n === 0x2028 || n === 0x2029 ? ' ' : c; }).join('').slice(0, max);
+  return [...String(v)].map((c) => { const n = c.charCodeAt(0); return n < 32 || (n >= 127 && n <= 159) || n === 0x2028 || n === 0x2029 ? ' ' : c; }).join('').slice(0, max);
 }
 
 /**

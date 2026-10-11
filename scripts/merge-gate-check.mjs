@@ -328,20 +328,36 @@ export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSy
   const source = `${workflow}@${defaultBranch}`;
   let runs;
   try {
-    runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--limit', String(MAIN_CI_RUNS),
-      '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
+    // `--event push`: only runs OF main's own commits. A fork PR whose head branch is also named `main` makes ci.yml
+    // runs with headBranch `main` (from the fork's own, editable workflow file); counting those would let a green
+    // fork run hide a red main.
+    runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--event', 'push', '--limit', String(MAIN_CI_RUNS),
+      '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,attempt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
   } catch (e) { return { source, error: `main CI unreadable: ${firstLine(e)}` }; }
+  if (Array.isArray(runs)) {
+    runs = runs.filter((r) => r?.event == null || r.event === 'push'); // belt and braces if a gh version ignores --event
+    // A RE-RUN puts a finished run back in progress, and an in-progress run is ignored, so the run before it (maybe
+    // green) would speak for a commit whose verdict is being redone. Undecided → hold.
+    const rerun = runs.find((r) => String(r?.status ?? '').toLowerCase() !== 'completed' && Number(r?.attempt) > 1);
+    if (rerun) return { source, error: `main CI run ${rerun.databaseId ?? '?'} is being re-run (attempt ${Number(rerun.attempt)}) — verdict pending` };
+  }
   const st = mainRedState(runs);
   if (st.status === 'unknown') return { source, error: `main CI status unknown (${st.reason})` };
-  return { source, red: st.status === 'red', firstRedSha: st.firstRed?.sha || null };
+  return { source, red: st.status === 'red', firstRedSha: st.firstRed?.sha || null, redShas: st.status === 'red' ? (st.redShas || []).filter(Boolean) : [] };
 }
 
 /**
  * The drain's "only the main-fix PR lands" while main is red (`decideRedMainHold`, the `main-fix` queue class): the
- * red-main owner's branch (`mainCiRedOwnerBranchPrefix`), from this repo, opened by the conveyor. Pure.
+ * red-main owner's branch (`mainCiRedOwnerBranchPrefix` + the red commit's 9-char sha), from this repo, opened by the
+ * conveyor, AND naming a commit of the CURRENT red window (`redShas`) — a stale fix branch from an earlier red does
+ * not pass. Pure.
  */
-export function isMainFixPr(pr) {
-  return !!pr && pr.isCrossRepository === false && String(pr.headRefName ?? '').startsWith(MAIN_CI_RED_DEFAULTS.mainCiRedOwnerBranchPrefix) && isTrustedPrAuthor(pr);
+export function isMainFixPr(pr, redShas = []) {
+  const prefix = MAIN_CI_RED_DEFAULTS.mainCiRedOwnerBranchPrefix;
+  const ref = String(pr?.headRefName ?? '');
+  if (!pr || pr.isCrossRepository !== false || !ref.startsWith(prefix) || !isTrustedPrAuthor(pr)) return false;
+  const sha9 = ref.slice(prefix.length).toLowerCase();
+  return /^[0-9a-f]{9}$/.test(sha9) && redShas.some((s) => String(s).toLowerCase().startsWith(sha9));
 }
 
 /**
@@ -355,7 +371,7 @@ export function combineRedMain(freeze, mainCi, pr = null) {
   if (mainCi.error) return { source, error: mainCi.error };
   if (freeze?.frozen) return { source, frozen: true, reason: `manual freeze: ${freeze.reason || 'active'}`, publishedAt: freeze.publishedAt ?? null };
   const sha = mainCi.firstRedSha ? ` since ${String(mainCi.firstRedSha).slice(0, 9)}` : '';
-  if (mainCi.red && !isMainFixPr(pr)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt ?? null };
+  if (mainCi.red && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt ?? null };
   return { source: mainCi.red ? `${source} (main CI red${sha}; main-fix PR exempt)` : source, frozen: false, reason: null, publishedAt: freeze?.publishedAt ?? null };
 }
 
@@ -447,9 +463,10 @@ async function main() {
   const preRecheck = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
   // Re-read both red-main sources last: the facts above can take minutes, and a freeze published (or main turning
   // red) meanwhile must still hold. Only a run made entirely of main-fix PRs may pass a red main.
+  const mainCiRecheck = preRecheck.ok ? readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' }) : null;
   const verdict = preRecheck.ok
     ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy }), {
-      mainCi, mainCiRecheck: readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' }), exempt: factsOf.length > 0 && factsOf.every((x) => isMainFixPr(x.pr)) })
+      mainCi, mainCiRecheck, exempt: factsOf.length > 0 && factsOf.every((x) => isMainFixPr(x.pr, mainCiRecheck?.redShas || [])) })
     : preRecheck;
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, workflowCheck: wfCheck, policy, prs }, null, 2)}\n`);
   else {

@@ -15,7 +15,7 @@ import {
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
-import { applyFreezeRecheck, gatherPrFacts, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
+import { applyFreezeRecheck, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
 import { isTrustedPrAuthor } from '../../conveyor/main-ci-red-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -507,6 +507,25 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
     expect(row({ runs: RED_RUNS, pr })).toMatchObject({ status: 'hold' });
   });
 
+  it('a newer GREEN run from a fork PR whose branch is also named `main` (event pull_request) cannot hide a red main', () => {
+    const forkGreen = { ...run('success', '2026-10-11T02:00:00Z', 'f'.repeat(40)), event: 'pull_request' };
+    expect(row({ runs: [...RED_RUNS.map((r) => ({ ...r, event: 'push' })), forkGreen] })).toMatchObject({ status: 'hold' });
+  });
+
+  it('a RE-RUN of main\'s red run (back in progress, attempt 2) does not let the older green run speak → FAIL CLOSED', () => {
+    const rerun = { ...run('', '2026-10-11T01:00:00Z', RED_SHA, 'in_progress'), attempt: 2 };
+    const r = row({ runs: [run('success', '2026-10-11T00:00:00Z', 'a'.repeat(40)), rerun] });
+    expect(r).toMatchObject({ status: 'fail-closed' });
+    expect(r.reason).toMatch(/being re-run \(attempt 2\)/);
+  });
+
+  it('a STALE main-fix branch (its sha is not in the current red window) is not exempt → HOLD', () => {
+    expect(row({ runs: RED_RUNS, pr: { ...FIX_PR, headRefName: 'lane/main-fix-ddddddddd' } })).toMatchObject({ status: 'hold' });
+    expect(isMainFixPr(FIX_PR, [RED_SHA])).toBe(true);
+    expect(isMainFixPr(FIX_PR, [])).toBe(false);
+    expect(isMainFixPr({ ...FIX_PR, headRefName: 'lane/main-fix-bbbb' }, [RED_SHA])).toBe(false);
+  });
+
   it('a MANUAL freeze holds even the main-fix PR', () => {
     expect(row({ freeze: MANUAL, runs: RED_RUNS, pr: FIX_PR })).toMatchObject({ status: 'hold' });
   });
@@ -515,7 +534,8 @@ describe('merge-gate reads main\'s OWN CI status from GitHub (operator ruling 20
     let seen;
     readMainCiFact({ repo: 'o/r', defaultBranch: 'trunk', exec: (cmd, args, opts) => { seen = { cmd, args, opts }; return '[]'; } });
     expect(seen.cmd).toBe('gh');
-    expect(seen.args).toEqual(expect.arrayContaining(['run', 'list', '--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'trunk']));
+    expect(seen.args).toEqual(expect.arrayContaining(['run', 'list', '--repo', 'o/r', '--workflow', 'ci.yml', '--branch', 'trunk', '--event', 'push']));
+    expect(seen.args[seen.args.indexOf('--json') + 1]).toMatch(/\bevent\b.*\battempt\b/);
     expect(seen.opts).toMatchObject({ timeout: expect.any(Number), maxBuffer: expect.any(Number) });
   });
 
@@ -604,8 +624,8 @@ describe('merge-gate-check threads the shared freeze into the gate facts (PR 471
       expect(firstRead).toBeGreaterThan(-1);
       expect(firstRead).toBeLessThan(main.indexOf('gatherPrFacts('));
       expect(main).toMatch(/gatherPrFacts\(\{[^}]*\bredMain, mainCi\b/);
-      expect(main).toMatch(/mainCi, mainCiRecheck: readMainCiFact\(/);
-      expect(main).toMatch(/exempt: factsOf\.length > 0 && factsOf\.every\(\(x\) => isMainFixPr\(x\.pr\)\)/);
+      expect(main).toMatch(/const mainCiRecheck = preRecheck\.ok \? readMainCiFact\(/);
+      expect(main).toMatch(/mainCi, mainCiRecheck, exempt: factsOf\.length > 0 && factsOf\.every\(\(x\) => isMainFixPr\(x\.pr, mainCiRecheck\?\.redShas \|\| \[\]\)\)/);
     });
   });
 });
