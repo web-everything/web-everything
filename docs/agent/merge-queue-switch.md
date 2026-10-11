@@ -28,7 +28,9 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   `we:scripts/settings/*.json` top-level `mergeDelivery` block. The log calls the repo layer **`tool`**:
   confirmation is `strategy=github-merge-queue (tool)`, not `(repo)`.
 - There is no env layer for the live strategy. `WE_DRAIN_MERGE_STRATEGY` is honoured only with `--dry-run`
-  to preview which PRs would be enqueued.
+  to preview which PRs would be enqueued. The one other input is a test seam: inside a test run (`VITEST` /
+  `WE_UNDER_TEST`) the drain does not read the live `scripts/settings/*.json` for this block, and
+  `WE_MERGE_DELIVERY_SETTINGS_FILE` replaces them with a given file. Do not set it on the resident drain.
 - `mergeQueue.batchSize` / `mergeQueue.strategy` in the same file are a different, older knob: the drain's own
   queue ordering in `we:scripts/lib/merge-queue-hook.mjs`. A `mergeQueue.batchSize: 1` override never changed
   the logged `batchSize=3 (platform)` because the merge-delivery reader only reads `mergeDelivery`.

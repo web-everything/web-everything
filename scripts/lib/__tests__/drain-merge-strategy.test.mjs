@@ -1,11 +1,12 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
-  readQueueState, FOLLOW_UP_MAX_ATTEMPTS,
+  readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
 
@@ -339,6 +340,32 @@ describe('dry-run strategy override', () => {
     const r = resolveDrainMergePolicy({ dryRun: true, env: { [DRY_RUN_STRATEGY_ENV]: 'yolo' }, load });
     expect(r.policy.strategy).toBe('drain-direct');
     expect(r.note).toMatch(/not one of/);
+  });
+});
+
+describe('tool-layer settings read (hermetic in a test run)', () => {
+  it('reads no live settings inside a test run, so the repo strategy cannot leak into a spawned drain', () => {
+    expect(readMergeDeliveryToolSettings({ VITEST: 'true' })).toEqual({});
+    expect(readMergeDeliveryToolSettings({ WE_UNDER_TEST: '1' })).toEqual({});
+  });
+  it('an override file replaces the declared files, in or out of a test run; an unreadable one reads as not set', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mdts-'));
+    try {
+      const file = join(dir, 's.json');
+      writeFileSync(file, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
+      expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file })).toEqual({ mergeDelivery: { strategy: 'github-merge-queue' } });
+      expect(readMergeDeliveryToolSettings({ VITEST: 'true', [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file }).mergeDelivery.strategy).toBe('github-merge-queue');
+      expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: join(dir, 'missing.json') })).toEqual({});
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('feeds resolveDrainMergePolicy: the default load honours the override file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mdts-'));
+    try {
+      const file = join(dir, 's.json');
+      writeFileSync(file, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
+      expect(resolveDrainMergePolicy({ env: { [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file } }).policy.strategy).toBe('github-merge-queue');
+      expect(resolveDrainMergePolicy({ env: { VITEST: 'true' } }).policy.strategy).toBe('drain-direct');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
