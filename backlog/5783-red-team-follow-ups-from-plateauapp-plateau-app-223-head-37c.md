@@ -45,3 +45,7 @@ One line per class: either the handling, or `n/a: <why>`.
 5. **Identity scoping** — TODO: the handling, or n/a: <why>.
 6. **State over time** — TODO: the handling, or n/a: <why>.
 7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+
+## Also raised by
+
+- Also raised by plateauapp/plateau-app#223 (finding 1: `we:src/wip/shared-source.ts:217` — edge-case, degraded Direct reads bypass the configured minimum rebuild interval)
