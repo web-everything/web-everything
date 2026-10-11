@@ -2,7 +2,7 @@
 // findings; gate holds never trigger one. Live: #4708 needed a second, operator-approved takeover by hand.
 import { describe, it, expect } from 'vitest';
 import {
-  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight,
+  resolveTakeoverBudget, takeoverEpisodes, takeoverProgress, planTakeover, gateHoldReason, findingWeight, openDefects,
   notConvergingText, renderPreviousTakeover, OPERATOR_TAKEOVER_PREFIX, TAKEOVER_BUDGET_STANDARD_DEFAULT,
 } from '../takeover-budget.mjs';
 import { takeoverMarkerBody, takeoverVoidMarkerBody, withTakeover } from '../fix-takeover.mjs';
@@ -302,6 +302,16 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
     // P2: the late R5 review lands first; its findings do not merge into T1's round.
     const p2 = [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FIVE), review(T1, 10, FOUR)];
     expect(plain(T1, p2)).toMatchObject({ ok: true, n: 2, previous: { after: { count: 4 } } });
+  });
+  it('the open defects are the current head\'s round, never a late old-head round after it', () => {
+    const clean = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, [])];
+    const late = [...clean, review(R5, 10, FIVE)];
+    expect(openDefects(late, T1)).toMatchObject({ count: 0 });
+    // A late old-head review changes nothing: the plan matches the thread without it.
+    const strip = (r) => JSON.parse(JSON.stringify(r));
+    expect(strip(plain(T1, late))).toEqual(strip(plain(T1, clean)));
+    expect(planTakeover({ pr: pr(T1, late), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind: 'review' }))
+      .toMatchObject({ ok: false, reason: 'review-cap-unjudged' });
   });
   it('a manual takeover started on an unreviewed pushed head and never pushed is spent, judged or not', () => {
     const R6 = H('7');

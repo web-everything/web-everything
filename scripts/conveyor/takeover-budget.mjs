@@ -303,9 +303,21 @@ export function gateHoldReason(pr, { defaultBranch = 'main' } = {}) {
   return null;
 }
 
-/** The open DEFECT findings of the PR's latest review round (null when the thread has none). */
-export function openDefects(comments) {
-  const latest = reviewRounds(comments).at(-1) ?? null;
+/**
+ * PURE: the PR's CURRENT review round: the latest round that names the PR head (or names no head), else the latest
+ * round. A late review of an older head is its own round ({@link reviewRounds}) and never stands in for the review of
+ * the head the PR is on now.
+ */
+export function currentRound(comments, head = null) {
+  const rounds = reviewRounds(comments);
+  const h = String(head ?? '').toLowerCase();
+  const onHead = h ? rounds.filter((r) => !r.head || sameHeadSha(r.head, h)).at(-1) : null;
+  return onHead ?? rounds.at(-1) ?? null;
+}
+
+/** The open DEFECT findings of the PR's current review round (null when the thread has none). */
+export function openDefects(comments, head = null) {
+  const latest = currentRound(comments, head);
   return latest ? tally(latest.findings) : null;
 }
 
@@ -327,12 +339,12 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
   if (budget < 1) return { ok: false, reason: 'setting-disabled' };
   if (pr?.ignoredRulings?.matches?.length) return { ok: false, reason: 'ruling-dispute' };
   const comments = pr?.comments;
-  const defects = openDefects(comments);
+  const defects = openDefects(comments, pr?.headRefOid ?? null);
   // The REVIEW round cap leads to a takeover too (one rule for both caps), but only once the current work is judged:
   // the latest review round came after the latest fixer push and left open defects. An unjudged head is owed a
   // review, not a takeover on top of code nobody has looked at.
   if (capKind === 'review') {
-    const latest = reviewRounds(comments).at(-1) ?? null;
+    const latest = currentRound(comments, pr?.headRefOid ?? null);
     const lastPush = (Array.isArray(comments) ? comments : [])
       .filter((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)).map(timeOf).filter(Number.isFinite);
     const pushedAt = lastPush.length ? Math.max(...lastPush) : -Infinity;
