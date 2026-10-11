@@ -93,7 +93,7 @@ export default {
         });
         // Two runs of `test` on the SAME head: a stale FAILURE (superseded) then the LATEST SUCCESS. `smoke`/
         // `daemon-soak` — the other two FALLBACK-required checks (`we:scripts/lib/required-status-checks.mjs`,
-        // no branch-protection fixture available in the fake `gh`) — each ran once, green.
+        // served by the fake `gh` as both branch rules and protection via `setRequiredChecks`) — each ran once, green.
         // Every other required check is derived from the fallback set, so a change to that set cannot leave one
         // of them missing from the rollup (a missing required check reads as not-green, never needs-review).
         w.gh.setChecks('we', pr, [

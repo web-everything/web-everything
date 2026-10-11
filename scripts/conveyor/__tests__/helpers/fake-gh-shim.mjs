@@ -562,6 +562,16 @@ function handleApi(store, rest) {
         return jsonResult({ required_status_checks: { contexts: repoState.requiredChecks } }, jq);
       }
     }
+    // The same declared set, served as a branch RULESET: `required-status-checks.mjs` reads rules first and
+    // throws on any non-denial rules failure, so an unsupported rules path would degrade every `setRequiredChecks`
+    // scenario to the untrusted fallback set instead of a live read.
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/rules\/branches\/([^/]+)$/))) {
+      const repoState = requireRepo(store, `${m[1]}/${m[2]}`);
+      if (Array.isArray(repoState.requiredChecks)) {
+        return jsonResult([{ type: 'required_status_checks',
+          parameters: { required_status_checks: repoState.requiredChecks.map((context) => ({ context })) } }], jq);
+      }
+    }
     if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/compare\/(.+)\.\.\.(.+)$/))) {
       const slug = `${m[1]}/${m[2]}`; const a = m[3]; const b = m[4];
       const repoState = requireRepo(store, slug);
