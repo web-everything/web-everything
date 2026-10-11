@@ -232,7 +232,7 @@ describe('projectAvoidedRounds', () => {
 describe('resolveReviewSettings', () => {
   it('preserves the built-in defaults and allows file shadow mode', () => {
     expect(resolveReviewSettings({ fileConfig: null, env: {} }))
-      .toEqual({ scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off' });
+      .toEqual({ scopedRereview: 'off', referralDefault: 'operator', roundBudget: 'off', takeoverReviewAttempts: 1 });
     expect(resolveReviewSettings({ fileConfig: { scopedRereview: 'shadow' }, env: {} }).scopedRereview).toBe('shadow');
   });
   it('lets an explicit off environment override the file', () => {

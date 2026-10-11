@@ -74,7 +74,9 @@ const UNSAFE_KEYS = new Set(['__proto__']);
  *  (two files each with a `$comment` are not a duplicate owner). */
 const DOC_KEY = '$comment';
 
-/** PURE: every leaf path (`a.b.c`) of a plain object. Arrays and scalars are leaves. */
+/** PURE: every leaf path (`a.b.c`) of a plain object. Arrays and scalars are leaves.
+ *  A top-level `$comment` is documentation, not a setting: every feature file may carry its own, so it has no owner
+ *  and never counts as a duplicate leaf (two feature files each documenting themselves is not a conflict). */
 export function settingsLeaves(obj, prefix = '') {
   if (!isPlainObject(obj)) return [];
   const out = [];
