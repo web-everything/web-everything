@@ -1,4 +1,5 @@
 ---
+bornAs: xcd73ay
 kind: story
 size: 2
 status: open

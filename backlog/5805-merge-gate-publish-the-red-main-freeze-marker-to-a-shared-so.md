@@ -1,4 +1,5 @@
 ---
+bornAs: xyd06qo
 kind: story
 size: 3
 status: resolved
