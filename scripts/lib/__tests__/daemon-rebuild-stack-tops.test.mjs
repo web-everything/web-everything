@@ -746,6 +746,37 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'drop', reason: 'conflict' });
       expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases[0]).toMatchObject({ kept: 'live' });
     });
+
+    it('…also when the base only fast-forwarded (no proven head): the part of its line the last build held decides', async () => {
+      // P1 was live only inside T (never merged on its own, never force-pushed); T's PR left and P fast-forwarded to P2.
+      const f = fixture();
+      const p1 = f.push('lane/ff-p', f.init, { [TAKEOVER]: lines({ 2: 'p1' }) });
+      f.push('lane/ff-t', p1, { [TAKEOVER]: lines({ 2: 'p1' }), [LADDER]: lines({ 9: 't' }) });
+      f.push('lane/ff-u', f.init, { [TAKEOVER]: lines({ 6: 'u' }) });
+      f.fetch();
+      const last = await f.build([{ ref: 'lane/ff-t', pr: 9703 }, { ref: 'lane/ff-u', pr: 9704 }], f.init);
+      f.push('lane/ff-p', p1, { [TAKEOVER]: lines({ 2: 'p1', 6: 'p2' }) }); // a fast-forward that clashes with U
+      f.fetch();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: last, mainRef: 'origin/main',
+        overlays: [{ ref: 'lane/ff-p', pr: 9701 }, { ref: 'lane/ff-u', pr: 9704 }],
+        prBaseChain: async (pr) => (pr === 9704 ? ['lane/ff-p'] : []), prForcePushes: async () => [],
+      });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-u')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+    });
+
+    it('unknown evidence: a top amended since the last build but still on the base\'s old head keeps the base aside', async () => {
+      const { f, pOld } = await ffMove({ adoptOld: false });
+      const last = await f.build([{ ref: 'lane/ff-c', pr: 9702 }], f.init);
+      f.push('lane/ff-c', pOld, { [TAKEOVER]: lines({ 5: 'c edit, amended' }), [LADDER]: lines({ 4: 'p v1', 8: 'c keeps p v1 here' }) });
+      f.fetch();
+      const plan = await ffPlan(f, { headSha: last, prForcePushes: async () => null });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'skip', reason: 'stack-base-moved', tops: ['lane/ff-c'] });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-c')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-evidence-unknown')?.detail.bases[0]).toMatchObject({ kept: 'set-aside' });
+    });
   });
 
   describe('makePrBaseChain gh budget', () => {
