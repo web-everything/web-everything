@@ -295,6 +295,20 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
     // No push yet and the PR still on R5: the one-per-head bound holds even though a verdict landed.
     expect(plain(R5, [...headless, marker(R5, 7), review(R5, 8, FOUR)])).toMatchObject({ ok: false, reason: 'takeover-spent' });
   });
+  it('a late old-head review after the takeover\'s own review neither hides it (no stall) nor merges into it', () => {
+    // P1: the takeover head T1 is reviewed, then a late review of R5 lands — T1's round still judges the takeover.
+    const p1 = [...rounds5, marker(R5, 7), rearm(8), review(T1, 9, FOUR), review(R5, 10, FIVE)];
+    expect(plain(T1, p1)).toMatchObject({ ok: true, n: 2, previous: { after: { count: 4 } } });
+    // P2: the late R5 review lands first; its findings do not merge into T1's round.
+    const p2 = [...rounds5, marker(R5, 7), rearm(8), review(R5, 9, FIVE), review(T1, 10, FOUR)];
+    expect(plain(T1, p2)).toMatchObject({ ok: true, n: 2, previous: { after: { count: 4 } } });
+  });
+  it('a manual takeover started on an unreviewed pushed head and never pushed is spent, judged or not', () => {
+    const R6 = H('7');
+    // A fixer pushed R6 at 06:30, after round 5's review of R5; the operator then took over on R6.
+    const thread = [...rounds5, { ...rearm(6), createdAt: at(6, 30) }, operatorTakeover(7), marker(R6, 8), review(R6, 9, FOUR)];
+    expect(plain(R6, thread)).toMatchObject({ ok: false, reason: 'takeover-spent' });
+  });
   it('a delayed review of an even older head (reviewed before the takeover) judges nothing either', () => {
     const R4 = H('4');
     const thread = [rearm(1), rearm(2), rearm(3), review(R4, 4, SIX), rearm(5), review(R5, 6, FIVE), marker(R5, 7), rearm(8), review(R4, 9, FOUR)];

@@ -183,6 +183,9 @@ export function reviewRounds(comments) {
   let open = null;
   for (const it of items) {
     if (it.boundary) { open = null; continue; }
+    // A review naming a DIFFERENT head than the open round's starts its own round: a late review of an older head
+    // must never merge into (and rename) the round of the head after it.
+    if (open && open.head && it.ev.head && !sameHeadSha(open.head, String(it.ev.head).slice(0, 9))) open = null;
     if (!open) { open = { at: it.t, end: it.t, head: null, findings: [] }; rounds.push(open); }
     open.end = it.t;
     if (it.ev.head) open.head = String(it.ev.head).slice(0, 9);
@@ -239,6 +242,14 @@ export function dispatchJudgeRule(comments, { start, end, startHead = null }) {
     return named.length ? !named.some((h) => oldHeads.some((o) => sameHeadSha(h, o))) : pushed;
   };
   return { anchor, pushed, oldHeads, judges };
+}
+
+/** PURE: did a trusted fixer push land after the last review round that ended before `at` (or with no such round)? */
+function pushedSinceLastReview(comments, at) {
+  const before = reviewRounds(comments).filter((r) => r.end < at).at(-1) ?? null;
+  const since = before ? before.end : -Infinity;
+  return (Array.isArray(comments) ? comments : []).some((c) => FIXER_TURN.test(bodyOf(c).trimStart()) && isTrustedMarkerAuthor(c)
+    && timeOf(c) > since && timeOf(c) < at);
 }
 
 /** An automatic-only takeover episode's marker head is the head it started from (see {@link dispatchJudgeRule}). */
@@ -341,9 +352,13 @@ export function planTakeover({ pr, roundCapAction = 'person', takeoverBudget = 1
     // verdict cannot authorize a further takeover on a head reviewed before the last one, or on the head its
     // automatic marker started from. Unjudged, any marker head counts too (the old bound), and a takeover with no
     // known start head at all reads as never pushed: it fails closed.
+    // A manual takeover's marker may name either end, so judged it does not count — unless a fixer pushed after the
+    // last review before the takeover: then the head it started from was never reviewed, and its marker head is the
+    // only start we have (it fails closed rather than letting a never-pushed takeover earn another).
     const lc = String(head ?? '').toLowerCase();
+    const startUnreviewed = pushedSinceLastReview(comments, latest.start);
     const starts = progress.judged
-      ? [...progress.oldHeads, progress.markerStart]
+      ? [...progress.oldHeads, progress.markerStart, startUnreviewed ? latest.head : null]
       : [...progress.oldHeads, latest.head];
     const known = starts.filter(Boolean).map((h) => String(h).toLowerCase());
     const neverPushed = (!progress.judged && !known.length) || known.some((h) => sameHeadSha(h, lc));
