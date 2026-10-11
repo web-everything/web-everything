@@ -331,35 +331,51 @@ describe('mechanical round vs the review round cap', () => {
   });
 });
 
-// Review on 3bef179e4: the mechanical grant ignored the cap site's opt-out, so a site owed a FIX (block-ruled referral)
-// or a person (operator send-back) got a review row, or a carried accept that hid the person note.
-describe('a cap site that opts out of review grants is never replaced by the mechanical grant', () => {
+// Review on 3bef179e4 (operator block on 235e7ce85, 977b6575b and 1cf408978): the mechanical grant was added as a
+// second copy of the takeover grant's dispatch path without the site's opt-out, so a site owed a FIX (block-ruled
+// referral) or a person (operator send-back) got a review row, or a carried accept that hid the person note. Every
+// past-cap grant now goes through ONE guarded path; this pins each grant at each opt-out site, with two controls:
+// the grant would fire on that exact PR, and the plain fix cap (no opt-out) does grant it.
+describe('a cap site that opts out of review grants is never replaced by any past-cap grant', () => {
   const referral = { key: 'k1', finding: { file: 'src/a.mjs', line: 1, summary: 'bad' }, ruling: 'block' };
   const sendBack = (h) => ({ id: 'op-send-back', createdAt: at(h), author: { login: 'chalbert' },
     body: '🔁 review — changes requested\n\nRecorded by chalbert via claude-code-chat.\n\nMUST FIX: rename the export.' });
+  const takeMarker = (h) => ({ author: BOT, createdAt: at(h),
+    body: takeoverMarkerBody({ pr: 7, head: HEAD, attempts: 5, cap: 5, rung: { id: 'stronger-model' } }) });
   const sites = [
     ['block-ruled referral (allowTakeoverReview: false)', (comments, mechanicalRound) =>
       ({ ...pr(comments, { mechanicalRound, labels: ['review:human'] }), blockRuledReferrals: [referral] })],
     ['operator send-back (allowTakeover: false)', (comments, mechanicalRound) =>
       pr([...comments.slice(0, -1), sendBack(7), comments.at(-1)], { mechanicalRound, labels: ['review:changes'] })],
   ];
-  const changed = [...spent, mechMarker(8)];
-  const carried = [...spent.slice(0, 5), acceptOn(PRIOR, 6), mechMarker(8)];
-  for (const [site, build] of sites) {
-    it(`${site}: a changed mechanical head gets no review row`, () => {
-      const p0 = build(changed, facts());
-      expect(mechanicalRoundGrant({ pr: p0 }), 'the grant itself would fire').toMatchObject({ ok: true, action: 'review' });
-      const p = plan(p0, { durableCounts: { 7: 7 } });
-      expect(p.dispatch.filter((x) => x.prNumber === 7 && (x.mechanicalRound || x.kind === 'review'))).toEqual([]);
-      expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeDefined();
+  // [grant, comments, mechanical facts, would the grant fire on this PR, the plan rows it produces]
+  const grants = [
+    ['takeover review', [...spent, takeoverOp(7), takeMarker(8)], null,
+      (p0) => takeoverReviewGrant({ pr: p0, takeoverReviewAttempts: 1 }).ok,
+      (p) => p.dispatch.filter((x) => x.prNumber === 7 && x.takeoverReview)],
+    ['mechanical review', [...spent, mechMarker(8)], facts(),
+      (p0) => mechanicalRoundGrant({ pr: p0 }).action === 'review',
+      (p) => p.dispatch.filter((x) => x.prNumber === 7 && x.mechanicalRound)],
+    ['mechanical carried accept', [...spent.slice(0, 5), acceptOn(PRIOR, 6), mechMarker(8)], facts({ netDiffIdentical: true }),
+      (p0) => mechanicalRoundGrant({ pr: p0 }).verdict === 'accept',
+      (p) => p.refusals.filter((x) => x.prNumber === 7 && x.kind === 'mechanical-carry-forward')],
+  ];
+  for (const [grant, comments, mechanicalRound, wouldFire, granted] of grants) {
+    it(`${grant}: the plain fix cap, which does not opt out, grants it (control)`, () => {
+      const p = plan(pr(comments, { mechanicalRound, labels: ['review:changes'] }), { durableCounts: { 7: 7 } });
+      expect(granted(p)).toHaveLength(1);
     });
-    it(`${site}: an identical mechanical head's carried accept does not hide the person note`, () => {
-      const p0 = build(carried, facts({ netDiffIdentical: true }));
-      expect(mechanicalRoundGrant({ pr: p0 }), 'the grant itself would carry').toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
-      const p = plan(p0, { durableCounts: { 7: 7 } });
-      expect(p.refusals.find((r) => r.prNumber === 7 && r.kind === 'mechanical-carry-forward')).toBeUndefined();
-      expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeDefined();
-    });
+    for (const [site, build] of sites) {
+      it(`${grant} at the ${site} site: never granted, the person note stays`, () => {
+        const p0 = build(comments, mechanicalRound);
+        expect(wouldFire(p0), 'the grant itself would fire on this PR').toBe(true);
+        const p = plan(p0, { durableCounts: { 7: 7 } });
+        expect(granted(p)).toEqual([]);
+        expect(p.dispatch.filter((x) => x.prNumber === 7 && x.kind === 'review')).toEqual([]);
+        expect(p.refusals.find((r) => r.prNumber === 7)?.kind).toBe('cap-exhausted');
+        expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeDefined();
+      });
+    }
   }
 });
 
