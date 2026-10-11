@@ -1,21 +1,21 @@
 ---
+bornAs: xfvgjgt
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/ci/quarantine-skip.mjs", "we:scripts/ci/__tests__/quarantine-skip.test.mjs"]
+scope: ["we:scripts/lib/judge-spawn.mjs", "we:scripts/lib/__tests__/judge-spawn.test.mjs"]
 dateOpened: "2026-10-10"
 tags: []
 ---
 
-# Prevention — Add a lint or check:standards rule that flags execFileSync('git', ['fetch'…]) without a timeout o… (from web-everything/web-everything#4816 review)
+# Prevention — Run one shared redactSecrets over any free-text stderr or stdout excerpt before it goes into an e… (from web-everything/web-everything#4865 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:scripts/ci/quarantine-skip.mjs:36` — Add a lint or check:standards rule that flags `execFileSync('git', ['fetch'…])` without a `timeout` option in scripts/ci/**. Alternatively, route all CI-step git network calls through one helper that always sets timeout and killSignal.
-2. `we:scripts/ci/quarantine-skip.mjs:78` — Add a CLI-level test (spawn the script with a bogus event path and a broken origin) that asserts exit 0 with empty stdout. Add a unit assertion that `gitRead` sets `timeout`. Better still, a standards rule that every `execFileSync('git', …)` on a CI read path carries a `timeout`.
+1. `we:scripts/lib/judge-spawn.mjs:253` — Run one shared `redactSecrets` over any free-text stderr or stdout excerpt before it goes into an error message, telemetry row or log line. Add a `check:standards` rule or run-record test that fails when a free-text TELEMETRY_STRINGS field is written without that sanitizer.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4816@a1e3f8274d4ff24cd37717f1a6fa679e80c14a7e
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#4865@6cf5a69d9d35af3717fa0c5e422786178199920e
 
 ## Acceptance
 
