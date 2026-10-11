@@ -28,7 +28,8 @@
  * a protection 403/404 (never a rate-limit 403 — that is transient), or both sources read fine and requiring
  * nothing, instead selects the repo's declared
  * policy, cached for the normal TTL as `declared`, unless a live entry already exists: that is returned as
- * `stale-cache` and left untouched on disk.
+ * `stale-cache` and left untouched on disk. A rules denial is such a denial even when classic protection reads
+ * fine: that classic set is partial, so it is never live, only added on top of the declared/fallback set.
  * Other failures still retry and prefer the cache, with its original age exposed to admission gates.
  * With no cache, failures return `fallback` for a declared repo; undeclared repos return [] with `fallback`
  * on 403/404 or `unavailable` otherwise. The shared check reducer then evaluates observed
@@ -182,11 +183,12 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     if (!union.length) throw Object.assign(new Error('required-status-checks: no required checks in rules or branch protection'), { noRequiredChecks: true });
     return union;
   }
-  // Rulesets can require checks classic protection lacks, so a partial classic set after a TRANSIENT rules
-  // failure must not be returned as live: throw so the caller's stale-cache handling keeps the last real set.
-  // Only a rules ACCESS denial lets a non-empty classic set stand (the rules API is simply unreadable here).
-  if (rulesError && (!checks.length || !protectionAccessDenied(rulesError))) throw rulesError;
-  return checks;
+  // Rulesets can require checks classic protection lacks, and an unreadable ruleset does not mean its requirements
+  // disappeared — so after ANY rules failure the classic set is partial and never returned as live: throw the rules
+  // error (its denial/transient classification intact) so the caller keeps a live cache or the declared policy. A
+  // denial carries the classic set as `partialChecks`, a floor the caller still requires (PR #4924 red team).
+  if (protectionAccessDenied(rulesError)) rulesError.partialChecks = checks;
+  throw rulesError;
 }
 
 /**
@@ -261,9 +263,11 @@ export function getRequiredStatusChecks({
       // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
       // the file is untouched, so the next call re-reads live once more.
       const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
+      // Checks a readable source still requires (classic protection behind a rules denial) are never dropped.
+      const partial = Array.isArray(error.partialChecks) ? error.partialChecks : [];
       if (!hasLiveCache) {
-        if (declared) return save([...declared], 'declared');
-        if (!cache) return { checks: [], source: 'fallback' };
+        if (declared) return save([...new Set([...declared, ...partial])], 'declared');
+        if (!cache) return { checks: [...partial], source: 'fallback' };
       }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */

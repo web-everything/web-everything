@@ -462,11 +462,55 @@ describe('defaultReadRequiredStatusChecks', () => {
     expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
   });
 
-  it('uses successful protection when the rules API is merely inaccessible', () => {
-    const gh = vi.fn()
-      .mockImplementationOnce(() => { throw new Error('HTTP 403: Resource not accessible by integration'); })
-      .mockReturnValueOnce(classicBranch('classic'));
-    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+  // An unreadable ruleset does not mean its requirements disappeared (red-team break on PR #4924): a rules ACCESS
+  // denial never returns the classic set as live — it stays a denial, carrying the classic set as a partial floor.
+  const rulesDenied = classic => vi.fn()
+    .mockImplementationOnce(() => { throw new Error('HTTP 403: Resource not accessible by integration'); })
+    .mockReturnValueOnce(classic);
+
+  it('a rules access denial is never a live result, even when classic protection is readable', () => {
+    expect(() => defaultReadRequiredStatusChecks({ gh: rulesDenied(classicBranch('classic')) }))
+      .toThrow(expect.objectContaining({ message: 'HTTP 403: Resource not accessible by integration', partialChecks: ['classic'] }));
+  });
+
+  it('a rules access denial keeps an expired live cache (ruleset-only check kept, file untouched) and the review gate still refuses its red', async () => {
+    const { readReviewCiGate } = await import('../review-ci-gate-io.mjs');
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('test')) });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000, readChecks }))
+      .toMatchObject({ checks: ['test', 'security-scan'], source: 'stale-cache' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
+      checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 1000,
+    });
+    const now = Date.now();
+    getRequiredStatusChecks({ repo, cachePath, now, readChecks: () => ['test', 'security-scan'] });
+    const gate = readReviewCiGate({ repo, pr: 1, readHead: () => 'a'.repeat(40),
+      readRequired: o => getRequiredStatusChecks({ ...o, cachePath, now: now + 1, readChecks }),
+      readChecks: () => [
+        { name: 'test', status: 'completed', conclusion: 'success' },
+        { name: 'security-scan', status: 'completed', conclusion: 'failure' },
+      ],
+    });
+    expect(gate).toMatchObject({ allowed: false, source: 'stale-cache' });
+  });
+
+  it('a rules access denial with no cache selects the declared policy, still requiring every classic check', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('test', 'classic-only')) });
+    const expected = { checks: [...FALLBACK_REQUIRED_STATUS_CHECKS, 'classic-only'], source: 'declared' };
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks })).toEqual(expected);
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({ ...expected, fetchedAtMs: 1000 });
+  });
+
+  it('a rules access denial on an undeclared repo with no cache is an untrusted fallback that keeps the classic set', () => {
+    const cachePath = join(dir, 'cache.json');
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('classic')) });
+    expect(getRequiredStatusChecks({ repo: 'owner/undeclared', cachePath, now: 1000, readChecks }))
+      .toEqual({ checks: ['classic'], source: 'fallback' });
+    expect(existsSync(cachePath)).toBe(false);
   });
 
   it('keeps an expired live cache when rules fail transiently but protection returns a partial set', () => {
