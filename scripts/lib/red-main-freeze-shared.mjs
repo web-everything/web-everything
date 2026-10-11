@@ -17,9 +17,11 @@
  *   - The branch name is a policy-cascade knob: `mergeDelivery.redMainFreezeBranch` (default `ops/red-main-freeze`),
  *     validated to `ops/<slug>` so the writer can never push to main or a lane.
  *
- *   A failed publish leaves the local marker in place (the drain still stops) and exits the CLI non-zero with a
- *   loud line: until the named retry (`publish` after a raise, `unfreeze` after a clear) succeeds, CI may show the
- *   previous state. Closing that window from the drain side is card x09e2bn.
+ *   A REJECTED push (a raced writer, a refusing hook, a transient blip) is retried, re-fetching the tip each time
+ *   ({@link PUBLISH_ATTEMPTS}), so a rejection no longer leaves CI reading a stale clear. Only a writer that cannot
+ *   reach origin at all for every attempt still fails: the local marker stays (the drain still stops) and the CLI
+ *   exits non-zero with a loud line naming the retry (`publish` after a raise, `unfreeze` after a clear). Nothing on
+ *   that host can reach CI then; the drain-side retry/refusal for that residual is card x09e2bn.
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
@@ -31,6 +33,8 @@ import { loadMergeDeliveryPolicy } from './merge-delivery-policy.mjs';
 import { readSettings } from './settings-files.mjs';
 
 export const SHARED_FREEZE_FILE = 'red-main-freeze.json';
+/** How many times the CLI hook tries to land one publish before it reports failure. */
+export const PUBLISH_ATTEMPTS = 4;
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /** The policy-cascade branch name (standard → platform → tool). Never throws. */
@@ -80,7 +84,7 @@ export function publishSharedFreeze({ marker, clear = false, board = REPO_ROOT, 
  * run unless a board is injected, so no test can push the live branch.
  * @returns {Promise<{ok:boolean, skipped?:string, branch?:string, pushed?:boolean, error?:string}>}
  */
-export async function publishFreezeFromCli({ marker, clear = false, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; } } = {}) {
+export async function publishFreezeFromCli({ marker, clear = false, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; }, attempts = PUBLISH_ATTEMPTS, backoffMs = 250, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
   if ((env.VITEST || env.WE_UNDER_TEST) && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'test-run' };
   // Explicit off switch for a child CLI that must clear VITEST/WE_UNDER_TEST (they also pick the freeze-marker path) yet must never push the live ops branch.
   if (env.WE_RED_MAIN_FREEZE_SHARED === 'off' && !env.WE_RED_MAIN_FREEZE_SHARED_BOARD) return { ok: true, skipped: 'disabled' };
@@ -89,16 +93,28 @@ export async function publishFreezeFromCli({ marker, clear = false, env = proces
     setExitCode(1);
     return { ok: false, refused: 'no-marker' };
   }
-  try {
-    const r = publish({ marker, ...(clear === true ? { clear: true } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
-    stderr(`red-main freeze: shared copy ${r.pushed ? 'published' : 'already current'} on ${r.branch} (frozen=${r.doc.frozen})\n`);
-    return { ok: true, branch: r.branch, pushed: r.pushed };
-  } catch (e) {
-    const error = String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
-    stderr(`red-main freeze: ✗ the SHARED copy was NOT published (${error}); the local marker is as ${clear === true ? 'cleared' : 'written'}. CI's merge-gate may show the previous state — re-run: node scripts/readiness/red-main-remediation.mjs ${clear === true ? 'unfreeze' : 'publish'}\n`);
-    setExitCode(1);
-    return { ok: false, error };
+  // A REJECTED raise (a raced writer, a refusing hook, a blip) must not leave CI reading a stale clear: every attempt
+  // re-fetches the tip and re-stages onto it, so a non-fast-forward resolves itself. Bounded; the refusals above
+  // never reach here, so only git failures are retried. A CLEAR is tried once: a rejected clear leaves CI frozen
+  // (fail closed), and retrying it could overwrite the very freeze another writer just pushed to cause the reject.
+  const tries = clear === true ? 1 : Math.max(1, attempts);
+  let error;
+  for (let attempt = 1; attempt <= tries; attempt += 1) {
+    try {
+      const r = publish({ marker, ...(clear === true ? { clear: true } : {}), ...(env.WE_RED_MAIN_FREEZE_SHARED_BOARD ? { board: env.WE_RED_MAIN_FREEZE_SHARED_BOARD } : {}) });
+      stderr(`red-main freeze: shared copy ${r.pushed ? 'published' : 'already current'} on ${r.branch} (frozen=${r.doc.frozen})${attempt > 1 ? ` after ${attempt} attempts` : ''}\n`);
+      return { ok: true, branch: r.branch, pushed: r.pushed, attempts: attempt };
+    } catch (e) {
+      error = String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
+      if (attempt < tries) {
+        stderr(`red-main freeze: shared publish attempt ${attempt}/${tries} failed (${error}); retrying\n`);
+        await sleep(backoffMs * attempt);
+      }
+    }
   }
+  stderr(`red-main freeze: ✗ the SHARED copy was NOT published${tries > 1 ? ` after ${tries} attempts` : ''} (${error}); the local marker is as ${clear === true ? 'cleared' : 'written'}. CI's merge-gate may show the previous state — re-run: node scripts/readiness/red-main-remediation.mjs ${clear === true ? 'unfreeze' : 'publish'}\n`);
+  setExitCode(1);
+  return { ok: false, error, attempts: tries };
 }
 
 /**

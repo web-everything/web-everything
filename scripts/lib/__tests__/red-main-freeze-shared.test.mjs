@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  SHARED_FREEZE_FILE, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch,
+  PUBLISH_ATTEMPTS, SHARED_FREEZE_FILE, buildSharedFreezeDoc, publishSharedFreeze, publishFreezeFromCli, readSharedFreeze, resolveFreezeBranch,
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
@@ -71,11 +71,35 @@ describe('shared red-main freeze (xyd06qo)', () => {
     let code = 0;
     const r = await publishFreezeFromCli({
       marker: { reason: 'red' }, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: (s) => lines.push(s), setExitCode: (c) => { code = c; },
-      publish: () => { throw new Error('push rejected'); },
+      publish: () => { throw new Error('push rejected'); }, sleep: async () => {},
     });
-    expect(r).toMatchObject({ ok: false, error: 'push rejected' });
+    expect(r).toMatchObject({ ok: false, error: 'push rejected', attempts: PUBLISH_ATTEMPTS });
     expect(code).toBe(1);
     expect(lines.join('')).toMatch(/SHARED copy was NOT published.*red-main-remediation\.mjs publish/s);
+  });
+
+  it('CLI hook: a rejected push is retried (bounded, with backoff) and succeeds once a later attempt lands', async () => {
+    const lines = [];
+    const waits = [];
+    let calls = 0;
+    let code = 0;
+    const r = await publishFreezeFromCli({
+      marker: { reason: 'red' }, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: (s) => lines.push(s), setExitCode: (c) => { code = c; },
+      sleep: async (ms) => { waits.push(ms); },
+      publish: () => { calls += 1; if (calls < 3) throw new Error('! [rejected] HEAD -> ops/red-main-freeze (fetch first)'); return { branch: BRANCH, pushed: true, doc: { frozen: true } }; },
+    });
+    expect(r).toMatchObject({ ok: true, pushed: true, attempts: 3 });
+    expect(calls).toBe(3);
+    expect(waits).toEqual([250, 500]);
+    expect(code).toBe(0);
+    expect(lines.join('')).toMatch(/attempt 1\/4 failed.*retrying.*published on ops\/red-main-freeze \(frozen=true\) after 3 attempts/s);
+  });
+
+  it('CLI hook: a refusal (no marker, no clear) is never retried — publish is not called at all', async () => {
+    let calls = 0;
+    const r = await publishFreezeFromCli({ marker: null, env: { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' }, stderr: () => {}, setExitCode: () => {}, sleep: async () => {}, publish: () => { calls += 1; } });
+    expect(r).toMatchObject({ ok: false, refused: 'no-marker' });
+    expect(calls).toBe(0);
   });
 
   it('CLI hook: never pushes from inside a test run unless a board is injected', async () => {
@@ -162,10 +186,10 @@ describe('shared red-main freeze: only an explicit clear may publish frozen:fals
     const lines = [];
     const boom = () => { throw new Error('push rejected'); };
     const env = { WE_RED_MAIN_FREEZE_SHARED_BOARD: '/b' };
-    await publishFreezeFromCli({ marker: null, clear: true, env, stderr: (s) => lines.push(s), setExitCode: () => {}, publish: boom });
+    await publishFreezeFromCli({ marker: null, clear: true, env, stderr: (s) => lines.push(s), setExitCode: () => {}, publish: boom, sleep: async () => {} });
     expect(lines.join('')).toMatch(/red-main-remediation\.mjs unfreeze/);
     lines.length = 0;
-    await publishFreezeFromCli({ marker: { reason: 'r' }, env, stderr: (s) => lines.push(s), setExitCode: () => {}, publish: boom });
+    await publishFreezeFromCli({ marker: { reason: 'r' }, env, stderr: (s) => lines.push(s), setExitCode: () => {}, publish: boom, sleep: async () => {} });
     expect(lines.join('')).toMatch(/red-main-remediation\.mjs publish/);
   });
 });
@@ -197,7 +221,16 @@ function cliFixture() {
   });
   const breakOrigin = () => g(board, 'remote', 'set-url', 'origin', join(root, 'nope.git'));
   const fixOrigin = () => g(board, 'remote', 'set-url', 'origin', remote);
-  return { root, marker, shared, run, breakOrigin, fixOrigin, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  /** The origin REJECTS its next `n` pushes (a pre-receive hook with a counter), then accepts again. */
+  const rejectNextPushes = (n) => {
+    const left = join(root, 'rejects-left');
+    writeFileSync(left, String(n));
+    const hook = join(remote, 'hooks', 'pre-receive');
+    writeFileSync(hook, `#!/bin/sh\nn=$(cat '${left}')\nif [ "$n" -gt 0 ]; then echo $((n - 1)) > '${left}'; echo 'rejected by test hook' >&2; exit 1; fi\nexit 0\n`);
+    chmodSync(hook, 0o755);
+    return () => Number(readFileSync(left, 'utf8'));
+  };
+  return { root, board, marker, shared, run, breakOrigin, fixOrigin, rejectNextPushes, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)', { timeout: 60_000 }, () => {
@@ -245,6 +278,27 @@ describe('red-main-remediation CLI → shared copy, end to end (PR 4715 review)'
     fx.fixOrigin();
     expect(fx.run(['publish']).status).toBe(0);
     expect(fx.shared()).toMatchObject({ frozen: true, reason: 'red' });
+  });
+
+  it('a REJECTED freeze push over a standing shared CLEAR is retried until it lands — CI holds, never passes on the stale clear', () => {
+    fx.run(['freeze', '--reason=old']);
+    expect(fx.run(['unfreeze']).status).toBe(0);
+    expect(gate(readSharedFreeze({ board: fx.board, branch: BRANCH }))).toMatchObject({ status: 'pass' });
+    const rejectsLeft = fx.rejectNextPushes(2);
+    const r = fx.run(['freeze', '--reason=red']);
+    expect(rejectsLeft()).toBe(0); // both rejections really happened
+    expect(r.status).toBe(0);
+    expect(fx.shared()).toMatchObject({ frozen: true, reason: 'red' });
+    expect(gate(readSharedFreeze({ board: fx.board, branch: BRANCH }))).toMatchObject({ status: 'hold' });
+  });
+
+  it('a rejected CLEAR push is NOT retried: exit 1, CI stays frozen (fail closed) until `unfreeze` is re-run', () => {
+    fx.run(['freeze', '--reason=red']);
+    const rejectsLeft = fx.rejectNextPushes(2);
+    const r = fx.run(['unfreeze']);
+    expect(r.status).toBe(1);
+    expect(rejectsLeft()).toBe(1); // exactly one attempt
+    expect(gate(readSharedFreeze({ board: fx.board, branch: BRANCH }))).toMatchObject({ status: 'hold' });
   });
 
   it('a failed publish on `unfreeze` retries with `unfreeze` (publish would refuse: no marker) and leaves the shared freeze standing', () => {
