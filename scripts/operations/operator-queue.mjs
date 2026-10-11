@@ -49,12 +49,11 @@ import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
 import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason } from '../lib/red-team-gate.mjs';
-// Staged CLI copies omit this transitive graph. Load optionally, but refuse to classify a
-// stand-down without its canonical answer reader; empty listings still work in those copies.
+// Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
+// keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
-let standDownAnswersError;
 try { standDownAnswers = await import('../conveyor/stand-down-answer-core.mjs'); }
-catch (error) { standDownAnswersError = error; }
+catch { /* Fail safe toward operator judgment. */ }
 // The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
 let rulingLedgerError = null;
@@ -481,10 +480,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
         if (standDownComments(pr.comments).length === 0) continue;
-        if (!standDownAnswers) throw standDownAnswersError;
         const comments = [...pr.comments].sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
         const latestIndex = comments.findLastIndex((comment) => standDownComments([comment]).length > 0);
-        const answered = standDownAnswers.operatorAnswerForStandDown(comments, latestIndex);
+        const answered = standDownAnswers?.operatorAnswerForStandDown(comments, latestIndex);
         if (answered) {
           (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,
             answeredAt: standDownAnswers.latestOperatorAnswerAt(comments) });
@@ -503,15 +501,14 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     }
   }
   if (readFailures) {
-    report.incomplete = true;
     process.exitCode = 1;
   }
   if (args.includes('--json')) {
-    console.log(JSON.stringify(report, null, 2));
+    console.log(JSON.stringify(readFailures ? { ...report, incomplete: true } : report, null, 2));
   } else {
     const printRows = (rows) => {
       if (rows) console.log(rows);
-      if (report.incomplete) console.log('UNKNOWN — reads failed, re-run');
+      if (readFailures) console.log('UNKNOWN — reads failed, re-run');
       else if (!rows) console.log('(none)');
     };
     for (const error of report.errors) console.error(`ERROR ${error}`);
@@ -537,8 +534,10 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     printRows(report.stoodDown.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
       + `[stood down ${pr.standDownAt || 'time unknown'}] ${pr.reason || '(no reason recorded)'}`
       + (pr.alsoReviewHuman ? '  [also review:human]' : '')).join('\n'));
-    console.log('answered — waiting for the fixer to resume');
-    printRows((report.standDownAnswered ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [answered ${pr.answeredAt || 'time unknown'}]`).join('\n'));
+    if (report.standDownAnswered?.length) {
+      console.log('answered — waiting for the fixer to resume');
+      printRows(report.standDownAnswered.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [answered ${pr.answeredAt || 'time unknown'}]`).join('\n'));
+    }
     console.log('STUCK — inspected (epic #3383 dispatched a diagnosis-only agent; read its comment):');
     printRows(report.stuck.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
       + `[${pr.episodes} episode${pr.episodes === 1 ? '' : 's'}, last ${pr.lastEpisode}]`).join('\n'));

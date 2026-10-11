@@ -91,7 +91,8 @@ describe('operator queue read safety', () => {
     run(['--with-backpressure', '--with-reconcile-notes']);
     expect(stdout().split('\n')[0]).toContain('INCOMPLETE');
     expect(stdout()).not.toContain('(none)');
-    expect(stdout().split('\n').filter((line) => line === UNKNOWN)).toHaveLength(11);
+    expect(stdout().split('\n').filter((line) => line === UNKNOWN)).toHaveLength(10);
+    expect(stdout()).not.toContain('answered — waiting for the fixer to resume');
     expect(stdout()).toContain('ERRORS');
     expect(process.exitCode).toBe(1);
     expect(sleep).toHaveBeenCalledWith(500);
