@@ -226,6 +226,51 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
   }
 }
 
+/**
+ * IO: collect the PR's own line for review-round accounting. Author dates survive rebases.
+ * A drain rebase merge puts main first and the branch LAST; ordinary merges keep the branch first.
+ * Missing/malformed git data and a truncated walk fail closed, never returning a partial proof.
+ */
+export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin', exec = execFileSync } = {}) {
+  const head = lc(pr?.headRefOid);
+  const fail = (reason) => ({ head, ok: false, reason });
+  if (!SHA40.test(head)) return fail('no-head');
+  const base = String(pr?.baseRefName || defaultBranch);
+  const headRef = String(pr?.headRefName ?? '');
+  if ([base, remote, ...(headRef ? [headRef] : [])].some((ref) => !SAFE_REF.test(ref) || ref.startsWith('-'))) return fail('unsafe-ref');
+  const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 256 * 1024 * 1024 }) ?? '');
+  try {
+    git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
+      ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
+    const text = git(['log', '--format=%H%x00%P%x00%aI%x00%s', '--end-of-options', `${remote}/${base}..${head}`]);
+    const map = new Map();
+    for (const line of text.split('\n').filter(Boolean)) {
+      const fields = line.split('\0');
+      if (fields.length !== 4) return fail('invalid-commit-data');
+      const [sha, parentText, authoredAt, subject] = fields;
+      const parents = parentText ? parentText.split(' ') : [];
+      if (!SHA40.test(sha) || parents.some((p) => !SHA40.test(p)) || !Number.isFinite(Date.parse(authoredAt)) || map.has(sha)) return fail('invalid-commit-data');
+      map.set(sha, { sha, parents, authoredAt, subject });
+    }
+    if (!map.has(head)) return fail('missing-head');
+    const commits = []; const seen = new Set();
+    let sha = head;
+    while (map.has(sha)) {
+      if (commits.length >= 500 || seen.has(sha)) return fail('walk-limit');
+      seen.add(sha);
+      const commit = map.get(sha);
+      commits.push(commit);
+      sha = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
+        ? commit.parents.at(-1) : commit.parents[0];
+    }
+    return { head, commits };
+  } catch { return fail('git-read-failed'); }
+}
+
+// Same leading-line/authorship match as countRearmComments; avoid importing its label CLI dependency.
+// Pinned to REARM_COMMENT_MARKER by the enrichment regression in mechanical-rebase-rounds.test.mjs.
+const isRearmMarker = (c) => bodyOf(c).trimStart().startsWith('🔧 conveyor fix — re-armed for re-review') && isTrustedMarkerAuthor(c);
+
 /** The cheap pre-filter: a trusted mechanical-round marker is the latest round event after the latest verdict. */
 export function hasPendingMechanicalRound(pr) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
@@ -236,9 +281,18 @@ export function hasPendingMechanicalRound(pr) {
 }
 
 /** IO: attach `mechanicalRound` facts to each PR whose latest round was mechanical. Never throws. */
-export function enrichPrsWithMechanicalRound(prs, { defaultBranch = 'main', readFacts = readMechanicalRoundFacts } = {}) {
+export function enrichPrsWithMechanicalRound(prs, {
+  defaultBranch = 'main', readFacts = readMechanicalRoundFacts, readRoundCommits: readCommits = readRoundCommits,
+} = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
-    if (!hasPendingMechanicalRound(pr)) return pr;
-    try { return { ...pr, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { return pr; }
+    let enriched = pr;
+    if (hasPendingMechanicalRound(pr)) {
+      try { enriched = { ...enriched, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { /* preserve existing behavior */ }
+    }
+    if (Array.isArray(pr?.comments) && pr.comments.some(isRearmMarker)) {
+      try { enriched = { ...enriched, roundCommits: readCommits({ pr, defaultBranch }) }; }
+      catch { enriched = { ...enriched, roundCommits: { head: lc(pr?.headRefOid), ok: false, reason: 'git-read-failed' } }; }
+    }
+    return enriched;
   });
 }
