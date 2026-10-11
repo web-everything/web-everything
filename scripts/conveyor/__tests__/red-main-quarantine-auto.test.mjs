@@ -423,11 +423,16 @@ describe('runSafetyNet — review round 1 (PR #4816)', () => {
       expect(later.calls.writes).toHaveLength(1);
       expect(later.calls.writes[0].change(stamped).list.mode).toBe('stop');
     });
+    it('an "unstamped" record dated in the future (clock stepped back) is not trusted', () => {
+      net({ mode: STOP, mainCiRuns: RUNS, now: at + 60 * MIN }); // recorded by a clock running an hour ahead
+      const stamped = { version: 1, entries: [], mode: 'quarantine' };
+      const back = net({ mode: STOP, mainCiRuns: RUNS, list: stamped, now: at });
+      expect(back.calls.reads).toBe(1);
+      expect(back.calls.writes).toHaveLength(1);
+    });
     it('a stamp-only push is refused when the ledger cannot record it (else a stale "unstamped" record would hide it)', () => {
       const unstamped = addEntries(null, { tests: [TEST_FILE], brokenSha: FIRST_RED, owner: 'o', reason: 'r', actor: 'red-main-safety-net', now: at }).list;
-      net({ mode: STOP, mainCiRuns: RUNS, now: at }); // the ledger says "unstamped"
-      rmSync(join(dir, SAFETY_NET_LEDGER));
-      mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // from now on the ledger write fails
+      mkdirSync(join(dir, SAFETY_NET_LEDGER), { recursive: true }); // the ledger write fails (the tick's own read records "unstamped")
       const { r, calls } = net({ mode: QUARANTINE, mainCiRuns: RUNS, list: unstamped, now: at + MIN });
       expect(calls.writes).toEqual([]);
       expect(r.applied).toBe(false);

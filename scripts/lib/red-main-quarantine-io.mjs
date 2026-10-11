@@ -210,7 +210,9 @@ export function runSafetyNet({
     // That covers a flip back to `stop` after this daemon published, and a fresh, lost, reset or stale ledger: an
     // "unstamped" record is trusted only for STAMP_RECHECK_MS, then read again. A failed read or withdraw leaves it
     // unknown: retried next tick. Nothing is written when the list is unstamped, and a replay tick never reads or writes.
-    const knownUnstamped = ledger.publishedMode === 'stop' && now - (Number(ledger.publishedModeAt) || 0) < STAMP_RECHECK_MS;
+    // A record from the future (clock stepped back, ledger copied from a host running ahead) is not trusted either.
+    const unstampedAge = now - (Number(ledger.publishedModeAt) || 0);
+    const knownUnstamped = ledger.publishedMode === 'stop' && unstampedAge >= 0 && unstampedAge < STAMP_RECHECK_MS;
     if (!isLive && live === true && !knownUnstamped) {
       try {
         const cur = readList();
