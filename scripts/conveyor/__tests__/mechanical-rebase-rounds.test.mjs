@@ -212,7 +212,7 @@ describe('mechanical re-arm rounds', () => {
           delete merged[LANE_MANIFEST];
           prev = commit(merged, [upstream, prev], 'drain: rebase lane/x onto origin/main, drop transient .lane-manifest.json', date);
         } else {
-          if (variant === 'repair') merged[`scripts/fix-${i}.mjs`] = `export const fix = ${i};\n`;
+          if (variant === 'repair') merged[`fix-${i}.mjs`] = `export const fix = ${i};\n`;
           if (variant === 'revert-upstream') delete merged[`u${i}.txt`];
           // Only the manifest's deletion is excused: content smuggled into it is still the PR's own.
           if (variant === 'manifest-edit') merged[LANE_MANIFEST] = `{"fix":${i}}\n`;
