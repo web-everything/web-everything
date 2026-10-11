@@ -44,7 +44,7 @@ export const GIT_TIMEOUT_MS = 20_000;
 
 /** The transport's git runner, with a hard timeout (the transport's own default has none). */
 export function timedGit(timeoutMs = GIT_TIMEOUT_MS) {
-  return (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGKILL', ...opts });
+  return (args, opts = {}) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: timeoutMs, killSignal: 'SIGTERM', ...opts }); // SIGTERM, not SIGKILL: git then removes its ref/packed-refs locks, so a timeout never wedges the next run
 }
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -114,8 +114,8 @@ export function publishSharedFreeze({ marker, clear = false, lifted, board = REP
 /**
  * The CLI hook (`red-main-remediation.mjs`): mirror the local marker, report, never throw. Skipped inside a test
  * run unless a board is injected, so no test can push the live branch.
- * `onFailedAttempt` runs after every failed raise attempt, BEFORE any wait: the CLI writes the local marker there, so
- * retrying never keeps the drain unfrozen. Its own throw is reported, never allowed to stop the retries.
+ * `onFailedAttempt` (optional) runs after every failed raise attempt, BEFORE any wait; its own throw is reported, never
+ * allowed to stop the retries. (The CLI writes its local marker before calling this hook at all.)
  * @returns {Promise<{ok:boolean, skipped?:string, refused?:string, branch?:string, pushed?:boolean, error?:string, attempts?:number}>}
  */
 export async function publishFreezeFromCli({ marker, clear = false, lifted, env = process.env, stderr = (s) => process.stderr.write(s), publish = publishSharedFreeze, setExitCode = (c) => { process.exitCode = c; }, attempts = PUBLISH_ATTEMPTS, backoffMs = 250, deadlineMs = 60_000, nowMs = () => Date.now(), sleep = (ms) => new Promise((r) => setTimeout(r, ms)), onFailedAttempt = null } = {}) {
@@ -129,7 +129,7 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
   }
   // A REJECTED raise (a raced writer, a refusing hook, a blip) must not leave CI reading a stale clear: every attempt
   // re-fetches the tip and re-stages onto it, so a non-fast-forward resolves itself. Bounded by count AND by a total
-  // deadline (git here has no timeout of its own). A deterministic refusal is never retried. A CLEAR is tried once: a
+  // deadline checked between attempts (each git call is separately capped by GIT_TIMEOUT_MS). A deterministic refusal is never retried. A CLEAR is tried once: a
   // rejected clear leaves CI frozen (fail closed), and a clear never overwrites a different freeze (see `lifted`).
   const tries = clear === true ? 1 : Math.max(1, attempts);
   const envMs = (name) => { const n = Number(env[name]); return Number.isInteger(n) && n > 0 ? n : null; };

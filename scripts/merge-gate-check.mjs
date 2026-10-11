@@ -314,6 +314,20 @@ export function readRedMainFact({ cwd, policy, read = readSharedFreeze }) {
 }
 
 /**
+ * The freeze RE-READ right before the verdict (PR 4715 review): fact-gathering between the first read and the verdict
+ * is slow and untimed, so a freeze published meanwhile must still hold this run. A PASS survives only when the second
+ * read is readable, not frozen, and the same document as the first; anything else holds (fail closed). Pure.
+ */
+export function applyFreezeRecheck(verdict, first, recheck) {
+  if (!verdict.ok) return verdict;
+  const why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${recheck?.error || 'not read'}`
+    : recheck.frozen ? `main went RED during this run (freeze: ${recheck.reason || 'active'})`
+      : (first?.frozen !== recheck.frozen || (first?.publishedAt ?? null) !== (recheck.publishedAt ?? null)) ? 'red-main freeze changed during this run'
+        : null;
+  return why ? { ...verdict, ok: false, reason: `${why} — fail closed; ${verdict.reason}` } : verdict;
+}
+
+/**
  * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
  * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
  * queue merge. `'pull_request'` needs POSITIVE proof — the runner reporting exactly `pull_request` — because it is
@@ -374,7 +388,9 @@ async function main() {
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`merge-gate: workflow self-check — ${wfCheck.ok ? 'ok' : 'FAIL'}: ${wfCheck.reason}\n`);
   const base = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
-  const verdict = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
+  const preRecheck = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
+  // Re-read the freeze last: the facts above can take minutes, and a freeze published meanwhile must still hold.
+  const verdict = preRecheck.ok ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy })) : preRecheck;
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, workflowCheck: wfCheck, policy, prs }, null, 2)}\n`);
   else {
     for (const p of prs) writeAllSync(1, `${formatPrResult(p)}\n`);

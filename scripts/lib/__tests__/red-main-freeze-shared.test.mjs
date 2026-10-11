@@ -15,7 +15,7 @@ import {
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
-import { gatherPrFacts, readRedMainFact } from '../../merge-gate-check.mjs';
+import { applyFreezeRecheck, gatherPrFacts, readRedMainFact } from '../../merge-gate-check.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = resolve(HERE, '..', '..', 'readiness', 'red-main-remediation.mjs');
@@ -460,5 +460,33 @@ describe('merge-gate-check threads the shared freeze into the gate facts (PR 471
   it('the default policy and the writer resolve to one branch', () => {
     const policy = loadMergeDeliveryPolicy({ toolSettings: {} });
     expect(policy.redMainFreezeBranch).toBe(resolveFreezeBranch({ toolSettings: {} }));
+  });
+
+  describe('the freeze is RE-READ right before the verdict (slow fact-gathering cannot pass on a stale clear)', () => {
+    const PASS = { ok: true, reason: 'all pass' };
+    const clearAt = (publishedAt) => ({ source: 's', frozen: false, reason: null, publishedAt });
+    it('unchanged clear → the PASS stands', () => {
+      expect(applyFreezeRecheck(PASS, clearAt('t0'), clearAt('t0'))).toEqual(PASS);
+    });
+    it.each([
+      ['frozen meanwhile', { source: 's', frozen: true, reason: 'post-land red', publishedAt: 't1' }, /went RED during this run.*post-land red/],
+      ['unreadable at verdict time', { source: 's', error: 'branch unreadable: timeout' }, /unreadable at verdict time.*timeout/],
+      ['re-published (frozen then cleared) meanwhile', clearAt('t2'), /changed during this run/],
+      ['not read', null, /unreadable at verdict time: not read/],
+    ])('%s → HOLD (fail closed)', (_n, recheck, msg) => {
+      const v = applyFreezeRecheck(PASS, clearAt('t0'), recheck);
+      expect(v.ok).toBe(false);
+      expect(v.reason).toMatch(msg);
+    });
+    it('a verdict already held is left as it is', () => {
+      const held = { ok: false, reason: 'held' };
+      expect(applyFreezeRecheck(held, clearAt('t0'), { source: 's', frozen: true, reason: 'x' })).toBe(held);
+    });
+    it('main() re-reads the freeze after gathering facts and feeds it to applyFreezeRecheck', () => {
+      const src = readFileSync(resolve(HERE, '..', '..', 'merge-gate-check.mjs'), 'utf8');
+      const main = src.slice(src.indexOf('async function main()'));
+      expect(main.indexOf('applyFreezeRecheck(preRecheck, redMain, readRedMainFact(')).toBeGreaterThan(main.indexOf('gatherPrFacts('));
+      expect(main).toMatch(/const verdict = preRecheck\.ok \? applyFreezeRecheck\(/);
+    });
   });
 });
