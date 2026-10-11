@@ -119,7 +119,8 @@ function changedFiles(git, mainSha, sha) {
  *     merged (a rebuild-committed `daemon-rebuild: merge overlay <P> (PR #n)` on the first-parent line of HEAD or a
  *     HEAD reflog entry — "the recorded adopted head sha changing", fast-forwards included), or (b) the `before`
  *     commit of a GitHub head_ref_force_pushed event on P's PR. Set aside, the children's tops kept until they are
- *     restacked. This deliberately overrides "live overlays win" for P. A sibling retargeted onto P never contains a
+ *     restacked. The entry's `tops` are only the CARRIERS — clashing tops that contain a proven old head of P (for
+ *     `last-adopted`, the clashing tops that build merged) — since only they replace P (see the 7b fallback). This deliberately overrides "live overlays win" for P. A sibling retargeted onto P never contains a
  *     head of P, so it never evicts P (it is reported in `unconfirmed` and parked by the plain conflict rule).
  *   - with no fresh proof — the force-push read is UNKNOWN (gh unreachable; reported in `unknown`), or the proof aged
  *     out of the reflog — the last adopted build decides: P keeps what it had there — set aside if HEAD merged a
@@ -207,15 +208,21 @@ export async function planOverlayStacks({
     }
     return fpCache.get(pr);
   };
-  // Hard evidence that P moved away from a head one of `clashing` was built on, or null when it cannot be known.
+  // Hard evidence that P moved away from a head one of `clashing` was built on: `{evidence, carriers}`, where
+  // `carriers` are the clashing tops that contain a proven old head of P — adopted OR force-pushed away, together (the
+  // tops that replace P) — or `{evidence:null}` when it cannot be known.
   const movedEvidence = async (p, clashing) => {
     // A head already in main is everyone's history, not P's: never evidence.
-    const carried = (s) => s !== p.sha && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0
-      && clashing.some((t) => anc(s, t.sha));
-    if ([...adoptedHeads(p)].some(carried)) return 'adopted-head';
+    const ownHeads = (heads) => heads.filter((s) => s !== p.sha && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0);
+    const carriersOf = (heads) => clashing.filter((t) => heads.some((s) => anc(s, t.sha)));
+    const adopted = carriersOf(ownHeads([...adoptedHeads(p)]));
+    if (adopted.length === clashing.length) return { evidence: 'adopted-head', carriers: adopted };
     const before = await forcePushedHeads(p.pr);
-    if (before == null) return null;
-    return before.some(carried) ? 'force-pushed' : 'none';
+    if (before == null) return adopted.length > 0 ? { evidence: 'adopted-head', carriers: adopted } : { evidence: null, carriers: [] };
+    const pushed = carriersOf(ownHeads(before));
+    const carriers = clashing.filter((t) => adopted.includes(t) || pushed.includes(t));
+    if (carriers.length === 0) return { evidence: 'none', carriers };
+    return { evidence: adopted.length > 0 ? 'adopted-head' : 'force-pushed', carriers };
   };
   const unconfirmed = [];
   const unknown = [];
@@ -250,7 +257,9 @@ export async function planOverlayStacks({
       // git error: both apply on their own, as before stacks existed.
       const clashing = tops.filter((t) => git(['merge-tree', '--write-tree', '--no-messages', p.sha, t.sha]).status === 1);
       if (clashing.length === 0) continue;
-      let evidence = await movedEvidence(p, clashing);
+      // Only the tops that replace P are recorded on the set-aside entry: the 7b fallback brings P back unless one of
+      // THEM applied, so an unrelated top (one that carries no head of P, or merges cleanly with P) never suppresses it.
+      let { evidence, carriers } = await movedEvidence(p, clashing);
       if (evidence == null || evidence === 'none') {
         // No fresh proof (unknown, or the proof aged out of the reflog): keep what the last adopted build did with P —
         // set aside if it merged a clashing top but not P, else live. Never a fresh eviction.
@@ -262,9 +271,10 @@ export async function planOverlayStacks({
         else if (!keptAside) for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
         if (!keptAside) continue;
         evidence = 'last-adopted';
+        carriers = clashing.filter((t) => last.some((m) => sameOverlay(m, t)));
       }
       setAside.set(p.ref, {
-        ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', evidence, tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })),
+        ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', evidence, tops: carriers.map(({ ref, pr, sha }) => ({ ref, pr, sha })),
       });
     }
     for (const t of tops) stackTops.add(t.ref);
@@ -573,7 +583,9 @@ export async function planRebuild({
   }
 
   // 7b. stack fallback (held item 212) — a base set aside for its tops comes back when NONE of those tops applied
-  //     (each was dropped for its own conflict): the stack never loses both the base and its tops.
+  //     (each was dropped for its own conflict): the stack never loses both the base and its tops. `d.tops` holds only
+  //     the tops that replace the base (containing it, or carrying a proven old head of it and clashing with it): any
+  //     other top of the stack applying says nothing about the base's content, so it never suppresses the fallback.
   //     A base that CANNOT be merged back (a newcomer applied first and now clashes with it, or git failed) must never
   //     vanish silently: the whole plan is run again with that base as an ordinary independent overlay, so the normal
   //     rules decide (an established base goes first and the newcomer is parked; a pinned one refuses). Each pass adds

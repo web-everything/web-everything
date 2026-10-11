@@ -189,6 +189,99 @@ describe('held item 212 — stacked overlays apply as stack tops', () => {
     expect(isAncestor(f.clone, bNew, plan.finalSha)).toBe(true);
   });
 
+  describe('red team round 4 — only a top that carries the base suppresses its fallback', () => {
+    const OTHER = 'scripts/unrelated.mjs';
+    /** #4756 force-pushed; #4792 carries its old head and conflicts with main; `extra` adds more tops of #4756. */
+    const movedWithFailingTop = (extra) => {
+      const f = fixture();
+      const bNew = f.moveBase();
+      gitOk(f.author, ['fetch', '-q', 'origin']);
+      gitOk(f.author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+      write(f.author, TAKEOVER, lines({ 6: 'main moved' }));
+      gitOk(f.author, ['commit', '-q', '-am', 'main']);
+      gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+      extra(f);
+      f.fetch();
+      return { f, bNew };
+    };
+    const planWith = (f, bNew, overlays, chains) => planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', overlays,
+      prBaseChain: async (pr) => chains[pr] ?? CHAINS[pr] ?? [],
+      prForcePushes: async (pr) => (pr === 4756 ? [{ before: f.bOld, after: bNew }] : []),
+    });
+
+    it('an unrelated top retargeted onto the base (carries no head of it) applying does not suppress the fallback', async () => {
+      const { f, bNew } = movedWithFailingTop((g) => g.push('lane/u', g.init, { [OTHER]: 'u\n' }));
+      const plan = await planWith(f, bNew, [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }, { ref: 'lane/u', pr: 9701 }], { 9701: [BASE] });
+      expect(plan.decisions.find((d) => d.ref === LAST)).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/u')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply', reason: 'applied-stack-fallback' });
+      expect(isAncestor(f.clone, bNew, plan.finalSha)).toBe(true);
+    });
+
+    it('a top that carries the old head but does not clash with the new one applying does not suppress the fallback', async () => {
+      // P1 → P2 keeps P1's line and adds one T rewrites; K carries P1 but touches only LADDER, so it merges cleanly with P2.
+      const f = fixture();
+      const p1 = f.push('lane/p', f.init, { [TAKEOVER]: lines({ 2: 'p' }) });
+      f.push('lane/t', p1, { [TAKEOVER]: lines({ 2: 'p', 8: 't', 12: 't' }) });
+      f.push('lane/k', p1, { [LADDER]: lines({ 3: 'k' }) });
+      const p2 = f.push('lane/p', f.init, { [TAKEOVER]: lines({ 2: 'p', 8: 'p2' }) });
+      gitOk(f.author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+      write(f.author, TAKEOVER, lines({ 12: 'main moved' })); // T conflicts with main; P2 does not
+      gitOk(f.author, ['commit', '-q', '-am', 'main']);
+      gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+      f.fetch();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: null, mainRef: 'origin/main',
+        overlays: [{ ref: 'lane/p', pr: 9801 }, { ref: 'lane/t', pr: 9802 }, { ref: 'lane/k', pr: 9803 }],
+        prBaseChain: async (pr) => (pr === 9801 ? [] : ['lane/p']),
+        prForcePushes: async (pr) => (pr === 9801 ? [{ before: p1, after: p2 }] : []),
+      });
+      expect(plan.decisions.find((d) => d.ref === 'lane/t')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/k')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({ action: 'apply', reason: 'applied-stack-fallback' });
+      expect(isAncestor(f.clone, p2, plan.finalSha)).toBe(true);
+    });
+
+    it('mixed evidence: a top carrying an adopted head and one carrying a force-pushed head both replace the base', async () => {
+      const f = fixture();
+      const p0 = f.push('lane/p', f.init, { [TAKEOVER]: lines({ 2: 'p0' }) });
+      f.fetch();
+      const old = await f.build([{ ref: 'lane/p', pr: 9901 }], f.init); // an earlier build adopted p0
+      f.push('lane/t1', p0, { [TAKEOVER]: lines({ 2: 'p0', 10: 't1' }) });
+      const p1 = f.push('lane/p', f.init, { [TAKEOVER]: lines({ 2: 'p1' }) });
+      f.push('lane/t2', p1, { [TAKEOVER]: lines({ 2: 'p1' }), [LADDER]: lines({ 4: 't2' }) });
+      const p2 = f.push('lane/p', f.init, { [TAKEOVER]: lines({ 2: 'p2' }) }); // force-pushed away from p1
+      gitOk(f.author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+      write(f.author, TAKEOVER, lines({ 10: 'main moved' })); // only t1 conflicts with main
+      gitOk(f.author, ['commit', '-q', '-am', 'main']);
+      gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+      f.fetch();
+      const plan = await planRebuild({
+        git: f.runGit, headSha: old, mainRef: 'origin/main',
+        overlays: [{ ref: 'lane/p', pr: 9901 }, { ref: 'lane/t1', pr: 9902 }, { ref: 'lane/t2', pr: 9903 }],
+        prBaseChain: async (pr) => (pr === 9901 ? [] : ['lane/p']),
+        prForcePushes: async (pr) => (pr === 9901 ? [{ before: p1, after: p2 }] : []),
+      });
+      expect(plan.decisions.find((d) => d.ref === 'lane/t1')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/t2')).toMatchObject({ action: 'apply' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/p')).toMatchObject({
+        action: 'skip', reason: 'stack-base-moved', tops: ['lane/t1', 'lane/t2'],
+      });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-restored');
+    });
+
+    it('the set-aside base names only its clashing carrier tops (the alert and the skip decision)', async () => {
+      const f = fixture();
+      const bNew = f.moveBase();
+      f.push('lane/u', f.init, { [OTHER]: 'u\n' });
+      f.fetch();
+      const plan = await planWith(f, bNew, [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }, { ref: 'lane/u', pr: 9701 }], { 9701: [BASE] });
+      expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'skip', reason: 'stack-base-moved', tops: [LAST] });
+      expect(plan.alerts.find((a) => a.kind === 'overlay-stack-base-moved')?.detail.tops).toEqual([LAST]);
+    });
+  });
+
   it('rebuildClone adopts the stack tops end to end (base chains recorded on the entries, no gh) and logs the one stack line', async () => {
     const f = fixture();
     f.fetch();
