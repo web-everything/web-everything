@@ -7,11 +7,15 @@
  *   same head with nothing durable recorded).
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildCiHealEscalationComment, parseCiHealEscalations, latestCiHealEscalationForHead,
+  escalationStaleAgainstBase, enrichPrsWithEscalationBaseFacts, defaultReadBaseHead,
+  buildInheritedRedBaseNote, CI_HEAL_INHERITED_BASE_NOTE_MARKER,
   composeCiHealEscalation, CI_HEAL_ESCALATION_MARKER, CI_HEAL_ESCALATION_OUTCOMES, postOrOweCiHealEscalation,
 } from '../ci-heal-escalation-mark.mjs';
 import { collectCiAuthDiagnosis } from '../ci-auth-diagnosis.mjs';
@@ -22,8 +26,8 @@ const AUTOMATION = { login: 'web-everything' };
 const HEAD = '70326866f0f299ddd005f9da54f0b87a3c169ac4'; // PR #2783's real head, 2026-09-27
 
 describe('CI_HEAL_ESCALATION_OUTCOMES', () => {
-  it('is exactly the three-valued enum the file header describes', () => {
-    expect(CI_HEAL_ESCALATION_OUTCOMES).toEqual(['needs-human', 'waiting-on-system-fix', 'not-a-ci-break']);
+  it('is exactly the four-valued enum the file header describes', () => {
+    expect(CI_HEAL_ESCALATION_OUTCOMES).toEqual(['needs-human', 'waiting-on-system-fix', 'not-a-ci-break', 'inherited-from-base']);
   });
 });
 
@@ -421,5 +425,135 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
     expect(result.comments).toEqual([expect.objectContaining({ kind: 'ci-heal-verdict-void', body: voidComment().body, posted: !dryRun, dryRun })]);
     expect(postComment).toHaveBeenCalledTimes(dryRun ? 0 : 1);
     if (!dryRun) expect(postComment).toHaveBeenCalledWith({ repo: fixture.repo, pr: 4535, body: voidComment().body });
+  });
+});
+
+
+describe('stacked base escalation facts (#4792)', () => {
+  const createdAt = '2026-10-11T16:34:56Z';
+  const comment = (extra = {}) => ({ author: AUTOMATION, createdAt,
+    body: buildCiHealEscalationComment({ headSha: HEAD, outcome: 'needs-human', ...extra }) });
+
+  it('round-trips inherited red and requires both base fields', () => {
+    const fields = { outcome: 'inherited-from-base', basePr: 4779, baseHeadSha: 'ABC1234' };
+    expect(parseCiHealEscalations([comment(fields)])[0]).toMatchObject({
+      outcome: 'inherited-from-base', basePr: '4779', baseHeadSha: 'abc1234',
+    });
+    for (const missing of ['basePr', 'baseHeadSha']) {
+      expect(() => comment({ ...fields, [missing]: null })).toThrow(TypeError);
+    }
+    expect(composeCiHealEscalation({ head: HEAD, outcome: fields.outcome,
+      'base-pr': '4779', 'base-head': 'ABC1234' })).toContain('base-head: abc1234');
+  });
+
+  it('allows needs-human to record a base head, and preserves legacy nulls', () => {
+    expect(parseCiHealEscalations([comment({ baseHeadSha: 'ABC1234' })])[0])
+      .toMatchObject({ baseHeadSha: 'abc1234', basePr: null });
+    expect(parseCiHealEscalations([comment()])[0]).toMatchObject({ baseHeadSha: null, basePr: null });
+  });
+
+  it.each([
+    [{ baseHeadSha: 'abc' }, { sha: 'def' }, true],
+    [{ baseHeadSha: 'ABC' }, { sha: 'abc', committedAt: '2026-10-12' }, false],
+    [{ createdAt }, { committedAt: '2026-10-11T16:44:54Z' }, true],
+    [{ createdAt }, { committedAt: '2026-10-11T16:24:54Z' }, false],
+    [{ createdAt }, { committedAt: createdAt }, false],
+    [{ createdAt }, { committedAt: 'invalid' }, false],
+    [{ createdAt: 'invalid' }, { committedAt: createdAt }, false],
+    [{ baseHeadSha: 'abc', createdAt }, { committedAt: '2026-10-12' }, false],
+    [null, { sha: 'abc' }, false], [{ createdAt }, null, false], [{}, {}, false],
+  ])('staleness: %j against %j → %s', (escalation, baseHead, stale) => {
+    expect(escalationStaleAgainstBase(escalation, baseHead)).toBe(stale);
+  });
+
+  it('only invalidates the latest matching verdict when base facts are supplied', () => {
+    const comments = [comment(), comment({ baseHeadSha: 'abc' })];
+    expect(latestCiHealEscalationForHead(comments, HEAD)?.baseHeadSha).toBe('abc');
+    expect(latestCiHealEscalationForHead(comments, HEAD, { baseHead: { sha: 'def' } })).toBeNull();
+    expect(latestCiHealEscalationForHead(comments, HEAD, { baseHead: { sha: 'ABC' } })).not.toBeNull();
+  });
+
+  it('reads each eligible base once, preserving untouched objects including failed reads', () => {
+    const pr = { headRefOid: HEAD, baseRefName: 'lane/base', comments: [comment()] };
+    const prs = [pr, { ...pr }, { ...pr, baseRefName: 'trunk' }, { ...pr, comments: [] },
+      { ...pr, baseRefName: 'lane/missing' }, { ...pr, baseRefName: 'lane/missing' },
+      { ...pr, baseRefName: null }, { ...pr, headRefOid: 'new' }];
+    const calls = [];
+    const facts = { sha: 'abc', committedAt: createdAt };
+    const result = enrichPrsWithEscalationBaseFacts(prs, { repo: 'owner/repo', defaultBranch: 'trunk',
+      readBaseHead: (ref, options) => { calls.push([ref, options]); return ref === 'lane/base' ? facts : null; } });
+    expect(calls).toEqual([['lane/base', { repo: 'owner/repo' }], ['lane/missing', { repo: 'owner/repo' }]]);
+    expect(result[0]).toEqual({ ...pr, escalationBaseHead: facts });
+    expect(result[1].escalationBaseHead).toEqual(facts);
+    for (let i = 2; i < prs.length; i++) expect(result[i]).toBe(prs[i]);
+    expect(enrichPrsWithEscalationBaseFacts(null)).toEqual([]);
+  });
+
+  it.each([undefined, null, '', false])('skips GitHub without an explicit repo (%s)', repo => {
+    const exec = vi.fn();
+    expect(defaultReadBaseHead('lane/base', { repo, exec })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('reads encoded GitHub branch facts and tolerates command/JSON failures', () => {
+    const calls = [];
+    const exec = (...args) => { calls.push(args); return JSON.stringify({ sha: 'abc', committedAt: createdAt }); };
+    expect(defaultReadBaseHead('lane/base', { repo: 'owner/repo', exec })).toEqual({ sha: 'abc', committedAt: createdAt });
+    expect(calls[0][0]).toBe('gh');
+    expect(calls[0][1]).toEqual(['api', 'repos/owner/repo/branches/lane%2Fbase', '--jq',
+      '{sha: .commit.sha, committedAt: .commit.commit.committer.date}']);
+    expect(calls[0][2]).toMatchObject({ timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] });
+    expect(defaultReadBaseHead('base', { repo: 'owner/repo', exec: () => { throw Error('offline'); } })).toBeNull();
+    expect(defaultReadBaseHead('base', { repo: 'owner/repo', exec: () => 'bad json' })).toBeNull();
+    expect(defaultReadBaseHead('base', { repo: 'owner/repo', exec: () => '{}' })).toBeNull();
+  });
+
+  it('addresses the base fixer with a distinct leading marker', () => {
+    const body = buildInheritedRedBaseNote({ stackedPr: 4792, stackedHead: HEAD, baseHeadSha: 'abc', reason: 'base test' });
+    expect(body.split('\n')[0]).toBe(CI_HEAL_INHERITED_BASE_NOTE_MARKER);
+    expect(body).toContain('stacked-pr: #4792');
+    expect(body).toContain('base-head: abc');
+    expect(body).toContain('reason: base test');
+    expect(body).toContain("this PR's fixer");
+  });
+});
+
+
+describe('inherited-red CLI routing', () => {
+  it.each([false, true])('resolves the base on GitHub and tolerates a failed base note (%s)', failNote => {
+    const dir = mkdtempSync(join(tmpdir(), 'ci-heal-base-'));
+    try {
+      const log = join(dir, 'calls.jsonl');
+      const stub = join(dir, 'gh');
+      writeFileSync(stub, `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + '\\n');
+if (args[0] === 'repo') console.log('main');
+else if (args[0] === 'api') console.log(JSON.stringify({ sha: 'abc1234', committedAt: '2026-10-11T16:44:54Z' }));
+else if (args[1] === 'list') console.log('4779');
+else if (args[1] === 'view') console.log(JSON.stringify({ baseRefName: 'lane/takeover-budget', headRefOid: '${HEAD}', labels: [{ name: 'review-status:fixing' }] }));
+else if (args[1] === 'comment' && args[2] === '4779' && ${failNote}) { console.error('base note unavailable'); process.exit(1); }
+`);
+      chmodSync(stub, 0o755);
+      const result = spawnSync(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '..', 'ci-heal-escalation-mark.mjs'),
+        '4792', '--repo=web-everything/web-everything', `--head=${HEAD}`, '--outcome=inherited-from-base', '--reason=base test'], {
+        encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, NODE_OPTIONS: '', PATH: `${dir}:${process.env.PATH}`, WE_GH_THROTTLE_LOCK_ROOT: join(dir, 'throttle') },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({ outcome: 'inherited-from-base', baseNotePosted: !failNote });
+      const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(calls).toContainEqual(['api', 'repos/web-everything/web-everything/branches/lane%2Ftakeover-budget',
+        '--jq', '{sha: .commit.sha, committedAt: .commit.commit.committer.date}']);
+      const posts = calls.filter(args => args[1] === 'comment');
+      expect(posts.map(args => args[2])).toEqual(['4792', '4779']);
+      expect(posts[0][4]).toContain('base-pr: #4779');
+      expect(posts[0][4]).toContain('base-head: abc1234');
+      expect(posts[1][4].split('\n')[0]).toBe(CI_HEAL_INHERITED_BASE_NOTE_MARKER);
+      expect(calls.flat()).not.toContain('review-status:needs-human');
+      if (failNote) expect(result.stderr).toContain('⚠ could not post inherited-red note');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

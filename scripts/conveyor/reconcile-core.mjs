@@ -2216,7 +2216,7 @@ export function planReconcile({
     }
 
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
         refuse('ci-heal-escalated', {
@@ -2351,7 +2351,7 @@ export function planReconcile({
       // tick plans a fresh heal with no human intervention required. Checked BEFORE the `ci-heal` cap below
       // (and skips it entirely) for the same reason `owed-ci-rerun` is: an escalation is a DIFFERENT, more
       // definitive stop than "one more round against the attempt cap".
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       if (escalation) {
         const isSystemFix = escalation.outcome === 'waiting-on-system-fix';
         // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything)
@@ -2384,12 +2384,17 @@ export function planReconcile({
           // Falls straight through to the ordinary ci-heal cap/dispatch path below, exactly as if this PR had
           // never been escalated at all — never a second, separate re-dispatch path to keep in sync with it.
         } else {
+          const isInherited = escalation.outcome === 'inherited-from-base';
           const kind = isSystemFix ? 'waiting-on-system-fix' : 'ci-heal-escalated';
           refuse(kind, {
             ...withPhase, headSha: escalation.headSha,
             ...(escalation.reason ? { escalationReason: escalation.reason } : {}),
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
-            why: isSystemFix
+            ...(escalation.basePr ? { basePr: escalation.basePr } : {}),
+            ...(escalation.baseHeadSha ? { baseHeadSha: escalation.baseHeadSha } : {}),
+            why: isInherited
+              ? `ci-heal found this exact head's red (\`${escalation.headSha}\`) inherited from base PR #${escalation.basePr} at base head \`${escalation.baseHeadSha}\` — owed to the base PR's fixer, not the operator; re-arms automatically when the base head moves or a new push changes this head`
+              : isSystemFix
               ? `ci-heal already escalated this exact head (\`${escalation.headSha}\`) as waiting on system fix #${escalation.systemFixRef} — the red is the tooling/gate's own fault, not this PR's; nothing further is owed until that fix lands or a new push changes this head`
               : isNotCiBreak
                 ? `ci-heal already confirmed this exact head (\`${escalation.headSha}\`) is NOT a CI break — the red is the review gate itself, held by the review label. No further heal is owed; review waits for complete successful required checks`
@@ -2402,7 +2407,7 @@ export function planReconcile({
           // per tick, until a new push or a person clears it. `not-a-ci-break` is deliberately NOT a dead end
           // (see above) — it still gets this same informational note (an operator reading the report should
           // see why no MORE ci-heal is coming), but cannot override the required-check prerequisite for review.
-          notes.push({
+          if (!isInherited) notes.push({
             kind: 'ci-heal-escalated', prNumber, headSha: escalation.headSha, outcome: escalation.outcome,
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
             text: isSystemFix
