@@ -85,6 +85,17 @@ describe('fix round history (card xx0055i)', () => {
     expect(Math.max(...dropped)).toBeLessThan(Math.min(...kept));
   });
 
+  it('when ONE round alone is over the cap, the round text is cut and the current rulings survive', () => {
+    const huge = review('2026-10-01T01:00:00Z', SHA('a'), Array.from({ length: 30 }, (_, k) => [`src/f${k}.mjs`, k + 1, `BIG_${k}_${'y'.repeat(210)}`]));
+    const comments = [huge, rulings('2026-10-01T01:05:00Z', SHA('a'), [['src/f0.mjs', 1, 'the ruled claim', 'block']]),
+      review('2026-10-01T02:00:00Z', SHA('b'), [['src/z.mjs', 1, 'current round']])];
+    const text = renderRoundHistory(buildRoundHistory({ comments }), { maxChars: 1200 });
+    expect(text.length).toBeLessThanOrEqual(1200);
+    expect(text).toMatch(/cut at 1200/);
+    expect(text).toContain('## Current rulings');
+    expect(text).toContain('the ruled claim');
+  });
+
   it('current rulings keep only the latest ruling per finding', () => {
     const r = currentRulings([
       rulings('2026-10-01T01:00:00Z', SHA('a'), [['f.mjs', 1, 'c', 'block']]),

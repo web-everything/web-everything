@@ -258,12 +258,21 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
     // One trusted re-arm = one spent round; WE_REVIEW_ROUND_CAP=1 puts the head at the cap (1/1).
     const pr = { ...basePr(H4, [trusted('🔧 conveyor fix — re-armed for re-review', 50), ...base, rulingOn(recA), rulingOn(recB)]) };
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pass = (loaders = {}) => runReconcilePass({ repo, now: Date.parse('2026-10-04T12:00:00Z'), readPrs: () => [pr], readAgents: () => [], enrich: (x) => x,
+      enrichMainRed: (prs) => ({ prs }), enrichAlreadyLanded: (x) => x, enrichBaseRef: (x) => x, enrichSystemFix: (x) => x,
+      enrichFixClaims: (x) => x, enrichTimeouts: (x) => x, enrichReferralHolds: (prs) => prs.map((p) => ({ ...p, blockRuledReferrals: blocked, referralHold: null })),
+      enrichMechanicalRound: (x) => x, loadOperatorRulingRounds: () => ({ value: 1, source: 'env' }),
+      loadFixSettings: () => ({ roundCapAction: 'takeover' }), loadTakeoverBudget: () => ({ value: 2, source: 'env' }), ...loaders,
+      resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), env: { WE_REVIEW_ROUND_CAP: '1' } });
     try {
-      const out = runReconcilePass({ repo, now: Date.parse('2026-10-04T12:00:00Z'), readPrs: () => [pr], readAgents: () => [], enrich: (x) => x,
-        enrichMainRed: (prs) => ({ prs }), enrichAlreadyLanded: (x) => x, enrichBaseRef: (x) => x, enrichSystemFix: (x) => x,
-        enrichFixClaims: (x) => x, enrichTimeouts: (x) => x, enrichReferralHolds: (prs) => prs.map((p) => ({ ...p, blockRuledReferrals: blocked, referralHold: null })),
-        enrichMechanicalRound: (x) => x, loadOperatorRulingRounds: () => ({ value: 1, source: 'env' }),
-        resolveMainSha: () => null, readRequiredChecks: () => ({ checks: ['test'] }), env: { WE_REVIEW_ROUND_CAP: '1' } });
+      // The takeover off switches, read by the pass's own loaders, stop the directed grant (the wiring, not just the planner).
+      for (const [name, loaders] of [['roundCapAction=person', { loadFixSettings: () => ({ roundCapAction: 'person' }) }],
+        ['budget 0', { loadTakeoverBudget: () => ({ value: 0, source: 'env' }) }],
+        ['budget invalid', { loadTakeoverBudget: () => ({ value: 0, source: 'env-invalid' }) }],
+        ['unreadable fix settings', { loadFixSettings: () => { throw new Error('unreadable'); } }]]) {
+        expect(pass(loaders).dispatch.some((x) => x.operatorRulingRound), name).toBe(false);
+      }
+      const out = pass();
       const d = out.dispatch.find((x) => x.operatorRulingRound);
       expect(d).toBeTruthy();
       expect(d.operatorRulingRound.source).toBe('env');
