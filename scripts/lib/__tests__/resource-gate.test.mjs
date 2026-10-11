@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   RESOURCE_GATE_STANDARD, resolveResourceGateSettings, loadResourceGateSettings, logGateSettingsOnce,
-  cutoverDecision, gateLaunch, decideFixCap, createResourceFixThrottle,
+  cutoverDecision, gateLaunch, decideFixCap, createResourceFixThrottle, resolveCutoverMode,
 } from '../resource-gate.mjs';
 import { admitLaunch, resolveCostAdmissionSettings } from '../cost-admission.mjs';
 import { lightResourceDecision } from '../cost-admission-facts.mjs';
@@ -79,6 +79,11 @@ describe('cutoverDecision — shadow keeps the legacy verdict deciding', () => {
   it('the process env switch WE_RESOURCE_CUTOVER=shadow applies even to a hand-built env', () => {
     vi.stubEnv('WE_RESOURCE_CUTOVER', 'shadow');
     expect(loadResourceGateSettings({ env: {} }).settings.cutover).toBe('shadow');
+  });
+  it('resolveCutoverMode follows the switch and defaults to enforce', () => {
+    expect(resolveCutoverMode({ WE_RESOURCE_CUTOVER: 'shadow' })).toBe('shadow');
+    expect(resolveCutoverMode({ WE_RESOURCE_CUTOVER: 'enforce' })).toBe('enforce');
+    expect(resolveCutoverMode({ WE_RESOURCE_CUTOVER: 'bogus' })).toBe('enforce');
   });
   it('a throwing observer and a throwing admit() leave the legacy result (never throws)', () => {
     const d = cutoverDecision({ gate: 'g', kind: 'build', legacy: { admit: true }, mode: 'enforce',

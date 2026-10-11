@@ -78,6 +78,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { cpus, homedir, loadavg, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { admit as admitResource, shadowAdmission } from './resource-admission.mjs';
+import { resolveCutoverMode } from './resource-gate.mjs';
 import { runBounded, resolveChildTimeoutMs, resolveLaneAcquireTimeoutMs } from './bounded-child.mjs';
 import { buildGhShimSettingsEnv, sanitizeSpawnEnv } from './gh-app-shim.mjs';
 import { ensureFreshGithubAppEnv } from './github-app-auth-env.mjs';
@@ -164,10 +165,13 @@ export function admissionLoadFactor(env, admission) {
 }
 
 /** The shared decision for kind `rebuild-smoke`: the shadow call's own answer (it logs the old/new pair), else a
- *  direct admit() (shadow switched off). `undefined` only when both fail — callers then keep the legacy load rule. */
+ *  direct admit() (shadow switched off). `undefined` when both fail — callers then keep the legacy load rule — and
+ *  under the `shadow` cut-over (WE_RESOURCE_CUTOVER, the rollback switch): the pair is still logged, but the legacy
+ *  load rule keeps deciding, as it does for every other gate (`resource-gate.mjs#cutoverDecision`). */
 function rebuildSmokeAdmission({ shadow, admit, shadowArgs, env }) {
   let decision;
   try { decision = shadow(shadowArgs); } catch { /* Observation failure falls through to a direct admit(). */ }
+  if (resolveCutoverMode(env) !== 'enforce') return undefined;
   if (isDecision(decision)) return decision;
   try { decision = admit({ kind: 'rebuild-smoke', env }); } catch { decision = undefined; }
   return isDecision(decision) ? decision : undefined;
