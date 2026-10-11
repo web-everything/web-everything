@@ -326,9 +326,31 @@ describe('defaultReadRequiredStatusChecks', () => {
     expect(gh).toHaveBeenCalledTimes(1);
   });
 
-  it('uses successful protection after a transient rules failure', () => {
-    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce('["classic"]');
+  it('propagates a transient rules failure even when classic protection succeeds', () => {
+    const error = new Error('HTTP 502');
+    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce('["classic"]');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
+  });
+
+  it('uses successful protection when the rules API is merely inaccessible', () => {
+    const gh = vi.fn()
+      .mockImplementationOnce(() => { throw new Error('HTTP 403: Resource not accessible by integration'); })
+      .mockReturnValueOnce('["classic"]');
     expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+  });
+
+  it('keeps an expired live cache when rules fail transiently but protection returns a partial set', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'soak-replay-gate'] });
+    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce('["test"]');
+    const result = getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    });
+    expect(result).toMatchObject({ checks: ['test', 'soak-replay-gate'], source: 'stale-cache' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
+      checks: ['test', 'soak-replay-gate'], source: 'live', fetchedAtMs: 1000,
+    });
   });
 
   it('routes the rules read through the real throttle personal read path when enabled', () => {

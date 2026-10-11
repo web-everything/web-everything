@@ -139,7 +139,10 @@ export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = re
     // A transient rules failure must not become a denial just because protection is inaccessible.
     throw rulesError && !protectionAccessDenied(rulesError) ? rulesError : error;
   }
-  if (!checks.length && rulesError) throw rulesError;
+  // Rulesets can require checks classic protection lacks, so a partial classic set after a TRANSIENT rules
+  // failure must not be returned as live: throw so the caller's stale-cache handling keeps the last real set.
+  // Only a rules ACCESS denial lets a non-empty classic set stand (the rules API is simply unreadable here).
+  if (rulesError && (!checks.length || !protectionAccessDenied(rulesError))) throw rulesError;
   return checks;
 }
 
