@@ -1,4 +1,5 @@
 ---
+bornAs: x2nsoej
 kind: story
 size: 3
 status: open
