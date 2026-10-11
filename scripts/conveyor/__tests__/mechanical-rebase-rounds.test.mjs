@@ -59,11 +59,12 @@ describe('mechanical re-arm rounds', () => {
     expect(result.refusals.some((r) => r.kind === 'cap-exhausted')).toBe(false);
     expect(result.dispatch).toContainEqual(expect.objectContaining({ kind: 'review', attempts: 2, mechanicalRebaseRounds: 4 }));
   });
-  it.each([['drain: rebase branch onto main', 0], ['fix the finding', 1]])('classifies a single-parent %s', (subject, real) => {
+  // The drain's rebase is always a two-parent commit-tree: a single-parent commit borrowing its subject is a fix.
+  it.each([['drain: rebase branch onto main', 1], ['drain: rebase lane/x onto main, drop transient .lane-manifest.json', 1], ['fix the finding', 1]])('classifies a single-parent %s as real', (subject, real) => {
     expect(countRealFixRounds({ ...pr, comments: [comment('11T06:06:06', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [{ ...commits[0], subject }] } })).toMatchObject({ ok: true, real });
   });
   it('excludes the ci-heal commit before the next review fix-begin', () => {
-    const drain = { ...commits[0], parents: [commits[8].sha], subject: 'drain: rebase x onto main', authoredAt: at('11T01:32:00') };
+    const drain = { ...commits[0], parents: [commits[7].parents[0], commits[8].sha], subject: 'drain: rebase x onto main', authoredAt: at('11T01:32:00'), mergesPrWork: false };
     expect(countRealFixRounds({ ...pr, comments: [begin('11T00:44:34', 'ci-heal-4757'), begin('11T01:30:50'), comment('11T01:33:11', REARM_COMMENT_MARKER)], roundCommits: { head, commits: [drain, commits[8]] } })).toMatchObject({ ok: true, real: 0 });
   });
   describe('a re-arm with no commit is never refunded', () => {
