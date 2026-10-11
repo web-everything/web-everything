@@ -329,6 +329,9 @@ export const REFUSAL_KINDS = Object.freeze([
   // latest takeover pushed a head no review has judged yet) — both emitted through the cap-site `refuseFn`, which the
   // source scan in `reconcile-core.test.mjs` reads since PR #4770.
   'gate-hold', 'takeover-awaiting-review',
+  // `thread-truncated` — the PR's comment list may be cut at the list page (exactly 100, not marked complete by its
+  // reader), so nothing is decided for it this tick (`takeover-budget.mjs#threadMayBeTruncated`).
+  'thread-truncated',
 ]);
 
 /**
@@ -1469,7 +1472,7 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   // A cut list (exactly the list cap) may hide a later withdrawal or takeover marker: it grants nothing. The same
   // check guards every past-cap grant (`takeover-budget.mjs#threadMayBeTruncated`).
-  if (threadMayBeTruncated(comments)) return { ok: false, reason: 'thread-truncated' };
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
   const rulings = decidingOperatorBlocks(pr, head, blocked);
   if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
@@ -1826,6 +1829,14 @@ export function planReconcile({
         : null,
     };
     const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra }); };
+    // A comment list that may be cut at the list page (exactly 100, not marked complete by the reader) hides every
+    // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
+    // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
+    // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
+    if (threadMayBeTruncated(pr)) {
+      refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
+      continue;
+    }
     // xilx617 (epic #4075/#3383) — EVERY `cap-exhausted` refusal EXCEPT the `ci-red` one above (which already
     // pushes its own `ci-heal-exhausted` note) also pushes a `round-cap-exhausted` note, mirroring that note's
     // own "refuse AND surface" treatment. `capKind` names the population; see {@link roundCapExhaustedNoteText}
@@ -1944,8 +1955,7 @@ export function planReconcile({
             + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover budget — fix.takeoverBudget or env WE_FIX_TAKEOVER_BUDGET — is 0 or invalid)' : '')
             + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
             + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
-            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : '')
-            + (takeover?.reason === 'thread-truncated' ? ' (no automatic takeover: the PR comment list was read only up to its first 100 comments, so the takeover markers and reviews after them could not be counted)' : ''),
+            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
       });
     };
     const refuseCapExhausted = capExhaustedVia(refuse);

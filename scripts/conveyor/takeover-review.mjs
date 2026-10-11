@@ -64,7 +64,7 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   if (!allowance) return { ok: false, reason: 'off' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
   // A cut thread hides the verdicts after comment 100: a head already judged would read as owed its review.
-  if (threadMayBeTruncated(comments)) return { ok: false, reason: 'thread-truncated' };
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
   const dispatches = escalationDispatches(comments);
   if (!dispatches.length) return { ok: false, reason: 'no-takeover' };
   const latest = dispatches.at(-1);
