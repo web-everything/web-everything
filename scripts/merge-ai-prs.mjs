@@ -120,7 +120,7 @@
 // `hasLabel` are imported normally (this file's OWN code below still calls both directly); the other three
 // are re-exported ONLY (mirrors `pr-land.mjs`'s own `forge-land-provider.mjs` split of used-here vs.
 // re-exported-only names) — every existing importer of THIS file keeps resolving all five unchanged.
-import { isTrustedMarkerAuthor } from './lib/marker-authorship.mjs';
+import { isTrustedMarkerAuthor, isOperatorAuthored } from './lib/marker-authorship.mjs';
 import { isAiGeneratedPr, hasLabel } from './lib/ai-pr-authorship.mjs';
 import { OPEN_PR_LIST_LIMIT, isDegradedOpenPrListing, filterOpenPrsByLabel } from './lib/no-search-backed-pr-list.mjs';
 // #2925/#xkfv491 (we:backlog/fix-review-ciheal-deadlock) — see this file's own re-export note (further down,
@@ -190,7 +190,12 @@ import { ensureFreshGithubAppEnv } from './lib/github-app-auth-env.mjs';
 import { buildSkipReasons, formatSkipSummary, formatSkipReasonsLine } from './lib/drain-skip-reasons.mjs';
 import { createStepTimer, formatTimingsSummary, PASS_STEP_ORDER } from './lib/pass-timings.mjs';
 import { runLedgerShadow, formatShadowLine } from './lib/drain-ledger-shadow.mjs'; // #5444 — ledger gate in SHADOW beside the labels; journals, never decides
-import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey } from './conveyor/land-overlap-yield.mjs'; // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
+import { computeOverlapContext, parseOverlapYieldOverrides, isExemptItem, overlapRowKey, readyToMergeLabelTimeMs } from './conveyor/land-overlap-yield.mjs'; // + readyToMergeLabelTimeMs: the drain order's ready-at (same cached label read) // #4308 — the land-time overlap-yield planner (see planLabelDrain's own `overlapContext` param)
+import { rankByDeliveryPriority, resolvePrioritySettings, PRIORITY_CLASSES, PRIORITY_MODES } from './lib/delivery-priority.mjs'; // drain order (2026-10-10): the shared P0-P4 class rule
+import { readDeliveryPrioritySettings } from './conveyor/delivery-priority-shadow.mjs'; // drain order: the shared aging/cap settings (platform preference `deliveryPriority`)
+import { execFileSyncThrottled } from './lib/gh-throttle.mjs'; // drain order: the operator-override labeler read
+import { resolveCascade, platformPreference } from './lib/policy-cascade.mjs'; // drain order: `drain.order` / `drain.priorityMode` via the shared cascade
+import { readSettings as readDeclaredDrainSettings } from './lib/settings-files.mjs'; // drain order: the tool layer (`drain` block of the declared settings)
 import { CONSTELLATION_REPOS, canonicalizeSlug, repoKeyForSlug } from './lib/constellation-repos.mjs';
 import { readLiveFixClaim } from './conveyor/fix-procedure.mjs';
 import { PREP_REVIEW_HEADLINE, prepNoteCoversHead } from './conveyor/prep-review.mjs'; // card x5f2daz — the light prepare-PR review record
@@ -2182,7 +2187,7 @@ export function prepareDrainVerdicts({ listings, repos = [], onlyPr = null, only
  * Pure.
  * @returns {{prsByRepo:Map, verdicts:Array, carrierHealth:Map, plan:{ready:Array, deferred:Array, staleLandedOpenItems:Array}}}
  */
-export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), overlapContext = null, overlapSkips = null } = {}) {
+export function planDrainPass({ verdicts = null, listings = null, openPrContext = {}, repos = [], onlyPr = null, onlyRepo = null, readOf, requiredCheck = 'test', escalationRelief = { prs: [], passWide: false }, label = null, isLocalRepo = () => false, localSlug = null, defaultBranchOf = () => null, candidateHeldByKey = null, landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), overlapContext = null, overlapSkips = null, readyOrder = null } = {}) {
   let prsByRepo = null;
   let vs = verdicts;
   if (!Array.isArray(vs)) {
@@ -2204,7 +2209,7 @@ export function planDrainPass({ verdicts = null, listings = null, openPrContext 
   // `landedThisPass` by construction and can never change an answer: the tests would pass (they hand-seed the set)
   // while production behaviour stayed byte-identical. The live derivation belongs in the CASCADE, against refs
   // that ACTUALLY merged — see `deriveCoupleIncomplete`. The disjointness/reachability test pins this.
-  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug });
+  const plan = planLabelDrain(vs, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: ctx.openItems, contextComplete: !!ctx.contextComplete, isWeRepo: isLocalRepo, overlapContext, overlapSkips, overlapLocalSlug: localSlug, readyOrder });
   return { prsByRepo, verdicts: vs, carrierHealth, plan };
 }
 
@@ -2294,7 +2299,7 @@ export function isConfirmSweepSettled({ merged = 0, pendingRebased = 0, consider
  * @param {{landedThisPass?:Set, provenOnMain?:Set, coupleIncomplete?:Set, extraOpenItems?:Iterable<number|string>, contextComplete?:boolean, isWeRepo?:function, overlapContext?:(Map|null), overlapSkips?:(Map|null), overlapLocalSlug?:(string|null)}} [proof]  the proof bag: positive proof-of-land sets plus (#3004) the NEGATIVE `coupleIncomplete` counter-evidence set (all `asItemId`-keyed). `overlapContext` (#4308) is `null` (every caller/test before #4308, unchanged behaviour) or a PRECOMPUTED `Map<string,{yieldTo,repo,files,untilMs,windowMinutes}>` keyed by `we:scripts/conveyor/land-overlap-yield.mjs#overlapRowKey` (`` `${repo||''}#${num}` `` — never a bare PR number, which collides across repos) — the caller's IO layer (`computeOverlapContext`) builds it fresh every planning pass (#4308 Window "read fresh at the start of every planning pass"); this function only ever CONSUMES it, never fetches it. `overlapLocalSlug` MUST be the same `localSlug` the caller's `buildOverlapRows` normalized every row's `repo` with (2026-09-29 review finding) — a candidate's own `c.repo` can be `null` for the local repo while the Map's keys were built against the normalized slug; omitting this reintroduces the exact key mismatch that silently disabled the feature for every local-repo candidate.
  * @returns {{ready:Array, deferred:Array<{num,item,waitOn:Array<number|string>}>, staleLandedOpenItems:Array<number|string>}}  ready is ordered (item asc, then PR#); staleLandedOpenItems = items proven landed yet still named by an open PR (#999/xq985wu F2 stale-PR diagnostic).
  */
-export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null } = {}) {
+export function planLabelDrain(candidates, { landedThisPass = new Set(), provenOnMain = new Set(), coupleIncomplete = new Set(), extraOpenItems = null, contextComplete = true, isWeRepo = () => false, overlapContext = null, overlapSkips = null, overlapLocalSlug = null, readyOrder = null } = {}) {
   const list = Array.isArray(candidates) ? candidates : [];
   // Every candidate still in play keeps its item "open" — a red/skip blocker must still defer its dependents,
   // so the open set is ALL candidate items, not just the mergeable ones. (A merged item is removed by the
@@ -2430,7 +2435,92 @@ export function planLabelDrain(candidates, { landedThisPass = new Set(), provenO
     return typeof id === 'string' ? Infinity : id;
   };
   ready.sort((a, b) => (rank(a.item) - rank(b.item)) || (a.num - b.num));
+  // Drain order (operator ruling 2026-10-10): with a `readyOrder` context the ready set is re-ordered by
+  // {@link orderReadyCandidates} (delivery-priority class when enforced, then oldest ready-label time, then PR #).
+  // Absent (every caller/test before it), the legacy order above stands unchanged.
+  if (readyOrder) {
+    const r = orderReadyCandidates(ready, readyOrder);
+    return { ready: r.ordered, deferred, staleLandedOpenItems, readyOrder: r.reasons };
+  }
   return { ready, deferred, staleLandedOpenItems };
+}
+
+/** Drain order (operator ruling 2026-10-10 ~22:15 ET) — the values of the `drain.order` setting. */
+export const DRAIN_ORDERS = Object.freeze(['ready-age', 'card-number']);
+const DRAIN_ORDER_STANDARD = Object.freeze({ order: 'ready-age', priorityMode: 'shadow' });
+/** `priority:*` PR labels → the shared rule's operator overrides (honoured only when the operator set the label). */
+export const DRAIN_PRIORITY_OVERRIDE_LABELS = Object.freeze({ 'priority:urgent': 'urgent', 'priority:now': 'now', 'priority:low': 'low' });
+
+/**
+ * PURE. Resolve the drain's own order settings through the shared policy cascade (standard → platform → tool → env):
+ * `drain.order` (`ready-age` | `card-number`, env `WE_DRAIN_ORDER`) and `drain.priorityMode` (`off` | `shadow` |
+ * `enforce`, env `WE_DRAIN_PRIORITY_MODE`). An invalid value is ignored (the lower layer stands).
+ * @returns {{order:string, orderSource:string, priorityMode:string, priorityModeSource:string, invalid:string[]}}
+ */
+export function resolveDrainOrderSettings({ tool, platform = null, env = process.env } = {}) {
+  const r = resolveCascade({
+    standard: DRAIN_ORDER_STANDARD, platform, tool,
+    envValues: { order: env?.WE_DRAIN_ORDER || undefined, priorityMode: env?.WE_DRAIN_PRIORITY_MODE || undefined },
+    valid: { order: (v) => DRAIN_ORDERS.includes(v), priorityMode: (v) => PRIORITY_MODES.includes(v) },
+  });
+  return { order: r.value.order, orderSource: r.sources.order, priorityMode: r.value.priorityMode, priorityModeSource: r.sources.priorityMode, invalid: r.invalid };
+}
+
+/**
+ * PURE. Plain delivery-priority facts for one ready drain candidate (the forge reads are the caller's).
+ * @param {object} c  a drain verdict
+ * @param {{readyAtMs?:number|null, changesCode?:boolean, stackedDependents?:number, override?:{value:string, byOperator:boolean}|null,
+ *   mainFix?:{repo?:string, pr:number, prs?:number[]}|null, repoKey?:string}} o
+ */
+export function drainPriorityFacts(c, { readyAtMs = null, changesCode, stackedDependents = 0, override = null, mainFix = null, repoKey = 'we' } = {}) {
+  const fixPrs = mainFix ? new Set([mainFix.pr, ...(Array.isArray(mainFix.prs) ? mainFix.prs : [])].map(Number)) : null;
+  return {
+    incident: fixPrs ? { open: true, owner: fixPrs.has(Number(c?.num)) && (mainFix.repo ?? 'we') === repoKey } : { open: false },
+    stackedDependents: Number(stackedDependents) || 0,
+    ...(typeof changesCode === 'boolean' ? { changesCode } : {}),
+    ...(override ? { override } : {}),
+    ...(Number.isFinite(readyAtMs) ? { waitingSince: readyAtMs } : {}),
+  };
+}
+
+const ET_CLOCK = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+
+/**
+ * PURE (the IO arrives through `infoOf`). Order the ready set: `card-number` = the legacy order (card NNN, a hash or
+ * no card last, then PR #); `ready-age` = delivery-priority class first when `priority.mode === 'enforce'` (shadow
+ * only reports it), then the ready-label time (oldest first; unknown last), then PR #. Stable; the input is untouched.
+ * The merge-queue class (main-fix first) is applied after this by `prioritizeMainFix`, and blockedBy/stack order is
+ * realized across passes, as before.
+ * @param {Array} ready
+ * @param {{order:string, priority:object, now:number, infoOf:(c:object)=>({readyAtMs:number|null, facts:object})}} ctx
+ * @returns {{ordered:Array, reasons:Array<{num:number, repo:(string|null), class:string, readyAtMs:(number|null), reason:string}>}}
+ */
+export function orderReadyCandidates(ready, { order = 'ready-age', priority, now = Date.now(), infoOf = () => ({ readyAtMs: null, facts: {} }) } = {}) {
+  const list = Array.isArray(ready) ? ready : [];
+  const settings = resolvePrioritySettings(priority);
+  const infos = list.map((c) => { try { return infoOf(c) ?? {}; } catch { return {}; } });
+  const ranked = rankByDeliveryPriority(list.map((c, i) => ({ id: i, facts: infos[i].facts ?? {} })), settings, now);
+  const prio = new Map(ranked.map((r) => [r.id, r]));
+  const rows = list.map((c, i) => ({ c, i, readyAtMs: Number.isFinite(infos[i].readyAtMs) ? infos[i].readyAtMs : null, p: prio.get(i) }));
+  const enforce = order === 'ready-age' && settings.mode === 'enforce';
+  const cls = (r) => PRIORITY_CLASSES.indexOf(r.p.class);
+  const age = (r) => (r.readyAtMs == null ? Infinity : r.readyAtMs);
+  if (order === 'ready-age') rows.sort((a, b) => (enforce ? cls(a) - cls(b) : 0) || (age(a) - age(b)) || (a.c.num - b.c.num) || (a.i - b.i));
+  const reasons = rows.map((r) => {
+    const when = r.readyAtMs == null ? 'ready time unknown'
+      : `ready ${ET_CLOCK.format(new Date(r.readyAtMs))} ET, waited ${Math.max(0, Math.floor((now - r.readyAtMs) / 60_000))} min`;
+    const why = r.p.reasons.join('; ');
+    const head = order === 'card-number' ? `card ${r.c.item ?? 'none'} · ${r.p.class}` : (enforce ? `${r.p.class} (${why})` : r.p.class);
+    return { num: r.c.num, repo: r.c.repo ?? null, class: r.p.class, readyAtMs: r.readyAtMs, reason: enforce ? `${head} · ${when}` : `${head} · ${when} · ${why}` };
+  });
+  return { ordered: rows.map((r) => r.c), reasons };
+}
+
+/** PURE. The pass's order log: a header line, then one line per ready PR with its reason. */
+export function formatDrainOrderLines(reasons, { order, orderSource, priorityMode, priorityModeSource } = {}) {
+  const list = Array.isArray(reasons) ? reasons : [];
+  const head = `  ↕ drain-order: ${order} (${orderSource}) · priority ${priorityMode} (${priorityModeSource}) · ${list.length} ready${priorityMode === 'enforce' && order === 'ready-age' ? '' : ' · class logged only'}`;
+  return [head, ...list.map((r, i) => `    ${i + 1}. ${r.repo ? `${r.repo}` : ''}#${r.num} ${r.reason}`)];
 }
 
 /** #999/xq985wu F3 — the per-repo open-PR listing cap `collectOpenPrContext` uses. Since #xq985wu that listing
@@ -5694,6 +5784,73 @@ async function runCli() {
       process.stderr.write(`  ⏳ overlap-yield: ${key} yields to #${w.yieldTo} (files: ${w.files.join(', ') || '(unknown)'}; window ${w.windowMinutes != null ? `${w.windowMinutes}m` : '?'}; until ${new Date(w.untilMs).toISOString()})\n`);
     }
   };
+  // Drain order (operator ruling 2026-10-10 ~22:15 ET) — serve the longest-waiting ready PR first. `drain.order`
+  // (`ready-age` default | `card-number`) and the drain's own `drain.priorityMode` (`shadow` default | `enforce` | `off`)
+  // resolve through the shared cascade; aging/cap come from the shared `deliveryPriority` settings. The forge reads
+  // live here: the ready-label time (cached per head sha, the same read overlap-yield uses), the open PRs stacked on
+  // this head, whether the change touches code, and a `priority:*` label (honoured only when the operator set it).
+  const drainOrder = (() => {
+    let tool; try { tool = readDeclaredDrainSettings()?.drain; } catch { tool = undefined; }
+    let platform = null; try { platform = platformPreference('drain') ?? null; } catch { platform = null; }
+    return resolveDrainOrderSettings({ tool, platform, env: process.env });
+  })();
+  const drainPriority = { ...readDeliveryPrioritySettings(), mode: drainOrder.priorityMode };
+  delete drainPriority.invalid;
+  const drainMainFix = (() => { try { return readMainFixPriority(); } catch { return null; } })();
+  // The open PRs of c's repo: the context listing (has `files`) when collected, plus this pass's own listed verdicts
+  // (always present; a dry-run / non-reconcile pass has no context listing), deduped by PR number.
+  const openPrsOf = (c) => {
+    const m = openPrContext?.prsByRepo instanceof Map ? openPrContext.prsByRepo : new Map();
+    const ctxRows = m.get(c.repo ?? null) || (isLocalRepo(c.repo) ? (m.get(localSlug) || m.get(null) || []) : []);
+    const seen = new Set(ctxRows.map((p) => Number(p?.number)));
+    const sameRepo = (v) => (v.repo ?? null) === (c.repo ?? null) || (isLocalRepo(v.repo) && isLocalRepo(c.repo));
+    return [...ctxRows, ...verdicts.filter((v) => sameRepo(v) && !seen.has(Number(v.num))).map((v) => ({ number: v.num, baseRefName: v.baseRefName ?? null }))];
+  };
+  const readOperatorOverride = (c, slug) => {
+    const names = (c.prLabels || []).map((l) => (typeof l === 'string' ? l : l?.name)).filter((n) => DRAIN_PRIORITY_OVERRIDE_LABELS[n]);
+    if (!names.length || !slug) return null;
+    let byOperator = false;
+    try {
+      const events = JSON.parse(String(execFileSyncThrottled('gh', ['api', `repos/${slug}/issues/${c.num}/events`, '--paginate'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024, timeout: 30_000, throttle: { op: 'drain-order override' },
+      }) || '[]'));
+      const last = (Array.isArray(events) ? events : []).filter((e) => e?.event === 'labeled' && e?.label?.name === names[0]).at(-1);
+      byOperator = isOperatorAuthored({ author: { login: last?.actor?.login } });
+    } catch { byOperator = false; }
+    return { value: DRAIN_PRIORITY_OVERRIDE_LABELS[names[0]], byOperator };
+  };
+  const readyInfoMemo = new Map();
+  const readyInfoOf = (c) => {
+    const slug = c.repo || localSlug;
+    const sha = c.listedHeadSha || c.headSha || null;
+    const key = `${slug}#${c.num}@${sha}`;
+    if (!readyInfoMemo.has(key)) {
+      const prs = openPrsOf(c);
+      const row = prs.find((p) => Number(p?.number) === Number(c.num)) || null;
+      const paths = Array.isArray(row?.files) ? row.files.map((f) => String(typeof f === 'string' ? f : f?.path ?? '')).filter(Boolean) : [];
+      let readyAtMs = null;
+      try { readyAtMs = readyToMergeLabelTimeMs({ repo: slug, num: c.num, sha }); } catch { readyAtMs = null; }
+      readyInfoMemo.set(key, {
+        readyAtMs,
+        stackedDependents: c.headRef ? prs.filter((p) => p && p.baseRefName === c.headRef && Number(p.number) !== Number(c.num)).length : 0,
+        changesCode: paths.length ? paths.some((x) => !(/^(backlog|docs)\//.test(x) || /\.md$/i.test(x))) : undefined,
+        override: readOperatorOverride(c, slug),
+      });
+    }
+    const info = readyInfoMemo.get(key);
+    const repoKey = isLocalRepo(c.repo) ? (repoKeyFromSlug(localSlug) || 'we') : repoKeyFromSlug(c.repo);
+    return { readyAtMs: info.readyAtMs, facts: drainPriorityFacts(c, { ...info, mainFix: drainMainFix, repoKey }) };
+  };
+  const readyOrderCtx = () => ({ order: drainOrder.order, priority: drainPriority, now: Date.now(), infoOf: readyInfoOf });
+  let lastDrainOrderLog = null;
+  const logDrainOrder = (plan) => {
+    if (AS_JSON || !Array.isArray(plan?.readyOrder) || !plan.readyOrder.length) return;
+    const lines = formatDrainOrderLines(plan.readyOrder.map((r) => (isLocalRepo(r.repo) ? { ...r, repo: null } : r)), drainOrder);
+    const sig = plan.readyOrder.map((r) => `${r.repo}#${r.num}:${r.class}`).join(',');
+    if (sig === lastDrainOrderLog) return; // log once per distinct order, not on every cascade re-plan
+    lastDrainOrderLog = sig;
+    process.stderr.write(`${lines.join('\n')}\n`);
+  };
   const overlapRows0 = buildOverlapRows({ candidates: verdicts, verdicts, openPrContext, mergedPrKeys: new Set(), localSlug, requiredCheck: REQUIRED });
   const overlapCtx0 = computeOverlapContext({ candidateRows: overlapRows0.candidateRows, openPrRows: overlapRows0.openPrRows, overrides: overlapYieldOverrides });
   logOverlapYields(overlapCtx0);
@@ -5709,7 +5866,9 @@ async function runCli() {
     provenOnMain,
     overlapContext: overlapCtx0.waits,
     overlapSkips: overlapCtx0.skips,
+    readyOrder: readyOrderCtx(),
   });
+  logDrainOrder(preparedPass.plan);
   // #xc7p3q9 — the ONE re-plan wiring (shared by the dry-run report and the live cascade): re-orders the joined+
   // stamped `verdicts` across merges, threading the SAME extraOpenItems + contextComplete + WE-repo predicate the
   // seam used. No second, divergently-typed `planLabelDrain` invocation (R4).
@@ -5725,7 +5884,9 @@ async function runCli() {
     const rows = buildOverlapRows({ candidates: cands, verdicts, openPrContext, mergedPrKeys, localSlug, requiredCheck: REQUIRED });
     const octx = computeOverlapContext({ candidateRows: rows.candidateRows, openPrRows: rows.openPrRows, overrides: overlapYieldOverrides });
     logOverlapYields(octx);
-    return planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug });
+    const p = planLabelDrain(cands, { landedThisPass, provenOnMain, coupleIncomplete, extraOpenItems: orderExtraOpenItems, contextComplete: !!openPrContext.contextComplete, isWeRepo: isLocalRepo, overlapContext: octx.waits, overlapSkips: octx.skips, overlapLocalSlug: localSlug, readyOrder: readyOrderCtx() });
+    logDrainOrder(p);
+    return p;
   };
   const toMerge = verdicts.filter((v) => v.decision === 'merge'); // @merge-gate-exempt the FINAL set actually merged; a held PR is `decision:'skip'` and MUST be excluded here — this is the hard AND that never lands a held PR
   const skipped = verdicts.filter((v) => v.decision === 'skip' && !v.requiredCheckReadError);
