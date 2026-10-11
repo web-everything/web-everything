@@ -1,4 +1,5 @@
 ---
+bornAs: xay2ja5
 kind: task
 status: open
 scope: ["we:scripts/lib/daemon-live-smoke.mjs", "we:scripts/lib/daemon-rebuild/smoke.mjs"]
