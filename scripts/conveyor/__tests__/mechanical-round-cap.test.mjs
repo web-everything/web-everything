@@ -168,7 +168,7 @@ describe('mechanical round vs the review round cap', () => {
         `✅ review — accepted\n\n> <!-- reviewed-sha: ${PRIOR} -->\n> ${nb(PRIOR)}`,
         `✅ review — accepted\n\nthe footer \`<!-- reviewed-sha: ${PRIOR} -->\` was stale`,
         `✅ review — accepted\n\n    <!-- reviewed-sha: ${PRIOR} -->`,
-        `✅ review — accepted\n\n---\nquoted ${nb(PRIOR)}\n\n<!-- reviewed-sha: ${OTHER} -->`,
+        `✅ review — accepted\n\n---\nquoted\u2028${nb(PRIOR)}\n\n<!-- reviewed-sha: ${OTHER} -->`,
         // reviewer text opening a fence it never closes cannot swallow the footer appended after it
         `✅ review — accepted\n\n- x\n${foot(PRIOR)}\n\`\`\`\n\n<!-- reviewed-sha: ${OTHER} -->`,
         `🔁 review — changes requested\n\n- x\n${foot(PRIOR)}\n~~~~\n\n---\n\n**Decision:** \`changes\`\n\n${nb(OTHER)}`,
@@ -497,7 +497,7 @@ describe('readMechanicalRoundFacts (real git)', { timeout: 30_000 }, () => {
   });
 
   // Ref names reach git argv; one outside the safe pattern is refused before ANY git call runs.
-  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main x', 'main`id`', "ma'in", 'mäin', 'main\rx', 'main​x', 'main﻿'];
+  const UNSAFE = ['-main', '--upload-pack=touch x', 'main;id', 'main$(id)', 'ma in', 'main\nx', 'main\u2028x', 'main`id`', "ma'in", 'mäin', 'main\rx', 'main\u200bx', 'main\ufeff'];
   it.each(UNSAFE)('an unsafe base ref %j is refused with no git call', (bad) => {
     let calls = 0;
     const exec = () => { calls++; return ''; };
