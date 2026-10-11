@@ -28,6 +28,7 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  * labels, reusing `standDownComments`/`STAND_DOWN_MARKER` rather than re-deriving the match rule — and never
  * duplicates a PR already shown in NEEDS YOU.
  */
+import { readSettings } from '../lib/settings-files.mjs';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -48,8 +49,13 @@ import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
 import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason } from '../lib/red-team-gate.mjs';
-// Loaded lazily and fail-soft, like `laneReclaimQueue`: the ledger pulls in `jury-core.mjs`'s whole graph, which this
-// file's header deliberately keeps out of its own (a copy staged without it must still run and print the queue).
+// Staged CLI copies omit this transitive graph. Load optionally, but refuse to classify a
+// stand-down without its canonical answer reader; empty listings still work in those copies.
+let standDownAnswers = null;
+let standDownAnswersError;
+try { standDownAnswers = await import('../conveyor/stand-down-answer-core.mjs'); }
+catch (error) { standDownAnswersError = error; }
+// The optional ledger also pulls in a graph that staged CLI copies may omit.
 let rulingLedger = null;
 let rulingLedgerError = null;
 try { rulingLedger = await import('../lib/ruling-ledger.mjs'); } catch (e) { rulingLedgerError = String(e?.message ?? e).split('\n')[0]; }
@@ -310,7 +316,7 @@ export function reconcileNotesFor(repos, { exec = execFileSync, scriptDir = dirn
   return notes;
 }
 
-/** Blocking sleep — `main` is synchronous, and this only runs on the rare UNKNOWN-mergeability path. */
+/** Blocking sleep for synchronous PR-read retries and UNKNOWN-mergeability polling. */
 const blockingSleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
@@ -336,7 +342,56 @@ export function pollMergeable({
   return mergeable;
 }
 
-export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDelayMs, unsupportedPath } = {}) {
+/** Declared setting: operatorQueue.readAttempts; env wins, default 3, minimum 2. Pure. */
+export function resolveReadAttempts({ env = {}, file = {} } = {}) {
+  for (const [raw, source] of [
+    [env.OPERATOR_QUEUE_READ_ATTEMPTS, 'env'], [file?.operatorQueue?.readAttempts, 'settings'],
+  ]) {
+    if (!['string', 'number'].includes(typeof raw) || String(raw).trim() === '') continue;
+    const value = Number(raw);
+    if (Number.isSafeInteger(value)) return { value: Math.max(2, value), source };
+  }
+  return { value: 3, source: 'default' };
+}
+
+function permanentPrReadFailure(error) {
+  if (error?.code === 'INVALID_PR_RESPONSE') return true;
+  const detail = `${error?.stderr ?? ''} ${error?.message ?? error}`;
+  return /Could not resolve to a Repository|\bHTTP\s+(?:401|404)\b|bad credentials|authentication (?:failed|required)|requires authentication|not logged (?:in|into)|gh auth login|resource not accessible by (?:integration|personal access token)/i.test(detail);
+}
+
+/** Retry transient transport/JSON failures with at most four seconds of backoff per read. */
+function readPrJson(args, { attempts, sleep, valid }) {
+  let lastError;
+  let backoffMs = 0;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = execFileSync('gh', args, {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER,
+      });
+      if (typeof response !== 'string') {
+        // Preserve the preceding transport diagnostic when no response follows it.
+        throw Object.assign(new Error(lastError?.message ?? 'invalid PR read response: expected a string'), {
+          code: 'INVALID_PR_RESPONSE', stderr: lastError?.stderr,
+        });
+      }
+      const value = JSON.parse(response);
+      if (!valid(value)) throw new Error('invalid PR read response');
+      return value;
+    } catch (error) {
+      if (permanentPrReadFailure(error) || attempt === attempts - 1 || backoffMs >= 4000) throw error;
+      lastError = error;
+      const delayMs = Math.min(500 * 2 ** Math.min(attempt, 3), 4000 - backoffMs);
+      sleep(delayMs);
+      backoffMs += delayMs;
+    }
+  }
+}
+
+export function main(args = process.argv.slice(2), { sleep = blockingSleep, pollAttempts, pollDelayMs, unsupportedPath } = {}) {
+  const readAttempts = resolveReadAttempts({ env: process.env, file: readSettings() });
+  console.error(`operator-queue: read attempts=${readAttempts.value} (source: ${readAttempts.source})`);
+  const read = (argv, valid) => readPrJson(argv, { attempts: readAttempts.value, sleep, valid });
   const requested = args.filter((arg) => arg.startsWith('--repo=')).map((arg) => arg.slice(7));
   const unsupported = readUnsupported({ path: unsupportedPath }).filter(
     (row) => !requested.length || requested.some((repo) => repoKeyForSlug(repo) === row.repo),
@@ -366,16 +421,37 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     ready: [], rulingNeeded: [], pending: [], notReady: [], stoodDown: [], stuck: [], errors: [], unsupported, laneDecisions, backpressure, reconcileNotes, ...(health ? { health } : {}),
   };
   if (rulingLedgerError) report.errors.push(`ruling-needed section unavailable: ${rulingLedgerError}`);
+  let readFailures = 0;
+  const failedRead = (subject, error) => {
+    readFailures += 1;
+    const detail = String(error.stderr || error.message || error).trim().replace(/\s+/g, ' ');
+    report.errors.push(`${subject}: ${detail}`);
+  };
   for (const repo of repoSlugs) {
     try {
-      const prs = JSON.parse(execFileSync('gh', [
-        'pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json',
-        'number,title,labels,headRefOid,mergeable,statusCheckRollup,comments',
-        // #4722 — `comments` on every open PR is MEGABYTES (review write-ups, red-team notes, fix-claim chatter).
-        // Node's default 1MB `maxBuffer` threw ENOBUFS, and that one throw dropped EVERY PR of the repo from every
-        // section (live 2026-10-10: web-everything/web-everything, 25 open PRs, all invisible). Same cap as the
-        // advisory-label sweep's own comment-carrying listing.
-      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: PR_LIST_MAX_BUFFER }));
+      const fields = 'number,title,labels,headRefOid,mergeable,statusCheckRollup';
+      const listing = ['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '200', '--json'];
+      let prs;
+      // Keep the one-call success path: existing consumers/mock queues expect comments in the listing.
+      // Only after its final failed attempt fall back to a small listing plus separate comment reads.
+      try {
+        prs = read([...listing, `${fields},comments`], Array.isArray);
+      } catch (error) {
+        if (permanentPrReadFailure(error)) throw error;
+        prs = read([...listing, fields], Array.isArray);
+        const complete = [];
+        for (const pr of prs) {
+          try {
+            const { comments } = read(['pr', 'view', String(pr.number), '--repo', repo, '--json', 'comments'],
+              (value) => Array.isArray(value?.comments));
+            complete.push({ ...pr, comments });
+          } catch (error) {
+            failedRead(`${repo}#${pr.number}`, error);
+          }
+        }
+        // Never classify a PR with missing comments as if it had an empty thread.
+        prs = complete;
+      }
       const readyNumbersThisRepo = new Set();
       const redTeamSetting = readConfirmedBreaks().value;
       for (const listed of prs.filter((candidate) => hasLabel(candidate, 'review:human'))) {
@@ -405,7 +481,14 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
       for (const pr of prs) {
         if (readyNumbersThisRepo.has(pr.number)) continue;
         if (standDownComments(pr.comments).length === 0) continue;
-        report.stoodDown.push(standDownRow(repo, pr));
+        if (!standDownAnswers) throw standDownAnswersError;
+        const comments = [...pr.comments].sort((a, b) => (Date.parse(a.createdAt) || 0) - (Date.parse(b.createdAt) || 0));
+        const latestIndex = comments.findLastIndex((comment) => standDownComments([comment]).length > 0);
+        const answered = standDownAnswers.operatorAnswerForStandDown(comments, latestIndex);
+        if (answered) {
+          (report.standDownAnswered ??= []).push({ repo, number: pr.number, title: pr.title,
+            answeredAt: standDownAnswers.latestOperatorAnswerAt(comments) });
+        } else report.stoodDown.push(standDownRow(repo, pr));
       }
       // STUCK — INSPECTED (epic #3383's stuck-PR watch): every open PR the watch has already dispatched a
       // diagnosis-only inspection agent for — this costs no extra `gh` call, since `comments` already rode the
@@ -416,13 +499,21 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
         if (row) report.stuck.push(row);
       }
     } catch (error) {
-      const detail = String(error.stderr || error.message).trim().replace(/\s+/g, ' ');
-      report.errors.push(`${repo}: ${detail}`);
+      failedRead(repo, error);
     }
+  }
+  if (readFailures) {
+    report.incomplete = true;
+    process.exitCode = 1;
   }
   if (args.includes('--json')) {
     console.log(JSON.stringify(report, null, 2));
   } else {
+    const printRows = (rows) => {
+      if (rows) console.log(rows);
+      if (report.incomplete) console.log('UNKNOWN — reads failed, re-run');
+      else if (!rows) console.log('(none)');
+    };
     for (const error of report.errors) console.error(`ERROR ${error}`);
     // #4722 — a repo whose listing failed shows NONE of its PRs below, so the failure must be on the same page as
     // the sections, never only on stderr (where it read as "nothing is waiting").
@@ -432,38 +523,40 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
     }
     if (health) console.log(health.join('\n'));
     console.log('NEEDS YOU (review:human + advisory:accepted, all gates pass):');
-    console.log(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');
+    printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
-    console.log(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
-      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : ''}`).join('\n')).join('\n') || '(none)');
+    printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
+      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : ''}`).join('\n')).join('\n'));
     console.log('PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):');
-    console.log(report.pending.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n') || '(none)');
+    printRows(report.pending.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n'));
     console.log('UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:');
-    console.log(report.unsupported.map((row) => `${row.repo}#${row.prNumber}  ${row.action}  ${row.why}`).join('\n') || '(none)');
+    printRows(report.unsupported.map((row) => `${row.repo}#${row.prNumber}  ${row.action}  ${row.why}`).join('\n'));
     console.log('NOT READY — agent work (review:human but gates fail):');
-    console.log(report.notReady.map((pr) => `${pr.repo}#${pr.number}  ${pr.reasons.join('; ')}`).join('\n') || '(none)');
+    printRows(report.notReady.map((pr) => `${pr.repo}#${pr.number}  ${pr.reasons.join('; ')}`).join('\n'));
     console.log('STOOD DOWN — needs your judgment (a fix agent asked a question; no label changed):');
-    console.log(report.stoodDown.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
+    printRows(report.stoodDown.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
       + `[stood down ${pr.standDownAt || 'time unknown'}] ${pr.reason || '(no reason recorded)'}`
-      + (pr.alsoReviewHuman ? '  [also review:human]' : '')).join('\n') || '(none)');
+      + (pr.alsoReviewHuman ? '  [also review:human]' : '')).join('\n'));
+    console.log('answered — waiting for the fixer to resume');
+    printRows((report.standDownAnswered ?? []).map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  [answered ${pr.answeredAt || 'time unknown'}]`).join('\n'));
     console.log('STUCK — inspected (epic #3383 dispatched a diagnosis-only agent; read its comment):');
-    console.log(report.stuck.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
-      + `[${pr.episodes} episode${pr.episodes === 1 ? '' : 's'}, last ${pr.lastEpisode}]`).join('\n') || '(none)');
+    printRows(report.stuck.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}  `
+      + `[${pr.episodes} episode${pr.episodes === 1 ? '' : 's'}, last ${pr.lastEpisode}]`).join('\n'));
     console.log('LANE RECLAIM — needs your decision (#3383, see `node scripts/lane-whois.mjs`):');
     // #4139 — ONE-CLICK actions, printed ready to paste: this file stays READ-ONLY (per its own header) and
     // never runs either of these itself. `reclaim` needs `--override` only when the lane's content is not
     // ALREADY provably preserved (`d.preserved` — some `unknown-work` rows are preserved; every
     // `finished-needs-review` row, by construction, is not). `keep` records the operator's own call so this
     // lane drops out of this list until its content changes (`we:scripts/lib/lane-whois-core.mjs#keepMarkerApplies`).
-    console.log(report.laneDecisions.map((d) => (
+    printRows(report.laneDecisions.map((d) => (
       `lane-${d.lane}  [${d.verdict}]  ${d.reason}  ${d.path}\n`
       + `    reclaim: node scripts/lane-pool.mjs reclaim --lane=${d.lane}${d.preserved ? '' : ' --override'} --json\n`
       + '    keep:    node scripts/lane-pool.mjs keep --lane='
       + `${d.lane} --reason='<why>'`
-    )).join('\n') || '(none)');
+    )).join('\n'));
     if (args.includes('--with-backpressure')) {
       console.log('BACKPRESSURE — open-PR limit reached (we:xniq7xs; land/review the existing PRs, or override `node scripts/operations/pr-limit.mjs allow|off`):');
-      console.log(report.backpressure.map((b) => `${b.repo}  ${b.count}/${b.limit} open agent PR(s) not yet review:accepted  (#${b.prNumbers.join(', #')})`).join('\n') || '(none)');
+      printRows(report.backpressure.map((b) => `${b.repo}  ${b.count}/${b.limit} open agent PR(s) not yet review:accepted  (#${b.prNumbers.join(', #')})`).join('\n'));
     }
     if (args.includes('--with-reconcile-notes')) {
       // #4191 (epic #4075/#3383) — ESCALATIONS: a PR whose auto-heal is exhausted, or whose bound session is
@@ -473,7 +566,7 @@ export function main(args = process.argv.slice(2), { sleep, pollAttempts, pollDe
       // carries the last failure reason inline for `ci-heal-exhausted` — never re-appended here, or it reads
       // twice.
       console.log('ESCALATIONS — needs your decision (ci-heal exhausted / a session is blocked on a permission prompt):');
-      console.log(report.reconcileNotes.map((n) => `${n.repo}#${n.prNumber ?? '?'}  [${n.kind}]  ${n.text}`).join('\n') || '(none)');
+      printRows(report.reconcileNotes.map((n) => `${n.repo}#${n.prNumber ?? '?'}  [${n.kind}]  ${n.text}`).join('\n'));
     }
   }
 }
