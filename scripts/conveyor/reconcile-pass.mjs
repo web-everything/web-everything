@@ -102,7 +102,7 @@ import { readBgIsolationStallInfo } from './bg-isolation-stall.mjs';
 // #4263 — the pure escalation reader (no fs/network of its own) reconcile-core.mjs already imports; re-scanning
 // comments HERE with the SAME function, never a re-derived copy, is what lets this enrich step find exactly the
 // `systemFixRef` PRs reconcile-core.mjs's own escalation branch will independently re-derive from the same data.
-import { latestCiHealEscalationForHead } from './ci-heal-escalation-mark.mjs';
+import { latestCiHealEscalationForHead, enrichPrsWithEscalationBaseFacts } from './ci-heal-escalation-mark.mjs';
 import { readLiveFixClaim } from './fix-procedure.mjs';
 import { enrichPrsWithReferralHolds } from './review-referral-hold.mjs';
 import { ledgerHoldStep, failClosedHolds, ledgerDeciding, renderLedgerShadowSummary } from './review-hold-ledger-shadow.mjs';
@@ -1286,6 +1286,8 @@ export function runReconcilePass({
   // #4263 — re-arms a `waiting-on-system-fix` ci-heal escalation once its named fix PR lands (see
   // {@link enrichPrsWithSystemFixFacts}'s own docblock). Injectable exactly like every other enrich step above.
   enrichSystemFix = enrichPrsWithSystemFixFacts,
+  // PR #4792: a moved stacked base re-arms the escalation.
+  enrichEscalationBase = enrichPrsWithEscalationBaseFacts,
   // fix procedure — attaches each PR's live fix claim (see {@link enrichPrsWithFixClaims}). Injectable like the rest.
   enrichFixClaims = enrichPrsWithFixClaims,
   enrichTimeouts = enrichPrsWithTimeoutEvidence,
@@ -1352,7 +1354,7 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(baseRefPrs, { repo: resolvedRepo }), { repo: repoKey }),
+  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
     { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   const agents = enrich(readAgents({}));
