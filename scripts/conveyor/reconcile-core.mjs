@@ -103,7 +103,7 @@
 import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
+import { REFERRAL_HOLD_MARKER, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
@@ -1463,6 +1463,9 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
   if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  // The PR list read stops at GH_LIST_COMMENT_CAP comments, so a thread of exactly that length may be cut before a
+  // later withdrawal or takeover marker. A full re-read runs longer than the cap; a cut list grants nothing.
+  if (comments.length === GH_LIST_COMMENT_CAP) return { ok: false, reason: 'thread-truncated' };
   const rulings = decidingOperatorBlocks(pr, head, blocked);
   if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
