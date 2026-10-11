@@ -115,7 +115,26 @@ export const GH_ARGV = Object.freeze({
   // file's documented reason for avoiding `reconcile-core.mjs#assessLiveness` — a heavy load-time import chain
   // is exactly the hazard both sides are keeping out of each other's graph).
   readPrFiles: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/files`, '--jq', '.[].filename'],
+  // The PR's formal reviews (PR #4631 round 3): `gh pr view --json comments` never returns them, so a "Request changes"
+  // review was invisible to the carry rule. A dedicated paginated read (not a `readPrState` field, which would change
+  // that argv for every caller and cannot be shown to page); one JSON object per line so `--paginate` pages
+  // concatenate, `--method GET` for the same reason as `readPrFiles`.
+  readPrReviews: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/pulls/${pr}/reviews`,
+    '--jq', '.[] | {state, submitted_at, user: {login: .user.login}}'],
+  // The COMPLETE comment thread, in the shape `gh pr view --json comments` returns (`author.login`, `body`, `createdAt`).
+  // `gh pr view --json comments` stops at one page (100): on a long thread a hold or the clear-human past comment 100 is
+  // invisible, which the carry rule must never read as "nothing stands against it" (PR #4631 round 3, truncated-read row).
+  readComments: (repo, pr) => ['api', '--paginate', '--method', 'GET', '-F', 'per_page=100', `repos/${repo}/issues/${pr}/comments`,
+    '--jq', '.[] | {author: {login: .user.login}, body, createdAt: .created_at}'],
 });
+
+/** `gh pr view --json comments` returns at most this many comments; a thread this long may be truncated. */
+export const PR_COMMENTS_PAGE_SIZE = 100;
+
+/** Parse `gh api --paginate --jq '.[] | {...}'` output (one JSON object per line). Throws on a malformed line. */
+export function parseJsonLines(out) {
+  return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean).map((l) => JSON.parse(l));
+}
 
 /**
  * The `gh` provider — the default, and byte-identical to what `review-set-label.mjs` executed inline before.
@@ -175,6 +194,17 @@ export function createGhProvider({
     readPrFiles(repo, pr) {
       const out = exec(GH_ARGV.readPrFiles(repo, pr), { maxBuffer: 64 * 1024 * 1024 });
       return String(out || '').split('\n').map((s) => s.trim()).filter(Boolean);
+    },
+
+    /** The PR's formal reviews, every page. Throws on a read miss (the caller treats that as unreadable, never as
+     *  "no reviews"). */
+    readPrReviews(repo, pr) {
+      return parseJsonLines(exec(GH_ARGV.readPrReviews(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
+    },
+
+    /** The PR's complete comment thread, every page (see {@link GH_ARGV.readComments}). Throws on a read miss. */
+    readComments(repo, pr) {
+      return parseJsonLines(exec(GH_ARGV.readComments(repo, pr), { maxBuffer: 64 * 1024 * 1024 }));
     },
   };
 }
