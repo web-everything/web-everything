@@ -23,7 +23,7 @@ The required merge-gate CI check (we:scripts/merge-gate-check.mjs, strategy gith
 
 ## Non-goals
 
-- [N1] The drain's own reader in `we:scripts/merge-ai-prs.mjs` keeps reading the local marker (held by #4624/#4631) — follow-up card x09e2bn, blocked on xx7ckd6.
+- [N1] The drain's own reader in `we:scripts/merge-ai-prs.mjs` keeps reading the local marker (held by #4624/#4631) — follow-up card 5905, blocked on xx7ckd6.
 
 ## Edge cases this change must handle
 
