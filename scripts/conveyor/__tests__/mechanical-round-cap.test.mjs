@@ -13,7 +13,7 @@ import { RECONCILE_FINDING_BANNER } from '../reconcile-finding.mjs';
 import { CONFLICT_FIX_COMMENT_MARKER } from '../conflict-fix-round-count.mjs';
 import { REARM_COMMENT_MARKER } from '../rearm-review.mjs';
 import { takeoverMarkerBody } from '../fix-takeover.mjs';
-import { takeoverReviewGrant } from '../takeover-review.mjs';
+import { takeoverReviewGrant, OPERATOR_TAKEOVER_PREFIX } from '../takeover-review.mjs';
 import { planReconcile } from '../reconcile-core.mjs';
 
 const BOT = { login: 'web-everything' };
@@ -27,6 +27,7 @@ const bounceOn = (head, h) => ({ author: BOT, createdAt: at(h),
 const acceptOn = (head, h) => ({ author: BOT, createdAt: at(h), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${head} -->` });
 const conflictBounce = (h) => ({ author: { login: 'chalbert' }, createdAt: at(h),
   body: `🔁 review — changes requested\n\nRecorded by parked-pr-conflict-watch\n\n${RECONCILE_FINDING_BANNER}\n\nPR #7 has drifted into a real GIT merge conflict.` });
+const takeoverOp = (h) => ({ author: BOT, createdAt: at(h), body: `${OPERATOR_TAKEOVER_PREFIX} — all open findings fixed**` });
 const mechMarker = (h) => ({ author: BOT, createdAt: at(h), body: `${CONFLICT_FIX_COMMENT_MARKER}\n\nA mechanical conflict-resolution round (no other edits)` });
 
 const facts = (over = {}) => ({ head: HEAD, priorHead: PRIOR, merged: 'c'.repeat(40), netDiffIdentical: false,
@@ -131,6 +132,20 @@ describe('mechanical round vs the review round cap', () => {
     it('a bare sha in prose with no structured marker at all is not a verdict on the parent', () => {
       const v = { author: BOT, createdAt: at(6), body: `🔁 review — changes requested\n\nrebased from ${PRIOR}` };
       expect(grant(v)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+    });
+    it('a Net basis line QUOTED mid-line in a finding, or an earlier one before the real footer, does not count', () => {
+      const quoted = { author: BOT, createdAt: at(6),
+        body: `🔁 review — changes requested\n\n- the PR body says "Net basis: \`${'0'.repeat(40)}..${PRIOR}\`" which is wrong\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
+      expect(grant(quoted)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+      const lineStart = { author: BOT, createdAt: at(6),
+        body: `🔁 review — changes requested\n\nNet basis: \`${'0'.repeat(40)}..${PRIOR}\`\n\nNet basis: \`${'0'.repeat(40)}..${OTHER}\`` };
+      expect(grant(lineStart)).toMatchObject({ ok: false, reason: 'prior-head-unreviewed' });
+    });
+    it('a verdict naming the CURRENT head by an abbreviated structured sha (before the round marker) is head-already-reviewed', () => {
+      const v = { author: BOT, createdAt: at(6), body: `✅ review — accepted\n\n<!-- reviewed-sha: ${HEAD.slice(0, 12)} -->` };
+      const p = pr([rearm(5), v, rearm(7), mechMarker(8)], { mechanicalRound: identical });
+      expect(mechanicalRoundGrant({ pr: p })).toMatchObject({ ok: false, reason: 'head-already-reviewed' });
+      expect(takeoverReviewGrant({ pr: pr([v, takeoverOp(7)]), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'head-already-reviewed' });
     });
     it('a structured marker naming the parent (full or abbreviated, any case) still counts', () => {
       expect(grant(acceptOn(PRIOR, 6))).toMatchObject({ ok: true, action: 'carry', verdict: 'accept' });
