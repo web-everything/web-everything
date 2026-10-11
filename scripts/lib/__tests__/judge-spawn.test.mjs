@@ -45,6 +45,10 @@ import {
   laneRootOf,
   sameDirectory,
   REAL_PATH,
+  JudgeUnparseableError,
+  resolveUnparseableRetries,
+  UNPARSEABLE_RETRY_SETTING,
+  retrySessionId,
 } from '../judge-spawn.mjs';
 
 const SHAPE = {
@@ -1278,3 +1282,169 @@ function fakeSpawnAtTopLevel(stdout, { code = 0, stderr = '' } = {}) {
   };
   return { fn, seen };
 }
+
+/**
+ * HELD ITEM 223 — A JUROR THAT EXITS WITH NOTHING PARSEABLE ON STDOUT IS RETRIED, AND ITS FAILURE IS RECORDED.
+ *
+ * Live, 2026-10-10: 15 of 119 review runs ended `blocked-on-infra` on "the juror did not emit parseable JSON on
+ * stdout". The juror had done its work (its API calls are in the OTEL log, the last one a large answer turn), and the
+ * same request replayed later completed 3/3 — a transient loss, not a bad request. Before this, the first such exit
+ * threw away the whole run, and the exit code, signal and stderr that would have said WHY were dropped on the way.
+ */
+describe('judgeSpawn — an unparseable stdout is retried once with a fresh session id (held item 223)', () => {
+  const ANSWER_JSON = JSON.stringify({
+    is_error: false, stop_reason: 'tool_use', session_id: 'aaaaaaaa-bbbb-8ccc-9ddd-eeeeeeeeeeee', total_cost_usd: 0.3,
+    duration_ms: 40_000, num_turns: 3, usage: { input_tokens: 4 }, structured_output: { verdict: 'accept', findings: [] },
+  });
+
+  /** A spawn that plays one scripted child per call: `{stdout, stderr, code, signal}`. Records every argv. */
+  function scriptedSpawn(children) {
+    const calls = [];
+    const fn = (cli, argv, opts) => {
+      const c = children[Math.min(calls.length, children.length - 1)];
+      calls.push({ cli, argv, opts });
+      return {
+        stdout: { on: (e, cb) => { if (e === 'data' && c.stdout) setTimeout(() => cb(c.stdout), 0); } },
+        stderr: { on: (e, cb) => { if (e === 'data' && c.stderr) setTimeout(() => cb(c.stderr), 0); } },
+        stdin: { on: () => {}, end: () => {} },
+        on: (e, cb) => { if (e === 'close') setTimeout(() => cb(c.code ?? null, c.signal ?? null), 1); },
+        kill: () => {},
+      };
+    };
+    return { fn, calls };
+  }
+  const sidOf = (argv) => flagValue(argv, '--session-id');
+
+  it('retries an EMPTY stdout once and returns the second attempt\'s answer', async () => {
+    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    const r = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn });
+    expect(calls).toHaveLength(2);
+    expect(r.value).toEqual({ verdict: 'accept', findings: [] });
+    expect(r.attempts).toBe(2);
+    // The failed attempt is carried on the result, so a caller can see a retry happened and why.
+    expect(r.failedAttempts).toHaveLength(1);
+    expect(r.failedAttempts[0]).toMatchObject({ attempt: 1, exitCode: 1, signal: null, stdoutBytes: 0 });
+  });
+
+  it('gives each attempt its OWN derived session id — distinct, deterministic, never the first one reused', async () => {
+    const { fn, calls } = scriptedSpawn([{ stdout: 'not json', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn });
+    const [first, second] = calls.map((c) => sidOf(c.argv));
+    expect(first).toBe(SID);
+    expect(second).not.toBe(first);
+    expect(second).toBe(retrySessionId(SID, 2));
+    expect(second).toMatch(/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+    // Distinct per attempt.
+    expect(retrySessionId(SID, 3)).not.toBe(retrySessionId(SID, 2));
+  });
+
+  it('still unparseable after the retry → a typed JudgeUnparseableError carrying exit code, signal and a bounded stderr tail', async () => {
+    const bigStderr = `${'x'.repeat(5000)}\nTHE-LAST-STDERR-LINE`;
+    const { fn, calls } = scriptedSpawn([
+      { stdout: '', stderr: 'first attempt died', code: null, signal: 'SIGTERM' },
+      { stdout: '', stderr: bigStderr, code: null, signal: 'SIGTERM' },
+    ]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', retries: 1, log: () => {}, spawnFn: fn })
+      .then(() => null, (e) => e);
+    expect(calls).toHaveLength(2);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err.exitCode).toBe(null);
+    expect(err.signal).toBe('SIGTERM');
+    expect(err.attempts).toBe(2);
+    expect(err.stderrTail).toContain('THE-LAST-STDERR-LINE');
+    expect(err.stderrTail.length).toBeLessThanOrEqual(1000);
+    expect(err.failedAttempts.map((a) => a.signal)).toEqual(['SIGTERM', 'SIGTERM']);
+    // The FIRST LINE keeps the old wording (so existing labels still match) and now names the evidence, because a
+    // caller that keeps only the first line (the review job's label) must still learn exit code and signal.
+    const firstLine = err.message.split('\n')[0];
+    expect(firstLine).toMatch(/^judge-spawn: the juror did not emit parseable JSON on stdout/);
+    expect(firstLine).toMatch(/attempt 2\/2/);
+    expect(firstLine).toMatch(/signal SIGTERM/);
+    expect(firstLine).toMatch(/THE-LAST-STDERR-LINE/);
+    expect(firstLine.length).toBeLessThanOrEqual(400);
+    // The run record's telemetry row is built from `err.telemetry`: it names the failure and the last actor.
+    expect(err.telemetry).toMatchObject({
+      sessionId: retrySessionId(SID, 2), exitCode: null, signal: 'SIGTERM', attempts: 2, failure: 'unparseable-stdout',
+    });
+    expect(typeof err.telemetry.wallMs).toBe('number');
+    expect(err.telemetry.stderrTail).toContain('THE-LAST-STDERR-LINE');
+  });
+
+  it('captures a non-zero exit code with no signal', async () => {
+    const { fn } = scriptedSpawn([{ stdout: '', code: 137 }]);
+    const err = await judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, log: () => {}, spawnFn: fn })
+      .then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(JudgeUnparseableError);
+    expect(err.exitCode).toBe(137);
+    expect(err.signal).toBe(null);
+    expect(err.message.split('\n')[0]).toMatch(/exit 137/);
+  });
+
+  it('retries: 0 spawns exactly once', async () => {
+    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 0, log: () => {}, spawnFn: fn }))
+      .rejects.toBeInstanceOf(JudgeUnparseableError);
+    expect(calls).toHaveLength(1);
+  });
+
+  it('does NOT retry a juror that answered with its own error text (a real failure, not a lost output)', async () => {
+    const { fn, calls } = scriptedSpawn([{ stdout: JSON.stringify({ is_error: true, result: 'Not logged in · Please run /login' }), code: 1 }]);
+    await expect(judgeSpawn({ mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, retries: 1, log: () => {}, spawnFn: fn }))
+      .rejects.toThrow('Not logged in');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('logs the retry with the setting\'s value AND where that value came from', async () => {
+    const lines = [];
+    const { fn } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    await judgeSpawn({
+      mandate: 'm', input: 'i', shape: SHAPE, runId: 'run-7', lens: 'rigor', log: (l) => lines.push(l), spawnFn: fn,
+      env: { [UNPARSEABLE_RETRY_SETTING.env]: '1' },
+    });
+    expect(lines.join('\n')).toMatch(new RegExp(`${UNPARSEABLE_RETRY_SETTING.key}=1 \\(source: env\\)`));
+    expect(lines.join('\n')).toContain(retrySessionId(SID, 2));
+  });
+
+  it('takes the retry count from the cascade when the caller passes none (env 0 → no retry)', async () => {
+    const { fn, calls } = scriptedSpawn([{ stdout: '', code: 1 }, { stdout: ANSWER_JSON, code: 0 }]);
+    await expect(judgeSpawn({
+      mandate: 'm', input: 'i', shape: SHAPE, sessionId: SID, log: () => {}, spawnFn: fn, env: { [UNPARSEABLE_RETRY_SETTING.env]: '0' },
+    })).rejects.toBeInstanceOf(JudgeUnparseableError);
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('resolveUnparseableRetries — the retry count is a cascade setting with its source', () => {
+  const readOf = (obj) => () => JSON.stringify(obj);
+  const key = UNPARSEABLE_RETRY_SETTING.key;
+  const envKey = UNPARSEABLE_RETRY_SETTING.env;
+
+  it('built-in default is one retry', () => {
+    expect(resolveUnparseableRetries({ env: {}, readFile: readOf({}) })).toEqual({ value: 1, source: 'default' });
+    expect(UNPARSEABLE_RETRY_SETTING.builtIn).toBe(1);
+  });
+  it('the settings file beats the built-in, env beats the settings file', () => {
+    expect(resolveUnparseableRetries({ env: {}, readFile: readOf({ [key]: 2 }) })).toEqual({ value: 2, source: 'settings' });
+    expect(resolveUnparseableRetries({ env: { [envKey]: '0' }, readFile: readOf({ [key]: 2 }) })).toEqual({ value: 0, source: 'env' });
+  });
+  it('a value that is not a small non-negative integer falls through to the next layer', () => {
+    expect(resolveUnparseableRetries({ env: { [envKey]: 'lots' }, readFile: readOf({ [key]: -1 }) })).toEqual({ value: 1, source: 'default' });
+    expect(resolveUnparseableRetries({ env: { [envKey]: '99' }, readFile: readOf({ [key]: '1.5' }) })).toEqual({ value: 1, source: 'default' });
+  });
+  it('an unreadable settings file is the built-in, never a throw', () => {
+    expect(resolveUnparseableRetries({ env: {}, readFile: () => { throw new Error('ENOENT'); } })).toEqual({ value: 1, source: 'default' });
+  });
+});
+
+describe('parseJudgeOutcome — a stray line around the result object does not lose the answer', () => {
+  it('reads the last line that is a JSON result object when the whole stdout is not one document', () => {
+    const answer = JSON.stringify({ is_error: false, stop_reason: 'tool_use', session_id: 's', structured_output: { verdict: 'accept', findings: [] } });
+    expect(parseJudgeOutcome(`some warning printed to stdout\n${answer}\n`).value).toEqual({ verdict: 'accept', findings: [] });
+  });
+  it('still throws the unparseable error, marked as such, when no line is a result object', () => {
+    let err;
+    try { parseJudgeOutcome('{"structured_output": {"verd', ''); } catch (e) { err = e; }
+    expect(err.message).toMatch(/did not emit parseable JSON/);
+    expect(err.unparseableStdout).toBe(true);
+  });
+});

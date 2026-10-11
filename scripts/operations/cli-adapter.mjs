@@ -735,6 +735,8 @@ function judgeTelemetryFrom(outcome, effective) {
     usage: outcome.usage,
     transcriptFile: outcome.transcriptFile,
     timedOut: outcome.timedOut,
+    // Held item 223 — a seat the provider had to retry (`judgeSpawn`'s unparseable-stdout retry) says so on the record.
+    attempts: outcome.attempts,
     model: outcome.servedModel ?? effective.model,
     ...pickAgyEvidence(outcome),
   };
@@ -1017,18 +1019,49 @@ export async function driveRun({
   let pendingResume = resume;
   const applied = [];
   // Answers a concurrent batch already produced, keyed by step name, consumed as the engine reaches each seat.
+  // HELD ITEM 223 — it also starts with the answers a PREVIOUS drive of this run saved (`run.prefilledSeats`): seats
+  // that ran beside a seat that failed, and answered. A resume commits them when the engine reaches them (the same
+  // byte-for-byte request check guards them) instead of spawning them again. Their spend was recorded when they
+  // ran, so `telemetryRecorded` keeps it from being counted a second time.
   const prefilled = new Map();
-  // A seat that ran (and cost something) but whose answer can never be committed — an earlier seat failed, or its
-  // request changed — still has its spend recorded, so the run's cost is the cost of every spawn that happened.
-  const recordSpentSeats = (rec) => {
+  for (const saved of Array.isArray(run?.prefilledSeats) ? run.prefilledSeats : []) {
+    prefilled.set(saved.step, {
+      step: saved.step, stepIndex: saved.stepIndex, request: saved.request, ok: true, value: judgeOutcome(saved.value, null),
+      startedAt: Date.parse(saved.startedAt) || clock(), finishedAt: Date.parse(saved.finishedAt) || clock(), telemetryRecorded: true,
+    });
+  }
+  /** The record without the saved answer for `step` (consumed or discarded). PURE over its input. */
+  const dropSaved = (rec, step) => {
+    if (!Array.isArray(rec.prefilledSeats)) return rec;
+    const rest = rec.prefilledSeats.filter((p) => p.step !== step);
+    if (rest.length === rec.prefilledSeats.length) return rec;
+    const { prefilledSeats: _drop, ...without } = rec;
+    return rest.length ? { ...without, prefilledSeats: rest } : without;
+  };
+  /** One spent seat's telemetry row onto `rec` — skipped when it was already recorded by an earlier drive. */
+  const recordSeatSpend = (rec, seat) => {
+    if (seat.telemetryRecorded) return rec;
+    const telemetry = seat.ok ? unwrapJudgeOutcome(seat.value).telemetry : seat.error?.telemetry;
+    if (!telemetry) return rec;
+    return { ...rec, telemetry: [...(rec.telemetry ?? []), normalizeJudgeTelemetry({ step: seat.step, stepIndex: seat.stepIndex, telemetry: { ...telemetry, lens: seat.request?.lens, model: telemetry.servedModel || telemetry.model || seat.request?.model, effort: seat.request?.effort } })] };
+  };
+  // An earlier seat failed: every seat still waiting has its spend recorded (the run's cost is the cost of every spawn
+  // that happened), and each one that ANSWERED is saved on the run so a resume can commit it (held item 223). Before
+  // this, those answers were dropped and a resume — or, worse, a fresh review — paid for every seat again.
+  const saveRemainingSeats = (rec) => {
     let next = rec;
+    const saved = Array.isArray(rec.prefilledSeats) ? rec.prefilledSeats.filter((p) => !prefilled.has(p.step)) : [];
     for (const seat of prefilled.values()) {
-      const telemetry = seat.ok ? unwrapJudgeOutcome(seat.value).telemetry : seat.error?.telemetry;
-      if (!telemetry) continue;
-      next = { ...next, telemetry: [...(next.telemetry ?? []), normalizeJudgeTelemetry({ step: seat.step, stepIndex: seat.stepIndex, telemetry: { ...telemetry, lens: seat.request?.lens, model: telemetry.servedModel || telemetry.model || seat.request?.model, effort: seat.request?.effort } })] };
+      next = recordSeatSpend(next, seat);
+      if (!seat.ok) continue;
+      saved.push({
+        step: seat.step, stepIndex: seat.stepIndex, request: seat.request, value: unwrapJudgeOutcome(seat.value).value,
+        startedAt: new Date(seat.startedAt).toISOString(), finishedAt: new Date(seat.finishedAt).toISOString(), telemetryRecorded: true,
+      });
     }
     prefilled.clear();
-    return next;
+    const { prefilledSeats: _old, ...without } = next;
+    return saved.length ? { ...without, prefilledSeats: saved.sort((a, b) => a.stepIndex - b.stepIndex) } : without;
   };
 
   for (let turn = 0; turn < maxTurns; turn += 1) {
@@ -1067,7 +1100,8 @@ export async function driveRun({
       // Their answers wait in `prefilled` and are committed below one at a time, in declared order, through the SAME
       // resume as a sequential spawn, so the record differs only in its step timings (which show the real overlap).
       if (parallelJudges && !prefilled.has(stepName)) {
-        const batch = planJudgeBatch(current, { registry });
+        // A seat whose answer is already in hand (saved by an earlier drive) is not spawned again.
+        const batch = planJudgeBatch(current, { registry }).filter((s) => s.step === stepName || !prefilled.has(s.step));
         if (batch.length > 1) {
           log(`parallel seats: run ${current.id} starting ${batch.length} seats together (${batch.map((s) => s.step).join(', ')})`);
           for (const seat of await runJudgeBatch({ batch, judge, clock, seatLanes, log })) prefilled.set(seat.step, seat);
@@ -1086,17 +1120,19 @@ export async function driveRun({
           if (e?.telemetry) {
             current = { ...current, telemetry: [...(current.telemetry ?? []), normalizeJudgeTelemetry({ step: stepName, stepIndex, telemetry: { ...e.telemetry, model: e.telemetry.servedModel, lens: current.pending.request?.lens } })] };
           }
-          current = recordSpentSeats(current);
+          current = saveRemainingSeats(current);
           store.write(current);
           throw e;
         }
         returned = pre.value;
+        current = dropSaved(current, stepName);
       } else {
         if (pre) {
-          // Never committed: the request the engine asked for now is not the one the batch answered. Spend recorded,
-          // answer discarded, seat spawned again — the safe fallback (see `./parallel-judges.mjs`).
-          prefilled.set(stepName, pre);
-          current = recordSpentSeats(current);
+          // Never committed: the request the engine asked for now is not the one the batch answered. Spend recorded
+          // (once — a saved seat's spend already is), answer discarded, THIS seat spawned again — the safe fallback
+          // (see `./parallel-judges.mjs`). The other seats' answers stay: each is checked against its own request
+          // when the engine reaches it.
+          current = dropSaved(recordSeatSpend(current, pre), stepName);
         }
         try { returned = await judge(current.pending.request); } catch (e) {
           if (e?.telemetry) {
