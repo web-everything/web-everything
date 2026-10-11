@@ -11,12 +11,14 @@
  *   takes no part in a stack. These tests replay that shape through planRebuild and rebuildClone.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { planRebuild, rebuildClone } from '../daemon-rebuild.mjs';
-import { addOverlay, resolveOverlayStackMode, OVERLAY_STACK_MODE_ENV } from '../daemon-overlays.mjs';
+import {
+  addOverlay, resolveOverlayStackMode, OVERLAY_STACK_MODE_ENV, makePrBaseChain, persistStackBases, readOverlays, GH_TIMED_OUT,
+} from '../daemon-overlays.mjs';
 import { gitRun } from '../main-staleness.mjs';
 
 process.env.WE_DAEMON_REBUILD_SKIP_UNRELATED = '0';
@@ -331,5 +333,171 @@ describe('held item 212 review round 1 — landed overlays and pinned bases', ()
     const { readOverlays } = await import('../daemon-overlays.mjs');
     addOverlay(f.clone, { ref: LAST, pr: 4792, stackBases: ['lane/ok-base', '../escape', '--upload-pack=x', 'has space', ''] }, { env: f.env });
     expect(readOverlays(f.clone, { env: f.env }).find((o) => o.ref === LAST).stackBases).toEqual(['lane/ok-base']);
+  });
+});
+
+describe('held item 212 review round 2 — stack fallback, claim confirmation, gh budget, stackBases writer', () => {
+  const mainMoves = (f, over) => {
+    gitOk(f.author, ['fetch', '-q', 'origin']);
+    gitOk(f.author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+    write(f.author, TAKEOVER, lines(over));
+    gitOk(f.author, ['commit', '-q', '-am', 'main']);
+    gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+  };
+
+  it('a live moved base survives a newcomer that blocks the fallback while every top fails (never silently lost)', async () => {
+    const f = fixture();
+    const bNew = f.moveBase();
+    f.fetch();
+    const live = await planRebuild({ git: f.runGit, headSha: f.init, mainRef: 'origin/main', overlays: [{ ref: BASE, pr: 4756 }] });
+    mainMoves(f, { 6: 'main moved' }); // the only top (#4792) now conflicts with main
+    f.push('lane/newcomer', f.init, { [TAKEOVER]: lines({ 2: 'newcomer edit' }) }); // clashes with the live base, not with main
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: live.finalSha, mainRef: 'origin/main', prBaseChain,
+      overlays: [{ ref: BASE, pr: 4756 }, { ref: LAST, pr: 4792 }, { ref: 'lane/newcomer', pr: 9301 }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === BASE)).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/newcomer')).toMatchObject({ action: 'drop', reason: 'conflict' });
+    expect(plan.decisions.some((d) => String(d.reason).startsWith('stack-'))).toBe(false);
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-newcomer-parked');
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-base-restored');
+    expect(isAncestor(f.clone, bNew, plan.finalSha)).toBe(true);
+  });
+
+  it('a PR base chain naming an unrelated overlay does not set that overlay aside (no shared history)', async () => {
+    const f = fixture();
+    f.push('lane/unrelated', f.init, { [TAKEOVER]: lines({ 9: 'unrelated' }) });
+    f.push('lane/claimer', f.init, { [LADDER]: lines({ 9: 'claimer' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9202 ? ['lane/unrelated'] : []),
+      overlays: [{ ref: 'lane/unrelated', pr: 9201 }, { ref: 'lane/claimer', pr: 9202 }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.map((d) => [d.ref, d.action])).toEqual([['lane/unrelated', 'apply'], ['lane/claimer', 'apply']]);
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-tops');
+    expect(plan.alerts.map((a) => a.kind)).toContain('overlay-stack-claim-unconfirmed');
+  });
+
+  it('an unconfirmed chain claim that also clashes with the named overlay still leaves that overlay live (the claimer is parked)', async () => {
+    const f = fixture();
+    f.push('lane/unrelated', f.init, { [TAKEOVER]: lines({ 9: 'unrelated' }) });
+    f.push('lane/claimer', f.init, { [TAKEOVER]: lines({ 9: 'claimer wants the same line' }) });
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9202 ? ['lane/unrelated'] : []),
+      overlays: [{ ref: 'lane/unrelated', pr: 9201 }, { ref: 'lane/claimer', pr: 9202 }],
+    });
+    expect(plan.decisions.find((d) => d.ref === 'lane/unrelated')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/claimer')).toMatchObject({ action: 'drop', reason: 'conflict' });
+  });
+
+  it('a moved base that merges cleanly with its top stays an independent overlay (nothing to set aside)', async () => {
+    const f = fixture();
+    const old = f.push('lane/cm-base', f.init, { [LADDER]: lines({ 4: 'v1' }) });
+    f.push('lane/cm-top', old, { [TAKEOVER]: lines({ 7: 'top' }) });
+    f.push('lane/cm-base', f.init, { [LADDER]: lines({ 9: 'v2' }) }); // rebased far from the top's lines
+    f.fetch();
+    const plan = await planRebuild({
+      git: f.runGit, headSha: null, mainRef: 'origin/main', prBaseChain: async (pr) => (pr === 9402 ? ['lane/cm-base'] : []),
+      overlays: [{ ref: 'lane/cm-base', pr: 9401 }, { ref: 'lane/cm-top', pr: 9402 }],
+    });
+    expect(plan.ok).toBe(true);
+    expect(plan.decisions.find((d) => d.ref === 'lane/cm-base')).toMatchObject({ action: 'apply' });
+    expect(plan.decisions.find((d) => d.ref === 'lane/cm-top')).toMatchObject({ action: 'apply' });
+    expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+  });
+
+  describe('makePrBaseChain gh budget', () => {
+    const SLUG = 'o/r';
+    it('a gh that always times out costs one call in total, then every PR falls back to its recorded chain', async () => {
+      const calls = [];
+      const gh = (args) => { calls.push(args); return GH_TIMED_OUT; };
+      const overlays = [1, 2, 3, 4, 5, 6].map((pr) => ({ ref: `lane/p${pr}`, pr, ...(pr === 3 ? { stackBases: ['lane/b', 'lane/a'] } : {}) }));
+      const chain = makePrBaseChain({ root: '/nonexistent', overlays, gh, slug: SLUG });
+      const out = [];
+      for (const o of overlays) out.push(await chain(o.pr));
+      expect(calls).toHaveLength(1);
+      expect(out[2]).toEqual(['lane/b', 'lane/a']);
+      expect(out.filter((_, i) => i !== 2).every((c) => c === null)).toBe(true);
+      expect(chain.fresh.size).toBe(0);
+    });
+
+    it('a timeout part-way through a chain returns the recorded chain, never the partial walk', async () => {
+      const gh = (args) => (args[1] === 'view' ? { baseRefName: 'lane/b' } : GH_TIMED_OUT);
+      const chain = makePrBaseChain({ root: '/nonexistent', overlays: [{ ref: 'lane/c', pr: 1, stackBases: ['lane/b', 'lane/a'] }], gh, slug: SLUG });
+      expect(await chain(1)).toEqual(['lane/b', 'lane/a']);
+      expect(chain.fresh.size).toBe(0);
+    });
+
+    it('a total time budget stops further gh calls', async () => {
+      let t = 0;
+      let n = 0;
+      const gh = () => { n += 1; t += 40_000; return { baseRefName: 'main' }; };
+      const chain = makePrBaseChain({ root: '/nonexistent', overlays: [], gh, slug: SLUG, budgetMs: 60_000, now: () => t });
+      for (const pr of [1, 2, 3, 4, 5]) await chain(pr);
+      expect(n).toBe(2);
+      expect([...chain.fresh.keys()]).toEqual([1, 2]);
+    });
+
+    it('chains gh answered completely are exposed as fresh; an unanswered intermediate lookup is not', async () => {
+      const gh = (args) => {
+        if (args[1] === 'view') return { baseRefName: args[2] === '1' ? 'lane/b' : 'lane/x' };
+        return args.includes('lane/b') ? [{ baseRefName: 'main' }] : undefined; // lane/x's lookup fails
+      };
+      const chain = makePrBaseChain({ root: '/nonexistent', overlays: [{ ref: 'lane/q', pr: 2, stackBases: ['lane/rec'] }], gh, slug: SLUG });
+      expect(await chain(1)).toEqual(['lane/b']);
+      expect(await chain(2)).toEqual(['lane/rec']);
+      expect([...chain.fresh.entries()]).toEqual([[1, ['lane/b']]]);
+    });
+  });
+
+  describe('stackBases writer', () => {
+    it('persistStackBases records only changed chains, keeps pr/reason, skips a vanished entry and unsafe names', async () => {
+      const f = fixture();
+      addOverlay(f.clone, { ref: LAST, pr: 4792, reason: 'keep me' }, { env: f.env });
+      addOverlay(f.clone, { ref: RULING, pr: 4797, reason: 'other' }, { env: f.env });
+      const read = (ref) => readOverlays(f.clone, { env: f.env }).find((o) => o.ref === ref);
+      const fresh = new Map([[4792, ['lane/a', '--evil']], [4797, []], [9999, ['lane/gone']]]);
+      expect(persistStackBases(f.clone, fresh, { env: f.env })).toEqual({ written: 1 });
+      expect(read(LAST)).toMatchObject({ pr: 4792, reason: 'keep me', stackBases: ['lane/a'] });
+      expect(read(RULING)).not.toHaveProperty('stackBases');
+      expect(persistStackBases(f.clone, fresh, { env: f.env })).toEqual({ written: 0 });
+      expect(persistStackBases(f.clone, new Map([[4792, []]]), { env: f.env })).toEqual({ written: 1 });
+      expect(read(LAST)).not.toHaveProperty('stackBases');
+    });
+
+    it('a real rebuild records the chains gh answered; a later gh-less pass still sees the stack through them', async () => {
+      const f = fixture();
+      f.moveBase();
+      f.fetch();
+      for (const o of OVERLAYS) addOverlay(f.clone, { ...o, reason: 'stack' }, { env: f.env });
+      const bin = mktemp('we-fake-gh-');
+      const map = join(bin, 'map.json');
+      const HEAD_BASE = {
+        'lane/takeover-budget': 'lane/mechanical-round-cap', 'lane/mechanical-round-cap': 'lane/takeover-review-attempt',
+        'lane/takeover-review-attempt': BASE, [BASE]: 'main',
+      };
+      write(bin, 'map.json', JSON.stringify({ prBase: { 4756: 'main', 4757: BASE, 4792: 'lane/takeover-budget', 4797: 'lane/takeover-budget' }, headBase: HEAD_BASE }));
+      write(bin, 'gh', [
+        '#!/usr/bin/env node', "const m = JSON.parse(require('fs').readFileSync(process.env.FAKE_GH_JSON, 'utf8'));",
+        'const a = process.argv.slice(2);',
+        "if (a[1] === 'view') { const b = m.prBase[a[2]]; if (!b) process.exit(1); console.log(JSON.stringify({ baseRefName: b })); }",
+        "else { const b = m.headBase[a[a.indexOf('--head') + 1]]; console.log(JSON.stringify(b ? [{ baseRefName: b }] : [])); }", '',
+      ].join('\n'));
+      chmodSync(join(bin, 'gh'), 0o755);
+      const env = { ...f.env, PATH: `${bin}:${process.env.PATH}`, GH_REPO: 'o/r', FAKE_GH_JSON: map };
+      const r = await rebuildClone({ root: f.clone, env, runSmoke: passSmoke(), prState: async () => 'OPEN', log: { error: () => {} } });
+      expect(r, JSON.stringify(r.alerts)).toMatchObject({ adopted: true });
+      const stored = readOverlays(f.clone, { env: f.env });
+      expect(stored.find((o) => o.ref === LAST)).toMatchObject({ pr: 4792, reason: 'stack', stackBases: CHAINS[4792] });
+      expect(stored.find((o) => o.ref === LADDER_REF).stackBases).toEqual([BASE]);
+      expect(stored.find((o) => o.ref === BASE)).not.toHaveProperty('stackBases');
+      // gh gone: the recorded chains alone still describe the stack.
+      const chain = makePrBaseChain({ root: f.clone, overlays: stored, gh: () => GH_TIMED_OUT, slug: 'o/r' });
+      expect(await chain(4797)).toEqual(CHAINS[4797]);
+    }, 30_000);
   });
 });

@@ -113,10 +113,20 @@ function changedFiles(git, mainSha, sha) {
  * its pin refuses a conflicting build rather than the build silently going without it. A registered overlay whose
  * tip is already an ancestor of main takes no part either (the main loop removes it as `in-main`).
  * Overlays whose PR is MERGED/CLOSED or whose ref is gone take no part (the main loop removes them).
+ * A PR base chain comes from the GitHub API, which any PR author can edit, so a chain claim ("C is stacked on P") makes C
+ * a child of P only when git corroborates it: P's tip is an ancestor of C's tip, or C carries a commit with the same
+ * author and subject as one of P's own (a rebase keeps both, so a rebased base is still recognised through its old head).
+ * An uncorroborated claim is ignored and reported in `unconfirmed`. A base that moved is set aside only when git shows
+ * a top really clashes with it; if every top merges cleanly with it, both apply independently.
+ * `keepIndependent` names refs that must never be set aside (a base whose fallback could not be merged — see the 7b
+ * pass of {@link planRebuild}).
  * @returns {Promise<{setAside:Map<string,{ref:string,pr:number|null,sha:string,reason:string,tops:Array<object>}>,
- *   tops:Array<{ref:string,pr:number|null,sha:string}>}>} `tops` = the tops of stacks only, in list order.
+ *   tops:Array<{ref:string,pr:number|null,sha:string}>, unconfirmed:Array<{ref:string,base:string}>}>}
+ *   `tops` = the tops of stacks only, in list order.
  */
-export async function planOverlayStacks({ git, mainSha, overlays, stateOf = async () => null, prBaseChain = null, isPinned = () => false }) {
+export async function planOverlayStacks({
+  git, mainSha, overlays, stateOf = async () => null, prBaseChain = null, isPinned = () => false, keepIndependent = new Set(),
+}) {
   const nodes = [];
   for (const raw of overlays) {
     if (!raw?.ref || nodes.some((n) => n.ref === raw.ref)) continue;
@@ -135,11 +145,28 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
     nodes.push({ raw, ref: raw.ref, pr, sha, chain: Array.isArray(chain) ? chain : [] });
   }
   const anc = (a, b) => a !== b && git(['merge-base', '--is-ancestor', a, b]).status === 0;
+  // "author<TAB>subject" of the commits an overlay adds on top of main (its own work), newest 200. A rebase keeps both.
+  const ownKeys = (n) => {
+    if (!n.keys) {
+      n.keys = new Set();
+      const mb = git(['merge-base', mainSha, n.sha]);
+      const base = mb.status === 0 ? String(mb.stdout ?? '').trim() : '';
+      const log = base ? git(['log', '--no-merges', '-n', '200', '--format=%ae%x09%s', `${base}..${n.sha}`]) : null;
+      if (log?.status === 0) for (const l of String(log.stdout ?? '').split('\n')) if (l.trim()) n.keys.add(l);
+    }
+    return n.keys;
+  };
+  const sharesWork = (p, c) => { const pk = ownKeys(p); return pk.size > 0 && [...pk].some((k) => ownKeys(c).has(k)); };
+  const unconfirmed = [];
   const children = new Map(nodes.map((n) => [n.ref, new Set()]));
   for (const c of nodes) {
     for (const p of nodes) {
       if (p === c || p.sha === c.sha) continue;
-      if (c.chain.includes(p.ref) || anc(p.sha, c.sha)) children.get(p.ref).add(c.ref);
+      if (anc(p.sha, c.sha)) children.get(p.ref).add(c.ref);
+      else if (c.chain.includes(p.ref)) {
+        if (sharesWork(p, c)) children.get(p.ref).add(c.ref);
+        else unconfirmed.push({ ref: c.ref, base: p.ref });
+      }
     }
   }
   const byRef = new Map(nodes.map((n) => [n.ref, n]));
@@ -156,13 +183,16 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
     if (isTop(p.ref)) continue;
     // A PINNED base (flag or mechanism) is never set aside, contained or moved: it stays an independent overlay, so a
     // conflict reaches `refusePinned` instead of leaving the build without it.
-    if (isPinned(p.raw, p.sha)) continue;
+    if (isPinned(p.raw, p.sha) || keepIndependent.has(p.ref)) continue;
     const tops = nodes.filter((n) => descendants(p.ref).has(n.ref) && isTop(n.ref));
     if (tops.length === 0) continue; // a cycle of equal tips — leave it to the plain loop
     const containing = tops.filter((t) => anc(p.sha, t.sha));
     if (containing.length > 0) {
       setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-contained', tops: containing.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
     } else {
+      // A moved base is only worth setting aside when a top really clashes with it (merge-tree status 1). Clean merge or a
+      // git error: both apply on their own, as before stacks existed.
+      if (!tops.some((t) => git(['merge-tree', '--write-tree', '--no-messages', p.sha, t.sha]).status === 1)) continue;
       setAside.set(p.ref, { ref: p.ref, pr: p.pr, sha: p.sha, reason: 'stack-base-moved', tops: tops.map(({ ref, pr, sha }) => ({ ref, pr, sha })) });
     }
     for (const t of tops) stackTops.add(t.ref);
@@ -170,6 +200,7 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
   return {
     setAside,
     tops: nodes.filter((n) => stackTops.has(n.ref)).map(({ ref, pr, sha }) => ({ ref, pr, sha })),
+    unconfirmed,
   };
 }
 
@@ -198,7 +229,7 @@ export async function planOverlayStacks({ git, mainSha, overlays, stateOf = asyn
  */
 export async function planRebuild({
   git, headSha, mainRef, overlays = [], prState, mainOnly = false, edgeResolve = true,
-  prBaseChain = null, stackMode = 'tops', stackModeSource = 'standard',
+  prBaseChain = null, stackMode = 'tops', stackModeSource = 'standard', keepIndependent = new Set(),
 }) {
   const mainSha = verifyRev(git, `${mainRef}^{commit}`);
   if (!mainSha) return { ok: false, reason: 'main-unresolved' };
@@ -255,8 +286,29 @@ export async function planRebuild({
 
   // Held item 212 (live 2026-10-10) — stacked overlay PRs are one stack: apply only its tops. See planOverlayStacks.
   const stacks = stackMode === 'tops' && listed.length > 1
-    ? await planOverlayStacks({ git, mainSha, overlays: listed, stateOf, prBaseChain, isPinned: (raw, sha) => pinnedStatus(git, raw, mainSha, sha).pinned })
-    : { setAside: new Map(), tops: [] };
+    ? await planOverlayStacks({
+      git, mainSha, overlays: listed, stateOf, prBaseChain, keepIndependent,
+      isPinned: (raw, sha) => pinnedStatus(git, raw, mainSha, sha).pinned,
+    })
+    : { setAside: new Map(), tops: [], unconfirmed: [] };
+  if (keepIndependent.size > 0) {
+    alerts.push({
+      kind: 'overlay-stack-base-restored',
+      detail: {
+        refs: [...keepIndependent],
+        message: `stack base(s) ${[...keepIndependent].join(', ')} could not be merged after their tops failed — planned again with them as independent overlays`,
+      },
+    });
+  }
+  if (stacks.unconfirmed.length > 0) {
+    alerts.push({
+      kind: 'overlay-stack-claim-unconfirmed',
+      detail: {
+        claims: stacks.unconfirmed,
+        message: `PR base chain names overlay(s) git does not link to the claimer (${stacks.unconfirmed.map((u) => `${u.ref} on ${u.base}`).join('; ')}) — treated as independent overlays`,
+      },
+    });
+  }
   if (stacks.setAside.size > 0) {
     const label = (o) => (o.pr != null ? `#${o.pr}` : o.ref);
     const asides = [...stacks.setAside.values()];
@@ -439,24 +491,36 @@ export async function planRebuild({
 
   // 7b. stack fallback (held item 212) — a base set aside for its tops comes back when NONE of those tops applied
   //     (each was dropped for its own conflict): the stack never loses both the base and its tops.
+  //     A base that CANNOT be merged back (a newcomer applied first and now clashes with it, or git failed) must never
+  //     vanish silently: the whole plan is run again with that base as an ordinary independent overlay, so the normal
+  //     rules decide (an established base goes first and the newcomer is parked; a pinned one refuses). Each pass adds
+  //     at least one ref to `keepIndependent`, and a kept ref can no longer be set aside, so this ends.
   const appliedRefs = () => new Set(applied.map((a) => a.ref));
+  const lostBases = [];
   for (const d of decisions) {
     if (d.action !== 'skip' || !['stack-base-moved', 'stack-contained'].includes(d.reason) || !d.sha) continue;
     if ((d.tops ?? []).some((t) => appliedRefs().has(t))) continue;
     const mt = git(['merge-tree', '--write-tree', '--no-messages', cur, d.sha]);
     const tree = String(mt.stdout ?? '').split('\n')[0].trim();
-    if (mt.status !== 0 || !tree || tree === verifyRev(git, `${cur}^{tree}`)) continue;
+    if (mt.status !== 0 || !tree) { lostBases.push(d.ref); continue; }
+    if (tree === verifyRev(git, `${cur}^{tree}`)) continue; // the build already carries its content
     const ct = git(['commit-tree', tree, '-p', cur, '-p', d.sha, '-m',
       `daemon-rebuild: merge overlay ${d.ref}${d.pr != null ? ` (PR #${d.pr})` : ''} onto ${cur} (stack base; its tops did not apply)`], {
       env: rebuildCommitEnv(git, cur, d.sha),
     });
     const newSha = String(ct.stdout ?? '').trim();
-    if (ct.status !== 0 || !newSha) continue;
+    if (ct.status !== 0 || !newSha) { lostBases.push(d.ref); continue; }
     cur = newSha;
     applied.push({ ref: d.ref, pr: d.pr, sha: d.sha });
     d.action = 'apply';
     d.reason = 'applied-stack-fallback';
     alerts.push({ kind: 'overlay-stack-fallback', detail: { ref: d.ref, pr: d.pr, sha: d.sha, tops: d.tops } });
+  }
+  if (lostBases.length > 0) {
+    return planRebuild({
+      git, headSha, mainRef, overlays, prState, mainOnly, edgeResolve, prBaseChain, stackMode, stackModeSource,
+      keepIndependent: new Set([...keepIndependent, ...lostBases]),
+    });
   }
 
   // x5059uu — say who lost, after the retry pass (a retried overlay is no longer dropped). A newcomer is PARKED: the

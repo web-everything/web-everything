@@ -20,7 +20,7 @@ import {
   pruneLandedBacklogSidecars,
 } from './local-state.mjs';
 import {
-  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode,
+  readOverlayState, overlayFilePath, removeOverlay, appendOverlayEvent, makePrBaseChain, resolveOverlayStackMode, persistStackBases,
 } from '../daemon-overlays.mjs';
 import { fetchMainAndOverlays, recordedEdgeSha } from './edge-fetch.mjs';
 import { planRebuild } from './plan.mjs';
@@ -256,11 +256,16 @@ export async function prepareRebuild({
   // Held item 212 — stacked overlay PRs apply as stacks (only their tops) unless `overlay.stackMode` says independent.
   // The PR base chains come from gh, else from each entry's recorded `stackBases`, else ancestry alone.
   const stack = resolveOverlayStackMode(env);
+  const chainOf = prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore, env });
   const plan = await planRebuild({
     git, headSha: prevHead, mainRef: 'origin/main', overlays: overlaysBefore, prState, mainOnly, edgeResolve,
-    stackMode: stack.mode, stackModeSource: stack.source,
-    prBaseChain: prBaseChain ?? makePrBaseChain({ root, overlays: overlaysBefore }),
+    stackMode: stack.mode, stackModeSource: stack.source, prBaseChain: chainOf,
   });
+  // The chains gh answered completely are written back onto the entries (only when they changed), so a rebuild that
+  // cannot reach gh later still knows the stacks. Best effort: a busy or unwritable list never fails the rebuild.
+  if (chainOf.fresh?.size > 0) {
+    try { persistStackBases(root, chainOf.fresh, { env }); } catch (e) { alert('stack-bases-not-recorded', { error: String(e?.message ?? e) }); }
+  }
   for (const event of plan.alerts || []) {
     alert(event.kind, event.detail);
     if (event.kind === 'overlay-conflict-unresolved' && event.detail.pr != null) {

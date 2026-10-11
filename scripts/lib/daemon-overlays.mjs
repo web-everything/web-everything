@@ -345,14 +345,26 @@ export function resolveOverlayStackMode(env = process.env, { settingsPath = OVER
 /** Both reads are one small JSON row / one URL line; anything bigger is not what we asked for. */
 const GH_MAX_BUFFER = 1024 * 1024;
 
-function ghSlug(root) {
+/** What a gh runner returns when the call hit its timeout (as opposed to `undefined`: gh answered with an error). */
+export const GH_TIMED_OUT = Symbol('gh-timed-out');
+/** One gh call may wait this long… */
+const GH_CALL_TIMEOUT_MS = 20_000;
+/** …and all gh calls of one rebuild's base-chain reads together may wait this long (rebuild lock is held meanwhile). */
+export const GH_CHAIN_BUDGET_MS = 60_000;
+
+function ghSlug(root, env) {
+  const fromEnv = env?.GH_REPO; // gh's own convention for "which repo"
+  if (typeof fromEnv === 'string' && /^[\w.-]+\/[\w.-]+$/.test(fromEnv)) return fromEnv;
   const r = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: root, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
   const m = r.status === 0 ? String(r.stdout || '').trim().match(/github\.com[:/]+([^/]+)\/([^/.]+?)(?:\.git)?\/?$/) : null;
   return m ? `${m[1]}/${m[2]}` : null;
 }
 
-function ghJson(args) {
-  const r = spawnSync('gh', args, { encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER });
+function ghJson(args, { env, timeoutMs = GH_CALL_TIMEOUT_MS } = {}) {
+  const r = spawnSync('gh', args, {
+    encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: GH_MAX_BUFFER, ...(env ? { env } : {}),
+  });
+  if (r.error?.code === 'ETIMEDOUT') return GH_TIMED_OUT;
   if (r.status !== 0) return undefined;
   try { return JSON.parse(String(r.stdout || '')); } catch { return undefined; }
 }
@@ -362,33 +374,99 @@ function ghJson(args) {
  * until `main` (nearest first, at most `maxDepth` hops). Asks gh; when gh cannot answer (no gh, no auth, a non-GitHub
  * origin) it falls back to the entry's recorded `stackBases`, else `null` (unknown — the rebuild then judges by ancestry
  * alone). Lookups are memoised for the life of the returned function (one rebuild).
- * @param {{root:string, overlays?:Array<object>, gh?:(args:string[])=>unknown, maxDepth?:number}} o
- * @returns {(pr:number)=>Promise<string[]|null>}
+ *
+ * Time bound: gh runs synchronously inside the rebuild, so all its calls share one budget (`budgetMs`) and a circuit
+ * breaker — the first gh timeout, or the budget running out, stops every further call; from then on each PR answers from
+ * its recorded `stackBases` (never from a half-walked chain after a trip). A lookup that fails without a timeout in the
+ * middle of a walk also answers from the recorded chain when there is one.
+ * `fresh` (a property of the returned function) holds `pr → chain` for the chains gh answered completely, for
+ * {@link persistStackBases}.
+ * @param {{root:string, overlays?:Array<object>, gh?:(args:string[], o?:{env?:object,timeoutMs?:number})=>unknown,
+ *   maxDepth?:number, budgetMs?:number, now?:()=>number, slug?:string|null, env?:NodeJS.ProcessEnv}} o
+ * @returns {((pr:number)=>Promise<string[]|null>) & {fresh:Map<number,string[]>}}
  */
-export function makePrBaseChain({ root, overlays = [], gh = ghJson, maxDepth = 8 } = {}) {
-  let slug;
-  const slugOf = () => { if (slug === undefined) { try { slug = ghSlug(root); } catch { slug = null; } } return slug; };
-  const baseOfRef = new Map();
+export function makePrBaseChain({
+  root, overlays = [], gh = ghJson, maxDepth = 8, budgetMs = GH_CHAIN_BUDGET_MS, now = Date.now, slug: slugOverride, env,
+} = {}) {
+  let slug = slugOverride;
+  const slugOf = () => { if (slug === undefined) { try { slug = ghSlug(root, env); } catch { slug = null; } } return slug; };
+  const startedAt = now();
+  let tripped = false;
+  /** One gh call under the shared budget; `undefined` once tripped, out of budget, or when gh could not answer. */
+  const call = (args) => {
+    if (tripped) return undefined;
+    const left = budgetMs - (now() - startedAt);
+    if (left <= 0) { tripped = true; return undefined; }
+    let out;
+    try { out = gh(args, { env, timeoutMs: Math.min(GH_CALL_TIMEOUT_MS, left) }); } catch { return undefined; }
+    if (out === GH_TIMED_OUT) { tripped = true; return undefined; }
+    return out;
+  };
+  const baseOfRef = new Map(); // head ref → its open PR's base branch, or null (no open PR: the end of the walk)
+  const failedRefs = new Set();
+  const memo = new Map();
+  const fresh = new Map();
   const recorded = (pr) => {
     const e = overlays.find((o) => o && o.pr === pr);
     return Array.isArray(e?.stackBases) ? e.stackBases.filter((b) => typeof b === 'string' && b) : null;
   };
-  return async (pr) => {
-    if (pr == null) return null;
+  const walk = (pr) => {
     const s = slugOf();
-    const first = s ? gh(['pr', 'view', String(pr), '--repo', s, '--json', 'baseRefName']) : undefined;
+    const first = s ? call(['pr', 'view', String(pr), '--repo', s, '--json', 'baseRefName']) : undefined;
     const base = first?.baseRefName;
     if (typeof base !== 'string' || !base) return recorded(pr);
     const chain = [];
+    let complete = true;
     let ref = base;
     while (ref && ref !== 'main' && chain.length < maxDepth && !chain.includes(ref)) {
       chain.push(ref);
       if (!baseOfRef.has(ref)) {
-        const rows = gh(['pr', 'list', '--repo', s, '--head', ref, '--state', 'open', '--json', 'baseRefName', '--limit', '1']);
-        baseOfRef.set(ref, Array.isArray(rows) && typeof rows[0]?.baseRefName === 'string' ? rows[0].baseRefName : null);
+        const rows = failedRefs.has(ref) ? undefined : call(['pr', 'list', '--repo', s, '--head', ref, '--state', 'open', '--json', 'baseRefName', '--limit', '1']);
+        if (!Array.isArray(rows)) { failedRefs.add(ref); complete = false; break; }
+        baseOfRef.set(ref, typeof rows[0]?.baseRefName === 'string' ? rows[0].baseRefName : null);
       }
       ref = baseOfRef.get(ref);
     }
+    if (tripped) return recorded(pr);
+    if (!complete) return recorded(pr) ?? chain;
+    fresh.set(pr, chain);
     return chain;
   };
+  const chainOf = async (pr) => {
+    if (pr == null) return null;
+    if (!memo.has(pr)) memo.set(pr, walk(pr));
+    return memo.get(pr);
+  };
+  chainOf.fresh = fresh;
+  return chainOf;
+}
+
+/**
+ * Record the base chains gh answered completely (`fresh`: `pr → chain`, from {@link makePrBaseChain}) on the registered
+ * entries, so a later rebuild that cannot reach gh still sees the stack. Writes only entries whose chain changed (an empty
+ * chain clears the field), under the list lock and from a fresh read, so a concurrent add/remove is never overwritten and
+ * an entry that vanished is skipped. Only `stackBases` is touched — `pr`, `reason` and the rest stay as they are. The
+ * rebuild still checks every recorded claim against git ancestry/history, so a recorded chain never decides alone.
+ * @param {string} root
+ * @param {Map<number,string[]>} fresh
+ * @param {{env?:NodeJS.ProcessEnv}} [o]
+ * @returns {{written:number}}
+ */
+export function persistStackBases(root, fresh, { env = process.env } = {}) {
+  if (!(fresh instanceof Map) || fresh.size === 0) return { written: 0 };
+  return withListLock(root, env, () => {
+    const list = readOverlaysForWrite(root, env).slice();
+    let written = 0;
+    for (let i = 0; i < list.length; i += 1) {
+      const e = list[i];
+      if (!e || e.pr == null || !fresh.has(e.pr)) continue;
+      const bases = (fresh.get(e.pr) ?? []).filter((b) => isSafeBranchName(b));
+      const had = Array.isArray(e.stackBases) ? e.stackBases : null;
+      if (had ? JSON.stringify(had) === JSON.stringify(bases) : bases.length === 0) continue;
+      if (bases.length === 0) { const { stackBases, ...rest } = e; void stackBases; list[i] = rest; } else list[i] = { ...e, stackBases: bases };
+      written += 1;
+    }
+    if (written > 0) writeOverlays(root, list, { env });
+    return { written };
+  });
 }
