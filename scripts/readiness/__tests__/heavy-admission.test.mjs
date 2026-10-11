@@ -1816,6 +1816,17 @@ describe('main-fix queue priority — red-main repair waiters are class P0 (deli
     expect(hit.out.cls).toBe('P0');
   });
 
+  it('the pattern list is count-capped and one classification has a total time budget', () => {
+    expect(validRepairPatterns(Array.from({ length: 16 }, (_, i) => `^p${i}-`))).toBe(true);
+    expect(validRepairPatterns(Array.from({ length: 17 }, (_, i) => `^p${i}-`))).toBe(false);
+    // 16 distinct patterns that each blow the 50ms bound: the budget (150ms) ends the whole call, not 16 x 50ms x 4 fields.
+    const slow = Array.from({ length: 16 }, (_, i) => `^(?:a|a?)+x${i}$`);
+    const r = probe(slow, 'a'.repeat(70) + 'b');
+    expect(r.timedOut, r.stderr).toBe(false);
+    expect(r.out, r.stderr).toMatchObject({ cls: 'P3', ok: true });
+    expect(r.out.ms).toBeLessThan(1500);
+  });
+
   it('an over-long identity value is not matched at all (it is no repair slug)', () => {
     const custom = { mode: 'enforce', repairPatterns: ['^hotfix-'] };
     expect(classifyWaiterPriority({ purpose: 'hotfix-1' }, custom).class).toBe('P0');

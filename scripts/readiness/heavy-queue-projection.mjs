@@ -504,6 +504,9 @@ const IDENTITY_FIELDS = ['purpose', 'session', 'holder', 'envSession'];
 export const MAX_REPAIR_PATTERN_LENGTH = 200;
 export const MAX_REPAIR_MATCH_VALUE_LENGTH = 256;
 export const REPAIR_MATCH_TIMEOUT_MS = 50;
+/** At most this many patterns, and at most this much wall-clock for one whole classification (every pattern x field). */
+export const MAX_REPAIR_PATTERNS = 16;
+export const REPAIR_CLASSIFY_BUDGET_MS = 150;
 
 /** True when `src` repeats a group that already contains a repeat (`(a+)+`, `([a-z]+)*`, `(?:a{1,5}){2,}`) — the
  *  exponential-backtracking shape — or uses a backreference. A conservative scan, not a regex parser; the hard time
@@ -544,7 +547,7 @@ function hasUnsafeRepeat(src) {
 
 /** True when every entry is a non-empty, length-capped string that compiles as a RegExp and nests no repeat. Pure. */
 export function validRepairPatterns(v) {
-  if (!Array.isArray(v)) return false;
+  if (!Array.isArray(v) || v.length > MAX_REPAIR_PATTERNS) return false;
   for (const p of v) {
     if (typeof p !== 'string' || p === '' || p.length > MAX_REPAIR_PATTERN_LENGTH) return false;
     try { new RegExp(p); } catch { return false; }
@@ -563,17 +566,20 @@ const timedOutRepairPatterns = new Set();
  * enforces inside regexp backtracking, so a pattern that gets past {@link validRepairPatterns} still cannot stall the
  * caller. A timeout, an invalid pattern or an over-long value is "no match". Pure apart from the poisoned-pattern memo.
  */
-export function repairPatternMatches(pattern, value) {
+export function repairPatternMatches(pattern, value, deadlineMs = Infinity) {
   if (typeof pattern !== 'string' || typeof value !== 'string' || value.length > MAX_REPAIR_MATCH_VALUE_LENGTH) return false;
   if (timedOutRepairPatterns.has(pattern)) return false;
+  const budgetMs = Math.min(REPAIR_MATCH_TIMEOUT_MS, Math.floor(deadlineMs - Date.now()));
+  if (!(budgetMs >= 1)) return false; // the whole classification's time budget is spent: the rest cannot match
   repairMatchSandbox ??= { context: vm.createContext(Object.create(null)), script: new vm.Script('new RegExp(__pattern).test(__value)') };
   const { context, script } = repairMatchSandbox;
   context.__pattern = pattern;
   context.__value = value;
   try {
-    return script.runInContext(context, { timeout: REPAIR_MATCH_TIMEOUT_MS }) === true;
+    return script.runInContext(context, { timeout: budgetMs }) === true;
   } catch (err) {
-    if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') timedOutRepairPatterns.add(pattern);
+    // The standard patterns are never poisoned: a timeout on a loaded host must not strip a real repair of P0.
+    if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT' && budgetMs >= REPAIR_MATCH_TIMEOUT_MS && !DEFAULT_REPAIR_PATTERNS.includes(pattern)) timedOutRepairPatterns.add(pattern);
     return false;
   }
 }
@@ -590,10 +596,11 @@ export function classifyWaiterPriority(identity, priority) {
   const normal = (reason) => ({ class: 'P3', reason, matched: null });
   if (priority?.mode !== 'enforce') return normal('priority off');
   const patterns = validRepairPatterns(priority.repairPatterns) ? priority.repairPatterns : DEFAULT_REPAIR_PATTERNS;
+  const deadlineMs = Date.now() + REPAIR_CLASSIFY_BUDGET_MS;
   for (const field of IDENTITY_FIELDS) {
     const value = identity?.[field];
     if (typeof value !== 'string' || value === '') continue;
-    const pattern = patterns.find((p) => repairPatternMatches(p, value));
+    const pattern = patterns.find((p) => repairPatternMatches(p, value, deadlineMs));
     if (pattern === undefined) continue;
     const d = deliveryPriority({ incident: { open: true, owner: true } }, { mode: 'enforce' }, 0);
     return { class: d.class, reason: `red-main repair: ${d.reasons.join('; ')}`, matched: { field, value, pattern } };
