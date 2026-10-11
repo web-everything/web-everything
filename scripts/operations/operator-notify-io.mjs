@@ -20,11 +20,16 @@ export function writeState(path, state) {
     renameSync(temp, path);
   } finally { rmSync(temp, { force: true }); }
 }
+function isIncompleteReport(stdout) {
+  try { return JSON.parse(stdout)?.incomplete === true; } catch { return false; }
+}
 export function readQueue({ spawnSyncFn = spawnSync } = {}) {
   const result = spawnSyncFn(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), 'operator-queue.mjs'), '--json'], {
     encoding: 'utf8', timeout: 120_000, maxBuffer: 16 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
   });
-  if (result.error || result.status !== 0) {
+  // A partial read (some repo failed) exits 1 but still prints the rows it did read, flagged `incomplete: true`;
+  // those rows must still be notified, so only an exit without that flagged JSON is a total failure.
+  if (result.error || (result.status !== 0 && !isIncompleteReport(result.stdout))) {
     throw new Error(`operator-queue failed: ${result.error?.message ?? `exit ${result.status}`} ${result.stderr ?? ''}`);
   }
   try { return JSON.parse(result.stdout); }
