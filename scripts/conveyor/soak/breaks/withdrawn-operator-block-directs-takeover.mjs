@@ -22,7 +22,7 @@ const HOLD = 'scripts/conveyor/review-referral-hold.mjs';
 const JURY = 'scripts/lib/jury-core.mjs';
 const TAKEOVER = 'scripts/conveyor/fix-takeover.mjs';
 const LADDER = 'scripts/conveyor/fixer-ladder.mjs';
-const REPO = 'web-everything/web-everything';
+const REPO = 'withdrawn-ruling-fixture/example';
 const PR = 4797;
 const HEAD = 'd'.repeat(40);
 const BOT = { login: 'web-everything' };
@@ -71,7 +71,7 @@ export default {
   id: 'withdrawn-operator-block-directs-takeover',
   title: 'a withdrawn operator block on an earlier review run directed a takeover for a later run\'s reviewer block of the same finding',
   card: 'PR 4797 red-team finding (card xx0055i)',
-  fixedBy: { sha: 'pending', where: 'lane/ruling-ends-dispute', paths: [CORE] },
+  fixedBy: { sha: '926b75851,454144e34', where: 'lane/ruling-ends-dispute', paths: [CORE] },
   fixPresent(root) { return readFileSync(join(root, CORE), 'utf8').includes('function decidingOperatorBlocks'); },
   // The same-class truncated-read variant (a withdrawal past comment 100) is pinned in ruling-not-addressed.test.mjs.
   async run({ log } = {}) {
