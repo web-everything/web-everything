@@ -1,6 +1,7 @@
 {
-  "$comment": "Card xnqxtdy. review.humanClearanceCarryForward true|false: a recorded human clearance (clear-human) carries to a new head when the move is a merge of main AND the PR's net diff is byte-identical to the cleared one; otherwise a human re-approves. Tool override env WE_REVIEW_HUMAN_CLEARANCE_CARRY. See scripts/lib/human-clearance-carry.mjs.",
+  "$comment": "Card xnqxtdy. review.humanClearanceCarryForward true|false: a recorded human clearance (clear-human) carries to a new head when the mechanical move and fingerprint equivalence are proven; otherwise a human re-approves. Tool override env WE_REVIEW_HUMAN_CLEARANCE_CARRY. See scripts/lib/human-clearance-carry.mjs. review.carryEquivalence contribution|strict (contribution = a clearance carries when the PR's own added/removed lines are identical and the cleared change replayed onto main reproduces the new head's tree; strict = byte-identical net diff only; env WE_REVIEW_CARRY_EQUIVALENCE; invalid fails closed to strict).",
   "review": {
-    "humanClearanceCarryForward": true
+    "humanClearanceCarryForward": true,
+    "carryEquivalence": "contribution"
   }
 }
