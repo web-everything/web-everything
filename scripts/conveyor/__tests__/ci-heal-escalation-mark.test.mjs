@@ -489,17 +489,23 @@ describe('stacked base escalation facts (#4792)', () => {
     expect(enrichPrsWithEscalationBaseFacts(null)).toEqual([]);
   });
 
+  it.each([undefined, null, '', false])('skips GitHub without an explicit repo (%s)', repo => {
+    const exec = vi.fn();
+    expect(defaultReadBaseHead('lane/base', { repo, exec })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('reads encoded GitHub branch facts and tolerates command/JSON failures', () => {
     const calls = [];
     const exec = (...args) => { calls.push(args); return JSON.stringify({ sha: 'abc', committedAt: createdAt }); };
-    expect(defaultReadBaseHead('lane/base', { exec })).toEqual({ sha: 'abc', committedAt: createdAt });
+    expect(defaultReadBaseHead('lane/base', { repo: 'owner/repo', exec })).toEqual({ sha: 'abc', committedAt: createdAt });
     expect(calls[0][0]).toBe('gh');
-    expect(calls[0][1]).toEqual(['api', 'repos/{owner}/{repo}/branches/lane%2Fbase', '--jq',
+    expect(calls[0][1]).toEqual(['api', 'repos/owner/repo/branches/lane%2Fbase', '--jq',
       '{sha: .commit.sha, committedAt: .commit.commit.committer.date}']);
     expect(calls[0][2]).toMatchObject({ timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] });
-    expect(defaultReadBaseHead('base', { exec: () => { throw Error('offline'); } })).toBeNull();
-    expect(defaultReadBaseHead('base', { exec: () => 'bad json' })).toBeNull();
-    expect(defaultReadBaseHead('base', { exec: () => '{}' })).toBeNull();
+    expect(defaultReadBaseHead('base', { repo: 'owner/repo', exec: () => { throw Error('offline'); } })).toBeNull();
+    expect(defaultReadBaseHead('base', { repo: 'owner/repo', exec: () => 'bad json' })).toBeNull();
+    expect(defaultReadBaseHead('base', { repo: 'owner/repo', exec: () => '{}' })).toBeNull();
   });
 
   it('addresses the base fixer with a distinct leading marker', () => {

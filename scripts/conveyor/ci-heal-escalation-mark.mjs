@@ -211,9 +211,10 @@ export function escalationStaleAgainstBase(escalation, baseHead) {
 
 /** GitHub owns this fact: daemon clones do not fetch stacked base refs (#4792). */
 export function defaultReadBaseHead(baseRefName, { repo = null, exec = execFileSync } = {}) {
+  if (!repo) return null;
   try {
     const result = JSON.parse(exec('gh', ['api',
-      `repos/${repo || '{owner}/{repo}'}/branches/${encodeURIComponent(baseRefName)}`,
+      `repos/${repo}/branches/${encodeURIComponent(baseRefName)}`,
       '--jq', '{sha: .commit.sha, committedAt: .commit.commit.committer.date}',
     ], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] }));
     if (typeof result?.sha !== 'string' || !result.sha) return null;
@@ -464,8 +465,9 @@ async function main() {
   }
   if (typeof flags.head !== 'string' || !flags.head) fail('--head=<sha> is required');
   const repo = typeof flags.repo === 'string' ? flags.repo : undefined;
+  const repoSlug = repo || resolveOwedRepo({ repoFlag: repo })?.slug;
   const inherited = flags.outcome === 'inherited-from-base';
-  const repoArgs = repo ? ['--repo', repo] : [];
+  const repoArgs = repoSlug ? ['--repo', repoSlug] : [];
   const ghRead = args => execFileSync('gh', args, {
     encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'],
   }).trim();
@@ -475,10 +477,10 @@ async function main() {
     try { baseRefName = JSON.parse(ghRead(['pr', 'view', String(pr), ...repoArgs, '--json', 'baseRefName,headRefOid'])).baseRefName; }
     catch { /* GitHub may be unavailable; keep explicitly supplied facts. */ }
     let defaultBranch = 'main';
-    try { defaultBranch = ghRead(['repo', 'view', ...(repo ? [repo] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name']) || 'main'; }
+    try { defaultBranch = ghRead(['repo', 'view', ...(repoSlug ? [repoSlug] : []), '--json', 'defaultBranchRef', '--jq', '.defaultBranchRef.name']) || 'main'; }
     catch { /* Default to main when the repository metadata is unavailable. */ }
     if (baseRefName && baseRefName !== defaultBranch) {
-      if (!flags['base-head']) flags['base-head'] = defaultReadBaseHead(baseRefName, { repo })?.sha;
+      if (!flags['base-head']) flags['base-head'] = defaultReadBaseHead(baseRefName, { repo: repoSlug })?.sha;
       if (inherited && !flags['base-pr']) {
         try {
           const number = ghRead(['pr', 'list', ...repoArgs, '--head', baseRefName, '--state', 'open', '--json', 'number', '--jq', '.[0].number']);
@@ -516,7 +518,7 @@ async function main() {
   let baseNotePosted = false;
   if (inherited && posted.commented) {
     try {
-      postPrComment({ pr: flags['base-pr'], repo, body: buildInheritedRedBaseNote({
+      postPrComment({ pr: flags['base-pr'], repo: repoSlug, body: buildInheritedRedBaseNote({
         stackedPr: pr, stackedHead: flags.head, baseHeadSha: flags['base-head'], reason: flags.reason || '',
       }) });
       baseNotePosted = true;

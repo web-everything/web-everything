@@ -1354,7 +1354,7 @@ export function runReconcilePass({
   // #4263 — re-check any `waiting-on-system-fix` escalation's named fix PR for having since landed.
   const fixerLadder = loadLadder();
   if (fixerLadder.error) console.error(`fixer-escalation: ignoring the local override, using the platform default: ${fixerLadder.error}`);
-  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: resolvedRepo, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
+  const prs = enrichScopeBloat(enrichCodeQL(enrichRulings(enrichLedgerHolds(enrichReferralHolds(enrichTimeouts(enrichFixClaims(enrichSystemFix(enrichEscalationBase(baseRefPrs, { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch }), { repo: resolvedRepo }), { repo: repoKey }),
     { repo: CONSTELLATION_REPOS[repoKey].slug }), { repo: CONSTELLATION_REPOS[repoKey].slug, now }), { repo: CONSTELLATION_REPOS[repoKey].slug, now, env }), { humanAt: fixerLadder.humanAt }), { repo: CONSTELLATION_REPOS[repoKey].slug }),
     { repo: CONSTELLATION_REPOS[repoKey].slug, defaultBranch });
   const agents = enrich(readAgents({}));
