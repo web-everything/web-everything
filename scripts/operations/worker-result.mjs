@@ -249,6 +249,7 @@ export const LEGACY_OUTCOME_MAP = Object.freeze({
   'blocked-on-load-flake': { outcome: 'blocked', kind: 'host-load', retryable: true },
   'blocked-on-permission': { outcome: 'blocked', kind: 'permission-wall', retryable: true },
   'waiting-on-system-fix': { outcome: 'blocked', kind: 'tooling-defect', retryable: false },
+  'inherited-from-base': { outcome: 'blocked', kind: 'dependency', retryable: false },
   'escalated-rearm-refused': { outcome: 'blocked', kind: 'tooling-defect', retryable: false },
   're-blocked': { outcome: 'blocked', kind: 'dependency', retryable: false },
   'escalated-conflict': { outcome: 'blocked', kind: 'conflict', retryable: false },
