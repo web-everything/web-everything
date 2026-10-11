@@ -1370,7 +1370,11 @@ it('threads the injected round-cap environment into the fixer decision', async (
     }],
     readAgents: () => [], enrich: (agents) => agents,
   };
-  expect(runReconcilePass({ ...options, env: {} }).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+  // Card xx0055i — `fix.roundCapAction: person` keeps the old cap refusal; the shipped `takeover` default
+  // dispatches one takeover fix at the cap instead.
+  expect(runReconcilePass({ ...options, env: { WE_FIX_ROUND_CAP_ACTION: 'person' } }).refusals).toContainEqual(expect.objectContaining({ kind: 'cap-exhausted' }));
+  expect(runReconcilePass({ ...options, env: { WE_FIX_ROUND_CAP_ACTION: 'takeover' } }).dispatch)
+    .toContainEqual(expect.objectContaining({ kind: 'fix', mode: 'takeover' }));
   expect(runReconcilePass({ ...options, env: { WE_REVIEW_ROUND_CAP: '7' } }).dispatch)
     .toContainEqual(expect.objectContaining({ kind: 'fix' }));
 });

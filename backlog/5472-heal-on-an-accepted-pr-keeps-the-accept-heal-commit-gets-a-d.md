@@ -6,7 +6,7 @@ parent: "5467"
 status: open
 blockedBy: ["5469"]
 relatedTo: ["5468", "2979", "3024"]
-scope: ["we:scripts/lib/git-patch-equivalence.mjs", "we:scripts/lib/review-need.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/accept-carry-forward.mjs", "we:scripts/settings/accept-carry-forward.json", "we:scripts/conveyor/accept-carry-sweep.mjs", "we:scripts/review-set-label.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:skills-src/conveyor/review-daemon.mjs"]
+scope: ["we:scripts/lib/git-patch-equivalence.mjs", "we:scripts/lib/review-need.mjs", "we:scripts/operations/review-pr.mjs", "we:.github/workflows/review-gate.yml", "we:scripts/conveyor/accept-carry-sweep.mjs", "we:scripts/conveyor/review-hold-reconcile.mjs", "we:scripts/lib/accept-carry-forward.mjs", "we:scripts/lib/merge-gate-inventory.mjs", "we:scripts/lib/review-escalation.mjs", "we:scripts/lib/review-label-provider.mjs", "we:scripts/merge-ai-prs.mjs", "we:scripts/review-set-label.mjs", "we:scripts/settings/accept-carry-forward.json", "we:skills-src/conveyor/review-daemon.mjs"]
 dateOpened: "2026-10-08"
 tags: [review]
 ---
@@ -18,6 +18,10 @@ Fixer/review proposal, operator 2026-10-08, P4. A merge of main that leaves the 
 ## Slice 1 — merge-main carry-forward (2026-10-09, urgent: merge queue #4619)
 
 Live trigger: #4535 was cleared by the operator at fcc29ce1; the merge queue refreshed it to 143107a87 (net diff byte-identical, reviewed-diff b945d333…); the drain's anti-test-gaming gate re-parked `review:human` and the review daemon paused on the same head, so it waited for a second approval. Delivered: the pure rule `decideAcceptCarryForward` (we:scripts/lib/accept-carry-forward.mjs; strict reviewed-diff only), the setting `acceptCarryForward` (cascade x5wnfcg; built-in off, platform on), the drain gate honouring a carried clearance, `restamp` crossing a mechanical `review:human` re-hold only with that proof, the review daemon's carry sweep, and the #4535 replay fixture. Still owed here: the delta review of a heal commit's own diff (A1 b-d) — a changed net diff falls back to today's full review.
+
+## Scope widened (operator 2026-10-11 ~07:50 ET)
+
+Scope grew from operator rulings on PR #4631 (drain-owned mechanical park label; a later native "changes requested" review stops carry-forward). Operator approved widening the declared scope to the 11 code files PR #4631 actually changes.
 
 ## Acceptance
 

@@ -686,6 +686,8 @@ export function buildPrGraphqlView(repoState, pr, { originPath, callerActor, fie
     headRefName: pr.headRefName,
     headRefOid: headOid,
     baseRefName: pr.baseRefName,
+    // Every fake PR lives in its own repo (no fork model) — the same-repo guard (`sameRepoRefusal`) reads this.
+    isCrossRepository: false,
     mergeable,
     mergeStateStatus,
     labels: pr.labels.map((name) => ({ name })),

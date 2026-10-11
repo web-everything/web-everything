@@ -45,7 +45,7 @@ const sets = () => new Map([
 const AUTHOR = 'app/bot';
 const rows = () => [
   { pr: 4624, headRefName: BASE.ref, headRefOid: BOTTOM, author: AUTHOR },
-  { pr: 4631, headRefName: 'lane/accept-carry-forward', headRefOid: TOP, author: AUTHOR },
+  { pr: 4631, baseRefName: BASE.ref, headRefName: 'lane/accept-carry-forward', headRefOid: TOP, author: AUTHOR },
   { pr: 4655, headRefName: 'lane/left', headRefOid: LEFT, author: AUTHOR },
   { pr: 4686, headRefName: 'lane/right', headRefOid: RIGHT, author: AUTHOR },
 ];
@@ -84,6 +84,72 @@ describe('findStackBases', () => {
   });
   it.each([4624, 4631])('does not form a new stack with untrusted PR #%i', (pr) => {
     expect(findStackBases(rows().map(r => ({ ...r, untrusted: r.pr === pr })), sets())).toEqual(new Map());
+  });
+});
+
+describe('stack relation comes from GitHub baseRefName (live 2026-10-11 deadlock)', () => {
+  const row = (pr, headRefName, headRefOid, baseRefName) => ({ pr, headRefName, headRefOid, baseRefName, author: AUTHOR });
+  const bottom = () => row(4756, 'lane/fixer-history-takeover', BOTTOM, 'main');
+  const top = () => row(4757, 'lane/child', TOP, bottom().headRefName);
+  const graph = () => new Map([
+    [BOTTOM, { reach: new Set([BOTTOM]), first: [BOTTOM] }],
+    [TOP, { reach: new Set([TOP, BOTTOM]), first: [TOP] }],
+  ]);
+
+  it('does not invert #4756 below #4792 because of ancestry', () => {
+    const prs = [row(4756, bottom().headRefName, TOP, 'main'),
+      row(4792, 'lane/last-takeover-review', BOTTOM, 'lane/takeover-budget')];
+    expect(findStackBases(prs, graph()).has(4756)).toBe(false);
+  });
+  it('does not hold #4756 on its stale accepted-against-#4792 marker with no stack', () => {
+    expect(decideStackDispatch({ pr: 4756, stack: null,
+      comments: [comment({ top: 4756, bottom: 4792, bottomRef: 'lane/last-takeover-review' })],
+      stackFingerprint: FINGERPRINT, mainFingerprint: FINGERPRINT }).action).toBe('review');
+  });
+  it('does not stack #4773 and #4777 when both target main', () => {
+    expect(findStackBases([row(4773, 'lane/a', TOP, 'main'), row(4777, 'lane/b', BOTTOM, 'main')], graph()).size).toBe(0);
+  });
+  it('maps the true #4757 stack to #4756', () => {
+    expect(findStackBases([bottom(), top()], graph()).get(4757)).toEqual({
+      pr: 4756, ref: bottom().headRefName, head: BOTTOM, contained: BOTTOM,
+    });
+  });
+  it('uses the declared base even when ancestry prefers another PR', () => {
+    const g = graph();
+    g.set(LEFT, { reach: new Set([LEFT, BOTTOM]), first: [LEFT] });
+    g.get(TOP).reach.add(LEFT);
+    expect(findStackBases([bottom(), top(), row(4792, 'lane/other', LEFT, 'main')], g).get(4757)?.pr).toBe(4756);
+  });
+  it.each([undefined, null, 'unknown'])('does not stack an unknown base %s', (baseRefName) => {
+    expect(findStackBases([bottom(), { ...top(), baseRefName }], graph()).size).toBe(0);
+  });
+  it('drops a declared pair when no bottom commit is contained', () => {
+    const g = graph();
+    g.get(TOP).reach.delete(BOTTOM);
+    expect(findStackBases([bottom(), top()], g).size).toBe(0);
+  });
+  it('breaks a reciprocal cycle and logs it once', () => {
+    const g = graph();
+    g.get(BOTTOM).reach.add(TOP);
+    const logs = [];
+    expect(findStackBases([{ ...bottom(), baseRefName: top().headRefName }, top()], g,
+      { log: (m) => logs.push(m) }).size).toBe(0);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatch(/stack cycle broken: #4756 -> #4757 -> #4756/);
+  });
+  it('removes only the loop and preserves a dependent outside it', () => {
+    const g = graph();
+    g.get(BOTTOM).reach.add(TOP);
+    g.set(LEFT, { reach: new Set([LEFT, TOP]), first: [LEFT] });
+    const logs = [];
+    const out = findStackBases([row(4792, 'lane/other', LEFT, top().headRefName),
+      { ...bottom(), baseRefName: top().headRefName }, top()], g, { log: (m) => logs.push(m) });
+    expect([...out.keys()]).toEqual([4792]);
+    expect(logs).toHaveLength(1);
+  });
+  it('reviews when the current base differs from the accepted marker bottom', () => {
+    expect(decideStackDispatch({ pr: 4631, stack: { ...STACK, pr: 4792 },
+      comments: [comment()], stackFingerprint: FINGERPRINT }).action).toBe('review');
   });
 });
 
@@ -396,7 +462,7 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
   const record = (over = {}) => ({ isCrossRepository: false, author: AUTHOR, ...over });
   const refsOf = (patch = {}) => new Map([
     [4624, { headRefName: BASE.ref, headRefOid: BOTTOM, ...record(), ...patch[4624] }],
-    [4631, { headRefName: 'lane/accept-carry-forward', headRefOid: TOP, ...record(), ...patch[4631] }],
+    [4631, { baseRefName: BASE.ref, headRefName: 'lane/accept-carry-forward', headRefOid: TOP, ...record(), ...patch[4631] }],
   ]);
   const lanes = () => new Map([[BASE.ref, BOTTOM], ['lane/accept-carry-forward', TOP]]);
   // The list scope-bloat passes: no author, no fork flag — GitHub's record must supply both.
@@ -428,6 +494,22 @@ describe('readStackBases — the same trust rule as the fix daemon', () => {
   it('takes the author from GitHub\'s record, never from the caller\'s list', () => {
     const lying = listed().map((p) => ({ ...p, author: AUTHOR, isCrossRepository: false }));
     expect(read({ 4631: { author: 'someone-else' } }, { prs: lying }).size).toBe(0);
+  });
+  it('takes baseRefName from GitHub refs even when the caller disagrees', () => {
+    const caller = (baseRefName) => listed().map(p => ({ ...p, baseRefName }));
+    expect(read({}, { prs: caller('main') }).get(4631)?.pr).toBe(4624);
+    for (const baseRefName of ['main', null, undefined]) {
+      expect(read({ 4631: { baseRefName } }, { prs: caller(BASE.ref) }).size).toBe(0);
+    }
+  });
+  it('threads the cycle logger through the GitHub reader', () => {
+    const logs = [];
+    const run = (args) => args[0] === 'rev-list'
+      ? (args.includes('--first-parent') ? args[args.indexOf('--end-of-options') + 1] : [TOP, BOTTOM].join('\n'))
+      : fakeGit(args);
+    expect(read({ 4624: { baseRefName: 'lane/accept-carry-forward' } }, { run, log: m => logs.push(m) }).size).toBe(0);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain('cycle');
   });
   it('rejects the same pairs the fix daemon rejects (one rule, two readers)', () => {
     const daemon = (patch) => readStacksForPass({ root: '/repo', repoKey: 'we', planned: [], openPrFiles: [{ pr: 4624 }, { pr: 4631 }],
