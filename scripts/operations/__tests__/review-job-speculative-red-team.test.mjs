@@ -23,6 +23,13 @@ const payload = (verdict, r = read()) => ({
   runId: 'review-pr-1', stopped: 'complete', verdict: { verdict, loop: { outcome: 'converged' } },
   findings: { read: r, judge: { findings: [] }, judgeSecurity: { findings: [] } },
 });
+/** Card xyyuvyz — the `review:human` advisory-accept shape (#4722): `needs-human` only because the human gate applies, panel all accept. */
+const advisoryAccept = (r = read()) => {
+  const lensVerdicts = { correctness: 'accept', security: 'accept', simplicity: 'accept' };
+  const p = payload('needs-human', r);
+  p.verdict = { ...p.verdict, loop: { outcome: 'escalated' }, humanRequired: true, lenses: Object.keys(lensVerdicts), lensVerdicts, findings: [], admittedFindings: [] };
+  return p;
+};
 
 // ── the job ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -87,6 +94,15 @@ describe('runReviewJob under review.speculativeRedTeam', () => {
     expect(spec.redTeamGate).toEqual(sequential.redTeamGate);
     expect(spec.verdict).toBe(sequential.verdict);
     expect(spec.outcome).toBe(sequential.outcome);
+  });
+
+  it('a review:human advisory accept → the speculative pass is finished (not discarded, no sequential pass) and the gate runs', () => {
+    const { io, calls } = jobIo({ over: { runLoop: (o) => { calls.push(['loop', o.readSink ?? null]); return { status: 0, stdout: JSON.stringify(advisoryAccept()), stderr: '' }; } } });
+    const out = runReviewJob({ pr: 10, repo: REPO, pid: 1 }, io);
+    expect(kinds(calls)).toEqual(['start', 'loop', 'await', 'finish', 'cleanup', 'gate']);
+    expect(calls.find((c) => c[0] === 'finish')[1]).toBe('needs-human');
+    expect(out.redTeam).toMatchObject({ status: 'ran', foldedVerdict: 'accept' });
+    expect(out.redTeamSpeculative).toMatchObject({ decision: 'finish' });
   });
 
   it('changes → the pass is called off and its spend recorded; nothing posted, no gate, no sequential pass', () => {
@@ -235,6 +251,49 @@ describe('speculateRedTeam + finishSpeculativeRedTeam', () => {
     const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, io);
     expect((await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: payload('changes'), pass, env: {} }, io)).status).toBe('not-owed');
     expect(posts).toEqual([]);
+  });
+
+  it('a review:human advisory accept finishes the speculative pass and posts (card xyyuvyz, #4722) — same result as the sequential pass', async () => {
+    const a = seatsIo();
+    const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, a.io);
+    const fin = await finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload: advisoryAccept(), pass: JSON.parse(JSON.stringify(pass)), env: {} }, a.io);
+    expect(fin.status).toBe('ran');
+    expect(a.posts.length).toBe(1);
+
+    const b = seatsIo();
+    const seq = await runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload: advisoryAccept(), env: {} }, b.io);
+    const strip = (r) => ({ ...r, callId: undefined, seat: { ...r.seat, callId: undefined } });
+    expect(strip(fin)).toEqual(strip(seq));
+  });
+
+  it('every red-team entry point reads the one gate: plain accept and advisory accept run, a non-accept is not owed', async () => {
+    const owed = [['plain accept', () => payload('accept')], ['advisory accept', () => advisoryAccept()]];
+    const refused = [['changes', () => payload('changes')], ['human gate, panel not accepting', () => {
+      const p = advisoryAccept();
+      p.verdict.lensVerdicts = { ...p.verdict.lensVerdicts, correctness: 'changes' };
+      return p;
+    }]];
+    const entries = {
+      runRedTeam: async (loopPayload, io) => runRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', loopPayload, env: {} }, io),
+      finishSpeculativeRedTeam: async (loopPayload, io) => {
+        const pass = await speculateRedTeam({ pr: 5, repo: REPO, lanePath: '/lane', read: read(), env: {}, resume: false }, io);
+        return finishSpeculativeRedTeam({ pr: 5, repo: REPO, loopPayload, pass, env: {} }, io);
+      },
+    };
+    for (const [entry, run] of Object.entries(entries)) {
+      for (const [name, make] of owed) {
+        const { io, posts } = seatsIo();
+        const r = await run(make(), io);
+        expect([entry, name, r.status]).toEqual([entry, name, 'ran']);
+        expect(posts.length).toBe(1);
+      }
+      for (const [name, make] of refused) {
+        const { io, posts } = seatsIo();
+        const r = await run(make(), io);
+        expect([entry, name, r.status]).toEqual([entry, name, 'not-owed']);
+        expect(posts).toEqual([]);
+      }
+    }
   });
 
   it('a prior clean row is reported, never resumed, by a speculative pass', async () => {
