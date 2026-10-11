@@ -795,9 +795,17 @@ function bodyHasExactLine(body, line) {
  *  start a `main-state:` / `main-green-sha:` line of its own, and the claim-refusal phrase is defanged so a failure
  *  that merely quotes it cannot read as a (free) claim-held marker. The sweeps never post a claim-held marker
  *  (they defer instead), so no new marker legitimately carries the phrase. */
-function markerFreeText(text) {
-  return String(text).replace(/\s+/g, ' ').replace(/holds the fix claim/gi, 'holds the fix-claim').trim();
+export function markerFreeText(text) {
+  return String(text).replace(/\s+/g, ' ')
+    .replace(/holds the fix claim/gi, 'holds the fix-claim')
+    // Legacy skip phrases the missing-run counter matches by substring; no new marker legitimately carries them.
+    .replace(/workflow-dispatch/gi, 'workflow dispatch')
+    // The builder's own `FAILED: ` is the only anchor the stacked / legacy-credential refusal reads trust.
+    .replace(/FAILED:/g, 'FAILED -')
+    .trim().slice(0, MARKER_FREE_TEXT_MAX);
 }
+/** A comment over GitHub's 65,536-character limit makes `gh pr comment` throw, leaving the attempt uncounted. */
+const MARKER_FREE_TEXT_MAX = 500;
 
 /** The structured part of a marker: every line before the outcome line (`conveyor …`), which is where the
  *  free text lives. A trailer-shaped line anywhere after it is never read. */
@@ -1383,17 +1391,20 @@ export function countMissingRunComments(comments, headSha = null, { baseRefName 
     if (typeof body !== 'string' || !body.trimStart().startsWith(MISSING_RUN_COMMENT_MARKER)) continue;
     if (!isTrustedMarkerAuthor(c)) continue;
     // A stacked refusal never pushed anything (stacks now restack instead); a fork-on-default-branch refusal still counts.
-    if (body.includes(MISSING_RUN_STACKED_REFUSAL_PREFIX)
-      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${defaultBranch}, head repo `)) continue;
+    // The refusal text only counts at the start of a line or right after the builder's own `FAILED: ` (free text
+    // is one line and cannot carry that anchor), so a failure that merely quotes it is still counted.
+    const hasStacked = (tail = '') => body.includes(`FAILED: ${MISSING_RUN_STACKED_REFUSAL_PREFIX}${tail}`)
+      || body.split('\n').some(l => l.startsWith(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${tail}`));
+    if (hasStacked() && !hasStacked(`${defaultBranch}, head repo `)) continue;
     // Old dispatch attempts cannot produce evaluated PR checks; do not let their
     // exhausted budget prevent the corrected recovery method from running.
     if (/via workflow-dispatch|trigger CI \(workflow-dispatch/.test(body)) continue;
     // xgq539z — legacy wrong-owner credential refusals (see MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL) are not counted.
-    if (body.includes(MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL)) continue;
+    if (body.includes(`FAILED: ${MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL}`)) continue;
     // Legacy base comparison remains harmless after the blanket refusal refund.
-    if (baseRefName && body.includes(MISSING_RUN_STACKED_REFUSAL_PREFIX)
-      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}?, head repo `)
-      && !body.includes(`${MISSING_RUN_STACKED_REFUSAL_PREFIX}${baseRefName}, head repo `)) continue;
+    if (baseRefName && hasStacked()
+      && !hasStacked('?, head repo ')
+      && !hasStacked(`${baseRefName}, head repo `)) continue;
     if (headSha && !missingRunBodyHasExactLine(body, `sha: ${headSha}`)) continue;
     if (recoveryMarkerIsFree(c, body, mainRedWindows, mainGreen, { refundRed: false })) continue;
     n += 1;

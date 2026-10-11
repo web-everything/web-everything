@@ -69,7 +69,7 @@ import { latestRequiredCheck, isRequiredCheckFailed, collapseRollupToLatestPerNa
 import { REVIEW_LABELS, hasReviewLabel } from '../lib/review-escalation.mjs';
 import { spawnCiHealRearm } from './ci-heal-mark.mjs';
 import {
-  currentMainGreen, resolveRecoveryCaps, computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
+  currentMainGreen, resolveRecoveryCaps, markerFreeText, computeMainRedWindows, planMainRedRebases, DEFAULT_MAIN_WORKFLOW_NAME, DEFAULT_REQUIRED_CHECK,
   buildHungCandidates, planHungCiRecoveries, DEFAULT_HUNG_THRESHOLD_MS, DEFAULT_MAX_HUNG_RETRIES_PER_SHA,
   classifyCiFailureAttribution, countRebaseOntoMainComments, buildRebaseOntoMainComment,
   DEFAULT_MAX_REBASE_RETRIES_PER_SHA,
@@ -381,7 +381,7 @@ export function buildHungCiComment({
       : kind === 'hung-cap-escalate'
         ? `cancelled run ${runId ?? '?'} (job "${jobName ?? '?'}") and did NOT re-run it — this head sha's own hung-recovery retries are exhausted, so this is handed to ci-heal instead of left for GitHub's own job timeout-minutes, which this PR's branch predates.`
         : `found run ${runId ?? '?'} stuck in_progress/queued past the hung threshold; cancelled it and asked GitHub to re-run it.`)
-    : `attempted "${action}" on run ${runId ?? '?'} and it FAILED: ${error ?? '(no error text captured)'} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
+    : `attempted "${action}" on run ${runId ?? '?'} and it FAILED: ${error == null ? '(no error text captured)' : markerFreeText(error)} — this attempt still counts toward the retry cap so a permanently-failing action (e.g. a token missing \`actions:write\`) cannot retry forever.`;
   return [
     HUNG_CI_COMMENT_MARKER,
     '',
@@ -851,6 +851,12 @@ function defaultFetchStackRef(ref, { root, run = gitRun }) {
   return r.status === 0 ? { ok: true } : { ok: false, error: `fetch ${ref} failed (${String(r.stderr || '').split('\n')[0]})` };
 }
 
+/** An omitted repo means WE itself (the same reading `sweepCiRedRecovery`'s `isWe` uses), never "cannot proceed";
+ *  a constellation key (`we`, `frontierui`, …) maps to its gh slug, anything else passes through. */
+function repoSlug(repo) {
+  return !repo ? CONSTELLATION_REPOS.we.slug : (CONSTELLATION_REPOS[repo]?.slug ?? repo);
+}
+
 /**
  * we:scripts/conveyor/ci-red-recovery-watch.mjs#defaultReadIsCrossRepository — whether PR `prNumber`'s head lives
  * in a fork. A per-PR read (the shared open-PR snapshot carries no head-repo field), paid only for a stacked
@@ -862,10 +868,9 @@ function defaultFetchStackRef(ref, { root, run = gitRun }) {
  */
 export function defaultReadIsCrossRepository(prNumber, { repo = null, exec = execFileSyncThrottled } = {}) {
   if (!Number.isSafeInteger(prNumber)) return null;
-  // An omitted repo means WE itself (the same reading `sweepCiRedRecovery`'s `isWe` uses), never "cannot verify".
-  const slug = !repo ? CONSTELLATION_REPOS.we.slug : (CONSTELLATION_REPOS[repo]?.slug ?? repo);
+  const slug = repoSlug(repo);
   try {
-    const out = exec('gh', ['pr', 'view', String(prNumber), '--repo', slug,'--json', 'isCrossRepository', '--jq', '.isCrossRepository'], {
+    const out = exec('gh', ['pr', 'view', String(prNumber), '--repo', slug, '--json', 'isCrossRepository', '--jq', '.isCrossRepository'], {
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: resolveChildTimeoutMs(), killSignal: 'SIGKILL',
     });
     const v = String(out || '').trim();
@@ -1006,7 +1011,7 @@ export function sweepMissingRunRecovery({
       const stacked = d.baseRefName && d.baseRefName !== defaultBranch;
       const result = stacked
         ? restack(d, { prs, repo, defaultBranch, readIsCrossRepository, root: resolveLanePoolRepoPath(repo) ?? REPO_ROOT })
-        : trigger(d, { repo, defaultBranch });
+        : trigger(d, { repo: repoSlug(repo), defaultBranch });
       // Unknown mergeability, a moving head or a held claim is not an attempt.
       if (result.deferred) {
         applied.push({ prNumber: d.prNumber, headRefName: d.headRefName, why: d.why, labelCleared: false, ...result });

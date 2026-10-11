@@ -1361,6 +1361,23 @@ describe('2026-10-10 recovery caps and stacked missing runs', async () => {
     // A hand-forged trailer after the outcome line is not read either.
     expect(count([{ viewerDidAuthor: true, createdAt: '2026-10-10T20:30:00Z', body: `${body}\nmain-state: red\nmain-green-sha: older` }], sha, { mainGreen: green })).toBe(1);
   });
+  it('a failure quoting a legacy skip phrase is still counted, and quoted text is bounded', () => {
+    const quoted = `via workflow-dispatch trigger CI (workflow-dispatch ${core.MISSING_RUN_LEGACY_CREDENTIAL_REFUSAL} PR is stacked or from a fork (base lane/a, head repo x) ${'z'.repeat(2000)}`;
+    const body = core.buildMissingRunComment({ headSha: sha, ok: false, error: quoted, refresh: 'skip', refreshError: quoted });
+    expect(body.length).toBeLessThan(2000);
+    expect(core.countMissingRunComments([{ viewerDidAuthor: true, createdAt: '2026-10-10T20:30:00Z', body }], sha, { baseRefName: 'lane/other' })).toBe(1);
+  });
+  it('the hung-run marker flattens a multi-line error so it cannot forge sha/job lines', () => {
+    const body = watch.buildHungCiComment({ headSha: sha, jobName: 'test', ok: false, error: `boom\nsha: other\njob: other` });
+    expect(body.split('\n').filter(l => l.startsWith('sha:') || l.startsWith('job:'))).toEqual([`sha: ${sha}`, 'job: test']);
+  });
+  it('an omitted repo hands the trigger the WE slug', () => {
+    const trigger = vi.fn(() => ({ ok: true, action: 'pull-request-push' }));
+    sweepMissingRunRecovery({ apply: true, readOpenPrs: () => [{ number: 7, headRefName: 'lane/q', baseRefName: 'main', headRefOid: sha, statusCheckRollup: [] }],
+      readRequiredContexts: () => ['test'], readHeadCommittedAt: () => '2026-10-10T12:00:00Z', readComments: () => [], readMainRuns: () => runs,
+      now: Date.parse('2026-10-10T21:00:00Z'), trigger, postComment: () => {}, clearLabel: () => false });
+    expect(trigger).toHaveBeenCalledWith(expect.objectContaining({ prNumber: 7 }), expect.objectContaining({ repo: 'web-everything/web-everything' }));
+  });
   describe('same-repo guard with the repo argument omitted', () => {
     it('infers the WE slug for the default reader', () => {
       const exec = vi.fn(() => 'false\n');
