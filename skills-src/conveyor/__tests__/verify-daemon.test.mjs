@@ -560,12 +560,29 @@ describe('in-flight PID reconciliation', () => {
   it('drops a dead PID, kills its surviving group, and logs the orphan', () => {
     const run = entry();
     const inFlight = new Map([['lane', run]]);
-    const killGroup = vi.fn(); const log = vi.fn();
-    const result = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: () => true, killGroup, log });
+    const killed = new Set();
+    const killGroup = vi.fn((g) => killed.add(-g)); const log = vi.fn();
+    const result = reconcileInFlight(inFlight, { isAlive: () => false, groupAlive: (p) => !killed.has(p), killGroup, log });
     expect(inFlight.size).toBe(0);
     expect(killGroup).toHaveBeenCalledWith(-777);
     expect(log).toHaveBeenCalledWith('verify-daemon: we/lane-9 in-flight run 12345678 orphaned (pid 777 gone) — dropped and re-queued');
     expect(result).toEqual({ orphaned: [{ pool: 'we', lane: 9, runId: run.runId, pid: 777, reason: 'pid-gone' }] });
+  });
+
+  it('PR 4764 round 7: a group that survives the kill (or cannot be checked) keeps the lane held; dropped only once confirmed gone', () => {
+    const run = entry();
+    const inFlight = new Map([['lane', run]]);
+    let survives = true;
+    const killGroup = vi.fn(); const log = vi.fn();
+    const opts = { isAlive: () => false, groupAlive: () => survives, killGroup, log };
+    expect(reconcileInFlight(inFlight, opts).orphaned).toEqual([]);
+    expect(reconcileInFlight(inFlight, { ...opts, groupAlive: () => { throw new Error('EPERM?'); } }).orphaned).toEqual([]);
+    expect(inFlight.get('lane')).toBe(run); // never a lane free beside surviving test runners
+    expect(killGroup).toHaveBeenCalledTimes(1); // the check that threw neither killed nor released
+    survives = false;
+    expect(reconcileInFlight(inFlight, opts).orphaned).toEqual([expect.objectContaining({ reason: 'pid-gone' })]);
+    expect(inFlight.size).toBe(0);
+    expect(log.mock.calls.flat().filter((l) => /not confirmed gone/.test(l))).toHaveLength(1);
   });
 
   // A pid whose process and group are both gone may already belong to an unrelated process that became its own
@@ -649,8 +666,9 @@ describe('in-flight PID reconciliation', () => {
       expect(inFlight.size).toBe(0);
       return { dispatched: [], deferred: [], failures: [] };
     });
+    let checks = 0; // the group is there for the kill (which throws), and gone by the re-check after it
     const effects = buildCliDaemonEffects({ log, runVerify, isDraining: () => draining,
-      processIsAlive: () => false, groupAlive: () => true, killGroup: () => { throw new Error('kill denied'); } });
+      processIsAlive: () => false, groupAlive: () => (checks++ === 0), killGroup: () => { throw new Error('kill denied'); } });
     effects.inFlight.set('lane', entry());
     effects.onTick(await effects.tickOnce());
     expect(effects.inFlight.size).toBe(0);
@@ -751,20 +769,38 @@ describe('#65 — a daemon restart hands in-flight gates to its successor instea
 
   it('an adopted run that exits is released (its child wrote the marker); one past the ceiling is killed and settled', () => {
     const log = vi.fn();
-    const killGroup = vi.fn();
+    const killed = new Set();
+    const killGroup = vi.fn((g) => killed.add(-g));
     const settleKilled = vi.fn();
     const inFlight = new Map([
       ['done', { pool: 'p', lane: 1, runId: 'r1', pid: 11, startedMs: 0, adopted: true }],
       ['hung', { pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true }],
       ['fresh', { pool: 'p', lane: 3, runId: 'r3', pid: 33, startedMs: 9_000, adopted: true }],
     ]);
-    const { orphaned } = reconcileInFlight(inFlight, { isAlive: (pid) => pid !== 11, groupAlive: () => true, killGroup,
+    const { orphaned } = reconcileInFlight(inFlight, { isAlive: (pid) => pid !== 11, groupAlive: (p) => !killed.has(p), killGroup,
       nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log });
     expect(orphaned.map(o => o.reason)).toEqual(['pid-gone', 'adopted-ceiling']);
     expect(settleKilled).toHaveBeenCalledWith(expect.objectContaining({ runId: 'r2' }), 5_000);
     expect(killGroup).toHaveBeenCalledWith(-22);
     expect([...inFlight.keys()]).toEqual(['fresh']);
     expect(log.mock.calls.flat().join('\n')).toMatch(/adopted run r1.*finished/);
+  });
+
+  it('PR 4764 round 7: an adopted run past its ceiling whose group survives the kill keeps its lane, is settled once, and is killed again each tick', () => {
+    const settleKilled = vi.fn();
+    const killGroup = vi.fn();
+    let alive = true;
+    const inFlight = new Map([['hung', { pool: 'p', lane: 2, runId: 'r2', pid: 22, startedMs: 0, adopted: true }]]);
+    const opts = { isAlive: () => alive, groupAlive: () => true, killGroup, nowMs: 10_000, adoptedCeilingMs: 5_000, settleKilled, log: () => {} };
+    reconcileInFlight(inFlight, opts);
+    reconcileInFlight(inFlight, opts);
+    expect(inFlight.has('hung')).toBe(true);
+    expect(settleKilled).toHaveBeenCalledTimes(1);
+    expect(killGroup).toHaveBeenCalledTimes(2);
+    alive = false;
+    const { orphaned } = reconcileInFlight(inFlight, { ...opts, groupAlive: () => false });
+    expect(inFlight.size).toBe(0);
+    expect(orphaned).toEqual([]); // already reported when the ceiling killed it
   });
 });
 

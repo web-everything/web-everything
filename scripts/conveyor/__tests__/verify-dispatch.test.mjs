@@ -13,7 +13,7 @@ import { spawnSync, spawn as spawnProcess, execFileSync } from 'node:child_proce
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER } from '../verify-dispatch.mjs';
+import { laneNeedsVerifyDispatch, inFlightSuperseded, sameVerifyRequest, resolveSupersedePolicy, resolveMaxInFlight, laneIndicesIn, spawnGateBounded, runVerifyDispatch, recordKilledVerification, GATE_STARTED_MARKER, GATE_QUEUED_MARKER, processGroupMayExist } from '../verify-dispatch.mjs';
 import { heldSlots, admissionLockRoot } from '../../readiness/heavy-admission.mjs';
 import { acquireRunnerLease, makeOwner } from '../../../skills-src/conveyor/runner-lock.mjs';
 import { VERIFY_DAEMON_LEASE_KEY, buildCliDaemonEffects, wireGateJobs } from '../../../skills-src/conveyor/verify-daemon.mjs';
@@ -1212,6 +1212,21 @@ describe('#4135 — job mode: a pending lane is handed to launchGate, never spaw
     const result = await effects.tickOnce();
     expect(spawnGate).not.toHaveBeenCalled();
     expect(result.dispatched).toEqual([]);
+  });
+
+  it('in-process (rollback) gate: when its leader settles while its process group lives on, the lane stays in flight (PR 4764 round 7)', async () => {
+    expect(runVerifyLane(['request', `--repo=${laneDir}`, '--gate=true', '--json'], laneDir).code).toBe(0);
+    // A real process group standing in for test runners that outlive their verify-lane leader.
+    const runners = spawnProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { detached: true, stdio: 'ignore' });
+    try {
+      const inFlight = new Map();
+      await runVerifyDispatch({ poolRoot, inFlight, awaitSettle: true,
+        spawnGate: (args, o) => { o.onSpawn(runners.pid); return Promise.resolve({ pid: runners.pid }); } });
+      expect(inFlight.get(laneDir)).toMatchObject({ pid: runners.pid, leaderSettled: true });
+      process.kill(-runners.pid, 'SIGKILL');
+      for (let i = 0; i < 100 && processGroupMayExist(runners.pid); i += 1) await new Promise((r) => setTimeout(r, 50));
+      expect(processGroupMayExist(runners.pid)).toBe(false); // the daemon's reconcile drops the entry from here
+    } finally { try { process.kill(-runners.pid, 'SIGKILL'); } catch {} }
   });
 
   it('a lane the job store says is held (laneHeld) is deferred at spawn time, in both modes — never spawned or queued', async () => {
