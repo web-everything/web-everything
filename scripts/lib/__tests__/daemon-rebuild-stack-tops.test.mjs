@@ -767,6 +767,58 @@ describe('held item 212 review round 2 — stack fallback, claim confirmation, g
       expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
     });
 
+    /** The last build ran T (on P1) and U (retargeted onto P, clashing with P's later line); T's PR then left. */
+    const lastBuiltOnP1 = async (f) => {
+      const p1 = f.push('lane/ff-p', f.init, { [TAKEOVER]: lines({ 2: 'p1' }) });
+      f.push('lane/ff-t', p1, { [TAKEOVER]: lines({ 2: 'p1' }), [LADDER]: lines({ 9: 't' }) });
+      f.push('lane/ff-u', f.init, { [TAKEOVER]: lines({ 6: 'u' }) });
+      f.fetch();
+      const last = await f.build([{ ref: 'lane/ff-t', pr: 9703 }, { ref: 'lane/ff-u', pr: 9704 }], f.init);
+      return { p1, last };
+    };
+    const planPU = (f, last, prForcePushes) => planRebuild({
+      git: f.runGit, headSha: last, mainRef: 'origin/main',
+      overlays: [{ ref: 'lane/ff-p', pr: 9701 }, { ref: 'lane/ff-u', pr: 9704 }],
+      prBaseChain: async (pr) => (pr === 9704 ? ['lane/ff-p'] : []), prForcePushes,
+    });
+    const pCameBackLoudly = (plan) => {
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-p')).toMatchObject({ action: 'drop', reason: 'conflict' });
+      expect(plan.decisions.find((d) => d.ref === 'lane/ff-u')).toMatchObject({ action: 'apply' });
+      expect(plan.alerts.map((a) => a.kind)).not.toContain('overlay-stack-base-moved');
+    };
+
+    it('an ordinary push before the force-push: the old head the build held is found through the pushed-away head', async () => {
+      const f = fixture();
+      const { p1, last } = await lastBuiltOnP1(f);
+      const p1b = f.push('lane/ff-p', p1, { [TAKEOVER]: lines({ 2: 'p1' }), [LADDER]: lines({ 3: 'p1 more' }) }); // ordinary push
+      f.fetch(); // a daemon tick saw it
+      const p2 =f.push('lane/ff-p', f.init, { [TAKEOVER]: lines({ 2: 'p2', 6: 'p2' }) }); // then force-pushed
+      f.fetch();
+      pCameBackLoudly(await planPU(f, last, async (pr) => (pr === 9701 ? [{ before: p1b, after: p2 }] : [])));
+    });
+
+    it('a base that merged main since the last build: every merge base counts, not only the one git prints first', async () => {
+      const f = fixture();
+      const mainCommit = (name) => {
+        gitOk(f.author, ['fetch', '-q', 'origin']);
+        gitOk(f.author, ['checkout', '-q', '-B', 'main', 'origin/main']);
+        write(f.author, name, `${name}\n`);
+        gitOk(f.author, ['add', '-A']);
+        gitOk(f.author, ['commit', '-q', '-m', name]);
+        gitOk(f.author, ['push', '-q', 'origin', 'HEAD:refs/heads/main']);
+      };
+      mainCommit('main1.txt');
+      const { p1, last } = await lastBuiltOnP1(f); // built on main1
+      mainCommit('main2.txt');
+      gitOk(f.author, ['checkout', '-q', '-B', 'lane/ff-p', p1]);
+      gitOk(f.author, ['merge', '-q', '--no-edit', 'origin/main']); // "Update branch": an ordinary push
+      write(f.author, TAKEOVER, lines({ 2: 'p1', 6: 'p2' }));
+      gitOk(f.author, ['commit', '-q', '-am', 'p2']);
+      gitOk(f.author, ['push', '-q', '-f', 'origin', 'HEAD:refs/heads/lane/ff-p']);
+      f.fetch();
+      pCameBackLoudly(await planPU(f, last, async () => []));
+    });
+
     it('unknown evidence: a top amended since the last build but still on the base\'s old head keeps the base aside', async () => {
       const { f, pOld } = await ffMove({ adoptOld: false });
       const last = await f.build([{ ref: 'lane/ff-c', pr: 9702 }], f.init);

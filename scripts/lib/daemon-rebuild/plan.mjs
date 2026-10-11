@@ -273,22 +273,28 @@ export async function planOverlayStacks({
         // set aside if it merged a clashing top but not P, else live. Never a fresh eviction.
         // P's tip already in HEAD (merged directly, or through a top that contained it) means P is live: never set aside.
         // A carrier here is a clashing top the last build merged that still holds what that build held of P (ancestry
-        // only): the proven old heads of P in HEAD, and the part of P's own line HEAD holds (merge-base of P and HEAD,
-        // when it is neither in main nor held by an overlay outside P's stack — a base P itself sits on). A top that
+        // only): the proven old heads of P in HEAD, and the part of P's own line HEAD holds (the merge bases of HEAD with
+        // P and with each proven old head, when neither in main nor held by an overlay outside P's stack — a base P
+        // itself sits on). A top that
         // holds none of it (a sibling retargeted onto P, or a top rewritten off P) never keeps P aside; an amended top
-        // still on that head does. Only when the last build held nothing provable of P does the name decide.
+        // still on that head does. Only when the last build held nothing provable of P does the name decide (residue: a
+        // pushed-away head this clone never fetched has no ancestry to read, so it proves nothing here).
         const last = mergedBy(headSha);
         const pLive = !!headSha && git(['merge-base', '--is-ancestor', p.sha, headSha]).status === 0;
-        const anchors = [];
+        const anchors = new Set();
         if (headSha && !pLive) {
-          anchors.push(...heads.filter((s) => anc(s, headSha)));
-          const mb = String(git(['merge-base', p.sha, headSha]).stdout ?? '').trim();
           const stack = descendants(p.ref);
           const heldOutside = (s) => nodes.some((n) => n !== p && !stack.has(n.ref) && (n.sha === s || anc(s, n.sha)));
-          if (OID.test(mb) && git(['merge-base', '--is-ancestor', mb, mainSha]).status !== 0 && !heldOutside(mb)) anchors.push(mb);
+          const ownOf = (s) => OID.test(s) && git(['merge-base', '--is-ancestor', s, mainSha]).status !== 0 && !heldOutside(s);
+          // Every merge base (`--all`: a line that merged main has several) of HEAD with P's tip and with each proven old
+          // head HEAD does not hold itself (an ordinary push came between the head a top was built on and the force-push).
+          for (const h of heads) if (anc(h, headSha)) anchors.add(h);
+          for (const s of [p.sha, ...heads.filter((h) => !anchors.has(h))]) {
+            for (const mb of outLines(git(['merge-base', '--all', s, headSha]))) if (ownOf(mb.trim())) anchors.add(mb.trim());
+          }
         }
         const lastMerged = (t) => last.some((m) => sameOverlay(m, t));
-        carriers = clashing.filter((t) => lastMerged(t) && (anchors.length === 0 || anchors.some((a) => a === t.sha || anc(a, t.sha))));
+        carriers = clashing.filter((t) => lastMerged(t) && (anchors.size === 0 || [...anchors].some((a) => a === t.sha || anc(a, t.sha))));
         const keptAside = !pLive && !last.some((m) => sameOverlay(m, p)) && carriers.length > 0;
         if (evidence == null) unknown.push({ ref: p.ref, pr: p.pr, kept: keptAside ? 'set-aside' : 'live', tops: clashing.map((t) => t.ref) });
         else if (!keptAside) for (const t of clashing) unconfirmed.push({ ref: t.ref, base: p.ref });
