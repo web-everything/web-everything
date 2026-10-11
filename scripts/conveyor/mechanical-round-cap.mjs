@@ -127,7 +127,11 @@ const REVIEW_PR_HEADINGS = [BOUNCE_PREFIX, '✅ review — accepted'];
 const REVIEW_PR_ATTRIBUTION = new RegExp(`^Recorded by \\S.* via ${escapeRe(REVIEW_PR_CHANNEL)}\\.$`);
 // The write-up's own last line, then (an accept only) buildVerdictComment's `<!-- … -->` marker block.
 export const REVIEW_PR_FOOTER = `_Recorded through ${REVIEW_PR_CHANNEL}._`;
-const MARKER_COMMENT_LINE = /^<!--.*-->$/;
+// One whole line shaped `<!-- … -->`. Tested by prefix/suffix, not a comment-matching regexp (CodeQL js/bad-tag-filter):
+// this is a line classifier on text already split at `\n`, never an HTML sanitizer. A line terminator inside the line
+// (`\r`, U+2028, U+2029) still disqualifies it, exactly as `.` did.
+const LINE_TERMINATOR = new RegExp("[\\r\\u2028\\u2029]");
+const isMarkerCommentLine = (line) => line.length >= 7 && line.startsWith('<!--') && line.endsWith('-->') && !LINE_TERMINATOR.test(line);
 
 /**
  * The one line index where this comment's producer writes its `Net basis` line, or -1. The producer is read from the
@@ -145,7 +149,7 @@ function basisSlot(lines, lastRule) {
   }
   if (!(REVIEW_PR_HEADINGS.includes(lead.trimEnd()) && lines[at + 1] === '' && REVIEW_PR_ATTRIBUTION.test(lines[at + 2] ?? ''))) return -1;
   let end = lines.length - 1;
-  while (end > at && (lines[end].trim() === '' || MARKER_COMMENT_LINE.test(lines[end]))) end -= 1;
+  while (end > at && (lines[end].trim() === '' || isMarkerCommentLine(lines[end]))) end -= 1;
   return lines[end] === REVIEW_PR_FOOTER && lines[end - 1] === '' && end - 2 > lastRule && lastRule > at ? end - 2 : -1;
 }
 
