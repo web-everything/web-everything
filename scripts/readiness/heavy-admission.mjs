@@ -247,9 +247,12 @@ export function privateAdmissionPool(env, checkoutRoot) {
   const named = canonicalPath(defaultPoolRoot(ADMISSION_MODULE_ROOT, env));
   // Every host pool this process could mean: the caller's checkout, this module's checkout (a pinned snapshot
   // outside the workspace has none of its own), the real user's `~/workspace/.lanes`, and the cwd's workspace.
-  const hostPools = [checkoutRoot, ADMISSION_MODULE_ROOT, join(realHomeDir(), 'workspace'), process.cwd()]
+  const hostPools = [checkoutRoot, ADMISSION_MODULE_ROOT, process.cwd()]
     .filter((root) => typeof root === 'string' && root !== '')
     .map((root) => canonicalPath(join(workspaceFor(root), '.lanes')));
+  // The real user's pool is already a pool path: running it through workspaceFor would treat `~/workspace` as a
+  // checkout and resolve to `~/.lanes` — wrong on any host whose checkouts do not live under a `.lanes` path.
+  hostPools.push(canonicalPath(join(realHomeDir(), 'workspace', '.lanes')));
   return !hostPools.includes(named);
 }
 
