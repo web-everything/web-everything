@@ -1,4 +1,5 @@
 ---
+bornAs: xz73kbf
 kind: story
 size: 1
 status: open
