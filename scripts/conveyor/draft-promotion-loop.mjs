@@ -69,7 +69,8 @@ export function defaultReadPrView({ repoSlug, prNumber, runGh = runGhSync, readC
   if (view.comments.length >= LIST_COMMENTS_PAGE_SIZE) {
     const complete = readComments(prNumber, { repo: repoSlug });
     if (!Array.isArray(complete)) throw new Error('complete comments read returned no array');
-    return { ...view, comments: complete };
+    // Proven complete by this read, whatever its length: the planner trusts the mark (`takeover-budget.mjs#threadMayBeTruncated`).
+    return { ...view, comments: complete, commentsComplete: true };
   }
   return view;
 }

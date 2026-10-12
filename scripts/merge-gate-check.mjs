@@ -46,11 +46,13 @@ import { GATE_IDS } from './lib/merge-gate-inventory.mjs';
 import { REVIEW_AUTHORITIES } from './lib/pr-merge-gate.mjs';
 import { rulesetSuggestion, readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
 import { writeAllSync } from './lib/write-all-sync.mjs';
+import { readSharedFreeze, flatText } from './lib/red-main-freeze-shared.mjs';
+import { MAIN_CI_RED_DEFAULTS, isTrustedPrAuthor, mainRedState } from './conveyor/main-ci-red-core.mjs';
 
 const firstLine = (e) => String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
 const ghJson = (args, exec) => JSON.parse(exec('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 }) || 'null');
 
-const PR_FIELDS = 'number,title,body,labels,commits,headRefName,headRefOid,baseRefName,statusCheckRollup,isCrossRepository';
+const PR_FIELDS = 'number,title,body,labels,commits,headRefName,headRefOid,baseRefName,statusCheckRollup,isCrossRepository,author';
 const BODY_HISTORY_QUERY = 'query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){userContentEdits(first:100){totalCount nodes{editedAt diff}}}}}';
 const SHA_RE = /^[0-9a-f]{40}$/;
 
@@ -153,7 +155,7 @@ export function readLedgerConfig(read = readDeclaredSettings) {
 }
 
 /** Gather every fact `evaluatePrGates` needs for one PR. Never throws; each failure is recorded on its fact. */
-export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
+export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds = null, ledgerConfig = null, redMain = null, mainCi = null, expectedHeadSha = null, requireExpectedHead = false, exec = execFileSync }) {
   const facts = { repo, num };
   // Ledger authority: gathered FIRST, so even a PR-read failure below carries the configured authority. A caller
   // that supplies no `ledgerConfig` gets an error (fail closed), never a silent `labels`. The ledger evidence
@@ -232,8 +234,9 @@ export function gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds
   else if (groupDuplicateIds && !Array.isArray(groupDuplicateIds)) facts.duplicateIds = { error: `group tree scan: ${groupDuplicateIds.error || 'unreadable'}` };
   else facts.duplicateIds = { main: mainDup, ...(groupDuplicateIds ? { group: groupDuplicateIds } : {}) };
 
-  // Red-main freeze: no shared source exists yet (the marker is local to the drain host) → evaluator fails closed.
-  facts.redMain = { source: null };
+  // Red-main: main's OWN CI status (the source of truth) combined with the shared MANUAL freeze (xyd06qo), both read
+  // once per run by the caller. Either missing or unreadable → `{source:null}` / `{error}` → the evaluator fails closed.
+  facts.redMain = redMain ? combineRedMain(redMain, mainCi, pr) : { source: null };
   // Enqueue clearance (drain-stamped) is not wired yet → manifest couples/blockedBy fail closed in the evaluator.
   facts.enqueueClearance = null;
   return facts;
@@ -303,6 +306,105 @@ export function groupHeadsOf(commits = []) {
 }
 
 /**
+ * The shared red-main freeze for this run (xyd06qo): read ONCE, from the run's checkout, off the branch the policy
+ * cascade names — the same knob the writer (`red-main-remediation.mjs`) publishes to. Never throws (unreadable is
+ * `{source, error}`, which the evaluator fails closed on).
+ */
+export function readRedMainFact({ cwd, policy, read = readSharedFreeze }) {
+  return read({ board: cwd, branch: policy.redMainFreezeBranch });
+}
+
+/** Single log line even for injected/untrusted source, reason or read errors. */
+export function formatRedMainFreeze(redMain) {
+  return `red-main freeze (${flatText(redMain.source)}): ${redMain.error ? `UNREADABLE — ${flatText(redMain.error)}` : redMain.frozen ? `FROZEN — ${flatText(redMain.reason)}` : 'clear'}\n`;
+}
+
+/** How many of main's CI runs to read: enough to find the last green one behind a short red streak. */
+const MAIN_CI_RUNS = 30;
+
+/**
+ * MAIN'S OWN CI STATUS, read straight from GitHub (operator ruling 2026-10-11, PR 4715): main's CI workflow runs on
+ * the default branch, judged by the same pure rule the red-main owner uses (`mainRedState`). A freeze publisher that
+ * keeps failing can then never hide a red main. Unreadable, or no finished run to judge, is `{source, error}`
+ * (fail closed). Bounded (timeout + maxBuffer). Never throws.
+ * @returns {{source:string, red?:boolean, firstRedSha?:string|null, error?:string}}
+ */
+export function readMainCiFact({ repo, defaultBranch = 'main', exec = execFileSync, workflow = MAIN_CI_RED_DEFAULTS.mainCiRedWorkflow }) {
+  const source = `${workflow}@${defaultBranch}`;
+  let runs;
+  try {
+    // `--event push`: only runs OF main's own commits. A fork PR whose head branch is also named `main` makes ci.yml
+    // runs with headBranch `main` (from the fork's own, editable workflow file); counting those would let a green
+    // fork run hide a red main.
+    runs = JSON.parse(exec('gh', ['run', 'list', '--repo', repo, '--workflow', workflow, '--branch', defaultBranch, '--event', 'push', '--limit', String(MAIN_CI_RUNS),
+      '--json', 'databaseId,conclusion,status,createdAt,updatedAt,headSha,event,attempt'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 8 * 1024 * 1024, timeout: 60_000 }) || 'null');
+  } catch (e) { return { source, error: `main CI unreadable: ${firstLine(e)}` }; }
+  if (Array.isArray(runs)) {
+    runs = runs.filter((r) => r?.event == null || r.event === 'push'); // belt and braces if a gh version ignores --event
+    // A RE-RUN puts a finished run back in progress, and an in-progress run is ignored, so the run before it (maybe
+    // green) would speak for a commit whose verdict is being redone. Undecided → hold.
+    const rerun = runs.find((r) => String(r?.status ?? '').toLowerCase() !== 'completed' && Number(r?.attempt) > 1);
+    if (rerun) return { source, error: `main CI run ${rerun.databaseId ?? '?'} is being re-run (attempt ${Number(rerun.attempt)}) — verdict pending` };
+  }
+  const st = mainRedState(runs);
+  if (st.status === 'unknown') return { source, error: `main CI status unknown (${st.reason})` };
+  return { source, red: st.status === 'red', firstRedSha: st.firstRed?.sha || null, redShas: st.status === 'red' ? (st.redShas || []).filter(Boolean) : [] };
+}
+
+/**
+ * The drain's "only the main-fix PR lands" while main is red (`decideRedMainHold`, the `main-fix` queue class): the
+ * red-main owner's branch (`mainCiRedOwnerBranchPrefix` + the red commit's 9-char sha), from this repo, opened by the
+ * conveyor, AND naming a commit of the CURRENT red window (`redShas`) — a stale fix branch from an earlier red does
+ * not pass. Pure.
+ */
+export function isMainFixPr(pr, redShas = []) {
+  const prefix = MAIN_CI_RED_DEFAULTS.mainCiRedOwnerBranchPrefix;
+  const ref = String(pr?.headRefName ?? '');
+  if (!pr || pr.isCrossRepository !== false || !ref.startsWith(prefix) || !isTrustedPrAuthor(pr)) return false;
+  const sha9 = ref.slice(prefix.length).toLowerCase();
+  return /^[0-9a-f]{9}$/.test(sha9) && redShas.some((s) => String(s).toLowerCase().startsWith(sha9));
+}
+
+/**
+ * The red-main fact the evaluator judges: main's CI status is the authority; the shared freeze carries only MANUAL
+ * freezes, which hold every PR. Anything unreadable is `{error}` (fail closed). Pure.
+ */
+export function combineRedMain(freeze, mainCi, pr = null) {
+  const source = [freeze?.source, mainCi?.source].filter(Boolean).map(v => flatText(v)).join(' + ');
+  if (freeze?.error) return { source, error: flatText(freeze.error) };
+  if (!mainCi) return { source, error: 'main CI status not read' };
+  if (mainCi.error) return { source, error: flatText(mainCi.error) };
+  // A MANUAL freeze holds every PR. An automatic one (never published by this writer, but an old or foreign doc may say
+  // so) counts as a red main: it holds every PR except the current main-fix PR, the same as main CI red below.
+  if (freeze?.frozen && freeze.kind !== 'auto') return { source, frozen: true, reason: `manual freeze: ${flatText(freeze.reason || 'active')}`, publishedAt: freeze.publishedAt == null ? null : flatText(freeze.publishedAt) };
+  if (freeze?.frozen && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `automatic red-main freeze: ${flatText(freeze.reason || 'active')}`, publishedAt: freeze.publishedAt == null ? null : flatText(freeze.publishedAt) };
+  const sha = mainCi.firstRedSha ? ` since ${String(mainCi.firstRedSha).slice(0, 9)}` : '';
+  if (mainCi.red && !isMainFixPr(pr, mainCi.redShas)) return { source, frozen: true, reason: `main CI red${sha}`, publishedAt: freeze?.publishedAt == null ? null : flatText(freeze.publishedAt) };
+  return { source: mainCi.red ? `${source} (main CI red${sha}; main-fix PR exempt)` : source, frozen: false, reason: null, publishedAt: freeze?.publishedAt == null ? null : flatText(freeze.publishedAt) };
+}
+
+/**
+ * The red-main sources RE-READ right before the verdict (PR 4715 review): fact-gathering between the first reads and
+ * the verdict is slow, so a freeze published, or main turning red, meanwhile must still hold this run. A PASS survives
+ * only when the second freeze read is readable, not frozen and the same document as the first, and main's CI is
+ * readable and not red (unless every PR judged is the main-fix PR: `exempt`). Anything else holds (fail closed). Pure.
+ */
+export function applyFreezeRecheck(verdict, first, recheck, { mainCi = undefined, mainCiRecheck = undefined, exempt = false } = {}) {
+  if (!verdict.ok) return verdict;
+  let why = !recheck || recheck.error ? `red-main freeze unreadable at verdict time: ${flatText(recheck?.error || 'not read')}`
+    // Same rule as combineRedMain: an automatic freeze spares a run made only of current main-fix PRs; a manual one never.
+    : recheck.frozen && (recheck.kind !== 'auto' || !exempt) ? `main went RED during this run (freeze: ${flatText(recheck.reason || 'active')})`
+      : (first?.frozen !== recheck.frozen || (first?.publishedAt ?? null) !== (recheck.publishedAt ?? null)) ? 'red-main freeze changed during this run'
+        : null;
+  if (!why && mainCi !== undefined) {
+    why = !mainCiRecheck || mainCiRecheck.error ? `main CI unreadable at verdict time: ${mainCiRecheck?.error || 'not read'}`
+      : mainCiRecheck.red && !exempt ? `main CI went RED during this run${mainCiRecheck.firstRedSha ? ` (since ${String(mainCiRecheck.firstRedSha).slice(0, 9)})` : ''}`
+        : null;
+  }
+  return why ? { ...verdict, ok: false, reason: `${why} — fail closed; ${verdict.reason}` } : verdict;
+}
+
+/**
  * The event the verdict is for, read off the invocation and the runner's own event (never off the configured
  * strategy): `--merge-group`, or Actions' `GITHUB_EVENT_NAME=merge_group` even when the flags say `--pr`, is a
  * queue merge. `'pull_request'` needs POSITIVE proof — the runner reporting exactly `pull_request` — because it is
@@ -352,15 +454,29 @@ async function main() {
   }
 
   const blockOnCodeQL = loadDrainGateSettings().drainBlocksOnCodeQL;
+  // One read of the shared red-main freeze for the whole run (xyd06qo); branch name from the same policy cascade.
+  const redMain = readRedMainFact({ cwd, policy });
+  process.stderr.write(formatRedMainFreeze(redMain));
+  // Main's OWN CI status — the authority for "is main red" (operator ruling 2026-10-11); the freeze above is manual only.
+  const mainCi = readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' });
+  process.stderr.write(`main CI (${mainCi.source}): ${mainCi.error ? `UNREADABLE — ${mainCi.error}` : mainCi.red ? `RED since ${String(mainCi.firstRedSha || '?').slice(0, 9)}` : 'green'}\n`);
   const ledgerConfig = readLedgerConfig();
   const expectHead = typeof f['expect-head'] === 'string' && f['expect-head'] ? f['expect-head'] : null;
   if (expectHead && nums.length !== 1) { process.stderr.write('merge-gate-check: --expect-head pins exactly one --pr\n'); process.exit(3); }
   const pinOf = (num) => (f['merge-group'] ? { expectedHeadSha: membership?.heads?.[num] ?? null, requireExpectedHead: true } : { expectedHeadSha: expectHead });
-  const prs = nums.map((num) => evaluatePrGates(gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, ...pinOf(num) }), { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
+  const factsOf = nums.map((num) => gatherPrFacts({ repo, num, cwd, defaultBranch, groupDuplicateIds: groupDup, ledgerConfig, redMain, mainCi, ...pinOf(num) }));
+  const prs = factsOf.map((facts) => evaluatePrGates(facts, { policy, blockOnCodeQL, mergeEvent: mergeEventOfFlags(f) }));
   const wfCheck = verifyRunningWorkflow({ cwd, defaultBranch: defaultBranch || 'main' });
   process.stderr.write(`merge-gate: workflow self-check — ${wfCheck.ok ? 'ok' : 'FAIL'}: ${wfCheck.reason}\n`);
   const base = f['merge-group'] ? evaluateGroup(prs, membership) : { ok: prs.every((p) => p.ok), reason: prs.every((p) => p.ok) ? 'all pass' : 'held', prs };
-  const verdict = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
+  const preRecheck = wfCheck.ok ? base : { ...base, ok: false, reason: `workflow self-check failed — fail closed: ${wfCheck.reason}; ${base.reason}` };
+  // Re-read both red-main sources last: the facts above can take minutes, and a freeze published (or main turning
+  // red) meanwhile must still hold. Only a run made entirely of main-fix PRs may pass a red main.
+  const mainCiRecheck = preRecheck.ok ? readMainCiFact({ repo, defaultBranch: defaultBranch || 'main' }) : null;
+  const verdict = preRecheck.ok
+    ? applyFreezeRecheck(preRecheck, redMain, readRedMainFact({ cwd, policy }), {
+      mainCi, mainCiRecheck, exempt: factsOf.length > 0 && factsOf.every((x) => isMainFixPr(x.pr, mainCiRecheck?.redShas || [])) })
+    : preRecheck;
   if (f.json) writeAllSync(1, `${JSON.stringify({ ok: verdict.ok, reason: verdict.reason, workflowCheck: wfCheck, policy, prs }, null, 2)}\n`);
   else {
     for (const p of prs) writeAllSync(1, `${formatPrResult(p)}\n`);

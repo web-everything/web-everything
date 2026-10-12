@@ -33,6 +33,10 @@
  *                             parent, so every PR would fail closed and nothing would ever merge. 'squash' /
  *                             'rebase' are refused (ignored → the standard 'merge') until non-merge-commit
  *                             pinning exists; a test ties every accepted method to a pinnable group head.
+ *     - `redMainFreezeBranch` the shared `ops/*` git branch the red-main freeze is PUBLISHED to (card xyd06qo):
+ *                             `we:scripts/readiness/red-main-remediation.mjs` freeze/unfreeze writes it next to the
+ *                             local marker, and the `merge-gate` check reads it (CI cannot see the drain host's
+ *                             marker). Must be `ops/<slug>`. Default `ops/red-main-freeze`.
  *     - `gatePlacement`       { <gate id>: 'merge-gate' | 'drain' | 'both' } — where a merge-time gate runs.
  *                             A placement may only drop the NON-merging side: under drain-direct the drain must
  *                             keep every gate (it is the merger), under github-merge-queue the merge-gate check
@@ -54,6 +58,7 @@ export const STANDARD_MERGE_DELIVERY = Object.freeze({
   batchSize: 1,
   maxGroupWaitMinutes: 5,
   mergeMethod: 'merge',
+  redMainFreezeBranch: 'ops/red-main-freeze',
   gatePlacement: Object.freeze({}),
 });
 
@@ -67,6 +72,8 @@ const VALIDATORS = Object.freeze({
   batchSize: intIn(1, 100),
   maxGroupWaitMinutes: intIn(0, 360),
   mergeMethod: (v) => MERGE_METHODS.includes(v),
+  // Only an `ops/` transport branch: the writer pushes here, so it must never be able to name `main` or a lane.
+  redMainFreezeBranch: (v) => typeof v === 'string' && /^ops\/[a-z0-9][a-z0-9-]{0,63}$/.test(v),
 });
 
 /** Does `placement` keep the gate on the side that merges under `strategy`? */
@@ -83,7 +90,7 @@ export function placementKeepsMerger(placement, strategy) {
  */
 export function resolveMergeDeliveryPolicy({ platform, tool, knownGates = null } = {}) {
   const out = { ...STANDARD_MERGE_DELIVERY, gatePlacement: {} };
-  const sources = { strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard' };
+  const sources = { strategy: 'standard', batchSize: 'standard', maxGroupWaitMinutes: 'standard', mergeMethod: 'standard', redMainFreezeBranch: 'standard' };
   const invalid = [];
   const layers = [['platform', platform], ['tool', tool]];
   for (const [name, layer] of layers) {
@@ -121,7 +128,7 @@ export function placementOf(policy, gateId) {
 
 /** One log line naming every effective value and the layer that set it. */
 export function formatMergeDeliverySourcesLine(policy) {
-  const keys = ['strategy', 'batchSize', 'maxGroupWaitMinutes', 'mergeMethod'];
+  const keys = ['strategy', 'batchSize', 'maxGroupWaitMinutes', 'mergeMethod', 'redMainFreezeBranch'];
   const parts = keys.map((k) => `${k}=${policy[k]} (${policy.sources?.[k] ?? 'standard'})`);
   for (const [g, p] of Object.entries(policy.gatePlacement || {})) parts.push(`gatePlacement.${g}=${p} (${policy.sources?.[`gatePlacement.${g}`]})`);
   const bad = policy.invalid?.length ? ` · ignored invalid: ${policy.invalid.join('; ')}` : '';

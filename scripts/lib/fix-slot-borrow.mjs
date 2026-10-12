@@ -26,6 +26,100 @@ import { BUILD_DISPATCH_POLICY } from '../conveyor/build-dispatch-policy.mjs';
 import { gateLaunch } from './resource-gate.mjs';
 import { isBorrowedRunnerDead, isPidAlive, resolveFixBorrowSettings } from './dispatch-throttle.mjs';
 
+import { readSettings } from './settings-files.mjs';
+import { readLockEntry, heartbeat } from '../readiness/file-locks.mjs';
+// Keep fix-run's static graph independent of the dispatch wrappers: use the light claim store.
+import { fixDispatchClaimRoot, fixDispatchResource } from '../conveyor/fix-claim-store.mjs';
+
+const platformPreferences = () => {
+  try { return JSON.parse(readFileSync(new URL('./delivery-platform-preferences.json', import.meta.url), 'utf8')); }
+  catch { return {}; }
+};
+
+/** fix.executor: standard → shared platform preferences → declared repo settings → environment. */
+export function resolveFixExecutorSetting({ env = process.env, platform = platformPreferences(), repo = readSettings() } = {}) {
+  let result = { value: 'codex-first', source: 'default' };
+  for (const [source, raw] of [['platform', platform?.fix?.executor], ['repo', repo?.fix?.executor], ['env', env?.WE_FIX_EXECUTOR]]) {
+    if (['codex-first', 'claude', 'provider-routing'].includes(raw)) result = { value: raw, source };
+  }
+  return result;
+}
+
+/**
+ * Pure; why this repair must run on Claude whatever `fix.executor` says, or null. The ONE list both the router
+ * ({@link chooseFixExecutor}) and the fixer-cap borrow guard read, so a borrowed slot never bypasses these per-entry rules.
+ */
+export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false } = {}) {
+  if (takeover) return 'takeover round';
+  // A ruling-not-addressed send-back runs on its own ladder rung (`launchTableFor`); only `claude --bg` applies that table.
+  if (rulingNotAddressed) return 'ruling-not-addressed send-back';
+  if (mainFix) return 'main-fix';
+  if (strongerModel || round >= 3) return 'stronger-model rung';
+  return null;
+}
+
+/** Pure; provider-routing leaves existing provider/borrow selection in control. */
+export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, launcherAvailable = false, ...entry } = {}) {
+  const source = setting.source ?? 'default';
+  const claude = (reason) => ({ executor: 'claude', reason, source });
+  if (setting.value === 'claude') return claude('fix.executor=claude');
+  if (setting.value === 'provider-routing') return claude('existing provider routing');
+  const only = claudeOnlyReason(entry);
+  if (only) return claude(only);
+  if (!launcherAvailable) return claude('codex launcher unavailable, fallback');
+  return { executor: 'codex', reason: 'codex-first ordinary repair', source };
+}
+
+export const formatFixExecutorLog = ({ executor, reason, source }) => `fix executor: ${executor} (${reason}, source ${source})`;
+
+/** Stamp routing separately from `borrowed`: builder accounting must never count this as a borrowed slot. */
+export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fixDispatchClaimRoot(), decision }) {
+  const resource = fixDispatchResource({ repo, pr, kind });
+  const claim = readLockEntry(lockRoot, resource);
+  if (!claim || claim.owner !== owner) return false;
+  return heartbeat(lockRoot, resource, owner, new Date().toISOString(), claim.pid ?? null,
+    { ...claim.meta, fixExecutor: { executor: decision.executor, reason: decision.reason } });
+}
+
+/**
+ * Adapt the CI-heal dispatch seam, retaining its claim, filled brief and dispatch sink bookkeeping.
+ * ONLY a Codex decision replaces the sink's provider and heal router. EVERY Claude outcome (fix.executor=claude,
+ * provider-routing, takeover, main-fix, stronger-model, launcher unavailable) leaves both in place, so it launches
+ * exactly as before this routing existed: `routeDispatchProvider` (model/effort table, registry providers, probation
+ * worker, injected `spawnAgent`) and `routeAvailableCiHeal` (including the native-Claude quota-hold refusal).
+ */
+export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launchCodex, writePrompt, removePrompt,
+  profileFor, stampExecutor = stampFixExecutor }) {
+  return async (planned, options = {}) => {
+    const decision = route({ ...planned, kind: 'ci-heal' });
+    const codex = decision.executor === 'codex';
+    const sinks = createSinks({ ...options, ...(codex ? { provider: (request) => {
+      console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
+      const profile = profileFor(options.repo ?? planned.repo ?? 'we');
+      stampExecutor({ repo: options.repo ?? planned.repo ?? 'we', pr: planned.pr, kind: 'ci-heal',
+        owner: request.claimOwner, lockRoot: request.claimRoot, decision });
+      const promptFile = writePrompt(request.sessionSlug, request.prompt);
+      try {
+        const handle = launchCodex({ ...request, cwd: options.root, promptFile, ref: planned.laneRef,
+          repo: profile.slug, laneRepo: profile.lanePoolRepo, claimRepo: options.repo ?? planned.repo ?? 'we',
+          scope: planned.scope.join(','), policyRoute: { provider: 'codex' } });
+        request.reportWrapped?.(Number(String(handle).replace(/^pid:/, '')));
+        return handle;
+      } catch (error) { removePrompt(promptFile); throw error; }
+    } } : {}) });
+    if (!codex) {
+      // Observe the existing provider's actual choice without changing that choice.
+      const entries = Object.entries(sinks);
+      for (const [key, sink] of entries) sinks[key] = async (...args) => {
+        const out = await sink(...args);
+        if (!out?.held) console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog({ ...decision, executor: out?.dispatch?.executor ?? 'claude' })}`);
+        return out;
+      };
+    }
+    return dispatch(planned, { ...options, sinks, ...(codex ? { routeHeal: () => null } : {}) });
+  };
+}
+
 export const BORROW_REASON = 'borrowed-build-slot';
 /** A PR not deferred on the cap for this long starts its wait over. */
 export const BORROW_WAIT_GAP_MS = 20 * 60_000;
@@ -49,6 +143,11 @@ export function fileOutcomeStore(path = defaultBorrowOutcomePath()) {
 
 /** Record one borrowed launch's end. `pushed` clears the PR's history; anything else is appended (last 10 kept). */
 export function recordBorrowOutcome({ repo, pr, outcome, reason = '', now = Date.now(), store = fileOutcomeStore() }) {
+  // fix-run also serves ordinary routed repairs; those must not mutate borrow outcomes.
+  for (const kind of ['fix', 'ci-heal']) {
+    const claim = readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo, pr, kind }));
+    if (claim?.meta?.fixExecutor && !claim.meta.borrowed) return;
+  }
   const t = store.read() ?? {};
   const k = `${repo ?? 'we'}#${pr}`;
   if (outcome === 'pushed') delete t[k];

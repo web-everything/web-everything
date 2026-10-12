@@ -201,7 +201,7 @@ export function runSafetyNet({
   const ledger = readJson(ledgerPath) ?? { version: 1, reds: {}, shadowList: { version: 1, entries: [] } };
   ledger.reds ??= {};
   const isLive = mode.value === 'quarantine' && live === true;
-  const state = mainRedState(mainCiRuns?.runs);
+  const state = mainRedState(mainCiRuns?.runs, { tip: mainCiRuns?.tip });
   const out = { mode: mode.value, modeSource: mode.source, shadow: !isLive, settingsSources: settings.sources ?? {}, applied: false };
   let sha = null;
   let activeKey = null;

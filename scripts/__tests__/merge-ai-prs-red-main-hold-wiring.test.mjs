@@ -48,6 +48,10 @@ process.exit(0);
 `;
 const fakeGit = `#!/usr/bin/env node
 const a = process.argv.slice(2);
+if (process.env.RMH_SHARED_FREEZE) {
+  if (a[0] === 'ls-tree' && a.includes('red-main-freeze.json')) { process.stdout.write('red-main-freeze.json'); process.exit(0); }
+  if (a[0] === 'show' && a[1]?.endsWith(':red-main-freeze.json')) { process.stdout.write(process.env.RMH_SHARED_FREEZE); process.exit(0); }
+}
 // RMH_STRANDED: a checkout attached to main whose origin/main log delivers open card 7001, so the drain's stranded-card
 // sweep resolves it and pushes the flip to main. Every git call is logged, so a test can see any write to main.
 const S = process.env.RMH_STRANDED;
@@ -71,7 +75,7 @@ const OTHER = 3002; // an unrelated PR that is otherwise fully mergeable
  * @param {{ freeze?: 'env'|'legacy'|'both'|null, priorityPrs?: number[]|null, publishedRed?: boolean, holdSetting?: 'on'|'off'|null,
  *           fixMergeable?: string, unfreezeFirst?: boolean, dryRun?: boolean, stranded?: boolean, lateFreeze?: boolean }} o
  */
-function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false } = {}) {
+function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdSetting = null, fixMergeable = 'MERGEABLE', unfreezeFirst = false, dryRun = false, stranded = false, lateFreeze = false, shared = null, markerKind = null, manualFix = 'hold' } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'drain-rmh-'));
   try {
     const bin = join(dir, 'bin');
@@ -88,7 +92,7 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     }))));
     const coord = join(dir, 'coord');
     mkdirSync(coord, { recursive: true });
-    const marker = { frozen: true, at: new Date(NOW).toISOString(), reason: 'fixture red', redRef: 'main', mergeSha: 'abc1234567', revertAuthority: true };
+    const marker = { ...(markerKind ? { kind: markerKind } : {}), frozen: true, at: new Date(NOW).toISOString(), reason: 'fixture red', redRef: 'main', mergeSha: 'abc1234567', revertAuthority: true };
     const newMarker = join(coord, 'red-main-freeze.json');
     const legacyMarker = join(dir, 'legacy', 'red-main-freeze.json');
     const envMarker = join(dir, 'explicit-freeze.json');
@@ -106,7 +110,8 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     writeFileSync(mqSettings, JSON.stringify({ mergeQueue: { enabled: false }, mergeFreshness: { enabled: false } }));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.RMH_HOME; syncBuiltinESMExports();");
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RMH_FIXTURE: fixture, RMH_HOME: dir, WE_COORDINATION_ROOT: coord,
-      ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings };
+      ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings,
+      WE_RED_MAIN_FREEZE_SHARED: 'off' }; // VITEST is cleared below, so the unfreeze CLI must not push the live shared ops branch (xyd06qo)
     if (freeze === 'sibling') delete env.WE_RED_MAIN_FREEZE_LEGACY;
     const gitLog = join(dir, 'git-calls.log');
     if (stranded) { // an open card whose delivery is already on main: the stranded-card sweep's job is to resolve + push it
@@ -122,6 +127,10 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     // Pin the hold + mode: with VITEST cleared the live scripts/settings/red-main-hold.json would otherwise be read.
     env.WE_DRAIN_RED_MAIN_HOLD = holdSetting || 'on';
     env.WE_DRAIN_RED_MAIN_MODE = 'stop';
+    env.WE_DRAIN_RED_MAIN_MANUAL_FREEZE_FIX_PR = manualFix;
+    env.WE_DRAIN_RED_MAIN_FREEZE_READER = shared === null ? 'local-only' : 'shared-first';
+    delete env.RMH_SHARED_FREEZE;
+    if (shared !== null) env.RMH_SHARED_FREEZE = shared;
     if (unfreezeFirst) { // the operator lifts the freeze through the real remediation CLI BEFORE the drain pass
       const u = spawnSync(process.execPath, ['--import', preload, remediation, 'unfreeze'], { cwd: dir, encoding: 'utf8', timeout: 30000, env });
       expect(u.status, u.stderr).toBe(0);
@@ -150,11 +159,11 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(status).toBe(0);
   }, 30000);
 
-  it('manual freeze + published fix PR (hold ON by default): only the fix PR reaches gh pr merge; the other is a red-main-hold skip', () => {
+  it('manual freeze + published fix PR (hold ON by default): every PR is held, including the fix PR', () => {
     const { attempts, stderr, status } = runCli({ freeze: 'env', priorityPrs: [FIX] });
-    expect(attempts).toEqual([FIX]);
+    expect(attempts).toEqual([]);
     expect(status).not.toBe(5); // the old whole-line stop is NOT what contains it
-    expect(stderr).toMatch(/skipped 1: #3002 red-main-hold/);
+    expect(stderr).toMatch(/red-main-hold/);
   }, 30000);
 
   it('a published red alone (no manual freeze) also holds the unrelated PR while the fix PR lands', () => {
@@ -257,9 +266,9 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [], autoResolvable: [{ id: '7001' }] });
   }, 30000);
 
-  it('manual freeze + published fix PR: only the fix PR lands; the stranded-card sweep still does not push', () => {
+  it('manual freeze + published fix PR: nothing lands or pushes', () => {
     const { mainPushes, attempts, stderr, result } = runCli({ freeze: 'env', priorityPrs: [FIX], stranded: true });
-    expect(attempts).toEqual([FIX]);
+    expect(attempts).toEqual([]);
     expect(mainPushes, stderr).toEqual([]);
     expect(result.strandedSweep).toMatchObject({ skipped: 'red-main-hold', applied: [] });
   }, 30000);
@@ -279,9 +288,9 @@ describe('card xx7ckd6 — red-main hold wired at the drain merge site (no --no-
     expect(mainPushes).toEqual([]);
   }, 30000);
 
-  it('control: setting ON + a freeze raised mid-pass is held the same way (only the fix PR lands)', () => {
+  it('control: setting ON + a freeze raised mid-pass is held the same way (nothing lands)', () => {
     const { attempts, mainPushes } = runCli({ lateFreeze: true, priorityPrs: [FIX], stranded: true });
-    expect(attempts).toEqual([FIX]);
+    expect(attempts).toEqual([]);
     expect(mainPushes).toEqual([]);
   }, 30000);
 
@@ -333,4 +342,41 @@ describe('runStrandedSweepStep — held while main is red (redMainHeld)', () => 
     expect(calls.lock).toBe(1);
     expect(calls.push).toBe(1);
   });
+});
+
+
+describe('x09e2bn shared reader wiring', () => {
+  it.each(['on', 'off'])('shared freeze alone holds the fix PR with hold %s', holdSetting => {
+    const r = runCli({ shared: JSON.stringify({ frozen: true, reason: 'shared operator stop' }), priorityPrs: [FIX], holdSetting });
+    expect(r.attempts, r.stderr).toEqual([]);
+    expect(r.stderr).toContain('redMainFreezeReader setting shared-first via env');
+    if (holdSetting === 'off') expect(r.status).toBe(5);
+    else expect(r.result.skipped[0].reason).toContain('shared operator stop');
+  }, 30000);
+  it('unreadable shared JSON holds with an error', () => {
+    const r = runCli({ shared: '{bad json', priorityPrs: [FIX] });
+    expect(r.attempts, r.stderr).toEqual([]);
+    expect(r.result.skipped[0].reason).toContain('shared freeze unreadable');
+  }, 30000);
+  it('local automatic freeze exempts the published fix PR', () => {
+    const r = runCli({ freeze: 'env', markerKind: 'auto', priorityPrs: [FIX] });
+    expect(r.attempts, r.stderr).toEqual([FIX]);
+  }, 30000);
+});
+
+describe('A5 manual fix setting wiring and OFF guidance', () => {
+  it('exempt restores only the published fix landing', () => {
+    const r = runCli({ freeze: 'env', shared: JSON.stringify({ frozen: true }), manualFix: 'exempt', priorityPrs: [FIX], stranded: true });
+    expect(r.attempts, r.stderr).toEqual([FIX]);
+    expect(r.mainPushes).toEqual([]);
+    expect(r.stderr).toContain('redMainManualFreezeFixPr setting exempt via env');
+  }, 30000);
+  it.each([['env', JSON.stringify({ frozen: true, mergeSha: 'sharedsha' }), 'abc1234567'], [null, JSON.stringify({ frozen: true, mergeSha: 'sharedsha' }), 'sharedsha']])('OFF guidance uses local then shared SHA (%s)', (freeze, shared, sha) => {
+    const r = runCli({ freeze, shared, holdSetting: 'off' });
+    expect(r.result.detail).toContain(`Revert-to-green (revert ${sha}), then \`node scripts/readiness/red-main-remediation.mjs unfreeze\` (#2681)`);
+  }, 30000);
+  it('OFF unreadable guidance identifies checks', () => {
+    const r = runCli({ shared: '{bad', holdSetting: 'off' });
+    expect(r.result.detail).toMatch(/Check.*ops.*read access.*JSON/);
+  }, 30000);
 });

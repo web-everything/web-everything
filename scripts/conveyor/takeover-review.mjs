@@ -17,7 +17,7 @@
  * PURE: reads only the PR's own comment thread and head sha.
  */
 // Takeover budget — each takeover is an EPISODE (its signals with no verdict between them); the grant is per episode.
-import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
+import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, threadMayBeTruncated, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
 import { isReviewVerdictComment as isVerdict, verdictJudged } from './mechanical-round-cap.mjs';
@@ -26,6 +26,7 @@ export { OPERATOR_TAKEOVER_PREFIX };
 
 import { RULING_NOT_ADDRESSED_MARKER } from '../lib/ruling-ledger.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { isPausedReview } from './takeover-budget.mjs';
 
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };
@@ -47,6 +48,9 @@ export function escalationDispatches(comments) {
   ].filter((d) => Number.isFinite(d.at)).sort((a, b) => a.at - b.at);
 }
 
+/** How many paused reviews (referrals awaiting a ruling) one escalation head may take before its grant is spent. */
+export const PAUSED_REVIEW_LIMIT = 2;
+
 /**
  * PURE: may this PR's CURRENT head get a review although the round cap is spent?
  * `{ ok: true, anchor, allowance, used, via }` or `{ ok: false, reason }`. ANY fix the system itself dispatched past
@@ -54,7 +58,8 @@ export function escalationDispatches(comments) {
  * `takeoverReviewAttempts` review(s) for the head it pushes. The anchor is the LATEST such dispatch, moved to the
  * first fixer push after it (a verdict on the OLD head that lands between the dispatch and the push spends nothing).
  * How many dispatches run at all stays bounded by the takeover budget/progress guard and the ladder's own human rung.
- * Reasons: `off` (setting 0), `no-takeover` (no escalation dispatch), `head-already-reviewed` (a verdict names this
+ * Reasons: `off` (setting 0), `thread-truncated` (the comment list may be cut at the list cap:
+ * `takeover-budget.mjs#threadMayBeTruncated`), `no-takeover` (no escalation dispatch), `head-already-reviewed` (a verdict names this
  * head), `takeover-review-spent` (verdicts after the anchor already used the allowance).
  * @param {{pr:{headRefOid?:string, comments?:Array<object>}, takeoverReviewAttempts?:number}} o
  */
@@ -62,6 +67,8 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const allowance = Number.isInteger(takeoverReviewAttempts) && takeoverReviewAttempts > 0 ? takeoverReviewAttempts : 0;
   if (!allowance) return { ok: false, reason: 'off' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  // A cut thread hides the verdicts after comment 100: a head already judged would read as owed its review.
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
   const dispatches = escalationDispatches(comments);
   if (!dispatches.length) return { ok: false, reason: 'no-takeover' };
   const latest = dispatches.at(-1);
@@ -71,10 +78,15 @@ export function takeoverReviewGrant({ pr, takeoverReviewAttempts = 0 } = {}) {
   const anchor = rule.anchor;
   const head = String(pr?.headRefOid ?? '').trim().toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(head)) return { ok: false, reason: 'no-head' };
-  const verdicts = comments.filter(isVerdict);
+  // A review that only PAUSED on referrals awaiting a ruling neither reviews the head nor spends the grant: the
+  // ruling wakes it and the woken review is the one owed (live #4708, 483aab1e2 refused 6/5). Bounded: a head whose
+  // review paused PAUSED_REVIEW_LIMIT times has spent its grant.
+  const verdicts = comments.filter((c) => isVerdict(c) && !isPausedReview(c));
   if (verdicts.some((c) => bodyOf(c).toLowerCase().includes(head) || verdictJudged(c, head))) return { ok: false, reason: 'head-already-reviewed' };
   const used = verdicts.filter((c) => rule.judges(timeOf(c), verdictHeads(c))).length;
   if (used >= allowance) return { ok: false, reason: 'takeover-review-spent', used, allowance };
+  const paused = comments.filter((c) => isPausedReview(c) && timeOf(c) > anchor).length;
+  if (paused >= PAUSED_REVIEW_LIMIT) return { ok: false, reason: 'takeover-review-spent', used, paused, allowance };
   return {
     ok: true, anchor: new Date(anchor).toISOString(), allowance, used, via: latest.via,
     takeover: takeoverEpisodes(comments).length,
