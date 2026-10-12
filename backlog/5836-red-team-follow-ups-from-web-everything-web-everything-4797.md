@@ -44,3 +44,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 - Also raised by web-everything/web-everything#4797 (finding 1: `we:scripts/conveyor/reconcile-core.mjs:1474` — edge-case, degraded A takeover posted in the ruling's timestamp second does not spend its allowance.)
 - Also raised by web-everything/web-everything#4797 (finding 1: `we:scripts/conveyor/reconcile-core.mjs:1478` — edge-case, degraded A takeover posted in the same second as its ruling does not spend the grant.)
+- Also raised by web-everything/web-everything#4797 (finding 1: `we:scripts/conveyor/reconcile-core.mjs:1481` — edge-case, degraded A takeover posted in the ruling's timestamp second does not spend its allowance.)

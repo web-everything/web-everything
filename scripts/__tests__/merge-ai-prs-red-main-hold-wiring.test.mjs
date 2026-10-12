@@ -107,7 +107,9 @@ function runCli({ freeze = null, priorityPrs = null, publishedRed = false, holdS
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.RMH_HOME; syncBuiltinESMExports();");
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RMH_FIXTURE: fixture, RMH_HOME: dir, WE_COORDINATION_ROOT: coord,
       ...(freeze === 'sibling' ? {} : { WE_RED_MAIN_FREEZE_LEGACY: legacyMarker }), WE_MERGE_QUEUE_SETTINGS_FILE: mqSettings,
-      WE_MERGE_DELIVERY_SETTINGS_FILE: mqSettings }; // VITEST is cleared below, so pin the merge-delivery tool layer to a file with no `mergeDelivery` (drain-direct), not the live one
+      // VITEST is cleared below, so pin the merge-delivery tool layer to a file with no `mergeDelivery` (drain-direct), not the live one.
+      WE_MERGE_DELIVERY_SETTINGS_FILE: mqSettings,
+      WE_RED_MAIN_FREEZE_SHARED: 'off' }; // VITEST is cleared below, so the unfreeze CLI must not push the live shared ops branch (xyd06qo)
     if (freeze === 'sibling') delete env.WE_RED_MAIN_FREEZE_LEGACY;
     const gitLog = join(dir, 'git-calls.log');
     if (stranded) { // an open card whose delivery is already on main: the stranded-card sweep's job is to resolve + push it
