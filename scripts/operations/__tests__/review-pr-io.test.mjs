@@ -2557,7 +2557,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       postComment: (repo, pr, body) => { trace.push(body.includes('mandatory-referrals-v1') ? 'referral' : 'advisory'); state.comments.push({ body, author: { login: 'web-everything' } }); },
       setLabels: (repo, pr, plan) => { trace.push(plan.add); state.labels = [...state.labels.filter((l) => !plan.remove.includes(l)), plan.add]; } };
     const referralJudge = vi.fn(async (request) => ({ sessionId: request.sessionId, value: { rulings: [] } }));
-    const sinks = createReviewPrSinks({ root, labelProvider: provider, postComment: provider.postComment, referralJudge, mirrorReferral: () => {}, cardReadable: () => true, out: () => {} });
+    const lines = [];
+    const sinks = createReviewPrSinks({ root, labelProvider: provider, postComment: provider.postComment, referralJudge, mirrorReferral: () => {}, cardReadable: () => true, out: (l) => lines.push(l) });
     const spawns = [];
     async function runOnce(id, verifierAnswer, seatFinding = original) {
       const declaration = reviewPrOperation({ codexAdvisory: false, correctnessAdvisory: false, antigravityReview: true,
@@ -2584,7 +2585,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       return run;
     }
     const records = () => readReferralRecords(state.comments, { head: state.headRefOid }).records;
-    return { state, trace, referralJudge, spawns, runOnce, records };
+    return { state, trace, lines, referralJudge, spawns, runOnce, records };
   }
 
   it('NOT REPRODUCED: one verifier turn, one record that holds nothing, one advisory — and a second run on the same head asks nothing and posts no new record or advisory', async () => {
@@ -2659,6 +2660,21 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     await w.runOnce('run-2', NOT_REPRODUCED);
     expect(w.spawns).toHaveLength(2);
     expect(w.records()).toHaveLength(1);
+  });
+
+  it('A NOT-REPRODUCED CLAIM TOO LARGE TO RECORD is skipped and verified again — it never parks the PR for a human', async () => {
+    const w = world();
+    const huge = { ...original, summary: `${'x'.repeat(70_000)} confirmed defect` };
+    const first = await w.runOnce('run-1', NOT_REPRODUCED, huge);
+    expect(w.lines.some((l) => /verification not recorded: finding key sha256:[0-9a-f]+ exceeds 60000 characters/.test(l))).toBe(true);
+    expect(w.lines.some((l) => l.startsWith('referral-overflow'))).toBe(false);
+    expect(w.records()).toEqual([]);
+    expect(w.trace).not.toContain('referral');
+    expect(w.state.labels).not.toContain('review:human');
+    expect(first.verdict.pendingReferrals).toEqual([]);
+    expect(first.pending).toMatchObject({ kind: 'confirm', of: 'agent' });
+    await w.runOnce('run-2', NOT_REPRODUCED, huge);
+    expect(w.spawns).toHaveLength(2);
   });
 
   it('a hostile verifier reason (newlines, backticks, a forged marker) is stored folded and cannot forge a record or an outcome line', async () => {

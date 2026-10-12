@@ -2405,6 +2405,13 @@ export function reviewPrOperation({
   // same list, so the two cannot disagree. A build with only tool-bearing (or no) advisory seats is byte-identical to before.
   const verifiedSeats = seats.filter((seat) => ADVISORY_SEAT_STEPS.includes(seat.step));
   const verifierDeclared = verifiedSeats.some(seatNeedsToolVerification);
+  // THE ONE DERIVATION of which claims the verifier is asked about and which are already settled on this head. The verifier step's
+  // request and the reduce step both call it with the run's findings, so their claim indexes cannot drift apart.
+  const verifierClaimsFor = (findings) => {
+    const known = knownVerifications(findings.read.referralVerified, findings.read.netBasis?.rev);
+    return { known, candidates: verificationCandidates({
+      seats: verifiedSeats.map((seat) => ({ step: seat.step, tools: seat.tools, findings: findings[seat.step]?.findings })), known }) };
+  };
 
   const declaration = op(REVIEW_PR_OP, {
     input: {
@@ -2723,10 +2730,7 @@ export function reviewPrOperation({
         reads: ['findings.read', ...verifiedSeats.map((seat) => `findings.${seat.step}`)],
         request: (view) => buildReviewReferralVerifierJudgeRequest({
           read: view.findings.read,
-          candidates: verificationCandidates({
-            seats: verifiedSeats.map((seat) => ({ step: seat.step, tools: seat.tools, findings: view.findings[seat.step]?.findings })),
-            known: knownVerifications(view.findings.read.referralVerified, view.findings.read.netBasis?.rev),
-          }),
+          candidates: verifierClaimsFor(view.findings).candidates,
         }),
       }),
     } : {}),
@@ -2831,11 +2835,9 @@ export function reviewPrOperation({
 
         // #4815 — THE CONFIRMATION TURN'S RESULT, read the same way the verifier step's request derived its claims. A tool-less seat's
         // qualifying claim stays CONFIRMED (and is referred) only when it was reproduced; every other one becomes an advisory note
-        // BEFORE the referral filter below ever sees it. Same inputs as the request fn, so the two cannot disagree on which claims exist.
-        const knownVerified = knownVerifications(read.referralVerified, read.netBasis?.rev);
-        const verifierClaims = verifierDeclared
-          ? verificationCandidates({ seats: seats.map((s) => ({ step: s.step, tools: s.tools, findings: s.answer?.findings })).filter((s) => ADVISORY_SEAT_STEPS.includes(s.step)), known: knownVerified })
-          : [];
+        // BEFORE the referral filter below ever sees it. `verifierClaimsFor` is the very derivation the verifier step's request used.
+        const { known: knownVerified, candidates: verifierClaims } = verifierDeclared
+          ? verifierClaimsFor(view.findings) : { known: knownVerifications(read.referralVerified, read.netBasis?.rev), candidates: [] };
         const settledClaims = settleVerification(verifierClaims, verifierDeclared ? view.findings[REFERRAL_VERIFIER_STEP] : null);
         const unverifiedClaims = [];
 
