@@ -672,14 +672,18 @@ describe('runFixCli', () => {
       expect(realFs.readdirSync(gitDir)).toEqual([]); // the copy is removed either way
     } finally { rmSync(outside, { recursive: true, force: true }); rmSync(gitDir, { recursive: true, force: true }); }
   });
-  it(`refuses to stage more than STAGE_MAX_BYTES in total before git sees any of it`, async () => {
+  // Capped as each file is read, not after all are: sparse files cost the agent no disk but each read costs a buffer, so
+  // reading stops at the file that crosses the cap and the files after it are never read.
+  it(`refuses to stage more than STAGE_MAX_BYTES in total before git sees any of it, reading no file past the cap`, async () => {
     const m = mk(['aaa', 'bbb']);
     m.spawn.mockResolvedValue({ finalMessage: 'big' });
-    const files = Array.from({ length: STAGE_MAX_BYTES / BLOB_MAX_BYTES + 1 }, (_, i) => `f${i}.bin`);
+    const files = Array.from({ length: STAGE_MAX_BYTES / BLOB_MAX_BYTES + 3 }, (_, i) => `f${i}.bin`);
     const run = (cmd, args, opts) => (args.includes('status') ? files.map(f => `?? ${f}\0`).join('') : m.run(cmd, args, opts));
     const big = () => Object.defineProperty(Buffer.from('x'), 'length', { value: BLOB_MAX_BYTES }); // no 64 MiB allocations
     const recordOutcome = vi.fn();
-    expect((await runFixCli(argv, { ...m.io, run, recordOutcome, stageEntry: () => ({ mode: '100644', data: big() }) })).code).toBe(1);
+    const stageEntry = vi.fn(() => ({ mode: '100644', data: big() }));
+    expect((await runFixCli(argv, { ...m.io, run, recordOutcome, stageEntry })).code).toBe(1);
+    expect(stageEntry).toHaveBeenCalledTimes(STAGE_MAX_BYTES / BLOB_MAX_BYTES + 1);
     expect(m.calls.some(c => staged(c) || c.includes('commit') || c.includes('push'))).toBe(false);
     expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: `refusing to stage over ${STAGE_MAX_BYTES} bytes of agent-written files: big` }));
   });

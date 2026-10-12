@@ -524,7 +524,7 @@ export async function runFixCli(argv = [], {
     // and `git add` runs with that copy as its work tree, so git's own conversions (eol, keeping CRLF a file already has in
     // the index, working-tree-encoding, core.fileMode) apply as they would to the lane file; .gitattributes comes from the
     // copy or, where unchanged, the index. Every path is read and checked before git runs, so a refusal leaves nothing in
-    // the object store. One file is held in memory at a time and the total is capped. The commit takes the index only.
+    // the object store. The total read is capped as each file is read. The commit takes the index only.
     // (A file the sandbox cannot read could also be RENAMED into the lane with one link, but a rename needs write access to
     // its source directory, and the sandbox's deny-read paths — codex-delivery-provider.mjs#defaultDeliveryDenyPaths —
     // lie outside its writable roots, so that is a hardlink-only problem here.)
@@ -540,13 +540,15 @@ export async function runFixCli(argv = [], {
           const e = dest.startsWith(copy + sep) ? stageEntry(lanePath, path) : null;
           if (!e) refused.push(path);
           else if (e.missing) removed.push(path);
+          // Capped as each file is read, never after: sparse files (`truncate -s 64M f{1..1000}`) cost the agent no disk but
+          // would each cost us a zero-filled buffer, so at most STAGE_MAX_BYTES plus the one file just read is ever held.
+          else if ((total += e.data.length) > STAGE_MAX_BYTES) throw new LauncherError(`refusing to stage over ${STAGE_MAX_BYTES} bytes of agent-written files`);
           else (e.mode === '120000' ? links : files).push([path, dest, e]);
         }
         if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular, out-of-lane or over-${BLOB_MAX_BYTES}-byte file`);
         // Regular files first, symlinks last, and every parent checked by realpath: a copy written through a symlink it
         // created itself (`X -> /elsewhere` then `x/y`, one entry on a case-insensitive filesystem) would write outside it.
         for (const [path, dest, e] of [...files, ...links]) {
-          if ((total += e.data.length) > STAGE_MAX_BYTES) throw new LauncherError(`refusing to stage over ${STAGE_MAX_BYTES} bytes of agent-written files`);
           mkdirSync(dirname(dest), { recursive: true });
           const parent = realpathSync(dirname(dest));
           if (parent !== copy && !parent.startsWith(copy + sep)) throw new LauncherError(`refusing to stage ${path}: its staging copy leaves the copy directory`);
