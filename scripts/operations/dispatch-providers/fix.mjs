@@ -116,6 +116,7 @@ export function fixDetachedProvider(request, {
   // Card 87 follow-up — a BORROWED fix hands its already-filled brief and lane facts to the launcher (see `fix-run.mjs`).
   if (request.promptFile) argv.push(`--prompt-file=${request.promptFile}`);
   if (request.ref) argv.push(`--ref=${request.ref}`);
+  if (request.mergeOnto) argv.push(`--merge-onto=${request.mergeOnto}`);
   if (request.repo) argv.push(`--repo=${request.repo}`);
   if (request.laneRepo) argv.push(`--lane-repo=${request.laneRepo}`);
   if (request.claimRepo) argv.push(`--claim-repo=${request.claimRepo}`);
