@@ -65,12 +65,28 @@ export function preparedReportRoute(evidence = {}) {
 const LANE_BUSY_EXHAUSTED = 'needs-you: prepare lane-busy - every lane stayed leased for the whole retry window; clear it with a reviewed prepare release once a lane is free';
 /** The hold reason of an infra-transient card whose whole retry budget was spent: surfaced, never silently held. */
 const INFRA_EXHAUSTED = `needs-you: prepare infra-transient - the ${INFRA_RETRY_BUDGET} retries for temporary infrastructure failures were spent; clear it with a reviewed prepare release once the infrastructure is healthy`;
-const unstampedReason = evidence => redactSpawnText(String(evidence?.error ?? evidence?.reason ?? 'missing terminal evidence'))
-  .split(/\r?\n/)[0].replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
-  // Like needsYouReason: worker prose must not activate the hold router's other routes.
-  .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue')
-  .replace(/already done on main/gi, 'done elsewhere').replace(/^\s*worker-declined/i, 'declined')
-  .trim().slice(0, 200);
+const unstampedReason = evidence => {
+  for (const candidate of [evidence?.error, evidence?.reason, 'missing terminal evidence']) {
+    const text = redactSpawnText(String(candidate ?? ''));
+    const brace = text.indexOf('{');
+    let reason = text.split(/\r?\n/)[0];
+    if (brace !== -1) {
+      const prefix = text.slice(0, brace).trim().replace(/:$/, '').trim();
+      // Dumps can be truncated: extract the first value of each field without parsing JSON.
+      const summary = ['stopped', 'outcome', 'reason', 'detail'].flatMap(field => {
+        const match = text.match(new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`));
+        return match ? [`${field}=${field === 'detail' ? match[1].slice(0, 120) : match[1]}`] : [];
+      });
+      reason = summary.length ? `${prefix} (${summary.join('; ')})` : prefix;
+    }
+    reason = reason.replace(/[\p{Cc}`<>]+/gu, ' ').replace(/\s+/g, ' ')
+      // Like needsYouReason: worker prose must not activate the hold router's other routes.
+      .replace(/spec\s+(?:not buildable|superseded)/gi, 'spec issue')
+      .replace(/already done on main/gi, 'done elsewhere').replace(/^\s*worker-declined/i, 'declined')
+      .trim().slice(0, 200);
+    if (reason && reason !== '{') return reason;
+  }
+};
 /** One unfinished re-dispatch per card, shared by new failures and legacy-ledger recovery. */
 function decideUnstampedRetry(state, failure, now) {
   const first = Object.values(state.failures).find(f =>

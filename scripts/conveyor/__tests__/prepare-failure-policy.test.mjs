@@ -44,6 +44,24 @@ describe('prepare failure evidence and durable decisions', () => {
     expect(second.holdReason).toBe('needs-you: prepare ended unstamped twice - open-pr refused: pr-limit / missing result');
     expect(fileCard).toHaveBeenCalledTimes(2);
   });
+  it.each([
+    ['pr-limit refusal', { error: `open-pr reported no PR number: ${JSON.stringify({
+      runId: 'prepare-5754', stopped: 'effect-halted', verdict: {}, findings: { submit: {
+        result: { outcome: 'refused', reason: 'pr-limit', detail: 'open-PR backpressure limit reached …' },
+      } },
+    }, null, 2)}` }, 'open-pr reported no PR number (stopped=effect-halted; outcome=refused; reason=pr-limit; detail=open-PR backpressure limit reached …)'],
+    ['truncated dump', { error: 'open-pr reported no PR number: {\n  "stopped": "effect-halted",\n  "findings": {' },
+      'open-pr reported no PR number (stopped=effect-halted)'],
+    ['bare brace', { error: '{', reason: 'prepare-unstamped' }, 'prepare-unstamped'],
+    ['bare brace without reason', { error: '{' }, 'missing terminal evidence'],
+    ['no summary fields', { error: 'open-pr reported no PR number: {\n "runId": "prepare-5754"' }, 'open-pr reported no PR number'],
+  ])('summarizes %s in the retry and operator hold', async (_, evidence, expected) => {
+    const opts = { path, fileCard, preparePolicy: { retryUnstampedOnce: true } };
+    const first = await recordPrepareFailure({ num: '5754', attempt: 'a', stage: 'result', evidence }, opts);
+    expect(first.unstampedReason).toBe(expected);
+    const second = await recordPrepareFailure({ num: '5754', attempt: 'b', stage: 'result', evidence }, opts);
+    expect(second.holdReason).toBe(`needs-you: prepare ended unstamped twice - ${expected.slice(0, 120)} / ${expected.slice(0, 120)}`);
+  });
   it('redacts and bounds both reasons and defuses hold-router phrases', async () => {
     const opts = { path, fileCard, preparePolicy: { retryUnstampedOnce: true } };
     const token = 'ghp_' + 'A'.repeat(36);
