@@ -294,6 +294,11 @@ export function hasLeftoverMarkers(text, sizes, allowance = new Map()) {
  * `fs` is a test seam.
  */
 export function readLaneFileSafe(path, lanePath, fs = nodeFs) {
+  return readLaneBytesSafe(path, lanePath, fs)?.data.toString('utf8') ?? null;
+}
+
+/** {@link readLaneFileSafe}, returning the raw bytes and the opened file's mode: `{ data: Buffer, mode }` or null. */
+export function readLaneBytesSafe(path, lanePath, fs = nodeFs) {
   let fd;
   try {
     const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
@@ -312,31 +317,36 @@ export function readLaneFileSafe(path, lanePath, fs = nodeFs) {
     const buf = Buffer.alloc(st.size + 1);
     let n = 0;
     for (let r; n < buf.length && (r = fs.readSync(fd, buf, n, buf.length - n, null)) > 0;) n += r;
-    return n > st.size ? null : buf.toString('utf8', 0, n);
+    return n > st.size ? null : { data: buf.subarray(0, n), mode: st.mode };
   } catch { return null; } finally {
     if (fd !== undefined) try { fs.closeSync(fd); } catch { /* already closed */ }
   }
 }
 
 /**
- * What `git add` (run OUTSIDE the agent's sandbox, with full read access) would read for one changed lane path: `'missing'`
- * (a deletion, nothing read), a `file:`/`link:` identity string (inode, link count, size, times), or null when the launcher
- * must not stage it — a hardlinked regular file (it can alias a credential the sandbox could link but not read), a directory
- * (`git add dir` reads every file under it) or other non-regular file, or a path whose parent resolves outside the lane.
- * A symlink is fine: git stores its link text, never the target's content. Comparing the strings taken before `git add`
- * and after the commit catches a file a process the agent left running swapped in meanwhile. `fs` is a test seam.
+ * What the launcher stages for one changed lane path, read by the LAUNCHER (never by git: `git add` and `commit -- paths`
+ * run outside the agent's sandbox with full read access, and re-open the path after any check): `{ missing: true }` for a
+ * deletion (nothing read), `{ mode, data }` with the bytes to hash, or null when the path must not be staged. A regular file
+ * is read through {@link readLaneBytesSafe}'s one checked descriptor, so a hardlink (it can alias a credential the sandbox
+ * could link but not read), a path whose parent resolves outside the lane, a file over BLOB_MAX_BYTES, or one swapped in
+ * mid-read (the file or a parent directory) is refused. A directory (`git add dir` reads every file under it) or other
+ * non-regular file is refused too. A symlink is staged as its own link text, as git does — never its target's content.
+ * `fs` is a test seam.
  */
 export function laneStageEntry(lanePath, path, fs = nodeFs) {
   const full = join(lanePath, path);
   let st;
-  try { st = fs.lstatSync(full, { bigint: true }); } catch (e) { return e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? 'missing' : null; }
-  if (st.isFile() ? st.nlink > 1n : !st.isSymbolicLink()) return null;
-  try {
-    const root = fs.realpathSync(lanePath);
-    const parent = fs.realpathSync(dirname(full));
-    if (parent !== root && !parent.startsWith(root + sep)) return null;
-  } catch { return null; }
-  return [st.isFile() ? 'file' : 'link', st.dev, st.ino, st.nlink, st.size, st.mtimeNs, st.ctimeNs].join(':');
+  try { st = fs.lstatSync(full); } catch (e) { return e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? { missing: true } : null; }
+  if (st.isSymbolicLink()) {
+    try {
+      const root = fs.realpathSync(lanePath);
+      const parent = fs.realpathSync(dirname(full));
+      if (parent !== root && !parent.startsWith(root + sep)) return null;
+      return { mode: '120000', data: fs.readlinkSync(full, { encoding: 'buffer' }) };
+    } catch { return null; }
+  }
+  const read = readLaneBytesSafe(full, lanePath, fs);
+  return read && { mode: read.mode & 0o111 ? '100755' : '100644', data: read.data };
 }
 
 /**
@@ -506,17 +516,27 @@ export async function runFixCli(argv = [], {
     }
     const provider = await resolveProvider(launch.provider);
     const git = (...args) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv });
-    // `git add` and the commit read lane files with OUR access, not the sandbox's: snapshot every path before staging
-    // (refusing what laneStageEntry refuses), and return the check, run after the commit and before any push, that none
-    // of them changed in between.
-    const guardStaging = (paths) => {
-      const taken = paths.map(path => stageEntry(lanePath, path));
-      const refused = paths.filter((_, i) => taken[i] == null);
-      if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular or out-of-lane file`);
-      return () => {
-        const changed = paths.filter((path, i) => stageEntry(lanePath, path) !== taken[i]);
-        if (changed.length) throw new LauncherError(`lane files changed while being staged: ${changed.slice(0, 5).join(', ')}; refusing to push`);
-      };
+    // Never `git add`: it runs with OUR read access, not the sandbox's, and re-opens each path after any check. Instead
+    // hash the bytes laneStageEntry read through one checked descriptor (`--path` applies .gitattributes conversions as
+    // `git add` would) and write the index entries directly. Every path is read BEFORE anything is hashed, so a refusal
+    // leaves nothing in the object store either. The commit then takes the index, never the worktree.
+    const stageLaneFiles = (paths) => {
+      const entries = paths.map(path => [path, stageEntry(lanePath, path)]);
+      const refused = entries.filter(([, e]) => !e).map(([path]) => path);
+      if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular, out-of-lane or over-${BLOB_MAX_BYTES}-byte file`);
+      const removed = (path) => `0 ${'0'.repeat(before.length)}\t${path}\0`; // mode 0 drops every stage of the path
+      const info = entries.map(([path, e]) => {
+        if (e.missing) return removed(path);
+        const oid = run('git', [...HARDENED_GIT_ARGS, 'hash-object', '-w', '--stdin', e.mode === '120000' ? '--no-filters' : `--path=${path}`],
+          { cwd: lanePath, env: gitEnv, input: e.data }).trim();
+        return `${removed(path)}${e.mode} ${oid}\t${path}\0`;
+      }).join('');
+      if (!info) return;
+      run('git', [...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info'], { cwd: lanePath, env: gitEnv, input: info });
+      // Entries written this way carry no stat data, so `merge --abort` would call every one "not uptodate" and refuse.
+      // A refresh only compares the worktree against the index (it writes no object, so a file swapped in now is hashed
+      // in memory at most, never stored or committed).
+      git('update-index', '-q', '--refresh', '--unmerged', '--ignore-missing');
     };
     const trailer = (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
     const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
@@ -623,9 +643,8 @@ export async function runFixCli(argv = [], {
       };
       if (unresolved.length) refuse(unresolved);
       const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])];
-      const stagedUnchanged = guardStaging(stage);
-      if (stage.length) git('add', '--', ...stage);
-      // Scan what will be COMMITTED too: `git add` applies .gitattributes (which the agent can write), so a file saved
+      stageLaneFiles(stage);
+      // Scan what will be COMMITTED too: staging applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
       const unresolvedStaged = unmerged.filter(path => {
         const entries = indexEntries(path);
@@ -635,15 +654,13 @@ export async function runFixCli(argv = [], {
       });
       if (unresolvedStaged.length) refuse(unresolvedStaged);
       commitMerge();
-      stagedUnchanged();
     } else if (paths.length) {
       const supplied = join(lanePath, '.fix-commit-msg.txt');
       const own = fileExists(supplied) ? readFile(supplied, lanePath) : null; // null for a symlink: ignore it
       const message = own?.trim() ? own.slice(0, 4000) : `fix(PR #${pr}): ${finalMessage.split('\n')[0] || 'apply review finding'}`;
-      const stagedUnchanged = guardStaging(paths);
-      git('add', '--', ...paths);
-      withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file, '--', ...paths));
-      stagedUnchanged();
+      stageLaneFiles(paths);
+      // No pathspec: `commit -- <paths>` would re-read those paths from the worktree, undoing what was staged above.
+      withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file));
     }
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     let result;
