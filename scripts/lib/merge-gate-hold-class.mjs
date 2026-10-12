@@ -21,6 +21,25 @@ const blocking = r => r.status === 'hold' || r.status === 'fail-closed';
 const manualFreeze = r => r.id === 'red-main-freeze' && r.status === 'hold'
   && /^main is RED \(freeze: manual freeze: .+\)$/.test(r.reason ?? '');
 
+/** Shared candidacy classification; workflow-edit protection is applied separately by PR-event policy. */
+export function isCandidacyHold(result) {
+  return result?.status === 'hold' && (candidacy.has(result.id)
+    || (result.id === 'ledger' && typeof result.reason === 'string' && result.reason.startsWith('labels:')));
+}
+
+/** Defer review work only on the proven PR leg; the drain and merge_group still enforce candidacy. */
+export function deferCandidacyHoldsOnPrEvent(prResult, { mergeEvent, setting } = {}) {
+  if (mergeEvent !== 'pull_request' || (typeof setting === 'string' ? setting : setting?.value) !== 'on') return prResult;
+  const results = prResult.results.map(result => {
+    if (!isCandidacyHold(result)
+      || (result.id === 'review-acceptance' && result.reason?.startsWith('human-only:'))) return result;
+    return { ...result, status: 'skipped-by-policy',
+      reason: `candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ${result.reason}` };
+  });
+  const remaining = results.filter(blocking);
+  return { ...prResult, ok: remaining.length === 0, results, blocking: remaining };
+}
+
 /** Read the LAST table for this PR; malformed newer evidence never falls back to an older table. */
 export function parsePrResultTable(log, prNumber) {
   const lines = String(log ?? '').split(/\r?\n/).map(l => l.replace(/^\d{4}-\d\d-\d\dT\S+\s/, ''));
@@ -70,7 +89,7 @@ export function classifyMergeGateHold({ results, prLabels, freeze, verdictComple
   let hasCandidacy = false, hasStaleFreeze = false;
   for (const r of holds) {
     if (r.status === 'fail-closed') { others.push(r); continue; }
-    if (candidacy.has(r.id) || (r.id === 'ledger' && r.reason?.startsWith('labels:'))) { hasCandidacy = true; continue; }
+    if (isCandidacyHold(r)) { hasCandidacy = true; continue; }
     if (manualFreeze(r) && mainCiGreen === true && freeze?.frozen === false && !freeze.error
       && Number.isFinite(Date.parse(verdictCompletedAt)) && Date.parse(freeze.publishedAt) > Date.parse(verdictCompletedAt)) { hasStaleFreeze = true; continue; }
     others.push(r);
@@ -127,10 +146,16 @@ export function readMergeGateVerdict({ repo, jobId, prNumber, runGh = runGhSync,
   } catch (e) { return { error: String(e?.message ?? e) }; }
 }
 
-const key = 'candidacyHoldIsNotCiFailure';
-const envKey = 'MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE';
+const defaultKey = 'candidacyHoldIsNotCiFailure';
+const holdSettings = {
+  candidacyHoldIsNotCiFailure: { envKey: 'MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE', logPrefix: 'merge-gate-hold' },
+  prEventCandidacyHoldsPass: { envKey: 'MERGE_GATE_PR_EVENT_CANDIDACY_HOLDS_PASS', logPrefix: 'merge-gate' },
+};
 /** Settings cascade; an invalid value in ANY layer fails closed, even underneath a valid override. */
-export function resolveMergeGateHoldSetting({ platform = {}, repo = {}, env = {}, readErrors = [] } = {}) {
+export function resolveMergeGateHoldSetting({ key = defaultKey, platform = {}, repo = {}, env = {}, readErrors = [] } = {}) {
+  const config = holdSettings[key];
+  if (!config) return { value: 'off', source: 'unreadable', why: 'unknown mergeGate setting' };
+  const { envKey } = config;
   if (readErrors.length) return { value: 'off', source: 'unreadable', why: readErrors.join('; ') };
   const { ignored, ...result } = resolveHumanGateRemovalSetting({ platform, repo, env, blockName: 'mergeGate', key, envKey });
   return result;
@@ -157,9 +182,9 @@ export function resolveHumanGateRemovalSetting({ platform = {}, repo = {}, env =
   }
   return ignored.length ? { value: 'off', source: ignored[0].source, why: ignored[0].reason, ignored } : { ...result, ignored };
 }
-let loggedSetting = false;
+const loggedSettings = new Set();
 /** Read declared feature settings and platform preferences; log the effective source once per process. */
-export function loadMergeGateHoldSetting({ env = process.env, readFile = readFileSync, readDeclared = readDeclaredSettings, log = line => console.error(line) } = {}) {
+export function loadMergeGateHoldSetting({ key = defaultKey, env = process.env, readFile = readFileSync, readDeclared = readDeclaredSettings, log = line => console.error(line) } = {}) {
   let platform = {}, repo = {};
   const readErrors = [];
   try { platform = JSON.parse(readFile(PLATFORM_PREFERENCES_PATH, 'utf8')); }
@@ -170,8 +195,11 @@ export function loadMergeGateHoldSetting({ env = process.env, readFile = readFil
     if (declared.errors?.length) readErrors.push('repo settings unreadable');
     if (declared.duplicates?.some(d => /^mergeGate(?:\.|$)/.test(d.path))) readErrors.push('duplicate mergeGate settings');
   } catch (e) { readErrors.push(`repo settings unreadable: ${e.message}`); }
-  const result = resolveMergeGateHoldSetting({ platform, repo, env, readErrors });
-  if (!loggedSetting) { loggedSetting = true; log(`merge-gate-hold · mergeGate.${key}=${result.value} (source: ${result.source})`); }
+  const result = resolveMergeGateHoldSetting({ key, platform, repo, env, readErrors });
+  if (!loggedSettings.has(key)) {
+    loggedSettings.add(key);
+    log(`${holdSettings[key]?.logPrefix ?? 'merge-gate'} · mergeGate.${key}=${result.value} (source: ${result.source})`);
+  }
   return result;
 }
 
