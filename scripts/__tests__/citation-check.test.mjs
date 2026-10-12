@@ -448,6 +448,19 @@ describe('findDanglingBacklogGlobCite — gate 6f-ii-d (#4318): the wildcard-glo
     expect(buildBacklogResolvableIds(undefined)).toEqual(new Set());
   });
 
+  it('buildBacklogResolvableIds: an item missing `num` (or a non-object entry) never pollutes the set (#4490)', () => {
+    const ids = buildBacklogResolvableIds([{ num: '1' }, {}, { num: null }, { num: undefined }, { num: '' }, null, 'x']);
+    expect(ids).toEqual(new Set(['1']));
+    expect(ids.has('undefined')).toBe(false);
+    expect(ids.has('null')).toBe(false);
+  });
+
+  it('buildBacklogResolvableIds: a numeric `num` and a bornAs hash still resolve (regression guard, #4490)', () => {
+    expect(buildBacklogResolvableIds([{ num: 5, bornAs: 'xqmw8g9' }])).toEqual(new Set(['5', 'xqmw8g9']));
+    // a num-less item still contributes its valid bornAs
+    expect(buildBacklogResolvableIds([{ bornAs: 'xqmw8g9' }])).toEqual(new Set(['xqmw8g9']));
+  });
+
   it('FIRES on a numeric id that was renumbered away — not just hash ids', () => {
     const hits = findDanglingBacklogGlobCite('see we:backlog/9999-*.md', 'docs/agent/rule.md', { resolvableIds: new Set(['4238']) });
     expect(hits).toEqual([{ id: '9999', path: 'backlog/9999-*.md' }]);
