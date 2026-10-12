@@ -1,0 +1,51 @@
+{
+  "$comment": "Codex per-task launch defaults. Cascade: standard CODEX_MODEL_BY_TASK_DEFAULT \u2192 platform codexModelByTask \u2192 this file \u2192 env WE_CODEX_MODEL_BY_TASK (JSON). Every kind names model AND effort; effort must be one the model catalogue entry lists.",
+  "codex": {
+    "modelByTask": {
+      "prepare": {
+        "model": "gpt-6-astra",
+        "effort": "medium"
+      },
+      "prepare-complex": {
+        "model": "gpt-6-astra",
+        "effort": "high"
+      },
+      "takeover": {
+        "model": "gpt-6-astra",
+        "effort": "high"
+      },
+      "design": {
+        "model": "gpt-6-astra",
+        "effort": "high"
+      },
+      "fix": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "ci-heal": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "build": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "worker": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "trivial": {
+        "model": "gpt-6-luna",
+        "effort": "low"
+      },
+      "review": {
+        "model": "gpt-6.1-sol",
+        "effort": "medium"
+      },
+      "review-mandatory": {
+        "model": "gpt-6-astra",
+        "effort": "high"
+      }
+    }
+  }
+}

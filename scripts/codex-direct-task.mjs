@@ -95,7 +95,7 @@ import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot } from './readiness/heavy-admission.mjs';
 
 import {
-  CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort,
+  CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, resolveCodexTaskRoute, parseRolloutUsageBucket,
 } from './lib/codex-model-routing.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
@@ -141,15 +141,17 @@ export {
  * @param {string} opts.cwd - the directory Codex should treat as its working root (an existing checkout, or a
  *   freshly-made scratch clone). REQUIRED.
  * @param {string} [opts.outputLastMessageFile] - if given, Codex writes its final message there too.
- * @param {string} [opts.model] - #x8wbivt: defaults to the ratified `CODEX_MODEL` pin — a caller must pass an
+ * @param {string} [opts.model] - #x8wbivt: defaults to the task route model — a caller must pass an
  *   explicit different string to override it; there is no way to omit `-m` entirely any more; omitting the
  *   CLI's own implicit-default resolution was the whole point of the ratification.
  * @param {'low'|'medium'|'high'|'xhigh'|'max'|'ultra'} [opts.effort] - a `CODEX_EFFORT_MAP` key, forwarded
  *   UNCHANGED as `-c model_reasoning_effort=<level>` (the map is an identity — nothing is clamped down to
- *   `high` any more; see `CODEX_EFFORT_MAP`). Throws on any other value. #x8wbivt: defaults to the `sonnet`
- *   rung's `medium` (via `CODEX_TIER_EFFORT`) for the same "never implicit" reason as `model` — resolve a
- *   `tier` through `resolveCodexEffort` before calling this if the caller thinks in rungs rather than raw
- *   levels.
+ *   `high` any more; see `CODEX_EFFORT_MAP`). Defaults to the task route; an explicit tier is also accepted.
+ * @param {string} [opts.taskKind] - task vocabulary or alias; worker by default, review in review mode.
+ * @param {number} [opts.size] - preparation size; 8 or greater selects prepare-complex.
+ * @param {boolean} [opts.epic] - selects prepare-complex for prepare tasks.
+ * @param {boolean} [opts.decision] - selects prepare-complex for prepare tasks.
+ * @param {string} [opts.care] - elevated/high upgrades prepare and mandatory review tasks.
  * @param {boolean} [opts.ephemeral] - forwards Codex's own `--ephemeral` (no session persistence). Default
  *   false — see file header for why this script's default differs from the judge role's.
  * @param {string[]} [opts.addDirs] - forwarded as repeated `--add-dir`, for a task that legitimately needs to
@@ -161,8 +163,8 @@ export {
 export function buildCodexDirectTaskArgv({
   cwd,
   outputLastMessageFile,
-  model = CODEX_MODEL,
-  effort = CODEX_TIER_EFFORT.sonnet,
+  model, effort, tier, taskKind, size, epic, decision, care, mandatoryLens,
+  env = process.env, route,
   ephemeral = false,
   addDirs = [],
   writableRoots = [],
@@ -172,6 +174,9 @@ export function buildCodexDirectTaskArgv({
   if (typeof cwd !== 'string' || !cwd.trim()) {
     throw new TypeError('codex-direct-task: `cwd` must be a non-empty path');
   }
+  route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens,
+    model, effort: effort !== undefined || tier !== undefined ? resolveCodexEffort({ tier, effort }) : undefined, env, log: false });
+  ({ model, effort } = route);
   // #4194 — REVIEW MODE runs Codex under its own `read-only` sandbox: a review seat reads the checkout and reports
   // findings; it must never edit anything. Every other caller keeps `workspace-write`, unchanged.
   const argv = ['exec', '--json', '-s', review ? 'read-only' : 'workspace-write', '--skip-git-repo-check', '-C', cwd];
@@ -188,12 +193,8 @@ export function buildCodexDirectTaskArgv({
     }
     argv.push('--add-dir', dir);
   }
-  // #3635 Fork 1 — UNCONDITIONAL. This previously read `if (model !== undefined) { … }`, which was already
-  // DEAD (the `model = CODEX_MODEL` parameter default means `model` is never `undefined` here, so the branch
-  // always ran) — but it read as a guard, and a later edit that dropped the parameter default would have
-  // turned a dead branch into the exact silent-inheritance hole `codex-judge-spawn.mjs` actually shipped.
-  // Validation now goes through the one shared `assertCodexModel`, so all three call sites agree on what a
-  // usable model name is.
+  // #3635 Fork 1 — UNCONDITIONAL: `-m` and effort are always emitted from the task route.
+  // Never rely on the CLI implicit default for either axis.
   argv.push('-m', assertCodexModel(model, 'codex-direct-task'));
   if (effort !== undefined) {
     const mapped = Object.hasOwn(CODEX_EFFORT_MAP, effort) ? CODEX_EFFORT_MAP[effort] : undefined;
@@ -639,7 +640,7 @@ export async function runCodexDirectExec({
   dir,
   task,
   model,
-  effort,
+  effort, taskKind, size, epic, decision, care, mandatoryLens, route, log,
   ephemeral = false,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   logFile,
@@ -658,7 +659,8 @@ export async function runCodexDirectExec({
   // `we:scripts/lane-pool.mjs`'s own `DEPS_MARKER`/`LEASE_MARKER` convention — inside `.git/` is "never
   // tracked or git-cleaned... never seen by `git status --porcelain`" for exactly this reason.
   const outputLastMessageFile = join(gitDir, 'codex-direct-task-last-message.txt');
-  const argv = buildCodexDirectTaskArgv({ cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot });
+  route ??= resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens, model, effort, env, log });
+  const argv = buildCodexDirectTaskArgv({ route, cwd: dir, outputLastMessageFile, model, effort, ephemeral, review, writableRoots, tempRoot });
   const prompt = buildCodexPrompt(task, { review });
   writeFileSync(logFile, ''); // truncate/create — this run owns the file from byte 0.
 
@@ -743,7 +745,7 @@ export async function runCodexDirectExec({
  * @param {string} opts.task
  * @param {string} [opts.dir] - an existing checkout/lane to work in. Omit to get a fresh scratch clone.
  * @param {string} [opts.repoRoot] - where to clone FROM when `dir` is omitted. Required in that case.
- * @param {string} [opts.model] - #x8wbivt: defaults to `CODEX_MODEL` (via `buildCodexDirectTaskArgv`'s own
+ * @param {string} [opts.model] - #x8wbivt: defaults to the task route (via `buildCodexDirectTaskArgv`'s own
  *   default) when omitted — never left to the CLI's own implicit resolution.
  * @param {string} [opts.effort] - explicit effort wins over `tier` — see `resolveCodexEffort`.
  * @param {'haiku'|'sonnet'|'opus'} [opts.tier] - #x8wbivt: the ratified rung vocabulary. Resolved to a real
@@ -775,7 +777,7 @@ export async function codexDirectTask({
   repoRoot,
   model,
   effort,
-  tier,
+  tier, taskKind, size, epic, decision, care, mandatoryLens, log,
   ephemeral = false,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   gate = 'none',
@@ -818,17 +820,16 @@ export async function codexDirectTask({
   const resolvedLogFile = logFile || join(gitDir, 'codex-direct-task.jsonl');
   mkdirSync(dirname(resolvedLogFile), { recursive: true });
 
-  // #x8wbivt: resolve the effort rung ONCE, here — the same explicit value then flows into both the real
-  // argv (`runCodexDirectExec` → `buildCodexDirectTaskArgv`) and, implicitly, the model pin (which
-  // `buildCodexDirectTaskArgv` defaults on its own when `model` is omitted).
-  const resolvedEffort = resolveCodexEffort({ tier, effort });
+  const route = resolveCodexTaskRoute({ kind: taskKind ?? (review ? 'review' : 'worker'), size, epic, decision, care, mandatoryLens,
+    model, effort: effort !== undefined || tier !== undefined ? resolveCodexEffort({ tier, effort }) : undefined, env, log });
+  ({ model, effort } = route);
 
   // A private temp root isolates concurrent fixture repositories. Keep it for manual resume/debugging,
   // just like the persisted Codex session and log; review mode allocates no new writable roots.
   const tempRoot = review ? undefined : mkdtempSync(join(tmpdir(), 'we-codex-task-tmp-'));
   const writableRoots = review ? [] : [gitDir, resolve(admissionLockRoot(resolve(targetDir), env)), tempRoot];
   const run = await runCodexDirectExec({
-    dir: targetDir, task, model, effort: resolvedEffort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
+    dir: targetDir, task, route, model, effort, ephemeral, timeoutMs, logFile: resolvedLogFile, stream, spawnFn, review,
     gitDir, writableRoots, tempRoot, env,
   });
   const events = parseJsonlEvents(run.stdout);
@@ -853,10 +854,17 @@ export async function codexDirectTask({
     quota = lookup.quota;
     quotaRolloutFile = lookup.rolloutFile;
     quotaRolloutCleared = Boolean(lookup.deleted);
+    try {
+      const observed = parseRolloutUsageBucket(quota?.raw
+        ? JSON.stringify({ type: 'event_msg', payload: { type: 'token_count', rate_limits: quota.raw } })
+        : quotaRolloutFile ? readFileSync(quotaRolloutFile, 'utf8') : '');
+      if (observed && log !== false) (log ?? (l => console.error(l)))(`codex-usage · bucket=${observed.limit_id} primary.used_percent=${observed.used_percent}`);
+    } catch { /* rollout/diagnostic lookup is best-effort */ }
+
   }
 
   return {
-    model, effort: resolvedEffort,
+    model, effort, route,
     dir: targetDir,
     scratch: scratch ? {
       created: true,
@@ -911,13 +919,14 @@ async function main() {
     console.log(
       'usage: node scripts/codex-direct-task.mjs --task=<text>|--task-file=<path> [--dir=<checkout>] '
       + '[--repo-root=<path>] [--model=<m>] [--effort=low|medium|high|xhigh|max|ultra] [--tier=haiku|sonnet|opus] '
-      + '[--timeout-ms=<n>] [--gate=none|standards|full] [--ephemeral] [--clear-rollout-after-run] '
+      + '[--task-kind=<kind>] [--size=<n>] [--care=low|normal|elevated|high] [--epic] [--decision] [--timeout-ms=<n>] [--gate=none|standards|full] [--ephemeral] [--clear-rollout-after-run] '
       + '[--no-stream] [--log=<path>] [--no-install] [--wire-origin-to-remote] [--review] [--json]\n'
       + '  --review (#4194): a READ-ONLY review task — Codex runs under `-s read-only` and is told to answer in its '
       + 'final message (the report\'s `lastMessage`) instead of editing files.\n'
-      + '  --model defaults to the ratified CODEX_MODEL pin (#x8wbivt); --effort/--tier default to the '
-      + "sonnet rung's `medium` — neither is ever left to codex's own implicit default. --tier is ignored "
-      + 'when --effort is also given.\n'
+      + '  --task-kind defaults to worker (review with --review). Model AND effort follow codex.modelByTask; '
+      + 'worker/fix/build/review use Sol/medium, trivial Luna/low, prepare Astra/medium, '
+      + 'prepare-complex/takeover/design/review-mandatory Astra/high.\n'
+      + '  --model and --effort override the route; --tier selects effort unless --effort is given.\n'
       + "  --wire-origin-to-remote (#3782): a fresh scratch clone's `origin` stays at the local repoRoot path "
       + 'by default (not push-capable) — the real remote is only printed. Pass this to opt back into rewriting '
       + "origin to the real remote so a human can push straight from the clone. No effect with --dir.",
@@ -943,6 +952,8 @@ async function main() {
       model: flags.model,
       effort: flags.effort,
       tier: flags.tier,
+      taskKind: flags['task-kind'], size: flags.size === undefined ? undefined : Number(flags.size),
+      care: flags.care, epic: Boolean(flags.epic), decision: Boolean(flags.decision),
       ephemeral: Boolean(flags.ephemeral),
       timeoutMs,
       gate: flags.gate || 'none',

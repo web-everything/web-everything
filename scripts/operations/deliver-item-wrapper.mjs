@@ -93,6 +93,7 @@
  *      remains the DEFAULT (see `DEFAULT_DELIVERY_AGENT_PROVIDER_NAME`); Codex is opt-in by name, and the
  *      operator chose to build it ahead of `#3581`'s ratified reviewer-first sequencing gate knowingly.
  */
+import { resolveCodexTaskRoute } from '../lib/codex-model-routing.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { randomUUID } from 'node:crypto';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
@@ -164,7 +165,6 @@ import {
 import {
   buildCodexDeliveryArgv, defaultSpawnCodexAgent, parseCodexThreadId, readCodexThreadId, writeCodexThreadId,
   defaultDeliveryDenyPaths, assertDenyPathsUsable, recordCodexTurnUsage,
-  CODEX_DELIVERY_MODEL, CODEX_DELIVERY_EFFORT,
 } from './codex-delivery-provider.mjs';
 // #3383 mechanical-dispatcher Bug 2 fix — THE missing run-quality recording call: `appendScorecard`
 // (`run-scorecard-store.mjs`) had zero real callers before this; see `run-quality-record.mjs`'s own header.
@@ -1256,7 +1256,7 @@ const CODEX_PROVIDER = {
   // what this spawns without a real `codex` process or a real filesystem.
   async spawn(
     {
-      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model = CODEX_DELIVERY_MODEL, effort = CODEX_DELIVERY_EFFORT,
+      sessionId, prompt, resumeSessionId = null, lane, sessionSlug, item, attemptTag, model, effort, taskKind = 'build', size, epic, decision, care, mandatoryLens,
       // build-path-codex-isolation-locus — see `runAgentToCompletion`'s own docblock for what sets this.
       lanePathOverride = null,
     } = {},
@@ -1274,6 +1274,8 @@ const CODEX_PROVIDER = {
       stageDeliveryReportCli = stageDeliveryReportCliIntoLane,
     } = {},
   ) {
+    const route = resolveCodexTaskRoute({ kind: taskKind, size, epic, decision, care, mandatoryLens, model, effort });
+    ({ model, effort } = route);
     // Identical resolution order to the Claude provider — the SAME single source of truth for the lane path
     // (#3627 bug 7(a)) and the SAME wrapper-process-resolved reports directory (#3627 bug 9). Both bugs are
     // provider-independent: they are about where the CHILD is and where its report lands, not about which CLI
@@ -2524,7 +2526,7 @@ export function buildPrBody({ item, report, delegation = null }) {
 export function delegationForBuild(provider, scope) {
   const vendor = String(provider?.vendor ?? 'claude');
   if (vendor === 'claude') return null;
-  const model = provider?.model ?? (vendor === 'codex' ? CODEX_DELIVERY_MODEL : '');
+  const model = provider?.model ?? (vendor === 'codex' ? resolveCodexTaskRoute({ kind: 'build', log: false }).model : '');
   const scopePaths = String(scope ?? '').split(',').map((s) => s.trim()).filter(Boolean);
   const derived = taskTypeFor({ kind: 'build', scopePaths });
   const taskType = DELEGATION_TASK_TYPES.includes(derived?.taskType) ? derived.taskType : 'other';
