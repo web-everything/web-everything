@@ -603,7 +603,7 @@ verbatim. When it lists tests as `NOT discriminating`, say for each one whether 
 (a revert whose restore failed is the exception: verify reports it red, and the next verify puts the files back).
 
 ```bash
-gh pr comment {{PR_NUM}} --repo {{REPO}} --body-file "$TMPDIR/fix-evidence-{{PR_NUM}}.md"
+gh pr comment {{PR_NUM}} --repo {{REPO}} --body-file <evidence-file>
 ```
 
 Do this before step 7's re-arm, so the evidence is already on the PR the moment a human (or the drain's
