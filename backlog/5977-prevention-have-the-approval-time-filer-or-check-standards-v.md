@@ -1,4 +1,5 @@
 ---
+bornAs: xc19f2v
 kind: story
 size: 3
 parent: "4075"
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/x4txkj2-prevention-have-the-approval-time-prevention-filer-group-ite.md:6` — Have the approval-time filer, or check:standards, verify that each scope path exists on main, or defer filing until the referenced PR has merged.
+1. `we:backlog/5970-prevention-have-the-approval-time-prevention-filer-group-ite.md:6` — Have the approval-time filer, or check:standards, verify that each scope path exists on main, or defer filing until the referenced PR has merged.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5039@83bf1bc3c8c5baa2cc7b5234ab2d82cee8c7b073
 
