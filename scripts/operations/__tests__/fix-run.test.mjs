@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync, truncateSync } from 'node:fs';
+import * as realFs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -220,7 +221,7 @@ describe('runFixCli', () => {
     const recordOutcome = vi.fn();
     const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
       fileExists: p => p.endsWith('MERGE_HEAD') ? merging : unresolved !== 'deleted',
-      readFile: () => unresolved === 'symlink' ? null : unresolved ? `${'<'.repeat(typeof unresolved === 'number' ? unresolved : 7)} HEAD\nleft\n=======\nright\n${'>'.repeat(typeof unresolved === 'number' ? unresolved : 7)} origin/main\n` : '> resolved blockquote\n< comparison\n',
+      readFile: () => unresolved === 'symlink' && m.spawn.mock.calls.length ? null : unresolved && unresolved !== 'symlink' ? `${'<'.repeat(typeof unresolved === 'number' ? unresolved : 7)} HEAD\nleft\n=======\nright\n${'>'.repeat(typeof unresolved === 'number' ? unresolved : 7)} origin/main\n` : '> resolved blockquote\n< comparison\n',
     });
     expect(m.spawn.mock.calls[0][0].prompt).toContain('ALREADY started git merge origin/main');
     expect(out.code).toBe(unresolved ? 1 : 0);
@@ -236,7 +237,7 @@ describe('runFixCli', () => {
   });
   // A mocked conflicted merge for the resource bounds: `paths` UU files, each with three index stages whose blobs claim
   // `blobSize` bytes; `cat-file` enforces the caller's maxBuffer the way execFileSync does (ENOBUFS, 1 MiB default).
-  const boundedConflict = async ({ paths = ['file.txt'], blobSize = 5 } = {}) => {
+  const boundedConflict = async ({ paths = ['file.txt'], blobSize = 5, readFile = () => 'resolved\n' } = {}) => {
     const m = mk(['aaa', 'bbb']);
     let merging = false;
     let added = false;
@@ -263,9 +264,17 @@ describe('runFixCli', () => {
     };
     const recordOutcome = vi.fn();
     const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
-      fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true), readFile: () => 'resolved\n' });
+      fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true), readFile });
     return { out, m, recordOutcome, blobBuffers };
   };
+  it('refuses before the agent runs when a conflicted file cannot be read (over 64 MiB, not regular), instead of scanning nothing', async () => {
+    const { out, m, recordOutcome } = await boundedConflict({ readFile: () => null });
+    expect(out.code).toBe(1);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringContaining('cannot read conflicted file file.txt') }));
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+    expect(m.calls.some(c => c.includes('add') || c.includes('commit') || c.includes('push'))).toBe(false);
+  });
   it.each([[MAX_CONFLICTED_PATHS + 1, true], [MAX_CONFLICTED_PATHS, false]])('rejects more than 100 conflicted paths before reading blobs (paths=%i, refused=%s)', async (n, refused) => {
     expect(MAX_CONFLICTED_PATHS).toBe(100);
     const { out, m, recordOutcome } = await boundedConflict({ paths: Array.from({ length: n }, (_, i) => `f${i}.txt`) });
@@ -718,6 +727,37 @@ describe('runFixCli', () => {
       writeFileSync(join(dir, 'over.txt'), ''); truncateSync(join(dir, 'over.txt'), BLOB_MAX_BYTES + 1);
       expect(readLaneFileSafe(join(dir, 'at.txt'), dir)?.length).toBe(BLOB_MAX_BYTES);
       expect(readLaneFileSafe(join(dir, 'over.txt'), dir) === null).toBe(true); // a boolean: a failure diff of 64 MiB would crash the reporter
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // A process the agent left running swaps the path right after the launcher's FIRST fs call on it (the check), before the read.
+  it.each(['symlink-out', 'giant-file'])('readLaneFileSafe reads the file it checked, not one swapped in after the check (%s)', (swap) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-race-'));
+    try {
+      const lane = join(dir, 'lane'); mkdirSync(lane);
+      const target = join(lane, 'ok.txt');
+      writeFileSync(join(dir, 'secret'), 'TOKEN');
+      writeFileSync(target, 'fine');
+      writeFileSync(join(lane, 'big.txt'), ''); truncateSync(join(lane, 'big.txt'), BLOB_MAX_BYTES + 1);
+      let fired = false;
+      const racing = new Proxy(realFs, { get: (fs, key) => typeof fs[key] !== 'function' ? fs[key] : (...args) => {
+        const result = fs[key](...args);
+        if (!fired) {
+          fired = true;
+          rmSync(target);
+          if (swap === 'symlink-out') symlinkSync(join(dir, 'secret'), target); else realFs.renameSync(join(lane, 'big.txt'), target);
+        }
+        return result;
+      } });
+      const text = readLaneFileSafe(target, lane, racing);
+      expect(fired).toBe(true);
+      expect(text === null || text === 'fine').toBe(true); // a boolean: never TOKEN, never the 64 MiB file
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('readLaneFileSafe returns null for a FIFO without blocking', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-fifo-'));
+    try {
+      execFileSync('mkfifo', [join(dir, 'pipe')]);
+      expect(readLaneFileSafe(join(dir, 'pipe'), dir)).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('a refused (symlinked) commit-message file falls back to the default message', async () => {

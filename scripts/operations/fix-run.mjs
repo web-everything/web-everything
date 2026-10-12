@@ -21,7 +21,8 @@
  * provider on main, so it is refused up front rather than launched half-working.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, existsSync, lstatSync, readFileSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import * as nodeFs from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -288,16 +289,31 @@ export function hasLeftoverMarkers(text, sizes, allowance = new Map()) {
  * Read an agent-written file in the lane from OUTSIDE the agent's sandbox: null (never followed) for a symlink, a
  * non-regular or hardlinked file, or a path whose realpath leaves the lane — the agent must not get the launcher to read for it.
  * Also null for a file over BLOB_MAX_BYTES, so an agent-written giant file fails the run instead of exhausting its memory.
+ * Every check is made on the ONE open descriptor that is then read (opened without following a final symlink, and
+ * non-blocking so a FIFO cannot hang it), so a process the agent left running cannot swap the path between check and read.
+ * `fs` is a test seam.
  */
-export function readLaneFileSafe(path, lanePath) {
+export function readLaneFileSafe(path, lanePath, fs = nodeFs) {
+  let fd;
   try {
-    const st = lstatSync(path);
+    const { O_RDONLY, O_NOFOLLOW, O_NONBLOCK } = fs.constants;
+    fd = fs.openSync(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    const st = fs.fstatSync(fd);
     if (!st.isFile() || st.nlink > 1) return null; // nlink > 1: a hardlink can alias a file outside the lane
     if (st.size > BLOB_MAX_BYTES) return null;
-    const root = realpathSync(lanePath);
-    if (!realpathSync(path).startsWith(root + sep)) return null;
-    return readFileSync(path, 'utf8');
-  } catch { return null; }
+    // The opened file must be the one at a real path inside the lane (a swapped parent directory would move it out).
+    const root = fs.realpathSync(lanePath);
+    const real = fs.realpathSync(path);
+    const at = fs.statSync(real);
+    if (!real.startsWith(root + sep) || at.dev !== st.dev || at.ino !== st.ino) return null;
+    // Read one byte past the size: a file that grew after fstat is refused, never truncated.
+    const buf = Buffer.alloc(st.size + 1);
+    let n = 0;
+    for (let r; n < buf.length && (r = fs.readSync(fd, buf, n, buf.length - n, null)) > 0;) n += r;
+    return n > st.size ? null : buf.toString('utf8', 0, n);
+  } catch { return null; } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -528,8 +544,10 @@ export async function runFixCli(argv = [], {
     }
     const markerSizes = new Map(unmerged.map(path => {
       const text = readFile(join(lanePath, path), lanePath);
+      // Fail closed: scanning '' for widths would silently miss a nested (wider) marker the file really holds.
+      if (text == null) throw new LauncherError(`cannot read conflicted file ${path} (not a regular lane file, or over ${BLOB_MAX_BYTES} bytes)`);
       const sizes = new Set(attrSizes.get(path));
-      for (const match of (text ?? '').matchAll(/^(<{7,}) [^\r\n]*$/gm)) sizes.add(match[1].length);
+      for (const match of text.matchAll(/^(<{7,}) [^\r\n]*$/gm)) sizes.add(match[1].length);
       if (!sizes.size) sizes.add(7);
       // The index stages (1 base, 2 ours, 3 theirs) are the baseline: marker-shaped lines they carry may be content.
       const stages = Object.fromEntries(indexEntries(path).filter(e => e.stage !== '0').map(e => [e.stage, blob(e.oid)]));
