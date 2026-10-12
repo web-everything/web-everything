@@ -323,9 +323,15 @@ export async function runFixCli(argv = [], {
   try {
     const brief = readPrompt(launch.promptFile);
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
-    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName,mergeable', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const mergeConflictingBase = !launch.mergeOnto && prHead.mergeable === 'CONFLICTING';
+    const mergeOnto = mergeConflictingBase ? PR_BASE_MERGE_TARGET : launch.mergeOnto;
+    // `@pr-base`: the dispatcher or launcher needs the live PR base; never guess `main`.
+    const target = mergeOnto === PR_BASE_MERGE_TARGET ? String(prHead.baseRefName ?? '').trim() : mergeOnto;
+    if (mergeOnto && !target) throw new Error('cannot resolve PR base for conflict merge');
+    if (mergeConflictingBase) write(`fix-run: PR #${pr} conflicts with ${target}; launcher merges origin/${target} first\n`);
     const comments = await readComments(pr, { repo: launch.repo });
-    const prContext = launch.mergeOnto && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+    const prContext = target && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
       ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
       : renderPrContext({ ...prHead, comments });
     const poolArgs = [
@@ -363,10 +369,7 @@ export async function runFixCli(argv = [], {
     const commitMerge = () => git('commit', '--no-edit', '--trailer', trailer);
     let unmerged = [];
     let mergePrompt = '';
-    if (launch.mergeOnto) {
-      // `@pr-base`: the dispatcher did not know the base; read it from the live PR, never guess `main`.
-      const target = launch.mergeOnto === PR_BASE_MERGE_TARGET ? String(prHead.baseRefName ?? '').trim() : launch.mergeOnto;
-      if (!target) throw new Error('cannot resolve PR base for conflict merge');
+    if (target) {
       if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new Error(`invalid merge ref: ${target}`);
       git('check-ref-format', '--branch', target);
       git('fetch', 'origin', target);

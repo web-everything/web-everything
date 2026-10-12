@@ -150,6 +150,39 @@ describe('runFixCli', () => {
     expect((await runFixCli([...argv, '--merge-onto=lane/base'], { ...m.io, run, fileExists: () => true, readComments: async () => [] })).code).toBe(0);
     expect(m.calls.some(c => c.includes('push'))).toBe(true);
   });
+  it.each([
+    ['CONFLICTING', true], ['CONFLICTING', false], ['MERGEABLE', true], ['UNKNOWN', true],
+  ])('uses live mergeability as a merge backstop (%s, finding=%s)', async (mergeable, hasFinding) => {
+    const m = mk(['aaa', 'bbb']);
+    const write = vi.fn();
+    const run = (cmd, args, opts) => {
+      if (cmd === 'gh' && args.includes('view')) {
+        m.calls.push([cmd, ...args]);
+        return JSON.stringify({ title: 'T', body: 'B', baseRefName: 'develop', mergeable });
+      }
+      return m.run(cmd, args, opts);
+    };
+    let callsBeforeSpawn;
+    m.spawn.mockImplementation(async () => { callsBeforeSpawn = [...m.calls]; });
+    const out = await runFixCli(argv, {
+      ...m.io, run, write, fileExists: () => false,
+      ...(!hasFinding ? { readComments: async () => [] } : {}),
+    });
+    expect(out.code).toBe(0);
+    expect(m.spawn).toHaveBeenCalledTimes(1);
+    if (mergeable === 'CONFLICTING') {
+      const fetch = callsBeforeSpawn.findIndex(c => c.includes('fetch'));
+      const merge = callsBeforeSpawn.findIndex(c => c.includes('merge'));
+      expect(fetch).toBeGreaterThanOrEqual(0);
+      expect(merge).toBeGreaterThan(fetch);
+      expect(callsBeforeSpawn[fetch]).toEqual(['git', ...HARDENED_GIT_ARGS, 'fetch', 'origin', 'develop']);
+      expect(callsBeforeSpawn[merge]).toEqual(['git', ...HARDENED_GIT_ARGS, 'merge', '--no-commit', '--no-ff', 'origin/develop']);
+      expect(write).toHaveBeenCalledWith('fix-run: PR #7 conflicts with develop; launcher merges origin/develop first\n');
+    } else {
+      expect(m.calls.some(c => c.includes('fetch') || c.includes('merge'))).toBe(false);
+    }
+    expect(m.calls).toContainEqual(['gh', 'pr', 'view', '7', '--json', 'title,body,baseRefName,mergeable', '--repo=o/r']);
+  });
   it('uses the supplied commit message with the shared provider trailer outside the lane', async () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
@@ -199,7 +232,7 @@ describe('runFixCli', () => {
     const m = mk(['aaa', 'bbb']);
     const run = (cmd, args, opts) => {
       if (cmd === 'gh' && args.includes('view')) {
-        expect(args).toContain('title,body,baseRefName');
+        expect(args).toContain('title,body,baseRefName,mergeable');
         m.calls.push([cmd, ...args]);
         return JSON.stringify({ title: 'T', body: 'B', baseRefName: base });
       }
