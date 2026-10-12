@@ -1270,12 +1270,12 @@ export async function probeGithubApiAvailability({ env, runChild = runBounded, b
     try {
       await runChild('gh', ['pr', 'list', '--state', 'open', '--limit', '200', '--repo', repo,
         '--json', GITHUB_PROBE_PR_LIST_FIELDS], { env, timeoutMs: budgets.ghEnvProbeMs });
-      results.push({ repo, ok: true, unavailable: false, detail: `gh pr list ${repo} ok with the smoke env` });
+      results.push({ repo, ok: true, unavailable: false, detail: `gh pr list --repo ${repo} ok with the smoke env` });
     } catch (e) {
       const text = `${String(e?.message ?? e)}\n${String(e?.stderr ?? '')}`;
       const unavailable = !/\b401\b|Bad credentials/i.test(text)
         && GITHUB_API_UNAVAILABLE_PATTERNS.some((re) => re.test(text));
-      results.push({ repo, ok: false, unavailable, detail: `gh pr list ${repo} failed with the smoke env: ${text.trim().replace(/\s+/g, ' ')}` });
+      results.push({ repo, ok: false, unavailable, detail: `gh pr list --repo ${repo} failed with the smoke env: ${text.trim().replace(/\s+/g, ' ')}` });
     }
   }
   return { unavailable: results.some((r) => r.unavailable), ok: results.length > 0 && results.every((r) => r.ok),
