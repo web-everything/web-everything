@@ -305,7 +305,9 @@ export function readLaneFileSafe(path, lanePath, fs = nodeFs) {
     const root = fs.realpathSync(lanePath);
     const real = fs.realpathSync(path);
     const at = fs.statSync(real);
-    if (!real.startsWith(root + sep) || at.dev !== st.dev || at.ino !== st.ino) return null;
+    // nlink again on the in-lane path: a file opened through a symlinked parent, then hardlinked into the lane after the
+    // fstat above, has the right dev/ino but two links.
+    if (!real.startsWith(root + sep) || at.dev !== st.dev || at.ino !== st.ino || at.nlink > 1) return null;
     // Read one byte past the size: a file that grew after fstat is refused, never truncated.
     const buf = Buffer.alloc(st.size + 1);
     let n = 0;

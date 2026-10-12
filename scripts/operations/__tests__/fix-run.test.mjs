@@ -729,8 +729,17 @@ describe('runFixCli', () => {
       expect(readLaneFileSafe(join(dir, 'over.txt'), dir) === null).toBe(true); // a boolean: a failure diff of 64 MiB would crash the reporter
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
-  // A process the agent left running swaps the path right after the launcher's FIRST fs call on it (the check), before the read.
-  it.each(['symlink-out', 'giant-file'])('readLaneFileSafe reads the file it checked, not one swapped in after the check (%s)', (swap) => {
+  // A process the agent left running swaps the path while the launcher reads it: `swap` runs once, just BEFORE the first
+  // fs call named in `before` (so it lands after every check that precedes that call).
+  const swappingFs = (before, swap) => {
+    const state = { fired: false };
+    state.fs = new Proxy(realFs, { get: (fs, key) => typeof fs[key] !== 'function' ? fs[key] : (...args) => {
+      if (!state.fired && before.includes(key)) { state.fired = true; swap(); }
+      return fs[key](...args);
+    } });
+    return state;
+  };
+  it.each(['symlink-out', 'giant-file'])('readLaneFileSafe reads the file it checked, not one swapped in just before the read (%s)', (swap) => {
     const dir = mkdtempSync(join(tmpdir(), 'fix-run-race-'));
     try {
       const lane = join(dir, 'lane'); mkdirSync(lane);
@@ -738,19 +747,31 @@ describe('runFixCli', () => {
       writeFileSync(join(dir, 'secret'), 'TOKEN');
       writeFileSync(target, 'fine');
       writeFileSync(join(lane, 'big.txt'), ''); truncateSync(join(lane, 'big.txt'), BLOB_MAX_BYTES + 1);
-      let fired = false;
-      const racing = new Proxy(realFs, { get: (fs, key) => typeof fs[key] !== 'function' ? fs[key] : (...args) => {
-        const result = fs[key](...args);
-        if (!fired) {
-          fired = true;
-          rmSync(target);
-          if (swap === 'symlink-out') symlinkSync(join(dir, 'secret'), target); else realFs.renameSync(join(lane, 'big.txt'), target);
-        }
-        return result;
-      } });
-      const text = readLaneFileSafe(target, lane, racing);
-      expect(fired).toBe(true);
-      expect(text === null || text === 'fine').toBe(true); // a boolean: never TOKEN, never the 64 MiB file
+      const racing = swappingFs(['readSync', 'readFileSync'], () => {
+        rmSync(target);
+        if (swap === 'symlink-out') symlinkSync(join(dir, 'secret'), target); else realFs.renameSync(join(lane, 'big.txt'), target);
+      });
+      const text = readLaneFileSafe(target, lane, racing.fs);
+      expect(racing.fired).toBe(true);
+      expect(text === 'fine').toBe(true); // a boolean: never TOKEN, never the 64 MiB file
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('readLaneFileSafe refuses a file opened through a symlinked parent and hardlinked into the lane after the check', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-link-'));
+    try {
+      const lane = join(dir, 'lane'); mkdirSync(lane);
+      const outside = join(dir, 'outside'); mkdirSync(outside);
+      writeFileSync(join(outside, 'ok.txt'), 'TOKEN');
+      symlinkSync(outside, join(lane, 'sub'));
+      // After the open/link-count check, the parent becomes a real lane directory holding a hardlink to the outside file.
+      const racing = swappingFs(['realpathSync'], () => {
+        rmSync(join(lane, 'sub'));
+        mkdirSync(join(lane, 'sub'));
+        linkSync(join(outside, 'ok.txt'), join(lane, 'sub', 'ok.txt'));
+      });
+      const text = readLaneFileSafe(join(lane, 'sub', 'ok.txt'), lane, racing.fs);
+      expect(racing.fired).toBe(true);
+      expect(text).toBeNull();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('readLaneFileSafe returns null for a FIFO without blocking', () => {
