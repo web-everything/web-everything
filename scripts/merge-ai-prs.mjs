@@ -182,6 +182,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRequiredWorkflowsRefresh, handleRequiredWorkflowsRefusal } from './lib/merge-queue-enqueue.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
@@ -6507,6 +6508,23 @@ async function runCli() {
             recordAlreadyMerged(); // #xngv3vn — confirmed merged despite the throw → merged + trace
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} confirmed merged despite the gh error above (local branch-delete/network failure, or a concurrent lander) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
+          }
+          // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
+          if (e?.code === REQUIRED_WORKFLOWS_UNSATISFIED) {
+            if (!mergeStrategy.requiredWorkflowsRefresh) {
+              mergeStrategy.requiredWorkflowsRefresh = resolveRequiredWorkflowsRefresh();
+              if (!AS_JSON) process.stderr.write(`  required-workflows refresh: ${mergeStrategy.requiredWorkflowsRefresh.value} (source ${mergeStrategy.requiredWorkflowsRefresh.source})\n`);
+            }
+            const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
+            const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha: e.headSha || c.headSha,
+              setting: mergeStrategy.requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
+              refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+            if (recovery.handled) {
+              c.decision = 'skip'; const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+              revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
+              if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
+              continue;
+            }
           }
           // #xngv3vn — a REAL merge failure (not the idempotent-already-merged case just above): the trace
           // built earlier is NEVER posted here — `postMergeTrace` is simply not called on this path — so this

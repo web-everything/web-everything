@@ -11,6 +11,97 @@
  *   drain last followed up, so the drain's existing post-land path runs for them.
  */
 import { execFileSync } from 'node:child_process';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
+
+export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
+
+/** Pure: required-workflows refusal (ruleset 24930207), never a status-check-only refusal. */
+export function isRequiredWorkflowsUnsatisfiedError(text) {
+  return /Required workflows? '.*?' (?:is|are) not satisfied/.test(String(text || ''));
+}
+
+/** env > top-level merge-queue setting > built-in on; required-workflows refusal (ruleset 24930207). */
+export function resolveRequiredWorkflowsRefresh({ env = process.env, file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'merge-queue.json') } = {}) {
+  const onOff = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
+  const value = onOff(env?.WE_DRAIN_REQUIRED_WORKFLOWS_REFRESH);
+  if (value) return { value, source: 'env' };
+  try { const v = onOff(JSON.parse(readFileSync(file, 'utf8'))?.requiredWorkflowsRefresh); if (v) return { value: v, source: 'settings' }; } catch { /* built-in */ }
+  return { value: 'on', source: 'default' };
+}
+
+/** Pure once-per-head decision; a refusal of the produced head needs human inspection, not another refresh. */
+export function decideRequiredWorkflowsRefresh({ key, headSha, state = {}, setting }) {
+  if ((setting?.value ?? setting) === 'off') return { action: 'off', reason: 'required-workflows refresh is off' };
+  const short = String(headSha || '').slice(0, 9), previous = state[key];
+  if (headSha && previous?.newHead === headSha) return { action: 'skip', reason: `ruleset still refuses head ${short} after a refresh from ${String(previous.fromHead).slice(0, 9)} — a person should look` };
+  if (headSha && previous?.fromHead === headSha) return { action: 'skip', reason: `head ${short} was already refreshed once to ${String(previous.newHead || '').slice(0, 9)} for required workflows — waiting for the fresh head` };
+  return { action: 'refresh', reason: `head ${short} has never been refreshed for required workflows` };
+}
+
+export function requiredWorkflowsRefreshStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-required-workflows-refresh.json'); }
+
+/** Missing, malformed or unreadable state is empty; callers can inject filesystem reads. */
+export function readRequiredWorkflowsRefreshState(path, readFile = readFileSync) {
+  try { const s = JSON.parse(readFile(path, 'utf8')); return s && typeof s === 'object' && !Array.isArray(s) ? s : {}; } catch { return {}; }
+}
+
+/** Atomic writer, matching the drain's other coordination state writers. */
+function writeRequiredWorkflowsRefreshState(path, state) {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+/** Re-read before recording; retain the newest 500 PRs. Injected writeFile accepts (path, state). */
+export function recordRequiredWorkflowsRefresh(path, key, { fromHead, newHead, action, at }, { readFile = readFileSync, writeFile = writeRequiredWorkflowsRefreshState } = {}) {
+  const state = { ...readRequiredWorkflowsRefreshState(path, readFile), [key]: { fromHead, newHead, action, at } };
+  const entries = Object.entries(state).sort((a, b) => String(a[1]?.at || '').localeCompare(String(b[1]?.at || ''))).slice(-500);
+  writeFile(path, Object.fromEntries(entries));
+}
+
+/**
+ * Handle required-workflows refusal (ruleset 24930207) through the existing freshness path. IO is injected:
+ * refreshStalePr, needsAcceptanceRestamp and restampAcceptance are the drain's existing implementations.
+ * Returns a skip reason for JSON and a stderr line; off falls through to the original enqueue failure path.
+ * runId is deliberately null: re-running a pre-ruleset run cannot satisfy required workflows.
+ */
+export async function handleRequiredWorkflowsRefusal({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
+  readState = readRequiredWorkflowsRefreshState, record = recordRequiredWorkflowsRefresh,
+  refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn = () => {}, now = () => new Date().toISOString() }) {
+  const decision = decideRequiredWorkflowsRefresh({ key, headSha, setting, state: readState(statePath) });
+  if (decision.action === 'off') return { handled: false };
+  if (decision.action === 'skip') return { handled: true, reason: `merge-queue: ${decision.reason}`, line: `  ⏸ required-workflows: PR ${tag}${c.num} — ${decision.reason}` };
+  let out;
+  try {
+    out = !cloneDir ? { ok: false, error: `no ${c.repo} clone provisioned` }
+      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId: null, expectedHead: headSha });
+  } catch (e) { out = { ok: false, error: errText(e) }; }
+  if (!out.ok) {
+    const reason = `merge-queue: required workflows unsatisfied → refresh FAILED: ${out.error}`;
+    return { handled: true, reason, line: `  ↻ required-workflows: refresh PR ${tag}${c.num} (${decision.reason}) → refresh FAILED: ${out.error}` };
+  }
+  let note = '';
+  // Record before restamping: a successful refresh must not loop even if acceptance IO fails.
+  try { record(statePath, key, { fromHead: headSha, newHead: out.newCommit, action: out.action, at: now() }); }
+  catch (e) { note = `; refresh state record failed: ${errText(e)}`; }
+  if (out.action === 'rebased' && needsAcceptanceRestamp(c, { action: 'rebased' })) {
+    let rs;
+    try { rs = await restampAcceptance({ pr: c.num, repo: c.repo, newHead: out.newCommit, cwd }); }
+    catch (e) { rs = { ok: false, reason: errText(e) }; }
+    if (!rs.ok) {
+      note += `; acceptance re-stamp failed: ${String(rs.reason).slice(0, 200)}`;
+      warn(`  ⚠ ${tag}${c.num} acceptance re-stamp failed (${rs.reason}) — it may re-park`);
+    }
+  }
+  const sha = String(out.newCommit || '').slice(0, 9);
+  return { handled: true, reason: `merge-queue: required workflows unsatisfied → refresh ${out.action} ${sha}${note}`,
+    line: `  ↻ required-workflows: refresh PR ${tag}${c.num} (${decision.reason}) → ${out.action} ${sha} — enqueue retried once the new runs are green${note}` };
+}
+
 
 export const ENQUEUE_MUTATION = 'mutation($id:ID!,$sha:GitObjectID){enqueuePullRequest(input:{pullRequestId:$id,expectedHeadOid:$sha}){mergeQueueEntry{id position state}}}';
 
@@ -126,12 +217,15 @@ export function enqueuePr({ repo, num, headSha, cwd, exec = execFileSync }) {
     const errs = out?.errors;
     if (Array.isArray(errs) && errs.length) {
       const msg = errs.map((x) => x?.message).join('; ');
+      const refusal = errs.find((x) => isRequiredWorkflowsUnsatisfiedError(x?.message));
+      if (refusal) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: msg, ...(refusal.type != null ? { type: refusal.type } : {}), ...(refusal.code != null ? { code: refusal.code } : {}) };
       return isAlreadyQueuedError(msg) ? { ok: true, already: true } : { ok: false, error: msg };
     }
     const entry = out?.data?.enqueuePullRequest?.mergeQueueEntry ?? null;
     return entry ? { ok: true, entry } : { ok: false, error: 'no merge queue entry returned' };
   } catch (e) {
     const t = errText(e);
+    if (isRequiredWorkflowsUnsatisfiedError(String(e?.stderr || e?.message || e))) return { ok: false, reason: REQUIRED_WORKFLOWS_UNSATISFIED, error: t };
     return isAlreadyQueuedError(t) ? { ok: true, already: true } : { ok: false, error: t };
   }
 }
