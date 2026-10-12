@@ -1,0 +1,4 @@
+{
+  "$comment": "mergeGate.candidacyHoldIsNotCiFailure keeps review and draft promotion moving when merge-gate fails solely on candidacy holds (including labels-authority ledger holds) or a manual/shared freeze cleared after that job completed. Only non-candidates without ready-to-merge qualify; real gates, fail-closed or unreadable evidence remain red CI. Values: on|off, standard default on. Cascade: standard -> platform preferences -> repo settings -> MERGE_GATE_CANDIDACY_HOLD_IS_NOT_CI_FAILURE. Any invalid layer fails closed to off. off restores 'any merge-gate failure is red CI'.",
+  "mergeGate": { "candidacyHoldIsNotCiFailure": "on" }
+}
