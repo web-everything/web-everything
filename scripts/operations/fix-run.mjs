@@ -22,7 +22,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import * as nodeFs from 'node:fs';
-import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, rmdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -214,6 +214,10 @@ const OID_RE = /^[0-9a-f]{40,64}$/;
 export const MAX_CONFLICTED_PATHS = 100;
 /** A conflicted text blob (or agent-written lane file) larger than this fails the run (execFileSync's 1 MiB default would fail far sooner). */
 export const BLOB_MAX_BYTES = 64 * 1024 * 1024;
+/** All agent-written files one run may stage together (each is also capped at BLOB_MAX_BYTES). */
+export const STAGE_MAX_BYTES = 4 * BLOB_MAX_BYTES;
+/** Slack between the launcher's clock and a filesystem's (coarser) birth timestamps. */
+const BIRTH_SKEW_MS = 2000;
 const REGULAR_MODES = new Set(['100644', '100755']);
 
 /**
@@ -317,7 +321,7 @@ export function readLaneBytesSafe(path, lanePath, fs = nodeFs) {
     const buf = Buffer.alloc(st.size + 1);
     let n = 0;
     for (let r; n < buf.length && (r = fs.readSync(fd, buf, n, buf.length - n, null)) > 0;) n += r;
-    return n > st.size ? null : { data: buf.subarray(0, n), mode: st.mode };
+    return n > st.size ? null : { data: buf.subarray(0, n), mode: st.mode, id: `${st.dev}:${st.ino}`, born: st.birthtimeMs };
   } catch { return null; } finally {
     if (fd !== undefined) try { fs.closeSync(fd); } catch { /* already closed */ }
   }
@@ -326,7 +330,8 @@ export function readLaneBytesSafe(path, lanePath, fs = nodeFs) {
 /**
  * What the launcher stages for one changed lane path, read by the LAUNCHER (never by git: `git add` and `commit -- paths`
  * run outside the agent's sandbox with full read access, and re-open the path after any check): `{ missing: true }` for a
- * deletion (nothing read), `{ mode, data }` with the bytes to hash, or null when the path must not be staged. A regular file
+ * deletion (nothing read), `{ mode, data, id?, born? }` with the bytes to stage (a regular file also carries its
+ * `dev:ino` and birth time), or null when the path must not be staged. A regular file
  * is read through {@link readLaneBytesSafe}'s one checked descriptor, so a hardlink (it can alias a credential the sandbox
  * could link but not read), a path whose parent resolves outside the lane, a file over BLOB_MAX_BYTES, or one swapped in
  * mid-read (the file or a parent directory) is refused. A directory (`git add dir` reads every file under it) or other
@@ -346,7 +351,7 @@ export function laneStageEntry(lanePath, path, fs = nodeFs) {
     } catch { return null; }
   }
   const read = readLaneBytesSafe(full, lanePath, fs);
-  return read && { mode: read.mode & 0o111 ? '100755' : '100644', data: read.data };
+  return read && { mode: read.mode & 0o100 ? '100755' : '100644', data: read.data, id: read.id, born: read.born }; // git's own exec test: owner x
 }
 
 /**
@@ -418,6 +423,7 @@ export async function runFixCli(argv = [], {
   recordRouted = recordRoutedOutcome,
   readFile = readLaneFileSafe,
   stageEntry = laneStageEntry,
+  now = Date.now,
   fileExists = existsSync,
   weRoot = REPO_ROOT,
   write = (l) => process.stdout.write(l),
@@ -516,27 +522,47 @@ export async function runFixCli(argv = [], {
     }
     const provider = await resolveProvider(launch.provider);
     const git = (...args) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv });
-    // Never `git add`: it runs with OUR read access, not the sandbox's, and re-opens each path after any check. Instead
-    // hash the bytes laneStageEntry read through one checked descriptor (`--path` applies .gitattributes conversions as
-    // `git add` would) and write the index entries directly. Every path is read BEFORE anything is hashed, so a refusal
-    // leaves nothing in the object store either. The commit then takes the index, never the worktree.
+    // Lane files as they were before the agent ran (filled just before it spawns): a file the agent asks to stage must be
+    // one of these inodes, or born after it started — otherwise it was moved in from outside the lane (a file the sandbox
+    // could rename but not read keeps its single link). Best effort where a filesystem reports no birth time.
+    const laneInodes = new Set();
+    let agentStartedAt = Infinity;
+    // Never let git open a lane path to stage it: `git add` and `commit -- paths` run with OUR read access, not the
+    // sandbox's, and re-open each path after any check. Each path's bytes are read through laneStageEntry's one checked
+    // descriptor into a private copy under the lane's .git (the sandbox cannot write there, so nothing can be swapped in),
+    // and `git add` runs with that copy as its work tree, so git's own conversions (eol, keeping CRLF a file already has in
+    // the index, working-tree-encoding, core.fileMode) apply as they would to the lane file; .gitattributes comes from the
+    // copy or, where unchanged, the index. Every path is read and checked before git runs, so a refusal leaves nothing in
+    // the object store. One file is held in memory at a time and the total is capped. The commit takes the index only.
     const stageLaneFiles = (paths) => {
-      const entries = paths.map(path => [path, stageEntry(lanePath, path)]);
-      const refused = entries.filter(([, e]) => !e).map(([path]) => path);
-      if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular, out-of-lane or over-${BLOB_MAX_BYTES}-byte file`);
-      const removed = (path) => `0 ${'0'.repeat(before.length)}\t${path}\0`; // mode 0 drops every stage of the path
-      const info = entries.map(([path, e]) => {
-        if (e.missing) return removed(path);
-        const oid = run('git', [...HARDENED_GIT_ARGS, 'hash-object', '-w', '--stdin', e.mode === '120000' ? '--no-filters' : `--path=${path}`],
-          { cwd: lanePath, env: gitEnv, input: e.data }).trim();
-        return `${removed(path)}${e.mode} ${oid}\t${path}\0`;
-      }).join('');
-      if (!info) return;
-      run('git', [...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info'], { cwd: lanePath, env: gitEnv, input: info });
-      // Entries written this way carry no stat data, so `merge --abort` would call every one "not uptodate" and refuse.
-      // A refresh only compares the worktree against the index (it writes no object, so a file swapped in now is hashed
-      // in memory at most, never stored or committed).
-      git('update-index', '-q', '--refresh', '--unmerged', '--ignore-missing');
+      const gitDir = git('rev-parse', '--absolute-git-dir').trim();
+      if (!gitDir) throw new LauncherError('cannot resolve the lane git directory to stage from');
+      const copy = mkdtempSync(join(gitDir, 'fix-run-stage-'));
+      try {
+        const added = [], removed = [], refused = [], moved = [];
+        let total = 0;
+        for (const path of paths) {
+          const dest = resolve(copy, path);
+          const e = dest.startsWith(copy + sep) ? stageEntry(lanePath, path) : null;
+          if (!e) { refused.push(path); continue; }
+          if (e.missing) { removed.push(path); continue; }
+          if (e.born > 0 && e.born < agentStartedAt - BIRTH_SKEW_MS && !laneInodes.has(e.id)) { moved.push(path); continue; }
+          if ((total += e.data.length) > STAGE_MAX_BYTES) throw new LauncherError(`refusing to stage over ${STAGE_MAX_BYTES} bytes of agent-written files`);
+          mkdirSync(dirname(dest), { recursive: true });
+          if (e.mode === '120000') symlinkSync(e.data, dest);
+          else writeFileSync(dest, e.data, { mode: e.mode === '100755' ? 0o755 : 0o644, flag: 'wx' });
+          added.push(path);
+        }
+        if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular, out-of-lane or over-${BLOB_MAX_BYTES}-byte file`);
+        if (moved.length) throw new LauncherError(`refusing to stage ${moved.slice(0, 5).join(', ')}: older than this run and not a lane file before it (moved in from outside the lane)`);
+        // Mode 0 drops every index stage of a path the agent deleted.
+        if (removed.length) run('git', [...HARDENED_GIT_ARGS, 'update-index', '-z', '--index-info'], { cwd: lanePath, env: gitEnv, input: removed.map(path => `0 ${'0'.repeat(before.length)}\t${path}\0`).join('') });
+        if (added.length) run('git', [...HARDENED_GIT_ARGS, `--git-dir=${gitDir}`, `--work-tree=${copy}`, 'add', '--', ...added], { cwd: copy, env: gitEnv });
+      } finally { rmSync(copy, { recursive: true, force: true }); }
+      // The index now holds the copy's stat data; refresh it against the lane so `merge --abort` does not refuse. A refresh
+      // only compares (it stores no object): a file swapped into the lane now is hashed in memory at most, never committed.
+      // `-q`, `--unmerged` and `--ignore-missing` apply only to the options after them, so they come first.
+      git('update-index', '-q', '--unmerged', '--ignore-missing', '--refresh');
     };
     const trailer = (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
     const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
@@ -609,6 +635,10 @@ export async function runFixCli(argv = [], {
       const stages = Object.fromEntries(indexEntries(path).filter(e => e.stage !== '0').map(e => [e.stage, blob(e.oid)]));
       return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
+    for (const path of run('git', [...HARDENED_GIT_ARGS, 'ls-files', '-z'], { cwd: lanePath, env: gitEnv, maxBuffer: BLOB_MAX_BYTES }).split('\0')) {
+      try { const st = nodeFs.lstatSync(join(lanePath, path)); if (path && st.isFile()) laneInodes.add(`${st.dev}:${st.ino}`); } catch { /* not checked out */ }
+    }
+    agentStartedAt = now();
     const spawned = await provider.spawn({
       sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
