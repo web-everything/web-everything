@@ -49,7 +49,7 @@ describe('card-level refusal (#4701)', () => {
     try {
       const fileCard = vi.fn(async () => ({ filed: true }));
       const f = await recordPrepareFailure({ num: '4701', attempt: 'a', stage: 'dispatch', evidence: { reason: CARD } },
-        { path: join(dir, 'p.json'), fileCard, now: 0, settings: S });
+        { path: join(dir, 'p.json'), fileCard, now: 0, settings: S, preparePolicy: { retryUnstampedOnce: false, autoSize: true } });
       expect(f).toMatchObject({ cause: 'unknown', held: true, retry: false });
       expect(f.retryAfter).toBeUndefined();
       expect(fileCard).toHaveBeenCalledTimes(1);
@@ -107,6 +107,19 @@ describe('prepare held failures retry with backoff (item 95)', () => {
     expect(releaseDuePrepareRetries({ path, now: 999 })).toEqual([]);
     expect(releaseDuePrepareRetries({ path, now: 1000 })).toEqual(['5188']);
     expect(Object.values(readFailureState(path).failures)[0]).toMatchObject({ held: false, retry: true });
+  });
+  it('by default releases the first unknown failure for one re-dispatch, then holds the same card on its second', async () => {
+    const first = await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'result', evidence: { reason: 'prepare-unstamped' } },
+      { path, fileCard, now: 0, settings: S });
+    expect(first).toMatchObject({ cause: 'unknown', held: false, retry: true, unstampedRetry: true });
+    expect(readFailureState(path).failures['9:a:result']).toMatchObject({ held: false, retry: true });
+
+    const second = await recordPrepareFailure({ num: '9', attempt: 'b', stage: 'result', evidence: { reason: 'prepare-unstamped' } },
+      { path, fileCard, now: 1000, settings: S });
+    expect(second).toMatchObject({ cause: 'unknown', held: true, retry: false,
+      holdReason: expect.stringMatching(/^needs-you: prepare ended unstamped twice/) });
+    expect(releaseDuePrepareRetries({ path, now: 1e12 })).toEqual([]);
+    expect(readFailureState(path).failures['9:b:result']).toMatchObject({ held: true, retry: false, holdReason: second.holdReason });
   });
   it('backs off exponentially across attempts, then stays held (exhausted) and is never auto-released', async () => {
     await rec('a', 0); releaseDuePrepareRetries({ path, now: 1000 });
@@ -305,7 +318,7 @@ describe('review round 1 — release, re-arm and ledger hardening', () => {
       expect(classifyPrepareFailure(e, stage)).toBe('unknown');
     }
     fileCard.mockResolvedValue({ ok: true });
-    const f = await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: e }, { path, fileCard, now: 0, settings: S });
+    const f = await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: e }, { path, fileCard, now: 0, settings: S, preparePolicy: { retryUnstampedOnce: false, autoSize: true } });
     expect(f).toMatchObject({ cause: 'unknown', held: true });
     expect(fileCard).toHaveBeenCalledTimes(1);
   });
@@ -356,7 +369,7 @@ describe('review round 1 — release, re-arm and ledger hardening', () => {
   it('a re-arm written while recordPrepareFailure awaits its diagnose card is not overwritten', async () => {
     seed({ old: { num: '7', attempt: '2026-10-06T17:56:00.000Z', stage: 'dispatch', cause: 'dispatch-transient', evidence: { reason: NOT_CONFIRMED }, held: true } });
     const slowCard = vi.fn(async () => { rearmFalseHolds({ path }); return { ok: true }; });
-    await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: { reason: 'weird' } }, { path, fileCard: slowCard, now: 0, settings: S });
+    await recordPrepareFailure({ num: '9', attempt: 'a', stage: 'stamp', evidence: { reason: 'weird' } }, { path, fileCard: slowCard, now: 0, settings: S, preparePolicy: { retryUnstampedOnce: false, autoSize: true } });
     const f = readFailureState(path).failures;
     expect(f.old.held).toBe(false);
     expect(Object.values(f).find(x => x.num === '9')).toMatchObject({ cause: 'unknown', held: true });
@@ -430,7 +443,7 @@ describe('builder-starved — clone-wide refusals and stale holds self-heal (202
       'b': { num: '4382', attempt: 'b', stage: 'dispatch', cause: 'unknown', held: true, retry: false, evidence: { reason: 'Command failed: node run.mjs dispatch-lane --num=4382' }, recordedAt: new Date(0).toISOString() },
       'c': { num: '4560', attempt: 'c', stage: 'result', cause: 'unknown', held: true, retry: false, evidence: { reason: 'prepare-unstamped' }, recordedAt: new Date(0).toISOString() },
     } }));
-    const due = releaseDuePrepareRetries({ path, now: 10_000, settings: S });
+    const due = releaseDuePrepareRetries({ path, now: 10_000, settings: S, preparePolicy: { retryUnstampedOnce: false, autoSize: true } });
     expect(due.sort()).toEqual(['4382', '4425']);
     const st = readFailureState(path).failures;
     expect(st.a).toMatchObject({ held: false, cause: 'clone-wide', healedFrom: 'unknown' });

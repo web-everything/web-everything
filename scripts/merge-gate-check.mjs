@@ -281,6 +281,11 @@ export function readGroupPrs({ repo, headSha, baseSha, headRef, cwd, base = 'mai
         return { sha, parents: String(parents || '').split(' ').filter(Boolean), subject: rest.join('\t') };
       });
   } catch { commitsRead = false; }
+  if (commitsRead) {
+    // Stacked per-entry groups use the previous entry's group commit as base_sha; only entries in this range belong.
+    const groupShas = new Set(commits.map((c) => c.sha));
+    entries = entries.filter((entry) => groupShas.has(entry?.headCommit?.oid));
+  }
   // A commit whose subject names no PR (squash/rebase merge, a hand-made commit) is resolved through the
   // commit→PR API; anything still unmapped makes the group incomplete.
   const resolved = {};
