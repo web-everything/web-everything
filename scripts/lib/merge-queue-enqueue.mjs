@@ -15,6 +15,9 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
 import { readDeclaredSettings } from './settings-files.mjs';
+import { reviewCiGate } from './review-ci-gate.mjs';
+import { latestFailingMergeGate, readMergeGateVerdict } from './merge-gate-hold-class.mjs';
+import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
@@ -33,7 +36,10 @@ export const REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT = 'on';
  * loadMergeQueueSettings; this key resolves independently of the other queue settings.
  * @returns {{value: 'on'|'off', source: string, invalid: string[]}}
  */
-export function resolveRefreshOnUnsatisfiedWorkflows({ env = process.env, settings, platform } = {}) {
+export const resolveRefreshOnUnsatisfiedWorkflows = options => resolveRefreshSetting('refreshOnUnsatisfiedWorkflows', 'WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS', options);
+export const resolveRefreshOnStaleMergeGate = options => resolveRefreshSetting('refreshOnStaleMergeGate', 'WE_MERGE_QUEUE_REFRESH_ON_STALE_MERGE_GATE', options);
+
+function resolveRefreshSetting(key, envKey, { env = process.env, settings, platform } = {}) {
   const invalid = [];
   const readJson = (path, source) => {
     try { return JSON.parse(readFileSync(path, 'utf8')); }
@@ -43,7 +49,7 @@ export function resolveRefreshOnUnsatisfiedWorkflows({ env = process.env, settin
     }
   };
   const layers = [
-    ['env', () => env?.WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS],
+    ['env', () => env?.[envKey]],
     ['settings', () => {
       let src = settings;
       const override = String(env?.WE_MERGE_QUEUE_SETTINGS_FILE ?? '').trim();
@@ -54,14 +60,14 @@ export function resolveRefreshOnUnsatisfiedWorkflows({ env = process.env, settin
         src = read.settings;
         invalid.push(...read.errors.map((e) => `settings: ${e.source}: ${e.error}`));
       }
-      return src?.mergeQueue?.refreshOnUnsatisfiedWorkflows;
+      return src?.mergeQueue?.[key];
     }],
-    ['platform', () => (platform === undefined ? readJson(PLATFORM_PREFERENCES_PATH, 'platform') : platform)?.mergeQueue?.refreshOnUnsatisfiedWorkflows],
+    ['platform', () => (platform === undefined ? readJson(PLATFORM_PREFERENCES_PATH, 'platform') : platform)?.mergeQueue?.[key]],
   ];
   for (const [source, read] of layers) {
     const value = read();
     if (value === 'on' || value === 'off') return { value, source, invalid };
-    if (value !== undefined) invalid.push(`${source}: mergeQueue.refreshOnUnsatisfiedWorkflows=${JSON.stringify(value)} (expected on|off)`);
+    if (value !== undefined) invalid.push(`${source}: mergeQueue.${key}=${JSON.stringify(value)} (expected on|off)`);
   }
   return { value: REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT, source: 'standard', invalid };
 }
@@ -103,20 +109,24 @@ export function recordRequiredWorkflowsRefresh(path, key, { fromHead, newHead, a
  * Returns a skip reason for JSON and a stderr line; off falls through to the original enqueue failure path.
  * runId is deliberately null: re-running a pre-ruleset run cannot satisfy required workflows.
  */
-export async function handleRequiredWorkflowsRefusal({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
+export function handleRequiredWorkflowsRefusal(options) { return handleQueueRefresh(options); }
+
+async function handleQueueRefresh({ c, key, headSha, setting, statePath = requiredWorkflowsRefreshStatePath(), cloneDir, cwd, tag = '#',
   readState = readRequiredWorkflowsRefreshState, record = recordRequiredWorkflowsRefresh,
+  decide = decideRequiredWorkflowsRefresh, runId = null, label = 'required-workflows', wording = 'required workflows unsatisfied', dryRun = false,
   refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn = () => {}, now = () => new Date().toISOString() }) {
-  const decision = decideRequiredWorkflowsRefresh({ key, headSha, setting, state: readState(statePath) });
+  if (dryRun) return { handled: false };
+  const decision = decide({ key, headSha, setting, state: readState(statePath) });
   if (decision.action === 'off') return { handled: false };
-  if (decision.action === 'skip') return { handled: true, reason: `merge-queue: ${decision.reason}`, line: `  ⏸ required-workflows: PR ${tag}${c.num} — ${decision.reason}` };
+  if (decision.action === 'skip') return { handled: true, reason: `merge-queue: ${decision.reason}`, line: `  ⏸ ${label}: PR ${tag}${c.num} — ${decision.reason}` };
   let out;
   try {
     out = !cloneDir ? { ok: false, error: `no ${c.repo} clone provisioned` }
-      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId: null, expectedHead: headSha });
+      : await refreshStalePr({ laneRef: c.headRef, root: cloneDir, repo: c.repo, runId, expectedHead: headSha });
   } catch (e) { out = { ok: false, error: errText(e) }; }
   if (!out.ok) {
-    const reason = `merge-queue: required workflows unsatisfied → refresh FAILED: ${out.error}`;
-    return { handled: true, reason, line: `  ↻ required-workflows: refresh PR ${tag}${c.num} (${decision.reason}) → refresh FAILED: ${out.error}` };
+    const reason = `merge-queue: ${wording} → refresh FAILED: ${out.error}`;
+    return { handled: true, reason, line: `  ↻ ${label}: refresh PR ${tag}${c.num} (${decision.reason}) → refresh FAILED: ${out.error}` };
   }
   let note = '';
   // Record before restamping: a successful refresh must not loop even if acceptance IO fails.
@@ -132,8 +142,8 @@ export async function handleRequiredWorkflowsRefusal({ c, key, headSha, setting,
     }
   }
   const sha = String(out.newCommit || '').slice(0, 9);
-  return { handled: true, reason: `merge-queue: required workflows unsatisfied → refresh ${out.action} ${sha}${note}`,
-    line: `  ↻ required-workflows: refresh PR ${tag}${c.num} (${decision.reason}) → ${out.action} ${sha} — enqueue retried once the new runs are green${note}` };
+  return { handled: true, reason: `merge-queue: ${wording} → refresh ${out.action} ${sha}${note}`,
+    line: `  ↻ ${label}: refresh PR ${tag}${c.num} (${decision.reason}) → ${out.action} ${sha} — enqueue retried once the new runs are green${note}` };
 }
 
 
@@ -307,4 +317,78 @@ export function rulesetSuggestion(policy, requiredChecks = ['test', 'smoke', 'da
 
 function errText(e) {
   return String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 300);
+}
+
+// Separate coordination ledger; the atomic bounded storage and refresh/restamp path are shared.
+export const staleMergeGateRefreshStatePath = (env = process.env) => join(resolveCoordinationRoot({ env }), 'drain-stale-merge-gate-refresh.json');
+export function decideStaleMergeGateRefresh({ key, headSha, state = {}, setting } = {}) {
+  if ((setting?.value ?? setting) === 'off') return { action: 'skip', reason: 'stale merge-gate refresh is off' };
+  if (!headSha) return { action: 'skip', reason: 'missing head' };
+  const previous = state[key];
+  if (previous?.fromHead === headSha || previous?.newHead === headSha) return { action: 'skip', reason: 'merge-gate head already refreshed once — waiting for fresh verdict; a person should look if it remains held' };
+  return { action: 'refresh', reason: 'merge-gate holds now satisfied' };
+}
+
+/** Pure: this authorizes a new run, never excusal or enqueue on the old verdict. */
+export function classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState, humanClearedSha, freeze } = {}) {
+  const no = reason => ({ stale: false, reason: `merge-gate ${reason}` });
+  if (!headSha || verdict?.head_sha !== headSha) return no('verdict head mismatch');
+  if (verdict.error || verdict.ok !== false || !Array.isArray(verdict.results) || !verdict.results.length) return no('verdict unreadable or not HOLD');
+  if (!landableApartFromMergeState) return no('PR is not otherwise landable');
+  const satisfied = new Set();
+  for (const row of verdict.results) {
+    if (row.status === 'fail-closed') return no(`fail-closed row ${row.id}`);
+    if (row.status !== 'hold') {
+      if (!['pass', 'queue', 'enqueue', 'skipped-by-policy'].includes(row.status)) return no('verdict row unreadable');
+      continue;
+    }
+    if (row.id === 'test-gaming' || (row.id === 'review-acceptance' && row.reason?.startsWith('human-only:'))) {
+      if (humanClearedSha !== headSha) return no(`hold ${row.id} not cleared on this head`);
+      satisfied.add('human clearance');
+    } else if (['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance'].includes(row.id)
+      || (row.id === 'ledger' && row.reason?.startsWith('labels:'))) {
+      satisfied.add('candidacy');
+    } else if (row.id === 'red-main-freeze' && /^main is RED \(freeze: manual freeze: .+\)$/.test(row.reason ?? '')) {
+      if (freeze?.error || freeze?.frozen !== false || !Number.isFinite(Date.parse(verdict.completed_at))
+        || !(Date.parse(freeze.publishedAt) > Date.parse(verdict.completed_at))) return no('hold red-main-freeze not proven lifted after verdict');
+      satisfied.add('red-main-freeze lifted');
+    } else return no(`hold ${row.id} remains real`);
+  }
+  return satisfied.size ? { stale: true, reason: `holds now satisfied: ${[...satisfied].join(', ')}` } : no('no hold rows');
+}
+
+/** Post-cascade recovery. All IO is injectable; the original skip remains unless a refresh is handled. */
+export async function handleStaleMergeGate({ c, pr, requiredChecks, classifyPr, classifyOptions = {}, setting, dryRun = false,
+  readVerdict = readMergeGateVerdict, readFreeze = readSharedFreeze, readAcceptance, acceptance,
+  statePath = staleMergeGateRefreshStatePath(), ...refreshOptions } = {}) {
+  const unchanged = { handled: false };
+  if (dryRun || (setting?.value ?? setting) !== 'on' || c?.decision !== 'skip' || c.state !== 'BLOCKED'
+    || !c.reason?.startsWith('merge state BLOCKED') || !pr?.headRefOid) return unchanged;
+  if (['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(String(pr.reviewDecision || '').toUpperCase())) return unchanged;
+  // The real classifier must also pass its gates AFTER the merge-state arm (body and review holds).
+  if (classifyPr({ ...pr, mergeStateStatus: 'CLEAN' }, classifyOptions).decision !== 'merge') return unchanged;
+  const headSha = pr.headRefOid;
+  const gate = reviewCiGate({ headSha, requiredChecks, checks: pr.statusCheckRollup });
+  if (gate.affected.length !== 1 || gate.affected[0].name !== 'merge-gate' || gate.affected[0].reason !== 'failure') return unchanged;
+  const run = latestFailingMergeGate(pr.statusCheckRollup);
+  if (!run || String(run.conclusion).toLowerCase() !== 'failure') return unchanged;
+  const ids = /\/actions\/runs\/(\d+)\/job\/(\d+)/.exec(run.detailsUrl ?? run.details_url ?? '');
+  const runId = Number(ids?.[1]), jobId = Number(ids?.[2]);
+  if (!Number.isSafeInteger(runId) || runId <= 0 || !Number.isSafeInteger(jobId) || jobId <= 0) return { ...unchanged, reason: 'merge-gate run/job URL unreadable' };
+  let classification;
+  try {
+    const verdict = await readVerdict({ repo: c.repo, jobId, prNumber: c.num });
+    if (verdict?.num !== c.num) return { ...unchanged, reason: 'merge-gate PR verdict unreadable' };
+    let evidence = acceptance;
+    if (verdict.results?.some(r => r.status === 'hold' && (r.id === 'test-gaming' || (r.id === 'review-acceptance' && r.reason?.startsWith('human-only:'))))) {
+      evidence ??= await readAcceptance({ pr: c.num, repo: c.repo, cwd: refreshOptions.cwd });
+      if (evidence?.headSha !== headSha) return { ...unchanged, reason: 'merge-gate acceptance head mismatch' };
+    }
+    const freeze = verdict.results?.some(r => r.status === 'hold' && r.id === 'red-main-freeze')
+      ? await readFreeze({ board: refreshOptions.cloneDir }) : undefined;
+    classification = classifyStaleMergeGate({ verdict, headSha, landableApartFromMergeState: true, humanClearedSha: evidence?.humanClearedSha, freeze });
+  } catch (e) { return { ...unchanged, reason: `merge-gate evidence unreadable: ${errText(e)}` }; }
+  if (!classification.stale) return { ...unchanged, reason: classification.reason };
+  return handleQueueRefresh({ ...refreshOptions, c, key: `${c.repo}#${c.num}`, headSha, setting, statePath,
+    decide: decideStaleMergeGateRefresh, runId, label: 'stale merge-gate', wording: `stale merge-gate (${classification.reason})` });
 }
