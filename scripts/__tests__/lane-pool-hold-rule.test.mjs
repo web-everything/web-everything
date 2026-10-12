@@ -20,6 +20,12 @@ const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).
 
 let base, poolRoot, storeDir, originDir, referenceDir, fixtureRoot, sharedFixture;
 
+// Every lane clone commits through un-injected git (the CLI's and the test's own), and a `gc --auto` /
+// `maintenance --auto` it detaches can still be writing into the lane's `.git` when afterEach removes it
+// (ENOTEMPTY on main @ 1c08e1b54 under CI load). Pin both off for every child git, and retry the removal.
+const GC_PINS = { GIT_CONFIG_COUNT: '2', GIT_CONFIG_KEY_0: 'gc.auto', GIT_CONFIG_VALUE_0: '0', GIT_CONFIG_KEY_1: 'maintenance.auto', GIT_CONFIG_VALUE_1: 'false' };
+const savedPins = {};
+
 function runPool(args, extraEnv = {}) {
   // `acquire --force` reaps dead leases through a best-effort `gh` PR read that degrades to "off" when gh fails;
   // declare the logged-out gh fixture so the hermetic guard does not count that read as live GitHub access.
@@ -31,6 +37,7 @@ function runPool(args, extraEnv = {}) {
 }
 
 beforeAll(() => {
+  for (const [k, v] of Object.entries(GC_PINS)) { savedPins[k] = process.env[k]; process.env[k] = v; }
   fixtureRoot = mkdtempSync(join(tmpdir(), 'lane-hold-fixture-'));
   originDir = join(fixtureRoot, 'origin.git');
   referenceDir = join(fixtureRoot, 'reference');
@@ -44,7 +51,10 @@ beforeAll(() => {
   git(['push', '--quiet', originDir, 'HEAD:refs/heads/trunk'], referenceDir);
   sharedFixture = sharedRepos(fixtureRoot, [originDir, referenceDir]);
 });
-afterAll(() => sharedFixture?.dispose());
+afterAll(() => {
+  sharedFixture?.dispose();
+  for (const [k, v] of Object.entries(savedPins)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+});
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'lane-hold-'));
   poolRoot = join(base, 'pool');
@@ -52,7 +62,7 @@ beforeEach(() => {
   mkdirSync(storeDir, { recursive: true });
 });
 afterEach(() => {
-  rmSync(base, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   sharedFixture.restore();
 });
 
