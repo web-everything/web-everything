@@ -17,7 +17,9 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   It also adds a `workflows` rule that pins `ci.yml`, `merge-gate.yml`, and `soak-replay-gate.yml` to
   `refs/heads/main` (`repository_id: 1142650361`). For `merge_group` runs GitHub reads workflow YAML from the
   group commit, so without the pin a PR could edit a workflow, or add one with a job named `merge-gate`, and
-  turn a required check green. This is layer (4) in the `merge-gate.yml` header. A test
+  turn a required check green. The pin does not replace that run: GitHub starts an extra run of each pinned
+  file from `main`, and the rule passes only when those runs pass. The PR's own edited run still happens. This
+  is layer (4) in the `merge-gate.yml` header. A test
   (`we:scripts/lib/__tests__/drain-merge-strategy.test.mjs`) fails when this body drifts from
   `node scripts/merge-gate-check.mjs --print-ruleset` (`rulesetSuggestion` in
   `we:scripts/lib/merge-queue-enqueue.mjs`).
@@ -51,6 +53,10 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   `mergeGate.mode: "enforce"` in a repo settings file or the `MERGE_GATE_MODE` repository variable
   (`we:scripts/lib/merge-gate-ci.mjs`, `loadMergeGateMode`). Confirm the merge-gate log shows `mode=enforce`.
 - [ ] Merge-gate shadow audit clean: no shadow "would HOLD" on a PR the drain then landed.
+- [ ] Card `xjdnlk0` done: the pinned `workflows` runs are proven on a live PR. GitHub starts them only on
+  opened, synchronize and reopened (plus `merge_group`), so a label or body edit may not re-run the pinned
+  `merge-gate` or `soak-replay-gate`. They may also share a `cancel-in-progress` concurrency group with the
+  repo's own runs and cancel them.
 - [ ] Main's CI is green and the safety net has published no red: neither `main-ci-red-state.json` nor
   `main-red-priority.json` exists (`we:scripts/lib/red-main-hold.mjs`). A published main-fix PR is exempt from
   the freeze's hold, so the drain would still `gh pr merge` it.
@@ -106,8 +112,11 @@ after every drain clone has the settings commit (the clone check below).
    gh api repos/web-everything/web-everything/rulesets/24883772 --jq '.rules[].type'
    ```
 
-   The readback must show `required_status_checks`, `merge_queue`, and `workflows`. If `workflows` is missing,
-   GitHub did not accept the pin: roll back now (see Rollback) and do not unfreeze. Confirm the pin itself:
+   The readback must show `required_status_checks`, `merge_queue`, and `workflows`. GitHub's rules page
+   describes ruleset workflows as an organization or enterprise feature, while ruleset `24883772` is a
+   repository ruleset, so the PUT may be refused. If the PUT fails (for example HTTP 422) or `workflows` is
+   missing from the readback, GitHub did not accept the pin. Do not retry the same body and do not unfreeze:
+   run the rollback below. Moving the pin to an organization ruleset is a separate change. Confirm the pin itself:
 
    ```bash
    gh api repos/web-everything/web-everything/rulesets/24883772 --jq '.rules[] | select(.type=="workflows") | .parameters.workflows[] | "\(.path) \(.ref)"'
@@ -134,8 +143,9 @@ after every drain clone has the settings commit (the clone check below).
    merge-delivery policy: strategy=github-merge-queue (tool), batchSize=5 (tool), maxGroupWaitMinutes=5 (tool), mergeMethod=merge (tool)
    ```
 
-   If step 2 fails, nothing has changed: unfreeze and stop. If step 3 fails after step 2 succeeded, stay frozen
-   and retry it, or run the rollback below.
+   If step 2 fails, nothing has changed: unfreeze and stop. If step 3 fails after step 2 succeeded, stay frozen.
+   Retry it only for a transient error (a network failure or HTTP 5xx). For a refused body (HTTP 4xx) or a
+   missing `workflows` rule, run the rollback below.
 
 ## First-batch proof to collect
 
