@@ -10,7 +10,7 @@ import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-ha
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
-import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES } from '../fix-run.mjs';
+import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, laneStageEntry, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -397,7 +397,8 @@ describe('runFixCli', () => {
       reason: 'conflict not resolvable by editing files: gone.txt(UD), img.png(UU binary)' }));
   });
   // Real-git harness: `main` = the PR head, `target` = the base it conflicts with. Fetch/push are stubbed; all merge IO is real.
-  const withRealMerge = async (setup, { agent, extra = [] }, check) => {
+  // `onGit(args, dir)` runs before each launcher git call: a process the agent left running, acting mid-staging.
+  const withRealMerge = async (setup, { agent, extra = [], onGit }, check) => {
     const dir = mkdtempSync(join(tmpdir(), 'fix-real-merge-'));
     const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
@@ -419,6 +420,7 @@ describe('runFixCli', () => {
       const run = (cmd, args, opts) => {
         if (cmd === 'git') {
           m.calls.push([cmd, ...args]);
+          onGit?.(args, dir);
           if (args.includes('fetch') || args.includes('push')) return '';
           return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8', stdio: 'pipe' });
         }
@@ -509,6 +511,72 @@ describe('runFixCli', () => {
       expect(out.code).toBe(0);
       expect(git('show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort()).toEqual(['added.txt', 'file.txt', 'other.txt']);
     });
+  });
+  // A file the sandbox may hardlink but not read (a credential under ~/.config): `git add` runs OUTSIDE the sandbox with
+  // full read access, so the launcher must never stage one. Both commit paths: the plain commit after a clean merge, and
+  // the conflict-resolution merge commit.
+  const withSecret = async (fn) => {
+    const d = mkdtempSync(join(tmpdir(), 'fix-run-secret-'));
+    try { const f = join(d, 'hosts.yml'); writeFileSync(f, 'oauth_token: SECRET\n'); await fn(f); } finally { rmSync(d, { recursive: true, force: true }); }
+  };
+  const stagingCases = {
+    'clean merge': { base: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'base\n'); writeFileSync(join(dir, 'other.txt'), 'x\n'); },
+      theirs: ({ dir }) => writeFileSync(join(dir, 'other.txt'), 'theirs\n'), ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n') },
+    conflict: { base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'base\n'),
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'theirs\n'), ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n') },
+  };
+  it.each(Object.keys(stagingCases))('refuses to stage a lane file hardlinked to a file outside the lane (%s): nothing added, nothing pushed', async (kind) => {
+    await withSecret(async (secret) => {
+      await withRealMerge(stagingCases[kind], { agent: ({ dir }) => {
+        writeFileSync(join(dir, 'file.txt'), 'resolved\n');
+        linkSync(secret, join(dir, 'leak.txt'));
+      } }, async ({ out, m, git, recordOutcome }) => {
+        expect(out.code).toBe(1);
+        expect(m.calls.some(c => c.includes('add') || c.includes('push'))).toBe(false);
+        expect(() => git('cat-file', '-e', git('hash-object', secret).trim())).toThrow(); // the secret never entered the object store
+        expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^refusing to stage .*leak\.txt/) }));
+      });
+    });
+  });
+  // A process the agent left running swaps a hardlink in just as the launcher runs `git add`; `restored` puts the
+  // original file back before the commit, so the path looks untouched afterwards except for its inode change time.
+  it.each(Object.keys(stagingCases).flatMap(kind => [[kind, 'kept'], [kind, 'restored']]))('refuses to push when a hardlink is swapped in during staging (%s, %s)', async (kind, after) => {
+    await withSecret(async (secret) => {
+      let state = 'armed';
+      await withRealMerge(stagingCases[kind], {
+        agent: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'resolved\n'); writeFileSync(join(dir, 'added.txt'), 'z\n'); },
+        onGit: (args, dir) => {
+          const path = join(dir, 'added.txt');
+          if (state === 'armed' && args.includes('add')) { realFs.renameSync(path, `${path}.orig`); linkSync(secret, path); state = 'linked'; }
+          else if (state === 'linked' && after === 'restored' && args.includes('commit')) { rmSync(path); realFs.renameSync(`${path}.orig`, path); state = 'done'; }
+        },
+      }, async ({ out, m, recordOutcome }) => {
+        expect(state).not.toBe('armed');
+        expect(out.code).toBe(1);
+        expect(m.calls.some(c => c.includes('push'))).toBe(false);
+        expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^lane files changed while being staged: added\.txt/) }));
+      });
+    });
+  });
+  it('laneStageEntry: a single-link regular file or a symlink stages; a hardlink, directory or path through an escaping parent does not', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-stage-'));
+    try {
+      const lane = join(dir, 'lane'); mkdirSync(lane);
+      const outside = join(dir, 'outside'); mkdirSync(outside);
+      writeFileSync(join(outside, 'secret'), 'TOKEN');
+      writeFileSync(join(lane, 'ok.txt'), 'fine');
+      symlinkSync(join(outside, 'secret'), join(lane, 'link'));
+      linkSync(join(outside, 'secret'), join(lane, 'hard.txt'));
+      mkdirSync(join(lane, 'nested'));
+      symlinkSync(outside, join(lane, 'out'));
+      expect(laneStageEntry(lane, 'ok.txt')).toMatch(/^file:/);
+      expect(laneStageEntry(lane, 'link')).toMatch(/^link:/); // git stores the link text, never the target's content
+      expect(laneStageEntry(lane, 'missing.txt')).toBe('missing'); // a deletion: nothing is read
+      expect(laneStageEntry(lane, 'hard.txt')).toBeNull();
+      expect(laneStageEntry(lane, 'nested')).toBeNull(); // `git add dir` would read every file under it
+      expect(laneStageEntry(lane, 'out/secret')).toBeNull();
+      expect(laneStageEntry(lane, '../outside/secret')).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   // Each marker git can emit (`<` ours, `|` diff3 base, `=` separator, `>` theirs), left behind ALONE, at the default
   // width and at a captured conflict-marker-size; with a label, bare, and CRLF.
@@ -772,6 +840,27 @@ describe('runFixCli', () => {
       const text = readLaneFileSafe(join(lane, 'sub', 'ok.txt'), lane, racing.fs);
       expect(racing.fired).toBe(true);
       expect(text).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  // A process the agent left running appends to the SAME inode after the size was taken (no path swap): the read must
+  // refuse it, and never ask for or take more than the captured size plus one byte.
+  it.each([1, 1 << 20])('readLaneFileSafe rejects in-place growth after fstat (+%i bytes) and bounds bytes read', (grow) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-grow-'));
+    try {
+      const target = join(dir, 'ok.txt');
+      writeFileSync(target, 'fine');
+      const seen = { grown: false, requested: 0, read: 0 };
+      const fs = new Proxy(realFs, { get: (real, key) => key !== 'readSync' ? real[key] : (fd, buf, off, len, pos) => {
+        if (!seen.grown) { seen.grown = true; realFs.appendFileSync(target, 'x'.repeat(grow)); }
+        seen.requested += len;
+        const r = real.readSync(fd, buf, off, len, pos);
+        seen.read += r;
+        return r;
+      } });
+      expect(readLaneFileSafe(target, dir, fs)).toBeNull();
+      expect(seen.grown).toBe(true);
+      expect(seen.requested).toBeLessThanOrEqual('fine'.length + 1);
+      expect(seen.read).toBe('fine'.length + 1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('readLaneFileSafe returns null for a FIFO without blocking', () => {

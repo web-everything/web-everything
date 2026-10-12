@@ -319,6 +319,27 @@ export function readLaneFileSafe(path, lanePath, fs = nodeFs) {
 }
 
 /**
+ * What `git add` (run OUTSIDE the agent's sandbox, with full read access) would read for one changed lane path: `'missing'`
+ * (a deletion, nothing read), a `file:`/`link:` identity string (inode, link count, size, times), or null when the launcher
+ * must not stage it — a hardlinked regular file (it can alias a credential the sandbox could link but not read), a directory
+ * (`git add dir` reads every file under it) or other non-regular file, or a path whose parent resolves outside the lane.
+ * A symlink is fine: git stores its link text, never the target's content. Comparing the strings taken before `git add`
+ * and after the commit catches a file a process the agent left running swapped in meanwhile. `fs` is a test seam.
+ */
+export function laneStageEntry(lanePath, path, fs = nodeFs) {
+  const full = join(lanePath, path);
+  let st;
+  try { st = fs.lstatSync(full, { bigint: true }); } catch (e) { return e?.code === 'ENOENT' || e?.code === 'ENOTDIR' ? 'missing' : null; }
+  if (st.isFile() ? st.nlink > 1n : !st.isSymbolicLink()) return null;
+  try {
+    const root = fs.realpathSync(lanePath);
+    const parent = fs.realpathSync(dirname(full));
+    if (parent !== root && !parent.startsWith(root + sep)) return null;
+  } catch { return null; }
+  return [st.isFile() ? 'file' : 'link', st.dev, st.ino, st.nlink, st.size, st.mtimeNs, st.ctimeNs].join(':');
+}
+
+/**
  * PURE. The PR comment posted when routed codex repairs stall on one head. Notes may be agent-authored (untrusted), so
  * they go inside a fenced block with backticks stripped, `@` mentions neutralised, and the finding phrases removed —
  * the comment must never read back as a reviewer's changes-requested / advisory finding.
@@ -386,6 +407,7 @@ export async function runFixCli(argv = [], {
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
   readFile = readLaneFileSafe,
+  stageEntry = laneStageEntry,
   fileExists = existsSync,
   weRoot = REPO_ROOT,
   write = (l) => process.stdout.write(l),
@@ -484,6 +506,18 @@ export async function runFixCli(argv = [], {
     }
     const provider = await resolveProvider(launch.provider);
     const git = (...args) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv });
+    // `git add` and the commit read lane files with OUR access, not the sandbox's: snapshot every path before staging
+    // (refusing what laneStageEntry refuses), and return the check, run after the commit and before any push, that none
+    // of them changed in between.
+    const guardStaging = (paths) => {
+      const taken = paths.map(path => stageEntry(lanePath, path));
+      const refused = paths.filter((_, i) => taken[i] == null);
+      if (refused.length) throw new LauncherError(`refusing to stage ${refused.slice(0, 5).join(', ')}: a hardlinked, non-regular or out-of-lane file`);
+      return () => {
+        const changed = paths.filter((path, i) => stageEntry(lanePath, path) !== taken[i]);
+        if (changed.length) throw new LauncherError(`lane files changed while being staged: ${changed.slice(0, 5).join(', ')}; refusing to push`);
+      };
+    };
     const trailer = (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
     const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
     const inMerge = () => { const path = mergeHeadPath(); return !!path && fileExists(resolve(lanePath, path)); };
@@ -589,6 +623,7 @@ export async function runFixCli(argv = [], {
       };
       if (unresolved.length) refuse(unresolved);
       const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])];
+      const stagedUnchanged = guardStaging(stage);
       if (stage.length) git('add', '--', ...stage);
       // Scan what will be COMMITTED too: `git add` applies .gitattributes (which the agent can write), so a file saved
       // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
@@ -600,12 +635,15 @@ export async function runFixCli(argv = [], {
       });
       if (unresolvedStaged.length) refuse(unresolvedStaged);
       commitMerge();
+      stagedUnchanged();
     } else if (paths.length) {
       const supplied = join(lanePath, '.fix-commit-msg.txt');
       const own = fileExists(supplied) ? readFile(supplied, lanePath) : null; // null for a symlink: ignore it
       const message = own?.trim() ? own.slice(0, 4000) : `fix(PR #${pr}): ${finalMessage.split('\n')[0] || 'apply review finding'}`;
+      const stagedUnchanged = guardStaging(paths);
       git('add', '--', ...paths);
       withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file, '--', ...paths));
+      stagedUnchanged();
     }
     const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     let result;
