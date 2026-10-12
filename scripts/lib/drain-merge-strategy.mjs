@@ -85,8 +85,9 @@ export function queueEnqueueModeFromPolicy(resolved) { return mergeActionFor(res
 
 /** Union classic protection with effective ruleset requirements; an unreadable set grants no relief. */
 export function readQueueRequiredChecks({ repo, branch = 'main', exec = execFileSync, readClassic = getRequiredStatusChecks } = {}) {
+  if (typeof repo !== 'string' || !repo.trim()) return null;
   try {
-    const rules = JSON.parse(exec('gh', ['api', `repos/${repo || '{owner}/{repo}'}/rules/branches/${branch}`, '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'],
+    const rules = JSON.parse(exec('gh', ['api', `repos/${repo}/rules/branches/${branch}`, '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'],
       { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }));
     if (!Array.isArray(rules)) return null;
     const classic = readClassic({ repo, branch }).checks;

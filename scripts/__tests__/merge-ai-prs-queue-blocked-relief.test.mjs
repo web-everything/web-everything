@@ -62,6 +62,13 @@ describe('required merge queue BLOCKED relief', () => {
 });
 
 describe('readQueueRequiredChecks', () => {
+  it.each([undefined, null, '', '   ', 42, {}])('returns null without reading checks for missing or invalid repo: %j', repo => {
+    const exec = vi.fn();
+    const readClassic = vi.fn();
+    expect(strategy.readQueueRequiredChecks({ repo, exec, readClassic })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+    expect(readClassic).not.toHaveBeenCalled();
+  });
   it('returns the sorted union of classic and ruleset requirements', () => {
     const exec = vi.fn(() => '["smoke","test"]');
     const readClassic = vi.fn(() => ({ checks: ['test', 'daemon-soak'] }));
