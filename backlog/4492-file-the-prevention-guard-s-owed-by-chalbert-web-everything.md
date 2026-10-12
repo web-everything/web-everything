@@ -3,10 +3,11 @@ bornAs: x6zg9hx
 kind: story
 size: 3
 parent: "4075"
-status: active
+status: resolved
 scope: ["we:scripts/conveyor/__tests__/hung-session.test.mjs", "we:scripts/conveyor/hung-session-mutation-check.mjs", "we:scripts/conveyor/__tests__/hung-session-mutation-check.test.mjs"]
 dateOpened: "2026-09-29"
 dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "dfe8b082a4e6a08541a3681e99d85b0db2b99e58"
 tags: []
