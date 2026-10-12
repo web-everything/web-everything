@@ -74,7 +74,9 @@ if (a[0] === 'pr' && a[1] === 'merge') {
 if (a[0] === 'pr' && a[1] === 'list') out(fx.prs.map((pr) => {
   const row = { ...pr };
   const tip = (pr._commits || [])[(pr._commits || []).length - 1];
-  if (fields.split(',').includes('files') && !('files' in row)) row.files = pr._files || [];
+  // These unrelated gate scenarios use known modifications; unknown/rename metadata
+  // and the pinned fallback are exercised by drain-workflow-edit-replay.test.mjs.
+  if (fields.split(',').includes('files') && !('files' in row)) row.files = (pr._files || []).map((f) => ({ changeType: 'MODIFIED', ...f }));
   if (fields.split(',').includes('headRefOid') && !row.headRefOid) row.headRefOid = (tip && tip.oid) || headOf(pr);
   return row;
 }));

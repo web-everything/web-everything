@@ -1951,7 +1951,12 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       // returning the whole history (a capped connection would leave `headSha` short of the real tip).
       v.listedHeadSha = typeof p.headRefOid === 'string' && p.headRefOid ? p.headRefOid : null;
       v.listedFiles = listedPrFiles(p);
-      v.listedFilesComplete = v.listedFiles !== null && v.listedFiles.length === p.files.length;
+      // gh file rows expose the destination path only. Renames/copies (and rows without
+      // change metadata) cannot prove that a workflow path was not removed: use the
+      // pinned --no-renames read in both the review gate and the bare sweep.
+      v.listedFilesComplete = v.listedFiles !== null && v.listedFiles.length === p.files.length
+        && p.files.every((f) => typeof f === 'string'
+          || ['ADDED', 'MODIFIED', 'DELETED'].includes(f?.changeType));
       // #3308 (round-2 correctness fix) — the PASS-WIDE half of the relief valve, recorded HERE because it is the
       // only place it is knowable. The scoped `=<pr#>` form stamps `v.reliefWaived` down in the escalation loop,
       // but that whole loop is gated on `REVIEW_ESCALATION = label && !escalationRelief.passWide` — so under a BARE

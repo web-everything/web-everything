@@ -23,12 +23,35 @@ function replay(pr, { setting, clearance, author = 'web-everything', ...extra } 
   });
 }
 describe('live workflow-edit replay', () => {
+  for (const changeType of ['RENAMED', 'COPIED', undefined]) {
+    for (const workflowOnly of [false, true]) {
+      it(`reads both paths for ${changeType ?? 'untyped'} listing entries (bare sweep: ${workflowOnly})`, () => {
+        const pr = { ...fixtures[1], files: [{ path: 'docs/ci.yml.bak', ...(changeType ? { changeType } : {}) }] };
+        const calls = [];
+        const result = replay(pr, { workflowOnly, exec: (cmd, args) => {
+          calls.push([cmd, args]);
+          if (cmd === 'gh') return JSON.stringify({ headRefOid: pr.headRefOid,
+            comments: [{ author: { login: 'web-everything' }, body: `<!-- reviewed-sha: ${pr.headRefOid} -->` }] });
+          return args[0] === 'diff' ? '.github/workflows/ci.yml\0docs/ci.yml.bak\0' : '';
+        } });
+        expect(result).toMatchObject({ action: 'park', applyLabel: 'review:human', humanRequired: true });
+        expect(calls.find(([, args]) => args[0] === 'diff')?.[1]).toContain('--no-renames');
+      });
+    }
+  }
   for (const pr of fixtures) it(`#${pr.number}: before (off) merge → default human-only hold → exact-head human clearance merge`, () => {
     expect(replay(pr, { setting: 'off' }).action).toBe('merge');
     const held = replay(pr);
     expect(held).toMatchObject({ action: 'park', applyLabel: 'review:human', humanRequired: true, reason: expect.stringContaining('human-only:') });
     expect(applyEscalationRelief(held, { relieved: true }).waive).toBe(false);
     expect(replay(pr, { clearance: pr.headRefOid }).action).toBe('merge');
+  });
+  it.each([false, true])('untyped non-local listing defers without git or labels (bare sweep: %s)', (workflowOnly) => {
+    const pr = { ...fixtures[1], files: [{ path: 'docs/ci.yml.bak' }] };
+    expect(replay(pr, { workflowOnly, local: false, exec: (cmd) => {
+      expect(cmd).toBe('gh');
+      return JSON.stringify({ headRefOid: pr.headRefOid, comments: [] });
+    } })).toMatchObject({ action: 'defer', applyLabel: null });
   });
   it('an older human clearance remains human-only', () => {
     expect(replay(fixtures[0], { clearance: 'b'.repeat(40) })).toMatchObject({ action: 'park', humanRequired: true, reason: expect.stringContaining('human-only:') });
