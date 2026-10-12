@@ -2887,7 +2887,9 @@ export function settleVerification(candidates, answer) {
     else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
     // EITHER answer needs evidence: a bare `false` is the cheapest thing a flaky or steered verifier can say, and a `not-reproduced`
     // is sticky for the head, so it is only recorded with what the verifier ran or read. Without it the claim is `failed`: still an
-    // advisory note, but retried on the next run instead of being retired.
+    // advisory note, but retried on the next run instead of being retired. Retiring on ONE answer is the operator's ruling for this
+    // turn; requiring a second signal is #xztd0mv, and
+    // holding a land while a claim stays unverified is #xf74q20.
     else if (!(typeof r.evidence === 'string' && r.evidence.trim())) {
       settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
     } else settled.set(c.key, { outcome: r.reproduced ? 'reproduced' : 'not-reproduced', reason: foldVerifyReason(r.evidence, '') });

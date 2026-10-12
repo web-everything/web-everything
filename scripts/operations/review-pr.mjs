@@ -2837,7 +2837,7 @@ export function reviewPrOperation({
         // qualifying claim stays CONFIRMED (and is referred) only when it was reproduced; every other one becomes an advisory note
         // BEFORE the referral filter below ever sees it. `verifierClaimsFor` is the very derivation the verifier step's request used.
         const { known: knownVerified, candidates: verifierClaims } = verifierDeclared
-          ? verifierClaimsFor(view.findings) : { known: knownVerifications(read.referralVerified, read.netBasis?.rev), candidates: [] };
+          ? verifierClaimsFor(view.findings) : { known: new Map(), candidates: [] }; // undeclared ⇒ every seated seat is tool-bearing
         const settledClaims = settleVerification(verifierClaims, verifierDeclared ? view.findings[REFERRAL_VERIFIER_STEP] : null);
         const unverifiedClaims = [];
 
