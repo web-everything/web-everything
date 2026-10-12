@@ -37,7 +37,7 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
-  resolveIoBoundLoadScale,
+  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner,
 } from '../daemon-live-smoke.mjs';
 
 // Existing fixtures must never observe or write the host's resource state.
@@ -1402,6 +1402,46 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
     expect(b.authFailed).toBe(false);
     const c = await probeGithubAuth({ env, runChild: async () => '{}' });
     expect(c.authFailed).toBe(false);
+  });
+
+  it('resolves smoke GitHub per-owner auth from the standard and env layers', () => {
+    expect(resolveSmokeGithubPerOwner({})).toEqual({ enabled: true, source: 'standard' });
+    expect(resolveSmokeGithubPerOwner({ WE_SMOKE_GH_PER_OWNER: '0' })).toEqual({ enabled: false, source: 'env' });
+    expect(resolveSmokeGithubPerOwner({ WE_SMOKE_GH_PER_OWNER: '1' })).toEqual({ enabled: true, source: 'env' });
+  });
+
+  it('refreshSmokeGithubEnv requests per-owner auth by default', async () => {
+    const ensureFresh = vi.fn(async () => ({ applied: false, reason: 'insufficient-access' }));
+    const src = { GH_TOKEN: STALE, GITHUB_TOKEN: STALE };
+    const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
+    expect(ensureFresh.mock.calls[0][0].perOwner).toBe(true);
+    expect(r.env).toEqual(src);
+  });
+
+  it('per-owner refresh preserves the shim PATH and removes inherited tokens only from the copy', async () => {
+    const src = { GH_TOKEN: STALE, GITHUB_TOKEN: STALE, PATH: '/original/bin', KEEP: '1' };
+    const before = { ...src };
+    const ensureFresh = async (o) => {
+      o.env.PATH = '/shim/bin:/original/bin';
+      return { applied: true, reason: 'ok', perOwner: true };
+    };
+    const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
+    expect(r.env).toEqual({ PATH: '/shim/bin:/original/bin', KEEP: '1' });
+    expect(r.env).not.toHaveProperty('GH_TOKEN');
+    expect(r.env).not.toHaveProperty('GITHUB_TOKEN');
+    expect(src).toEqual(before);
+  });
+
+  it('disabling per-owner auth keeps the pinned-token refresh in the copy', async () => {
+    const src = { WE_SMOKE_GH_PER_OWNER: '0', GH_TOKEN: STALE, GITHUB_TOKEN: STALE };
+    const ensureFresh = vi.fn(async (o) => {
+      o.setEnv(FRESH);
+      return { applied: true, reason: 'ok' };
+    });
+    const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
+    expect(ensureFresh.mock.calls[0][0].perOwner).toBe(false);
+    expect(r.env).toEqual({ ...src, GH_TOKEN: FRESH });
+    expect(src.GH_TOKEN).toBe(STALE);
   });
 
   it('refreshSmokeGithubEnv writes the token into a COPY (never process.env); force bypasses the cache; a throw is contained', async () => {

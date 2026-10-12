@@ -90,6 +90,7 @@ permissions:
   pull-requests: read
   checks: read
   statuses: read
+  actions: read # readMainCiFact (scripts/merge-gate-check.mjs) lists main's CI runs with `gh run list`
 
 concurrency:
   group: merge-gate-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'ready-to-merge' && !startsWith(github.event.label.name, 'review:') && format('unwatched-{0}', github.run_id) || github.event.pull_request.number || github.event.merge_group.head_sha || github.run_id }}

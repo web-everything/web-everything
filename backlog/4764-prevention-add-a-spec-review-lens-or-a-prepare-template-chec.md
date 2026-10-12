@@ -3,9 +3,10 @@ bornAs: xa7mguu
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: resolved
 scope: ["we:backlog/4557-file-the-prevention-guard-s-owed-by-chalbert-web-everything.md"]
 dateOpened: "2026-10-02"
+dateResolved: "2026-10-11"
 tags: []
 ---
 

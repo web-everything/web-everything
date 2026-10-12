@@ -17,10 +17,11 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { realpathSync, writeSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, realpathSync, writeSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { lastGoodForClone, rebuildGraceForClone } from './daemon-last-good.mjs';
+import { readSettings as readOperatorSettings } from './settings-files.mjs';
 
 /** Default git runner — spawnSync (returns non-zero without throwing). */
 export function gitRun(args, opts = {}) {
@@ -358,20 +359,28 @@ export const OPERATOR_CLI_STALE_MARKER = 'run from an up-to-date lane';
  * clone): it refuses, via the shared {@link assertMainNotStale} chokepoint, whenever the commits it is missing
  * from `origin/<base>` touch a file this code can load ({@link isCodePath}). Backlog-only lag is tolerated.
  * Offline (fetch fails) or a root that is not a git checkout stays fail-soft, like the rest of this file.
+ * Drain re-stamp (PR #4880, 2026-10-11): a held CODE clone can invoke this CLI with cwd in a fresh DATA
+ * clone. Before refusing, re-run once from that checkout if its code is fresh and its working tree is clean.
  * @param {string} root the checkout the CLI's own code was loaded from
  * @param {{label?: string, base?: string, run?: typeof gitRun, listBehindFiles?: (root: string) => (string[]|null)}} [o]
  */
 export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'main', run = gitRun,
   listBehindFiles = (r) => behindFiles(r, base, run), env = process.env,
+  cwd = process.cwd(), argv = process.argv, execArgv = process.execArgv,
+  exists = existsSync, readSettings = readOperatorSettings, spawn = spawnSync, exit = (code) => process.exit(code),
+  write = (s) => { try { writeSync(2, s); } catch { /* stderr closed */ } },
   skipUnderVitest = !!process.env.VITEST } = {}) {
   // A daemon-managed clone is kept current by its own gated rebuild (#4044); a unit test run drives the CLI from
   // whatever checkout CI built and injects its own seams. Neither is an operator running from a stale clone.
   if (env?.WE_DAEMON_MANAGED_CLONE === '1' || skipUnderVitest) return { skipped: true };
   let last = null;
-  const check = (r) => {
+  const check = (r, failClosed = false) => {
     const cwd = { cwd: r, timeout: 60_000, killSignal: 'SIGKILL' };
     if (run(['fetch', 'origin', base, '--quiet'], cwd).status !== 0) return (last = { offline: true });
     const count = run(['rev-list', '--count', `HEAD..origin/${base}`], cwd);
+    if (failClosed && (count.status !== 0 || !/^\d+$/.test(String(count.stdout ?? '').trim()))) {
+      return { offline: true };
+    }
     const behind = count.status === 0 ? Number(count.stdout.trim()) || 0 : 0;
     if (!behind) return (last = { fresh: true, behind: 0 });
     const files = listBehindFiles(r);
@@ -383,10 +392,48 @@ export function assertOperatorCliFresh(root, { label = 'operator-cli', base = 'm
     return assertMainNotStale(root, check, { base, label });
   } catch (e) {
     if (!isStaleMainRefusalMessage(e?.message)) throw e;
-    throw new Error(`${label}: this checkout is ${last?.behind ?? 'several'} commit(s) behind origin/${base} in code it `
+    const behind = last?.behind ?? 'several';
+    const refusal = new Error(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it `
       + `runs (${STALE_MAIN_REFUSAL_MARKER}) — its verdict could be wrong on a bug main already fixed, so it refuses: `
       + `${OPERATOR_CLI_STALE_MARKER} (a fresh lane on origin/${base}: \`node scripts/lane-pool.mjs acquire\`). `
       + 'Nothing was changed.');
+    let candidate;
+    let entry;
+    let source = 'default';
+    try {
+      let value = env?.WE_OPERATOR_CLI_FRESH_FALLBACK;
+      if (value !== undefined) source = 'env';
+      else {
+        try { value = readSettings()?.operatorCli?.freshFallback; } catch { /* absent settings */ }
+        if (value !== undefined) source = 'settings';
+      }
+      if (value !== 'on' && value !== 'off') { value = 'on'; source = 'default'; }
+      if (value === 'off' || env?.WE_OPERATOR_CLI_FRESH_REEXEC === '1') throw refusal;
+      const top = run(['rev-parse', '--show-toplevel'], { cwd, timeout: 60_000, killSignal: 'SIGKILL' });
+      candidate = String(top.stdout ?? '').trim();
+      if (top.status !== 0 || !candidate || !isAbsolute(candidate) || isSameCheckout(candidate, root)) throw refusal;
+      if (!argv[1]) throw refusal;
+      const rel = relative(resolve(root), resolve(cwd, argv[1]));
+      if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) throw refusal;
+      entry = resolve(candidate, rel);
+      if (!exists(entry) || !check(candidate, true)?.fresh || codeDirty(candidate, run)) throw refusal;
+    } catch {
+      throw refusal;
+    }
+    write(`${label}: this checkout is ${behind} commit(s) behind origin/${base} in code it runs — re-running from the fresh checkout `
+      + `${candidate} (operator-cli fresh fallback, knob source: ${source}).\n`);
+    let child;
+    try {
+      child = spawn(process.execPath, [...execArgv, entry, ...argv.slice(2)], {
+        stdio: 'inherit', cwd, env: { ...env, WE_OPERATOR_CLI_FRESH_REEXEC: '1' },
+      });
+      if (child?.error) throw refusal;
+    } catch {
+      throw refusal;
+    }
+    const status = Number.isInteger(child?.status) ? child.status : 1;
+    exit(status);
+    return { reexecedFrom: candidate, status };
   }
 }
 
