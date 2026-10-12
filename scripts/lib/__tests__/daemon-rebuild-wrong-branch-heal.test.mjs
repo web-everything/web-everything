@@ -72,6 +72,7 @@ describe('planWrongBranchHeal (pure rule)', () => {
 });
 
 describe('healWrongBranch (2026-10-11 detached drain-daemon clone)', () => {
+  const emptyGitDir = mkdtempSync(join(tmpdir(), 'wrong-branch-heal-gitdir-'));
   it.each(detachedCases)('detached IO: $name', ({ headSha, changedPaths, hasMain = true, expected }) => {
     const calls = [];
     const git = (args) => {
@@ -80,6 +81,7 @@ describe('healWrongBranch (2026-10-11 detached drain-daemon clone)', () => {
         case 'symbolic-ref --short HEAD': return { status: 1, stdout: '' };
         case 'rev-parse --verify --quiet HEAD': return { status: headSha ? 0 : 1, stdout: headSha ? `${headSha}\n` : '' };
         case 'rev-parse --verify --quiet refs/heads/main': return { status: hasMain ? 0 : 1, stdout: hasMain ? `${mainSha}\n` : '' };
+        case 'rev-parse --absolute-git-dir': return { status: 0, stdout: `${emptyGitDir}\n` };
         case 'status --porcelain=v1 -z --untracked-files=no': return { status: changedPaths === null ? 1 : 0, stdout: (changedPaths ?? []).map((p) => ` M ${p}\0`).join('') };
         case 'checkout --quiet main': return { status: 0, stdout: '' };
         default: throw new Error(`Unexpected git command: ${args.join(' ')}`);
@@ -106,6 +108,65 @@ describe('healWrongBranch (2026-10-11 detached drain-daemon clone)', () => {
       expect(g(['symbolic-ref', '--short', 'HEAD']).stdout.trim()).toBe('main');
       expect(g(['rev-parse', 'HEAD']).stdout.trim()).toBe(sha);
       expect(g(['status', '--porcelain=v1']).stdout).toBe('');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('in-progress git operations block the heal (red-team: paused interactive rebase)', () => {
+  it('pure rule: refuses on any in-progress operation, on both paths, and when state is unreadable', () => {
+    const ops = ['rebase-merge'];
+    expect(planWrongBranchHeal({ branch: null, headSha: mainSha, mainSha, changedPaths: [], hasMain: true, settings, inProgress: ops }))
+      .toEqual({ heal: false, reason: 'operation-in-progress', detail: { operations: ops } });
+    expect(planWrongBranchHeal({ branch: 'ops/review-requests', changedPaths: ['verdict-ledger/x'], hasMain: true, settings, inProgress: ['CHERRY_PICK_HEAD'] }).reason)
+      .toBe('operation-in-progress');
+    expect(planWrongBranchHeal({ branch: null, headSha: mainSha, mainSha, changedPaths: [], hasMain: true, settings, inProgress: null }).reason)
+      .toBe('git-dir-unreadable');
+    expect(planWrongBranchHeal({ branch: null, headSha: mainSha, mainSha, changedPaths: [], hasMain: true, settings, inProgress: [] })).toEqual({ heal: true });
+  });
+
+  // Each state is created by real git, then healWrongBranch must leave HEAD detached and the operation intact.
+  const scenarios = {
+    'rebase paused by break before the first pick': (dir, g, ctx) => {
+      g(['checkout', '--quiet', 'feature']);
+      const r = spawnSync('git', ['rebase', '-i', 'main'], { cwd: dir, encoding: 'utf8', env: { ...ENV, GIT_SEQUENCE_EDITOR: `sh -c 'printf "break\\n" | cat - "$0" > "$0.new" && mv "$0.new" "$0"'` } });
+      expect(r.status).toBe(0);
+      expect(existsSync(join(dir, '.git/rebase-merge'))).toBe(true);
+      ctx.expectIntact = () => expect(existsSync(join(dir, '.git/rebase-merge'))).toBe(true);
+    },
+    'cherry-pick stopped (CHERRY_PICK_HEAD present)': (dir, g, ctx) => {
+      g(['checkout', '--quiet', '--detach']);
+      // simulate a stopped sequencer: CHERRY_PICK_HEAD is what git leaves for a stopped pick
+      writeFileSync(join(dir, '.git/CHERRY_PICK_HEAD'), `${g(['rev-parse', 'feature']).stdout.trim()}\n`);
+      ctx.expectIntact = () => expect(existsSync(join(dir, '.git/CHERRY_PICK_HEAD'))).toBe(true);
+    },
+    'bisect in progress': (dir, g, ctx) => {
+      g(['checkout', '--quiet', '--detach']);
+      writeFileSync(join(dir, '.git/BISECT_LOG'), 'git bisect start\n');
+      ctx.expectIntact = () => expect(existsSync(join(dir, '.git/BISECT_LOG'))).toBe(true);
+    },
+  };
+  it.each(Object.keys(scenarios))('real clone, detached at main: %s', (name) => {
+    const dir = mkdtempSync(join(tmpdir(), 'wrong-branch-heal-op-'));
+    const g = gitIn(dir);
+    const gc = (a) => g(['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', ...a]);
+    try {
+      g(['init', '--quiet', '-b', 'main']);
+      writeFileSync(join(dir, 'a.txt'), 'a\n'); g(['add', 'a.txt']); gc(['commit', '--quiet', '-m', 'a']);
+      g(['checkout', '--quiet', '-b', 'feature']);
+      writeFileSync(join(dir, 'b.txt'), 'b\n'); g(['add', 'b.txt']); gc(['commit', '--quiet', '-m', 'b']);
+      g(['checkout', '--quiet', 'main']);
+      const ctx = {};
+      scenarios[name](dir, g, ctx);
+      if (name.startsWith('rebase')) {
+        expect(g(['symbolic-ref', '--short', 'HEAD']).status).not.toBe(0);
+        expect(g(['rev-parse', 'HEAD']).stdout.trim()).toBe(g(['rev-parse', 'main']).stdout.trim());
+      }
+      const r = healWrongBranch({ git: g, settings });
+      expect(r).toMatchObject({ healed: false, reason: 'operation-in-progress' });
+      expect(g(['symbolic-ref', '--short', 'HEAD']).status).not.toBe(0);
+      ctx.expectIntact();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

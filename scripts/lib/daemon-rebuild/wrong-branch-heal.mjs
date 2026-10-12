@@ -15,12 +15,18 @@
  * readable status shows zero tracked changes. This changes no files and needs no saved ref; unreadable
  * HEAD, a different commit, or any tracked change still refuses.
  *
+ * IN-PROGRESS OPERATIONS (red-team, PR #4964): a paused interactive rebase (`break`, `edit`, a stopped pick) leaves
+ * HEAD detached on a clean tree, indistinguishable from a stray detach by SHA and status alone. Moving HEAD
+ * under a rebase, cherry-pick/revert sequence, bisect or merge corrupts the pending operation, so any such
+ * marker in the git dir refuses the heal on BOTH paths (an unreadable git dir refuses too).
+ *
  * THE HEAL ({@link healWrongBranch}): save the tracked changes as a commit under a named ref
  * (`refs/we/wrong-branch-heal/<ts>`, via `stash create`, so nothing is lost), drop them from the tree, and switch
  * back to the local `main` (non-forced). The store's next append re-derives its rows from its own tip, so the
  * saved changes are an audit copy, not a pending write.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { daemonRebuildSettingsPath } from './skip-unrelated.mjs';
 
 export const WRONG_BRANCH_HEAL_DEFAULTS = Object.freeze({
@@ -42,12 +48,18 @@ export function resolveWrongBranchHealSettings({ path = daemonRebuildSettingsPat
   }
 }
 
+/** Files/dirs in the git dir that mean a multi-step git operation is paused or running (per-worktree). */
+export const IN_PROGRESS_MARKERS = Object.freeze(['rebase-merge', 'rebase-apply', 'sequencer', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'MERGE_HEAD', 'BISECT_LOG']);
+
 /**
  * Pure: may this clone state be healed back to main?
- * @param {{branch: string|null, headSha?: string|null, mainSha?: string|null, changedPaths: string[]|null, hasMain: boolean, settings: {branches: string[], pathPrefixes: string[]}}} o
+ * `inProgress`: markers found in the git dir (`[]` none, `null` git dir unreadable; omitted = not checked).
+ * @param {{branch: string|null, headSha?: string|null, mainSha?: string|null, changedPaths: string[]|null, hasMain: boolean, settings: {branches: string[], pathPrefixes: string[]}, inProgress?: string[]|null}} o
  * @returns {{heal: true} | {heal: false, reason: string, detail?: object}}
  */
-export function planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings }) {
+export function planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress = [] }) {
+  if (inProgress === null) return { heal: false, reason: 'git-dir-unreadable' };
+  if (inProgress.length) return { heal: false, reason: 'operation-in-progress', detail: { operations: [...inProgress] } };
   if (!branch) {
     if (!headSha) return { heal: false, reason: 'detached-or-unreadable-head' };
     if (!hasMain || !mainSha) return { heal: false, reason: 'no-local-main' };
@@ -92,9 +104,12 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
   const mainSha = hasMain ? out(main) : null;
   const detachedHead = !branch ? git(['rev-parse', '--verify', '--quiet', 'HEAD']) : null;
   const headSha = detachedHead?.status === 0 ? out(detachedHead) : null;
+  const gd = git(['rev-parse', '--absolute-git-dir']);
+  const gitDir = gd.status === 0 ? out(gd) : '';
+  const inProgress = gitDir ? IN_PROGRESS_MARKERS.filter((m) => existsSync(join(gitDir, m))) : null;
   const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   const changedPaths = st.status === 0 ? parseTrackedChanges(st.stdout) : null;
-  const plan = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings });
+  const plan = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress });
   if (!plan.heal) return { healed: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) };
 
   let savedRef = null;
