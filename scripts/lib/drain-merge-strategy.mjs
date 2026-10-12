@@ -36,6 +36,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { loadMergeDeliveryPolicy, formatMergeDeliverySourcesLine, MERGE_DELIVERY_STRATEGIES } from './merge-delivery-policy.mjs';
 import { mergeActionFor, enqueuePr, planQueueFollowUps } from './merge-queue-enqueue.mjs';
+import { getRequiredStatusChecks } from './required-status-checks.mjs';
 import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
@@ -77,6 +78,23 @@ export function resolveDrainMergePolicy({ dryRun = false, env = process.env, loa
   if (!dryRun) return { policy, note: `${DRY_RUN_STRATEGY_ENV}=${raw} ignored (honoured only with --dry-run)` };
   if (!MERGE_DELIVERY_STRATEGIES.includes(raw)) return { policy, note: `${DRY_RUN_STRATEGY_ENV}=${raw} ignored (not one of ${MERGE_DELIVERY_STRATEGIES.join(', ')})` };
   return { policy: { ...policy, strategy: raw, sources: { ...policy.sources, strategy: `dry-run ${DRY_RUN_STRATEGY_ENV}` } }, note: null };
+}
+
+/** Whether this resolved pass policy sends local candidates to GitHub's required queue. */
+export function queueEnqueueModeFromPolicy(resolved) { return mergeActionFor(resolved.policy) === 'enqueue'; }
+
+/** Union classic protection with effective ruleset requirements; an unreadable set grants no relief. */
+export function readQueueRequiredChecks({ repo, branch = 'main', exec = execFileSync, readClassic = getRequiredStatusChecks } = {}) {
+  try {
+    const rules = JSON.parse(exec('gh', ['api', `repos/${repo || '{owner}/{repo}'}/rules/branches/${branch}`, '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'],
+      { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }));
+    if (!Array.isArray(rules)) return null;
+    const classic = readClassic({ repo, branch }).checks;
+    if (!Array.isArray(classic)) return null;
+    const checks = [...new Set([...classic, ...rules])];
+    if (!checks.length || checks.some(name => typeof name !== 'string' || !name.trim())) return null;
+    return checks.sort();
+  } catch { return null; }
 }
 
 /** The clearance comment body for one judged head. Pure. */
