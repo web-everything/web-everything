@@ -66,7 +66,7 @@ export default {
   recommendationHint: "Main's CI is red; one owner is dispatched per broken commit unless an open PR already fixes it.",
   evaluate({ mainCiRuns }, { now, config, quarantineSafetyNet = defaultQuarantineSafetyNet }) {
     const settings = mainCiRedSettings(config);
-    const state = mainRedState(mainCiRuns?.runs);
+    const state = mainRedState(mainCiRuns?.runs, { tip: mainCiRuns?.tip });
     let quarantine = null;
     try { quarantine = quarantineSafetyNet ? quarantineSafetyNet(mainCiRuns, { now }) : null; } catch { quarantine = null; }
     if (state.status !== 'red') return [];

@@ -311,6 +311,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // would otherwise land in the operator's real ~/.claude; resource-gate.test.mjs owns the cut-over itself.
     WE_RESOURCE_CUTOVER: 'shadow',
     WE_RESOURCE_SHADOW: 'off',
+    // fix.executor defaults to codex-first, which launches ordinary fix / ci-heal rounds through the detached fix-run
+    // wrapper — a launch the fake `claude --bg` session store cannot see, so every scenario's "dispatches one fixer /
+    // ci-heal session" invariant reads as never dispatched. Pin the Claude path; fix-executor-routing.test.mjs owns
+    // the routing itself.
+    WE_FIX_EXECUTOR: 'claude',
   };
   delete env.WE_GITHUB_APP_ID;
   delete env.WE_GITHUB_APP_INSTALLATION_ID;
