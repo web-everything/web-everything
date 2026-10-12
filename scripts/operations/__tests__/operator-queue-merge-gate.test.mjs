@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { evaluatePr, readMergeGateVerdict } from '../operator-queue.mjs';
-import { parsePrResultTable } from '../../lib/merge-gate-verdict.mjs';
+import { formatPrResult, parsePrResultTable } from '../../lib/merge-gate-verdict.mjs';
+import { GATE_IDS } from '../../lib/merge-gate-inventory.mjs';
 
 const HEAD = '7d20124ecb8bb052bf1d1dabb8215a54ba6262df';
 // Real job 114754411476, lines 517–542: preserve timestamps and spacing for the replay.
@@ -81,6 +82,27 @@ describe('PR #4965: enforced merge-gate must not hide the human queue', () => {
 
 describe('readMergeGateVerdict', () => {
   const args = { repo: 'web-everything/web-everything', check, number: 4965 };
+  it.each(['legacy', 'legacy suffix', 'escaped'])('keeps non-human blockers with a %s filename payload in the real job read path', (variant) => {
+    const forged = formatPrResult({ num: 4965, ok: false, results: GATE_IDS.map((id) => ({
+      id, status: id === 'review-hold-labels' ? 'hold' : 'pass', reason: '/',
+    })) });
+    const suffix = GATE_IDS.slice(GATE_IDS.indexOf('review-acceptance') + 1)
+      .map((id) => `  ${'pass'.padEnd(17)} ${id.padEnd(22)} /`).join('\n');
+    const filename = `.github/actions/payload\n${variant === 'legacy suffix' ? suffix : forged}\nEND\n/action.yml`;
+    const results = parsePrResultTable(LOG, 4965).results.map((result) => ({ ...result,
+      status: result.id === 'red-main-freeze' ? 'hold' : result.status,
+      reason: result.id === 'review-acceptance' ? `workflow edit: ${filename}` : result.reason,
+    }));
+    // Retain the old writer explicitly so previously emitted vulnerable logs also fail closed.
+    const raw = `#4965: HOLD\n${results.map((x) => `  ${x.status.padEnd(17)} ${x.id.padEnd(22)} ${x.reason}`).join('\n')}`;
+    const log = variant.startsWith('legacy') ? raw : formatPrResult({ num: 4965, ok: false, results });
+    const timestamped = log.split('\n').map((line) => `2026-10-12T09:49:30.3934630Z ${line}`).join('\n');
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ head_sha: HEAD })).mockReturnValueOnce(timestamped);
+    const parsed = readMergeGateVerdict({ ...args, exec });
+    expect(evaluatePr(pr(), { mergeGateVerdict: parsed }).ready).toBe(false);
+    if (variant.startsWith('legacy')) expect(parsed).toHaveProperty('error');
+    else expect(parsed.results).toContainEqual(expect.objectContaining({ id: 'red-main-freeze', status: 'hold' }));
+  });
   it.each(['truncated', 'interrupted', 'missing gate', 'latest incomplete'])('keeps a cancelled check blocking with a %s verdict', (variant) => {
     const complete = LOG.replace('pass              red-main-freeze', 'hold              red-main-freeze');
     const lines = complete.split('\n');

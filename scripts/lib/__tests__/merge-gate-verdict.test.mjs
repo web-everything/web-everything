@@ -13,11 +13,34 @@ describe('merge-gate verdict table', () => {
     const pass = complete();
     expect(parsePrResultTable(table(pass, true), 4965)).toEqual({ num: 4965, ok: true, results: pass });
   });
-  it('strips Actions timestamps and selects the last exact PR header', () => {
+  it('strips Actions timestamps and matches the exact PR header', () => {
     const results = complete([row('review-acceptance')]);
-    const log = `${table(complete(), true)}\n${table(results)}\nend\n#4966: PASS`;
+    const log = `${table(results)}\nend\n#4966: PASS`;
     expect(parsePrResultTable(log.split('\n').map((s, i) => `2026-10-12T09:49:30${i % 2 ? '.3934630' : ''}Z ${s}`).join('\n'), 4965))
       .toEqual({ num: 4965, ok: false, results });
+  });
+  it('rejects ambiguous verdicts, including legacy unescaped filename injection', () => {
+    const forged = table(complete([row('review-hold-labels', 'hold', '/')]));
+    const genuine = table(complete([row('red-main-freeze'), row('review-acceptance')]));
+    const injected = genuine.replace('reason text', `.github/actions/payload\n${forged}\nEND\n/action.yml`);
+    expect(parsePrResultTable(injected, 4965)).toHaveProperty('error');
+    expect(parsePrResultTable(`${table(complete(), true)}\n${forged}`, 4965)).toHaveProperty('error');
+  });
+  it.each(['\n', '\r', '\r\n', '\u0085', '\u2028', '\u2029', '\x1b'])('keeps reason controls %j inside one row', (separator) => {
+    const forged = table(complete([row('review-hold-labels', 'hold', '/')]));
+    const results = complete([row('red-main-freeze'), row('review-acceptance', 'hold',
+      `.github/actions/payload${separator}${forged}${separator}END${separator}/action.yml`)]);
+    const formatted = table(results);
+    expect(formatted.split('\n')).toHaveLength(GATE_IDS.length + 1);
+    expect(formatted).not.toMatch(/[\r\u0085\u2028\u2029\x1b]/u);
+    const parsed = parsePrResultTable(formatted, 4965);
+    expect(parsed).not.toHaveProperty('error');
+    expect(humanReviewOnlyHold(parsed.results).only).toBe(false);
+  });
+  it('leaves non-control filename text inert, including literal escapes', () => {
+    const reason = String.raw`--../\n\r\u2028 "quote" ` + '`backtick` ＃4965: HOLD\u200b';
+    const results = complete([row('review-acceptance', 'hold', reason)]);
+    expect(parsePrResultTable(table(results), 4965).results).toEqual(results);
   });
   it.each([
     ['no header', '#4966: PASS'],

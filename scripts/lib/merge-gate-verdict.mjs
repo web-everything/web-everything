@@ -5,26 +5,44 @@ const STATUS_WIDTH = 17;
 const ID_WIDTH = 22;
 export const VERDICT_STATUSES = Object.freeze(['pass', 'hold', 'fail-closed', 'queue', 'enqueue', 'skipped-by-policy']);
 
-/** Human-readable check summary. */
+/** Human-readable check summary. Reasons are display text, never log structure. */
 export function formatPrResult(p) {
   const lines = [`#${p.num}: ${p.ok ? 'PASS' : 'HOLD'}`];
-  for (const x of p.results) lines.push(`  ${x.status.padEnd(STATUS_WIDTH)} ${x.id.padEnd(ID_WIDTH)} ${x.reason}`);
+  for (const x of p.results) {
+    // Filenames and other PR-controlled prose may contain log/terminal controls.
+    // Escape after concatenation and never decode on read: one result stays one line.
+    const reason = String(x.reason).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu,
+      (char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    lines.push(`  ${x.status.padEnd(STATUS_WIDTH)} ${x.id.padEnd(ID_WIDTH)} ${reason}`);
+  }
   return lines.join('\n');
 }
 
-/** Read the last verdict for this PR, never an earlier successful attempt. Pure. */
+/** Require one unambiguous verdict for this PR. Pure. */
 export function parsePrResultTable(logText, num) {
   const lines = String(logText ?? '').split(/\r?\n/)
     .map((line) => line.replace(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z /, ''));
-  const index = lines.findLastIndex((line) => line === `#${num}: PASS` || line === `#${num}: HOLD`);
+  let index = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i] !== `#${num}: PASS` && lines[i] !== `#${num}: HOLD`) continue;
+    // Also reject historical logs written before reason escaping: an injected
+    // complete table must never override the genuine verdict (or vice versa).
+    if (index >= 0) return { error: `ambiguous verdict headers for #${num}` };
+    index = i;
+  }
   if (index < 0) return { error: `no verdict header for #${num}` };
   const ok = lines[index] === `#${num}: PASS`;
   const results = [];
   const seen = new Set();
   const row = new RegExp(`^  (.{${STATUS_WIDTH}}) (\\S+) (.*)$`);
+  let ended = false;
   for (const line of lines.slice(index + 1)) {
     const match = row.exec(line);
-    if (!match) break;
+    if (!match) { ended = true; continue; }
+    // An injected suffix can complete the inventory without a second header,
+    // then use prose to hide the genuine remaining rows. Do not ignore them.
+    // Conservatively reject later tables too: this log is not unambiguous proof.
+    if (ended) return { error: `verdict rows after table end for #${num}` };
     const status = match[1].trim();
     const id = match[2];
     if (!VERDICT_STATUSES.includes(status)) return { error: `unknown status: ${status}` };
