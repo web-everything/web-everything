@@ -4301,11 +4301,6 @@ async function runCli() {
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
-  const workflowEditSetting = resolveDrainWorkflowEditHuman();
-  process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
-  const workflowReadOptions = (v) => ({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
-    listedHeadSha: v.listedHeadSha, workflowEditSetting: workflowEditSetting.value,
-    local: isLocalRepo(v.repo), defaultBranch: defaultBranchOf(v.repo) });
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
   // #2290 — `--only=<pr>` (alias `--couple=<pr>`, and the legacy `--pr=<pr>`) scopes the sweep to ONE PR: the
   // single-couple FAST DRAIN that /pr (pr-land) and /finish (lane-resume) shell so they still feel instant
@@ -4862,6 +4857,12 @@ async function runCli() {
   // ── ONE sweep pass — reconcile labels → list → classify → cascade-merge → sync. Returns the pass result (no
   // emit/exit), so the watch loop can call it repeatedly. A gh-list failure still hard-fails (bad env).
   const sweepOnce = async () => {
+  // Keep listing, bare-loop and review-escalation policy on one fresh snapshot per pass.
+  const workflowEditSetting = resolveDrainWorkflowEditHuman();
+  process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
+  const workflowReadOptions = (v) => ({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
+    listedHeadSha: v.listedHeadSha, workflowEditSetting: workflowEditSetting.value,
+    local: isLocalRepo(v.repo), defaultBranch: defaultBranchOf(v.repo) });
   // x2e120n — this pass's own step timer + wall-clock start. See pass-timings.mjs's header for the full
   // rationale; the short version: attach `result.timings` + print one unconditional stderr summary line so
   // "why is a pass slow" has a real breakdown instead of a single opaque `ms`.
