@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isGateSelfPath } from '../lib/review-escalation.mjs';
+import { isPolicySpecPath } from '../lib/gate-config.mjs';
 import { aiPr } from './fixtures/merge-ai-prs-fixtures.mjs';
 
 const source = join(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -24,6 +25,10 @@ describe('workflow human hold through the drain CLI', () => {
     mkdirSync(join(root, 'backlog'));
     mkdirSync(join(root, 'bin'));
     settings = join(root, 'scripts/drain-gate-settings.json');
+    writeFileSync(join(root, 'isolate-home.cjs'), `
+require('node:os').homedir = () => process.env.WORKFLOW_HOME;
+require('node:module').syncBuiltinESMExports();
+`);
     // No real git operations (including writes to .git) or network calls in this fixture.
     writeFileSync(join(root, 'bin/git'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
     writeFileSync(join(root, 'bin/gh'), `#!/usr/bin/env node
@@ -35,7 +40,8 @@ if (a[0] === 'repo') out = 'main';
 else if (a[0] === 'pr' && a[1] === 'list') {
   out = [pr];
   if (process.env.FLIP_SETTINGS && a[a.indexOf('--json') + 1].split(',').includes('mergeable')) {
-    fs.writeFileSync(process.env.FLIP_SETTINGS, JSON.stringify({ drainWorkflowEditHuman: 'off' }));
+    fs.appendFileSync(process.env.LIST_FIELDS, JSON.stringify(a[a.indexOf('--json') + 1].split(',')) + '\\n');
+    fs.writeFileSync(process.env.FLIP_SETTINGS, JSON.stringify({ drainWorkflowEditHuman: process.env.NEXT_SETTING }));
   }
 } else if (a[0] === 'pr' && a[1] === 'view') out = { ...pr, comments: [] };
 fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
@@ -45,13 +51,16 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
 
   const cli = ({ labeled = true, watch = false, setting = 'on', files = [{ path: '.github/workflows/x.yml', changeType: 'MODIFIED' }] } = {}) => {
     writeFileSync(settings, JSON.stringify({ drainWorkflowEditHuman: setting }));
-    return spawnSync(process.execPath, [join(root, 'scripts/merge-ai-prs.mjs'),
+    writeFileSync(join(root, 'list-fields.jsonl'), '');
+    return spawnSync(process.execPath, ['--require', join(root, 'isolate-home.cjs'), join(root, 'scripts/merge-ai-prs.mjs'),
       '--this-repo', ...(labeled ? ['--label=ready-to-merge', '--no-review-escalation'] : []),
       '--no-reconcile-labels', '--dry-run', ...(watch ? ['--watch', '--interval=0.001', '--max-idle=2'] : ['--json']),
       '--no-drain-lease', '--no-red-main-freeze', '--no-rebase-drop', '--no-heal-collision', '--no-overlap-yield',
     ], { cwd: root, encoding: 'utf8', timeout: 20000, env: {
       ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, LANE_POOL_ROOT: root,
       WE_DRAIN_WORKFLOW_EDIT_HUMAN: '', FLIP_SETTINGS: watch ? settings : '',
+      WE_GITHUB_AUTH: 'personal', WORKFLOW_HOME: root,
+      NEXT_SETTING: setting === 'on' ? 'off' : 'on', LIST_FIELDS: join(root, 'list-fields.jsonl'),
       WORKFLOW_PR: JSON.stringify(aiPr({ number: 3432, headRefOid: sha, headRefName: 'lane/3432',
         baseRefName: 'main', labels: [{ name: 'ready-to-merge' }], files,
         statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS' }],
@@ -86,17 +95,26 @@ fs.writeSync(1, typeof out === 'string' ? out : JSON.stringify(out));
     expect(report.reconciledLabels).toEqual([]);
   });
 
-  it('reloads and logs the policy on both watch passes after the file changes', () => {
-    const result = cli({ watch: true });
+  it.each(['on', 'off'])('reloads policy and listing fields on both watch passes (initially %s)', (setting) => {
+    const result = cli({ watch: true, setting });
     expect(result.status, result.stderr).toBe(0);
     const lines = result.stderr.split('\n').filter((line) => line.startsWith('policy · drainWorkflowEditHuman='));
     expect(lines).toHaveLength(2);
-    expect(lines[0]).toContain('drainWorkflowEditHuman=on (settings)');
-    expect(lines[1]).toContain('drainWorkflowEditHuman=off (settings)');
+    const next = setting === 'on' ? 'off' : 'on';
+    expect(lines[0]).toContain(`drainWorkflowEditHuman=${setting} (settings)`);
+    expect(lines[1]).toContain(`drainWorkflowEditHuman=${next} (settings)`);
+    const fields = readFileSync(join(root, 'list-fields.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(fields.map((f) => f.includes('files'))).toEqual([setting === 'on', next === 'on']);
+    const passes = result.stderr.split(/── pass \d+ ──/).slice(1);
+    expect(passes).toHaveLength(2);
+    for (const [index, value] of [setting, next].entries()) {
+      expect(passes[index]).toContain(`DRY-RUN: ${value === 'on' ? 0 : 1} AI PR(s) to merge`);
+    }
   });
 
   it.each(['scripts/drain-gate-settings.json', 'scripts/lib/drain-workflow-edit-hold.mjs'])(
     'requires human review for policy changes to %s', (path) => {
       expect(isGateSelfPath(path)).toBe(true);
+      expect(isPolicySpecPath(path)).toBe(true);
     });
 });
