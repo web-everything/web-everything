@@ -47,7 +47,7 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
 
 ## Preconditions
 
-- [ ] PR #4715 merged: red-main freeze published to a shared ops branch CI can read; it carries card x09e2bn,
+- [ ] PR #4715 merged: red-main freeze published to a shared ops branch CI can read; it carries card 5905,
   the drain-side reader of that branch.
 - [ ] `merge-gate` runs in **enforce**. PR #4715 does not itself set `mergeGate.mode`; enforce needs
   `mergeGate.mode: "enforce"` in a repo settings file or the `MERGE_GATE_MODE` repository variable
@@ -55,7 +55,7 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   Apply step 4 re-checks this on a fresh merge-gate run on main and stops unless its log says `enforce`: in `shadow` the
   required `merge-gate` check passes with "SHADOW: would HOLD", so the queue would merge PRs the drain holds.
 - [ ] Merge-gate shadow audit clean: no shadow "would HOLD" on a PR the drain then landed.
-- [ ] Card `xjdnlk0` done: the pinned `workflows` runs are proven on a live PR. GitHub starts them only on
+- [ ] Card `5918` done: the pinned `workflows` runs are proven on a live PR. GitHub starts them only on
   opened, synchronize and reopened (plus `merge_group`), so a label or body edit may not re-run the pinned
   `merge-gate` or `soak-replay-gate`. They may also share a `cancel-in-progress` concurrency group with the
   repo's own runs and cancel them.
@@ -64,7 +64,7 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   the freeze's hold, so the drain would still `gh pr merge` it.
 - [ ] You can run `gh` with your own admin login and merge this PR by hand: the freeze below stops the drain
   from merging it.
-- [ ] Card `xsvxy4v` done: the drain confirms a PR is `MERGED` before it records a landing. Without it, any
+- [ ] Card `5919` done: the drain confirms a PR is `MERGED` before it records a landing. Without it, any
   drain that still reads `drain-direct` after the switch (a stale clone, a lane's `/pr` or `/finish` run, which
   reads its own branch's settings, a `pr-watch` fast drain, a manual `/drain`) records an enqueue as landed.
   The freeze and the clone check below cover only the drain clones; the switch window's stop list below
