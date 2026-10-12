@@ -826,6 +826,7 @@ describe('standalone prepare', () => {
   const prepared = ITEM_RAW + '\n## Design\nConcrete preparation.\n## MVP\nBounded change.\n## Test plan\nReplay the failure.\n## Proof plan\nProbe the CLI.\n';
   function prepareIo(options = {}) {
     const fake = fakeIo({ numstat: `12\t0\t${path}`, postWorkerRaw: prepared, ...options });
+    fake.io.preparePolicy = { autoSize: false };
     fake.io.readCommittedCard = () => fake.io.findItem().raw;
     fake.io.readPrepareBrief = () => '# Prepare {{ITEM_NUM}}: {{ITEM_SPEC_PATH}}';
     fake.io.stampPrepare = () => {
@@ -840,6 +841,36 @@ describe('standalone prepare', () => {
     return fake;
   }
   const prepareArgs = () => args(codex, { taskType: 'prepare', scope: `we:${path}` });
+  it.each([undefined, 0, -1, 1.5])('repairs a task missing a positive integer estimate (%s)', async estimate => {
+    const raw = prepared.replace('status: open', 'kind: task\nstatus: open');
+    const postWorkerRaw = estimate === undefined ? raw : raw.replace('status: open', `estimatedLoc: ${estimate}\nstatus: open`);
+    const { io, calls } = prepareIo({ item: { path, raw, spec: raw, scope: ['we:docs/probation/probation.md'] }, postWorkerRaw });
+    io.preparePolicy = { autoSize: true };
+    const tasks = [];
+    io.writeTaskFile = (_dir, name, text) => { tasks.push(text); return name; };
+    const result = await runProbationBuild(prepareArgs(), io);
+    expect(result.detail).toContain('Missing size: a task needs a positive integer estimatedLoc');
+    expect(tasks.some(t => t.includes('Repair the card in place') && t.includes('Missing size:'))).toBe(true);
+    expect(calls.filter(c => c[0] === 'worker')).toHaveLength(2);
+    expect(calls.some(c => c[0] === 'stamp')).toBe(false);
+  });
+  it('allows the worker to author estimatedLoc and stamps the task', async () => {
+    const raw = prepared.replace('status: open', 'kind: task\nstatus: open');
+    const { io, calls } = prepareIo({ item: { path, raw, spec: raw, scope: ['we:docs/probation/probation.md'] },
+      postWorkerRaw: raw.replace('status: open', 'estimatedLoc: 42\nstatus: open') });
+    io.preparePolicy = { autoSize: true };
+    expect(await runProbationBuild(prepareArgs(), io)).toMatchObject({ outcome: 'opened-pr' });
+    expect(calls.some(c => c[0] === 'stamp')).toBe(true);
+  });
+  it.each([false, true])('requires size on non-task cards (sized=%s)', async sized => {
+    const raw = prepared.replace('status: open', 'kind: story\nstatus: open');
+    const { io } = prepareIo({ item: { path, raw, spec: raw, scope: ['we:docs/probation/probation.md'] },
+      postWorkerRaw: sized ? raw.replace('status: open', 'size: 2\nstatus: open') : raw });
+    io.preparePolicy = { autoSize: true };
+    const result = await runProbationBuild(prepareArgs(), io);
+    expect(result.outcome).toBe(sized ? 'opened-pr' : 'escalated-needs-human');
+    if (!sized) expect(result.detail).toContain('Missing size:');
+  });
   it.each([
     ['cyclic', '12', 'open', ['4291'], 'blockedBy cycle'],
     ['unknown', '99', null, [], 'does not resolve'],

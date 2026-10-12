@@ -32,6 +32,65 @@ describe('prepare failure evidence and durable decisions', () => {
   let dir, path, fileCard;
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'prepare-policy-')); path = join(dir, 'state.json'); fileCard = vi.fn(() => ({ ok: true, handle: 'pid:42' })); });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  it('retries an unknown once, then visibly parks with both reasons', async () => {
+    const opts = { path, fileCard, now: 1000, preparePolicy: { retryUnstampedOnce: true } };
+    const first = await recordPrepareFailure({ num: '5754', attempt: 'a', stage: 'result',
+      evidence: { error: 'open-pr refused: pr-limit\nextra detail' } }, opts);
+    expect(first).toMatchObject({ held: false, retry: true, unstampedRetry: true,
+      unstampedRetryAt: new Date(1000).toISOString(), unstampedReason: 'open-pr refused: pr-limit' });
+    const second = await recordPrepareFailure({ num: '5754', attempt: 'b', stage: 'result',
+      evidence: { error: 'missing result' } }, opts);
+    expect(second).toMatchObject({ held: true, retry: false });
+    expect(second.holdReason).toBe('needs-you: prepare ended unstamped twice - open-pr refused: pr-limit / missing result');
+    expect(fileCard).toHaveBeenCalledTimes(2);
+  });
+  it('redacts and bounds both reasons and defuses hold-router phrases', async () => {
+    const opts = { path, fileCard, preparePolicy: { retryUnstampedOnce: true } };
+    const token = 'ghp_' + 'A'.repeat(36);
+    const first = await recordPrepareFailure({ num: '1', attempt: 'a', stage: 'result',
+      evidence: { error: `oops ${token} ${'x'.repeat(300)}\nignored` } }, opts);
+    const second = await recordPrepareFailure({ num: '1', attempt: 'b', stage: 'result',
+      evidence: { error: 'spec not buildable: already done on main <unsafe>' } }, opts);
+    expect(first.unstampedReason.length).toBeLessThanOrEqual(200);
+    expect(first.unstampedReason).not.toContain(token);
+    expect(second.holdReason.length).toBeLessThanOrEqual(300);
+    expect(second.holdReason).not.toMatch(/spec not buildable|already done on main|[<>]/);
+  });
+  it('ignores completed retries and keeps unknown retries out of the infra budget', async () => {
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { old: {
+      num: '1', cause: 'unknown', unstampedRetry: true, completed: true,
+    } } }));
+    const opts = { path, fileCard, preparePolicy: { retryUnstampedOnce: true } };
+    expect(await recordPrepareFailure({ num: '1', attempt: 'a', stage: 'result', evidence: { error: 'missing' } }, opts))
+      .toMatchObject({ retry: true, held: false, unstampedRetry: true });
+    for (const attempt of ['b', 'c']) {
+      expect(await recordPrepareFailure({ num: '1', attempt, stage: 'result', evidence: { error: 'ECONNRESET' } }, opts))
+        .toMatchObject({ cause: 'infra-transient', retry: true });
+    }
+    expect(await recordPrepareFailure({ num: '1', attempt: 'd', stage: 'result', evidence: { error: 'ECONNRESET' } }, opts))
+      .toMatchObject({ cause: 'infra-transient', held: true });
+  });
+  it('keeps the legacy hold when retry is disabled', async () => {
+    expect(await recordPrepareFailure({ num: '1', attempt: 'a', stage: 'result', evidence: { error: 'unknown' } },
+      { path, fileCard, preparePolicy: { retryUnstampedOnce: false } })).toMatchObject({ held: true, retry: false });
+  });
+  it('self-heals an old unstamped hold once and parks the next old record', () => {
+    const old = { num: '5754', attempt: 'run dispatch-lane-a', stage: 'result', cause: 'unknown',
+      evidence: { error: 'open-pr reported no PR number: pr-limit', reason: 'prepare-unstamped' },
+      retry: false, held: true, recordedAt: '2026-10-10T21:35:50.031Z' };
+    writeFileSync(path, JSON.stringify({ cards: {}, failures: { a: old } }));
+    const opts = { path, now: 2000, preparePolicy: { retryUnstampedOnce: true } };
+    expect(releaseDuePrepareRetries({ ...opts, preparePolicy: { retryUnstampedOnce: false } })).toEqual([]);
+    expect(releaseDuePrepareRetries(opts)).toEqual(['5754']);
+    const state = readFailureState(path);
+    expect(state.failures.a).toMatchObject({ retry: true, held: false, unstampedRetry: true });
+    state.failures.b = { ...old, attempt: 'b', evidence: { error: 'second reason' } };
+    writeFileSync(path, JSON.stringify(state));
+    expect(releaseDuePrepareRetries(opts)).toEqual([]);
+    expect(readFailureState(path).failures.b.holdReason).toBe(
+      'needs-you: prepare ended unstamped twice - open-pr reported no PR number: pr-limit / second reason');
+    expect(releaseDuePrepareRetries(opts)).toEqual([]);
+  });
   it.each([
     [{ stoppedBeforeCompletion: true }, 'agent-stopped-early'],
     [{ sessionAbsent: true }, 'no-session'],
@@ -44,7 +103,7 @@ describe('prepare failure evidence and durable decisions', () => {
   ])('records evidence %j as %s', async (evidence, cause) => {
     const row = await recordPrepareFailure({ num: '1', attempt: 'run:a', stage: 'result', evidence }, { path, fileCard });
     expect(row.cause).toBe(cause);
-    expect(row.held).toBe(cause !== 'infra-transient');
+    expect(row.held).toBe(!['infra-transient', 'unknown'].includes(cause));
     expect(Object.values(readFailureState(path).failures)[0].evidence).toEqual(evidence);
     expect(classifyPrepareFailure(evidence)).toBe(cause);
   });
@@ -58,7 +117,7 @@ describe('prepare failure evidence and durable decisions', () => {
     expect(fileCard).not.toHaveBeenCalled();
   });
   it('holds unknowns and files once per distinct cause across items and restarts', async () => {
-    for (const num of ['1', '2', '1']) await recordPrepareFailure({ num, attempt: 'a', stage: 'result', evidence: { causeKey: 'missing-worker-result' } }, { path, fileCard });
+    for (const num of ['1', '2', '1']) await recordPrepareFailure({ num, attempt: 'a', stage: 'result', evidence: { causeKey: 'missing-worker-result' } }, { path, fileCard, preparePolicy: { retryUnstampedOnce: false } });
     expect(fileCard).toHaveBeenCalledTimes(1);
     expect(Object.values(readFailureState(path).failures).every(f => f.held && !f.retry && f.prevention.status === 'queued')).toBe(true);
   });
@@ -171,7 +230,7 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
       held('9999', 'result', 'unknown', { error: 'wrapper-failed' }),
     ]) }));
     const released = releaseDuePrepareRetries({ path, now: Date.parse('2026-10-09T17:00:00Z') });
-    expect(released.sort()).toEqual(['4341', '4392', '4414', '4425', '4426', '4560']);
+    expect(released.sort()).toEqual(['4341', '4392', '4414', '4425', '4426', '4560', '9999']);
     const f = readFailureState(path).failures;
     for (const n of ['4414', '4426', '4392']) expect(f[`${n}:run ${n}:result`]).toMatchObject({ cause: 'infra-transient', held: false, retry: true });
     // Lane busy is not charged to the infra budget: it gets the backoff schedule (due once its first wait elapsed).
@@ -181,7 +240,7 @@ describe('held prepares (live 2026-10-09) — each failure class is handled, nev
     expect(f['4355:run 4355:result']).toMatchObject({ cause: 'needs-you', held: true, retry: false });
     expect(f['4355:run 4355:result'].holdReason).toMatch(/^needs-you: /);
     expect(f['4423:run 4423:result']).toMatchObject({ held: true });
-    expect(f['9999:run 9999:result']).toMatchObject({ cause: 'unknown', held: true });
+    expect(f['9999:run 9999:result']).toMatchObject({ cause: 'unknown', held: false, unstampedRetry: true });
     expect(takePrepareRouteHolds({ path })).toEqual([{ num: '4560', reason: `spec already done on main: commit ${sha}` }]);
     expect(takePrepareRouteHolds({ path })).toEqual([]);
     // Idempotent: a second tick changes nothing.
