@@ -106,7 +106,7 @@ export function readSessionLog(sessionSlug, root = REPO_ROOT) {
   finally { if (fd !== undefined) closeSync(fd); }
 }
 function currentCheckoutBuild(root) {
-  try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }).trim(); }
+  try { return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 64 * 1024 }).trim(); }
   catch { return null; }
 }
 function postFixLoopParkComment({ repoSlug, pr, body }) {
@@ -114,7 +114,7 @@ function postFixLoopParkComment({ repoSlug, pr, body }) {
   try {
     const path = join(dir, 'comment.txt');
     writeFileSync(path, body);
-    execFileSyncThrottled('gh', ['pr', 'comment', String(pr), '--repo', repoSlug, '--body-file', path], { encoding: 'utf8', timeout: 30000 });
+    execFileSyncThrottled('gh', ['pr', 'comment', String(pr), '--repo', repoSlug, '--body-file', path], { encoding: 'utf8', timeout: 30000, maxBuffer: 64 * 1024 });
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 /** Use the fixer's existing stronger rung, otherwise the routing policy's native Claude heal route. */
