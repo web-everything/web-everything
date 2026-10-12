@@ -1,15 +1,22 @@
 ---
+bornAs: xyityv3
 kind: story
-size: 1
+size: 3
+parent: "4075"
 status: open
-scope: ["we:scripts/operations/fix-run.mjs", "we:scripts/operations/__tests__/"]
+scope: ["we:scripts/lib/build-queue.mjs", "we:scripts/lib/__tests__/build-queue.test.mjs"]
 dateOpened: "2026-10-12"
 tags: []
 ---
 
-# fix-run: detect unmerged binary paths by status, not numstat
+# Prevention — Add a scope-review checkpoint mapping each new policy setting to the stated goal and separating i… (from web-everything/web-everything#5038 review)
 
-From the PR #4984 review finding (operator ruled card, 2026-10-12): we:scripts/operations/fix-run.mjs (~line 395) detects binary merge conflicts by looking for '-\t-\t' rows in git diff --numstat, but git prints '0\t0\t<path>' for unmerged binary paths, so binary UU conflicts are never caught and the launcher could commit an unresolved binary conflict. Detect unmerged paths with git diff --name-only --diff-filter=U (or git ls-files -u) and refuse/abort the merge with a recorded reason; add a real-git test with a conflicted binary file.
+Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:scripts/lib/build-queue.mjs:311` — Add a scope-review checkpoint mapping each new policy setting to the stated goal and separating independent policy features.
+
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 2 → #5971.
+
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5038@7baf939e79c9185ee15e8144447f2cff768e0f16
 
 ## Acceptance
 
