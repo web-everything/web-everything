@@ -7,6 +7,9 @@ import { join } from 'node:path';
 import * as q from '../merge-queue-enqueue.mjs';
 import { createDrainMergeStrategy } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { loadMergeQueueSettings } from '../merge-queue-hook.mjs';
+import { validateQueueSettings } from '../merge-queue.mjs';
+import * as settingsFiles from '../settings-files.mjs';
 const HEAD = 'a'.repeat(40), NEXT = 'b'.repeat(40), KEY = 'owner/repo#42';
 const LIVE = `gh: Pull request Required workflows 'CI, CI, Merge gate, Merge gate, Soak replay gate, Soak replay gate' are not satisfied Required status check "merge-gate" is expected.`;
 function execFor(graphql = false) {
@@ -45,13 +48,79 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
     expect(q.decideRequiredWorkflowsRefresh({ ...base, state })).toMatchObject({ action: 'skip', reason: expect.stringContaining(HEAD.slice(0, 9)) });
     expect(q.decideRequiredWorkflowsRefresh({ ...base, state, headSha: NEXT })).toMatchObject({ action: 'skip', reason: expect.stringMatching(/person/) });
   });
-  it('resolves env > file > default with sources', () => temporary((dir) => {
-    const file = join(dir, 'settings.json');
-    expect(q.resolveRequiredWorkflowsRefresh({ env: {}, file })).toEqual({ value: 'on', source: 'default' });
-    writeFileSync(file, '{"requiredWorkflowsRefresh":"off"}');
-    expect(q.resolveRequiredWorkflowsRefresh({ env: {}, file })).toEqual({ value: 'off', source: 'settings' });
-    expect(q.resolveRequiredWorkflowsRefresh({ env: { WE_DRAIN_REQUIRED_WORKFLOWS_REFRESH: 'on' }, file })).toEqual({ value: 'on', source: 'env' });
+  const setting = (value) => ({ mergeQueue: { refreshOnUnsatisfiedWorkflows: value } });
+  const envSetting = (value) => ({ WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS: value });
+  it.each([
+    [envSetting('off'), setting('on'), setting('on'), 'off', 'env'],
+    [{}, setting('off'), setting('on'), 'off', 'settings'],
+    [{}, {}, setting('off'), 'off', 'platform'],
+    [{}, {}, {}, 'on', 'standard'],
+  ])('resolves env > settings > platform > standard (%s, %s, %s)', (env, settings, platform, value, source) => {
+    expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env, settings, platform })).toEqual({ value, source, invalid: [] });
+    expect(q.REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT).toBe('on');
+  });
+  it.each([
+    [envSetting('invalid'), setting('off'), setting('on'), 'off', 'settings', ['env']],
+    [{}, setting('invalid'), setting('off'), 'off', 'platform', ['settings']],
+    [{}, {}, setting('invalid'), 'on', 'standard', ['platform']],
+    [envSetting('invalid'), setting('invalid'), setting('invalid'), 'on', 'standard', ['env', 'settings', 'platform']],
+  ])('reports invalid layers and falls through (%s, %s, %s)', (env, settings, platform, value, source, layers) => {
+    const out = q.resolveRefreshOnUnsatisfiedWorkflows({ env, settings, platform });
+    expect(out).toMatchObject({ value, source });
+    expect(out.invalid).toEqual(layers.map((layer) => `${layer}: mergeQueue.refreshOnUnsatisfiedWorkflows="invalid" (expected on|off)`));
+  });
+  it.each([null, false, 0, '', 'ON', ' off ', [], {}])('rejects non-on/off values: %j', (value) => {
+    const out = q.resolveRefreshOnUnsatisfiedWorkflows({ env: {}, settings: setting(value), platform: setting('off') });
+    expect(out).toMatchObject({ value: 'off', source: 'platform' });
+    expect(out.invalid).toHaveLength(1);
+    expect(out.invalid[0]).toContain('settings: mergeQueue.refreshOnUnsatisfiedWorkflows=');
+  });
+  it('resolves independently of unrelated invalid queue settings and ignores the retired knob', () => {
+    expect(q.resolveRefreshOnUnsatisfiedWorkflows({
+      env: { WE_DRAIN_REQUIRED_WORKFLOWS_REFRESH: 'off' },
+      settings: { requiredWorkflowsRefresh: 'off', mergeQueue: { batchSize: 999, refreshOnUnsatisfiedWorkflows: 'on' } },
+      platform: setting('off'),
+    })).toEqual({ value: 'on', source: 'settings', invalid: [] });
+  });
+  it('reads declared settings outside tests', () => {
+    const reader = vi.spyOn(settingsFiles, 'readDeclaredSettings').mockReturnValue({ settings: setting('off'), errors: [] });
+    try {
+      expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env: {}, platform: {} })).toEqual({ value: 'off', source: 'settings', invalid: [] });
+      expect(reader).toHaveBeenCalledOnce();
+    } finally { reader.mockRestore(); }
+  });
+  it.each(['VITEST', 'WE_UNDER_TEST'])('isolates repo settings under %s unless an explicit file is given', (flag) => temporary((dir) => {
+    const reader = vi.spyOn(settingsFiles, 'readDeclaredSettings').mockImplementation(() => { throw new Error('must not read live settings'); });
+    try {
+      const env = { [flag]: '1' };
+      expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env, platform: setting('off') })).toEqual({ value: 'off', source: 'platform', invalid: [] });
+      const file = join(dir, 'settings.json');
+      writeFileSync(file, JSON.stringify(setting('on')));
+      expect(q.resolveRefreshOnUnsatisfiedWorkflows({ env: { ...env, WE_MERGE_QUEUE_SETTINGS_FILE: ` ${file} ` }, platform: setting('off') }))
+        .toEqual({ value: 'on', source: 'settings', invalid: [] });
+      expect(reader).not.toHaveBeenCalled();
+    } finally { reader.mockRestore(); }
   }));
+  it('falls through a malformed explicit settings file to platform', () => temporary((dir) => {
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, 'invalid JSON');
+    const out = q.resolveRefreshOnUnsatisfiedWorkflows({ env: { WE_UNDER_TEST: '1', WE_MERGE_QUEUE_SETTINGS_FILE: file }, platform: setting('off') });
+    expect(out).toMatchObject({ value: 'off', source: 'platform', invalid: [expect.stringContaining('settings:')] });
+  }));
+  it('declares and documents the real repo setting without comment collisions or queue validation errors', () => {
+    const file = JSON.parse(readFileSync(new URL('../../settings/merge-queue.json', import.meta.url), 'utf8'));
+    expect(file.mergeQueue.refreshOnUnsatisfiedWorkflows).toBe('on');
+    expect(file.$comment).toContain('mergeQueue.refreshOnUnsatisfiedWorkflows');
+    expect(file.$comment).toContain('WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS');
+    expect(loadMergeQueueSettings({ file, env: {} }).errors).toEqual([]);
+    expect(validateQueueSettings(file.mergeQueue)).toEqual({ ok: true, errors: [] });
+    const merged = settingsFiles.mergeSettingsLayers([
+      { source: 'other.json', data: { $comment: 'Another setting description' } },
+      { source: 'merge-queue.json', data: file },
+    ]);
+    expect(merged.duplicates).toEqual([]);
+    expect(loadMergeQueueSettings({ file: merged.settings, env: {} }).errors).toEqual([]);
+  });
   it('reads tolerantly and atomically bounds state to the newest 500 entries', () => temporary((dir) => {
     const path = q.requiredWorkflowsRefreshStatePath({ WE_COORDINATION_ROOT: dir });
     expect(path).toBe(join(dir, 'drain-required-workflows-refresh.json'));
@@ -107,10 +176,12 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
     const postStart = cli.indexOf('if (requiredWorkflowsRefusals.length)', start);
     expect(postStart).toBeGreaterThan(cli.indexOf('if (!progressed) break;', start));
     const postLoop = cli.slice(postStart, cli.indexOf('if (deferred.length && !AS_JSON)', postStart));
-    expect(postLoop).toContain('const requiredWorkflowsRefresh = resolveRequiredWorkflowsRefresh()');
+    expect(postLoop).toContain('const requiredWorkflowsRefresh = resolveRefreshOnUnsatisfiedWorkflows()');
     expect(postLoop).toContain('for (const { c, headSha, detail } of requiredWorkflowsRefusals)');
     expect(postLoop).toContain('await handleRequiredWorkflowsRefusal');
     expect(postLoop).toContain('setting: requiredWorkflowsRefresh');
+    expect(postLoop).toContain('  merge-queue: refreshOnUnsatisfiedWorkflows=${requiredWorkflowsRefresh.value} (${requiredWorkflowsRefresh.source})');
+    expect(postLoop).toContain(' · ignored invalid: ${requiredWorkflowsRefresh.invalid.join');
     expect(cli).not.toContain('mergeStrategy.requiredWorkflowsRefresh');
     const handled = postLoop.slice(postLoop.indexOf('if (recovery.handled)'), postLoop.indexOf('} else {'));
     expect(handled).toContain('revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason })');

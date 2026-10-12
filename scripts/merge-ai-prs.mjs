@@ -182,7 +182,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
-import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRequiredWorkflowsRefresh, handleRequiredWorkflowsRefusal } from './lib/merge-queue-enqueue.mjs';
+import { REQUIRED_WORKFLOWS_UNSATISFIED, resolveRefreshOnUnsatisfiedWorkflows, handleRequiredWorkflowsRefusal } from './lib/merge-queue-enqueue.mjs';
 import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
@@ -6540,8 +6540,8 @@ async function runCli() {
     }
     // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
     if (requiredWorkflowsRefusals.length) {
-      const requiredWorkflowsRefresh = resolveRequiredWorkflowsRefresh();
-      if (!AS_JSON) process.stderr.write(`  required-workflows refresh: ${requiredWorkflowsRefresh.value} (source ${requiredWorkflowsRefresh.source})\n`);
+      const requiredWorkflowsRefresh = resolveRefreshOnUnsatisfiedWorkflows();
+      if (!AS_JSON) process.stderr.write(`  merge-queue: refreshOnUnsatisfiedWorkflows=${requiredWorkflowsRefresh.value} (${requiredWorkflowsRefresh.source})${requiredWorkflowsRefresh.invalid.length ? ` · ignored invalid: ${requiredWorkflowsRefresh.invalid.join('; ')}` : ''}\n`);
       for (const { c, headSha, detail } of requiredWorkflowsRefusals) {
         const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
         const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,

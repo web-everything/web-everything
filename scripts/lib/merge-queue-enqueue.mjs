@@ -13,7 +13,8 @@
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { PLATFORM_PREFERENCES_PATH } from './merge-delivery-policy.mjs';
+import { readDeclaredSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 export const REQUIRED_WORKFLOWS_UNSATISFIED = 'required-workflows-unsatisfied';
@@ -23,13 +24,46 @@ export function isRequiredWorkflowsUnsatisfiedError(text) {
   return /Required workflows? '.*?' (?:is|are) not satisfied/.test(String(text || ''));
 }
 
-/** env > top-level merge-queue setting > built-in on; required-workflows refusal (ruleset 24930207). */
-export function resolveRequiredWorkflowsRefresh({ env = process.env, file = join(dirname(fileURLToPath(import.meta.url)), '..', 'settings', 'merge-queue.json') } = {}) {
-  const onOff = (v) => { const x = String(v ?? '').trim().toLowerCase(); return x === 'on' || x === 'off' ? x : null; };
-  const value = onOff(env?.WE_DRAIN_REQUIRED_WORKFLOWS_REFRESH);
-  if (value) return { value, source: 'env' };
-  try { const v = onOff(JSON.parse(readFileSync(file, 'utf8'))?.requiredWorkflowsRefresh); if (v) return { value: v, source: 'settings' }; } catch { /* built-in */ }
-  return { value: 'on', source: 'default' };
+/** Standard behaviour: refresh a green PR refused by the queue so fresh required workflows can count. */
+export const REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT = 'on';
+
+/**
+ * mergeQueue.refreshOnUnsatisfiedWorkflows: first valid env > settings > platform > standard value.
+ * Inject settings/platform objects to avoid filesystem reads. Settings discovery and test isolation match
+ * loadMergeQueueSettings; this key resolves independently of the other queue settings.
+ * @returns {{value: 'on'|'off', source: string, invalid: string[]}}
+ */
+export function resolveRefreshOnUnsatisfiedWorkflows({ env = process.env, settings, platform } = {}) {
+  const invalid = [];
+  const readJson = (path, source) => {
+    try { return JSON.parse(readFileSync(path, 'utf8')); }
+    catch (e) {
+      if (e?.code !== 'ENOENT') invalid.push(`${source}: ${String(e?.message ?? e).split('\n')[0]}`);
+      return {};
+    }
+  };
+  const layers = [
+    ['env', () => env?.WE_MERGE_QUEUE_REFRESH_ON_UNSATISFIED_WORKFLOWS],
+    ['settings', () => {
+      let src = settings;
+      const override = String(env?.WE_MERGE_QUEUE_SETTINGS_FILE ?? '').trim();
+      if (src === undefined && override) src = readJson(override, 'settings');
+      if (src === undefined && (env?.VITEST || env?.WE_UNDER_TEST)) src = {};
+      if (src === undefined) {
+        const read = readDeclaredSettings();
+        src = read.settings;
+        invalid.push(...read.errors.map((e) => `settings: ${e.source}: ${e.error}`));
+      }
+      return src?.mergeQueue?.refreshOnUnsatisfiedWorkflows;
+    }],
+    ['platform', () => (platform === undefined ? readJson(PLATFORM_PREFERENCES_PATH, 'platform') : platform)?.mergeQueue?.refreshOnUnsatisfiedWorkflows],
+  ];
+  for (const [source, read] of layers) {
+    const value = read();
+    if (value === 'on' || value === 'off') return { value, source, invalid };
+    if (value !== undefined) invalid.push(`${source}: mergeQueue.refreshOnUnsatisfiedWorkflows=${JSON.stringify(value)} (expected on|off)`);
+  }
+  return { value: REFRESH_ON_UNSATISFIED_WORKFLOWS_DEFAULT, source: 'standard', invalid };
 }
 
 /** Pure once-per-head decision; a refusal of the produced head needs human inspection, not another refresh. */
