@@ -6025,8 +6025,6 @@ async function runCli() {
   if (!AS_JSON) process.stderr.write(`  merge-queue: freshness ${MERGE_QUEUE.freshness.enabled ? `ON (max ${MERGE_QUEUE.freshness.maxAgeMinutes} min, disjoint main moves ${MERGE_QUEUE.freshness.allowDisjointMainMoves ? 'allowed if non-code only' : 'refused'})` : 'off'}, main-fix first ${MERGE_QUEUE.queue.enabled ? 'on' : 'off'}\n`);
   const MERGE_QUEUE_STATE = refreshedStatePath();
   const mergeStrategy = createDrainMergeStrategy({ dryRun: DRY_RUN, quiet: AS_JSON, isLocalRepo, localSlug, withLock: (fn) => withLandWriteLock(fn, { runUnlockedOnContention: false }) }); // xtpxusq — logs strategy + source once per pass
-  const numberCardsBeforeEnqueue = logQueueNumbering();
-  const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null);
   const mainFixPriority = MERGE_QUEUE.queue.enabled ? readMainFixPriority() : null;
   /**
    * card xs1hdl7 — THE MERGE-QUEUE FRESHNESS GATE for one candidate at its pinned head. true = merge-fresh (or the
@@ -6088,6 +6086,9 @@ async function runCli() {
     if (!AS_JSON) process.stderr.write(`  ↻ merge-queue: refresh PR ${repoTag(cand.repo)}${cand.num} (${why}) → ${out.action}${out.newCommit ? ` ${String(out.newCommit).slice(0, 9)}` : ''}${out.ok ? '' : ` FAILED: ${out.error}`} — not merged this pass\n`);
     return false;
   };
+  // Queue-mode branch numbering (mq-number-before-enqueue): number + resolve cards on the PR branch before enqueue.
+  const numberCardsBeforeEnqueue = logQueueNumbering();
+  const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null);
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
