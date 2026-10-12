@@ -8,7 +8,7 @@ import { createFixBorrowGate } from '../../lib/fix-slot-borrow.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
-import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig } from '../fix-run.mjs';
+import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -44,12 +44,12 @@ describe('a codex borrow is accepted once fix-run exists (red before: "no codex 
 });
 
 describe('a codex borrow launches through fix-run with the filled brief', () => {
-  it('dispatchFix on a borrowed codex slot writes the brief and calls the fix launcher, not claude --bg', () => {
+  it.each([{ isConflict: true, baseRefName: 'develop', mergeOnto: 'develop' }, { restack: { onto: 'lane/base' }, mergeOnto: 'lane/base' }])('dispatchFix forwards the merge target with the filled brief (%j)', (entry) => {
     const spawnBorrowed = vi.fn(() => 'pid:4242');
     const spawnAgent = vi.fn();
     const writeBorrowedPrompt = vi.fn(() => '/tmp/p.md');
     const out = dispatchFix({
-      pr: 7, itemNum: '7', lane: 2, laneRef: 'lane/7-x', scope: ['we:a.mjs'], overlapScope: ['we:a.mjs'], headRefOid: 'abc',
+      ...entry, pr: 7, itemNum: '7', lane: 2, laneRef: 'lane/7-x', scope: ['we:a.mjs'], overlapScope: ['we:a.mjs'], headRefOid: 'abc',
     }, {
       root: '/repo', repo: 'we', borrowed: { executor: 'codex', reason: 'borrowed-build-slot' },
       assertNotALaneCheckout: undefined,
@@ -62,20 +62,20 @@ describe('a codex borrow launches through fix-run with the filled brief', () => 
     expect(writeBorrowedPrompt).toHaveBeenCalledTimes(1);
     expect(writeBorrowedPrompt.mock.calls[0][1]).toContain('brief 7 lane/7-x');
     expect(spawnBorrowed).toHaveBeenCalledWith(expect.objectContaining({
-      pr: 7, ref: 'lane/7-x', promptFile: '/tmp/p.md', policyRoute: { provider: 'codex' },
+      pr: 7, ref: 'lane/7-x', mergeOnto: entry.mergeOnto, promptFile: '/tmp/p.md', policyRoute: { provider: 'codex' },
     }));
     expect(out.agentId).toBe('pid:4242');
   });
   it('fixDetachedProvider forwards the prompt file, ref and --provider=codex to fix-run', () => {
     const spawnDetached = vi.fn(() => ({ pid: 99 }));
     const h = fixDetachedProvider({
-      pr: 7, sessionSlug: 'fix-7', ref: 'lane/7-x', promptFile: '/tmp/p.md', repo: 'o/r', laneRepo: '/w', scope: 'we:a.mjs',
+      pr: 7, sessionSlug: 'fix-7', ref: 'lane/7-x', mergeOnto: 'main', promptFile: '/tmp/p.md', repo: 'o/r', laneRepo: '/w', scope: 'we:a.mjs',
       policyRoute: { provider: 'codex' },
     }, { spawnDetached, logPathFor: () => '/tmp/l', readDeliveryAgentMarker: () => null });
     expect(h).toBe('pid:99');
     const argv = spawnDetached.mock.calls[0][0];
     expect(argv[0]).toBe(FIX_RUN_SCRIPT);
-    expect(parseFixRunArgv(argv.slice(1))).toMatchObject({ pr: '7', provider: 'codex', ref: 'lane/7-x', promptFile: '/tmp/p.md', repo: 'o/r' });
+    expect(parseFixRunArgv(argv.slice(1))).toMatchObject({ pr: '7', provider: 'codex', ref: 'lane/7-x', mergeOnto: 'main', promptFile: '/tmp/p.md', repo: 'o/r' });
   });
 });
 
@@ -99,8 +99,123 @@ describe('runFixCli', () => {
       write: vi.fn((_r, _p, sha) => { owed.sha = sha; }),
       clear: vi.fn(() => { owed.sha = null; }),
     };
-    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
+    return { calls, envs, run, spawn, owed, pendingRearm, io: { run, pendingRearm, readComments: async () => [{ createdAt: '2026-01-01', body: '🔁 review — changes requested\nFIX THE THING' }], releaseClaim: async () => ({ released: [] }), recordOutcome: () => {}, recordRouted: () => ({}), removePrompt: () => {}, readPrompt: () => 'BRIEF', resolveProvider: () => ({ spawn }), weRoot: '/we', write: () => {}, writeErr: () => {} } };
   };
+  it('captures JSONL through the real provider spawn seam even when the provider returns nothing', async () => {
+    const m = mk(['aaa', 'aaa']);
+    m.spawn.mockImplementation(async (_request, io) => { await io.spawnAgent([], {}); });
+    const recordOutcome = vi.fn();
+    await runFixCli(argv, { ...m.io, recordOutcome, spawnCodex: async () => ({ stdout: [
+      'diagnostic line', JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'First note' } }),
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Final diagnosis\n' + 'x'.repeat(400) } }),
+    ].join('\n') }) });
+    const reason = recordOutcome.mock.calls[0][0].reason;
+    expect(reason).toMatch(/^Final diagnosis x/);
+    expect(reason).not.toContain('\n');
+    expect(reason).toHaveLength(300);
+  });
+  it('records numeric PRs and the final agent message', async () => {
+    const m = mk(['aaa', 'aaa']);
+    m.spawn.mockResolvedValue({ stdout: JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'Unable to repair this finding' } }) });
+    const recordOutcome = vi.fn();
+    const recordRouted = vi.fn(() => ({}));
+    await runFixCli(argv, { ...m.io, recordOutcome, recordRouted });
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ pr: 7, reason: 'Unable to repair this finding' }));
+    expect(recordRouted).toHaveBeenCalledWith(expect.objectContaining({ pr: 7, head: 'aaa' }));
+  });
+  it('commits uncommitted edits using explicit paths and excludes scratch', async () => {
+    const m = mk(['aaa', 'bbb']);
+    m.spawn.mockResolvedValue({ finalMessage: 'Repair finding' });
+    const run = (cmd, args, opts) => {
+      if (args.includes('status')) return ' M file.txt\0?? .fix-commit-msg.txt\0';
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli(argv, { ...m.io, run })).code).toBe(0);
+    expect(m.calls).toContainEqual(['git', ...HARDENED_GIT_ARGS, 'add', '--', 'file.txt']);
+    expect(m.calls.find(c => c.includes('commit'))?.slice(-2)).toEqual(['--', 'file.txt']);
+    expect(m.calls.some(c => c.includes('push'))).toBe(true);
+  });
+  it('commits a clean merge before the agent and accepts a merge-only brief', async () => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    const run = (cmd, args, opts) => {
+      if (args.includes('--git-path')) return merging ? 'MERGE_HEAD' : '';
+      if (args.includes('merge')) merging = true;
+      if (args.includes('commit')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    m.spawn.mockImplementation(async () => {
+      expect(m.calls.some(c => c.includes('commit') && c.includes('--no-edit'))).toBe(true);
+    });
+    expect((await runFixCli([...argv, '--merge-onto=lane/base'], { ...m.io, run, fileExists: () => true, readComments: async () => [] })).code).toBe(0);
+    expect(m.calls.some(c => c.includes('push'))).toBe(true);
+  });
+  it('uses the supplied commit message with the shared provider trailer outside the lane', async () => {
+    const m = mk(['aaa', 'bbb']);
+    const run = (cmd, args, opts) => {
+      if (args.includes('status')) return ' M file.txt\0?? .fix-commit-msg.txt\0';
+      if (args.includes('commit')) {
+        const file = args[args.indexOf('-F') + 1];
+        expect(file).not.toContain('/lanes/');
+        expect(readFileSync(file, 'utf8')).toBe('Chosen subject\n\nCo-Authored-By: Codex <noreply@openai.com>\n');
+      }
+      return m.run(cmd, args, opts);
+    };
+    expect((await runFixCli(argv, { ...m.io, run, fileExists: p => p.endsWith('.fix-commit-msg.txt'), readFile: () => 'Chosen subject' })).code).toBe(0);
+  });
+  it('keeps rename endpoints and unusual filenames but excludes launcher scratch', () => {
+    expect(changedPaths('R  new name\0old name\0 D deleted\0?? line\nbreak\0?? .converge-1\0?? .delivery-commit-msg-7\0?? .fix-x-commit-message.txt\0')).toEqual(['new name', 'old name', 'deleted', 'line\nbreak']);
+  });
+  it.each([false, true])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    m.spawn.mockResolvedValue({ finalMessage: 'Agent final diagnosis' });
+    const run = (cmd, args, opts) => {
+      m.calls.push([cmd, ...args]);
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('diff')) return 'file.txt\0';
+      if (args.includes('commit') || args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
+      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : true,
+      readFile: () => unresolved ? '<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> origin/main\n' : 'resolved',
+    });
+    expect(m.spawn.mock.calls[0][0].prompt).toContain('ALREADY started git merge origin/main');
+    expect(out.code).toBe(unresolved ? 1 : 0);
+    if (unresolved) {
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+      expect(m.calls.some(c => c.includes('push'))).toBe(false);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: Agent final diagnosis' }));
+    } else {
+      expect(m.calls.some(c => c.includes('commit') && c.includes('--no-edit') && c.includes('--trailer'))).toBe(true);
+      expect(m.calls.some(c => c.includes('push'))).toBe(true);
+    }
+  });
+  it('posts escalation only at the threshold and logs a failed post without throwing', async () => {
+    for (const n of [1, 2, 3]) {
+      const m = mk(['aaa', 'aaa']);
+      const table = { 'we#7': Array.from({ length: n }, () => ({ head: 'aaa', outcome: 'no-change', reason: 'no edits' })) };
+      const writeErr = vi.fn();
+      const run = (cmd, args, opts) => {
+        if (args.includes('comment')) {
+          expect(readFileSync(args.at(-1), 'utf8')).toContain('**fix-run: codex repair unproductive on aaa**');
+          throw new Error('comment unavailable');
+        }
+        return m.run(cmd, args, opts);
+      };
+      expect((await runFixCli(argv, { ...m.io, run, writeErr, recordRouted: () => table })).code).toBe(0);
+      expect(writeErr.mock.calls.length).toBe(n === 2 ? 1 : 0);
+    }
+  });
+  it('rejects option injection as a merge ref before fetch or spawn', async () => {
+    const m = mk(['aaa']);
+    expect((await runFixCli([...argv, '--merge-onto=--evil'], m.io)).code).toBe(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('fetch'))).toBe(false);
+  });
   it('runs codex in the acquired lane with the brief, pushes (no force), re-arms, releases', async () => {
     const m = mk(['aaa', 'bbb']);
     const { code, result } = await runFixCli(argv, m.io);

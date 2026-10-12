@@ -17,12 +17,12 @@
  * WHY THE LAUNCHER (not the agent) PUSHES. Codex runs in the same no-network `:workspace` sandbox as a build
  * (`codex-delivery-provider.mjs`, UNKNOWN 3): it cannot `gh`, `lane-pool` or `git push`. So this launcher owns every
  * step that needs the network or the lane pool — acquire the lane at the PR's head ref, push, re-arm, release — and
- * the agent only edits and commits in the lane. A preamble on the brief says so. `antigravity-*` has no delivery
+ * the agent only edits files in the lane. A preamble on the brief says so. `antigravity-*` has no delivery
  * provider on main, so it is refused up front rather than launched half-working.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,7 +30,7 @@ import { REPO_ROOT } from './detached-dispatch.mjs';
 // Imported FROM the leaf, never the other way round (see `fix.mjs#FIX_RUN_EXECUTORS`): this file's top-level `await`
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
-import { recordBorrowOutcome } from '../lib/fix-slot-borrow.mjs';
+import { recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
 import { LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
@@ -45,7 +45,7 @@ const releaseBorrowedClaim = async (o) => (await import('../conveyor/fix-dispatc
 
 export { FIX_RUN_EXECUTORS };
 
-/** The agent can write anywhere in the lane's `.git` (hooks, config), and the push runs OUTSIDE its sandbox with our
+/** Defense in depth: even though Codex protects `.git`, the push runs OUTSIDE its sandbox with our
  *  credentials. The code-running keys are pinned inert through the shared `lane-git-hardening` helper (env form, so
  *  the pins also hold for anything git itself spawns). */
 export const HARDENED_GIT_ARGS = Object.freeze(laneGitConfigArgs());
@@ -118,7 +118,7 @@ export function parseFixRunArgv(argv = []) {
     pr: String(flags.pr).trim(), sessionSlug: String(flags.session).trim(), ref: String(flags.ref).trim(),
     promptFile: String(flags['prompt-file']).trim(),
     item: opt('num'), repo: opt('repo'), claimRepo: opt('claim-repo'), laneRepo: opt('lane-repo'), scope: opt('scope'),
-    provider: opt('provider') ?? 'codex', effort: opt('effort'), model: opt('model'),
+    mergeOnto: opt('merge-onto'), provider: opt('provider') ?? 'codex', effort: opt('effort'), model: opt('model'),
   };
 }
 
@@ -129,15 +129,48 @@ export const SANDBOX_PREAMBLE = [
   'Do NOT run `gh`, `lane-pool.mjs`, `fix-procedure.mjs`, `rearm-review.mjs` or `git push`; skip every brief step that does.',
   'The reviewer\'s finding is in the "PR CONTEXT (fetched by the launcher)" section right below. Brief step 2 / 2a\'s `gh pr view` is',
   'already done for you: take the latest changes-requested (or advisory) comment in that section as the authoritative ask.',
-  'Do the judgment work only: apply the reviewer finding in this directory, then `git commit` it here.',
-  'The launcher pushes your commit(s) and re-arms review after you exit. If nothing needs changing, commit nothing.',
+  'The sandbox forbids ALL `.git` writes. Edit files only; do NOT run git add, commit, merge, checkout, reset, stash or rebase.',
+  'You may write a commit message to .fix-commit-msg.txt. The launcher stages, commits, pushes and re-arms review after you exit.',
   '',
   '---',
   '',
 ].join('\n');
 
-const sh = (cmd, args, opts) => String(execFileSync(cmd, args, { encoding: 'utf8', ...opts }) ?? '').trim();
+const sh = (cmd, args, opts) => String(execFileSync(cmd, args, { encoding: 'utf8', ...opts }) ?? '');
 
+
+const singleLine = (text) => String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
+export function agentFinalMessage(result) {
+  let message = result?.finalMessage ?? '';
+  for (const line of String(result?.stdout ?? '').split('\n')) {
+    try {
+      const event = JSON.parse(line);
+      if (event.type === 'item.completed' && event.item?.type === 'agent_message') message = event.item.text;
+      else if (event.type === 'agent_message') message = event.text ?? event.message;
+    } catch { /* non-JSON diagnostic */ }
+  }
+  return String(message ?? '');
+}
+
+// NUL porcelain preserves spaces/newlines and includes both sides of a rename.
+export function changedPaths(porcelain) {
+  const records = String(porcelain ?? '').split('\0');
+  const paths = [];
+  for (let i = 0; i < records.length; i++) {
+    const row = records[i];
+    if (!row) continue;
+    paths.push(row.slice(3));
+    if (/[RC]/.test(row.slice(0, 2))) paths.push(records[++i]);
+  }
+  return [...new Set(paths.filter(p => p && !/^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.fix-commit-msg\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/.test(basename(p))))];
+}
+
+function withMessageFile(message, action) {
+  const dir = mkdtempSync(join(tmpdir(), 'we-fix-message-'));
+  const file = join(dir, 'message.txt');
+  try { writeFileSync(file, message, { mode: 0o600 }); return action(file); }
+  finally { rmSync(dir, { recursive: true, force: true }); }
+}
 
 const CHANGES_COMMENT_RE = /changes requested|THIS IS AN ADVISORY REVIEW/i;
 const cap = (t, n) => (String(t ?? '').length > n ? `${String(t).slice(0, n)}\n[... truncated ...]` : String(t ?? ''));
@@ -181,9 +214,13 @@ export async function runFixCli(argv = [], {
   removePrompt = removePromptFile,
   pendingRearm = defaultPendingRearm(),
   resolveProvider = resolveDeliveryAgentProvider,
+  spawnCodex = async (...args) => (await import('./codex-delivery-provider.mjs')).defaultSpawnCodexAgent(...args),
   readComments = readAllComments,
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
+  recordRouted = recordRoutedOutcome,
+  readFile = (p) => readFileSync(p, 'utf8'),
+  fileExists = existsSync,
   weRoot = REPO_ROOT,
   write = (l) => process.stdout.write(l),
   writeErr = (l) => process.stderr.write(l),
@@ -192,16 +229,34 @@ export async function runFixCli(argv = [], {
   let laneRelease = null;
   // How this borrowed launch ended. Recorded (so repeated failures stop the PR borrowing) and the claim is released on
   // EVERY exit: a borrowed fix that ends must not keep holding its claim and a cap slot until the TTL.
+  let before = null;
+  let finalMessage = '';
+  let abortMerge = null;
   let outcome = 'failed';
   let reason = 'launch did not complete';
   const settle = async () => {
     if (!launch?.pr) return;
     const repo = launch.claimRepo ?? 'we';
-    try { recordOutcome({ repo, pr: launch.pr, outcome, reason }); } catch (e) { writeErr(`fix-run: could not record the outcome: ${String(e?.message ?? e)}\n`); }
+    reason = singleLine(reason);
+    try { recordOutcome({ repo, pr: Number(launch.pr), outcome, reason }); } catch (e) { writeErr(`fix-run: could not record the outcome: ${String(e?.message ?? e)}\n`); }
+    if (launch.provider === 'codex' && before) {
+      try {
+        const id = { repo, pr: Number(launch.pr), head: before };
+        const table = recordRouted({ ...id, outcome, reason });
+        if (consecutiveUnproductiveOnHead(table, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE) {
+          const reasons = table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE).map(o => `- ${singleLine(o.reason)}`).join('\n');
+          withMessageFile(`**fix-run: codex repair unproductive on ${before.slice(0, 9)}**\n\n${reasons}\n\nThe next repair falls back to Claude.`, file =>
+            run('gh', ['pr', 'comment', launch.pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
+        }
+      } catch (e) { writeErr(`fix-run: could not record routed outcome / post escalation: ${String(e?.message ?? e)}\n`); }
+    }
     try {
       const r = await releaseClaim({ repo, pr: Number(launch.pr), who: launch.sessionSlug });
       write(`fix-run: PR #${launch.pr} ${outcome} (${reason}); claim ${r?.released?.length ? 'released' : 'not held / already released'}\n`);
-    } catch (e) { writeErr(`fix-run: claim release failed: ${String(e?.message ?? e)}\n`); }
+    } catch (e) {
+      writeErr(`fix-run: claim release failed: ${String(e?.message ?? e)}\n`);
+      write(`fix-run: PR #${launch.pr} ${outcome} (${reason}); claim release failed\n`);
+    }
   };
   try {
     launch = parseFixRunArgv(argv);
@@ -222,7 +277,10 @@ export async function runFixCli(argv = [], {
     const brief = readPrompt(launch.promptFile);
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
     const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
-    const prContext = renderPrContext({ ...prHead, comments: await readComments(pr, { repo: launch.repo }) });
+    const comments = await readComments(pr, { repo: launch.repo });
+    const prContext = launch.mergeOnto && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
+      ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
+      : renderPrContext({ ...prHead, comments });
     const poolArgs = [
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'acquire', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
       '--purpose=conveyor-fix', `--session=${sessionSlug}`, ...(launch.scope ? [`--scope=${launch.scope}`] : []), `--base=${ref}`,
@@ -233,9 +291,9 @@ export async function runFixCli(argv = [], {
       resolve(weRoot, 'scripts', 'lane-pool.mjs'), 'release', ...(launch.laneRepo ? [`--repo=${launch.laneRepo}`] : []),
       `--lane=${laneNum}`, `--session=${sessionSlug}`,
     ], { cwd: weRoot });
-    const gitEnv = laneGitHardeningEnv(process.env);
+    const gitEnv = { ...laneGitHardeningEnv(process.env), GIT_LITERAL_PATHSPECS: '1' };
     const laneConfig = () => run('git', [...LANE_CONFIG_LIST_ARGS], { cwd: lanePath, env: gitEnv });
-    const before = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath });
+    before = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     const configBefore = laneConfig();
     const risky = riskyLaneConfig(configBefore);
     if (risky.length) throw new Error(`lane git config defines command/credential/remote-rewrite keys (${risky.join(', ')}); refusing to run in it`);
@@ -251,15 +309,63 @@ export async function runFixCli(argv = [], {
       return { code: 0, result };
     }
     const provider = await resolveProvider(launch.provider);
-    await provider.spawn({
-      sessionId: undefined, prompt: SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
+    const git = (...args) => run('git', [...HARDENED_GIT_ARGS, ...args], { cwd: lanePath, env: gitEnv });
+    const trailer = (await import('./deliver-item-wrapper.mjs')).coAuthorTrailerFor(launch.provider);
+    const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
+    const inMerge = () => { const path = mergeHeadPath(); return !!path && fileExists(resolve(lanePath, path)); };
+    const commitMerge = () => git('commit', '--no-edit', '--trailer', trailer);
+    let unmerged = [];
+    let mergePrompt = '';
+    if (launch.mergeOnto) {
+      const target = launch.mergeOnto;
+      if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new Error(`invalid merge ref: ${target}`);
+      git('check-ref-format', '--branch', target);
+      git('fetch', 'origin', target);
+      abortMerge = () => { if (inMerge()) git('merge', '--abort'); };
+      try { git('merge', '--no-commit', '--no-ff', `origin/${target}`); }
+      catch (e) {
+        unmerged = git('diff', '--name-only', '--diff-filter=U', '-z').split('\0').filter(Boolean);
+        if (!inMerge() || !unmerged.length) throw e;
+      }
+      if (!unmerged.length && inMerge()) commitMerge();
+      if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
+    }
+    const spawned = await provider.spawn({
+      sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
-    }, { resolveLane: () => lanePath });
-    const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath });
+    }, { resolveLane: () => lanePath, ...(launch.provider === 'codex' ? {
+      spawnAgent: async (...args) => {
+        try {
+          const result = await spawnCodex(...args);
+          finalMessage = agentFinalMessage(result);
+          return result;
+        } catch (e) { finalMessage = agentFinalMessage(e); throw e; }
+      },
+    } : {}) });
+    finalMessage = agentFinalMessage(spawned) || finalMessage;
+    const configAfterAgent = laneConfig();
+    if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new Error('lane git config changed while the agent ran; refusing to push');
+    const paths = changedPaths(git('status', '--porcelain=v1', '-z', '--untracked-files=all'));
+    if (inMerge()) {
+      const unresolved = unmerged.filter(path => fileExists(join(lanePath, path)) && /^(<<<<<<< |>>>>>>> )/m.test(readFile(join(lanePath, path))));
+      if (unresolved.length) {
+        git('merge', '--abort');
+        throw new Error(`conflict unresolved in ${unresolved.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
+      }
+      const stage = [...new Set([...unmerged, ...paths])];
+      if (stage.length) git('add', '--', ...stage);
+      commitMerge();
+    } else if (paths.length) {
+      const supplied = join(lanePath, '.fix-commit-msg.txt');
+      const message = fileExists(supplied) ? readFile(supplied) : `fix(PR #${pr}): ${finalMessage.split('\n')[0] || 'apply review finding'}`;
+      git('add', '--', ...paths);
+      withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file, '--', ...paths));
+    }
+    const after = run('git', ['rev-parse', 'HEAD'], { cwd: lanePath }).trim();
     let result;
     if (after === before) {
-      result = 'no-change (agent committed nothing; claim released, PR is re-planned)';
-      outcome = 'no-change'; reason = 'agent committed nothing';
+      outcome = 'no-change'; reason = finalMessage || 'agent committed nothing';
+      result = `no-change (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
       // The agent could write the lane's `.git`; this push runs outside its sandbox with our credentials, so refuse
       // if its repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
@@ -274,13 +380,14 @@ export async function runFixCli(argv = [], {
       rearm();
       pendingRearm.clear(launch.repo, pr);
       result = `PR #${pr} (pushed ${after.slice(0, 9)}, re-armed review:pending)`;
-      outcome = 'pushed'; reason = `pushed ${after.slice(0, 9)}`;
+      outcome = 'pushed'; reason = finalMessage || `pushed ${after.slice(0, 9)}`;
     }
     write(`fix-run: PR #${pr} finished - ${result}\n`);
     return { code: 0, result };
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
-    outcome = 'failed'; reason = String(e?.message ?? e).split('\n')[0];
+    outcome = 'failed'; reason = `${String(e?.message ?? e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }
     return { code: 1, result: null };
   } finally {
     removePrompt(launch.promptFile); // one-shot, untrusted text: gone on every exit, success or not

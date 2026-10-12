@@ -1892,3 +1892,14 @@ describe('fix dispatch staleness contract', () => {
     }
   });
 });
+
+
+it('routes repeated empty Codex repairs to Claude for this head only', async () => {
+  const { routeFixExecutor } = await import('../reconcile-fix-dispatch.mjs');
+  const planned = { repo: 'fui', pr: 7, isConflict: true, headRefOid: 'abc' };
+  const options = { launcherAvailable: true, readRouted: () => ({ 'fui#7': [
+    { head: 'abc', outcome: 'failed' }, { head: 'abc', outcome: 'no-change' },
+  ] }) };
+  expect(routeFixExecutor(planned, options)).toMatchObject({ executor: 'claude' });
+  expect(routeFixExecutor({ ...planned, headRefOid: 'new' }, options)).toMatchObject({ executor: 'codex' });
+});

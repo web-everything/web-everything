@@ -176,3 +176,25 @@ describe('a borrowed fix is a normal claim that the build daemon counts', () => 
     expect(busy.openItems.nums).not.toContain('fix-8');
   });
 });
+
+
+describe('routed Codex outcomes', () => {
+  it('bounds history, counts only trailing failures on the head, clears on push, and routes fallback', async () => {
+    const { recordRoutedOutcome, consecutiveUnproductiveOnHead, chooseFixExecutor, claudeOnlyReason } = await import('../fix-slot-borrow.mjs');
+    let table = {};
+    const store = { read: () => table, write: t => { table = t; } };
+    const id = { repo: 'we', pr: 7, head: 'abc', readClaim: () => null };
+    for (let i = 0; i < 12; i++) recordRoutedOutcome({ ...id, outcome: 'no-change', reason: 'empty', store });
+    expect(table['we#7']).toHaveLength(10);
+    expect(consecutiveUnproductiveOnHead(table, id)).toBe(10);
+    expect(consecutiveUnproductiveOnHead(table, { ...id, head: 'new' })).toBe(0);
+    expect(claudeOnlyReason({ codexUnproductive: 1 })).toBeNull();
+    expect(claudeOnlyReason({ codexUnproductive: 2 })).toContain('2 empty runs');
+    expect(chooseFixExecutor({ launcherAvailable: true, codexUnproductive: 2 }).executor).toBe('claude');
+    expect(chooseFixExecutor({ launcherAvailable: true, codexUnproductive: 0 }).executor).toBe('codex');
+    recordRoutedOutcome({ ...id, outcome: 'pushed', store });
+    expect(table).toEqual({});
+    recordRoutedOutcome({ ...id, outcome: 'failed', store, readClaim: () => ({ meta: { borrowed: { executor: 'codex' } } }) });
+    expect(table).toEqual({});
+  });
+});

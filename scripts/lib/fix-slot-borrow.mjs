@@ -49,11 +49,12 @@ export function resolveFixExecutorSetting({ env = process.env, platform = platfo
  * Pure; why this repair must run on Claude whatever `fix.executor` says, or null. The ONE list both the router
  * ({@link chooseFixExecutor}) and the fixer-cap borrow guard read, so a borrowed slot never bypasses these per-entry rules.
  */
-export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false } = {}) {
+export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false, codexUnproductive = 0 } = {}) {
   if (takeover) return 'takeover round';
   // A ruling-not-addressed send-back runs on its own ladder rung (`launchTableFor`); only `claude --bg` applies that table.
   if (rulingNotAddressed) return 'ruling-not-addressed send-back';
   if (mainFix) return 'main-fix';
+  if (codexUnproductive >= ROUTED_CODEX_MAX_UNPRODUCTIVE) return `codex unproductive on this head (${codexUnproductive} empty runs) → stronger-model rung`;
   if (strongerModel || round >= 3) return 'stronger-model rung';
   return null;
 }
@@ -91,7 +92,7 @@ export function stampFixExecutor({ repo, pr, kind = 'fix', owner, lockRoot = fix
 export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launchCodex, writePrompt, removePrompt,
   profileFor, stampExecutor = stampFixExecutor }) {
   return async (planned, options = {}) => {
-    const decision = route({ ...planned, kind: 'ci-heal' });
+    const decision = route({ ...planned, repo: options.repo ?? planned.repo ?? 'we', kind: 'ci-heal' });
     const codex = decision.executor === 'codex';
     const sinks = createSinks({ ...options, ...(codex ? { provider: (request) => {
       console.error(`reconcile-fix-dispatch: PR #${planned.pr} ${formatFixExecutorLog(decision)}`);
@@ -101,6 +102,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
       const promptFile = writePrompt(request.sessionSlug, request.prompt);
       try {
         const handle = launchCodex({ ...request, cwd: options.root, promptFile, ref: planned.laneRef,
+          mergeOnto: planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName ?? 'main' : null),
           repo: profile.slug, laneRepo: profile.lanePoolRepo, claimRepo: options.repo ?? planned.repo ?? 'we',
           scope: planned.scope.join(','), policyRoute: { provider: 'codex' } });
         request.reportWrapped?.(Number(String(handle).replace(/^pid:/, '')));
@@ -133,6 +135,33 @@ export const builderExecutorFor = (executor) => (executor === 'claude' ? 'claude
  *  that PR: it falls back to the normal fixer queue. */
 export const BORROW_MAX_UNPRODUCTIVE = 2;
 export const BORROW_FAILURE_WINDOW_MS = 60 * 60_000;
+
+export const ROUTED_CODEX_MAX_UNPRODUCTIVE = 2;
+export const defaultRoutedOutcomePath = () => join(resolveCoordinationRoot(), 'fix-routed-outcomes.json');
+export const readRoutedOutcomes = () => fileOutcomeStore(defaultRoutedOutcomePath()).read();
+
+export function consecutiveUnproductiveOnHead(table, { repo = 'we', pr, head }) {
+  if (!head) return 0;
+  let count = 0;
+  for (const entry of [...(table?.[`${repo}#${pr}`] ?? [])].reverse()) {
+    if (entry.head !== head || entry.outcome === 'pushed') break;
+    count++;
+  }
+  return count;
+}
+
+export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '', now = Date.now(), store = fileOutcomeStore(defaultRoutedOutcomePath()),
+  readClaim = (kind) => readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo, pr, kind })),
+}) {
+  // Borrowed launches keep their existing ledger and retry policy.
+  if (['fix', 'ci-heal'].some(kind => readClaim(kind)?.meta?.borrowed)) return {};
+  const table = store.read() ?? {};
+  const key = `${repo}#${pr}`;
+  if (outcome === 'pushed') delete table[key];
+  else table[key] = [...(table[key] ?? []), { at: now, head, outcome, reason: String(reason).replace(/\s+/g, ' ').slice(0, 300) }].slice(-10);
+  store.write(table);
+  return table;
+}
 
 export const defaultBorrowOutcomePath = () => join(resolveCoordinationRoot(), 'fix-borrow-outcomes.json');
 
