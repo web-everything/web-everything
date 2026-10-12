@@ -4,7 +4,7 @@ kind: story
 size: 2
 parent: "5767"
 status: open
-scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-clone-lock.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/number-pending-hashes-before-push.mjs"]
+scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/drain-lock.mjs", "we:scripts/lib/daemon-self-sync.mjs", "we:scripts/lib/daemon-clone-lock.mjs", "we:scripts/pr-land.mjs", "we:scripts/lib/number-pending-hashes-before-push.mjs", "we:scripts/__tests__/merge-ai-prs.test.mjs", "we:scripts/readiness/__tests__/drain-lock.test.mjs", "we:scripts/lib/__tests__/daemon-self-sync.test.mjs", "we:scripts/lib/__tests__/daemon-clone-lock.test.mjs", "we:scripts/__tests__/pr-land.test.mjs"]
 dateOpened: "2026-10-10"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "003fe207938f566474742a3e00718b370ffd1b50"
