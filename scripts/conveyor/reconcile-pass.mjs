@@ -48,6 +48,8 @@
  * cannot corrupt anything, and a lease taken inside a one-shot read is a lease nothing releases when the process
  * is killed.
  */
+import { excusePrMergeGateHolds, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { readMainRedPriority } from '../lib/main-red-priority.mjs'; // card xu1nixv
 import { fetchPrCommits } from '../lib/pr-limit.mjs';
 import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
@@ -1324,6 +1326,8 @@ export function enrichPrsWithLedgerHolds(prs, { repo, now = Date.now(), env = pr
  */
 export function runReconcilePass({
   readPrs = defaultReadPrs, readAgents = defaultReadAgents, enrich = enrichAgents,
+  excuseMergeGateHolds = excusePrMergeGateHolds, readMergeGateVerdict = defaultReadMergeGateVerdict,
+  readFreeze = readSharedFreeze, mergeGateSetting,
   enrichMainRed = enrichPrsWithMainRedFacts, enrichAlreadyLanded = enrichPrsWithAlreadyLandedFacts,
   // #4265 — the stacked-base conflict-fix cap's own `currentSha` (see {@link enrichPrsWithBaseRefFacts}'s own
   // docblock). Injectable exactly like every other enrich step above, so a test supplies a fixture with no git.
@@ -1397,7 +1401,15 @@ export function runReconcilePass({
   const hydrated = hydrateChecks(rawPrs, {
     repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug, requiredChecks, readChecks, defaultBranch,
   });
-  const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(hydrated.prs, { repo: resolvedRepo, defaultBranch, requiredChecks });
+  // Evidence is applied before every downstream CI reader, including main-red attribution.
+  let holdPrs = hydrated.prs;
+  try {
+    holdPrs = excuseMergeGateHolds(hydrated.prs, {
+      repo: resolvedRepo ?? CONSTELLATION_REPOS[repoKey].slug,
+      readMergeGateVerdict, readFreeze, mergeGateSetting, env,
+    });
+  } catch { /* An unreadable verdict must retain the original red checks. */ }
+  const { prs: redPrs, mainRedWindows, mainLatestCheckRuns } = enrichMainRed(holdPrs, { repo: resolvedRepo, defaultBranch, requiredChecks });
   // live incident, PR #2752 (#4034/#2748) — attach `alreadyLandedInMain` to any PR carrying
   // `merge-status:conflicting` whose own content is already, file-by-file, present on `main`. Costs nothing
   // beyond the label scan `readPrs` already fetched every field for when no PR carries that label.
