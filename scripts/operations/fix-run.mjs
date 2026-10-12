@@ -506,12 +506,19 @@ export async function runFixCli(argv = [], {
       if (!unmerged.length && inMerge()) commitMerge();
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
-    // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes.
-    // These UU/AA conflicts use HEAD as the opening label (optionally followed by a path).
+    // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes. Widths come
+    // from the `conflict-marker-size` attribute (merged tree and HEAD, as for `merge` above; anything but a positive
+    // number is git's 7) and from every opening marker line in the file at least 7 wide: these UU/AA conflicts open with
+    // HEAD, and a criss-cross merge's virtual base nests wider ones. The attribute covers a file the UTF-8 read cannot decode.
+    const attrSizes = new Map(unmerged.map(path => [path, new Set()]));
+    if (unmerged.length) for (const source of [[], ['--source=HEAD']]) {
+      const attrs = git('check-attr', ...source, '-z', 'conflict-marker-size', '--', ...unmerged).split('\0');
+      for (let i = 0; i + 2 < attrs.length; i += 3) attrSizes.get(attrs[i])?.add(/^0*[1-9]\d*$/.test(attrs[i + 2]) ? Number(attrs[i + 2]) : 7);
+    }
     const markerSizes = new Map(unmerged.map(path => {
       const text = readFile(join(lanePath, path), lanePath);
-      const sizes = new Set();
-      for (const match of (text ?? '').matchAll(/^(<+) HEAD(?::[^\r\n]*)?\r?$/gm)) sizes.add(match[1].length);
+      const sizes = new Set(attrSizes.get(path));
+      for (const match of (text ?? '').matchAll(/^(<{7,}) [^\r\n]*$/gm)) sizes.add(match[1].length);
       if (!sizes.size) sizes.add(7);
       // The index stages (1 base, 2 ours, 3 theirs) are the baseline: marker-shaped lines they carry may be content.
       const stages = Object.fromEntries(indexEntries(path).filter(e => e.stage !== '0').map(e => [e.stage, blob(e.oid)]));

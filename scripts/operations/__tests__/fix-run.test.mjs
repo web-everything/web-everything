@@ -504,6 +504,21 @@ describe('runFixCli', () => {
       expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: resolved' }));
     });
   });
+  it('takes the width from conflict-marker-size when the file is not UTF-8 (no HEAD line to read it from)', async () => {
+    const utf16 = (dir, text) => writeFileSync(join(dir, 'file.txt'), Buffer.from(text, 'utf16le'));
+    await withRealMerge({
+      base: ({ dir }) => {
+        writeFileSync(join(dir, '.gitattributes'), 'file.txt working-tree-encoding=UTF-16LE conflict-marker-size=32\n');
+        utf16(dir, 'base\n');
+      },
+      theirs: ({ dir }) => utf16(dir, 'theirs\n'),
+      ours: ({ dir }) => utf16(dir, 'ours\n'),
+    }, { agent: ({ dir }) => utf16(dir, `ours\n${'='.repeat(32)}\ntheirs\n`) }, async ({ out, m, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: resolved' }));
+    });
+  });
   it('never runs merge --abort in the agent-writable lane after its git config changed', async () => {
     const m = mk(['aaa', 'aaa']);
     let merging = false;
