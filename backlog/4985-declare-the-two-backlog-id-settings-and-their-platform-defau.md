@@ -3,10 +3,11 @@ bornAs: x2rabof
 kind: story
 size: 3
 parent: "3383"
-status: active
+status: resolved
 scope: ["we:config/platformDefaults.ts", "we:config/defineConfig.ts", "we:config/index.ts", "we:config/__tests__/", "we:scripts/lib/backlog-id-settings.mjs"]
 dateOpened: "2026-10-03"
 dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "6d9d737f3f528a9fde2f5e162cd5d5151abe0d72"
 tags: []
