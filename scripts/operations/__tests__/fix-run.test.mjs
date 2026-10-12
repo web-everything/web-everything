@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync, truncateSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -9,7 +9,7 @@ import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-ha
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
-import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, unmergedPaths } from '../fix-run.mjs';
+import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, unmergedPaths, MAX_CONFLICTED_PATHS, BLOB_MAX_BYTES } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -231,6 +231,70 @@ describe('runFixCli', () => {
       expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: Agent final diagnosis' }));
     } else {
       expect(m.calls.some(c => c.includes('commit') && c.includes('--no-edit') && c.includes('--trailer'))).toBe(true);
+      expect(m.calls.some(c => c.includes('push'))).toBe(true);
+    }
+  });
+  // A mocked conflicted merge for the resource bounds: `paths` UU files, each with three index stages whose blobs claim
+  // `blobSize` bytes; `cat-file` enforces the caller's maxBuffer the way execFileSync does (ENOBUFS, 1 MiB default).
+  const boundedConflict = async ({ paths = ['file.txt'], blobSize = 5 } = {}) => {
+    const m = mk(['aaa', 'bbb']);
+    let merging = false;
+    let added = false;
+    const blobBuffers = [];
+    m.spawn.mockResolvedValue({ finalMessage: 'resolved' });
+    const run = (cmd, args, opts) => {
+      m.calls.push([cmd, ...args]);
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return paths.map(p => `UU ${p}\0`).join('');
+      if (args.includes('--numstat')) return '1\t1\tx\0';
+      if (args.includes('add')) added = true;
+      if (args.includes('ls-files')) {
+        const path = args[args.length - 1];
+        return added ? `100644 ${'c'.repeat(40)} 0\t${path}\0` : ['a', 'b', 'd'].map((x, i) => `100644 ${x.repeat(40)} ${i + 1}\t${path}\0`).join('');
+      }
+      if (args.includes('cat-file')) {
+        blobBuffers.push(opts?.maxBuffer);
+        if (blobSize > (opts?.maxBuffer ?? 1024 * 1024)) throw Object.assign(new Error('spawnSync git ENOBUFS'), { code: 'ENOBUFS' });
+        return 'ours\n';
+      }
+      if (args.includes('commit') || args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
+      fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true), readFile: () => 'resolved\n' });
+    return { out, m, recordOutcome, blobBuffers };
+  };
+  it.each([[MAX_CONFLICTED_PATHS + 1, true], [MAX_CONFLICTED_PATHS, false]])('rejects more than 100 conflicted paths before reading blobs (paths=%i, refused=%s)', async (n, refused) => {
+    expect(MAX_CONFLICTED_PATHS).toBe(100);
+    const { out, m, recordOutcome } = await boundedConflict({ paths: Array.from({ length: n }, (_, i) => `f${i}.txt`) });
+    const reason = recordOutcome.mock.calls[0]?.[0]?.reason ?? '';
+    if (refused) {
+      expect(out.code).toBe(1);
+      expect(reason).toContain(`too many conflicted files to classify (${n} > 100)`);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('cat-file') || c.includes('check-attr') || c.includes('ls-files'))).toBe(false);
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+      expect(m.calls.some(c => c.includes('add') || c.includes('commit') || c.includes('push'))).toBe(false);
+    } else {
+      expect(m.spawn).toHaveBeenCalled();
+      expect(reason).not.toContain('too many conflicted files');
+    }
+  });
+  it.each([[BLOB_MAX_BYTES + 1, true], [BLOB_MAX_BYTES, false]])('rejects conflict blobs exceeding 64 MiB (size=%i, refused=%s)', async (size, refused) => {
+    expect(BLOB_MAX_BYTES).toBe(64 * 1024 * 1024);
+    const { out, m, recordOutcome, blobBuffers } = await boundedConflict({ blobSize: size });
+    expect(blobBuffers.length).toBeGreaterThan(0);
+    expect(blobBuffers.every(b => b === BLOB_MAX_BYTES)).toBe(true);
+    if (refused) {
+      expect(out.code).toBe(1);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringContaining('ENOBUFS') }));
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+      expect(m.calls.some(c => c.includes('add') || c.includes('commit') || c.includes('push'))).toBe(false);
+    } else {
+      expect(out.code).toBe(0);
       expect(m.calls.some(c => c.includes('push'))).toBe(true);
     }
   });
@@ -645,6 +709,15 @@ describe('runFixCli', () => {
       expect(readLaneFileSafe(join(lane, 'missing'), lane)).toBeNull();
       linkSync(join(dir, 'secret'), join(lane, 'hard.txt'));
       expect(readLaneFileSafe(join(lane, 'hard.txt'), lane)).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('readLaneFileSafe refuses a lane file over BLOB_MAX_BYTES and reads one exactly at it', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-size-'));
+    try {
+      writeFileSync(join(dir, 'at.txt'), ''); truncateSync(join(dir, 'at.txt'), BLOB_MAX_BYTES); // sparse: no 64 MiB write
+      writeFileSync(join(dir, 'over.txt'), ''); truncateSync(join(dir, 'over.txt'), BLOB_MAX_BYTES + 1);
+      expect(readLaneFileSafe(join(dir, 'at.txt'), dir)?.length).toBe(BLOB_MAX_BYTES);
+      expect(readLaneFileSafe(join(dir, 'over.txt'), dir) === null).toBe(true); // a boolean: a failure diff of 64 MiB would crash the reporter
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('a refused (symlinked) commit-message file falls back to the default message', async () => {

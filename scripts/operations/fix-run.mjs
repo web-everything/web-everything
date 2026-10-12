@@ -210,9 +210,9 @@ export function changedPaths(porcelain) {
 const TEXT_MERGE_ATTRS = new Set(['unspecified', 'set', 'text', 'union']);
 const OID_RE = /^[0-9a-f]{40,64}$/;
 
-const MAX_CONFLICTED_PATHS = 100;
-/** A conflicted text blob larger than this fails the run (execFileSync's 1 MiB default would fail far sooner). */
-const BLOB_MAX_BYTES = 64 * 1024 * 1024;
+export const MAX_CONFLICTED_PATHS = 100;
+/** A conflicted text blob (or agent-written lane file) larger than this fails the run (execFileSync's 1 MiB default would fail far sooner). */
+export const BLOB_MAX_BYTES = 64 * 1024 * 1024;
 const REGULAR_MODES = new Set(['100644', '100755']);
 
 /**
@@ -287,11 +287,13 @@ export function hasLeftoverMarkers(text, sizes, allowance = new Map()) {
 /**
  * Read an agent-written file in the lane from OUTSIDE the agent's sandbox: null (never followed) for a symlink, a
  * non-regular or hardlinked file, or a path whose realpath leaves the lane — the agent must not get the launcher to read for it.
+ * Also null for a file over BLOB_MAX_BYTES, so an agent-written giant file fails the run instead of exhausting its memory.
  */
 export function readLaneFileSafe(path, lanePath) {
   try {
     const st = lstatSync(path);
     if (!st.isFile() || st.nlink > 1) return null; // nlink > 1: a hardlink can alias a file outside the lane
+    if (st.size > BLOB_MAX_BYTES) return null;
     const root = realpathSync(lanePath);
     if (!realpathSync(path).startsWith(root + sep)) return null;
     return readFileSync(path, 'utf8');
