@@ -25,7 +25,7 @@
  * back to the local `main` (non-forced). The store's next append re-derives its rows from its own tip, so the
  * saved changes are an audit copy, not a pending write.
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { daemonRebuildSettingsPath } from './skip-unrelated.mjs';
 
@@ -49,7 +49,23 @@ export function resolveWrongBranchHealSettings({ path = daemonRebuildSettingsPat
 }
 
 /** Files/dirs in the git dir that mean a multi-step git operation is paused or running (per-worktree). */
-export const IN_PROGRESS_MARKERS = Object.freeze(['rebase-merge', 'rebase-apply', 'sequencer', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'MERGE_HEAD', 'BISECT_LOG']);
+export const IN_PROGRESS_MARKERS = Object.freeze(['rebase-merge', 'rebase-apply', 'sequencer', 'REBASE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'MERGE_HEAD', 'BISECT_LOG', 'BISECT_START', 'index.lock']);
+
+/**
+ * IO: markers of an in-progress operation (or a live git process, `index.lock`) in the clone's git dir.
+ * `null` when the git dir or any marker cannot be read: only ENOENT counts as absent, so a permission error
+ * or a git dir that is not a directory fails closed instead of reading as "nothing in progress".
+ */
+export function readInProgress(git) {
+  const gd = git(['rev-parse', '--absolute-git-dir']);
+  const gitDir = gd.status === 0 ? String(gd.stdout ?? '').trim() : '';
+  if (!gitDir) return null;
+  const found = [];
+  for (const m of IN_PROGRESS_MARKERS) {
+    try { lstatSync(join(gitDir, m)); found.push(m); } catch (e) { if (e?.code !== 'ENOENT') return null; }
+  }
+  return found;
+}
 
 /**
  * Pure: may this clone state be healed back to main?
@@ -104,13 +120,15 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
   const mainSha = hasMain ? out(main) : null;
   const detachedHead = !branch ? git(['rev-parse', '--verify', '--quiet', 'HEAD']) : null;
   const headSha = detachedHead?.status === 0 ? out(detachedHead) : null;
-  const gd = git(['rev-parse', '--absolute-git-dir']);
-  const gitDir = gd.status === 0 ? out(gd) : '';
-  const inProgress = gitDir ? IN_PROGRESS_MARKERS.filter((m) => existsSync(join(gitDir, m))) : null;
+  const inProgress = readInProgress(git);
   const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=no']);
   const changedPaths = st.status === 0 ? parseTrackedChanges(st.stdout) : null;
   const plan = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress });
   if (!plan.heal) return { healed: false, reason: plan.reason, ...(plan.detail ? { detail: plan.detail } : {}) };
+
+  // Re-read right before the first mutation: an operation may have started since the plan was read.
+  const again = planWrongBranchHeal({ branch, headSha, mainSha, changedPaths, hasMain, settings, inProgress: readInProgress(git) });
+  if (!again.heal) return { healed: false, reason: again.reason, ...(again.detail ? { detail: again.detail } : {}) };
 
   let savedRef = null;
   if (changedPaths.length) {
@@ -124,6 +142,8 @@ export function healWrongBranch({ git, settings = resolveWrongBranchHealSettings
     // Only tracked store files change here (the rule proved it); untracked files are untouched by reset.
     if (git(['reset', '--hard', '--quiet', 'HEAD']).status !== 0) return { healed: false, reason: 'reset-failed', detail: { savedRef } };
   }
+  const last = readInProgress(git);
+  if (last === null || last.length) return { healed: false, reason: last ? 'operation-in-progress' : 'git-dir-unreadable', ...(last ? { detail: { operations: last, savedRef } } : { detail: { savedRef } }) };
   // NOT forced: an untracked file the switch would overwrite makes it fail, and we refuse instead of clobbering.
   const sw = git(['checkout', '--quiet', 'main']);
   if (sw.status !== 0) return { healed: false, reason: 'switch-failed', detail: { savedRef, stderr: String(sw.stderr ?? '').slice(0, 300) } };

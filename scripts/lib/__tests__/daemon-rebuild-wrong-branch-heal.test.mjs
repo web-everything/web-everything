@@ -173,6 +173,43 @@ describe('in-progress git operations block the heal (red-team: paused interactiv
   });
 });
 
+describe('in-progress check: fail-closed reads and re-check before mutating', () => {
+  const mk = (root, extra = {}) => (args) => {
+    switch (args.join(' ')) {
+      case 'symbolic-ref --short HEAD': return { status: 1, stdout: '' };
+      case 'rev-parse --verify --quiet HEAD': case 'rev-parse --verify --quiet refs/heads/main': return { status: 0, stdout: `${mainSha}\n` };
+      case 'rev-parse --absolute-git-dir': return { status: 0, stdout: `${root}\n` };
+      case 'status --porcelain=v1 -z --untracked-files=no': extra.onStatus?.(); return { status: 0, stdout: '' };
+      case 'checkout --quiet main': extra.checkedOut = true; return { status: 0, stdout: '' };
+      default: throw new Error(`Unexpected git command: ${args.join(' ')}`);
+    }
+  };
+  it('a git dir that is not a directory (stat error other than ENOENT) refuses', () => {
+    const root = mkdtempSync(join(tmpdir(), 'wrong-branch-heal-notdir-'));
+    try {
+      writeFileSync(join(root, 'gitdir-file'), 'x');
+      const extra = {};
+      expect(healWrongBranch({ git: mk(join(root, 'gitdir-file'), extra), settings })).toEqual({ healed: false, reason: 'git-dir-unreadable' });
+      expect(extra.checkedOut).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('an operation that starts after the plan was read (during status) still blocks the switch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'wrong-branch-heal-race-'));
+    try {
+      const extra = { onStatus: () => mkdirSync(join(root, 'rebase-merge')) };
+      expect(healWrongBranch({ git: mk(root, extra), settings })).toMatchObject({ healed: false, reason: 'operation-in-progress', detail: { operations: ['rebase-merge'] } });
+      expect(extra.checkedOut).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+  it('a live git process (index.lock) blocks the switch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'wrong-branch-heal-lock-'));
+    try {
+      writeFileSync(join(root, 'index.lock'), '');
+      expect(healWrongBranch({ git: mk(root), settings })).toMatchObject({ healed: false, reason: 'operation-in-progress' });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('healWrongBranch (replay of the 2026-10-09 review-daemon clone)', () => {
   it('saves the ledger change to a named ref, returns to main, restores the daemon entry, keeps untracked', () => {
     const { dir, g } = replayClone();
