@@ -62,7 +62,7 @@ const REQUEST = JSON.stringify({ pr: PR, repo: FIXTURE_SLUG, to: 'review:accepte
  * worktree directory. That is a clock collision, not a git fact, so faking it removes noise rather than
  * removing the subject.
  */
-function stage(ctx, over = {}) {
+function stage(ctx, over = {}, clock = null) {
   let tick = 0;
   // `root` (the DRIVER's checkout) is deliberately a DIFFERENT directory from `repoRoot` (the board's). In
   // production those genuinely differ — that is #3261's whole point, one board per repo — and a fixture that
@@ -70,7 +70,7 @@ function stage(ctx, over = {}) {
   // once: with the two equal, moving the `worktree prune` from the board to the driver changed nothing and
   // the mutation survived. Here `root` is a real checkout of a DIFFERENT origin, so pruning it is a
   // no-op on the board — which is the damage.
-  const sinks = createRecordVerdictSinks({ root: driverRootFor(ctx), repoRoot: ctx.clone, now: () => ++tick + 1_000 });
+  const sinks = createRecordVerdictSinks({ root: driverRootFor(ctx), repoRoot: ctx.clone, now: clock || (() => ++tick + 1_000) });
   return sinks[STAGE_REQUEST_EFFECT]({
     repo: FIXTURE_SLUG, path: REQUEST_PATH, content: REQUEST, pr: PR, to: 'review:accepted', ...over,
   });
@@ -498,3 +498,34 @@ describe('the sink against a FULL clone — the happy geometry still works', () 
  *  hooks exist only to make that explicit to the next reader. */
 beforeEach(() => {});
 afterEach(() => {});
+
+describe('a killed transport writer cannot wedge later writes (2026-10-09/10-11)', () => {
+  it.each([false, true])('stages past a stranded branch holder, preserving its work (dirty=%s)', async (dirty) => {
+    await withNarrowClone(async (ctx) => {
+      seedApplierOnMain(ctx);
+      ctx.seedOriginBranch(TRANSPORT_BRANCH);
+      ctx.git(['fetch', '--quiet', 'origin', trackingRefspec(TRANSPORT_BRANCH)]);
+      const wt = join(ctx.clone, '.operations', 'transport', 'wt-1');
+      mkdirSync(join(ctx.clone, '.operations', 'transport'), { recursive: true });
+      ctx.git(['worktree', 'add', '-b', TRANSPORT_BRANCH, wt, 'origin/' + TRANSPORT_BRANCH]);
+      writeFileSync(join(wt, 'unpushed.txt'), 'interrupted writer\n');
+      ctx.git(['add', 'unpushed.txt'], { cwd: wt });
+      ctx.git(['commit', '--quiet', '-m', 'interrupted before push'], { cwd: wt });
+      const strandedHead = ctx.git(['rev-parse', 'HEAD'], { cwd: wt }).trim();
+      if (dirty) writeFileSync(join(wt, 'uncommitted.txt'), 'keep me\n');
+
+      expect(await stage(ctx, {}, () => 700001)).toEqual({ path: REQUEST_PATH, pushed: true });
+      expect(ctx.showOnOrigin(TRANSPORT_BRANCH, REQUEST_PATH)).toBe(REQUEST);
+      const listed = ctx.git(['worktree', 'list', '--porcelain']);
+      if (dirty) {
+        expect(listed).toContain(wt);
+        expect(readFileSync(join(wt, 'uncommitted.txt'), 'utf8')).toBe('keep me\n');
+        expect(ctx.git(['rev-parse', 'HEAD'], { cwd: wt }).trim()).toBe(strandedHead);
+      } else {
+        expect(listed).not.toContain(wt);
+        expect(existsSync(wt)).toBe(false);
+        expect(ctx.git(['rev-parse', 'refs/transport-stranded/wt-1']).trim()).toBe(strandedHead);
+      }
+    });
+  });
+});
