@@ -1,21 +1,22 @@
 ---
+bornAs: x0y4th6
 kind: story
 size: 3
 parent: "4075"
 status: open
-scope: ["we:scripts/conveyor/__tests__/hung-session-mutation-check.test.mjs", "we:scripts/conveyor/hung-session-mutation-check.mjs"]
+scope: ["we:backlog/xz73kbf-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md"]
 dateOpened: "2026-10-12"
 tags: []
 ---
 
-# Prevention — Add a unit test that reads we:scripts/conveyor/hung-session.mjs and asserts each DEFAULT_MUTATION… (from web-everything/web-everything#5019 review)
+# Prevention — Add a card-template field such as blockedBy: PR #NNNN for cards derived from open-PR reviews. (from web-everything/web-everything#5006 review)
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
+1. `we:backlog/5937-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md:13` — Add a card-template field such as `blockedBy: PR #NNNN` for cards derived from open-PR reviews.
 
-1. `we:scripts/conveyor/__tests__/hung-session-mutation-check.test.mjs:8` — Add a unit test that reads we:scripts/conveyor/hung-session.mjs and asserts each DEFAULT_MUTATIONS.find occurs exactly once. Better, run the checker from a gate or CI script so drift is caught automatically.
-2. `we:scripts/conveyor/hung-session-mutation-check.mjs:111` — Add a deterministic parameterized test that makes each rmSync call throw in turn and verifies that every subsequent cleanup is still attempted.
+Already tracked on open cards (recorded there as "Also raised by", not refiled): finding 1 → #5615.
 
-Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5019@ab6f6cc4db14ec1435f4f72b713b9207523b4760
+Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5006@c7b701fca45f9033767847f02c9dd08dcae65ab1
 
 ## Acceptance
 

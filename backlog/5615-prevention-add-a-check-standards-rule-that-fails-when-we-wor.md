@@ -46,4 +46,4 @@ One line per class: either the handling, or `n/a: <why>`.
 
 ## Also raised by
 
-- Also raised by web-everything/web-everything#5006 (finding 1: `we:backlog/xz73kbf-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md:19` — Add a check:standards rule that rejects open cards containing literal 'TODO:' placeholders in Acceptance or Edge cases once a card is claimed or moved to in-progress.)
+- Also raised by web-everything/web-everything#5006 (finding 1: `we:backlog/5937-fix-run-detect-unmerged-binary-paths-by-status-not-numstat.md:19` — Add a check:standards rule that rejects open cards containing literal 'TODO:' placeholders in Acceptance or Edge cases once a card is claimed or moved to in-progress.)
