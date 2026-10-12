@@ -114,7 +114,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
-import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, readRoutedOutcomes, consecutiveUnproductiveOnHead, mergeOntoFor, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -1165,9 +1165,8 @@ export function roundEscalationFor(planned, { fixSettings, loadLadder = () => lo
 
 /** The Claude-only inputs of a planned fix or ci-heal entry, as the router and the borrow guard both read them. */
 function claudeOnlyInputs(planned, { fixSettings, loadLadder, readRouted = readRoutedOutcomes }) {
-  const codexUnproductive = consecutiveUnproductiveOnHead(readRouted(), {
-    repo: planned.repo ?? 'we', pr: planned.pr, head: planned.headRefOid,
-  });
+  const id = { repo: planned.repo ?? 'we', pr: planned.pr };
+  const codexUnproductive = consecutiveUnproductiveOnHead(readRouted(id), { ...id, head: planned.headRefOid });
   return { ...planned, codexUnproductive, round: planned.round ?? roundOf(planned), mainFix: planned.mainFix === true,
     strongerModel: !!planned.strongerModel || !!roundEscalationFor(planned, { fixSettings, loadLadder }) };
 }
@@ -1475,7 +1474,7 @@ export function dispatchFix(planned, {
           pr: planned.pr, num: planned.itemNum, sessionSlug, cwd: root,
           ref: planned.laneRef, repo: ghRepoSlug(repo), laneRepo: tokens.LANE_REPO, scope: planned.scope.join(','),
           promptFile, claimRepo: repo,
-          mergeOnto: planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName ?? 'main' : null),
+          mergeOnto: mergeOntoFor(planned),
           policyRoute: { provider: decision.executor === 'codex' ? 'codex' : 'antigravity-claude' },
         });
       } catch (e) {

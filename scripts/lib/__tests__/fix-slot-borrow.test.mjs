@@ -189,12 +189,43 @@ describe('routed Codex outcomes', () => {
     expect(consecutiveUnproductiveOnHead(table, id)).toBe(10);
     expect(consecutiveUnproductiveOnHead(table, { ...id, head: 'new' })).toBe(0);
     expect(claudeOnlyReason({ codexUnproductive: 1 })).toBeNull();
-    expect(claudeOnlyReason({ codexUnproductive: 2 })).toContain('2 empty runs');
+    expect(claudeOnlyReason({ codexUnproductive: 2 })).toContain('2 unproductive runs) → falls back to Claude');
     expect(chooseFixExecutor({ launcherAvailable: true, codexUnproductive: 2 }).executor).toBe('claude');
     expect(chooseFixExecutor({ launcherAvailable: true, codexUnproductive: 0 }).executor).toBe('codex');
     recordRoutedOutcome({ ...id, outcome: 'pushed', store });
     expect(table).toEqual({});
     recordRoutedOutcome({ ...id, outcome: 'failed', store, readClaim: () => ({ meta: { borrowed: { executor: 'codex' } } }) });
     expect(table).toEqual({});
+  });
+  it('counts only the trailing run on the current head (an interleaved head resets the count)', async () => {
+    const { consecutiveUnproductiveOnHead } = await import('../fix-slot-borrow.mjs');
+    const id = { repo: 'we', pr: 7, head: 'abc' };
+    const at = (...heads) => ({ 'we#7': heads.map(head => ({ head, outcome: 'no-change' })) });
+    expect(consecutiveUnproductiveOnHead(at('abc', 'abc', 'old', 'abc'), id)).toBe(1);
+    expect(consecutiveUnproductiveOnHead(at('abc', 'abc', 'old'), id)).toBe(0);
+    expect(consecutiveUnproductiveOnHead({ 'we#7': [{ head: 'abc', outcome: 'failed' }, { head: 'abc', outcome: 'pushed' }] }, id)).toBe(0);
+    expect(consecutiveUnproductiveOnHead(at('abc', 'abc'), { ...id, repo: 'fui' })).toBe(0);
+  });
+  it('keeps one atomically-written ledger file per PR, so interleaved writers for different PRs never clobber each other', async () => {
+    const { recordRoutedOutcome, readRoutedOutcomes, consecutiveUnproductiveOnHead } = await import('../fix-slot-borrow.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'routed-outcomes-'));
+    vi.stubEnv('WE_COORDINATION_ROOT', dir);
+    try {
+      const a = { repo: 'we', pr: 1, head: 'h1', readClaim: () => null };
+      const b = { repo: 'fui', pr: 2, head: 'h2', readClaim: () => null };
+      for (let i = 0; i < 2; i++) { recordRoutedOutcome({ ...a, outcome: 'no-change' }); recordRoutedOutcome({ ...b, outcome: 'failed', note: 'x' }); }
+      expect(consecutiveUnproductiveOnHead(readRoutedOutcomes(a), a)).toBe(2);
+      expect(consecutiveUnproductiveOnHead(readRoutedOutcomes(b), b)).toBe(2);
+      expect(readRoutedOutcomes(b)['fui#2'][0]).toMatchObject({ note: 'x' });
+      expect(readRoutedOutcomes({ repo: 'we', pr: 2 })).toEqual({});
+    } finally { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('mergeOntoFor: restack base first, then the conflict base, else the @pr-base sentinel (never a guessed main); no merge otherwise', async () => {
+    const { mergeOntoFor } = await import('../fix-slot-borrow.mjs');
+    expect(mergeOntoFor({ restack: { onto: 'lane/b' }, isConflict: true, baseRefName: 'dev' })).toBe('lane/b');
+    expect(mergeOntoFor({ isConflict: true, baseRefName: 'dev' })).toBe('dev');
+    expect(mergeOntoFor({ isConflict: true })).toBe('@pr-base');
+    expect(mergeOntoFor({ isConflict: true, baseRefName: '' })).toBe('@pr-base');
+    expect(mergeOntoFor({})).toBeNull();
   });
 });

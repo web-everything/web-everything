@@ -21,16 +21,16 @@
  * provider on main, so it is refused up front rather than launched half-working.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, existsSync, lstatSync, readFileSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { REPO_ROOT } from './detached-dispatch.mjs';
 // Imported FROM the leaf, never the other way round (see `fix.mjs#FIX_RUN_EXECUTORS`): this file's top-level `await`
 // below deadlocks if `dispatch-providers/fix.mjs` imports it back.
 import { FIX_RUN_EXECUTORS } from './dispatch-providers/fix.mjs';
-import { recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
+import { PR_BASE_MERGE_TARGET, recordBorrowOutcome, recordRoutedOutcome, consecutiveUnproductiveOnHead, ROUTED_CODEX_MAX_UNPRODUCTIVE } from '../lib/fix-slot-borrow.mjs';
 import { LANE_CONFIG_LIST_ARGS, laneGitConfigArgs, laneGitHardeningEnv } from '../lib/lane-git-hardening.mjs';
 
 // LAZY on purpose: `deliver-item-wrapper.mjs` reaches `dispatch-providers/fix.mjs` (which imports this file) through
@@ -152,6 +152,24 @@ export function agentFinalMessage(result) {
   return String(message ?? '');
 }
 
+/** Unmerged codes an agent can resolve by editing one text file in place (both modified / both added). */
+const EDITABLE_CONFLICT_CODES = new Set(['UU', 'AA']);
+const UNMERGED_CODES = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU']);
+
+/** PURE. The unmerged rows of NUL porcelain v1 output: `[{ path, code }]`. */
+export function unmergedPaths(porcelain) {
+  const records = String(porcelain ?? '').split('\0');
+  const out = [];
+  for (let i = 0; i < records.length; i++) {
+    const row = records[i];
+    if (!row) continue;
+    const code = row.slice(0, 2);
+    if (UNMERGED_CODES.has(code)) out.push({ path: row.slice(3), code });
+    else if (/[RC]/.test(code)) i++; // skip a rename's source path
+  }
+  return out;
+}
+
 // NUL porcelain preserves spaces/newlines and includes both sides of a rename.
 export function changedPaths(porcelain) {
   const records = String(porcelain ?? '').split('\0');
@@ -162,7 +180,34 @@ export function changedPaths(porcelain) {
     paths.push(row.slice(3));
     if (/[RC]/.test(row.slice(0, 2))) paths.push(records[++i]);
   }
-  return [...new Set(paths.filter(p => p && !/^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.fix-commit-msg\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/.test(basename(p))))];
+  return [...new Set(paths.filter(p => p && !/^(?:\.fix-.*(?:commit-msg|commit-message).*\.txt|\.delivery-commit-msg-.*|\.converge-.*)$/.test(basename(p))))];
+}
+
+/**
+ * Read an agent-written file in the lane from OUTSIDE the agent's sandbox: null (never followed) for a symlink, a
+ * non-regular or hardlinked file, or a path whose realpath leaves the lane — the agent must not get the launcher to read for it.
+ */
+export function readLaneFileSafe(path, lanePath) {
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile() || st.nlink > 1) return null; // nlink > 1: a hardlink can alias a file outside the lane
+    const root = realpathSync(lanePath);
+    if (!realpathSync(path).startsWith(root + sep)) return null;
+    return readFileSync(path, 'utf8');
+  } catch { return null; }
+}
+
+/**
+ * PURE. The PR comment posted when routed codex repairs stall on one head. The notes are agent-authored (untrusted), so
+ * they go inside a fenced block with backticks stripped, `@` mentions neutralised, and the finding phrases removed —
+ * the comment must never read back as a reviewer's changes-requested / advisory finding.
+ */
+export function escalationComment(head, entries) {
+  const clean = (t) => singleLine(t).replace(/`/g, "'").replace(/@/g, '@\u200b').replace(new RegExp(CHANGES_COMMENT_RE.source, 'gi'), '[…]');
+  // The note is the agent's final message. The Codex sandbox has no network and its read deny-list covers secrets, so
+  // the note can only echo lane content (the repo itself); it is still capped at 200 chars.
+  const lines = entries.map(o => `- ${clean(o.outcome)}: ${clean(o.note || o.outcome).slice(0, 200)}`).join('\n');
+  return `**fix-run: codex repair unproductive on ${String(head).slice(0, 9)}**\n\n\`\`\`text\n${lines}\n\`\`\`\n\nThe next repair falls back to Claude.`;
 }
 
 function withMessageFile(message, action) {
@@ -219,7 +264,7 @@ export async function runFixCli(argv = [], {
   releaseClaim = releaseBorrowedClaim,
   recordOutcome = recordBorrowOutcome,
   recordRouted = recordRoutedOutcome,
-  readFile = (p) => readFileSync(p, 'utf8'),
+  readFile = readLaneFileSafe,
   fileExists = existsSync,
   weRoot = REPO_ROOT,
   write = (l) => process.stdout.write(l),
@@ -227,8 +272,9 @@ export async function runFixCli(argv = [], {
 } = {}) {
   let launch;
   let laneRelease = null;
-  // How this borrowed launch ended. Recorded (so repeated failures stop the PR borrowing) and the claim is released on
-  // EVERY exit: a borrowed fix that ends must not keep holding its claim and a cap slot until the TTL.
+  // How this launch (borrowed or routed) ended. Recorded in the borrow ledger (repeated failures stop the PR borrowing)
+  // and, for routed codex, the per-head ledger (repeated failures fall back to Claude). The claim is released on EVERY
+  // exit: a fix that ends must not keep holding its claim and a cap slot until the TTL.
   let before = null;
   let finalMessage = '';
   let abortMerge = null;
@@ -242,10 +288,11 @@ export async function runFixCli(argv = [], {
     if (launch.provider === 'codex' && before) {
       try {
         const id = { repo, pr: Number(launch.pr), head: before };
-        const table = recordRouted({ ...id, outcome, reason });
+        // `reason` (may carry raw command errors) stays in the local ledger; only `note` (the agent's final message) is
+        // ever posted to the PR.
+        const table = recordRouted({ ...id, outcome, reason, note: finalMessage });
         if (consecutiveUnproductiveOnHead(table, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE) {
-          const reasons = table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE).map(o => `- ${singleLine(o.reason)}`).join('\n');
-          withMessageFile(`**fix-run: codex repair unproductive on ${before.slice(0, 9)}**\n\n${reasons}\n\nThe next repair falls back to Claude.`, file =>
+          withMessageFile(escalationComment(before, table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE)), file =>
             run('gh', ['pr', 'comment', launch.pr, ...(launch.repo ? ['--repo', launch.repo] : []), '--body-file', file], { cwd: weRoot }));
         }
       } catch (e) { writeErr(`fix-run: could not record routed outcome / post escalation: ${String(e?.message ?? e)}\n`); }
@@ -276,7 +323,7 @@ export async function runFixCli(argv = [], {
   try {
     const brief = readPrompt(launch.promptFile);
     // The launcher has the network, the agent does not: fetch the reviewer's finding here and hand it over in the brief.
-    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
+    const prHead = JSON.parse(run('gh', ['pr', 'view', pr, '--json', 'title,body,baseRefName', ...(launch.repo ? [`--repo=${launch.repo}`] : [])], { cwd: weRoot }) || '{}');
     const comments = await readComments(pr, { repo: launch.repo });
     const prContext = launch.mergeOnto && !comments.some(c => CHANGES_COMMENT_RE.test(c.body ?? ''))
       ? `## PR CONTEXT (fetched by the launcher)\nTitle: ${prHead.title ?? ''}\n${prHead.body ?? ''}\n\n`
@@ -317,15 +364,28 @@ export async function runFixCli(argv = [], {
     let unmerged = [];
     let mergePrompt = '';
     if (launch.mergeOnto) {
-      const target = launch.mergeOnto;
+      // `@pr-base`: the dispatcher did not know the base; read it from the live PR, never guess `main`.
+      const target = launch.mergeOnto === PR_BASE_MERGE_TARGET ? String(prHead.baseRefName ?? '').trim() : launch.mergeOnto;
+      if (!target) throw new Error('cannot resolve PR base for conflict merge');
       if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(target)) throw new Error(`invalid merge ref: ${target}`);
       git('check-ref-format', '--branch', target);
       git('fetch', 'origin', target);
       abortMerge = () => { if (inMerge()) git('merge', '--abort'); };
       try { git('merge', '--no-commit', '--no-ff', `origin/${target}`); }
       catch (e) {
-        unmerged = git('diff', '--name-only', '--diff-filter=U', '-z').split('\0').filter(Boolean);
-        if (!inMerge() || !unmerged.length) throw e;
+        const conflicts = unmergedPaths(git('status', '--porcelain=v1', '-z'));
+        if (!inMerge() || !conflicts.length) throw e;
+        // Only a text both-modified/both-added conflict can be resolved by editing one file. Anything else (binary,
+        // modify/delete, rename) is aborted BEFORE the agent runs and recorded as failed; after ROUTED_CODEX_MAX_UNPRODUCTIVE such
+        // consecutive unproductive runs on the same head, the next repair falls back to Claude.
+        const binary = new Set(git('diff', '--numstat', '-z', '--', ...conflicts.map(c => c.path)).split('\0')
+          .filter(row => row.startsWith('-\t-\t')).map(row => row.slice(4)));
+        const bad = conflicts.filter(c => !EDITABLE_CONFLICT_CODES.has(c.code) || binary.has(c.path));
+        if (bad.length) {
+          git('merge', '--abort');
+          throw new Error(`conflict not resolvable by editing files: ${bad.map(c => `${c.path}(${binary.has(c.path) ? `${c.code} binary` : c.code})`).join(', ')}`);
+        }
+        unmerged = conflicts.map(c => c.path);
       }
       if (!unmerged.length && inMerge()) commitMerge();
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
@@ -347,7 +407,13 @@ export async function runFixCli(argv = [], {
     if (configAfterAgent !== configBefore || riskyLaneConfig(configAfterAgent).length) throw new Error('lane git config changed while the agent ran; refusing to push');
     const paths = changedPaths(git('status', '--porcelain=v1', '-z', '--untracked-files=all'));
     if (inMerge()) {
-      const unresolved = unmerged.filter(path => fileExists(join(lanePath, path)) && /^(<<<<<<< |>>>>>>> )/m.test(readFile(join(lanePath, path))));
+      // Every conflicted path is a text UU/AA conflict (checked above), so it must still exist as a regular file in the
+      // lane with no conflict markers; a missing, symlinked, hardlinked or escaping path counts as unresolved.
+      const unresolved = unmerged.filter(path => {
+        if (!fileExists(join(lanePath, path))) return true;
+        const text = readFile(join(lanePath, path), lanePath);
+        return text == null || /^(<<<<<<< |>>>>>>> )/m.test(text);
+      });
       if (unresolved.length) {
         git('merge', '--abort');
         throw new Error(`conflict unresolved in ${unresolved.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
@@ -357,7 +423,8 @@ export async function runFixCli(argv = [], {
       commitMerge();
     } else if (paths.length) {
       const supplied = join(lanePath, '.fix-commit-msg.txt');
-      const message = fileExists(supplied) ? readFile(supplied) : `fix(PR #${pr}): ${finalMessage.split('\n')[0] || 'apply review finding'}`;
+      const own = fileExists(supplied) ? readFile(supplied, lanePath) : null; // null for a symlink: ignore it
+      const message = own?.trim() ? own.slice(0, 4000) : `fix(PR #${pr}): ${finalMessage.split('\n')[0] || 'apply review finding'}`;
       git('add', '--', ...paths);
       withMessageFile(`${message.trim()}\n\n${trailer}\n`, file => git('commit', '-F', file, '--', ...paths));
     }
@@ -367,8 +434,8 @@ export async function runFixCli(argv = [], {
       outcome = 'no-change'; reason = finalMessage || 'agent committed nothing';
       result = `no-change (${singleLine(reason)}; claim released, PR is re-planned)`;
     } else {
-      // The agent could write the lane's `.git`; this push runs outside its sandbox with our credentials, so refuse
-      // if its repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
+      // Defense in depth (config was already re-checked right after the agent): this push runs outside the sandbox with
+      // our credentials, so refuse again if the repo-local config (remote URL, sshCommand, insteadOf, credential helper, includes...) changed or is now
       // risky, and run the push with the code-running keys pinned inert (env, so no gap after the check) and no hooks.
       const configAfter = laneConfig();
       if (configAfter !== configBefore || riskyLaneConfig(configAfter).length) {

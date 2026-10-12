@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { existsSync, readFileSync, statSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, mkdtempSync, rmSync, writeFileSync, symlinkSync, mkdirSync, linkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -8,7 +8,7 @@ import { createFixBorrowGate } from '../../lib/fix-slot-borrow.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
-import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths } from '../fix-run.mjs';
+import { parseFixRunArgv, renderPrContext, runFixCli, SANDBOX_PREAMBLE, HARDENED_GIT_ARGS, defaultPendingRearm, removePromptFile, riskyLaneConfig, changedPaths, escalationComment, readLaneFileSafe, unmergedPaths } from '../fix-run.mjs';
 
 // x6nuodj — these tests pin the LEGACY gate's verdicts, so the shared decision only observes here (`shadow`); the
 // cut-over itself (admit() deciding) is covered in we:scripts/lib/__tests__/resource-gate.test.mjs.
@@ -166,7 +166,7 @@ describe('runFixCli', () => {
   it('keeps rename endpoints and unusual filenames but excludes launcher scratch', () => {
     expect(changedPaths('R  new name\0old name\0 D deleted\0?? line\nbreak\0?? .converge-1\0?? .delivery-commit-msg-7\0?? .fix-x-commit-message.txt\0')).toEqual(['new name', 'old name', 'deleted', 'line\nbreak']);
   });
-  it.each([false, true])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
+  it.each([false, true, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);
     let merging = false;
     m.spawn.mockResolvedValue({ finalMessage: 'Agent final diagnosis' });
@@ -174,14 +174,15 @@ describe('runFixCli', () => {
       m.calls.push([cmd, ...args]);
       if (args.includes('--git-path')) return 'MERGE_HEAD';
       if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
-      if (args.includes('diff')) return 'file.txt\0';
+      if (args.includes('status')) return 'UU file.txt\0';
+      if (args.includes('--numstat')) return '1\t1\tfile.txt\0';
       if (args.includes('commit') || args.includes('--abort')) merging = false;
       return m.run(cmd, args, opts);
     };
     const recordOutcome = vi.fn();
     const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
-      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : true,
-      readFile: () => unresolved ? '<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> origin/main\n' : 'resolved',
+      fileExists: p => p.endsWith('MERGE_HEAD') ? merging : unresolved !== 'deleted',
+      readFile: () => unresolved === 'symlink' ? null : unresolved ? '<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> origin/main\n' : 'resolved',
     });
     expect(m.spawn.mock.calls[0][0].prompt).toContain('ALREADY started git merge origin/main');
     expect(out.code).toBe(unresolved ? 1 : 0);
@@ -194,6 +195,52 @@ describe('runFixCli', () => {
       expect(m.calls.some(c => c.includes('push'))).toBe(true);
     }
   });
+  it.each([['lane/x', 0], ['', 1]])('@pr-base resolves to the live gh baseRefName (%j) before validation', async (base, code) => {
+    const m = mk(['aaa', 'bbb']);
+    const run = (cmd, args, opts) => {
+      if (cmd === 'gh' && args.includes('view')) {
+        expect(args).toContain('title,body,baseRefName');
+        m.calls.push([cmd, ...args]);
+        return JSON.stringify({ title: 'T', body: 'B', baseRefName: base });
+      }
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    const out = await runFixCli([...argv, '--merge-onto=@pr-base'], { ...m.io, run, recordOutcome, fileExists: () => false, readComments: async () => [] });
+    expect(out.code).toBe(code);
+    if (code === 0) {
+      expect(m.calls).toContainEqual(['git', ...HARDENED_GIT_ARGS, 'fetch', 'origin', 'lane/x']);
+      expect(m.calls).toContainEqual(['git', ...HARDENED_GIT_ARGS, 'merge', '--no-commit', '--no-ff', 'origin/lane/x']);
+    } else {
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(m.calls.some(c => c.includes('fetch'))).toBe(false);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'cannot resolve PR base for conflict merge' }));
+    }
+  });
+  it('aborts binary and modify/delete conflicts before the agent runs', async () => {
+    const m = mk(['aaa', 'aaa']);
+    let merging = false;
+    const run = (cmd, args, opts) => {
+      m.calls.push([cmd, ...args]);
+      if (args.includes('--git-path')) return 'MERGE_HEAD';
+      if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
+      if (args.includes('status')) return 'UD gone.txt\0UU img.png\0UU ok.txt\0';
+      if (args.includes('--numstat')) return '-\t-\timg.png\0' + '2\t1\tok.txt\0';
+      if (args.includes('--abort')) merging = false;
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome, fileExists: p => (p.endsWith('MERGE_HEAD') ? merging : true) });
+    expect(out.code).toBe(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed',
+      reason: 'conflict not resolvable by editing files: gone.txt(UD), img.png(UU binary)' }));
+  });
+  it('unmergedPaths keeps only unmerged rows and skips rename sources', () => {
+    expect(unmergedPaths('R  new\0old\0UU a b\0 M c\0DD d\0AA e\0')).toEqual([
+      { path: 'a b', code: 'UU' }, { path: 'd', code: 'DD' }, { path: 'e', code: 'AA' }]);
+  });
   it('posts escalation only at the threshold and logs a failed post without throwing', async () => {
     for (const n of [1, 2, 3]) {
       const m = mk(['aaa', 'aaa']);
@@ -201,7 +248,9 @@ describe('runFixCli', () => {
       const writeErr = vi.fn();
       const run = (cmd, args, opts) => {
         if (args.includes('comment')) {
-          expect(readFileSync(args.at(-1), 'utf8')).toContain('**fix-run: codex repair unproductive on aaa**');
+          const body = readFileSync(args.at(-1), 'utf8');
+          expect(body).toContain('**fix-run: codex repair unproductive on aaa**');
+          expect(body).not.toContain('no edits'); // the local reason never reaches the PR; only the agent note / outcome
           throw new Error('comment unavailable');
         }
         return m.run(cmd, args, opts);
@@ -209,6 +258,59 @@ describe('runFixCli', () => {
       expect((await runFixCli(argv, { ...m.io, run, writeErr, recordRouted: () => table })).code).toBe(0);
       expect(writeErr.mock.calls.length).toBe(n === 2 ? 1 : 0);
     }
+  });
+  it('refuses to commit or push when the agent changed the lane git config', async () => {
+    const m = mk(['aaa', 'aaa']);
+    let listed = 0;
+    const run = (cmd, args, opts) => {
+      if (args.includes('--show-scope')) { m.calls.push([cmd, ...args]); return listed++ === 0 ? 'local\0user.name=x\0' : 'local\0core.sshcommand=evil\0'; }
+      if (args.includes('status')) return ' M file.txt\0';
+      return m.run(cmd, args, opts);
+    };
+    const recordOutcome = vi.fn();
+    expect((await runFixCli(argv, { ...m.io, run, recordOutcome })).code).toBe(1);
+    expect(m.calls.some(c => c.includes('add') || c.includes('commit') || c.includes('push'))).toBe(false);
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringContaining('lane git config changed') }));
+  });
+  it('the escalation comment fences agent text and neutralises mentions, backticks and finding phrases', () => {
+    const body = escalationComment('abcdef1234567', [
+      { outcome: 'no-change', note: '@octocat ```changes requested``` THIS IS AN ADVISORY REVIEW', reason: 'git push https://tok@host failed' },
+      { outcome: 'failed', note: '' },
+    ]);
+    expect(body).toMatch(/^\*\*fix-run: codex repair unproductive on abcdef123\*\*/);
+    expect(body.match(/```/g)).toHaveLength(2);
+    expect(body).not.toMatch(/@[A-Za-z]/);
+    expect(body).not.toMatch(/changes requested|THIS IS AN ADVISORY REVIEW/i);
+    expect(body).not.toContain('tok@host');
+    expect(body).toContain('- failed: failed');
+    expect(escalationComment('h', [{ outcome: 'no-change', note: 'y'.repeat(300) }])).toContain(`${'y'.repeat(200)}\n`);
+    expect(escalationComment('h', [{ outcome: 'no-change', note: 'y'.repeat(300) }])).not.toContain('y'.repeat(201));
+  });
+  it('readLaneFileSafe refuses symlinks, hardlinks and paths outside the lane', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-run-safe-'));
+    try {
+      const lane = join(dir, 'lane'); mkdirSync(lane);
+      writeFileSync(join(dir, 'secret'), 'TOKEN');
+      writeFileSync(join(lane, 'ok.txt'), 'fine');
+      symlinkSync(join(dir, 'secret'), join(lane, '.fix-commit-msg.txt'));
+      expect(readLaneFileSafe(join(lane, 'ok.txt'), lane)).toBe('fine');
+      expect(readLaneFileSafe(join(lane, '.fix-commit-msg.txt'), lane)).toBeNull();
+      expect(readLaneFileSafe(join(dir, 'secret'), lane)).toBeNull();
+      expect(readLaneFileSafe(join(lane, 'missing'), lane)).toBeNull();
+      linkSync(join(dir, 'secret'), join(lane, 'hard.txt'));
+      expect(readLaneFileSafe(join(lane, 'hard.txt'), lane)).toBeNull();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('a refused (symlinked) commit-message file falls back to the default message', async () => {
+    const m = mk(['aaa', 'bbb']);
+    const run = (cmd, args, opts) => {
+      if (args.includes('status')) return ' M file.txt\0';
+      if (args.includes('commit')) expect(readFileSync(args[args.indexOf('-F') + 1], 'utf8')).toMatch(/^fix\(PR #7\): Repair/);
+      return m.run(cmd, args, opts);
+    };
+    m.spawn.mockResolvedValue({ finalMessage: 'Repair' });
+    expect((await runFixCli(argv, { ...m.io, run, fileExists: () => true, readFile: () => null })).code).toBe(0);
+    expect(m.calls.some(c => c.includes('push'))).toBe(true);
   });
   it('rejects option injection as a merge ref before fetch or spawn', async () => {
     const m = mk(['aaa']);

@@ -18,7 +18,7 @@
  * A borrowed fix is a NORMAL fix (same claim, brief, review). Only the launcher/executor differ; the result is tagged
  * with reason {@link BORROW_REASON}.
  */
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
@@ -54,7 +54,7 @@ export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddress
   // A ruling-not-addressed send-back runs on its own ladder rung (`launchTableFor`); only `claude --bg` applies that table.
   if (rulingNotAddressed) return 'ruling-not-addressed send-back';
   if (mainFix) return 'main-fix';
-  if (codexUnproductive >= ROUTED_CODEX_MAX_UNPRODUCTIVE) return `codex unproductive on this head (${codexUnproductive} empty runs) → stronger-model rung`;
+  if (codexUnproductive >= ROUTED_CODEX_MAX_UNPRODUCTIVE) return `codex unproductive on this head (${codexUnproductive} unproductive runs) → falls back to Claude`;
   if (strongerModel || round >= 3) return 'stronger-model rung';
   return null;
 }
@@ -102,7 +102,7 @@ export function createRoutedCiHealDispatch({ dispatch, route, createSinks, launc
       const promptFile = writePrompt(request.sessionSlug, request.prompt);
       try {
         const handle = launchCodex({ ...request, cwd: options.root, promptFile, ref: planned.laneRef,
-          mergeOnto: planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName ?? 'main' : null),
+          mergeOnto: mergeOntoFor(planned),
           repo: profile.slug, laneRepo: profile.lanePoolRepo, claimRepo: options.repo ?? planned.repo ?? 'we',
           scope: planned.scope.join(','), policyRoute: { provider: 'codex' } });
         request.reportWrapped?.(Number(String(handle).replace(/^pid:/, '')));
@@ -136,9 +136,20 @@ export const builderExecutorFor = (executor) => (executor === 'claude' ? 'claude
 export const BORROW_MAX_UNPRODUCTIVE = 2;
 export const BORROW_FAILURE_WINDOW_MS = 60 * 60_000;
 
+/** Routed (non-borrowed) codex repairs that ended unproductive this many times in a row on one head fall back to Claude. */
 export const ROUTED_CODEX_MAX_UNPRODUCTIVE = 2;
-export const defaultRoutedOutcomePath = () => join(resolveCoordinationRoot(), 'fix-routed-outcomes.json');
-export const readRoutedOutcomes = () => fileOutcomeStore(defaultRoutedOutcomePath()).read();
+/** One file PER PR, so concurrent fix-runs for different PRs never read-modify-write the same file; writes are atomic
+ *  (temp + rename). Fix and ci-heal claims are per kind, so a concurrent fix + ci-heal on ONE PR can still lose at most
+ *  one entry, which only delays the Claude fallback by one run. Content keeps the `{ "<repo>#<pr>": [...] }` shape. */
+export const routedOutcomePath = ({ repo = 'we', pr }) =>
+  join(resolveCoordinationRoot(), 'fix-routed-outcomes', `${String(repo).replace(/[^A-Za-z0-9._-]/g, '_')}_${String(pr).replace(/[^0-9]/g, '')}.json`);
+export const readRoutedOutcomes = ({ repo = 'we', pr } = {}) => fileLedger(routedOutcomePath({ repo, pr })).read();
+
+/** Sentinel merge target: fix-run resolves it to the PR's live `baseRefName` from `gh pr view` (never guesses `main`). */
+export const PR_BASE_MERGE_TARGET = '@pr-base';
+/** The ref a launcher-started merge targets: the restack base, else the PR base for a conflict, else (base unknown)
+ *  {@link PR_BASE_MERGE_TARGET} so fix-run reads it — a guessed `main` could merge main into a stacked PR. null = no merge. */
+export const mergeOntoFor = (planned) => planned.restack?.onto ?? (planned.isConflict ? planned.baseRefName || PR_BASE_MERGE_TARGET : null);
 
 export function consecutiveUnproductiveOnHead(table, { repo = 'we', pr, head }) {
   if (!head) return 0;
@@ -150,7 +161,10 @@ export function consecutiveUnproductiveOnHead(table, { repo = 'we', pr, head }) 
   return count;
 }
 
-export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '', now = Date.now(), store = fileOutcomeStore(defaultRoutedOutcomePath()),
+const oneLine = (t) => String(t ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
+
+/** `reason` is the local diagnosis (may hold command errors); `note` is the agent's final message, the only text a PR comment shows. */
+export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '', note = '', now = Date.now(), store = fileLedger(routedOutcomePath({ repo, pr })),
   readClaim = (kind) => readLockEntry(fixDispatchClaimRoot(), fixDispatchResource({ repo, pr, kind })),
 }) {
   // Borrowed launches keep their existing ledger and retry policy.
@@ -158,7 +172,7 @@ export function recordRoutedOutcome({ repo = 'we', pr, head, outcome, reason = '
   const table = store.read() ?? {};
   const key = `${repo}#${pr}`;
   if (outcome === 'pushed') delete table[key];
-  else table[key] = [...(table[key] ?? []), { at: now, head, outcome, reason: String(reason).replace(/\s+/g, ' ').slice(0, 300) }].slice(-10);
+  else table[key] = [...(table[key] ?? []), { at: now, head, outcome, reason: oneLine(reason), note: oneLine(note) }].slice(-10);
   store.write(table);
   return table;
 }
@@ -194,7 +208,12 @@ export const defaultBorrowLedgerPath = () => join(resolveCoordinationRoot(), 'fi
 function fileLedger(path) {
   return {
     read() { try { const v = JSON.parse(readFileSync(path, 'utf8')); return v && typeof v === 'object' ? v : {}; } catch { return {}; } },
-    write(v) { try { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, JSON.stringify(v), { mode: 0o600 }); } catch { /* best-effort: a lost ledger only restarts the wait */ } },
+    write(v) {
+      // temp + rename: a reader never sees a half-written file.
+      const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+      try { mkdirSync(dirname(path), { recursive: true }); writeFileSync(tmp, JSON.stringify(v), { mode: 0o600 }); renameSync(tmp, path); }
+      catch { try { rmSync(tmp, { force: true }); } catch { /* best-effort */ } /* best-effort: a lost ledger only restarts the wait */ }
+    },
   };
 }
 
