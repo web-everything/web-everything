@@ -3,9 +3,10 @@ bornAs: xbha495
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/lib/git-hook-surface.mjs", "we:scripts/lib/__tests__/git-hook-surface.test.mjs"]
 dateOpened: "2026-09-29"
+dateStarted: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "b7f61e71234b717f8bbfc6ae0f544d5c0e65b7dd"
 tags: []
@@ -25,6 +26,11 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2954@3ce84db0d414861df0d5f4cf8c323e08c430792b
 
 ## Progress
+
+- Implementation sanity read (2026-10-12): the source still conflated absent and unreadable config reads, permitted deletion from null bytes, and compared unreadable snapshots as unchanged. The scoped design remained buildable.
+- Red proof (2026-10-12): added the real ELOOP-to-readable-config regression before changing the primitive. `node we:scripts/readiness/heavy-admission.mjs run -- npx vitest run we:scripts/lib/__tests__/git-hook-surface.test.mjs` exited 1: 54 passed, the new regression failed because reset incorrectly returned `clean: true` for the unreadable baseline.
+- Implemented explicit absent/present/unreadable state, baseline validation before mutation or Git repair, fail-closed comparison and final-read handling, and updated snapshot/reset/comparison contracts. Tests cover empty present bytes, absent deletion, recovered-byte preservation, both unreadable comparison positions, invalid baselines, structural-refusal reuse, and failed deletion; existing restoration, hook cleanup and symlink-target sentinel cases remain passing.
+- Green proof (2026-10-12): the same queued targeted command exited 0 with all 68 tests passing. Both launchers already consume snapshots and refuse unsuccessful resets; no launcher edit was needed. Standards and diff-coverage gates were not run, per the delivery brief's explicit assignment of gate execution to the wrapper; no gate success is claimed. Wider review/lint/coverage proposals remain under Follow-ups.
 
 Preparation research (revalidated 2026-10-09; runner owns stamping):
 
