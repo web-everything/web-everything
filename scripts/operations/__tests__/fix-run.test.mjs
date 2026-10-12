@@ -433,6 +433,36 @@ describe('runFixCli', () => {
       expect(git('show', '--name-only', '--format=', 'HEAD').split('\n').filter(Boolean).sort()).toEqual(['added.txt', 'file.txt', 'other.txt']);
     });
   });
+  // Each marker git can emit (`<` ours, `|` diff3 base, `=` separator, `>` theirs), left behind ALONE, at the default
+  // width and at a captured conflict-marker-size; with a label, bare, and CRLF.
+  const leftovers = [7, 32].flatMap(n => [
+    ['<', n, `${'<'.repeat(n)} HEAD`], ['|', n, `${'|'.repeat(n)} merged common ancestors`], ['|', n, '|'.repeat(n)],
+    ['=', n, '='.repeat(n)], ['=', n, `${'='.repeat(n)}\r`], ['>', n, `${'>'.repeat(n)} origin/target`], ['>', n, '>'.repeat(n)],
+  ]);
+  it.each(leftovers)('rejects an isolated leftover %s marker (width %i) after resolution: %j', async (_kind, width, line) => {
+    const attrs = width === 7 ? '' : `file.txt conflict-marker-size=${width}\n`;
+    await withRealMerge({
+      base: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'base\n'); writeFileSync(join(dir, '.gitattributes'), attrs); },
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'theirs\n'),
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n'),
+    }, { agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), `ours\n${line}\ntheirs\n`) }, async ({ out, m, git, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('add') || c.includes('push'))).toBe(false);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: resolved' }));
+      expect(git('status', '--porcelain')).toBe('');
+    });
+  });
+  it('accepts marker-shaped lines a side already had (a setext heading, a fixture) and other widths', async () => {
+    const fixture = 'Title\n=======\n\n<<<<<<< HEAD\n';
+    await withRealMerge({
+      base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), `${fixture}base\n`),
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), `${fixture}theirs\n`),
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), `${fixture}ours\n`),
+    }, { agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), `${fixture}resolved\n========\n|| or\n> quote\n`) }, async ({ out, m }) => {
+      expect(out.code).toBe(0);
+      expect(m.calls.some(c => c.includes('push'))).toBe(true);
+    });
+  });
   it('never runs merge --abort in the agent-writable lane after its git config changed', async () => {
     const m = mk(['aaa', 'aaa']);
     let merging = false;

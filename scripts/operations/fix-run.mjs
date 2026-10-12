@@ -211,6 +211,8 @@ const TEXT_MERGE_ATTRS = new Set(['unspecified', 'set', 'text', 'union']);
 const OID_RE = /^[0-9a-f]{40,64}$/;
 
 const MAX_CONFLICTED_PATHS = 100;
+/** A conflicted text blob larger than this fails the run (execFileSync's 1 MiB default would fail far sooner). */
+const BLOB_MAX_BYTES = 64 * 1024 * 1024;
 const REGULAR_MODES = new Set(['100644', '100755']);
 
 /**
@@ -243,6 +245,35 @@ export function binaryConflictPaths(git, paths) {
     if (pairs.some(([a, b]) => git('diff', '--numstat', '--no-ext-diff', '--no-textconv', a.oid, b.oid).startsWith('-\t-\t'))) kinds.set(path, 'binary');
   }
   return kinds;
+}
+
+/**
+ * PURE. Conflict-marker lines in `text` at one of `sizes`, counted by line: `<`, `|` (diff3 base), `=` or `>` repeated
+ * EXACTLY `size` times, then whitespace or end of line — git's own `is_conflict_marker` rule, so a Markdown blockquote or
+ * a longer rule line is not a marker.
+ */
+export function conflictMarkerLines(text, sizes) {
+  const counts = new Map();
+  for (const raw of String(text ?? '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    const marker = /^([<|=>])\1*/.exec(line)?.[0];
+    if (!marker || !sizes.has(marker.length) || (line.length > marker.length && !/\s/.test(line[marker.length]))) continue;
+    counts.set(line, (counts.get(line) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * PURE. Whether a resolved file still holds a conflict marker: any marker line occurring more often than in every one of
+ * `baselines` (the conflict's index stages). A marker-shaped line a side already carried (a setext heading, a test
+ * fixture) is content, not a leftover.
+ */
+export function hasLeftoverMarkers(text, sizes, baselines = []) {
+  const before = baselines.map(b => conflictMarkerLines(b, sizes));
+  for (const [line, n] of conflictMarkerLines(text, sizes)) {
+    if (before.every(counts => n > (counts.get(line) ?? 0))) return true;
+  }
+  return false;
 }
 
 /**
@@ -468,7 +499,13 @@ export async function runFixCli(argv = [], {
       const sizes = new Set();
       for (const match of (text ?? '').matchAll(/^(<+) HEAD(?::[^\r\n]*)?\r?$/gm)) sizes.add(match[1].length);
       if (!sizes.size) sizes.add(7);
-      return [path, sizes];
+      // The index stages (base/ours/theirs) are the baseline: marker-shaped lines they carry are content, not leftovers.
+      const baselines = [];
+      for (const entry of git('ls-files', '-u', '-z', '--', path).split('\0')) {
+        const oid = /^\d+ ([0-9a-f]+) [123]\t/.exec(entry)?.[1];
+        if (oid && OID_RE.test(oid)) baselines.push(run('git', [...HARDENED_GIT_ARGS, 'cat-file', 'blob', oid], { cwd: lanePath, env: gitEnv, maxBuffer: BLOB_MAX_BYTES }));
+      }
+      return [path, { sizes, baselines }];
     }));
     const spawned = await provider.spawn({
       sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
@@ -493,12 +530,10 @@ export async function runFixCli(argv = [], {
       const unresolved = unmerged.filter(path => {
         if (!fileExists(join(lanePath, path))) return true;
         const text = readFile(join(lanePath, path), lanePath);
-        // Match this file's marker width, so ordinary Markdown blockquotes remain valid resolutions.
+        // Every marker kind (incl. a lone separator or diff3 base line) at this file's captured width; see hasLeftoverMarkers.
         if (text == null) return true;
-        for (const match of text.matchAll(/^(<+|>+) /gm)) {
-          if (markerSizes.get(path).has(match[1].length)) return true;
-        }
-        return false;
+        const { sizes, baselines } = markerSizes.get(path);
+        return hasLeftoverMarkers(text, sizes, baselines);
       });
       if (unresolved.length) {
         git('merge', '--abort');
