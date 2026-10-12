@@ -36,7 +36,7 @@ export default {
         ...['test', 'smoke', 'daemon-soak', 'soak-replay-gate'].map(name => ({
           ...done(name), conclusion: number === 5020 && name === 'test' ? 'FAILURE' : 'SUCCESS',
         })),
-        { ...done('merge-gate'), conclusion: 'FAILURE', detailsUrl: `https://github.com/web-everything/web-everything/actions/runs/38245735516/job/${114798995647 + number - 5008}` },
+        { ...done('merge-gate'), conclusion: 'FAILURE', detailsUrl: `https://github.com/example-owner/example-repo/actions/runs/38245735516/job/${114798995647 + number - 5008}` },
       ],
     }));
     const plan = runReconcilePass({
