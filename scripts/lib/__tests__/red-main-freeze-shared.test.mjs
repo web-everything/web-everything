@@ -54,7 +54,8 @@ describe('shared red-main freeze (xyd06qo)', () => {
     const writes = [];
     const r = publishSharedFreeze({
       marker: { reason: 'red', at: 'x' }, board: '/board', branch: BRANCH, run,
-      transport: { mkdir: () => {}, write: (p, c) => writes.push({ p, c }), rm: () => {}, now: () => 1 },
+      // The transport also drops a `wt-<ms>.owner` liveness sidecar beside the worktree; it is not staged content.
+      transport: { mkdir: () => {}, write: (p, c) => { if (!p.endsWith('.owner')) writes.push({ p, c }); }, rm: () => {}, now: () => 1 },
     });
     expect(r).toMatchObject({ branch: BRANCH, pushed: true, doc: { frozen: true, reason: 'red' } });
     expect(writes).toHaveLength(1);

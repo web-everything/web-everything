@@ -1324,7 +1324,7 @@ function finishGitMiss({ home, g, store, loud, record }) {
  *  (`ok: false`, `ledgerWriteMiss: true`) and a retry is a clean re-append. Every caller must honour `ok` before it
  *  swaps a label (`review-pr-io`, `merge-ai-prs` and `review-set-label` do). */
 function refuseClearingOnGitMiss({ g, store, loud, record }) {
-  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; retry once the ledger transport is reachable`);
+  loud(`verdict-ledger: GIT WRITE MISS (${store}) for ${record.repo}#${record.pr} ${eventLabel(record)}: ${g.error} — clearing event does NOT clear (F4) and NO home row was written; the git transport write failed (cause above), a retry re-appends cleanly`);
   return {
     ok: false, path: null, record: null, locked: false, store, git: g, ledgerWriteMiss: true,
     errors: [`ledger-write-miss: ${g.error}`],
