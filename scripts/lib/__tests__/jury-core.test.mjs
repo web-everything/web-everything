@@ -2854,7 +2854,7 @@ describe('xc7ctn1 @pr<N> card citations reach every validator that consumes CARD
 // ── #4815 — the confirmation turn: a tool-less seat's CONFIRMED claim is checked before it becomes a referral ───────
 import {
   seatNeedsToolVerification, knownVerifications, verificationCandidates, settleVerification, applyVerification,
-  downgradeUnverifiedFinding, verificationsToPersist, VERIFY_MAX_CANDIDATES, UNVERIFIED_NOTE_PREFIX,
+  downgradeUnverifiedFinding, verificationsToPersist, VERIFY_MAX_CANDIDATES, UNVERIFIED_NOTE_PREFIX, verifierEvidenceCitesClaim,
 } from '../jury-core.mjs';
 
 describe('#4815 seat capability and the confirmation turn (pure)', () => {
@@ -2931,12 +2931,17 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
       for (const evidence of [
         'the guard is fine; this does not reproduce', 'a.mjs looks fine', 'a.mjs:0 nothing', 'b.mjs:3 the guard is fine',
         'ba.mjs:3 the guard is fine', 'x/a.mjs:3 the guard is fine', 'a.mjs.bak:3 fine', 'a.mjs:abc fine', 'A.MJS:3 fine',
-        'a.mjs\n:3 fine',
+        'a.mjs\n:3 fine', 'éa.mjs:3 fine', 'а.mjs:3 fine'.replace('а', 'ⓐ'),
+        // checked on the text that is STORED (folded, capped): a citation past the cap would retire with a reason that lacks it
+        `${'y'.repeat(320)} a.mjs:3 the guard is fine`,
       ]) {
         const got = one(evidence);
         expect(got.outcome).toBe('failed');
         expect(got.reason).toMatch(/cites no line in the claim's own file/);
       }
+      const retired = one(`see \`a.mjs:3\`\nthe guard is fine ${'z'.repeat(400)}`);
+      expect(retired.outcome).toBe('not-reproduced');
+      expect(verifierEvidenceCitesClaim(claim(), retired.reason)).toBe(true);
       // a claim with no file can never be corroborated this way: it stays held, never retired
       expect(one('a.mjs:3 fine', claim({ file: undefined })).outcome).toBe('failed');
       // the claim's own path is data: regex metacharacters in it match only themselves

@@ -2861,16 +2861,22 @@ export function verificationCandidates({ seats, known = new Map() }) {
 }
 
 /**
- * Does the verifier's evidence cite a line (`<path>:<n>`, n ≥ 1) in the claim's OWN cited file? The path is data: it is matched
- * literally, case-sensitive, as a whole path token (not a suffix of a longer path, not a prefix of a longer name), on the folded
- * evidence, and is never opened. A claim with no file has nothing to cite, so this is false for it. PURE.
+ * Does the verifier's STORED reason (`foldVerifyReason`: folded, one line, capped) cite a line (`<path>:<n>`, n ≥ 1) in the
+ * claim's OWN cited file? It runs on the same text that is persisted, so a retiring record always shows the citation that let it
+ * retire. The path is data: matched literally, case-sensitive, as a whole path token (no letter, digit or path character of any
+ * script before it), and never opened. A claim with no file has nothing to cite, so this is false for it.
+ *
+ * THIS IS A FORMAT FILTER, NOT A SECOND SIGNAL. It turns away a lazy or free-form "does not reproduce", and makes every recorded
+ * negative point at a line a reader can check. It does not prove the cited line supports the answer: the claim's own path and
+ * line are in the verifier's input, so a steered verifier can echo them. Corroboration by an independent seat is #xztd0mv. PURE.
  */
 export function verifierEvidenceCitesClaim(original, evidence) {
   const file = exactCitedPath(original?.file);
   if (!file || typeof evidence !== 'string') return false;
   const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const cite = new RegExp(`(?<![\\w./\\\\@+~-])(?:\\./)?${escaped}:(\\d+)(?!\\d)`, 'g');
-  return [...foldUntrusted(evidence).matchAll(cite)].some((m) => Number(m[1]) >= 1);
+  const cite = new RegExp(`(?<![\\p{L}\\p{N}\\p{M}_./\\\\@+~-])(?:\\./)?${escaped}:(\\d+)(?!\\d)`, 'gu');
+  for (const m of foldVerifyReason(evidence, '').matchAll(cite)) if (Number(m[1]) >= 1) return true;
+  return false;
 }
 
 /**
@@ -2908,10 +2914,10 @@ export function settleVerification(candidates, answer) {
     // on the next run instead of being retired, and the review reducer holds acceptance while verification is unfinished.
     else if (!(typeof r.evidence === 'string' && r.evidence.trim())) {
       settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
-    // A `false` RETIRES a mandatory hold, and the verifier reads attacker-controlled PR content, so its own say-so is not enough
-    // (PR #5025 review). It is recorded only when the evidence also cites a line in the claim's own file — a check the code makes,
-    // not the model — so a steered "this does not reproduce" with free-form evidence stays held and is asked again. A `true` keeps
-    // the hold, so it needs no such corroboration.
+    // A `false` RETIRES a mandatory hold, and the verifier reads attacker-controlled PR content (PR #5025 review). It is recorded
+    // only when its stored reason cites a line in the claim's own file; free-form evidence stays held and is asked again. That is
+    // a format filter (see `verifierEvidenceCitesClaim`), not corroboration: retiring on ONE answer is the operator's ruling for
+    // #4815, and requiring a second independent signal is #xztd0mv. A `true` keeps the hold, so it needs no citation.
     } else if (!r.reproduced && !verifierEvidenceCitesClaim(c.original, r.evidence)) {
       settled.set(c.key, { outcome: 'failed',
         reason: 'the verifier\'s not-reproduced answer cites no line in the claim\'s own file, so it cannot retire the claim' });

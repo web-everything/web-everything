@@ -653,8 +653,8 @@ export const ADVISORY_SEAT_STEPS = Object.freeze(ADVISORY_SEATS.map((s) => s.ste
  * #4815 — THE CONFIRMATION TURN. A seat that carries no tools can only assert that a finding is CONFIRMED broken; it cannot have
  * reproduced it. Before such a claim becomes a mandatory referral (which holds the PR until someone rules on it), ONE tool-bearing
  * verifier gets one turn to reproduce it on the PR head. Reproduced: the claim stays CONFIRMED and is referred as before. Not
- * reproduced, with evidence citing a line in the claim's own file (checked by code, not taken on the verifier's word): it is an
- * advisory note. Failed, inconclusive or uncorroborated verification holds acceptance until a subsequent check settles it.
+ * reproduced, with evidence citing a line in the claim's own file (a format filter, not a second signal; that is #xztd0mv): it is
+ * an advisory note. Failed, inconclusive or uncited verification holds acceptance until a subsequent check settles it.
  * The step is declared only when a seated advisory seat
  * is not tool-bearing, and its request is a no-spawn answer when there is nothing to verify, so a run pays only for a claim.
  */

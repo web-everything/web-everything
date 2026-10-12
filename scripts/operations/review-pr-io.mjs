@@ -4,7 +4,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
   findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
-  requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason } from '../lib/jury-core.mjs';
+  requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason, verifierEvidenceCitesClaim } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -979,6 +979,9 @@ export function createReviewPrSinks({
         for (const v of Array.isArray(payload.verifications) ? payload.verifications : []) {
           try {
             if (typeof v?.seat !== 'string' || !v.seat || !REFERRAL_VERIFY_OUTCOMES.includes(v.outcome) || !requiresMandatoryReferral(v.original)) continue;
+            // PR #5025 review: a retiring record is written only for a reason that itself cites a line in the claim's own file — the
+            // same check `settleVerification` made, re-made here on the text this sink stores, so no payload can retire without it.
+            if (v.outcome === 'not-reproduced' && !verifierEvidenceCitesClaim(v.original, v.reason)) continue;
             verifiedByKey.set(referralFindingKey(v.seat, v.original), v);
           } catch { /* a malformed outcome is skipped; the claim is verified again next run */ }
         }
