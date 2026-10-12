@@ -1,5 +1,4 @@
 ---
-bornAs: xw9p4sd
 kind: task
 status: open
 dateOpened: '2026-10-12'
@@ -9,7 +8,7 @@ scope: ['we:scripts/check-standards-rules.mjs', 'we:scripts/merge-ai-prs.mjs']
 
 # Enforce per-pass drain policy resolution and CLI gate coverage
 
-Add a standards rule that rejects live drain settings resolved outside `sweepOnce`, preventing a long-lived watch from retaining stale operator policy. Prevention follow-up from PR #4965 and #5974.
+Add a standards rule that rejects live drain settings resolved outside `sweepOnce`, preventing a long-lived watch from retaining stale operator policy. Prevention follow-up from PR #4965 and #xec3amn.
 
 Cover `resolve*Setting()` and equivalent policy resolvers such as `resolveDrainWorkflowEditHuman()`. Distinguish fixed invocation options from settings intended to refresh each pass. Include fixtures proving that startup-only reads fail and pass-local reads succeed.
 

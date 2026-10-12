@@ -1,5 +1,4 @@
 ---
-bornAs: xec3amn
 kind: story
 size: 2
 status: open
