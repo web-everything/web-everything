@@ -44,6 +44,7 @@
  *       `repos/{o}/{r}/issues/{n}/events`, `repos/{o}/{r}/issues/{n}/timeline`,
  *       `repos/{o}/{r}/issues/{n}/comments`, `repos/{o}/{r}/compare/{a}...{b}`,
  *       `repos/{o}/{r}/contents/{path}?ref={sha}`,
+ *       `repos/{o}/{r}/branches/{name}` (URL-encoded branch, head SHA and committer date),
  *       `repos/{o}/{r}/commits/{sha}/check-runs` and `…/status` (only for an open PR's current head sha;
  *       `…/status` always lists no legacy statuses)
  *   - Fields produced with GitHub's real shape (camelCase for `--json`, snake_case for `api`'s REST JSON) —
@@ -553,6 +554,16 @@ function handleApi(store, rest) {
       if (!pr) return { stderr: `fake-gh: unsupported api path ${path} (no open PR has head ${sha})\n`, exitCode: 1 };
       const page = { state: 'pending', sha, total_count: 0, statuses: [] };
       return jsonResult(hasFlag(rest, '--slurp') ? [page] : page, jq, { compact: true });
+    }
+    if ((m = path.match(/^repos\/([^/]+)\/([^/]+)\/branches\/([^/]+)$/))) {
+      const repoState = requireRepo(store, `${m[1]}/${m[2]}`);
+      const name = decodeURIComponent(m[3]);
+      try {
+        const [sha, date] = execFileSync('git', ['show', '-s', '--format=%H%n%cI', `refs/heads/${name}`], {
+          cwd: repoState.originPath, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1024 * 1024,
+        }).trim().split('\n');
+        return jsonResult({ name, commit: { sha, commit: { committer: { date } } } }, jq);
+      } catch { return { stderr: 'HTTP 404: Not Found\n', exitCode: 1 }; }
     }
     // Branch protection's required status checks — only when a scenario declared them (`setRequiredChecks`);
     // otherwise unsupported, exactly as before, so readers keep their documented fallback.

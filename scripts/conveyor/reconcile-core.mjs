@@ -106,8 +106,12 @@ import { reviewCiGate } from '../lib/review-ci-gate.mjs';
 import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
-import { planTakeover, takeoverReviewCap } from './fix-takeover.mjs';
+import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
+import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
+import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, reviewedHeadsOf } from './mechanical-round-cap.mjs';
+import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
  *  override (the IO shell, `reconcile-pass.mjs`, passes the loaded ladder with its routing-policy models). */
@@ -116,14 +120,15 @@ const DEFAULT_FIXER_LADDER = Object.freeze({
 });
 import { OPERATOR_ANSWER_MARKER, isOperatorAnswerStandDownSuperseded, latestOperatorAnswer } from './stand-down-answer-core.mjs';
 import { classifyPr } from '../progress-board.mjs';
-import { reduceCheckState } from '../operations/pr-status.mjs';
+import { reduceCheckState, CI_TRUTH_EXCLUDED_CHECKS } from '../operations/pr-status.mjs';
+import { collapseRollupToLatestPerName } from '../lib/rollup-collapse.mjs';
 import { isForeignCompletionSessionId, sanitizeDeniedCommand } from '../operations/completion-record.mjs';
 import { NEGOTIATION_ROUND_CAP } from '../lib/jury-core.mjs';
 import { countRearmComments, REARM_COMMENT_MARKER } from './rearm-review.mjs';
 // #3383 — see this module's own REFUSAL 3 note below, and `advisory-round-count.mjs`'s header for the
 // `#2117`/`#2298` incident this closes.
 import { countAdvisoryComments, ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
-import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER } from './ci-heal-mark.mjs';
+import { countCiHealComments, countChargeableCiHealComments, resolveCiHealBudgetRestore, resolveCodeqlOwnBudget, CI_HEAL_COMMENT_MARKER, CI_HEAL_FAILURE_MARKER } from './ci-heal-mark.mjs';
 import { latestCiHealEscalationForHead, CI_HEAL_ESCALATION_MARKER } from './ci-heal-escalation-mark.mjs';
 import {
   isStandDownSuperseded, STAND_DOWN_MARKER, SUPERSEDE_STAND_DOWN_MARKER,
@@ -316,6 +321,18 @@ export const REFUSAL_KINDS = Object.freeze([
   // `scope-bloat` (x29vm8a — a diff that is mostly not this PR's own change is not reviewed) and `ruling-dispute` (the
   // ruling-integrity gate's human rung: a fixer ladder that ran out of rungs).
   'scope-bloat', 'ruling-dispute',
+  // xs9re3k — a past-cap mechanical round (a conflict-resolution merge, no other edits) whose net diff is identical
+  // to the head the prior verdict judged: that verdict is carried forward (`mechanical-round-cap.mjs#mechanicalRoundGrant`),
+  // no review is dispatched and no "a person must take it over" note replaces it. Emitted through `capExhaustedVia`'s
+  // injected `refuseFn`, which the source scan in `reconcile-core.test.mjs` now reads too.
+  'mechanical-carry-forward',
+  // `gate-hold` (the PR's own gate holds it and no defect is open — no takeover) and `takeover-awaiting-review` (the
+  // latest takeover pushed a head no review has judged yet) — both emitted through the cap-site `refuseFn`, which the
+  // source scan in `reconcile-core.test.mjs` reads since PR #4770.
+  'gate-hold', 'takeover-awaiting-review',
+  // `thread-truncated` — the PR's comment list may be cut at the list page (exactly 100, not marked complete by its
+  // reader), so nothing is decided for it this tick (`takeover-budget.mjs#threadMayBeTruncated`).
+  'thread-truncated',
 ]);
 
 /**
@@ -400,6 +417,166 @@ const OWED_ELSEWHERE = Object.freeze({
  * own copy's value so a drift between them fails loud in CI rather than silently diverging.
  */
 export const CI_HEAL_ROUND_CAP = 3;
+
+/** `ciHeal.attemptCap` / `ciHeal.resetOnFixHead` — the ci-heal budget settings (live PR #4631, 2026-10-10). */
+export const CI_HEAL_ATTEMPT_CAP_ENV = 'WE_CI_HEAL_ATTEMPT_CAP';
+export const CI_HEAL_RESET_ON_FIX_HEAD_ENV = 'WE_CI_HEAL_RESET_ON_FIX_HEAD';
+const asHealCap = (v) => { const s = String(v ?? '').trim(); return /^\d{1,2}$/.test(s) ? Number(s) : null; };
+const asFlag = (v) => {
+  if (typeof v === 'boolean') return v;
+  const s = String(v ?? '').trim().toLowerCase();
+  return ['1', 'true', 'on'].includes(s) ? true : ['0', 'false', 'off'].includes(s) ? false : null;
+};
+
+/**
+ * PURE: the ci-heal budget cascade — standard default → platform preference (`platform.ciHeal`) → tool override
+ * (`repo`, the `ciHeal` settings block) → env. An invalid layer is skipped, never trusted. Each value carries the
+ * layer that set it, and that source rides on every ci-heal row and note, so the log names where the budget came from.
+ * `resetOnFixHead` (standard `true`): a fixer's push (a new non-mechanical head) starts a new heal budget — LIVE PR
+ * #4631 2026-10-10 22:11 ET was refused "exhausted (3/3)" five minutes after the fixer pushed a real fix, on heals
+ * spent against older heads. Still bounded: fix rounds have their own cap, so heal↔fix cannot alternate forever.
+ * @returns {{cap:number, capSource:string, resetOnFixHead:boolean, resetSource:string}}
+ */
+export function resolveCiHealBudget({ env = {}, platform = null, repo = null } = {}) {
+  const out = { cap: CI_HEAL_ROUND_CAP, capSource: 'standard', resetOnFixHead: true, resetSource: 'standard' };
+  for (const [source, layer, capRaw, resetRaw] of [
+    ['platform', platform?.ciHeal, platform?.ciHeal?.attemptCap, platform?.ciHeal?.resetOnFixHead],
+    ['repo', repo, repo?.attemptCap, repo?.resetOnFixHead],
+    ['env', env, env?.[CI_HEAL_ATTEMPT_CAP_ENV], env?.[CI_HEAL_RESET_ON_FIX_HEAD_ENV]],
+  ]) {
+    if (!layer || typeof layer !== 'object') continue;
+    const cap = asHealCap(capRaw);
+    if (cap !== null && cap > 0) Object.assign(out, { cap, capSource: source });
+    const reset = asFlag(resetRaw);
+    if (reset !== null) Object.assign(out, { resetOnFixHead: reset, resetSource: source });
+  }
+  return out;
+}
+
+const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
+/**
+ * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
+ * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
+ * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
+ * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
+ * rebases included; a merge flagged `mergesPrWork` brought a repair branch in, or carries content git's clean merge of
+ * its parents does not, and is real, so a drain rebase that auto-resolved a conflict or renumbered a card is spent too).
+ * A round with no commit at all is spent, never refunded.
+ */
+export function countRealFixRounds(pr) {
+  const facts = pr?.roundCommits;
+  const fail = (reason) => ({ ok: false, reason });
+  if (!facts || facts.ok === false || !Array.isArray(facts.commits)) return fail('no-commits');
+  const shaPattern = /^[0-9a-f]{40}$/;
+  if (!shaPattern.test(pr?.headRefOid) || facts.head !== pr.headRefOid) return fail('stale-head');
+  const seen = new Set();
+  for (const c of facts.commits) {
+    if (!c || !shaPattern.test(c.sha) || seen.has(c.sha) || !Array.isArray(c.parents)
+      || c.parents.some((p) => !shaPattern.test(p)) || typeof c.subject !== 'string'
+      || typeof c.authoredAt !== 'string' || !Number.isFinite(Date.parse(c.authoredAt))
+      || (c.parents.length > 1 && typeof c.mergesPrWork !== 'boolean')) return fail('invalid-commit');
+    seen.add(c.sha);
+  }
+  // An empty/truncated enrichment cannot establish that a round was mechanical.
+  if (facts.commits[0]?.sha !== facts.head) return fail('missing-head');
+  for (let i = 0; i < facts.commits.length; i += 1) {
+    const c = facts.commits[i];
+    const next = c.parents.length > 1 && c.subject.startsWith('drain: rebase') ? c.parents.at(-1) : c.parents[0];
+    if (i + 1 < facts.commits.length ? next !== facts.commits[i + 1].sha : seen.has(next)) return fail('invalid-walk');
+    // The last commit must lead out of the range; a parentless one is a root or shallow boundary (missing rounds).
+    if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
+  }
+  const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
+  const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
+  const begins = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_MARKER)
+    && /^fix-\d+$/.test(FIX_MARKER_WHO_RE.exec(c.body)?.[1] ?? ''));
+  const time = (c) => Date.parse(c.createdAt);
+  if ([...rearms, ...begins].some((c) => !Number.isFinite(time(c)))) return fail('invalid-comment-time');
+  rearms.sort((a, b) => time(a) - time(b));
+  begins.sort((a, b) => time(a) - time(b));
+  let previous = -Infinity;
+  const rounds = rearms.map((c) => {
+    const end = time(c);
+    // Only a re-arm closes a round, so a replacement claim (after a crash, a reclaim's fix-end, or a stand-down)
+    // never moves the start past work an earlier claim in the same round already did: the start is the EARLIEST
+    // review fix-begin after the previous re-arm. A ci-heal commit inside such a window reads as real, which only
+    // errs toward keeping the attempt spent.
+    const first = begins.find((b) => time(b) > previous && time(b) <= end);
+    const start = first ? time(first) : previous;
+    const inWindow = facts.commits.filter((commit) => Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end);
+    // A merge that brings the PR's own work in (a repair branch merged --no-ff, or an edit folded into the merge
+    // itself) is real, like a fix commit.
+    // A single-parent commit is always real: the drain's rebase is a two-parent commit-tree, so a single-parent
+    // `drain: rebase …` subject is only ever a fix commit borrowing the name.
+    const shas = inWindow.filter((commit) => commit.parents.length === 1 || commit.mergesPrWork)
+      .map((commit) => commit.sha);
+    previous = end;
+    // Refund only on positive evidence: the window holds commits and every one is an upstream merge or drain rebase.
+    // A window with NO commit proves nothing (an unchanged head re-armed again, a rewritten branch), so it stays spent.
+    return { at: c.createdAt, real: shas.length > 0, mechanical: shas.length === 0 && inWindow.length > 0, shas };
+  });
+  return { ok: true, real: rounds.filter((r) => !r.mechanical).length, total: rounds.length, rounds };
+}
+
+const FIX_MARKER_WHO_RE = /^\*\*Who:\*\* `([^`]+)`/m;
+const FIX_END_WHO_RE = /^`([^`]+)` released the fix claim/m;
+
+/**
+ * PURE: when this PR last got a new NON-MECHANICAL head — the latest trusted `fix-end` from a fixer (any session
+ * that is not a ci-heal) whose released sha differs from the sha its own `fix-begin` claimed at, i.e. the fixer
+ * pushed. A ci-heal's own push, a fix turn that pushed nothing, a marker with no sha and an untrusted author never
+ * count. Reads only the PR's own comments (no commit list is fetched for a review-labelled PR).
+ * @returns {{at:string, by:string, sha:string}|null}
+ */
+export function ciHealBudgetResetAt(comments) {
+  const trusted = (Array.isArray(comments) ? comments : [])
+    .filter((c) => typeof c?.body === 'string' && isTrustedMarkerAuthor(c) && Number.isFinite(Date.parse(c?.createdAt)));
+  const beginSha = new Map();
+  let latest = null;
+  for (const c of trusted) {
+    const body = c.body.trimStart();
+    if (body.startsWith(FIX_BEGIN_MARKER)) {
+      const who = FIX_MARKER_WHO_RE.exec(body)?.[1];
+      if (who) beginSha.set(who, FIX_MARKER_SHA_RE.exec(body.split('\n').find((l) => l.startsWith('**Branch:**')) ?? '')?.[1] ?? null);
+      continue;
+    }
+    if (!body.startsWith(FIX_END_MARKER)) continue;
+    const who = FIX_END_WHO_RE.exec(body)?.[1];
+    const sha = FIX_MARKER_SHA_RE.exec(body)?.[1];
+    if (!who || !sha || /ci-heal/.test(who)) continue;
+    const from = beginSha.get(who);
+    if (!from || from.slice(0, 7) === sha.slice(0, 7)) continue;
+    if (!latest || Date.parse(c.createdAt) > Date.parse(latest.at)) latest = { at: c.createdAt, by: who, sha };
+  }
+  return latest;
+}
+
+/** PURE: drop ci-heal marker comments posted at/before `resetAt`; every other comment (refund windows too) stays. */
+function healCommentsSince(comments, resetAt) {
+  if (!resetAt) return comments;
+  const cut = Date.parse(resetAt);
+  return (Array.isArray(comments) ? comments : []).filter((c) => {
+    const first = (typeof c === 'string' ? c : c?.body ?? '').trimStart().split('\n')[0];
+    const isHeal = first.startsWith(CI_HEAL_COMMENT_MARKER) || first === CI_HEAL_FAILURE_MARKER;
+    return !isHeal || Date.parse(c?.createdAt) > cut;
+  });
+}
+
+/**
+ * PURE: split the head's failing checks (latest run per name) into the REQUIRED ones a ci-heal repairs and the
+ * non-required ones it only reports. Live PR #4631: `merge-gate` (not required, red by design until #4715) was
+ * named four times as a failure to heal. Without a required set, the `reduceCheckState` exclusion list applies.
+ * @returns {{required:string[], nonRequired:string[]}}
+ */
+export function splitFailingChecks(rollup, requiredChecks) {
+  const required = Array.isArray(requiredChecks) && requiredChecks.length ? requiredChecks : null;
+  const out = { required: [], nonRequired: [] };
+  for (const name of failingCheckNames(collapseRollupToLatestPerName(rollup))) {
+    const isRequired = required ? required.includes(name) : !CI_TRUTH_EXCLUDED_CHECKS.includes(name);
+    out[isRequired ? 'required' : 'nonRequired'].push(name);
+  }
+  return out;
+}
 
 /** How long a requested-but-unobserved CI re-run may be held quietly before it becomes an operator escalation. */
 export const TIMEOUT_RETRY_PENDING_ESCALATE_MS = 30 * 60 * 1000;
@@ -1224,6 +1401,25 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   return true;
 }
 
+/**
+ * The pre-review gates a review emission that does NOT go through {@link dispatchReviewRow} must still honour: a draft
+ * PR and a scope-bloated diff are never reviewed (the same two refusals `dispatchReviewRow` makes). The direct
+ * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
+ * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
+ */
+function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
+  if (pr?.isDraft) {
+    refuse('draft', { ...withPhase, ...extra, why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
+    return true;
+  }
+  if (pr?.scopeBloat) {
+    refuse('scope-bloat', { ...withPhase, ...extra, scopeBloat: pr.scopeBloat,
+      why: `scope-bloat: ${pr.scopeBloat.why} — a fixer rebases it first, no review reads this diff` });
+    return true;
+  }
+  return false;
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
@@ -1249,6 +1445,7 @@ export function resolveRoundCap(env = {}) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
+  advisoryReview = null,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1353,6 +1550,17 @@ function dispatchReviewRow({
     });
     return;
   }
+  // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
+  // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
+  // the CI gate: it is this function's review, never a second hand-rolled copy of it.
+  if (advisoryReview) {
+    if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+    dispatch.push({
+      ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
+      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason }, why: advisoryReview.why,
+    });
+    return;
+  }
   // ── `no-findings` — refuse it (a fixer would invent work), but a review is still owed unless the review
   // count exceeds the cap: the last allowed fix is always owed its final review.
   const finalReview = attempts >= roundCap;
@@ -1399,6 +1607,116 @@ function dispatchReviewRow({
     ...base, ...withPhase, kind: 'review', findings, attempts, ...extra, ...(finalReview ? { finalReview: true } : {}),
     why: `parked for an independent review with ${findings} finding(s) on the thread and nothing live working it` + finalWhy,
   });
+}
+
+/** `fix.operatorRulingExtraRounds` — how many directed repair rounds one operator ruling grants past the round cap. */
+export const OPERATOR_RULING_EXTRA_ROUNDS_SETTING = 'operatorRulingExtraRounds';
+export const OPERATOR_RULING_EXTRA_ROUNDS_ENV = 'WE_FIX_OPERATOR_RULING_EXTRA_ROUNDS';
+export const OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT = 1;
+/** A rounds value: an integer 0..99 (a number, or a digit string). `null` when invalid (`[2]`, `""`, `1.5`, `-1`, `off`). */
+const asRounds = (v) => {
+  if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v <= 99 ? v : null;
+  return typeof v === 'string' && /^\d{1,2}$/.test(v.trim()) ? Number(v.trim()) : null;
+};
+
+/**
+ * PURE: the policy cascade for `fix.operatorRulingExtraRounds` — standard default → platform preference → tool override
+ * (`we:scripts/settings/fix.json`) → env. Both file layers are the parsed JSON documents, whose settings live under
+ * their `fix` key (like every other `fix.*` setting; see `takeover-budget.mjs#resolveTakeoverBudget`). It fails
+ * CLOSED, like that sibling: the highest layer that is PRESENT (a non-blank env var, or a key that is not null in a
+ * file's `fix` object) decides, and a present value that is not a valid count turns the grant off (value 0, source
+ * `<layer>-invalid`) instead of falling through to the standard 1, so a typo meant to stop it never starts a session.
+ * @returns {{value:number, source:'standard'|'platform'|'repo'|'env'|'platform-invalid'|'repo-invalid'|'env-invalid'}}
+ */
+export function resolveOperatorRulingExtraRounds({ env = {}, platform = null, repo = null } = {}) {
+  const present = (v) => v !== undefined && v !== null;
+  const envRaw = env?.[OPERATOR_RULING_EXTRA_ROUNDS_ENV];
+  const layers = [
+    ['env', typeof envRaw === 'string' && envRaw.trim() === '' ? undefined : envRaw],
+    ['repo', repo?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]],
+    ['platform', platform?.fix?.[OPERATOR_RULING_EXTRA_ROUNDS_SETTING]],
+  ];
+  for (const [source, raw] of layers) {
+    if (!present(raw)) continue;
+    const v = asRounds(raw);
+    return v === null ? { value: 0, source: `${source}-invalid` } : { value: v, source };
+  }
+  return { value: OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT, source: 'standard' };
+}
+
+/**
+ * PURE: the directed repair round an operator ruling grants on the blocked-findings round cap (live: PR #4631
+ * @f0f4943fb, 2026-10-10 — the operator ruled every open finding `block` WITH A DIRECTION on the current head, and
+ * the cap still sent it back to "a person must take it over", so nothing could act on the direction).
+ *
+ * Granted only when EVERY block-ruled referral on this head is covered by a trusted operator `block` ruling recorded
+ * for this exact head (an `auto-policy` block is not the operator). The grant is bound to the ruling: takeover
+ * markers posted on this head after the latest covering ruling count against `allowance`, so the same ruling never
+ * grants a second round (a voided marker — the launch provably never started — does not count). A new head is not
+ * covered by a ruling on the old one, so a finding that comes back goes to the operator again.
+ * @returns {{ok:true, head:string, rulingAt:string, used:number, allowance:number, rulings:Array<object>}|{ok:false, reason:string}}
+ */
+export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUNDS_STANDARD_DEFAULT } = {}) {
+  const head = String(pr?.headRefOid ?? '');
+  const blocked = Array.isArray(pr?.blockRuledReferrals) ? pr.blockRuledReferrals : [];
+  if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
+  if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  // A cut list (exactly the list cap) may hide a later withdrawal or takeover marker: it grants nothing. The same
+  // check guards every past-cap grant (`takeover-budget.mjs#threadMayBeTruncated`).
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
+  const rulings = decidingOperatorBlocks(pr, head, blocked);
+  if (!rulings) return { ok: false, reason: 'not-covered' };
+  const stamp = (r) => Date.parse(r.createdAt ?? r.at);
+  const rulingAtMs = Math.max(...rulings.map(stamp).filter(Number.isFinite));
+  if (!Number.isFinite(rulingAtMs)) return { ok: false, reason: 'not-covered' };
+  const used = takeoverMarkers(comments).filter((m) => sameHeadSha(m.head, head) && Date.parse(m.at ?? '') > rulingAtMs).length;
+  if (used >= allowance) return { ok: false, reason: 'ruling-round-spent', used, allowance };
+  return { ok: true, head, rulingAt: new Date(rulingAtMs).toISOString(), used, allowance, rulings };
+}
+
+/**
+ * PURE: the operator `block` ruling that DECIDES each blocked finding on `head`, in every review run that holds it, or
+ * null when any is not decided that way. Read with the same per-record state the acceptance gate uses
+ * ({@link referralRecordState}), so an operator ruling counts only while it is the latest operator word on that exact
+ * (head, run, finding): a later operator `not-real` withdraws it, and a block on run-4 never covers run-5's block of
+ * the same finding, which only the reviewer ruled (red-team break on head 26eff6d2a). A run that still holds the
+ * finding pending also answers null (fail closed). An `auto-policy` block is not the operator.
+ */
+function decidingOperatorBlocks(pr, head, blocked) {
+  const comments = Array.isArray(pr?.comments) ? pr.comments : [];
+  const operatorRulings = [];
+  for (const c of comments) {
+    for (const r of readOperatorRulings([c], { head }).rulings) operatorRulings.push({ ...r, createdAt: c.createdAt ?? null });
+  }
+  const records = readReferralRecords(comments, { head }).records.filter((r) => r.head === head);
+  const context = { head, body: typeof pr?.body === 'string' ? pr.body : '', createdAt: pr?.createdAt, operatorRulings, records };
+  const states = new Map(records.map((r) => [r, referralRecordState(r, context)]));
+  const deciding = [];
+  for (const b of blocked) {
+    const runs = records.filter((r) => activeReferrals(r).some((f) => f.key === b.key));
+    let held = false;
+    for (const r of runs) {
+      const state = states.get(r);
+      if (state.pending.includes(b.key)) return null;
+      if (!state.blocked.includes(b.key)) continue;
+      const decided = state.rulings.filter((x) => x.key === b.key);
+      const op = decided.length === 1 ? decided[0] : null;
+      if (!op?.operator || op.result !== 'block' || op.head !== head || op.runId !== r.runId
+        || String(op.actor).toLowerCase() === AUTO_POLICY_ACTOR) return null;
+      deciding.push(op);
+      held = true;
+    }
+    if (!held) return null;
+  }
+  return deciding;
+}
+
+/** The operator's direction(s), verbatim, as the fix brief's operator-answer section reads them. */
+function operatorRulingAnswer(rulings) {
+  const reasons = [...new Set(rulings.map((r) => r.reason))];
+  const last = rulings.at(-1);
+  return { actor: last.actor, channel: last.channel, at: last.at, reason: reasons.join('\n\n') };
 }
 
 // A canonical operator verdict is itself the durable grant. Anchor the allowance to
@@ -1564,19 +1882,30 @@ export function missingReviewLabel(pr) {
 }
 
 export function planReconcile({
-  repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap = CI_HEAL_ROUND_CAP,
+  repo = 'we', prs = [], agents = [], durableCounts = {}, now = 0, roundCap = NEGOTIATION_ROUND_CAP, ciHealCap: ciHealCapArg = null,
+  // `ciHeal.*` budget cascade ({@link resolveCiHealBudget}); the IO shell may pass the resolved layers. An explicit
+  // `ciHealCap` still wins (source `caller`).
+  ciHealBudget = resolveCiHealBudget({ env: globalThis.process?.env ?? {} }),
   ciHealBudgetRestore = resolveCiHealBudgetRestore(process.env),
   codeqlOwnBudget = resolveCodeqlOwnBudget(process.env), // #4453 — a CodeQL hold is charged only CodeQL heals
   conflictFixCap = CONFLICT_FIX_ROUND_CAP, advisoryFixCap = ADVISORY_FIX_ROUND_CAP, defaultBranch = 'main',
   cardBatchExtract = CARD_BATCH_EXTRACT_WIRED,
   fixerLadder = DEFAULT_FIXER_LADDER,
   // Card xx0055i — what the FIX round cap does: `person` (this pure core's default, byte-identical to before) or
-  // `takeover` (one takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting.
-  roundCapAction = 'person', takeoverMaxPerPr = 1,
+  // `takeover` (a takeover dispatch first). The IO shell passes the resolved `fix.roundCapAction` setting and the
+  // `fix.takeoverBudget` cascade value (we:scripts/conveyor/takeover-budget.mjs); 1 here keeps the pure default.
+  roundCapAction = 'person', takeoverBudget = 1,
   // A head pushed after a takeover earns this many reviews beyond the round cap (`review.takeoverReviewAttempts`,
   // we:scripts/conveyor/takeover-review.mjs). 0 here (this pure core's default, byte-identical to before); the IO
   // shell passes the resolved setting.
   takeoverReviewAttempts = 0,
+  // `review.mechanicalRoundsCountTowardCap` (we:scripts/conveyor/mechanical-round-cap.mjs). `false` (the standard
+  // default): a proven mechanical round's head carries its parent's verdict forward on an identical net diff, or earns
+  // one review past the cap when only the conflict hunks changed. `true`: mechanical rounds count as rounds.
+  mechanicalRoundsCountTowardCap = false,
+  // `fix.operatorRulingExtraRounds` ({value, source}; see {@link resolveOperatorRulingExtraRounds}). The IO shell passes
+  // the resolved cascade; the default is the standard layer alone.
+  operatorRulingExtraRounds = resolveOperatorRulingExtraRounds(),
   mainRedWindows = [], mainLatestCheckRuns = [],
   // #2748 false-red follow-up (soak-replay-gate, PR #2775) — the repo's REQUIRED status-check names (branch
   // protection, `we:scripts/lib/required-status-checks.mjs`), threaded straight through to `classifyPr` so
@@ -1610,6 +1939,20 @@ export function planReconcile({
   const refusals = [];
   const notes = [];
   const counts = durableCounts && typeof durableCounts === 'object' ? durableCounts : {};
+  const ciHealCap = Number.isInteger(ciHealCapArg) && ciHealCapArg >= 0 ? ciHealCapArg : ciHealBudget.cap;
+  const ciHealCapSource = ciHealCap === ciHealCapArg ? 'caller' : ciHealBudget.capSource;
+  // The heal budget a PR is charged against right now: heals since its last non-mechanical head (when the setting is
+  // on), with the sources named so the log says where the cap and the reset rule came from.
+  const healBudgetFor = (pr) => {
+    const reset = ciHealBudget.resetOnFixHead ? ciHealBudgetResetAt(pr?.comments) : null;
+    const comments = healCommentsSince(pr?.comments, reset?.at);
+    const spentBeforeReset = reset ? countCiHealComments(pr?.comments) - countCiHealComments(comments) : 0;
+    return {
+      comments,
+      log: { cap: ciHealCap, capSource: ciHealCapSource, resetOnFixHead: ciHealBudget.resetOnFixHead,
+        resetSource: ciHealBudget.resetSource, resetAt: reset?.at ?? null, resetBy: reset?.by ?? null, spentBeforeReset },
+    };
+  };
 
   // Stable: only the red-main fix PR moves to the front; every other PR keeps its order.
   const orderedPrs = (Array.isArray(prs) ? [...prs] : []).sort((a, b) => (isMainFixPriority(a?.number) ? 0 : 1) - (isMainFixPriority(b?.number) ? 0 : 1));
@@ -1629,10 +1972,15 @@ export function planReconcile({
     const baseRoundCap = roundCap + roundExtensions;
     const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
     const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
+    const realFixRounds = countRealFixRounds(pr);
     const base = {
+      ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
       ...(operatorAnswer ? { operatorAnswer } : {}),
+      // The red-main fix PR (published priority record): every fix / ci-heal row of it routes to Claude
+      // (`fix-slot-borrow.mjs#claudeOnlyReason`), never a codex-first executor or a borrowed codex slot.
+      ...(mainFixPriority ? { mainFix: true } : {}),
       prNumber,
       headRefName: pr?.headRefName ?? null,
       headRefOid: pr?.headRefOid ?? null,
@@ -1695,66 +2043,214 @@ export function planReconcile({
         : null,
     };
     const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra }); };
+    // A comment list that may be cut at the list page (exactly 100, not marked complete by the reader) hides every
+    // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
+    // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
+    // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
+    if (threadMayBeTruncated(pr)) {
+      refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
+      continue;
+    }
     // xilx617 (epic #4075/#3383) — EVERY `cap-exhausted` refusal EXCEPT the `ci-red` one above (which already
     // pushes its own `ci-heal-exhausted` note) also pushes a `round-cap-exhausted` note, mirroring that note's
     // own "refuse AND surface" treatment. `capKind` names the population; see {@link roundCapExhaustedNoteText}
     // for why the text carries no clock-derived number.
+    // The grants that may replace a FIX/REVIEW cap row, read only by {@link capExhaustedVia} and only at a site that
+    // allows them. `{ action: 'review', row, why }` (one review past the cap), `{ action: 'carry', mech, why }` (a
+    // carried accept), `{ action: 'annotate', mech }` (a carried bounce: the cap row stays) or `null`.
+    const pastCapGrant = (extra) => {
+      const head = String(pr?.headRefOid ?? '').slice(0, 9);
+      // A takeover's own head is judged once even though the cap is spent (live: #4708, takeover head 7e29b95c4
+      // refused 5/5 every tick, so the takeover could never be reviewed). Only a head pushed after a trusted takeover
+      // signal or the system's own escalation rung that no verdict names yet, and only `takeoverReviewAttempts` reviews.
+      const takeover = takeoverReviewGrant({ pr, takeoverReviewAttempts });
+      if (takeover.ok) {
+        return { action: 'review', row: { takeoverReview: takeover },
+          why: `${takeover.via === 'escalation-rung' ? 'escalation-rung' : 'takeover'} head \`${head}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
+            + ` but a head pushed by the system's own escalation (${takeover.via ?? 'takeover'}) earns ${takeover.allowance} review(s) beyond the cap`
+            + ` (review.takeoverReviewAttempts); ${takeover.used} used` };
+      }
+      // The mechanical-round grants below never apply to an advisory-fix head (a review:human PR's advisory repair).
+      if (extra.capKind === 'advisory-fix') return null;
+      // A head made by a PROVEN mechanical round (conflict-resolution merge, no other edits) does not spend a round
+      // (live: #4631 f0f4943fb). Identical net diff → the parent head's verdict is carried; only the conflict hunks
+      // changed → one review past the cap. The merge gate is untouched.
+      const mech = mechanicalRoundGrant({ pr, countTowardCap: mechanicalRoundsCountTowardCap });
+      if (!mech.ok) return null;
+      if (mech.action === 'review') {
+        return { action: 'review', row: { mechanicalRound: mech },
+          why: `mechanical head \`${head}\` — a conflict-resolution round on`
+            + ` \`${mech.priorHead.slice(0, 9)}\` changed only conflict hunks (${mech.changedFiles.join(', ') || 'none listed'});`
+            + ` it spends no round (${extra.attempts}/${extra.cap}), so this head earns one review`
+            + ' (review.mechanicalRoundsCountTowardCap=false)' };
+      }
+      if (mech.action === 'carry' && mech.verdict === 'accept') {
+        // TODO(#4631): the accept itself is re-stamped by the accept carry-forward sweep
+        // (we:scripts/lib/accept-carry-forward.mjs#decideAcceptCarryForward), which owns the head-bound proofs.
+        // Here the planner only stops asking a person to take over a PR whose reviewed diff did not change.
+        return { action: 'carry', mech,
+          why: `PR #${prNumber}: mechanical round on \`${mech.priorHead.slice(0, 9)}\` left the net diff byte-identical;`
+            + ' its accept is carried forward (no new review, no round spent)' };
+      }
+      return mech.action === 'carry' ? { action: 'annotate', mech } : null;
+    };
     // Built over an injected `refuseFn` so the ci-red-parallel review (below) can fold its `cap-exhausted` into
     // the PR's one `owed-ci-rerun` row while still surfacing the SAME note.
     const capExhaustedVia = (refuseFn) => (extra, { allowTakeover = true, allowTakeoverReview = allowTakeover } = {}) => {
-      // A takeover's own head is judged once even though the cap is spent (live: #4708, takeover head 7e29b95c4
-      // refused 5/5 every tick, so the takeover could never be reviewed). Only the FIX/REVIEW round caps, only a head
-      // pushed after a trusted takeover signal that no verdict names yet, and only `takeoverReviewAttempts` reviews.
-      // The review still needs green CI and no referral hold; review:human still needs the operator. A call site that
-      // passes `allowTakeover: false` (the operator send-back, whose must-fix body a person reads) is never replaced
-      // by a review dispatch either.
-      if (allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review')) {
-        const grant = takeoverReviewGrant({ pr, takeoverReviewAttempts });
-        if (grant.ok) {
-          if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
-          if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
-          dispatch.push({
-            ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), takeoverReview: grant,
-            why: `takeover head \`${String(pr?.headRefOid ?? '').slice(0, 9)}\` — the rounds are spent (${extra.attempts}/${extra.cap}),`
-              + ` but a head pushed by a takeover earns ${grant.allowance} review(s) beyond the cap`
-              + ` (review.takeoverReviewAttempts); ${grant.used} used`,
-          });
-          return;
-        }
+      // Only the FIX/REVIEW round caps take a past-cap grant. Its review still needs green CI and no referral hold;
+      // review:human still needs the operator. A call site that passes `allowTakeover: false` (the operator send-back,
+      // whose must-fix body a person reads) is never replaced by a review dispatch either (the default below).
+      // `allowTakeoverReview: false` opts the site out of EVERY past-cap grant (the takeover review and the mechanical
+      // round's review or carried verdict): its head is owed a fix, or a person reads the row. The grants are read in
+      // ONE place, {@link pastCapGrant}, which only runs when the site allows them, and every review a grant sends
+      // passes the same referral-hold and CI gates below. A new grant joins pastCapGrant; it never gets its own
+      // dispatch path (review on 3bef179e4: the mechanical grant was first added as a second, unguarded copy).
+      const grant = allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') ? pastCapGrant(extra) : null;
+      if (grant?.action === 'review') {
+        if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
+        if (refuseUnreviewable({ pr, refuse: refuseFn, withPhase: extra })) return;
+        if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
+        dispatch.push({ ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), ...grant.row, why: grant.why });
+        return;
       }
-      // Card xx0055i — at the FIX round cap, `fix.roundCapAction: takeover` dispatches ONE takeover fix (full round
-      // history, top claude rung of the fixer ladder) instead of the "a person must take it over" note. A spent
-      // takeover, a ruling dispute, or the `person` setting falls through to the note exactly as before. A call
-      // site passes `allowTakeover: false` when the row it would replace carries an instruction a takeover brief
-      // cannot hold (the operator send-back's must-fix body): that one always reaches a person.
-      const takeover = extra.capKind === 'fix' && allowTakeover ? planTakeover({ pr, roundCapAction, takeoverMaxPerPr, fixerLadder }) : null;
+      if (grant?.action === 'carry') {
+        refuseFn('mechanical-carry-forward', { ...extra, mechanicalRound: grant.mech, why: grant.why });
+        notes.push({ kind: 'mechanical-carry-forward', prNumber, verdict: grant.mech.verdict, priorHead: grant.mech.priorHead, text: grant.why });
+        return;
+      }
+      if (grant?.action === 'annotate') extra = { ...extra, mechanicalRound: grant.mech };
+      // Card xx0055i + takeover budget — at the FIX round cap, `fix.roundCapAction: takeover` dispatches a takeover fix
+      // (full round history, top claude rung of the fixer ladder) instead of the "a person must take it over" note,
+      // up to `fix.takeoverBudget` per PR, a further one only when the previous one REDUCED the open findings
+      // (we:scripts/conveyor/takeover-budget.mjs). A ruling dispute, the `person` setting, a spent budget or a takeover
+      // that did not converge reaches the operator. A call site passes `allowTakeover: false` when the row it would
+      // replace carries an instruction a takeover brief cannot hold (the operator send-back's must-fix body).
+      // Every round cap — fix, advisory-fix (a review:human PR's advisory repair) or review — leads to a takeover
+      // within the budget (the review cap only once the current head is judged with open defects; planTakeover's
+      // `capKind`).
+      const takeover = ['fix', 'review', 'advisory-fix'].includes(extra.capKind) && allowTakeover
+        ? planTakeover({ pr, roundCapAction, takeoverBudget, fixerLadder, defaultBranch, capKind: extra.capKind })
+        : null;
       if (takeover?.ok) {
         dispatch.push({
           ...base, ...extra, kind: 'fix', mode: 'takeover', findings: Math.max(1, Number(extra.findings) || 0),
           ...(Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length ? { blockRuledReferrals: pr.blockRuledReferrals } : {}),
-          takeover: { attempts: extra.attempts, cap: extra.cap, rung: takeover.rung, route: takeover.route },
-          why: `fix rounds exhausted (${extra.attempts}/${extra.cap}) — one automatic takeover on the ${takeover.rung.id} route (fix.roundCapAction=takeover) before the operator is asked`,
+          takeover: {
+            attempts: extra.attempts, cap: extra.cap, rung: takeover.rung, route: takeover.route, n: takeover.n, budget: takeover.budget,
+            ...(takeover.previous ? { previous: takeover.previous } : {}),
+          },
+          why: `fix rounds exhausted (${extra.attempts}/${extra.cap}) — automatic takeover ${takeover.n} of ${takeover.budget} on the ${takeover.rung.id} route (fix.roundCapAction=takeover)`
+            + (takeover.previous ? ` — takeover ${takeover.previous.n} reduced the open findings ${takeover.previous.before?.count}→${takeover.previous.after?.count} (weight ${takeover.previous.before?.weight}→${takeover.previous.after?.weight})` : '')
+            + ' before the operator is asked',
         });
+        return;
+      }
+      // The PR's own gate holds it (a stacked base not merged yet, a review:human hold, a hold-gate check) and no
+      // defect is open: that is the gate working, not a defect — no takeover and no "a person must take it over".
+      if (takeover?.reason === 'gate-hold') {
+        // Live #4764: spent repair rounds still owe a current advisory, or a visible operator handoff.
+        const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+        const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
+        const latest = headSha ? latestAdvisory(trustedComments) : undefined;
+        const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
+        // Structured evidence only: a verdict counts when its own footer names the live head. A sha merely mentioned
+        // in a verdict's prose (an older review quoting the new head) never marks that head reviewed.
+        const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
+          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+        // A review whose basis was degraded or unpinned posts an advisory note with NO head to compare (no `Net basis`
+        // footer), so it can never "cover" the live head. When the newest advisory note on the thread is such a
+        // headless one, a review has already run: do not spend another every tick — the operator rules (bounds the loop).
+        let lastHeaded = -1;
+        let lastHeadless = -1;
+        trustedComments.forEach((c, i) => {
+          if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
+          if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
+        });
+        const unpinnedAdvisory = lastHeadless > lastHeaded;
+        // The owed advisory goes through dispatchReviewRow, the ONE review decision (referral hold, scope-bloat, draft,
+        // already-reviewed-head, CI). If it refuses, the refusal is named in the operator note below, never swallowed.
+        let reviewRefusal = null;
+        if (takeover.hold === 'review-human-hold' && headSha && !advisoryIsCurrent && !alreadyReviewed && !unpinnedAdvisory) {
+          const rowsBefore = dispatch.length;
+          dispatchReviewRow({
+            pr, requiredChecks, withPhase: extra, base, attempts: extra.attempts, roundCap: extra.cap, now, dispatch,
+            refuse: (kind, x) => { reviewRefusal = { kind, why: x?.why }; refuseFn(kind, x); },
+            refuseCapExhausted: () => {},
+            advisoryReview: {
+              head: headSha, reason: 'gate-hold-advisory',
+              why: `the repair rounds are spent (${extra.attempts}/${extra.cap}), but an advisory review is not a repair round;`
+                + ` the newest advisory is on \`${latest?.head ?? 'none'}\`, not the live head \`${headSha}\`,`
+                + ' so one advisory review runs on the live head so the operator has a current advisory',
+            },
+          });
+          if (dispatch.length > rowsBefore) {
+            // Only an advisory review row may stand; any other row dispatchReviewRow pushed (a scope-bloat rebase fix)
+            // does not belong on a review:human PR at the cap — drop it and fall through to the refusal and note.
+            if (dispatch.slice(rowsBefore).every(d => d.kind === 'review' && d.advisoryReview)) return;
+            dispatch.length = rowsBefore;
+          }
+        }
+        refuseFn('gate-hold', { ...extra, takeover: 'gate-hold', hold: takeover.hold,
+          why: `held by its own gate (${takeover.hold}) with no open defect finding — the gate is doing its job; no takeover` });
+        // A base hold clears itself only while an OPEN PR owns the base branch (it will land and the drain retargets this
+        // PR). A base nobody owns (closed unmerged, deleted) never clears: that stays a person's call, like
+        // reconcile-pass's `stacked-base-orphaned`.
+        const basePr = pr?.baseRefName ? prs.find(c => c?.headRefName === pr.baseRefName && c.number !== prNumber) : undefined;
+        const selfClearing = takeover.hold === 'awaiting-base' || (takeover.hold === 'stacked-base-unmerged' && Boolean(basePr));
+        const reason = selfClearing
+          ? `waiting on its base branch (${takeover.hold}); the hold clears itself when the base PR lands, nobody needs to act`
+          : takeover.hold === 'stacked-base-unmerged'
+            ? `its base branch \`${pr?.baseRefName}\` has no open PR that will land it — a person must retarget this PR or restore the base`
+          : takeover.hold !== 'review-human-hold'
+          ? `a person must resolve the gate dependency (${takeover.hold}) before this PR can advance`
+          : reviewRefusal
+            ? `the advisory review owed on the live head \`${headSha.slice(0, 9)}\` was refused (${reviewRefusal.kind}: ${reviewRefusal.why ?? 'no reason given'})`
+              + ' — clear that, or a person must review the PR and supply a ruling'
+          : unpinnedAdvisory
+            ? 'the newest advisory was posted without a pinned basis (no head to compare), so a review already ran — a person must read it and supply a ruling'
+          : advisoryIsCurrent
+            ? `the advisory on the live head \`${headSha.slice(0, 9)}\` is in — a person must rule (review it, or send it back with a ruling)`
+            : alreadyReviewed
+              ? `the live head \`${headSha.slice(0, 9)}\` was already reviewed but has no current trusted advisory — a person must check the review and supply a ruling`
+              : 'the live head is unavailable — a person must check the PR before an advisory can run';
+        notes.push({
+          // A base hold clears itself: it reuses the status-only `stacked-awaiting-base` kind (no PR comment, no escalation).
+          kind: selfClearing ? 'stacked-awaiting-base' : 'gate-hold-needs-operator', prNumber, hold: takeover.hold,
+          ...(selfClearing ? { baseRefName: pr?.baseRefName, basePrNumber: basePr?.number ?? null } : {}),
+          attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind, head: headSha,
+          text: `PR #${prNumber}: held by its own gate (${takeover.hold}) at the repair cap (${extra.attempts}/${extra.cap}, ${extra.capKind}); ${reason}`,
+        });
+        return;
+      }
+      // The latest takeover pushed and no review has judged its head yet: its one review is owed (the grant above
+      // dispatches it once CI allows), so nobody is asked to take the PR over meanwhile.
+      if (takeover?.reason === 'takeover-awaiting-review') {
+        refuseFn('takeover-awaiting-review', { ...extra, takeover: takeover.reason,
+          why: `takeover ${takeover.n} of ${takeover.budget} pushed a new head that no review has judged yet — its review is owed first` });
         return;
       }
       refuseFn('cap-exhausted', { ...extra, ...(takeover ? { takeover: takeover.reason } : {}) });
       notes.push({
         kind: 'round-cap-exhausted', prNumber, attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind,
         ...(extra.capKind === 'fix' ? { parkToHuman: true } : {}),
-        text: roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
-          + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover limit — fix.takeoverMaxPerPr or env WE_FIX_TAKEOVER_MAX_PER_PR — is 0 or invalid)' : '')
-          + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
-          + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
+        ...(takeover?.reason === 'takeover-not-converging' ? { takeoverNotConverging: true } : {}),
+        text: takeover?.reason === 'takeover-not-converging'
+          ? notConvergingText(prNumber, takeover)
+          : roundCapExhaustedNoteText(prNumber, extra.attempts, extra.cap, extra.capKind)
+            + (takeover?.reason === 'setting-disabled' ? ' (the automatic takeover is turned off: the takeover budget — fix.takeoverBudget or env WE_FIX_TAKEOVER_BUDGET — is 0 or invalid)' : '')
+            + (takeover?.reason === 'takeover-spent' ? ' (the automatic takeover already ran and did not clear it)' : '')
+            + (takeover?.reason === 'takeover-budget-spent' ? ` (the takeover budget is spent: ${takeover.n} of ${takeover.budget})` : '')
+            + (takeover?.reason === 'takeover-void-limit' ? ' (the automatic takeover hit launch faults and its retries are used up — see the notes on the thread)' : ''),
       });
     };
     const refuseCapExhausted = capExhaustedVia(refuse);
     // The shared round count — see REFUSAL 3 below for why it is a `Math.max` over three durable sources.
     const roundAttempts = () => Math.max(
-      Number(counts[prNumber]) || 0,
+      realFixRounds.ok ? realFixRounds.real : Number(counts[prNumber]) || 0,
       operatorBudget?.attempts ?? 0,
-      countRearmComments(pr?.comments),
+      realFixRounds.ok ? realFixRounds.real : countRearmComments(pr?.comments),
       countAdvisoryComments(pr?.comments),
-    );
+    ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
 
     // ── REFUSAL 1 — `stood-down` is TERMINAL. No decay, no clock: `now` is not read on this path, so the same
     // PR returns the same refusal a week later unless an operator answer or supersede resolves it.
@@ -2130,8 +2626,9 @@ export function planReconcile({
     }
 
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
-      const healAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
+      const healBudget = healBudgetFor(pr);
+      const healAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
         refuse('ci-heal-escalated', {
           ...withPhase, headSha: escalation.headSha,
@@ -2139,16 +2636,16 @@ export function planReconcile({
         });
       } else if (healAttempts >= ciHealCap) {
         refuse('cap-exhausted', {
-          ...withPhase, attempts: healAttempts, cap: ciHealCap,
+          ...withPhase, attempts: healAttempts, cap: ciHealCap, ciHealBudget: healBudget.log,
           why: `the drain holds this PR for a failed CodeQL check, and its durable CI-heal count is ${healAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
         });
         notes.push({
-          kind: 'ci-heal-exhausted', prNumber, attempts: healAttempts, cap: ciHealCap, lastFailureReason: 'CodeQL (drain gate)',
+          kind: 'ci-heal-exhausted', prNumber, attempts: healAttempts, cap: ciHealCap, lastFailureReason: 'CodeQL (drain gate)', ciHealBudget: healBudget.log,
           text: `PR #${prNumber}: ci-heal attempts exhausted (${healAttempts}/${ciHealCap}) — auto-heal cannot clear the CodeQL alert the drain is holding this PR for; a person must take it over. Last failure: CodeQL (drain gate)`,
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure,
+          ...base, ...withPhase, kind: 'ci-heal', reason: 'codeql', attempts: healAttempts, codeql: pr.codeqlFailure, ciHealBudget: healBudget.log,
           why: `the drain refuses to land this PR because its CodeQL check failed (${(pr.codeqlFailure.alerts ?? []).length} alert(s)), nothing live is working it, and ${healAttempts} of ${ciHealCap} CI-heal attempts are spent`,
         });
       }
@@ -2265,7 +2762,7 @@ export function planReconcile({
       // tick plans a fresh heal with no human intervention required. Checked BEFORE the `ci-heal` cap below
       // (and skips it entirely) for the same reason `owed-ci-rerun` is: an escalation is a DIFFERENT, more
       // definitive stop than "one more round against the attempt cap".
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       if (escalation) {
         const isSystemFix = escalation.outcome === 'waiting-on-system-fix';
         // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything)
@@ -2298,12 +2795,17 @@ export function planReconcile({
           // Falls straight through to the ordinary ci-heal cap/dispatch path below, exactly as if this PR had
           // never been escalated at all — never a second, separate re-dispatch path to keep in sync with it.
         } else {
+          const isInherited = escalation.outcome === 'inherited-from-base';
           const kind = isSystemFix ? 'waiting-on-system-fix' : 'ci-heal-escalated';
           refuse(kind, {
             ...withPhase, headSha: escalation.headSha,
             ...(escalation.reason ? { escalationReason: escalation.reason } : {}),
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
-            why: isSystemFix
+            ...(escalation.basePr ? { basePr: escalation.basePr } : {}),
+            ...(escalation.baseHeadSha ? { baseHeadSha: escalation.baseHeadSha } : {}),
+            why: isInherited
+              ? `ci-heal found this exact head's red (\`${escalation.headSha}\`) inherited from base PR #${escalation.basePr} at base head \`${escalation.baseHeadSha}\` — owed to the base PR's fixer, not the operator; re-arms automatically when the base head moves or a new push changes this head`
+              : isSystemFix
               ? `ci-heal already escalated this exact head (\`${escalation.headSha}\`) as waiting on system fix #${escalation.systemFixRef} — the red is the tooling/gate's own fault, not this PR's; nothing further is owed until that fix lands or a new push changes this head`
               : isNotCiBreak
                 ? `ci-heal already confirmed this exact head (\`${escalation.headSha}\`) is NOT a CI break — the red is the review gate itself, held by the review label. No further heal is owed; review waits for complete successful required checks`
@@ -2316,7 +2818,7 @@ export function planReconcile({
           // per tick, until a new push or a person clears it. `not-a-ci-break` is deliberately NOT a dead end
           // (see above) — it still gets this same informational note (an operator reading the report should
           // see why no MORE ci-heal is coming), but cannot override the required-check prerequisite for review.
-          notes.push({
+          if (!isInherited) notes.push({
             kind: 'ci-heal-escalated', prNumber, headSha: escalation.headSha, outcome: escalation.outcome,
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
             text: isSystemFix
@@ -2372,12 +2874,18 @@ export function planReconcile({
       }
       if (pr.timeoutRetry && !pr.timeoutRetry.eligible) refusals.push({ kind: 'timeout-retry-ineligible', prNumber,
         why: `PR #${prNumber}: ${pr.timeoutRetry.reason}` });
-      const ciHealAttempts = countChargeableCiHealComments(pr?.comments, { restore: ciHealBudgetRestore });
-      const refunded = countCiHealComments(pr?.comments) - ciHealAttempts;
+      // Live PR #4631 — only REQUIRED failures are healed or named as the failure; a non-required red (`merge-gate`,
+      // red by design until #4715) is reported beside it, never healed. The budget is the heals since the PR's last
+      // non-mechanical head ({@link ciHealBudgetResetAt}), not every heal it ever had.
+      const failing = splitFailingChecks(pr?.statusCheckRollup, requiredChecks);
+      const healBudget = healBudgetFor(pr);
+      const ciHealAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore });
+      const refunded = countCiHealComments(healBudget.comments) - ciHealAttempts;
+      const healFacts = { failingRequiredChecks: failing.required, nonRequiredRed: failing.nonRequired, ciHealBudget: healBudget.log };
       const refund = refunded > 0 ? { refunded } : {};
       if (ciHealAttempts >= ciHealCap) {
         refuse('cap-exhausted', {
-          ...withPhase, ...refund, attempts: ciHealAttempts, cap: ciHealCap,
+          ...withPhase, ...refund, ...healFacts, attempts: ciHealAttempts, cap: ciHealCap,
           why: `the PR's own durable CI-heal count is ${ciHealAttempts} against a cap of ${ciHealCap} — auto-heal is exhausted here and a person must take it`,
         });
         // #xznd5za (epic #3383/#4075) — a capped `ci-red` PR must never be MERELY refused. `cap-exhausted` was
@@ -2394,16 +2902,19 @@ export function planReconcile({
         // makes the operator re-open the PR just to find out what is actually still red. `failingCheckNames`
         // reads the SAME `pr.statusCheckRollup` `withPhase`/`check` above already derived `check.state` from;
         // never re-fetched, never re-derived beyond naming the rows a `red` state already counted.
-        const lastFailureReason = failingCheckNames(pr?.statusCheckRollup).join(', ') || 'required check failing (no readable check name)';
+        const lastFailureReason = failing.required.join(', ') || 'required check failing (no readable check name)';
+        const reported = failing.nonRequired.length ? ` (not required, reported only: ${failing.nonRequired.join(', ')})` : '';
         notes.push({
-          kind: 'ci-heal-exhausted', prNumber, attempts: ciHealAttempts, cap: ciHealCap, lastFailureReason,
+          kind: 'ci-heal-exhausted', prNumber, attempts: ciHealAttempts, cap: ciHealCap, lastFailureReason, ...healFacts,
           text: `PR #${prNumber}: ci-heal attempts exhausted (${ciHealAttempts}/${ciHealCap}) — auto-heal cannot`
-            + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}`,
+            + ` repair this required-check failure any further; a person must take it over. Last failure: ${lastFailureReason}${reported}`,
         });
       } else {
         dispatch.push({
-          ...base, ...withPhase, ...refund, kind: 'ci-heal', attempts: ciHealAttempts,
-          why: `a required check is failing, nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`,
+          ...base, ...withPhase, ...refund, ...healFacts, kind: 'ci-heal', attempts: ciHealAttempts,
+          why: `a required check is failing (${failing.required.join(', ') || 'unnamed'}), nothing live is working it, and ${ciHealAttempts} of ${ciHealCap} CI-heal attempts are spent`
+            + (healBudget.log.resetAt ? ` since ${healBudget.log.resetBy}'s push at ${healBudget.log.resetAt}` : '')
+            + ` (cap from ${ciHealCapSource})`,
         });
       }
       continue;
@@ -2452,6 +2963,29 @@ export function planReconcile({
     // Unruled referrals never reach here (`blockRuledReferrals` is empty while any is pending).
     if (phase === 'needs-human' && Array.isArray(pr?.blockRuledReferrals) && pr.blockRuledReferrals.length) {
       const attempts = roundAttempts();
+      // An operator ruling WITH A DIRECTION on this head grants ONE directed takeover round past the cap
+      // (`fix.operatorRulingExtraRounds`), its brief carrying the ruling text verbatim. Once per ruling; see
+      // {@link operatorRulingRound}.
+      // The directed takeover is still an automatic takeover: the takeover kill switches stop it too
+      // (`fix.roundCapAction=person`, `fix.takeoverBudget` 0 or invalid), so one off switch turns off every
+      // automatic takeover, not only the one `planTakeover` dispatches.
+      const takeoverOn = roundCapAction === 'takeover' && Number.isInteger(takeoverBudget) && takeoverBudget > 0;
+      const directed = attempts >= effectiveRoundCap && takeoverOn ? operatorRulingRound(pr, { allowance: operatorRulingExtraRounds.value }) : null;
+      if (directed?.ok) {
+        const setting = `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}=${operatorRulingExtraRounds.value} (source: ${operatorRulingExtraRounds.source})`;
+        const ladder = takeoverRung(fixerLadder);
+        dispatch.push({
+          ...base, ...withPhase, kind: 'fix', mode: 'takeover', findings: pr.blockRuledReferrals.length,
+          attempts, cap: effectiveRoundCap, blockRuledReferrals: pr.blockRuledReferrals,
+          operatorAnswer: operatorRulingAnswer(directed.rulings),
+          takeover: { attempts, cap: effectiveRoundCap, rung: ladder.rung, route: ladder.route, n: directed.used + 1, budget: directed.allowance },
+          operatorRulingRound: { head: directed.head, rulingAt: directed.rulingAt, used: directed.used, allowance: directed.allowance,
+            setting: `fix.${OPERATOR_RULING_EXTRA_ROUNDS_SETTING}`, source: operatorRulingExtraRounds.source },
+          why: `fix rounds exhausted (${attempts}/${effectiveRoundCap}), but the operator ruled every blocked finding on this head with a direction`
+            + ` (${directed.rulingAt}) — directed takeover ${directed.used + 1} of ${directed.allowance} on the ${ladder.rung.id} route, ${setting}`,
+        });
+        continue;
+      }
       if (attempts >= effectiveRoundCap) {
         refuseCapExhausted({
           ...withPhase, attempts, cap: effectiveRoundCap, capKind: 'fix',
@@ -2561,6 +3095,7 @@ export function planReconcile({
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
             if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+            if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -2618,6 +3153,7 @@ export function planReconcile({
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,

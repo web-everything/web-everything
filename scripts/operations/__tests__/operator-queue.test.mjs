@@ -181,6 +181,62 @@ describe('operator queue read safety', () => {
     expect(process.exitCode).toBeUndefined();
   });
 
+  it('completes a successful capped listing and sees the accepted advisory on the current head', () => {
+    const advisory = (head, outcome, createdAt) => ({
+      body: `**Verdict:** human review required\n**Advisory outcome:** \`${outcome}\`\nNet basis: \`aaaaaaaaa..${head}\``,
+      author: { login: 'web-everything' }, createdAt,
+    });
+    const comments = [
+      advisory('3956cb512', 'changes', '2026-10-11T09:00:00Z'),
+      { body: '🔁 review — changes requested', createdAt: '2026-10-11T09:01:00Z' },
+      ...Array.from({ length: 98 }, () => ({ body: 'discussion' })),
+    ];
+    const listed = { ...pr(4631, comments), headRefOid: '572049b31',
+      labels: [{ name: 'review:human' }, { name: 'advisory:accepted' }],
+      statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+    };
+    expect(queue.evaluatePr(listed)).toMatchObject({ ready: false, reasons: expect.arrayContaining(['changes requested']) });
+    execFileSync.mockReturnValueOnce(JSON.stringify([listed])).mockReturnValueOnce(commentTsv([
+      ...comments, advisory('572049b31', 'accept', '2026-10-11T10:00:00Z'),
+    ]));
+    run(['--json']);
+    const report = JSON.parse(stdout());
+    expect(report.ready).toEqual([expect.objectContaining({ number: 4631 })]);
+    expect(report.notReady).toEqual([]);
+    expect(report.errors).toEqual([]);
+    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(execFileSync).toHaveBeenLastCalledWith('gh', expect.arrayContaining([
+      'api', '--paginate', 'repos/o/n/issues/4631/comments',
+    ]), expect.any(Object));
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it('drops a capped successful listing when the complete thread permanently fails', () => {
+    const comments = [standDown, ...Array.from({ length: 99 }, () => ({ body: 'discussion' }))];
+    execFileSync.mockReturnValueOnce(JSON.stringify([pr(1, comments)]))
+      .mockImplementationOnce(() => { throw new Error('HTTP 404: Not Found'); });
+    run(['--json']);
+    const report = JSON.parse(stdout());
+    expect(report).toMatchObject({ incomplete: true, errors: ['o/n#1: HTTP 404: Not Found'] });
+    for (const [section, rows] of Object.entries(report)) {
+      if (section !== 'errors' && Array.isArray(rows)) expect(rows).toEqual([]);
+    }
+    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+  });
+
+  it('keeps a successful 99-comment listing without a complete read', () => {
+    const comments = [standDown, ...Array.from({ length: 98 }, () => ({ body: 'discussion' }))];
+    execFileSync.mockReturnValueOnce(JSON.stringify([pr(1, comments)]));
+    run(['--json']);
+    expect(JSON.parse(stdout())).toMatchObject({
+      errors: [], stoodDown: [expect.objectContaining({ number: 1 })],
+    });
+    expect(execFileSync).toHaveBeenCalledTimes(1);
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it('does not retry a permanent comment failure and retains the next PR', () => {
     execFileSync.mockImplementation((_cmd, args) => {
       if (args.at(-1).endsWith(',comments')) throw new Error('heavy query failed');

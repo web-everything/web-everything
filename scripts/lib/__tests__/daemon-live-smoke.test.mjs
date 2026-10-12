@@ -37,7 +37,7 @@ import {
   isEnvTimeoutRow, isEnvTimeoutFailureSet, widenSmokeBudgetsEnv,
   DISPATCH_DRY_RUN_SCRIPT, DISPATCH_DRY_RUN_CODE_ENTRIES, busyPoolSkip, hostLooksBusy,
   smokeLoadFactor, SMOKE_LOAD_SCALE_ENV, SMOKE_LOAD_SCALE_MAX_ENV, DEFAULT_SMOKE_LOAD_SCALE_MAX,
-  resolveIoBoundLoadScale,
+  resolveIoBoundLoadScale, resolveSmokeGithubPerOwner,
 } from '../daemon-live-smoke.mjs';
 
 // Existing fixtures must never observe or write the host's resource state.
@@ -121,7 +121,7 @@ describe('resource shadow observations', () => {
   // children (not CPU) and were killed, so main, every overlay and last-good all failed the smoke.
   it('keeps load scaling for the I/O-bound checks even when admitted (smokeIoBoundLoadScale, standard on)', () => {
     const b = resolveSmokeBudgets({}, { load: () => 48, cores: () => 12, admission: { verdict: 'admit' } });
-    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 720_000, ghApiMs: 30_000 });
+    expect(b).toMatchObject({ reconcileMs: 480_000, dispatchDryRunMs: 1_200_000, ghApiMs: 30_000 });
     expect(resolveIoBoundLoadScale({})).toMatchObject({ enabled: true, source: 'standard' });
   });
   it('the I/O-bound rule never lowers a non-admit factor, and honours the env layer and absolute overrides', () => {
@@ -134,8 +134,8 @@ describe('resource shadow observations', () => {
   });
   it.each(['hold', 'wait'])('uses the maximum budget factor for %s even at zero load', (verdict) => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict } };
-    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(720_000);
-    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(360_000);
+    expect(resolveSmokeBudgets({}, host).dispatchDryRunMs).toBe(1_200_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host).dispatchDryRunMs).toBe(600_000);
   });
   it('preserves disabled scaling and absolute per-check overrides under a hold', () => {
     const host = { load: () => 0, cores: () => 12, admission: { verdict: 'hold' } };
@@ -250,17 +250,17 @@ describe('load-aware smoke budgets', () => {
       lanePoolListMs: 300_000, laneAcquireMs: 2_400_000, laneReleaseMs: 300_000,
       laneAcquireWaitMs: 30_000, lanePoolBusyCapMs: 60_000, laneAcquireBusyCapMs: 120_000,
       ghApiMs: 30_000, ghPrListMs: 30_000, reconcileMs: 120_000,
-      dispatchDryRunMs: 180_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
+      dispatchDryRunMs: 300_000, treeStaysCleanMs: 10_000, daemonBootMs: 45_000,
     });
   });
 
   it('load 48 on 12 cores scales dispatch and reconcile by four', () => {
-    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 720_000, reconcileMs: 480_000 });
+    expect(resolveSmokeBudgets({}, host())).toMatchObject({ dispatchDryRunMs: 1_200_000, reconcileMs: 480_000 });
   });
 
   it('load 100 on 12 cores is capped at four times the defaults', () => {
     expect(resolveSmokeBudgets({}, host(100))).toEqual(resolveSmokeBudgets({}, host()));
-    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({}, host(100)).dispatchDryRunMs).toBe(1_200_000);
   });
 
   it('an explicit operator budget stays absolute under load', () => {
@@ -279,7 +279,7 @@ describe('load-aware smoke budgets', () => {
 
   it('WE_SMOKE_LOAD_SCALE_MAX=2 caps scaling at twice the defaults', () => {
     expect(resolveSmokeBudgets({ WE_SMOKE_LOAD_SCALE_MAX: '2' }, host())).toMatchObject({
-      dispatchDryRunMs: 360_000, reconcileMs: 240_000,
+      dispatchDryRunMs: 600_000, reconcileMs: 240_000,
     });
   });
 
@@ -288,7 +288,7 @@ describe('load-aware smoke budgets', () => {
   });
 
   it.each(['0', '-1', 'invalid', 'Infinity'])('invalid budget override %s still scales the default', (value) => {
-    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(720_000);
+    expect(resolveSmokeBudgets({ WE_SMOKE_DISPATCH_DRY_RUN_MS: value }, host()).dispatchDryRunMs).toBe(1_200_000);
   });
 
   it('exports the knobs and a pure factor with a one-core floor', () => {
@@ -313,7 +313,7 @@ describe('load-aware smoke budgets', () => {
     const widened = widenSmokeBudgetsEnv({ ...env, WE_SMOKE_LOAD_SCALE: '0' });
     delete widened.WE_SMOKE_LOAD_SCALE;
     const retry = resolveSmokeBudgets(widened, host());
-    expect(retry.dispatchDryRunMs).toBe(1_800_000);
+    expect(retry.dispatchDryRunMs).toBe(3_000_000);
     expect(retry.reconcileMs).toBe(1_200_000);
   });
 });
@@ -1402,6 +1402,46 @@ describe('GitHub auth in the smoke — fresh token per attempt; a probed 401 is 
     expect(b.authFailed).toBe(false);
     const c = await probeGithubAuth({ env, runChild: async () => '{}' });
     expect(c.authFailed).toBe(false);
+  });
+
+  it('resolves smoke GitHub per-owner auth from the standard and env layers', () => {
+    expect(resolveSmokeGithubPerOwner({})).toEqual({ enabled: true, source: 'standard' });
+    expect(resolveSmokeGithubPerOwner({ WE_SMOKE_GH_PER_OWNER: '0' })).toEqual({ enabled: false, source: 'env' });
+    expect(resolveSmokeGithubPerOwner({ WE_SMOKE_GH_PER_OWNER: '1' })).toEqual({ enabled: true, source: 'env' });
+  });
+
+  it('refreshSmokeGithubEnv requests per-owner auth by default', async () => {
+    const ensureFresh = vi.fn(async () => ({ applied: false, reason: 'insufficient-access' }));
+    const src = { GH_TOKEN: STALE, GITHUB_TOKEN: STALE };
+    const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
+    expect(ensureFresh.mock.calls[0][0].perOwner).toBe(true);
+    expect(r.env).toEqual(src);
+  });
+
+  it('per-owner refresh preserves the shim PATH and removes inherited tokens only from the copy', async () => {
+    const src = { GH_TOKEN: STALE, GITHUB_TOKEN: STALE, PATH: '/original/bin', KEEP: '1' };
+    const before = { ...src };
+    const ensureFresh = async (o) => {
+      o.env.PATH = '/shim/bin:/original/bin';
+      return { applied: true, reason: 'ok', perOwner: true };
+    };
+    const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
+    expect(r.env).toEqual({ PATH: '/shim/bin:/original/bin', KEEP: '1' });
+    expect(r.env).not.toHaveProperty('GH_TOKEN');
+    expect(r.env).not.toHaveProperty('GITHUB_TOKEN');
+    expect(src).toEqual(before);
+  });
+
+  it('disabling per-owner auth keeps the pinned-token refresh in the copy', async () => {
+    const src = { WE_SMOKE_GH_PER_OWNER: '0', GH_TOKEN: STALE, GITHUB_TOKEN: STALE };
+    const ensureFresh = vi.fn(async (o) => {
+      o.setEnv(FRESH);
+      return { applied: true, reason: 'ok' };
+    });
+    const r = await refreshSmokeGithubEnv({ env: src, ensureFresh });
+    expect(ensureFresh.mock.calls[0][0].perOwner).toBe(false);
+    expect(r.env).toEqual({ ...src, GH_TOKEN: FRESH });
+    expect(src.GH_TOKEN).toBe(STALE);
   });
 
   it('refreshSmokeGithubEnv writes the token into a COPY (never process.env); force bypasses the cache; a throw is contained', async () => {

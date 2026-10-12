@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -7,6 +7,10 @@ import {
   rulingNeeded, ignoredRulings, claimSimilarity, sameFinding, hasSentBack, renderRulingNotAddressed,
   fixerRulingBrief, RULING_NOT_ADDRESSED_MARKER,
 } from '../ruling-ledger.mjs';
+
+// Ledger fixtures must not depend on which historical commits exist in the host checkout.
+// The real Git probe is covered by restack-equivalence.test.mjs.
+vi.mock('../restack-equivalence.mjs', () => ({ isRestackOf: () => false }));
 
 const repo = 'web-everything/web-everything';
 const H1 = 'a'.repeat(40), H2 = 'b'.repeat(40), H3 = 'c'.repeat(40);
@@ -378,5 +382,62 @@ describe('similarity', () => {
   it('needs a file on both sides', () => {
     expect(sameFinding({ file: null, summary: SUMMARY }, { file: 'a', summary: SUMMARY })).toBe(false);
     expect(sameFinding({ file: './a', summary: SUMMARY }, { file: 'a', summary: SUMMARY })).toBe(true);
+  });
+});
+
+
+describe('#4770 mechanical restack after an auto-policy block', () => {
+  const thread = () => {
+    const r1 = record({ head: H1, runId: 'restack-before' });
+    const auto = { author: { login: 'web-everything' }, createdAt: t(3),
+      body: buildOperatorRulingComment({ version: 1, repo, pr: r1.pr, head: H1,
+        actor: AUTO_POLICY_ACTOR, channel: 'test', reason: block.rationale, at: t(3), clearerId: '',
+        rulings: [{ runId: r1.runId, key: r1.referrals[0].key, result: 'block' }] }) };
+    return { headRefOid: H2, baseRefName: 'lane/bottom', comments: [comment(r1, 1), auto,
+      comment(record({ head: H2, runId: 'restack-after' }), 20)] };
+  };
+  it.each([true, false])('only suppresses ignored rulings for equivalent code (%s)', (equivalent) => {
+    const pr = thread();
+    const restackOf = vi.fn(() => equivalent);
+    const result = ignoredRulings(pr, { restackOf });
+    if (equivalent) expect(result).toBeNull();
+    else expect(result?.matches).toEqual([expect.objectContaining({ priorHead: H1, source: 'structured' })]);
+    expect(restackOf).toHaveBeenCalledTimes(1);
+    expect(restackOf).toHaveBeenCalledWith(H1, H2, pr);
+  });
+  it.each([true, false])('checks only the latest standing block after a re-block (%s)', (equivalent) => {
+    const pr = thread();
+    const r2 = record({ head: H2, runId: 'restack-after' });
+    pr.comments.push({ author: { login: 'web-everything' }, createdAt: t(21),
+      body: buildOperatorRulingComment({ version: 1, repo, pr: r2.pr, head: H2,
+        actor: AUTO_POLICY_ACTOR, channel: 'test', reason: block.rationale, at: t(21), clearerId: '',
+        rulings: [{ runId: r2.runId, key: r2.referrals[0].key, result: 'block' }] }) },
+    comment(record({ head: H3, runId: 'restack-latest' }), 30));
+    pr.headRefOid = H3;
+    const restackOf = vi.fn((from, to) => equivalent && from === H2 && to === H3);
+    const result = ignoredRulings(pr, { restackOf });
+    if (equivalent) expect(result).toBeNull();
+    else expect(result?.matches).toEqual([expect.objectContaining({ priorHead: H2, source: 'structured' })]);
+    expect(restackOf).toHaveBeenCalledTimes(1);
+    expect(restackOf).toHaveBeenCalledWith(H2, H3, pr);
+    expect(restackOf).not.toHaveBeenCalledWith(H1, H3, pr);
+  });
+  it('fails closed when the equivalence probe throws', () => {
+    expect(ignoredRulings(thread(), { restackOf: () => { throw Error('unavailable'); } })?.matches).toHaveLength(1);
+  });
+  it('does not probe nonmatching findings', () => {
+    const pr = thread();
+    pr.comments[2] = comment(record({ head: H2, runId: 'restack-after', file: 'unrelated.md' }), 20);
+    const restackOf = vi.fn(() => true);
+    expect(ignoredRulings(pr, { restackOf })).toBeNull();
+    expect(restackOf).not.toHaveBeenCalled();
+  });
+  it('probes a distinct prior head only once across matching blocks', () => {
+    const pr = thread();
+    pr.comments.splice(1, 0, comment(record({ head: H1, runId: 'restack-before', rulings: [block] }), 2));
+    const restackOf = vi.fn(() => true);
+    expect(ignoredRulings(pr, { restackOf })).toBeNull();
+    expect(restackOf).toHaveBeenCalledTimes(1);
+    expect(restackOf).toHaveBeenCalledWith(H1, H2, pr);
   });
 });
