@@ -185,9 +185,12 @@ const BORN_AS_HASH_TEST_RE = new RegExp(`^${HASH_SLUG}$`);
  * @returns Set<string> of every id currently resolvable to a real backlog file.
  */
 export function buildBacklogResolvableIds(backlog) {
-  const items = backlog || [];
+  // Only items with a real `num` (non-empty string/number) — `String(undefined)`/`String(null)` must never
+  // enter the set as a bogus "resolvable" id (#4490). A non-object entry is skipped, not thrown on.
+  const items = (backlog || []).filter((b) => b && typeof b === 'object');
+  const hasNum = (b) => (typeof b.num === 'string' && b.num !== '') || (typeof b.num === 'number' && Number.isFinite(b.num));
   return new Set([
-    ...items.map((b) => String(b.num)),
+    ...items.filter(hasNum).map((b) => String(b.num)),
     ...items.filter((b) => typeof b.bornAs === 'string' && BORN_AS_HASH_TEST_RE.test(b.bornAs)).map((b) => b.bornAs),
   ]);
 }

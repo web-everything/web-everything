@@ -21,6 +21,8 @@
  * tick's `already-landed` refusal needs git reads (blob identity against `main`'s history) that a fast step must not
  * pay; a conflicting green draft is rare and the tick still promotes it when it is not already landed.
  */
+import { excusePrMergeGateHolds } from '../lib/merge-gate-hold-class.mjs';
+import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { CONSTELLATION_REPOS, repoKeyForSlug } from '../lib/constellation-repos.mjs';
 import { runGhSync } from '../lib/gh-throttle.mjs';
 import { createDraftPromoteProvider } from '../lib/draft-promote-provider.mjs';
@@ -84,6 +86,7 @@ export function runDraftPromotionStep({
   listDrafts = defaultListDrafts,
   readHeadCheckState = defaultReadHeadCheckState,
   readPrView = defaultReadPrView,
+  readMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
   readAgents = () => enrichAgents(defaultReadAgents({})),
   readClaim = readLiveFixClaim,
   readRequiredChecks = ({ repoSlug }) => getRequiredStatusChecks({ repo: repoSlug }),
@@ -105,7 +108,7 @@ export function runDraftPromotionStep({
       const row = (action, why) => rows.push({ repo, pr: n, action, why });
       let checks;
       try {
-        const fresh = readHeadCheckState({ repoSlug: repo, sha: pr.headRefOid });
+        const fresh = readHeadCheckState({ repoSlug: repo, sha: pr.headRefOid, prNumber: n });
         checks = { state: fresh?.state, sha: pr.headRefOid };
       } catch (e) { row('error', `check read: ${oneLine(e)}`); continue; }
       const decision = isDraftOwedPromotion({ pr, checks });
@@ -146,7 +149,8 @@ export function runDraftPromotionStep({
       } catch (e) { row('error', `fix claim read: ${oneLine(e)}`); continue; }
       let plan;
       try {
-        plan = planReconcile({ repo: repoKey, prs: [planPr], agents, requiredChecks, now: now() });
+        const prs = excusePrMergeGateHolds([planPr], { repo, readMergeGateVerdict, readFreeze, mergeGateSetting });
+        plan = planReconcile({ repo: repoKey, prs, agents, requiredChecks, now: now() });
       } catch (e) { row('error', `classifier: ${oneLine(e)}`); continue; }
       if (!plan.dispatch.some((d) => d.prNumber === n && d.kind === 'promote-draft')) {
         const other = plan.refusals.find((r) => r.prNumber === n) ?? plan.dispatch.find((d) => d.prNumber === n);
