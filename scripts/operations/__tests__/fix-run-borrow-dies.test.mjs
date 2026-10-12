@@ -68,7 +68,7 @@ describe('(1) a borrowed fix that ends releases its claim and records a reason',
     const recordOutcome = vi.fn();
     expect((await runFixCli(argv, io({ releaseClaim, recordOutcome }))).code).toBe(0);
     expect(releaseClaim).toHaveBeenCalledWith({ repo: 'we', pr: 7, who: 'fix-7' });
-    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ repo: 'we', pr: '7', outcome: 'no-change', reason: expect.any(String) }));
+    expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ repo: 'we', pr: 7, outcome: 'no-change', reason: expect.any(String) }));
   });
   it('agent crash: still releases the claim and records "failed" with the error', async () => {
     const releaseClaim = vi.fn(async () => ({}));
