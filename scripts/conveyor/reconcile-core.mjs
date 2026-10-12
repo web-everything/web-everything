@@ -103,12 +103,12 @@
 import { countGrantedRoundExtensions } from './round-extension-mark.mjs';
 import { isAiGeneratedPr } from '../lib/ai-pr-authorship.mjs';
 import { reviewCiGate } from '../lib/review-ci-gate.mjs';
-import { REFERRAL_HOLD_MARKER, GH_LIST_COMMENT_CAP } from './review-referral-hold.mjs';
+import { REFERRAL_HOLD_MARKER } from './review-referral-hold.mjs';
 import { rulingDisputeText } from '../lib/ruling-ledger.mjs';
 import { DEFAULT_FIXER_ESCALATION, pickRung } from '../lib/fixer-escalation-policy.mjs';
 import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
-import { planTakeover, notConvergingText } from './takeover-budget.mjs';
+import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
 import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
@@ -330,6 +330,9 @@ export const REFUSAL_KINDS = Object.freeze([
   // latest takeover pushed a head no review has judged yet) — both emitted through the cap-site `refuseFn`, which the
   // source scan in `reconcile-core.test.mjs` reads since PR #4770.
   'gate-hold', 'takeover-awaiting-review',
+  // `thread-truncated` — the PR's comment list may be cut at the list page (exactly 100, not marked complete by its
+  // reader), so nothing is decided for it this tick (`takeover-budget.mjs#threadMayBeTruncated`).
+  'thread-truncated',
 ]);
 
 /**
@@ -1564,9 +1567,9 @@ export function operatorRulingRound(pr, { allowance = OPERATOR_RULING_EXTRA_ROUN
   if (!/^[a-f0-9]{40}$/.test(head) || !blocked.length) return { ok: false, reason: 'no-blocked-findings' };
   if (!(Number.isInteger(allowance) && allowance > 0)) return { ok: false, reason: 'setting-zero' };
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
-  // The PR list read stops at GH_LIST_COMMENT_CAP comments, so a thread of exactly that length may be cut before a
-  // later withdrawal or takeover marker. A full re-read runs longer than the cap; a cut list grants nothing.
-  if (comments.length === GH_LIST_COMMENT_CAP) return { ok: false, reason: 'thread-truncated' };
+  // A cut list (exactly the list cap) may hide a later withdrawal or takeover marker: it grants nothing. The same
+  // check guards every past-cap grant (`takeover-budget.mjs#threadMayBeTruncated`).
+  if (threadMayBeTruncated(pr)) return { ok: false, reason: 'thread-truncated' };
   const rulings = decidingOperatorBlocks(pr, head, blocked);
   if (!rulings) return { ok: false, reason: 'not-covered' };
   const stamp = (r) => Date.parse(r.createdAt ?? r.at);
@@ -1940,6 +1943,14 @@ export function planReconcile({
         : null,
     };
     const refuse = (kind, extra) => { refusals.push({ ...base, kind, ...extra }); };
+    // A comment list that may be cut at the list page (exactly 100, not marked complete by the reader) hides every
+    // marker after comment 100: the rearm count reads low, a stand-down or a spent takeover reads absent — each one
+    // fails OPEN. Nothing is decided for this PR on such a view; the reconcile pass's readers re-read the thread in
+    // full and mark it (`takeover-budget.mjs#threadMayBeTruncated`), so this fires only on an unvetted snapshot.
+    if (threadMayBeTruncated(pr)) {
+      refuse('thread-truncated', { why: `the comment list has exactly ${pr.comments.length} comments and was not marked complete by its reader — it may be cut, so the markers after it cannot be counted; nothing is decided on this view` });
+      continue;
+    }
     // xilx617 (epic #4075/#3383) — EVERY `cap-exhausted` refusal EXCEPT the `ci-red` one above (which already
     // pushes its own `ci-heal-exhausted` note) also pushes a `round-cap-exhausted` note, mirroring that note's
     // own "refuse AND surface" treatment. `capKind` names the population; see {@link roundCapExhaustedNoteText}
@@ -2444,7 +2455,7 @@ export function planReconcile({
     }
 
     if (!ciRepairOwed && phase === 'queued' && pr?.codeqlFailure) {
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       const healBudget = healBudgetFor(pr);
       const healAttempts = countChargeableCiHealComments(healBudget.comments, { restore: ciHealBudgetRestore, onlyReason: codeqlOwnBudget ? 'codeql' : null });
       if (escalation) {
@@ -2580,7 +2591,7 @@ export function planReconcile({
       // tick plans a fresh heal with no human intervention required. Checked BEFORE the `ci-heal` cap below
       // (and skips it entirely) for the same reason `owed-ci-rerun` is: an escalation is a DIFFERENT, more
       // definitive stop than "one more round against the attempt cap".
-      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid);
+      const escalation = latestCiHealEscalationForHead(pr?.comments, base.headRefOid, { baseHead: pr?.escalationBaseHead ?? null });
       if (escalation) {
         const isSystemFix = escalation.outcome === 'waiting-on-system-fix';
         // we:backlog/fix-review-ciheal-deadlock (LIVE DEADLOCK 2026-09-28/29, PR #2878, web-everything/web-everything)
@@ -2613,12 +2624,17 @@ export function planReconcile({
           // Falls straight through to the ordinary ci-heal cap/dispatch path below, exactly as if this PR had
           // never been escalated at all — never a second, separate re-dispatch path to keep in sync with it.
         } else {
+          const isInherited = escalation.outcome === 'inherited-from-base';
           const kind = isSystemFix ? 'waiting-on-system-fix' : 'ci-heal-escalated';
           refuse(kind, {
             ...withPhase, headSha: escalation.headSha,
             ...(escalation.reason ? { escalationReason: escalation.reason } : {}),
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
-            why: isSystemFix
+            ...(escalation.basePr ? { basePr: escalation.basePr } : {}),
+            ...(escalation.baseHeadSha ? { baseHeadSha: escalation.baseHeadSha } : {}),
+            why: isInherited
+              ? `ci-heal found this exact head's red (\`${escalation.headSha}\`) inherited from base PR #${escalation.basePr} at base head \`${escalation.baseHeadSha}\` — owed to the base PR's fixer, not the operator; re-arms automatically when the base head moves or a new push changes this head`
+              : isSystemFix
               ? `ci-heal already escalated this exact head (\`${escalation.headSha}\`) as waiting on system fix #${escalation.systemFixRef} — the red is the tooling/gate's own fault, not this PR's; nothing further is owed until that fix lands or a new push changes this head`
               : isNotCiBreak
                 ? `ci-heal already confirmed this exact head (\`${escalation.headSha}\`) is NOT a CI break — the red is the review gate itself, held by the review label. No further heal is owed; review waits for complete successful required checks`
@@ -2631,7 +2647,7 @@ export function planReconcile({
           // per tick, until a new push or a person clears it. `not-a-ci-break` is deliberately NOT a dead end
           // (see above) — it still gets this same informational note (an operator reading the report should
           // see why no MORE ci-heal is coming), but cannot override the required-check prerequisite for review.
-          notes.push({
+          if (!isInherited) notes.push({
             kind: 'ci-heal-escalated', prNumber, headSha: escalation.headSha, outcome: escalation.outcome,
             ...(escalation.systemFixRef ? { systemFixRef: escalation.systemFixRef } : {}),
             text: isSystemFix

@@ -1,0 +1,32 @@
+{
+  "$comment": "Live replay, PR web-everything/web-everything#4535 (2026-10-09). Operator clear-human at fcc29ce1; merge-queue refresh (#4619) made merge commit 143107a87 (parents: main 20da1d742, fcc29ce1); drain re-parked review:human at 14:36Z. Net-diff fingerprints computed with normalizeDiffFingerprint over git diff <merge-base> <head> for both heads. Comments trimmed to marker lines.",
+  "repo": "web-everything/web-everything",
+  "pr": 4535,
+  "acceptedHead": "fcc29ce1d5b108576ed06d04d0925e4b77ef6132",
+  "newHead": "143107a87c30d761236b1b642a328cca00e9f471",
+  "netDiff": {
+    "fcc29ce1d5b108576ed06d04d0925e4b77ef6132": "b945d333cf9db630147d1304a7febdf743428b361cd91dabb8c382acf49f99be",
+    "143107a87c30d761236b1b642a328cca00e9f471": "b945d333cf9db630147d1304a7febdf743428b361cd91dabb8c382acf49f99be"
+  },
+  "labelsAfterRepark": [
+    "review:human",
+    "review-round:3",
+    "advisory:accepted"
+  ],
+  "comments": [
+    {
+      "author": {
+        "login": "web-everything"
+      },
+      "createdAt": "2026-10-09T08:47:10Z",
+      "body": "✅ review — accepted\n<!-- reviewed-sha: 50fdb566d4a4c4043e9af1da9d03b06ab1762a48 -->\n<!-- reviewed-diff: 06889b9e916f7f63a996ecd141238645295eed5c6d354e385dabd8844fe96085 -->\n<!-- reviewed-contribution: fd96f3c2e912fd9cb49f4b3af628cf01a3fbd46d6b5be5a4f5f61193bd54bc08 -->\n<!-- cleared-by-actor: d76dcb99-1f6a-479d-b273-f0b53b9916df -->"
+    },
+    {
+      "author": {
+        "login": "chalbert"
+      },
+      "createdAt": "2026-10-09T13:58:47Z",
+      "body": "✅ review — `review:human` cleared via the sanctioned path\nCleared by chalbert via `review-set-label.mjs --to=clear-human` (#2895).\n> Operator in chat 2026-10-09: \"Ok\" (approve with follow-up)\n🧑 Cleared by the HUMAN CEREMONY, not by an established-independent agent (#2844). The clearing actor is this PR's own author (bd616854-1f67-4f80-8be5-40fe1456e3bf) — a subagent inherits its parent's session id, so the operator clearing a PR their own session opened reads as a self-clear at the session level. `--to=clear-human` is EXEMPT from the self-clear refusal that binds `--to=accepted`, because it carries a stronger signal than a session id: it is refused unless the PR carries `review:human`, and it requires the explicit actor and the quoted reason above. Read this as \"a human ceremony cleared it\", NOT as \"an independent reviewer cleared it\".\nOperator in chat 2026-10-09: \"Ok\" (approve with follow-up; stays in warn mode). Advisory accepted on head fcc29ce1. Follow-up card (must land before switching to enforce): nested-suite failure crediting a weak parent-suite test; recovery overwriting an intentional edit that matches a prefix of the original; revert-red-induced red labelled redCause infra.\n<!-- reviewed-sha: fcc29ce1d5b108576ed06d04d0925e4b77ef6132 -->\n<!-- reviewed-diff: b945d333cf9db630147d1304a7febdf743428b361cd91dabb8c382acf49f99be -->\n<!-- reviewed-contribution: de028d74f9149975c58bdd9ad58ea60efdc85edf560da3b46282e560e9c9966c -->\n<!-- cleared-human: chalbert -->\n<!-- cleared-by-actor: bd616854-1f67-4f80-8be5-40fe1456e3bf -->"
+    }
+  ]
+}

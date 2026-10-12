@@ -256,7 +256,7 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
   `--outcome=healed`. A merge of main (even one whose tree equals the examined head) or any code edit, committed or
   not, is NOT metadata-only and still takes the gate in step 4.
 - If the required check is red for a reason that is NOT a CI/merge break and NOT a metadata fix — do **NOT**
-  guess which of the three outcomes below applies without checking; picking the wrong one either hides a real
+  guess which of the four outcomes below applies without checking; picking the wrong one either hides a real
   defect from the operator, wastes their attention on tooling that already has a fix in flight, or (we:backlog/
   fix-review-ciheal-deadlock, LIVE DEADLOCK 2026-09-28/29, PR #2878) silently blocks the PR's own review forever:
   - **`not-a-ci-break` — check this FIRST, before reaching for `needs-human`:** every check `gh pr checks`
@@ -276,6 +276,18 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     STRUCTURED signal, not prose: `reconcile-core.mjs`'s escalation refusal reads this exact outcome as "dispatch
     the review this PR was always owed, in parallel" — unlike `needs-human` below, it never durably blocks
     review dispatch.
+  - **`inherited-from-base`** — this PR is STACKED (its base is not main) and the red belongs to the BASE PR:
+    it reproduces on the base head itself, or the failing test/code belongs to the base PR and this diff does
+    not touch it. Use the freshly fetched `$BASE_SHA` from step 2; local `origin/<base branch>` may be stale.
+    ```bash
+    node "{{WE_ROOT}}/scripts/operations/completion-cli.mjs" report --repo={{REPO}} --session={{SESSION_SLUG}} --status=done --outcome=escalated-needs-human
+    node "{{WE_ROOT}}/scripts/conveyor/fix-procedure.mjs" fix-end {{PR_NUM}} --repo={{REPO}} --who={{SESSION_SLUG}}
+    node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
+      --head="$EXAMINED_HEAD" --outcome=inherited-from-base --base-pr=<base PR number> \
+      --base-head="$BASE_SHA" --reason="<name the failing test and the base PR code it contradicts>"
+    ```
+    This routes a note to the base PR and re-arms this PR's ci-heal automatically when the base head moves;
+    never use `needs-human` for inherited red.
   - **`needs-human`** — operator credential replacement is required, the diff itself is genuinely wrong and needs a design call, or you are simply unsure
     (never for the review-gate-only case above — that is ALWAYS `not-a-ci-break`, never this). Report and stop:
     ```bash
@@ -284,6 +296,7 @@ gh run view <run-id> --log-failed --repo {{REPO}} # the failing step's log (opti
     node "{{WE_ROOT}}/scripts/conveyor/ci-heal-escalation-mark.mjs" {{PR_NUM}} --repo={{REPO}} \
       --head="$EXAMINED_HEAD" --outcome=needs-human "${CI_AUTH_ARGS[@]}" --reason="<name the actual finding>"
     ```
+    On a stacked PR, pass `--base-head="$BASE_SHA"` so the escalation re-arms when the base moves.
     When the red is `main`'s own defect (it reproduces on a merge with main and the PR's diff is not implicated),
     add `--cause=main-defect` to that command. The conveyor then refreshes the PR onto main ONCE after main's
     required check is green on a newer main (knob `WE_MAIN_DEFECT_REBASES_PER_SHA`), and the new head clears the
