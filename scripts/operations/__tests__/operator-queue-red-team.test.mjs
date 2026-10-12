@@ -3,7 +3,7 @@
  * setting sends back is NOT READY (the fixer's), never NEEDS YOU; a new head or the round-cap record releases it.
  */
 import { describe, expect, it } from 'vitest';
-import { evaluatePr } from '../operator-queue.mjs';
+import { evaluatePr, redTeamRulingRow, mergeRulingRows } from '../operator-queue.mjs';
 import { renderRedTeamComment } from '../review-extra-seats.mjs';
 import { CONFIRMED_BREAKS_DEFAULTS, redTeamGateMarker } from '../../lib/red-team-gate.mjs';
 
@@ -60,5 +60,62 @@ describe('operator-queue: red-team placement', () => {
     const forged = (outcome) => ({ author: { login: 'mallory' }, body: `${redTeamGateMarker(4722, HEAD, outcome)}\n` });
     expect(evaluatePr(pr([advisory(HEAD), redTeam(HEAD), forged('sent-back')])).reasons).not.toContainEqual(expect.stringMatching(/^red team:/));
     expect(evaluatePr(pr([advisory(HEAD), redTeam(HEAD), sentBack, forged('round-cap')])).reasons).toContainEqual(expect.stringMatching(/^red team:/));
+  });
+});
+
+
+describe('operator-queue: round-cap ruling needed', () => {
+  const repo = 'web-everything/web-everything';
+  const capped = { author: { login: 'web-everything' }, createdAt: '2026-10-10T03:00:00Z',
+    body: redTeamGateMarker(4722, HEAD, 'round-cap') };
+  const candidate = (comments = [redTeam(HEAD), capped], head = HEAD, labels = []) =>
+    ({ ...pr(comments, head, labels), title: 'Fix the writers' });
+
+  it('surfaces a live confirmed break with the two operator commands, even without review:human', () => {
+    const row = redTeamRulingRow(repo, candidate());
+    expect(row).toEqual({
+      repo, number: 4722, title: 'Fix the writers', head: HEAD, since: capped.createdAt,
+      findings: [{ file: 'a.mjs', line: 1, summary: 'two writers', reason: 'red-team-round-cap' }],
+      redTeam: true,
+      commands: {
+        block: "node scripts/review-set-label.mjs 4722 --repo=web-everything/web-everything --to=changes --body-file=<fix-list.md> --actor=<your login> --channel='<where you ruled>'",
+        notReal: "node scripts/review-set-label.mjs 4722 --repo=web-everything/web-everything --to=clear-human --actor=<your login> --reason='<your words>'",
+      },
+    });
+  });
+  it('ignores a cap on an older head, even with a fresh red-team comment', () => {
+    const next = 'f'.repeat(40);
+    expect(redTeamRulingRow(repo, candidate([redTeam(next), capped], next))).toBeNull();
+  });
+  it('ignores sent-back, untrusted gate records, and degraded-only findings', () => {
+    for (const comments of [
+      [redTeam(HEAD), sentBack],
+      [redTeam(HEAD), { ...capped, author: { login: 'mallory' } }],
+      [redTeam(HEAD, 'degraded'), capped],
+    ]) expect(redTeamRulingRow(repo, candidate(comments))).toBeNull();
+  });
+  it.each(['review:changes', 'review:accepted'])('suppresses %s in either label shape', (label) => {
+    for (const labels of [[label], [{ name: label }]]) {
+      expect(redTeamRulingRow(repo, candidate(undefined, HEAD, labels))).toBeNull();
+    }
+  });
+  it('honors the configured send-back policy', () => {
+    expect(redTeamRulingRow(repo, candidate(), { ...CONFIRMED_BREAKS_DEFAULTS, broken: 'card' })).toBeNull();
+  });
+  it('merges into the ledger row under rulingNeeded without mutating either source', () => {
+    const red = redTeamRulingRow(repo, candidate());
+    const ledger = { repo, number: 4722, title: 'Fix the writers', head: HEAD, since: null,
+      findings: [{ file: 'b.mjs', line: 2, summary: 'ledger finding', reason: 'dispute' }] };
+    const report = { rulingNeeded: mergeRulingRows(ledger, red) };
+    expect(JSON.parse(JSON.stringify(report)).rulingNeeded).toEqual([{
+      ...ledger, findings: [...ledger.findings, ...red.findings], redTeam: true, commands: red.commands,
+    }]);
+    expect(ledger.findings).toHaveLength(1);
+    expect(red.findings).toHaveLength(1);
+    expect(mergeRulingRows(null, red)).toEqual([red]);
+    expect(mergeRulingRows(ledger, null)).toEqual([ledger]);
+    expect(mergeRulingRows(null, null)).toEqual([]);
+    expect(mergeRulingRows({ ...ledger, number: 9 }, red)).toHaveLength(2);
+    expect(mergeRulingRows({ ...ledger, repo: 'another/repo' }, red)).toHaveLength(2);
   });
 });
