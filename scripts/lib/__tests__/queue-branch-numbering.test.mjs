@@ -144,8 +144,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withNumberingLock } from '../../readiness/drain-lock.mjs';
-import { buildFollowupInput, followupSteps } from '../drain-followup-job.mjs';
-import { openReservationPr, probeQueuedLand } from '../queue-branch-numbering.mjs';
+import { buildFollowupInput } from '../drain-followup-job.mjs';
+import { openReservationPr, probeQueuedLand, sweepQueuedHashCards } from '../queue-branch-numbering.mjs';
 
 it('retains reservations when the pass cannot prove a PR closed', () => {
   expect(openReservationPr({ prsByRepo: new Map([['r', []]]), contextComplete: true }, 'r', 1)).toBe(false);
@@ -153,18 +153,16 @@ it('retains reservations when the pass cannot prove a PR closed', () => {
   expect(openReservationPr({ prsByRepo: new Map(), contextComplete: true }, 'r', 1)).toBeUndefined();
 });
 
-it('threads the queue flag and skips detached numbering before any git or lock operation', () => {
-  const input = buildFollowupInput({ numberingOnBranch: true });
-  const lock = vi.fn(() => { throw new Error('must not lock'); });
-  const exec = vi.fn(() => { throw new Error('must not execute'); });
-  expect(followupSteps({ cwd: '/unused', exec, withNumberingLock: lock })[0].run({ input })).toMatchObject({ skipped: expect.any(String) });
-  expect(lock).not.toHaveBeenCalled(); expect(exec).not.toHaveBeenCalled();
+it('threads the queue flag into follow-up input', () => {
+  expect(buildFollowupInput({ numberingOnBranch: true }).numberingOnBranch).toBe(true);
   expect(buildFollowupInput({})).not.toHaveProperty('numberingOnBranch');
 });
 
 it('reports stranded queue hashes with a read-only probe', () => {
   const exec = vi.fn(() => 'backlog/xabc123-bad.md\n'); const write = vi.fn();
-  expect(probeQueuedLand('/clone', { exec, log: { write } }).warning).toContain('not pushed; the merge_group gate should have refused it');
+  const result = probeQueuedLand('/clone', { exec, log: { write } });
+  expect(result.files).toEqual(['backlog/xabc123-bad.md']);
+  expect(result.warning).toContain('not pushed; the merge_group gate should have refused it');
   expect(exec).toHaveBeenCalledTimes(1);
   expect(exec.mock.calls[0][1][0]).toBe('ls-tree');
   expect(write).toHaveBeenCalledWith(expect.stringContaining('WARNING'));
@@ -204,3 +202,41 @@ it('publishes a real fast-forward numbering commit to the PR branch, never main'
     expect(git('rev-parse', 'HEAD')).toBe(old);
   } finally { rmSync(root, { recursive: true, force: true }); }
 }, 30_000);
+
+describe('sweepQueuedHashCards', () => {
+  function setup() {
+    const nodes = [1, 2, 3, 4].map((number) => ({ id: `entry-${number}`, state: 'QUEUED', pullRequest: {
+      id: `pr-${number}`, number, headRefName: `topic-${number}`, headRefOid: `sha-${number}`, isCrossRepository: number === 3,
+    } }));
+    const exec = vi.fn((cmd, args) => {
+      if (cmd === 'gh' && args[3].startsWith('query=query(')) return JSON.stringify({ data: { repository: { mergeQueue: { entries: { nodes } } } } });
+      if (args[0] === 'ls-tree') return args[3] === 'sha-2' ? 'backlog/012-clean.md' : 'backlog/xabc123-card.md';
+      return '{}';
+    });
+    return { repo: 'owner/repo', cwd: '/clone', exec, log: { write: vi.fn() }, prepare: vi.fn(() => ({ action: 'numbered', newHead: 'new' })), isOpen: () => true };
+  }
+  it('dequeues hash-bearing PRs, prepares their branches, and leaves clean and cross-repo PRs alone', () => {
+    const x = setup();
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [1, 4], errors: [] });
+    expect(x.exec).toHaveBeenCalledWith('gh', ['api', 'graphql', '-f', expect.stringContaining('mergeQueue(branch:"main")'), '-f', 'owner=owner', '-f', 'name=repo'], expect.any(Object));
+    expect(x.exec).toHaveBeenCalledWith('gh', ['api', 'graphql', '-f', 'query=mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', '-f', 'id=pr-1'], expect.any(Object));
+    expect(x.prepare).toHaveBeenCalledWith({ c: { num: 1, repo: null, headRef: 'topic-1', item: null, hasManifest: false }, traceHeadSha: 'sha-1', cwd: '/clone', isLocal: true, isOpen: x.isOpen });
+    expect(x.prepare).toHaveBeenCalledTimes(2);
+    expect(x.exec.mock.calls.some(([, args]) => args.includes('refs/heads/topic-3'))).toBe(false);
+    expect(x.log.write).toHaveBeenCalledWith(expect.stringContaining('PR 1 DEQUEUED: carries hash card(s) backlog/xabc123-card.md'));
+  });
+  it('continues after an entry fetch fails', () => {
+    const x = setup(); const exec = x.exec;
+    x.exec = vi.fn((cmd, args, opts) => {
+      if (args.includes('refs/heads/topic-1')) throw new Error('fetch failed');
+      return exec(cmd, args, opts);
+    });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [4], numbered: [4], errors: [{ num: 1, reason: 'fetch failed' }] });
+  });
+  it('records preparation refusal and queue-read failure without throwing', () => {
+    const x = setup(); x.prepare.mockReturnValue({ action: 'skip', reason: 'mutex refused' });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [1, 4], numbered: [], errors: [{ num: 1, reason: 'mutex refused' }, { num: 4, reason: 'mutex refused' }] });
+    x.exec.mockImplementation(() => { throw new Error('queue unavailable'); });
+    expect(sweepQueuedHashCards(x)).toEqual({ dequeued: [], numbered: [], errors: [{ num: null, reason: 'queue unavailable' }] });
+  });
+});

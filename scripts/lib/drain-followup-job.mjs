@@ -151,14 +151,19 @@ function underNumberingLock(withNumberingLock, label, fn) {
 export function followupSteps(deps) {
   const {
     cwd, exec = execFileSync, numberPendingHashes, resolveLandedItem, planResolveOnLand, pushNumberingOnLand,
-    regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand = null, now = () => new Date().toISOString(),
+    regenDerivedOnLand, withNumberingLock, syncPrimaryOnLand = null, log = process.stderr, now = () => new Date().toISOString(),
   } = deps;
   return [
     {
       name: 'number-resolve-push',
-      run: ({ input }) => input.numberingOnBranch ? { skipped: 'numbering and resolve happen on the PR branch before enqueue' } : underNumberingLock(withNumberingLock, 'number-resolve-push', (heartbeat = () => {}) => {
+      run: ({ input }) => underNumberingLock(withNumberingLock, 'number-resolve-push', (heartbeat = () => {}) => {
         const baseSha = resetToRemoteTip({ exec, cwd });
         heartbeat();
+        if (input.numberingOnBranch) {
+          const files = String(exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+          if (!files.split(/\r?\n/).some((file) => /^backlog\/x[0-9a-z]{6}-[^/]*\.md$/.test(file))) return { skipped: 'numbering and resolve happen on the PR branch before enqueue' };
+          log.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
+        }
         const n = numberPendingHashes(cwd);
         heartbeat();
         const plan = planResolveOnLand({ landedItems: input.landedItems, assigned: n.assigned, carriers: input.carriers, openHeadRefs: input.openHeadRefs });

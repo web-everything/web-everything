@@ -169,7 +169,7 @@ import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { logQueueNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand } from './lib/queue-branch-numbering.mjs';
+import { logQueueNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -6089,6 +6089,7 @@ async function runCli() {
   // Queue-mode branch numbering (mq-number-before-enqueue): number + resolve cards on the PR branch before enqueue.
   const numberCardsBeforeEnqueue = logQueueNumbering();
   const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null);
+  if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
   const coupleHeld = [];
@@ -6602,7 +6603,9 @@ async function runCli() {
   // none of them is the silent skip this whole item was filed against.
   let resolveOnLandReport = { resolved: [], alreadyResolved: [], deferred: [], failed: [] };
   if (landedLocalAny && numberingOnBranch && !DRY_RUN) numbered = probeQueuedLand(process.cwd());
-  if (landedLocal && !DRY_RUN && !numberingOnBranch) {
+  const queuedHashOnMain = !!numbered.files?.length;
+  if (landedLocal && !DRY_RUN && (!numberingOnBranch || queuedHashOnMain)) {
+    if (queuedHashOnMain) process.stderr.write('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
     // #2391 — number+publish is the NUMBERING CRITICAL SECTION (sole-serial-writer, #2288/#2290). Guard it with
     // the TTL-bounded numbering mutex so a concurrent drain/land never mints the same NNN off the same base.
     const numLock = withNumberingLock(() => {

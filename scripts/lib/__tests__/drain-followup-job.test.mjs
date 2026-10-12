@@ -6,7 +6,7 @@
  *   launch that is SIGKILLed mid-job, picked up by a fresh store after a simulated daemon restart, and resumes
  *   from its checkpoint so numbering and its push happen exactly once.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -142,6 +142,29 @@ describe('followupSteps', () => {
   });
 
   beforeEach(() => { makeFollowupWorktreePreparer({ repoDir: clone, worktreeDir: worktree })(); });
+
+  it.each([false, true])('number-resolve-push with branch numbering checks fresh main (hash present: %s)', (hasHash) => {
+    const { calls, deps } = fakes();
+    const exec = vi.fn((cmd, args) => {
+      if (args[0] === 'rev-parse') return args[1] === '--git-dir' ? '/repo/.git/worktrees/job' : args[1] === '--git-common-dir' ? '/repo/.git' : 'tip';
+      if (args[0] === 'ls-tree') return hasHash ? 'backlog/xabc123-card.md' : 'backlog/123-card.md\nother/xabc123-card.md\nbacklog/nested/xabc123-card.md';
+      return '';
+    });
+    const log = { write: vi.fn() };
+    const out = followupSteps({ ...deps, exec, log })[0].run({ input: { ...input, numberingOnBranch: true } });
+    expect(exec).toHaveBeenCalledWith('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], expect.any(Object));
+    expect(exec.mock.calls.findIndex(([, args]) => args[0] === 'fetch')).toBeLessThan(exec.mock.calls.findIndex(([, args]) => args[0] === 'ls-tree'));
+    expect(calls.number).toBe(hasHash ? 1 : 0);
+    expect(calls.push).toEqual(hasHash ? [true] : []);
+    if (hasHash) {
+      expect(out.numbering.pushed).toBe(true);
+      expect(log.write).toHaveBeenCalledWith('  ⚠ FALLBACK: hash card(s) reached main under the merge queue — running the post-land JIT push so main does not stay red\n');
+    } else {
+      expect(out.skipped).toEqual(expect.any(String));
+      expect(calls.resolve).toEqual([]);
+      expect(log.write).not.toHaveBeenCalled();
+    }
+  });
 
   it('numbers, resolves from the RECORD (deferring a half-open couple) and pushes once, under the lock with no unlocked fallback', () => {
     // A crashed earlier attempt left an unpushed local commit: the step must rebuild from the remote tip.

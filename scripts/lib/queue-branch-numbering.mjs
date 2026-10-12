@@ -157,14 +157,51 @@ export function finishBranchPreparation(out, { c, revalidationAborted, needsAcce
   return false;
 }
 
+/** Evict pre-rollout hash-bearing queue entries; normal drain admission waits for their new CI. */
+export function sweepQueuedHashCards({ repo, cwd = process.cwd(), exec = execFileSync, log = process.stderr,
+  prepare = prepareBranchBeforeEnqueue, isOpen } = {}) {
+  const result = { dequeued: [], numbered: [], errors: [] };
+  const fail = (num, e) => {
+    const reason = String(e.message || e);
+    result.errors.push({ num, reason });
+    log.write(`  ⚠ merge-queue sweep${num == null ? '' : ` PR ${num}`}: ${reason}\n`);
+  };
+  const run = (cmd, args) => exec(cmd, args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const graphql = (query, fields) => {
+    const response = JSON.parse(run('gh', ['api', 'graphql', '-f', `query=${query}`, ...fields.flatMap((field) => ['-f', field])]));
+    if (response.errors?.length) throw new Error(response.errors.map((e) => e.message).join('; '));
+    return response;
+  };
+  try {
+    const [owner, name] = repo.split('/');
+    const queue = graphql('query($owner:String!,$name:String!){repository(owner:$owner,name:$name){mergeQueue(branch:"main"){entries(first:100){nodes{id state pullRequest{id number headRefName headRefOid isCrossRepository}}}}}}', [`owner=${owner}`, `name=${name}`]);
+    for (const { pullRequest: pr } of queue.data.repository.mergeQueue?.entries.nodes || []) {
+      if (pr.isCrossRepository) continue;
+      try {
+        run('git', ['fetch', 'origin', `refs/heads/${pr.headRefName}`]);
+        const files = hashBacklogFiles(run('git', ['ls-tree', '-r', '--name-only', pr.headRefOid, '--', 'backlog/']));
+        if (!files.length) continue;
+        graphql('mutation($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', [`id=${pr.id}`]);
+        result.dequeued.push(pr.number);
+        log.write(`  ⇠ PR ${pr.number} DEQUEUED: carries hash card(s) ${files.join(', ')} — numbering on its branch, re-enqueued after CI\n`);
+        const out = prepare({ c: { num: pr.number, repo: null, headRef: pr.headRefName, item: null, hasManifest: false }, traceHeadSha: pr.headRefOid, cwd, isLocal: true, isOpen });
+        log.write(`  ↻ PR ${pr.number} queue branch preparation: ${out.action}${out.reason ? ` — ${out.reason}` : ''}${out.newHead ? ` → ${out.newHead}` : ''}\n`);
+        if (out.action === 'numbered') result.numbered.push(pr.number);
+        else if (out.action === 'skip') fail(pr.number, out.reason);
+      } catch (e) { fail(pr.number, e); }
+    }
+  } catch (e) { fail(null, e); }
+  return result;
+}
+
 export function probeQueuedLand(cwd, { exec = execFileSync, log = process.stderr } = {}) {
   const assigned = [];
   try {
     const files = hashBacklogFiles(exec('git', ['ls-tree', '-r', '--name-only', 'origin/main', '--', 'backlog/'], { cwd, encoding: 'utf8' }));
-    if (!files.length) return { assigned, committed: false };
+    if (!files.length) return { assigned, committed: false, files };
     const warning = `hash card(s) ${files.join(', ')} on main after a queued land — not pushed; the merge_group gate should have refused it`;
     log.write(`  ⚠ WARNING: ${warning}\n`);
-    return { assigned, committed: false, warning };
+    return { assigned, committed: false, files, warning };
   } catch (e) {
     const warning = `queued-land numbering probe failed — not pushed: ${e.message}`;
     log.write(`  ⚠ WARNING: ${warning}\n`);
