@@ -761,3 +761,11 @@ describe('CLI --json flush — the full payload round-trips through an execFileS
     expect(out.trimEnd().endsWith('}')).toBe(true);
   }, 60_000); // the shell spawns several collectors — generous timeout, not a perf assertion
 });
+
+it.each(['enforce', 'shadow', 'off'])('shapeQueue carries finite buildPriority in %s mode', (priorityMode) => {
+  const queue = [0, 3, null, undefined, Infinity, NaN, '2'].map((buildPriority, i) => ({ num: String(i), buildPriority }));
+  const shaped = shapeQueue({ priorityMode, queue });
+  expect(shaped[0].buildPriority).toBe(0);
+  expect(shaped[1].buildPriority).toBe(3);
+  for (const row of shaped.slice(2)) expect(row).not.toHaveProperty('buildPriority');
+});

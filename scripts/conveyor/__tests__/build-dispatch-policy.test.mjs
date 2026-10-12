@@ -577,3 +577,10 @@ describe('main-red freeze', () => {
     expect(plan.mainRedFreeze).toEqual({ frozen: false });
   });
 });
+
+it('prepareAheadNums prioritizes P0 then the operator list before class', () => {
+  const queue = [{ num: '1', priorityClass: 'P2' }, { num: '2', priorityClass: 'P3', buildPriority: 1 },
+    { num: '3', priorityClass: 'P0' }, { num: '4', priorityClass: 'P3', buildPriority: 0 }];
+  const launch = queue.map(({ num }) => ({ num }));
+  expect([...prepareAheadNums({ queue, launch, window: 3 })]).toEqual(['3', '4', '2']);
+});
