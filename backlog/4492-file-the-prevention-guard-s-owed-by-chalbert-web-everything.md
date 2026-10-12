@@ -3,9 +3,10 @@ bornAs: x6zg9hx
 kind: story
 size: 3
 parent: "4075"
-status: open
+status: active
 scope: ["we:scripts/conveyor/__tests__/hung-session.test.mjs", "we:scripts/conveyor/hung-session-mutation-check.mjs", "we:scripts/conveyor/__tests__/hung-session-mutation-check.test.mjs"]
 dateOpened: "2026-09-29"
+dateStarted: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "dfe8b082a4e6a08541a3681e99d85b0db2b99e58"
 tags: []
@@ -20,6 +21,27 @@ Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outsta
 Idempotency key (do not edit): approval-prevention-key:chalbert/web-everything#2939@2789b3efcec6d5140dcb54f4763b793752353d86
 
 ## Progress
+
+- Delivery revalidation (2026-10-12): the three source targets remain exact-once and the named cases/checker were absent. Implemented the bounded checker and injected-runner refusal tests. Before adding the regression group, the real admitted CLI exited 1 with `missing required case: Parsed timestamp fallback omitted`. Added seven deterministic shared-reader cases. Real-run debugging corrected Vitest 1's empty file-suite prefix and quoted table titles; the final checker uses exact normalized names and stable `%s` titles. Its runtime-error receipt additionally rejects unhandled errors omitted by Vitest's JSON reporter.
+- Delivery verification (2026-10-12): the real admitted checker exited 0 with the evidence below. Afterward, the admitted unmodified reader/checker suites passed all 194 tests (71 reader, 123 checker). The runtime source SHA-256 was identical before and after: `59ef1a08f787d1f0e905aef33a2d88a042e416552b104f1f0be213fdc8105089`. No mutant, temporary config, or report-directory artifacts remained. The repository standards gate is left to the wrapper, as required by the delivery brief.
+
+  Acceptance command: `node we:scripts/readiness/heavy-admission.mjs run -- node we:scripts/conveyor/hung-session-mutation-check.mjs`
+
+  ```text
+  baseline: 7 named cases passed
+  epoch-default: KILLED
+    Parsed timestamp fallback omitted: expected +0 to be 12345 // Object.is equality
+    Parsed timestamp fallback null: expected +0 to be 12345 // Object.is equality
+  zero-mtime: KILLED
+    Parsed timestamp fallback omitted: expected +0 to be 12345 // Object.is equality
+    Parsed timestamp fallback null: expected +0 to be 12345 // Object.is equality
+    Parsed timestamp fallback empty: expected +0 to be 12345 // Object.is equality
+    Parsed timestamp fallback invalid: expected +0 to be 12345 // Object.is equality
+  always-stat: KILLED
+    Parsed timestamp fallback mixed-forward: expected 12345 to be 1790545474000 // Object.is equality
+    Parsed timestamp fallback mixed-reverse: expected 12345 to be 1790545474000 // Object.is equality
+  hung-session-mutation-check: OK — three mutants killed
+  ```
 
 - Original premise/scope: the approval advisory requested branch coverage or mutation testing for the `Date.parse` fallback, naming only we:scripts/conveyor/__tests__/hung-session.test.mjs.
 - Corrected premise: this is prevention debt, not a demonstrated runtime bug. The timestamp scan now belongs to `readTranscriptTailActivity` in we:scripts/conveyor/hung-session.mjs:151-201 (extracted by commit `2789b3efcec6d5140dcb54f4763b793752353d86`). Its successfully summarized entries pass through `Date.parse(entry?.ts ?? '')`; only finite timestamps suppress the mtime fallback.
