@@ -2,9 +2,10 @@
 bornAs: x09e2bn
 kind: story
 size: 2
-status: open
+status: resolved
 scope: ["we:scripts/merge-ai-prs.mjs", "we:scripts/readiness/red-main-remediation.mjs"]
 dateOpened: "2026-10-09"
+dateResolved: "2026-10-12"
 tags: []
 ---
 
