@@ -208,6 +208,8 @@ import { prepareDrainFreeze, drainFreezeSignal, flatText } from './lib/red-main-
 import { resolveRedMainHoldSetting, resolveRedMainMode, decideRedMainHold, RED_MAIN_HOLD_REASON } from './lib/red-main-hold.mjs';
 import { resolveAcceptCarryForward, latestAcceptRecord, decideAcceptCarryForward, laterReviewHold } from './lib/accept-carry-forward.mjs'; // card xu7kxtt (#5472) — an identical net diff keeps the accept
 import { decideQuarantineHold, resolveFixFiles, listedPrFiles } from './lib/red-main-quarantine.mjs'; // mode `quarantine` (OFF by default until its red-team review)
+import { readPinnedChangedFiles } from './lib/merge-queue-enqueue.mjs';
+import { decideDrainWorkflowEditHold, resolveDrainWorkflowEditHuman } from './lib/drain-workflow-edit-hold.mjs';
 import { readQuarantine } from './lib/red-main-quarantine-io.mjs'; // the "contain" third of the red-main safety net: while main is red only the main-fix PR(s) land
 export { remoteManifestApiArgs };
 
@@ -829,6 +831,9 @@ export function unlandableStateReason(state) {
 
 /** Unreadable verification defers this pass before any review-label writer runs. */
 export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
+  if (readOptions?.workflowOnly && !decideDrainWorkflowEditHold({
+    files: readOptions.files, filesComplete: readOptions.filesComplete, setting: readOptions.workflowEditSetting,
+  }).hold) return { action: 'merge' };
   let evidence = {};
   if (hasReviewLabel(labels, REVIEW_LABELS.accepted)) {
     try { evidence = readDrainAcceptance(readOptions); }
@@ -837,6 +842,27 @@ export function decideDrainReviewGate({ labels, ...gateInputs }, readOptions) {
         reason: `review acceptance verification unreadable — merge deferred this pass: ${error.message || error}` };
     }
   }
+  // Exact-head ceremony only: inspect the SAME acceptance reader's SHA before carry-forward can rebind it.
+  let files = readOptions?.files;
+  let filesComplete = Array.isArray(files) && readOptions?.filesComplete !== false
+    && (readOptions?.listedHeadSha === undefined || (!!readOptions.listedHeadSha
+      && (!evidence.headSha || readOptions.listedHeadSha.toLowerCase() === evidence.headSha.toLowerCase())));
+  if (!filesComplete && readOptions?.workflowEditSetting !== 'off' && readOptions?.local) {
+    const read = readPinnedChangedFiles({ headSha: evidence.headSha || readOptions.listedHeadSha,
+      base: readOptions.defaultBranch ?? 'main', cwd: readOptions.cwd ?? process.cwd(),
+      exec: readOptions.exec ?? execFileSync });
+    if (read.error) return { action: 'defer', applyLabel: null,
+      reason: `workflow-edit change list unreadable — merge deferred this pass: ${read.error}` };
+    files = read.files;
+    filesComplete = true;
+  }
+  const workflow = decideDrainWorkflowEditHold({ files, filesComplete,
+    headSha: evidence.headSha, humanClearedSha: evidence.humanClearedSha, setting: readOptions?.workflowEditSetting });
+  if (workflow.defer) return { action: 'defer', applyLabel: null, reason: workflow.reason };
+  if (workflow.hold) return { action: 'park', applyLabel: REVIEW_LABELS.human, humanRequired: true,
+    workflowEditHold: true, reason: workflow.reason };
+  // The bare/waived rubric pass uses only this additional boundary; its existing backstops still run.
+  if (readOptions?.workflowOnly) return { action: 'merge' };
   // #xnqxtdy — a recorded human clearance carries across a merge-of-main head move with a byte-identical net diff
   // (we:scripts/lib/human-clearance-carry.mjs); the durable record is posted before the clearance is honoured.
   const carry = applyHumanClearanceCarry({ evidence, pr: readOptions?.pr, repo: readOptions?.repo,
@@ -1924,6 +1950,13 @@ export function buildDrainVerdicts({ prsByRepo, readOf, repos = [], requiredChec
       // verdict scored). The pre-merge revalidation pins the merge to it; it does not depend on the commits read
       // returning the whole history (a capped connection would leave `headSha` short of the real tip).
       v.listedHeadSha = typeof p.headRefOid === 'string' && p.headRefOid ? p.headRefOid : null;
+      v.listedFiles = listedPrFiles(p);
+      // gh file rows expose the destination path only. Renames/copies (and rows without
+      // change metadata) cannot prove that a workflow path was not removed: use the
+      // pinned --no-renames read in both the review gate and the bare sweep.
+      v.listedFilesComplete = v.listedFiles !== null && v.listedFiles.length === p.files.length
+        && p.files.every((f) => typeof f === 'string'
+          || ['ADDED', 'MODIFIED', 'DELETED'].includes(f?.changeType));
       // #3308 (round-2 correctness fix) — the PASS-WIDE half of the relief valve, recorded HERE because it is the
       // only place it is knowable. The scoped `=<pr#>` form stamps `v.reliefWaived` down in the escalation loop,
       // but that whole loop is gated on `REVIEW_ESCALATION = label && !escalationRelief.passWide` — so under a BARE
@@ -4268,6 +4301,11 @@ async function runCli() {
   const overlapYieldOverrides = parseOverlapYieldOverrides({ argv, env: process.env });
   const AS_JSON = !!flags.json;
   const DRY_RUN = !!flags['dry-run'];
+  const workflowEditSetting = resolveDrainWorkflowEditHuman();
+  process.stderr.write(`policy · drainWorkflowEditHuman=${workflowEditSetting.value} (${workflowEditSetting.source})\n`);
+  const workflowReadOptions = (v) => ({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
+    listedHeadSha: v.listedHeadSha, workflowEditSetting: workflowEditSetting.value,
+    local: isLocalRepo(v.repo), defaultBranch: defaultBranchOf(v.repo) });
   const REQUIRED = typeof flags.check === 'string' ? flags.check : 'test';
   // #2290 — `--only=<pr>` (alias `--couple=<pr>`, and the legacy `--pr=<pr>`) scopes the sweep to ONE PR: the
   // single-couple FAST DRAIN that /pr (pr-land) and /finish (lane-resume) shell so they still feel instant
@@ -4862,10 +4900,10 @@ async function runCli() {
     const run = async (limit) => {
       // #4108 (converge round 2) — only widen to SWEEP_LIST_FIELDS when RECONCILE is actually on: that is the
       // ONLY case anything reuses this repo's rows for the context (see `liveListingsByRepo` below). RECONCILE
-      // off means this call is never reused, so the extra context fields (`files`, `isDraft`) would just be
-      // GraphQL cost with no offsetting call removed.
+      // off means this call is never reused, but the workflow-edit gate still needs `files` when enabled.
       const listArgs = ['pr', 'list', ...repoFlag(repo), '--state', 'open', '--limit', String(limit),
-        '--json', RECONCILE ? SWEEP_LIST_FIELDS : CANDIDATE_ONLY_FIELDS];
+        '--json', RECONCILE ? SWEEP_LIST_FIELDS
+          : CANDIDATE_ONLY_FIELDS + (workflowEditSetting.value !== 'off' ? ',files' : '')];
       const { stdout } = await execFileP('gh', listArgs, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
       return JSON.parse(stdout.trim() || '[]');
     };
@@ -5204,6 +5242,15 @@ async function runCli() {
     const allowPending = !!label; // `--label ... --no-review-escalation`: explicit operator override, honor review:pending
     for (const v of verdicts) {
       if (v.decision !== 'merge') continue; // @merge-gate-exempt DOWNGRADE-only backstop (merge→skip); a held PR is already `skip`, so it needs no reviewHeld branch — re-admitting it here could only wrongly merge it
+      if (decideDrainWorkflowEditHold({ files: v.listedFiles, filesComplete: v.listedFilesComplete,
+        setting: workflowEditSetting.value }).hold) {
+        const gate = decideDrainReviewGate({ labels: v.prLabels, escalate: false }, {
+          pr: v.num, repo: v.repo, ...workflowReadOptions(v), workflowOnly: true });
+        if (gate.action !== 'merge') {
+          v.decision = 'skip'; v.reason = gate.reason; v.humanRequired = !!gate.humanRequired;
+          continue;
+        }
+      }
       if (hasUnclearedReviewLabel(v.prLabels, { allowPending })) {
         v.decision = 'skip';
         v.reason = allowPending
@@ -5585,7 +5632,7 @@ async function runCli() {
       // named, tested place.
       const gate = decideDrainReviewGate(
         drainGateInputs({ score, labels: v.prLabels, deviation: v.deviation }),
-        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN });
+        { pr: v.num, repo: v.repo, cwd: escCwd, local: isLocalRepo(v.repo), dryRun: DRY_RUN, ...workflowReadOptions(v) });
       if (gate.action === 'defer') {
         v.decision = 'skip';
         v.reason = gate.reason;
@@ -5624,7 +5671,7 @@ async function runCli() {
         // message), NOT on the fresh-diff `score.reasons`. PREPEND it (not either/or): the ride-in commit can
         // ALSO produce fresh escalation reasons (it may touch a blast-radius path), and the operator needs BOTH
         // — WHY the accept was invalidated AND what the new commit tripped — on the durable body/comment/log.
-        const parkReasons = gate.staleAcceptance ? [gate.reason, ...score.reasons] : score.reasons;
+        const parkReasons = gate.staleAcceptance || gate.workflowEditHold ? [gate.reason, ...score.reasons] : score.reasons;
         // #2832 / #984 F2 — the go-ahead strip runs for EVERY park/wait-author outcome, OUTSIDE the
         // `gate.applyLabel` guard below. `review:changes` reaches here as `wait-author` with NO `applyLabel`, so
         // nesting the strip under that guard left it as the one hold label with no standing reconcile. Keyed on
