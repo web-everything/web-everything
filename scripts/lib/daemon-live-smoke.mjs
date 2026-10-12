@@ -1091,10 +1091,26 @@ export function hasGithubAuthSignature(results) {
   return Array.isArray(results) && results.some((r) => !r.ok && GITHUB_AUTH_FAILURE_RE.test(String(r.detail ?? '')));
 }
 
+/** Policy `smokeGithubPerOwner` (platform / env `WE_SMOKE_GH_PER_OWNER` 0|1 over standard `{enabled:true}`).
+ *  @returns {{enabled:boolean, source:string}} */
+export function resolveSmokeGithubPerOwner(env = process.env) {
+  try {
+    const v = env?.WE_SMOKE_GH_PER_OWNER;
+    const r = cascadePolicy('smokeGithubPerOwner', undefined, {
+      env, standard: { enabled: true },
+      envValues: { enabled: v === '0' ? false : v === '1' ? true : undefined },
+      valid: { enabled: (x) => typeof x === 'boolean' },
+    });
+    return { enabled: r.value?.enabled !== false, source: r.sources?.enabled ?? 'standard' };
+  } catch { return { enabled: true, source: 'standard' }; }
+}
+
 /**
- * Return a COPY of `env` whose `GH_TOKEN` is the fleet's current App installation token — the exact refresh a
- * daemon's own tick runs first (`github-app-auth-env.mjs#ensureFreshGithubAppEnv`), written into the copy,
- * never into `process.env`. `force` skips the cache and mints (used once, after GitHub rejected the token).
+ * Return a COPY of `env` with fresh fleet App auth and, by default, the per-owner gh shim in PATH.
+ * Live 2026-10-12 ET: the drain code clone held off #4966 when reconcile-dry-run failed on the two private
+ * cross-org repos because the smoke pinned one org's token. Per-owner refresh clears inherited pinned tokens
+ * from the copy; disabling `smokeGithubPerOwner` restores the single-token path. Never mutates `process.env`.
+ * `force` skips the cache and mints (used once, after GitHub rejected the token).
  * App auth not configured, or a failed mint, leaves `env` as it was. Never throws.
  * @param {{env?:NodeJS.ProcessEnv, force?:boolean, ensureFresh?:typeof ensureFreshGithubAppEnv, log?:Console}} [o]
  * @returns {Promise<{env:NodeJS.ProcessEnv, refresh:{applied:boolean, reason:string}|null}>}
@@ -1103,14 +1119,23 @@ export async function refreshSmokeGithubEnv({
   env = process.env, force = false, ensureFresh = ensureFreshGithubAppEnv, log = console,
 } = {}) {
   const out = { ...env };
+  const perOwner = resolveSmokeGithubPerOwner(env);
+  try {
+    if (!process.env.VITEST) log.error?.(`daemon-live-smoke: smoke-gh-per-owner ${JSON.stringify(perOwner)}`);
+  } catch { /* logging never changes the smoke */ }
   let refresh = null;
   try {
     refresh = await ensureFresh({
       env: out,
+      perOwner: perOwner.enabled,
       setEnv: (token) => { out.GH_TOKEN = token; },
       ...(force ? { readCache: () => null } : {}),
       log,
     });
+    if (refresh?.applied === true && refresh.perOwner === true) {
+      delete out.GH_TOKEN;
+      delete out.GITHUB_TOKEN;
+    }
   } catch (e) {
     refresh = { applied: false, reason: `refresh-threw: ${firstLine(e)}` };
   }
