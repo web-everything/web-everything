@@ -28,7 +28,7 @@ process.stdout.write('ran-from=' + realpathSync(root) + '\\n');
 process.exit(0);
 `;
 const git = (cwd, ...args) => execFileSync('git', args, {
-  cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000,
+  cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 1024 * 1024,
 });
 
 export default {
