@@ -14,6 +14,8 @@ import { execFileSyncThrottled as execFileSync } from '../lib/gh-throttle.mjs';
  *   - (card x1b8hlo) the post-accept red team has no CONFIRMED break on the live head that `redTeam.confirmedBreaks`
  *     sends back to the fixer (`we:scripts/lib/red-team-gate.mjs#redTeamQueueReason`).
  *
+ * RULING NEEDED also includes trusted live-head red-team round-cap records with unresolved send-back findings.
+ *
  * THREE BUCKETS, not two. `mergeable: UNKNOWN` is GitHub's transient "still computing" state, and reporting it in
  * NOT READY ("agent work is owed") made a healthy PR flap between ready and not-ready from run to run. So an
  * UNKNOWN PR is re-polled a few times with backoff (GitHub computes on request); one that is STILL unknown lands in
@@ -48,7 +50,7 @@ import { standDownComments, standDownReason } from '../conveyor/stand-down.mjs';
 import { healthSectionLines } from '../conveyor/health-watch-section.mjs';
 // Card x1b8hlo — the LIGHT red-team gate module (no heavy graph): a confirmed red-team break the setting sends back
 // keeps the PR out of NEEDS YOU while it is unresolved on the live head.
-import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason } from '../lib/red-team-gate.mjs';
+import { CONFIRMED_BREAKS_DEFAULTS, readConfirmedBreaks, redTeamQueueReason, redTeamRulingNeeded } from '../lib/red-team-gate.mjs';
 // Staged CLI copies may omit this transitive graph. Without the canonical answer reader,
 // keep stand-downs visible as unanswered so the operator can still act on them.
 let standDownAnswers = null;
@@ -83,6 +85,32 @@ export function rulingNeededRow(repo, pr) {
     since: need.since === null ? null : new Date(need.since).toISOString(),
     findings: need.findings.map((f) => ({ file: f.file, line: f.line, summary: f.summary, reason: f.reason })),
   };
+}
+
+/** A red-team round-cap ruling and its read-only operator command suggestions. PURE. */
+export function redTeamRulingRow(repo, pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
+  const need = redTeamRulingNeeded(pr, setting);
+  if (!need) return null;
+  const command = `node scripts/review-set-label.mjs ${pr.number} --repo=${repo}`;
+  return {
+    repo, number: pr.number, title: pr.title, head: need.head, since: need.since,
+    findings: need.findings.map(({ file, line, summary }) => ({ file, line, summary, reason: 'red-team-round-cap' })),
+    redTeam: true,
+    commands: {
+      block: `${command} --to=changes --body-file=<fix-list.md> --actor=<your login> --channel='<where you ruled>'`,
+      notReal: `${command} --to=clear-human --actor=<your login> --reason='<your words>'`,
+    },
+  };
+}
+
+/** Combine both ruling sources for the same PR without changing either source row. PURE. */
+export function mergeRulingRows(ledger, redTeam) {
+  if (!ledger || !redTeam || ledger.repo !== redTeam.repo || ledger.number !== redTeam.number) {
+    return [ledger, redTeam].filter(Boolean);
+  }
+  return [{
+    ...ledger, findings: [...ledger.findings, ...redTeam.findings], redTeam: true, commands: redTeam.commands,
+  }];
 }
 
 /** The open-PR listing's stdout cap (it carries every PR's comments). See the listing call in `main`. */
@@ -489,8 +517,9 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
         else report.notReady.push({ ...row, reasons: result.reasons });
       }
       for (const pr of prs) {
-        const row = rulingNeededRow(repo, pr);
-        if (row) report.rulingNeeded.push(row);
+        report.rulingNeeded.push(...mergeRulingRows(
+          rulingNeededRow(repo, pr), redTeamRulingRow(repo, pr, redTeamSetting),
+        ));
       }
       // STOOD DOWN — every OPEN PR (any labels) carrying a stand-down comment, minus anything already in NEEDS
       // YOU above. `standDownComments` is the reused, single-sourced gate for "does this PR qualify at all".
@@ -540,7 +569,8 @@ export function main(args = process.argv.slice(2), { sleep = blockingSleep, poll
     printRows(report.ready.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n'));
     console.log('RULING NEEDED — review parked with confirmed findings; each needs your block/card/not-real ruling:');
     printRows(report.rulingNeeded.map((r) => `${r.repo}#${r.number}  ${r.title}  [waiting since ${r.since || 'time unknown'}, head ${r.head.slice(0, 9)}]\n`
-      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : ''}`).join('\n')).join('\n'));
+      + r.findings.map((f) => `    - ${f.file ?? '(no file)'}${f.line ? `:${f.line}` : ''}  ${f.summary}${f.reason === 'dispute' ? '  [came back after your block ruling; the fixer and reviewer disagree]' : f.reason === 'red-team-round-cap' ? '  [red team confirmed break; round cap reached, not sent back]' : ''}`).join('\n')
+      + (r.redTeam ? `\n    block (send back past the cap): ${r.commands.block}\n    not real (clear it):            ${r.commands.notReal}` : '')).join('\n'));
     console.log('PENDING — transient, re-run (GitHub is still computing mergeability; no agent work owed):');
     printRows(report.pending.map((pr) => `${pr.repo}#${pr.number}  ${pr.title}`).join('\n'));
     console.log('UNSUPPORTED REPO — owed work the conveyor cannot dispatch for this repo:');
