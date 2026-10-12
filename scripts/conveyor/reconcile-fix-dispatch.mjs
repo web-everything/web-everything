@@ -154,6 +154,8 @@ import {
   buildRoundResumePrompt, planRoundEscalation, planRoundResume, readRoundResumeInputs, roundOf,
 } from './fix-resume.mjs';
 import { loadFixerLadder } from './fixer-ladder.mjs';
+import { mainRedPriorityRank } from './main-ci-red-core.mjs';
+import { readMainRedPriority } from '../lib/main-red-priority.mjs';
 import { claudeSpawnAlias } from '../lib/dispatch-routing-policy.mjs';
 import { countRearmComments } from './rearm-review.mjs';
 import { countAdvisoryComments } from './advisory-round-count.mjs';
@@ -1735,6 +1737,8 @@ export function runReconcileFixDispatch({
   // The borrow guard's round-escalation inputs; injectable so a test never reads the live settings or ladder.
   fixSettings = resolveFixSettings(),
   loadLadder = () => loadFixerLadder(),
+  // The published red-main priority record, for an idle restack row the planner never built (hermetic under a test runner).
+  readMainRedPriorityRecord = () => readMainRedPriority(),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
@@ -1818,6 +1822,8 @@ export function runReconcileFixDispatch({
     let synthetic;
     try { synthetic = readPrForRestack?.(top); } catch { continue; }
     if (!synthetic) continue;
+    // The planner never saw this row: stamp the red-main fix PR here too, so its restack stays on Claude.
+    if (mainRedPriorityRank(synthetic.prNumber, readMainRedPriorityRecord(), { now: Date.now(), repo: repoKey }) === 0) synthetic = { ...synthetic, mainFix: true };
     // The agent pushes to this branch: only a same-repo PR whose head is the tip of its origin lane/* branch qualifies.
     if (synthetic.isCrossRepository !== false || !/^lane\//.test(synthetic.headRefName ?? '')) continue;
     idleLaneTips ??= readLaneTips(root);

@@ -47,7 +47,7 @@ export function resolveFixExecutorSetting({ env = process.env, platform = platfo
 
 /**
  * Pure; why this repair must run on Claude whatever `fix.executor` says, or null. The ONE list both the router
- * ({@link chooseFixExecutor}) and the fixer-cap borrow guard read, so a borrowed slot never bypasses the router.
+ * ({@link chooseFixExecutor}) and the fixer-cap borrow guard read, so a borrowed slot never bypasses these per-entry rules.
  */
 export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false } = {}) {
   if (takeover) return 'takeover round';

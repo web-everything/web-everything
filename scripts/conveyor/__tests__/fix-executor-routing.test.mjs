@@ -354,3 +354,37 @@ describe('a red-main fix PR stays on Claude through the real planner', () => {
     expect(await route(heal)).toMatchObject({ executor: 'claude', reason: 'main-fix' });
   });
 });
+
+// Self-review (PR #4897 round 3): an idle restack row is read from `gh pr view`, never from the planner, so the
+// dispatcher must stamp `mainFix` on it too; otherwise the red-main fix PR's restack routes codex-first.
+describe('an idle restack of the red-main fix PR stays on Claude', () => {
+  it('routes the restack through the router with mainFix set from the priority record', async () => {
+    const { runReconcileFixDispatch, routeFixExecutor } = await import('../reconcile-fix-dispatch.mjs');
+    const { detectStacks, PR_STACK_DEFAULTS } = await import('../pr-stack.mjs');
+    const bottom = { pr: 4624, headRefName: 'lane/red-main-contain', headRefOid: 'a'.repeat(40) };
+    const top = { pr: 4631, headRefName: 'lane/accept-carry-forward', headRefOid: 'c'.repeat(40) };
+    const now = Date.now();
+    const stacks = detectStacks([bottom, top], { isAncestor: (x, y) => x === bottom.headRefOid && y === top.headRefOid, now: () => now });
+    // Each run moves the bottom to a new head: the dispatcher dedupes a restack per (top, bottom head) in-process.
+    const run = (record, bottomHead) => {
+      const fixExecutorRoute = vi.fn((planned) => routeFixExecutor(planned,
+        { setting, fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null, launcherAvailable: true }));
+      const out = runReconcileFixDispatch({ root: '/repo', repo: 'we', checkStaleness: () => ({ stale: false }),
+        reconcile: () => ({ dispatch: [], refusals: [{ kind: 'nothing-owed', prNumber: top.pr }] }),
+        prStack: () => ({ pairs: [{ ...stacks.pairs[0], bottomHead, inSync: false }] }), prStackSettings: PR_STACK_DEFAULTS,
+        readLaneTips: () => new Map([[top.headRefName, top.headRefOid]]),
+        readPrForRestack: () => ({ ...top, prNumber: top.pr, kind: 'fix', labels: [], body: '', isCrossRepository: false }),
+        readMainRedPriorityRecord: () => record, fixExecutorRoute,
+        findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1], dispatch: (p) => p,
+        fetchItemlessDiffPaths: () => ['scripts/x.mjs'], resolveFallbackScope: () => ['we:scripts/x.mjs'],
+        resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'we' }),
+        listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null });
+      expect(out.dispatched).toEqual([expect.objectContaining({ pr: top.pr, restack: expect.objectContaining({ idle: true }) })]);
+      return fixExecutorRoute.mock.results[0].value;
+    };
+    const record = { repo: 'we', pr: top.pr, firstRedSha: '7c731a95e', setAt: now, expiresAt: now + 30 * 60_000 };
+    expect(run(record, 'd'.repeat(40))).toMatchObject({ executor: 'claude', reason: 'main-fix' });
+    expect(run(null, 'e'.repeat(40)).executor).toBe('codex');
+    expect(run({ ...record, pr: bottom.pr }, 'f'.repeat(40)).executor).toBe('codex');
+  });
+});
