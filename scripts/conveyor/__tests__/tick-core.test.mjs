@@ -2393,3 +2393,27 @@ describe('reuseFailedLanePoolRead — never re-run a lane-pool read dispatch-pla
     expect(reuseFailedLanePoolRead(null, [])).toBeNull();
   });
 });
+
+describe('no-size item preparation policy', () => {
+  const tick = (prepareAutoSize, bookkeeping = { tick: 1 }) => planTick({
+    state: { queue: [{ num: 5745 }], unshaped: [], lanes: [], prs: [] },
+    plan: { launch: [], held: [{ num: 5745, reason: 'no-size' }] },
+    freeLanes: [4], bookkeeping,
+    config: { launchKinds: ['prepare-item'], prepareAutoSize, prepareAheadWindow: 1 },
+  });
+  it('routes no-size into the item prepare window', () => {
+    const out = tick(true);
+    expect(out.decisions.spawnPrepareItems).toEqual([{ num: 5745, lane: 4 }]);
+    expect(out.decisions.spawnPrepareScope).toEqual([]);
+  });
+  it('leaves the builder unchanged when disabled', () => {
+    expect(tick(false).decisions.spawnPrepareItems).toEqual([]);
+  });
+  it('retains an existing item guard on a no-size hold', () => {
+    const out = tick(true, { tick: 1, prepareGuards: [
+      { num: 5745, kind: 'prepare-item', lane: 4, spawnedTick: 0, sawPr: false },
+    ] });
+    expect(out.decisions.spawnPrepareItems).toEqual([]);
+    expect(out.nextState.prepareGuards).toEqual(expect.arrayContaining([expect.objectContaining({ num: 5745, kind: 'prepare-item' })]));
+  });
+});
