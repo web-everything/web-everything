@@ -63,14 +63,34 @@ describe('void needs-human settings and green evidence', () => {
     expect(resolve('off', 'on')).toMatchObject({ value: true, source: 'repo' });
     expect(resolve('on', 'on', { WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'off' })).toMatchObject({ value: false, source: 'env' });
   });
-  it('ignores invalid layers with reasons', () => {
+  it('fails closed on invalid layers with reasons', () => {
     const result = resolve('off', 'invalid', { WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'bad' });
-    expect(result).toMatchObject({ value: false, source: 'platform' });
+    expect(result).toMatchObject({ value: false, source: 'repo' });
     expect(result.ignored).toEqual([expect.objectContaining({ source: 'repo', reason: expect.any(String) }), expect.objectContaining({ source: 'env', reason: expect.any(String) })]);
-    expect(resolveVoidNeedsHumanWhenCiGreen({}, { read: () => '{' })).toMatchObject({ value: true, source: 'standard' });
+    expect(resolveVoidNeedsHumanWhenCiGreen({}, { read: () => '{' })).toMatchObject({ value: false, source: 'platform' });
+  });
+  it.each(['{', 'null', '[]', '{"ciHealVerdict":null}', '{"ciHealVerdict":[]}', '{"ciHealVerdict":{"voidNeedsHumanWhenCiGreen":true}}'])('invalid document %s cannot be overridden on', document => {
+    expect(resolveVoidNeedsHumanWhenCiGreen({ WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'on' }, {
+      platformPath: 'platform', path: 'repo', read: path => path === 'platform' ? document : '{}',
+    }).value).toBe(false);
+  });
+  it.each(['EACCES', 'EIO'])('unreadable platform %s cannot be overridden on', code => {
+    expect(resolveVoidNeedsHumanWhenCiGreen({ WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'on' }, {
+      read: () => { throw Object.assign(new Error(code), { code }); },
+    }).value).toBe(false);
+  });
+  it('allows absent optional platform preferences but fails closed on a missing repo file', () => {
+    const missing = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+    expect(resolveVoidNeedsHumanWhenCiGreen({}, { platformPath: 'platform', read: path => path === 'platform' ? missing() : '{}' }).value).toBe(true);
+    expect(resolveVoidNeedsHumanWhenCiGreen({}, { read: missing }).value).toBe(false);
   });
   it('exposes the resolved boolean and source', () => {
     expect(resolveCiHealVerdictSettings({ WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'off' })).toMatchObject({ voidNeedsHumanWhenCiGreen: false, voidNeedsHumanSource: 'env' });
+  });
+  it('invalid repo or env cannot silently restore the default on', () => {
+    expect(resolve('on', 'invalid').value).toBe(false);
+    expect(resolve('on', 'on', { WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'invalid' }).value).toBe(false);
+    expect(resolve('invalid', 'on', { WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN: 'on' }).value).toBe(false);
   });
   it('requires a known, settled required set, excluding review-gate', () => {
     const checks = ['test', 'review-gate'];

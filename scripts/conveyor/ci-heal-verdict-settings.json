@@ -1,5 +1,5 @@
 {
-  "$comment": "ciHealVerdict.voidNeedsHumanWhenCiGreen (on|off) durably voids needs-human escalations when this exact non-conflicted head has all required CI green, excluding review-gate. Standard default on; platform preferences < this repo file < WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN. Invalid layers are ignored with a reason. recheckNotCiBreak retains its existing repo/env resolution.",
+  "$comment": "ciHealVerdict.voidNeedsHumanWhenCiGreen (on|off) durably voids needs-human escalations when this exact non-conflicted head has all required CI green, excluding review-gate, and no CodeQL drain hold. Standard default on; platform preferences < this repo file < WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN. Any invalid or unreadable layer disables retirement with a reason, even under a later on override; absent optional platform preferences are allowed. recheckNotCiBreak retains its existing repo/env resolution.",
   "ciHealVerdict": {
     "recheckNotCiBreak": "on",
     "voidNeedsHumanWhenCiGreen": "on"

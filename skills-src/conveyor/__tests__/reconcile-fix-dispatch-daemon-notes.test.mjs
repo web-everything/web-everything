@@ -238,3 +238,17 @@ it('the notes reader retains the same hydrated, excused rollup the core judged',
   expect(out.prsByNumber.get(5012)).toBe(corrected);
   expect(excuseMergeGateHolds).toHaveBeenCalledWith([raw], { repo: 'web-everything/web-everything' });
 });
+
+it('the notes reader carries the CodeQL drain hold into daemon re-verification', () => {
+  const raw = { number: 5033, statusCheckRollup: [] };
+  const enriched = { ...raw, codeqlFailure: { reason: 'security alert' } };
+  const out = defaultReadNotesForRepo({ repo: 'we', readPrs: () => [raw],
+    excuseMergeGateHolds: prs => prs, enrichCodeQL: () => [enriched],
+    reconcile: ({ readPrs, excuseMergeGateHolds, enrichCodeQL }) => {
+      const prs = excuseMergeGateHolds(readPrs({}), {});
+      enrichCodeQL?.(prs, {});
+      return { notes: [] };
+    },
+  });
+  expect(out.prsByNumber.get(5033)).toEqual(enriched);
+});

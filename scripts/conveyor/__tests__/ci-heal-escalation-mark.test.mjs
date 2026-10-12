@@ -607,6 +607,7 @@ describe('needs-human verdict void', async () => {
       { verdictSettings: { voidNeedsHumanWhenCiGreen: false } },
       { pr: { ...o.pr, headRefOid: 'abcdef0123456789' } },
       { pr: { ...o.pr, mergeStateStatus: 'DIRTY' } },
+      { pr: { ...o.pr, codeqlFailure: { reason: 'security alert' } } },
       { pr: { ...o.pr, comments: [] } },
       { pr: { ...o.pr, statusCheckRollup: [] } },
     ]) {

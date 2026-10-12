@@ -1967,6 +1967,7 @@ export function planReconcile({
     if (verdictSettings.voidNeedsHumanWhenCiGreen
         && String(pr?.state ?? 'OPEN').toUpperCase() === 'OPEN'
         && String(pr?.mergeStateStatus ?? '').toUpperCase() !== 'DIRTY'
+        && !pr.codeqlFailure
         && ciGreenForEscalation({ rollup: pr.statusCheckRollup, requiredChecks })
         && latestCiHealEscalationForHead(pr.comments, pr.headRefOid, {
           baseHead: pr.escalationBaseHead ?? null, recheck: verdictSettings.recheckNotCiBreak,

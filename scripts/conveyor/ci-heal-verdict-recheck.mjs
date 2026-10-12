@@ -20,6 +20,7 @@
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
 import { PLATFORM_PREFERENCES_PATH } from '../lib/merge-delivery-policy.mjs';
+import { resolveHumanGateRemovalSetting } from '../lib/merge-gate-hold-class.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -54,24 +55,21 @@ export function resolveCiHealVerdictSettings(env = process.env, options = {}) {
   };
 }
 
-/** Standard → platform preferences → repo → env. Invalid layers retain the prior value and a reason. */
+/** Standard → platform preferences → repo → env. Any invalid layer disables retirement. */
 export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
   path = ciHealVerdictSettingsPath(), platformPath = PLATFORM_PREFERENCES_PATH, read = readFileSync,
 } = {}) {
-  let value = true, source = 'standard';
-  const ignored = [];
-  const apply = (raw, layer) => {
-    if (raw === undefined) return;
-    const parsed = typeof raw === 'string' && /^(on|off)$/.test(raw) ? raw === 'on' : null;
-    if (parsed === null) { ignored.push({ source: layer, reason: 'expected on or off' }); return; }
-    value = parsed; source = layer;
-  };
+  const documents = {}, errors = [];
   for (const [layer, filePath] of [['platform', platformPath], ['repo', path]]) {
-    try { apply(JSON.parse(read(filePath, 'utf8'))?.ciHealVerdict?.voidNeedsHumanWhenCiGreen, layer); }
-    catch (error) { ignored.push({ source: layer, reason: String(error?.message ?? error).split('\n')[0] }); }
+    try { documents[layer] = JSON.parse(read(filePath, 'utf8')); }
+    catch (error) {
+      // Only the optional platform file may be absent. A missing declared repo file is an error.
+      if (layer !== 'platform' || error?.code !== 'ENOENT') errors.push({ source: layer, reason: String(error?.message ?? error).split('\n')[0] });
+    }
   }
-  apply(env?.WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN, 'env');
-  return { value, source, ignored };
+  const result = resolveHumanGateRemovalSetting({ ...documents, env, errors,
+    blockName: 'ciHealVerdict', key: 'voidNeedsHumanWhenCiGreen', envKey: 'WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN' });
+  return { value: result.value === 'on', source: result.source, ignored: result.ignored };
 }
 
 /** No known required set means no evidence that CI is green. Pure. */

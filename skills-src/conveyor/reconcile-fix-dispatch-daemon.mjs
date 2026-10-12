@@ -62,7 +62,7 @@ import { runReconcileCiHealDispatch, dispatchCiHeal } from '../../scripts/operat
 import { runReconcilePromoteDraftDispatch } from '../../scripts/operations/promote-draft-pr-dispatch.mjs'; // draft-first PRs, operator-approved 2026-09-27 — see runPromoteDraftDispatchAllRepos below
 import { resolveLiveQueueBaseline } from '../../scripts/readiness/heavy-admission.mjs'; // card xkyw1x4
 import { createQueueBudget } from '../../scripts/readiness/heavy-queue-projection.mjs'; // card xkyw1x4
-import { runReconcilePass, defaultReadPrs } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
+import { runReconcilePass, defaultReadPrs, enrichPrsWithCodeQL } from '../../scripts/conveyor/reconcile-pass.mjs'; // #4191
 import { createResourceFixThrottle } from '../../scripts/lib/resource-gate.mjs'; // x6nuodj: dynamic fixer cap + host gate via admit()
 import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.mjs';
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
@@ -312,7 +312,7 @@ export function runPromoteDraftDispatchAllRepos({ repos = FIX_DISPATCH_DAEMON_RE
  * @param {{repo:string, reconcile?:Function, readPrs?:Function}} o
  * @returns {{notes:Array<object>, prsByNumber:Map<number,object>}}
  */
-export function defaultReadNotesForRepo({ repo, reconcile = runReconcilePass, readPrs = defaultReadPrs, excuseMergeGateHolds = excusePrMergeGateHolds } = {}) {
+export function defaultReadNotesForRepo({ repo, reconcile = runReconcilePass, readPrs = defaultReadPrs, excuseMergeGateHolds = excusePrMergeGateHolds, enrichCodeQL = enrichPrsWithCodeQL } = {}) {
   let capturedPrs = [];
   const result = reconcile({
     repo,
@@ -320,6 +320,11 @@ export function defaultReadNotesForRepo({ repo, reconcile = runReconcilePass, re
     // Retain hydrated, excused rows: the original read remains red for candidacy/freeze holds.
     excuseMergeGateHolds: (prs, options) => {
       capturedPrs = excuseMergeGateHolds(prs, options);
+      return capturedPrs;
+    },
+    // CodeQL is enriched after the rollup: keep its non-required drain hold for the void recheck too.
+    enrichCodeQL: (prs, options) => {
+      capturedPrs = enrichCodeQL(prs, options);
       return capturedPrs;
     },
   });
@@ -491,7 +496,7 @@ export function planVerdictVoid({ note, pr, repo, verdictSettings, readRequiredC
 /** Reverify a green-head retirement and plan its durable void, once per escalation and bounded per head. */
 export function planNeedsHumanVoid({ note, pr, repo, verdictSettings, readRequiredChecks }) {
   if (!verdictSettings?.voidNeedsHumanWhenCiGreen || note?.kind !== 'ci-heal-escalation-moot'
-      || note.outcome !== 'needs-human' || !pr) return null;
+      || note.outcome !== 'needs-human' || !pr || pr.codeqlFailure) return null;
   const head = String(note.headSha ?? '').trim().toLowerCase();
   if (!head || head !== String(pr.headRefOid ?? '').trim().toLowerCase()
       || String(pr.state ?? 'OPEN').toUpperCase() !== 'OPEN'

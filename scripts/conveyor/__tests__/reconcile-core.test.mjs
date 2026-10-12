@@ -3887,4 +3887,8 @@ describe('green-head needs-human retirement (#5012)', () => {
     ]) expect(plan(row).notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
     expect(plan(pr, false).notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
   });
+  it.each([{ labels: pr.labels }, { labels: [{ name: 'ready-to-merge' }, { name: 'review:accepted' }] }])('preserves a non-required CodeQL escalation with labels %j', ({ labels }) => {
+    const result = plan({ ...pr, labels, codeqlFailure: { reason: 'security alert' } });
+    expect(result.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+  });
 });
