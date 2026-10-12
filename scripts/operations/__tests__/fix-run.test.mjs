@@ -203,6 +203,7 @@ describe('runFixCli', () => {
   it.each([false, true, 1, 32, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);
     let merging = false;
+    let added = false;
     m.spawn.mockResolvedValue({ finalMessage: 'Agent final diagnosis' });
     const run = (cmd, args, opts) => {
       m.calls.push([cmd, ...args]);
@@ -210,6 +211,9 @@ describe('runFixCli', () => {
       if (args.includes('merge') && args.includes('--no-commit')) { merging = true; throw new Error('conflicts'); }
       if (args.includes('status')) return 'UU file.txt\0';
       if (args.includes('--numstat')) return '1\t1\tfile.txt\0';
+      if (args.includes('add')) added = true;
+      if (args.includes('ls-files') && added) return `100644 ${'c'.repeat(40)} 0\tfile.txt\0`;
+      if (args.includes('cat-file')) return '> resolved blockquote\n< comparison\n';
       if (args.includes('commit') || args.includes('--abort')) merging = false;
       return m.run(cmd, args, opts);
     };
@@ -461,6 +465,43 @@ describe('runFixCli', () => {
     }, { agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), `${fixture}resolved\n========\n|| or\n> quote\n`) }, async ({ out, m }) => {
       expect(out.code).toBe(0);
       expect(m.calls.some(c => c.includes('push'))).toBe(true);
+    });
+  });
+  it('accepts a resolution keeping a marker-shaped line each side added (more than either side alone has)', async () => {
+    const lines = (...xs) => `${xs.join('\n')}\n`;
+    await withRealMerge({
+      base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), lines('A', '=======', 'B', 'x', 'C', 'D')),
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), lines('A', '=======', 'B', 'theirs', 'C', 'D', 'T', '=======')),
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), lines('O', '=======', 'A', '=======', 'B', 'ours', 'C', 'D')),
+    }, { agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), lines('O', '=======', 'A', '=======', 'B', 'both', 'C', 'D', 'T', '=======')) },
+    async ({ out, m }) => {
+      expect(out.code).toBe(0);
+      expect(m.calls.some(c => c.includes('push'))).toBe(true);
+    });
+  });
+  it('rejects a leftover separator matching a marker-shaped line only the base had', async () => {
+    await withRealMerge({
+      base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'Title\n=======\nbase\n'),
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'Title\ntheirs\n'),
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'Title\nours\n'),
+    }, { agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'Title\nours\n=======\ntheirs\n') }, async ({ out, m }) => {
+      expect(out.code).toBe(1);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+    });
+  });
+  it('scans the staged blob: markers hidden by an agent-written working-tree-encoding are still rejected', async () => {
+    await withRealMerge({
+      base: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'base\n'),
+      theirs: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'theirs\n'),
+      ours: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'ours\n'),
+    }, { agent: ({ dir }) => {
+      writeFileSync(join(dir, '.gitattributes'), 'file.txt working-tree-encoding=UTF-16LE\n');
+      writeFileSync(join(dir, 'file.txt'), Buffer.from('ours\n=======\ntheirs\n', 'utf16le'));
+    } }, async ({ out, m, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.calls.some(c => c.includes('add'))).toBe(true);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('push'))).toBe(false);
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: resolved' }));
     });
   });
   it('never runs merge --abort in the agent-writable lane after its git config changed', async () => {

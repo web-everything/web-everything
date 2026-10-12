@@ -264,15 +264,23 @@ export function conflictMarkerLines(text, sizes) {
 }
 
 /**
- * PURE. Whether a resolved file still holds a conflict marker: any marker line occurring more often than in every one of
- * `baselines` (the conflict's index stages). A marker-shaped line a side already carried (a setext heading, a test
- * fixture) is content, not a leftover.
+ * PURE. How many copies of each marker-shaped line a correct merge of the index stages may hold: max(ours, theirs,
+ * ours + theirs - base), so each side's own additions survive (a setext heading, a test fixture) while a line only the
+ * base carried excuses nothing. A missing stage (an add/add conflict has no base) counts as empty.
  */
-export function hasLeftoverMarkers(text, sizes, baselines = []) {
-  const before = baselines.map(b => conflictMarkerLines(b, sizes));
-  for (const [line, n] of conflictMarkerLines(text, sizes)) {
-    if (before.every(counts => n > (counts.get(line) ?? 0))) return true;
+export function markerAllowance(sizes, { base = '', ours = '', theirs = '' } = {}) {
+  const [b, o, t] = [base, ours, theirs].map(text => conflictMarkerLines(text, sizes));
+  const allowance = new Map();
+  for (const line of new Set([...o.keys(), ...t.keys()])) {
+    const [nb, no, nt] = [b, o, t].map(counts => counts.get(line) ?? 0);
+    allowance.set(line, Math.max(no, nt, no + nt - nb));
   }
+  return allowance;
+}
+
+/** PURE. Whether a resolved file still holds a conflict marker: a marker line occurring more often than `allowance` permits. */
+export function hasLeftoverMarkers(text, sizes, allowance = new Map()) {
+  for (const [line, n] of conflictMarkerLines(text, sizes)) if (n > (allowance.get(line) ?? 0)) return true;
   return false;
 }
 
@@ -460,6 +468,12 @@ export async function runFixCli(argv = [], {
     const mergeHeadPath = () => git('rev-parse', '--git-path', 'MERGE_HEAD').trim();
     const inMerge = () => { const path = mergeHeadPath(); return !!path && fileExists(resolve(lanePath, path)); };
     const commitMerge = () => git('commit', '--no-edit', '--trailer', trailer);
+    const blob = (oid) => run('git', [...HARDENED_GIT_ARGS, 'cat-file', 'blob', oid], { cwd: lanePath, env: gitEnv, maxBuffer: BLOB_MAX_BYTES });
+    // Index entries for exactly `path` (a pathspec could also match other names, e.g. one holding `*`).
+    const indexEntries = (path) => git('ls-files', '-s', '-z', '--', path).split('\0')
+      .map(entry => /^(\d+) ([0-9a-f]+) ([0-3])\t([\s\S]*)$/.exec(entry))
+      .filter(m => m && OID_RE.test(m[2]) && m[4] === path)
+      .map(m => ({ mode: m[1], oid: m[2], stage: m[3] }));
     let unmerged = [];
     let mergePrompt = '';
     if (target) {
@@ -499,13 +513,9 @@ export async function runFixCli(argv = [], {
       const sizes = new Set();
       for (const match of (text ?? '').matchAll(/^(<+) HEAD(?::[^\r\n]*)?\r?$/gm)) sizes.add(match[1].length);
       if (!sizes.size) sizes.add(7);
-      // The index stages (base/ours/theirs) are the baseline: marker-shaped lines they carry are content, not leftovers.
-      const baselines = [];
-      for (const entry of git('ls-files', '-u', '-z', '--', path).split('\0')) {
-        const oid = /^\d+ ([0-9a-f]+) [123]\t/.exec(entry)?.[1];
-        if (oid && OID_RE.test(oid)) baselines.push(run('git', [...HARDENED_GIT_ARGS, 'cat-file', 'blob', oid], { cwd: lanePath, env: gitEnv, maxBuffer: BLOB_MAX_BYTES }));
-      }
-      return [path, { sizes, baselines }];
+      // The index stages (1 base, 2 ours, 3 theirs) are the baseline: marker-shaped lines they carry may be content.
+      const stages = Object.fromEntries(indexEntries(path).filter(e => e.stage !== '0').map(e => [e.stage, blob(e.oid)]));
+      return [path, { sizes, allowance: markerAllowance(sizes, { base: stages[1], ours: stages[2], theirs: stages[3] }) }];
     }));
     const spawned = await provider.spawn({
       sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
@@ -532,15 +542,25 @@ export async function runFixCli(argv = [], {
         const text = readFile(join(lanePath, path), lanePath);
         // Every marker kind (incl. a lone separator or diff3 base line) at this file's captured width; see hasLeftoverMarkers.
         if (text == null) return true;
-        const { sizes, baselines } = markerSizes.get(path);
-        return hasLeftoverMarkers(text, sizes, baselines);
+        const { sizes, allowance } = markerSizes.get(path);
+        return hasLeftoverMarkers(text, sizes, allowance);
       });
-      if (unresolved.length) {
+      const refuse = (paths) => {
         git('merge', '--abort');
-        throw new LauncherError(`conflict unresolved in ${unresolved.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
-      }
+        throw new LauncherError(`conflict unresolved in ${paths.join(', ')}: ${finalMessage || 'agent committed nothing'}`);
+      };
+      if (unresolved.length) refuse(unresolved);
       const stage = [...new Set([...unmerged, ...unstagedPaths(statusAfterAgent)])];
       if (stage.length) git('add', '--', ...stage);
+      // Scan what will be COMMITTED too: `git add` applies .gitattributes (which the agent can write), so a file saved
+      // under e.g. working-tree-encoding=UTF-16LE hides its markers from the UTF-8 read above but not from its staged blob.
+      const unresolvedStaged = unmerged.filter(path => {
+        const entries = indexEntries(path);
+        if (entries.length !== 1 || entries[0].stage !== '0' || !REGULAR_MODES.has(entries[0].mode)) return true;
+        const { sizes, allowance } = markerSizes.get(path);
+        return hasLeftoverMarkers(blob(entries[0].oid), sizes, allowance);
+      });
+      if (unresolvedStaged.length) refuse(unresolvedStaged);
       commitMerge();
     } else if (paths.length) {
       const supplied = join(lanePath, '.fix-commit-msg.txt');
