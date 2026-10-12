@@ -65,7 +65,8 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
 - [ ] Card `xsvxy4v` done: the drain confirms a PR is `MERGED` before it records a landing. Without it, any
   drain that still reads `drain-direct` after the switch (a stale clone, a lane's `/pr` or `/finish` run, which
   reads its own branch's settings, a `pr-watch` fast drain, a manual `/drain`) records an enqueue as landed.
-  The freeze and the clone check below only cover the switch window and the drain clones.
+  The freeze and the clone check below cover only the drain clones; the switch window's stop list below
+  covers the other drains for that window only.
 
 ## Why the drain must be frozen during the switch
 
@@ -93,14 +94,18 @@ Two paths get past this, so close both for the whole switch:
 - **A published main-fix PR.** The freeze does not hold it (the exemption above). If main goes red and a fix PR
   is published before the ruleset step (apply step 4), do not take that step until the fix PR is merged and
   nothing is published. Once this PR has merged, the drain cannot land it (its enqueue fails with no queue), so
-  merge it yourself with admin `gh` (`gh pr merge <fix PR> --merge --repo web-everything/web-everything`).
-  The clone check comes before the ruleset for the same reason: a drain that already has the new setting only
-  tries to enqueue, and without the ruleset the enqueue fails, so nothing is recorded as landed.
+  merge it yourself with your admin login
+  (`env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh pr merge <fix PR> --merge --repo web-everything/web-everything`).
+  A clone that has not pulled this PR yet is still `drain-direct` and may merge it directly; with no ruleset yet
+  that is a real merge, which is fine. The clone check comes before the ruleset for the same reason: a drain that
+  already has the new setting only tries to enqueue, and without the ruleset the enqueue fails, so nothing is
+  recorded as landed.
 - **A drain run from a checkout that is not a drain clone.** The conveyor's `pr-watch` runs
-  `scripts/merge-ai-prs.mjs` from its own checkout (its event-driven land), and a manual `/drain` uses whichever
-  checkout it runs in. Such a checkout reads its own `scripts/settings/*.json`, which the clone check does not
-  cover. Stop the conveyor (or run `pr-watch` with `--no-fast-drain`) and run no manual drain until the last
-  apply step, or first pull main into each such checkout.
+  `scripts/merge-ai-prs.mjs` from its own checkout (its event-driven land), a lane's `/pr` or `/finish` runs it
+  from that lane, and a manual `/drain` uses whichever checkout it runs in. Such a checkout reads its own
+  `scripts/settings/*.json`, which the clone check does not cover. Until the last apply step: stop the conveyor
+  (or run `pr-watch` with `--no-fast-drain`), let delivery and fix agents already running finish first, and run
+  no `/pr`, `/finish` or manual drain.
 
 ## Apply order
 
@@ -112,7 +117,8 @@ Two paths get past this, so close both for the whole switch:
    node scripts/readiness/red-main-remediation.mjs status   # frozen: true
    ```
 
-   Also stop the conveyor (or run `pr-watch` with `--no-fast-drain`) and run no manual drain (see above).
+   Also stop the conveyor (or run `pr-watch` with `--no-fast-drain`), wait for running delivery and fix agents
+   to finish, and run no `/pr`, `/finish` or manual drain (see above).
    Do not go on until a pass that began after the freeze has finished. A pass already past its freeze check can
    still merge.
 2. Merge this settings PR yourself, **before** the ruleset exists, so the merge needs no queue bypass. The
@@ -124,7 +130,7 @@ Two paths get past this, so close both for the whole switch:
    ```
 
    Until step 4, the drain is `github-merge-queue` against an unqueued main. It is frozen, so it merges nothing
-   except a published main-fix PR, and that enqueue fails (see above).
+   except a published main-fix PR, and for a clone that has this commit that enqueue fails (see above).
 3. Check every drain clone has the settings commit from step 2 (still frozen; a frozen pass still refreshes, so
    wait one pass if a clone is behind). Do this **before** the ruleset, so no clone is still `drain-direct` once
    the queue exists. Clones are listed by `daemonCloneRoots` in `we:scripts/lib/daemon-clone-registry.mjs`; for
@@ -196,8 +202,8 @@ The order is the reverse of apply: ruleset first, then the settings revert, so t
 The same precondition applies (no published red).
 
 1. Freeze and wait for a post-freeze pass with no `gh pr merge`, as in apply step 1
-   (`--reason="merge-queue switch: rollback"`). Stop the conveyor (or use `--no-fast-drain`) and run no manual
-   drain, as above.
+   (`--reason="merge-queue switch: rollback"`). Stop the conveyor (or use `--no-fast-drain`), let running agents
+   finish, and run no `/pr`, `/finish` or manual drain, as above.
 2. Restore the ruleset from the saved body, stripping read-only fields:
 
    ```bash
