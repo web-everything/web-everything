@@ -27,7 +27,7 @@ Found by the converge panel's security lens on #4815 (a carve-out there: the car
 1. **Untrusted text** — the held-land note names the claim through `foldUntrusted`, never raw juror text.
 2. **Truncated reads** — an unreadable PR head leaves every claim unverified, so it holds the land; it never reads as "nothing to verify".
 3. **Shared state files** — n/a: the hold is derived from the run's own `reduce` finding, no new file.
-4. **Fail closed** — a missing or malformed `unverifiedClaims` field holds the land; only an explicit empty list releases it.
+4. **Fail closed** — a PRESENT but malformed `unverifiedClaims` (not a list, or an entry without its seat or key) holds the land. An absent field or an empty list releases it, because `reduce` omits the field when nothing is unverified; an unreadable `reduce` finding holds the land.
 5. **Identity scoping** — the hold names the claim by seat and finding key, scoped to the run's head; a new head starts fresh.
 6. **State over time** — a later run on the same head that settles the claim (either way) releases the hold; a restart mid-run keeps it.
 7. **Who wrote it** — the hold is read from the operation's own reduce output, never from a comment a PR author can post.
