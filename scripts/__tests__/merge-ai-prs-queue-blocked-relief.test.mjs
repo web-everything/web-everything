@@ -1,5 +1,8 @@
-import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { getRequiredStatusChecks, defaultReadRequiredStatusChecks } from '../lib/required-status-checks.mjs';
 import { classifyPr, revalidateForMerge, buildDrainVerdicts, prepareDrainVerdicts, unlandableStateReason } from '../merge-ai-prs.mjs';
 import * as strategy from '../lib/drain-merge-strategy.mjs';
 
@@ -38,6 +41,11 @@ describe('required merge queue BLOCKED relief', () => {
       expect(classifyPr(pr(extra), opts)).not.toHaveProperty('queueBlockedRelief');
     }
   });
+  it('never lets a green aggregate stand in for a required check with no row of its own', () => {
+    const verdict = classifyPr(pr({ statusCheckRollup: [green('test')] }), { queueRequiredChecks: ['test', 'integration'] });
+    expect(verdict).toMatchObject({ decision: 'skip', reason: expect.stringContaining('integration (missing)') });
+    expect(verdict).not.toHaveProperty('queueBlockedRelief');
+  });
   it('accepts legacy StatusContext rows', () => {
     expect(classifyPr(pr({ statusCheckRollup: [green('test'), { __typename: 'StatusContext', context: 'smoke', state: 'SUCCESS' }] }), opts).decision).toBe('merge');
   });
@@ -64,39 +72,64 @@ describe('required merge queue BLOCKED relief', () => {
 });
 
 describe('readQueueRequiredChecks', () => {
-  it.each(['unavailable', 'fallback', 'stale-cache', undefined])('refuses uncertain classic source %s', source => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => '["smoke"]', readClassic: () => ({ checks: ['test'], source }) })).toBeNull();
+  const readOf = (checks, source) => vi.fn(() => ({ checks, source }));
+  const read = (readRequired, extra = {}) => strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', readRequired, ...extra });
+  it.each(['cache', 'declared', 'unavailable', 'fallback', 'stale-cache', undefined])('refuses non-live source %s (it may miss a ruleset check)', source => {
+    expect(read(readOf(['test', 'smoke'], source))).toBeNull();
   });
   it.each([undefined, null, '', '   '])('requires an explicit resolved branch: %j', branch => {
-    const exec = vi.fn(() => '["test"]');
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch, exec, readClassic: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
-    expect(exec).not.toHaveBeenCalled();
+    const readRequired = readOf(['test'], 'live');
+    expect(read(readRequired, { branch })).toBeNull();
+    expect(readRequired).not.toHaveBeenCalled();
   });
   it.each([undefined, null, '', '   ', 42, {}])('returns null without reading checks for missing or invalid repo: %j', repo => {
-    const exec = vi.fn();
-    const readClassic = vi.fn();
-    expect(strategy.readQueueRequiredChecks({ repo, branch: 'release', exec, readClassic })).toBeNull();
-    expect(exec).not.toHaveBeenCalled();
-    expect(readClassic).not.toHaveBeenCalled();
+    const readRequired = readOf(['test'], 'live');
+    expect(read(readRequired, { repo })).toBeNull();
+    expect(readRequired).not.toHaveBeenCalled();
   });
-  it('returns the sorted union of classic and ruleset requirements', () => {
-    const exec = vi.fn(() => '["smoke","test"]');
-    const readClassic = vi.fn(() => ({ checks: ['test', 'daemon-soak'], source: 'live' }));
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec, readClassic })).toEqual(['daemon-soak', 'smoke', 'test']);
-    expect(readClassic).toHaveBeenCalledWith({ repo: 'owner/repo', branch: 'release' });
-    expect(exec.mock.calls[0].slice(0, 2)).toEqual(['gh', ['api', 'repos/owner/repo/rules/branches/release', '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]']]);
+  it('returns the sorted, de-duplicated set from a forced live read', () => {
+    const readRequired = readOf(['test', 'smoke', 'test', 'daemon-soak'], 'live');
+    expect(read(readRequired)).toEqual(['daemon-soak', 'smoke', 'test']);
+    expect(readRequired).toHaveBeenCalledWith({ repo: 'owner/repo', branch: 'release', ttlMs: 0 });
   });
-  it.each(['not json', '{}', 'null'])('fails closed on malformed rules: %s', output => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => output, readClassic: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
+  it.each([[null], [{}], [{ checks: 'test', source: 'live' }], [{ checks: [], source: 'live' }], [{ checks: ['test', ''], source: 'live' }], [{ checks: ['test', 7], source: 'live' }]])('fails closed on a malformed read: %j', result => {
+    expect(read(() => result)).toBeNull();
   });
-  it('fails closed on a rules read error', () => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => { throw new Error('denied'); }, readClassic: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
+  it('fails closed when the shared reader throws', () => {
+    expect(read(() => { throw new Error('denied'); })).toBeNull();
   });
-  it('returns null for an empty union', () => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => '[]', readClassic: () => ({ checks: [], source: 'live' }) })).toBeNull();
+  it('issues no rules read of its own: the shared reader is the only GitHub IO', () => {
+    expect(readFileSync('scripts/lib/drain-merge-strategy.mjs', 'utf8')).not.toMatch(/rules\/branches/);
+    expect(String(strategy.readQueueRequiredChecks)).not.toMatch(/\bexec\b/);
   });
-  it.each(['live', 'cache', 'declared'])('accepts authoritative classic source %s', source => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => '["smoke"]', readClassic: () => ({ checks: ['test'], source }) })).toEqual(['smoke', 'test']);
+  describe('through the real shared reader', () => {
+    let dir;
+    beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'queue-required-')); });
+    afterEach(() => rmSync(dir, { recursive: true, force: true }));
+    const filler = Array.from({ length: 30 }, (_, i) => ({ type: 'pull_request', parameters: { i } }));
+    const pagedGh = () => vi.fn(args => args.includes('--paginate')
+      ? JSON.stringify([filler, [{ type: 'required_status_checks', parameters: { required_status_checks: [{ context: 'smoke' }] } }]])
+      : JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: { contexts: ['test'] } } }));
+    const shared = (cachePath, gh) => o => getRequiredStatusChecks({ ...o, cachePath, readChecks: a => defaultReadRequiredStatusChecks({ ...a, gh }) });
+    // A partial entry an older reader wrote (first rules page only, or classic only), stamped `live`.
+    const legacyCache = fetchedAtMs => {
+      const cachePath = join(dir, 'cache.json');
+      writeFileSync(cachePath, JSON.stringify({ entries: { 'owner/repo@release': { checks: ['test'], source: 'live', fetchedAtMs } } }));
+      return cachePath;
+    };
+    it('keeps a ruleset check that GitHub returns on a later page', () => {
+      const gh = pagedGh();
+      expect(read(shared(join(dir, 'cache.json'), gh))).toEqual(['smoke', 'test']);
+      expect(gh.mock.calls[0][0]).toEqual(['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/release?per_page=100']);
+    });
+    it('re-reads live past a fresh partial cache entry instead of trusting it', () => {
+      const gh = pagedGh();
+      expect(read(shared(legacyCache(Date.now() - 1_000), gh))).toEqual(['smoke', 'test']);
+      expect(gh).toHaveBeenCalled();
+    });
+    it('grants no relief from a future-dated cache entry', () => {
+      expect(read(shared(legacyCache(Date.now() + 3_600_000), pagedGh()))).toBeNull();
+    });
   });
 });
 
@@ -104,8 +137,7 @@ describe('production queue requirements wiring', () => {
   const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
   it('reads queue requirements for the resolved default branch', () => {
     const readChecks = vi.fn(({ repo, branch }) => strategy.readQueueRequiredChecks({
-      repo, branch, exec: () => '["smoke"]',
-      readClassic: () => ({ checks: ['test'], source: 'live' }),
+      repo, branch, readRequired: () => ({ checks: ['test', 'smoke'], source: 'live' }),
     }));
     const defaultBranchOf = vi.fn(() => 'release');
     const queueRequiredChecksOf = strategy.createQueueRequiredChecksOf({ queueEnqueueMode: true, isLocalRepo: () => true, localSlug: 'owner/local', defaultBranchOf, readChecks });

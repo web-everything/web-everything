@@ -954,6 +954,14 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
       queueBlocker = `; reviewDecision=${reviewDecision}`;
       return false;
     }
+    // GitHub enforces each required check by its own row: an aggregate (`withoutImpliedRequiredChecks` inside the
+    // gate) must never stand in for a required check that has no row, or the enqueue is refused.
+    const rows = new Set((pr.statusCheckRollup || []).map(row => row?.name ?? row?.context));
+    const absent = queueRequiredChecks.filter(name => !rows.has(name));
+    if (absent.length) {
+      queueBlocker = `; required-checks-not-successful: ${absent.map(name => `${name} (missing)`).join(', ')}`;
+      return false;
+    }
     const gate = reviewCiGate({ headSha: pr.headRefOid || '(listing head)', requiredChecks: queueRequiredChecks, checks: pr.statusCheckRollup || [] });
     if (!gate.allowed) {
       queueBlocker = `; ${gate.reason}${gate.affected.length ? `: ${gate.affected.map(({ name, reason }) => `${name} (${reason})`).join(', ')}` : ''}`;

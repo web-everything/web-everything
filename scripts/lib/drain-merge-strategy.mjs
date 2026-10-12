@@ -83,21 +83,22 @@ export function resolveDrainMergePolicy({ dryRun = false, env = process.env, loa
 /** Whether this resolved pass policy sends local candidates to GitHub's required queue. */
 export function queueEnqueueModeFromPolicy(resolved) { return mergeActionFor(resolved.policy) === 'enqueue'; }
 
-/** Union classic protection with effective ruleset requirements; an unreadable set grants no relief. */
-export function readQueueRequiredChecks({ repo, branch, exec = execFileSync, readClassic = getRequiredStatusChecks } = {}) {
+/**
+ * The queue's required set, through the ONE shared reader (`getRequiredStatusChecks`): its paginated ruleset read
+ * unioned with classic protection. Only a `live` read is known to be that full union: a cache entry carries no
+ * version, so one written by an older reader (first rules page only, or classic only) or dated in the future would
+ * pass as `cache`. `ttlMs: 0` forces the live read (memoized once per pass by the caller); every other source —
+ * `cache`, `declared`, `fallback`, `stale-cache`, `unavailable` — and any failure grants no relief.
+ */
+export function readQueueRequiredChecks({ repo, branch, readRequired = getRequiredStatusChecks } = {}) {
   if (typeof repo !== 'string' || !repo.trim()) return null;
   if (typeof branch !== 'string' || !branch.trim()) return null;
   try {
-    const rules = JSON.parse(exec('gh', ['api', `repos/${repo}/rules/branches/${branch}`, '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'],
-      { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }));
-    if (!Array.isArray(rules)) return null;
-    const { checks: classic, source } = readClassic({ repo, branch });
-    // Fresh cached reads and declared repository policy are supported; degraded reads are not authoritative.
-    if (!['live', 'cache', 'declared'].includes(source)) return null;
-    if (!Array.isArray(classic)) return null;
-    const checks = [...new Set([...classic, ...rules])];
-    if (!checks.length || checks.some(name => typeof name !== 'string' || !name.trim())) return null;
-    return checks.sort();
+    const { checks, source } = readRequired({ repo, branch, ttlMs: 0 }) ?? {};
+    if (source !== 'live' || !Array.isArray(checks)) return null;
+    const unique = [...new Set(checks)];
+    if (!unique.length || unique.some(name => typeof name !== 'string' || !name.trim())) return null;
+    return unique.sort();
   } catch { return null; }
 }
 
