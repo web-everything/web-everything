@@ -4385,6 +4385,21 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
   });
 
   describe('reduce', () => {
+    it.each(['required runtime unavailable', 'read-only inspection is inconclusive'])('keeps an inconclusive check retryable: %s', (reason) => {
+      const answers = { ...withAdvisory(), judgeReferralVerifier: {
+        summary: reason, results: [{ index: 0, reproduced: null, evidence: reason }],
+      } };
+      const first = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, answers);
+      expect(first.reduce.verifications).toEqual([]);
+      expect(first.reduce.referrals).toEqual([]);
+      expect(first.reduce.unverifiedClaims).toEqual([expect.objectContaining({ reason })]);
+      const retry = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, {
+        ...withAdvisory(), judgeReferralVerifier: REPRODUCED_VERIFIER_ANSWER,
+      }, 'retry-4815');
+      expect(retry.requests[REFERRAL_VERIFIER_STEP].skipSpawn).toBeUndefined();
+      expect(retry.reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
+    });
+
     it('NOT REPRODUCED: no referral; the claim is one advisory note with its original text and the reason; the run is not blocked', () => {
       const { reduce, run } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: NOT_REPRODUCED });
       expect(reduce.referrals).toEqual([]);
@@ -4477,6 +4492,9 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(request.shape.required).toEqual(['summary', 'results']);
       expect(request.input).toContain('index: 0');
       expect(request.mandate).toContain('VERIFIER');
+      expect(request.shape.properties.results.items.properties.reproduced.type).toEqual(['boolean', 'null']);
+      expect(request.mandate).toContain('reproduced=null');
+      expect(request.mandate).toContain('reproduced=false ONLY');
     });
 
     it('the mandate treats the PR and the checkout as untrusted, demands evidence for every answer, and keeps the shell read-only', () => {

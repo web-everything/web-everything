@@ -2662,6 +2662,22 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.records()).toHaveLength(1);
   });
 
+  it('an inconclusive result preserves its reason without retiring the claim, then retries on the same head', async () => {
+    const w = world();
+    const reason = 'Cannot run the cited check: required runtime unavailable';
+    const first = await w.runOnce('run-inconclusive', {
+      summary: reason, results: [{ index: 0, reproduced: null, evidence: reason }],
+    });
+    expect(first.findings.reduce.unverifiedClaims).toEqual([expect.objectContaining({ reason })]);
+    expect(first.findings.reduce.verifications).toEqual([]);
+    expect(w.records()).toEqual([]);
+    expect(w.referralJudge).not.toHaveBeenCalled();
+    await w.runOnce('run-retry', REPRODUCED);
+    expect(w.spawns.map((s) => s.head)).toEqual([H1, H1]);
+    expect(w.records()[0].verified[0].outcome).toBe('reproduced');
+    expect(w.referralJudge).toHaveBeenCalledTimes(1);
+  });
+
   it('A NOT-REPRODUCED CLAIM TOO LARGE TO RECORD is skipped and verified again — it never parks the PR for a human', async () => {
     const w = world();
     const huge = { ...original, summary: `${'x'.repeat(70_000)} confirmed defect` };

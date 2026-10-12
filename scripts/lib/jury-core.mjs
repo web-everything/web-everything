@@ -2863,7 +2863,7 @@ export function verificationCandidates({ seats, known = new Map() }) {
 /**
  * Read the verifier's answer against the candidates it was asked about: `key → { outcome, reason }`, outcome one of
  * `reproduced | not-reproduced | failed`. FAIL CLOSED ON THE CLAIM: a missing, skipped, malformed, conflicting or
- * evidence-free answer is `failed`, never `reproduced`. PURE.
+ * evidence-free or explicitly inconclusive (reproduced=null) answer is `failed`, never persisted. PURE.
  */
 export function settleVerification(candidates, answer) {
   const settled = new Map();
@@ -2884,6 +2884,9 @@ export function settleVerification(candidates, answer) {
   for (const c of candidates) {
     const r = byIndex.get(c.index);
     if (conflicted.has(c.index)) settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave conflicting results for this claim' });
+    else if (r?.reproduced === null) settled.set(c.key, {
+      outcome: 'failed', reason: foldVerifyReason(r.evidence, 'the verifier could not determine whether the claim reproduces'),
+    });
     else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
     // EITHER answer needs evidence: a bare `false` is the cheapest thing a flaky or steered verifier can say, and a `not-reproduced`
     // is sticky for the head, so it is only recorded with what the verifier ran or read. Without it the claim is `failed`: still an

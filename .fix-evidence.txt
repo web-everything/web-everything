@@ -1,0 +1,39 @@
+PR #5025 / finding F1: inability to verify was instructed as a definitive negative.
+
+Before proof (each file run once before source repair):
+npm run test:unit -- scripts/operations/__tests__/review-pr.test.mjs
+339 tests: 3 failed, 336 passed. Schema expected ['boolean', 'null'], received 'boolean'; two inconclusive reason assertions received 'the verifier gave no result for this claim'.
+npm run test:unit -- scripts/operations/__tests__/review-pr-io.test.mjs
+234 tests: 1 failed, 233 passed. Inconclusive integration replay expected the runtime-unavailable reason, received 'the verifier gave no result for this claim'.
+
+The emitted request was the inspected surface: its original mandate explicitly grouped 'could not run what the test needs' with reproduced=false; its schema admitted only boolean results. No live model call was possible in the networkless sandbox.
+
+Repair: reproduced=null means inconclusive; false requires a completed check showing the alleged defect does not occur. Null maps to failed with its folded reason, which existing persistence excludes. Regression coverage includes a real operation/sink replay retaining comments between runs: null creates no retirement, and a subsequent same-head true result creates a referral.
+
+After evidence: pending launcher verify gate. Tests were not rerun after repair, per fix.localTests proof-only instruction. Revert-red result also pending launcher gate; no green verdict is claimed. git diff --check passed.
+
+Variants considered:
+- Fixed at scripts/operations/review-pr.mjs:676,688: missing prerequisites/access, time exhaustion, and inconclusive inspection have a distinct null answer in both schema and mandate.
+- Fixed at scripts/lib/jury-core.mjs:2887: null remains failed and retains a bounded advisory reason.
+- Checked settleVerification: omitted, malformed, skipped, evidence-free, and conflicting answers remain failed; a null/boolean duplicate conflicts rather than retiring.
+- Checked verificationsToPersist and review-pr-io sink: only definitive outcomes persist; failed cannot retire a durable referral.
+- Checked existing true/false, tool-bearing bypass, degraded head, and same/new-head tests.
+
+Variant matrix:
+untrusted text: checked existing foldVerifyReason/foldUntrusted; new reason uses the same folding and cap. No executable or path use added.
+truncated read: checked degraded/empty head skipSpawn path; unavailable inspection now has null.
+shared state: checked failed outcomes never enter referral persistence; no new writer or lock.
+rollback/switch: n/a, no target switch or recovery selection changed.
+normalization: checked existing referral keys and head scoping remain unchanged; null does not create a key or durable outcome.
+resource bounds: checked existing 300-character reason cap and claim cap; no new subprocess or buffer.
+trust boundary: checked existing untrusted claim framing and read-only sandbox remain; reason cannot become a persisted definitive result.
+
+```class-sweep
+{"v":1,"findings":[{"finding":"F1","class":"Inconclusive verification collapsed into a durable negative","siblings":[{"path":"family","site":"scripts/lib/jury-core.mjs#settleVerification","status":"fixed","note":"Explicit null is failed with a folded reason; definitive boolean semantics retained."},{"path":"callers","site":"scripts/operations/review-pr.mjs","status":"fixed","note":"Verifier schema and mandate distinguish inability from a completed negative check; reducer consumes failed without persistence."},{"path":"branches","site":"scripts/operations/review-pr-io.mjs","status":"checked","note":"Sink only accepts definitive outcomes; no failed retirement. Shared verifier serves both tool-less seats."},{"path":"recovery","site":"scripts/operations/__tests__/review-pr-io.test.mjs","status":"fixed","note":"Same-head replay after null retries and can create a reproduced referral."},{"path":"pr","site":"scripts/operations/__tests__/review-pr.test.mjs","status":"fixed","note":"Pins request contract and advisory reason for unavailable/inconclusive checks."},{"path":"pr","site":"scripts/lib/__tests__/jury-core.test.mjs","status":"checked","note":"Existing malformed/conflicting/evidence-free and persistence tests preserve failed versus settled distinction."},{"path":"pr","site":"scripts/operations/cli-adapter.mjs","status":"checked","note":"skipSpawn forwards the declared answer; does not synthesize negatives."},{"path":"pr","site":"scripts/operations/__tests__/parallel-judges.test.mjs","status":"checked","note":"Scripted judge honors skipSpawn; no inability-to-negative conversion."}]}]}
+```
+
+Adversarial self-review: clean; no must-fix findings. Reviewed nullable schema transport, failed-outcome persistence exclusion, same-head replay, and sibling failure paths. No tests were run during self-review.
+
+Generalized lesson: a verification protocol must represent inability to determine separately from a definitive negative whenever negatives suppress retries.
+
+Launcher override: no network, git writes, commit, push, rearm, or inaccessible daemon scripts were used. The launcher owns commit, verify and review handback. Class-sweep checker and remote evidence posting were not run in this sandbox.
