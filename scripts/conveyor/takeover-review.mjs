@@ -17,7 +17,7 @@
  * PURE: reads only the PR's own comment thread and head sha.
  */
 // Takeover budget — each takeover is an EPISODE (its signals with no verdict between them); the grant is per episode.
-import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, OPERATOR_TAKEOVER_PREFIX, isPausedReview } from './takeover-budget.mjs';
+import { takeoverEpisodes, dispatchJudgeRule, verdictHeads, OPERATOR_TAKEOVER_PREFIX } from './takeover-budget.mjs';
 // A conflict-watch bounce asks for a rebase and judges nothing, so it never spends the takeover's review (live:
 // #4631, whose takeover head was bounced for a merge conflict and then refused 6/5 as if reviewed).
 import { isReviewVerdictComment as isVerdict, verdictJudged } from './mechanical-round-cap.mjs';
@@ -26,6 +26,7 @@ export { OPERATOR_TAKEOVER_PREFIX };
 
 import { RULING_NOT_ADDRESSED_MARKER } from '../lib/ruling-ledger.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
+import { isPausedReview } from './takeover-budget.mjs';
 
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? ''); return Number.isFinite(t) ? t : NaN; };

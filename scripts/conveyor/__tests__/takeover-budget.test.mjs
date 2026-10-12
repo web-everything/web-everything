@@ -400,34 +400,6 @@ describe('only a verdict on the takeover\'s own head judges it (PR #4779 review 
   });
 });
 
-describe('every round cap kind leads to a takeover (A5)', () => {
-  it.each(['fix', 'review', 'advisory-fix'])('planTakeover owes a takeover at the %s cap with open defects', (capKind) => {
-    const judged = [...rounds5, rearm(7), review(T1, 8, FOUR)];
-    expect(planTakeover({ pr: pr(T1, judged), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind }))
-      .toMatchObject({ ok: true, n: 1 });
-  });
-  it('a review:human PR at the advisory-fix cap with open defects gets a takeover dispatch, not "a person must take it over"', () => {
-    const comments = [];
-    for (let i = 0; i < ADVISORY_FIX_ROUND_CAP; i += 1) {
-      comments.push(review(R5, 2 * i + 1, FIVE));
-      comments.push({ author: BOT, createdAt: at(2 * i + 2), body: buildAdvisoryFixComment({}) });
-    }
-    comments.push(review(R5, 9, FOUR)); // the note the last advisory fix did not clear, on the current head
-    const p = pr(R5, comments, { labels: [{ name: 'review:human' }, { name: 'advisory:changes' }] });
-    expect(plan(p).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', capKind: 'advisory-fix', takeover: { n: 1 } });
-    // With the person setting, the same PR is a plain advisory-fix cap refusal.
-    expect(plan(p, { roundCapAction: 'person' }).refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', capKind: 'advisory-fix' });
-  });
-});
-
-describe('gateHoldReason', () => {
-  it('names the hold, or null for a PR its gate does not hold', () => {
-    expect(gateHoldReason(pr(R5, []))).toBeNull();
-    expect(gateHoldReason(pr(R5, [], { statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }, { name: 'merge-gate', conclusion: 'FAILURE' }] }))).toBeNull();
-    expect(gateHoldReason(pr(R5, [], { statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE' }] }))).toBe('review-gate-hold');
-  });
-});
-
 // The LAST takeover's head always earns its one review before the PR goes to the operator (live #4708: takeover 2
 // pushed 483aab1e2 with the budget spent; its review PAUSED on two mandatory referrals, the planner read that pause
 // as a verdict, told the operator "a person must take it over" and refused the woken re-review as cap-exhausted 6/5).
@@ -501,5 +473,33 @@ describe('the last takeover head earns its review even when the budget is spent'
     expect(p.refusals.filter((r) => r.prNumber === 7 && r.kind === 'cap-exhausted')).toEqual([]);
     expect(p.notes.find((n) => n.kind === 'round-cap-exhausted')).toBeUndefined();
     expect(takeoverReviewGrant({ pr: pr(T2, accepted), takeoverReviewAttempts: 1 })).toMatchObject({ ok: false, reason: 'head-already-reviewed' });
+  });
+});
+
+describe('every round cap kind leads to a takeover (A5)', () => {
+  it.each(['fix', 'review', 'advisory-fix'])('planTakeover owes a takeover at the %s cap with open defects', (capKind) => {
+    const judged = [...rounds5, rearm(7), review(T1, 8, FOUR)];
+    expect(planTakeover({ pr: pr(T1, judged), roundCapAction: 'takeover', takeoverBudget: 2, fixerLadder: LADDER, capKind }))
+      .toMatchObject({ ok: true, n: 1 });
+  });
+  it('a review:human PR at the advisory-fix cap with open defects gets a takeover dispatch, not "a person must take it over"', () => {
+    const comments = [];
+    for (let i = 0; i < ADVISORY_FIX_ROUND_CAP; i += 1) {
+      comments.push(review(R5, 2 * i + 1, FIVE));
+      comments.push({ author: BOT, createdAt: at(2 * i + 2), body: buildAdvisoryFixComment({}) });
+    }
+    comments.push(review(R5, 9, FOUR)); // the note the last advisory fix did not clear, on the current head
+    const p = pr(R5, comments, { labels: [{ name: 'review:human' }, { name: 'advisory:changes' }] });
+    expect(plan(p).dispatch.find((x) => x.prNumber === 7)).toMatchObject({ kind: 'fix', mode: 'takeover', capKind: 'advisory-fix', takeover: { n: 1 } });
+    // With the person setting, the same PR is a plain advisory-fix cap refusal.
+    expect(plan(p, { roundCapAction: 'person' }).refusals.find((r) => r.prNumber === 7)).toMatchObject({ kind: 'cap-exhausted', capKind: 'advisory-fix' });
+  });
+});
+
+describe('gateHoldReason', () => {
+  it('names the hold, or null for a PR its gate does not hold', () => {
+    expect(gateHoldReason(pr(R5, []))).toBeNull();
+    expect(gateHoldReason(pr(R5, [], { statusCheckRollup: [{ name: 'test', conclusion: 'FAILURE' }, { name: 'merge-gate', conclusion: 'FAILURE' }] }))).toBeNull();
+    expect(gateHoldReason(pr(R5, [], { statusCheckRollup: [{ name: 'review-gate', conclusion: 'FAILURE' }] }))).toBe('review-gate-hold');
   });
 });
