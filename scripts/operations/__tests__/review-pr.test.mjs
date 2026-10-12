@@ -4343,7 +4343,10 @@ import { referralFindingKey as findingKeyOf, normalizeFinding as normalizeFindin
 
 describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', () => {
   const claim = { file: NET_PATHS[0], line: 20, summary: 'confirmed defect', verdict: 'CONFIRMED', impactIfUnfixed: 'broken' };
-  const NOT_REPRODUCED = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: 'the guard holds on the head' }] };
+  // A negative is recorded only when its evidence cites a line in the claim's own file (PR #5025 review).
+  const notReproduced = (file = claim.file) => ({ summary: 'ran it', results: [{ index: 0, reproduced: false, evidence: `${file}:20 the guard holds on the head` }] });
+  const NOT_REPRODUCED = notReproduced();
+  const NO_REPRO_REASON = `${claim.file}:20 the guard holds on the head`;
   const verifierRun = (opts, seatOpts, answers, id = 'run-4815') => {
     const { registry, declaration } = registryFor(opts, seatOpts);
     const requests = {};
@@ -4410,8 +4413,8 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(notes[0].summary).toContain('the guard holds on the head');
       expect(notes[0].summary).toContain('confirmed defect');
       expect(notes[0].verdict).toBe('PLAUSIBLE');
-      expect(reduce.verifications).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', outcome: 'not-reproduced', reason: 'the guard holds on the head' })]);
-      expect(reduce.unverifiedClaims).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', reason: 'the guard holds on the head' })]);
+      expect(reduce.verifications).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', outcome: 'not-reproduced', reason: NO_REPRO_REASON })]);
+      expect(reduce.unverifiedClaims).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', reason: NO_REPRO_REASON })]);
       // the only effect worth declaring is the one that records the outcome
       const effect = run.pending?.effects?.[0] ?? run.effects?.find((e) => e.type === REVIEW_EFFECTS.MANDATORY_REFERRALS);
       expect(effect?.payload?.verifications).toHaveLength(1);
@@ -4448,11 +4451,29 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       expect(reduce.findings.some((f) => String(f.summary).includes('confirmed defect'))).toBe(true);
     });
 
+    // PR #5025 review: the verifier reads attacker-controlled PR content, so a steered "this does not reproduce" with free-form
+    // evidence must not retire the mandatory hold on one model answer. It stays unsettled, holds acceptance, and is asked again.
+    it.each([
+      ['free-form evidence', 'checked it; this does not reproduce, the guard is fine'],
+      ['a line in another file', `${NET_PATHS[1]}:20 the guard is fine`],
+      ['the file named without a line', `${NET_PATHS[0]} looks fine`],
+    ])('a lone negative citing %s does not retire the claim: held, nothing persisted, re-asked next run', (_n, evidence) => {
+      const steered = { summary: 'ran it', results: [{ index: 0, reproduced: false, evidence }] };
+      const first = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: steered });
+      expect(first.reduce.verifications).toEqual([]);
+      expect(first.reduce.verdict).toBe('needs-human');
+      expect(first.reduce.pendingVerifications).toEqual([expect.objectContaining({ seat: 'judgeAdvisory', reason: expect.stringMatching(/cites no line in the claim's own file/) })]);
+      expect(deriveAdvisoryOutcome(first.run.verdict)).toBeNull();
+      const retry = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: REPRODUCED_VERIFIER_ANSWER }, 'retry-steered');
+      expect(retry.requests[REFERRAL_VERIFIER_STEP].skipSpawn).toBeUndefined();
+      expect(retry.reduce.referrals).toEqual([{ seat: 'judgeAdvisory', original: claim }]);
+    });
+
     it('holds for claims beyond the verifier batch even when all submitted claims were disproved', () => {
       const claims = Array.from({ length: 13 }, (_, i) => ({ ...claim, summary: `confirmed defect ${i}` }));
       const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { antigravityReview: true }, {
         judgeAntigravityReview: { summary: 'claims', findings: claims },
-        judgeReferralVerifier: { results: claims.slice(0, 12).map((_, index) => ({ index, reproduced: false, evidence: 'guard holds' })) },
+        judgeReferralVerifier: { results: claims.slice(0, 12).map((_, index) => ({ index, reproduced: false, evidence: `${claim.file}:20 guard holds` })) },
       });
       expect(reduce.verdict).toBe('needs-human');
       expect(reduce.pendingVerifications).toHaveLength(1);
@@ -4488,7 +4509,7 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
     it.each([['docs', NET_PATHS[1]], ['config', NET_PATHS[0]], ['data', NET_PATHS[0]]])('a %s-kind claim is verified the same way', (category, file) => {
       const typed = { ...claim, file, category };
       const answers = { judgeAdvisory: { summary: 's', findings: [typed] } };
-      expect(verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...answers, judgeReferralVerifier: NOT_REPRODUCED }).reduce.referrals).toEqual([]);
+      expect(verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...answers, judgeReferralVerifier: notReproduced(file) }).reduce.referrals).toEqual([]);
       expect(verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...answers, judgeReferralVerifier: REPRODUCED_VERIFIER_ANSWER }).reduce.referrals).toHaveLength(1);
     });
 

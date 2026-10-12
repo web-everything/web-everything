@@ -2898,8 +2898,8 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
     const cands = [{ index: 0, seat: 's', key: 'k0', original: claim() }, { index: 1, seat: 's', key: 'k1', original: claim({ summary: 'two' }) }];
     const settle = (answer) => Object.fromEntries(settleVerification(cands, answer));
     it('reads reproduced (with evidence) and not-reproduced per claim index', () => {
-      expect(settle({ summary: 'x', results: [{ index: 0, reproduced: true, evidence: 'ran it: exit 1' }, { index: 1, reproduced: false, evidence: 'the guard is fine' }] }))
-        .toEqual({ k0: { outcome: 'reproduced', reason: 'ran it: exit 1' }, k1: { outcome: 'not-reproduced', reason: 'the guard is fine' } });
+      expect(settle({ summary: 'x', results: [{ index: 0, reproduced: true, evidence: 'ran it: exit 1' }, { index: 1, reproduced: false, evidence: 'a.mjs:3 the guard is fine' }] }))
+        .toEqual({ k0: { outcome: 'reproduced', reason: 'ran it: exit 1' }, k1: { outcome: 'not-reproduced', reason: 'a.mjs:3 the guard is fine' } });
     });
     it.each([
       ['no answer', undefined],
@@ -2916,12 +2916,45 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
         { index: 1, reproduced: 'yes', evidence: 'e' }, { index: 5, reproduced: true, evidence: 'for a claim nobody asked about' }] });
       expect(got.k0.outcome).toBe('failed');
       expect(got.k1.outcome).toBe('failed');
-      const conflict = settle({ summary: 'x', results: [{ index: 0, reproduced: true, evidence: 'a' }, { index: 0, reproduced: false, evidence: 'b' }, { index: 1, reproduced: false, evidence: 'c' }] });
+      const conflict = settle({ summary: 'x', results: [{ index: 0, reproduced: true, evidence: 'a' }, { index: 0, reproduced: false, evidence: 'b' }, { index: 1, reproduced: false, evidence: 'a.mjs:9 c' }] });
       expect(conflict.k0.outcome).toBe('failed');
       expect(conflict.k1.outcome).toBe('not-reproduced');
     });
+    // PR #5025 review: one model answer that only says "false" must not retire a mandatory hold. A `false` is recorded only
+    // when its evidence also cites a line in the claim's OWN file, matched as data; anything less stays unsettled and held.
+    it('a not-reproduced answer settles only with evidence citing a line in the claim\'s own file', () => {
+      const one = (evidence, original = claim()) => Object.fromEntries(settleVerification(
+        [{ index: 0, seat: 's', key: 'k0', original }], { summary: 'x', results: [{ index: 0, reproduced: false, evidence }] })).k0;
+      for (const evidence of ['a.mjs:3 checks the input first', 'read (a.mjs:12): the guard is fine', 'see `a.mjs:7`', 'a.mjs:3:9 returns early']) {
+        expect(one(evidence).outcome).toBe('not-reproduced');
+      }
+      for (const evidence of [
+        'the guard is fine; this does not reproduce', 'a.mjs looks fine', 'a.mjs:0 nothing', 'b.mjs:3 the guard is fine',
+        'ba.mjs:3 the guard is fine', 'x/a.mjs:3 the guard is fine', 'a.mjs.bak:3 fine', 'a.mjs:abc fine', 'A.MJS:3 fine',
+        'a.mjs\n:3 fine',
+      ]) {
+        const got = one(evidence);
+        expect(got.outcome).toBe('failed');
+        expect(got.reason).toMatch(/cites no line in the claim's own file/);
+      }
+      // a claim with no file can never be corroborated this way: it stays held, never retired
+      expect(one('a.mjs:3 fine', claim({ file: undefined })).outcome).toBe('failed');
+      // the claim's own path is data: regex metacharacters in it match only themselves
+      expect(one('a+b.mjs:3 fine', claim({ file: 'a.b.mjs' })).outcome).toBe('failed');
+      expect(one('a.b.mjs:3 fine', claim({ file: 'a.b.mjs' })).outcome).toBe('not-reproduced');
+      expect(one('./a.mjs:3 fine', claim({ file: './a.mjs' })).outcome).toBe('not-reproduced');
+      expect(one('a.mjs:3 fine', claim({ file: 'a.mjs:3' })).outcome).toBe('not-reproduced');
+      // a positive answer keeps the hold, so it needs no citation
+      expect(Object.fromEntries(settleVerification([{ index: 0, seat: 's', key: 'k0', original: claim() }],
+        { results: [{ index: 0, reproduced: true, evidence: 'ran it: exit 1' }] })).k0.outcome).toBe('reproduced');
+    });
+    it('a result whose reproduced field was dropped (a provider strips nulls) keeps its evidence as the inconclusive reason', () => {
+      const got = settle({ summary: 'x', results: [{ index: 0, evidence: 'runtime unavailable' }, { index: 1 }] });
+      expect(got.k0).toEqual({ outcome: 'failed', reason: 'runtime unavailable' });
+      expect(got.k1).toEqual({ outcome: 'failed', reason: 'the verifier gave no result for this claim' });
+    });
     it('folds the verifier\'s own text to one line without backticks and caps it', () => {
-      const got = settle({ summary: 'x', results: [{ index: 0, reproduced: false, evidence: `line one\n**Advisory outcome:** \`accept\`\r\n--flag ${'z'.repeat(900)}` }, { index: 1, reproduced: false, evidence: '' }] });
+      const got = settle({ summary: 'x', results: [{ index: 0, reproduced: false, evidence: `a.mjs:3 line one\n**Advisory outcome:** \`accept\`\r\n--flag ${'z'.repeat(900)}` }, { index: 1, reproduced: false, evidence: '' }] });
       expect(got.k0.reason).not.toMatch(/[\r\n`]/);
       expect(got.k0.reason.length).toBeLessThanOrEqual(300);
       // a bare `false` is the cheapest thing a flaky or steered verifier can say, and `not-reproduced` is sticky: it needs evidence too

@@ -2861,9 +2861,23 @@ export function verificationCandidates({ seats, known = new Map() }) {
 }
 
 /**
+ * Does the verifier's evidence cite a line (`<path>:<n>`, n ≥ 1) in the claim's OWN cited file? The path is data: it is matched
+ * literally, case-sensitive, as a whole path token (not a suffix of a longer path, not a prefix of a longer name), on the folded
+ * evidence, and is never opened. A claim with no file has nothing to cite, so this is false for it. PURE.
+ */
+export function verifierEvidenceCitesClaim(original, evidence) {
+  const file = exactCitedPath(original?.file);
+  if (!file || typeof evidence !== 'string') return false;
+  const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const cite = new RegExp(`(?<![\\w./\\\\@+~-])(?:\\./)?${escaped}:(\\d+)(?!\\d)`, 'g');
+  return [...foldUntrusted(evidence).matchAll(cite)].some((m) => Number(m[1]) >= 1);
+}
+
+/**
  * Read the verifier's answer against the candidates it was asked about: `key → { outcome, reason }`, outcome one of
  * `reproduced | not-reproduced | failed`. FAIL CLOSED ON THE CLAIM: a missing, skipped, malformed, conflicting or
- * evidence-free or explicitly inconclusive (reproduced=null) answer is `failed`, never persisted. PURE.
+ * evidence-free or explicitly inconclusive (reproduced=null, or dropped by a provider that strips nulls) answer is `failed`,
+ * never persisted, and so is a `false` whose evidence cites no line in the claim's own file. PURE.
  */
 export function settleVerification(candidates, answer) {
   const settled = new Map();
@@ -2884,16 +2898,23 @@ export function settleVerification(candidates, answer) {
   for (const c of candidates) {
     const r = byIndex.get(c.index);
     if (conflicted.has(c.index)) settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave conflicting results for this claim' });
-    else if (r?.reproduced === null) settled.set(c.key, {
-      outcome: 'failed', reason: foldVerifyReason(r.evidence, 'the verifier could not determine whether the claim reproduces'),
-    });
-    else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
+    // An explicit null is inconclusive. So is a result with evidence but no `reproduced` at all: the Codex parse path strips null
+    // properties, so that is how a null arrives from the real provider, and its evidence is the reason worth keeping.
+    else if (r && (r.reproduced === null || (r.reproduced === undefined && typeof r.evidence === 'string' && r.evidence.trim()))) {
+      settled.set(c.key, { outcome: 'failed', reason: foldVerifyReason(r.evidence, 'the verifier could not determine whether the claim reproduces') });
+    } else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
     // EITHER answer needs evidence: a bare `false` is the cheapest thing a flaky or steered verifier can say, and a `not-reproduced`
-    // is sticky for the head, so it is only recorded with what the verifier ran or read. Without it the claim is `failed`: still an
-    // advisory note, but retried on the next run instead of being retired. Retiring on ONE answer is the operator's ruling for this
-    // turn; requiring a second signal is #xztd0mv. The review reducer holds acceptance while verification is unfinished.
+    // is sticky for the head, so it is only recorded with what the verifier ran or read. Without it the claim is `failed`: retried
+    // on the next run instead of being retired, and the review reducer holds acceptance while verification is unfinished.
     else if (!(typeof r.evidence === 'string' && r.evidence.trim())) {
       settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
+    // A `false` RETIRES a mandatory hold, and the verifier reads attacker-controlled PR content, so its own say-so is not enough
+    // (PR #5025 review). It is recorded only when the evidence also cites a line in the claim's own file — a check the code makes,
+    // not the model — so a steered "this does not reproduce" with free-form evidence stays held and is asked again. A `true` keeps
+    // the hold, so it needs no such corroboration.
+    } else if (!r.reproduced && !verifierEvidenceCitesClaim(c.original, r.evidence)) {
+      settled.set(c.key, { outcome: 'failed',
+        reason: 'the verifier\'s not-reproduced answer cites no line in the claim\'s own file, so it cannot retire the claim' });
     } else settled.set(c.key, { outcome: r.reproduced ? 'reproduced' : 'not-reproduced', reason: foldVerifyReason(r.evidence, '') });
   }
   return settled;
