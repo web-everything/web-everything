@@ -24,6 +24,7 @@ describe('TRUST_CHAIN_TIER_FILES — the in-scope set (#2875)', () => {
       'scripts/lib/auto-land-seam.mjs',
       'scripts/lib/disposition-judge.mjs',
       'scripts/lib/disposition-land-seam.mjs',
+      'scripts/lib/drain-workflow-edit-hold.mjs',
       'scripts/lib/gate-config.mjs',
       'scripts/lib/review-core.mjs',
       'scripts/lib/review-escalation.mjs',

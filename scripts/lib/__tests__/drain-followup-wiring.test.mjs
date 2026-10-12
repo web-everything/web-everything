@@ -76,7 +76,7 @@ function runCli({ env: extraEnv = {} } = {}) {
       statusCheckRollup: [{ name: 'test', conclusion: 'SUCCESS', status: 'COMPLETED' }],
       labels: [{ name: 'ready-to-merge' }], comments: [],
       commits: [{ oid: `sha-${number}`, authors: [{ name: 'Claude', email: 'noreply@anthropic.com' }] }],
-      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0 }],
+      files: [{ path: `backlog/leaf-${number}.md`, additions: 1, deletions: 0, changeType: 'ADDED' }],
     }))));
     const preload = 'data:text/javascript,' + encodeURIComponent("import os from 'node:os'; import { syncBuiltinESMExports } from 'node:module'; os.homedir = () => process.env.FU_HOME; syncBuiltinESMExports();");
     const jobsRoot = join(dir, 'jobs');
