@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { classifyPr, revalidateForMerge, buildDrainVerdicts, prepareDrainVerdicts, unlandableStateReason } from '../merge-ai-prs.mjs';
 import * as strategy from '../lib/drain-merge-strategy.mjs';
 
@@ -34,6 +35,7 @@ describe('required merge queue BLOCKED relief', () => {
   it('retains earlier and later safety gates', () => {
     for (const extra of [{ fixClaim: { who: 'fixer' } }, { mergeable: 'CONFLICTING' }, { body: '' }, { labels: [{ name: 'ready-to-merge' }, { name: 'review:changes' }] }]) {
       expect(classifyPr(pr(extra), opts).decision).toBe('skip');
+      expect(classifyPr(pr(extra), opts)).not.toHaveProperty('queueBlockedRelief');
     }
   });
   it('accepts legacy StatusContext rows', () => {
@@ -62,27 +64,87 @@ describe('required merge queue BLOCKED relief', () => {
 });
 
 describe('readQueueRequiredChecks', () => {
+  it.each(['unavailable', 'fallback', 'stale-cache', undefined])('refuses uncertain classic source %s', source => {
+    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => '["smoke"]', readClassic: () => ({ checks: ['test'], source }) })).toBeNull();
+  });
+  it.each([undefined, null, '', '   '])('requires an explicit resolved branch: %j', branch => {
+    const exec = vi.fn(() => '["test"]');
+    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch, exec, readClassic: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+  });
   it.each([undefined, null, '', '   ', 42, {}])('returns null without reading checks for missing or invalid repo: %j', repo => {
     const exec = vi.fn();
     const readClassic = vi.fn();
-    expect(strategy.readQueueRequiredChecks({ repo, exec, readClassic })).toBeNull();
+    expect(strategy.readQueueRequiredChecks({ repo, branch: 'release', exec, readClassic })).toBeNull();
     expect(exec).not.toHaveBeenCalled();
     expect(readClassic).not.toHaveBeenCalled();
   });
   it('returns the sorted union of classic and ruleset requirements', () => {
     const exec = vi.fn(() => '["smoke","test"]');
-    const readClassic = vi.fn(() => ({ checks: ['test', 'daemon-soak'] }));
+    const readClassic = vi.fn(() => ({ checks: ['test', 'daemon-soak'], source: 'live' }));
     expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec, readClassic })).toEqual(['daemon-soak', 'smoke', 'test']);
     expect(readClassic).toHaveBeenCalledWith({ repo: 'owner/repo', branch: 'release' });
     expect(exec.mock.calls[0].slice(0, 2)).toEqual(['gh', ['api', 'repos/owner/repo/rules/branches/release', '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]']]);
   });
   it.each(['not json', '{}', 'null'])('fails closed on malformed rules: %s', output => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', exec: () => output, readClassic: () => ({ checks: ['test'] }) })).toBeNull();
+    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => output, readClassic: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
   });
   it('fails closed on a rules read error', () => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', exec: () => { throw new Error('denied'); }, readClassic: () => ({ checks: ['test'] }) })).toBeNull();
+    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => { throw new Error('denied'); }, readClassic: () => ({ checks: ['test'], source: 'live' }) })).toBeNull();
   });
   it('returns null for an empty union', () => {
-    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', exec: () => '[]', readClassic: () => ({ checks: [] }) })).toBeNull();
+    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => '[]', readClassic: () => ({ checks: [], source: 'live' }) })).toBeNull();
+  });
+  it.each(['live', 'cache', 'declared'])('accepts authoritative classic source %s', source => {
+    expect(strategy.readQueueRequiredChecks({ repo: 'owner/repo', branch: 'release', exec: () => '["smoke"]', readClassic: () => ({ checks: ['test'], source }) })).toEqual(['smoke', 'test']);
+  });
+});
+
+describe('production queue requirements wiring', () => {
+  const source = readFileSync('scripts/merge-ai-prs.mjs', 'utf8');
+  it('reads queue requirements for the resolved default branch', () => {
+    const readChecks = vi.fn(({ repo, branch }) => strategy.readQueueRequiredChecks({
+      repo, branch, exec: () => '["smoke"]',
+      readClassic: () => ({ checks: ['test'], source: 'live' }),
+    }));
+    const defaultBranchOf = vi.fn(() => 'release');
+    const queueRequiredChecksOf = strategy.createQueueRequiredChecksOf({ queueEnqueueMode: true, isLocalRepo: () => true, localSlug: 'owner/local', defaultBranchOf, readChecks });
+    const result = prepareDrainVerdicts({ listings: [{ repo: null, prs: [pr({ baseRefName: 'release' })] }], repos: [null], defaultBranchOf, queueRequiredChecksOf });
+    expect(result.verdicts[0]).toMatchObject({ decision: 'merge', queueBlockedRelief: true });
+    expect(readChecks).toHaveBeenCalledWith({ repo: 'owner/local', branch: 'release' });
+    queueRequiredChecksOf(null);
+    expect(readChecks).toHaveBeenCalledTimes(1);
+    expect(source).toMatch(/const queueRequiredChecksOf = createQueueRequiredChecksOf\(\{\s*queueEnqueueMode, isLocalRepo, localSlug, defaultBranchOf,/);
+  });
+  it.each([[false, true, 'release'], [true, false, 'release'], [true, true, null]])('refuses relief for mode=%s local=%s branch=%s', (queueEnqueueMode, local, branch) => {
+    const readChecks = vi.fn(() => required);
+    const checksOf = strategy.createQueueRequiredChecksOf({ queueEnqueueMode, isLocalRepo: () => local, localSlug: 'owner/local', defaultBranchOf: () => branch, readChecks });
+    expect(checksOf('owner/local')).toBeNull();
+    expect(readChecks).not.toHaveBeenCalled();
+  });
+  it('refuses unresolved slugs and caches failures only for the same branch', () => {
+    const readChecks = vi.fn(() => null);
+    let branch = 'release';
+    const args = { queueEnqueueMode: true, isLocalRepo: () => true, defaultBranchOf: () => branch, readChecks };
+    expect(strategy.createQueueRequiredChecksOf(args)(null)).toBeNull();
+    expect(readChecks).not.toHaveBeenCalled();
+    const checksOf = strategy.createQueueRequiredChecksOf({ ...args, localSlug: 'owner/local' });
+    expect(checksOf(null)).toBeNull();
+    expect(checksOf('owner/local')).toBeNull();
+    expect(readChecks).toHaveBeenCalledTimes(1);
+    branch = 'next';
+    expect(checksOf(null)).toBeNull();
+    expect(readChecks).toHaveBeenLastCalledWith({ repo: 'owner/local', branch: 'next' });
+    expect(readChecks).toHaveBeenCalledTimes(2);
+  });
+  it('threads requirements through every fresh revalidation call', () => {
+    const calls = [...source.matchAll(/\brevalidateFresh\((\w+)\.repo,\s*\1\.num,\s*\{([\s\S]*?)\}\)/g)];
+    expect(calls).toHaveLength(3);
+    for (const [, candidate, options] of calls) expect(options).toContain(`queueRequiredChecks: queueRequiredChecksOf(${candidate}.repo)`);
+  });
+  it('requests reviewDecision in candidate and fresh GitHub fields', () => {
+    expect(source.match(/const CANDIDATE_ONLY_FIELDS = '([^']+)'/)[1].split(',')).toContain('reviewDecision');
+    const freshRead = source.slice(source.indexOf('const fetchFreshPrForRevalidation ='), source.indexOf('const UNKNOWN_RETRY ='));
+    expect(freshRead.match(/'--json',\s*'([^']+)'/)[1].split(',')).toContain('reviewDecision');
   });
 });

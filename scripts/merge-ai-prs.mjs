@@ -182,7 +182,7 @@ import { deliveredItemNumsFromPr, deliveredHashFromPr, declaredResolvedIdsFromPr
 // to this source). See scripts/lib/reconcile-predicate.mjs for the full rationale.
 import { parseArgvFlags, reconcileWouldRunFor } from './lib/reconcile-predicate.mjs';
 import { reviewCiGate } from './lib/review-ci-gate.mjs';
-import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, readQueueRequiredChecks } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
+import { createDrainMergeStrategy, resolveDrainMergePolicy, queueEnqueueModeFromPolicy, createQueueRequiredChecksOf } from './lib/drain-merge-strategy.mjs'; // xtpxusq — merge-delivery strategy (drain-direct | github-merge-queue)
 // #3215 — the drain applies holds of its own (a fresh park, a #2409 stale-acceptance re-park); this is the
 // same ledger `review-set-label.mjs` already writes through for the review seam, never a second format.
 import { buildVerdictRecord, appendVerdict, labelVerdictOf, buildLedgerEvent, EVENT_TYPES, parseLedgerEvents, verdictLedgerPath } from './lib/verdict-ledger.mjs';
@@ -1004,7 +1004,7 @@ export function classifyPr(pr, { requiredCheck = 'test', trustLabel = 'ready-to-
   else if (reviewUncleared) { decision = 'skip'; reviewHeld = true; reason = `unsatisfied review hold ("${heldLabel}") present without review:accepted — refusing to merge regardless of "${trustLabel}" (#2820)`; }
   if (queueBlockedRelief && decision === 'merge') reason += `; BLOCKED only by the required merge queue (all ${queueRequiredChecks.length} required checks green) — enqueue`;
   return { num, title, decision, reason, aiGenerated, certifyLabel, humanCleared, reviewHeld, codeqlBlocked, testGreen, state, mergeable, offDefaultBase,
-    ...(queueBlockedRelief ? { queueBlockedRelief: true } : {}),
+    ...(queueBlockedRelief && decision === 'merge' ? { queueBlockedRelief: true } : {}),
     ...(pr?.requiredCheckReadError ? { requiredCheckReadError: pr.requiredCheckReadError } : {}) };
 }
 
@@ -4983,17 +4983,12 @@ async function runCli() {
   // `planDrainPass` AFTER the escalation/park pass (R5), so `held` is read from each carrier's final decision.
   const resolvedMergePolicy = resolveDrainMergePolicy({ dryRun: DRY_RUN });
   const queueEnqueueMode = queueEnqueueModeFromPolicy(resolvedMergePolicy);
-  const queueRequiredChecksMemo = new Map();
-  const queueRequiredChecksOf = (repo) => {
-    if (!queueEnqueueMode || !isLocalRepo(repo)) return null;
-    const slug = repo || localSlug;
-    if (!queueRequiredChecksMemo.has(slug)) {
-      const checks = readQueueRequiredChecks({ repo: slug });
-      queueRequiredChecksMemo.set(slug, checks);
+  const queueRequiredChecksOf = createQueueRequiredChecksOf({
+    queueEnqueueMode, isLocalRepo, localSlug, defaultBranchOf,
+    onRead: (checks) => {
       if (checks && !AS_JSON) process.stderr.write(`  github-merge-queue: BLOCKED PRs with all required checks green (${checks.join(', ')}) are enqueue-eligible\n`);
-    }
-    return queueRequiredChecksMemo.get(slug);
-  };
+    },
+  });
   verdicts.push(...buildDrainVerdicts({
     queueRequiredChecksOf,
     prsByRepo,

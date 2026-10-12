@@ -84,18 +84,39 @@ export function resolveDrainMergePolicy({ dryRun = false, env = process.env, loa
 export function queueEnqueueModeFromPolicy(resolved) { return mergeActionFor(resolved.policy) === 'enqueue'; }
 
 /** Union classic protection with effective ruleset requirements; an unreadable set grants no relief. */
-export function readQueueRequiredChecks({ repo, branch = 'main', exec = execFileSync, readClassic = getRequiredStatusChecks } = {}) {
+export function readQueueRequiredChecks({ repo, branch, exec = execFileSync, readClassic = getRequiredStatusChecks } = {}) {
   if (typeof repo !== 'string' || !repo.trim()) return null;
+  if (typeof branch !== 'string' || !branch.trim()) return null;
   try {
     const rules = JSON.parse(exec('gh', ['api', `repos/${repo}/rules/branches/${branch}`, '--jq', '[.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'],
       { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] }));
     if (!Array.isArray(rules)) return null;
-    const classic = readClassic({ repo, branch }).checks;
+    const { checks: classic, source } = readClassic({ repo, branch });
+    // Fresh cached reads and declared repository policy are supported; degraded reads are not authoritative.
+    if (!['live', 'cache', 'declared'].includes(source)) return null;
     if (!Array.isArray(classic)) return null;
     const checks = [...new Set([...classic, ...rules])];
     if (!checks.length || checks.some(name => typeof name !== 'string' || !name.trim())) return null;
     return checks.sort();
   } catch { return null; }
+}
+
+/** Per-pass requirements lookup, confined to local enqueue candidates and their resolved default branch. */
+export function createQueueRequiredChecksOf({ queueEnqueueMode, isLocalRepo, localSlug, defaultBranchOf, readChecks = readQueueRequiredChecks, onRead = () => {} }) {
+  const memo = new Map();
+  return (repo) => {
+    if (!queueEnqueueMode || !isLocalRepo(repo)) return null;
+    const slug = repo || localSlug;
+    const branch = defaultBranchOf(repo);
+    if (typeof slug !== 'string' || !slug.trim() || typeof branch !== 'string' || !branch.trim()) return null;
+    const key = JSON.stringify([slug, branch]);
+    if (!memo.has(key)) {
+      const checks = readChecks({ repo: slug, branch });
+      memo.set(key, checks);
+      onRead(checks);
+    }
+    return memo.get(key);
+  };
 }
 
 /** The clearance comment body for one judged head. Pure. */
