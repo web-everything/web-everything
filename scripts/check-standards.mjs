@@ -779,16 +779,13 @@ if (!LOCAL_MODE) {
     for (const msg of born.errors) err(msg);
     for (const msg of born.warnings) warn(msg);
   }
-  const { isMergeGroupCiRun, resolveQueueNumbering, hashBacklogFiles, exemptDrainNumberedItems } = await import('./lib/queue-branch-numbering.mjs');
+  const { isMergeGroupCiRun, resolveQueueNumbering, mergeGroupHashRefusals, exemptDrainNumberedItems } = await import('./lib/queue-branch-numbering.mjs');
   const setting = resolveQueueNumbering();
   for (const message of setting.invalid) warn(message);
   if (isMergeGroupCiRun()) {
-    if (setting.value) {
-      try {
-        const tracked = readdirSync(join(ROOT, 'backlog')).map((f) => `backlog/${f}`);
-        for (const file of hashBacklogFiles(tracked)) err(`Backlog file "${file}" would land on main with a NON-NUMERIC leading id — the drain numbers cards on the PR branch before enqueue (mergeQueue.numberCardsBeforeEnqueue); this merge group is refused so main never goes red on it`);
-      } catch (e) { err(`Cannot inspect merge group backlog for non-numeric ids: ${e.message}`); }
-    }
+    try {
+      for (const m of mergeGroupHashRefusals({ files: readdirSync(join(ROOT, 'backlog')).map((f) => `backlog/${f}`) })) err(m);
+    } catch (e) { err(`Cannot inspect merge group backlog for non-numeric ids: ${e.message}`); }
   }
   // #2319 — hash-on-main invariant: a backlog file on origin/main with a non-numeric leading id means a land route
   // bypassed JIT numbering (#2288) and stranded a hash. Read the MAIN tree (not the working tree) so in-lane

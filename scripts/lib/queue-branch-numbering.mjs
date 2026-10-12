@@ -14,6 +14,12 @@ const lines = (value) => Array.isArray(value) ? value : String(value).split(/\r?
 const cardId = (path) => idFromName(basename(path, '.md'));
 export const hashBacklogFiles = (files) => lines(files).filter((p) => /^backlog\/[^/]+\.md$/.test(p) && isHash(cardId(p)));
 export const isMergeGroupCiRun = (env = process.env) => env.GITHUB_ACTIONS === 'true' && env.GITHUB_EVENT_NAME === 'merge_group';
+/** Temporary ids are unconditionally refused in merge-group CI, independent of drain settings. */
+export function mergeGroupHashRefusals({ env = process.env, files }) {
+  if (!isMergeGroupCiRun(env)) return [];
+  return hashBacklogFiles(files).map((file) => `Backlog file "${file}" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)`);
+}
+
 /** The drain's birth-hash stamp exempts queue-numbered cards from the hand-picked-id gate. */
 export function exemptDrainNumberedItems(items, { enabled }) {
   return enabled ? items.filter((item) => !isHash(item.bornAs)) : items;

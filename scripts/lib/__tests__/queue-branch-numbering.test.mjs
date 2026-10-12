@@ -1,8 +1,26 @@
 import { describe, it, expect, vi } from 'vitest';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
-import { exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
+import { exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 
 describe('queue branch numbering', () => {
+  it('refuses hash cards in merge groups even when drain numbering is off', () => {
+    const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
+    expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md', 'backlog/5970-bar.md'] })).toEqual([
+      'Backlog file "backlog/xabc123-foo.md" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)',
+    ]);
+  });
+  it('does not refuse hash cards outside merge-group CI', () => {
+    for (const env of [{}, { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'pull_request' }, { GITHUB_EVENT_NAME: 'merge_group' }]) {
+      expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md'] })).toEqual([]);
+    }
+  });
+  it('wires the merge-group refusal without a numbering setting condition', () => {
+    const source = readFileSync('scripts/check-standards.mjs', 'utf8');
+    const block = source.match(/if \(isMergeGroupCiRun\(\)\) \{([\s\S]*?)\/\/ #2319/);
+    expect(block).not.toBeNull();
+    expect(block[1]).toContain('mergeGroupHashRefusals(');
+    expect(block[1]).not.toContain('setting.value');
+  });
   it('resolves defaults, file, env and reports invalid layers', () => {
     const readFile = () => JSON.stringify({ mergeQueue: { numberCardsBeforeEnqueue: false } });
     expect(resolveQueueNumbering({ readFile, env: {} })).toMatchObject({ value: false, source: 'scripts/settings/merge-queue-numbering.json' });
