@@ -208,7 +208,8 @@ describe('recovery preserves before removing and fails safely', () => {
   };
   it('guards worktree probes and saves the commit before removal', () => {
     const { calls, logs } = recover();
-    expect(calls.map((c) => c.args[0])).toEqual(['worktree', 'status', 'rev-parse', 'merge-base', 'update-ref', 'worktree']);
+    expect(calls.map((c) => c.args[0])).toEqual(['worktree', 'ls-files', 'status', 'rev-parse', 'merge-base', 'update-ref', 'worktree']);
+    calls.splice(1, 1); // the index-bit probe; the indices below address the rest of the sequence
     expect(calls[4]).toMatchObject({ cwd: '/board', args: ['update-ref', 'refs/transport-stranded/wt-1', 'abc'] });
     expect(calls[5].args).toEqual(['worktree', 'remove', '--force', path]);
     for (const c of calls.filter((c) => c.cwd === path)) {
@@ -222,7 +223,7 @@ describe('recovery preserves before removing and fails safely', () => {
     expect(calls.some((c) => c.args[0] === 'update-ref')).toBe(false);
     expect(calls.at(-1).args).toEqual(['worktree', 'remove', '--force', path]);
   });
-  it.each([{ dirty: true }, { fail: 'status' }, { fail: 'rev-parse' }, { fail: 'update-ref' }])('leaves work untouched when unsafe: %j', (opts) => {
+  it.each([{ dirty: true }, { fail: 'status' }, { fail: 'ls-files' }, { fail: 'rev-parse' }, { fail: 'update-ref' }])('leaves work untouched when unsafe: %j', (opts) => {
     const { calls, logs } = recover(opts);
     expect(calls.some((c) => c.args[1] === 'remove')).toBe(false);
     expect(logs.join()).toContain(path);
@@ -307,7 +308,20 @@ describe('the dirty guard sees untracked files whatever the git config says (red
     expect(status).toEqual(expect.arrayContaining(['--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']));
   });
 
-  it('with real git and status.showUntrackedFiles=no, a worktree holding an unadded file is NOT removed', async () => {
+  it.each([
+    ['status.showUntrackedFiles=no hides an unadded file', (git, board, wt, wf, j) => {
+      git(['config', 'status.showUntrackedFiles', 'no'], board);
+      wf(j(wt, 'net.diff'), 'request written just before the writer died\n');
+    }],
+    ['--assume-unchanged hides an edit to a tracked file', (git, board, wt, wf, j) => {
+      git(['update-index', '--assume-unchanged', 'a.txt'], wt);
+      wf(j(wt, 'a.txt'), 'edited and hidden\n');
+    }],
+    ['--skip-worktree hides an edit to a tracked file', (git, board, wt, wf, j) => {
+      git(['update-index', '--skip-worktree', 'a.txt'], wt);
+      wf(j(wt, 'a.txt'), 'edited and hidden\n');
+    }],
+  ])('with real git, a worktree whose work is hidden is NOT removed: %s', async (_label, hide) => {
     const { mkdtempSync, writeFileSync: wf, rmSync: rmf, existsSync, readFileSync, realpathSync } = await import('node:fs');
     const { tmpdir } = await import('node:os');
     const { join: j } = await import('node:path');
@@ -323,15 +337,17 @@ describe('the dirty guard sees untracked files whatever the git config says (red
       git(['clone', '--quiet', origin, board], root);
       wf(j(board, 'a.txt'), 'x\n'); git(['add', '.'], board); git(['commit', '--quiet', '-m', 'm'], board);
       git(['push', '--quiet', 'origin', 'main'], board);
-      git(['config', 'status.showUntrackedFiles', 'no'], board);
       const wt = j(board, '.operations', 'transport', 'wt-1');
       git(['worktree', 'add', '--detach', '--force', wt, 'HEAD'], board);
-      wf(j(wt, 'net.diff'), 'request written just before the writer died\n');
-      expect(git(['status', '--porcelain'], wt).trim()).toBe(''); // the config really does hide it
-      reclaimStrandedTransportWorktrees({ board, branch: 'main', now: () => 600001, log: () => {} });
-      expect(existsSync(j(wt, 'net.diff'))).toBe(true);
-      expect(readFileSync(j(wt, 'net.diff'), 'utf8')).toContain('request written');
+      hide(git, board, wt, wf, j);
+      expect(git(['status', '--porcelain'], wt).trim()).toBe(''); // plain status really is blind to it
+      const logs = [];
+      reclaimStrandedTransportWorktrees({ board, branch: 'main', now: () => 600001, log: (l) => logs.push(l) });
+      expect(logs.join()).toContain('dirty stranded worktree'); // skipped BECAUSE it is dirty, not for another reason
       expect(git(['worktree', 'list'], board)).toContain('wt-1');
+      expect(existsSync(wt)).toBe(true);
+      const kept = existsSync(j(wt, 'net.diff')) ? 'net.diff' : 'a.txt';
+      expect(readFileSync(j(wt, kept), 'utf8')).toMatch(/request written|edited and hidden/);
     } finally { rmf(root, { recursive: true, force: true }); }
   });
 });

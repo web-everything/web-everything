@@ -188,7 +188,10 @@ export function reclaimStrandedTransportWorktrees({
         const ownerPid = readOwnerPid(read, ownerFile(root, name));
         if (ownerPid && alive(ownerPid)) continue; // its writer is still running, however long that takes
         const wtOpts = { cwd: path, env: worktreeGitEnv(path) };
-        if (run([...DIRTY_PROBE_ARGS], wtOpts).trim()) {
+        // The index can hide edits from status too: `update-index --assume-unchanged` (tag `h`) and
+        // `--skip-worktree` (tag `S`). Every tracked file must carry the plain `H` tag.
+        const hiddenIndexBits = run(['ls-files', '-v'], wtOpts).split(/\r?\n/).some((line) => line && line[0] !== 'H');
+        if (hiddenIndexBits || run([...DIRTY_PROBE_ARGS], wtOpts).trim()) {
           warn(`git-transport-branch: WARNING dirty stranded worktree ${path}; left untouched`);
           continue;
         }
