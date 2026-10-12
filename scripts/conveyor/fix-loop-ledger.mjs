@@ -83,10 +83,15 @@ export function infraFailureCount({ logText, pr, sessions }) {
 /** Control rows persist across the counting window: each head gets only one Claude re-arm.
  * Exact infra rows come from ordered log evidence; aggregate-only callers conservatively discount the newest rows. */
 export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), config = fixLoopConfig(), infraFailures = 0, build, infraRows = null }) {
+  if (!config.hold) return { action: 'dispatch' };
   const identity = row => row.repo === repo && row.pr === pr && row.head === head;
   const controls = (rows ?? []).filter(row => validRow(row) && identity(row) && Date.parse(row.at) <= new Date(now).getTime());
   if (controls.some(row => row.kind === 'park')) return { action: 'parked' };
   const rearm = controls.find(row => row.kind === 'rearm');
+  // Log text is not authenticated launcher evidence. Bound spend independently of
+  // discounts and the rolling window, allowing one extra attempt and a final re-arm.
+  const rawCount = controls.filter(isSession).length;
+  if (rawCount >= config.maxSessions + 2) return { action: 'park', reason: 'raw per-head repair session ceiling reached' };
   const matches = windowRows(rows, now, config).filter(identity);
   const state = fixLoopState({ rows, repo, pr, head, now, config, infraFailures });
   const counted = infraRows ? matches.filter(row => !infraRows.includes(row)) : matches.slice(0, matches.length - state.infraFailures);
@@ -100,7 +105,10 @@ export function fixLoopDisposition({ rows, repo, pr, head, now = Date.now(), con
     if (new Date(now).getTime() >= Date.parse(until)) return { action: 'dispatch' };
     return { action: 'hold', until };
   }
-  if (!state.held) return { action: 'dispatch' };
+  if (!state.held) {
+    if (rawCount >= config.maxSessions + 1) return { action: 'rearm', reason: 'final attempt before raw per-head session ceiling' };
+    return { action: 'dispatch' };
+  }
   if (build && counted.some(row => row.build !== build)) return { action: 'rearm', reason: 'fixer build-change' };
   if (new Date(now).getTime() >= Date.parse(until)) return { action: 'rearm', reason: 're-arm window elapsed' };
   return { action: 'hold', until };

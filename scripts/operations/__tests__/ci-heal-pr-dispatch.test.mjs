@@ -12,7 +12,7 @@
  * `held` test uses a sink that behaves as that guard does and asserts the module passes it through unchanged.
  */
 
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync, readSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -879,6 +879,38 @@ describe('CI-heal salvage before agent dispatch', () => {
     expect(result.dispatched).toHaveLength(1);
     expect(dispatch.mock.calls[0][0].strongerModel).toBe(true);
   });
+  it.each(['truncated', 'older-head', 'older-window', 'extra-terminal'])('leaves %s terminal evidence unassigned', async variant => {
+    const evidence = rows();
+    const terminal = 'fix-run: PR #3895 failed (no-finding: none); claim released';
+    if (variant === 'older-head') evidence.unshift({ ...evidence[0], head: 'c'.repeat(40) });
+    if (variant === 'older-window') evidence.unshift({ ...evidence[0], at: new Date(Date.now() - 7 * 3600000).toISOString() });
+    const ledger = loop({ readRows: () => evidence, readSessionLog: () =>
+      Array(variant === 'truncated' ? 1 : variant === 'extra-terminal' ? 4 : 3).fill(terminal).join('\n') });
+    const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals[0].kind).toBe('fix-loop-hold');
+    expect(result.refusals[0].why).toContain('0 infrastructure discount');
+  });
+  it('caps repeated forged infrastructure outcomes regardless of discounts', async () => {
+    const evidence = [...rows(), ...rows()].slice(0, 5);
+    const ledger = loop({ readRows: () => evidence, readSessionLog: () =>
+      Array(5).fill('fix-run: PR #3895 failed (sandbox); claim released').join('\n') });
+    const postParkComment = vi.fn();
+    const { result, dispatch } = await exercise(() => null, { fixLoop: ledger, postParkComment });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(result.refusals[0].kind).toBe('fix-loop-parked');
+    expect(postParkComment.mock.calls[0][0].body).toContain('raw per-head repair session ceiling reached');
+  });
+  it.each(['rearm', 'park'])('dispatches with holds disabled despite a %s row', async kind => {
+    const evidence = rows();
+    evidence.push({ ...evidence[0], kind, reason: 'fixture' });
+    const { result, dispatch } = await exercise(() => null, {
+      fixLoop: loop({ readRows: () => evidence }),
+      fixConfig: { maxSessions: 3, windowHours: 6, hold: false },
+    });
+    expect(result.dispatched).toHaveLength(1);
+    expect(dispatch).toHaveBeenCalledTimes(1);
+  });
   it('records a legacy-build re-arm and dispatches on Claude', async () => {
     const ledger = loop({ readRows: () => rows().map(({ build, ...r }) => r) });
     const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
@@ -1058,7 +1090,14 @@ it('bounds dispatch log reads to 64 KiB and treats missing or unreadable logs as
     expect(readSessionLog('missing', root)).toBe('');
     const terminal = 'fix-run: PR #1 failed (EPERM); claim released\n';
     writeFileSync(join(dir, 'fixture.log'), 'x'.repeat(70 * 1024) + '\n' + terminal);
-    expect(readSessionLog('fixture', root)).toBe(terminal);
+    const read = vi.fn(readSync);
+    expect(readSessionLog('fixture', root, { read })).toBe(terminal);
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read.mock.calls[0].slice(2)).toEqual([0, 65536, 70 * 1024 + 1 + Buffer.byteLength(terminal) - 65536]);
+    expect(readSessionLog('fixture', root, { allowTruncated: false })).toBe('');
+    writeFileSync(join(dir, 'complete.log'), terminal);
+    expect(readSessionLog('complete', root, { allowTruncated: false })).toBe(terminal);
+    expect(readSessionLog('complete', root, { allowTruncated: false, read: () => 0 })).toBe('');
     mkdirSync(join(dir, 'directory.log'));
     expect(readSessionLog('directory', root)).toBe('');
   } finally { rmSync(root, { recursive: true, force: true }); }

@@ -12,6 +12,21 @@ const state = (rows, extra = {}) => fixLoopState({ rows, repo: 'we', pr: 3990, h
 const dirs = [];
 afterEach(() => dirs.splice(0).forEach(dir => rmSync(dir, { recursive: true, force: true })));
 const temp = () => { const dir = mkdtempSync(join(tmpdir(), 'fix-loop-')); dirs.push(dir); return dir; };
+it.each(['ordinary', 'rearm', 'park'])('disabling holds bypasses %s controls', kind => {
+  const rows = [row(), row(), row()];
+  if (kind !== 'ordinary') rows.push(row({ kind, reason: 'fixture' }));
+  expect(fixLoopDisposition({ rows, repo: 'we', pr: 3990, head, now,
+    config: { ...config, hold: false } })).toEqual({ action: 'dispatch' });
+});
+it('caps raw dispatches for a head even when every outcome is discounted and the window expired', () => {
+  const rows = Array.from({ length: 5 }, () => row({ at: new Date(now - 7 * 3600000).toISOString() }));
+  expect(fixLoopDisposition({ rows: rows.slice(0, 4), repo: 'we', pr: 3990, head, now, config,
+    infraFailures: 4, infraRows: rows }).action).toBe('rearm');
+  expect(fixLoopDisposition({ rows, repo: 'we', pr: 3990, head, now, config,
+    infraFailures: 5, infraRows: rows }).action).toBe('park');
+  expect(fixLoopDisposition({ rows, repo: 'we', pr: 3990, head, now,
+    config: { ...config, hold: false } }).action).toBe('dispatch');
+});
 it('config defaults, overrides, and invalid values', () => {
   expect(config).toEqual({ maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 120, rearmAfterMinutesSource: 'default' });
   expect(hermeticConfig({ WE_FIX_LOOP_MAX_SESSIONS: '5', WE_FIX_LOOP_WINDOW_HOURS: '.5', WE_FIX_LOOP_HOLD: '0' }))

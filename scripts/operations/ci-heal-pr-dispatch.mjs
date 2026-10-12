@@ -84,7 +84,7 @@ import { planRoundEscalation } from '../conveyor/fix-resume.mjs';
 import { deliveryDispatchLogPath } from './detached-dispatch.mjs';
 import { buildStandDownComment } from '../conveyor/stand-down.mjs';
 import { readFixLoopRows, appendFixLoopRow, fixLoopConfig, fixLoopState, fixLoopSessionRows, fixLoopDisposition,
-  classifyFixRunOutcome, infraFailureCount, fixDispatchKilled, fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
+  classifyFixRunOutcome, fixDispatchKilled, fixDispatchKillFile, hasFixHoldLabel } from '../conveyor/fix-loop-ledger.mjs';
 
 const defaultFixLoop = {
   readRows: () => isUnderTest() && !process.env.WE_FIX_LOOP_LEDGER ? [] : readFixLoopRows(),
@@ -93,13 +93,15 @@ const defaultFixLoop = {
 };
 
 /** PRs #4992/#4993/#4965, 2026-10-12: bounded launcher evidence must never prevent dispatch. */
-export function readSessionLog(sessionSlug, root = REPO_ROOT) {
+export function readSessionLog(sessionSlug, root = REPO_ROOT, { read = readSync, allowTruncated = true } = {}) {
   let fd;
   try {
     fd = openSync(deliveryDispatchLogPath(sessionSlug, root), 'r');
     const size = fstatSync(fd).size, start = Math.max(0, size - 64 * 1024);
+    if (start > 0 && !allowTruncated) return '';
     const buffer = Buffer.alloc(size - start);
-    const count = readSync(fd, buffer, 0, buffer.length, start);
+    const count = read(fd, buffer, 0, buffer.length, start);
+    if (count !== buffer.length && !allowTruncated) return '';
     const text = buffer.subarray(0, count).toString('utf8');
     return start > 0 ? (text.includes('\n') ? text.slice(text.indexOf('\n') + 1) : '') : text;
   } catch { return ''; }
@@ -471,21 +473,24 @@ export async function runReconcileCiHealDispatch({
 
     const identity = { rows: loopRows, repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, now, config: fixConfig };
     const raw = fixLoopState(identity);
-    let infraFailures = 0;
     const infraRows = [], sessionRows = fixLoopSessionRows(identity);
     for (const session of new Set(raw.sessions)) {
       let logText = '';
-      try { logText = await (fixLoop.readSessionLog ?? (slug => readSessionLog(slug, root)))(session); } catch { /* Unreadable logs never block. */ }
+      try { logText = await (fixLoop.readSessionLog ?? (slug => readSessionLog(slug, root, { allowTruncated: false })))(session); } catch { /* Unreadable logs never block. */ }
       const matching = sessionRows.filter(row => row.session === session);
-      infraFailures += infraFailureCount({ logText, pr: entry.prNumber, sessions: matching.length });
+      // These logs are shared across heads and runs and have no dispatch IDs.
+      // Never align a partial history, an older head, or a rolling-window slice.
+      const history = loopRows.filter(row => row?.repo === repoKey && row.pr === entry.prNumber
+        && row.session === session && ['ci-heal', 'fix'].includes(row.kind));
+      if (history.length !== matching.length || history.some(row => !matching.includes(row))) continue;
       const terminals = String(logText ?? '').split('\n').map(classifyFixRunOutcome)
-        .filter(row => row?.pr === entry.prNumber).slice(-matching.length);
+        .filter(row => row?.pr === entry.prNumber);
+      if (terminals.length !== matching.length) continue;
       terminals.forEach((outcome, i) => {
-        // Runs are ordered; a newly dispatched Claude session may not have a terminal line yet.
-        // Do not transfer an earlier launcher's failure onto that newer session.
         if (outcome.infra) infraRows.push(matching[i]);
       });
     }
+    const infraFailures = infraRows.length;
     const loop = fixLoopState({ ...identity, infraFailures });
     const disposition = fixLoopDisposition({ ...identity, infraFailures, infraRows, build });
     const shortHead = String(entry.headRefOid ?? '').slice(0, 7);
@@ -496,7 +501,7 @@ export async function runReconcileCiHealDispatch({
         if (disposition.action === 'park') {
           await postParkComment({ repoSlug: CONSTELLATION_REPOS[repoKey].slug, pr: entry.prNumber,
             body: buildStandDownComment({ actor: 'ci-heal fix-loop hold', reason: 'fix-loop-exhausted',
-              detail: `${counts}; the Claude re-arm also produced nothing. Head: ${entry.headRefOid}.` }) });
+              detail: `${counts}; ${disposition.reason}. Head: ${entry.headRefOid}.` }) });
           await fixLoop.append({ repo: repoKey, pr: entry.prNumber, head: entry.headRefOid, kind: 'park', reason: disposition.reason });
         }
         refusals.push({ pr: entry.prNumber, kind: 'fix-loop-parked', why });
