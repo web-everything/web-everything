@@ -238,6 +238,59 @@ describe('recovery preserves before removing and fails safely', () => {
   });
 });
 
+describe('recovery of an orphan writer killed before its first commit', () => {
+  it.each(['detached', 'existing branch', 'unreadable ref', 'non-branch ref'])(
+    'retains a failed HEAD that is not proven unborn: %s', (kind) => {
+      const calls = []; const logs = [];
+      reclaimStrandedTransportWorktrees({
+        board: '/board', branch: 'ops/new', now: () => 600001, exists: () => true, read: () => null,
+        log: (line) => logs.push(line),
+        run: (args) => {
+          calls.push(args);
+          if (args[1] === 'list') return 'worktree /board/.operations/transport/wt-1\n\n';
+          if (args[0] === 'rev-parse' || (args[0] === 'symbolic-ref' && kind === 'detached')) throw new Error('bad HEAD');
+          if (args[0] === 'symbolic-ref') return kind === 'non-branch ref' ? 'refs/tags/x\n' : 'refs/heads/ops/new\n';
+          if (args[0] === 'show-ref' && kind === 'unreadable ref') throw Object.assign(new Error('unreadable'), { status: 128 });
+          return '';
+        },
+      });
+      expect(calls.some((args) => args[1] === 'remove' || args[0] === 'update-ref')).toBe(false);
+      expect(logs.join()).toContain('sweep failed');
+    },
+  );
+
+  it('reclaims a clean unborn-HEAD worktree and its owner without a warning or backup', async () => {
+    const { mkdtempSync, writeFileSync, rmSync, existsSync, realpathSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'transport-unborn-')));
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[key];
+    const git = (args, cwd = root) => execFileSync('git', args, { cwd, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      git(['init', '--quiet']);
+      git(['-c', 'core.hooksPath=/dev/null', 'commit', '--quiet', '--allow-empty', '-m', 'seed']);
+      const wt = join(root, '.operations', 'transport', 'wt-1');
+      git(['worktree', 'add', '--no-checkout', '--detach', wt, 'HEAD']);
+      git(['symbolic-ref', 'HEAD', 'refs/heads/ops/new'], wt);
+      git(['read-tree', '--empty'], wt);
+      writeFileSync(`${wt}.owner`, JSON.stringify({ pid: 4242 }));
+      expect(git(['status', '--porcelain'], wt)).toBe('');
+      expect(() => git(['rev-parse', '--verify', 'HEAD'], wt)).toThrow();
+      const logs = [];
+      reclaimStrandedTransportWorktrees({
+        board: root, branch: 'ops/new', now: () => 600001, alive: () => false, log: (line) => logs.push(line),
+      });
+      expect(logs.join()).not.toMatch(/WARNING|sweep failed/);
+      expect(existsSync(wt)).toBe(false);
+      expect(existsSync(`${wt}.owner`)).toBe(false);
+      expect(git(['worktree', 'list', '--porcelain'])).not.toContain(wt);
+      expect(git(['for-each-ref', 'refs/transport-stranded/'])).toBe('');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
 describe('liveness, not age, decides whether a stale-looking worktree is abandoned (red team 2026-10-11)', () => {
   const path = '/board/.operations/transport/wt-1';
   const sweep = ({ owner = null, alive = () => false, readThrows = false } = {}) => {

@@ -195,12 +195,25 @@ export function reclaimStrandedTransportWorktrees({
           warn(`git-transport-branch: WARNING dirty stranded worktree ${path}; left untouched`);
           continue;
         }
-        const sha = run(['rev-parse', 'HEAD'], wtOpts).trim();
+        let sha = null;
+        try { sha = run(['rev-parse', 'HEAD'], wtOpts).trim(); }
+        catch (headError) {
+          // A killed orphan writer may not have made its first commit. Prove the symbolic branch
+          // is absent before treating a HEAD failure as unborn; other failures must retain the tree.
+          const ref = run(['symbolic-ref', '--quiet', 'HEAD'], wtOpts).trim();
+          if (!ref.startsWith('refs/heads/')) throw headError;
+          let absent = false;
+          try { run(['show-ref', '--verify', '--quiet', ref], wtOpts); }
+          catch (e) { if (e.status !== 1) throw e; absent = true; }
+          if (!absent) throw headError;
+        }
         let backup = null;
-        try { run(['merge-base', '--is-ancestor', sha, `origin/${branch}`], { cwd: board }); }
-        catch {
-          backup = `refs/transport-stranded/${name}`;
-          run(['update-ref', backup, sha], { cwd: board });
+        if (sha) {
+          try { run(['merge-base', '--is-ancestor', sha, `origin/${branch}`], { cwd: board }); }
+          catch {
+            backup = `refs/transport-stranded/${name}`;
+            run(['update-ref', backup, sha], { cwd: board });
+          }
         }
         run(['worktree', 'remove', '--force', path], { cwd: board });
         try { rm(ownerFile(root, name), { force: true }); } catch { /* best effort */ }
