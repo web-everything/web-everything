@@ -2811,6 +2811,128 @@ export function mandatoryReferralReviewer(runId) {
   return { id: deriveSessionId(sessionSeed([runId, 'mandatory-referral-correctness'])), lens: 'correctness' };
 }
 
+// ── #4815 — the confirmation turn: a tool-less seat's CONFIRMED claim is checked by a tool-bearing verifier ─────────
+/** Capability comes from the seat's own declaration (`tools: true`), never from a juror's claim; anything else is checked. */
+export const seatNeedsToolVerification = (seat) => seat?.tools !== true;
+
+/** Persisted outcomes on a record's `verified` list. A verifier that failed is never persisted (it is retried). */
+export const REFERRAL_VERIFY_OUTCOMES = Object.freeze(['reproduced', 'not-reproduced']);
+export const UNVERIFIED_NOTE_PREFIX = 'Unverified by a tool-bearing seat';
+export const VERIFY_REASON_MAX = 300;
+/** At most this many claims go to one verifier turn; the rest stay unverified advisory notes. */
+export const VERIFY_MAX_CANDIDATES = 12;
+
+const verifyReason = (text, fallback) => (foldUntrusted(text).replace(/\s+/g, ' ').trim().slice(0, VERIFY_REASON_MAX)) || fallback;
+
+/**
+ * `key → outcome` for one head, from the `{ head, key, outcome }` rows the `read` step recorded. Outcome is
+ * `reproduced`, `not-reproduced`, or `referred` (a live referral an older record holds with no verification). PURE.
+ */
+export function knownVerifications(rows, head) {
+  const known = new Map();
+  if (typeof head !== 'string' || !head) return known;
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (r && r.head === head && typeof r.key === 'string'
+      && (REFERRAL_VERIFY_OUTCOMES.includes(r.outcome) || r.outcome === 'referred')) known.set(r.key, r.outcome);
+  }
+  return known;
+}
+
+/**
+ * The qualifying claims that still need a verifier turn: from seats whose declaration says they carry no tools, one
+ * per finding key, skipping any key already settled on this head. `seats` is `[{ step, tools, findings }]`. PURE.
+ */
+export function verificationCandidates({ seats, known = new Map() }) {
+  const candidates = [];
+  const seen = new Set();
+  for (const seat of Array.isArray(seats) ? seats : []) {
+    if (!seatNeedsToolVerification(seat)) continue;
+    for (const original of Array.isArray(seat.findings) ? seat.findings : []) {
+      if (!requiresMandatoryReferral(original)) continue;
+      let key;
+      try { key = referralFindingKey(seat.step, original); } catch { continue; }
+      if (known.has(key) || seen.has(key)) continue;
+      seen.add(key);
+      if (candidates.length < VERIFY_MAX_CANDIDATES) candidates.push({ index: candidates.length, seat: seat.step, key, original });
+    }
+  }
+  return candidates;
+}
+
+/**
+ * Read the verifier's answer against the candidates it was asked about: `key → { outcome, reason }`, outcome one of
+ * `reproduced | not-reproduced | failed`. FAIL CLOSED ON THE CLAIM: a missing, skipped, malformed, conflicting or
+ * evidence-free answer is `failed`, never `reproduced`. PURE.
+ */
+export function settleVerification(candidates, answer) {
+  const settled = new Map();
+  const failAll = (reason) => {
+    for (const c of candidates) settled.set(c.key, { outcome: 'failed', reason });
+    return settled;
+  };
+  if (!answer || typeof answer !== 'object') return failAll('the verifier returned no answer');
+  if (answer.skipped) return failAll(verifyReason(`the verifier was skipped: ${answer.skipped.reason ?? answer.summary ?? ''}`, 'the verifier was skipped'));
+  if (!Array.isArray(answer.results)) return failAll('the verifier returned malformed results');
+  const byIndex = new Map();
+  const conflicted = new Set();
+  for (const r of answer.results) {
+    if (!r || !Number.isInteger(r.index)) continue;
+    if (byIndex.has(r.index) && byIndex.get(r.index).reproduced !== r.reproduced) conflicted.add(r.index);
+    byIndex.set(r.index, r);
+  }
+  for (const c of candidates) {
+    const r = byIndex.get(c.index);
+    if (conflicted.has(c.index)) settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave conflicting results for this claim' });
+    else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
+    else if (r.reproduced) {
+      if (typeof r.evidence === 'string' && r.evidence.trim()) settled.set(c.key, { outcome: 'reproduced', reason: verifyReason(r.evidence, '') });
+      else settled.set(c.key, { outcome: 'failed', reason: 'the verifier reported the claim reproduced without evidence' });
+    } else settled.set(c.key, { outcome: 'not-reproduced', reason: verifyReason(r.evidence, 'not reproduced on the PR head') });
+  }
+  return settled;
+}
+
+/** One qualifying claim as an advisory note: the original assertion stays visible, it can no longer be CONFIRMED. PURE. */
+export function downgradeUnverifiedFinding(original, reason) {
+  return { ...original, verdict: 'PLAUSIBLE',
+    summary: `[${UNVERIFIED_NOTE_PREFIX}: ${verifyReason(reason, 'no reason recorded')}] ${original?.summary ?? ''}` };
+}
+
+/**
+ * One seat's findings after the confirmation turn. A qualifying claim from a seat that needs verification stays
+ * CONFIRMED only when its key is `reproduced` (this run) or already known as reproduced/referred on this head;
+ * every other claim becomes an advisory note. Returns the findings (same order) and what was downgraded. PURE.
+ */
+export function applyVerification({ seat, findings, known = new Map(), settled = new Map() }) {
+  // Anything that is not a list (absent, or the wrong type the reduce step refuses) goes back untouched, as does a tool-bearing seat.
+  if (!Array.isArray(findings) || !seatNeedsToolVerification(seat)) return { findings, downgraded: [] };
+  const downgraded = [];
+  const out = findings.map((original) => {
+    if (!requiresMandatoryReferral(original)) return original;
+    let key;
+    try { key = referralFindingKey(seat.step, original); } catch { return original; }
+    const prior = known.get(key);
+    if (prior === 'reproduced' || prior === 'referred') return original;
+    const now = settled.get(key);
+    if (now?.outcome === 'reproduced') return original;
+    const reason = prior === 'not-reproduced' ? 'a tool-bearing seat could not reproduce it on this head'
+      : now?.reason ?? 'no tool-bearing verification ran for this claim';
+    const note = downgradeUnverifiedFinding(original, reason);
+    downgraded.push({ seat: seat.step, key, original, reason });
+    return note;
+  });
+  return { findings: out, downgraded };
+}
+
+/** The verifier outcomes worth recording on the head's referral records (`failed` is not: it is retried). PURE. */
+export function verificationsToPersist(candidates, settled) {
+  return candidates.flatMap((c) => {
+    const s = settled.get(c.key);
+    return s && REFERRAL_VERIFY_OUTCOMES.includes(s.outcome)
+      ? [{ seat: c.seat, key: c.key, original: c.original, outcome: s.outcome, ...(s.outcome === 'not-reproduced' ? { reason: s.reason } : {}) }] : [];
+  });
+}
+
 const supersededRulings = (ruling) => ruling.supersedes == null ? []
   : Array.isArray(ruling.supersedes) ? ruling.supersedes : [ruling.supersedes];
 
@@ -2823,7 +2945,9 @@ export const REFERRAL_SUPERSEDE_REASON = 'superseded: the mandatory owner alread
 export const REFERRAL_CARRY_REASON = 'carried: the operator ruled this finding on an earlier head; its cited lines are unchanged';
 export const REFERRAL_DROP_REASON = 'dropped: seat disabled by operator config';
 // A drop only retires a finding nobody has ruled on: a finding with a ruling (a `block` above all) keeps counting.
-export const activeReferrals = (record) => record.referrals.filter(f => !(record.dropped ?? []).some(d => d.key === f.key)
+// The same holds for a finding a tool-bearing verifier could not reproduce (#4815): it is retired to an advisory note.
+export const activeReferrals = (record) => record.referrals.filter(f => (!(record.dropped ?? []).some(d => d.key === f.key)
+  && !(record.verified ?? []).some(v => v.key === f.key && v.outcome === 'not-reproduced'))
   || record.rulings.some(r => r.key === f.key));
 
 // `withdrawn` is the set of carried keys whose carry no longer stands at read time (`referralRecordState` holds them
@@ -3058,6 +3182,14 @@ export function validateReferralRecord(r) {
         || (c.from.rulingId !== undefined && (typeof c.from.rulingId !== 'string' || !c.from.rulingId.trim() || c.result === 'block'))
         || !['block', 'card', 'not-real'].includes(c.result)
         || (c.result === 'card' ? !CARD_REF_RE.test(c.card ?? '') : c.card !== undefined)))) return false;
+    // #4815 — what a tool-bearing verifier concluded about a tool-less seat's claim on THIS head. A `not-reproduced`
+    // entry retires the finding to an advisory note (see `activeReferrals`) and must say why; `reproduced` is a plain mark.
+    if (r.verified !== undefined && (!Array.isArray(r.verified)
+      || new Set(r.verified.map(v => v?.key)).size !== r.verified.length
+      || r.verified.some(v => !v || !keys.has(v.key) || !REFERRAL_VERIFY_OUTCOMES.includes(v.outcome)
+        || (v.outcome === 'not-reproduced'
+          ? typeof v.reason !== 'string' || !v.reason.trim() || v.reason.length > VERIFY_REASON_MAX
+          : v.reason !== undefined)))) return false;
     const ids = new Set();
     for (const rli of r.rulings) {
       if (!rli || typeof rli.id !== 'string' || !rli.id || ids.has(rli.id)
@@ -3227,7 +3359,8 @@ export function renderReferralRecord(record) {
     + (record.superseded ?? []).map(s => `\n- ${s.key}: ${s.reason} (by run ${s.by.runId})`).join('')
     + (record.carried ?? []).map(c => `\n- ${c.key}: ${c.reason} (${c.from.rulingId !== undefined ? 'reviewer' : 'operator'} ${c.result}, from ${c.from.head}, run ${c.from.runId})`).join('')
     + (record.dropped ?? []).map(d => `\n- ${d.key}: ${d.reason}`).join('')
-    + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : 'finding-specific rulings recorded')}. Rulings: ${JSON.stringify(record.rulings)}\n`
+    + (record.verified ?? []).map(v => `\n- ${v.key}: verified by a tool-bearing seat: ${v.outcome}${v.reason ? ` (${foldUntrusted(v.reason)})` : ''}`).join('')
+    + `\nAttempt recorded: ${record.attempted}. Reason: ${record.failure ?? (referralRecordState(record).pending.length ? 'mandatory finding-specific review required' : activeReferrals(record).length || !(record.verified ?? []).some(v => v.outcome === 'not-reproduced') ? 'finding-specific rulings recorded' : 'no active referral: the claim was not reproduced by a tool-bearing seat and stays an advisory note')}. Rulings: ${JSON.stringify(record.rulings)}\n`
     + `Record any missing finding-specific rulings with the mandatory reviewer identified above, retaining prior rulings and explicit supersedes IDs. Then start a fresh review-pr --pr=${record.pr} --repo=${record.repo}; it reuses this PR record without another automated attempt. card requires a readable backlog reference.\n`
     + `<!-- ${REFERRAL_RECORD_MARKER}: ${encodeURIComponent(JSON.stringify(record))} -->`;
 }
@@ -3285,6 +3418,7 @@ export function readReferralRecords(comments, { head } = {}) {
           || JSON.stringify((r.dropped ?? []).slice(0, (previous.dropped ?? []).length)) !== JSON.stringify(previous.dropped ?? [])
           || JSON.stringify((r.carried ?? []).slice(0, (previous.carried ?? []).length)) !== JSON.stringify(previous.carried ?? [])
           || JSON.stringify((r.superseded ?? []).slice(0, (previous.superseded ?? []).length)) !== JSON.stringify(previous.superseded ?? [])
+          || JSON.stringify((r.verified ?? []).slice(0, (previous.verified ?? []).length)) !== JSON.stringify(previous.verified ?? [])
           || JSON.stringify(r.rulings.slice(0, previous.rulings.length)) !== JSON.stringify(previous.rulings))) {
           malformed ||= holdsHead(r); continue;
         }

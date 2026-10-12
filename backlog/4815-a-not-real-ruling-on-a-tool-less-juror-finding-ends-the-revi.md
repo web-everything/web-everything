@@ -2,9 +2,11 @@
 bornAs: xfkqowg
 kind: story
 size: 3
-status: open
+status: resolved
 scope: ["we:scripts/lib/jury-core.mjs", "we:scripts/operations/review-pr.mjs", "we:scripts/lib/__tests__/jury-core.test.mjs", "we:scripts/operations/review-pr-io.mjs", "we:scripts/operations/__tests__/review-pr.test.mjs", "we:scripts/operations/__tests__/review-pr-io.test.mjs"]
 dateOpened: "2026-10-02"
+dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-10"
 preparedAgainstSha: "512c6aaa587a6836a3597b7bf9dae6446ae211ae"
 tags: []
@@ -27,6 +29,8 @@ Old premise: the core lacked cross-run `not-real` carry, an operator ruling path
 - Scope narrowed: `we:scripts/conveyor/reconcile-core.mjs` and its test are dropped. Duplicate dispatch stops once the referral stops being raised falsely; no evidence from current code that reconciliation itself loops.
 
 Re-stamped 2026-10-10 against `main` @ 512c6aaa5 (stale-stamp refresh: `we:scripts/operations/review-pr.mjs` changed again — #4763 roster/seat work, juror seats concurrent). Premise re-checked: still **not delivered** (`requiresMandatoryReferral` verdict+impact only, `we:scripts/lib/jury-core.mjs:2788`; no seat `tools` field; no verifier step). Only that file's line citations moved (seat constants now 435/544/619/631, `ADVISORY_SEAT_STEPS` 638, panel `allowedTools` 1436, reduce call 2747-2748, advisory judge steps ~2519-2600); the operator-ruling test citation now points at `we:scripts/operations/__tests__/record-referral-ruling.test.mjs:49`. Design, MVP and goal unchanged.
+
+**Built 2026-10-12** (the confirmation turn). Seat capability is declared as `tools` on the four advisory seat constants (`judgeAdvisory` false, `judgeCorrectnessAdvisory` true, `judgeAntigravityReview` false, `judgeAgyCorrectness` true; panel jurors pass `tools: true` at the reduce call site). A new `judgeReferralVerifier` judge step (declared only when a seated advisory seat is not tool-bearing, right before `reduce`) asks one read-only Codex turn to reproduce each CONFIRMED broken claim a tool-less seat made; with no claim, or an unreadable PR head, its request carries `skipSpawn` and `createDefaultJudge` answers it without spawning. `reduce` keeps a claim CONFIRMED (and referred) only when it was reproduced, or is already reproduced/referred on this head; any other claim becomes a `PLAUSIBLE` advisory note that keeps the original assertion and the reason. Outcomes persist as a `verified` list on the head's referral record (`reproduced` marks a live referral; `not-reproduced` retires it via `activeReferrals`, in a chunk of its own, so a re-run on the same head neither re-verifies nor re-asks and a new head verifies afresh). A failed verifier is never persisted (it is retried) and never clears a durable referral. Pure core in `we:scripts/lib/jury-core.mjs` (`verificationCandidates`, `settleVerification`, `applyVerification`, `verificationsToPersist`). Red→green: the replay in `we:scripts/operations/__tests__/review-pr-io.test.mjs` ("synthetic #3432-shaped replay") failed on pre-change `main` (the unreproduced claim became a referral, no verifier turn) and passes now: one verifier turn, one retired record, one advisory, then no new turn, no new referral. Historical #3432 artifacts stay a follow-up.
 
 The incident counts (51 records on #3432) are reported context; the root-cause section below is the orchestrator's decode and is not re-verified here.
 
