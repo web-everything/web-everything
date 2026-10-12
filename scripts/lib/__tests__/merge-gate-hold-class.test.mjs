@@ -1,3 +1,6 @@
+// @vitest-environment node
+import { isCandidacyHold, deferCandidacyHoldsOnPrEvent, loadMergeGateHoldSetting } from '../merge-gate-hold-class.mjs';
+import { formatPrResult } from '../merge-gate-ci.mjs';
 import { runDraftPromotionStep } from '../../conveyor/draft-promotion-loop.mjs';
 import { readReviewCiGate, readReviewHeadAndLabels } from '../review-ci-gate-io.mjs';
 import { describe, it, expect, vi } from 'vitest';
@@ -264,5 +267,70 @@ describe('facts-first review CI merge-gate refusals', () => {
       affected: [{ name: 'test', reason: 'failure' }],
     });
     expect(live).not.toHaveBeenCalled();
+  });
+});
+
+describe('PR-event candidacy deferral', () => {
+  const key = 'prEventCandidacyHoldsPass';
+  const envKey = 'MERGE_GATE_PR_EVENT_CANDIDACY_HOLDS_PASS';
+  const held = (id, reason = 'pending', status = 'hold') => ({ id, reason, status });
+  const pending = () => {
+    const results = ['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance'].map(id => held(id));
+    results.push(held('ledger', 'labels: labels hold'), held('codeql', 'clear', 'pass'));
+    return { num: 5011, ok: false, results, blocking: results.filter(r => r.status === 'hold'), clearanceCarry: { retained: true } };
+  };
+  it.each(['candidate-label', 'producer-certified', 'review-hold-labels', 'review-acceptance', 'ledger'])('recognizes only candidacy holds for %s', id => {
+    expect(isCandidacyHold(held(id, 'labels: labels hold'))).toBe(true);
+    for (const status of ['pass', 'fail-closed', 'skipped-by-policy']) expect(isCandidacyHold(held(id, 'labels: labels hold', status))).toBe(false);
+  });
+  it('rejects other ledger authority and other gates', () => {
+    expect(isCandidacyHold(held('ledger', 'ledger: pending'))).toBe(false);
+    expect(isCandidacyHold(held('test-gaming'))).toBe(false);
+    expect(isCandidacyHold(null)).toBe(false);
+  });
+  it('defers candidacy, preserves metadata and inputs, and produces a parseable PASS', () => {
+    const input = pending(), before = structuredClone(input);
+    const out = deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: { value: 'on' } });
+    expect(out).toMatchObject({ num: 5011, ok: true, blocking: [], clearanceCarry: input.clearanceCarry });
+    expect(out.results.slice(0, 5)).toEqual(input.blocking.map(r => ({ ...r, status: 'skipped-by-policy', reason: `candidacy hold deferred to the merge_group run (mergeGate.prEventCandidacyHoldsPass=on): ${r.reason}` })));
+    expect(input).toEqual(before);
+    expect(parsePrResultTable(formatPrResult(out), 5011)).toMatchObject({ ok: true, results: out.results });
+  });
+  it.each(['merge_group', 'workflow_dispatch', undefined, null, 'PULL_REQUEST', 'pull_request_target'])('leaves event %s unchanged', mergeEvent => {
+    const input = pending();
+    expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent, setting: 'on' })).toEqual(input);
+  });
+  it.each(['off', 'invalid', undefined])('leaves setting %s unchanged', setting => {
+    const input = pending();
+    expect(deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting })).toEqual(input);
+  });
+  it.each([
+    ...['test-gaming', 'manifest-baseline', 'red-main-freeze', 'codeql', 'default-base', 'non-empty-body', 'duplicate-id-on-main', 'couple-whole', 'blocked-by'].map(id => held(id)),
+    held('candidate-label', 'unreadable', 'fail-closed'), held('review-acceptance', 'human-only: workflow edit'), held('ledger', 'ledger: blocked'),
+  ])('keeps $id / $reason blocking', row => {
+    const input = pending(); input.results.push(row); input.blocking.push(row);
+    const out = deferCandidacyHoldsOnPrEvent(input, { mergeEvent: 'pull_request', setting: 'on' });
+    expect(out.ok).toBe(false); expect(out.blocking).toEqual([row]);
+  });
+  it('resolves the second key independently across all layers, failing closed', () => {
+    const resolve = options => resolveMergeGateHoldSetting({ key, ...options });
+    expect(resolve({})).toEqual({ value: 'on', source: 'standard' });
+    expect(resolve({ platform: { mergeGate: { [key]: 'off' } } })).toEqual({ value: 'off', source: 'platform' });
+    const platform = { mergeGate: { [key]: 'off' } }, repo = { mergeGate: { [key]: 'on' } };
+    expect(resolve({ platform, repo })).toEqual({ value: 'on', source: 'repo' });
+    expect(resolve({ platform, repo, env: { [envKey]: 'off' } })).toEqual({ value: 'off', source: 'env' });
+    for (const layer of ['platform', 'repo', 'env']) {
+      expect(resolve({ [layer]: layer === 'env' ? { [envKey]: 'bad' } : { mergeGate: { [key]: 'bad' } } })).toMatchObject({ value: 'off', source: layer });
+    }
+    expect(resolve({ platform: { mergeGate: { [key]: 'bad' } }, env: { [envKey]: 'on' } }).value).toBe('off');
+    expect(resolve({ readErrors: ['unreadable'] }).value).toBe('off');
+    expect(resolve({ repo: { mergeGate: { candidacyHoldIsNotCiFailure: 'off' } } })).toEqual({ value: 'on', source: 'standard' });
+  });
+  it('loads the new key and logs its effective source once', () => {
+    const log = vi.fn();
+    const options = { key, env: {}, readFile: () => '{}', readDeclared: () => ({ settings: { mergeGate: { [key]: 'off' } } }), log };
+    expect(loadMergeGateHoldSetting(options)).toEqual({ value: 'off', source: 'repo' });
+    loadMergeGateHoldSetting(options);
+    expect(log.mock.calls).toEqual([['merge-gate · mergeGate.prEventCandidacyHoldsPass=off (source: repo)']]);
   });
 });
