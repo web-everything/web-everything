@@ -148,13 +148,17 @@ afterAll(() => {
   for (const d of [shimDir, workDir]) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best-effort */ } }
 });
 
+// The drain's freeze reader defaults to the shared ops branch and fails CLOSED when it is unreadable. This suite's
+// hermetic workDir has no ops branch, and it exercises the gate — not the freeze reader — so pin the local reader.
+const HERMETIC_FREEZE_ENV = { WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only' };
+
 /** Run the REAL entrypoint against a canned fixture, return its parsed --json result. */
 function runDrain(fixture, args) {
   const fxPath = join(workDir, `fixture-${fixture._id}.json`);
   writeFileSync(fxPath, JSON.stringify(fixture));
   const stdout = execFileSync('node', [SCRIPT, ...args, '--dry-run', '--this-repo', '--json'], {
     cwd: workDir,                                   // a clean dir — no park-state, no real repo
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
+    env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -173,7 +177,7 @@ function runDrainLive(fixture, args) {
   writeFileSync(logPath, '');
   const stdout = execFileSync('node', [SCRIPT, ...args, '--no-drain-lease', '--this-repo', '--json'], {
     cwd: workDir,
-    env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
+    env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_COMMENT_LOG: logPath },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -302,7 +306,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     try {
       const stdout = execFileSync('node', [SCRIPT, '--label=ready-to-merge', '--no-reconcile-labels', '--no-drain-lease', '--this-repo', '--json'], {
         cwd: workDir,
-        env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
+        env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath },
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -333,7 +337,7 @@ describe('the real drain entrypoint consults the gate before merging', () => {
     try {
       stdout = execFileSync('node', [SCRIPT, '--label=ready-to-merge', '--no-reconcile-labels', '--no-drain-lease', '--this-repo', '--json'], {
         cwd: workDir,
-        env: { ...process.env, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_MERGE_LOG: mergeLog, GATE_COMMENT_LOG: commentLog },
+        env: { ...process.env, ...HERMETIC_FREEZE_ENV, PATH: `${shimDir}:${process.env.PATH}`, GATE_FIXTURE: fxPath, GATE_MERGE_LOG: mergeLog, GATE_COMMENT_LOG: commentLog },
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
