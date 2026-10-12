@@ -1,0 +1,62 @@
+{
+  "id": 24883772,
+  "name": "main: required checks",
+  "target": "branch",
+  "source_type": "Repository",
+  "source": "web-everything/web-everything",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "exclude": [],
+      "include": [
+        "~DEFAULT_BRANCH"
+      ]
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          {
+            "context": "test",
+            "integration_id": 15368
+          },
+          {
+            "context": "smoke",
+            "integration_id": 15368
+          },
+          {
+            "context": "daemon-soak",
+            "integration_id": 15368
+          },
+          {
+            "context": "soak-replay-gate",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ],
+  "node_id": "RRS_lACqUmVwb3NpdG9yec5EG3X5zgF7sjw",
+  "created_at": "2026-10-11T11:43:10.496-04:00",
+  "updated_at": "2026-10-11T11:43:10.560-04:00",
+  "bypass_actors": [
+    {
+      "actor_id": 5,
+      "actor_type": "RepositoryRole",
+      "bypass_mode": "always"
+    }
+  ],
+  "current_user_can_bypass": "always",
+  "_links": {
+    "self": {
+      "href": "https://api.github.com/repos/web-everything/web-everything/rulesets/24883772"
+    },
+    "html": {
+      "href": "https://github.com/web-everything/web-everything/rules/24883772"
+    }
+  }
+}

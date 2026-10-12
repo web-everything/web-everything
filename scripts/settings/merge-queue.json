@@ -1,4 +1,10 @@
 {
+  "mergeDelivery": {
+    "strategy": "github-merge-queue",
+    "batchSize": 5,
+    "maxGroupWaitMinutes": 5,
+    "mergeMethod": "merge"
+  },
   "mergeQueue": {
     "enabled": true,
     "batchSize": 1,
