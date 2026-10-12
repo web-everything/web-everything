@@ -397,6 +397,40 @@ describe('runFixCli', () => {
     expect(out.code).toBe(1);
     expect(m.spawn).not.toHaveBeenCalled();
   });
+  it('posts the launcher refusal reason when risky lane config prevents the agent from running', async () => {
+    const m = mk(['aaa']);
+    const comments = [];
+    const run = (cmd, args, opts) => {
+      if (args[0] === 'config') return 'local\0remote.primary.url\next::sh -c secret-command\0';
+      if (args.includes('comment')) { comments.push(readFileSync(args.at(-1), 'utf8')); return ''; }
+      return m.run(cmd, args, opts);
+    };
+    const recordRouted = entry => ({ 'we#7': [entry, entry] });
+    expect((await runFixCli(argv, { ...m.io, run, recordRouted })).code).toBe(1);
+    expect(m.spawn).not.toHaveBeenCalled();
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain('lane git config defines command/credential/remote-rewrite keys (remote.primary.url); refusing to run in it');
+    expect(comments[0]).not.toContain('secret-command');
+  });
+  it.each(['status', 'signal', 'stderr', 'stdout', 'pid', 'status/stderr', 'non-Error'])(
+    'does not post raw command errors (%s)', async marker => {
+      const m = mk(['aaa']);
+      const message = 'Command failed: git fetch https://secret@example.com/repo.git';
+      const error = marker === 'non-Error' ? { message } : Object.assign(new Error(message),
+        marker === 'status/stderr' ? { status: 1, stderr: Buffer.from(message) } : { [marker]: undefined });
+      const comments = [];
+      const run = (cmd, args, opts) => {
+        if (args[0] === 'config') throw error;
+        if (args.includes('comment')) { comments.push(readFileSync(args.at(-1), 'utf8')); return ''; }
+        return m.run(cmd, args, opts);
+      };
+      const recordRouted = entry => ({ 'we#7': [entry, entry] });
+      expect((await runFixCli(argv, { ...m.io, run, recordRouted })).code).toBe(1);
+      expect(comments).toHaveLength(1);
+      expect(comments[0]).toContain('- failed: failed');
+      expect(comments[0]).not.toContain(message);
+      expect(comments[0]).not.toContain('secret');
+    });
   it('a failed pending-marker write is not fatal: the repair is still pushed and re-armed', async () => {
     const m = mk(['aaa', 'bbb']);
     m.pendingRearm.write.mockImplementation(() => { throw new Error('disk full'); });

@@ -198,14 +198,14 @@ export function readLaneFileSafe(path, lanePath) {
 }
 
 /**
- * PURE. The PR comment posted when routed codex repairs stall on one head. The notes are agent-authored (untrusted), so
+ * PURE. The PR comment posted when routed codex repairs stall on one head. Notes may be agent-authored (untrusted), so
  * they go inside a fenced block with backticks stripped, `@` mentions neutralised, and the finding phrases removed —
  * the comment must never read back as a reviewer's changes-requested / advisory finding.
  */
 export function escalationComment(head, entries) {
   const clean = (t) => singleLine(t).replace(/`/g, "'").replace(/@/g, '@\u200b').replace(new RegExp(CHANGES_COMMENT_RE.source, 'gi'), '[…]');
-  // The note is the agent's final message. The Codex sandbox has no network and its read deny-list covers secrets, so
-  // the note can only echo lane content (the repo itself); it is still capped at 200 chars.
+  // Notes contain the agent's final message or the launcher's own error, never raw child-process errors.
+  // Both use the same sanitising and 200-character cap.
   const lines = entries.map(o => `- ${clean(o.outcome)}: ${clean(o.note || o.outcome).slice(0, 200)}`).join('\n');
   return `**fix-run: codex repair unproductive on ${String(head).slice(0, 9)}**\n\n\`\`\`text\n${lines}\n\`\`\`\n\nThe next repair falls back to Claude.`;
 }
@@ -288,8 +288,8 @@ export async function runFixCli(argv = [], {
     if (launch.provider === 'codex' && before) {
       try {
         const id = { repo, pr: Number(launch.pr), head: before };
-        // `reason` (may carry raw command errors) stays in the local ledger; only `note` (the agent's final message) is
-        // ever posted to the PR.
+        // `reason` (may carry raw command errors) stays in the local ledger; only `note` (the agent's final message
+        // or the launcher's own error) is ever posted to the PR.
         const table = recordRouted({ ...id, outcome, reason, note: finalMessage });
         if (consecutiveUnproductiveOnHead(table, id) === ROUTED_CODEX_MAX_UNPRODUCTIVE) {
           withMessageFile(escalationComment(before, table[`${repo}#${launch.pr}`].slice(-ROUTED_CODEX_MAX_UNPRODUCTIVE)), file =>
@@ -457,6 +457,9 @@ export async function runFixCli(argv = [], {
   } catch (e) {
     writeErr(`fix-run: PR #${pr} FAILED: ${String(e?.message ?? e)}\n`);
     outcome = 'failed'; reason = `${String(e?.message ?? e)}${finalMessage && !String(e?.message).includes(finalMessage) ? `: ${finalMessage}` : ''}`;
+    if (!finalMessage && e instanceof Error && !['status', 'signal', 'stderr', 'stdout', 'pid'].some(key => key in e)) {
+      finalMessage = e.message;
+    }
     try { abortMerge?.(); } catch (abortError) { writeErr(`fix-run: merge abort failed: ${abortError.message}\n`); }
     return { code: 1, result: null };
   } finally {
