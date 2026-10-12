@@ -3,7 +3,7 @@ kind: task
 status: open
 dateOpened: '2026-10-12'
 tags: [automation, testing]
-scope: ['scripts/check-standards-rules.mjs', 'scripts/merge-ai-prs.mjs']
+scope: ['we:scripts/check-standards-rules.mjs', 'we:scripts/merge-ai-prs.mjs']
 ---
 
 # Enforce per-pass drain policy resolution and CLI gate coverage
