@@ -3,10 +3,11 @@ bornAs: xbha495
 kind: story
 size: 3
 parent: "4075"
-status: active
+status: resolved
 scope: ["we:scripts/lib/git-hook-surface.mjs", "we:scripts/lib/__tests__/git-hook-surface.test.mjs"]
 dateOpened: "2026-09-29"
 dateStarted: "2026-10-12"
+dateResolved: "2026-10-12"
 preparedDate: "2026-10-09"
 preparedAgainstSha: "b7f61e71234b717f8bbfc6ae0f544d5c0e65b7dd"
 tags: []
