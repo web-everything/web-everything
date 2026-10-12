@@ -507,13 +507,22 @@ export async function runFixCli(argv = [], {
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
     // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes. Widths come
-    // from the `conflict-marker-size` attribute (merged tree and HEAD, as for `merge` above; anything but a positive
-    // number is git's 7) and from every opening marker line in the file at least 7 wide: these UU/AA conflicts open with
+    // from the `conflict-marker-size` attribute (merged tree and HEAD, as for `merge` above; unspecified is git's 7) and
+    // from every opening marker line in the file at least 7 wide: these UU/AA conflicts open with
     // HEAD, and a criss-cross merge's virtual base nests wider ones. The attribute covers a file the UTF-8 read cannot decode.
     const attrSizes = new Map(unmerged.map(path => [path, new Set()]));
     if (unmerged.length) for (const source of [[], ['--source=HEAD']]) {
       const attrs = git('check-attr', ...source, '-z', 'conflict-marker-size', '--', ...unmerged).split('\0');
-      for (let i = 0; i + 2 < attrs.length; i += 3) attrSizes.get(attrs[i])?.add(/^0*[1-9]\d*$/.test(attrs[i + 2]) ? Number(attrs[i + 2]) : 7);
+      for (let i = 0; i + 2 < attrs.length; i += 3) {
+        const sizes = attrSizes.get(attrs[i]);
+        if (!sizes) continue;
+        if (/^[1-9]\d{0,8}$/.test(attrs[i + 2])) { sizes.add(Number(attrs[i + 2])); continue; }
+        // Anything else (unspecified, `+10`, `10x`, an out-of-range number): git's own parse may give 7 or the leading
+        // number, so scan for both rather than guess.
+        sizes.add(7);
+        const lead = Number.parseInt(attrs[i + 2], 10);
+        if (lead > 0 && lead < 2 ** 31) sizes.add(lead);
+      }
     }
     const markerSizes = new Map(unmerged.map(path => {
       const text = readFile(join(lanePath, path), lanePath);
