@@ -1,6 +1,7 @@
 import { buildOperatorRulingComment, referralFindingKey, mandatoryReferralReviewer, normalizeFinding, renderReferralRecord,
   readReferralRecords, validateReferralRecord, mandatoryReferralState, activeReferrals, REFERRAL_CARRY_REASON } from '../../lib/jury-core.mjs';
 import { assertMandatoryReferralsCleared } from '../../review-set-label.mjs';
+import { reviewLoopAutoConfirm } from '../../lib/review-loop-policy.mjs';
 /**
  * @file review-pr-io.test.mjs — the `review-pr` io shell (#3035): the four sinks, with no `gh` and no network.
  *
@@ -2650,14 +2651,18 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
   });
 
-  it('A VERIFIER THAT FAILS leaves no record at all: the claim is an advisory note, nothing blocks, and the next run tries again', async () => {
+  it('A VERIFIER THAT FAILS leaves no settlement record, holds acceptance, and the next run tries again', async () => {
     const w = world();
     const first = await w.runOnce('run-1', { summary: 'skipped: quota', findings: [], skipped: { reason: 'quota' } });
+    expect(first.verdict.verdict).toBe('needs-human');
+    expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
     expect(first.findings.reduce.referrals).toEqual([]);
     expect(first.findings.reduce.verifications).toEqual([]);
     expect(w.records()).toEqual([]);
     expect(w.state.labels).not.toContain('review:human');
-    await w.runOnce('run-2', NOT_REPRODUCED);
+    const retried = await w.runOnce('run-2', NOT_REPRODUCED);
+    expect(retried.verdict.pendingVerifications).toBeUndefined();
+    expect(reviewLoopAutoConfirm(retried.pending, retried)).toEqual({ value: 'accept' });
     expect(w.spawns).toHaveLength(2);
     expect(w.records()).toHaveLength(1);
   });
@@ -2669,6 +2674,8 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
       summary: reason, results: [{ index: 0, reproduced: null, evidence: reason }],
     });
     expect(first.findings.reduce.unverifiedClaims).toEqual([expect.objectContaining({ reason })]);
+    expect(first.verdict.verdict).toBe('needs-human');
+    expect(reviewLoopAutoConfirm(first.pending, first)).toBeNull();
     expect(first.findings.reduce.verifications).toEqual([]);
     expect(w.records()).toEqual([]);
     expect(w.referralJudge).not.toHaveBeenCalled();

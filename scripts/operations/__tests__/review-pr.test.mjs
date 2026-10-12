@@ -4391,6 +4391,7 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       } };
       const first = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, answers);
       expect(first.reduce.verifications).toEqual([]);
+      expect(first.reduce.verdict).toBe('needs-human');
       expect(first.reduce.referrals).toEqual([]);
       expect(first.reduce.unverifiedClaims).toEqual([expect.objectContaining({ reason })]);
       const retry = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, {
@@ -4430,13 +4431,32 @@ describe('#4815 the confirmation turn on a tool-less seat\'s CONFIRMED claim', (
       ['the verifier returned a clean juror answer', CLEAN_ANSWER],
       ['the verifier said reproduced with no evidence', { summary: 'x', results: [{ index: 0, reproduced: true, evidence: '' }] }],
       ['the verifier answered about another claim', { summary: 'x', results: [{ index: 3, reproduced: true, evidence: 'e' }] }],
-    ])('%s: the claim is an advisory note, the run is not blocked, and nothing is recorded as settled', (_n, answer) => {
-      const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: answer });
+      ['negative without evidence', { results: [{ index: 0, reproduced: false, evidence: '' }] }],
+      ['conflicting results', { results: [{ index: 0, reproduced: true, evidence: 'yes' }, { index: 0, reproduced: false, evidence: 'no' }] }],
+    ])('%s: holds acceptance without recording the claim as settled', (_n, answer) => {
+      const { reduce, run, registry } = verifierRun({ netRev: PINNED_HEAD }, { codexAdvisory: true }, { ...withAdvisory(), judgeReferralVerifier: answer });
       expect(reduce.referrals).toEqual([]);
-      expect(reduce.verdict).toBe('accept');
+      expect(reduce.verdict).toBe('needs-human');
+      expect(reduce.pendingVerifications).toHaveLength(1);
+      expect(deriveAdvisoryOutcome(run.verdict)).toBeNull();
+      const note = renderAdvisoryNote({ read: run.findings.read, verdict: run.verdict });
+      expect(parseAdvisories([{ body: note, createdAt: '2026-10-12T16:00:00Z' }]))
+        .toEqual([expect.objectContaining({ outcome: 'pending-verification', head: PINNED_HEAD })]);
+      expect(() => advanceWhileRunning(run, { registry, resume: { value: 'accept' } })).toThrow(/verification/i);
       expect(reduce.unverifiedClaims).toHaveLength(1);
       expect(reduce.verifications).toEqual([]);
       expect(reduce.findings.some((f) => String(f.summary).includes('confirmed defect'))).toBe(true);
+    });
+
+    it('holds for claims beyond the verifier batch even when all submitted claims were disproved', () => {
+      const claims = Array.from({ length: 13 }, (_, i) => ({ ...claim, summary: `confirmed defect ${i}` }));
+      const { reduce } = verifierRun({ netRev: PINNED_HEAD }, { antigravityReview: true }, {
+        judgeAntigravityReview: { summary: 'claims', findings: claims },
+        judgeReferralVerifier: { results: claims.slice(0, 12).map((_, index) => ({ index, reproduced: false, evidence: 'guard holds' })) },
+      });
+      expect(reduce.verdict).toBe('needs-human');
+      expect(reduce.pendingVerifications).toHaveLength(1);
+      expect(reduce.verifications).toHaveLength(12);
     });
 
     it('a tool-bearing seat\'s claim bypasses the turn: with only correctnessAdvisory there is no verifier step and the claim is referred', () => {

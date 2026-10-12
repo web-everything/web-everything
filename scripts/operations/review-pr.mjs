@@ -653,7 +653,8 @@ export const ADVISORY_SEAT_STEPS = Object.freeze(ADVISORY_SEATS.map((s) => s.ste
  * #4815 — THE CONFIRMATION TURN. A seat that carries no tools can only assert that a finding is CONFIRMED broken; it cannot have
  * reproduced it. Before such a claim becomes a mandatory referral (which holds the PR until someone rules on it), ONE tool-bearing
  * verifier gets one turn to reproduce it on the PR head. Reproduced: the claim stays CONFIRMED and is referred as before. Not
- * reproduced, or the verifier failed: it is an advisory note and never blocks. The step is declared only when a seated advisory seat
+ * reproduced: it is an advisory note. Failed or inconclusive verification holds acceptance until a subsequent check settles it.
+ * The step is declared only when a seated advisory seat
  * is not tool-bearing, and its request is a no-spawn answer when there is nothing to verify, so a run pays only for a claim.
  */
 export const REFERRAL_VERIFIER_STEP = 'judgeReferralVerifier';
@@ -2010,6 +2011,9 @@ export function planRecordDecision(view) {
   const repo = view.input.repo;
   const actor = view.input.actor;
   const to = answer === 'accept' ? 'accepted' : 'changes';
+  if (to === 'accepted' && verdict.pendingVerifications?.length) {
+    throw new Error('Tool-bearing verification required before recording acceptance; retry the unresolved claims.');
+  }
   if (verdict.pendingReferrals?.length || (to === 'accepted' && verdict.blockedReferrals?.length)) {
     throw new Error('Mandatory finding-specific ruling required before recording acceptance; resume the referral review.');
   }
@@ -2171,7 +2175,7 @@ export function deriveAdvisoryOutcome(verdict) {
   if (v.blockedReferrals?.length) return ADVISORY_OUTCOMES.CHANGES;
   // Unruled mandatory referrals mean the panel is not done: no outcome (so no `advisory:*` label) rather than a
   // clean `accept`. Not `changes` either: nothing is broken, a ruling is owed, and `changes` would dispatch a fixer.
-  if (v.pendingReferrals?.length) return null;
+  if (v.pendingReferrals?.length || v.pendingVerifications?.length) return null;
   const lensVerdicts = v.lensVerdicts && typeof v.lensVerdicts === 'object' ? v.lensVerdicts : {};
   const lenses = Array.isArray(v.lenses) && v.lenses.length ? v.lenses : Object.keys(lensVerdicts);
   try {
@@ -2277,7 +2281,9 @@ export function renderAdvisoryNote({ read, verdict } = {}) {
       // No outcome line parses back as `accept` (`parseAdvisories`), so unruled referrals state a non-accept word.
       : v.pendingReferrals?.length
         ? ['', `**Advisory outcome:** \`${ADVISORY_PENDING_REFERRAL_OUTCOME}\` — mandatory referrals still need a ruling; no \`advisory:*\` label is applied`]
-        : []),
+        : v.pendingVerifications?.length
+          ? ['', '**Advisory outcome:** `pending-verification` — claims still need tool-bearing verification; no `advisory:*` label is applied']
+          : []),
     '',
     '---',
     '',
@@ -2981,7 +2987,13 @@ export function reviewPrOperation({
           claudeVerdict: s.answer.shadow.claudeVerdict ?? null, agyVerdict: s.answer.shadow.agyVerdict ?? null,
           verdictAgree: s.answer.shadow.verdictAgree ?? null, overlap: s.answer.shadow.overlap ?? null,
         }));
-        const humanRequired = read.humanRequired === true;
+        // Downgraded claims include definitive negatives AND unfinished checks. Only the latter hold
+        // acceptance. Start from every downgraded claim, including those beyond the verifier batch limit.
+        const pendingVerifications = unverifiedClaims
+          .filter(({ key }) => knownVerified.get(key) !== 'not-reproduced'
+            && settledClaims.get(key)?.outcome !== 'not-reproduced')
+          .map(({ seat, key, reason }) => ({ seat, key, reason }));
+        const humanRequired = read.humanRequired === true || pendingVerifications.length > 0;
         const verdict = derivePanelVerdict({
           lensVerdicts: panelLensVerdicts,
           humanRequired,
@@ -3009,6 +3021,7 @@ export function reviewPrOperation({
           // run without one is byte-identical to before.
           ...(verifierClaims.length ? { verifications: verificationsToPersist(verifierClaims, settledClaims) } : {}),
           ...(unverifiedClaims.length ? { unverifiedClaims: unverifiedClaims.map(({ seat, key, reason }) => ({ seat, key, reason })) } : {}),
+          ...(pendingVerifications.length ? { pendingVerifications } : {}),
           deferredAdvisory,
           advisoryScope: { scope: advisoryScopeFellBack ? 'all' : advisoryScope.scope, fellBack: advisoryScopeFellBack },
           // WHERE THE LOOP STANDS, distinct from what this round decided. "converged" and "exhausted" both end
@@ -3194,7 +3207,8 @@ export function reviewPrOperation({
         return `${read.repo}#${read.pr} — ${(v.lenses ?? []).length} juror(s) returned ${n} finding(s) `
           + `(${perLens || 'no lens verdicts recorded'}); ${citationNote}`
           + `\`derivePanelVerdict\` reduced them to \`${v.verdict}\``
-          + `${v.humanRequired ? ' (gate-self: review:human)' : ''}. `
+          + `${v.pendingVerifications?.length ? ` (${v.pendingVerifications.length} claim(s) awaiting tool-bearing verification)`
+            : v.humanRequired ? ' (gate-self: review:human)' : ''}. `
           + `Record which verdict? (${CONFIRM_OPTIONS.join(' | ')}; \`abstain\` writes nothing)`;
       },
       of: (view) => (view.verdict.humanRequired ? CONFIRM_ACTORS.HUMAN : CONFIRM_ACTORS.AGENT),
