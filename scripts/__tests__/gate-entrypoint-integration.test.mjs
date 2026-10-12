@@ -35,6 +35,11 @@ const a = process.argv.slice(2);
 const ji = a.indexOf('--json');
 const fields = ji >= 0 ? String(a[ji + 1] || '') : '';
 function out(o) { process.stdout.write(JSON.stringify(o)); process.exit(0); }
+// The live head: real GitHub always has one, so a fixture whose commits carry no oid gets a stable per-PR stand-in.
+function headOf(pr) {
+  const tip = (pr._commits || [])[(pr._commits || []).length - 1];
+  return pr._headRefOid || (tip && tip.oid) || ('0'.repeat(40) + pr.number).slice(-40);
+}
 // Record every 'pr comment' the drain posts (only when a log path is set — dry-run runs never reach here, so the
 // default JSON-reading tests are unaffected). Used by the finding-1 non-dry-run test to prove which park kinds
 // get a durable skip/park comment.
@@ -62,7 +67,17 @@ if (a[0] === 'pr' && a[1] === 'merge') {
   if (pr && pr._mergeFailButLands) { fs.writeFileSync(process.env.GATE_FIXTURE + '.merged-' + pr.number, ''); process.stderr.write('forced post-merge gh failure\\n'); process.exit(1); }
   if (pr && pr._mergeFail) { process.stderr.write('forced merge failure\\n'); process.exit(1); }
 }
-if (a[0] === 'pr' && a[1] === 'list') out(fx.prs);
+// xec3amn — a real listing answers the requested files and head on every row; the drain's default-on workflow-edit
+// gate reads both from the listing, so a row missing them would model a malformed listing and defer every PR.
+// The listed head is the commits tip (a later _headRefOid then models a push after the pass-start read); with no
+// tip oid the fixture's _headRefOid, else headOf's stand-in, is the head at listing time too.
+if (a[0] === 'pr' && a[1] === 'list') out(fx.prs.map((pr) => {
+  const row = { ...pr };
+  const tip = (pr._commits || [])[(pr._commits || []).length - 1];
+  if (fields.split(',').includes('files') && !('files' in row)) row.files = pr._files || [];
+  if (fields.split(',').includes('headRefOid') && !row.headRefOid) row.headRefOid = (tip && tip.oid) || headOf(pr);
+  return row;
+}));
 if (a[0] === 'pr' && a[1] === 'view') {
   const pr = fx.prs.find((p) => String(p.number) === String(a[2])) || {};
   const fieldList = fields.split(',');
@@ -102,8 +117,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
     if (pr._clearedBy) cs.push({ body: '✅ review — \`review:human\` cleared via the sanctioned path\\n\\nCleared by ' + pr._clearedBy + ' via \`review-set-label.mjs --to=clear-human\` (#2895).' });
     // xvzc4v4 advisory fix — with no explicit _headRefOid the live head IS the tip commit (as on real GitHub);
     // a fixture sets _headRefOid to something else to model a push landing after the pass-start commits read.
-    const tip = (pr._commits || [])[(pr._commits || []).length - 1];
-    resp.headRefOid = pr._headRefOid || (tip && tip.oid) || '';
+    resp.headRefOid = headOf(pr);
     resp.comments = cs;
   }
   if (fieldList.includes('state')) resp.state = (pr._state === 'MERGED' || fs.existsSync(process.env.GATE_FIXTURE + '.merged-' + pr.number)) ? 'MERGED' : 'OPEN';
