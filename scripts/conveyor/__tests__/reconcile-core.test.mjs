@@ -3863,3 +3863,28 @@ describe('queued PR blocked by a cancelled newest-suite check (#4651)', () => {
     expect(result.refusals).toContainEqual(expect.objectContaining({ kind: 'nothing-owed', prNumber: 4651 }));
   });
 });
+
+
+describe('green-head needs-human retirement (#5012)', () => {
+  const head = '9dd77ac9123456789abcdef0123456789abcdef0123';
+  const requiredChecks = ['test', 'smoke', 'daemon-soak', 'soak-replay-gate', 'merge-gate', 'review-gate'];
+  const pr = { number: 5012, state: 'OPEN', headRefOid: head, mergeStateStatus: 'BLOCKED',
+    labels: [{ name: 'review:pending' }], comments: [{ author: { login: 'web-everything' },
+      body: buildCiHealEscalationComment({ headSha: head, outcome: 'needs-human' }) }],
+    statusCheckRollup: requiredChecks.map(name => ({ name, status: 'COMPLETED', conclusion: name === 'review-gate' ? 'FAILURE' : 'SUCCESS' })),
+  };
+  const plan = (row = pr, on = true) => planReconcileCore({ prs: [row], requiredChecks, verdictSettings: { voidNeedsHumanWhenCiGreen: on } });
+  it('emits one moot note outside ci-red without changing dispatch/refusals', () => {
+    const on = plan(), off = plan(pr, false);
+    expect(on.notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([expect.objectContaining({ prNumber: 5012, headSha: head, outcome: 'needs-human' })]);
+    expect({ ...on, notes: [] }).toEqual({ ...off, notes: [] });
+  });
+  it('requires this open, non-conflicted head and every required check green', () => {
+    for (const row of [
+      { ...pr, mergeStateStatus: 'DIRTY' }, { ...pr, state: 'CLOSED' },
+      { ...pr, headRefOid: 'abcdef0123456789' },
+      ...['FAILURE', 'pending', 'missing'].map(state => ({ ...pr, statusCheckRollup: state === 'missing' ? pr.statusCheckRollup.slice(1) : pr.statusCheckRollup.map((r, i) => i ? r : { ...r, conclusion: state, status: state === 'pending' ? 'IN_PROGRESS' : 'COMPLETED' }) })),
+    ]) expect(plan(row).notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+    expect(plan(pr, false).notes.filter(n => n.kind === 'ci-heal-escalation-moot')).toEqual([]);
+  });
+});

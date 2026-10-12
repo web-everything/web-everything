@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
-  defaultNoteCommentDryRun, runReconcileNotesAllRepos, runTickAllRepos,
+  defaultReadNotesForRepo, defaultNoteCommentDryRun, runReconcileNotesAllRepos, runTickAllRepos,
   formatNoteLine, formatNoteCommentLine, FIX_DISPATCH_DAEMON_REPOS,
 } from '../reconcile-fix-dispatch-daemon.mjs';
 
@@ -221,4 +221,20 @@ it.each([false, true])('records parking failure (throws=%s) without losing the n
     prsByNumber: new Map([[20, { labels: [], comments: [] }]]) });
   const out = runReconcileNotesAllRepos({ repos: ['we'], tick, parkToHuman, postComment: () => ({ ok: true }), dryRun: false });
   expect(out.comments[0]).toMatchObject({ parked: false, parkError: 'label failure', posted: true });
+});
+
+
+it('the notes reader retains the same hydrated, excused rollup the core judged', () => {
+  const raw = { number: 5012, statusCheckRollup: [{ name: 'merge-gate', conclusion: 'FAILURE' }] };
+  const corrected = { ...raw, statusCheckRollup: [{ name: 'merge-gate', conclusion: 'SUCCESS', mergeGateHoldExcused: { kind: 'candidacy' } }] };
+  const excuseMergeGateHolds = vi.fn(() => [corrected]);
+  const out = defaultReadNotesForRepo({ repo: 'we', readPrs: () => [raw], excuseMergeGateHolds,
+    reconcile: ({ readPrs, excuseMergeGateHolds }) => {
+      const prs = readPrs({});
+      expect(excuseMergeGateHolds(prs, { repo: 'web-everything/web-everything' })).toEqual([corrected]);
+      return { notes: [{ kind: 'ci-heal-escalation-moot', prNumber: 5012 }] };
+    },
+  });
+  expect(out.prsByNumber.get(5012)).toBe(corrected);
+  expect(excuseMergeGateHolds).toHaveBeenCalledWith([raw], { repo: 'web-everything/web-everything' });
 });

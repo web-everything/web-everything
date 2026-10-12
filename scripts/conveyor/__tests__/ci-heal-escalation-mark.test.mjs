@@ -319,7 +319,7 @@ describe('not-a-ci-break verdict invalidation — live #4535', async () => {
   it('round-trips lowercase heads and check names without confusing marker types', () => {
     const c = { author: AUTOMATION, body: buildCiHealVerdictVoidComment({ headSha: head.toUpperCase(), red: ['test', 'daemon-soak'] }) };
     expect(c.body.startsWith(CI_HEAL_VERDICT_VOID_MARKER)).toBe(true);
-    expect(parseCiHealVerdictVoids([c])).toEqual([{ headSha: head, red: ['test', 'daemon-soak'], createdAt: null, index: 0 }]);
+    expect(parseCiHealVerdictVoids([c])).toEqual([{ voids: 'not-a-ci-break', headSha: head, red: ['test', 'daemon-soak'], createdAt: null, index: 0 }]);
     expect(parseCiHealVerdictVoids(fixture.comments)).toEqual([]);
     expect(parseCiHealEscalations([c])).toEqual([]);
   });
@@ -555,5 +555,71 @@ else if (args[1] === 'comment' && args[2] === '4779' && ${failNote}) { console.e
       expect(calls.flat()).not.toContain('review-status:needs-human');
       if (failNote) expect(result.stderr).toContain('⚠ could not post inherited-red note');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+
+describe('needs-human verdict void', async () => {
+  const { buildCiHealVerdictVoidComment: buildVoid, parseCiHealVerdictVoids, needsHumanVoidState, notCiBreakVerdictVoidState } = await import('../ci-heal-escalation-mark.mjs');
+  const { planNeedsHumanVoid, MAX_VERDICT_VOIDS_PER_HEAD, runReconcileNotesAllRepos } = await import('../../../skills-src/conveyor/reconcile-fix-dispatch-daemon.mjs');
+  const escalation = (outcome = 'needs-human') => ({ author: AUTOMATION, body: buildCiHealEscalationComment({ headSha: HEAD, outcome }) });
+  const voidComment = (voids = 'needs-human', headSha = HEAD) => ({ author: AUTOMATION, body: buildVoid({ headSha, voids, cause: 'ci-green\nnow' }) });
+  const options = (comments = [escalation()]) => ({
+    note: { kind: 'ci-heal-escalation-moot', prNumber: 5012, headSha: HEAD, outcome: 'needs-human' },
+    repo: 'we', verdictSettings: { voidNeedsHumanWhenCiGreen: true },
+    pr: { headRefOid: HEAD, state: 'OPEN', comments, statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }] },
+    readRequiredChecks: () => ['test'],
+  });
+  it('preserves the original not-a-ci-break comment byte for byte', () => {
+    expect(buildVoid({ headSha: HEAD, red: ['test'] })).toBe([
+      '🚦 conveyor CI-heal — verdict void', '', 'voids: not-a-ci-break', 'head: ' + HEAD, 'red: test', '',
+      'The earlier `not-a-ci-break` verdict on this exact head is no longer true: the required check(s) above completed '
+        + 'FAILED after it was recorded. The verdict is void, so the ordinary CI-heal path (with its usual attempt cap) '
+        + 'owns this head again. No person is needed for this step.',
+    ].join('\n'));
+  });
+  it('builds and parses the new typed void with a single-line cause', () => {
+    expect(voidComment().body).toContain('voids: needs-human\nhead: ' + HEAD + '\ncause: ci-green now');
+    expect(parseCiHealVerdictVoids([voidComment()])[0]).toMatchObject({ voids: 'needs-human', headSha: HEAD });
+  });
+  it('honors the setting, head, trust and thread order', () => {
+    const comments = [escalation(), voidComment()];
+    expect(latestCiHealEscalationForHead(comments, HEAD, { voidNeedsHuman: true })).toBeNull();
+    expect(latestCiHealEscalationForHead(comments, HEAD, { voidNeedsHuman: false })?.outcome).toBe('needs-human');
+    for (const c of [voidComment('not-a-ci-break'), voidComment('needs-human', 'abcdef0123456789'), { ...voidComment(), author: { login: 'rando' } }]) {
+      expect(latestCiHealEscalationForHead([escalation(), c], HEAD, { voidNeedsHuman: true })?.outcome).toBe('needs-human');
+    }
+    expect(latestCiHealEscalationForHead([voidComment(), escalation()], HEAD, { voidNeedsHuman: true })?.outcome).toBe('needs-human');
+    expect(latestCiHealEscalationForHead([escalation('not-a-ci-break'), voidComment()], HEAD, { recheck: true })?.outcome).toBe('not-a-ci-break');
+    expect(notCiBreakVerdictVoidState([escalation('not-a-ci-break'), voidComment()], HEAD).voidCount).toBe(0);
+    expect(needsHumanVoidState(comments, HEAD)).toEqual({ escalationIndex: 0, voided: true, voidCount: 1 });
+  });
+  it('plans once per escalation, dedupes and caps', () => {
+    expect(planNeedsHumanVoid(options())).toMatchObject({ key: 'ci-heal-needs-human-void:5012:' + HEAD + ':0', alreadyPosted: false });
+    expect(planNeedsHumanVoid(options([escalation(), voidComment()]))).toMatchObject({ alreadyPosted: true });
+    const cycles = Array.from({ length: MAX_VERDICT_VOIDS_PER_HEAD }, () => [escalation(), voidComment()]).flat();
+    expect(planNeedsHumanVoid(options([...cycles, escalation()]))).toBeNull();
+    expect(planNeedsHumanVoid(options([escalation(), voidComment(), escalation()]))).toMatchObject({ alreadyPosted: false });
+  });
+  it('re-verifies facts and never falls through to an operator note', () => {
+    const o = options();
+    for (const override of [
+      { verdictSettings: { voidNeedsHumanWhenCiGreen: false } },
+      { pr: { ...o.pr, headRefOid: 'abcdef0123456789' } },
+      { pr: { ...o.pr, mergeStateStatus: 'DIRTY' } },
+      { pr: { ...o.pr, comments: [] } },
+      { pr: { ...o.pr, statusCheckRollup: [] } },
+    ]) {
+      expect(planNeedsHumanVoid({ ...o, ...override })).toBeNull();
+      const postComment = vi.fn(() => ({ ok: true }));
+      runReconcileNotesAllRepos({ ...o, ...override, repos: ['we'], dryRun: false, postComment,
+        tick: () => ({ notes: [o.note], prsByNumber: new Map([[5012, override.pr ?? o.pr]]) }) });
+      expect(postComment).not.toHaveBeenCalled();
+    }
+    const postComment = vi.fn(() => ({ ok: true }));
+    runReconcileNotesAllRepos({ ...o, repos: ['we'], dryRun: false, postComment,
+      tick: () => ({ notes: [o.note], prsByNumber: new Map([[5012, o.pr]]) }) });
+    expect(postComment).toHaveBeenCalledTimes(1);
+    expect(postComment).toHaveBeenCalledWith(expect.objectContaining({ body: expect.stringContaining('voids: needs-human') }));
   });
 });

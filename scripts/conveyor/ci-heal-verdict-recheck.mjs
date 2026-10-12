@@ -19,6 +19,7 @@
  * Declared setting `ci-heal-verdict-settings.json` (env `WE_CI_HEAL_RECHECK_NOT_CI_BREAK` beats the file);
  * missing, malformed or `off` = the behaviour before this card. PURE apart from the settings file read.
  */
+import { PLATFORM_PREFERENCES_PATH } from '../lib/merge-delivery-policy.mjs';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -41,10 +42,43 @@ const parseSwitch = (raw) => {
 };
 
 /** `{ recheckNotCiBreak }` in force. Env beats the file; missing or malformed = off (today). */
-export function resolveCiHealVerdictSettings(env = process.env, { path = ciHealVerdictSettingsPath(), read = readFileSync } = {}) {
+export function resolveCiHealVerdictSettings(env = process.env, options = {}) {
+  const { path = ciHealVerdictSettingsPath(), read = readFileSync } = options;
   let file = {};
   try { file = JSON.parse(read(path, 'utf8'))?.ciHealVerdict ?? {}; } catch { file = {}; }
-  return { recheckNotCiBreak: parseSwitch(env?.[CI_HEAL_VERDICT_ENV]) ?? parseSwitch(file.recheckNotCiBreak) ?? false };
+  const resolved = resolveVoidNeedsHumanWhenCiGreen(env, options);
+  return {
+    recheckNotCiBreak: parseSwitch(env?.[CI_HEAL_VERDICT_ENV]) ?? parseSwitch(file.recheckNotCiBreak) ?? false,
+    voidNeedsHumanWhenCiGreen: resolved.value, voidNeedsHumanSource: resolved.source,
+    voidNeedsHumanIgnored: resolved.ignored,
+  };
+}
+
+/** Standard → platform preferences → repo → env. Invalid layers retain the prior value and a reason. */
+export function resolveVoidNeedsHumanWhenCiGreen(env = process.env, {
+  path = ciHealVerdictSettingsPath(), platformPath = PLATFORM_PREFERENCES_PATH, read = readFileSync,
+} = {}) {
+  let value = true, source = 'standard';
+  const ignored = [];
+  const apply = (raw, layer) => {
+    if (raw === undefined) return;
+    const parsed = typeof raw === 'string' && /^(on|off)$/.test(raw) ? raw === 'on' : null;
+    if (parsed === null) { ignored.push({ source: layer, reason: 'expected on or off' }); return; }
+    value = parsed; source = layer;
+  };
+  for (const [layer, filePath] of [['platform', platformPath], ['repo', path]]) {
+    try { apply(JSON.parse(read(filePath, 'utf8'))?.ciHealVerdict?.voidNeedsHumanWhenCiGreen, layer); }
+    catch (error) { ignored.push({ source: layer, reason: String(error?.message ?? error).split('\n')[0] }); }
+  }
+  apply(env?.WE_CI_HEAL_VOID_NEEDS_HUMAN_WHEN_CI_GREEN, 'env');
+  return { value, source, ignored };
+}
+
+/** No known required set means no evidence that CI is green. Pure. */
+export function ciGreenForEscalation({ rollup, requiredChecks }) {
+  if (!Array.isArray(requiredChecks) || !requiredChecks.length) return false;
+  const { red, pending, missing } = requiredCheckStates({ rollup, requiredChecks });
+  return !red.length && !pending.length && !missing.length;
 }
 
 const sameSha = (a, b) => {
