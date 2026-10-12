@@ -48,6 +48,7 @@ import { loadPresets } from './lib/presets-loader.cjs';
 import { loadDataRegistry } from './lib/registry-loader.cjs';
 import { loadAdapters } from './lib/adapters-loader.cjs';
 import { localToday } from './lib/local-date.mjs';
+import { runGitGrepGate } from './lib/git-grep-gate.mjs';
 import { findUtcDaySlices, utcDaySliceMessage } from './lib/utc-day-slice-scan.mjs';
 import { scanInvisibleSourceTree } from './lib/invisible-source-scan.mjs';
 import { scanFilesCached, gitGrepCached, cacheEnabled, fileKeys } from './lib/standards-cache.mjs';
@@ -1821,13 +1822,11 @@ try {
     exclude: (f) => f.startsWith('node_modules/') || f.startsWith('backlog/'), getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
   });
   if (!hits) {
-    hits = [];
-    try {
-      hits = execFileSync(
-        'git', ['grep', '--threads=1', '-nE', HASH_PATH_CITE_SOURCE, '--', '.', ':!node_modules', ':!backlog'],
-        { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
-      ).split('\n').filter(Boolean);
-    } catch { /* git grep exits 1 on no match, or git unavailable — no findings either way, never a gate crash */ }
+    // Fail closed (#4490): only git grep's exit 1 means "no match"; any other failure is emitted via emit3.
+    hits = runGitGrepGate(HASH_PATH_CITE_SOURCE, {
+      pathspecs: ['.', ':!node_modules', ':!backlog'], cwd: ROOT, emit: emit3,
+      kind: 'citation-hash-path-scan-error', label: 'hash-path citation gate (6f-ii-c)',
+    }).lines;
   }
   const seen = new Set();
   for (const { file: rel, path: cited, hash } of findHashPathCitesInGrepLines(hits)) {
@@ -1886,26 +1885,13 @@ try {
     exclude: (f) => f.startsWith('node_modules/'), getKeys: cacheKeys, onStats: (l) => cacheStatLines.push(l),
   });
   if (!hits) {
-    hits = [];
-    try {
-      hits = execFileSync(
-        'git', ['grep', '--threads=1', '-nE', BACKLOG_GLOB_CITE_SOURCE, '--', '.', ':!node_modules'],
-        { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 16 * 1024 * 1024 },
-      ).split('\n').filter(Boolean);
-    } catch (e) {
-      // git grep exits 1 on "no match" — that is the common, expected empty case, never a gate crash. Any
-      // OTHER exit (git unavailable, output past maxBuffer, a real error) is NOT the same as "no findings" —
-      // independent review (#4318, security lens) caught the sibling gates' identical catch-all silently
-      // reporting clean on a real scan failure. Route it through the SAME emit4 the gate's own findings use
-      // (not a bare `warn`) so CITATION_GATES_ENFORCED promotes a real scan failure to a hard error exactly
-      // like it would promote a real finding — a scan that couldn't run is not entitled to a softer floor
-      // than a scan that ran and found something.
-      if (e?.status !== 1) {
-        emit4(`backlog-glob citation gate: git grep failed unexpectedly (${String(e?.message || e).split('\n')[0]}) ` +
-          `— this run's findings for gate 6f-ii-d may be INCOMPLETE, not clean.`,
-          { kind: 'citation-backlog-glob-scan-error', file: 'scripts/check-standards.mjs', global: true });
-      }
-    }
+    // git grep exits 1 on "no match"; any OTHER exit is a failed scan, not "no findings" (#4318 security
+    // review). The shared helper (#4490) routes it through the SAME emit4 the gate's own findings use, so
+    // CITATION_GATES_ENFORCED promotes a real scan failure to a hard error exactly like a real finding.
+    hits = runGitGrepGate(BACKLOG_GLOB_CITE_SOURCE, {
+      pathspecs: ['.', ':!node_modules'], cwd: ROOT, emit: emit4,
+      kind: 'citation-backlog-glob-scan-error', label: 'backlog-glob citation gate (6f-ii-d)',
+    }).lines;
   }
   for (const f of findDanglingBacklogGlobCitesInGrepLines(hits, { resolvableIds })) {
     emit4(`${f.file}: cites \`${f.path}\` — id \`${f.id}\` resolves to no currently-tracked or landed ` +
