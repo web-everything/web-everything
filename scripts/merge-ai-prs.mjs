@@ -169,7 +169,7 @@ import { parseEscalationReason } from './review-detail.mjs';
 import { deriveResolutionBasis, graduatedToFromBody, renderResolutionBasisBanner } from './lib/review-render.mjs'; // #2447 — the graduatedTo resolution-basis banner (presentation only; never gates)
 import { readSharedOpenPrs, readShaCache, writeShaCache, snapshotOpenCount, nextLimit } from './lib/pr-snapshot.mjs';
 import { markPrSnapshotDirty } from './lib/pr-snapshot-store.mjs';
-import { logQueueNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
+import { logQueueNumbering, mainAcceptsBranchNumbering, prepareBranchBeforeEnqueue, finishBranchPreparation, openReservationPr, probeQueuedLand, sweepQueuedHashCards } from './lib/queue-branch-numbering.mjs';
 import { handOffDrainFollowup, buildFollowupInput } from './lib/drain-followup-job.mjs'; // x4y74wj — the post-merge follow-up as a detached job (see the follow-up point)
 import { extractManifestFromBody, manifestAuditLine, asItemId, isItemId, repoKeyFromSlug, manifestBaseForRepo } from './readiness/lane-manifest.mjs';
 import { readFreeze, migrateLegacyFreeze, resolveLegacyFreezeMarkerPath, pendingLegacyFreezeMarkers } from './readiness/red-main-remediation.mjs'; // #2681 — the RED-MAIN dispatch-freeze the sole writer consults (stop-the-line while main is red)
@@ -6088,7 +6088,8 @@ async function runCli() {
   };
   // Queue-mode branch numbering (mq-number-before-enqueue): number + resolve cards on the PR branch before enqueue.
   const numberCardsBeforeEnqueue = logQueueNumbering();
-  const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null);
+  const numberingOnBranch = numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && mainAcceptsBranchNumbering();
+  if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(null) && !numberingOnBranch) process.stderr.write("  merge-queue: numberCardsBeforeEnqueue=on but main's CI does not yet accept drain-numbered cards (contract drain-branch-numbering-ci-v1 missing on origin/main) — numbering at land (post-land push) this pass\n");
   if (numberingOnBranch && !DRY_RUN) sweepQueuedHashCards({ repo: localSlug, cwd: process.cwd(), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
   // fix-couple-split — couple members HELD this pass because their partner half is not landing with them, and (the
   // cross-repo residual) a carrier whose own merge failed AFTER its impl half landed.
@@ -6418,7 +6419,7 @@ async function runCli() {
           // shares with a concurrent resident-daemon sweep (the fast drain bypasses the whole-process lease), so
           // it is what serializes the actual merge write, not just NNN allocation. Inside the lock, the re-check
           // makes a PR another lander already merged a safe no-op — never a double `gh pr merge`.
-          if (numberCardsBeforeEnqueue && mergeStrategy.enqueues(c.repo)) {
+          if (numberingOnBranch && mergeStrategy.enqueues(c.repo)) {
             const prepared = prepareBranchBeforeEnqueue({ c, traceHeadSha, isLocal: isLocalRepo(c.repo), isOpen: (repo, num) => openReservationPr(openPrContext, repo, num) });
             if (!finishBranchPreparation(prepared, { c, revalidationAborted, needsAcceptanceRestamp, restampAcceptance })) { const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip'; continue; }
           }

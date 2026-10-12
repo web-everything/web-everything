@@ -1,8 +1,31 @@
 import { describe, it, expect, vi } from 'vitest';
 import { handNumberedNewItems } from '../../check-standards-rules.mjs';
-import { exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
+import { BRANCH_NUMBERING_CI_CONTRACT, mainAcceptsBranchNumbering, drainNumberedPairs, exemptDrainNumberedItems, resolveQueueNumbering, hashBacklogFiles, isMergeGroupCiRun, mergeGroupHashRefusals, prepareBranchBeforeEnqueue, reservationPlan, finishBranchPreparation } from '../queue-branch-numbering.mjs';
 
 describe('queue branch numbering', () => {
+  it('probes main for the branch-numbering CI contract and fails closed', () => {
+    expect(BRANCH_NUMBERING_CI_CONTRACT).toBe('drain-branch-numbering-ci-v1');
+    const exec = vi.fn(() => '// drain-branch-numbering-ci-v1');
+    expect(mainAcceptsBranchNumbering({ cwd: '/clone', exec })).toBe(true);
+    expect(exec).toHaveBeenCalledWith('git', ['show', 'origin/main:scripts/lib/queue-branch-numbering.mjs'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    expect(mainAcceptsBranchNumbering({ exec: () => '// older main' })).toBe(false);
+    expect(mainAcceptsBranchNumbering({ exec: () => { throw new Error('missing ref'); } })).toBe(false);
+  });
+  it('reads normalized pairs only from drain JIT-number subjects on the branch', () => {
+    const exec = vi.fn(() => [
+      'drain: JIT-number xabc123→#5986, xdef456→#5987 at land (#2288)',
+      'drain: JIT-number xghi789→#0042 at land (#2288)',
+      'unrelated xabc123→#9999',
+      'prefix drain: JIT-number xabc123→#9999 at land (#2288)',
+      'drain: JIT-number xabc123→#9999 at land (#2288) suffix',
+      'drain: JIT-number invalid→#5988, xabc123→#bad at land (#2288)',
+    ].join('\n'));
+    expect(drainNumberedPairs({ cwd: '/clone', exec })).toEqual(new Set(['xabc123→5986', 'xdef456→5987', 'xghi789→42']));
+    expect(exec).toHaveBeenCalledWith('git', ['log', '--format=%s', 'origin/main..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    drainNumberedPairs({ cwd: '/clone', exec, base: 'custom-base' });
+    expect(exec).toHaveBeenLastCalledWith('git', ['log', '--format=%s', 'custom-base..HEAD'], { cwd: '/clone', encoding: 'utf8', stdio: 'pipe' });
+    expect(drainNumberedPairs({ cwd: '/clone', exec: () => { throw new Error('missing ref'); } })).toEqual(new Set());
+  });
   it('refuses hash cards in merge groups even when drain numbering is off', () => {
     const env = { GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'merge_group', WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'off' };
     expect(mergeGroupHashRefusals({ env, files: ['backlog/xabc123-foo.md', 'backlog/5970-bar.md'] })).toEqual([
@@ -29,16 +52,18 @@ describe('queue branch numbering', () => {
     expect(resolveQueueNumbering({ readFile, env: { WE_MQ_NUMBER_CARDS_BEFORE_ENQUEUE: 'bad' } })).toMatchObject({ value: false, invalid: [expect.stringContaining('bad')] });
     expect(resolveQueueNumbering({ readFile: () => { throw Object.assign(new Error(), { code: 'ENOENT' }); }, env: {} })).toMatchObject({ value: true, source: 'default' });
   });
-  it('exempts only hash birth stamps when queue numbering is enabled without mutating input', () => {
+  it('exempts only matching hash and numeric pairs without mutating input', () => {
     const items = Object.freeze([
-      Object.freeze({ num: '5938', bornAs: 'xabc123' }),
+      Object.freeze({ num: '05938', bornAs: 'xabc123' }),
+      Object.freeze({ num: '5939', bornAs: 'xabc123' }),
+      Object.freeze({ num: '5938', bornAs: 'xdef456' }),
       ...[undefined, null, '', '5938', 'xabc12', 'xabc1234', 'XABC123', ' xabc123'].map((bornAs) => Object.freeze({ num: '5939', bornAs })),
     ]);
-    expect(exemptDrainNumberedItems(items, { enabled: true })).toEqual(items.slice(1));
-    expect(exemptDrainNumberedItems(items, { enabled: false })).toBe(items);
-    expect(exemptDrainNumberedItems([], { enabled: true })).toEqual([]);
+    expect(exemptDrainNumberedItems(items, { drainNumbered: new Set(['xabc123→5938']) })).toEqual(items.slice(1));
+    expect(exemptDrainNumberedItems(items, { drainNumbered: new Set() })).toEqual(items);
+    expect(exemptDrainNumberedItems([], { drainNumbered: new Set(['xabc123→5938']) })).toEqual([]);
   });
-  it('keeps the hand-picked-id gate active for unstamped cards and when numbering is off', () => {
+  it('keeps the hand-picked-id gate active for unstamped cards and absent drain pairs', () => {
     const items = [
       { id: '5938-drained', num: '5938', bornAs: 'xabc123' },
       { id: '5939-picked', num: '5939' },
@@ -46,11 +71,11 @@ describe('queue branch numbering', () => {
       { id: '010-main', num: '010' },
     ];
     const main = ['backlog/010-main.md'];
-    const enabled = handNumberedNewItems(exemptDrainNumberedItems(items, { enabled: true }), main);
+    const enabled = handNumberedNewItems(exemptDrainNumberedItems(items, { drainNumbered: new Set(['xabc123→5938']) }), main);
     expect(enabled).toHaveLength(2);
     expect(enabled[0]).toContain('5939-picked');
     expect(enabled[1]).toContain('5940-invalid');
-    expect(handNumberedNewItems(exemptDrainNumberedItems(items, { enabled: false }), main)).toHaveLength(3);
+    expect(handNumberedNewItems(exemptDrainNumberedItems(items, { drainNumbered: new Set() }), main)).toHaveLength(3);
   });
   it('detects only tracked hash card names and merge groups', () => {
     expect(hashBacklogFiles('backlog/xabc123-foo.md\nbacklog/012-bar.md\nother/xabc123-a.md\nbacklog/xabc12-b.md')).toEqual(['backlog/xabc123-foo.md']);

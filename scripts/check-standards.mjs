@@ -779,7 +779,7 @@ if (!LOCAL_MODE) {
     for (const msg of born.errors) err(msg);
     for (const msg of born.warnings) warn(msg);
   }
-  const { isMergeGroupCiRun, resolveQueueNumbering, mergeGroupHashRefusals, exemptDrainNumberedItems } = await import('./lib/queue-branch-numbering.mjs');
+  const { isMergeGroupCiRun, resolveQueueNumbering, mergeGroupHashRefusals, exemptDrainNumberedItems, drainNumberedPairs } = await import('./lib/queue-branch-numbering.mjs');
   const setting = resolveQueueNumbering();
   for (const message of setting.invalid) warn(message);
   if (isMergeGroupCiRun()) {
@@ -821,7 +821,7 @@ if (!LOCAL_MODE) {
     // because pr-land.mjs's runHeal() self-check runs on a locally-renumbered, not-yet-pushed tree that this
     // gate cannot distinguish from a real mistake — the heal IS the sanctioned numbering path.
     if (!process.env.WE_SKIP_HAND_NUMBERED_GATE) {
-      for (const msg of handNumberedNewItems(exemptDrainNumberedItems(backlog, { enabled: setting.value }), mainBacklog)) err(msg);
+      for (const msg of handNumberedNewItems(exemptDrainNumberedItems(backlog, { drainNumbered: drainNumberedPairs({ cwd: ROOT }) }), mainBacklog)) err(msg);
     }
   } catch { /* origin/main not resolvable here — the drain's post-land assert still guards the land path */ }
 }

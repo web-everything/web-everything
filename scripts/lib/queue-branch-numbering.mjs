@@ -20,9 +20,33 @@ export function mergeGroupHashRefusals({ env = process.env, files }) {
   return hashBacklogFiles(files).map((file) => `Backlog file "${file}" would land on main with a NON-NUMERIC leading id — a temporary (hash) id can never enter main through the merge queue; the drain numbers cards on the PR branch before enqueue. This merge group is refused (unconditional, no setting disables it)`);
 }
 
-/** The drain's birth-hash stamp exempts queue-numbered cards from the hand-picked-id gate. */
-export function exemptDrainNumberedItems(items, { enabled }) {
-  return enabled ? items.filter((item) => !isHash(item.bornAs)) : items;
+export const BRANCH_NUMBERING_CI_CONTRACT = 'drain-branch-numbering-ci-v1';
+
+export function mainAcceptsBranchNumbering({ cwd = process.cwd(), exec = execFileSync } = {}) {
+  try {
+    return String(exec('git', ['show', 'origin/main:scripts/lib/queue-branch-numbering.mjs'], { cwd, encoding: 'utf8', stdio: 'pipe' })).includes(BRANCH_NUMBERING_CI_CONTRACT);
+  } catch { return false; }
+}
+
+export function drainNumberedPairs({ cwd, exec = execFileSync, base = 'origin/main' }) {
+  try {
+    const subjects = exec('git', ['log', '--format=%s', `${base}..HEAD`], { cwd, encoding: 'utf8', stdio: 'pipe' });
+    const pairs = new Set();
+    for (const subject of lines(subjects)) {
+      const match = subject.match(/^drain: JIT-number (.+) at land \(#2288\)$/);
+      if (!match) continue;
+      for (const assignment of match[1].split(', ')) {
+        const pair = assignment.match(/^(x[0-9a-z]{6})→#(\d+)$/);
+        if (pair) pairs.add(`${pair[1]}→${Number(pair[2])}`);
+      }
+    }
+    return pairs;
+  } catch { return new Set(); }
+}
+
+/** drain-branch-numbering-ci-v1: exempt only birth hashes paired with their drain-recorded number. */
+export function exemptDrainNumberedItems(items, { drainNumbered }) {
+  return items.filter((item) => !(isHash(item.bornAs) && drainNumbered.has(`${item.bornAs}→${Number(item.num)}`)));
 }
 
 const boolean = (v) => ({ on: true, true: true, 1: true, off: false, false: false, 0: false })[String(v).toLowerCase()];
