@@ -52,7 +52,7 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
 - [ ] `merge-gate` runs in **enforce**. PR #4715 does not itself set `mergeGate.mode`; enforce needs
   `mergeGate.mode: "enforce"` in a repo settings file or the `MERGE_GATE_MODE` repository variable
   (`we:scripts/lib/merge-gate-ci.mjs`, `loadMergeGateMode`). Confirm the merge-gate log shows `mode=enforce`.
-  Apply step 4 re-checks this with a script and refuses to go on unless it prints `enforce`: in `shadow` the
+  Apply step 4 re-checks this on a fresh merge-gate run on main and stops unless its log says `enforce`: in `shadow` the
   required `merge-gate` check passes with "SHADOW: would HOLD", so the queue would merge PRs the drain holds.
 - [ ] Merge-gate shadow audit clean: no shadow "would HOLD" on a PR the drain then landed.
 - [ ] Card `xjdnlk0` done: the pinned `workflows` runs are proven on a live PR. GitHub starts them only on
@@ -142,17 +142,26 @@ Two paths get past this, so close both for the whole switch:
    git -C <drain clone> merge-base --is-ancestor <merge commit sha> HEAD && echo ok
    ```
 
-4. Apply the ruleset with the operator's personal gh, not the App token. First, from a checkout of main that
-   has the step-2 merge commit, resolve the merge-gate mode exactly as CI does (repo settings, then the
-   `MERGE_GATE_MODE` repository variable), and do not run the PUT unless it exits 0:
+4. Apply the ruleset with the operator's personal gh, not the App token. First prove the mode CI really runs
+   in. Do not resolve it locally: a local read cannot see an organization-level `MERGE_GATE_MODE` variable, and a
+   failed variable read or a local settings edit would make it disagree with CI. Instead start the merge-gate
+   dry run on main (`workflow_dispatch`, which resolves the mode on GitHub from main's settings and `vars`), and
+   read the mode line from its log:
 
    ```bash
-   MERGE_GATE_MODE="$(env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh variable get MERGE_GATE_MODE --repo web-everything/web-everything 2>/dev/null)" \
-     node --input-type=module -e "import { loadMergeGateMode } from './scripts/lib/merge-gate-ci.mjs'; const r = loadMergeGateMode(); console.log('merge-gate mode=' + r.mode + ' (' + r.source + ')'); process.exit(r.mode === 'enforce' ? 0 : 1)"
+   GH="env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh"
+   SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+   $GH workflow run merge-gate.yml --repo web-everything/web-everything --ref main -f prs=4950
+   # once it appears (a few seconds), take the dispatch run that started after $SINCE:
+   RUN=$($GH run list --repo web-everything/web-everything --workflow merge-gate.yml --event workflow_dispatch --limit 1 --json databaseId,createdAt --jq ".[] | select(.createdAt >= \"$SINCE\") | .databaseId")
+   $GH run watch "$RUN" --repo web-everything/web-everything >/dev/null
+   $GH run view "$RUN" --repo web-everything/web-everything --log | grep -m1 -o 'merge-gate mode: [a-z]* (source: [^)]*)'
    ```
 
-   It must print `merge-gate mode=enforce`. An unset or unreadable variable counts as not set, so a missing
-   enforce setting prints `shadow` and exits 1. Then apply:
+   The dry run needs a PR to evaluate (with none it fails before it resolves the mode); `4950` is fine even once
+   merged, because the mode line is printed whatever the PR's verdict, and the run's own pass or fail does not
+   matter here. Go on only if it prints `merge-gate mode: enforce (source: …)`. Anything else stops the switch:
+   `shadow`, no such line, an empty `RUN`, or any failed command. Then apply:
 
    ```bash
    env -u GH_TOKEN -u GITHUB_TOKEN /opt/homebrew/bin/gh api -X PUT repos/web-everything/web-everything/rulesets/24883772 --input scripts/rulesets/main-required-checks.merge-queue.json
