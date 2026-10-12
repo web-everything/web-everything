@@ -11,12 +11,9 @@
  * list — an advisory workflow's mere EXISTENCE was enough to cause a false red, and the same will be true of
  * the NEXT one someone adds, forever, unless something closes the gap structurally.
  *
- * THE FIX: invert the question. Branch protection (`gh api repos/<repo>/branches/<branch>/protection --jq
- * .required_status_checks.contexts`) already states which checks are ACTUALLY required to merge — the one
- * ground truth that does not need updating by hand every time a new advisory workflow is added. A reader that
- * asks "did a REQUIRED check fail" instead of "did any check outside a hand-maintained exclusion list fail"
- * cannot be fooled by a new advisory check, because the new check simply is not in the required set until
- * someone deliberately adds it to branch protection.
+ * THE FIX: invert the question. Read branch rulesets (App-token readable) AND classic branch protection, and
+ * take their union — GitHub enforces both — to learn which checks are ACTUALLY required to merge. Asking "did a REQUIRED check fail"
+ * cannot be fooled by a new advisory check: it only counts once explicitly required by repository policy.
  *
  * THIS FILE OWNS THE IO (`gh api …`, cached to a sidecar file — same convention as `we:scripts/progress-
  * board.mjs`'s own `reports/.progress-board-cache.json`) so every PURE reducer that wants the required set
@@ -28,9 +25,11 @@
  * DEGRADATION, on the same "never lose the read" principle `we:scripts/progress-board.mjs` documents: a fresh
  * live fetch wins when available; a live fetch that fails falls back to the last cache written (even stale —
  * a branch-protection change is rare, so a day-old required set is still far more accurate than guessing);
- * a protection 403/404 (never a rate-limit 403 — that is transient) instead selects the repo's declared
+ * a protection 403/404 (never a rate-limit 403 — that is transient), or both sources read fine and requiring
+ * nothing, instead selects the repo's declared
  * policy, cached for the normal TTL as `declared`, unless a live entry already exists: that is returned as
- * `stale-cache` and left untouched on disk.
+ * `stale-cache` and left untouched on disk. A rules denial is such a denial even when classic protection reads
+ * fine: that classic set is partial, so it is never live, only added on top of the declared/fallback set.
  * Other failures still retry and prefer the cache, with its original age exposed to admission gates.
  * With no cache, failures return `fallback` for a declared repo; undeclared repos return [] with `fallback`
  * on 403/404 or `unavailable` otherwise. The shared check reducer then evaluates observed
@@ -46,12 +45,12 @@ import { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks } from './requi
 import { CONSTELLATION_REPOS } from './constellation-repos.mjs';
 
 /**
- * The required set as confirmed live on 2026-09-26 (`gh api repos/web-everything/web-everything/branches/main/
- * protection --jq .required_status_checks.contexts`). Used as WE's declared policy on protection 403/404,
- * or as an untrusted fallback for other failures when no cache exists. A successful live fetch always wins,
- * so a real branch-protection change is picked up on the next successful read regardless of this constant.
+ * The required set as confirmed live on 2026-10-11 via the rules API
+ * (`repos/web-everything/web-everything/rules/branches/main`, ruleset 24883772).
+ * Used as WE's declared policy on access denial, or as an untrusted fallback for other failures when no
+ * cache exists. A successful live fetch always wins, picking up changes on the next successful read.
  */
-export const FALLBACK_REQUIRED_STATUS_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'integration']);
+export const FALLBACK_REQUIRED_STATUS_CHECKS = Object.freeze(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
 
 export { REQUIRED_CHECK_IMPLIED_BY, withoutImpliedRequiredChecks };
 
@@ -83,6 +82,63 @@ export function defaultCachePath() {
   return join(process.cwd(), 'reports', '.required-status-checks-cache.json');
 }
 
+/** Pure projection of branch rules into the union of required status-check contexts. */
+export function requiredChecksFromRules(rulesJson) {
+  if (!Array.isArray(rulesJson)) throw new Error('required-status-checks: unexpected shape from branch rules');
+  return [...new Set(rulesJson
+    .filter(rule => rule?.type === 'required_status_checks')
+    .flatMap(rule => rule.parameters?.required_status_checks ?? [])
+    .map(check => check?.context)
+    .filter(context => typeof context === 'string' && context.length > 0))];
+}
+
+/**
+ * Pure projection of a `GET repos/{repo}/branches/{branch}` body into its classic-protection required contexts
+ * (`contexts` ∪ `checks[].context`). An unprotected branch, or protection that requires no status checks, is [];
+ * a protected branch whose protection the token cannot see is an unexpected shape, never "no checks".
+ */
+export function requiredChecksFromBranch(branchJson) {
+  const shapeError = () => new Error('required-status-checks: unexpected shape from branch');
+  if (!branchJson || typeof branchJson !== 'object' || Array.isArray(branchJson)) throw shapeError();
+  if (branchJson.protected === false) return [];
+  if (branchJson.protected !== true || !branchJson.protection || typeof branchJson.protection !== 'object') throw shapeError();
+  if (branchJson.protection.enabled === false) return []; // protected by a ruleset only — no classic protection
+  const status = branchJson.protection.required_status_checks;
+  if (status == null) return [];
+  if (typeof status !== 'object') throw shapeError();
+  const contexts = Array.isArray(status.contexts) ? status.contexts : [];
+  const checks = Array.isArray(status.checks) ? status.checks.map(check => check?.context) : [];
+  return [...new Set([...contexts, ...checks].filter(context => typeof context === 'string' && context.length > 0))];
+}
+
+/**
+ * `gh api --paginate --slurp` prints an array of PAGES; flatten it to the rule list. A bare rule list (no page
+ * wrapper) passes through; a mix of pages and bare rules is an unexpected shape, never a partial read.
+ */
+function flattenRulePages(parsed) {
+  if (!Array.isArray(parsed)) return parsed; // requiredChecksFromRules rejects the shape
+  const pages = parsed.filter(Array.isArray).length;
+  if (pages === 0) return parsed;
+  if (pages !== parsed.length) throw new Error('required-status-checks: unexpected mix of pages and rules from branch rules');
+  return parsed.flat();
+}
+
+/** Shared routing, timeout and piped IO for both GitHub sources. */
+function readRequiredChecksGh(args) {
+  const opts = { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] };
+  if (resolvePersonalRouteEnabled()) {
+    // Personal routing lives in the CLI read path, not runGhSync.
+    const result = runGhCliPassthrough(args, {
+      spawn: (bin, argv, spawnOpts) => spawnSync(bin, argv, { ...spawnOpts, ...opts }),
+    });
+    if (result.status !== 0 || result.deferred) {
+      throw Object.assign(new Error('required-status-checks: read failed'), { stderr: result.stderr });
+    }
+    return String(result.stdout ?? '');
+  }
+  return readGh(args, opts); // #74d: failure/oversize throws; never parsed as empty
+}
+
 /**
  * The injected `gh` reader. Returns the repo's required status-check context names, or throws — never
  * swallows an error itself, so {@link getRequiredStatusChecks} is the one place that decides what a failure
@@ -92,28 +148,62 @@ export function defaultCachePath() {
  * the CURRENT directory's git remote — the same "let gh infer it" convention this repo's other readers use
  * (e.g. `we:scripts/conveyor/reconcile-pass.mjs#defaultReadAheadBy`) — rather than failing a caller that never
  * had a repo slug to pass.
- * @param {{repo?: string, branch?: string}} o
+ * @param {{repo?: string, branch?: string, gh?: Function}} o
  * @returns {string[]}
  */
-export function defaultReadRequiredStatusChecks({ repo, branch = 'main' } = {}) {
-  const args = ['api', `repos/${repo || '{owner}/{repo}'}/branches/${branch}/protection`, '--jq', '.required_status_checks.contexts'];
-  const opts = { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] };
-  let out;
-  if (resolvePersonalRouteEnabled()) {
-    // Personal routing lives in the CLI read path, not runGhSync. Keep the reader's timeout and piped IO.
-    const result = runGhCliPassthrough(args, {
-      spawn: (bin, argv, spawnOpts) => spawnSync(bin, argv, { ...spawnOpts, ...opts }),
-    });
-    if (result.status !== 0 || result.deferred) {
-      throw Object.assign(new Error('required-status-checks: protection read failed'), { stderr: result.stderr });
-    }
-    out = String(result.stdout ?? '');
-  } else {
-    out = readGh(args, opts); // #74d: failure/oversize throws; never parsed as empty
+export function defaultReadRequiredStatusChecks({ repo, branch = 'main', gh = readRequiredChecksGh } = {}) {
+  const base = `repos/${repo || '{owner}/{repo}'}`;
+  let rulesChecks = [];
+  let rulesError;
+  let rulesFailed = false; // a flag, not `rulesError`'s truthiness: a `throw undefined` is still a failed read
+  try {
+    // The rules endpoint pages at 30: read every page (`--slurp` → one array of pages) so a required check on a
+    // later page is never dropped. A blank body is a failed read, not "no rules" (JSON.parse('') throws).
+    const out = gh(['api', '--paginate', '--slurp', `${base}/rules/branches/${branch}?per_page=100`]);
+    rulesChecks = requiredChecksFromRules(flattenRulePages(JSON.parse(out.trim())));
+  } catch (error) {
+    rulesError = error;
+    rulesFailed = true;
   }
-  const parsed = JSON.parse(out.trim() || '[]');
-  if (!Array.isArray(parsed)) throw new Error('required-status-checks: unexpected shape from branch protection');
-  return parsed.map(String);
+
+  // GitHub enforces rulesets AND classic protection together, so classic protection is always read too and the
+  // required set is their UNION — a check only classic protection requires must never be dropped (PR #4924).
+  // Read it off the BRANCH (`protection.required_status_checks`), not `…/protection`: an App token gets a 403 on
+  // the latter (live 2026-10-11) but can read the former. Any classic failure throws — never a ruleset-only set.
+  let checks;
+  try {
+    const out = gh(['api', `${base}/branches/${branch}`]);
+    checks = requiredChecksFromBranch(JSON.parse(out.trim())); // blank body = failed read, same as the rules read
+  } catch (error) {
+    // The ruleset read fine: its set is partial, never live, but stays required on whatever the caller falls back to.
+    if (!rulesFailed) throw withPartialChecks(error, rulesChecks);
+    // A transient rules failure must not become a denial just because protection is inaccessible.
+    throw !protectionAccessDenied(rulesError) ? rulesError : error;
+  }
+  if (!rulesFailed) {
+    const union = [...new Set([...rulesChecks, ...checks])];
+    // Both sources read fine and neither requires a check: an authoritative "nothing required", which selects the
+    // repo's declared policy exactly as a protection denial does — never the untrusted `fallback`.
+    if (!union.length) throw Object.assign(new Error('required-status-checks: no required checks in rules or branch protection'), { noRequiredChecks: true });
+    return union;
+  }
+  // Rulesets can require checks classic protection lacks, and an unreadable ruleset does not mean its requirements
+  // disappeared — so after ANY rules failure the classic set is partial and never returned as live: throw the rules
+  // error (its denial/transient classification intact) so the caller keeps a live cache or the declared policy. It
+  // carries the classic set as `partialChecks`, a floor the caller still requires (PR #4924 red team).
+  throw withPartialChecks(rulesError, checks);
+}
+
+/**
+ * One source read fine while the other failed: attach the readable source's checks to the failure as
+ * `partialChecks` — never a live set, but a floor {@link getRequiredStatusChecks} adds to every degraded result.
+ * A non-object throw cannot carry it and passes through unchanged (its classification must not change either).
+ */
+function withPartialChecks(error, partialChecks) {
+  if (error && typeof error === 'object') { // always set: a reused error never keeps an earlier call's floor
+    try { error.partialChecks = partialChecks; } catch { /* a frozen error degrades without the floor */ }
+  }
+  return error;
 }
 
 /**
@@ -177,26 +267,32 @@ export function getRequiredStatusChecks({
     return { checks, source };
   };
 
+  // Checks a source that DID read still requires (the other source failed): never live, but added to every degraded
+  // result below — the declared policy, the stale cache or the fallback — so a degraded read never drops them. Only
+  // on top of a non-empty base: an empty set means "count every observed check", and a partial set would narrow it.
+  let partial = [];
+  const withPartial = checks => (checks.length ? [...new Set([...checks, ...partial])] : checks);
   try {
     const checks = readChecks({ repo, branch });
     if (Array.isArray(checks) && checks.length) {
       return save(checks, 'live');
     }
   } catch (error) {
-    if (protectionAccessDenied(error)) {
+    if (Array.isArray(error?.partialChecks)) partial = error.partialChecks;
+    if (protectionAccessDenied(error) || error?.noRequiredChecks === true) {
       // An existing live entry (source `live`, or a legacy source-less one) is real branch-protection data: a
       // denial must never clobber it with the declared policy. Fall through to the stale-cache tail instead —
       // the file is untouched, so the next call re-reads live once more.
       const hasLiveCache = cache && cache.source !== 'declared' && cache.source !== 'unavailable';
       if (!hasLiveCache) {
-        if (declared) return save([...declared], 'declared');
+        if (declared) return save(withPartial(declared), 'declared');
         if (!cache) return { checks: [], source: 'fallback' };
       }
     }
     /* gh missing, unauthenticated, offline, rate-limited, or an unexpected response shape — degrade below */
   }
 
-  if (cache) return { checks: cache.checks, source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
+  if (cache) return { checks: withPartial(cache.checks), source: cache.source === 'unavailable' ? 'unavailable' : 'stale-cache',
     cacheAgeMs: now - cache.fetchedAtMs };
-  return declared ? { checks: [...declared], source: 'fallback' } : { checks: [], source: 'unavailable' };
+  return declared ? { checks: withPartial(declared), source: 'fallback' } : { checks: [], source: 'unavailable' };
 }
