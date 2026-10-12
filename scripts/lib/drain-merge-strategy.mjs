@@ -40,6 +40,9 @@ import { readSettings } from './settings-files.mjs';
 import { resolveCoordinationRoot } from '../operations/coordination-root.mjs';
 
 export const DRY_RUN_STRATEGY_ENV = 'WE_DRAIN_MERGE_STRATEGY';
+/** Env: a JSON settings file read INSTEAD of the declared files for the `mergeDelivery` tool layer (always honoured — how a
+ *  test that spawns the real drain arms or pins the strategy). Same shape as `WE_MERGE_QUEUE_SETTINGS_FILE`. */
+export const MERGE_DELIVERY_SETTINGS_FILE_ENV = 'WE_MERGE_DELIVERY_SETTINGS_FILE';
 export const CLEARANCE_MARKER = 'we-drain-enqueue-clearance';
 const CLEARANCE_RE = new RegExp(`<!--\\s*${CLEARANCE_MARKER}\\s+head=([0-9a-f]{7,40})\\s*-->`, 'gi');
 const FOLLOWED_UP_CAP = 500;
@@ -48,10 +51,26 @@ export const FOLLOW_UP_MAX_ATTEMPTS = 5;
 export function queueStatePath(env = process.env) { return join(resolveCoordinationRoot({ env }), 'drain-merge-queue-followups.json'); }
 
 /**
+ * The settings object the tool layer reads. Hermetic by default, like `merge-queue-hook.mjs#resolveMergeQueueSettings`:
+ * inside a test run (`VITEST` / `WE_UNDER_TEST`) the live `scripts/settings/*.json` are NOT read, so flipping the repo's
+ * real strategy never changes what a test that spawns the real drain CLI sees. `WE_MERGE_DELIVERY_SETTINGS_FILE` replaces
+ * the declared files (and works outside a test run too). An unreadable override reads as "layer not set".
+ */
+export function readMergeDeliveryToolSettings(env = process.env, warn = (m) => process.stderr.write(`${m}\n`)) {
+  const override = String(env?.[MERGE_DELIVERY_SETTINGS_FILE_ENV] ?? '').trim();
+  if (override) {
+    try { return JSON.parse(readFileSync(override, 'utf8')); }
+    catch (e) { warn(`  ⚠ ${MERGE_DELIVERY_SETTINGS_FILE_ENV}=${override} unreadable (${String(e?.message ?? e).split('\n')[0]}) — merge-delivery tool layer treated as not set`); return {}; }
+  }
+  if (env?.VITEST || env?.WE_UNDER_TEST) return {};
+  return readSettings();
+}
+
+/**
  * Resolve the drain's policy for this pass. The dry-run override applies only when `dryRun` is true.
  * @returns {{policy:object, note:(string|null)}}
  */
-export function resolveDrainMergePolicy({ dryRun = false, env = process.env, load = () => loadMergeDeliveryPolicy({ toolSettings: readSettings() }) } = {}) {
+export function resolveDrainMergePolicy({ dryRun = false, env = process.env, load = () => loadMergeDeliveryPolicy({ toolSettings: readMergeDeliveryToolSettings(env) }) } = {}) {
   const policy = load();
   const raw = env?.[DRY_RUN_STRATEGY_ENV];
   if (raw === undefined || raw === '') return { policy, note: null };

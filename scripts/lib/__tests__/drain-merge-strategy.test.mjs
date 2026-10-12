@@ -1,13 +1,15 @@
 // @vitest-environment node
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   createDrainMergeStrategy, resolveDrainMergePolicy, readEnqueueClearance, buildClearanceComment, hasClearanceFor, DRY_RUN_STRATEGY_ENV,
-  readQueueState, FOLLOW_UP_MAX_ATTEMPTS,
+  readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 
 const HEAD = 'b'.repeat(40);
 const LOCAL = 'web-everything/web-everything';
@@ -339,6 +341,97 @@ describe('dry-run strategy override', () => {
     const r = resolveDrainMergePolicy({ dryRun: true, env: { [DRY_RUN_STRATEGY_ENV]: 'yolo' }, load });
     expect(r.policy.strategy).toBe('drain-direct');
     expect(r.note).toMatch(/not one of/);
+  });
+});
+
+describe('tool-layer settings read (hermetic in a test run)', () => {
+  it('reads no live settings inside a test run, so the repo strategy cannot leak into a spawned drain', () => {
+    expect(readMergeDeliveryToolSettings({ VITEST: 'true' })).toEqual({});
+    expect(readMergeDeliveryToolSettings({ WE_UNDER_TEST: '1' })).toEqual({});
+  });
+  it('an override file replaces the declared files, in or out of a test run; an unreadable one reads as not set', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mdts-'));
+    try {
+      const file = join(dir, 's.json');
+      writeFileSync(file, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
+      expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file })).toEqual({ mergeDelivery: { strategy: 'github-merge-queue' } });
+      expect(readMergeDeliveryToolSettings({ VITEST: 'true', [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file }).mergeDelivery.strategy).toBe('github-merge-queue');
+      const warned = [];
+      expect(readMergeDeliveryToolSettings({ [MERGE_DELIVERY_SETTINGS_FILE_ENV]: join(dir, 'missing.json') }, (m) => warned.push(m))).toEqual({});
+      expect(warned).toHaveLength(1);
+      expect(warned[0]).toMatch(/unreadable/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('outside a test run with no override, the declared settings files are read (the live path stays wired)', () => {
+    expect(readMergeDeliveryToolSettings({})).toHaveProperty('mergeQueue');
+  });
+  it('feeds resolveDrainMergePolicy: the default load honours the override file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mdts-'));
+    try {
+      const file = join(dir, 's.json');
+      writeFileSync(file, JSON.stringify({ mergeDelivery: { strategy: 'github-merge-queue' } }));
+      expect(resolveDrainMergePolicy({ env: { [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file } }).policy.strategy).toBe('github-merge-queue');
+      expect(resolveDrainMergePolicy({ env: { VITEST: 'true' } }).policy.strategy).toBe('drain-direct');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('the merge-queue ruleset body matches rulesetSuggestion (docs/agent/merge-queue-switch.md)', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const body = JSON.parse(readFileSync(join(root, 'scripts', 'rulesets', 'main-required-checks.merge-queue.json'), 'utf8'));
+  const settings = JSON.parse(readFileSync(join(root, 'scripts', 'settings', 'merge-queue.json'), 'utf8'));
+  const want = rulesetSuggestion(settings.mergeDelivery);
+  const rule = (type) => body.rules.filter((r) => r.type === type);
+  // web-everything/web-everything (`gh api repos/web-everything/web-everything --jq .id`).
+  const REPO_ID = 1142650361;
+
+  it('pins every workflow that defines a required check to refs/heads/main (the merge_group YAML comes from the group commit otherwise)', () => {
+    expect(rule('workflows')).toHaveLength(1);
+    const { parameters } = rule('workflows')[0];
+    expect(parameters.do_not_enforce_on_create).toBe(false);
+    const pinned = parameters.workflows.map(({ path, ref }) => ({ path, ref }));
+    expect(pinned).toEqual(want.requiredWorkflows);
+    for (const w of parameters.workflows) {
+      expect(w.repository_id).toBe(REPO_ID);
+      expect(w).not.toHaveProperty('sha');
+    }
+  });
+  it('requires exactly the suggested checks, each restricted to the GitHub Actions app', () => {
+    expect(rule('required_status_checks')).toHaveLength(1);
+    const checks = rule('required_status_checks')[0].parameters.required_status_checks;
+    expect(checks.map((c) => c.context)).toEqual(want.requiredStatusChecks);
+    for (const c of checks) expect(c.integration_id).toBe(want.requiredStatusCheckIntegrationId);
+  });
+  it('carries the suggested merge_queue parameters', () => {
+    expect(rule('merge_queue')).toHaveLength(1);
+    const q = want.mergeQueue;
+    expect(rule('merge_queue')[0].parameters).toEqual({
+      merge_method: q.mergeMethod, max_entries_to_build: q.maxEntriesToBuild, min_entries_to_merge: q.minEntriesToMerge,
+      max_entries_to_merge: q.maxEntriesToMerge, min_entries_to_merge_wait_minutes: q.minEntriesToMergeWaitMinutes,
+      grouping_strategy: q.groupingStrategy, check_response_timeout_minutes: q.checkResponseTimeoutMinutes,
+    });
+  });
+  it('targets the default branch and has no rule type the suggestion does not account for', () => {
+    expect(body.conditions.ref_name.include).toEqual(['~DEFAULT_BRANCH']);
+    expect(body.rules.map((r) => r.type).sort()).toEqual(['merge_queue', 'required_status_checks', 'workflows']);
+  });
+
+  // The body is "the current ruleset plus additions": everything outside the added rules must equal the saved GET,
+  // or the operator's PUT silently drops it (the admin bypass the hand-merges and the rollback rely on, above all).
+  const rollback = JSON.parse(readFileSync(join(root, 'scripts', 'rulesets', 'main-required-checks.rollback.json'), 'utf8'));
+  const rollbackRule = (type) => rollback.rules.filter((r) => r.type === type);
+  it('keeps the current ruleset fields outside the added rules: name, target, enforcement, conditions, admin bypass', () => {
+    for (const key of ['name', 'target', 'enforcement', 'conditions', 'bypass_actors']) expect(body[key], key).toEqual(rollback[key]);
+    expect(body.bypass_actors).toContainEqual({ actor_id: 5, actor_type: 'RepositoryRole', bypass_mode: 'always' });
+  });
+  it('keeps every current required check and its parameters, and adds only merge-gate', () => {
+    expect(rollbackRule('required_status_checks')).toHaveLength(1);
+    const { required_status_checks: was, ...wasParams } = rollbackRule('required_status_checks')[0].parameters;
+    const { required_status_checks: now, ...nowParams } = rule('required_status_checks')[0].parameters;
+    expect(nowParams).toEqual(wasParams);
+    for (const c of was) expect(now).toContainEqual(c);
+    expect(now.filter((c) => !was.some((w) => w.context === c.context)).map((c) => c.context)).toEqual(['merge-gate']);
+    expect(rollback.rules.map((r) => r.type)).toEqual(['required_status_checks']);
   });
 });
 
