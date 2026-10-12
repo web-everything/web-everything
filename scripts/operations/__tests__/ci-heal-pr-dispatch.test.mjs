@@ -12,7 +12,7 @@
  * `held` test uses a sink that behaves as that guard does and asserts the module passes it through unchanged.
  */
 
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
@@ -21,9 +21,10 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 
 import { DISPATCH_EFFECT } from '../dispatch-lane.mjs';
 import { briefPath, REPO_ROOT } from '../dispatch-lane-io.mjs';
-import { dispatchCiHeal, runReconcileCiHealDispatch, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
+import { dispatchCiHeal, runReconcileCiHealDispatch, readSessionLog, resolveStrongerCiHealRoute, routeAvailableCiHeal, dispatchTimeoutRetry, flushTimeoutFollowups, timeoutGithubEffects, readTimeoutHold, TIMEOUT_PENDING_MAX_AGE_MS } from '../ci-heal-pr-dispatch.mjs';
 import { readUnsupported } from '../../conveyor/unsupported-repo.mjs';
 import { flushOwedWrites, readOwedWrites, recordOwedWrite, OWED_MAX_AGE_MS } from '../../conveyor/ci-heal-owed.mjs';
+import { STAND_DOWN_MARKER } from '../../conveyor/stand-down.mjs';
 import { buildCiHealComment } from '../../conveyor/ci-heal-mark.mjs';
 import { enrichPrsWithTimeoutEvidence } from '../../conveyor/reconcile-pass.mjs';
 import { readTimeoutBudget, timeoutKey } from '../../conveyor/timeout-retry-state.mjs';
@@ -866,9 +867,76 @@ describe('CI-heal salvage before agent dispatch', () => {
       return { result, dispatch };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }
-  const loop = (overrides = {}) => ({ killed: () => false, readRows: () => [], append: vi.fn(), ...overrides });
-  const rows = () => Array.from({ length: 3 }, () => ({ v: 1, at: new Date().toISOString(), repo: 'we',
-    pr: entry.prNumber, head: entry.headRefOid, kind: 'ci-heal' }));
+  const loop = (overrides = {}) => ({ killed: () => false, readRows: () => [], append: vi.fn(),
+    currentBuild: () => 'b'.repeat(40), readSessionLog: () => '', ...overrides });
+  const rows = () => Array.from({ length: 3 }, () => ({ v: 1, at: new Date(Date.now() - 1000).toISOString(), repo: 'we',
+    pr: entry.prNumber, head: entry.headRefOid, kind: 'ci-heal', build: 'b'.repeat(40), session: 'ci-heal-3895' }));
+
+  it('discounts three infrastructure refusals and dispatches on Claude', async () => {
+    const ledger = loop({ readRows: rows, readSessionLog: () =>
+      Array(3).fill('fix-run: PR #3895 failed (no-finding: none); claim released').join('\n') });
+    const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
+    expect(result.dispatched).toHaveLength(1);
+    expect(dispatch.mock.calls[0][0].strongerModel).toBe(true);
+  });
+  it('records a legacy-build re-arm and dispatches on Claude', async () => {
+    const ledger = loop({ readRows: () => rows().map(({ build, ...r }) => r) });
+    const { result, dispatch } = await exercise(() => null, { fixLoop: ledger });
+    expect(result.dispatched).toHaveLength(1);
+    expect(dispatch.mock.calls[0][0].strongerModel).toBe(true);
+    expect(ledger.append.mock.calls.map(([r]) => r.kind)).toEqual(['rearm', 'ci-heal']);
+  });
+  it.each([false, true])('parks once, retaining retry on comment failure=%s', async fail => {
+    const now = Date.now(), evidence = rows().map(r => ({ ...r, at: new Date(now - 3000).toISOString() }));
+    evidence.push({ ...evidence[0], kind: 'rearm', reason: 'window', at: new Date(now - 2000).toISOString() },
+      { ...evidence[0], at: new Date(now - 1000).toISOString() });
+    const ledger = loop({ readRows: () => evidence, append: vi.fn(r => evidence.push({ ...r, v: 1, at: new Date(now).toISOString() })) });
+    const postParkComment = vi.fn(() => { if (fail) throw Error('offline'); });
+    const { result, dispatch } = await exercise(() => null, { fixLoop: ledger, postParkComment, now });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(postParkComment).toHaveBeenCalledTimes(1);
+    expect(postParkComment.mock.calls[0][0].body.startsWith(STAND_DOWN_MARKER)).toBe(true);
+    expect(result.refusals[0].kind).toBe(fail ? 'fix-loop-park-failed' : 'fix-loop-parked');
+    expect(evidence.filter(r => r.kind === 'park')).toHaveLength(fail ? 0 : 1);
+    if (!fail) {
+      await exercise(() => null, { fixLoop: ledger, postParkComment, now });
+      expect(postParkComment).toHaveBeenCalledTimes(1);
+    }
+  });
+
+
+  it('does not transfer older launcher failures onto a later Claude session when parking', async () => {
+    const now = Date.now(), evidence = rows().map(r => ({ ...r, at: new Date(now - 3000).toISOString() }));
+    evidence.push({ ...evidence[0], kind: 'rearm', reason: 'window', at: new Date(now - 2000).toISOString() },
+      { ...evidence[0], at: new Date(now - 1000).toISOString() });
+    const ledger = loop({ readRows: () => evidence, readSessionLog: () =>
+      Array(3).fill('fix-run: PR #3895 failed (no-finding: none); claim released').join('\n') });
+    const postParkComment = vi.fn();
+    const { result } = await exercise(() => null, { fixLoop: ledger, postParkComment, now });
+    expect(result.refusals[0].kind).toBe('fix-loop-parked');
+    expect(postParkComment).toHaveBeenCalledTimes(1);
+  });
+  it('does not consume a re-arm when there is no lane', async () => {
+    const ledger = loop({ readRows: () => rows().map(({ build, ...r }) => r) });
+    const { result } = await exercise(() => null, { fixLoop: ledger, pickFreeLanes: () => [] });
+    expect(result.refusals[0].kind).toBe('no-lane');
+    expect(ledger.append).not.toHaveBeenCalled();
+  });
+  it('logs a timed hold with its discount and setting source', async () => {
+    const ledger = loop({ readRows: rows });
+    const { result } = await exercise(() => null, { fixLoop: ledger,
+      fixConfig: { maxSessions: 3, windowHours: 6, hold: true, rearmAfterMinutes: 60, rearmAfterMinutesSource: 'repo' } });
+    expect(result.refusals[0].why).toContain('0 infrastructure discount');
+    expect(result.refusals[0].why).toContain('re-arms on the stronger-model rung at');
+    expect(result.refusals[0].why).toContain('rearmAfterMinutes=60 (source repo)');
+  });
+  it('build and log read failures do not prevent an otherwise eligible dispatch', async () => {
+    const ledger = loop({ readRows: () => rows().slice(0, 1), currentBuild: () => { throw Error('no git'); },
+      readSessionLog: () => { throw Error('unreadable'); } });
+    const { result } = await exercise(() => null, { fixLoop: ledger });
+    expect(result.dispatched).toHaveLength(1);
+    expect(ledger.append).toHaveBeenCalledWith(expect.objectContaining({ build: null }));
+  });
   it('kill file refuses before salvage or dispatch', async () => {
     const salvage = vi.fn();
     const { result, dispatch } = await exercise(salvage, { fixLoop: loop({ killed: () => true }) });
@@ -901,7 +969,7 @@ describe('CI-heal salvage before agent dispatch', () => {
     await exercise(() => null, { fixLoop: ledger });
     expect(ledger.append).toHaveBeenCalledTimes(1);
     expect(ledger.append).toHaveBeenCalledWith({ repo: 'we', pr: 3895, kind: 'ci-heal',
-      head: entry.headRefOid, session: 'ci-heal-3895' });
+      head: entry.headRefOid, session: 'ci-heal-3895', build: 'b'.repeat(40) });
   });
   it('append failure does not undo a successful dispatch', async () => {
     const { result } = await exercise(() => null, { fixLoop: loop({ append: () => { throw Error('disk'); } }) });
@@ -954,4 +1022,44 @@ describe('CI-heal salvage before agent dispatch', () => {
     });
     expect(salvage).not.toHaveBeenCalled(); expect(dispatch).not.toHaveBeenCalled();
   });
+});
+
+it('stronger-model CI heal bypasses probation and sends an explicit Claude route to the sink', async () => {
+  const { calls, sinks } = recordingSink();
+  const routeHeal = vi.fn(() => { throw Error('must bypass'); });
+  const policyRoute = { provider: 'claude', model: 'fixture-stronger', effort: 'high', fallback: [] };
+  await dispatchCiHeal({ pr: 4992, itemNum: null, lane: 1, laneRef: 'lane/fix', scope: [], strongerModel: true }, {
+    root: '/repo', readBrief: () => TEMPLATE, sinks, routeHeal,
+    resolveStrongerRoute: () => ({ policyRoute, source: 'fixture ladder' }),
+    readFixClaim: () => null, pollAttempts: () => [], acquireClaim: () => ({ ok: true }), releaseClaim: () => {},
+  });
+  expect(routeHeal).not.toHaveBeenCalled();
+  expect(calls[0].routing.policyRoute).toEqual(policyRoute);
+});
+
+it('resolves the existing stronger ladder and falls back to the exact Claude ci-heal policy route', () => {
+  const route = { provider: 'claude', model: 'policy-stronger', effort: 'max' };
+  const loadLadder = () => ({ policy: { rungs: [{ id: 'stronger-model', action: 'dispatch', taskType: 'fixture' }] },
+    routes: { 'stronger-model': route }, available: () => true });
+  expect(resolveStrongerCiHealRoute({ loadLadder })).toEqual({
+    policyRoute: { ...route, fallback: [] }, source: 'fixer-escalation rung stronger-model',
+  });
+  const policy = { criticalWorkGate: { kinds: ['ci-heal'] } };
+  const resolveRoute = vi.fn(() => ({ ...route, model: 'policy-default' }));
+  expect(resolveStrongerCiHealRoute({ loadLadder: () => null, readPolicy: () => policy, resolveRoute }))
+    .toEqual({ policyRoute: { ...route, model: 'policy-default', fallback: [] }, source: 'routing-policy ci-heal default' });
+  expect(resolveRoute).toHaveBeenCalledWith({ operation: 'ci-heal', available: ['claude'], gateClosed: true, policy });
+});
+it('bounds dispatch log reads to 64 KiB and treats missing or unreadable logs as empty', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ci-heal-log-'));
+  try {
+    const dir = join(root, '.operations', 'delivery-dispatch-logs');
+    mkdirSync(dir, { recursive: true });
+    expect(readSessionLog('missing', root)).toBe('');
+    const terminal = 'fix-run: PR #1 failed (EPERM); claim released\n';
+    writeFileSync(join(dir, 'fixture.log'), 'x'.repeat(70 * 1024) + '\n' + terminal);
+    expect(readSessionLog('fixture', root)).toBe(terminal);
+    mkdirSync(join(dir, 'directory.log'));
+    expect(readSessionLog('directory', root)).toBe('');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
