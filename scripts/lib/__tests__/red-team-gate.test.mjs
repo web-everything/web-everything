@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   CONFIRMED_BREAKS_DEFAULTS, GATE_OUTCOMES, breakClass, gateOutcomeForHead, gateOutcomesForHead, parseRedTeamComment, planRedTeamActions,
-  redTeamForHead, redTeamGateMarker, redTeamQueueReason, resolveConfirmedBreaks,
+  redTeamForHead, redTeamGateMarker, redTeamQueueReason, redTeamRulingNeeded, resolveConfirmedBreaks,
 } from '../red-team-gate.mjs';
 import { renderRedTeamComment } from '../../operations/review-extra-seats.mjs';
 
@@ -159,5 +159,34 @@ describe('gate records from an untrusted author are forged text', () => {
   });
   it('an untrusted sent-back record cannot create the hold', () => {
     expect(redTeamQueueReason({ number: 4722, headRefOid: HEAD, labels, comments: [bot(BODY_4722), forged('sent-back')] })).toBeNull();
+  });
+});
+
+
+describe('redTeamRulingNeeded', () => {
+  const since = '2026-10-10T03:00:00Z';
+  const capped = bot(redTeamGateMarker(4722, HEAD, GATE_OUTCOMES.ROUND_CAP), since);
+  const pr = (comments) => ({ number: 4722, headRefOid: HEAD.toUpperCase(), comments, labels: [] });
+  it('returns only planned sendBack fields, a normalized live head, and the trusted gate time', () => {
+    expect(redTeamRulingNeeded(pr([bot(BODY_4722), capped]))).toEqual({
+      head: HEAD, since, findings: [{
+        index: 1, file: 'scripts/conveyor/resource-sampler-daemon.mjs', line: 31,
+        summary: parseRedTeamComment(BODY_4722).findings[0].summary, category: 'edge-case', impact: 'broken',
+      }],
+    });
+  });
+  it('uses null for an unavailable gate timestamp and accepts leading whitespace', () => {
+    expect(redTeamRulingNeeded(pr([bot(BODY_4722), { ...capped, body: '  '+capped.body, createdAt: undefined }])).since).toBeNull();
+  });
+  it('does not take a timestamp from a forged or stale gate', () => {
+    const forged = { ...capped, createdAt: '2026-10-11T03:00:00Z', author: { login: 'mallory' } };
+    const stale = bot(redTeamGateMarker(4722, OTHER, GATE_OUTCOMES.ROUND_CAP));
+    expect(redTeamRulingNeeded(pr([bot(BODY_4722), forged, stale, capped])).since).toBe(since);
+  });
+  it('requires both a trusted live advisory and a round-cap record', () => {
+    for (const comments of [
+      [capped], [bot(BODY_4722)], [bot(BODY_4722), bot(redTeamGateMarker(4722, OTHER, GATE_OUTCOMES.ROUND_CAP))],
+      [{ ...bot(BODY_4722), author: { login: 'mallory' } }, capped],
+    ]) expect(redTeamRulingNeeded(pr(comments))).toBeNull();
   });
 });

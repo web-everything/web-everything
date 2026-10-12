@@ -199,3 +199,23 @@ export function redTeamQueueReason(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
   if (!labels.includes('review:changes')) return null;
   return `red team: ${sendBack.length} confirmed break(s) on this head (${sendBack.map((f) => `#${f.index}`).join(', ')}) — the fixer owns them`;
 }
+
+
+/** Confirmed send-back findings parked at the round cap on the live head, awaiting an operator ruling. PURE. */
+export function redTeamRulingNeeded(pr, setting = CONFIRMED_BREAKS_DEFAULTS) {
+  const parsed = redTeamForHead(pr?.comments, pr?.number, pr?.headRefOid);
+  if (!parsed) return null;
+  const { sendBack } = planRedTeamActions(parsed, setting);
+  if (!sendBack.length) return null;
+  const head = parsed.rev;
+  if (gateOutcomeForHead(pr.comments, pr.number, head) !== GATE_OUTCOMES.ROUND_CAP) return null;
+  const labels = (Array.isArray(pr?.labels) ? pr.labels : []).map((l) => (typeof l === 'string' ? l : l?.name));
+  if (labels.includes('review:changes') || labels.includes('review:accepted')) return null;
+  const marker = redTeamGateMarker(pr.number, head, GATE_OUTCOMES.ROUND_CAP);
+  const record = pr.comments.find((c) => isTrustedMarkerAuthor(c)
+    && String((typeof c === 'string' ? c : c?.body) ?? '').trimStart().startsWith(marker));
+  return {
+    head, since: record?.createdAt ?? null,
+    findings: sendBack.map(({ index, file, line, summary, category, impact }) => ({ index, file, line, summary, category, impact })),
+  };
+}
