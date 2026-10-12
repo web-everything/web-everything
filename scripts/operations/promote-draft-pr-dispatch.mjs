@@ -55,6 +55,8 @@
  * threading this function's own already-resolved `repoSlug` through to the provider as an explicit `--repo`
  * — `undefined` for the WE-default path (byte-identical to before), the real slug otherwise.
  */
+import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from '../lib/merge-gate-hold-class.mjs';
+import { readSharedFreeze } from '../lib/red-main-freeze-shared.mjs';
 import { repoKeyForSlug, CONSTELLATION_REPOS } from '../lib/constellation-repos.mjs';
 import { armSelfReexecOnFastForward, assertMainNotStale, isCodePath } from '../lib/main-staleness.mjs';
 import { closureHits, collectImportClosure } from '../lib/import-closure.mjs';
@@ -102,13 +104,28 @@ export function isPromoteCodePath(path, { closure = promoteCodeClosure() } = {})
  * @returns {{state:string, why:string, counts:object}}
  */
 export function defaultReadHeadCheckState({
-  repoSlug, sha, runGh = runGhSync, getRequiredChecks = getRequiredStatusChecks,
+  repoSlug, sha, prNumber, runGh = runGhSync, getRequiredChecks = getRequiredStatusChecks,
+  readPrLabels = defaultReadPrLabels, readMergeGateVerdict = defaultReadMergeGateVerdict,
+  readFreeze = readSharedFreeze, mergeGateSetting,
 } = {}) {
   const requiredChecks = getRequiredChecks({ repo: repoSlug }).checks;
   const raw = runGh(checksArgv({ repo: repoSlug, sha }), {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], throttle: { op: 'pr-status-checks', repo: repoSlug },
   });
-  return reduceCheckState(parseJsonLines(raw), requiredChecks);
+  let rows = parseJsonLines(raw);
+  try {
+    if (latestFailingMergeGate(rows)) {
+      const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
+      if (setting.value === 'on') {
+        const labels = readPrLabels({ repoSlug, prNumber, runGh });
+        rows = excuseMergeGateRows(rows, { prNumber, headSha: sha, labels, setting,
+          readVerdict: args => readMergeGateVerdict({ ...args, repo: repoSlug, runGh }),
+          freeze: () => readFreeze(),
+        }).rows;
+      }
+    }
+  } catch { /* Preserve red on unreadable labels, settings or job evidence. */ }
+  return reduceCheckState(rows, requiredChecks);
 }
 
 function validatePrLabels(labels) {
@@ -314,7 +331,10 @@ export function runReconcilePromoteDraftDispatch({
     // already stale by the time control reaches here — this is the second, authoritative read.
     let fresh;
     try {
-      fresh = readHeadCheckState({ repoSlug, sha });
+      fresh = readHeadCheckState({ repoSlug, sha,
+        // Custom readers retain their established per-head seam; the default also binds PR evidence.
+        ...(readHeadCheckState === defaultReadHeadCheckState ? { prNumber: entry.prNumber, readPrLabels } : {}),
+      });
     } catch (e) {
       refusals.push({
         pr: entry.prNumber, kind: 'stale-check-unreadable', headSha: sha,

@@ -88,10 +88,10 @@ export function readReviewCiGateFactsFirst({ repo, pr, lookup = lookupReviewFact
   if (viaStore.allowed) return { ...viaStore, factsSource: 'store' };
   // A refusal is trusted only when every affected check is a COMPLETED non-success. 'missing' / 'pending' / an
   // unreadable gate can be a store gap (the store lists completed GitHub check runs only, never legacy statuses),
-  // so those re-read GitHub.
+  // so those re-read GitHub. A merge-gate refusal also needs live job IDs and labels to evaluate candidacy holds.
   const affected = viaStore.affected;
   const completedFailure = viaStore.reason === 'required-checks-not-successful' && Array.isArray(affected) && affected.length > 0
-    && affected.every((a) => !['missing', 'pending', 'malformed', 'wrong-head'].includes(a.reason));
+    && affected.every((a) => a.name !== 'merge-gate' && !['missing', 'pending', 'malformed', 'wrong-head'].includes(a.reason));
   if (completedFailure) return { ...viaStore, factsSource: 'store' };
   return live({ repo, pr, ...rest });
 }

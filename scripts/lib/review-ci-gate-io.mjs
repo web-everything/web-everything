@@ -1,12 +1,16 @@
 /** Fresh repo-explicit review eligibility, with injectable read-only GitHub IO. */
 import { readGh } from './proc-read.mjs';
 import { getRequiredStatusChecks } from './required-status-checks.mjs';
+import { excuseMergeGateRows, latestFailingMergeGate, loadMergeGateHoldSetting, readMergeGateVerdict as defaultReadMergeGateVerdict } from './merge-gate-hold-class.mjs';
+import { readSharedFreeze } from './red-main-freeze-shared.mjs';
 import { reviewCiGate } from './review-ci-gate.mjs';
 
 const MAX_STALE_CACHE_AGE_MS = 24 * 60 * 60_000;
 
 const gh = argv => readGh(argv, { encoding: 'utf8', timeout: 15_000, stdio: ['ignore', 'pipe', 'pipe'] });
 export const readReviewHead = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid'])).headRefOid;
+/** Fetch labels with the head so the default gate needs no separate label request. */
+export const readReviewHeadAndLabels = ({ repo, pr, run = gh }) => JSON.parse(run(['pr', 'view', String(pr), '--repo', repo, '--json', 'headRefOid,labels']));
 /**
  * Every check run PLUS every legacy commit status (`{context, state}`) for the SHA: a required context may be
  * published through either, and a reader of check runs alone would call a green commit-status context missing.
@@ -27,12 +31,21 @@ export const readReviewChecks = ({ repo, headSha, run = gh }) => [
   }),
 ];
 
-export function readReviewCiGate({ repo, pr, readHead = readReviewHead,
+export function readReviewCiGate({ repo, pr, readHead, readLabels,
+  readHeadAndLabels = readReviewHeadAndLabels,
+  readMergeGateVerdict = defaultReadMergeGateVerdict, readFreeze = readSharedFreeze, mergeGateSetting,
   readChecks = readReviewChecks, readRequired = getRequiredStatusChecks } = {}) {
   let headSha = null;
+  let labels;
+  // Keep the existing injected SHA reader; absent label evidence can never excuse a failure.
+  const head = readHead ?? (args => {
+    const view = readHeadAndLabels(args);
+    labels = view.labels;
+    return view.headRefOid;
+  });
   try {
     if (typeof repo !== 'string' || !/^[^/]+\/[^/]+$/.test(repo)) throw new Error('explicit repo required');
-    headSha = readHead({ repo, pr });
+    headSha = head({ repo, pr });
     if (typeof headSha !== 'string' || !headSha.trim()) return reviewCiGate({ headSha });
     const required = readRequired({ repo, ttlMs: 0 });
     const stale = required?.source === 'stale-cache';
@@ -45,9 +58,18 @@ export function readReviewCiGate({ repo, pr, readHead = readReviewHead,
     if (!['live', 'cache', 'declared'].includes(required?.source) && !trustedStale) {
       return withSource({ allowed: false, headSha, reason: 'untrusted-required-set' });
     }
-    const checks = readChecks({ repo, headSha });
-    const currentHead = readHead({ repo, pr });
+    let checks = readChecks({ repo, headSha });
+    const currentHead = head({ repo, pr });
     if (currentHead !== headSha) return withSource({ allowed: false, headSha, currentHead, reason: 'head-changed' });
+    try {
+      if (latestFailingMergeGate(checks)) {
+        const setting = mergeGateSetting ?? loadMergeGateHoldSetting();
+        checks = excuseMergeGateRows(checks, { prNumber: Number(pr), headSha,
+          labels: readLabels ? readLabels({ repo, pr }) : labels, setting,
+          readVerdict: args => readMergeGateVerdict({ ...args, repo }), freeze: () => readFreeze(),
+        }).rows;
+      }
+    } catch { /* Unreadable excusal evidence preserves the original failed checks. */ }
     return withSource(reviewCiGate({ headSha, requiredChecks: required.checks, checks }));
   } catch (error) {
     return { allowed: false, headSha, reason: 'unreadable-ci', error: String(error?.message ?? error) };
