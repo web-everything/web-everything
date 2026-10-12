@@ -9,6 +9,7 @@ import {
   readQueueState, FOLLOW_UP_MAX_ATTEMPTS, readMergeDeliveryToolSettings, MERGE_DELIVERY_SETTINGS_FILE_ENV,
 } from '../drain-merge-strategy.mjs';
 import { resolveMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
+import { rulesetSuggestion } from '../merge-queue-enqueue.mjs';
 
 const HEAD = 'b'.repeat(40);
 const LOCAL = 'web-everything/web-everything';
@@ -372,6 +373,47 @@ describe('tool-layer settings read (hermetic in a test run)', () => {
       expect(resolveDrainMergePolicy({ env: { [MERGE_DELIVERY_SETTINGS_FILE_ENV]: file } }).policy.strategy).toBe('github-merge-queue');
       expect(resolveDrainMergePolicy({ env: { VITEST: 'true' } }).policy.strategy).toBe('drain-direct');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('the merge-queue ruleset body matches rulesetSuggestion (docs/agent/merge-queue-switch.md)', () => {
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+  const body = JSON.parse(readFileSync(join(root, 'scripts', 'rulesets', 'main-required-checks.merge-queue.json'), 'utf8'));
+  const settings = JSON.parse(readFileSync(join(root, 'scripts', 'settings', 'merge-queue.json'), 'utf8'));
+  const want = rulesetSuggestion(settings.mergeDelivery);
+  const rule = (type) => body.rules.filter((r) => r.type === type);
+  // web-everything/web-everything (`gh api repos/web-everything/web-everything --jq .id`).
+  const REPO_ID = 1142650361;
+
+  it('pins every workflow that defines a required check to refs/heads/main (the merge_group YAML comes from the group commit otherwise)', () => {
+    expect(rule('workflows')).toHaveLength(1);
+    const { parameters } = rule('workflows')[0];
+    expect(parameters.do_not_enforce_on_create).toBe(false);
+    const pinned = parameters.workflows.map(({ path, ref }) => ({ path, ref }));
+    expect(pinned).toEqual(want.requiredWorkflows);
+    for (const w of parameters.workflows) {
+      expect(w.repository_id).toBe(REPO_ID);
+      expect(w).not.toHaveProperty('sha');
+    }
+  });
+  it('requires exactly the suggested checks, each restricted to the GitHub Actions app', () => {
+    expect(rule('required_status_checks')).toHaveLength(1);
+    const checks = rule('required_status_checks')[0].parameters.required_status_checks;
+    expect(checks.map((c) => c.context)).toEqual(want.requiredStatusChecks);
+    for (const c of checks) expect(c.integration_id).toBe(want.requiredStatusCheckIntegrationId);
+  });
+  it('carries the suggested merge_queue parameters', () => {
+    expect(rule('merge_queue')).toHaveLength(1);
+    const q = want.mergeQueue;
+    expect(rule('merge_queue')[0].parameters).toEqual({
+      merge_method: q.mergeMethod, max_entries_to_build: q.maxEntriesToBuild, min_entries_to_merge: q.minEntriesToMerge,
+      max_entries_to_merge: q.maxEntriesToMerge, min_entries_to_merge_wait_minutes: q.minEntriesToMergeWaitMinutes,
+      grouping_strategy: q.groupingStrategy, check_response_timeout_minutes: q.checkResponseTimeoutMinutes,
+    });
+  });
+  it('targets the default branch and has no rule type the suggestion does not account for', () => {
+    expect(body.conditions.ref_name.include).toEqual(['~DEFAULT_BRANCH']);
+    expect(body.rules.map((r) => r.type).sort()).toEqual(['merge_queue', 'required_status_checks', 'workflows']);
   });
 });
 

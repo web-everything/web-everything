@@ -14,6 +14,13 @@ the ruleset (GitHub side) and the `mergeDelivery` repo setting (drain side).
   `check_response_timeout_minutes: 60`. CI's real duration is about 11–22 minutes; 60 leaves headroom for a slow
   soak. It also adds `merge-gate` (GitHub Actions, `integration_id: 15368`) beside the required `test`, `smoke`,
   `daemon-soak`, and `soak-replay-gate` checks. The admin bypass (`RepositoryRole 5`, `always`) is kept.
+  It also adds a `workflows` rule that pins `ci.yml`, `merge-gate.yml`, and `soak-replay-gate.yml` to
+  `refs/heads/main` (`repository_id: 1142650361`). For `merge_group` runs GitHub reads workflow YAML from the
+  group commit, so without the pin a PR could edit a workflow, or add one with a job named `merge-gate`, and
+  turn a required check green. This is layer (4) in the `merge-gate.yml` header. A test
+  (`we:scripts/lib/__tests__/drain-merge-strategy.test.mjs`) fails when this body drifts from
+  `node scripts/merge-gate-check.mjs --print-ruleset` (`rulesetSuggestion` in
+  `we:scripts/lib/merge-queue-enqueue.mjs`).
 - `we:scripts/rulesets/main-required-checks.rollback.json` — ruleset exactly as read on 2026-10-11 with
   `gh api repos/web-everything/web-everything/rulesets/24883772`: verbatim GET response, read-only fields included.
 - `we:scripts/settings/merge-queue.json` → `mergeDelivery`: `strategy: github-merge-queue`, `batchSize: 5`,
@@ -99,7 +106,14 @@ after every drain clone has the settings commit (the clone check below).
    gh api repos/web-everything/web-everything/rulesets/24883772 --jq '.rules[].type'
    ```
 
-   The readback must show `required_status_checks` and `merge_queue`.
+   The readback must show `required_status_checks`, `merge_queue`, and `workflows`. If `workflows` is missing,
+   GitHub did not accept the pin: roll back now (see Rollback) and do not unfreeze. Confirm the pin itself:
+
+   ```bash
+   gh api repos/web-everything/web-everything/rulesets/24883772 --jq '.rules[] | select(.type=="workflows") | .parameters.workflows[] | "\(.path) \(.ref)"'
+   ```
+
+   It must list `ci.yml`, `merge-gate.yml`, and `soak-replay-gate.yml`, each at `refs/heads/main`.
 4. Check every drain clone has the settings commit from step 2 (still frozen; a frozen pass still refreshes, so
    wait one pass if a clone is behind). Clones are listed by `daemonCloneRoots` in
    `we:scripts/lib/daemon-clone-registry.mjs`; for each:

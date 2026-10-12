@@ -51,6 +51,29 @@
         "grouping_strategy": "ALLGREEN",
         "check_response_timeout_minutes": 60
       }
+    },
+    {
+      "type": "workflows",
+      "parameters": {
+        "do_not_enforce_on_create": false,
+        "workflows": [
+          {
+            "path": ".github/workflows/ci.yml",
+            "repository_id": 1142650361,
+            "ref": "refs/heads/main"
+          },
+          {
+            "path": ".github/workflows/merge-gate.yml",
+            "repository_id": 1142650361,
+            "ref": "refs/heads/main"
+          },
+          {
+            "path": ".github/workflows/soak-replay-gate.yml",
+            "repository_id": 1142650361,
+            "ref": "refs/heads/main"
+          }
+        ]
+      }
     }
   ],
   "bypass_actors": [
