@@ -299,6 +299,9 @@ export function fileSectionFingerprints(diffText) {
 const pathOfHeader = (h) => { const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(h); return m ? m[2] : h; };
 
 const SAFE_REF = /^[A-Za-z0-9._/-]+$/;
+// Keep in sync with lib/rebase-drop-manifest.mjs#LANE_MANIFEST (the drain rebase drops it); importing it here would
+// pull fix-procedure into this module. Pinned by mechanical-rebase-rounds.test.mjs.
+export const LANE_MANIFEST = '.lane-manifest.json';
 
 /**
  * IO: the git evidence for {@link mechanicalRoundGrant}. Never throws; any read failure is `proven: false`.
@@ -343,6 +346,91 @@ export function readMechanicalRoundFacts({ pr, defaultBranch = 'main', remote = 
   }
 }
 
+/**
+ * IO: collect the PR's own line for review-round accounting. Author dates survive rebases.
+ * A drain rebase merge puts main first and the branch LAST; ordinary merges keep the branch first.
+ * Every merge on the line carries `mergesPrWork`: true when a merged-in parent is reachable from neither the base
+ * nor the default branch (a repair branch merged --no-ff), so its fix commits off the line are never read as a
+ * mechanical round. It is also true when the merge's own tree is not git's clean merge of its parents: a repair
+ * folded into an upstream merge (`--no-commit`, then edit), a conflict resolution, a reverted upstream hunk, or an
+ * octopus merge all carry content no parent brought, so only a merge git reproduces exactly (bar the drain's dropped
+ * lane manifest) is mechanical. Missing/malformed git data and a truncated walk fail closed, never a partial proof.
+ */
+export function readRoundCommits({ pr, defaultBranch = 'main', remote = 'origin', exec = execFileSync } = {}) {
+  const head = lc(pr?.headRefOid);
+  const fail = (reason) => ({ head, ok: false, reason });
+  if (!SHA40.test(head)) return fail('no-head');
+  const base = String(pr?.baseRefName || defaultBranch);
+  const headRef = String(pr?.headRefName ?? '');
+  if ([base, remote, defaultBranch, ...(headRef ? [headRef] : [])].some((ref) => !SAFE_REF.test(ref) || ref.startsWith('-'))) return fail('unsafe-ref');
+  const git = (args) => String(exec('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000, maxBuffer: 256 * 1024 * 1024 }) ?? '');
+  const readRange = (upstream) => {
+    const text = git(['log', '--format=%H%x00%P%x00%T%x00%aI%x00%s', '--end-of-options', `${remote}/${upstream}..${head}`]);
+    const map = new Map();
+    for (const line of text.split('\n').filter(Boolean)) {
+      const fields = line.split('\0');
+      if (fields.length !== 5) return null;
+      const [sha, parentText, tree, authoredAt, subject] = fields;
+      const parents = parentText ? parentText.split(' ') : [];
+      if (!SHA40.test(sha) || parents.some((p) => !SHA40.test(p)) || !SHA40.test(tree)
+        || !Number.isFinite(Date.parse(authoredAt)) || map.has(sha)) return null;
+      map.set(sha, { sha, parents, tree, authoredAt, subject });
+    }
+    return map;
+  };
+  // A merge is mechanical only when its tree is what git itself makes of its two parents: a clean `merge-tree`
+  // (no conflict) whose result differs from the commit at most by the drain's dropped lane manifest. Anything else
+  // (a conflict, an edit folded into the merge, an upstream hunk reverted, three or more parents, an unreadable
+  // result) carries content no parent brought, so it is the PR's own work. Never throws.
+  const reproducesCleanMerge = (commit) => {
+    if (commit.parents.length !== 2) return false;
+    try {
+      const out = git(['merge-tree', '--write-tree', '--name-only', '--no-messages', '-z', '--end-of-options', ...commit.parents]);
+      const [tree, ...conflicted] = out.split('\0');
+      if (!SHA40.test(tree) || conflicted.some(Boolean)) return false;
+      if (tree === commit.tree) return true;
+      // Only the manifest's DELETION is the drain's: an added or edited manifest is content no parent brought.
+      const changed = git(['diff', '--no-ext-diff', '--name-status', '--no-renames', '-z', '--end-of-options', tree, commit.tree])
+        .split('\0').filter(Boolean);
+      return changed.length === 2 && changed[0] === 'D' && changed[1] === LANE_MANIFEST;
+    } catch { return false; } // merge-tree exits 1 on a conflict: not a clean merge
+  };
+  try {
+    git(['fetch', '--quiet', '--no-tags', '--end-of-options', remote, `+${base}:refs/remotes/${remote}/${base}`,
+      ...(defaultBranch !== base ? [`+${defaultBranch}:refs/remotes/${remote}/${defaultBranch}`] : []),
+      ...(headRef ? [`+${headRef}:refs/remotes/${remote}/${headRef}`] : [])]);
+    const map = readRange(base);
+    if (!map) return fail('invalid-commit-data');
+    if (!map.has(head)) return fail('missing-head');
+    // A merged-in parent is upstream when the base or the default branch reaches it (a sync, or a drain rebase of a
+    // stacked PR onto main). Anything else is the PR's own work brought in off the line.
+    const onDefault = defaultBranch === base ? map : readRange(defaultBranch);
+    if (!onDefault) return fail('invalid-commit-data');
+    const commits = []; const seen = new Set();
+    let sha = head;
+    while (map.has(sha)) {
+      if (commits.length >= 500 || seen.has(sha)) return fail('walk-limit');
+      seen.add(sha);
+      const { tree, ...commit } = map.get(sha);
+      const lineParent = commit.parents.length > 1 && commit.subject.startsWith('drain: rebase')
+        ? commit.parents.at(-1) : commit.parents[0];
+      commits.push(commit.parents.length > 1
+        ? { ...commit, mergesPrWork: commit.parents.some((p) => p !== lineParent && map.has(p) && onDefault.has(p))
+          || !reproducesCleanMerge({ ...commit, tree }) }
+        : commit);
+      sha = lineParent;
+    }
+    // The walk must leave the range through a real parent (a base-side commit). A parentless last commit is a
+    // root or a shallow-clone boundary: the earlier fix rounds are missing, so it proves nothing.
+    if (!SHA40.test(sha ?? '')) return fail('truncated-history');
+    return { head, commits };
+  } catch { return fail('git-read-failed'); }
+}
+
+// Same leading-line/authorship match as countRearmComments; avoid importing its label CLI dependency.
+// Pinned to REARM_COMMENT_MARKER by the enrichment regression in mechanical-rebase-rounds.test.mjs.
+const isRearmMarker = (c) => bodyOf(c).trimStart().startsWith('🔧 conveyor fix — re-armed for re-review') && isTrustedMarkerAuthor(c);
+
 /** The cheap pre-filter: a trusted mechanical-round marker is the latest round event after the latest verdict. */
 export function hasPendingMechanicalRound(pr) {
   const comments = Array.isArray(pr?.comments) ? pr.comments : [];
@@ -352,10 +440,27 @@ export function hasPendingMechanicalRound(pr) {
   return Math.max(...markers) > (verdicts.length ? Math.max(...verdicts) : -Infinity);
 }
 
+// Keep in sync with reconcile-core.mjs#resolveRoundCap; importing it here would create a cycle.
+function resolveRoundCap(env = process.env) {
+  const value = env.WE_REVIEW_ROUND_CAP;
+  return typeof value === 'string' && /^\d+$/.test(value.trim())
+    && Number.isSafeInteger(Number(value)) && Number(value) > 0 ? Number(value) : 5;
+}
+
 /** IO: attach `mechanicalRound` facts to each PR whose latest round was mechanical. Never throws. */
-export function enrichPrsWithMechanicalRound(prs, { defaultBranch = 'main', readFacts = readMechanicalRoundFacts } = {}) {
+export function enrichPrsWithMechanicalRound(prs, {
+  defaultBranch = 'main', readFacts = readMechanicalRoundFacts, readRoundCommits: readCommits = readRoundCommits,
+  roundCap = resolveRoundCap(),
+} = {}) {
   return (Array.isArray(prs) ? prs : []).map((pr) => {
-    if (!hasPendingMechanicalRound(pr)) return pr;
-    try { return { ...pr, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { return pr; }
+    let enriched = pr;
+    if (hasPendingMechanicalRound(pr)) {
+      try { enriched = { ...enriched, mechanicalRound: readFacts({ pr, defaultBranch }) }; } catch { /* preserve existing behavior */ }
+    }
+    if (Array.isArray(pr?.comments) && pr.comments.filter(isRearmMarker).length >= roundCap) {
+      try { enriched = { ...enriched, roundCommits: readCommits({ pr, defaultBranch }) }; }
+      catch { enriched = { ...enriched, roundCommits: { head: lc(pr?.headRefOid), ok: false, reason: 'git-read-failed' } }; }
+    }
+    return enriched;
   });
 }

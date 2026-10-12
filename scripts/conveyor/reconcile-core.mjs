@@ -454,6 +454,70 @@ export function resolveCiHealBudget({ env = {}, platform = null, repo = null } =
 }
 
 const FIX_MARKER_SHA_RE = /at `([0-9a-f]{7,40})`/;
+/**
+ * Pure durable review-round evidence. Each trusted re-arm closes (start, rearmAt], where
+ * start is the earliest review fix-begin after the previous re-arm (never ci-heal), else the previous re-arm.
+ * Invalid evidence leaves the historical cap accounting untouched. `real` counts the rounds that SPENT an attempt:
+ * every round except one proven mechanical (its window holds only upstream merges git reproduces cleanly, plain drain
+ * rebases included; a merge flagged `mergesPrWork` brought a repair branch in, or carries content git's clean merge of
+ * its parents does not, and is real, so a drain rebase that auto-resolved a conflict or renumbered a card is spent too).
+ * A round with no commit at all is spent, never refunded.
+ */
+export function countRealFixRounds(pr) {
+  const facts = pr?.roundCommits;
+  const fail = (reason) => ({ ok: false, reason });
+  if (!facts || facts.ok === false || !Array.isArray(facts.commits)) return fail('no-commits');
+  const shaPattern = /^[0-9a-f]{40}$/;
+  if (!shaPattern.test(pr?.headRefOid) || facts.head !== pr.headRefOid) return fail('stale-head');
+  const seen = new Set();
+  for (const c of facts.commits) {
+    if (!c || !shaPattern.test(c.sha) || seen.has(c.sha) || !Array.isArray(c.parents)
+      || c.parents.some((p) => !shaPattern.test(p)) || typeof c.subject !== 'string'
+      || typeof c.authoredAt !== 'string' || !Number.isFinite(Date.parse(c.authoredAt))
+      || (c.parents.length > 1 && typeof c.mergesPrWork !== 'boolean')) return fail('invalid-commit');
+    seen.add(c.sha);
+  }
+  // An empty/truncated enrichment cannot establish that a round was mechanical.
+  if (facts.commits[0]?.sha !== facts.head) return fail('missing-head');
+  for (let i = 0; i < facts.commits.length; i += 1) {
+    const c = facts.commits[i];
+    const next = c.parents.length > 1 && c.subject.startsWith('drain: rebase') ? c.parents.at(-1) : c.parents[0];
+    if (i + 1 < facts.commits.length ? next !== facts.commits[i + 1].sha : seen.has(next)) return fail('invalid-walk');
+    // The last commit must lead out of the range; a parentless one is a root or shallow boundary (missing rounds).
+    if (i + 1 === facts.commits.length && !shaPattern.test(next ?? '')) return fail('truncated-history');
+  }
+  const comments = (Array.isArray(pr?.comments) ? pr.comments : []).filter(isTrustedMarkerAuthor);
+  const rearms = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(REARM_COMMENT_MARKER));
+  const begins = comments.filter((c) => typeof c.body === 'string' && c.body.trimStart().startsWith(FIX_BEGIN_MARKER)
+    && /^fix-\d+$/.test(FIX_MARKER_WHO_RE.exec(c.body)?.[1] ?? ''));
+  const time = (c) => Date.parse(c.createdAt);
+  if ([...rearms, ...begins].some((c) => !Number.isFinite(time(c)))) return fail('invalid-comment-time');
+  rearms.sort((a, b) => time(a) - time(b));
+  begins.sort((a, b) => time(a) - time(b));
+  let previous = -Infinity;
+  const rounds = rearms.map((c) => {
+    const end = time(c);
+    // Only a re-arm closes a round, so a replacement claim (after a crash, a reclaim's fix-end, or a stand-down)
+    // never moves the start past work an earlier claim in the same round already did: the start is the EARLIEST
+    // review fix-begin after the previous re-arm. A ci-heal commit inside such a window reads as real, which only
+    // errs toward keeping the attempt spent.
+    const first = begins.find((b) => time(b) > previous && time(b) <= end);
+    const start = first ? time(first) : previous;
+    const inWindow = facts.commits.filter((commit) => Date.parse(commit.authoredAt) > start && Date.parse(commit.authoredAt) <= end);
+    // A merge that brings the PR's own work in (a repair branch merged --no-ff, or an edit folded into the merge
+    // itself) is real, like a fix commit.
+    // A single-parent commit is always real: the drain's rebase is a two-parent commit-tree, so a single-parent
+    // `drain: rebase …` subject is only ever a fix commit borrowing the name.
+    const shas = inWindow.filter((commit) => commit.parents.length === 1 || commit.mergesPrWork)
+      .map((commit) => commit.sha);
+    previous = end;
+    // Refund only on positive evidence: the window holds commits and every one is an upstream merge or drain rebase.
+    // A window with NO commit proves nothing (an unchanged head re-armed again, a rewritten branch), so it stays spent.
+    return { at: c.createdAt, real: shas.length > 0, mechanical: shas.length === 0 && inWindow.length > 0, shas };
+  });
+  return { ok: true, real: rounds.filter((r) => !r.mechanical).length, total: rounds.length, rounds };
+}
+
 const FIX_MARKER_WHO_RE = /^\*\*Who:\*\* `([^`]+)`/m;
 const FIX_END_WHO_RE = /^`([^`]+)` released the fix claim/m;
 
@@ -1908,7 +1972,9 @@ export function planReconcile({
     const baseRoundCap = roundCap + roundExtensions;
     const operatorBudget = operatorFixBudget(pr?.comments, baseRoundCap);
     const effectiveRoundCap = operatorBudget?.cap ?? baseRoundCap;
+    const realFixRounds = countRealFixRounds(pr);
     const base = {
+      ...(realFixRounds.ok ? { mechanicalRebaseRounds: realFixRounds.total - realFixRounds.real } : {}),
       ...(roundExtensions > 0 ? { roundExtensions } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
       ...(operatorAnswer ? { operatorAnswer } : {}),
@@ -2180,9 +2246,9 @@ export function planReconcile({
     const refuseCapExhausted = capExhaustedVia(refuse);
     // The shared round count — see REFUSAL 3 below for why it is a `Math.max` over three durable sources.
     const roundAttempts = () => Math.max(
-      Number(counts[prNumber]) || 0,
+      realFixRounds.ok ? realFixRounds.real : Number(counts[prNumber]) || 0,
       operatorBudget?.attempts ?? 0,
-      countRearmComments(pr?.comments),
+      realFixRounds.ok ? realFixRounds.real : countRearmComments(pr?.comments),
       countAdvisoryComments(pr?.comments),
     ) + (mechanicalRoundsCountTowardCap ? countConflictFixComments(pr?.comments) : 0);
 
