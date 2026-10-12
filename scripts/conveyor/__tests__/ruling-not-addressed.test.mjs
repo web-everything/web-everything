@@ -324,6 +324,24 @@ describe('operator ruling with a direction on the blocked-findings round cap (#4
     expect(loadOperatorRulingExtraRounds({ env: {}, read: files({}, { ...shipped, fix: { ...shipped.fix, [R]: 0 } }) })).toEqual({ value: 0, source: 'repo' });
   });
 
+  it('every reader of scripts/settings/fix.json honours the SAME nested `fix` document (one shape, all resolvers)', async () => {
+    const { resolveFixSettings } = await import('../fix-takeover.mjs');
+    const { resolveTakeoverBudget } = await import('../takeover-budget.mjs');
+    // The documented shape: every setting under the `fix` key, next to a top-level $comment.
+    const doc = JSON.stringify({ $comment: 'c', fix: { roundCapAction: 'person', roundHistory: 'off', takeoverBudget: 5,
+      resumeAcrossRounds: 'off', strongerModelFromRound: 7, operatorRulingExtraRounds: 0 } });
+    const read = () => doc;
+    expect(resolveFixSettings({ env: {}, file: 'fix.json', read })).toMatchObject({
+      roundCapAction: 'person', roundHistory: 'off', resumeAcrossRounds: 'off', strongerModelFromRound: 7 });
+    expect(resolveTakeoverBudget({ env: {}, readPlatform: () => null, readRepo: () => JSON.parse(doc) })).toEqual({ value: 5, source: 'repo' });
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: (f) => (/delivery-platform-preferences/.test(f) ? '{}' : doc) })).toEqual({ value: 0, source: 'repo' });
+    // A flat document (the old shape) is read by none of them: each falls to its default.
+    const flat = JSON.stringify({ roundCapAction: 'person', takeoverBudget: 5, operatorRulingExtraRounds: 0 });
+    expect(resolveFixSettings({ env: {}, file: 'fix.json', read: () => flat }).roundCapAction).toBe('takeover');
+    expect(resolveTakeoverBudget({ env: {}, readPlatform: () => null, readRepo: () => JSON.parse(flat) })).toEqual({ value: 2, source: 'standard' });
+    expect(loadOperatorRulingExtraRounds({ env: {}, read: (f) => (/delivery-platform-preferences/.test(f) ? '{}' : flat) })).toEqual({ value: 1, source: 'standard' });
+  });
+
   it('the takeover kill switches stop the directed takeover too (roundCapAction=person, budget 0 or invalid)', () => {
     const ruled = [...base, rulingOn(recA), rulingOn(recB)];
     expect(planOn(ruled).dispatch.map((d) => d.operatorRulingRound?.used)).toEqual([0]);
