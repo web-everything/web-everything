@@ -53,7 +53,7 @@ export const HARDENED_GIT_ARGS = Object.freeze(laneGitConfigArgs());
 /** Lane-local config keys that name a command, proxy, remote rewrite or credential source and are NOT pinned inert
  *  (a pin to a fixed value would break legitimate auth). A lane whose local/worktree scope defines one is refused
  *  BEFORE the agent runs and again before the push — a baseline an earlier agent poisoned is not trusted. Pure. */
-const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
+const RISKY_LANE_CONFIG_RE = /^(credential\..*|core\.(askpass|gitproxy|editor)|merge\..+\.(driver|recursive)|gpg\..*|trailer\..+\.(cmd|command)|http\..*|https\..*|url\..+\.(insteadof|pushinsteadof)|protocol\..*|remote\..+\.(pushurl|proxy|receivepack|uploadpack|vcs)|include\.path|includeif\..+|filter\..+|alias\..+)$/i;
 const SAFE_REMOTE_URL_RE = /^(https:\/\/|ssh:\/\/|git@[\w.-]+:)/i;
 export function riskyLaneConfig(listOutput) {
   const parts = String(listOutput ?? '').split('\0');
@@ -393,6 +393,15 @@ export async function runFixCli(argv = [], {
       if (!unmerged.length && inMerge()) commitMerge();
       if (unmerged.length) mergePrompt = `The launcher has ALREADY started git merge origin/${target}; the conflicted files are: ${unmerged.join(', ')}. Resolve them by editing the files only. Do NOT run any git command that writes (merge, add, commit, checkout, reset, stash, rebase) — the sandbox forbids .git writes; the launcher stages and commits after you exit.\n\n`;
     }
+    // Capture emitted widths before the agent runs: the merge itself may already have changed .gitattributes.
+    // These UU/AA conflicts use HEAD as the opening label (optionally followed by a path).
+    const markerSizes = new Map(unmerged.map(path => {
+      const text = readFile(join(lanePath, path), lanePath);
+      const sizes = new Set();
+      for (const match of (text ?? '').matchAll(/^(<+) HEAD(?::[^\r\n]*)?\r?$/gm)) sizes.add(match[1].length);
+      if (!sizes.size) sizes.add(7);
+      return [path, sizes];
+    }));
     const spawned = await provider.spawn({
       sessionId: undefined, prompt: mergePrompt + SANDBOX_PREAMBLE + prContext + brief, lane: laneNum, sessionSlug, item: launch.item ?? '', attemptTag: '',
       ...(launch.model ? { model: launch.model } : {}), ...(launch.effort ? { effort: launch.effort } : {}),
@@ -415,7 +424,12 @@ export async function runFixCli(argv = [], {
       const unresolved = unmerged.filter(path => {
         if (!fileExists(join(lanePath, path))) return true;
         const text = readFile(join(lanePath, path), lanePath);
-        return text == null || /^(<<<<<<< |>>>>>>> )/m.test(text);
+        // Match this file's marker width, so ordinary Markdown blockquotes remain valid resolutions.
+        if (text == null) return true;
+        for (const match of text.matchAll(/^(<+|>+) /gm)) {
+          if (markerSizes.get(path).has(match[1].length)) return true;
+        }
+        return false;
       });
       if (unresolved.length) {
         git('merge', '--abort');

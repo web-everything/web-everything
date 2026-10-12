@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createFixBorrowGate } from '../../lib/fix-slot-borrow.mjs';
+import { LANE_GIT_CONFIG_PINS, laneGitHardeningEnv } from '../../lib/lane-git-hardening.mjs';
 import { dispatchFix, writePrivateBorrowedPrompt } from '../../conveyor/reconcile-fix-dispatch.mjs';
 import { resolveFixBorrowSettings } from '../../lib/dispatch-throttle.mjs';
 import { fixDetachedProvider, fixLauncherAvailable, FIX_RUN_SCRIPT } from '../dispatch-providers/fix.mjs';
@@ -199,7 +200,7 @@ describe('runFixCli', () => {
   it('keeps rename endpoints and unusual filenames but excludes launcher scratch', () => {
     expect(changedPaths('R  new name\0old name\0 D deleted\0?? line\nbreak\0?? .converge-1\0?? .delivery-commit-msg-7\0?? .fix-x-commit-message.txt\0')).toEqual(['new name', 'old name', 'deleted', 'line\nbreak']);
   });
-  it.each([false, true, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
+  it.each([false, true, 1, 32, 'symlink', 'deleted'])('launcher merges conflicts (unresolved=%s)', async (unresolved) => {
     const m = mk(['aaa', 'bbb']);
     let merging = false;
     m.spawn.mockResolvedValue({ finalMessage: 'Agent final diagnosis' });
@@ -215,18 +216,64 @@ describe('runFixCli', () => {
     const recordOutcome = vi.fn();
     const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run, recordOutcome,
       fileExists: p => p.endsWith('MERGE_HEAD') ? merging : unresolved !== 'deleted',
-      readFile: () => unresolved === 'symlink' ? null : unresolved ? '<<<<<<< HEAD\nleft\n=======\nright\n>>>>>>> origin/main\n' : 'resolved',
+      readFile: () => unresolved === 'symlink' ? null : unresolved ? `${'<'.repeat(typeof unresolved === 'number' ? unresolved : 7)} HEAD\nleft\n=======\nright\n${'>'.repeat(typeof unresolved === 'number' ? unresolved : 7)} origin/main\n` : '> resolved blockquote\n< comparison\n',
     });
     expect(m.spawn.mock.calls[0][0].prompt).toContain('ALREADY started git merge origin/main');
     expect(out.code).toBe(unresolved ? 1 : 0);
     if (unresolved) {
       expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('add'))).toBe(false);
       expect(m.calls.some(c => c.includes('push'))).toBe(false);
       expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: 'conflict unresolved in file.txt: Agent final diagnosis' }));
     } else {
       expect(m.calls.some(c => c.includes('commit') && c.includes('--no-edit') && c.includes('--trailer'))).toBe(true);
       expect(m.calls.some(c => c.includes('push'))).toBe(true);
     }
+  });
+  it('aborts a real conflict with conflict-marker-size=32 without committing or pushing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fix-marker-size-'));
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.invalid' };
+    const git = (...args) => execFileSync('git', [...HARDENED_GIT_ARGS, ...args], { cwd: dir, env, encoding: 'utf8', stdio: 'pipe' });
+    try {
+      git('init', '--initial-branch=main');
+      writeFileSync(join(dir, '.gitattributes'), 'file.txt conflict-marker-size=32\n');
+      writeFileSync(join(dir, 'file.txt'), 'base\n');
+      git('add', '.gitattributes', 'file.txt');
+      git('commit', '-m', 'base');
+      git('checkout', '-b', 'target');
+      writeFileSync(join(dir, 'file.txt'), 'theirs\n');
+      git('commit', '-am', 'theirs');
+      git('update-ref', 'refs/remotes/origin/target', git('rev-parse', 'HEAD').trim());
+      git('checkout', 'main');
+      writeFileSync(join(dir, 'file.txt'), 'ours\n');
+      git('commit', '-am', 'ours');
+      const head = git('rev-parse', 'HEAD');
+      const m = mk([]);
+      m.spawn.mockImplementation(async () => {
+        expect(readFileSync(join(dir, 'file.txt'), 'utf8')).toContain(`${'<'.repeat(32)} HEAD`);
+        return { finalMessage: 'Left conflict untouched' };
+      });
+      const run = (cmd, args, opts) => {
+        if (cmd === 'git') {
+          m.calls.push([cmd, ...args]);
+          // The remote-tracking ref above stands in for the network fetch; all merge/abort IO is real.
+          if (args.includes('fetch') || args.includes('push')) return '';
+          return execFileSync(cmd, args, { cwd: dir, env: { ...env, ...opts?.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, encoding: 'utf8', stdio: 'pipe' });
+        }
+        if (args.includes('acquire')) return dir;
+        return m.run(cmd, args, opts);
+      };
+      const out = await runFixCli([...argv, '--merge-onto=target'], { ...m.io, run });
+      expect(m.spawn).toHaveBeenCalledOnce();
+      expect(out.code).toBe(1);
+      expect(m.calls.some(c => c.includes('--abort'))).toBe(true);
+      expect(m.calls.some(c => c.includes('commit') || c.includes('add') || c.includes('push'))).toBe(false);
+      expect(git('rev-parse', 'HEAD')).toBe(head);
+      expect(existsSync(join(dir, '.git', 'MERGE_HEAD'))).toBe(false);
+      expect(readFileSync(join(dir, 'file.txt'), 'utf8')).toBe('ours\n');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it.each([['lane/x', 0], ['', 1]])('@pr-base resolves to the live gh baseRefName (%j) before validation', async (base, code) => {
     const m = mk(['aaa', 'bbb']);
@@ -390,12 +437,13 @@ describe('runFixCli', () => {
     expect(env.GIT_CONFIG_COUNT).toBeDefined();                              // pins also ride git's own env, not only argv
     expect(Object.values(env)).toContain('core.sshCommand');
   });
-  it('refuses a lane whose config ALREADY defines a credential/proxy/rewrite key, before running the agent', async () => {
+  it.each(['credential.helper', 'merge.custom.driver', 'merge.custom.recursive', 'gpg.program', 'gpg.ssh.program', 'core.editor', 'trailer.custom.cmd', 'trailer.custom.command'])('refuses pre-poisoned lane config %s before merge or agent execution', async (key) => {
     const m = mk(['aaa', 'aaa']);
-    const run = vi.fn((cmd, args) => (args[0] === 'config' ? 'local\0credential.helper\n!evil\0' : m.run(cmd, args)));
-    const out = await runFixCli(argv, { ...m.io, run });
+    const run = vi.fn((cmd, args) => (args[0] === 'config' ? `local\0${key}\n!evil\0` : m.run(cmd, args)));
+    const out = await runFixCli([...argv, '--merge-onto=main'], { ...m.io, run });
     expect(out.code).toBe(1);
     expect(m.spawn).not.toHaveBeenCalled();
+    expect(m.calls.some(c => c.includes('merge') || c.includes('commit') || c.includes('push'))).toBe(false);
   });
   it('posts the launcher refusal reason when risky lane config prevents the agent from running', async () => {
     const m = mk(['aaa']);
@@ -507,6 +555,36 @@ describe('runFixCli', () => {
 
 describe('riskyLaneConfig', () => {
   const list = (...kv) => kv.map(([scope, k, v]) => `${scope}\0${k}\n${v}\0`).join('');
+  // Inventory of launcher commands, including recovery. Read-only plumbing has no command-running keys.
+  it.each([
+    ['config', ['include.path', 'includeIf.gitdir:x.path']],
+    ['rev-parse', []], ['check-ref-format', []],
+    ['fetch', ['core.hooksPath', 'core.sshCommand', 'credential.helper', 'remote.origin.uploadpack']],
+    ['merge', ['core.hooksPath', 'core.fsmonitor', 'merge.custom.driver', 'merge.custom.recursive', 'core.editor', 'commit.gpgsign', 'gpg.program', 'gpg.ssh.program']],
+    ['merge --abort', ['core.hooksPath', 'core.fsmonitor', 'filter.custom.smudge', 'filter.custom.process']],
+    ['status', ['core.fsmonitor', 'filter.custom.clean']],
+    ['diff --numstat', ['core.fsmonitor', 'filter.custom.clean']],
+    ['add', ['core.fsmonitor', 'filter.custom.clean', 'filter.custom.process']],
+    ['commit', ['core.hooksPath', 'core.fsmonitor', 'core.editor', 'commit.gpgsign', 'gpg.program', 'gpg.ssh.program', 'trailer.custom.cmd', 'trailer.custom.command']],
+    ['push', ['core.hooksPath', 'core.sshCommand', 'credential.helper', 'remote.origin.receivepack']],
+  ])('pins or refuses command-running config for %s', (_command, keys) => {
+    const pins = new Map(LANE_GIT_CONFIG_PINS.map(([k, v]) => [k.toLowerCase(), v]));
+    for (const key of keys) {
+      if (pins.has(key.toLowerCase())) {
+        expect(HARDENED_GIT_ARGS).toContain(`${key}=${pins.get(key.toLowerCase())}`);
+      } else {
+        for (const scope of ['local', 'worktree']) {
+          expect(riskyLaneConfig(list([scope, key, 'evil']))).toEqual([key]);
+        }
+      }
+    }
+  });
+  it('disables signing in both argv and inherited environment pins', () => {
+    expect(HARDENED_GIT_ARGS).toContain('commit.gpgsign=false');
+    const env = laneGitHardeningEnv({});
+    const pins = Array.from({ length: Number(env.GIT_CONFIG_COUNT) }, (_, i) => [env[`GIT_CONFIG_KEY_${i}`], env[`GIT_CONFIG_VALUE_${i}`]]);
+    expect(pins).toContainEqual(['commit.gpgsign', 'false']);
+  });
   it('flags unpinned command/credential/rewrite keys in the lane scope, not host scope', () => {
     expect(riskyLaneConfig(list(['local', 'credential.helper', '!x'], ['local', 'url.https://e/.insteadOf', 'https://github.com/'],
       ['worktree', 'core.gitProxy', 'p'], ['local', 'include.path', '../x'], ['local', 'remote.origin.pushurl', 'u'], ['local', 'alias.push', '!x'])))
