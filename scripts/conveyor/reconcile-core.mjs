@@ -110,7 +110,7 @@ import { takeoverMarkers, takeoverReviewCap, takeoverRung, sameHeadSha } from '.
 import { AUTO_POLICY_ACTOR, activeReferrals, readOperatorRulings, readReferralRecords, referralRecordState } from '../lib/jury-core.mjs';
 import { planTakeover, notConvergingText, threadMayBeTruncated } from './takeover-budget.mjs';
 import { takeoverReviewGrant } from './takeover-review.mjs';
-import { mechanicalRoundGrant } from './mechanical-round-cap.mjs';
+import { mechanicalRoundGrant, isReviewVerdictComment, verdictJudged, reviewedHeadsOf } from './mechanical-round-cap.mjs';
 import { countConflictFixComments } from './conflict-fix-round-count.mjs';
 
 /** The ladder `planReconcile` uses when its caller supplies none: the platform default, Claude rungs only, no route
@@ -1337,6 +1337,25 @@ function refuseReferralHold({ pr, refuse, withPhase, extra = {} }) {
   return true;
 }
 
+/**
+ * The pre-review gates a review emission that does NOT go through {@link dispatchReviewRow} must still honour: a draft
+ * PR and a scope-bloated diff are never reviewed (the same two refusals `dispatchReviewRow` makes). The direct
+ * `kind: 'review'` branches (a past-cap grant, the advisory-fix cap's stale-advisory review, the addressed-advisory
+ * review) call this next to {@link refuseReferralHold}, so none of them reviews what the main path would refuse.
+ */
+function refuseUnreviewable({ pr, refuse, withPhase, extra = {} }) {
+  if (pr?.isDraft) {
+    refuse('draft', { ...withPhase, ...extra, why: 'PR is still a draft — no independent review is dispatched until it is promoted to ready for review' });
+    return true;
+  }
+  if (pr?.scopeBloat) {
+    refuse('scope-bloat', { ...withPhase, ...extra, scopeBloat: pr.scopeBloat,
+      why: `scope-bloat: ${pr.scopeBloat.why} — a fixer rebases it first, no review reads this diff` });
+    return true;
+  }
+  return false;
+}
+
 /** A shared prerequisite for every review emission, including advisory review branches. */
 function reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra = {} }) {
   const ci = reviewCiGate({ headSha: pr?.headRefOid, requiredChecks, checks: pr?.statusCheckRollup });
@@ -1362,6 +1381,7 @@ export function resolveRoundCap(env = {}) {
  */
 function dispatchReviewRow({
   pr, requiredChecks, withPhase, base, attempts, roundCap, refuse, refuseCapExhausted, dispatch, extra = {}, now = 0,
+  advisoryReview = null,
 }) {
   if (refuseReferralHold({ pr, refuse, withPhase, extra })) return;
   // ── `scope-bloat` (card x29vm8a) — a diff that is mostly NOT this PR's own change is never reviewed (live 2026-10-08,
@@ -1463,6 +1483,17 @@ function dispatchReviewRow({
       why: `this exact head (\`${headSha}\`) already carries a \`reviewed-sha\` accept marker from a prior` +
         ' review — dispatching another review for a commit nobody has touched since risks a second,' +
         ' contradicting verdict landing on it (#2588)',
+    });
+    return;
+  }
+  // ── gate-held advisory (live #4764) — an advisory review is not a repair round, so it skips the findings/cap
+  // accounting below, but it passes every gate ABOVE (referral hold, scope-bloat, draft, already-reviewed-head) and
+  // the CI gate: it is this function's review, never a second hand-rolled copy of it.
+  if (advisoryReview) {
+    if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase, extra })) return;
+    dispatch.push({
+      ...base, ...withPhase, kind: 'review', findings: countFindings(pr?.comments), ...extra,
+      advisoryReview: { head: advisoryReview.head, reason: advisoryReview.reason }, why: advisoryReview.why,
     });
     return;
   }
@@ -2011,6 +2042,7 @@ export function planReconcile({
       const grant = allowTakeoverReview && (extra.capKind === 'fix' || extra.capKind === 'review' || extra.capKind === 'advisory-fix') ? pastCapGrant(extra) : null;
       if (grant?.action === 'review') {
         if (refuseReferralHold({ pr, refuse: refuseFn, withPhase: extra })) return;
+        if (refuseUnreviewable({ pr, refuse: refuseFn, withPhase: extra })) return;
         if (!reviewChecksAllow({ pr, requiredChecks, refuse: refuseFn, withPhase: extra })) return;
         dispatch.push({ ...base, ...extra, kind: 'review', findings: countFindings(pr?.comments), ...grant.row, why: grant.why });
         return;
@@ -2050,8 +2082,78 @@ export function planReconcile({
       // The PR's own gate holds it (a stacked base not merged yet, a review:human hold, a hold-gate check) and no
       // defect is open: that is the gate working, not a defect — no takeover and no "a person must take it over".
       if (takeover?.reason === 'gate-hold') {
+        // Live #4764: spent repair rounds still owe a current advisory, or a visible operator handoff.
+        const headSha = typeof pr?.headRefOid === 'string' ? pr.headRefOid.trim().toLowerCase() : '';
+        const trustedComments = Array.isArray(pr?.comments) ? pr.comments.filter(isTrustedMarkerAuthor) : [];
+        const latest = headSha ? latestAdvisory(trustedComments) : undefined;
+        const advisoryIsCurrent = advisoryCoversHead(latest, headSha);
+        // Structured evidence only: a verdict counts when its own footer names the live head. A sha merely mentioned
+        // in a verdict's prose (an older review quoting the new head) never marks that head reviewed.
+        const alreadyReviewed = Boolean(headSha) && (parseReviewedSha(trustedComments) === headSha
+          || trustedComments.some(c => isReviewVerdictComment(c) && verdictJudged(c, headSha)));
+        // A review whose basis was degraded or unpinned posts an advisory note with NO head to compare (no `Net basis`
+        // footer), so it can never "cover" the live head. When the newest advisory note on the thread is such a
+        // headless one, a review has already run: do not spend another every tick — the operator rules (bounds the loop).
+        let lastHeaded = -1;
+        let lastHeadless = -1;
+        trustedComments.forEach((c, i) => {
+          if (!String(c?.body ?? '').trimStart().startsWith(ADVISORY_NOTE_MARKER)) return;
+          if (latestAdvisory([c]) || reviewedHeadsOf(c).length) lastHeaded = i; else lastHeadless = i;
+        });
+        const unpinnedAdvisory = lastHeadless > lastHeaded;
+        // The owed advisory goes through dispatchReviewRow, the ONE review decision (referral hold, scope-bloat, draft,
+        // already-reviewed-head, CI). If it refuses, the refusal is named in the operator note below, never swallowed.
+        let reviewRefusal = null;
+        if (takeover.hold === 'review-human-hold' && headSha && !advisoryIsCurrent && !alreadyReviewed && !unpinnedAdvisory) {
+          const rowsBefore = dispatch.length;
+          dispatchReviewRow({
+            pr, requiredChecks, withPhase: extra, base, attempts: extra.attempts, roundCap: extra.cap, now, dispatch,
+            refuse: (kind, x) => { reviewRefusal = { kind, why: x?.why }; refuseFn(kind, x); },
+            refuseCapExhausted: () => {},
+            advisoryReview: {
+              head: headSha, reason: 'gate-hold-advisory',
+              why: `the repair rounds are spent (${extra.attempts}/${extra.cap}), but an advisory review is not a repair round;`
+                + ` the newest advisory is on \`${latest?.head ?? 'none'}\`, not the live head \`${headSha}\`,`
+                + ' so one advisory review runs on the live head so the operator has a current advisory',
+            },
+          });
+          if (dispatch.length > rowsBefore) {
+            // Only an advisory review row may stand; any other row dispatchReviewRow pushed (a scope-bloat rebase fix)
+            // does not belong on a review:human PR at the cap — drop it and fall through to the refusal and note.
+            if (dispatch.slice(rowsBefore).every(d => d.kind === 'review' && d.advisoryReview)) return;
+            dispatch.length = rowsBefore;
+          }
+        }
         refuseFn('gate-hold', { ...extra, takeover: 'gate-hold', hold: takeover.hold,
           why: `held by its own gate (${takeover.hold}) with no open defect finding — the gate is doing its job; no takeover` });
+        // A base hold clears itself only while an OPEN PR owns the base branch (it will land and the drain retargets this
+        // PR). A base nobody owns (closed unmerged, deleted) never clears: that stays a person's call, like
+        // reconcile-pass's `stacked-base-orphaned`.
+        const basePr = pr?.baseRefName ? prs.find(c => c?.headRefName === pr.baseRefName && c.number !== prNumber) : undefined;
+        const selfClearing = takeover.hold === 'awaiting-base' || (takeover.hold === 'stacked-base-unmerged' && Boolean(basePr));
+        const reason = selfClearing
+          ? `waiting on its base branch (${takeover.hold}); the hold clears itself when the base PR lands, nobody needs to act`
+          : takeover.hold === 'stacked-base-unmerged'
+            ? `its base branch \`${pr?.baseRefName}\` has no open PR that will land it — a person must retarget this PR or restore the base`
+          : takeover.hold !== 'review-human-hold'
+          ? `a person must resolve the gate dependency (${takeover.hold}) before this PR can advance`
+          : reviewRefusal
+            ? `the advisory review owed on the live head \`${headSha.slice(0, 9)}\` was refused (${reviewRefusal.kind}: ${reviewRefusal.why ?? 'no reason given'})`
+              + ' — clear that, or a person must review the PR and supply a ruling'
+          : unpinnedAdvisory
+            ? 'the newest advisory was posted without a pinned basis (no head to compare), so a review already ran — a person must read it and supply a ruling'
+          : advisoryIsCurrent
+            ? `the advisory on the live head \`${headSha.slice(0, 9)}\` is in — a person must rule (review it, or send it back with a ruling)`
+            : alreadyReviewed
+              ? `the live head \`${headSha.slice(0, 9)}\` was already reviewed but has no current trusted advisory — a person must check the review and supply a ruling`
+              : 'the live head is unavailable — a person must check the PR before an advisory can run';
+        notes.push({
+          // A base hold clears itself: it reuses the status-only `stacked-awaiting-base` kind (no PR comment, no escalation).
+          kind: selfClearing ? 'stacked-awaiting-base' : 'gate-hold-needs-operator', prNumber, hold: takeover.hold,
+          ...(selfClearing ? { baseRefName: pr?.baseRefName, basePrNumber: basePr?.number ?? null } : {}),
+          attempts: extra.attempts, cap: extra.cap, capKind: extra.capKind, head: headSha,
+          text: `PR #${prNumber}: held by its own gate (${takeover.hold}) at the repair cap (${extra.attempts}/${extra.cap}, ${extra.capKind}); ${reason}`,
+        });
         return;
       }
       // The latest takeover pushed and no review has judged its head yet: its one review is owed (the grant above
@@ -2927,6 +3029,7 @@ export function planReconcile({
           const advisoryIsStale = Boolean(latest) && !advisoryCoversHead(latest, headSha);
           if (advisoryIsStale) {
             if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+            if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
             if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
             dispatch.push({
               ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
@@ -2984,6 +3087,7 @@ export function planReconcile({
       // ordinary `!addressed` branch above) is completely unaffected — it never reaches this line at all.
       const advisoryFindingsHere = countFindings(pr?.comments);
       if (refuseReferralHold({ pr, refuse, withPhase })) continue;
+      if (refuseUnreviewable({ pr, refuse, withPhase })) continue;
       if (!reviewChecksAllow({ pr, requiredChecks, refuse, withPhase })) continue;
       dispatch.push({
         ...base, ...withPhase, kind: 'review', findings: advisoryFindingsHere,
