@@ -3,6 +3,7 @@
  * Real temp repositories exercise hooks and cleanup independently of the scoped version-probe doubles.
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -172,7 +173,10 @@ describe('snapshotHookSurface / hookSurfaceChanged', () => {
   it('reads a fresh repo as an unremarkable baseline — only *.sample templates, never a live hook name', () => {
     const dir = makeRepo();
     const snap = snapshotHookSurface(dir);
-    expect(snap.configHash).toEqual(expect.any(String));
+    const bytes = readFileSync(join(dir, '.git', 'config'));
+    expect(snap.configState).toBe('present');
+    expect(snap.configBytes.equals(bytes)).toBe(true);
+    expect(snap.configHash).toBe(createHash('sha256').update(bytes).digest('hex'));
     // `git init` ships inert `*.sample` templates by default; none of them is a live hook name.
     expect(Object.keys(snap.files).every((name) => name.endsWith('.sample'))).toBe(true);
     expect(Object.keys(snap.files)).not.toContain('pre-commit');
@@ -243,12 +247,117 @@ describe('snapshotHookSurface / hookSurfaceChanged', () => {
     expect(hookSurfaceChanged(null, snap).changed).toBe(true);
     expect(hookSurfaceChanged(snap, undefined).changed).toBe(true);
   });
+
+  it('fails closed for unreadable config in either position, including two unreadable reads', () => {
+    const dir = makeRepo();
+    const configPath = join(dir, '.git', 'config');
+    const present = snapshotHookSurface(dir);
+    rmSync(configPath);
+    const absent = snapshotHookSurface(dir);
+    symlinkSync('config', configPath);
+    const unreadable = snapshotHookSurface(dir);
+    expect(unreadable.configState).toBe('unreadable');
+    for (const other of [present, absent, unreadable]) {
+      expect(hookSurfaceChanged(unreadable, other).changed).toBe(true);
+      expect(hookSurfaceChanged(other, unreadable).changed).toBe(true);
+    }
+  });
+
+  it('preserves hash and file comparisons for fixtures without read state', () => {
+    const before = { configHash: null, files: { hook: 'original' } };
+    expect(hookSurfaceChanged(before, { ...before }).changed).toBe(false);
+    expect(hookSurfaceChanged(before, { ...before, configHash: 'changed' }).changed).toBe(true);
+    expect(hookSurfaceChanged(before, { ...before, files: { hook: 'edited' } }).changed).toBe(true);
+    expect(hookSurfaceChanged(before, { ...before, files: {} }).reason).toMatch(/removed: hook/);
+  });
 });
 
 describe('resetHookSurface', () => {
   const hooksPathOnDisk = (dir) => {
     try { return execFileSync('git', ['config', '--local', '--get', 'core.hooksPath'], { cwd: dir, encoding: 'utf8' }).trim(); } catch { return null; }
   };
+
+  it('preserves recovered config bytes when the baseline read failed with ELOOP', () => {
+    const dir = makeRepo();
+    const configPath = join(dir, '.git', 'config');
+    const recovered = Buffer.from('[core]\n\thooksPath = /recovered-hooks\n');
+    rmSync(configPath);
+    symlinkSync('config', configPath);
+    const baseline = snapshotHookSurface(dir);
+    rmSync(configPath);
+    writeFileSync(configPath, recovered);
+    vi.mocked(execFileSync).mockClear();
+
+    const result = resetHookSurface(dir, baseline);
+
+    expect(result.clean).toBe(false);
+    expect(existsSync(configPath)).toBe(true);
+    expect(readFileSync(configPath).equals(recovered)).toBe(true);
+    expect(baseline.configState).toBe('unreadable');
+    expect(baseline.configBytes).toBeNull();
+    expect(baseline.configHash).toBeNull();
+    expect(execFileSync).not.toHaveBeenCalled();
+    expect(hookSurfaceChanged(baseline, baseline).changed).toBe(true);
+  });
+
+  it.each([
+    ['missing state', { configBytes: null }],
+    ['present with null', { configState: 'present', configBytes: null }],
+    ['present with missing bytes', { configState: 'present' }],
+    ['present with a string', { configState: 'present', configBytes: 'invalid' }],
+    ['absent with bytes', { configState: 'absent', configBytes: Buffer.alloc(0) }],
+    ['absent with missing bytes', { configState: 'absent' }],
+    ['unknown state', { configState: 'unknown', configBytes: null }],
+    ['null baseline', null],
+  ])('refuses %s before config mutation, hook deletion or git repair', (_label, baseline) => {
+    const dir = makeRepo();
+    const configPath = join(dir, '.git', 'config');
+    const bytes = Buffer.from('[core]\n\thooksPath = /preserve-hooks\n');
+    writeFileSync(configPath, bytes);
+    const hookPath = join(dir, '.git', 'hooks', 'pre-commit');
+    writeFileSync(hookPath, 'preserve-hook\n');
+    vi.mocked(execFileSync).mockClear();
+
+    const result = resetHookSurface(dir, baseline);
+
+    expect(result.clean).toBe(false);
+    expect(readFileSync(configPath).equals(bytes)).toBe(true);
+    expect(readFileSync(hookPath, 'utf8')).toBe('preserve-hook\n');
+    expect(result.leftover).toContain('pre-commit');
+    expect(execFileSync).not.toHaveBeenCalled();
+  });
+
+  it('restores an empty present config as bytes rather than deleting it', () => {
+    const dir = makeRepo();
+    const configPath = join(dir, '.git', 'config');
+    writeFileSync(configPath, Buffer.alloc(0));
+    const baseline = snapshotHookSurface(dir);
+    expect(baseline.configState).toBe('present');
+    expect(baseline.configBytes.length).toBe(0);
+    writeFileSync(configPath, '[core]\n\tworker-planted = true\n');
+
+    const result = resetHookSurface(dir, baseline);
+
+    expect(result.clean).toBe(true);
+    expect(readFileSync(configPath).length).toBe(0);
+    expect(result.snapshot.configState).toBe('present');
+    expect(result.snapshot.configHash).toBe(baseline.configHash);
+  });
+
+  it('refuses an unreadable final config even when git repair reports success', () => {
+    const dir = makeRepo();
+    const configPath = join(dir, '.git', 'config');
+    rmSync(configPath);
+    symlinkSync('config', configPath);
+    // Isolate the final-read condition from Git's own refusal to read the same ELOOP config.
+    vi.mocked(execFileSync).mockReturnValue('');
+
+    const result = resetHookSurface(dir);
+
+    expect(result.clean).toBe(false);
+    expect(result.snapshot.configState).toBe('unreadable');
+    expect(result.leftover).toEqual([]);
+  });
 
   it('deletes a planted hook, keeps *.sample files, and drops a repointed hooksPath (repo tracks no .githooks/)', () => {
     const dir = makeRepo();
@@ -310,6 +419,7 @@ describe('resetHookSurface', () => {
     execFileSync('git', ['config', 'include.path', '/tmp/evil-include'], { cwd: dir });
     const result = resetHookSurface(dir, baseline);
     expect(result.clean).toBe(true);
+    expect(result.snapshot.configBytes.equals(baseline.configBytes)).toBe(true);
     expect(result.snapshot.configHash).toBe(baseline.configHash);
     expect(hookSurfaceChanged(baseline, result.snapshot).changed).toBe(false);
   });
@@ -331,6 +441,7 @@ describe('resetHookSurface', () => {
     const dir = makeRepo();
     rmSync(join(dir, '.git', 'config'), { force: true }); // simulate a baseline snapshot taken with no config on disk
     const baseline = snapshotHookSurface(dir);
+    expect(baseline.configState).toBe('absent');
     expect(baseline.configBytes).toBeNull(); // sanity: this IS the "baseline had none" case
     writeFileSync(join(dir, '.git', 'config'), '[core]\n\tworker-planted = true\n'); // worker creates one from nothing
 
@@ -338,7 +449,23 @@ describe('resetHookSurface', () => {
 
     expect(result.clean).toBe(true);
     expect(existsSync(join(dir, '.git', 'config'))).toBe(false); // never survives the reset
+    expect(result.snapshot.configState).toBe('absent');
     expect(result.snapshot.configHash).toBeNull();
+  });
+
+  it('reports failed deletion from an absent baseline without removing directory contents', () => {
+    const dir = makeRepo();
+    const configPath = join(dir, '.git', 'config');
+    rmSync(configPath);
+    const baseline = snapshotHookSurface(dir);
+    mkdirSync(configPath);
+    writeFileSync(join(configPath, 'sentinel'), 'preserve\n');
+
+    const result = resetHookSurface(dir, baseline);
+
+    expect(result.clean).toBe(false);
+    expect(result.snapshot.configState).toBe('unreadable');
+    expect(readFileSync(join(configPath, 'sentinel'), 'utf8')).toBe('preserve\n');
   });
 
   it('a baseline restore that cannot complete (the worker made .git/config a directory) reports clean:false', () => {
@@ -363,6 +490,13 @@ describe('resetHookSurface', () => {
 
     expect(result.clean).toBe(false); // no safe baseline — caller must refuse, never proceed
     expect(readFileSync(sentinel, 'utf8')).toBe('do-not-delete\n'); // the link target was never touched
+    expect(result.snapshot.configState).toBe('unreadable');
+    expect(hookSurfaceChanged(result.snapshot, result.snapshot).changed).toBe(true);
+    rmSync(join(dir, '.git', 'hooks'));
+    const configPath = join(dir, '.git', 'config');
+    const bytes = readFileSync(configPath);
+    expect(resetHookSurface(dir, result.snapshot).clean).toBe(false);
+    expect(readFileSync(configPath).equals(bytes)).toBe(true);
   });
 
   it('never deletes/writes through a symlinked .git (#4291 advisory review, security/security)', () => {
