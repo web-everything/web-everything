@@ -18,6 +18,7 @@ export const LANE_GIT_CONFIG_PINS = Object.freeze([
   ['core.hooksPath', '/dev/null'],
   ['core.attributesFile', '/dev/null'],
   ['core.sshCommand', 'ssh'],
+  ['commit.gpgsign', 'false'],
 ]);
 
 /** The pins as `-c k=v` argv pairs, for a caller that builds its own git command line. */
