@@ -3,9 +3,11 @@ bornAs: xak56ki
 kind: story
 size: 2
 tier: pinned
-status: open
+status: resolved
 scope: ["we:scripts/operations/probation-build-run.mjs", "we:scripts/lib/daemon-clone-registry.mjs"]
 dateOpened: "2026-09-29"
+dateResolved: "2026-10-12"
+graduatedTo: 10fedba67afc9550fb9a6592282603117284c0c2
 tags: []
 ---
 
