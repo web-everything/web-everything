@@ -15,7 +15,9 @@
  *     worktree holding the shared local branch and an unpushed commit. Detached writers cannot block each
  *     other's checkout or move each other's branch ref; push races remain normal non-fast-forward refusals.
  *     Cleanup runs in finally; later writers also reclaim stale clean worktrees, saving unpushed HEADs first.
- *     Dirty worktrees are left for an operator, never discarded.
+ *     Dirty worktrees (untracked and ignored files included, whatever the git config says) are left for an
+ *     operator, never discarded. A worktree whose writer process is still alive (its `wt-<ms>.owner` pid) is
+ *     never reclaimed, however old: age only decides when no live owner is recorded.
  *   · EVERY SIDE EFFECT IS INJECTED — `git` AND the three filesystem calls. `git` alone was not enough and CI
  *     caught it: a suite that injected only `run` still executed the real `mkdirSync` against its fixture root
  *     of `/repo`. Running as root that SUCCEEDED, creating a directory at the filesystem root and leaving the
@@ -124,6 +126,36 @@ function withGitError(run) {
 const stderrLog = (line) => process.stderr.write(`${line}\n`);
 
 /**
+ * LIVENESS, NOT AGE (red team: a writer stuck in a slow post-commit hook has an old, clean worktree that is
+ * still in use). Each writer drops `wt-<ms>.owner` next to its worktree holding its pid; the sweep leaves any
+ * worktree whose owner process is still alive. A reused pid only ever keeps a dead writer's worktree longer,
+ * which is the safe direction. A missing or unreadable owner file falls back to the age rule (old writers, or
+ * one killed before it wrote the file).
+ */
+const ownerFile = (root, name) => join(root, `${name}.owner`);
+const processAlive = (pid) => {
+  try { process.kill(pid, 0); return true; } catch (e) { return e?.code === 'EPERM'; }
+};
+
+function readOwnerPid(read, file) {
+  const text = read(file);
+  if (text == null) return null;
+  try {
+    const pid = JSON.parse(text)?.pid;
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch { return null; }
+}
+
+/**
+ * Argument list for the guard's "is anything uncommitted here?" probe. Spelled out so no user/repo git config
+ * (`status.showUntrackedFiles=no`, `diff.ignoreSubmodules=all`, ...; command-line flags outrank config) can hide a file from it: untracked and
+ * ignored files count too, because the HEAD backup cannot preserve them.
+ */
+export const DIRTY_PROBE_ARGS = Object.freeze([
+  'status', '--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none',
+]);
+
+/**
  * Best-effort recovery of killed writers. Only old wt-<milliseconds> directories directly in the transport
  * root qualify. Save a clean HEAD not known to be on origin BEFORE removing its worktree; dirty or broken
  * worktrees stay put. All git and filesystem probes are injectable, just like the staging path.
@@ -134,7 +166,8 @@ const stderrLog = (line) => process.stderr.write(`${line}\n`);
  */
 export function reclaimStrandedTransportWorktrees({
   board, branch, run = defaultGit, now = () => Date.now(), staleMs = 10 * 60_000,
-  log = stderrLog, exists = existsSync, exclude = null,
+  log = stderrLog, exists = existsSync, exclude = null, read = readExisting, alive = processAlive,
+  rm = rmSync,
 } = {}) {
   run = withGitError(run);
   // Even an unavailable logging sink must not turn maintenance into a write failure.
@@ -151,8 +184,11 @@ export function reclaimStrandedTransportWorktrees({
       if (!match || now() - Number(match[1]) < staleMs) continue;
       try {
         if (!exists(path)) continue; // finally's prune handles missing directories
+        // Absent/garbled record -> age rule. A record we cannot READ throws into the catch below: left alone.
+        const ownerPid = readOwnerPid(read, ownerFile(root, name));
+        if (ownerPid && alive(ownerPid)) continue; // its writer is still running, however long that takes
         const wtOpts = { cwd: path, env: worktreeGitEnv(path) };
-        if (run(['status', '--porcelain'], wtOpts).trim()) {
+        if (run([...DIRTY_PROBE_ARGS], wtOpts).trim()) {
           warn(`git-transport-branch: WARNING dirty stranded worktree ${path}; left untouched`);
           continue;
         }
@@ -164,6 +200,7 @@ export function reclaimStrandedTransportWorktrees({
           run(['update-ref', backup, sha], { cwd: board });
         }
         run(['worktree', 'remove', '--force', path], { cwd: board });
+        try { rm(ownerFile(root, name), { force: true }); } catch { /* best effort */ }
         warn(`git-transport-branch: reclaimed ${path}${backup ? `; preserved at ${backup}` : ''}`);
       } catch (e) {
         warn(`git-transport-branch: stranded worktree sweep failed for ${path}: ${e.message}`);
@@ -216,8 +253,12 @@ export function stageOnTransportBranch({
   const runWt = (args, opts = {}) => run(args, { ...opts, cwd: wt, env: { ...wtEnv, ...(opts.env || {}) } });
   const created = createIfAbsent
     && !run(['ls-remote', '--heads', 'origin', `refs/heads/${branch}`], { cwd: board }).trim();
+  const owner = ownerFile(dirname(wt), basename(wt));
   try {
-    reclaimStrandedTransportWorktrees({ board, branch, run, now, log, exists, exclude: wt });
+    // Claim liveness BEFORE the worktree exists, so no sweep can ever see this worktree without its owner.
+    // Best effort: if it cannot be written the worktree is merely subject to the age rule, as before.
+    try { write(owner, `${JSON.stringify({ pid: process.pid })}\n`); } catch { /* best effort */ }
+    reclaimStrandedTransportWorktrees({ board, branch, run, now, log, exists, exclude: wt, read, rm });
     if (created) {
       // An orphan WITHOUT a checkout: `--no-checkout` keeps the board's files out of the worktree, the
       // symbolic-ref points HEAD at the unborn branch, and `read-tree --empty` drops the index the add seeded
@@ -248,6 +289,7 @@ export function stageOnTransportBranch({
     // Remove this run's directory, then prune its registration. A killed run misses finally entirely;
     // the next writer's best-effort sweep handles its stale worktree without discarding unpushed work.
     try { rm(wt, { recursive: true, force: true }); } catch { /* already gone */ }
+    try { rm(owner, { force: true }); } catch { /* already gone */ }
     // PRUNED IN `board`, not in whatever directory the driver happens to be: the worktree was registered in the
     // board's checkout, so pruning elsewhere leaves a stale registration in the repo that will need it (#3261).
     try { run(['worktree', 'prune'], { cwd: board }); } catch { /* best effort */ }

@@ -236,3 +236,102 @@ describe('recovery preserves before removing and fails safely', () => {
     expect(logs.join()).toContain('listing failed');
   });
 });
+
+describe('liveness, not age, decides whether a stale-looking worktree is abandoned (red team 2026-10-11)', () => {
+  const path = '/board/.operations/transport/wt-1';
+  const sweep = ({ owner = null, alive = () => false, readThrows = false } = {}) => {
+    const calls = []; const removed = []; const probed = [];
+    reclaimStrandedTransportWorktrees({
+      board: '/board', branch: 'ops/x', now: () => 600001, exists: () => true, log: () => {},
+      read: (p) => {
+        probed.push(p);
+        if (readThrows) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+        return owner;
+      },
+      alive: (pid) => { probed.push(`pid:${pid}`); return alive(pid); },
+      rm: (p) => removed.push(p),
+      run: (args) => {
+        calls.push(args);
+        if (args[0] === 'worktree' && args[1] === 'list') return `worktree ${path}\nHEAD abc\n\n`;
+        if (args[0] === 'rev-parse') return 'abc\n';
+        if (args[0] === 'merge-base') throw Object.assign(new Error('x'), { status: 1 });
+        return '';
+      },
+    });
+    return { calls, removed, probed };
+  };
+  it('leaves an old, clean worktree alone while its writer process is alive', () => {
+    const { calls, probed } = sweep({ owner: '{"pid":4242}\n', alive: (pid) => pid === 4242 });
+    expect(calls).toEqual([['worktree', 'list', '--porcelain']]);
+    expect(probed).toEqual(['/board/.operations/transport/wt-1.owner', 'pid:4242']);
+  });
+  it('reclaims it once the writer is gone, and drops the owner record with it', () => {
+    const { calls, removed } = sweep({ owner: '{"pid":4242}\n' });
+    expect(calls.at(-1)).toEqual(['worktree', 'remove', '--force', path]);
+    expect(removed).toEqual(['/board/.operations/transport/wt-1.owner']);
+  });
+  it.each([['no record', null], ['garbled record', '{"pi'], ['bad pid', '{"pid":"x"}']])('falls back to the age rule with %s', (_l, owner) => {
+    expect(sweep({ owner }).calls.at(-1)).toEqual(['worktree', 'remove', '--force', path]);
+  });
+  it('leaves it alone when the owner record cannot be read', () => {
+    expect(sweep({ readThrows: true }).calls.some((c) => c[1] === 'remove')).toBe(false);
+  });
+  it('records its own pid before creating the worktree and removes the record afterwards', () => {
+    const s = stub();
+    stage(s);
+    const owner = '/board/.operations/transport/wt-111.owner';
+    const at = (pred) => s.calls.findIndex(pred);
+    const wrote = at((c) => c.fs === 'write' && c.path === owner);
+    expect(JSON.parse(s.calls[wrote].content).pid).toBe(process.pid);
+    expect(wrote).toBeLessThan(at((c) => c.args?.[0] === 'worktree' && c.args?.[1] === 'add'));
+    expect(s.calls.filter((c) => c.fs === 'rm').some((c) => c.path === owner)).toBe(true);
+  });
+  it('a failing owner write never fails the transport write', () => {
+    const s = stub();
+    s.seams.write = (p, c) => { if (p.endsWith('.owner')) throw new Error('disk full'); s.calls.push({ fs: 'write', path: p, content: c }); };
+    expect(stage(s).pushed).toBe(true);
+  });
+});
+
+describe('the dirty guard sees untracked files whatever the git config says (red team 2026-10-11)', () => {
+  it('asks for untracked and ignored files explicitly, on the command line', () => {
+    const { calls } = (() => {
+      const calls = [];
+      reclaimStrandedTransportWorktrees({
+        board: '/board', branch: 'ops/x', now: () => 600001, exists: () => true, log: () => {}, read: () => null,
+        run: (args) => { calls.push(args); return args[0] === 'worktree' ? 'worktree /board/.operations/transport/wt-1\n\n' : ''; },
+      });
+      return { calls };
+    })();
+    const status = calls.find((c) => c[0] === 'status');
+    expect(status).toEqual(expect.arrayContaining(['--porcelain', '--untracked-files=all', '--ignored=traditional', '--ignore-submodules=none']));
+  });
+
+  it('with real git and status.showUntrackedFiles=no, a worktree holding an unadded file is NOT removed', async () => {
+    const { mkdtempSync, writeFileSync: wf, rmSync: rmf, existsSync, readFileSync, realpathSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join: j } = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+    for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE']) delete env[k];
+    const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] });
+    // realpath: git lists worktrees by their real path, and the sweep compares against `<board>/.operations/transport`.
+    const root = realpathSync(mkdtempSync(j(tmpdir(), 'transport-untracked-')));
+    try {
+      const origin = j(root, 'origin.git'); const board = j(root, 'board');
+      git(['init', '--quiet', '--bare', '-b', 'main', origin], root);
+      git(['clone', '--quiet', origin, board], root);
+      wf(j(board, 'a.txt'), 'x\n'); git(['add', '.'], board); git(['commit', '--quiet', '-m', 'm'], board);
+      git(['push', '--quiet', 'origin', 'main'], board);
+      git(['config', 'status.showUntrackedFiles', 'no'], board);
+      const wt = j(board, '.operations', 'transport', 'wt-1');
+      git(['worktree', 'add', '--detach', '--force', wt, 'HEAD'], board);
+      wf(j(wt, 'net.diff'), 'request written just before the writer died\n');
+      expect(git(['status', '--porcelain'], wt).trim()).toBe(''); // the config really does hide it
+      reclaimStrandedTransportWorktrees({ board, branch: 'main', now: () => 600001, log: () => {} });
+      expect(existsSync(j(wt, 'net.diff'))).toBe(true);
+      expect(readFileSync(j(wt, 'net.diff'), 'utf8')).toContain('request written');
+      expect(git(['worktree', 'list'], board)).toContain('wt-1');
+    } finally { rmf(root, { recursive: true, force: true }); }
+  });
+});
