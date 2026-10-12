@@ -36,6 +36,9 @@ export function parsePrResultTable(logText, num) {
     results.push({ id, status, reason: match[3].slice(padding) });
   }
   if (!results.length) return { error: `no verdict rows for #${num}` };
+  // A readable prefix cannot prove that later, non-human gates did not block.
+  const missing = GATE_IDS.filter((id) => !seen.has(id));
+  if (missing.length) return { error: `incomplete verdict for #${num}: missing gates: ${missing.join(', ')}` };
   const blocked = results.some(({ status }) => status === 'hold' || status === 'fail-closed');
   if (ok === blocked) return { error: 'verdict header disagrees with blocking rows' };
   return { num, ok, results };

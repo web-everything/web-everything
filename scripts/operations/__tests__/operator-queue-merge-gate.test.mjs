@@ -81,6 +81,24 @@ describe('PR #4965: enforced merge-gate must not hide the human queue', () => {
 
 describe('readMergeGateVerdict', () => {
   const args = { repo: 'web-everything/web-everything', check, number: 4965 };
+  it.each(['truncated', 'interrupted', 'missing gate', 'latest incomplete'])('keeps a cancelled check blocking with a %s verdict', (variant) => {
+    const complete = LOG.replace('pass              red-main-freeze', 'hold              red-main-freeze');
+    const lines = complete.split('\n');
+    const truncated = lines.slice(0, 14).join('\n');
+    const log = variant === 'truncated' ? truncated
+      : variant === 'interrupted' ? [...lines.slice(0, 14), 'continued reason', ...lines.slice(14)].join('\n')
+      : variant === 'missing gate' ? lines.filter((line) => !line.includes('red-main-freeze')).join('\n')
+      : `${LOG}\n${truncated}`;
+    const cancelled = { ...check, conclusion: 'CANCELLED' };
+    const subject = pr();
+    subject.statusCheckRollup[1] = cancelled;
+    const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ head_sha: HEAD })).mockReturnValueOnce(log);
+    const parsed = readMergeGateVerdict({ ...args, check: cancelled, exec });
+    const result = evaluatePr(subject, { mergeGateVerdict: parsed });
+    expect(result.ready).toBe(false);
+    expect(parsed).toHaveProperty('error');
+    expect(result.reasons.join('; ')).toContain('merge-gate verdict unreadable');
+  });
   it('reads job identity then the job log', () => {
     const exec = vi.fn().mockReturnValueOnce(JSON.stringify({ head_sha: HEAD })).mockReturnValueOnce(LOG);
     expect(readMergeGateVerdict({ ...args, exec })).toEqual(verdict());

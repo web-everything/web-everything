@@ -4,17 +4,18 @@ import { formatPrResult, parsePrResultTable, VERDICT_STATUSES, HUMAN_REVIEW_HOLD
 
 const row = (id, status = 'hold', reason = 'reason text') => ({ id, status, reason });
 const table = (results, ok = false) => formatPrResult({ num: 4965, ok, results });
+const complete = (overrides = []) => GATE_IDS.map((id) => overrides.find((result) => result.id === id) ?? row(id, 'pass'));
 
 describe('merge-gate verdict table', () => {
   it('round-trips every inventory row and emitted status without changing reason bytes', () => {
     const results = GATE_IDS.map((id, i) => row(id, VERDICT_STATUSES[i % VERDICT_STATUSES.length], '  reason — trailing  '));
     expect(parsePrResultTable(table(results), 4965)).toEqual({ num: 4965, ok: false, results });
-    const pass = [row('codeql', 'pass')];
+    const pass = complete();
     expect(parsePrResultTable(table(pass, true), 4965)).toEqual({ num: 4965, ok: true, results: pass });
   });
   it('strips Actions timestamps and selects the last exact PR header', () => {
-    const results = [row('review-acceptance')];
-    const log = `${table([row('codeql', 'pass')], true)}\n${table(results)}\nend\n#4966: PASS`;
+    const results = complete([row('review-acceptance')]);
+    const log = `${table(complete(), true)}\n${table(results)}\nend\n#4966: PASS`;
     expect(parsePrResultTable(log.split('\n').map((s, i) => `2026-10-12T09:49:30${i % 2 ? '.3934630' : ''}Z ${s}`).join('\n'), 4965))
       .toEqual({ num: 4965, ok: false, results });
   });
@@ -24,12 +25,18 @@ describe('merge-gate verdict table', () => {
     ['unknown status', table([row('codeql', 'unknown')])],
     ['unknown id', table([row('not-a-gate')])],
     ['duplicate id', table([row('codeql'), row('codeql')])],
-    ['PASS with hold', table([row('codeql')], true)],
-    ['PASS with fail-closed', table([row('codeql', 'fail-closed')], true)],
-    ['HOLD without blockers', table([row('codeql', 'pass')])],
+    ['PASS with hold', table(complete([row('codeql')]), true)],
+    ['PASS with fail-closed', table(complete([row('codeql', 'fail-closed')]), true)],
+    ['HOLD without blockers', table(complete())],
     ['last header empty', `${table([row('codeql')])}\n#4965: HOLD`],
   ])('fails closed: %s', (_, log) => {
     expect(parsePrResultTable(log, 4965)).toEqual({ error: expect.any(String) });
+  });
+  it.each(GATE_IDS)('rejects a table missing %s, including nonblocking gates', (missing) => {
+    const results = complete([row('review-acceptance')]).filter(({ id }) => id !== missing);
+    expect(parsePrResultTable(table(results), 4965)).toEqual({
+      error: `incomplete verdict for #4965: missing gates: ${missing}`,
+    });
   });
 });
 
