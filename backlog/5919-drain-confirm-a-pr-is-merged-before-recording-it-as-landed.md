@@ -1,4 +1,5 @@
 ---
+bornAs: xsvxy4v
 kind: story
 size: 3
 status: open
