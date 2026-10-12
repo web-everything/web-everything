@@ -256,9 +256,13 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
     const calls = [];
     await sink(calls, { diff: 'ops/review-requests/1496-accepted.json' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' })
       .catch(() => {});
-    const checkouts = calls.filter((c) => c.args?.[0] === 'checkout');
-    expect(checkouts.length).toBeGreaterThan(0);
-    for (const c of checkouts) expect(c.cwd).not.toBe('/repo');
+    const rootCalls = calls.filter((c) => c.args && c.cwd === '/repo');
+    expect(rootCalls.length).toBeGreaterThan(0);
+    for (const { args } of rootCalls) {
+      expect(['worktree', 'fetch', 'update-ref', 'merge-base', 'rev-parse', 'ls-remote', 'ls-tree']).toContain(args[0]);
+      if (args[0] === 'worktree') expect(['add', 'prune', 'remove', 'list']).toContain(args[1]);
+    }
+    expect(calls.some((c) => c.args?.[0] === 'commit' && c.cwd !== '/repo')).toBe(true);
   });
 
   it('always prunes the worktree, even when the push throws', async () => {
@@ -287,7 +291,7 @@ describe('the sink — a worktree, never a branch switch in the caller\'s lane',
     const calls = [];
     await sink(calls, { diff: 'x' })({ path: 'ops/review-requests/1496-accepted.json', content: '{}\n', pr: 1496, to: 'accepted', repo: 'web-everything/web-everything' });
     const push = calls.find((c) => c.args?.[0] === 'push');
-    expect(push.args).toContain(`HEAD:${TRANSPORT_BRANCH}`);
+    expect(push.args).toContain(`HEAD:refs/heads/${TRANSPORT_BRANCH}`);
   });
 });
 
@@ -525,7 +529,7 @@ describe('#3264 — board genesis, and a board that cannot apply is REFUSED', ()
     const d = drive({ heads: [MAIN_REF, BOARD_REF] });
     await d.stage(payload);
     expect(pushes(d.calls)).not.toContain(`refs/remotes/origin/${BOARD_SOURCE_BRANCH}:${BOARD_REF}`);
-    expect(pushes(d.calls)).toEqual([`HEAD:${TRANSPORT_BRANCH}`]);
+    expect(pushes(d.calls)).toEqual([`HEAD:refs/heads/${TRANSPORT_BRANCH}`]);
   });
 
   it('a similarly-named branch is NOT the board — a non-empty ls-remote is not an answer', async () => {
