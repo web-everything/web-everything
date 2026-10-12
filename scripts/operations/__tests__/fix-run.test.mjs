@@ -329,14 +329,14 @@ describe('runFixCli', () => {
     try {
       git('init', '--initial-branch=main');
       setup.base({ dir, git });
-      git('add', '-A'); git('commit', '-m', 'base');
+      git('add', '-A'); setup.baseIndex?.({ dir, git }); git('commit', '-m', 'base');
       git('checkout', '-b', 'target');
       setup.theirs({ dir, git });
-      git('add', '-A'); git('commit', '-m', 'theirs');
+      git('add', '-A'); setup.theirsIndex?.({ dir, git }); git('commit', '-m', 'theirs');
       git('update-ref', 'refs/remotes/origin/target', git('rev-parse', 'HEAD').trim());
       git('checkout', 'main');
       setup.ours({ dir, git });
-      git('add', '-A'); git('commit', '-m', 'ours');
+      git('add', '-A'); setup.oursIndex?.({ dir, git }); git('commit', '-m', 'ours');
       const m = mk([]);
       m.spawn.mockImplementation(async () => { agent({ dir }); return { finalMessage: 'resolved' }; });
       const run = (cmd, args, opts) => {
@@ -379,6 +379,32 @@ describe('runFixCli', () => {
       expect(m.spawn).not.toHaveBeenCalled();
       expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('a.dat(UU binary)') }));
       expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringContaining('b.txt(UU binary)') }));
+    });
+  });
+  it('judges the merge driver by the attributes HEAD had, not the ones the merge itself rewrote', async () => {
+    await withRealMerge({
+      base: ({ dir }) => { writeFileSync(join(dir, 'x.txt'), 'a\nb\nc\n'); writeFileSync(join(dir, '.gitattributes'), 'x.txt -merge\n'); },
+      theirs: ({ dir }) => { writeFileSync(join(dir, 'x.txt'), 'a\nb-theirs\nc\n'); writeFileSync(join(dir, '.gitattributes'), ''); },
+      ours: ({ dir }) => writeFileSync(join(dir, 'x.txt'), 'a\nb-ours\nc\n'),
+    }, { agent: () => {} }, async ({ out, m, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: 'conflict not resolvable by editing files: x.txt(UU binary)' }));
+    });
+  });
+  it('refuses symlink and gitlink (submodule) conflicts up front without throwing on the other paths', async () => {
+    const sha = (n) => String(n).repeat(40);
+    await withRealMerge({
+      base: ({ dir, git }) => { symlinkSync('one', join(dir, 'link')); writeFileSync(join(dir, 'file.txt'), 'base\n'); },
+      baseIndex: ({ git }) => git('update-index', '--add', '--cacheinfo', `160000,${sha(1)},sub`),
+      theirs: ({ dir, git }) => { rmSync(join(dir, 'link')); symlinkSync('theirs', join(dir, 'link')); writeFileSync(join(dir, 'file.txt'), 'theirs\n'); },
+      theirsIndex: ({ git }) => git('update-index', '--add', '--cacheinfo', `160000,${sha(2)},sub`),
+      ours: ({ dir, git }) => { rmSync(join(dir, 'link')); symlinkSync('ours', join(dir, 'link')); writeFileSync(join(dir, 'file.txt'), 'ours\n'); },
+      oursIndex: ({ git }) => git('update-index', '--add', '--cacheinfo', `160000,${sha(3)},sub`),
+    }, { agent: () => {} }, async ({ out, m, recordOutcome }) => {
+      expect(out.code).toBe(1);
+      expect(m.spawn).not.toHaveBeenCalled();
+      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ reason: expect.stringMatching(/link\(UU non-regular\).*sub\(UU non-regular\)|sub\(UU non-regular\).*link\(UU non-regular\)/) }));
     });
   });
   it('commits a resolved text conflict alongside a clean base deletion and rename', async () => {

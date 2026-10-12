@@ -210,28 +210,39 @@ export function changedPaths(porcelain) {
 const TEXT_MERGE_ATTRS = new Set(['unspecified', 'set', 'text', 'union']);
 const OID_RE = /^[0-9a-f]{40,64}$/;
 
+const MAX_CONFLICTED_PATHS = 100;
+const REGULAR_MODES = new Set(['100644', '100755']);
+
 /**
- * Which unmerged paths git merged as BINARY, i.e. left one side's bytes in the worktree with no conflict markers (so a
- * marker scan would call them resolved). `git diff --numstat` cannot tell: it prints `0\t0` for an unmerged path. Instead:
- * a `merge` attribute that is unset or names another driver, or any pair of the three index blobs that git diffs as binary
- * (NUL in the first 8000 bytes of either side — the same test its merge uses, on all of base/ours/theirs).
+ * Which unmerged paths an agent cannot resolve by editing one text file, though git leaves them with NO conflict markers
+ * (so a marker scan would call them resolved): `Map<path, 'binary' | 'non-regular'>`. `git diff --numstat` cannot tell
+ * (it prints `0\t0` for an unmerged path). Instead:
+ *   - non-regular: any stage is a symlink or gitlink (mode 120000/160000), or the stages disagree on mode;
+ *   - binary: a `merge` attribute that is unset or names another driver — read from BOTH the merged tree and HEAD, since
+ *     the merge may itself rewrite `.gitattributes` while git picked the driver from ours — or any pair of the three
+ *     index blobs that git diffs as binary (NUL in the first 8000 bytes of either side, as its own merge decides).
  */
 export function binaryConflictPaths(git, paths) {
-  const binary = new Set();
-  if (!paths.length) return binary;
-  const attrs = git('check-attr', '-z', 'merge', '--', ...paths).split('\0');
-  for (let i = 0; i + 2 < attrs.length; i += 3) if (!TEXT_MERGE_ATTRS.has(attrs[i + 2])) binary.add(attrs[i]);
+  const kinds = new Map();
+  if (!paths.length) return kinds;
+  if (paths.length > MAX_CONFLICTED_PATHS) throw new LauncherError(`too many conflicted files to classify (${paths.length} > ${MAX_CONFLICTED_PATHS})`);
+  for (const source of [[], ['--source=HEAD']]) {
+    const attrs = git('check-attr', ...source, '-z', 'merge', '--', ...paths).split('\0');
+    for (let i = 0; i + 2 < attrs.length; i += 3) if (!TEXT_MERGE_ATTRS.has(attrs[i + 2])) kinds.set(attrs[i], 'binary');
+  }
   const stages = new Map();
   for (const entry of git('ls-files', '-u', '-z', '--', ...paths).split('\0')) {
-    const m = /^\d+ ([0-9a-f]+) ([123])\t([\s\S]*)$/.exec(entry);
-    if (!m || !OID_RE.test(m[1])) continue;
-    stages.set(m[3], { ...stages.get(m[3]), [m[2]]: m[1] });
+    const m = /^(\d+) ([0-9a-f]+) ([123])\t([\s\S]*)$/.exec(entry);
+    if (!m || !OID_RE.test(m[2])) continue;
+    stages.set(m[4], { ...stages.get(m[4]), [m[3]]: { mode: m[1], oid: m[2] } });
   }
   for (const [path, s] of stages) {
-    const pairs = [[s[2], s[3]], [s[1], s[2]], [s[1], s[3]]].filter(([a, b]) => a && b && a !== b);
-    if (pairs.some(([a, b]) => git('diff', '--numstat', '--no-ext-diff', '--no-textconv', a, b).startsWith('-\t-\t'))) binary.add(path);
+    const present = Object.values(s);
+    if (present.some(x => !REGULAR_MODES.has(x.mode)) || new Set(present.map(x => x.mode)).size > 1) { kinds.set(path, 'non-regular'); continue; }
+    const pairs = [[s[2], s[3]], [s[1], s[2]], [s[1], s[3]]].filter(([a, b]) => a && b && a.oid !== b.oid);
+    if (pairs.some(([a, b]) => git('diff', '--numstat', '--no-ext-diff', '--no-textconv', a.oid, b.oid).startsWith('-\t-\t'))) kinds.set(path, 'binary');
   }
-  return binary;
+  return kinds;
 }
 
 /**
@@ -439,11 +450,11 @@ export async function runFixCli(argv = [], {
         // Only a text both-modified/both-added conflict can be resolved by editing one file. Anything else (binary,
         // modify/delete, rename) is aborted BEFORE the agent runs and recorded as failed; after ROUTED_CODEX_MAX_UNPRODUCTIVE such
         // consecutive unproductive runs on the same head, the next repair falls back to Claude.
-        const binary = binaryConflictPaths(git, conflicts.map(c => c.path));
-        const bad = conflicts.filter(c => !EDITABLE_CONFLICT_CODES.has(c.code) || binary.has(c.path));
+        const kinds = binaryConflictPaths(git, conflicts.map(c => c.path));
+        const bad = conflicts.filter(c => !EDITABLE_CONFLICT_CODES.has(c.code) || kinds.has(c.path));
         if (bad.length) {
           git('merge', '--abort');
-          throw new LauncherError(`conflict not resolvable by editing files: ${bad.map(c => `${c.path}(${binary.has(c.path) ? `${c.code} binary` : c.code})`).join(', ')}`);
+          throw new LauncherError(`conflict not resolvable by editing files: ${bad.map(c => `${c.path}(${kinds.has(c.path) ? `${c.code} ${kinds.get(c.path)}` : c.code})`).join(', ')}`);
         }
         unmerged = conflicts.map(c => c.path);
       }
