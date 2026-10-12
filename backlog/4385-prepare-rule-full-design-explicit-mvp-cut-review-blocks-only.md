@@ -5,6 +5,7 @@ size: 5
 priority: high
 status: open
 scope: ["we:agent-memory-src/story-preparation-checklist.md", "we:skills-src/conveyor/prepare-decision-agent-brief.md", "we:scripts/conveyor/run-rating.mjs", "we:scripts/conveyor/__tests__/run-rating.test.mjs", "we:docs/agent/backlog-workflow.md"]
+scopeRationale: "we:scripts/conveyor/run-scorecard-store.mjs is cited only as a no-change reference (it already passes unknown extra fields through, so Could A needs no schema migration), and we:skills-src/conveyor/prepare-item-agent-brief.md is Could C — a deferred follow-up, not built by this card's MVP. Neither file is edited here."
 dateOpened: "2026-09-28"
 preparedDate: "2026-10-12"
 preparedAgainstSha: "176afcf9341f8b320ac537e242891761687cb30f"
