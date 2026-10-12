@@ -66,13 +66,14 @@ export function defineDrainFollowupKind({ prepareWorktree, maxAttempts } = {}) {
  * @param {{passId?: string, landedLocal?: boolean, merged?: Array, landedItems?: Array, carriers?: Array,
  *   openHeadRefs?: Iterable}} o
  */
-export function buildFollowupInput({ passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false, passCwd = null } = {}) {
+export function buildFollowupInput({ numberingOnBranch = false, passId = null, landedLocal = false, merged = [], landedItems = [], carriers = [], openHeadRefs = [], primary = null, primaryHinted = false, passCwd = null } = {}) {
   return {
     // The operator's primary checkout to ff-sync once main has the follow-up commits (absent = nothing to sync).
     // `passCwd`: the pass's own checkout, which the pass already fast-forwards inline — the job must never pull it too.
     ...(primary ? { primary: String(primary), primaryHinted: !!primaryHinted, ...(passCwd ? { passCwd: String(passCwd) } : {}) } : {}),
     passId: passId == null ? null : String(passId),
     landedLocal: !!landedLocal,
+    ...(numberingOnBranch ? { numberingOnBranch: true } : {}),
     merged: (Array.isArray(merged) ? merged : []).filter((m) => m && m.num != null)
       .map((m) => ({ num: Number(m.num), repo: m.repo == null ? null : String(m.repo) })),
     landedItems: strList(landedItems),
@@ -155,7 +156,7 @@ export function followupSteps(deps) {
   return [
     {
       name: 'number-resolve-push',
-      run: ({ input }) => underNumberingLock(withNumberingLock, 'number-resolve-push', (heartbeat = () => {}) => {
+      run: ({ input }) => input.numberingOnBranch ? { skipped: 'numbering and resolve happen on the PR branch before enqueue' } : underNumberingLock(withNumberingLock, 'number-resolve-push', (heartbeat = () => {}) => {
         const baseSha = resetToRemoteTip({ exec, cwd });
         heartbeat();
         const n = numberPendingHashes(cwd);
