@@ -2587,7 +2587,7 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     return { state, trace, referralJudge, spawns, runOnce, records };
   }
 
-  it('NOT REPRODUCED: one verifier turn, one record that holds nothing, one advisory — and a second run on the same head asks nothing and posts nothing', async () => {
+  it('NOT REPRODUCED: one verifier turn, one record that holds nothing, one advisory — and a second run on the same head asks nothing and posts no new record or advisory', async () => {
     const w = world();
     const first = await w.runOnce('run-1', NOT_REPRODUCED);
     expect(w.spawns).toHaveLength(1);
@@ -2603,7 +2603,10 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(first.pending).toMatchObject({ kind: 'confirm', of: 'agent' });
     expect(first.verdict.verdict).not.toBe('needs-human');
     expect(first.verdict.findings.filter((f) => String(f.summary).includes('Unverified by a tool-bearing seat'))).toHaveLength(1);
-    const posted = w.state.comments.length;
+    const referralPosts = () => w.trace.filter((t) => t === 'referral').length;
+    const advisoryPosts = () => w.trace.filter((t) => t === 'advisory').length;
+    const [referralBefore, advisoryBefore] = [referralPosts(), advisoryPosts()];
+    expect(referralBefore).toBe(1);
 
     // The same tool-less seat re-raises the same claim on the same head: the REPRODUCED answer proves the verifier is never consulted.
     const second = await w.runOnce('run-2', REPRODUCED);
@@ -2613,7 +2616,9 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(w.records()).toHaveLength(1);
     expect(w.state.comments.filter((c) => c.body.includes('mandatory-referrals-v1'))).toHaveLength(1);
     expect(second.pending).toMatchObject({ kind: 'confirm' });
-    expect(w.state.comments.length).toBeGreaterThanOrEqual(posted);
+    // exactly: no second referral record, and no repeat of the advisory either
+    expect(referralPosts()).toBe(referralBefore);
+    expect(advisoryPosts()).toBe(advisoryBefore);
 
     // A NEW head is a new claim: it is verified again and a fresh record is written for it.
     w.state.headRefOid = H2;
@@ -2636,10 +2641,11 @@ describe('#4815 the confirmation turn end to end (synthetic #3432-shaped replay)
     expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
     expect(w.state.labels).toEqual(['review:human']);
 
+    const recordPosts = w.trace.filter((t) => t === 'referral').length;
     await w.runOnce('run-2', NOT_REPRODUCED);
     expect(w.spawns).toHaveLength(1);
     expect(w.referralJudge).toHaveBeenCalledTimes(1);
-    expect(w.state.comments.filter((c) => c.body.includes('mandatory-referrals-v1')).length).toBeGreaterThanOrEqual(1);
+    expect(w.trace.filter((t) => t === 'referral').length).toBe(recordPosts);
     expect(() => assertMandatoryReferralsCleared(w.state, { repo: 'o/n', pr: 7 })).toThrow(/mandatory referral hold/);
   });
 

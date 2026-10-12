@@ -4,7 +4,7 @@ import { normalizeFinding, referralRecordState, referralFindingKey, mandatoryRef
   readReferralRecords, mandatoryReferralState, renderReferralRecord, readOperatorRulings,
   findCarriedOperatorRuling, findCarriedReviewerRuling, exactCitedPath, REFERRAL_CARRY_REASON, activeReferrals, liveReferrals, findSupersedingNotReal, REFERRAL_SUPERSEDE_REASON, REFERRAL_DROP_REASON,
   findingIdentityTable, findingIdOf, findingIdentityPromptRows, sameAsLinkAllowed, FINDING_ID_PATTERN, FINDING_SAME_AS_MANDATE,
-  requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, VERIFY_REASON_MAX } from '../lib/jury-core.mjs';
+  requiresMandatoryReferral, REFERRAL_VERIFY_OUTCOMES, foldVerifyReason } from '../lib/jury-core.mjs';
 import { judgeSpawn } from '../lib/judge-spawn.mjs';
 import { appendJuryEvent } from '../lib/jury-ledger.mjs';
 import { decideParkToHuman, referralCardReadable } from '../review-set-label.mjs';
@@ -988,7 +988,7 @@ export function createReviewPrSinks({
           if (v.outcome !== 'not-reproduced' || recordedKeys.has(key) || additions.has(key)) continue;
           const original = boundedReferral(v.original, sourceByOriginal.get(JSON.stringify(v.original)) ?? prUrl);
           retiredAdditions.set(key, { key, seat: v.seat, original, finding: normalizeFinding(original),
-            reason: String(v.reason ?? '').replace(/\s+/g, ' ').trim().slice(0, VERIFY_REASON_MAX) || 'not reproduced on the PR head' });
+            reason: foldVerifyReason(v.reason, 'not reproduced on the PR head') });
         }
         if (additions.size || retiredAdditions.size) {
           const chunks = [];

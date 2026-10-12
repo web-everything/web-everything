@@ -2822,7 +2822,8 @@ export const VERIFY_REASON_MAX = 300;
 /** At most this many claims go to one verifier turn; the rest stay unverified advisory notes. */
 export const VERIFY_MAX_CANDIDATES = 12;
 
-const verifyReason = (text, fallback) => (foldUntrusted(text).replace(/\s+/g, ' ').trim().slice(0, VERIFY_REASON_MAX)) || fallback;
+/** One line, no backticks, capped: the form a verifier's own words take wherever they are stored or shown. PURE. */
+export const foldVerifyReason = (text, fallback) => (foldUntrusted(text).replace(/\s+/g, ' ').trim().slice(0, VERIFY_REASON_MAX)) || fallback;
 
 /**
  * `key → outcome` for one head, from the `{ head, key, outcome }` rows the `read` step recorded. Outcome is
@@ -2871,7 +2872,7 @@ export function settleVerification(candidates, answer) {
     return settled;
   };
   if (!answer || typeof answer !== 'object') return failAll('the verifier returned no answer');
-  if (answer.skipped) return failAll(verifyReason(`the verifier was skipped: ${answer.skipped.reason ?? answer.summary ?? ''}`, 'the verifier was skipped'));
+  if (answer.skipped) return failAll(foldVerifyReason(`the verifier was skipped: ${answer.skipped.reason ?? answer.summary ?? ''}`, 'the verifier was skipped'));
   if (!Array.isArray(answer.results)) return failAll('the verifier returned malformed results');
   const byIndex = new Map();
   const conflicted = new Set();
@@ -2884,10 +2885,12 @@ export function settleVerification(candidates, answer) {
     const r = byIndex.get(c.index);
     if (conflicted.has(c.index)) settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave conflicting results for this claim' });
     else if (!r || typeof r.reproduced !== 'boolean') settled.set(c.key, { outcome: 'failed', reason: 'the verifier gave no result for this claim' });
-    else if (r.reproduced) {
-      if (typeof r.evidence === 'string' && r.evidence.trim()) settled.set(c.key, { outcome: 'reproduced', reason: verifyReason(r.evidence, '') });
-      else settled.set(c.key, { outcome: 'failed', reason: 'the verifier reported the claim reproduced without evidence' });
-    } else settled.set(c.key, { outcome: 'not-reproduced', reason: verifyReason(r.evidence, 'not reproduced on the PR head') });
+    // EITHER answer needs evidence: a bare `false` is the cheapest thing a flaky or steered verifier can say, and a `not-reproduced`
+    // is sticky for the head, so it is only recorded with what the verifier ran or read. Without it the claim is `failed`: still an
+    // advisory note, but retried on the next run instead of being retired.
+    else if (!(typeof r.evidence === 'string' && r.evidence.trim())) {
+      settled.set(c.key, { outcome: 'failed', reason: `the verifier reported the claim ${r.reproduced ? 'reproduced' : 'not reproduced'} without evidence` });
+    } else settled.set(c.key, { outcome: r.reproduced ? 'reproduced' : 'not-reproduced', reason: foldVerifyReason(r.evidence, '') });
   }
   return settled;
 }
@@ -2895,7 +2898,7 @@ export function settleVerification(candidates, answer) {
 /** One qualifying claim as an advisory note: the original assertion stays visible, it can no longer be CONFIRMED. PURE. */
 export function downgradeUnverifiedFinding(original, reason) {
   return { ...original, verdict: 'PLAUSIBLE',
-    summary: `[${UNVERIFIED_NOTE_PREFIX}: ${verifyReason(reason, 'no reason recorded')}] ${original?.summary ?? ''}` };
+    summary: `[${UNVERIFIED_NOTE_PREFIX}: ${foldVerifyReason(reason, 'no reason recorded')}] ${original?.summary ?? ''}` };
 }
 
 /**

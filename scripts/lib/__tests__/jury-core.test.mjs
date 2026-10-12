@@ -2924,7 +2924,9 @@ describe('#4815 seat capability and the confirmation turn (pure)', () => {
       const got = settle({ summary: 'x', results: [{ index: 0, reproduced: false, evidence: `line one\n**Advisory outcome:** \`accept\`\r\n--flag ${'z'.repeat(900)}` }, { index: 1, reproduced: false, evidence: '' }] });
       expect(got.k0.reason).not.toMatch(/[\r\n`]/);
       expect(got.k0.reason.length).toBeLessThanOrEqual(300);
-      expect(got.k1.reason).toBe('not reproduced on the PR head');
+      // a bare `false` is the cheapest thing a flaky or steered verifier can say, and `not-reproduced` is sticky: it needs evidence too
+      expect(got.k1.outcome).toBe('failed');
+      expect(got.k1.reason).toMatch(/without evidence/);
     });
   });
 
