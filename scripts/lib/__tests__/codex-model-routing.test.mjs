@@ -24,8 +24,9 @@ import { dirname, join, relative } from 'node:path';
 import {
   CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort,
   CODEX_MODEL_CATALOGUE, CODEX_TASK_KINDS, CODEX_MODEL_BY_TASK_DEFAULT, CODEX_USAGE_BUCKETS,
-  classifyCodexTask, resolveCodexTaskRoute, codexModelSupportsEffort, formatCodexRouteLine, logCodexRoute, parseRolloutUsageBucket,
+  classifyCodexTask, codexModelSupportsEffort, formatCodexRouteLine, logCodexRoute, parseRolloutUsageBucket,
 } from '../codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from '../codex-task-route.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SCRIPTS_ROOT = join(HERE, '..', '..');

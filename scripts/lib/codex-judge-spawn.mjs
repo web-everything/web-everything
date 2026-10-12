@@ -87,7 +87,8 @@ import {
 import { tmpdir, homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { CODEX_EFFORT_MAP, CODEX_MODEL, assertCodexModel, resolveCodexTaskRoute } from './codex-model-routing.mjs';
+import { CODEX_EFFORT_MAP, CODEX_MODEL, assertCodexModel } from './codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from './codex-task-route.mjs';
 import { JUDGE_TIMEOUT_GRACE_MS, JUDGE_TIMEOUT_MS, JudgeTimeoutError } from './judge-spawn.mjs';
 // #3383 mechanical-dispatcher Bug 2 fix — THE missing run-quality recording call for the advisory-review
 // judge seat: `appendScorecard` (`we:scripts/conveyor/run-scorecard-store.mjs`) had zero real callers before

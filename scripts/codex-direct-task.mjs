@@ -95,8 +95,9 @@ import { dirname, join, resolve } from 'node:path';
 import { admissionLockRoot } from './readiness/heavy-admission.mjs';
 
 import {
-  CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, resolveCodexTaskRoute, parseRolloutUsageBucket,
+  CODEX_EFFORT_MAP, CODEX_MODEL, CODEX_TIER_EFFORT, assertCodexModel, resolveCodexEffort, parseRolloutUsageBucket,
 } from './lib/codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from './lib/codex-task-route.mjs';
 
 // ── constants ─────────────────────────────────────────────────────────────────────────────────────
 export const CODEX_CLI = 'codex';

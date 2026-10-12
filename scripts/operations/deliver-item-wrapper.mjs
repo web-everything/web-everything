@@ -93,7 +93,7 @@
  *      remains the DEFAULT (see `DEFAULT_DELIVERY_AGENT_PROVIDER_NAME`); Codex is opt-in by name, and the
  *      operator chose to build it ahead of `#3581`'s ratified reviewer-first sequencing gate knowingly.
  */
-import { resolveCodexTaskRoute } from '../lib/codex-model-routing.mjs';
+import { resolveCodexTaskRoute } from '../lib/codex-task-route.mjs';
 import { machinePrTitle, readMainCard } from './machine-pr-title.mjs';
 import { randomUUID } from 'node:crypto';
 import { admissionLockRoot } from '../readiness/heavy-admission.mjs';
