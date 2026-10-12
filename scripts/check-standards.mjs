@@ -785,7 +785,7 @@ if (!LOCAL_MODE) {
   if (isMergeGroupCiRun()) {
     if (setting.value) {
       try {
-        const tracked = execFileSync('git', ['ls-files', 'backlog/'], { cwd: ROOT, encoding: 'utf8' });
+        const tracked = readdirSync(join(ROOT, 'backlog')).map((f) => `backlog/${f}`);
         for (const file of hashBacklogFiles(tracked)) err(`Backlog file "${file}" would land on main with a NON-NUMERIC leading id — the drain numbers cards on the PR branch before enqueue (mergeQueue.numberCardsBeforeEnqueue); this merge group is refused so main never goes red on it`);
       } catch (e) { err(`Cannot inspect merge group backlog for non-numeric ids: ${e.message}`); }
     }
