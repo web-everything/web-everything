@@ -11,7 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import {
   dispatchFix, fetchCardScopeAtRef, fetchPrDiffPaths, isDiffTooLargeError, PermanentScopeReadError, fetchPrDiffScope, fixBriefPath, freeLaneNumbers, isSafeFallbackScopeEntry, planFixesFromReconcile, runReconcileFixDispatch,
-  findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims,
+  findResumeCandidate, buildResumePrompt, tryResumeFix, filterFixesByInFlightScope, dropTerminalFixClaims, routeFixExecutor,
 } from '../reconcile-fix-dispatch.mjs';
 import { CONFLICT_LABEL } from '../parked-pr-conflict-watch.mjs';
 import { DISPATCHED_AGENT_SYSTEM_PROMPT_FILE, dispatchSessionCwd } from '../../operations/dispatch-lane-io.mjs';
@@ -1890,5 +1890,16 @@ describe('fix dispatch staleness contract', () => {
       if (previous === undefined) delete process.env.WE_DAEMON_MANAGED_CLONE;
       else process.env.WE_DAEMON_MANAGED_CLONE = previous;
     }
+  });
+});
+
+describe('routed Codex fallback', () => {
+  it('routes repeated unproductive Codex repairs to Claude for this head only', () => {
+    const planned = { repo: 'fui', pr: 7, isConflict: true, headRefOid: 'abc' };
+    const readRouted = vi.fn(() => ({ 'fui#7': [{ head: 'abc', outcome: 'failed' }, { head: 'abc', outcome: 'no-change' }] }));
+    const options = { launcherAvailable: true, readRouted };
+    expect(routeFixExecutor(planned, options)).toMatchObject({ executor: 'claude' });
+    expect(readRouted).toHaveBeenCalledWith({ repo: 'fui', pr: 7 });
+    expect(routeFixExecutor({ ...planned, headRefOid: 'new' }, options)).toMatchObject({ executor: 'codex' });
   });
 });

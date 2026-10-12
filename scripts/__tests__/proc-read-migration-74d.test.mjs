@@ -18,10 +18,14 @@ let savedPath;
 let savedMode;
 let savedOut;
 
-// FAKE_OUT is the stdout line; FAKE_PAD appends BIG bytes of whitespace; FAKE_FAIL exits 1.
+// FAKE_OUT is the stdout line (FAKE_RULES_OUT instead, when set, for a branch-rules API read); FAKE_PAD appends
+// BIG bytes of whitespace; FAKE_FAIL exits 1.
 const shim = `#!/bin/sh
 [ -n "$FAKE_FAIL" ] && { echo boom >&2; exit 1; }
-printf '%s' "$FAKE_OUT"
+case "$*" in
+  */rules/*) printf '%s' "\${FAKE_RULES_OUT:-$FAKE_OUT}" ;;
+  *) printf '%s' "$FAKE_OUT" ;;
+esac
 [ -n "$FAKE_PAD" ] && head -c ${BIG} /dev/zero | tr '\\0' ' '
 exit 0
 `;
@@ -36,12 +40,13 @@ beforeAll(() => {
 });
 afterAll(() => {
   process.env.PATH = savedPath;
-  for (const k of ['FAKE_FAIL', 'FAKE_OUT', 'FAKE_PAD']) delete process.env[k];
+  for (const k of ['FAKE_FAIL', 'FAKE_OUT', 'FAKE_RULES_OUT', 'FAKE_PAD']) delete process.env[k];
   rmSync(dir, { recursive: true, force: true });
 });
 
-const fake = ({ out = '', pad = false, fail = false }) => {
+const fake = ({ out = '', rulesOut = '', pad = false, fail = false }) => {
   process.env.FAKE_OUT = out;
+  if (rulesOut) process.env.FAKE_RULES_OUT = rulesOut; else delete process.env.FAKE_RULES_OUT;
   if (pad) process.env.FAKE_PAD = '1'; else delete process.env.FAKE_PAD;
   if (fail) process.env.FAKE_FAIL = '1'; else delete process.env.FAKE_FAIL;
 };
@@ -67,7 +72,9 @@ describe('#74d migrated readers: oversize completes, failure is never empty', ()
 
   it('required-status-checks: oversize valid JSON parses; failure throws, never []', async () => {
     const { defaultReadRequiredStatusChecks } = await import('../lib/required-status-checks.mjs');
-    fake({ out: '["test"]', pad: true });
+    // Rules (one empty page) and the classic set off the branch body are both read, each padded past 1 MiB.
+    const branch = JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: { contexts: ['test'] } } });
+    fake({ out: branch, rulesOut: '[[]]', pad: true });
     expect(defaultReadRequiredStatusChecks({ repo: 'a/b' })).toEqual(['test']);
     fake({ fail: true });
     expect(() => defaultReadRequiredStatusChecks({ repo: 'a/b' })).toThrow();

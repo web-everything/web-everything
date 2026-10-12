@@ -7,11 +7,15 @@
  * daemons make resolves against real git.
  */
 
+import { FALLBACK_REQUIRED_STATUS_CHECKS } from '../../lib/required-status-checks.mjs';
+
 /** @typedef {{key:string, owes:(null|'review'|'fix'|'ci-heal'), pr:number, note:string}} FleetPr */
 
 // The branch-protection required set the fake GitHub serves (the live set, `required-status-checks.mjs`'s
 // fallback). A PR owes a review only once EVERY required check succeeded on its head, so GREEN covers them all.
-const REQUIRED = ['test', 'smoke', 'daemon-soak'];
+// Derived from the fallback, never retyped: `pr-state-io.mjs` reads the declared fallback when the fake `gh` serves no
+// `protection/required_status_checks`, so a hand-copied set goes stale the moment the fallback changes.
+const REQUIRED = [...FALLBACK_REQUIRED_STATUS_CHECKS];
 const GREEN = REQUIRED.map((name) => ({ name, conclusion: 'SUCCESS' }));
 const RED = [{ name: 'test', conclusion: 'FAILURE' }];
 

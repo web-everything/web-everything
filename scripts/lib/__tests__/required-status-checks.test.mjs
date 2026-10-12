@@ -16,7 +16,7 @@ vi.mock('node:child_process', async (importOriginal) => {
   return { ...actual, spawnSync, execFileSync, default: { ...actual.default, spawnSync, execFileSync } };
 });
 import { execFileSync, spawnSync } from 'node:child_process';
-import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
+import { getRequiredStatusChecks, defaultReadRequiredStatusChecks, requiredChecksFromRules, FALLBACK_REQUIRED_STATUS_CHECKS } from '../required-status-checks.mjs';
 
 describe('getRequiredStatusChecks', () => {
   let dir;
@@ -101,7 +101,7 @@ describe('getRequiredStatusChecks', () => {
   it.each([
     ['plateauapp/plateau-app', ['test', 'e2e']],
     ['frontier-ui/frontierui', ['test']],
-    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak', 'integration']],
+    ['web-everything/web-everything', ['test', 'smoke', 'daemon-soak', 'soak-replay-gate']],
   ])('caches the declared set for %s on a plan-feature 403, then retries after TTL', (repo, checks) => {
     const readChecks = vi.fn(plan403);
     expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, ttlMs: 1000, readChecks }))
@@ -246,6 +246,29 @@ describe('getRequiredStatusChecks', () => {
   });
 });
 
+const requiredRule = (...contexts) => ({ type: 'required_status_checks', parameters: {
+  required_status_checks: contexts.map(context => ({ context, integration_id: 15368 })),
+} });
+/** A `GET repos/{repo}/branches/{branch}` body whose classic protection requires `contexts`. */
+const classicBranch = (...contexts) => JSON.stringify({ name: 'main', protected: true, protection: {
+  enabled: true, required_status_checks: { enforcement_level: 'non_admins', contexts, checks: [] },
+} });
+
+describe('requiredChecksFromRules', () => {
+  it('unions required rules, deduplicating contexts and ignoring other rule types', () => {
+    expect(requiredChecksFromRules([
+      requiredRule('test', 'smoke', 'test'),
+      { ...requiredRule('ignored'), type: 'pull_request' },
+      requiredRule('smoke', 'daemon-soak'),
+      { type: 'deletion' },
+    ])).toEqual(['test', 'smoke', 'daemon-soak']);
+  });
+  it('returns no contexts when there are no required checks', () => {
+    expect(requiredChecksFromRules([])).toEqual([]);
+    expect(requiredChecksFromRules([{ type: 'deletion' }, requiredRule()])).toEqual([]);
+  });
+});
+
 describe('defaultReadRequiredStatusChecks', () => {
   let dir;
   beforeEach(() => {
@@ -256,19 +279,313 @@ describe('defaultReadRequiredStatusChecks', () => {
   });
   afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
-  it('routes the protection read through the real throttle personal read path when enabled', () => {
+  // GitHub enforces rulesets AND classic protection together, so the required set is their union (PR #4924).
+  const bothSources = (rules, protection) => vi.fn(args => {
+    const reply = args.some(a => a.includes('/rules/')) ? rules : protection;
+    if (reply instanceof Error) throw reply;
+    return reply;
+  });
+  const UNPROTECTED = JSON.stringify({ name: 'main', protected: false });
+
+  it('unions ruleset and classic-protection checks: a classic-only check is never dropped', () => {
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke', 'test')]]), classicBranch('test', 'classic-only'));
+    expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', branch: 'release', gh })).toEqual(['smoke', 'test', 'classic-only']);
+    expect(gh.mock.calls).toEqual([
+      [['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/release?per_page=100']],
+      [['api', 'repos/owner/repo/branches/release']],
+    ]);
+  });
+
+  // Live 2026-10-11: the App token gets `Resource not accessible by integration (HTTP 403)` on `…/protection`, but
+  // `GET …/branches/main` returns this shape — so the classic set is read from the branch, never skipped on a 403.
+  it('reads classic checks off the branch body (contexts ∪ checks[].context) — the App-token-readable endpoint', () => {
+    const live = JSON.stringify({ name: 'main', protected: true, protection: { enabled: true, required_status_checks: {
+      enforcement_level: 'non_admins', contexts: ['test', 'smoke'],
+      checks: [{ app_id: 15368, context: 'test' }, { app_id: 15368, context: 'checks-only' }],
+    } } });
+    const gh = bothSources(JSON.stringify([[requiredRule('test', 'soak-replay-gate')]]), live);
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['test', 'soak-replay-gate', 'smoke', 'checks-only']);
+  });
+
+  it.each([
+    ['an unprotected branch', UNPROTECTED],
+    ['ruleset-only protection (classic disabled)', JSON.stringify({ protected: true, protection: { enabled: false,
+      required_status_checks: { enforcement_level: 'off', contexts: [], checks: [] } } })],
+    ['classic protection that requires no status checks', JSON.stringify({ protected: true, protection: { enabled: true } })],
+    ['null contexts', JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: { contexts: null } } })],
+  ])('keeps the ruleset set alone for %s', (_label, branchBody) => {
+    const gh = bothSources(JSON.stringify([[requiredRule('test', 'smoke', 'test')]]), branchBody);
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['test', 'smoke']);
+  });
+
+  // Live 2026-10-11 bodies: frontierui is ruleset-protected with no check rule; plateau-app is unprotected. Two
+  // successful reads that require nothing are an authoritative "nothing required" — the declared policy, cached
+  // as `declared` like a protection denial, never the untrusted `fallback` the review gate refuses.
+  it.each([
+    ['frontier-ui/frontierui', JSON.stringify([[{ type: 'deletion' }, { type: 'non_fast_forward' }]]),
+      JSON.stringify({ protected: true, protection: { enabled: false, required_status_checks: { checks: [], contexts: [], enforcement_level: 'off' } } }),
+      ['test']],
+    ['plateauapp/plateau-app', '[[]]',
+      JSON.stringify({ protected: false, protection: { enabled: false, required_status_checks: { checks: [], contexts: [], enforcement_level: 'off' } } }),
+      ['test', 'e2e']],
+  ])('%s: nothing required by either source selects the declared policy', (repo, rules, branchBody, declared) => {
+    const cachePath = join(dir, 'cache.json');
+    const gh = bothSources(rules, branchBody);
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
+    expect(() => readChecks({ repo })).toThrow(expect.objectContaining({ noRequiredChecks: true }));
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks })).toEqual({ checks: declared, source: 'declared' });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1001, readChecks })).toEqual({ checks: declared, source: 'declared' });
+  });
+
+  it('nothing required never clobbers a live cache entry (stale-cache, file untouched)', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'frontier-ui/frontierui';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test'] });
+    const gh = bothSources('[[]]', UNPROTECTED);
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    })).toMatchObject({ checks: ['test'], source: 'stale-cache' });
+  });
+
+  it('drops blank or non-string classic contexts instead of turning them into check names', () => {
+    const body = JSON.stringify({ protected: true, protection: { enabled: true, required_status_checks: {
+      contexts: ['', null, 7, 'real'], checks: [{ context: '' }, null, {}] } } });
+    expect(defaultReadRequiredStatusChecks({ gh: bothSources('[[]]', body) })).toEqual(['real']);
+  });
+
+  it.each([
+    ['a transient failure', new Error('HTTP 502')],
+    ['a rate-limit 403', new Error('HTTP 403: API rate limit exceeded')],
+    ['an access 403', new Error('HTTP 403: Resource not accessible by integration')],
+    ['a 404', new Error('gh: Not Found (HTTP 404)')],
+    ['a blank body', ''],
+    ['an array body', '["classic"]'],
+    ['a protected branch whose protection is hidden', JSON.stringify({ protected: true })],
+    ['a non-object required_status_checks', JSON.stringify({ protected: true, protection: { required_status_checks: 'x' } })],
+  ])('a nonempty ruleset never stands alone as live when the classic read hits %s', (_label, protection) => {
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke')]]), protection);
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('keeps an expired live cache when rules succeed but classic protection fails transiently', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['smoke', 'classic-only'] });
+    const gh = bothSources(JSON.stringify([[requiredRule('smoke')]]), new Error('HTTP 502'));
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    })).toMatchObject({ checks: ['smoke', 'classic-only'], source: 'stale-cache' });
+  });
+
+  it('reads EVERY rules page: a required check on page two is not dropped', () => {
+    const page1 = [requiredRule('test'), ...Array.from({ length: 29 }, () => ({ type: 'deletion' }))];
+    const page2 = [requiredRule('security-scan')];
+    // `gh api --paginate --slurp` prints one array of pages
+    const gh = bothSources(JSON.stringify([page1, page2]), UNPROTECTED);
+    expect(defaultReadRequiredStatusChecks({ repo: 'owner/repo', gh })).toEqual(['test', 'security-scan']);
+    expect(gh.mock.calls[0]).toEqual([['api', '--paginate', '--slurp', 'repos/owner/repo/rules/branches/main?per_page=100']]);
+  });
+
+  it('treats a blank rules response as a failed read, never as "no rules"', () => {
+    const gh = vi.fn().mockReturnValueOnce('').mockReturnValueOnce(classicBranch('classic'));
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('treats a blank classic-protection body as a failed read, never as "no checks"', () => {
+    const gh = vi.fn().mockReturnValueOnce('[[]]').mockReturnValueOnce('');
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('falls through to classic protection when the single rules page is empty', () => {
+    const gh = vi.fn().mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('classic'));
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+  });
+
+  it('rejects a non-array rules body', () => {
+    const gh = vi.fn().mockReturnValueOnce('{"message":"x"}').mockReturnValueOnce(classicBranch('classic'));
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('rejects a rules response that mixes pages and bare rules', () => {
+    const gh = vi.fn().mockReturnValueOnce(JSON.stringify([[requiredRule('test')], requiredRule('x')])).mockReturnValueOnce(classicBranch('classic'));
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow();
+  });
+
+  it('falls back to classic protection when rules are empty', () => {
+    const gh = vi.fn().mockReturnValueOnce('[]').mockReturnValueOnce(classicBranch('classic'));
+    expect(defaultReadRequiredStatusChecks({ gh })).toEqual(['classic']);
+    expect(gh.mock.calls).toEqual([
+      [['api', '--paginate', '--slurp', 'repos/{owner}/{repo}/rules/branches/main?per_page=100']],
+      [['api', 'repos/{owner}/{repo}/branches/main']],
+    ]);
+  });
+
+  it.each([
+    ['HTTP 403: Resource not accessible by integration', 'HTTP 403: Resource not accessible by integration', 'declared'],
+    ['HTTP 502', 'HTTP 403: Resource not accessible by integration', 'fallback'],
+    ['HTTP 403: API rate limit exceeded', 'HTTP 403: Resource not accessible by integration', 'fallback'],
+    ['HTTP 403: Resource not accessible by integration', 'HTTP 502', 'fallback'],
+  ])('preserves error classification: rules %s, protection %s', (rulesMessage, protectionMessage, source) => {
+    const rulesError = new Error(rulesMessage);
+    const protectionError = new Error(protectionMessage);
+    const gh = vi.fn(args => { throw args.some(a => a.includes('/rules/')) ? rulesError : protectionError; });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
+    expect(() => readChecks({})).toThrow(source === 'fallback' && !rulesMessage.includes('Resource not accessible') ? rulesError : protectionError);
+    expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath: join(dir, 'cache.json'), readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source });
+    if (source === 'fallback') expect(existsSync(join(dir, 'cache.json'))).toBe(false);
+  });
+
+  it.each(['HTTP 403: Resource not accessible by integration', 'HTTP 502'])('preserves rules failure when protection is empty: %s', message => {
+    const error = new Error(message);
+    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce(UNPROTECTED);
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
+  });
+
+  it('replaces an expired live cache with a successful rules read', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['old-check'] });
+    const gh = bothSources(JSON.stringify([[requiredRule(...FALLBACK_REQUIRED_STATUS_CHECKS)]]), UNPROTECTED);
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    })).toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
+      checks: [...FALLBACK_REQUIRED_STATUS_CHECKS], source: 'live', fetchedAtMs: 90_000_000,
+    });
+    expect(gh).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates a transient rules failure even when classic protection succeeds', () => {
+    const error = new Error('HTTP 502');
+    const gh = vi.fn().mockImplementationOnce(() => { throw error; }).mockReturnValueOnce(classicBranch('classic'));
+    expect(() => defaultReadRequiredStatusChecks({ gh })).toThrow(error);
+  });
+
+  // An unreadable ruleset does not mean its requirements disappeared (red-team break on PR #4924): a rules ACCESS
+  // denial never returns the classic set as live — it stays a denial, carrying the classic set as a partial floor.
+  const rulesDenied = classic => vi.fn()
+    .mockImplementationOnce(() => { throw new Error('HTTP 403: Resource not accessible by integration'); })
+    .mockReturnValueOnce(classic);
+
+  it('a rules access denial is never a live result, even when classic protection is readable', () => {
+    expect(() => defaultReadRequiredStatusChecks({ gh: rulesDenied(classicBranch('classic')) }))
+      .toThrow(expect.objectContaining({ message: 'HTTP 403: Resource not accessible by integration', partialChecks: ['classic'] }));
+  });
+
+  it('a rules access denial keeps an expired live cache (ruleset-only check kept, file untouched) and the review gate still refuses its red', async () => {
+    const { readReviewCiGate } = await import('../review-ci-gate-io.mjs');
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('test')) });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000, readChecks }))
+      .toMatchObject({ checks: ['test', 'security-scan'], source: 'stale-cache' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
+      checks: ['test', 'security-scan'], source: 'live', fetchedAtMs: 1000,
+    });
+    const now = Date.now();
+    getRequiredStatusChecks({ repo, cachePath, now, readChecks: () => ['test', 'security-scan'] });
+    const gate = readReviewCiGate({ repo, pr: 1, readHead: () => 'a'.repeat(40),
+      readRequired: o => getRequiredStatusChecks({ ...o, cachePath, now: now + 1, readChecks }),
+      readChecks: () => [
+        { name: 'test', status: 'completed', conclusion: 'success' },
+        { name: 'security-scan', status: 'completed', conclusion: 'failure' },
+      ],
+    });
+    expect(gate).toMatchObject({ allowed: false, source: 'stale-cache' });
+  });
+
+  it('a rules access denial with no cache selects the declared policy, still requiring every classic check', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('test', 'classic-only')) });
+    const expected = { checks: [...FALLBACK_REQUIRED_STATUS_CHECKS, 'classic-only'], source: 'declared' };
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks })).toEqual(expected);
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({ ...expected, fetchedAtMs: 1000 });
+  });
+
+  // The same break with the sources swapped: a readable ruleset behind a classic denial is a floor too.
+  it('a classic access denial behind a readable ruleset keeps every ruleset check on top of the declared policy', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    const gh = () => bothSources(JSON.stringify([[requiredRule('test', 'security-scan')]]),
+      new Error('HTTP 403: Resource not accessible by integration'));
+    expect(() => defaultReadRequiredStatusChecks({ gh: gh() }))
+      .toThrow(expect.objectContaining({ partialChecks: ['test', 'security-scan'] }));
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: gh() });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS, 'security-scan'], source: 'declared' });
+  });
+
+  it('a denial behind a live cache adds the readable source\'s checks to the stale-cache result, file untouched', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'security-scan'] });
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: rulesDenied(classicBranch('test', 'new-classic')) });
+    expect(getRequiredStatusChecks({ repo, cachePath, now: 90_000_000, readChecks }))
+      .toMatchObject({ checks: ['test', 'security-scan', 'new-classic'], source: 'stale-cache' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`].checks).toEqual(['test', 'security-scan']);
+  });
+
+  it('a transient rules failure with no cache keeps the readable classic set on top of the fallback', () => {
+    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce(classicBranch('classic-only'));
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh });
+    expect(getRequiredStatusChecks({ repo: 'web-everything/web-everything', cachePath: join(dir, 'cache.json'), readChecks }))
+      .toEqual({ checks: [...FALLBACK_REQUIRED_STATUS_CHECKS, 'classic-only'], source: 'fallback' });
+  });
+
+  it('a rules read that throws a falsy value is still a failed read, never a classic-only live set', () => {
+    const gh = vi.fn().mockImplementationOnce(() => { throw undefined; }).mockReturnValueOnce(classicBranch('classic'));
+    let threw = false;
+    try { defaultReadRequiredStatusChecks({ gh }); } catch { threw = true; }
+    expect(threw).toBe(true);
+  });
+
+  // With no base set, an empty set means "count every observed check": a partial set would narrow that and drop a
+  // ruleset-only red for source-blind readers (`reduceCheckState`, `ciFailed`), so it is never returned alone.
+  it.each([
+    ['a rules access denial', () => rulesDenied(classicBranch('classic')), 'fallback'],
+    ['a transient rules failure', () => vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); })
+      .mockReturnValueOnce(classicBranch('classic')), 'unavailable'],
+  ])('%s on an undeclared repo with no cache returns the empty "count everything" set, never the partial one', (_label, gh, source) => {
+    const cachePath = join(dir, 'cache.json');
+    const readChecks = options => defaultReadRequiredStatusChecks({ ...options, gh: gh() });
+    expect(getRequiredStatusChecks({ repo: 'owner/undeclared', cachePath, now: 1000, readChecks }))
+      .toEqual({ checks: [], source });
+    expect(existsSync(cachePath)).toBe(false);
+  });
+
+  it('keeps an expired live cache when rules fail transiently but protection returns a partial set', () => {
+    const cachePath = join(dir, 'cache.json');
+    const repo = 'web-everything/web-everything';
+    getRequiredStatusChecks({ repo, cachePath, now: 1000, readChecks: () => ['test', 'soak-replay-gate'] });
+    const gh = vi.fn().mockImplementationOnce(() => { throw new Error('HTTP 502'); }).mockReturnValueOnce(classicBranch('test'));
+    const result = getRequiredStatusChecks({ repo, cachePath, now: 90_000_000,
+      readChecks: options => defaultReadRequiredStatusChecks({ ...options, gh }),
+    });
+    expect(result).toMatchObject({ checks: ['test', 'soak-replay-gate'], source: 'stale-cache' });
+    expect(JSON.parse(readFileSync(cachePath, 'utf8')).entries[`${repo}@main`]).toEqual({
+      checks: ['test', 'soak-replay-gate'], source: 'live', fetchedAtMs: 1000,
+    });
+  });
+
+  it('routes the rules read through the real throttle personal read path when enabled', () => {
     vi.stubEnv('WE_GH_THROTTLE_PERSONAL_ROUTE', '1');
     vi.stubEnv('WE_GITHUB_AUTH_PERSONAL_EXCEPTIONS', 'reads'); // github.auth=app keeps the route off unless 'reads' is listed
     vi.stubEnv('GH_TOKEN', 'ghs_test_fixture');
     execFileSync.mockReturnValueOnce('ghp_test_fixture');
-    spawnSync.mockImplementationOnce((_bin, _args, opts) => {
+    const routed = (_bin, args, opts) => {
       expect(opts.env.GH_TOKEN === 'ghp_test_fixture').toBe(true);
       expect(opts.timeout).toBe(15_000);
-      return { status: 0, stdout: Buffer.from('["personal-check"]'), stderr: Buffer.alloc(0) };
-    });
-    expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check']);
+      const body = args.some(a => a.includes('/rules/')) ? JSON.stringify([[requiredRule('personal-check')]]) : classicBranch('classic-check');
+      return { status: 0, stdout: Buffer.from(body), stderr: Buffer.alloc(0) };
+    };
+    spawnSync.mockImplementationOnce(routed).mockImplementationOnce(routed);
+    expect(defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything' })).toEqual(['personal-check', 'classic-check']);
     expect(execFileSync).toHaveBeenCalledWith('gh', ['auth', 'token'], expect.any(Object));
-    expect(spawnSync.mock.calls[0][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts']);
+    expect(spawnSync.mock.calls[0][1]).toEqual(['api', '--paginate', '--slurp', 'repos/web-everything/web-everything/rules/branches/main?per_page=100']);
+    expect(spawnSync.mock.calls[1][1]).toEqual(['api', 'repos/web-everything/web-everything/branches/main']);
     expect(process.env.GH_TOKEN === 'ghs_test_fixture').toBe(true);
   });
 
@@ -280,12 +597,13 @@ describe('defaultReadRequiredStatusChecks', () => {
       .toEqual({ source: 'declared', checks: ['test', 'e2e'] });
   });
 
-  it('shells `gh api repos/<repo>/branches/<branch>/protection --jq .required_status_checks.contexts`', () => {
+  it('shells `gh api repos/<repo>/branches/<branch>` for the classic set', () => {
+    execFileSync.mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('test', 'smoke', 'daemon-soak'));
     const result = defaultReadRequiredStatusChecks({ repo: 'web-everything/web-everything', branch: 'main' });
     expect(result).toEqual(['test', 'smoke', 'daemon-soak']);
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/web-everything/web-everything/branches/main/protection', '--jq', '.required_status_checks.contexts'],
+      ['api', 'repos/web-everything/web-everything/branches/main'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });
@@ -295,10 +613,11 @@ describe('defaultReadRequiredStatusChecks', () => {
   // rather than this reader failing a caller (e.g. a local CLI run with no `--repo` flag) that never had a
   // slug to pass.
   it('falls back to gh\'s own {owner}/{repo} template placeholders when no repo slug is given', () => {
+    execFileSync.mockReturnValueOnce('[[]]').mockReturnValueOnce(classicBranch('test'));
     defaultReadRequiredStatusChecks({});
     expect(execFileSync).toHaveBeenCalledWith(
       'gh',
-      ['api', 'repos/{owner}/{repo}/branches/main/protection', '--jq', '.required_status_checks.contexts'],
+      ['api', 'repos/{owner}/{repo}/branches/main'],
       expect.objectContaining({ encoding: 'utf8' }),
     );
   });
@@ -306,9 +625,9 @@ describe('defaultReadRequiredStatusChecks', () => {
 
 describe('adding a required check never stalls reviews (live 2026-10-07, `integration`, #4261)', () => {
   const ok = (name) => ({ name, status: 'completed', conclusion: 'success' });
-  it('the declared fallback names `integration`', async () => {
+  it('the declared fallback matches ruleset 24883772', async () => {
     const m = await import('../required-status-checks.mjs');
-    expect(m.FALLBACK_REQUIRED_STATUS_CHECKS).toContain('integration');
+    expect(m.FALLBACK_REQUIRED_STATUS_CHECKS).toEqual(['test', 'smoke', 'daemon-soak', 'soak-replay-gate']);
   });
   it('integration is implied by a green `test`, only when it has no row of its own', async () => {
     const { withoutImpliedRequiredChecks: w } = await import('../required-status-checks.mjs');
