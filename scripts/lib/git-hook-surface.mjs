@@ -131,13 +131,15 @@ function fingerprintEntry(path) {
  * value regardless of what is actually on disk.
  *
  * Never throws: a missing `.git/hooks/` reads as `{}` (not itself suspicious — a fresh/shallow clone may have
- * none); a missing/unreadable `.git/config` reads `configHash: null`.
+ * none). Config read provenance is explicit: `present` means bytes and hash were read successfully,
+ * `absent` means ENOENT, and `unreadable` means another read failure. The latter two have null bytes/hash;
+ * null payloads alone never authorize deletion.
  *
  * `configBytes` carries the file itself (raw bytes, so a restore is byte-exact), so a caller can hand this
  * snapshot back to {@link resetHookSurface} as the baseline to restore after a detected tamper (#4291 advisory
  * finding). It may hold credentials (a remote URL with a token): never log or serialize a snapshot.
  * @param {string} dir - the lane's own checkout root (NOT `.git` itself).
- * @returns {{configHash: string|null, configBytes: Buffer|null, files: Record<string,string>}}
+ * @returns {{configState: 'absent'|'present'|'unreadable', configHash: string|null, configBytes: Buffer|null, files: Record<string,string>}}
  */
 export function snapshotHookSurface(dir) {
   const files = {};
@@ -149,23 +151,32 @@ export function snapshotHookSurface(dir) {
   } catch { /* no .git/hooks/ at all — files stays {} */ }
   let configHash = null;
   let configBytes = null;
+  let configState = 'unreadable';
   try {
-    configBytes = readFileSync(join(dir, '.git', 'config'));
-    configHash = createHash('sha256').update(configBytes).digest('hex');
-  } catch { /* no .git/config — configHash stays null */ }
-  return { configHash, configBytes, files };
+    const bytes = readFileSync(join(dir, '.git', 'config'));
+    configHash = createHash('sha256').update(bytes).digest('hex');
+    configBytes = bytes;
+    configState = 'present';
+  } catch (error) {
+    if (error.code === 'ENOENT') configState = 'absent';
+  }
+  return { configState, configHash, configBytes, files };
 }
 
 /**
  * Did a lane's hook-plantable surface change between two {@link snapshotHookSurface} reads? PURE, fail-closed:
  * a missing `before`/`after` (a caller that skipped taking one) reads as changed — this must never be the
- * quiet default that waves a run through.
- * @param {{configHash: string|null, files: Record<string,string>}|null|undefined} before
- * @param {{configHash: string|null, files: Record<string,string>}|null|undefined} after
+ * quiet default that waves a run through. An explicitly unreadable config in either snapshot always reads
+ * as changed, even with matching null hashes. Legacy comparison fixtures may omit configState.
+ * @param {{configState?: 'absent'|'present'|'unreadable', configHash: string|null, files: Record<string,string>}|null|undefined} before
+ * @param {{configState?: 'absent'|'present'|'unreadable', configHash: string|null, files: Record<string,string>}|null|undefined} after
  * @returns {{changed: boolean, reason: string}}
  */
 export function hookSurfaceChanged(before, after) {
   if (!before || !after) return { changed: true, reason: 'the hook surface could not be read (a before or after snapshot is missing)' };
+  if (before.configState === 'unreadable' || after.configState === 'unreadable') {
+    return { changed: true, reason: '.git/config could not be read' };
+  }
   if ((before.configHash ?? null) !== (after.configHash ?? null)) {
     return { changed: true, reason: '.git/config changed (hooksPath, an include, or some other entry)' };
   }
@@ -234,6 +245,9 @@ function restoreRepoHooksPath(dir) {
  * the WHOLE `.git/config` is put back to its text first (a `core.fsmonitor`, `include.path` or alias the worker
  * added is gone, rather than hashed into the next dispatch's baseline). The file is removed and re-created, so a
  * `.git/config` symlink the worker planted is replaced, never written through.
+ * Only an explicitly absent baseline with null bytes authorizes deletion; a present baseline requires
+ * Buffer bytes (including an empty Buffer). Unreadable, missing-state or inconsistent supplied baselines
+ * refuse before any mutation or git call. Omitting the baseline preserves pre-worker cleanup behavior.
  *
  * `.git`/`.git/hooks` MUST be real directories, never followed through (#4291 advisory review, security/security):
  * a worker sandboxed to the lane could replace either with a symlink pointing outside it, and the readdir+rmSync
@@ -242,12 +256,14 @@ function restoreRepoHooksPath(dir) {
  * real directory, this returns `clean: false` immediately, touching neither path — a missing `.git` or
  * `.git/hooks` is not itself suspicious (a fresh/shallow clone may have neither yet) and falls through as usual.
  *
+ * Structural refusal returns a synthetic unreadable snapshot, never a known-absent config.
  * @param {string} dir
- * @param {{configBytes?: Buffer|null}} [baseline]
- * @returns {{clean: boolean, leftover: string[], snapshot: {configHash: string|null, configBytes: Buffer|null, files: Record<string,string>}}}
+ * @param {{configState: 'absent'|'present'|'unreadable', configBytes: Buffer|null}} [baseline]
+ * @returns {{clean: boolean, leftover: string[], snapshot: {configState: 'absent'|'present'|'unreadable', configHash: string|null, configBytes: Buffer|null, files: Record<string,string>}}}
  *   `clean: false` means the cleanup could not fully complete (a leftover non-sample hook file, or the config
- *   write/restore failed) — a caller MUST treat that as "no safe baseline": refuse before running any worker,
- *   and after a tamper run no further git in the lane (not even the discard).
+ *   baseline was refused, write/restore failed, or final read was unreadable) — a caller MUST treat that as
+ *   "no safe baseline": refuse before running any worker, and after a tamper run no further git in the lane
+ *   (not even the discard).
  */
 export function resetHookSurface(dir, baseline) {
   for (const p of [join(dir, '.git'), join(dir, '.git', 'hooks')]) {
@@ -255,21 +271,27 @@ export function resetHookSurface(dir, baseline) {
     try { st = lstatSync(p); } catch { continue; } // missing is fine — nothing to protect yet, fall through
     if (!st.isDirectory()) {
       // A symlink (or a plain file) in place of a real directory — refuse without touching anything under it.
-      return { clean: false, leftover: [], snapshot: { configHash: null, configBytes: null, files: {} } };
+      return { clean: false, leftover: [], snapshot: { configState: 'unreadable', configHash: null, configBytes: null, files: {} } };
     }
   }
+  if (baseline !== undefined
+    && !((baseline?.configState === 'present' && Buffer.isBuffer(baseline.configBytes))
+      || (baseline?.configState === 'absent' && baseline.configBytes === null))) {
+    const snapshot = snapshotHookSurface(dir);
+    return { clean: false, leftover: Object.keys(snapshot.files).filter((name) => !name.endsWith('.sample')), snapshot };
+  }
+  const configPath = join(dir, '.git', 'config');
   let restoreOk = true;
-  if (baseline?.configBytes != null) {
-    const configPath = join(dir, '.git', 'config');
+  if (baseline?.configState === 'present') {
     try {
       rmSync(configPath, { force: true });
       writeFileSync(configPath, baseline.configBytes, { flag: 'wx' });
     } catch { restoreOk = false; }
-  } else if (baseline && baseline.configBytes == null) {
+  } else if (baseline?.configState === 'absent') {
     // The baseline was taken with no `.git/config` on disk at all (#4393) — a config a worker created from
     // nothing since then must not survive the reset. Only fires when a baseline was actually passed (the
     // pre-worker cleanup call site passes none at all, and must leave a pre-existing repo's own config alone).
-    try { rmSync(join(dir, '.git', 'config'), { force: true }); } catch { restoreOk = false; }
+    try { rmSync(configPath, { force: true }); } catch { restoreOk = false; }
   }
   try {
     const hooksDir = join(dir, '.git', 'hooks');
@@ -281,5 +303,5 @@ export function resetHookSurface(dir, baseline) {
   const configOk = restoreRepoHooksPath(dir);
   const snapshot = snapshotHookSurface(dir);
   const leftover = Object.keys(snapshot.files).filter((name) => !name.endsWith('.sample'));
-  return { clean: restoreOk && configOk && leftover.length === 0, leftover, snapshot };
+  return { clean: restoreOk && configOk && snapshot.configState !== 'unreadable' && leftover.length === 0, leftover, snapshot };
 }
