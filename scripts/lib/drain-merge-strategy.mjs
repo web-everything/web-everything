@@ -85,15 +85,17 @@ export function queueEnqueueModeFromPolicy(resolved) { return mergeActionFor(res
 
 /**
  * The queue's required set, through the ONE shared reader (`getRequiredStatusChecks`): its paginated ruleset read
- * unioned with classic protection. Only a `live` or fresh `cache` read is that full union; `declared`, `fallback`,
- * `stale-cache` and `unavailable` may miss a ruleset check, so they grant no relief (and neither does any failure).
+ * unioned with classic protection. Only a `live` read is known to be that full union: a cache entry carries no
+ * version, so one written by an older reader (first rules page only, or classic only) or dated in the future would
+ * pass as `cache`. `ttlMs: 0` forces the live read (memoized once per pass by the caller); every other source —
+ * `cache`, `declared`, `fallback`, `stale-cache`, `unavailable` — and any failure grants no relief.
  */
 export function readQueueRequiredChecks({ repo, branch, readRequired = getRequiredStatusChecks } = {}) {
   if (typeof repo !== 'string' || !repo.trim()) return null;
   if (typeof branch !== 'string' || !branch.trim()) return null;
   try {
-    const { checks, source } = readRequired({ repo, branch }) ?? {};
-    if (!['live', 'cache'].includes(source) || !Array.isArray(checks)) return null;
+    const { checks, source } = readRequired({ repo, branch, ttlMs: 0 }) ?? {};
+    if (source !== 'live' || !Array.isArray(checks)) return null;
     const unique = [...new Set(checks)];
     if (!unique.length || unique.some(name => typeof name !== 'string' || !name.trim())) return null;
     return unique.sort();
