@@ -37,6 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { normalizeComment, classifyEvent } from '../operations/coroner-rounds.mjs';
 import { isTrustedMarkerAuthor } from '../lib/marker-authorship.mjs';
 import { isReviewVerdictComment, reviewedHeadsOf } from './mechanical-round-cap.mjs';
+import { ADVISORY_NOTE_MARKER } from './advisory-round-count.mjs';
 import { takeoverMarkers, takeoverVoidRefused, takeoverRung, sameHeadSha } from './fix-takeover.mjs';
 import { LIST_COMMENTS_PAGE_SIZE } from './pr-comments-complete.mjs';
 
@@ -105,6 +106,26 @@ export function resolveTakeoverBudget({
 const bodyOf = (c) => (typeof c?.body === 'string' ? c.body : '');
 const timeOf = (c) => { const t = Date.parse(c?.createdAt ?? c?.created_at ?? ''); return Number.isFinite(t) ? t : NaN; };
 const stamp = (s) => { const t = Date.parse(s ?? ''); return Number.isFinite(t) ? t : NaN; };
+
+/** The advisory outcome a review posts while mandatory referrals are unruled (`review-pr.mjs`): neither verdict. */
+export const PENDING_REFERRAL_OUTCOME = 'pending-referral';
+
+/**
+ * A trusted advisory that PAUSED: the review stopped on mandatory referrals awaiting a ruling — its (last, real)
+ * `**Advisory outcome:**` line is `pending-referral`, or, on a note with no outcome line, the reason right after the
+ * marker is `Pending: …` (`jury-core.mjs#explainPanelOutcome`). It judges nothing: the ruling wakes the review, which
+ * re-runs on the same head. Live #4708: the paused advisory on the last takeover's head 483aab1e2 (15:37Z) was read
+ * as its verdict, so the operator was told "a person must take it over" and the woken review was refused 6/5.
+ */
+export function isPausedReview(c) {
+  const lead = bodyOf(c).trimStart();
+  if (!lead.startsWith(ADVISORY_NOTE_MARKER) || !isTrustedMarkerAuthor(c)) return false;
+  const outcomes = [...lead.matchAll(/^\*\*Advisory outcome:\*\*\s*`?([a-z-]+)`?/gim)];
+  if (outcomes.length) return outcomes.at(-1)[1].toLowerCase() === PENDING_REFERRAL_OUTCOME;
+  return /^\s*Pending:/.test(lead.slice(ADVISORY_NOTE_MARKER.length).split('\n')[0]);
+}
+/** A review verdict that concluded (a paused advisory is not one). */
+export const isConcludedVerdict = (c) => isReviewVerdictComment(c) && !isPausedReview(c);
 
 /** A trusted operator-approved manual takeover comment. */
 export function isOperatorTakeover(c) {
@@ -175,7 +196,8 @@ function mergeFinding(into, f) {
 /**
  * PURE: the PR's review rounds from its thread alone, oldest first: `[{ at, end, head, findings }]`. A round is
  * every trusted review event (panel/advisory verdicts, referral rulings, policy send-backs, bounces, accepts)
- * between two boundaries — a fixer turn (re-arm, advisory fix) or a takeover signal. Grouping by those boundaries,
+ * between two boundaries — a fixer turn (re-arm, advisory fix) or a takeover signal. A paused advisory
+ * ({@link isPausedReview}) is skipped; `concluded` marks a round holding a concluded review verdict. Grouping by those boundaries,
  * not by head sha, keeps a round whole when some of its comments name no head. Findings closed by a ruling
  * (`not-real`, `card`, …) are left out.
  *
@@ -195,8 +217,14 @@ export function reviewRounds(comments) {
     const t = stamp(c.at);
     if (!Number.isFinite(t) || !c.trusted) continue;
     if (FIXER_TURN.test(c.body.split('\n')[0]) || isOperatorTakeover(raw)) { items.push({ t, boundary: true }); continue; }
+    if (isPausedReview(raw)) continue;
     const ev = classifyEvent(c);
-    if (ev && (ev.type === 'round' || ev.type === 'review')) items.push({ t, ev });
+    // A block ruling on a paused review's referrals concludes that review too (the policy or the operator ruled it):
+    // otherwise a review that pauses on the same referrals every run would leave the takeover unjudged forever
+    // (live #4708, 17:44Z: the woken review paused again on the referrals already ruled block).
+    if (ev && (ev.type === 'round' || ev.type === 'review')) {
+      items.push({ t, ev, concluded: isConcludedVerdict(raw) || (ev.type === 'round' && /send-back|referral-block/.test(String(ev.trigger ?? ''))) });
+    }
   }
   for (const t of boundaries) items.push({ t, boundary: true });
   items.sort((a, b) => a.t - b.t || (a.boundary ? -1 : 1));
@@ -220,12 +248,13 @@ export function reviewRounds(comments) {
     // The segment's headless round learns the first NEW head named in it (a repeat head may be older code).
     if (!r && h && open && !open.head && !seen.has(h)) { r = Object.assign(open, { head: h, repeat: false }); byHead.set(h, r); }
     if (!r) {
-      r = { at: it.t, end: it.t, head: h, findings: [], repeat: Boolean(h && seen.has(h)), stale: false };
+      r = { at: it.t, end: it.t, head: h, findings: [], repeat: Boolean(h && seen.has(h)), stale: false, concluded: false };
       rounds.push(r); segment.push(r);
       if (h) byHead.set(h, r);
       if (!open || !(open.head && !open.repeat)) open = r;
     }
     r.end = it.t;
+    if (it.concluded) r.concluded = true;
     for (const f of it.ev.findings ?? []) mergeFinding(r.findings, f);
   }
   close();
@@ -312,8 +341,9 @@ export function takeoverProgress(comments, episode) {
   const markerStart = markerStartHead(episode);
   const rule = dispatchJudgeRule(comments, { start: episode.start, end: episode.end, startHead: markerStart });
   const heads = { oldHeads: rule.oldHeads, markerStart };
-  // A late re-review of older code (stale) judges only when no fresh round does.
-  const judging = rounds.filter((r) => rule.judges(r.at, [r.head]));
+  // A late re-review of older code (stale) judges only when no fresh round does. Only a CONCLUDED review judges the
+  // takeover: rulings on a paused review alone do not (the woken review is owed).
+  const judging = rounds.filter((r) => r.concluded && rule.judges(r.at, [r.head]));
   const after = judging.filter((r) => !r.stale).at(-1) ?? judging.at(-1) ?? null;
   if (!after) return { judged: false, ...heads };
   const b = tally(before?.findings ?? []);
