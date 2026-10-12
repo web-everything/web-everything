@@ -1,11 +1,11 @@
 {
   "schema": 1,
-  "frozen": true,
-  "reason": "merge-queue switch: ruleset apply (operator go 2026-10-12)",
-  "at": "2026-10-12T11:52:38.038Z",
-  "redRef": "main",
+  "frozen": false,
+  "reason": null,
+  "at": null,
+  "redRef": null,
   "mergeSha": null,
-  "kind": "manual",
-  "publishedAt": "2026-10-12T11:52:38.051Z",
+  "kind": null,
+  "publishedAt": "2026-10-12T12:49:46.432Z",
   "publishedBy": "red-main-remediation"
 }
