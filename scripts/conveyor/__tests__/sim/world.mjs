@@ -316,6 +316,11 @@ export function createWorld({ repos = ['we'], lanes = 3, clockStartOffsetMs = 0 
     // ci-heal session" invariant reads as never dispatched. Pin the Claude path; fix-executor-routing.test.mjs owns
     // the routing itself.
     WE_FIX_EXECUTOR: 'claude',
+    // x09e2bn — the drain's red-main freeze reader defaults to the shared ops branch and fails CLOSED when it is
+    // unreadable. The sim world has no ops branch, so every drain pass would hold all PRs and nothing would land
+    // ("never landed", "never observed an overlap-yield line"). Pin the local reader; red-main-freeze-drain.test.mjs
+    // owns the shared reader itself.
+    WE_DRAIN_RED_MAIN_FREEZE_READER: 'local-only',
   };
   delete env.WE_GITHUB_APP_ID;
   delete env.WE_GITHUB_APP_INSTALLATION_ID;

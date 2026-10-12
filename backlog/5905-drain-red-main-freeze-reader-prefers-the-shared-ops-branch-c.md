@@ -18,24 +18,52 @@ Also owed here (PR #4715 round-3 self-review, the same auto/manual class one fil
 
 ## Acceptance
 
-- [A1] **Executable** — TODO: a command that fails before this item lands and passes after.
+Prerequisite update: the historical blocker above is satisfied; the local marker already resolves through the coordination root in we:scripts/readiness/red-main-remediation.mjs.
 
-Hint: a card that loosens a refusal needs two Must lines — what happens on error (refuse), and every input kind besides source code (docs, config, data) that the loosening must still treat cautiously.
+- [A1] **Executable** — shared manual freezes hold every PR by default; unreadable shared state always holds every PR; both clear releases; local-only restores the local reader. All five settings report default/platform/settings/env sources.
 
-Hint: For any receive or write endpoint, specify the body-size cap, rate limit, CSRF/origin check, and protection against abuse of state-resetting triggers; mirror each in the port test plan, or explain why it does not apply.
+  ```bash
+  npm run test:unit -- scripts/lib/__tests__/red-main-freeze-drain.test.mjs -t A1
+  ```
+- [A2] **Executable** — unpublished manual freezes warn and retry once per pass; refuse holds every PR and dequeues the local queue. Successful retry, warn, dequeue-off, dry-run and API failures are covered.
+
+  ```bash
+  npm run test:unit -- scripts/lib/__tests__/red-main-freeze-drain.test.mjs -t A2
+  ```
+- [A3] **Executable** — explicit and legacy automatic markers exempt only the published fix; manual markers and the manual compatibility setting hold it. Hold OFF stops on every freeze.
+
+  ```bash
+  npm run test:unit -- scripts/lib/__tests__/red-main-freeze-drain.test.mjs -t A3
+  ```
+- [A4] **Executable** — the real CLI observes shared freezes in ON/OFF paths and preserves automatic fix exemption.
+
+  ```bash
+  npm run test:unit -- scripts/__tests__/merge-ai-prs-red-main-hold-wiring.test.mjs
+  ```
+- [A5] **Executable** — `redMainManualFreezeFixPr` cascades default/platform/settings/env (`WE_DRAIN_RED_MAIN_MANUAL_FREEZE_FIX_PR`): `hold` (default) holds the published fix PR under a manual freeze; `exempt` restores only the published fix PR landing under hold ON. Unreadable shared state and unpublished manual freezes with `redMainUnpublishedFreeze=refuse` always hold it. All settings log their source; OFF retains revert/unfreeze guidance and unreadable-copy checks.
+
+  ```bash
+  npm run test:unit -- scripts/lib/__tests__/red-main-freeze-drain.test.mjs scripts/__tests__/merge-ai-prs-red-main-hold-wiring.test.mjs
+  ```
+- [A6] **Executable** — the shared `flatText` helper sanitizes every string returned by `readSharedFreeze`, including source and errors, plus merge-gate source/reason/error printing and verdict paths. Newlines, CR and U+2028 cannot inject a workflow-command line.
+
+  ```bash
+  npm run test:unit -- scripts/lib/__tests__/red-main-freeze-shared.test.mjs
+  ```
+- Must refuse on unreadable shared state, including malformed or truncated JSON.
+- Must hold docs, configuration, data and code PRs equally; there is no file-kind exemption.
 
 ## Non-goals
 
-- [N1] TODO: what this item deliberately does not do — or `n/a: <why>` when nothing is excluded.
+- [N1] No heartbeat or background publisher. CI cannot see an unpublished local freeze when the GitHub API is unreachable too; the drain cannot enqueue then either, and already-queued PRs remain the stated residual when dequeue fails.
+- [N2] No new web endpoint: CSRF/origin checks and request rate limits do not apply. Existing authenticated git/gh transports retain bounded output and call timeouts. Dry runs do not publish or dequeue; they report intended actions.
 
 ## Edge cases this change must handle
 
-One line per class: either the handling, or `n/a: <why>`.
-
-1. **Untrusted text** — TODO: the handling, or n/a: <why>.
-2. **Truncated reads** — TODO: the handling, or n/a: <why>.
-3. **Shared state files** — TODO: the handling, or n/a: <why>.
-4. **Fail closed** — TODO: the handling, or n/a: <why>.
-5. **Identity scoping** — TODO: the handling, or n/a: <why>.
-6. **State over time** — TODO: the handling, or n/a: <why>.
-7. **Who wrote it** — TODO: the handling, or n/a: <why>.
+1. **Untrusted text** — the ONE shared `flatText` helper flattens and caps every shared-reader string (including source, mergeSha and git/branch errors) on read, and merge-gate source/reason/error at printing and verdict composition. Marker reason/at and revert SHA are sanitized too; CR/LF and U+2028 cannot start an injected `::error::` line.
+2. **Truncated reads** — `readSharedFreeze` uses maxBuffer and validates JSON plus boolean frozen; read failures hold closed. Queue reads validate data and pagination.
+3. **Shared state files** — ops branch plus coordination-root marker; frozen in either source holds, and local-only is an explicit rollback setting.
+4. **Fail closed** — unreadable shared state holds every PR; unpublished refuse retains the manual hold even if publishing or dequeue fails.
+5. **Identity scoping** — dequeue queries only the local repository and its default branch when that repository uses github-merge-queue.
+6. **State over time** — re-read once per pass, reuse across stop/hold, and retry publication once per pass followed by a fresh shared read; queue pagination visits all entries. No heartbeat.
+7. **Who wrote it** — shared documents retain publishedBy/kind provenance; `freezeKindOf` classifies local explicit/legacy automatic markers, with unknown kinds treated as manual.

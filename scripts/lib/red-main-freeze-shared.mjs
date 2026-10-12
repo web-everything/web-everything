@@ -12,7 +12,7 @@
  *     is the merge-gate's authority for a red main, and a published copy would hold even the main-fix PR.
  *     `unfreeze` clears locally, then publishes an EXPLICIT clear (`clear: true`). `publish` republishes the local
  *     freeze and REFUSES when there is none: "no marker" (a clone without the gitignored file, or a corrupt one) is
- *     never a clear, so only `unfreeze` can publish `frozen:false`. The local marker stays the drain's own source.
+ *     never a clear, so only `unfreeze` can publish `frozen:false`. The drain combines the local marker with this shared copy.
  *   - READER: {@link readSharedFreeze} → the merge-gate's MANUAL-freeze input. Since the operator ruling of 2026-10-11
  *     the gate's authority for "is main red" is main's OWN CI status, read from GitHub (`merge-gate-check.mjs`
  *     `readMainCiFact`), so a publisher that keeps failing can never hide a red main; this copy only adds manual
@@ -30,10 +30,13 @@
  *   clear is computed against the fresh tip and refuses to wipe a DIFFERENT freeze (another writer's, pushed meanwhile). The
  *   residual is EVERY attempt failing, for any reason (origin unreachable, a push policy that refuses each time): the
  *   local marker stays (the drain still stops) and the CLI exits non-zero with a loud line naming the retry
- *   (`publish` after a raise, `unfreeze` after a clear). The drain-side detect/retry/refuse for that is card x09e2bn.
+ *   (`publish` after a raise, `unfreeze` after a clear). The drain detects, retries and contains that state once per pass (x09e2bn).
  *
  *   IMPURE (git, fs) — every side effect is injectable.
  */
+import { readFileSync } from 'node:fs';
+import { cascadePolicy } from './policy-cascade.mjs';
+import { RED_MAIN_HOLD_SETTINGS_FILE, redMainSignal } from './red-main-hold.mjs';
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -218,18 +221,141 @@ export async function publishFreezeFromCli({ marker, clear = false, lifted, env 
 
 /**
  * Read the shared freeze for the merge-gate. Never throws; anything unreadable is `{source, error}` (fail closed).
- * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, error?:string}}
+ * @returns {{source:string, frozen?:boolean, reason?:string|null, at?:string|null, publishedAt?:string|null, mergeSha?:string|null, error?:string}}
  */
 export function readSharedFreeze({ board = REPO_ROOT, branch = resolveFreezeBranch(), run = timedGit() } = {}) {
-  const source = `${branch}:${SHARED_FREEZE_FILE}`;
+  const source = flatText(`${branch}:${SHARED_FREEZE_FILE}`);
   let text;
   try { text = readFromTransportBranch({ board, branch, paths: [SHARED_FREEZE_FILE], run })[SHARED_FREEZE_FILE]; }
-  catch (e) { return { source, error: `branch unreadable: ${String(e?.stderr || e?.message || e).trim().split('\n').pop().slice(0, 200)}` }; }
-  if (text == null) return { source, error: `${SHARED_FREEZE_FILE} not on ${branch}` };
+  catch (e) { return { source, error: flatText(`branch unreadable: ${String(e?.stderr || e?.message || e).trim()}`) }; }
+  if (text == null) return { source, error: flatText(`${SHARED_FREEZE_FILE} not on ${branch}`) };
   let doc;
-  try { doc = JSON.parse(text); } catch { return { source, error: `${SHARED_FREEZE_FILE} is not JSON` }; }
-  if (!doc || typeof doc.frozen !== 'boolean') return { source, error: `${SHARED_FREEZE_FILE} has no boolean "frozen"` };
+  try { doc = JSON.parse(text); } catch { return { source, error: flatText(`${SHARED_FREEZE_FILE} is not JSON`) }; }
+  if (!doc || typeof doc.frozen !== 'boolean') return { source, error: flatText(`${SHARED_FREEZE_FILE} has no boolean "frozen"`) };
   const clean = (v) => (v == null ? null : flatText(v)); // printed to the CI log and the hold reason: never raw
   // `kind`: only an explicit 'auto' is automatic; anything else (absent, an old doc, junk) counts as MANUAL (fail closed).
-  return { source, frozen: doc.frozen, kind: doc.kind === 'auto' ? 'auto' : 'manual', reason: clean(doc.reason), at: clean(doc.at), publishedAt: clean(doc.publishedAt) };
+  return { source, frozen: doc.frozen, kind: doc.kind === 'auto' ? 'auto' : 'manual', reason: clean(doc.reason), at: clean(doc.at), publishedAt: clean(doc.publishedAt), mergeSha: clean(doc.mergeSha) };
+}
+
+const DRAIN_FREEZE_SETTINGS = {
+  redMainFreezeReader: ['WE_DRAIN_RED_MAIN_FREEZE_READER', 'shared-first', 'local-only'],
+  redMainUnpublishedFreeze: ['WE_DRAIN_RED_MAIN_UNPUBLISHED_FREEZE', 'refuse', 'warn'],
+  redMainUnpublishedDequeue: ['WE_DRAIN_RED_MAIN_UNPUBLISHED_DEQUEUE', 'on', 'off'],
+  redMainLocalAutoFreeze: ['WE_DRAIN_RED_MAIN_LOCAL_AUTO_FREEZE', 'fix-exempt', 'manual'],
+  redMainManualFreezeFixPr: ['WE_DRAIN_RED_MAIN_MANUAL_FREEZE_FIX_PR', 'hold', 'exempt'],
+};
+
+/** Same scalar cascade as redMainHold; injected layers avoid filesystem reads. */
+function resolveFreezeScalar(key, { env = process.env, file = RED_MAIN_HOLD_SETTINGS_FILE, tool, platform } = {}) {
+  if (tool === undefined) { try { tool = JSON.parse(readFileSync(file, 'utf8')); } catch { tool = {}; } }
+  const [envKey, builtIn, alternative] = DRAIN_FREEZE_SETTINGS[key];
+  const norm = v => { const s = String(v ?? '').trim().toLowerCase(); return [builtIn, alternative].includes(s) ? s : null; };
+  const c = cascadePolicy(key, tool?.[key], { env, standard: builtIn, platform: platform === undefined ? undefined : platform[key] ?? null, envValues: { '': norm(env[envKey]) ?? undefined }, valid: v => norm(v) !== null });
+  return { value: norm(c.value), source: ({ tool: 'settings', standard: 'default' })[c.sources['']] ?? c.sources[''] };
+}
+
+export const resolveRedMainFreezeReader = o => resolveFreezeScalar('redMainFreezeReader', o);
+export const resolveRedMainUnpublishedFreeze = o => resolveFreezeScalar('redMainUnpublishedFreeze', o);
+export const resolveRedMainUnpublishedDequeue = o => resolveFreezeScalar('redMainUnpublishedDequeue', o);
+export const resolveRedMainLocalAutoFreeze = o => resolveFreezeScalar('redMainLocalAutoFreeze', o);
+
+export const resolveRedMainManualFreezeFixPr = o => resolveFreezeScalar('redMainManualFreezeFixPr', o);
+
+export function resolveDrainFreezeSettings(o = {}) {
+  return {
+    redMainFreezeReader: resolveRedMainFreezeReader(o),
+    redMainUnpublishedFreeze: resolveRedMainUnpublishedFreeze(o),
+    redMainUnpublishedDequeue: resolveRedMainUnpublishedDequeue(o),
+    redMainLocalAutoFreeze: resolveRedMainLocalAutoFreeze(o),
+    redMainManualFreezeFixPr: resolveRedMainManualFreezeFixPr(o),
+  };
+}
+
+/** Frozen in either source. Pure; shared failures never become a clear. */
+export function evaluateDrainFreeze({ local = null, shared = null, settings }) {
+  const sharedFirst = settings.redMainFreezeReader.value === 'shared-first';
+  const error = sharedFirst && (shared?.error || (typeof shared?.frozen !== 'boolean' ? 'shared freeze not read' : null));
+  const localManual = local != null && freezeKindOf(local) === 'manual';
+  const unpublished = sharedFirst && localManual && (!!error || shared?.frozen !== true);
+  const refuse = unpublished && settings.redMainUnpublishedFreeze.value === 'refuse';
+  const auto = local != null && !localManual;
+  const manual = localManual || (sharedFirst && shared?.frozen === true) || (auto && settings.redMainLocalAutoFreeze.value === 'manual');
+  const frozen = !!(local != null || error || (sharedFirst && shared?.frozen === true));
+  const reason = [refuse ? 'unpublished manual freeze' : manual ? 'manual freeze' : auto ? 'automatic freeze' : null,
+    error ? `shared freeze unreadable: ${flatText(error)}` : null,
+    local != null ? `${flatText(local.reason ?? 'active')} at ${flatText(local.at ?? '?')}` : null,
+    sharedFirst && shared?.frozen ? `shared: ${flatText(shared.reason ?? 'active')} at ${flatText(shared.at ?? '?')}` : null,
+  ].filter(Boolean).join(' — ');
+  return { frozen, manual: !!manual, manualFixExempt: settings.redMainManualFreezeFixPr?.value === 'exempt', auto, error: error ? flatText(error) : null, unpublished, refuse, reason, local, shared };
+}
+
+/** Adapt the effective freeze to the existing hold/quarantine signal. Pure. */
+export function drainFreezeSignal({ state, mainRedState, priority, now, holdOn = true }) {
+  const stopAll = (state.manual && !state.manualFixExempt) || state.error || state.refuse || (!holdOn && state.frozen);
+  const signal = redMainSignal({ mainRedState: holdOn ? mainRedState : null, priority: holdOn ? priority : null, manualFreeze: state.manual || stopAll ? { reason: state.reason } : null, now });
+  if (state.auto && holdOn && !stopAll) { signal.red = true; signal.sources.push('local-auto'); }
+  if (stopAll) signal.fixPrs = [];
+  return signal;
+}
+
+/** Queue IO is local-repo scoped, timed, paginated, and never throws out of the pass. */
+export function dequeueUnpublishedFreeze({ repo, branch, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s) }) {
+  const report = e => stderr(`red-main freeze: ✗ DEQUEUE FAILED: ${flatText(e?.message ?? e)}; already-queued PRs may still land\n`);
+  const graphql = query => {
+    const r = JSON.parse(exec('gh', ['api', 'graphql', '-f', `query=${query}`], { encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, stdio: ['ignore', 'pipe', 'pipe'] }));
+    if (r.errors?.length) throw new Error(JSON.stringify(r.errors));
+    if (!r.data) throw new Error('missing GraphQL data');
+    return r.data;
+  };
+  try {
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo ?? '')) throw new Error('unknown local repository');
+    const [owner, name] = repo.split('/');
+    const repository = `repository(owner:${JSON.stringify(owner)},name:${JSON.stringify(name)})`;
+    if (!branch) branch = graphql(`query { ${repository} { defaultBranchRef { name } } }`).repository?.defaultBranchRef?.name;
+    if (!branch) throw new Error('unknown default branch');
+    let cursor = null;
+    const seen = new Set();
+    const entries = [];
+    do {
+      const data = graphql(`query { ${repository} { mergeQueue(branch:${JSON.stringify(branch)}) { entries(first:100${cursor ? `,after:${JSON.stringify(cursor)}` : ''}) { nodes { pullRequest { id number } } pageInfo { hasNextPage endCursor } } } } }`);
+      const queue = data.repository?.mergeQueue;
+      if (data.repository && queue === null) break;
+      const page = queue?.entries;
+      if (!Array.isArray(page?.nodes)) throw new Error('unreadable merge queue entries');
+      entries.push(...page.nodes);
+      if (!page.pageInfo || typeof page.pageInfo.hasNextPage !== 'boolean') throw new Error('unreadable merge queue pagination');
+      cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+      if (page.pageInfo.hasNextPage && (!cursor || seen.has(cursor))) throw new Error('invalid merge queue cursor');
+      if (cursor) seen.add(cursor);
+    } while (cursor);
+    for (const entry of entries) {
+      try {
+        const pr = entry?.pullRequest;
+        if (!pr?.id || !Number.isInteger(pr.number)) throw new Error('invalid queued PR');
+        if (dryRun) { stderr(`red-main freeze: would dequeue #${pr.number} from ${repo}\n`); continue; }
+        const data = graphql(`mutation { dequeuePullRequest(input:{id:${JSON.stringify(pr.id)}}) { clientMutationId } }`);
+        if (!data.dequeuePullRequest) throw new Error(`dequeue #${pr.number} returned no result`);
+        stderr(`red-main freeze: dequeued #${pr.number} from ${repo}\n`);
+      } catch (e) { report(e); }
+    }
+  } catch (e) { report(e); }
+}
+
+/** One pass of IO around the pure decision. Retry once, then reuse the new shared read. */
+export async function prepareDrainFreeze({ local = null, settings = resolveDrainFreezeSettings(), shared, readShared = readSharedFreeze, publish = publishFreezeFromCli, env = process.env, repo, branch, enqueues = false, dryRun = false, exec = execFileSync, stderr = s => process.stderr.write(s), logSettings = true } = {}) {
+  if (logSettings) for (const [key, setting] of Object.entries(settings)) stderr(`red-main freeze: ${key} setting ${setting.value} via ${setting.source}\n`);
+  const read = () => { try { return readShared(); } catch (e) { return { error: flatText(e?.message ?? e) }; } };
+  if (settings.redMainFreezeReader.value === 'shared-first' && shared === undefined) shared = read();
+  let state = evaluateDrainFreeze({ local, shared, settings });
+  if (state.unpublished) {
+    stderr(`red-main freeze: ⚠ UNPUBLISHED MANUAL FREEZE: ${flatText(local.reason ?? 'active')} at ${flatText(local.at ?? '?')}; CI's merge-gate cannot see it — ${dryRun ? 'would retry publish' : 'retrying publish'}\n`);
+    if (!dryRun) {
+      try { await publish({ marker: local, setExitCode: () => {}, env, stderr, attempts: 1 }); }
+      catch (e) { stderr(`red-main freeze: ✗ publish failed: ${flatText(e?.message ?? e)}\n`); }
+      shared = read();
+      state = evaluateDrainFreeze({ local, shared, settings });
+    }
+    if (state.refuse && enqueues && settings.redMainUnpublishedDequeue.value === 'on') dequeueUnpublishedFreeze({ repo, branch, dryRun, exec, stderr });
+  }
+  return { ...state, settings };
 }

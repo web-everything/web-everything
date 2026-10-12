@@ -16,7 +16,7 @@ import {
 } from '../red-main-freeze-shared.mjs';
 import { evaluatePrGates } from '../merge-gate-ci.mjs';
 import { loadMergeDeliveryPolicy } from '../merge-delivery-policy.mjs';
-import { applyFreezeRecheck, combineRedMain, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
+import { applyFreezeRecheck, combineRedMain, formatRedMainFreeze, gatherPrFacts, isMainFixPr, readMainCiFact, readRedMainFact } from '../../merge-gate-check.mjs';
 import { isTrustedPrAuthor } from '../../conveyor/main-ci-red-core.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -804,5 +804,37 @@ describe('merge-gate-check threads the shared freeze into the gate facts (PR 471
       expect(main).toMatch(/const mainCiRecheck = preRecheck\.ok \? readMainCiFact\(/);
       expect(main).toMatch(/mainCi, mainCiRecheck, exempt: factsOf\.length > 0 && factsOf\.every\(\(x\) => isMainFixPr\(x\.pr, mainCiRecheck\?\.redShas \|\| \[\]\)\)/);
     });
+  });
+});
+
+describe('A6 shared text sanitized on read and merge-gate output', () => {
+  const dirty = 'before\n::error::pwned\r\u2028after';
+  const single = text => { expect(text).not.toMatch(/[\r\n\u2028\u2029]/); expect(text).not.toMatch(/^::error::/m); };
+  it('sanitizes every returned string, including source, SHA and unreadable errors', () => {
+    const doc = { frozen: true, reason: dirty, at: dirty, publishedAt: dirty, mergeSha: dirty };
+    const fact = readSharedFreeze({ board: '/b', branch: BRANCH, run: reader({ text: JSON.stringify(doc) }) });
+    expect(fact.mergeSha).toBe('before ::error::pwned  after');
+    for (const value of Object.values(fact)) if (typeof value === 'string') single(value);
+    single(formatRedMainFreeze(fact).trimEnd());
+    single(gate(combineRedMain(fact, { source: 'ci', red: false })).reason);
+    for (const [branch, run] of [[BRANCH + dirty, reader()], [BRANCH, () => { throw Object.assign(new Error('fetch failed'), { stderr: dirty }); }]]) {
+      const error = readSharedFreeze({ board: '/b', branch, run });
+      expect(error.error).toBeTruthy();
+      for (const value of Object.values(error)) single(value);
+      if (branch === BRANCH) expect(error.error).toContain('before ::error::pwned  after');
+      single(formatRedMainFreeze(error).trimEnd());
+      single(gate(combineRedMain(error, { source: 'ci', red: false })).reason);
+    }
+  });
+  it.each([{ frozen: true, reason: dirty }, { error: dirty }])('flattens combine, recheck and the actual print formatter', raw => {
+    const fact = { source: dirty, ...raw };
+    const combined = combineRedMain(fact, { source: 'ci', red: false });
+    for (const value of Object.values(combined)) if (typeof value === 'string') single(value);
+    single(applyFreezeRecheck({ ok: true, reason: 'pass' }, { frozen: false }, fact).reason);
+    const line = formatRedMainFreeze(fact);
+    expect(line.endsWith('\n')).toBe(true);
+    single(line.slice(0, -1));
+    const source = readFileSync(resolve(HERE, '../../merge-gate-check.mjs'), 'utf8');
+    expect(source).toContain('process.stderr.write(formatRedMainFreeze(redMain))');
   });
 });
