@@ -6048,6 +6048,7 @@ async function runCli() {
   // a FRESH re-read right before the merge (see `revalidateForMerge`): reported, never silently dropped, and
   // left `skip` so it keeps blocking its dependents and is re-read fresh next pass.
   const revalidationAborted = [];
+  const requiredWorkflowsRefusals = [];
   const pendingRebased = []; // #2198 — PRs rebuilt onto main this pass; CI re-running, land on a later pass
   // card xs1hdl7 — the merge-queue freshness hook. Settings from scripts/settings/merge-queue.json; off = today.
   const MERGE_QUEUE = loadMergeQueueSettings();
@@ -6509,22 +6510,11 @@ async function runCli() {
             if (!AS_JSON) process.stderr.write(`  ✓ ${repoTag(c.repo)}${c.num} confirmed merged despite the gh error above (local branch-delete/network failure, or a concurrent lander) — running its numbering/resolve/regen follow-up now, idempotently (xvzc4v4)\n`);
             continue;
           }
-          // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
-          if (e?.code === REQUIRED_WORKFLOWS_UNSATISFIED) {
-            if (!mergeStrategy.requiredWorkflowsRefresh) {
-              mergeStrategy.requiredWorkflowsRefresh = resolveRequiredWorkflowsRefresh();
-              if (!AS_JSON) process.stderr.write(`  required-workflows refresh: ${mergeStrategy.requiredWorkflowsRefresh.value} (source ${mergeStrategy.requiredWorkflowsRefresh.source})\n`);
-            }
-            const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
-            const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha: e.headSha || c.headSha,
-              setting: mergeStrategy.requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
-              refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
-            if (recovery.handled) {
-              c.decision = 'skip'; const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
-              revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
-              if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
-              continue;
-            }
+          // Defer required-workflows recovery until the live cascade finishes.
+          if (e?.code && e.code === REQUIRED_WORKFLOWS_UNSATISFIED) {
+            c.decision = 'skip'; const cc = remaining.find((x) => sameCand(x, c)); if (cc) cc.decision = 'skip';
+            requiredWorkflowsRefusals.push({ c, headSha: e.headSha || c.headSha, detail });
+            continue;
           }
           // #xngv3vn — a REAL merge failure (not the idempotent-already-merged case just above): the trace
           // built earlier is NEVER posted here — `postMergeTrace` is simply not called on this path — so this
@@ -6547,6 +6537,24 @@ async function runCli() {
         }
       }
       if (!progressed) break; // every ready candidate failed → stop (dependents stay deferred)
+    }
+    // required-workflows refusal (ruleset 24930207): one refresh, then await fresh workflow runs.
+    if (requiredWorkflowsRefusals.length) {
+      const requiredWorkflowsRefresh = resolveRequiredWorkflowsRefresh();
+      if (!AS_JSON) process.stderr.write(`  required-workflows refresh: ${requiredWorkflowsRefresh.value} (source ${requiredWorkflowsRefresh.source})\n`);
+      for (const { c, headSha, detail } of requiredWorkflowsRefusals) {
+        const cloneDir = isLocalRepo(c.repo) ? process.cwd() : siblingCloneDir(c.repo);
+        const recovery = await handleRequiredWorkflowsRefusal({ c, key: `${c.repo || localSlug || 'cwd'}#${c.num}`, headSha,
+          setting: requiredWorkflowsRefresh, cloneDir, cwd: isLocalRepo(c.repo) ? undefined : cloneDir, tag: repoTag(c.repo),
+          refreshStalePr, needsAcceptanceRestamp, restampAcceptance, warn: (line) => { if (!AS_JSON) process.stderr.write(`${line}\n`); } });
+        if (recovery.handled) {
+          revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason });
+          if (!AS_JSON) process.stderr.write(`${recovery.line}\n`);
+        } else {
+          failedMerges.push({ num: c.num, repo: c.repo, detail, headSha: c.headSha ?? null });
+          if (!AS_JSON) process.stderr.write(`  ✗ ${repoTag(c.repo)}${c.num} merge failed: ${detail}\n`);
+        }
+      }
     }
     if (deferred.length && !AS_JSON) process.stderr.write(`  · ${deferred.length} deferred (blockedBy an unlanded PR): ${deferred.map((d) => `#${d.num}→[${d.waitOn.join(',')}]`).join(', ')}\n`);
     if (staleLandedOpenItems.length && !AS_JSON) process.stderr.write(`  ⓘ stale-PR note (#999/xq985wu F2): ${nameStaleHolders(staleLandedOpenItems)} — proven landed but still named by an open PR (edge cleared; the open PR is stale/abandoned/impl-half)\n`);

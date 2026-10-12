@@ -91,15 +91,35 @@ describe('required-workflows refusal (ruleset 24930207)', () => {
     expect(out.reason).toContain('acceptance re-stamp failed: hold');
     expect(warn).toHaveBeenCalledWith('  ⚠ #42 acceptance re-stamp failed (hold) — it may re-park');
   });
-  it('wires recovery after already-merged recovery and before generic failure, with JSON skip reasons', () => {
+  it('collects refusals synchronously after already-merged recovery and recovers after the cascade', () => {
     const cli = readFileSync(new URL('../../merge-ai-prs.mjs', import.meta.url), 'utf8');
-    const start = cli.indexOf('if (e?.code === REQUIRED_WORKFLOWS_UNSATISFIED)');
+    const start = cli.indexOf('if (e?.code && e.code === REQUIRED_WORKFLOWS_UNSATISFIED)');
     const block = cli.slice(start, cli.indexOf('// #xngv3vn — a REAL merge failure', start));
     expect(cli.lastIndexOf('if (isPrAlreadyMerged(c.repo, c.num))', start)).toBeGreaterThan(cli.lastIndexOf('} catch (e)', start));
-    expect(block).toContain('headSha: e.headSha || c.headSha');
-    expect(block).toContain('revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason })');
+    expect(start).toBeGreaterThan(-1);
+    expect(cli).toContain('const requiredWorkflowsRefusals = [];');
+    expect(block).toContain('requiredWorkflowsRefusals.push({ c, headSha: e.headSha || c.headSha, detail })');
+    expect(block).not.toMatch(/\bawait\b/);
+    expect(block).not.toContain('handleRequiredWorkflowsRefusal');
     expect(block).toContain("c.decision = 'skip'"); expect(block).toContain('continue;');
     expect(block).not.toContain('failedMerges.push');
+    expect(block).toContain("if (cc) cc.decision = 'skip'");
+    const postStart = cli.indexOf('if (requiredWorkflowsRefusals.length)', start);
+    expect(postStart).toBeGreaterThan(cli.indexOf('if (!progressed) break;', start));
+    const postLoop = cli.slice(postStart, cli.indexOf('if (deferred.length && !AS_JSON)', postStart));
+    expect(postLoop).toContain('const requiredWorkflowsRefresh = resolveRequiredWorkflowsRefresh()');
+    expect(postLoop).toContain('for (const { c, headSha, detail } of requiredWorkflowsRefusals)');
+    expect(postLoop).toContain('await handleRequiredWorkflowsRefusal');
+    expect(postLoop).toContain('setting: requiredWorkflowsRefresh');
+    expect(cli).not.toContain('mergeStrategy.requiredWorkflowsRefresh');
+    const handled = postLoop.slice(postLoop.indexOf('if (recovery.handled)'), postLoop.indexOf('} else {'));
+    expect(handled).toContain('revalidationAborted.push({ num: c.num, repo: c.repo, reason: recovery.reason })');
+    expect(handled).toContain('recovery.line');
+    expect(handled).not.toContain('failedMerges.push');
+    const unhandled = postLoop.slice(postLoop.indexOf('} else {'));
+    expect(unhandled).toContain('failedMerges.push({ num: c.num, repo: c.repo, detail, headSha: c.headSha ?? null })');
+    expect(unhandled).toContain('merge failed: ${detail}');
+    expect(unhandled).not.toContain('revalidationAborted.push');
   });
   it('off never refreshes', async () => {
     const refreshStalePr = vi.fn();
