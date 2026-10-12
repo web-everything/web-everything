@@ -1,4 +1,5 @@
 ---
+bornAs: xaxezem
 kind: story
 size: 3
 parent: "4075"
@@ -12,7 +13,7 @@ tags: []
 
 Filed mechanically ON APPROVAL (operator rule, 2026-09-27 — "prevention outstanding should be filed by default on approval") — this accept verdict named the guard(s) below as owed. None of them blocked the approval; the debt is tracked here instead:
 
-1. `we:backlog/xfb2frn-prevention-flatten-newlines-in-formatprresult-which-is-a-one.md` — Add a check:standards rule, or a filer self-check, that rejects or flags a backlog card whose `scope` paths do not exist on main. The same rule would flag a card whose Acceptance section is still a TODO. Where the source PR is unmerged, the card should say so, for example with a `blockedBy` field.
+1. `we:backlog/5971-prevention-flatten-newlines-in-formatprresult-which-is-a-one.md` — Add a check:standards rule, or a filer self-check, that rejects or flags a backlog card whose `scope` paths do not exist on main. The same rule would flag a card whose Acceptance section is still a TODO. Where the source PR is unmerged, the card should say so, for example with a `blockedBy` field.
 
 Idempotency key (do not edit): approval-prevention-key:web-everything/web-everything#5040@a28dea3fa785920e6de0e650f45cd27b1644473f
 
