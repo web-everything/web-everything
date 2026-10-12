@@ -146,9 +146,9 @@ describe('runFixCli', () => {
       expect((await runFixCli(argv, { ...m.io, run })).code).toBe(0);
       // `git add` runs only against the launcher's private copy (under the git dir), never the lane, and the copy is removed.
       const add = m.calls.find(c => c.includes('add'));
-      expect(add.slice(-3)).toEqual(['add', '--', 'file.txt']);
+      expect(add.slice(-4)).toEqual(['add', '-f', '--', 'file.txt']);
       expect(add).toContain(`--work-tree=${copied.cwd}`);
-      expect(copied.cwd.startsWith(join(tmpdir(), 'fix-run-stage-'))).toBe(true);
+      expect(copied.cwd.startsWith(join(realFs.realpathSync(tmpdir()), 'fix-run-stage-'))).toBe(true);
       expect(copied.text).toBe('edited\n');
       expect(existsSync(copied.cwd)).toBe(false);
       expect(inputs).toContain(`0 ${'0'.repeat(3)}\tgone.txt\x00`); // a deletion is a direct index write: nothing to read
@@ -643,21 +643,34 @@ describe('runFixCli', () => {
       expect(git('ls-tree', 'HEAD', 'run.sh')).toMatch(/^100644 /);
     });
   });
-  // A file the sandbox could rename into the lane but not read keeps its single link, so the link count cannot catch it:
-  // a staged file must be an inode the lane already had before the agent ran, or one born after it started.
-  it('refuses a file older than the run that was not a lane file before it (moved in), but stages an old tracked file edited in place', async () => {
-    await withRealMerge(stagingCases.conflict, {
-      agent: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'resolved\n'); writeFileSync(join(dir, 'moved.txt'), 'SECRET\n'); },
-      io: { stageEntry: (lane, path) => { const e = laneStageEntry(lane, path); return e && !e.missing ? { ...e, born: 1 } : e; } },
-    }, async ({ out, m, recordOutcome }) => {
-      expect(out.code).toBe(1);
-      expect(m.calls.some(c => staged(c) || c.includes('push'))).toBe(false);
-      expect(recordOutcome).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'failed', reason: expect.stringMatching(/^refusing to stage moved\.txt: older than this run/) }));
+  // The copy lacks the lane's unchanged .gitignore files, so without `-f` a negation there (`!keep.tmp` against an
+  // `info/exclude` of `*.tmp`) would be lost and `git add` would refuse a path the lane's own status listed.
+  it('stages a path the lane un-ignores in an unchanged .gitignore', async () => {
+    await withRealMerge({ ...stagingCases.conflict, base: (o) => { stagingCases.conflict.base(o); writeFileSync(join(o.dir, '.gitignore'), '!keep.tmp\n'); writeFileSync(join(o.dir, '.git', 'info', 'exclude'), '*.tmp\n'); } }, {
+      agent: ({ dir }) => { writeFileSync(join(dir, 'file.txt'), 'resolved\n'); writeFileSync(join(dir, 'keep.tmp'), 'k\n'); },
+    }, async ({ out, git }) => {
+      expect(out.code).toBe(0);
+      expect(git('show', 'HEAD:keep.tmp')).toBe('k\n');
     });
-    await withRealMerge(stagingCases.conflict, {
-      agent: ({ dir }) => writeFileSync(join(dir, 'file.txt'), 'resolved\n'),
-      io: { stageEntry: (lane, path) => { const e = laneStageEntry(lane, path); return e && !e.missing ? { ...e, born: 1 } : e; } },
-    }, async ({ out }) => expect(out.code).toBe(0));
+  });
+  // `X -> <outside>` then `x/y`: one directory entry on a case-insensitive filesystem. Writing the copy through the link it
+  // just made would put launcher-written bytes outside the copy; regular files go first and every parent is checked.
+  it('never writes the staging copy through a symlink it created (X -> outside, then x/y)', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'fix-run-outside-'));
+    const gitDir = mkdtempSync(join(tmpdir(), 'fix-run-gitdir-'));
+    try {
+      const m = mk(['aaa', 'bbb']);
+      m.spawn.mockResolvedValue({ finalMessage: 'x' });
+      const run = (cmd, args, opts) => {
+        if (args.includes('status')) return '?? X\0?? x/y\0';
+        if (args.includes('--absolute-git-dir')) return gitDir;
+        return m.run(cmd, args, opts);
+      };
+      const stageEntry = (_lane, path) => (path === 'X' ? { mode: '120000', data: Buffer.from(outside) } : { mode: '100644', data: Buffer.from('y\n') });
+      await runFixCli(argv, { ...m.io, run, stageEntry });
+      expect(realFs.readdirSync(outside)).toEqual([]);
+      expect(realFs.readdirSync(gitDir)).toEqual([]); // the copy is removed either way
+    } finally { rmSync(outside, { recursive: true, force: true }); rmSync(gitDir, { recursive: true, force: true }); }
   });
   it(`refuses to stage more than STAGE_MAX_BYTES in total before git sees any of it`, async () => {
     const m = mk(['aaa', 'bbb']);
