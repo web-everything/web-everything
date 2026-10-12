@@ -53,7 +53,7 @@ import {
   RUNNER_LOCK_ROOT, makeOwner,
   acquireRunnerLease, heartbeatRunnerLease, releaseRunnerLeaseIfOwned,
 } from './runner-lock.mjs';
-import { runReconcileFixDispatch, writePrivateBorrowedPrompt, roundEscalationFor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
+import { runReconcileFixDispatch, writePrivateBorrowedPrompt, routeFixExecutor } from '../../scripts/conveyor/reconcile-fix-dispatch.mjs';
 import { runAwaitVerifyPassDefault, formatAwaitVerifyLines } from '../../scripts/conveyor/await-verify-pass.mjs';
 // xn025gx (fixer proposal A1 + A2 part 1, rulings P1/P2) — the fast push-on-green loop and the active-only fix slot.
 import { runTickAwaitVerify, defaultSlotCountedFixClaims, superviseAwaitVerifyLoop, formatReleaseLines } from '../../scripts/conveyor/await-verify-loop.mjs';
@@ -68,7 +68,7 @@ import { createDispatchSinks } from '../../scripts/operations/dispatch-lane-io.m
 import { repoProfile } from '../../scripts/lib/repo-profile.mjs';
 import { resolveFixSettings } from '../../scripts/conveyor/fix-takeover.mjs';
 import { unlinkSync } from 'node:fs';
-import { createFixBorrowGate, resolveFixExecutorSetting, chooseFixExecutor, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
+import { createFixBorrowGate, resolveFixExecutorSetting, createRoutedCiHealDispatch } from '../../scripts/lib/fix-slot-borrow.mjs'; // card 87: borrow a free builder slot
 import { listBuildDispatchClaims } from '../../scripts/conveyor/build-dispatch-claim.mjs';
 import { fixLauncherAvailable, fixDetachedProvider } from '../../scripts/operations/dispatch-providers/fix.mjs';
 import { listFixDispatchClaims } from '../../scripts/conveyor/fix-claim-store.mjs';
@@ -741,11 +741,8 @@ export async function runTickAllRepos({
   }) : null;
   const executorSetting = resolveFixExecutorSetting();
   const fixSettings = resolveFixSettings();
-  const fixExecutorRoute = (planned) => chooseFixExecutor({
-    setting: executorSetting, ...planned, round: planned.round ?? (Number(planned.attempts) || 0) + 1,
-    mainFix: planned.mainFix || planned.kind === 'main-fix',
-    strongerModel: planned.strongerModel || !!roundEscalationFor(planned, { fixSettings }),
-    launcherAvailable: fixLauncherAvailable('codex'),
+  const fixExecutorRoute = (planned) => routeFixExecutor(planned, {
+    setting: executorSetting, fixSettings, launcherAvailable: fixLauncherAvailable('codex'),
   });
   const routedCiHealTick = (options) => {
     let entries = [];

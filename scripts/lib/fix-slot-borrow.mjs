@@ -45,18 +45,27 @@ export function resolveFixExecutorSetting({ env = process.env, platform = platfo
   return result;
 }
 
+/**
+ * Pure; why this repair must run on Claude whatever `fix.executor` says, or null. The ONE list both the router
+ * ({@link chooseFixExecutor}) and the fixer-cap borrow guard read, so a borrowed slot never bypasses the router.
+ */
+export function claudeOnlyReason({ round = 1, takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false } = {}) {
+  if (takeover) return 'takeover round';
+  // A ruling-not-addressed send-back runs on its own ladder rung (`launchTableFor`); only `claude --bg` applies that table.
+  if (rulingNotAddressed) return 'ruling-not-addressed send-back';
+  if (mainFix) return 'main-fix';
+  if (strongerModel || round >= 3) return 'stronger-model rung';
+  return null;
+}
+
 /** Pure; provider-routing leaves existing provider/borrow selection in control. */
-export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, round = 1,
-  takeover = false, rulingNotAddressed = false, mainFix = false, strongerModel = false, launcherAvailable = false } = {}) {
+export function chooseFixExecutor({ setting = { value: 'codex-first', source: 'default' }, launcherAvailable = false, ...entry } = {}) {
   const source = setting.source ?? 'default';
   const claude = (reason) => ({ executor: 'claude', reason, source });
   if (setting.value === 'claude') return claude('fix.executor=claude');
   if (setting.value === 'provider-routing') return claude('existing provider routing');
-  if (takeover) return claude('takeover round');
-  // A ruling-not-addressed send-back runs on its own ladder rung (`launchTableFor`); only `claude --bg` applies that table.
-  if (rulingNotAddressed) return claude('ruling-not-addressed send-back');
-  if (mainFix) return claude('main-fix');
-  if (strongerModel || round >= 3) return claude('stronger-model rung');
+  const only = claudeOnlyReason(entry);
+  if (only) return claude(only);
   if (!launcherAvailable) return claude('codex launcher unavailable, fallback');
   return { executor: 'codex', reason: 'codex-first ordinary repair', source };
 }

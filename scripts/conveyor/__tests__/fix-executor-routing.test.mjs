@@ -270,13 +270,16 @@ it('routes an admitted second round to Codex before attempting a Claude resume',
 describe('borrowing a builder slot keeps table-bearing entries on Claude', () => {
   const rung = { id: 'opus-high', at: 1 };
   const claudeRoute = { provider: 'claude', model: 'opus', effort: 'high' };
-  const run = async (extra, executor) => {
+  // A ladder whose `stronger-model` rung is launchable on Claude, so `roundEscalationFor` names a rung from round `fromRound`.
+  const ladder = () => ({ policy: { rungs: [{ id: 'stronger-model', action: 'dispatch', taskType: 'fix-strong' }] },
+    routes: { 'stronger-model': { provider: 'claude', model: 'opus' } } });
+  const run = async (extra, executor, { fixSettings = { strongerModelFromRound: 3 } } = {}) => {
     const { runReconcileFixDispatch } = await import('../reconcile-fix-dispatch.mjs');
     const dispatch = vi.fn(() => ({ pr: 42 }));
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const result = runReconcileFixDispatch({
-        root: '/repo', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }),
+        root: '/repo', repo: 'we', checkStaleness: () => ({ fresh: true, behind: 0 }), fixSettings, loadLadder: ladder,
         reconcile: () => ({ dispatch: [{ kind: 'fix', prNumber: 42, headRefName: 'lane/42-x', attempts: 1, files: ['scripts/x.mjs'], ...extra }],
           refusals: [], notes: [] }),
         findItemFn: () => ({ num: '42', scope: ['we:scripts/x.mjs'], specPath: 'backlog/42-x.md' }),
@@ -291,8 +294,14 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
   it.each([
     ['ruling-not-addressed send-back', { rulingNotAddressed: { rung, route: claudeRoute, matches: [] } }],
     ['takeover', { takeover: { rung, route: claudeRoute, attempts: 5, cap: 5 } }],
-  ])('refuses a codex borrow for a %s and keeps waiting', async (_name, extra) => {
-    const { result, dispatch } = await run(extra, 'codex');
+    // Review finding (PR #4897 round 3, codex-correctness): the guard must cover every Claude-only input
+    // `chooseFixExecutor` has, so a borrowed slot never bypasses the router.
+    ['ordinary round-3 escalation', { attempts: 2 }],
+    ['round-3 repair with no stronger-model rung configured', { attempts: 2 }, { fixSettings: { strongerModelFromRound: 0 } }],
+    ['round-2 repair on a stronger-model rung (fix.strongerModelFromRound=2)', { attempts: 1 }, { fixSettings: { strongerModelFromRound: 2 } }],
+    ['red-main fix', { mainFix: true }],
+  ])('refuses a codex borrow for a %s and keeps waiting', async (_name, extra, opts) => {
+    const { result, dispatch } = await run(extra, 'codex', opts);
     expect(dispatch).not.toHaveBeenCalled();
     expect(result.dispatched).toHaveLength(0);
     expect(result.refusals).toEqual([expect.objectContaining({ pr: 42, kind: 'fix-cap', why: expect.stringContaining("Claude") })]);
@@ -302,5 +311,46 @@ describe('borrowing a builder slot keeps table-bearing entries on Claude', () =>
     expect(claude.dispatch).toHaveBeenCalledTimes(1);
     const ordinary = await run({}, 'codex');
     expect(ordinary.dispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Review finding (PR #4897 round 3, correctness): the red-main fix PR must reach the router with `mainFix` set by the
+// REAL planner, not a hand-set flag. Runs `planReconcile` -> (`planFixesFromReconcile` for a fix row) -> the SAME
+// `routeFixExecutor` the fix-dispatch daemon's `fixExecutorRoute` calls, under the default `codex-first` setting.
+describe('a red-main fix PR stays on Claude through the real planner', () => {
+  const NOW = Date.parse('2026-09-25T02:00:00Z');
+  const priority = (pr) => ({ repo: 'we', pr, firstRedSha: '7c731a95e', setAt: NOW, expiresAt: NOW + 30 * 60_000 });
+  const fixPr = (over = {}) => ({
+    number: 4522, state: 'OPEN', headRefName: 'lane/fix-red-main', headRefOid: 'aa11bb22cc33dd44ee55ff6677889900aabbccdd',
+    labels: [{ name: 'review:changes' }], mergeStateStatus: 'CLEAN', files: ['scripts/x.mjs'],
+    statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'success' }],
+    comments: [{ body: '🔁 human review — changes requested\n\nfix the thing' }], ...over,
+  });
+  const route = async (entry) => {
+    const { routeFixExecutor } = await import('../reconcile-fix-dispatch.mjs');
+    return routeFixExecutor(entry, { setting, fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null, launcherAvailable: true });
+  };
+  const plan = async (prs, mainRedPriority) => {
+    const { planReconcile } = await import('../reconcile-core.mjs');
+    return planReconcile({ requiredChecks: ['gate'], prs, agents: [], now: NOW, ...(mainRedPriority ? { mainRedPriority } : {}) });
+  };
+  it('a review-changes fix row of the red-main owner routes to Claude; the same PR without the record routes to codex', async () => {
+    const { planFixesFromReconcile } = await import('../reconcile-fix-dispatch.mjs');
+    const planned = async (rec) => {
+      const { dispatch } = await plan([fixPr()], rec);
+      expect(dispatch).toEqual([expect.objectContaining({ kind: 'fix', prNumber: 4522 })]);
+      const out = planFixesFromReconcile(dispatch, () => null, () => []);
+      expect(out.planned).toHaveLength(1);
+      return out.planned[0];
+    };
+    expect(await route(await planned(priority(4522)))).toMatchObject({ executor: 'claude', reason: 'main-fix' });
+    expect((await route(await planned(null))).executor).toBe('codex');
+  });
+  it('a ci-heal row of the red-main owner routes to Claude', async () => {
+    const red = fixPr({ labels: [], comments: [], statusCheckRollup: [{ name: 'gate', status: 'completed', conclusion: 'failure' }] });
+    const { dispatch } = await plan([red], priority(4522));
+    const heal = dispatch.find((d) => d.kind === 'ci-heal' && d.prNumber === 4522);
+    expect(heal).toBeTruthy();
+    expect(await route(heal)).toMatchObject({ executor: 'claude', reason: 'main-fix' });
   });
 });

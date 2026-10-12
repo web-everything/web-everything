@@ -114,7 +114,7 @@ import { readLiveFixClaim, withAltBranchHint } from './fix-procedure.mjs';
 import { overlapsInFlight } from '../readiness/overlap-chain.mjs';
 import { readStacksForPass, readOriginLaneTips, resolvePrStackSettings, applyStackOrder, planIdleRestacks, markRestackUsed, recordRestackAttempt, withRestackHint, nextRemembered, writeRemembered, clearUnheldHolds } from './pr-stack.mjs';
 import { applyNetScopeToReconcile, markRebaseExemptUsed, rebaseOverlapExemption, resolveNetScopeSettings } from './net-scope.mjs'; // card xd1tvd0
-import { BORROW_REASON, chooseFixExecutor, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
+import { BORROW_REASON, chooseFixExecutor, claudeOnlyReason, formatFixExecutorLog, stampFixExecutor } from '../lib/fix-slot-borrow.mjs';
 import { fixDetachedProvider } from '../operations/dispatch-providers/fix.mjs';
 import { removePromptFile } from '../operations/fix-run.mjs';
 import { listBuildDispatchClaims } from './build-dispatch-claim.mjs';
@@ -356,6 +356,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
         ...(entry.operatorSendBack ? { operatorSendBack: entry.operatorSendBack } : {}),
         ...(entry.altBranch ? { altBranch: entry.altBranch } : {}), // fix procedure — a saved repair to recover first.
         ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
+        ...(entry.mainFix === true ? { mainFix: true } : {}), // the red-main fix PR: its repair stays on Claude.
         ...roundFields(entry), // card xrbu1bp — the round (resume + stronger model) and the base (resume bound).
       });
       continue;
@@ -475,6 +476,7 @@ export function planFixesFromReconcile(dispatchEntries, findItemFn, loadItems, r
       ...(entry.scopeBloat ? { scopeBloat: entry.scopeBloat } : {}),
       ...(entry.altBranch ? { altBranch: entry.altBranch } : {}),
       ...(entry.takeover ? { takeover: entry.takeover } : {}), // card xx0055i — the one takeover at the round cap.
+      ...(entry.mainFix === true ? { mainFix: true } : {}), // the red-main fix PR: its repair stays on Claude.
       ...roundFields(entry), // card xrbu1bp — the round (resume + stronger model) and the base (resume bound).
     });
   }
@@ -1159,6 +1161,17 @@ export function roundEscalationFor(planned, { fixSettings, loadLadder = () => lo
   return planRoundEscalation({ round, fromRound, fixerLadder });
 }
 
+/** The Claude-only inputs of a planned fix or ci-heal entry, as the router and the borrow guard both read them. */
+function claudeOnlyInputs(planned, { fixSettings, loadLadder }) {
+  return { ...planned, round: planned.round ?? roundOf(planned), mainFix: planned.mainFix === true,
+    strongerModel: !!planned.strongerModel || !!roundEscalationFor(planned, { fixSettings, loadLadder }) };
+}
+
+/** The executor for a planned fix or ci-heal entry: the fix-dispatch daemon's `fixExecutorRoute`. */
+export function routeFixExecutor(planned, { setting, fixSettings, loadLadder, launcherAvailable }) {
+  return chooseFixExecutor({ ...claudeOnlyInputs(planned, { fixSettings, loadLadder }), setting, launcherAvailable });
+}
+
 /** Card xrbu1bp — the routing table this fix launch runs on: the ruling rung, the takeover rung, or the round rung. */
 export function launchTableFor(planned, roundEscalation) {
   return fixerTableFor(planned.rulingNotAddressed ?? planned.takeover ?? roundEscalation ?? null);
@@ -1719,6 +1732,9 @@ export function runReconcileFixDispatch({
   // Card 87 — `createFixBorrowGate`: a fix held ONLY by the fixer cap may borrow a free builder slot. null = never.
   borrowGate = null,
   fixExecutorRoute = null,
+  // The borrow guard's round-escalation inputs; injectable so a test never reads the live settings or ladder.
+  fixSettings = resolveFixSettings(),
+  loadLadder = () => loadFixerLadder(),
 } = {}) {
   const repoKey = repo == null ? 'we' : repoKeyForSlug(repo);
   if (repoKey === null) throw new Error(`reconcile-fix-dispatch: --repo ${repo} is not a constellation repo`);
@@ -1848,10 +1864,11 @@ export function runReconcileFixDispatch({
     if (!t.admit) {
       const b = t.kind === 'fix-cap' && borrowGate ? borrowGate.consider({ repo: repoKey, pr: entry.pr }) : null;
       if (!b?.borrow) { refusals.push({ pr: entry.pr, kind: t.kind, why: b?.why && b.why !== 'borrow-off' ? `${t.why}; not borrowing a builder slot: ${b.why}` : t.why }); continue; }
-      // A borrowed non-Claude launch never applies the ladder table (`launchTableFor`), so an entry that carries one
-      // (ruling send-back, takeover, round escalation) keeps waiting for the fixer cap instead.
-      if (b.executor !== 'claude' && (entry.takeover || entry.rulingNotAddressed || roundEscalationFor(entry, { fixSettings: resolveFixSettings() }))) {
-        refusals.push({ pr: entry.pr, kind: t.kind, why: `${t.why}; not borrowing a ${b.executor} builder slot: this repair runs on a stronger Claude model rung` });
+      // A borrowed non-Claude launch skips the router, so any entry the router keeps on Claude (ruling send-back,
+      // takeover, red-main fix, round escalation, round 3+) keeps waiting for the fixer cap instead.
+      const claudeOnly = b.executor !== 'claude' ? claudeOnlyReason(claudeOnlyInputs(entry, { fixSettings, loadLadder })) : null;
+      if (claudeOnly) {
+        refusals.push({ pr: entry.pr, kind: t.kind, why: `${t.why}; not borrowing a ${b.executor} builder slot: this repair stays on Claude (${claudeOnly})` });
         continue;
       }
       borrowed = { executor: b.executor, reason: b.reason ?? BORROW_REASON };

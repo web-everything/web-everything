@@ -1881,6 +1881,9 @@ export function planReconcile({
       ...(roundExtensions > 0 ? { roundExtensions } : {}),
       ...(operatorBudget ? { operatorFixBudget: operatorBudget } : {}),
       ...(operatorAnswer ? { operatorAnswer } : {}),
+      // The red-main fix PR (published priority record): every fix / ci-heal row of it routes to Claude
+      // (`fix-slot-borrow.mjs#claudeOnlyReason`), never a codex-first executor or a borrowed codex slot.
+      ...(mainFixPriority ? { mainFix: true } : {}),
       prNumber,
       headRefName: pr?.headRefName ?? null,
       headRefOid: pr?.headRefOid ?? null,
