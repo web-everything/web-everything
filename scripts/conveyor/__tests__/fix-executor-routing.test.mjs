@@ -388,3 +388,52 @@ describe('an idle restack of the red-main fix PR stays on Claude', () => {
     expect(run({ ...record, pr: bottom.pr }, 'f'.repeat(40)).executor).toBe('codex');
   });
 });
+
+// Converge round 1: the routed-codex fallback reads `<repo>#<pr>`, and a codex launch must carry the merge target.
+describe('routed codex wiring: repo and merge target reach the router and the launcher', () => {
+  it.each([
+    [{ isConflict: true, baseRefName: 'develop' }, 'develop'],
+    [{ restack: { onto: 'lane/base' } }, 'lane/base'],
+    [{}, null],
+  ])('a codex ci-heal routes with options.repo and forwards mergeOnto (%j)', async (extra, mergeOnto) => {
+    const { createRoutedCiHealDispatch } = await import('../../lib/fix-slot-borrow.mjs');
+    const launchCodex = vi.fn(() => 'pid:1');
+    const route = vi.fn(() => ({ executor: 'codex', reason: 'r', source: 's' }));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const run = createRoutedCiHealDispatch({
+      dispatch: async (planned, { sinks }) => Object.values(sinks)[0]({ sessionSlug: 'ci-heal-42', prompt: 'P', claimOwner: 'o' }),
+      route, createSinks: ({ provider }) => ({ launch: provider }),
+      launchCodex, writePrompt: () => '/tmp/p.md', removePrompt: vi.fn(), stampExecutor: vi.fn(),
+      profileFor: () => ({ slug: 'web-everything/frontier-ui', lanePoolRepo: '/fui' }),
+    });
+    try { await run({ pr: 42, laneRef: 'lane/42-x', scope: ['fui:x.ts'], ...extra }, { root: '/repo', repo: 'fui' }); }
+    finally { log.mockRestore(); }
+    expect(route).toHaveBeenCalledWith(expect.objectContaining({ repo: 'fui', kind: 'ci-heal' }));
+    expect(launchCodex).toHaveBeenCalledWith(expect.objectContaining({ mergeOnto, claimRepo: 'fui' }));
+  });
+
+  it('runReconcileFixDispatch hands the router the repo key, so a seeded frontierui ledger falls back to Claude', async () => {
+    const { runReconcileFixDispatch, routeFixExecutor } = await import('../reconcile-fix-dispatch.mjs');
+    const { detectStacks, PR_STACK_DEFAULTS } = await import('../pr-stack.mjs');
+    const bottom = { pr: 11, headRefName: 'lane/b', headRefOid: 'a'.repeat(40) };
+    const top = { pr: 12, headRefName: 'lane/t', headRefOid: 'c'.repeat(40) };
+    const now = Date.now();
+    const stacks = detectStacks([bottom, top], { isAncestor: (x, y) => x === bottom.headRefOid && y === top.headRefOid, now: () => now });
+    const readRouted = vi.fn(({ repo, pr }) => (repo === 'frontierui' && pr === top.pr
+      ? { 'frontierui#12': [{ head: top.headRefOid, outcome: 'no-change' }, { head: top.headRefOid, outcome: 'failed' }] } : {}));
+    const fixExecutorRoute = vi.fn((planned) => routeFixExecutor(planned,
+      { setting, fixSettings: { strongerModelFromRound: 3 }, loadLadder: () => null, launcherAvailable: true, readRouted }));
+    runReconcileFixDispatch({ root: '/repo', repo: 'frontierui', checkStaleness: () => ({ stale: false }),
+      reconcile: () => ({ dispatch: [], refusals: [{ kind: 'nothing-owed', prNumber: top.pr }] }),
+      prStack: () => ({ pairs: [{ ...stacks.pairs[0], bottomHead: 'd'.repeat(40), inSync: false }] }), prStackSettings: PR_STACK_DEFAULTS,
+      readLaneTips: () => new Map([[top.headRefName, top.headRefOid]]),
+      readPrForRestack: () => ({ ...top, prNumber: top.pr, kind: 'fix', labels: [], body: '', isCrossRepository: false }),
+      readMainRedPriorityRecord: () => null, fixExecutorRoute,
+      findItemFn: () => null, loadItems: () => [], pickFreeLanes: () => [1], dispatch: (p) => p,
+      fetchItemlessDiffPaths: () => ['x.ts'], resolveFallbackScope: () => ['fui:x.ts'],
+      resolveProfile: () => ({ capabilities: { fix: true, ciHeal: true }, canonicalPrefix: 'fui' }),
+      listBuildClaims: () => [], listFixClaims: () => [], priorityShadow: null });
+    expect(fixExecutorRoute).toHaveBeenCalledWith(expect.objectContaining({ repo: 'frontierui', pr: top.pr }));
+    expect(fixExecutorRoute.mock.results[0].value).toMatchObject({ executor: 'claude', reason: expect.stringContaining('falls back to Claude') });
+  });
+});
